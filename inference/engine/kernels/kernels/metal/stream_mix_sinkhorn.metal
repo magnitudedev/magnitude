@@ -27,6 +27,11 @@ constant constexpr uint THREADS = 256u;
 // A slice's reduced values: its squares, then every mix.
 constant constexpr uint SUMS = 1u + MIXES;
 
+// Pre element `index` of a row: the result's, by its owner, or the
+// threadgroup copy the finish launch mixes the input by.
+inline void put_own(element::Out<element::F32> own, ulong index, float value) { own.put(index, value); }
+inline void put_own(threadgroup float *own, ulong index, float value) { own[index] = value; }
+
 // Pre (`own`), post and the Sinkhorn comb (`joined`) of a row from its
 // reduced mixes (each already scaled by the row's inverse norm, held by
 // every thread), formed by the whole threadgroup: thread e < S * S owns comb
@@ -35,11 +40,11 @@ constant constexpr uint SUMS = 1u + MIXES;
 // every element takes the same operations in the same order as one thread
 // forming them all would. Every thread of the threadgroup calls it.
 // Independent of any entry ABI: the caller passes its views' strides, and
-// `own` is device or threadgroup memory.
+// `own` is the pre result or threadgroup memory (`put_own`).
 template <typename Own>
 inline void publish_coefficients(thread const float (&mixes)[MIXES], threadgroup float *comb, uint thread_index,
     device const float *base, ulong base_stride, device const float *scale, ulong scale_stride, Own own,
-    ulong own_stride, device float *joined, ulong joined_stride, float epsilon, uint iterations) {
+    ulong own_stride, element::Out<element::F32> joined, ulong joined_stride, float epsilon, uint iterations) {
     const uint source = thread_index / STREAMS, target = thread_index % STREAMS;
     const bool owns = thread_index < STREAMS * STREAMS;
     // The element's logit, then its row's softmax.
@@ -93,14 +98,14 @@ inline void publish_coefficients(thread const float (&mixes)[MIXES], threadgroup
         }
     }
     if (owns)
-        joined[ulong(STREAMS + thread_index) * joined_stride] = value;
+        joined.put(ulong(STREAMS + thread_index) * joined_stride, value);
     if (thread_index < STREAMS) {
         const uint stream = thread_index;
-        own[ulong(stream) * own_stride] =
-            functions::sigmoid(mixes[stream] * scale[0] + base[ulong(stream) * base_stride]) + epsilon;
-        joined[ulong(stream) * joined_stride] = 2.0f
+        put_own(own, ulong(stream) * own_stride,
+            functions::sigmoid(mixes[stream] * scale[0] + base[ulong(stream) * base_stride]) + epsilon);
+        joined.put(ulong(stream) * joined_stride, 2.0f
             * functions::sigmoid(mixes[STREAMS + stream] * scale[scale_stride]
-                + base[ulong(STREAMS + stream) * base_stride]);
+                + base[ulong(STREAMS + stream) * base_stride]));
     }
 }
 
@@ -121,7 +126,8 @@ constant constexpr uint CHUNK = 6144u / MIXES / 32u * 32u;
 // it from `staged`, CHUNK columns a round.
 template <uint TILE>
 inline void reduce_slice(device const float *hidden, device const float *previous, device const float *function,
-    device float *partials, device float *input, constant ulong *seismic_words, uint2 group, uint thread_index,
+    device float *partials, element::Out<element::F32> input, constant ulong *seismic_words, uint2 group,
+    uint thread_index,
     uint sg, uint lane, threadgroup float *staged, threadgroup float (*simdgroups)[THREADS / 32u]) {
     constexpr uint SIMDGROUPS = THREADS / 32u;
     constexpr uint GROUPS = TILE < SIMDGROUPS ? TILE : SIMDGROUPS;
@@ -215,7 +221,7 @@ inline void reduce_slice(device const float *hidden, device const float *previou
             const ulong row = row0 + r;
             streams::collapse<STREAMS>(hidden + row * SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1,
                 SEISMIC_HIDDEN_STRIDE_2, previous + row * SEISMIC_PREVIOUS_STRIDE_0, SEISMIC_PREVIOUS_STRIDE_1,
-                input + row * SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, h,
+                input.offset(row * SEISMIC_RESULT_0_STRIDE_0), SEISMIC_RESULT_0_STRIDE_1, h,
                 group.x * THREADS + thread_index, split * THREADS);
         }
     }
@@ -226,14 +232,14 @@ inline void reduce_slice(device const float *hidden, device const float *previou
         device const float *previous [[buffer(SEISMIC_BUFFER_PREVIOUS)]],                                     \
         device const float *function [[buffer(SEISMIC_BUFFER_FUNCTION)]],                                     \
         device float *partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]],                                   \
-        device float *input [[buffer(SEISMIC_RESULT_0_BUFFER)]],                                              \
+        SEISMIC_RESULT_0_PARAM(input),                                                                         \
         constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],                                       \
         uint2 group [[threadgroup_position_in_grid]], uint thread_index [[thread_index_in_threadgroup]],      \
         uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {                \
         threadgroup float simdgroups[SUMS][THREADS / 32u];                                                     \
         threadgroup float staged[STAGED];                                                                      \
-        reduce_slice<TILE>(hidden, previous, function, partials, input, seismic_words, group, thread_index, sg, \
-            lane, staged, simdgroups);                                                                         \
+        reduce_slice<TILE>(hidden, previous, function, partials, element::Out<element::F32>(input), seismic_words, \
+            group, thread_index, sg, lane, staged, simdgroups);                                                \
     }
 
 STREAM_MIX_SLICE_KERNEL(stream_mix_sinkhorn_split, 1u, 1u)
@@ -246,9 +252,9 @@ kernel void stream_mix_sinkhorn_finish(
     device const float *base [[buffer(SEISMIC_BUFFER_BASE)]],
     device const float *scale [[buffer(SEISMIC_BUFFER_SCALE)]],
     device const float *partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]],
-    device float *input [[buffer(SEISMIC_RESULT_0_BUFFER)]],
-    device float *pre [[buffer(SEISMIC_RESULT_1_BUFFER)]],
-    device float *join [[buffer(SEISMIC_RESULT_2_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(input),
+    SEISMIC_RESULT_1_PARAM(pre),
+    SEISMIC_RESULT_2_PARAM(join),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint row [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
@@ -269,22 +275,24 @@ kernel void stream_mix_sinkhorn_finish(
     float mixes[MIXES];
     for (uint j = 0; j < MIXES; ++j)
         mixes[j] = reduced[1u + j] * inverse;
+    const element::Out<element::F32> joined
+        = element::Out<element::F32>(join).offset(ulong(row) * SEISMIC_RESULT_2_STRIDE_0);
     if (CARRIED) {
         publish_coefficients(mixes, comb, thread_index, base, SEISMIC_BASE_STRIDE_0, scale, SEISMIC_SCALE_STRIDE_0,
-            pre + ulong(row) * SEISMIC_RESULT_1_STRIDE_0, SEISMIC_RESULT_1_STRIDE_1,
-            join + ulong(row) * SEISMIC_RESULT_2_STRIDE_0, SEISMIC_RESULT_2_STRIDE_1, epsilon, iterations);
+            element::Out<element::F32>(pre).offset(ulong(row) * SEISMIC_RESULT_1_STRIDE_0), SEISMIC_RESULT_1_STRIDE_1,
+            joined, SEISMIC_RESULT_2_STRIDE_1, epsilon, iterations);
     } else {
         // Every thread holds its mixes, so `reduced` takes the pre.
         publish_coefficients(mixes, comb, thread_index, base, SEISMIC_BASE_STRIDE_0, scale, SEISMIC_SCALE_STRIDE_0,
-            reduced, 1ul, join + ulong(row) * SEISMIC_RESULT_2_STRIDE_0, SEISMIC_RESULT_2_STRIDE_1, epsilon,
-            iterations);
+            reduced, 1ul, joined, SEISMIC_RESULT_2_STRIDE_1, epsilon, iterations);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         // The sublayer's input: the streams mixed by this site's pre.
         float own[STREAMS];
         for (uint stream = 0; stream < STREAMS; ++stream)
             own[stream] = reduced[stream];
         streams::collapse<STREAMS>(hidden + ulong(row) * SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1,
-            SEISMIC_HIDDEN_STRIDE_2, own, input + ulong(row) * SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1,
-            h, thread_index, THREADS);
+            SEISMIC_HIDDEN_STRIDE_2, own,
+            element::Out<element::F32>(input).offset(ulong(row) * SEISMIC_RESULT_0_STRIDE_0),
+            SEISMIC_RESULT_0_STRIDE_1, h, thread_index, THREADS);
     }
 }

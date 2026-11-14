@@ -1,3 +1,5 @@
+#include <seismic/element.h>
+
 // `parked_scale` (route.seismic): the kernel parks on the host's answer word,
 // read through a `volatile coherent(system)` pointer under system-scope
 // fences, then scales `x` by it.
@@ -16,13 +18,14 @@ constant uint PATIENCE = 1u << 24;
 kernel void parked_scale(
     volatile coherent(system) device const int *answer [[buffer(SEISMIC_BUFFER_ANSWER)]],
     device const float *x [[buffer(SEISMIC_BUFFER_X)]],
-    device float *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(result_cells),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]) {
+    const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> result(result_cells);
     int seen = 0;
     for (uint spin = 0; spin < PATIENCE && seen == 0; ++spin) {
         metal::atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst, system_scope);
         seen = answer[0];
     }
     for (ulong index = 0; index < SEISMIC_DIM_N; ++index)
-        result[index * SEISMIC_RESULT_0_STRIDE_0] = x[index * SEISMIC_X_STRIDE_0] * float(seen);
+        result.put(index * SEISMIC_RESULT_0_STRIDE_0, x[index * SEISMIC_X_STRIDE_0] * float(seen));
 }

@@ -42,11 +42,11 @@ fn stream_mix_sinkhorn<L: Isa, E: Elements>(
         *mix = projected * inverse;
     }
     // SAFETY: each work item writes its own row of every result.
-    let (input, join) = unsafe { (cx.result_0().row_mut([row, 0]), cx.result_2().row_mut([row, 0])) };
+    let (input, mut join) = unsafe { (cx.result_0().row_mut([row, 0]), cx.result_2().row_mut([row, 0])) };
     let mut pre = [0.0f32; MAX_STREAMS];
     for stream in 0..s {
         pre[stream] = activation::sigmoid(mix[stream] * scale.get([0]) + base.get([stream])) + epsilon;
-        join[stream] = 2.0 * activation::sigmoid(mix[s + stream] * scale.get([1]) + base.get([s + stream]));
+        join.set(stream, 2.0 * activation::sigmoid(mix[s + stream] * scale.get([1]) + base.get([s + stream])));
     }
     let pre = &pre[..s];
     let mut comb = [[0.0f32; MAX_STREAMS]; MAX_STREAMS];
@@ -83,11 +83,11 @@ fn stream_mix_sinkhorn<L: Isa, E: Elements>(
         }
     }
     for source in 0..s {
-        join[s + source * s..s + (source + 1) * s].copy_from_slice(&comb[source][..s]);
+        join.part_mut(s + source * s, s).store(&comb[source][..s]);
     }
     let carried = if cx.dim_p() > 0 {
         // SAFETY: each work item writes its own row of every result.
-        unsafe { cx.result_1().row_mut([row, 0]) }.copy_from_slice(pre);
+        unsafe { cx.result_1().row_mut([row, 0]) }.store(pre);
         cx.arg_previous().row([row, 0])
     } else {
         pre

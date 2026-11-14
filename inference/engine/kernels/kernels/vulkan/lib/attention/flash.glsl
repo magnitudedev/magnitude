@@ -117,7 +117,7 @@ void flash_scores_add(uint64_t q, uint64_t q_stride, const uint w, uint k_base, 
         const vec2 x = vec2(element_at(ELEMENT_F16, q, uint64_t(r) * q_stride + d),
             element_at(ELEMENT_F16, q, uint64_t(r) * q_stride + d + 1u));
         [[unroll]] for (uint j = 0u; j < 16u; ++j) {
-            const vec2 k = unpackHalf2x16(seismic_shared_u32[(k_base + (16u * h + j) * pitch + d) / 2u]);
+            const vec2 k = seismic_unpack_f16x2(seismic_shared_u32[(k_base + (16u * h + j) * pitch + d) / 2u]);
             state.s[j] = seismic_fma_rn(x.x, k.x, state.s[j]);
             state.s[j] = seismic_fma_rn(x.y, k.y, state.s[j]);
         }
@@ -161,9 +161,9 @@ void flash_scores_add_shared(uint q_half, uint q_pitch, const uint w, uint k_bas
     const uint lane = SEISMIC_LANE;
     const uint r = lane % 16u, h = lane / 16u;
     for (uint d = 0u; d < w; d += 2u) {
-        const vec2 x = unpackHalf2x16(seismic_shared_u32[(q_half + r * q_pitch + d) / 2u]);
+        const vec2 x = seismic_unpack_f16x2(seismic_shared_u32[(q_half + r * q_pitch + d) / 2u]);
         [[unroll]] for (uint j = 0u; j < 16u; ++j) {
-            const vec2 k = unpackHalf2x16(seismic_shared_u32[(k_base + (16u * h + j) * pitch + d) / 2u]);
+            const vec2 k = seismic_unpack_f16x2(seismic_shared_u32[(k_base + (16u * h + j) * pitch + d) / 2u]);
             state.s[j] = seismic_fma_rn(x.x, k.x, state.s[j]);
             state.s[j] = seismic_fma_rn(x.y, k.y, state.s[j]);
         }
@@ -322,7 +322,7 @@ void flash_accumulate(uint p_half, uint v_base, const uint w, const uint window,
         const float p = seismic_f16_to_f32(seismic_shared_u16[p_half + r * 32u + j]);
         [[unroll]] for (uint c = 0u; c < FLASH_MAX_W / 2u; c += 2u) {
             if (c < columns) {
-                const vec2 v = unpackHalf2x16(seismic_shared_u32[(v_base + j * pitch + column0 + h * columns + c) / 2u]);
+                const vec2 v = seismic_unpack_f16x2(seismic_shared_u32[(v_base + j * pitch + column0 + h * columns + c) / 2u]);
                 o.c[c] = seismic_fma_rn(p, v.x, o.c[c]);
                 o.c[c + 1u] = seismic_fma_rn(p, v.y, o.c[c + 1u]);
             }

@@ -68,9 +68,10 @@ void ngram_gate() {
             const float root = sqrt(max(abs(g), 1e-6));
             const float signed_root = g > 0.0 ? root : (g < 0.0 ? -root : 0.0);
             const float gate = seismic_div_rn(1.0, 1.0 + exp(-signed_root));
-            const uint64_t target = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + row * SEISMIC_RESULT_0_STRIDE_0 * 4ul;
-            element_f32_put(target + stream * SEISMIC_RESULT_0_STRIDE_1 * 4ul, gate);
-            element_f32_put(target + (SEISMIC_DIM_S + stream) * SEISMIC_RESULT_0_STRIDE_1 * 4ul,
+            const Out result = SEISMIC_RESULT_0_OUT;
+            const uint64_t first = row * SEISMIC_RESULT_0_STRIDE_0;
+            out_put(result, first + stream * SEISMIC_RESULT_0_STRIDE_1, gate);
+            out_put(result, first + (SEISMIC_DIM_S + stream) * SEISMIC_RESULT_0_STRIDE_1,
                 inversesqrt(gate * gate * seismic_div_rn(values, float(width)) + epsilon));
         }
     }

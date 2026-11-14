@@ -38,9 +38,9 @@ fn project_rows_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u6
     });
     projection::project_staged_arithmetic(&cx.arg_weight(), first..first + columns, staged, quantized, |row, projected| {
         // SAFETY: each work item writes its own columns of every row.
-        let out = unsafe { result.span_mut([row, first], columns) };
+        let mut out = unsafe { result.span_mut([row, first], columns) };
         for (target, projected) in out.iter_mut().zip(projected) {
-            *target = E::Y::narrow(scale * *projected);
+            target.set(scale * *projected);
         }
     });
 }

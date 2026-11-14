@@ -168,12 +168,11 @@ struct Weights {
 // y[m, column + n] rounded to the stored element E (logits: element::F32).
 template <typename E>
 struct Store {
-    device uchar *y;
+    element::Out<E> y;
     ulong stride0, stride1;
     ulong column;
     void store(uint m, uint n, float value) const {
-        reinterpret_cast<device typename E::storage *>(y)
-            [ulong(m) * stride0 + (column + n) * stride1] = E::store(value);
+        y.put(ulong(m) * stride0 + (column + n) * stride1, value);
     }
     void store2(uint m, uint n, float first, float second) const {
         store(m, n, first);
@@ -181,26 +180,26 @@ struct Store {
     }
     // Row m resolved once, for a caller that stores several columns of it.
     struct Row {
-        device typename E::storage *y;
+        element::Out<E> y;
         ulong stride1;
-        void store(uint n, float value) const { y[ulong(n) * stride1] = E::store(value); }
+        void store(uint n, float value) const { y.put(ulong(n) * stride1, value); }
     };
     Row row(uint m) const {
-        return Row{reinterpret_cast<device typename E::storage *>(y) + ulong(m) * stride0 + column * stride1,
+        return Row{y.offset(ulong(m) * stride0 + column * stride1),
             stride1};
     }
 };
 
 template <typename A, typename Rows>
 struct Residual {
-    device float *y;
+    element::Out<element::F32> y;
     ulong stride0, stride1;
     device const float *residual;
     ulong residual0, residual1;
     Rows rows;
     void store(uint m, uint n, float value) const {
-        y[ulong(m) * stride0 + ulong(n) * stride1] =
-            residual[ulong(rows.at(m)) * residual0 + ulong(n) * residual1] + A::round(value);
+        y.put(ulong(m) * stride0 + ulong(n) * stride1,
+            residual[ulong(rows.at(m)) * residual0 + ulong(n) * residual1] + A::round(value));
     }
     void store2(uint m, uint n, float first, float second) const {
         store(m, n, first);
@@ -209,11 +208,11 @@ struct Residual {
     // Row m resolved once (its result row and its residual row), for a
     // caller that stores several columns of it.
     struct Row {
-        device float *y;
+        element::Out<element::F32> y;
         device const float *residual;
         ulong stride1, residual1;
         void store(uint n, float value) const {
-            y[ulong(n) * stride1] = residual[ulong(n) * residual1] + A::round(value);
+            y.put(ulong(n) * stride1, residual[ulong(n) * residual1] + A::round(value));
         }
         // Columns n .. n + 7 from their sums as (even, odd): two vector
         // loads and stores on unit strides.
@@ -225,21 +224,20 @@ struct Residual {
                 high[i] = A::round(high[i]);
             }
             if (stride1 == 1 && residual1 == 1) {
-                device packed_float4 *to = reinterpret_cast<device packed_float4 *>(y + n);
                 device const packed_float4 *from = reinterpret_cast<device const packed_float4 *>(residual + n);
-                to[0] = float4(from[0]) + low;
-                to[1] = float4(from[1]) + high;
+                y.put4(n, float4(from[0]) + low);
+                y.put4(n + 4u, float4(from[1]) + high);
                 return;
             }
             PROJECTION_UNROLL
             for (uint i = 0; i < 4; ++i) {
-                y[ulong(n + i) * stride1] = residual[ulong(n + i) * residual1] + low[i];
-                y[ulong(n + 4u + i) * stride1] = residual[ulong(n + 4u + i) * residual1] + high[i];
+                y.put(ulong(n + i) * stride1, residual[ulong(n + i) * residual1] + low[i]);
+                y.put(ulong(n + 4u + i) * stride1, residual[ulong(n + 4u + i) * residual1] + high[i]);
             }
         }
     };
     Row row(uint m) const {
-        return Row{y + ulong(m) * stride0, residual + ulong(rows.at(m)) * residual0, stride1, residual1};
+        return Row{y.offset(ulong(m) * stride0), residual + ulong(rows.at(m)) * residual0, stride1, residual1};
     }
 };
 
@@ -251,7 +249,7 @@ struct Residual {
 // with `Residual`'s interface (column strides are the streams' too).
 template <typename A, typename Rows, uint STREAMS, bool COMBED>
 struct Scatter {
-    device float *y;
+    element::Out<element::F32> y;
     ulong stride0, stride1;
     device const float *residual;
     ulong residual0, residual1;
@@ -260,7 +258,7 @@ struct Scatter {
     ulong inject0;
     uint width;
     struct Row {
-        device float *y;
+        element::Out<element::F32> y;
         device const float *residual;
         ulong stride1, residual1;
         device const float *inject;
@@ -271,7 +269,7 @@ struct Scatter {
                 PROJECTION_UNROLL
                 for (uint s = 0; s < STREAMS; ++s) {
                     const ulong column = ulong(s * width + n);
-                    y[column * stride1] = residual[column * residual1] + rounded * inject[s];
+                    y.put(column * stride1, residual[column * residual1] + rounded * inject[s]);
                 }
                 return;
             }
@@ -288,7 +286,7 @@ struct Scatter {
                 for (uint s = 0; s < STREAMS; ++s) {
                     mixed = mixed + comb[s * STREAMS + d] * streams[s];
                 }
-                y[ulong(d * width + n) * stride1] = mixed + rounded * inject[d];
+                y.put(ulong(d * width + n) * stride1, mixed + rounded * inject[d]);
             }
         }
         void store8(uint n, float4 even, float4 odd) const {
@@ -300,7 +298,7 @@ struct Scatter {
         }
     };
     Row row(uint m) const {
-        return Row{y + ulong(m) * stride0, residual + ulong(rows.at(m)) * residual0, stride1, residual1,
+        return Row{y.offset(ulong(m) * stride0), residual + ulong(rows.at(m)) * residual0, stride1, residual1,
             inject + ulong(m) * inject0, width};
     }
     void store(uint m, uint n, float value) const { row(m).store(n, value); }
@@ -316,7 +314,7 @@ struct Scatter {
 template <typename A, typename Rows, uint STREAMS, bool INJECTED, bool COMBED>
 struct OutputOf {
     typedef Scatter<A, Rows, STREAMS, COMBED> type;
-    static type make(device float *y, ulong stride0, ulong stride1, device const float *residual, ulong residual0,
+    static type make(element::Out<element::F32> y, ulong stride0, ulong stride1, device const float *residual, ulong residual0,
         ulong residual1, Rows rows, device const float *inject, ulong inject0, uint width) {
         return type{y, stride0, stride1, residual, residual0, residual1, rows, inject, inject0, width};
     }
@@ -324,7 +322,7 @@ struct OutputOf {
 template <typename A, typename Rows>
 struct OutputOf<A, Rows, 1, false, false> {
     typedef Residual<A, Rows> type;
-    static type make(device float *y, ulong stride0, ulong stride1, device const float *residual, ulong residual0,
+    static type make(element::Out<element::F32> y, ulong stride0, ulong stride1, device const float *residual, ulong residual0,
         ulong residual1, Rows rows, device const float *, ulong, uint) {
         return type{y, stride0, stride1, residual, residual0, residual1, rows};
     }
@@ -335,16 +333,16 @@ struct OutputOf<A, Rows, 1, false, false> {
 // for each of the STREAMS streams residual[s] + (selected + shared) * inject[s].
 // `out`, `residual` and `inject` point at the row; strides are column strides.
 template <uint STREAMS, bool INJECTED>
-inline void routed_join(device float *out, ulong out1, device const float *residual, ulong residual1,
+inline void routed_join(element::Out<element::F32> out, ulong out1, device const float *residual, ulong residual1,
     device const float *inject, ulong width, ulong n, float selected, float shared) {
     if (!INJECTED) {
-        out[n * out1] = residual[n * residual1] + selected + shared;
+        out.put(n * out1, residual[n * residual1] + selected + shared);
         return;
     }
     PROJECTION_UNROLL
     for (uint s = 0; s < STREAMS; ++s) {
         const ulong column = ulong(s) * width + n;
-        out[column * out1] = residual[column * residual1] + (selected + shared) * inject[s];
+        out.put(column * out1, residual[column * residual1] + (selected + shared) * inject[s]);
     }
 }
 
@@ -352,13 +350,12 @@ inline void routed_join(device float *out, ulong out1, device const float *resid
 //   y = round_A(silu(acc / S))
 template <typename A>
 struct MixLow {
-    device uchar *y;
+    element::Out<A> y;
     ulong stride0, stride1;
     float streams;
     void store(uint m, uint n, float value) const {
         const float v = value / streams;
-        reinterpret_cast<device typename A::storage *>(y)[ulong(m) * stride0 + ulong(n) * stride1] =
-            A::store(v / (1.0f + metal::exp(-v)));
+        y.put(ulong(m) * stride0 + ulong(n) * stride1, v / (1.0f + metal::exp(-v)));
     }
     void store2(uint m, uint n, float first, float second) const {
         store(m, n, first);
@@ -369,11 +366,11 @@ struct MixLow {
 // A mix site's inject values (`stream_mix_down`), over S streams:
 //   y = 2 sigmoid(acc / S)                                              (F32)
 struct MixInject {
-    device float *y;
+    element::Out<element::F32> y;
     ulong stride0, stride1;
     float streams;
     void store(uint m, uint n, float value) const {
-        y[ulong(m) * stride0 + ulong(n) * stride1] = 2.0f / (1.0f + metal::exp(-value / streams));
+        y.put(ulong(m) * stride0 + ulong(n) * stride1, 2.0f / (1.0f + metal::exp(-value / streams)));
     }
     void store2(uint m, uint n, float first, float second) const {
         store(m, n, first);
@@ -386,7 +383,7 @@ struct MixInject {
 //   y = sigmoid(acc) * x[m, n] * inverse[m, s] * norm[n] / S             (F32)
 template <typename N>
 struct Mix {
-    device float *y;
+    element::Out<element::F32> y;
     ulong stride0, stride1;
     device const float *x;
     ulong x0, x1;
@@ -407,7 +404,7 @@ struct Mix {
     }
     void store(uint m, uint n, float value, thread const early &e) const {
         const float gate = 1.0f / (1.0f + metal::exp(-value));
-        y[ulong(m) * stride0 + ulong(n) * stride1] = gate * e.normalized / streams;
+        y.put(ulong(m) * stride0 + ulong(n) * stride1, gate * e.normalized / streams);
     }
     void store(uint m, uint n, float value) const { store(m, n, value, load_early(m, n)); }
     void store2(uint m, uint n, float first, float second) const {
@@ -418,14 +415,13 @@ struct Mix {
 
 template <typename A>
 struct SiluMul {
-    device uchar *y;
+    element::Out<A> y;
     ulong stride0, stride1;
     void store_pair(uint m, uint n, float gate_sum, float up_sum) const {
         float gate = A::round(gate_sum);
         float up = A::round(up_sum);
         float activated = A::round(gate / (1.0f + metal::exp(-gate)));
-        reinterpret_cast<device typename A::storage *>(y)
-            [ulong(m) * stride0 + ulong(n) * stride1] = A::store(activated * up);
+        y.put(ulong(m) * stride0 + ulong(n) * stride1, activated * up);
     }
 };
 
@@ -438,7 +434,7 @@ struct SiluMul {
 // NaN. Any other entry compiles none.
 template <typename A>
 struct Glu {
-    device uchar *y;
+    element::Out<A> y;
     ulong stride0, stride1;
     int function;
     void store_pair(uint m, uint n, float gate_sum, float up_sum) const {
@@ -451,8 +447,7 @@ struct Glu {
         up = up < -limit ? -limit : up;
 #endif
         float activated = A::round(functions::activate(function, gate));
-        reinterpret_cast<device typename A::storage *>(y)
-            [ulong(m) * stride0 + ulong(n) * stride1] = A::store(activated * up);
+        y.put(ulong(m) * stride0 + ulong(n) * stride1, activated * up);
     }
 };
 
@@ -460,12 +455,11 @@ struct Glu {
 //   y = round_A(act(round_A(acc)))
 template <typename A>
 struct Activated {
-    device uchar *y;
+    element::Out<A> y;
     ulong stride0, stride1;
     int function;
     void store(uint m, uint n, float value) const {
-        reinterpret_cast<device typename A::storage *>(y)[ulong(m) * stride0 + ulong(n) * stride1] =
-            A::store(functions::activate(function, A::round(value)));
+        y.put(ulong(m) * stride0 + ulong(n) * stride1, functions::activate(function, A::round(value)));
     }
     void store2(uint m, uint n, float first, float second) const {
         store(m, n, first);
@@ -476,10 +470,10 @@ struct Activated {
 // The F32 product of two projections of one input (paired), unrounded:
 //   y = gate * up
 struct Mul {
-    device float *y;
+    element::Out<element::F32> y;
     ulong stride0, stride1;
     void store_pair(uint m, uint n, float gate_sum, float up_sum) const {
-        y[ulong(m) * stride0 + ulong(n) * stride1] = gate_sum * up_sum;
+        y.put(ulong(m) * stride0 + ulong(n) * stride1, gate_sum * up_sum);
     }
 };
 
@@ -487,15 +481,14 @@ struct Mul {
 //   y = round_A(round_A(act(round_A(acc))) * external[m, n])
 template <typename A>
 struct ActivatedMul {
-    device uchar *y;
+    element::Out<A> y;
     ulong stride0, stride1;
     device const float *external;
     ulong external0, external1;
     int function;
     void store(uint m, uint n, float value) const {
         float activated = A::round(functions::activate(function, A::round(value)));
-        reinterpret_cast<device typename A::storage *>(y)[ulong(m) * stride0 + ulong(n) * stride1] =
-            A::store(activated * external[ulong(m) * external0 + ulong(n) * external1]);
+        y.put(ulong(m) * stride0 + ulong(n) * stride1, activated * external[ulong(m) * external0 + ulong(n) * external1]);
     }
     void store2(uint m, uint n, float first, float second) const {
         store(m, n, first);
@@ -506,12 +499,11 @@ struct ActivatedMul {
 // F32 logits, softcapped in F32 from the accumulator when `cap` > 0:
 //   y = cap > 0 ? cap * tanh(acc / cap) : acc
 struct Logits {
-    device uchar *y;
+    element::Out<element::F32> y;
     ulong stride0, stride1;
     float cap;
     void store(uint m, uint n, float value) const {
-        reinterpret_cast<device float *>(y)[ulong(m) * stride0 + ulong(n) * stride1] =
-            cap > 0.0f ? functions::softcap(cap, value) : value;
+        y.put(ulong(m) * stride0 + ulong(n) * stride1, cap > 0.0f ? functions::softcap(cap, value) : value);
     }
     void store2(uint m, uint n, float first, float second) const {
         store(m, n, first);
@@ -710,12 +702,12 @@ struct SharedNorm {
 // SharedNorm applies it: inverses[m * stride0 + group * stride1].
 template <typename In>
 inline void publish_inverses(thread const In &in, uint m_rows, threadgroup const float *squares,
-    device float *inverses, ulong stride0, ulong stride1, uint thread_index, uint threads) {
+    element::Out<element::F32> inverses, ulong stride0, ulong stride1, uint thread_index, uint threads) {
     for (uint item = thread_index; item < m_rows * in.groups(); item += threads) {
         uint m = item / in.groups(), group = item % in.groups();
         float sum = sum_parts<In::parts>(squares + item * In::parts);
-        inverses[ulong(m) * stride0 + ulong(group) * stride1] =
-            metal::rsqrt(sum / float(in.width()) + in.epsilon());
+        inverses.put(ulong(m) * stride0 + ulong(group) * stride1,
+            metal::rsqrt(sum / float(in.width()) + in.epsilon()));
     }
 }
 

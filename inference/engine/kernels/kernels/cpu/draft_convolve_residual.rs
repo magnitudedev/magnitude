@@ -10,13 +10,13 @@ fn draft_convolve_residual<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, grou
     let (dynamic, base, output) = (cx.arg_dynamic(), cx.arg_base(), cx.arg_output());
     let residual = cx.arg_residual().row([row, 0]);
     // SAFETY: each work item writes its own row.
-    let result = unsafe { cx.result_0().row_mut([row, 0]) };
+    let mut result = unsafe { cx.result_0().row_mut([row, 0]) };
     for (column, value) in result.iter_mut().enumerate() {
         let mut sum = 0.0f32;
         for offset in 0..taps.min(position + 1) {
             let coefficient = base.get([1, offset, column]) + dynamic.get([row, 1, offset, column / channels]);
             sum = coefficient.mul_add(output.get([row - offset, column]), sum);
         }
-        *value = residual[column] + sum;
+        value.set(residual[column] + sum);
     }
 }

@@ -1,8 +1,10 @@
 // line_stream: a simdgroup sums a row of C values, each lane UNROLL 16-byte
 // loads in flight at once (C is a multiple of 32 lanes x 4 values x UNROLL).
+#include <seismic/element.h>
+
 kernel void line_stream(
     device const float *input [[buffer(SEISMIC_BUFFER_INPUT)]],
-    device float *out [[buffer(SEISMIC_BUFFER_OUT)]],
+    SEISMIC_OUT_OUT_PARAM(out),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint group [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
@@ -29,5 +31,5 @@ kernel void line_stream(
         total += partial[k];
     total = simd_sum(total);
     if (lane == 0)
-        out[row * SEISMIC_OUT_STRIDE_0] = total;
+        element::Out<ELEMENT_OF(SEISMIC_OUT)>(out).put(row * SEISMIC_OUT_STRIDE_0, total);
 }

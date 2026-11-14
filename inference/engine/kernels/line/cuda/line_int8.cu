@@ -3,6 +3,8 @@
 // accumulators seeded apart, every operand byte twice each warp's first `x`
 // truncated; it writes `x` back (line.seismic). A warp runs whole or not at
 // all.
+#include <seismic/element.cuh>
+
 extern "C" __global__ void line_int8(SEISMIC_KERNEL_PARAMS) {
     typedef unsigned long long u64;
     constexpr unsigned UNROLL = SEISMIC_TUNE_UNROLL;
@@ -31,7 +33,6 @@ extern "C" __global__ void line_int8(SEISMIC_KERNEL_PARAMS) {
         total += (unsigned)((d[k][0] + d[k][1]) + (d[k][2] + d[k][3]));
     if (lane < SEISMIC_DIM_N) {
         const float x = xs[lane * SEISMIC_X_STRIDE_0];
-        reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_OUT))[lane * SEISMIC_OUT_STRIDE_0] =
-            x + (total == 0xFFFFFFFFu ? 1.0f : 0.0f);
+        SEISMIC_OUT_OUT.put(lane * SEISMIC_OUT_STRIDE_0, x + (total == 0xFFFFFFFFu ? 1.0f : 0.0f));
     }
 }

@@ -17,8 +17,8 @@ kernel void embedding_rows(
     device const uchar *table [[buffer(SEISMIC_BUFFER_TABLE)]],
     device const int *tokens [[buffer(SEISMIC_BUFFER_TOKENS)]],
     device const int *directory [[buffer(SEISMIC_BUFFER_DIRECTORY)]],
-    device uchar *embedded [[buffer(SEISMIC_RESULT_0_BUFFER)]],
-    device float *widened [[buffer(SEISMIC_RESULT_1_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(embedded_cells),
+    SEISMIC_RESULT_1_PARAM(widened_cells),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint row [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
@@ -28,16 +28,15 @@ kernel void embedding_rows(
     const uint width = uint(SEISMIC_DIM_D);
     const float scale = as_type<float>(uint(SEISMIC_PARAM_SCALE));
     projection::Weights<packets::W0> rows{table, KERNEL_W0_LAYOUT(width), width, nullptr};
-    device typename activation::storage *out =
-        reinterpret_cast<device typename activation::storage *>(embedded);
+    const element::Out<activation> out(embedded_cells);
+    const element::Out<element::F32> widened(widened_cells);
     const long held = gathered::row(directory, SEISMIC_DIRECTORY_STRIDE_0, SEISMIC_DIM_R,
         SEISMIC_DIM_F, tokens[ulong(row) * SEISMIC_TOKENS_STRIDE_0]);
     // A row that names no table row reads zeros (the whole threadgroup's).
     if (held < 0) {
         for (uint column = thread_index; column < width; column += embedding_threads) {
-            out[ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + ulong(column) * SEISMIC_RESULT_0_STRIDE_1] =
-                activation::store(0.0f);
-            widened[ulong(row) * SEISMIC_RESULT_1_STRIDE_0 + ulong(column) * SEISMIC_RESULT_1_STRIDE_1] = 0.0f;
+            out.put(ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + ulong(column) * SEISMIC_RESULT_0_STRIDE_1, 0.0f);
+            widened.put(ulong(row) * SEISMIC_RESULT_1_STRIDE_0 + ulong(column) * SEISMIC_RESULT_1_STRIDE_1, 0.0f);
         }
         return;
     }
@@ -64,12 +63,9 @@ kernel void embedding_rows(
                 uint column = 32u * p + 8u * step + i;
                 if (column < width) {
                     float decoded = ((i & 1u) ? odd[i >> 1] : even[i >> 1]) * scale;
-                    const float rounded = activation::round(SEISMIC_PARAM_NORMALIZE != 0 ? decoded * inverse : decoded);
-                    // A NaN (a non-finite block scale's product) is the registry's one NaN.
-                    const float value = rounded != rounded ? as_type<float>(0x7fc00000u) : rounded;
-                    out[ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + ulong(column) * SEISMIC_RESULT_0_STRIDE_1] =
-                        activation::store(value);
-                    widened[ulong(row) * SEISMIC_RESULT_1_STRIDE_0 + ulong(column) * SEISMIC_RESULT_1_STRIDE_1] = value;
+                    float value = activation::round(SEISMIC_PARAM_NORMALIZE != 0 ? decoded * inverse : decoded);
+                    out.put(ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + ulong(column) * SEISMIC_RESULT_0_STRIDE_1, value);
+                    widened.put(ulong(row) * SEISMIC_RESULT_1_STRIDE_0 + ulong(column) * SEISMIC_RESULT_1_STRIDE_1, value);
                 }
             }
         }

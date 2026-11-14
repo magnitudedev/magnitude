@@ -11,7 +11,8 @@
 #include "routed.glsl"
 
 // The includer defines ROUTED_SOURCE_ROWS, the sources' rows: the entry's
-// XS, or a streamed entry's fixed SOURCE_ROWS.
+// XS, or a streamed entry's fixed SOURCE_ROWS; and ROUTED_PROJECTED_PUT(m, k,
+// n, value), which stores slot k of row m's channel n in A through `Out`.
 
 #if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
 #define ROUTED_ACT ELEMENT_ACT
@@ -39,8 +40,8 @@
 #define OUTPUT_LANES SEISMIC_TUNE_LANES
 
 // The projection launch: each (row, choice)'s, and the shared expert's,
-// A-rounded down projection at ROUTED_PROJECTED_INDEX(m, slot, n) of the
-// includer's projections (ROUTED_PROJECTED_KIND at ROUTED_PROJECTED_BASE).
+// A-rounded down projection, published through the includer's
+// ROUTED_PROJECTED_PUT(m, slot, n, value).
 void routed_output_projection() {
     const uint tile = gl_WorkGroupID.x;
     const uint64_t m = gl_WorkGroupID.y / (SEISMIC_DIM_K + 1ul);
@@ -81,7 +82,6 @@ void routed_output_projection() {
     [[unroll]] for (uint r = 0u; r < PROJECTION_GEMV_MAX_R; ++r) {
         const uint n = first + r;
         if (r < OUTPUT_R && n < hidden && SEISMIC_LANE % OUTPUT_LANES == r)
-            element_put(ROUTED_PROJECTED_KIND, ROUTED_PROJECTED_BASE, ROUTED_PROJECTED_INDEX(m, choice, uint64_t(n)),
-                element_round(ROUTED_ACT, totals[r * PROJECTION_GEMV_MAX_M]));
+            ROUTED_PROJECTED_PUT(m, choice, uint64_t(n), totals[r * PROJECTION_GEMV_MAX_M]);
     }
 }

@@ -216,10 +216,9 @@ __device__ __forceinline__ void advance_piece(const Operands &in, const float *i
                                      sum);
             const float value = shared.x[i][local_row + r];
             const float output = seismic_fma_rn(skip, value, seismic_fma_rn(shared.gamma[i], inter, sum));
-            element::put<Act>(in.mixed,
-                              static_cast<u64>(first + i) * SEISMIC_RESULT_0_STRIDE_0 + head * SEISMIC_RESULT_0_STRIDE_1 +
-                                  (row0 + r) * SEISMIC_RESULT_0_STRIDE_2,
-                              output);
+            in.mixed.put(static_cast<u64>(first + i) * SEISMIC_RESULT_0_STRIDE_0 + head * SEISMIC_RESULT_0_STRIDE_1 +
+                             (row0 + r) * SEISMIC_RESULT_0_STRIDE_2,
+                         output);
         }
     }
     // S <- gamma_last S + sum_j (gamma_last / gamma_j) u_j B_j^T.

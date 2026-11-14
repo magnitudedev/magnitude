@@ -1874,11 +1874,15 @@ impl Search {
     }
 }
 
-fn search(subject: &Subject<'_>, forms: Forms<'_>) -> Result<Option<Search>, CoverageError> {
-    let mut search = Search::default();
-    // The base: the first binding in candidate order that is admitted,
-    // implemented and not rejected by the toolchain.
-    let base = base_row(
+/// The base of `subject`'s search, formed and recorded in `search`: the first
+/// binding in candidate order that is admitted, implemented and not rejected
+/// by the toolchain.
+fn search_base(
+    subject: &Subject<'_>,
+    forms: Forms<'_>,
+    search: &mut Search,
+) -> Result<Option<Row>, CoverageError> {
+    base_row(
         subject,
         forms.former.base(),
         |row, mut evaluated| {
@@ -1896,7 +1900,12 @@ fn search(subject: &Subject<'_>, forms: Forms<'_>) -> Result<Option<Search>, Cov
                 _ => false,
             }
         },
-    )?;
+    )
+}
+
+fn search(subject: &Subject<'_>, forms: Forms<'_>) -> Result<Option<Search>, CoverageError> {
+    let mut search = Search::default();
+    let base = search_base(subject, forms, &mut search)?;
     let Some(base) = base else {
         return Ok(None);
     };
@@ -2337,6 +2346,42 @@ pub fn cover(
     coverage.groups = universe.len();
     coverage.reached = reached.len();
     coverage.unreached = universe.difference(&reached).cloned().collect();
+    Ok(coverage)
+}
+
+/// Form the base configuration of every native implementation of `module`
+/// with `toolchain`, through `forming`, in parallel across entries: each
+/// entry's first binding in candidate order that is admitted and
+/// implemented, without [`cover`]'s search of the others. What a caller that
+/// must run on every change bounds by entry, one formation of each.
+/// `progress` counts the entries formed.
+pub fn form_bases(
+    module: &CheckedModule,
+    toolchain: &Toolchain,
+    forming: &dyn Forming,
+    progress: &Progress,
+) -> Result<Coverage, CoverageError> {
+    let forms = Forms {
+        former: &toolchain.former,
+        forming,
+    };
+    let subjects = subjects(module, toolchain.backend())?;
+    progress.begin(subjects.len());
+    let bases = in_parallel(&subjects, |subject| {
+        let mut search = Search::default();
+        let base = search_base(subject, forms, &mut search);
+        progress.advance();
+        base.map(|base| (base.is_some(), search))
+    });
+    let mut coverage = Coverage::default();
+    for (subject, base) in subjects.iter().zip(bases) {
+        let (implemented, search) = base?;
+        if !implemented {
+            coverage.unimplemented.push(subject.info.name.clone());
+        }
+        coverage.formed += search.formed;
+        coverage.failures.extend(search.failures);
+    }
     Ok(coverage)
 }
 

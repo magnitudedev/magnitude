@@ -25,12 +25,12 @@ fn stream_mix_down_normalize<L: Isa, E: Elements>(
         cx.scratch_normalized()
             .slice_mut::<f32>(4 * row * width, width)
     };
-    let inverses = unsafe { cx.result_2().span_mut([row, 0], s) };
+    let mut inverses = unsafe { cx.result_2().span_mut([row, 0], s) };
     for stream in 0..s {
         cx.arg_norm().decode_row(stream, norm);
         let x = cx.arg_hidden().row([row, stream, 0]);
         let inverse = reduce::rms_inverse(x, cx.arg_epsilon());
-        inverses[stream] = inverse;
+        inverses.set(stream, inverse);
         for ((target, value), w) in normalized[stream * h..(stream + 1) * h]
             .iter_mut()
             .zip(x)
@@ -79,9 +79,9 @@ fn stream_mix_down_rows<L: Isa, E: Elements>(
             normalized,
             |row, projected| {
                 // SAFETY: each work item writes its own columns of every row.
-                let out = unsafe { result.span_mut([row, rows.start], rows.len()) };
+                let mut out = unsafe { result.span_mut([row, rows.start], rows.len()) };
                 for (target, v) in out.iter_mut().zip(projected) {
-                    *target = 2.0 * activation::sigmoid(v / streams);
+                    target.set(2.0 * activation::sigmoid(v / streams));
                 }
             },
         );

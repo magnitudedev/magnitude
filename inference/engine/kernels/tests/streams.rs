@@ -559,6 +559,35 @@ fn native_repeat_rows_matches_portable_body() {
     }
 }
 
+/// A NaN published by `repeat_rows`, whatever its sign, quietness and payload (the entry assigns
+/// its F32 products itself), is the registry's one NaN.
+#[test]
+fn repeat_rows_publishes_every_nan_as_the_one_nan() {
+    for device in devices() {
+        let h = 8usize;
+        let source = [
+            0x7f80_0001u32, 0xff80_0001, 0x7fc0_1234, 0xffc0_0000, 0xffff_ffff, 0x7fbf_ffff, 0x3f80_0000, 0x7f80_0000,
+        ]
+        .map(f32::from_bits)
+        .to_vec();
+        let scales = vec![1.0f32, -0.5];
+        let repeated = at_defaults(&device, repeat_rows::native_entry(), &[])
+            .unwrap()
+            .call(repeat_rows::Args {
+                rows: &tensor(&device, DType::F32, &[1, h], &source),
+                scales: &tensor(&device, DType::F32, &[scales.len()], &scales),
+            })
+            .unwrap();
+        let actual = read(&repeated.value, DType::F32);
+        assert_eq!(actual.len(), scales.len() * h);
+        for (index, value) in actual.iter().enumerate() {
+            if source[index % h].is_nan() {
+                assert_eq!(value.to_bits(), 0x7fc0_0000, "{:?} repeat_rows[{index}]", device.backend());
+            }
+        }
+    }
+}
+
 /// DeepSeek V4.1 Flash's mix sites: H, S, Sinkhorn iterations, and the
 /// mixing's epsilon and RMS statistic's (`hc_eps`, `norm_eps`).
 const V41: (usize, usize, usize) = (5120, 4, 20);

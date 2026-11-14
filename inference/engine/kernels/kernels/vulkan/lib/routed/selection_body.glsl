@@ -25,7 +25,7 @@ float SELECT_FN(select_router_norm)(uint source) { \
 
 #define SELECT_DEFINE_PUBLISH \
 void SELECT_FN(select_publish)(uint64_t row, uint source, float value) { \
-    element_put(SELECT_ACT, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), \
+    out_put(SEISMIC_RESULT_0_OUT, \
         row * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(source) * SEISMIC_RESULT_0_STRIDE_1, value); \
 }
 
@@ -290,9 +290,8 @@ void SELECT_FN(select_select_row)(uint64_t row, out int winners[SELECT_K]) { \
                     + uint64_t(winners[slot]) * SEISMIC_EXPERT_SCALE_STRIDE_0 * 4ul); \
             element_i32_put(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES) \
                 + (row * SEISMIC_ROUTES_STRIDE_0 + uint64_t(slot) * SEISMIC_ROUTES_STRIDE_1) * 4ul, winners[slot]); \
-            element_f32_put(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHTS) \
-                    + (row * SEISMIC_WEIGHTS_STRIDE_0 + uint64_t(slot) * SEISMIC_WEIGHTS_STRIDE_1) * 4ul, \
-                weight); \
+            out_put(SEISMIC_OUT_WEIGHTS, \
+                row * SEISMIC_WEIGHTS_STRIDE_0 + uint64_t(slot) * SEISMIC_WEIGHTS_STRIDE_1, weight); \
         } \
     } \
 }

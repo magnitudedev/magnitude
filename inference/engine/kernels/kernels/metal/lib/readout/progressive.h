@@ -320,7 +320,7 @@ struct Selection {
 // PROGRESSIVE_ROWS keys then the arrival counter.
 inline void publish(threadgroup atomic_uint *lowest, device atomic_uint *bounds, threadgroup uint *last, uint tiles,
     uint rows, uint tid, device const float *floor, ulong floor_stride, device const float *lengths,
-    ulong length_stride, device float *threshold, ulong threshold_stride) {
+    ulong length_stride, element::Out<element::F32> threshold, ulong threshold_stride) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid < rows)
         atomic_fetch_max_explicit(&bounds[tid], atomic_load_explicit(&lowest[tid], memory_order_relaxed),
@@ -329,7 +329,7 @@ inline void publish(threadgroup atomic_uint *lowest, device atomic_uint *bounds,
         const uint k = atomic_load_explicit(&bounds[tid], memory_order_relaxed);
         const float raised = k == 0u ? -INFINITY : order::value(k);
         const float floored = floor ? metal::max(floor[tid * floor_stride], raised) : raised;
-        threshold[tid * threshold_stride] = metal::isfinite(lengths[tid * length_stride]) ? floored : -INFINITY;
+        threshold.put(tid * threshold_stride, metal::isfinite(lengths[tid * length_stride]) ? floored : -INFINITY);
         atomic_store_explicit(&bounds[tid], 0u, memory_order_relaxed);
     }
 }
@@ -381,8 +381,8 @@ template <bool REFINE>
 inline void gather(device const uchar *features, ulong feature_stride, thread const Planes &planes,
     device const float *radius_previous, device const float *radius_next, ulong radius_stride, device const float *coarse,
     ulong coarse_row, ulong coarse_col, device const float *floor, ulong floor_stride, device const float *lengths, ulong length_stride,
-    thread const Selection &selection, device float *out, ulong out_row, ulong out_col, device float *threshold,
-    ulong threshold_stride, device atomic_uint *bounds, uint rows, uint vocabulary, uint d,
+    thread const Selection &selection, element::Out<element::F32> out, ulong out_row, ulong out_col,
+    element::Out<element::F32> threshold, ulong threshold_stride, device atomic_uint *bounds, uint rows, uint vocabulary, uint d,
     threadgroup atomic_uint *lowest, threadgroup uint *last, threadgroup uint4 *stage, uint tile, uint tiles, uint tid,
     uint threads, uint simdgroups, uint sg, uint lane) {
     if (REFINE && tid < PROGRESSIVE_ROWS)
@@ -412,7 +412,7 @@ inline void gather(device const uchar *features, ulong feature_stride, thread co
                     floor[m * floor_stride]))
                 candidate |= 1u << m;
             else
-                out[m * out_row + ulong(n) * out_col] = -INFINITY;
+                out.put(m * out_row + ulong(n) * out_col, -INFINITY);
         }
     for (uint pending = uint(uint64_t(simd_ballot(candidate != 0u))); pending != 0u; pending &= pending - 1u) {
         const uint i = ctz(pending);
@@ -446,7 +446,7 @@ inline void gather(device const uchar *features, ulong feature_stride, thread co
             if (lane != 0u)
                 continue;
             const float logit = REFINE ? coarse[m * coarse_row + ulong(v) * coarse_col] + acc : acc;
-            out[m * out_row + ulong(v) * out_col] = REFINE ? logit : selection.transform(logit);
+            out.put(m * out_row + ulong(v) * out_col, REFINE ? logit : selection.transform(logit));
             if (REFINE && selection.competes(m, v))
                 selection.raise(&lowest[m], m, v, logit - radius_next[v * radius_stride] * lengths[m * length_stride]);
         }

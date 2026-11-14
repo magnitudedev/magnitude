@@ -98,7 +98,7 @@ void routed_zero_features(projection_epilogue out_, uint rows, uint first, uint 
     for (uint i = gl_LocalInvocationIndex; i < rows * count; i += gl_WorkGroupSize.x) {
         const uint n = first + i % count;
         if (n < features)
-            element_put(out_.act, out_.y, projection_out_row(out_, i / count) + uint64_t(n) * out_.y1, 0.0);
+            out_put(out_.y, projection_out_row(out_, i / count) + uint64_t(n) * out_.y1, 0.0);
     }
 }
 

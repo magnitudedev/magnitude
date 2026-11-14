@@ -52,9 +52,9 @@ struct Ports {
     route::Input in;
     route::Columns columns;
     route::Selection selection;
-    unsigned char *normalized;
+    element::Out<element::Act> normalized;
     const unsigned char *shared_gate, *shared_up;
-    unsigned char *shared_product;
+    element::Out<element::Act> shared_product;
     const int *routes;
     const int *step;
     ResolvePorts bank;
@@ -69,9 +69,9 @@ struct Ports {
 
 #define ROUTED_ROUTE_PORTS                                                                                 \
     Ports {                                                                                                \
-        ROUTE_INPUT, ROUTE_COLUMNS, ROUTE_SELECTION, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER),                 \
+        ROUTE_INPUT, ROUTE_COLUMNS, ROUTE_SELECTION, SEISMIC_RESULT_0_OUT,                                 \
             SEISMIC_PTR(SEISMIC_BUFFER_SHARED_GATE), SEISMIC_PTR(SEISMIC_BUFFER_SHARED_UP),               \
-            SEISMIC_PTR(SEISMIC_RESULT_2_BUFFER), reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES)), \
+            SEISMIC_RESULT_2_OUT, reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES)),       \
             reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_STEP)), ROUTED_RESOLVE_PORTS,        \
             {route::Input{reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL)),          \
                           SEISMIC_PTR(SEISMIC_BUFFER_NEXT_NORM), SEISMIC_NEXT_NORM_STRIDE_0},             \

@@ -16,6 +16,24 @@ REPACK_BINDING(GateBinding, SEISMIC_CONVERSION_SG_UG, SEISMIC_CONVEYOR_GATE, SEI
 REPACK_BINDING(UpBinding, SEISMIC_CONVERSION_SU_UU, SEISMIC_CONVEYOR_UP, SEISMIC_UP, SEISMIC_DIM_F, SEISMIC_DIM_H)
 REPACK_BINDING(DownBinding, SEISMIC_CONVERSION_SD_UD, SEISMIC_CONVEYOR_DOWN, SEISMIC_DOWN, SEISMIC_DIM_H, SEISMIC_DIM_F)
 
+// Each routed tensor's destination as its binding holds it: a dense float
+// tensor's owner handle, any other's bytes.
+#ifdef SEISMIC_OUT_GATE
+#define LAND_GATE SEISMIC_OUT_GATE
+#else
+#define LAND_GATE SEISMIC_PTR(SEISMIC_BUFFER_GATE)
+#endif
+#ifdef SEISMIC_OUT_UP
+#define LAND_UP SEISMIC_OUT_UP
+#else
+#define LAND_UP SEISMIC_PTR(SEISMIC_BUFFER_UP)
+#endif
+#ifdef SEISMIC_OUT_DOWN
+#define LAND_DOWN SEISMIC_OUT_DOWN
+#else
+#define LAND_DOWN SEISMIC_PTR(SEISMIC_BUFFER_DOWN)
+#endif
+
 #include "lib/streaming/land.cuh"
 #include "../streaming/round.hpp"
 
@@ -30,8 +48,7 @@ __device__ void routed_round_block(SEISMIC_KERNEL_PARAMS) {
         streaming_round_arrive(slot, SEISMIC_SCRATCH_STRIDE_1, q);
     streaming::Lander land{{SEISMIC_PTR(SEISMIC_BUFFER_CONVEYOR_GATE), SEISMIC_PTR(SEISMIC_BUFFER_CONVEYOR_UP),
                             SEISMIC_PTR(SEISMIC_BUFFER_CONVEYOR_DOWN)},
-                           {SEISMIC_PTR(SEISMIC_BUFFER_GATE), SEISMIC_PTR(SEISMIC_BUFFER_UP),
-                            SEISMIC_PTR(SEISMIC_BUFFER_DOWN)},
+                           {LAND_GATE, LAND_UP, LAND_DOWN},
                            SEISMIC_DIM_GV > 0, seismic_words_value, shared, {}, {}, 0};
     streaming_land(land, reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_BUFFER_LANDING)), SEISMIC_LANDING_STRIDE_0, slot,
                    SEISMIC_SCRATCH_STRIDE_1, q, reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_COUNTERS)),

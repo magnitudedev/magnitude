@@ -26,10 +26,10 @@ extern "C" __global__ void post_norm_residual(SEISMIC_KERNEL_PARAMS) {
     const float *r = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL))
         + (u64)out_rows[row * SEISMIC_OUT_ROWS_STRIDE_0] * SEISMIC_RESIDUAL_STRIDE_0;
     const u8 *norm = SEISMIC_PTR(SEISMIC_BUFFER_NORM);
-    float *result = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)) + row * SEISMIC_RESULT_0_STRIDE_0;
+    const auto result = SEISMIC_RESULT_0_OUT.offset(row * SEISMIC_RESULT_0_STRIDE_0);
     for (u64 i = threadIdx.x; i < width; i += blockDim.x) {
         const float normalized = p[i * SEISMIC_PROJECTED_STRIDE_1] * inverse
             * element::at<Norm>(norm, i * SEISMIC_NORM_STRIDE_0);
-        result[i * SEISMIC_RESULT_0_STRIDE_1] = (r[i * SEISMIC_RESIDUAL_STRIDE_1] + normalized) * scale;
+        result.put(i * SEISMIC_RESULT_0_STRIDE_1, (r[i * SEISMIC_RESIDUAL_STRIDE_1] + normalized) * scale);
     }
 }

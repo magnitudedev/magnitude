@@ -9,12 +9,13 @@
 #include "lib/projection/packing.h"
 
 kernel void packing_bound(device const uchar *weight [[buffer(SEISMIC_BUFFER_WEIGHT)]],
-    device float *bound [[buffer(SEISMIC_BUFFER_BOUND)]],
+    SEISMIC_OUT_BOUND_PARAM(bound_cells),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint block [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
+    const element::Out<element::F32> bound(bound_cells);
     typedef projection::packing_codes<packets::W0> coded;
     static_assert(coded::folds == 1 || coded::folds == 2, "a packing bound is of a format's packed codes");
     const uint k = uint(SEISMIC_DIM_K), rows = uint(SEISMIC_DIM_N);
@@ -45,6 +46,6 @@ kernel void packing_bound(device const uchar *weight [[buffer(SEISMIC_BUFFER_WEI
         for (uint i = 1; i < 8u; ++i)
             largest = metal::max(largest, peaks[i]);
         for (uint run = 0; run < coded::folds; ++run)
-            bound[block * coded::folds + run] = float(largest[run]);
+            bound.put(block * coded::folds + run, float(largest[run]));
     }
 }

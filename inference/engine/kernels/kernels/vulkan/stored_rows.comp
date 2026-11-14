@@ -11,7 +11,7 @@
 void stored_rows() {
     const uint64_t slots = SEISMIC_PTR(SEISMIC_BUFFER_SLOTS);
     const uint64_t tokens = SEISMIC_PTR(SEISMIC_BUFFER_TOKENS);
-    const uint64_t rows = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const Out rows = SEISMIC_RESULT_0_OUT;
     const uint width = uint(SEISMIC_DIM_W);
     const uint column = gl_WorkGroupID.y * 256u + gl_LocalInvocationID.x;
     if (column >= width)
@@ -23,13 +23,13 @@ void stored_rows() {
         const uint64_t at = row * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(column) * SEISMIC_RESULT_0_STRIDE_1;
         // A row without a slot reads zeros.
         if (held < 0l) {
-            element_put(ELEMENT_ACT, rows, at, 0.0);
+            out_put(rows, at, 0.0);
             continue;
         }
         const uint64_t per = uint64_t(SEISMIC_DIM_P);
         const uint64_t record = slab_region(slots, uint64_t(held) / per);
         const packets_packet packet = packets_load(PACKETS_W0, record + (uint64_t(held) % per) * geometry.stride,
             geometry, column / 32u, width);
-        element_put(ELEMENT_ACT, rows, at, packets_value_at(PACKETS_W0, packet, column % 32u));
+        out_put(rows, at, packets_value_at(PACKETS_W0, packet, column % 32u));
     }
 }

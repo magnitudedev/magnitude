@@ -14,7 +14,7 @@ void corrector_attention() {
     const uint64_t qkv = SEISMIC_PTR(SEISMIC_BUFFER_QKV);
     const uint64_t input_bias = SEISMIC_PTR(SEISMIC_BUFFER_INPUT_BIAS);
     const uint64_t bias = SEISMIC_PTR(SEISMIC_BUFFER_BIAS);
-    const uint64_t result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const Out result = SEISMIC_RESULT_0_OUT;
     const uint64_t nodes = SEISMIC_DIM_N, width = SEISMIC_DIM_W;
     const uint64_t row = gl_WorkGroupID.x, head = gl_WorkGroupID.y;
     const uint64_t block = row / nodes, query = row % nodes;
@@ -60,7 +60,7 @@ void corrector_attention() {
                 + 2ul * SEISMIC_QKV_STRIDE_2 + head * SEISMIC_QKV_STRIDE_3 + c * SEISMIC_QKV_STRIDE_4) * 4ul);
             out_value = seismic_fma_rn(weight, v + b, out_value);
         }
-        element_put(ELEMENT_ACT, result, block * SEISMIC_RESULT_0_STRIDE_0 + query * SEISMIC_RESULT_0_STRIDE_1
+        out_put(result, block * SEISMIC_RESULT_0_STRIDE_0 + query * SEISMIC_RESULT_0_STRIDE_1
             + head * SEISMIC_RESULT_0_STRIDE_2 + c * SEISMIC_RESULT_0_STRIDE_3, seismic_div_rn(out_value, total));
     }
 }

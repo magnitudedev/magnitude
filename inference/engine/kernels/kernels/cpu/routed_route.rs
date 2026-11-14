@@ -53,18 +53,20 @@ fn routed_route_select<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [
         (cx.scratch_normalized().slice::<f32>(4 * row * h, h), cx.scratch_logits().slice::<f32>(4 * row * e, e))
     };
     // SAFETY: each work item writes its own row of the routes and scores.
-    let (routes, scores) = unsafe { (cx.arg_routes().row_mut([row, 0]), cx.arg_scores().row_mut([row, 0])) };
+    let (routes, mut scores) = unsafe { (cx.arg_routes().row_mut([row, 0]), cx.arg_scores().row_mut([row, 0])) };
     let expert_scale = cx.arg_expert_scale();
     let (probabilities, order) = shared.split_at_mut(4 * e);
-    routed::select(
-        logits,
-        seismic::cpu::tensor::floats(probabilities, e),
-        ranked::indices(order, e),
-        cx.arg_normalize() != 0,
-        (cx.dim_es(), |expert| expert_scale.get([expert])),
-        routes,
-        scores,
-    );
+    scores.compute(|scores| {
+        routed::select(
+            logits,
+            seismic::cpu::tensor::floats(probabilities, e),
+            ranked::indices(order, e),
+            cx.arg_normalize() != 0,
+            (cx.dim_es(), |expert| expert_scale.get([expert])),
+            routes,
+            scores,
+        )
+    });
     let gate = reduce::dot(normalized, cx.arg_shared_router().row([0]));
     // SAFETY: each work item writes its own row's coefficient.
     unsafe { cx.result_1().set([row], activation::sigmoid(gate)) };

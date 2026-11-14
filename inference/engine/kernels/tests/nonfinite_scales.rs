@@ -12,8 +12,8 @@
 //! scale (`Q8_0`), an F32 grid scale (`fp8g128`), an E8M0 byte (`mxfp8g32`,
 //! `mxfp4`) and UE4M3 fields (`nvfp4`).
 
-use magnitude_kernels::embedding_rows;
-use seismic::{BackendName, Device, Element, Layout, NativeSpecialization, Tensor};
+use magnitude_kernels::{embedding_rows, stored_rows};
+use seismic::{BackendName, Device, Element, GgufScales, Grid, Layout, NativeSpecialization, Tensor};
 use seismic_lang::registry::bf16_round;
 
 mod gguf_formats;
@@ -71,13 +71,18 @@ fn i32_tensor(device: &Device, shape: &[u64], values: &[i32]) -> Tensor {
     Tensor::from_host(device, Element::i32(), shape, &bytes).unwrap()
 }
 
+/// A result's values as F32, whatever its element (the gather's wide result is F32, a row of
+/// `stored_rows` the activation's BF16).
 fn read_f32(tensor: &Tensor) -> Vec<f32> {
-    tensor
-        .read_to_host()
-        .unwrap()
-        .chunks_exact(4)
-        .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
-        .collect()
+    let bytes = tensor.read_to_host().unwrap();
+    if tensor.element() == Element::bf16() {
+        bytes
+            .chunks_exact(2)
+            .map(|word| f32::from_bits(u32::from(u16::from_le_bytes(word.try_into().unwrap())) << 16))
+            .collect()
+    } else {
+        bytes.chunks_exact(4).map(|word| f32::from_le_bytes(word.try_into().unwrap())).collect()
+    }
 }
 
 /// The reference's value as the BF16 gather returns it: the registry's one
@@ -98,33 +103,66 @@ fn non_finite_block_scales_decode_to_the_canonical_nan_on_every_device() {
             for layout in &layouts {
                 gather(&device, &case, *layout);
             }
+            read_stored(&device, &case);
         }
     }
 }
 
-fn gather(device: &Device, case: &Case, layout: Layout) {
+/// A case's rows in a layout: the format's blocks of the case's scales, as resident
+/// storage, and the registry's decode of them.
+struct Fixture {
+    element: Element,
+    rows: usize,
+    shape: [u64; 2],
+    resident: Vec<u8>,
+    reference: Vec<f64>,
+    /// Row `r`'s selection of row `r`.
+    tokens: Vec<i32>,
+}
+
+fn fixture(case: &Case, layout: Layout) -> Option<Fixture> {
     let format = case.format;
     let mut rng = Rng(0x5eed);
     let blocks = K / format.block_values();
     // One row per scale pattern; each row's blocks cycle through the
-    // patterns and a finite control (the format's own random scale).
-    let mut external = Vec::new();
-    let rows = case.scales.len();
-    for row in 0..rows {
-        for block in 0..blocks {
-            let mut bytes = format.block(&mut rng, 0.05);
-            let pattern = (row + block) % (case.scales.len() + 1);
-            if let Some(bits) = case.scales.get(pattern) {
-                (case.set)(&mut bytes, *bits);
-            }
-            external.extend(bytes);
+    // patterns and a finite control (the format's own random scale). Under a
+    // grid the patterns go to its tiles, each a scale of tile rows and
+    // columns, so there are rows enough for a tile to each.
+    let patterns = case.scales.len() + 1;
+    let (rows, external) = match format.scales {
+        GgufScales::Grid(Grid { tile, .. }) => {
+            let (tile_rows, column_tiles) = (tile[0] as usize, K / tile[1] as usize);
+            let rows = tile_rows * patterns.div_ceil(column_tiles);
+            let shape = [rows as u64, K as u64];
+            let mut bytes = format.external(&mut rng, &shape, 0.05);
+            format.set_grid_scales(
+                &mut bytes,
+                &shape,
+                |row, packet| case.scales.get(((row / tile_rows) * column_tiles + packet) % patterns).copied(),
+                case.set,
+            );
+            (rows, bytes)
         }
-    }
+        _ => {
+            let rows = case.scales.len();
+            let mut external = Vec::new();
+            for row in 0..rows {
+                for block in 0..blocks {
+                    let mut bytes = format.block(&mut rng, 0.05);
+                    if let Some(bits) = case.scales.get((row + block) % patterns) {
+                        (case.set)(&mut bytes, *bits);
+                    }
+                    external.extend(bytes);
+                }
+            }
+            (rows, external)
+        }
+    };
     let shape = [rows as u64, K as u64];
     let Some(element) = Element::gguf_packet_source(format.encoding, format.scales)
         .and_then(|source| source.converted(layout, format.operands))
     else {
-        return;
+        return None;
     };
     let resident = element
         .repack_host(format.source(), &shape, &external)
@@ -135,6 +173,15 @@ fn gather(device: &Device, case: &Case, layout: Layout) {
         "{format:?}: the blocks hold non-finite products"
     );
     let tokens = (0..rows as i32).flat_map(|row| [row, 0]).collect::<Vec<_>>();
+    Some(Fixture { element, rows, shape, resident, reference, tokens })
+}
+
+/// The rows gathered by `embedding_rows` in `layout`.
+fn gather(device: &Device, case: &Case, layout: Layout) {
+    let Some(Fixture { element, rows, shape, resident, reference, tokens }) = fixture(case, layout) else {
+        return;
+    };
+    let format = case.format;
     let elements = || embedding_rows::Elements { EW: element, A: Element::bf16() };
     let statics = embedding_rows::native_implementation(device)
         .unwrap()
@@ -160,13 +207,44 @@ fn gather(device: &Device, case: &Case, layout: Layout) {
             epsilon: 0.0,
         })
         .unwrap();
-    let actual = read_f32(&out.r1);
+    check(device, "embedding_rows", format, layout, &read_f32(&out.r1), &reference);
+}
+
+/// The rows read by `stored_rows` from resident slots (one record holding every row, in the
+/// rows16 layout every backend's `stored_rows` reads) through a dense directory.
+fn read_stored(device: &Device, case: &Case) {
+    let Some(Fixture { element, rows, resident, reference, tokens, .. }) = fixture(case, Layout::Rows16) else {
+        return;
+    };
+    let stored = stored_rows::native_entry_with(stored_rows::Elements { E: element, A: Element::bf16() });
+    let Some(offered) = stored.offered(device).unwrap() else {
+        return;
+    };
+    let specialization = offered
+        .default_specialization(&NativeSpecialization::new().with_static("W", K as u64))
+        .unwrap();
+    let slots = (0..rows as i32).collect::<Vec<_>>();
+    let result = stored
+        .prepare(device, &specialization)
+        .unwrap()
+        .call(stored_rows::Args {
+            slots: &Tensor::from_host(device, element, &[1, rows as u64, K as u64], &resident).unwrap(),
+            tokens: &i32_tensor(device, &[rows as u64, 2], &tokens),
+            directory: &i32_tensor(device, &[rows as u64, 1], &slots),
+        })
+        .unwrap()
+        .value;
+    check(device, "stored_rows", case.format, Layout::Rows16, &read_f32(&result), &reference);
+}
+
+/// Asserts `actual` is the reference's values as a BF16 gather returns them.
+fn check(device: &Device, kernel: &str, format: Format, layout: Layout, actual: &[f32], reference: &[f64]) {
     let failures = (0..actual.len())
         .filter(|i| actual[*i].to_bits() != expected(reference[*i]))
         .collect::<Vec<_>>();
     assert!(
         failures.is_empty(),
-        "{:?} gather of {format:?} in {layout:?}: {} of {} differ; first (index, actual, expected): {:?}",
+        "{:?} {kernel} of {format:?} in {layout:?}: {} of {} differ; first (index, actual, expected): {:?}",
         device.backend(),
         failures.len(),
         actual.len(),

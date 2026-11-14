@@ -26,7 +26,7 @@ constant constexpr uint draft_outputs = draft_simdgroups * draft_rows_per_simdgr
     device const uchar *embedding_norm [[buffer(SEISMIC_BUFFER_EMBEDDING_NORM)]], \
     device const uchar *hidden_norm [[buffer(SEISMIC_BUFFER_HIDDEN_NORM)]], \
     device const uchar *combine [[buffer(SEISMIC_BUFFER_COMBINE)]], \
-    device float *result [[buffer(SEISMIC_RESULT_0_BUFFER)]], \
+    SEISMIC_RESULT_0_PARAM(result_cells), \
     device uchar *joined_rows [[buffer(SEISMIC_BUFFER_SCRATCH_JOINED)]], \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
 
@@ -105,6 +105,7 @@ kernel void draft_rows(DRAFT_ROWS_ARGUMENTS,
     typedef typename activation::storage storage;
     const uint width = uint(SEISMIC_DIM_D);
     const ulong row = ulong(group.y);
+    const element::Out<element::F32> result(result_cells);
     draft_join(tokens, directory, table, conditioning, embedding_norm, hidden_norm, seismic_words,
         shared, row, thread_index, sg, lane);
     threadgroup storage *joined = reinterpret_cast<threadgroup storage *>(shared);
@@ -132,7 +133,7 @@ kernel void draft_rows(DRAFT_ROWS_ARGUMENTS,
         }
         sum = simd_sum(sum);
         if (lane == 0)
-            result[(row / SEISMIC_DIM_S) * SEISMIC_RESULT_0_STRIDE_0 + ((row % SEISMIC_DIM_S) * width + output) * SEISMIC_RESULT_0_STRIDE_1] = sum;
+            result.put((row / SEISMIC_DIM_S) * SEISMIC_RESULT_0_STRIDE_0 + ((row % SEISMIC_DIM_S) * width + output) * SEISMIC_RESULT_0_STRIDE_1, sum);
     }
 }
 
@@ -161,7 +162,7 @@ kernel void draft_rows_gemm(DRAFT_ROWS_ARGUMENTS,
     const uint width = uint(SEISMIC_DIM_D);
     const uint inputs = 2u * width;
     projection::Plain<activation, projection::AllRows> in{joined_rows, inputs, 1, inputs, {}};
-    projection::Store<element::F32> out{reinterpret_cast<device uchar *>(result),
+    projection::Store<element::F32> out{element::Out<element::F32>(result_cells),
         width, SEISMIC_RESULT_0_STRIDE_1, 0};
     projection::Weights<packets::W1> weights{combine, KERNEL_W1_LAYOUT(inputs), inputs, nullptr};
     projection::gemm<packets::W1, 64, 64>(in, out, weights, uint(SEISMIC_DIM_M * SEISMIC_DIM_S),

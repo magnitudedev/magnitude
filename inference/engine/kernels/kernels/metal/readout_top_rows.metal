@@ -17,7 +17,7 @@ typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
 // The view logits to `logits`; each competing row's lower-bound score into
 // `lowest`.
 struct BoundOut {
-    device float *logits;
+    element::Out<element::F32> logits;
     ulong row, col;
     device const float *radius;
     ulong radius_stride;
@@ -25,7 +25,7 @@ struct BoundOut {
     threadgroup atomic_uint *lowest;
     progressive::Selection selection;
     void store(uint m, uint n, float value) const {
-        logits[ulong(m) * row + ulong(n) * col] = value;
+        logits.put(ulong(m) * row + ulong(n) * col, value);
         if (selection.competes(m, n))
             selection.raise(&lowest[m], m, n, value - radius[ulong(n) * radius_stride] * lengths[m]);
     }
@@ -46,10 +46,10 @@ struct BoundOut {
     device const float *temperature [[buffer(SEISMIC_BUFFER_TEMPERATURE)]],             \
     device const uint *mask [[buffer(SEISMIC_BUFFER_MASK)]],                            \
     device const int *constrained [[buffer(SEISMIC_BUFFER_CONSTRAINED)]],               \
-    device float *logits [[buffer(SEISMIC_RESULT_0_BUFFER)]],                           \
-    device float *threshold [[buffer(SEISMIC_RESULT_1_BUFFER)]],                        \
-    device uchar *features [[buffer(SEISMIC_RESULT_2_BUFFER)]],                         \
-    device float *lengths_out [[buffer(SEISMIC_RESULT_3_BUFFER)]],                      \
+    SEISMIC_RESULT_0_PARAM(logits),                                                     \
+    SEISMIC_RESULT_1_PARAM(threshold),                                                  \
+    SEISMIC_RESULT_2_PARAM(features),                                                   \
+    SEISMIC_RESULT_3_PARAM(lengths_out),                                                \
     device atomic_uint *bounds [[buffer(SEISMIC_BUFFER_SCRATCH_BOUNDS)]],               \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
 
@@ -65,7 +65,8 @@ struct BoundOut {
 // The rows' normalized lengths into `lengths` (threadgroup 0 also publishes
 // the features and lengths), the threshold keys cleared.
 template <typename X>
-inline void top_lengths(thread const X &x, uint rows, uint d, device uchar *features, device float *lengths_out,
+inline void top_lengths(thread const X &x, uint rows, uint d, element::Out<progressive::activation> features,
+    element::Out<element::F32> lengths_out,
     ulong length_stride, threadgroup float *lengths, threadgroup float *parts, threadgroup atomic_uint *lowest, uint tile, uint tid,
     uint simdgroups, uint sg, uint lane) {
     if (tid < PROGRESSIVE_ROWS)
@@ -83,9 +84,7 @@ inline void top_lengths(thread const X &x, uint rows, uint d, device uchar *feat
                 sum = metal::fma(b, b, sum);
             }
             if (tile == 0)
-                *reinterpret_cast<device uint4 *>(
-                    reinterpret_cast<device typename progressive::activation::storage *>(features) + ulong(m) * d + i)
-                    = progressive::activation::pack8(even, odd);
+                features.put8(ulong(m) * d + i, even, odd);
         }
         sum = simd_sum(sum);
         if (lane == 0)
@@ -97,7 +96,7 @@ inline void top_lengths(thread const X &x, uint rows, uint d, device uchar *feat
                 total += parts[s];
             lengths[m] = metal::sqrt(total);
             if (tile == 0)
-                lengths_out[m * length_stride] = lengths[m];
+                lengths_out.put(m * length_stride, lengths[m]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -106,7 +105,7 @@ inline void top_lengths(thread const X &x, uint rows, uint d, device uchar *feat
 // Raise the rows' thresholds; the last threadgroup publishes them (-inf where
 // a row's length is not finite: no bound holds) and clears the keys.
 inline void top_publish(threadgroup atomic_uint *lowest, threadgroup const float *lengths, device atomic_uint *bounds,
-    threadgroup uint *last, device float *threshold, ulong threshold_stride, uint rows, uint tiles, uint tid) {
+    threadgroup uint *last, element::Out<element::F32> threshold, ulong threshold_stride, uint rows, uint tiles, uint tid) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid < rows)
         atomic_fetch_max_explicit(&bounds[tid], atomic_load_explicit(&lowest[tid], memory_order_relaxed),
@@ -114,7 +113,7 @@ inline void top_publish(threadgroup atomic_uint *lowest, threadgroup const float
     if (arrive::last(&bounds[PROGRESSIVE_ROWS], tiles, last, tid) && tid < rows) {
         const uint k = atomic_load_explicit(&bounds[tid], memory_order_relaxed);
         const float raised = k == 0u ? -INFINITY : order::value(k);
-        threshold[tid * threshold_stride] = metal::isfinite(lengths[tid]) ? raised : -INFINITY;
+        threshold.put(tid * threshold_stride, metal::isfinite(lengths[tid]) ? raised : -INFINITY);
         atomic_store_explicit(&bounds[tid], 0u, memory_order_relaxed);
     }
 }
@@ -136,9 +135,10 @@ inline void top_publish(threadgroup atomic_uint *lowest, threadgroup const float
     projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);   \
     threadgroup_barrier(mem_flags::mem_threadgroup);                                    \
     const auto x = projection::shared_norm(in, squares);                               \
-    top_lengths(x, rows, d, features, lengths_out, SEISMIC_RESULT_3_STRIDE_0, lengths, parts, lowest, tile, tid, simdgroups, sg, lane); \
+    top_lengths(x, rows, d, element::Out<progressive::activation>(features),                                \
+        element::Out<element::F32>(lengths_out), SEISMIC_RESULT_3_STRIDE_0, lengths, parts, lowest, tile, tid, simdgroups, sg, lane); \
     /* Radius column 0: the 4-bit view's. */                                             \
-    const BoundOut out{logits, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, radius, \
+    const BoundOut out{element::Out<element::F32>(logits), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, radius, \
         SEISMIC_RADIUS_STRIDE_0, lengths, lowest,                                       \
         {draws, SEISMIC_DRAWS_STRIDE_0, SEISMIC_DRAWS_STRIDE_1, temperature, SEISMIC_TEMPERATURE_STRIDE_0, mask, \
             SEISMIC_MASK_STRIDE_0, SEISMIC_MASK_STRIDE_1, constrained, SEISMIC_CONSTRAINED_STRIDE_0, as_type<float>(uint(SEISMIC_PARAM_SOFTCAP))}}
@@ -150,7 +150,7 @@ kernel void readout_top_rows_gemv(TOP_ROWS_ARGUMENTS, TOP_ROWS_THREADS) {
     PROJECTION_FOR_ROWS(rows,
         projection::gemv_runtime<packets::ProgressiveTop, ROWS, MAXM, LANES>(
             x, out, w, rows, uint(SEISMIC_DIM_V), d, tile, shared, simdgroups, sg, lane));
-    top_publish(lowest, lengths, bounds, &last, threshold, SEISMIC_RESULT_1_STRIDE_0, rows, tiles, tid);
+    top_publish(lowest, lengths, bounds, &last, element::Out<element::F32>(threshold), SEISMIC_RESULT_1_STRIDE_0, rows, tiles, tid);
 }
 #endif
 
@@ -160,6 +160,6 @@ kernel void readout_top_rows_batch(TOP_ROWS_ARGUMENTS, TOP_ROWS_THREADS) {
     TOP_ROWS_OPERANDS;
     projection::gemv_batch_runtime<packets::ProgressiveTop, BATCH_ROWS>(x, out, w, rows, uint(SEISMIC_DIM_V), d,
         tile, shared, simdgroups, sg, lane);
-    top_publish(lowest, lengths, bounds, &last, threshold, SEISMIC_RESULT_1_STRIDE_0, rows, tiles, tid);
+    top_publish(lowest, lengths, bounds, &last, element::Out<element::F32>(threshold), SEISMIC_RESULT_1_STRIDE_0, rows, tiles, tid);
 }
 #endif

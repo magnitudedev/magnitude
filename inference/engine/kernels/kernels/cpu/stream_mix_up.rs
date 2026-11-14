@@ -51,12 +51,12 @@ fn stream_mix_up_rows<L: Isa, E: Elements>(
         |row, projected| {
             let inverses = cx.arg_inverse().row([row, 0]);
             // SAFETY: each work item writes its own columns of every row.
-            let out = unsafe { result.span_mut([row, rows.start], rows.len()) };
+            let mut out = unsafe { result.span_mut([row, rows.start], rows.len()) };
             for ((target, column), v) in out.iter_mut().zip(rows.clone()).zip(projected) {
                 let (stream, at) = (column / h, column % h);
                 let normalized =
                     cx.arg_hidden().get([row, stream, at]) * inverses[stream] * norm[column];
-                *target = activation::sigmoid(*v) * normalized / streams;
+                target.set(activation::sigmoid(*v) * normalized / streams);
             }
         },
     );

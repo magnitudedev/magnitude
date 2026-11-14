@@ -32,8 +32,8 @@ kernel void routed_expand(
     device const uchar *shared_up [[buffer(SEISMIC_BUFFER_SHARED_UP)]],
     device const float *gate_scale [[buffer(SEISMIC_BUFFER_GATE_SCALE)]],
     device const float *up_scale [[buffer(SEISMIC_BUFFER_UP_SCALE)]],
-    device uchar *expert_product [[buffer(SEISMIC_RESULT_0_BUFFER)]],
-    device uchar *shared_product [[buffer(SEISMIC_RESULT_1_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(expert_product_cells),
+    SEISMIC_RESULT_1_PARAM(shared_product_cells),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     threadgroup uchar *shared [[threadgroup(0)]],
     uint2 group [[threadgroup_position_in_grid]],
@@ -45,6 +45,8 @@ kernel void routed_expand(
     // Weight rows per threadgroup.
     const uint TILE = simdgroups * R * (32u / L);
     typedef routed::Act A;
+    const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> expert_product(expert_product_cells);
+    const element::Out<ELEMENT_OF(SEISMIC_RESULT_1)> shared_product(shared_product_cells);
     const uint tile = group.x;
     const ulong choices = SEISMIC_DIM_M * SEISMIC_DIM_K;
 
@@ -59,9 +61,9 @@ kernel void routed_expand(
         const auto up = routed::stack_weights<packets::W1>(expert_up, KERNEL_W1_LAYOUT(SEISMIC_DIM_H), expert,
             SEISMIC_DIM_F, SEISMIC_DIM_H);
         const auto out = projection::scaling<(SEISMIC_DIM_GS + SEISMIC_DIM_US != 0)>::wrap(
-            projection::SiluMul<A>{expert_product
-                + (m * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1) * A::bytes,
-                0, SEISMIC_RESULT_0_STRIDE_2},
+            projection::SiluMul<A>{
+                expert_product.offset(m * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1), 0,
+                SEISMIC_RESULT_0_STRIDE_2},
             projection::scale_factor(gate_scale, SEISMIC_DIM_GS, SEISMIC_GATE_SCALE_STRIDE_0, ulong(expert)),
             projection::scale_factor(up_scale, SEISMIC_DIM_US, SEISMIC_UP_SCALE_STRIDE_0, ulong(expert)));
         PROJECTION_OPERANDS_SHARED(globals, EXPERT_NVFP4);

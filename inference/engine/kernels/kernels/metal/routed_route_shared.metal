@@ -21,11 +21,11 @@ kernel void routed_route_shared(
     device const uchar *shared_gate [[buffer(SEISMIC_BUFFER_SHARED_GATE)]],
     device const uchar *shared_up [[buffer(SEISMIC_BUFFER_SHARED_UP)]],
     device int *routes [[buffer(SEISMIC_BUFFER_ROUTES)]],
-    device float *scores [[buffer(SEISMIC_BUFFER_SCORES)]],
+    SEISMIC_OUT_SCORES_PARAM(scores_cells),
     device const float *expert_scale [[buffer(SEISMIC_BUFFER_EXPERT_SCALE)]],
-    device uchar *normalized [[buffer(SEISMIC_RESULT_0_BUFFER)]],
-    device float *coefficient [[buffer(SEISMIC_RESULT_1_BUFFER)]],
-    device uchar *shared_product [[buffer(SEISMIC_RESULT_2_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(normalized_cells),
+    SEISMIC_RESULT_1_PARAM(coefficient_cells),
+    SEISMIC_RESULT_2_PARAM(shared_product_cells),
     arrive::coherent_device<float> logits [[buffer(SEISMIC_BUFFER_SCRATCH_LOGITS)]],
     device atomic_uint *arrivals [[buffer(SEISMIC_BUFFER_SCRATCH_ARRIVALS)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
@@ -37,6 +37,10 @@ kernel void routed_route_shared(
     threadgroup float parts[SEISMIC_CONST_DECODE_ROWS * route_simdgroups];
     threadgroup float inverses[SEISMIC_CONST_DECODE_ROWS];
     threadgroup uint last;
+    const element::Out<ELEMENT_OF(SEISMIC_SCORES)> scores(scores_cells);
+    const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> normalized(normalized_cells);
+    const element::Out<ELEMENT_OF(SEISMIC_RESULT_1)> coefficient(coefficient_cells);
+    const element::Out<ELEMENT_OF(SEISMIC_RESULT_2)> shared_product(shared_product_cells);
     const RouteRows in = decode_rows(residual, norm, parts, inverses, seismic_words, simd, lane, tid);
     if (group < route_groups) {
         route_group(in, router, shared_router, expert_scale, routes, scores, normalized, coefficient, logits,

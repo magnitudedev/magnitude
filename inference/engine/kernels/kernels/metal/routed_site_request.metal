@@ -4,7 +4,7 @@
 // F32 rows through system-coherent stores, then thread 0 publishes the
 // request in the slot (`streaming/site.hpp`).
 
-#include <seismic/element.h>
+#include <seismic/coherent.h>
 #include "lib/streaming/control.h"
 #include "../streaming/site.hpp"
 
@@ -15,11 +15,12 @@ kernel void routed_site_request(
     device const float *weights [[buffer(SEISMIC_BUFFER_WEIGHTS)]],
     device const uchar *normalized [[buffer(SEISMIC_BUFFER_NORMALIZED)]],
     SYSTEM int *site [[buffer(SEISMIC_BUFFER_SITE)]],
-    SYSTEM float *site_rows [[buffer(SEISMIC_BUFFER_SITE_ROWS)]],
+    SEISMIC_OUT_SITE_ROWS_PARAM(site_rows_cells),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint tid [[thread_index_in_threadgroup]],
     uint threads [[threads_per_threadgroup]]) {
     typedef ELEMENT_OF(SEISMIC_ELEMENT_A) A;
+    const auto site_rows = element::system(element::Out<element::F32>(site_rows_cells));
     const uint choices = uint(SEISMIC_DIM_M) * uint(SEISMIC_DIM_K);
     if (!streaming_site_any(sources, SEISMIC_SOURCES_STRIDE_0, SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2,
             choices))
@@ -30,8 +31,9 @@ kernel void routed_site_request(
     const ulong rows = SEISMIC_DIM_M, columns = SEISMIC_DIM_H;
     for (ulong i = tid; i < rows * columns; i += threads) {
         const ulong m = i / columns, n = i % columns;
-        site_rows[slot * SEISMIC_SITE_ROWS_STRIDE_0 + m * SEISMIC_SITE_ROWS_STRIDE_1
-            + n * SEISMIC_SITE_ROWS_STRIDE_2] = A::load(rows_in[m * SEISMIC_NORMALIZED_STRIDE_0 + n * SEISMIC_NORMALIZED_STRIDE_1]);
+        site_rows.put(slot * SEISMIC_SITE_ROWS_STRIDE_0 + m * SEISMIC_SITE_ROWS_STRIDE_1
+                + n * SEISMIC_SITE_ROWS_STRIDE_2,
+            A::load(rows_in[m * SEISMIC_NORMALIZED_STRIDE_0 + n * SEISMIC_NORMALIZED_STRIDE_1]));
     }
     streaming_publish_barrier();
     if (tid == 0)

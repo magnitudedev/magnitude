@@ -20,8 +20,8 @@
 // Dense history planes [T, KV, W] (activation element).
 #define HISTORY()                                                                            \
     attention::DenseHistory {                                                                \
-        reinterpret_cast<const attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY)),   \
-        reinterpret_cast<const attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE)), \
+        SEISMIC_OUT_HISTORY_KEY,                                                             \
+        SEISMIC_OUT_HISTORY_VALUE,                                                           \
             SEISMIC_HISTORY_KEY_STRIDE_0, SEISMIC_HISTORY_KEY_STRIDE_1,                      \
             SEISMIC_HISTORY_VALUE_STRIDE_0, SEISMIC_HISTORY_VALUE_STRIDE_1,                  \
             SEISMIC_PARAM_SLAB_ROWS                                                          \
@@ -78,23 +78,23 @@ extern "C" __global__ void __launch_bounds__(256) attention_prefill_prepare(SEIS
 extern "C" __global__ void __launch_bounds__(attention::prefill::MMA_THREADS, 1)
     attention_prefill_attend(SEISMIC_KERNEL_PARAMS) {
     attention::prefill::attend(
-        ATTENTION_INPUTS(), HISTORY(),
+        ATTENTION_INPUTS(), HISTORY().reads(),
         attention::prefill::PrefillRows{SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_QUERIES),
                                       SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_KEYS),
                                       SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_VALUES),
-                                      SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SPLIT()},
+                                      SEISMIC_RESULT_0_OUT, SPLIT()},
         attention::prefill::Block{static_cast<int>(blockIdx.x), static_cast<int>(blockIdx.y),
                                 static_cast<int>(blockIdx.z), static_cast<int>(gridDim.z)},
         SELECTION(), PICKED());
 }
 
 extern "C" __global__ void attention_prefill_merge(SEISMIC_KERNEL_PARAMS) {
-    attention::prefill::merge_partitions(ATTENTION_INPUTS(), SPLIT(), SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER));
+    attention::prefill::merge_partitions(ATTENTION_INPUTS(), SPLIT(), SEISMIC_RESULT_0_OUT);
 }
 
 // The output rotary (RO = 1): block (row, query head), thread per pair.
 extern "C" __global__ void attention_prefill_rotate(SEISMIC_KERNEL_PARAMS) {
-    attention::prefill::output_rotary(ATTENTION_INPUTS(), SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), blockIdx.x,
+    attention::prefill::output_rotary(ATTENTION_INPUTS(), SEISMIC_RESULT_0_OUT, blockIdx.x,
                                       static_cast<int>(blockIdx.y), static_cast<int>(threadIdx.x));
 }
 

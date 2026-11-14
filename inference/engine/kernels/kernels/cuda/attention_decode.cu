@@ -48,8 +48,8 @@ extern "C" __global__ void __launch_bounds__(attention::prefill::MMA_THREADS)
     attention::prefill::attend(
         ATTENTION_INPUTS(),
         attention::DenseHistory{
-            reinterpret_cast<const attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY)),
-            reinterpret_cast<const attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE)),
+            SEISMIC_OUT_HISTORY_KEY,
+            SEISMIC_OUT_HISTORY_VALUE,
             SEISMIC_HISTORY_KEY_STRIDE_0, SEISMIC_HISTORY_KEY_STRIDE_1,
             SEISMIC_HISTORY_VALUE_STRIDE_0, SEISMIC_HISTORY_VALUE_STRIDE_1,
             SEISMIC_PARAM_SLAB_ROWS},
@@ -89,8 +89,8 @@ extern "C" __global__ void __launch_bounds__(WARPS * 32)
     attention_decode_partial(SEISMIC_KERNEL_PARAMS) {
     const attention::Inputs in = ATTENTION_INPUTS();
     const attention::DenseHistory history{
-        reinterpret_cast<const attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY)),
-        reinterpret_cast<const attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE)),
+        SEISMIC_OUT_HISTORY_KEY,
+        SEISMIC_OUT_HISTORY_VALUE,
         SEISMIC_HISTORY_KEY_STRIDE_0, SEISMIC_HISTORY_KEY_STRIDE_1,
         SEISMIC_HISTORY_VALUE_STRIDE_0, SEISMIC_HISTORY_VALUE_STRIDE_1, SEISMIC_PARAM_SLAB_ROWS};
     float *partials = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS));
@@ -208,5 +208,5 @@ extern "C" __global__ void attention_decode_merge(SEISMIC_KERNEL_PARAMS) {
         ATTENTION_INPUTS(),
         reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS)),
         reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS)),
-        SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), blockIdx.x, blockIdx.y, threadIdx.x);
+        SEISMIC_RESULT_0_OUT, blockIdx.x, blockIdx.y, threadIdx.x);
 }

@@ -1,0 +1,34 @@
+# Conformance of each backend's element owner: every row of `x` narrowed to
+# `E` (f32, bf16 or f16), each row written by a different write operation of
+# the owner (CUDA and Metal `element::Out`, Vulkan `out_put*`), so the
+# rows' bits are equal on a conforming owner. A NaN stays a NaN (the boundary
+# makes it the registry's one NaN of `E` on the way out); every other value is `E`'s round to nearest even. Row `r` is the
+# backend's operation `r`, so `R` is the number of operations the backend's
+# kernel has; each thread writes spans of eight elements.
+fn owner_publish[R, N](x: &tensor[R, N] f32) -> tensor[R, N] E where N % 8 == 0:
+    let mut result = tensor[R, N] E
+    for r in 0..R:
+        for i in 0..N:
+            result[r, i] = x[r, i]
+    return result
+
+native owner_publish for cuda from "cuda/owner_publish.cu":
+    static (R, N)
+    where R == 7
+    launch owner_publish:
+        threadgroups (R, 1, 1)
+        threads_per_threadgroup (64, 1, 1)
+
+native owner_publish for metal from "metal/owner_publish.metal":
+    static (R, N)
+    where R == 6
+    launch owner_publish:
+        threadgroups (R, 1, 1)
+        threads_per_threadgroup (64, 1, 1)
+
+native owner_publish for vulkan from "vulkan/owner_publish.comp":
+    static (R, N)
+    where R == 4
+    launch owner_publish:
+        threadgroups (R, 1, 1)
+        threads_per_threadgroup (64, 1, 1)

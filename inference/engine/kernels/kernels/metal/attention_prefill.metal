@@ -52,8 +52,8 @@ kernel void attention_prefill_prepare(
     device const float *rotary_amplitudes [[buffer(SEISMIC_BUFFER_ROTARY_AMPLITUDES)]],
     device const int *coordinates [[buffer(SEISMIC_BUFFER_COORDINATES)]],
     device const int *destinations [[buffer(SEISMIC_BUFFER_DESTINATIONS)]],
-    device const ulong *history_key [[buffer(SEISMIC_BUFFER_HISTORY_KEY)]],
-    device const ulong *history_value [[buffer(SEISMIC_BUFFER_HISTORY_VALUE)]],
+    SEISMIC_OUT_HISTORY_KEY_PARAM(history_key),
+    SEISMIC_OUT_HISTORY_VALUE_PARAM(history_value),
     device attention::Scalar *queries [[buffer(SEISMIC_BUFFER_SCRATCH_QUERIES)]],
     device attention::Scalar *keys [[buffer(SEISMIC_BUFFER_SCRATCH_KEYS)]],
     device attention::Scalar *values [[buffer(SEISMIC_BUFFER_SCRATCH_VALUES)]],
@@ -61,7 +61,7 @@ kernel void attention_prefill_prepare(
     uint group [[threadgroup_position_in_grid]],
     uint simd [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    attention::prefill_prepare<SEISMIC_TUNE_QT>(attention::dense_history{history_key,
+    attention::prefill_prepare<SEISMIC_TUNE_QT>(attention::dense_planes{history_key,
         attention::values_plane(history_key, history_value), ulong(SEISMIC_PARAM_SLAB_ROWS)},
         query, key, value, query_norm, key_norm, value_norm, rotary_components, rotary_frequencies,
         rotary_amplitudes, coordinates, destinations, queries, keys, values, SEISMIC_DIM_M,
@@ -77,9 +77,9 @@ kernel void attention_prefill_attend(
     device const float *sinks [[buffer(SEISMIC_BUFFER_SINKS)]],
     device const int *visible [[buffer(SEISMIC_BUFFER_VISIBLE)]],
     device const int *fresh [[buffer(SEISMIC_BUFFER_FRESH)]],
-    device const ulong *history_key [[buffer(SEISMIC_BUFFER_HISTORY_KEY)]],
-    device const ulong *history_value [[buffer(SEISMIC_BUFFER_HISTORY_VALUE)]],
-    device attention::Scalar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_OUT_HISTORY_KEY_PARAM(history_key),
+    SEISMIC_OUT_HISTORY_VALUE_PARAM(history_value),
+    SEISMIC_RESULT_0_PARAM(result_cells),
     device const attention::Scalar *queries [[buffer(SEISMIC_BUFFER_SCRATCH_QUERIES)]],
     device const attention::Scalar *keys [[buffer(SEISMIC_BUFFER_SCRATCH_KEYS)]],
     device const attention::Scalar *values [[buffer(SEISMIC_BUFFER_SCRATCH_VALUES)]],
@@ -98,10 +98,10 @@ kernel void attention_prefill_attend(
     if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
         return;
     PREFILL_EXCHANGE(exchange, SEISMIC_TUNE_QT);
-    attention::prefill_attend<SEISMIC_TUNE_QT>(attention::dense_history{history_key,
-        attention::values_plane(history_key, history_value), ulong(SEISMIC_PARAM_SLAB_ROWS)},
-        query, gate, visible, fresh, result, queries, keys, values, partials, statistics, counts,
-        SEISMIC_DIM_M, SEISMIC_DIM_R, as_type<float>(uint(SEISMIC_PARAM_SCALE)) * ATTENTION_LOG2E,
+    attention::prefill_attend<SEISMIC_TUNE_QT>(attention::dense_planes{history_key,
+        attention::values_plane(history_key, history_value), ulong(SEISMIC_PARAM_SLAB_ROWS)}.reads(),
+        query, gate, visible, fresh, element::Out<element::Act>(result_cells), queries, keys, values, partials,
+        statistics, counts, SEISMIC_DIM_M, SEISMIC_DIM_R, as_type<float>(uint(SEISMIC_PARAM_SCALE)) * ATTENTION_LOG2E,
         SEISMIC_PARAM_GATE_FUNCTION != 0, shared, exchange, group, groups, thread_index, simd, lane,
         PREFILL_WORKLIST(selection, worklist), sinks);
 }
@@ -110,7 +110,7 @@ kernel void attention_prefill_merge(
     device const attention::Scalar *query [[buffer(SEISMIC_BUFFER_QUERY)]],
     device const attention::Scalar *gate [[buffer(SEISMIC_BUFFER_GATE)]],
     device const float *sinks [[buffer(SEISMIC_BUFFER_SINKS)]],
-    device attention::Scalar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(result_cells),
     device const float *partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]],
     device const float *statistics [[buffer(SEISMIC_BUFFER_SCRATCH_STATISTICS)]],
     device const uint *counts [[buffer(SEISMIC_BUFFER_SCRATCH_COUNTS)]],
@@ -119,8 +119,8 @@ kernel void attention_prefill_merge(
     uint column [[thread_index_in_threadgroup]]) {
     if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
         return;
-    attention::prefill_merge<SEISMIC_TUNE_QT>(query, gate, result, partials, statistics, counts,
-        SEISMIC_DIM_M, group.x, group.y, column, SEISMIC_PARAM_GATE_FUNCTION != 0, sinks);
+    attention::prefill_merge<SEISMIC_TUNE_QT>(query, gate, element::Out<element::Act>(result_cells), partials,
+        statistics, counts, SEISMIC_DIM_M, group.x, group.y, column, SEISMIC_PARAM_GATE_FUNCTION != 0, sinks);
 }
 
 // A layer with picks (KS > 0): threadgroup (kv head, row), the shared-tile
@@ -144,11 +144,11 @@ kernel void attention_prefill_shared(
     device const int *coordinates [[buffer(SEISMIC_BUFFER_COORDINATES)]],
     device const int *visible [[buffer(SEISMIC_BUFFER_VISIBLE)]],
     device const int *fresh [[buffer(SEISMIC_BUFFER_FRESH)]],
-    device const ulong *history_key [[buffer(SEISMIC_BUFFER_HISTORY_KEY)]],
-    device const ulong *history_value [[buffer(SEISMIC_BUFFER_HISTORY_VALUE)]],
+    SEISMIC_OUT_HISTORY_KEY_PARAM(history_key),
+    SEISMIC_OUT_HISTORY_VALUE_PARAM(history_value),
     device const int *selected_rows [[buffer(SEISMIC_BUFFER_SELECTED_ROWS)]],
     device const ulong *selected [[buffer(SEISMIC_BUFFER_SELECTED)]],
-    device attention::Scalar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(result_cells),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     threadgroup uchar *shared [[threadgroup(0)]],
     uint3 group [[threadgroup_position_in_grid]],
@@ -159,8 +159,8 @@ kernel void attention_prefill_shared(
     if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
         return;
     attention::decode_shared<SEISMIC_TUNE_KEYS, 1, SEISMIC_DIM_KS, true, SEISMIC_DIM_RO != 0>(
-        attention::dense_history{history_key, attention::values_plane(history_key, history_value),
-            ulong(SEISMIC_PARAM_SLAB_ROWS)},
+        attention::dense_planes{history_key, attention::values_plane(history_key, history_value),
+            ulong(SEISMIC_PARAM_SLAB_ROWS)}.reads(),
         query, key, value, query_norm, key_norm, value_norm, rotary_components, rotary_frequencies,
         rotary_amplitudes, coordinates, visible, fresh, nullptr, nullptr, shared, SEISMIC_DIM_R,
         as_type<float>(uint(SEISMIC_PARAM_EPSILON)), as_type<float>(uint(SEISMIC_PARAM_SCALE)) * ATTENTION_LOG2E, 1,
@@ -168,7 +168,8 @@ kernel void attention_prefill_shared(
         attention::decode_picks{selected_rows, selected, ulong(SEISMIC_PARAM_SELECTED_SLAB_ROWS)},
         attention::key_rounding(SEISMIC_DIM_KR != 0, uint(SEISMIC_PARAM_KEY_BLOCK), uint(SEISMIC_PARAM_KEY_ELEMENT),
             uint(SEISMIC_PARAM_KEY_SCALE), uint(SEISMIC_PARAM_KEY_AMAX_FLOOR)),
-        attention::shared_result{query, gate, sinks, result, SEISMIC_PARAM_GATE_FUNCTION != 0});
+        attention::shared_result{query, gate, sinks, element::Out<element::Act>(result_cells),
+            SEISMIC_PARAM_GATE_FUNCTION != 0});
 #endif
 }
 
@@ -201,12 +202,12 @@ kernel void attention_prefill_rotate(
     device const float *rotary_frequencies [[buffer(SEISMIC_BUFFER_ROTARY_FREQUENCIES)]],
     device const float *rotary_amplitudes [[buffer(SEISMIC_BUFFER_ROTARY_AMPLITUDES)]],
     device const int *coordinates [[buffer(SEISMIC_BUFFER_COORDINATES)]],
-    device attention::Scalar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(result_cells),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint pair [[thread_index_in_threadgroup]]) {
     if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
         return;
-    attention::output_rotary(result, coordinates, rotary_components, rotary_frequencies, rotary_amplitudes,
-        group.x, group.y, pair);
+    attention::output_rotary(element::Out<element::Act>(result_cells), coordinates, rotary_components,
+        rotary_frequencies, rotary_amplitudes, group.x, group.y, pair);
 }

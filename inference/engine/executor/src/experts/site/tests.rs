@@ -543,3 +543,26 @@ fn the_reference_site_measures() {
         assert!(workers > 0 && lines.expert.one.get() > 0., "{backend:?}: {workers} workers, {lines:?}");
     }
 }
+
+/// Host reads of a site slot's rows and output canonicalize every NaN to the
+/// registry's one NaN (`0x7fc0_0000`), as `Tensor::read_to_host` does.
+#[test]
+fn host_reads_of_a_site_slot_canonicalize_nans() {
+    let device = cpu();
+    let mut x = rows();
+    x[0] = f32::from_bits(0xffc0_1234);
+    let (layer, _) = fixture(&device);
+    let compute = HostCompute::start(vec![layer], &threads(1)).unwrap();
+    let handle: Compute = compute.handle();
+    let _flight = handle.flight().expect("a site layer issues flights");
+    let layer = &handle.layers()[0];
+    layer.request(1, &[(0, 0, 1.0, 0)], &x);
+    assert_eq!(answer(layer, 1, 1), 1);
+    let answered = layer.answered(1).expect("step 1 is answered");
+    assert_eq!(answered.rows[0].to_bits(), 0x7fc0_0000);
+    for value in &answered.output[..layer.shape.hidden] {
+        if value.is_nan() {
+            assert_eq!(value.to_bits(), 0x7fc0_0000);
+        }
+    }
+}

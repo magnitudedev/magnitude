@@ -5,6 +5,7 @@
 // 4096 / SEISMIC_SUBGROUP_LANES an invocation), in UNROLL independent
 // accumulators seeded apart, the operands each subgroup's first `x` in f16;
 // it writes `x` back (line.seismic). A subgroup runs whole or not at all.
+#include <seismic/element.glsl>
 #include "../../kernels/vulkan/lib/core/matrix.glsl"
 
 void line_matrix() {
@@ -30,7 +31,7 @@ void line_matrix() {
     [[unroll]] for (uint k = 0u; k < UNROLL; ++k)
         total += d[k][0];
     if (lane < SEISMIC_DIM_N)
-        seismic_f32(SEISMIC_PTR(SEISMIC_BUFFER_OUT))[uint(lane * SEISMIC_OUT_STRIDE_0)].v =
-            xs[uint(lane * SEISMIC_X_STRIDE_0)].v + (floatBitsToUint(total) == 0xFFFFFFFFu ? 1.0 : 0.0);
+        out_put(SEISMIC_OUT_OUT, lane * SEISMIC_OUT_STRIDE_0,
+            xs[uint(lane * SEISMIC_X_STRIDE_0)].v + (floatBitsToUint(total) == 0xFFFFFFFFu ? 1.0 : 0.0));
 #endif
 }

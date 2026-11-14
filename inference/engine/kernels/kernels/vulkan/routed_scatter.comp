@@ -10,15 +10,6 @@
 #else
 #error "routed_scatter requires a bf16 or f16 activation"
 #endif
-#if defined(SEISMIC_ELEMENT_R_REPRESENTATION_F32)
-#define ROUTED_PUBLISHED ELEMENT_F32
-#elif defined(SEISMIC_ELEMENT_R_REPRESENTATION_BF16)
-#define ROUTED_PUBLISHED ELEMENT_BF16
-#elif defined(SEISMIC_ELEMENT_R_REPRESENTATION_F16)
-#define ROUTED_PUBLISHED ELEMENT_F16
-#else
-#error "routed_scatter requires a dense published element"
-#endif
 
 #define SCATTER_THREADS 256u
 
@@ -51,7 +42,7 @@ void routed_scatter() {
         if (i < valid) {
             const uint64_t column = uint64_t(n + i);
             const float selected = (i & 1u) != 0u ? selected_odd[i >> 1] : selected_even[i >> 1];
-            element_put(ROUTED_PUBLISHED, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER),
+            out_put(SEISMIC_RESULT_0_OUT,
                 m * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1,
                 element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_BASE)
                     + (m * SEISMIC_BASE_STRIDE_0 + column * SEISMIC_BASE_STRIDE_1) * 4ul) + selected);

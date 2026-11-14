@@ -2931,14 +2931,14 @@ impl NativePrepared {
                 NativeResult::Tensor { .. } => decoded.push(DecodedValue::Tensor(
                     tensors.next().expect("native result tensor count changed"),
                 )),
-                NativeResult::Scalar(dtype) => decoded.push(DecodedValue::Scalar(scalar_value(
+                NativeResult::Scalar(dtype) => decoded.push(DecodedValue::scalar(scalar_value(
                     *dtype,
                     read_word(&scalar_bytes, offset),
                 ))),
-                NativeResult::Index => decoded.push(DecodedValue::Scalar(ArgumentValue::Index(
+                NativeResult::Index => decoded.push(DecodedValue::scalar(ArgumentValue::Index(
                     read_word(&scalar_bytes, offset).into(),
                 ))),
-                NativeResult::Range => decoded.push(DecodedValue::Scalar(ArgumentValue::Range {
+                NativeResult::Range => decoded.push(DecodedValue::scalar(ArgumentValue::Range {
                     start: read_word(&scalar_bytes, offset).into(),
                     end: read_word(&scalar_bytes, offset + 1).into(),
                 })),

@@ -37,7 +37,7 @@ using Epi = Scaling::type<projection::Store<ELEMENT_OF(SEISMIC_ELEMENT_Y)>>;
     (reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS)) +                            \
      (projection::u64)(group) * projection::SPLIT * SEISMIC_DIM_M * SEISMIC_DIM_N)
 #define EPILOGUE(group)                                                                                   \
-    Scaling::wrap(projection::Store<ELEMENT_OF(SEISMIC_ELEMENT_Y)>{SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER),   \
+    Scaling::wrap(projection::Store<ELEMENT_OF(SEISMIC_ELEMENT_Y)>{SEISMIC_RESULT_0_OUT,   \
                                                                   SEISMIC_RESULT_0_STRIDE_0,              \
                                                                   (projection::u64)(group) * SEISMIC_DIM_N}, \
                   projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT_SCALE), SEISMIC_DIM_WS, 0, 0), 1.0f)

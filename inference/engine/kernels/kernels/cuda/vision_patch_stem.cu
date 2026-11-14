@@ -50,7 +50,7 @@ struct Partial {
 // ((partial) + product (+ bias)) + (with NT = 1) the four table corners
 // scaled by their coefficients, summed in order.
 struct Stem {
-    float *y;
+    element::Out<element::F32> y;
     u64 stride;
     const float *partial;
     const u8 *bias;
@@ -74,7 +74,7 @@ struct Stem {
         return projected + blended;
     }
     __device__ __forceinline__ void operator()(u32 m, u32 n, float first, float second) const {
-        *reinterpret_cast<float2 *>(y + (u64)m * stride + n) = make_float2(value(m, n, first), value(m, n + 1, second));
+        y.put2((u64)m * stride + n, value(m, n, first), value(m, n + 1, second));
     }
 };
 
@@ -86,7 +86,7 @@ extern "C" __global__ void vision_patch_stem_first(SEISMIC_KERNEL_PARAMS) {
 
 extern "C" __global__ void vision_patch_stem_last(SEISMIC_KERNEL_PARAMS) {
     __shared__ vision::GemmShared shared;
-    const Stem epilogue{reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)),
+    const Stem epilogue{SEISMIC_RESULT_0_OUT,
                         SEISMIC_RESULT_0_STRIDE_0,
                         PARTIAL,
                         SEISMIC_PTR(SEISMIC_BUFFER_BIAS),

@@ -79,16 +79,19 @@ typedef rotary::layout<ATTENTION_W, SEISMIC_DIM_P, ATTENTION_ROTARY_FIRST, ATTEN
 typedef head_layout::table rotary_table;
 
 // Appends lane `lane`'s columns of one kv head row at history row
-// `destination` (the caller skips rows without a destination). The element
-// owns publication rounding and its storage payload; native casts do not
-// define a second semantic preparation recipe.
-inline void append(device Scalar *history, int destination, uint kv_head, uint lane,
+// `destination` (the caller skips rows without a destination). The history's
+// owner handle owns publication rounding and its storage payload.
+inline void append(element::Out<element::Act> history, int destination, uint kv_head, uint lane,
     thread const float (&x)[ATTENTION_E]) {
     const ulong target = (ulong(destination) * SEISMIC_DIM_KV + kv_head) * ATTENTION_W + lane * ATTENTION_E;
     ATTENTION_UNROLL
     for (uint i = 0; i < ATTENTION_E; ++i)
-        reinterpret_cast<device element::Act::storage *>(history)[target + i] = element::Act::store(float(x[i]));
+        history.put(target + i, x[i]);
 }
+
+// A dense plane as its owner's slab table, typed by the activation element: only the write path
+// (`dense_planes`) holds it; reads take its plain address table (`slab::reads`).
+typedef slab::Table<element::Act> history_plane;
 
 // Keys per decode partition for a row seeing `total` keys: at least `span`,
 // and few enough that `parts` partitions cover the row. Never zero.
@@ -274,8 +277,9 @@ inline void rounded_head_rotary(device const Scalar *raw, device const float *no
 // its own launch after the entry has stored every query head's ungated
 // output: threadgroup (row, query head), thread p turns pair p back by the
 // row's negated angles (`output_rotary`), in F32, and publishes it again.
-inline void output_rotary(device Scalar *result, device const int *coordinates, device const int *components,
-    device const float *frequencies, device const float *amplitudes, ulong row, ulong head, uint pair) {
+inline void output_rotary(element::Out<element::Act> result, device const int *coordinates,
+    device const int *components, device const float *frequencies, device const float *amplitudes, ulong row,
+    ulong head, uint pair) {
     if (pair >= SEISMIC_DIM_P)
         return;
     const uint lo = head_layout::lead(pair);
@@ -283,10 +287,11 @@ inline void output_rotary(device Scalar *result, device const int *coordinates, 
     float c;
     const float s = -rotary::sincos(float(coordinates[row * 4 + components[pair]]) * frequencies[pair], c);
     const float cosine = c * amplitudes[pair], sine = s * amplitudes[pair];
-    device Scalar *out = result + (row * SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP + head) * ATTENTION_W;
-    const float low = float(out[lo]), high = float(out[hi]);
-    out[lo] = Scalar(low * cosine - high * sine);
-    out[hi] = Scalar(high * cosine + low * sine);
+    const element::Out<element::Act> out =
+        result.offset((row * SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP + head) * ATTENTION_W);
+    const float low = out.at(lo), high = out.at(hi);
+    out.put(lo, low * cosine - high * sine);
+    out.put(hi, high * cosine + low * sine);
 }
 
 // One head row normalized and rotated by its own table.
@@ -600,16 +605,16 @@ inline float gate_logit(device const Scalar *query, device const Scalar *gate, u
 }
 
 // An attended column times its gate `g` (`gate_logit`): sigmoid, or softplus
-// when `softplus`. Rounded to the activation.
-inline Scalar gated(float attended, float g, bool softplus) {
+// when `softplus`. The result's owner rounds it to the activation as it publishes it.
+inline float gated(float attended, float g, bool softplus) {
     if (ATTENTION_I == 0 && ATTENTION_U == 0)
-        return Scalar(attended);
-    return Scalar(softplus ? attended * (metal::max(g, 0.0f) + metal::log(1.0f + metal::exp(-metal::abs(g))))
-                           : attended / (1.0f + metal::exp(-g)));
+        return attended;
+    return softplus ? attended * (metal::max(g, 0.0f) + metal::log(1.0f + metal::exp(-metal::abs(g))))
+                    : attended / (1.0f + metal::exp(-g));
 }
 
 // One attended column of query head `head` of `row` times its gate.
-inline Scalar gate_output(device const Scalar *query, device const Scalar *gate, ulong row, ulong head,
+inline float gate_output(device const Scalar *query, device const Scalar *gate, ulong row, ulong head,
     uint column, float attended, bool softplus) {
     return gated(attended, gate_logit(query, gate, row, head, column), softplus);
 }
@@ -648,7 +653,7 @@ inline float turned_back(float attended, float other, uint column, ulong row, de
 // consume them.
 template <uint SPAN, uint PARTS, uint TOKENS, uint PICKS = 0, bool ROTATED = false>
 inline void decode_output(device const Scalar *query, device const Scalar *gate, device const int *visible,
-    device const int *fresh, device Scalar *result, device const float *partials,
+    device const int *fresh, element::Out<element::Act> result, device const float *partials,
     device const float *statistics, threadgroup float *weights, ulong spans, ulong rows, ulong head, ulong row,
     uint column, uint lane, bool softplus, device const float *sinks = nullptr, bool writer = true,
     threadgroup float *row_values = nullptr, device const int *coordinates = nullptr,
@@ -712,7 +717,7 @@ inline void decode_output(device const Scalar *query, device const Scalar *gate,
             attended = turned_back(attended, row_values[head_layout::partner(column)], column, row, coordinates,
                 components, frequencies, amplitudes);
     }
-    result[(row * KV * G + head) * W + column] = gated(attended, g, softplus);
+    result.put((row * KV * G + head) * W + column, gated(attended, g, softplus));
 }
 
 #include "history.h"
@@ -929,11 +934,12 @@ struct prefill_run {
 
 // The plane a dense entry reads history values from: its value plane, or
 // the key plane for stored-key values (whose value plane has no rows).
-inline device const ulong *values_plane(device const ulong *history_key, device const ulong *history_value) {
+inline device const history_plane *values_plane(device const history_plane *history_key,
+    device const history_plane *history_value) {
     return ATTENTION_STORED_KEY ? history_key : history_value;
 }
 
-// Dense history: [T, KV, W] activation planes, whose products take
+// Dense history read: [T, KV, W] activation planes, whose products take
 // activation-dtype operands; `value` is `values_plane`'s.
 struct dense_history {
     enum : bool { AFFINE = false };
@@ -949,21 +955,6 @@ struct dense_history {
         ATTENTION_UNROLL
         for (uint i = 0; i < ATTENTION_E; ++i)
             x[i] = element::Act::round(x[i]);
-    }
-
-    // A fresh row's key and value made what history holds (`held`), and
-    // appended at `destination` unless it is negative.
-    inline void hold(int destination, uint kv_head, uint lane, thread float (&k)[ATTENTION_E],
-        thread float (&v)[ATTENTION_E]) const {
-        held<true>(k, lane);
-        held<false>(v, lane);
-        if (destination < 0)
-            return;
-        attention::append(slab::row<Scalar>(key, ulong(destination), rows_per_slab,
-            SEISMIC_DIM_KV * ATTENTION_W), 0, kv_head, lane, k);
-        if (!ATTENTION_STORED_KEY)
-            attention::append(slab::row<Scalar>(value, ulong(destination), rows_per_slab,
-                SEISMIC_DIM_KV * ATTENTION_W), 0, kv_head, lane, v);
     }
 
     template <uint THREADS, uint KEYS = PREFILL_KEYS>
@@ -1067,6 +1058,32 @@ struct dense_history {
     }
 };
 
+// Dense history's planes as their owner's tables: the write path (`hold`)
+// and its read view (`reads`).
+struct dense_planes {
+    typedef dense_history History;
+    device const history_plane *key;
+    device const history_plane *value;
+    ulong rows_per_slab;
+
+    inline dense_history reads() const { return dense_history{slab::reads(key), slab::reads(value), rows_per_slab}; }
+
+    // A fresh row's key and value made what history holds (`held`), and
+    // appended at `destination` unless it is negative.
+    inline void hold(int destination, uint kv_head, uint lane, thread float (&k)[ATTENTION_E],
+        thread float (&v)[ATTENTION_E]) const {
+        dense_history::held<true>(k, lane);
+        dense_history::held<false>(v, lane);
+        if (destination < 0)
+            return;
+        attention::append(slab::out_row(key, ulong(destination), rows_per_slab,
+            SEISMIC_DIM_KV * ATTENTION_W), 0, kv_head, lane, k);
+        if (!ATTENTION_STORED_KEY)
+            attention::append(slab::out_row(value, ulong(destination), rows_per_slab,
+                SEISMIC_DIM_KV * ATTENTION_W), 0, kv_head, lane, v);
+    }
+};
+
 // Affine K8/V4 history: code rows plus group (scale, zero) pairs per (row, kv
 // head). Its products take F16 operands, the codec's coefficient element: a
 // staged tile, history or fresh, holds the decoded values code * scale + zero
@@ -1089,31 +1106,6 @@ struct affine_history {
     template <bool KEY>
     static inline void held(thread float (&x)[ATTENTION_E], uint lane) {
         decode(held_encoding<KEY>(x), x);
-    }
-
-    // A fresh row's key and value made what history holds (`held`) from one
-    // encoding each, which is stored at `destination` unless it is negative.
-    inline void hold(int destination, uint kv_head, uint lane, thread float (&k)[ATTENTION_E],
-        thread float (&v)[ATTENTION_E]) const {
-        typedef lane_codes<ATTENTION_KEY_BITS> key_lane;
-        typedef lane_codes<ATTENTION_VALUE_BITS> value_lane;
-        const lane_encoding<ATTENTION_KEY_BITS> key_encoding = held_encoding<true>(k);
-        const lane_encoding<ATTENTION_VALUE_BITS> value_encoding = held_encoding<false>(v);
-        decode(key_encoding, k);
-        decode(value_encoding, v);
-        if (destination < 0)
-            return;
-        const ulong vector = kv_head;
-        store<ATTENTION_KEY_BITS>(key_encoding,
-            slab::row<uint>(key_codes, ulong(destination), rows_per_slab,
-                SEISMIC_DIM_KV * key_lane::row_words) + vector * key_lane::row_words,
-            slab::row<half>(key_coefficients, ulong(destination), rows_per_slab,
-                SEISMIC_DIM_KV * key_lane::pairs * 2) + vector * key_lane::pairs * 2, lane);
-        store<ATTENTION_VALUE_BITS>(value_encoding,
-            slab::row<uint>(value_codes, ulong(destination), rows_per_slab,
-                SEISMIC_DIM_KV * value_lane::row_words) + vector * value_lane::row_words,
-            slab::row<half>(value_coefficients, ulong(destination), rows_per_slab,
-                SEISMIC_DIM_KV * value_lane::pairs * 2) + vector * value_lane::pairs * 2, lane);
     }
 
     // Code piece c (16 bytes: 128 / B codes, within one group) of one
@@ -1329,7 +1321,46 @@ struct affine_history {
     }
 };
 
+// Affine history's planes as their owner's tables (codes are integers, held as plain addresses): the
+// write path (`hold`) and its read view (`reads`).
+struct affine_planes {
+    typedef affine_history History;
+    device const ulong *key_codes;
+    device const coefficient_plane *key_coefficients;
+    device const ulong *value_codes;
+    device const coefficient_plane *value_coefficients;
+    ulong rows_per_slab;
 
+    inline affine_history reads() const {
+        return affine_history{key_codes, slab::reads(key_coefficients), value_codes, slab::reads(value_coefficients),
+            rows_per_slab};
+    }
+
+    // A fresh row's key and value made what history holds (`held`) from one
+    // encoding each, which is stored at `destination` unless it is negative.
+    inline void hold(int destination, uint kv_head, uint lane, thread float (&k)[ATTENTION_E],
+        thread float (&v)[ATTENTION_E]) const {
+        typedef lane_codes<ATTENTION_KEY_BITS> key_lane;
+        typedef lane_codes<ATTENTION_VALUE_BITS> value_lane;
+        const lane_encoding<ATTENTION_KEY_BITS> key_encoding = held_encoding<true>(k);
+        const lane_encoding<ATTENTION_VALUE_BITS> value_encoding = held_encoding<false>(v);
+        decode(key_encoding, k);
+        decode(value_encoding, v);
+        if (destination < 0)
+            return;
+        const ulong vector = kv_head;
+        store<ATTENTION_KEY_BITS>(key_encoding,
+            slab::row<uint>(key_codes, ulong(destination), rows_per_slab,
+                SEISMIC_DIM_KV * key_lane::row_words) + vector * key_lane::row_words,
+            slab::out_row(key_coefficients, ulong(destination), rows_per_slab,
+                SEISMIC_DIM_KV * key_lane::pairs * 2).offset(vector * key_lane::pairs * 2), lane);
+        store<ATTENTION_VALUE_BITS>(value_encoding,
+            slab::row<uint>(value_codes, ulong(destination), rows_per_slab,
+                SEISMIC_DIM_KV * value_lane::row_words) + vector * value_lane::row_words,
+            slab::out_row(value_coefficients, ulong(destination), rows_per_slab,
+                SEISMIC_DIM_KV * value_lane::pairs * 2).offset(vector * value_lane::pairs * 2), lane);
+    }
+};
 #endif
 // The history row tiles a call's rows see (the entry's `history_tiles`):
 // `count` listed tiles of PREFILL_HISTORY_TILE rows, distinct and ascending.
@@ -1574,16 +1605,16 @@ inline void prefill_decode(affine_history history, history_window window, decode
 // scratch as history holds them, from the one encoding the history policy
 // appends at the row's destination (`hold`). A layer without fresh rows
 // prepares only queries.
-template <uint QT, class History>
-inline void prefill_prepare(History history, device const Scalar *query,
+template <uint QT, class Planes>
+inline void prefill_prepare(Planes planes, device const Scalar *query,
     device const Scalar *key, device const Scalar *value, device const float *query_norm,
     device const float *key_norm, device const float *value_norm, device const int *rotary_components,
     device const float *rotary_frequencies, device const float *rotary_amplitudes,
     device const int *coordinates, device const int *destinations,
-    device typename History::Operand *queries, device typename History::Operand *keys,
-    device typename History::Operand *values, ulong M, float epsilon, bool inject_only,
+    device typename Planes::History::Operand *queries, device typename Planes::History::Operand *keys,
+    device typename Planes::History::Operand *values, ulong M, float epsilon, bool inject_only,
     uint group, uint simd, uint lane, rounding::Rounding key_rounding) {
-    typedef typename History::Operand Operand;
+    typedef typename Planes::History::Operand Operand;
     constexpr uint W = ATTENTION_W;
     constexpr uint E = ATTENTION_E;
     constexpr uint KV = SEISMIC_DIM_KV;
@@ -1630,7 +1661,7 @@ inline void prefill_prepare(History history, device const Scalar *query,
             y[i] = x[i];
     else
         fresh_row<false>(key, value, key_norm, value_norm, table, row, uint(kv_head), epsilon, key_rounding, lane, y);
-    history.hold(destinations[row], uint(kv_head), lane, x, y);
+    planes.hold(destinations[row], uint(kv_head), lane, x, y);
     if (inject_only)
         return;
     for (uint i = 0; i < E; ++i) {
@@ -1820,9 +1851,10 @@ struct prefill_fragments {
     // A split tile stores (partial output, maximum, denominator) per row and
     // partition; an unsplit one its gated output (with the head's sink, if
     // any).
-    static inline void store(device const Scalar *query, device const Scalar *gate, device Scalar *result,
-        device float *partials, device float *statistics, ulong first_token, ulong M, uint head, uint partition,
-        uint active, uint window_first, bool softplus, device const float *sinks, thread prefill_fragments &self) {
+    static inline void store(device const Scalar *query, device const Scalar *gate,
+        element::Out<element::Act> result, device float *partials, device float *statistics, ulong first_token,
+        ulong M, uint head, uint partition, uint active, uint window_first, bool softplus, device const float *sinks,
+        thread prefill_fragments &self) {
         constexpr uint H = SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP;
         const ulong token = first_token + self.fm;
         if (token >= M)
@@ -1846,8 +1878,8 @@ struct prefill_fragments {
             ATTENTION_UNROLL
             for (uint e = 0; e < 2; ++e) {
                 const uint column = window_first + d * 8 + self.fn + e;
-                result[(token * H + head) * W + column] = gate_output(query, gate, token, head, column,
-                    self.output[d].thread_elements()[e] * inverse, softplus);
+                result.put((token * H + head) * W + column, gate_output(query, gate, token, head, column,
+                    self.output[d].thread_elements()[e] * inverse, softplus));
             }
         }
     }
@@ -1922,9 +1954,10 @@ struct prefill_tensors {
     }
 
     static inline void windows(History history, device const Scalar *query, device const Scalar *gate,
-        device const int *visible, device const int *fresh, device Scalar *result, device const Operand *keys,
-        device const Operand *values, device float *partials, device float *statistics, ulong M, ulong R,
-        float scale, bool softplus, threadgroup Operand *staged, threadgroup const prefill_interval *intervals,
+        device const int *visible, device const int *fresh, element::Out<element::Act> result,
+        device const Operand *keys, device const Operand *values, device float *partials, device float *statistics,
+        ulong M, ulong R, float scale, bool softplus, threadgroup Operand *staged,
+        threadgroup const prefill_interval *intervals,
         threadgroup float *exchange, uint kv_head, uint partition, uint active, uint tiles_lo, uint tiles_hi,
         device const Operand *query_rows, uint head, ulong first_token, bool computes, uint owner,
         uint thread_index, uint lane, device const float *sinks) {
@@ -2076,8 +2109,8 @@ struct prefill_tensors {
                 const ulong row_token = first_token + index[1];
                 const uint column = window_first + index[0];
                 if (row_token < M)
-                    result[(row_token * H + head) * W + column] = gate_output(query, gate, row_token, head, column,
-                        output[i] * *inverse.map_iterator(output.get_iterator(i)), softplus);
+                    result.put((row_token * H + head) * W + column, gate_output(query, gate, row_token, head, column,
+                        output[i] * *inverse.map_iterator(output.get_iterator(i)), softplus));
             }
         }
     }
@@ -2190,9 +2223,9 @@ struct prefill_direct {
     }
 
     static inline void windows(History history, device const Scalar *query, device const Scalar *gate,
-        device const int *visible, device const int *fresh, device Scalar *result, device const Operand *keys,
-        device const Operand *values, device float *partials, device float *statistics, ulong M, ulong R,
-        float scale, bool softplus, threadgroup const prefill_interval *intervals,
+        device const int *visible, device const int *fresh, element::Out<element::Act> result,
+        device const Operand *keys, device const Operand *values, device float *partials, device float *statistics,
+        ulong M, ulong R, float scale, bool softplus, threadgroup const prefill_interval *intervals,
         threadgroup const prefill_run *runs, uint kv_head, uint partition, device const Operand *query_rows,
         uint head, ulong first_token, device const float *sinks) {
         constexpr uint H = SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP;
@@ -2367,8 +2400,8 @@ struct prefill_direct {
                 const uint column = window_first + index[0];
                 const float inverse = 1.0f / divisor(sinks, head, maximum[slot(i)], denominator[slot(i)]);
                 if (row_token < M)
-                    result[(row_token * H + head) * W + column] = gate_output(query, gate, row_token, head, column,
-                        output[i] * inverse, softplus);
+                    result.put((row_token * H + head) * W + column, gate_output(query, gate, row_token, head, column,
+                        output[i] * inverse, softplus));
             }
         }
     }
@@ -2389,7 +2422,7 @@ struct prefill_direct {
 // scheduled apart).
 template <uint QT, class History>
 inline void prefill_windows(History history, device const Scalar *query, device const Scalar *gate,
-    device const int *visible, device const int *fresh, device Scalar *result,
+    device const int *visible, device const int *fresh, element::Out<element::Act> result,
     device const typename History::Operand *keys, device const typename History::Operand *values,
     device float *partials, device float *statistics, ulong M, ulong R, float scale, bool softplus,
     threadgroup typename History::Operand *staged, threadgroup const prefill_interval *intervals,
@@ -2502,7 +2535,8 @@ struct prefill_owner {
 // L2's arguments shared by both forms' entries.
 #define PREFILL_OWNED_PARAMETERS                                                                          \
     History history, device const Scalar *query, device const Scalar *gate, device const int *visible,     \
-    device const int *fresh, device Scalar *result, device const typename History::Operand *queries,       \
+    device const int *fresh, element::Out<element::Act> result,                                           \
+    device const typename History::Operand *queries,                                                       \
     device const typename History::Operand *keys, device const typename History::Operand *values,          \
     device float *partials, device float *statistics, ulong M, ulong R, float scale, bool softplus,        \
     threadgroup typename History::Operand *staged, threadgroup const prefill_interval *intervals,          \
@@ -3072,9 +3106,10 @@ struct prefill_coissue {
 
     // After both roles: the product lanes store the rows they own, in their
     // window's columns.
-    static inline void store(device const Scalar *query, device const Scalar *gate, device Scalar *result,
-        device float *partials, ulong M, bool softplus, threadgroup const prefill_run *runs,
-        threadgroup const pair *mine, uint partition, uint window, uint head, ulong first_token, uint lane) {
+    static inline void store(device const Scalar *query, device const Scalar *gate,
+        element::Out<element::Act> result, device float *partials, ulong M, bool softplus,
+        threadgroup const prefill_run *runs, threadgroup const pair *mine, uint partition, uint window, uint head,
+        ulong first_token, uint lane) {
         constexpr uint H = SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP;
         const uint kg = lane / CG;
         const uint cg = lane % CG;
@@ -3094,19 +3129,20 @@ struct prefill_coissue {
                     if (runs[0].end > 1)
                         partials[((ulong(partition) * M + token) * H + head) * W + column] = output[c];
                     else
-                        result[(token * H + head) * W + column] = gate_output(query, gate, token, head, column,
-                            output[c] * mine->inverse[row], softplus);
+                        result.put((token * H + head) * W + column, gate_output(query, gate, token, head, column,
+                            output[c] * mine->inverse[row], softplus));
                 }
             }
         }
     }
 
     static inline void attend(History history, device const Scalar *query, device const Scalar *gate,
-        device const int *visible, device const int *fresh, device Scalar *result, device const half *queries,
-        device const half *keys, device const half *values, device float *partials, device float *statistics,
-        ulong M, ulong R, float scale, bool softplus, threadgroup const prefill_interval *intervals,
-        threadgroup const prefill_run *runs, threadgroup uchar *exchange, uint tile, uint kv_head,
-        uint head_group, uint partition, uint simd, uint lane, device const float *sinks) {
+        device const int *visible, device const int *fresh, element::Out<element::Act> result,
+        device const half *queries, device const half *keys, device const half *values, device float *partials,
+        device float *statistics, ulong M, ulong R, float scale, bool softplus,
+        threadgroup const prefill_interval *intervals, threadgroup const prefill_run *runs,
+        threadgroup uchar *exchange, uint tile, uint kv_head, uint head_group, uint partition, uint simd, uint lane,
+        device const float *sinks) {
         const bool product = simd >= PAIRS;
         // The pair, its rows and its window; the rows' other pair is the
         // pair itself in a head of one window.
@@ -3149,11 +3185,11 @@ struct prefill_coissue {
     // as a masked step of the roles does. A pair of a head of two windows
     // forms the whole head's scores and its window's output.
     static inline void recompute(History history, device const Scalar *query, device const Scalar *gate,
-        device const int *visible, device const int *fresh, device Scalar *result, device const half *keys,
-        device const half *values, device float *partials, device float *statistics, ulong M, ulong R, float scale,
-        bool softplus, threadgroup const prefill_interval *intervals, threadgroup const prefill_run *runs,
-        uint kv_head, uint partition, uint window, device const half *query_rows, uint head, ulong first_token,
-        uint lane, device const float *sinks) {
+        device const int *visible, device const int *fresh, element::Out<element::Act> result,
+        device const half *keys, device const half *values, device float *partials, device float *statistics,
+        ulong M, ulong R, float scale, bool softplus, threadgroup const prefill_interval *intervals,
+        threadgroup const prefill_run *runs, uint kv_head, uint partition, uint window,
+        device const half *query_rows, uint head, ulong first_token, uint lane, device const float *sinks) {
         typedef prefill_fragments<QT, History> Form;
         constexpr ulong STRIDE = SEISMIC_DIM_KV * W;
         static_assert(Form::WINDOW == C && Form::KEYS <= PREFILL_PAD, "one output window over padded operand rows");
@@ -3321,7 +3357,7 @@ inline void prefill_list(device const int *visible, device const int *fresh, dev
 // does (the split records stay unnormalized; the merge adds the sink).
 template <uint QT, class History>
 inline void prefill_attend(History history, device const Scalar *query, device const Scalar *gate,
-    device const int *visible, device const int *fresh, device Scalar *result,
+    device const int *visible, device const int *fresh, element::Out<element::Act> result,
     device const typename History::Operand *queries, device const typename History::Operand *keys,
     device const typename History::Operand *values, device float *partials,
     device float *statistics, device uint *counts, ulong M, ulong R, float scale, bool softplus,
@@ -3462,9 +3498,9 @@ inline void prefill_attend(History history, device const Scalar *query, device c
 // launch leaves such a call alone.
 template <uint QT>
 inline void prefill_fold(history_window window, prefill_held held, uint round, device const Scalar *query,
-    device const Scalar *gate, device Scalar *result, device const float *partials, device const float *statistics,
-    device const uint *counts, ulong M, uint tile, ulong head, uint column, bool softplus,
-    device const float *sinks = nullptr) {
+    device const Scalar *gate, element::Out<element::Act> result, device const float *partials,
+    device const float *statistics, device const uint *counts, ulong M, uint tile, ulong head, uint column,
+    bool softplus, device const float *sinks = nullptr) {
     constexpr uint W = ATTENTION_W;
     constexpr uint H = SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP;
     // A call of one round stored its results in the attend launch.
@@ -3499,8 +3535,8 @@ inline void prefill_fold(history_window window, prefill_held held, uint round, d
             }
         }
         if (held.last) {
-            result[state * W + column] = gate_output(query, gate, row, head, column,
-                accumulated / divisor(sinks, head, maximum, denominator), softplus);
+            result.put(state * W + column, gate_output(query, gate, row, head, column,
+                accumulated / divisor(sinks, head, maximum, denominator), softplus));
             continue;
         }
         window.kept[state * W + column] = accumulated;
@@ -3515,7 +3551,7 @@ inline void prefill_fold(history_window window, prefill_held held, uint round, d
 // that took several key partitions merges each of its rows' partitions in
 // partition order and applies the gate; other tiles were stored by L2.
 template <uint QT>
-inline void prefill_merge(device const Scalar *query, device const Scalar *gate, device Scalar *result,
+inline void prefill_merge(device const Scalar *query, device const Scalar *gate, element::Out<element::Act> result,
     device const float *partials, device const float *statistics, device const uint *counts,
     ulong M, uint tile, ulong head, uint column, bool softplus, device const float *sinks = nullptr) {
     constexpr uint W = ATTENTION_W;
@@ -3526,7 +3562,7 @@ inline void prefill_merge(device const Scalar *query, device const Scalar *gate,
     for (ulong row = ulong(tile) * QT; row < metal::min(ulong(tile + 1) * QT, M); ++row) {
         const ulong state = row * H + head;
         const float attended = merge(partials, statistics, state, M * H, count, column, sinks, head);
-        result[state * W + column] = gate_output(query, gate, row, head, column, attended, softplus);
+        result.put(state * W + column, gate_output(query, gate, row, head, column, attended, softplus));
     }
 }
 
@@ -3572,6 +3608,17 @@ struct decode_picks {
     device const ulong *selected;
     ulong rows_per_slab;
 };
+
+// The picked rows as a dense history plane (key and value alike): rows of
+// `selected`, read as the activation element.
+template <uint PICKS>
+inline dense_history picks_plane(decode_picks picks) {
+    // The `PICKS == 0 ||` term makes the assert depend on PICKS, so an entry
+    // without picks, which binds no `selected`, never evaluates it.
+    static_assert(PICKS == 0 || ELEMENT_KIND(ATTENTION_SELECTED) == ELEMENT_KIND(ELEMENT_A),
+        "the picked rows read as the activation element");
+    return dense_history{picks.selected, picks.selected, picks.rows_per_slab};
+}
 
 // The position of set bit `n` (from 0) of `mask` when it holds more than n;
 // otherwise some position below 32.
@@ -4227,7 +4274,7 @@ inline void decode_matrix(History history, device const Scalar *query, device co
     // any team), an exhausted team's or empty window's round only its
     // barrier.
     if constexpr (PICKS > 0) {
-        const History plane{picks.selected, picks.selected, picks.rows_per_slab};
+        const History plane = picks_plane<PICKS>(picks);
         device const int *row_picks = picks.rows + row0 * PICKS;
         constexpr bool EXCHANGED = COLS > 1 && TEAMS > 1;
         // Team t's picks [lo, hi), by pick index.
@@ -4413,9 +4460,13 @@ struct shared_result {
     device const Scalar *query;
     device const Scalar *gate;
     device const float *sinks;
-    device Scalar *result;
+    element::Out<element::Act> result;
     bool softplus;
 };
+
+// A partitioned shared-tile row publishes partials, not results: it has no
+// `shared_result`.
+struct no_shared_result {};
 
 template <uint KEYS, uint PARTS, uint PICKS, bool DIRECT = false, bool ROTATED = false>
 inline void decode_shared(dense_history history, device const Scalar *query, device const Scalar *key,
@@ -4425,7 +4476,7 @@ inline void decode_shared(dense_history history, device const Scalar *query, dev
     device const int *fresh, device float *partials, device float *statistics, threadgroup uchar *shared,
     ulong R, float epsilon, float scale, uint span_min, uint kv_head, uint partition, ulong row,
     uint thread_index, uint simd, uint lane, decode_picks picks, rounding::Rounding key_rounding,
-    shared_result direct = {}) {
+    typename metal::conditional<DIRECT, shared_result, no_shared_result>::type direct = {}) {
     typedef dense_history::KeyOperand KeyOperand;
     constexpr uint W = ATTENTION_W;
     constexpr uint E = ATTENTION_E;
@@ -4568,9 +4619,10 @@ inline void decode_shared(dense_history history, device const Scalar *query, dev
     uint4 key_piece[LOADS];
     uint4 value_piece[LOADS];
     auto load = [&](tile t) {
-        device const ulong *key_table = t.picked ? picks.selected : history.key;
-        device const ulong *value_table = t.picked ? picks.selected : history.value;
-        const ulong rows_per_slab = t.picked ? picks.rows_per_slab : history.rows_per_slab;
+        const dense_history plane = t.picked ? picks_plane<PICKS>(picks) : history;
+        device const ulong *key_table = plane.key;
+        device const ulong *value_table = plane.value;
+        const ulong rows_per_slab = plane.rows_per_slab;
         const decode_slab_tile<Scalar> key_slab(key_table, rows_per_slab, t.rows.first);
         const decode_slab_tile<Scalar> value_slab(value_table, rows_per_slab, t.rows.first);
         ATTENTION_UNROLL
@@ -4717,9 +4769,9 @@ inline void decode_shared(dense_history history, device const Scalar *query, dev
                     attended = turned_back(attended, finished[e - column + head_layout::partner(column)], column, row,
                         coordinates, rotary_components, rotary_frequencies, rotary_amplitudes);
                 const ulong at = row * KV * G + kv_head * G + h;
-                direct.result[at * W + column] =
+                direct.result.put(at * W + column,
                     gated(attended, gate_logit(direct.query, direct.gate, row, kv_head * G + h, column),
-                        direct.softplus);
+                        direct.softplus));
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }

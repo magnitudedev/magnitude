@@ -14,7 +14,7 @@ typedef element::Act activation;
     device const float *hidden [[buffer(SEISMIC_BUFFER_HIDDEN)]],                       \
     device const uchar *gate_weight [[buffer(SEISMIC_BUFFER_GATE_WEIGHT)]],             \
     device const float *inputs [[buffer(SEISMIC_BUFFER_INPUTS)]],                       \
-    device uchar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],                           \
+    SEISMIC_RESULT_0_PARAM(result_cells),                                               \
     device uchar *rounded [[buffer(SEISMIC_BUFFER_SCRATCH_ROUNDED)]],                   \
     device const float *gate_scale [[buffer(SEISMIC_BUFFER_GATE_SCALE)]],               \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
@@ -23,8 +23,9 @@ typedef element::Act activation;
     const uint k = uint(SEISMIC_DIM_D);                                                 \
     projection::Plain<activation, projection::AllRows> in{rounded, SEISMIC_DIM_D, 1, k, {}}; \
     const auto out = projection::scaling<(SEISMIC_DIM_GS != 0)>::wrap(                  \
-        projection::ActivatedMul<activation>{result, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, \
-            inputs + ulong(int(SEISMIC_PARAM_LAYER)) * SEISMIC_INPUTS_STRIDE_1, SEISMIC_INPUTS_STRIDE_0, \
+        projection::ActivatedMul<activation>{element::Out<activation>(result_cells), SEISMIC_RESULT_0_STRIDE_0, \
+            SEISMIC_RESULT_0_STRIDE_1, inputs + ulong(int(SEISMIC_PARAM_LAYER)) * SEISMIC_INPUTS_STRIDE_1, \
+            SEISMIC_INPUTS_STRIDE_0, \
             SEISMIC_INPUTS_STRIDE_2, int(SEISMIC_PARAM_ACTIVATION)},                    \
         projection::scale_factor(gate_scale, SEISMIC_DIM_GS, 0, 0), 1.0f);              \
     projection::Weights<packets::W0> w{gate_weight, KERNEL_W0_LAYOUT(k), k}

@@ -109,7 +109,8 @@ inline Ranked rank_row(ulong row, Logit logit, uint lane) {
 // lane 0.
 template <typename Logit>
 inline void select_row(ulong row, Logit logit, device const float *expert_scale, device int *routes,
-    device float *scores, device float *coefficient, constant ulong *seismic_words, uint lane) {
+    element::Out<element::F32> scores, element::Out<element::F32> coefficient, constant ulong *seismic_words,
+    uint lane) {
     constexpr uint K = SEISMIC_DIM_K;
     const Ranked ranked = rank_row(row, logit, lane);
     // Slot s holds rank K - 1 - s; the renormalization divides by the
@@ -127,10 +128,10 @@ inline void select_row(ulong row, Logit logit, device const float *expert_scale,
             float score = SEISMIC_PARAM_NORMALIZE != 0 ? probability / denominator : probability;
             if (SEISMIC_DIM_ES != 0)
                 score *= expert_scale[ulong(winner) * SEISMIC_EXPERT_SCALE_STRIDE_0];
-            scores[row * SEISMIC_SCORES_STRIDE_0 + slot * SEISMIC_SCORES_STRIDE_1] = score;
+            scores.put(row * SEISMIC_SCORES_STRIDE_0 + slot * SEISMIC_SCORES_STRIDE_1, score);
         }
-        coefficient[row * SEISMIC_RESULT_1_STRIDE_0] =
-            1.0f / (1.0f + metal::exp(-logit(logit_index(row, SEISMIC_DIM_E))));
+        coefficient.put(row * SEISMIC_RESULT_1_STRIDE_0,
+            1.0f / (1.0f + metal::exp(-logit(logit_index(row, SEISMIC_DIM_E)))));
     }
 }
 
@@ -176,8 +177,9 @@ inline void router_columns(thread const RouteRows &in, device const uchar *route
 // Router threadgroup `group` (< route_groups) over the decode rows `in`.
 // Every thread calls it; `last` is one threadgroup word.
 inline void route_group(thread const RouteRows &in, device const uchar *router,
-    device const float *shared_router, device const float *expert_scale, device int *routes, device float *scores,
-    device uchar *normalized, device float *coefficient, arrive::coherent_device<float> logits,
+    device const float *shared_router, device const float *expert_scale, device int *routes,
+    element::Out<element::F32> scores, element::Out<Act> normalized, element::Out<element::F32> coefficient,
+    arrive::coherent_device<float> logits,
     device atomic_uint *arrivals, constant ulong *seismic_words,
     threadgroup uchar *shared, threadgroup uint *last, uint group, uint tid, uint simd, uint lane) {
     const uint rows = uint(SEISMIC_DIM_M);
@@ -185,7 +187,7 @@ inline void route_group(thread const RouteRows &in, device const uchar *router,
     if (group == 0) {
         for (uint item = tid; item < rows * k; item += 32 * SEISMIC_TUNE_SIMDGROUPS) {
             const ulong row = item / k, source = item % k;
-            element::put<Act>(normalized, row * SEISMIC_RESULT_0_STRIDE_0 + source * SEISMIC_RESULT_0_STRIDE_1,
+            normalized.put(row * SEISMIC_RESULT_0_STRIDE_0 + source * SEISMIC_RESULT_0_STRIDE_1,
                 in.value(uint(row), source));
         }
     }

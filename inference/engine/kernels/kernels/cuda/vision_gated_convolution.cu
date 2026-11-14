@@ -24,6 +24,6 @@ extern "C" __global__ void vision_gated_convolution(SEISMIC_KERNEL_PARAMS) {
                        sum);
     }
     const float convolved = A::round(sum);
-    element::put<A>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), row * SEISMIC_RESULT_0_STRIDE_0 + channel,
-                    convolved * element::at<A>(SEISMIC_PTR(SEISMIC_BUFFER_GATE), row * SEISMIC_GATE_STRIDE_0 + channel));
+    SEISMIC_RESULT_0_OUT.put(row * SEISMIC_RESULT_0_STRIDE_0 + channel,
+                             convolved * element::at<A>(SEISMIC_PTR(SEISMIC_BUFFER_GATE), row * SEISMIC_GATE_STRIDE_0 + channel));
 }

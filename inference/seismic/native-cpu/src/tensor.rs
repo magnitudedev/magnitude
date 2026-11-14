@@ -10,7 +10,7 @@
 //! two work items write the same element, and no work item reads an element
 //! another writes in the same launch.
 
-use crate::element::{Dense, Element};
+use crate::element::{Dense, Element, Stored};
 use std::marker::PhantomData;
 
 /// A tensor of dense elements `E` with rank `RANK`. Every element's storage
@@ -82,17 +82,27 @@ macro_rules! addressing {
                 }
                 offset
             }
-
-            /// The base address of the view.
-            pub fn pointer(&self) -> *mut u8 {
-                self.base.cast()
-            }
         }
     };
 }
 
 addressing!(Tensor, E, [E: Element]);
 addressing!(Scalars, T, [T: Copy]);
+
+impl<E: Element, const RANK: usize> Tensor<'_, E, RANK> {
+    /// The base address of the view, read-only (a slab tensor's address table): a write goes
+    /// through the element's own accessors.
+    pub fn pointer(&self) -> *const u8 {
+        self.base.cast_const().cast()
+    }
+}
+
+impl<T: Copy, const RANK: usize> Scalars<'_, T, RANK> {
+    /// The base address of the view (raw scalars, never a floating element's).
+    pub fn pointer(&self) -> *mut u8 {
+        self.base.cast()
+    }
+}
 
 impl<E: Dense, const RANK: usize> Tensor<'_, E, RANK> {
     /// The element at `index`, widened to `f32`.
@@ -133,13 +143,20 @@ impl<'a, E: Element, const RANK: usize> Tensor<'a, E, RANK> {
         }
     }
 
+    /// The same row as stored elements of `E`, the source of a bit move
+    /// ([`Element::move_stored`]).
+    #[inline(always)]
+    pub fn stored(&self, index: [usize; RANK]) -> Stored<'a, E> {
+        Stored::of(self.row(index))
+    }
+
     /// The same row, writable.
     ///
     /// # Safety
     /// The module's write contract, for every element of the row.
     #[inline(always)]
     #[allow(clippy::mut_from_ref)]
-    pub unsafe fn row_mut(&self, index: [usize; RANK]) -> &'a mut [E::Storage] {
+    pub unsafe fn row_mut(&self, index: [usize; RANK]) -> E::Writable<'a> {
         assert_eq!(
             self.strides[RANK - 1],
             1,
@@ -147,12 +164,12 @@ impl<'a, E: Element, const RANK: usize> Tensor<'a, E, RANK> {
         );
         let mut start = index;
         start[RANK - 1] = 0;
-        unsafe {
+        E::writable(unsafe {
             std::slice::from_raw_parts_mut(
                 self.base.add(self.offset_row(start)),
                 self.extents[RANK - 1],
             )
-        }
+        })
     }
 
     #[inline(always)]
@@ -188,7 +205,7 @@ impl<'a, E: Element, const RANK: usize> Tensor<'a, E, RANK> {
     /// The module's write contract, for every element of the span.
     #[inline(always)]
     #[allow(clippy::mut_from_ref)]
-    pub unsafe fn span_mut(&self, index: [usize; RANK], length: usize) -> &'a mut [E::Storage] {
+    pub unsafe fn span_mut(&self, index: [usize; RANK], length: usize) -> E::Writable<'a> {
         assert_eq!(
             self.strides[RANK - 1],
             1,
@@ -198,7 +215,7 @@ impl<'a, E: Element, const RANK: usize> Tensor<'a, E, RANK> {
             index[RANK - 1] + length <= self.extents[RANK - 1],
             "span outside its row"
         );
-        unsafe { std::slice::from_raw_parts_mut(self.base.add(self.offset(index)), length) }
+        E::writable(unsafe { std::slice::from_raw_parts_mut(self.base.add(self.offset(index)), length) })
     }
 }
 
@@ -336,14 +353,6 @@ pub fn widen_row<E: Dense>(row: &[E::Storage], out: &mut [f32]) {
     }
 }
 
-/// `values` rounded to `E` into `row`.
-#[inline(always)]
-pub fn narrow_row<E: Dense>(values: &[f32], row: &mut [E::Storage]) {
-    let row = &mut row[..values.len()];
-    for (value, target) in values.iter().zip(row) {
-        *target = E::narrow(*value);
-    }
-}
 
 #[cfg(test)]
 mod tests {

@@ -9,7 +9,7 @@ typedef ELEMENT_OF(SEISMIC_ELEMENT_U) Destination;
 // written from its own record's base.
 kernel void import_dense(
     device const uchar *source [[buffer(SEISMIC_BUFFER_SOURCE)]],
-    device const ulong *destination [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(destination),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint raw_index [[thread_position_in_grid]]) {
     ulong index = ulong(raw_index);
@@ -17,8 +17,7 @@ kernel void import_dense(
     ulong k = index % SEISMIC_DIM_K;
     ulong n = index / SEISMIC_DIM_K % SEISMIC_DIM_N;
     ulong b = index / SEISMIC_DIM_K / SEISMIC_DIM_N;
-    element::put<Destination>(slab::region<uchar>(destination, b),
-        n * SEISMIC_RESULT_0_STRIDE_1 + k * SEISMIC_RESULT_0_STRIDE_2,
-        element::at<Source>(source,
+    slab::out_region<Destination>(destination, b).put(
+        n * SEISMIC_RESULT_0_STRIDE_1 + k * SEISMIC_RESULT_0_STRIDE_2, element::at<Source>(source,
             b * SEISMIC_SOURCE_STRIDE_0 + n * SEISMIC_SOURCE_STRIDE_1 + k * SEISMIC_SOURCE_STRIDE_2));
 }

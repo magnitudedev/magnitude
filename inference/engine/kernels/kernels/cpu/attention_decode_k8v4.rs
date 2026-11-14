@@ -205,10 +205,10 @@ fn merge<E: Elements>(cx: &Context<'_, E>, form: Form, kv_head: usize, row: usiz
             gate.row([row, head, 0])
         };
         // SAFETY: each work item writes its own row of the result.
-        let out = unsafe { result.row_mut([row, head, 0]) };
-        attention::gate_row::<E::A>(output, denominator, gates, softplus, out);
+        let mut out = unsafe { result.row_mut([row, head, 0]) };
+        attention::gate_row::<E::A>(output, denominator, gates, softplus, &mut out);
         if let Some((cosines, sines)) = turned {
-            attention::output_rotary::<E::A>(out, form.layout, cosines, sines);
+            attention::output_rotary::<E::A>(&mut out, form.layout, cosines, sines);
         }
     }
 }

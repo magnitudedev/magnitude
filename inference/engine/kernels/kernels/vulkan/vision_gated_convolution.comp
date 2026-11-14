@@ -30,7 +30,7 @@ void vision_gated_convolution() {
                     sum);
         }
         const float convolved = element_round(ELEMENT_ACT, sum);
-        element_put(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), row * SEISMIC_RESULT_0_STRIDE_0 + channel,
+        out_put(SEISMIC_RESULT_0_OUT, row * SEISMIC_RESULT_0_STRIDE_0 + channel,
             convolved * element_at(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_GATE), row * SEISMIC_GATE_STRIDE_0 + channel));
     }
 }

@@ -13,7 +13,6 @@ fn import_dense<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3]
     for row in rows {
         source.decode_row(row, values);
         // SAFETY: each work item writes its own rows.
-        let target = unsafe { destination.row_mut([row / n, row % n, 0]) };
-        seismic::cpu::tensor::narrow_row::<E::U>(values, target);
+        unsafe { destination.row_mut([row / n, row % n, 0]) }.store(values);
     }
 }

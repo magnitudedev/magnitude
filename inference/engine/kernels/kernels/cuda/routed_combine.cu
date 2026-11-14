@@ -12,7 +12,7 @@ using GShape = projection::GemmShape<64, 2, 4, 3>;
 using element::Act;
 
 struct CombineEpi {
-    float *out;
+    element::Out<element::F32> out;
     projection::u64 out_stride;
     const float *residual;
     projection::u64 residual_stride;
@@ -36,7 +36,7 @@ struct CombineEpi {
             selected = __fmaf_rn(scores[m * scores_stride + k], projected, selected);
         }
         projection::routed_join<SEISMIC_DIM_SN, (SEISMIC_DIM_IN != 0)>(
-            out + m * out_stride, residual + m * residual_stride, inject + m * inject_stride, SEISMIC_DIM_H, n,
+            out.offset(m * out_stride), residual + m * residual_stride, inject + m * inject_stride, SEISMIC_DIM_H, n,
             selected, Act::round(value) * coefficient[m]);
     }
 };
@@ -57,7 +57,9 @@ __global__ void routed_combine_shared(SEISMIC_KERNEL_PARAMS) {
     extern __shared__ uint4 dynamic_shared[];
     if (blockIdx.x >= projection::gemm_columns(SEISMIC_DIM_S))
         return;
-    const projection::Glu<typename Operands::Storage, Act> epi{SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_SHARED_PRODUCT), SEISMIC_DIM_S, 0};
+    const projection::Glu<typename Operands::Storage, Act> epi{
+        element::out_over_scratch<typename Operands::Storage>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_SHARED_PRODUCT)),
+        SEISMIC_DIM_S, 0};
     projection::gemm_segment<GShape, Operands>(reinterpret_cast<projection::u8 *>(dynamic_shared),
                              projection::ActivationRows{OPERAND == 1 ? SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED) : SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED),
                                  OPERAND == 1 ? SEISMIC_DIM_H : SEISMIC_NORMALIZED_STRIDE_0},
@@ -74,7 +76,7 @@ __global__ void routed_combine(SEISMIC_KERNEL_PARAMS) {
     extern __shared__ uint4 dynamic_shared[];
     if (blockIdx.x >= projection::gemm_columns(SEISMIC_DIM_H))
         return;
-    const CombineEpi epi{reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)), SEISMIC_RESULT_0_STRIDE_0,
+    const CombineEpi epi{SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0,
                          reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL)), SEISMIC_RESIDUAL_STRIDE_0,
                          SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_OUTPUT), SEISMIC_DIM_T, SEISMIC_EXPERT_OUTPUT_STRIDE_0,
                          SEISMIC_EXPERT_OUTPUT_STRIDE_1,

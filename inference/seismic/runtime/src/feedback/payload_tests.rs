@@ -4,6 +4,7 @@ use seismic_compiler::feedback::FeedbackOptions;
 use seismic_compiler::prepared::ArgumentValue;
 use seismic_lang::checked::{check_source, SourceFile, SourceSet};
 use seismic_lang::entry::ElementBindings;
+use seismic_lang::reference_math::conversion::{canonical_nan, exact_f64};
 
 fn scalar_argument(dtype: DType, bits: u32) -> EncodedScalar {
     match dtype {
@@ -11,6 +12,16 @@ fn scalar_argument(dtype: DType, bits: u32) -> EncodedScalar {
         DType::BF16 => EncodedScalar::BF16(bits as u16),
         DType::F32 => EncodedScalar::F32Bits(bits),
         _ => unreachable!(),
+    }
+}
+
+/// `bits` of a floating `dtype` as they read out of the engine: any NaN is the registry's one NaN,
+/// every other value its own bits.
+fn held(dtype: DType, bits: u32) -> u32 {
+    if exact_f64(dtype, bits).is_nan() {
+        canonical_nan(dtype)
+    } else {
+        bits
     }
 }
 
@@ -22,6 +33,8 @@ fn result_bits(result: ArgumentValue) -> u32 {
     }
 }
 
+/// Values move through a load, a helper, a join, a carry, a store and a result with their bits, signed
+/// zeros and subnormals included; a NaN of any sign and payload leaves as the registry's one NaN.
 fn payload_transport(backend: registry::BackendName) {
     let devices = crate::devices::Devices::discover(&[]).unwrap();
     let device = devices.open_backend(backend).unwrap();
@@ -106,6 +119,15 @@ fn tensor(x: &tensor[8] {dtype}, y: &tensor[8] {dtype}, choose: bool, times: ran
         let alternate = words.iter().copied().rev().collect::<Vec<_>>();
         let input_bytes = bytes(&words);
         let alternate_bytes = bytes(&alternate);
+        let held_bytes = |values: &[u32]| {
+            bytes(
+                &values
+                    .iter()
+                    .map(|&bits| held(dtype, bits))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let (held_input, held_alternate) = (held_bytes(&words), held_bytes(&alternate));
         let x = Arc::new(
             TensorInner::from_host(&device, registry::dense(dtype), &[8], &input_bytes).unwrap(),
         );
@@ -128,7 +150,7 @@ fn tensor(x: &tensor[8] {dtype}, y: &tensor[8] {dtype}, choose: bool, times: ran
                     .take_scalar();
                 assert_eq!(
                     result_bits(actual),
-                    if choose { alternate[index] } else { word },
+                    held(dtype, if choose { alternate[index] } else { word }),
                     "{backend:?}/{dtype} scalar branch/carry payload"
                 );
             }
@@ -143,33 +165,28 @@ fn tensor(x: &tensor[8] {dtype}, y: &tensor[8] {dtype}, choose: bool, times: ran
             let mut result = crate::api::kernel::call(&tensor, args).unwrap();
             assert_eq!(
                 result.take_tensor().read_to_host().unwrap(),
-                if choose {
-                    &alternate_bytes
-                } else {
-                    &input_bytes
-                }
-                .as_slice(),
+                if choose { &held_alternate } else { &held_input }.as_slice(),
                 "{backend:?}/{dtype} load/join/store payload"
             );
             assert_eq!(
                 result_bits(result.take_scalar()),
-                if choose { alternate[0] } else { words[0] },
+                held(dtype, if choose { alternate[0] } else { words[0] }),
                 "{backend:?}/{dtype} loaded scalar result"
             );
-            assert_eq!(x.read_to_host().unwrap(), input_bytes);
-            assert_eq!(y.read_to_host().unwrap(), alternate_bytes);
+            assert_eq!(x.read_to_host().unwrap(), held_input);
+            assert_eq!(y.read_to_host().unwrap(), held_alternate);
         }
     }
 }
 
 #[test]
-fn cpu_payloads_survive_load_helper_join_carry_store_and_result() {
+fn cpu_bits_survive_load_helper_join_carry_store_and_result() {
     payload_transport(registry::BackendName::Cpu);
 }
 
 #[test]
 #[ignore = "requires Metal device"]
-fn metal_payloads_survive_load_helper_join_carry_store_and_result() {
+fn metal_bits_survive_load_helper_join_carry_store_and_result() {
     payload_transport(registry::BackendName::Metal);
 }
 
@@ -198,7 +215,14 @@ fn absolute(a: f16) -> f16:
             vec![7.0f32.to_bits(), 4.0f32.to_bits()],
             3.0f32.to_bits(),
         ),
-        ("absolute", DType::F16, vec![0xfc01], 0x7c01),
+        ("absolute", DType::F16, vec![0x8001], 0x0001),
+        // A NaN's payload is unobservable outside the engine: it leaves as the registry's one NaN.
+        (
+            "absolute",
+            DType::F16,
+            vec![0xfc01],
+            canonical_nan(DType::F16),
+        ),
     ] {
         let kernel = Arc::new(
             crate::api::kernel::prepare(
@@ -307,7 +331,15 @@ fn maximum(a: &tensor[4] f32, b: &tensor[4] f32) -> tensor[4] f32:
                 .unwrap(),
             );
             args.push_tensor(input.clone());
-            inputs.push((input, bytes));
+            inputs.push((
+                input,
+                encode(
+                    &words
+                        .iter()
+                        .map(|&bits| held(dtype, bits))
+                        .collect::<Vec<_>>(),
+                ),
+            ));
         }
         let output = crate::api::kernel::call(&kernel, args)
             .unwrap()

@@ -50,10 +50,10 @@ struct Operands {
     device const float *rate;
     device const float *time_bias;
     device const float *skip;
-    device const ulong *window;
-    device const ulong *state;
-    device const ulong *tape;
-    device Storage *mixed;
+    device const slab::Table<element::Act> *window;
+    device const slab::Table<element::F32> *state;
+    device const slab::Table<element::F32> *tape;
+    element::Out<element::Act> mixed;
     constant ulong *seismic_words;
 };
 
@@ -68,17 +68,31 @@ inline bool leads_group(uint head) {
     return head == 0 || group_of(head - 1) != group_of(head);
 }
 
-// Tape row `entry` of `bank`.
-inline device float *tape_row(Operands in, ulong bank, long entry) {
+// Tape row `entry` of `bank`, written.
+inline element::Out<element::F32> tape_row(Operands in, ulong bank, long entry) {
     constant ulong *seismic_words = in.seismic_words;
-    return versions::bank<float>(in.tape, bank, SEISMIC_TAPE_STRIDE_0, seismic_words)
+    return versions::bank(in.tape, bank, SEISMIC_TAPE_STRIDE_0, seismic_words)
+        .offset(ulong(entry) * SEISMIC_TAPE_STRIDE_1);
+}
+
+// The same, read.
+inline device const float *tape_view(Operands in, ulong bank, long entry) {
+    constant ulong *seismic_words = in.seismic_words;
+    return versions::bank_view(in.tape, bank, SEISMIC_TAPE_STRIDE_0, seismic_words)
         + ulong(entry) * SEISMIC_TAPE_STRIDE_1;
 }
 
-// Row `row` of head `head`'s state in `bank`: N contiguous floats.
-inline device float *state_row(Operands in, ulong bank, uint head, ulong row) {
+// Row `row` of head `head`'s state in `bank`: N contiguous floats, written.
+inline element::Out<element::F32> state_row(Operands in, ulong bank, uint head, ulong row) {
     constant ulong *seismic_words = in.seismic_words;
-    return versions::bank<float>(in.state, bank, SEISMIC_STATE_STRIDE_0, seismic_words)
+    return versions::bank(in.state, bank, SEISMIC_STATE_STRIDE_0, seismic_words)
+        .offset(head * SEISMIC_STATE_STRIDE_1 + row * SEISMIC_STATE_STRIDE_2);
+}
+
+// The same, read.
+inline device const float *state_view(Operands in, ulong bank, uint head, ulong row) {
+    constant ulong *seismic_words = in.seismic_words;
+    return versions::bank_view(in.state, bank, SEISMIC_STATE_STRIDE_0, seismic_words)
         + head * SEISMIC_STATE_STRIDE_1 + row * SEISMIC_STATE_STRIDE_2;
 }
 
@@ -87,7 +101,7 @@ inline device float *state_row(Operands in, ulong bank, uint head, ulong row) {
 inline float raw(Operands in, versions::Slot slot, long position, ulong channel) {
     constant ulong *seismic_words = in.seismic_words;
     if (position < 0) {
-        device const Storage *window = versions::bank<Storage>(in.window, slot.source, SEISMIC_WINDOW_STRIDE_0,
+        device const Storage *window = versions::bank_view(in.window, slot.source, SEISMIC_WINDOW_STRIDE_0,
             seismic_words);
         return element::Act::load(window[ulong(slot.taped + long(TAPS) - 1 + position) * SEISMIC_WINDOW_STRIDE_1
             + channel]);
@@ -136,7 +150,10 @@ inline void publish_window(Operands in, versions::Slot slot, uint head, uint thr
     constant ulong *seismic_words = in.seismic_words;
     const long taps = long(TAPS) - 1;
     const long rows = taps + versions::tape_rows(slot, long(SEISMIC_DIM_T));
-    device Storage *target = versions::bank<Storage>(in.window, slot.target, SEISMIC_WINDOW_STRIDE_0, seismic_words);
+    const element::Out<element::Act> target = versions::bank(in.window, slot.target, SEISMIC_WINDOW_STRIDE_0,
+        seismic_words);
+    const element::Out<element::Act> source = versions::bank(in.window, slot.source, SEISMIC_WINDOW_STRIDE_0,
+        seismic_words);
     const uint group = group_of(head);
     const ulong per_tap = P + (leads_group(head) ? 2 * N : 0);
     for (ulong item = thread_index; item < ulong(rows) * per_tap; item += threads) {
@@ -145,8 +162,13 @@ inline void publish_window(Operands in, versions::Slot slot, uint head, uint thr
         const ulong channel = offset < P ? head * P + offset
             : offset < P + N           ? B_CHANNEL + group * N + offset - P
                                        : C_CHANNEL + group * N + offset - P - N;
-        target[ulong(tap) * SEISMIC_WINDOW_STRIDE_1 + channel]
-            = element::Act::store(raw(in, slot, slot.stop + tap - taps, channel));
+        const long position = slot.stop + tap - taps;
+        const ulong to = ulong(tap) * SEISMIC_WINDOW_STRIDE_1 + channel;
+        if (position < 0)
+            target.move_stored(to, source, ulong(slot.taped + slot.stop + tap) * SEISMIC_WINDOW_STRIDE_1 + channel, 1);
+        else
+            target.copy_stored(to, in.projection,
+                ulong(slot.lo + position) * SEISMIC_PROJECTION_STRIDE_0 + X_COLUMN + channel, 1);
     }
 }
 
@@ -160,7 +182,7 @@ struct Rows {
 template <uint LANE_ROWS>
 inline void load_rows(Operands in, ulong bank, uint head, ulong row0, uint lane, thread Rows<LANE_ROWS> &rows) {
     STATE_SPACE_UNROLL for (uint r = 0; r < LANE_ROWS; ++r) {
-        device const float *from = state_row(in, bank, head, row0 + r) + lane * COLUMNS;
+        device const float *from = state_view(in, bank, head, row0 + r) + lane * COLUMNS;
         STATE_SPACE_UNROLL for (uint c = 0; c < COLUMNS; ++c) {
             rows.values[r][c] = from[c];
         }
@@ -170,9 +192,9 @@ inline void load_rows(Operands in, ulong bank, uint head, ulong row0, uint lane,
 template <uint LANE_ROWS>
 inline void store_rows(Operands in, ulong bank, uint head, ulong row0, uint lane, thread const Rows<LANE_ROWS> &rows) {
     STATE_SPACE_UNROLL for (uint r = 0; r < LANE_ROWS; ++r) {
-        device float *to = state_row(in, bank, head, row0 + r) + lane * COLUMNS;
+        const element::Out<element::F32> to = state_row(in, bank, head, row0 + r).offset(lane * COLUMNS);
         STATE_SPACE_UNROLL for (uint c = 0; c < COLUMNS; ++c) {
-            to[c] = rows.values[r][c];
+            to.put(c, rows.values[r][c]);
         }
     }
 }
@@ -186,7 +208,7 @@ inline void load_version(Operands in, versions::Slot slot, uint head, ulong row0
     load_rows<LANE_ROWS>(in, slot.source, head, row0, lane, rows);
     const uint group = group_of(head);
     for (long entry = 0; entry < slot.taped; ++entry) {
-        device const float *tape = tape_row(in, slot.source, entry);
+        device const float *tape = tape_view(in, slot.source, entry);
         const float decay = tape[TAPE_D + head];
         float b[COLUMNS];
         STATE_SPACE_UNROLL for (uint c = 0; c < COLUMNS; ++c) {
@@ -266,22 +288,22 @@ inline void advance_rows(Operands in, versions::Slot slot, long begin, uint head
                 b[j] = b_block[i * N + lane * COLUMNS + j];
                 c[j] = c_block[i * N + lane * COLUMNS + j];
             }
-            device float *entry = row >= publish && row - publish < recorded
-                ? tape_row(in, slot.target, row - publish) : nullptr;
-            if (entry != nullptr && records_b) {
+            const element::Out<element::F32> entry = row >= publish && row - publish < recorded
+                ? tape_row(in, slot.target, row - publish) : element::Out<element::F32>(nullptr);
+            if (entry.present() && records_b) {
                 STATE_SPACE_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
-                    entry[TAPE_B + group * N + lane * COLUMNS + j] = b[j];
+                    entry.put(TAPE_B + group * N + lane * COLUMNS + j, b[j]);
                 }
             }
-            if (entry != nullptr && records && lane == 0) {
-                entry[TAPE_D + head] = decay;
+            if (entry.present() && records && lane == 0) {
+                entry.put(TAPE_D + head, decay);
             }
             float mine = 0.0f;
             STATE_SPACE_UNROLL for (uint r = 0; r < LANE_ROWS; ++r) {
                 const float value = x_block[i * BLOCK_ROWS + local_row + r];
                 const float input = delta * value;
-                if (entry != nullptr && lane == r) {
-                    entry[TAPE_U + head * P + row0 + r] = input;
+                if (entry.present() && lane == r) {
+                    entry.put(TAPE_U + head * P + row0 + r, input);
                 }
                 float sum = 0.0f;
                 STATE_SPACE_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
@@ -292,8 +314,8 @@ inline void advance_rows(Operands in, versions::Slot slot, long begin, uint head
                 mine = lane == r ? output : mine;
             }
             if (lane < LANE_ROWS) {
-                in.mixed[ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + head * SEISMIC_RESULT_0_STRIDE_1
-                    + (row0 + lane) * SEISMIC_RESULT_0_STRIDE_2] = element::Act::store(mine);
+                in.mixed.put(ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + head * SEISMIC_RESULT_0_STRIDE_1
+                    + (row0 + lane) * SEISMIC_RESULT_0_STRIDE_2, mine);
             }
             if (row + 1 == publish) {
                 store_rows<LANE_ROWS>(in, slot.target, head, row0, lane, rows);
@@ -356,8 +378,8 @@ inline void zero_uncovered(Operands in, versions::Slots slots, uint head, ulong 
     const long covered = count == 0 ? 0 : versions::slot_end(slots, count - 1, seismic_words);
     for (ulong row = ulong(covered); row < SEISMIC_DIM_M; ++row) {
         if (lane < LANE_ROWS) {
-            in.mixed[row * SEISMIC_RESULT_0_STRIDE_0 + head * SEISMIC_RESULT_0_STRIDE_1
-                + (row0 + lane) * SEISMIC_RESULT_0_STRIDE_2] = element::Act::store(0.0f);
+            in.mixed.put(row * SEISMIC_RESULT_0_STRIDE_0 + head * SEISMIC_RESULT_0_STRIDE_1
+                + (row0 + lane) * SEISMIC_RESULT_0_STRIDE_2, 0.0f);
         }
     }
 }

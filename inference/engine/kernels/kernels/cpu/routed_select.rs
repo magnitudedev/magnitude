@@ -62,16 +62,18 @@ fn routed_select_select<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: 
     scores.copy_from_slice(unsafe { cx.scratch_logits().slice::<f32>(4 * row * e, e) });
     select::scores(cx.arg_score(), scores);
     // SAFETY: each work item writes its own row of the routes and weights.
-    let (routes, weights) = unsafe { (cx.arg_routes().row_mut([row, 0]), cx.arg_weights().row_mut([row, 0])) };
+    let (routes, mut weights) = unsafe { (cx.arg_routes().row_mut([row, 0]), cx.arg_weights().row_mut([row, 0])) };
     let bias = cx.arg_bias();
-    select::top_k(scores, |expert| bias.get([expert]), order, routes, weights);
-    let denominator = weights.iter().sum::<f32>();
-    let (normalization, epsilon, scale) =
-        (cx.arg_normalization(), cx.arg_normalization_epsilon(), cx.arg_scale());
-    let expert_scale = cx.arg_expert_scale();
-    for (weight, expert) in weights.iter_mut().zip(routes.iter()) {
-        *weight = select::normalized(normalization, *weight, denominator, epsilon)
-            * scale
-            * routed::scale_factor(cx.dim_es(), |e| expert_scale.get([e]), *expert);
-    }
+    weights.compute(|weights| {
+        select::top_k(scores, |expert| bias.get([expert]), order, routes, weights);
+        let denominator = weights.iter().sum::<f32>();
+        let (normalization, epsilon, scale) =
+            (cx.arg_normalization(), cx.arg_normalization_epsilon(), cx.arg_scale());
+        let expert_scale = cx.arg_expert_scale();
+        for (weight, expert) in weights.iter_mut().zip(routes.iter()) {
+            *weight = select::normalized(normalization, *weight, denominator, epsilon)
+                * scale
+                * routed::scale_factor(cx.dim_es(), |e| expert_scale.get([e]), *expert);
+        }
+    });
 }

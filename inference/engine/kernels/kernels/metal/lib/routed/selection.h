@@ -34,13 +34,13 @@ inline void decode_inverses(device const float *residual, threadgroup float *par
         simd, lane, tid);
 }
 
-inline void publish_normalized(device const float *residual, device const uchar *norm, device uchar *normalized,
+inline void publish_normalized(device const float *residual, device const uchar *norm, element::Out<Act> normalized,
     threadgroup const float *inverses, constant ulong *seismic_words, uint tid) {
     for (uint item = tid; item < uint(SEISMIC_DIM_M) * uint(SEISMIC_DIM_H); item += 32 * SEISMIC_TUNE_SIMDGROUPS) {
         const ulong row = item / SEISMIC_DIM_H, source = item % SEISMIC_DIM_H;
         const float value = residual[row * SEISMIC_RESIDUAL_STRIDE_0 + source * SEISMIC_RESIDUAL_STRIDE_1];
-        element::put<Act>(normalized, row * SEISMIC_RESULT_0_STRIDE_0 + source * SEISMIC_RESULT_0_STRIDE_1,
-            Act::round(value * inverses[row] * element::at<Norm>(norm, source * SEISMIC_NORM_STRIDE_0)));
+        normalized.put(row * SEISMIC_RESULT_0_STRIDE_0 + source * SEISMIC_RESULT_0_STRIDE_1,
+            value * inverses[row] * element::at<Norm>(norm, source * SEISMIC_NORM_STRIDE_0));
     }
 }
 
@@ -63,8 +63,8 @@ inline void select_columns(device const float *residual, device const uchar *rou
 // One row's selection by one simdgroup, stored by lane 0.
 template <typename Logits>
 inline void select_row(ulong row, Logits logits, device const float *bias,
-    device const float *expert_scale, device int *routes, device float *weights, constant ulong *seismic_words,
-    uint lane) {
+    device const float *expert_scale, device int *routes, element::Out<element::F32> weights,
+    constant ulong *seismic_words, uint lane) {
     constexpr uint K = SEISMIC_DIM_K;
     const int normalization = int(SEISMIC_PARAM_NORMALIZATION);
     const select::Selected<K> selected = select::rank<uint(SEISMIC_DIM_E), K>(int(SEISMIC_PARAM_SCORE),
@@ -84,7 +84,7 @@ inline void select_row(ulong row, Logits logits, device const float *bias,
             if (SEISMIC_DIM_ES != 0)
                 weight *= expert_scale[ulong(selected.winners[slot]) * SEISMIC_EXPERT_SCALE_STRIDE_0];
             routes[row * SEISMIC_ROUTES_STRIDE_0 + slot * SEISMIC_ROUTES_STRIDE_1] = selected.winners[slot];
-            weights[row * SEISMIC_WEIGHTS_STRIDE_0 + slot * SEISMIC_WEIGHTS_STRIDE_1] = weight;
+            weights.put(row * SEISMIC_WEIGHTS_STRIDE_0 + slot * SEISMIC_WEIGHTS_STRIDE_1, weight);
         }
     }
 }

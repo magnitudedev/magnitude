@@ -2,18 +2,20 @@
 // highest logits in (value descending, token ascending) order. Round r scans
 // the tokens ordered strictly after round r - 1's choice, so no chosen set is
 // kept.
+#include <seismic/element.h>
 #include "lib/core/reduce.h"
 
 kernel void draft_top_k(
     device const float *logits [[buffer(SEISMIC_BUFFER_LOGITS)]],
     device int *candidates [[buffer(SEISMIC_BUFFER_CANDIDATES)]],
-    device float *unary [[buffer(SEISMIC_BUFFER_UNARY)]],
+    SEISMIC_OUT_UNARY_PARAM(unary_cells),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint row [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float partials[8];
+    const element::Out<element::F32> unary(unary_cells);
     const ulong vocabulary = SEISMIC_DIM_V;
     device const float *line = logits + ulong(row) * SEISMIC_LOGITS_STRIDE_0;
     float previous = INFINITY;
@@ -37,7 +39,7 @@ kernel void draft_top_k(
             const ulong at = ulong(row) * SEISMIC_DIM_K + rank;
             candidates[at * SEISMIC_CANDIDATES_STRIDE_0] = previous_token;
             candidates[at * SEISMIC_CANDIDATES_STRIDE_0 + SEISMIC_CANDIDATES_STRIDE_1] = 0;
-            unary[ulong(row) * SEISMIC_UNARY_STRIDE_0 + rank * SEISMIC_UNARY_STRIDE_1] = chosen;
+            unary.put(ulong(row) * SEISMIC_UNARY_STRIDE_0 + rank * SEISMIC_UNARY_STRIDE_1, chosen);
         }
     }
 }
@@ -100,13 +102,14 @@ kernel void draft_top_k_merge(
     device const int *partial_ids [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIAL_TOKENS)]],
     device const float *partial_values [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIAL_VALUES)]],
     device int *candidates [[buffer(SEISMIC_BUFFER_CANDIDATES)]],
-    device float *unary [[buffer(SEISMIC_BUFFER_UNARY)]],
+    SEISMIC_OUT_UNARY_PARAM(unary_cells),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint row [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float partials[8];
+    const element::Out<element::F32> unary(unary_cells);
     const ulong parts = (SEISMIC_DIM_V + 4095ul) / 4096ul;
     const ulong count = parts * SEISMIC_DIM_K;
     float previous = INFINITY;
@@ -133,7 +136,7 @@ kernel void draft_top_k_merge(
             const ulong at = ulong(row) * SEISMIC_DIM_K + rank;
             candidates[at * SEISMIC_CANDIDATES_STRIDE_0] = previous_token;
             candidates[at * SEISMIC_CANDIDATES_STRIDE_0 + SEISMIC_CANDIDATES_STRIDE_1] = 0;
-            unary[ulong(row) * SEISMIC_UNARY_STRIDE_0 + rank * SEISMIC_UNARY_STRIDE_1] = chosen;
+            unary.put(ulong(row) * SEISMIC_UNARY_STRIDE_0 + rank * SEISMIC_UNARY_STRIDE_1, chosen);
         }
     }
 }

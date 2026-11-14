@@ -94,51 +94,53 @@ fn shape_rows_prepare<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u
     }
     let s = shaping(cx, row);
     // SAFETY: each work item rewrites its own slice of its row.
-    let values = unsafe { cx.arg_logits().span_mut([row, begin], end - begin) };
-    // The history tokens of this slice, sorted, so each penalized token
-    // counts its occurrences once. Penalties apply to the raw logits before
-    // every value of the slice is tempered.
-    let history = cx.arg_history().row([row, 0]);
-    // SAFETY: every bit pattern is a `u32`; the pool aligns private bytes
-    // for any scalar, so the middle part starts at the first byte.
-    let (head, recent, _) = unsafe { shared.align_to_mut::<u32>() };
-    assert!(head.is_empty() && recent.len() >= history.len(), "the launch declares Hn words of private bytes");
-    let mut marked = 0;
-    for token in history {
-        if *token >= begin as i32 && (*token as usize) < end {
-            recent[marked] = *token as u32;
-            marked += 1;
-        }
-    }
-    let recent = &mut recent[..marked];
-    recent.sort_unstable();
-    let mut first = 0;
-    while first < recent.len() {
-        let token = recent[first] as usize;
-        let count = recent[first..].iter().take_while(|other| **other as usize == token).count();
-        let value = &mut values[token - begin];
-        *value = if *value < 0.0 { *value * s.repetition } else { *value / s.repetition };
-        *value = *value - s.presence - s.frequency * count as f32;
-        first += count;
-    }
-    if s.temperature != 0.0 {
-        for value in values.iter_mut() {
-            *value /= s.temperature;
-        }
-    }
-    // A constrained row removes every rejected value but NaN and +inf, which
-    // keep the row unfiltered for sampling to report.
-    if cx.arg_constrained().get([row]) != 0 {
-        let mask = cx.arg_mask();
-        for (token, value) in (begin..end).zip(values.iter_mut()) {
-            if (mask.get([row, token / 32]) >> (token % 32)) & 1 == 0 && *value < f32::INFINITY {
-                *value = f32::NEG_INFINITY;
+    let mut values = unsafe { cx.arg_logits().span_mut([row, begin], end - begin) };
+    values.compute(|values| {
+        // The history tokens of this slice, sorted, so each penalized token
+        // counts its occurrences once. Penalties apply to the raw logits before
+        // every value of the slice is tempered.
+        let history = cx.arg_history().row([row, 0]);
+        // SAFETY: every bit pattern is a `u32`; the pool aligns private bytes
+        // for any scalar, so the middle part starts at the first byte.
+        let (head, recent, _) = unsafe { shared.align_to_mut::<u32>() };
+        assert!(head.is_empty() && recent.len() >= history.len(), "the launch declares Hn words of private bytes");
+        let mut marked = 0;
+        for token in history {
+            if *token >= begin as i32 && (*token as usize) < end {
+                recent[marked] = *token as u32;
+                marked += 1;
             }
         }
-    }
-    let maximum = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let nonfinite = values.iter().any(|value| value.is_nan() || *value == f32::INFINITY);
-    partial.copy_from_slice(&[maximum.to_bits(), u32::from(nonfinite)]);
+        let recent = &mut recent[..marked];
+        recent.sort_unstable();
+        let mut first = 0;
+        while first < recent.len() {
+            let token = recent[first] as usize;
+            let count = recent[first..].iter().take_while(|other| **other as usize == token).count();
+            let value = &mut values[token - begin];
+            *value = if *value < 0.0 { *value * s.repetition } else { *value / s.repetition };
+            *value = *value - s.presence - s.frequency * count as f32;
+            first += count;
+        }
+        if s.temperature != 0.0 {
+            for value in values.iter_mut() {
+                *value /= s.temperature;
+            }
+        }
+        // A constrained row removes every rejected value but NaN and +inf, which
+        // keep the row unfiltered for sampling to report.
+        if cx.arg_constrained().get([row]) != 0 {
+            let mask = cx.arg_mask();
+            for (token, value) in (begin..end).zip(values.iter_mut()) {
+                if (mask.get([row, token / 32]) >> (token % 32)) & 1 == 0 && *value < f32::INFINITY {
+                    *value = f32::NEG_INFINITY;
+                }
+            }
+        }
+        let maximum = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let nonfinite = values.iter().any(|value| value.is_nan() || *value == f32::INFINITY);
+        partial.copy_from_slice(&[maximum.to_bits(), u32::from(nonfinite)]);
+    });
 }
 
 #[inline(always)]
@@ -163,56 +165,58 @@ fn shape_rows_filter<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u6
         return;
     }
     // SAFETY: each work item writes its own row.
-    let values = unsafe { cx.arg_logits().row_mut([row, 0]) };
-    // SAFETY: each work item owns its row's region of the scratch.
-    let order = unsafe { cx.scratch_order().slice_mut::<u64>(8 * row * vocabulary, vocabulary) };
+    let mut values = unsafe { cx.arg_logits().row_mut([row, 0]) };
+    values.compute(|values| {
+        // SAFETY: each work item owns its row's region of the scratch.
+        let order = unsafe { cx.scratch_order().slice_mut::<u64>(8 * row * vocabulary, vocabulary) };
 
-    // Top-k: keep every value at least the k-th largest.
-    let need = s.top_k.max(0) as usize;
-    let threshold = if top_k && need <= vocabulary {
-        for (slot, value) in order.iter_mut().zip(values.iter()) {
-            *slot = u64::from(finite_ordered_key(*value));
+        // Top-k: keep every value at least the k-th largest.
+        let need = s.top_k.max(0) as usize;
+        let threshold = if top_k && need <= vocabulary {
+            for (slot, value) in order.iter_mut().zip(values.iter()) {
+                *slot = u64::from(finite_ordered_key(*value));
+            }
+            let (_, kth, _) = order.select_nth_unstable_by(need - 1, |a, b| b.cmp(a));
+            *kth as u32
+        } else {
+            0
+        };
+        let survives = |value: f32| {
+            finite_ordered_key(value) >= threshold && !(min_p && seismic::cpu::math::exp(value - maximum) < s.min_p)
+        };
+        if !top_p {
+            for value in values.iter_mut() {
+                if !survives(*value) {
+                    *value = f32::NEG_INFINITY;
+                }
+            }
+            return;
         }
-        let (_, kth, _) = order.select_nth_unstable_by(need - 1, |a, b| b.cmp(a));
-        *kth as u32
-    } else {
-        0
-    };
-    let survives = |value: f32| {
-        finite_ordered_key(value) >= threshold && !(min_p && seismic::cpu::math::exp(value - maximum) < s.min_p)
-    };
-    if !top_p {
-        for value in values.iter_mut() {
-            if !survives(*value) {
+
+        // Top-p over the survivors, ranked by descending key then ascending
+        // token: (!key, token) ascending.
+        let mut survivors = 0;
+        let mut total = 0u64;
+        for (token, value) in values.iter_mut().enumerate() {
+            if survives(*value) {
+                order[survivors] = (u64::from(!finite_ordered_key(*value)) << 32) | token as u64;
+                survivors += 1;
+                total += mass(*value, maximum);
+            } else {
                 *value = f32::NEG_INFINITY;
             }
         }
-        return;
-    }
-
-    // Top-p over the survivors, ranked by descending key then ascending
-    // token: (!key, token) ascending.
-    let mut survivors = 0;
-    let mut total = 0u64;
-    for (token, value) in values.iter_mut().enumerate() {
-        if survives(*value) {
-            order[survivors] = (u64::from(!finite_ordered_key(*value)) << 32) | token as u64;
-            survivors += 1;
-            total += mass(*value, maximum);
-        } else {
-            *value = f32::NEG_INFINITY;
+        let target = top_p_target(s.top_p, total);
+        let ranked = &mut order[..survivors];
+        ranked.sort_unstable();
+        let mut before = 0u64;
+        for entry in ranked.iter() {
+            let token = (*entry & 0xffff_ffff) as usize;
+            if before < target {
+                before += mass(values[token], maximum);
+            } else {
+                values[token] = f32::NEG_INFINITY;
+            }
         }
-    }
-    let target = top_p_target(s.top_p, total);
-    let ranked = &mut order[..survivors];
-    ranked.sort_unstable();
-    let mut before = 0u64;
-    for entry in ranked.iter() {
-        let token = (*entry & 0xffff_ffff) as usize;
-        if before < target {
-            before += mass(values[token], maximum);
-        } else {
-            values[token] = f32::NEG_INFINITY;
-        }
-    }
+    });
 }

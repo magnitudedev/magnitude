@@ -1,8 +1,10 @@
 // One participant sums in element order after staging the whole vector in
 // shared memory.
+#include <seismic/element.cuh>
+
 extern "C" __global__ void gated_staged(SEISMIC_KERNEL_PARAMS) {
     const float *x = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_X));
-    float *result = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER));
+    const auto result = SEISMIC_RESULT_0_OUT;
     extern __shared__ float staging[];
     const unsigned long long n = SEISMIC_DIM_N;
     for (unsigned long long i = 0; i < n; ++i) {
@@ -12,7 +14,7 @@ extern "C" __global__ void gated_staged(SEISMIC_KERNEL_PARAMS) {
     for (unsigned long long i = 0; i < n; ++i) {
         total += staging[i];
     }
-    result[0] = total;
+    result.put(0, total);
 }
 
 // One participant sums in element order after mirroring the vector into
@@ -20,7 +22,7 @@ extern "C" __global__ void gated_staged(SEISMIC_KERNEL_PARAMS) {
 extern "C" __global__ void gated_mirrored(SEISMIC_KERNEL_PARAMS) {
     const float *x = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_X));
     float *mirror = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_MIRROR));
-    float *result = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER));
+    const auto result = SEISMIC_RESULT_0_OUT;
     const unsigned long long n = SEISMIC_DIM_N;
     for (unsigned long long i = 0; i < n; ++i) {
         mirror[i] = x[i * SEISMIC_X_STRIDE_0];
@@ -29,5 +31,5 @@ extern "C" __global__ void gated_mirrored(SEISMIC_KERNEL_PARAMS) {
     for (unsigned long long i = 0; i < n; ++i) {
         total += mirror[i];
     }
-    result[0] = total;
+    result.put(0, total);
 }

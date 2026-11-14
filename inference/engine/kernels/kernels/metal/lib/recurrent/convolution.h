@@ -18,22 +18,20 @@ struct Taps {
     device const Storage *rows[RECURRENT_TAPS];
 };
 
-// The raw input row at slot-local `position`: the source version's window rows
-// before the slot, the projection after.
-inline device const Storage *raw_row(device const Storage *projection, device const ulong *window, Slot slot,
-    long position, constant ulong *seismic_words) {
-    return position < 0
-        ? bank<Storage>(window, slot.source, SEISMIC_WINDOW_STRIDE_0, seismic_words)
-            + ulong(slot.taped + long(RECURRENT_TAPS) - 1 + position) * SEISMIC_WINDOW_STRIDE_1
-        : projection + ulong(slot.lo + position) * SEISMIC_PROJECTION_STRIDE_0;
-}
-
-// The convolution input rows of slot-local row `local` for taps 0..C.
-inline void taps(device const Storage *projection, device const ulong *window, Slot slot, long local,
-    thread Taps &taps, constant ulong *seismic_words) {
+// The convolution input rows of slot-local row `local` for taps 0..C: the
+// raw input row at slot-local `position` is the source version's window row
+// before the slot, read through its const view, and the projection's after.
+inline Taps taps(device const Storage *projection, device const slab::Table<element::Act> *window, Slot slot,
+    long local, constant ulong *seismic_words) {
+    device const Storage *source = versions::bank_view(window, slot.source, SEISMIC_WINDOW_STRIDE_0, seismic_words);
+    Taps taps;
     RECURRENT_UNROLL for (uint tap = 0; tap < RECURRENT_TAPS; ++tap) {
-        taps.rows[tap] = raw_row(projection, window, slot, local + long(tap) - long(RECURRENT_TAPS - 1), seismic_words);
+        const long position = local + long(tap) - long(RECURRENT_TAPS - 1);
+        taps.rows[tap] = position < 0
+            ? source + ulong(slot.taped + long(RECURRENT_TAPS) - 1 + position) * SEISMIC_WINDOW_STRIDE_1
+            : projection + ulong(slot.lo + position) * SEISMIC_PROJECTION_STRIDE_0;
     }
+    return taps;
 }
 
 // SiLU of the causal depthwise convolution of `channel` over `rows`.
@@ -65,7 +63,7 @@ inline float4 convolve4(device const float *convolution, thread const Taps &taps
 // and the source window (`convolve`).
 struct Convolving {
     device const Storage *projection;
-    device const ulong *window;
+    device const slab::Table<element::Act> *window;
     device const float *convolution;
     Slot slot;
     struct Row {
@@ -79,10 +77,7 @@ struct Convolving {
         }
     };
     Row row(long row, constant ulong *seismic_words) const {
-        Row result;
-        taps(projection, window, slot, row - slot.lo, result.taps, seismic_words);
-        result.convolution = convolution;
-        return result;
+        return Row{taps(projection, window, slot, row - slot.lo, seismic_words), convolution};
     }
 };
 
@@ -90,15 +85,17 @@ struct Convolving {
 // C - 1 raw rows before the publication row, then the raw rows of its tape):
 // its value channels and the q/k channels of the key heads congruent to it.
 // Thread `thread_index` of `threads` copies an even share.
-inline void publish_window(device const Storage *projection, device const ulong *window, Slot slot, ulong head,
-    uint thread_index, uint threads, constant ulong *seismic_words) {
+inline void publish_window(device const Storage *projection, device const slab::Table<element::Act> *window,
+    Slot slot, ulong head, uint thread_index, uint threads, constant ulong *seismic_words) {
     const ulong width = SEISMIC_DIM_W;
     const ulong key_heads = SEISMIC_DIM_NK;
     const ulong value_heads = SEISMIC_DIM_NV;
     const long taps = long(RECURRENT_TAPS) - 1;
-    const long rows = taps + tape_rows(slot, seismic_words);
-    device Storage *target_window = bank<Storage>(window, slot.target, SEISMIC_WINDOW_STRIDE_0, seismic_words);
-    device const Storage *source_window = bank<Storage>(window, slot.source, SEISMIC_WINDOW_STRIDE_0, seismic_words);
+    const long rows = taps + versions::tape_rows(slot, long(SEISMIC_DIM_T));
+    const element::Out<element::Act> target_window =
+        versions::bank(window, slot.target, SEISMIC_WINDOW_STRIDE_0, seismic_words);
+    const element::Out<element::Act> source_window =
+        versions::bank(window, slot.source, SEISMIC_WINDOW_STRIDE_0, seismic_words);
     const ulong owned = key_heads > head ? (key_heads - head - 1) / value_heads + 1 : 0;
     const ulong per_tap = width + 2 * width * owned;
     for (ulong item = thread_index; item < ulong(rows) * per_tap; item += threads) {
@@ -114,12 +111,14 @@ inline void publish_window(device const Storage *projection, device const ulong 
             channel = within < width ? owner * width + within : (key_heads + owner) * width + within - width;
         }
         const long position = slot.stop + tap - taps;
-        target_window[ulong(tap) * SEISMIC_WINDOW_STRIDE_1
-            + channel * SEISMIC_WINDOW_STRIDE_2] = position < 0
-            ? source_window[ulong(slot.taped + slot.stop + tap) * SEISMIC_WINDOW_STRIDE_1
-                + channel * SEISMIC_WINDOW_STRIDE_2]
-            : projection[ulong(slot.lo + position) * SEISMIC_PROJECTION_STRIDE_0
-                + channel * SEISMIC_PROJECTION_STRIDE_1];
+        const ulong to = ulong(tap) * SEISMIC_WINDOW_STRIDE_1 + channel * SEISMIC_WINDOW_STRIDE_2;
+        // Both the source window and the projection are stored in `Act`: moved without decoding.
+        if (position < 0)
+            target_window.move_stored(to, source_window, ulong(slot.taped + slot.stop + tap) * SEISMIC_WINDOW_STRIDE_1
+                + channel * SEISMIC_WINDOW_STRIDE_2, 1);
+        else
+            target_window.copy_stored(to, projection, ulong(slot.lo + position) * SEISMIC_PROJECTION_STRIDE_0
+                + channel * SEISMIC_PROJECTION_STRIDE_1, 1);
     }
 }
 

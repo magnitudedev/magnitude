@@ -72,8 +72,8 @@ fn routed_down_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64
     }
     let base = cx.arg_base().span([row, columns.start], columns.len());
     // SAFETY: each work item writes its own channels of its own row.
-    let out = unsafe { cx.result_0().span_mut([row, columns.start], columns.len()) };
+    let mut out = unsafe { cx.result_0().span_mut([row, columns.start], columns.len()) };
     for ((target, base), selected) in out.iter_mut().zip(base).zip(selected.iter()) {
-        *target = E::R::narrow(base + selected);
+        target.set(base + selected);
     }
 }

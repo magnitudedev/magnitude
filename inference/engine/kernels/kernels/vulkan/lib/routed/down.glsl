@@ -7,7 +7,7 @@
 // `routed_decode_source`). Every lane of a lane group (a whole
 // subgroup) receives each channel's total; where the includer publishes them
 // (`routed_down_project`), `routed_down_publish` writes every choice's
-// projection in A at ROUTED_PROJECTED_INDEX(m, k, n) of ROUTED_PROJECTED_BASE.
+// projection in A through ROUTED_PROJECTED_PUT(m, k, n, value).
 #define KERNEL_W0 SEISMIC_EXPERT_DOWN
 #include "../core/activation.glsl"
 #include "routed.glsl"
@@ -61,7 +61,7 @@ void routed_down_choice(const uint64_t m, const uint64_t k, const uint tile, out
         hidden, uint(SEISMIC_DIM_F), tile, totals, unused);
 }
 
-#ifdef ROUTED_PROJECTED_BASE
+#ifdef ROUTED_PROJECTED_PUT
 // Workgroup (x, m)'s projections of every choice, each channel's by one lane.
 void routed_down_publish() {
     const uint tile = gl_WorkGroupID.x;
@@ -74,8 +74,7 @@ void routed_down_publish() {
         [[unroll]] for (uint r = 0u; r < PROJECTION_GEMV_MAX_R; ++r) {
             const uint n = first + r;
             if (r < DOWN_R && n < hidden && SEISMIC_LANE % DOWN_LANES == r)
-                element_put(ROUTED_ACT, ROUTED_PROJECTED_BASE, ROUTED_PROJECTED_INDEX(m, k, uint64_t(n)),
-                    totals[r * PROJECTION_GEMV_MAX_M]);
+                ROUTED_PROJECTED_PUT(m, k, uint64_t(n), totals[r * PROJECTION_GEMV_MAX_M]);
         }
     }
 }

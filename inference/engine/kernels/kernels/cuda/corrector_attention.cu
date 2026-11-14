@@ -13,7 +13,7 @@ extern "C" __global__ void corrector_attention(SEISMIC_KERNEL_PARAMS) {
     const float *qkv = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_QKV));
     const float *input_bias = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_INPUT_BIAS));
     const float *bias = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_BIAS));
-    element::u8 *result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const auto result = SEISMIC_RESULT_0_OUT;
     const u64 nodes = SEISMIC_DIM_N, width = SEISMIC_DIM_W;
     const u64 block = blockIdx.x / nodes, query = blockIdx.x % nodes, head = blockIdx.y;
     const unsigned warp = threadIdx.x / 32, lane = threadIdx.x % 32, warps = blockDim.x / 32;
@@ -49,9 +49,8 @@ extern "C" __global__ void corrector_attention(SEISMIC_KERNEL_PARAMS) {
         float out = 0.0f;
         for (u64 key = 0; key < nodes; ++key)
             out = seismic_fma_rn(scores[key], projected(key, 2, column), out);
-        element::put<element::Act>(result,
-                                   block * SEISMIC_RESULT_0_STRIDE_0 + query * SEISMIC_RESULT_0_STRIDE_1 +
-                                       head * SEISMIC_RESULT_0_STRIDE_2 + column * SEISMIC_RESULT_0_STRIDE_3,
-                                   out / total);
+        result.put(block * SEISMIC_RESULT_0_STRIDE_0 + query * SEISMIC_RESULT_0_STRIDE_1 +
+                       head * SEISMIC_RESULT_0_STRIDE_2 + column * SEISMIC_RESULT_0_STRIDE_3,
+                   out / total);
     }
 }

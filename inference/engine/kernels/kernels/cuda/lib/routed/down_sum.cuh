@@ -7,8 +7,6 @@
 // the answer hooks: `ROUTED_SITE_AWAIT(m)`, block-collective, and
 // `ROUTED_SITE_ADD(m, n, selected)`, which adds row m's answer at channel n
 // where the CPU answered (`lib/routed/sited.cuh`; nothing in `routed_down`).
-using Published = ELEMENT_OF(SEISMIC_ELEMENT_R);
-
 // Thread (n, m)'s body: R(base + (sum_k w_k * projected_k + cpu)), the sum
 // in slot order. The includer defines the kernel `routed_down_combine` over it.
 #define ROUTED_DOWN_COMBINE_BODY                                                                           \
@@ -26,5 +24,4 @@ using Published = ELEMENT_OF(SEISMIC_ELEMENT_R);
     ROUTED_SITE_ADD(m, n, selected)                                                                        \
     const float *base =                                                                                    \
         reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_BASE)) + m * SEISMIC_BASE_STRIDE_0;     \
-    element::put<Published>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + m * SEISMIC_RESULT_0_STRIDE_0 * Published::bytes, \
-                            n, base[n] + selected);
+    SEISMIC_RESULT_0_OUT.put(m * SEISMIC_RESULT_0_STRIDE_0 + n, base[n] + selected);

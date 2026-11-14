@@ -15,7 +15,7 @@ kernel void routed_scatter(
     device const uchar *expert_output [[buffer(SEISMIC_BUFFER_EXPERT_OUTPUT)]],
     device const int *inverse [[buffer(SEISMIC_BUFFER_INVERSE)]],
     device const float *weights [[buffer(SEISMIC_BUFFER_WEIGHTS)]],
-    device uchar *value [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(value_cells),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint2 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
@@ -42,11 +42,10 @@ kernel void routed_scatter(
     }
     const float selected[8] = {selected_even.x, selected_odd.x, selected_even.y, selected_odd.y,
         selected_even.z, selected_odd.z, selected_even.w, selected_odd.w};
-    typedef ELEMENT_OF(SEISMIC_ELEMENT_R) Published;
-    device typename Published::storage *published = reinterpret_cast<device typename Published::storage *>(value);
+    const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> value(value_cells);
     for (uint i = 0; i < 8u && n + i < columns; ++i) {
         const ulong column = n + i;
-        published[m * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1] =
-            Published::store(base[m * SEISMIC_BASE_STRIDE_0 + column * SEISMIC_BASE_STRIDE_1] + selected[i]);
+        value.put(m * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1,
+            base[m * SEISMIC_BASE_STRIDE_0 + column * SEISMIC_BASE_STRIDE_1] + selected[i]);
     }
 }

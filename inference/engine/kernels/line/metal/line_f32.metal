@@ -1,9 +1,11 @@
 // line_f32: S fused f32 multiply-adds a thread, in UNROLL independent
 // chains seeded apart, in loop iterations of ROUNDS rounds of every chain;
 // it writes `x` back (line.seismic).
+#include <seismic/element.h>
+
 kernel void line_f32(
     device const float *xs [[buffer(SEISMIC_BUFFER_X)]],
-    device float *out [[buffer(SEISMIC_BUFFER_OUT)]],
+    SEISMIC_OUT_OUT_PARAM(out),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint index [[thread_position_in_grid]]) {
     constexpr uint UNROLL = SEISMIC_TUNE_UNROLL;
@@ -25,5 +27,6 @@ kernel void line_f32(
     float total = 0.0f;
     for (uint k = 0; k < UNROLL; ++k)
         total += chain[k];
-    out[lane * SEISMIC_OUT_STRIDE_0] = x + (as_type<uint>(total) == 0xFFFFFFFFu ? 1.0f : 0.0f);
+    element::Out<ELEMENT_OF(SEISMIC_OUT)>(out).put(lane * SEISMIC_OUT_STRIDE_0,
+        x +(as_type<uint>(total) == 0xFFFFFFFFu ? 1.0f : 0.0f));
 }

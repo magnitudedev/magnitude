@@ -25,7 +25,7 @@ void vision_position() {
                 uint64_t(corner) * SEISMIC_TABLE_STRIDE_0 + column)
                 * element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_COEFFICIENTS) + (row * 4ul + i) * 4ul);
         }
-        element_f32_put(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + (row * SEISMIC_RESULT_0_STRIDE_0 + column) * 4ul,
+        out_put(SEISMIC_RESULT_0_OUT, row * SEISMIC_RESULT_0_STRIDE_0 + column,
             element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_SOURCE) + (row * SEISMIC_SOURCE_STRIDE_0 + column) * 4ul) + blended);
     }
 }

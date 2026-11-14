@@ -18,7 +18,7 @@ void corrector_features() {
     const uint64_t norm_bias = SEISMIC_PTR(SEISMIC_BUFFER_NORM_BIAS);
     const uint64_t up_weight = SEISMIC_PTR(SEISMIC_BUFFER_UP_WEIGHT);
     const uint64_t up_bias = SEISMIC_PTR(SEISMIC_BUFFER_UP_BIAS);
-    const uint64_t result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const Out result = SEISMIC_RESULT_0_OUT;
     const uint64_t row = gl_WorkGroupID.x;
     const uint64_t count = SEISMIC_DIM_K, width = SEISMIC_DIM_H;
     const uint64_t lane = gl_LocalInvocationIndex, threads = gl_WorkGroupSize.x;
@@ -67,7 +67,7 @@ void corrector_features() {
             value = seismic_fma_rn(
                 element_f32_at(up_weight + (column * SEISMIC_UP_WEIGHT_STRIDE_0 + uint64_t(f) * SEISMIC_UP_WEIGHT_STRIDE_1) * 4ul),
                 seismic_shared_f32[FEATURES_NORMED + uint(rank) * 5u + f], value);
-        element_put(ELEMENT_ACT, result,
+        out_put(result,
             (row * count + rank) * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1,
             seismic_div_rn(value, 1.0 + exp(-value)));
     }

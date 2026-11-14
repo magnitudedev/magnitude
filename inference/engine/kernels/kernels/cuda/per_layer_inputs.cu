@@ -54,7 +54,6 @@ extern "C" __global__ void per_layer_inputs(SEISMIC_KERNEL_PARAMS) {
     const float inverse = rsqrtf(total / (float)chunk + epsilon);
     const float normalized =
         p * inverse * element::at<Norm>(SEISMIC_PTR(SEISMIC_BUFFER_NORM), (u64)i * SEISMIC_NORM_STRIDE_0);
-    float *result = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER));
-    result[row * SEISMIC_RESULT_0_STRIDE_0 + (first + i) * SEISMIC_RESULT_0_STRIDE_1] =
-        (normalized + tokens[i] * gathered_scale) * scale;
+    SEISMIC_RESULT_0_OUT.put(row * SEISMIC_RESULT_0_STRIDE_0 + (first + i) * SEISMIC_RESULT_0_STRIDE_1,
+                             (normalized + tokens[i] * gathered_scale) * scale);
 }

@@ -2,7 +2,7 @@
 use crate::driver::workflow::{
     AccessMode, AllocationDescription, AllocationKind, ArgumentBinding, BoundInvocation, BoundNode,
     ByteRange, OutputDescription, OutputRef, PlanError, PreparedPolicy, ResourceId,
-    ScalarDescriptor, ScalarValue, TensorDescriptor, WorkflowId, WorkflowPlanDraft,
+    ScalarDescriptor, TensorDescriptor, WorkflowId, WorkflowPlanDraft,
 };
 use crate::driver::AdmittedCommand;
 use crate::driver::*;
@@ -252,26 +252,12 @@ fn descriptor_argument(
             })
         }
         crate::driver::workflow::ValueDescriptor::Scalar(ScalarDescriptor::HostReady(value)) => {
-            scalar_argument(value.clone())
+            value.value()
         }
         crate::driver::workflow::ValueDescriptor::PendingTensor { .. }
         | crate::driver::workflow::ValueDescriptor::Scalar(ScalarDescriptor::DeviceProduced) => {
             unreachable!("device-produced scalars are rejected at the workflow boundary")
         }
-    }
-}
-
-fn scalar_argument(value: ScalarValue) -> ArgumentValue {
-    match value {
-        ScalarValue::F32Bits(bits) => ArgumentValue::F32(f32::from_bits(bits)),
-        ScalarValue::F16(value) => ArgumentValue::F16(value),
-        ScalarValue::BF16(value) => ArgumentValue::BF16(value),
-        ScalarValue::I32(value) => ArgumentValue::I32(value),
-        ScalarValue::U32(value) => ArgumentValue::U32(value),
-        ScalarValue::U64(value) => ArgumentValue::U64(value),
-        ScalarValue::Bool(value) => ArgumentValue::Bool(value),
-        ScalarValue::Index(value) => ArgumentValue::Index(value),
-        ScalarValue::Range { start, end } => ArgumentValue::Range { start, end },
     }
 }
 

@@ -23,8 +23,8 @@ fn routed_scatter<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 
     }
     let base = cx.arg_base().row([row, 0]);
     // SAFETY: each work item writes its own row.
-    let out = unsafe { cx.result_0().row_mut([row, 0]) };
+    let mut out = unsafe { cx.result_0().row_mut([row, 0]) };
     for ((target, base), selected) in out.iter_mut().zip(base).zip(selected.iter()) {
-        *target = E::R::narrow(base + selected);
+        target.set(base + selected);
     }
 }

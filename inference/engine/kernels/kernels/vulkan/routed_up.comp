@@ -48,12 +48,12 @@ void routed_up_rows(const uint64_t choice, uint64_t rows, uint64_t outputs, uint
         SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED) + own, SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_NORMALIZED_STRIDE_1, hidden,
         rows), ROUTED_OPERANDS);
     const uint64_t product = outputs == 0ul
-        ? (m * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1) * uint64_t(bytes)
+        ? m * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1
         : 0ul;
     const projection_weights up = routed_source_weights(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP),
         SEISMIC_PTR(SEISMIC_BUFFER_TIER_UP), source, PACKETS_W0_STACKED_ROWS, hidden);
     const projection_epilogue out_ = projection_scaled(projection_gathered(projection_activated(ROUTED_ACT,
-            SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + product, 0ul, SEISMIC_RESULT_0_STRIDE_2,
+            out_offset(SEISMIC_RESULT_0_OUT, product), 0ul, SEISMIC_RESULT_0_STRIDE_2,
             int(SEISMIC_PARAM_ACTIVATION)), outputs),
         projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_US, SEISMIC_UP_SCALE_STRIDE_0, expert),
         1.0);

@@ -29,8 +29,8 @@ projection_prologue prepared_input() {
 }
 projection_epilogue prepared_output() {
     const uint64_t column = SEISMIC_DIM_I == 0 ? 0ul : uint64_t(gl_WorkGroupID.x);
-    return projection_scaled(projection_logits(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) +
-        (uint64_t(gl_WorkGroupID.y) * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1) * 4ul, SEISMIC_RESULT_0_STRIDE_0,
+    return projection_scaled(projection_logits(out_offset(SEISMIC_RESULT_0_OUT,
+        uint64_t(gl_WorkGroupID.y) * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1), SEISMIC_RESULT_0_STRIDE_0,
         SEISMIC_RESULT_0_STRIDE_1, element_word_f32(SEISMIC_PARAM_SOFTCAP)),
         projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT_SCALE), SEISMIC_DIM_WS, 0ul, 0ul), 1.0);
 }
@@ -41,8 +41,8 @@ void readout_project_rows_gemv() {
         const int token = element_i32_at(table);
         if (token < 0 || uint64_t(token) >= SEISMIC_DIM_V) {
             if (gl_LocalInvocationIndex == 0u)
-                element_f32_put(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) +
-                    (uint64_t(gl_WorkGroupID.y) * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(gl_WorkGroupID.x) * SEISMIC_RESULT_0_STRIDE_1) * 4ul, uintBitsToFloat(0xff800000u));
+                out_put(SEISMIC_RESULT_0_OUT,
+                    uint64_t(gl_WorkGroupID.y) * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(gl_WorkGroupID.x) * SEISMIC_RESULT_0_STRIDE_1, uintBitsToFloat(0xff800000u));
             return;
         }
     }

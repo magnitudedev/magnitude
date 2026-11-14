@@ -65,7 +65,7 @@ __device__ __forceinline__ void rows(const route::Input &in, const float *invers
 // load and store nothing but reach the block-collective staging. Every
 // thread calls it.
 __device__ __forceinline__ void block(const route::Input &in, const projection::u8 *gate, const projection::u8 *up,
-                                      projection::u8 *product, float (*parts)[route::WARPS], float *inverses,
+                                      element::Out<projection::Act> product, float (*parts)[route::WARPS], float *inverses,
                                       projection::u8 *memory, unsigned block,
                                       const seismic_words_t &seismic_words_value) {
     __shared__ projection::GemvShared<Shape, Rows> gemv;

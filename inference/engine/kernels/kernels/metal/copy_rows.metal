@@ -1,7 +1,13 @@
 #include <seismic/slab.h>
 
+// A floating plane is the plane's owner's (`SEISMIC_OUT_ROWS_PARAM`): its rows
+// move as the stored elements, undecoded. Any other dense plane moves as bytes.
 kernel void copy_rows(
+#ifdef SEISMIC_OUT_ROWS_PARAM
+    SEISMIC_OUT_ROWS_PARAM(rows),
+#else
     device const ulong *rows [[buffer(SEISMIC_BUFFER_ROWS)]],
+#endif
     device const uchar *from [[buffer(SEISMIC_BUFFER_FROM)]],
     device const uchar *to [[buffer(SEISMIC_BUFFER_TO)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
@@ -23,14 +29,18 @@ kernel void copy_rows(
     if (source_row < 0 || destination_row < 0
         || ulong(source_row) >= SEISMIC_DIM_T || ulong(destination_row) >= SEISMIC_DIM_T) return;
     const ulong slab_rows = ulong(SEISMIC_PARAM_SLAB_ROWS);
+    ulong source_offset = (ulong(source_row) % slab_rows) * SEISMIC_ROWS_STRIDE_0
+        + head * SEISMIC_ROWS_STRIDE_1 + column * SEISMIC_ROWS_STRIDE_2;
+    ulong destination_offset = (ulong(destination_row) % slab_rows) * SEISMIC_ROWS_STRIDE_0
+        + head * SEISMIC_ROWS_STRIDE_1 + column * SEISMIC_ROWS_STRIDE_2;
+#ifdef SEISMIC_OUT_ROWS_PARAM
+    slab::out_region(rows, ulong(destination_row) / slab_rows).move_stored(destination_offset,
+        slab::out_region(rows, ulong(source_row) / slab_rows), source_offset, 1);
+#else
     device const uchar *source = slab::region<uchar>(rows, ulong(source_row) / slab_rows);
     device uchar *target = slab::region<uchar>(rows, ulong(destination_row) / slab_rows);
-    ulong source_offset = ((ulong(source_row) % slab_rows) * SEISMIC_ROWS_STRIDE_0
-        + head * SEISMIC_ROWS_STRIDE_1 + column * SEISMIC_ROWS_STRIDE_2)
-        * SEISMIC_ROWS_PACKET_SIZE;
-    ulong destination_offset = ((ulong(destination_row) % slab_rows) * SEISMIC_ROWS_STRIDE_0
-        + head * SEISMIC_ROWS_STRIDE_1 + column * SEISMIC_ROWS_STRIDE_2)
-        * SEISMIC_ROWS_PACKET_SIZE;
     for (ulong byte = 0; byte < SEISMIC_ROWS_PACKET_SIZE; ++byte)
-        target[destination_offset + byte] = source[source_offset + byte];
+        target[destination_offset * SEISMIC_ROWS_PACKET_SIZE + byte]
+            = source[source_offset * SEISMIC_ROWS_PACKET_SIZE + byte];
+#endif
 }

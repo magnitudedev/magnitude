@@ -79,20 +79,18 @@ uint vector_next(uint64_t row, uint position, uint visible) { return position; }
 // read as key and value. A stored-key value is the key. Returns whether the
 // key is attended: a pick of -1 is not, nor a visible key a WorkList prefill
 // does not select (their columns are zero).
-bool vector_read(attention_history h, inout attention_cursor c, inout uint64_t keys, inout uint64_t values,
+bool vector_read(attention_history h, inout attention_cursor c, inout Stored keys, inout Stored values,
     uint64_t row, uint kv_head, uint picks, uint position, out float k[ATTENTION_E], out float v[ATTENTION_E]) {
     bool moved;
     const uint64_t index = attention_cursor_seek(c, SEISMIC_PTR(SEISMIC_BUFFER_VISIBLE),
         SEISMIC_PTR(SEISMIC_BUFFER_FRESH), row, SEISMIC_DIM_R, picks, uint64_t(SEISMIC_PARAM_SLAB_ROWS), position,
         moved);
     const uint lane = SEISMIC_LANE;
-    const uint64_t act_bytes = uint64_t(ELEMENT_BYTES(ELEMENT_ACT));
-    const uint64_t head_bytes = uint64_t(ATTENTION_W) * act_bytes;
-    const uint64_t row_bytes = uint64_t(ATTENTION_KV) * head_bytes;
+    const uint64_t row_elements = uint64_t(ATTENTION_KV) * ATTENTION_W;
     // The slab's rows follow the cursor whether or not this key is read.
     if (moved) {
-        keys = slab_region(h.key, c.slab) + uint64_t(kv_head) * head_bytes;
-        values = slab_region(h.value, c.slab) + uint64_t(kv_head) * head_bytes;
+        keys = out_stored(slab_out_region(h.key, c.slab), uint64_t(kv_head) * ATTENTION_W);
+        values = out_stored(slab_out_region(h.value, c.slab), uint64_t(kv_head) * ATTENTION_W);
     }
     if (VECTOR_SELECTED && c.span <= SEISMIC_DIM_R && !vector_reads(row, position)) {
         [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i) {
@@ -102,12 +100,12 @@ bool vector_read(attention_history h, inout attention_cursor c, inout uint64_t k
         return false;
     }
     if (c.span < SEISMIC_DIM_R) {
-        const uint64_t at = (index - c.slab_lo) * row_bytes;
-        attention_load_row(keys + at, uint64_t(lane) * ATTENTION_E, k);
+        const uint64_t at = (index - c.slab_lo) * row_elements + uint64_t(lane) * ATTENTION_E;
+        attention_load_row(keys, at, k);
         if (ATTENTION_STORED_KEY)
             v = k;
         else
-            attention_load_row(values + at, uint64_t(lane) * ATTENTION_E, v);
+            attention_load_row(values, at, v);
         return true;
     }
     if (c.span == SEISMIC_DIM_R) {
@@ -126,8 +124,10 @@ bool vector_read(attention_history h, inout attention_cursor c, inout uint64_t k
         }
         return false;
     }
+    const uint64_t head_bytes = uint64_t(ATTENTION_W) * uint64_t(ELEMENT_BYTES(ELEMENT_ACT));
     attention_load_row(history_address(SEISMIC_PTR(SEISMIC_BUFFER_SELECTED), uint64_t(pick),
-        uint64_t(SEISMIC_PARAM_SELECTED_SLAB_ROWS), row_bytes, head_bytes, kv_head), uint64_t(lane) * ATTENTION_E, k);
+        uint64_t(SEISMIC_PARAM_SELECTED_SLAB_ROWS), uint64_t(ATTENTION_KV) * head_bytes, head_bytes, kv_head),
+        uint64_t(lane) * ATTENTION_E, k);
     v = k;
     return true;
 }
@@ -215,7 +215,7 @@ void vector_partial(attention_history h, uint kv_head, uint group, uint part, ui
     const uint first = range.x, last = range.y;
     attention_cursor c = attention_cursor_at(visible, fresh, row, spans, picks, first);
     // The cursor's slab's key and value rows.
-    uint64_t keys = 0ul, values = 0ul;
+    Stored keys = stored_at_buffer(ELEMENT_ACT, 0ul), values = keys;
     // The row's visible keys, which the bitmap selects among; its picks follow.
     const uint visible_keys = total - picks;
     // The batches at fixed positions first + i * VECTOR_BATCH, from the one

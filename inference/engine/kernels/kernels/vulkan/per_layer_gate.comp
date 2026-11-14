@@ -27,7 +27,7 @@ projection_prologue per_layer_gate_input() {
 projection_epilogue per_layer_gate_output() {
     const uint64_t inputs = SEISMIC_PTR(SEISMIC_BUFFER_INPUTS)
         + uint64_t(int(SEISMIC_PARAM_LAYER)) * SEISMIC_INPUTS_STRIDE_1 * 4ul;
-    return projection_scaled(projection_activated_mul(GATE_ACT, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0,
+    return projection_scaled(projection_activated_mul(GATE_ACT, SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0,
         SEISMIC_RESULT_0_STRIDE_1, inputs, SEISMIC_INPUTS_STRIDE_0, SEISMIC_INPUTS_STRIDE_2,
         int(SEISMIC_PARAM_ACTIVATION)),
         projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_GATE_SCALE), SEISMIC_DIM_GS, 0ul, 0ul), 1.0);

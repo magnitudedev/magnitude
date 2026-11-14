@@ -23,5 +23,5 @@ extern "C" __global__ void vision_pool(SEISMIC_KERNEL_PARAMS) {
     if (SEISMIC_DIM_NS == 1)
         value = (value - element::at<StandardBias>(SEISMIC_PTR(SEISMIC_BUFFER_STANDARD_BIAS), column))
                 * element::at<StandardScale>(SEISMIC_PTR(SEISMIC_BUFFER_STANDARD_SCALE), column);
-    reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER))[row * SEISMIC_RESULT_0_STRIDE_0 + column] = value;
+    SEISMIC_RESULT_0_OUT.put(row * SEISMIC_RESULT_0_STRIDE_0 + column, value);
 }

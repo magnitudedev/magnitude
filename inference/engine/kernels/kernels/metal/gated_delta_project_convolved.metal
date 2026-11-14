@@ -30,20 +30,20 @@ typedef projection::operands<NVFP4> Operands;
 // The slot of each row, resolved once per threadgroup before the projection
 // so the epilogue's window reads do not wait on the slot tables: `lo` < 0 on
 // a row outside every slot; the source and successor window banks as
-// addresses.
+// resolved entries.
 struct ConvolvedRow {
     long lo;
     long stop;
     long kept;
     long taped;
-    ulong source;
-    ulong target;
+    slab::Table<activation> source;
+    slab::Table<activation> target;
 };
 
 // Threads 0..M-1 resolve row `thread_index`'s slot into `rows`; the caller
 // barriers before the epilogue reads them.
-inline void convolved_rows(versions::Slots slots, device const ulong *window, threadgroup ConvolvedRow *rows,
-    uint thread_index, constant ulong *seismic_words) {
+inline void convolved_rows(versions::Slots slots, device const slab::Table<activation> *window,
+    threadgroup ConvolvedRow *rows, uint thread_index, constant ulong *seismic_words) {
     if (thread_index >= SEISMIC_DIM_M)
         return;
     ConvolvedRow row;
@@ -55,10 +55,8 @@ inline void convolved_rows(versions::Slots slots, device const ulong *window, th
         row.stop = slot.stop;
         row.kept = long(SEISMIC_DIM_C) - 1 + versions::tape_rows(slot, long(SEISMIC_DIM_T));
         row.taped = slot.taped;
-        row.source = reinterpret_cast<ulong>(
-            versions::bank<activation::storage>(window, slot.source, SEISMIC_WINDOW_STRIDE_0, seismic_words));
-        row.target = reinterpret_cast<ulong>(
-            versions::bank<activation::storage>(window, slot.target, SEISMIC_WINDOW_STRIDE_0, seismic_words));
+        row.source = versions::bank_entry(window, slot.source, SEISMIC_WINDOW_STRIDE_0, seismic_words);
+        row.target = versions::bank_entry(window, slot.target, SEISMIC_WINDOW_STRIDE_0, seismic_words);
     }
     rows[thread_index] = row;
 }
@@ -83,9 +81,9 @@ inline float row_sum(thread const float (&sums)[N], ulong index) {
 }
 
 struct ConvolvedChannel {
-    device uchar *projection;
+    element::Out<activation> projection;
     ulong projection0, projection1;
-    device float *convolved;
+    element::Out<element::F32> convolved;
     ulong convolved0, convolved1;
     device const float *convolution;
     threadgroup const ConvolvedRow *rows;
@@ -95,17 +93,16 @@ struct ConvolvedChannel {
     // channel n rounded to A.
     template <typename Value>
     void convolve(uint m, uint n, Value value) const {
-        typedef activation::storage Storage;
-        device float *out = convolved + ulong(m) * convolved0 + ulong(n) * convolved1;
+        const element::Out<element::F32> out = convolved.offset(ulong(m) * convolved0 + ulong(n) * convolved1);
         const ConvolvedRow row = rows[m];
         if (row.lo < 0) {
-            *out = 0.0f;
+            out.put(0, 0.0f);
             return;
         }
         const long taps = long(SEISMIC_DIM_C) - 1;
         const long local = long(m) - row.lo;
         const ulong channel = ulong(n);
-        device const Storage *source = reinterpret_cast<device const Storage *>(row.source);
+        device const activation::storage *source = slab::view(row.source);
         float sum = 0.0f;
         PROJECTION_UNROLL for (uint tap = 0; tap < SEISMIC_DIM_C; ++tap) {
             const long position = local + long(tap) - taps;
@@ -115,15 +112,15 @@ struct ConvolvedChannel {
             sum = metal::fma(convolution[channel * SEISMIC_CONVOLUTION_STRIDE_0 + tap * SEISMIC_CONVOLUTION_STRIDE_1],
                 input, sum);
         }
-        *out = sum / (1.0f + metal::exp(-sum));
-        device Storage *target = reinterpret_cast<device Storage *>(row.target);
+        out.put(0, sum / (1.0f + metal::exp(-sum)));
+        const element::Out<activation> target = slab::out(row.target);
         const long kept = local - row.stop + taps;
         if (kept >= 0 && kept < row.kept)
-            target[ulong(kept) * SEISMIC_WINDOW_STRIDE_1 + channel] = activation::store(value(ulong(m)));
+            target.put(ulong(kept) * SEISMIC_WINDOW_STRIDE_1 + channel, value(ulong(m)));
         if (local == 0) {
             for (long tap = 0; row.stop + tap < taps; ++tap)
-                target[ulong(tap) * SEISMIC_WINDOW_STRIDE_1 + channel] =
-                    source[ulong(row.taped + row.stop + tap) * SEISMIC_WINDOW_STRIDE_1 + channel];
+                target.move_stored(ulong(tap) * SEISMIC_WINDOW_STRIDE_1 + channel, slab::out(row.source),
+                    ulong(row.taped + row.stop + tap) * SEISMIC_WINDOW_STRIDE_1 + channel, 1);
         }
     }
 
@@ -131,8 +128,7 @@ struct ConvolvedChannel {
     // channel from every row's sum of it.
     template <uint N>
     void store_column(uint m, uint n, thread const float (&sums)[N]) const {
-        reinterpret_cast<device activation::storage *>(projection)[ulong(m) * projection0 + ulong(n) * projection1] =
-            activation::store(row_sum(sums, m));
+        projection.put(ulong(m) * projection0 + ulong(n) * projection1, row_sum(sums, m));
         convolve(m, n, [&](ulong j) { return activation::round(row_sum(sums, j)); });
     }
 
@@ -142,10 +138,9 @@ struct ConvolvedChannel {
     // items run at once. A lane group's column epilogue would run its rows'
     // items one after another.
     void convolve_channels(uint first, uint count, uint m_rows, uint thread_index, uint threads) const {
-        device const activation::storage *published = reinterpret_cast<device const activation::storage *>(projection);
         for (uint item = thread_index; item < count * m_rows; item += threads) {
             const uint n = first + item / m_rows, m = item % m_rows;
-            convolve(m, n, [&](ulong j) { return activation::load(published[j * projection0 + ulong(n) * projection1]); });
+            convolve(m, n, [&](ulong j) { return projection.at(j * projection0 + ulong(n) * projection1); });
         }
     }
 };
@@ -163,10 +158,10 @@ struct ConvolvedChannel {
     device const int *previous_bank [[buffer(SEISMIC_BUFFER_PREVIOUS_BANK)]],           \
     device const int *previous_tape [[buffer(SEISMIC_BUFFER_PREVIOUS_TAPE)]],           \
     device const int *following_bank [[buffer(SEISMIC_BUFFER_FOLLOWING_BANK)]],         \
-    device const ulong *window [[buffer(SEISMIC_BUFFER_WINDOW)]],                       \
-    device uchar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],                           \
+    SEISMIC_OUT_WINDOW_PARAM(window),                                                   \
+    SEISMIC_RESULT_0_PARAM(result_cells),                                               \
     device uchar *normalized [[buffer(SEISMIC_BUFFER_SCRATCH_NORMALIZED)]],             \
-    device float *convolved [[buffer(SEISMIC_RESULT_1_BUFFER)]],                        \
+    SEISMIC_RESULT_1_PARAM(convolved_cells),                                            \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
 
 #define RECURRENT_PROJECT_OPERANDS                                                      \
@@ -182,14 +177,15 @@ struct ConvolvedChannel {
     projection::Weights<packets::W1> gate{gate_weight, KERNEL_W1_LAYOUT(k), k};         \
     projection::Weights<packets::W2> alpha{alpha_weight, KERNEL_W2_LAYOUT(k), k};       \
     projection::Weights<packets::W3> beta{beta_weight, KERNEL_W3_LAYOUT(k), k};         \
-    ConvolvedChannel qkv_out{result, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, \
-        convolved, SEISMIC_RESULT_1_STRIDE_0, SEISMIC_RESULT_1_STRIDE_1, convolution,   \
-        slot_rows, seismic_words};                                                      \
-    projection::Store<activation> gate_out{result, SEISMIC_RESULT_0_STRIDE_0,           \
+    ConvolvedChannel qkv_out{element::Out<activation>(result_cells), SEISMIC_RESULT_0_STRIDE_0, \
+        SEISMIC_RESULT_0_STRIDE_1, element::Out<element::F32>(convolved_cells),         \
+        SEISMIC_RESULT_1_STRIDE_0, SEISMIC_RESULT_1_STRIDE_1, convolution, slot_rows,   \
+        seismic_words};                                                                 \
+    projection::Store<activation> gate_out{element::Out<activation>(result_cells), SEISMIC_RESULT_0_STRIDE_0, \
         SEISMIC_RESULT_0_STRIDE_1, qkv_rows};                                           \
-    projection::Store<activation> alpha_out{result, SEISMIC_RESULT_0_STRIDE_0,          \
+    projection::Store<activation> alpha_out{element::Out<activation>(result_cells), SEISMIC_RESULT_0_STRIDE_0, \
         SEISMIC_RESULT_0_STRIDE_1, qkv_rows + gate_rows};                               \
-    projection::Store<activation> beta_out{result, SEISMIC_RESULT_0_STRIDE_0,           \
+    projection::Store<activation> beta_out{element::Out<activation>(result_cells), SEISMIC_RESULT_0_STRIDE_0, \
         SEISMIC_RESULT_0_STRIDE_1, qkv_rows + gate_rows + head_rows}
 
 // The GEMV of a launch that serves COUNT (ONE, SEVERAL) rows. The last
@@ -198,7 +194,7 @@ struct ConvolvedChannel {
 #define RECURRENT_PROJECT_CONVOLVED_GEMV(ROWS, LANES, COUNT)                            \
     threadgroup ConvolvedRow slot_rows[16];                                             \
     RECURRENT_PROJECT_OPERANDS;                                                         \
-    projection::Store<activation> qkv_values{result, SEISMIC_RESULT_0_STRIDE_0,         \
+    projection::Store<activation> qkv_values{element::Out<activation>(result_cells), SEISMIC_RESULT_0_STRIDE_0, \
         SEISMIC_RESULT_0_STRIDE_1, 0};                                                  \
     uint per = simdgroups * ROWS * (32u / LANES);                                       \
     uint rows = uint(SEISMIC_DIM_M);                                                    \

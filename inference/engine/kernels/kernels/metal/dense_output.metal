@@ -21,7 +21,7 @@ typedef projection::operands<NVFP4> Operands;
     device uchar *staged [[buffer(SEISMIC_BUFFER_SCRATCH_STAGED)]],                     \
     device const uchar *down_weight [[buffer(SEISMIC_BUFFER_DOWN_WEIGHT)]],             \
     device const int *out_rows [[buffer(SEISMIC_BUFFER_OUT_ROWS)]],                     \
-    device float *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],                           \
+    SEISMIC_RESULT_0_PARAM(result_cells),                                               \
     device float *partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]],                 \
     device float *small_partials [[buffer(SEISMIC_BUFFER_SCRATCH_SMALL_PARTIALS)]],     \
     device uchar *fragments [[buffer(SEISMIC_BUFFER_SCRATCH_FRAGMENTS)]],               \
@@ -47,7 +47,7 @@ typedef projection::operands<NVFP4> Operands;
         ? projection::Plain<activation, projection::AllRows>{staged, SEISMIC_DIM_F, 1, uint(SEISMIC_DIM_F), {}} \
         : raw;                                                                          \
     const auto out = projection::scaling<(SEISMIC_DIM_DS != 0)>::wrap(                  \
-        projection::Residual<activation, projection::SelectedRows>{result,              \
+        projection::Residual<activation, projection::SelectedRows>{element::Out<element::F32>(result_cells), \
             SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, residual, SEISMIC_RESIDUAL_STRIDE_0, \
             SEISMIC_RESIDUAL_STRIDE_1, {out_rows}},                                     \
         projection::scale_factor(down_scale, SEISMIC_DIM_DS, 0, 0), 1.0f);              \

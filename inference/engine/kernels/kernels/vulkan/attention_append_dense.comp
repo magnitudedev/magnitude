@@ -29,8 +29,7 @@ void attention_append_dense() {
     if (!ATTENTION_FRESH || row >= SEISMIC_DIM_M) return;
     const int destination = element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_DESTINATIONS) + row * 4ul);
     if (destination < 0) return;
-    const attention_history h = attention_dense_history(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY),
-        SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE));
+    const attention_history h = attention_dense_history(SEISMIC_OUT_HISTORY_KEY, SEISMIC_OUT_HISTORY_VALUE);
     float x[ATTENTION_E];
     history_fresh_row(true, row, kv_head, lane, x);
     history_hold(h, true, destination, kv_head, lane, false, x);

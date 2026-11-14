@@ -29,7 +29,7 @@
 #include "lib/attention/history.glsl"
 
 attention_history decode_history() {
-    return attention_dense_history(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY), SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE));
+    return attention_dense_history(SEISMIC_OUT_HISTORY_KEY, SEISMIC_OUT_HISTORY_VALUE);
 }
 
 #if SEISMIC_TUNE_MATRIX
@@ -84,7 +84,7 @@ void attention_decode_partial() {
 // with the head's sink when SK = 1) and the output gate.
 void attention_decode_merge() {
     attention_decode_gate(ATTENTION_QUERY_BUFFER, ATTENTION_GATE_BUFFER, SEISMIC_PTR(SEISMIC_BUFFER_VISIBLE),
-        SEISMIC_PTR(SEISMIC_BUFFER_FRESH), SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER),
+        SEISMIC_PTR(SEISMIC_BUFFER_FRESH), SEISMIC_RESULT_0_OUT,
         SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS), SEISMIC_DIM_R,
         DECODE_PICKS, gl_WorkGroupID.x, gl_WorkGroupID.y, gl_LocalInvocationIndex, SEISMIC_TUNE_SPAN,
         SEISMIC_TUNE_PARTS);
@@ -97,7 +97,7 @@ void attention_decode_prepare() {}
 #endif
 
 void attention_decode_rotate() {
-    attention_rotate_output(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES),
+    attention_rotate_output(SEISMIC_RESULT_0_OUT, SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES),
         SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_COMPONENTS), SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_FREQUENCIES),
         ATTENTION_AMPLITUDE_BUFFER);
 }

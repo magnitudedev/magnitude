@@ -6,8 +6,9 @@
 // policy from its own ABI (`HISTORY()`): a header may name only macros every
 // including entry generates.
 
-// Dense history: key and value planes [T, KV, W] of the activation element.
-struct DenseHistory {
+// Read-only view of dense history: key and value planes [T, KV, W] of the
+// activation element.
+struct DenseReads {
     static constexpr bool CODED = false;
     const u32 *key;
     const u32 *value;
@@ -20,26 +21,62 @@ struct DenseHistory {
         return static_cast<int>(min(static_cast<u64>(hi), (static_cast<u64>(token) / slab_rows + 1) * slab_rows));
     }
 
-    // Byte addresses of a (history row, kv head) vector.
-    __device__ __forceinline__ u8 *key_vector(int token, int kv_head) const {
-        return slab::row(key, token, slab_rows, key_row * Act::bytes)
-            + static_cast<u64>(kv_head) * key_head * Act::bytes;
+    // Byte addresses of a (history row, kv head) vector, for reading.
+    __device__ __forceinline__ const u8 *key_vector(int token, int kv_head) const {
+        return slab::row(key, static_cast<u64>(token), slab_rows, key_row * Act::bytes) +
+               static_cast<u64>(kv_head) * key_head * Act::bytes;
     }
     // A stored-key history's values are its key plane (it has no value plane).
-    __device__ __forceinline__ u8 *value_vector(int token, int kv_head) const {
+    __device__ __forceinline__ const u8 *value_vector(int token, int kv_head) const {
         if constexpr (STORED_KEY) return key_vector(token, kv_head);
-        return slab::row(value, token, slab_rows, value_row * Act::bytes)
-            + static_cast<u64>(kv_head) * value_head * Act::bytes;
+        return slab::row(value, static_cast<u64>(token), slab_rows, value_row * Act::bytes) +
+               static_cast<u64>(kv_head) * value_head * Act::bytes;
+    }
+};
+
+// Dense history: key and value planes [T, KV, W] of the activation element.
+struct DenseHistory {
+    static constexpr bool CODED = false;
+    element::SlabOut<Act> key;
+    element::SlabOut<Act> value;
+    u64 key_row, key_head, value_row, value_head;
+    u64 slab_rows;
+
+    __device__ __forceinline__ DenseReads reads() const {
+        return DenseReads{key.reads(), value.reads(), key_row, key_head, value_row, value_head, slab_rows};
+    }
+    __device__ __forceinline__ operator DenseReads() const { return reads(); }
+
+    // The end of the run of rows [token, hi) within history row `token`'s
+    // slab.
+    __device__ __forceinline__ int slab_end(int token, int hi) const { return reads().slab_end(token, hi); }
+
+    // The handles of a (history row, kv head) vector.
+    __device__ __forceinline__ element::Out<Act> key_out(int token, int kv_head) const {
+        return key.row(static_cast<u64>(token), slab_rows, key_row).offset(static_cast<u64>(kv_head) * key_head);
+    }
+    // A stored-key history's values are its key plane (it has no value plane).
+    __device__ __forceinline__ element::Out<Act> value_out(int token, int kv_head) const {
+        if constexpr (STORED_KEY) return key_out(token, kv_head);
+        return value.row(static_cast<u64>(token), slab_rows, value_row)
+            .offset(static_cast<u64>(kv_head) * value_head);
+    }
+    // Byte addresses of a (history row, kv head) vector, for reading.
+    __device__ __forceinline__ const u8 *key_vector(int token, int kv_head) const {
+        return reads().key_vector(token, kv_head);
+    }
+    __device__ __forceinline__ const u8 *value_vector(int token, int kv_head) const {
+        return reads().value_vector(token, kv_head);
     }
 
     __device__ __forceinline__ void append(int destination, int kv_head, const float (&k)[DPL],
                                            const float (&v)[DPL], int lane) const {
-        u8 *k_row = key_vector(destination, kv_head);
-        u8 *v_row = value_vector(destination, kv_head);
+        const element::Out<Act> k_row = key_out(destination, kv_head);
+        const element::Out<Act> v_row = value_out(destination, kv_head);
 #pragma unroll
         for (int d = 0; d < DPL; ++d) {
-            element::put<Act>(k_row, lane * DPL + d, k[d]);
-            if constexpr (!STORED_KEY) element::put<Act>(v_row, lane * DPL + d, v[d]);
+            k_row.put(lane * DPL + d, k[d]);
+            if constexpr (!STORED_KEY) v_row.put(lane * DPL + d, v[d]);
         }
     }
 };
@@ -99,11 +136,12 @@ template <int B> struct LaneCodes {
 };
 
 // A lane's share of an encoded vector: its DPL codes, laid out as
-// `LaneCodes::load` returns a code row's, and its group's (scale, zero) pair
-// as stored (F16 scale in the low half, zero in the high).
+// `LaneCodes::load` returns a code row's, and its group's F16-rounded
+// (scale, zero) pair.
 template <int B> struct LaneEncoding {
     u32 codes[LaneCodes<B>::words];
-    u32 pair;
+    float scale;
+    float zero;
 };
 
 // This lane's share of the B-bit encoding of one vector held by a warp (each
@@ -126,10 +164,8 @@ __device__ __forceinline__ LaneEncoding<B> quantize(const float (&x)[DPL]) {
         low = fminf(low, seismic_shfl_xor_f32(low, offset));
         high = fmaxf(high, seismic_shfl_xor_f32(high, offset));
     }
-    const u16 zero_bits = seismic_f32_to_f16(low);
-    const u16 scale_bits = seismic_f32_to_f16((high - low) / static_cast<float>(Codes::levels));
-    const float zero = seismic_f16_to_f32(zero_bits);
-    const float scale = seismic_f16_to_f32(scale_bits);
+    const float zero = element::F16::round(low);
+    const float scale = element::F16::round((high - low) / static_cast<float>(Codes::levels));
     const float inverse = scale > 0.0f ? 1.0f / scale : 0.0f;
     LaneEncoding<B> e;
 #pragma unroll
@@ -140,15 +176,16 @@ __device__ __forceinline__ LaneEncoding<B> quantize(const float (&x)[DPL]) {
         const u32 c = min(static_cast<u32>(fmaxf(t, 0.0f)), Codes::levels);
         e.codes[d * B / 32] |= c << ((d * B) % 32);
     }
-    e.pair = static_cast<u32>(scale_bits) | (static_cast<u32>(zero_bits) << 16);
+    e.scale = scale;
+    e.zero = zero;
     return e;
 }
 
 // Stores a warp's encoding of one vector: its codes at `row` (its code row)
 // and its group pairs at `pairs` (the whole warp calls it).
 template <int B>
-__device__ __forceinline__ void store_encoding(const LaneEncoding<B> &e, u32 *row, u32 *pairs,
-                                               int lane) {
+__device__ __forceinline__ void store_encoding(const LaneEncoding<B> &e, u32 *row,
+                                               const element::Out<element::F16> &pairs, int lane) {
     typedef LaneCodes<B> Codes;
     if constexpr (Codes::bits >= 32) {
 #pragma unroll
@@ -162,16 +199,18 @@ __device__ __forceinline__ void store_encoding(const LaneEncoding<B> &e, u32 *ro
             joined |= seismic_shfl_xor_u32(joined, offset);
         if (lane % sharing == 0) row[lane / sharing] = joined;
     }
-    if (lane % PAIR_LANES == 0) pairs[lane / PAIR_LANES] = e.pair;
+    // Pair p is elements 2p (scale) and 2p + 1 (zero): one 32-bit store.
+    if (lane % PAIR_LANES == 0) {
+        pairs.put2(2 * static_cast<u64>(lane / PAIR_LANES), e.scale, e.zero);
+    }
 }
 
 // A (scale, zero) pair, as F32.
 __device__ __forceinline__ float2 coefficients(u32 pair) { return seismic_unpack_f16x2(pair); }
 
-// Affine history: code planes [T, KV, W * B / 32] u32 and (scale, zero)
-// planes [T, KV, 2 * PAIRS] f16 per vector kind. Every plane is canonical: a
-// vector's code row and its pairs are contiguous.
-struct AffineHistory {
+// Read-only view of affine history: code planes [T, KV, W * B / 32] u32 and
+// (scale, zero) planes [T, KV, 2 * PAIRS] f16 per vector kind.
+struct AffineReads {
     static constexpr bool CODED = true;
     const u32 *key_codes;
     const u32 *key_pairs;
@@ -185,24 +224,6 @@ struct AffineHistory {
     // slab.
     __device__ __forceinline__ int slab_end(int token, int hi) const {
         return static_cast<int>(min(static_cast<u64>(hi), (static_cast<u64>(token) / slab_rows + 1) * slab_rows));
-    }
-
-    // A vector's code row and (scale, zero) pairs (one u32 each).
-    __device__ __forceinline__ u32 *key_row(int token, int kv_head) const {
-        return reinterpret_cast<u32 *>(slab::row(key_codes, token, slab_rows, key_codes_row * 4))
-            + static_cast<u64>(kv_head) * key_codes_head;
-    }
-    __device__ __forceinline__ u32 *key_pair(int token, int kv_head) const {
-        return reinterpret_cast<u32 *>(slab::row(key_pairs, token, slab_rows, key_pairs_row * 2))
-            + static_cast<u64>(kv_head) * key_pairs_head / 2;
-    }
-    __device__ __forceinline__ u32 *value_row(int token, int kv_head) const {
-        return reinterpret_cast<u32 *>(slab::row(value_codes, token, slab_rows, value_codes_row * 4))
-            + static_cast<u64>(kv_head) * value_codes_head;
-    }
-    __device__ __forceinline__ u32 *value_pair(int token, int kv_head) const {
-        return reinterpret_cast<u32 *>(slab::row(value_pairs, token, slab_rows, value_pairs_row * 2))
-            + static_cast<u64>(kv_head) * value_pairs_head / 2;
     }
 
     // A (history row, kv head)'s vectors in the four planes, its slab located
@@ -221,11 +242,62 @@ struct AffineHistory {
             return reinterpret_cast<const u32 *>(slab::region(table, index) + within * row_bytes) +
                    static_cast<u64>(kv_head) * head_words;
         };
+        auto pairs = [&](const u32 *table, u64 row_elements, u64 head_elements) {
+            return reinterpret_cast<const u32 *>(
+                slab::region(table, index) + (within * row_elements + static_cast<u64>(kv_head) * head_elements) * 2);
+        };
         return Vectors{at(key_codes, key_codes_row * 4, key_codes_head),
-                       at(key_pairs, key_pairs_row * 2, key_pairs_head / 2),
+                       pairs(key_pairs, key_pairs_row, key_pairs_head),
                        at(value_codes, value_codes_row * 4, value_codes_head),
-                       at(value_pairs, value_pairs_row * 2, value_pairs_head / 2)};
+                       pairs(value_pairs, value_pairs_row, value_pairs_head)};
     }
+};
+
+// Affine history: code planes [T, KV, W * B / 32] u32 and (scale, zero)
+// planes [T, KV, 2 * PAIRS] f16 per vector kind. Every plane is canonical: a
+// vector's code row and its pairs are contiguous.
+struct AffineHistory {
+    static constexpr bool CODED = true;
+    const u32 *key_codes;
+    element::SlabOut<element::F16> key_pairs;
+    const u32 *value_codes;
+    element::SlabOut<element::F16> value_pairs;
+    u64 key_codes_row, key_codes_head, key_pairs_row, key_pairs_head;
+    u64 value_codes_row, value_codes_head, value_pairs_row, value_pairs_head;
+    u64 slab_rows;
+
+    __device__ __forceinline__ AffineReads reads() const {
+        return AffineReads{key_codes,       key_pairs.reads(), value_codes,     value_pairs.reads(),
+                           key_codes_row,   key_codes_head,    key_pairs_row,   key_pairs_head,
+                           value_codes_row, value_codes_head,  value_pairs_row, value_pairs_head,
+                           slab_rows};
+    }
+    __device__ __forceinline__ operator AffineReads() const { return reads(); }
+
+    // The end of the run of rows [token, hi) within history row `token`'s
+    // slab.
+    __device__ __forceinline__ int slab_end(int token, int hi) const { return reads().slab_end(token, hi); }
+
+    // A vector's code row and (scale, zero) pairs (one u32 each).
+    __device__ __forceinline__ u32 *key_row(int token, int kv_head) const {
+        return reinterpret_cast<u32 *>(slab::row(key_codes, token, slab_rows, key_codes_row * 4))
+            + static_cast<u64>(kv_head) * key_codes_head;
+    }
+    __device__ __forceinline__ element::Out<element::F16> key_pair(int token, int kv_head) const {
+        return key_pairs.row(static_cast<u64>(token), slab_rows, key_pairs_row)
+            .offset(static_cast<u64>(kv_head) * key_pairs_head);
+    }
+    __device__ __forceinline__ u32 *value_row(int token, int kv_head) const {
+        return reinterpret_cast<u32 *>(slab::row(value_codes, token, slab_rows, value_codes_row * 4))
+            + static_cast<u64>(kv_head) * value_codes_head;
+    }
+    __device__ __forceinline__ element::Out<element::F16> value_pair(int token, int kv_head) const {
+        return value_pairs.row(static_cast<u64>(token), slab_rows, value_pairs_row)
+            .offset(static_cast<u64>(kv_head) * value_pairs_head);
+    }
+
+    using Vectors = AffineReads::Vectors;
+    __device__ __forceinline__ Vectors vectors(int token, int kv_head) const { return reads().vectors(token, kv_head); }
 
     // A lane's share of a key's and a value's encodings.
     struct Encoding {

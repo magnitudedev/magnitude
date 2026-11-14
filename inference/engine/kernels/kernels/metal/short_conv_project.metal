@@ -25,7 +25,7 @@ typedef projection::operands<NVFP4> Operands;
     device const uchar *b_weight [[buffer(SEISMIC_BUFFER_B_WEIGHT)]],                   \
     device const uchar *c_weight [[buffer(SEISMIC_BUFFER_C_WEIGHT)]],                   \
     device const uchar *x_weight [[buffer(SEISMIC_BUFFER_X_WEIGHT)]],                   \
-    device uchar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],                           \
+    SEISMIC_RESULT_0_PARAM(result_cells),                                               \
     device uchar *normalized [[buffer(SEISMIC_BUFFER_SCRATCH_NORMALIZED)]],             \
     device const float *b_scale [[buffer(SEISMIC_BUFFER_B_SCALE)]],                     \
     device const float *c_scale [[buffer(SEISMIC_BUFFER_C_SCALE)]],                     \
@@ -38,12 +38,12 @@ typedef projection::operands<NVFP4> Operands;
         SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1, norm, SEISMIC_NORM_STRIDE_0, \
         as_type<float>(uint(SEISMIC_PARAM_EPS)), hidden, {}};                           \
     const auto u = projection::scaling<(SEISMIC_DIM_BS != 0 || SEISMIC_DIM_XS != 0)>::wrap( \
-        projection::Mul{reinterpret_cast<device float *>(result), SEISMIC_RESULT_0_STRIDE_0, \
+        projection::Mul{element::Out<element::F32>(result_cells), SEISMIC_RESULT_0_STRIDE_0, \
             SEISMIC_RESULT_0_STRIDE_1},                                                 \
         projection::scale_factor(b_scale, SEISMIC_DIM_BS, 0, 0),                        \
         projection::scale_factor(x_scale, SEISMIC_DIM_XS, 0, 0));                       \
     const auto c = projection::scaling<(SEISMIC_DIM_CS != 0)>::wrap(                    \
-        projection::Store<element::F32>{result, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, channels}, \
+        projection::Store<element::F32>{element::Out<element::F32>(result_cells), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, channels}, \
         projection::scale_factor(c_scale, SEISMIC_DIM_CS, 0, 0), 1.0f);                 \
     projection::Weights<packets::W0> b_rows{b_weight, KERNEL_W0_LAYOUT(SEISMIC_DIM_H), hidden}; \
     projection::Weights<packets::W1> x_rows{x_weight, KERNEL_W1_LAYOUT(SEISMIC_DIM_H), hidden}; \

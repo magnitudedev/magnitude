@@ -9,7 +9,7 @@ kernel void draft_convolve_input(
     device const uchar *input [[buffer(SEISMIC_BUFFER_INPUT)]],
     device const float *dynamic [[buffer(SEISMIC_BUFFER_DYNAMIC)]],
     device const float *base [[buffer(SEISMIC_BUFFER_BASE)]],
-    device uchar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(result_cells),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint raw_index [[thread_position_in_grid]]) {
     const ulong index = ulong(raw_index);
@@ -24,5 +24,6 @@ kernel void draft_convolve_input(
         sum = metal::fma(coefficient,
             element::at<activation>(input, (row - offset) * SEISMIC_INPUT_STRIDE_0 + column * SEISMIC_INPUT_STRIDE_1), sum);
     }
-    element::put<activation>(result, row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1, sum);
+    element::Out<activation>(result_cells).put(
+        row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1, sum);
 }

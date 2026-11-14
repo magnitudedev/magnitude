@@ -14,7 +14,7 @@ using Epi = projection::Mix<ELEMENT_OF(SEISMIC_NORM)>;
 #define UP KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_UP_WEIGHT))
 #define EPILOGUE                                                                                         \
     Epi {                                                                                                \
-        reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)), SEISMIC_RESULT_0_STRIDE_0,      \
+        SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0,      \
             reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN)), SEISMIC_HIDDEN_STRIDE_0, \
             reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_INVERSE)), SEISMIC_INVERSE_STRIDE_0, \
             SEISMIC_PTR(SEISMIC_BUFFER_NORM), SEISMIC_DIM_H, (float)SEISMIC_DIM_S                        \

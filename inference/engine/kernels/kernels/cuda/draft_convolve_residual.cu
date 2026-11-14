@@ -1,6 +1,7 @@
 // draft_convolve_residual: DFlash2's half-1 grouped dynamic causal convolution
 // of a sublayer's F32 output rows within each draft block, plus the residual;
 // one thread per output element, summing its taps in offset order.
+#include <seismic/element.cuh>
 
 extern "C" __global__ void draft_convolve_residual(SEISMIC_KERNEL_PARAMS) {
     typedef unsigned long long u64;
@@ -8,7 +9,7 @@ extern "C" __global__ void draft_convolve_residual(SEISMIC_KERNEL_PARAMS) {
     const float *output = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_OUTPUT));
     const float *dynamic = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_DYNAMIC));
     const float *base = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_BASE));
-    float *result = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER));
+    const auto result = SEISMIC_RESULT_0_OUT;
     const u64 index = (u64)blockIdx.x * blockDim.x + threadIdx.x;
     const u64 channels = SEISMIC_DIM_C, width = SEISMIC_DIM_G * channels;
     if (index >= (u64)SEISMIC_DIM_M * width)
@@ -23,6 +24,6 @@ extern "C" __global__ void draft_convolve_residual(SEISMIC_KERNEL_PARAMS) {
                     group * SEISMIC_DYNAMIC_STRIDE_3];
         sum = seismic_fma_rn(coefficient, output[(row - offset) * SEISMIC_OUTPUT_STRIDE_0 + column * SEISMIC_OUTPUT_STRIDE_1], sum);
     }
-    result[row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1] =
-        residual[row * SEISMIC_RESIDUAL_STRIDE_0 + column * SEISMIC_RESIDUAL_STRIDE_1] + sum;
+    result.put(row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1,
+               residual[row * SEISMIC_RESIDUAL_STRIDE_0 + column * SEISMIC_RESIDUAL_STRIDE_1] + sum);
 }

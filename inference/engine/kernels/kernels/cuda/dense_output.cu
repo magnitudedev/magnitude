@@ -27,7 +27,7 @@ using Epi = Scaling::type<projection::Residual<projection::Act, projection::Sele
         projection::Residual<projection::Act, projection::SelectedRows>{                                  \
             reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL)), SEISMIC_RESIDUAL_STRIDE_0, \
             projection::SelectedRows{reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS))},    \
-            reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)), SEISMIC_RESULT_0_STRIDE_0},     \
+            SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0},     \
         projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_DOWN_SCALE), SEISMIC_DIM_DS, 0, 0), 1.0f)
 
 template <int NB, int KSPLIT> using OutputShape = projection::GemvShape<8, 1, KSPLIT, NB>;

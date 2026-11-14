@@ -15,7 +15,7 @@
         for (uint stream = 0u; stream < streams; ++stream)                                             \
             sum += WEIGHT(stream)                                                                      \
                 * element_f32_at(x + (uint64_t(stream) * stream_stride + uint64_t(column) * column_stride) * 4ul); \
-        element_f32_put(result + uint64_t(column) * result_stride * 4ul, sum);                         \
+        out_put(result, uint64_t(column) * result_stride, sum);                                        \
     }
 
 // Row `x`'s `streams` streams (`stream_stride` apart, columns
@@ -23,7 +23,7 @@
 // the h columns of `result` (`result_stride` apart), the invocations taking every
 // `step`-th column from `first`.
 void streams_collapse(uint64_t x, uint64_t stream_stride, uint64_t column_stride, uint64_t weights,
-    uint64_t weight_stride, uint64_t result, uint64_t result_stride, const uint streams, uint h, uint first,
+    uint64_t weight_stride, Out result, uint64_t result_stride, const uint streams, uint h, uint first,
     uint step) {
 #define STREAMS_STORED_WEIGHT(s) element_f32_at(weights + uint64_t(s) * weight_stride * 4ul)
     STREAMS_COLLAPSE(STREAMS_STORED_WEIGHT)
@@ -31,7 +31,7 @@ void streams_collapse(uint64_t x, uint64_t stream_stride, uint64_t column_stride
 }
 
 // As above, every stream at weight 1: the streams' sum in stream order.
-void streams_sum(uint64_t x, uint64_t stream_stride, uint64_t column_stride, uint64_t result,
+void streams_sum(uint64_t x, uint64_t stream_stride, uint64_t column_stride, Out result,
     uint64_t result_stride, const uint streams, uint h, uint first, uint step) {
 #define STREAMS_UNIT_WEIGHT(s) 1.0
     STREAMS_COLLAPSE(STREAMS_UNIT_WEIGHT)
@@ -41,7 +41,7 @@ void streams_sum(uint64_t x, uint64_t stream_stride, uint64_t column_stride, uin
 // As above, by the per-stream weights `carried` an invocation holds (to 8
 // streams, the bound of the entries that mix by them).
 void streams_collapse(uint64_t x, uint64_t stream_stride, uint64_t column_stride, const float carried[8],
-    uint64_t result, uint64_t result_stride, const uint streams, uint h, uint first, uint step) {
+    Out result, uint64_t result_stride, const uint streams, uint h, uint first, uint step) {
 #define STREAMS_CARRIED_WEIGHT(s) carried[s]
     STREAMS_COLLAPSE(STREAMS_CARRIED_WEIGHT)
 #undef STREAMS_CARRIED_WEIGHT

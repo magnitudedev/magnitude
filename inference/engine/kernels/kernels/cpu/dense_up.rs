@@ -38,9 +38,9 @@ fn dense_up_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3
     });
     projection::project_staged_arithmetic(&cx.arg_up_weight(), rows.clone(), normalized, quantized, |row, up| {
         // SAFETY: each work item writes its own columns of every row.
-        let out = unsafe { result.span_mut([row, rows.start], rows.len()) };
+        let mut out = unsafe { result.span_mut([row, rows.start], rows.len()) };
         for (target, up) in out.iter_mut().zip(up) {
-            *target = functions::activated::<E::A>(function, scale * *up);
+            target.set(functions::activated_value::<E::A>(function, scale * *up));
         }
     });
 }

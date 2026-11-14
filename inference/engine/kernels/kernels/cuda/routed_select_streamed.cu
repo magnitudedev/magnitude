@@ -51,7 +51,7 @@ extern "C" __global__ void routed_select_streamed_gemv(SEISMIC_KERNEL_PARAMS) {
     const unsigned char *next_router = SEISMIC_PTR(SEISMIC_BUFFER_NEXT_ROUTER);
     const unsigned char *after_router_norm = SEISMIC_PTR(SEISMIC_BUFFER_AFTER_ROUTER_NORM);
     const unsigned char *after_router = SEISMIC_PTR(SEISMIC_BUFFER_AFTER_ROUTER);
-    unsigned char *normalized = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const element::Out<Act> normalized = SEISMIC_RESULT_0_OUT;
     float *logits = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS));
     __shared__ float parts[SEISMIC_CONST_DECODE_ROWS][SELECT_WARPS];
     __shared__ float inverses[SEISMIC_CONST_DECODE_ROWS];
@@ -59,7 +59,7 @@ extern "C" __global__ void routed_select_streamed_gemv(SEISMIC_KERNEL_PARAMS) {
     decode_inverses(residual, parts, inverses, seismic_words_value);
     if (blockIdx.x < COLUMN_GROUPS) {
         select_columns(residual, inverses, router_norm, SEISMIC_ROUTER_NORM_STRIDE_0, router, SEISMIC_ROUTER_STRIDE_0,
-                       norm, blockIdx.x == 0 ? normalized : nullptr, logits, blockIdx.x, staged, seismic_words_value);
+                       norm, blockIdx.x == 0 ? &normalized : nullptr, logits, blockIdx.x, staged, seismic_words_value);
         return;
     }
     const unsigned lead = (blockIdx.x - COLUMN_GROUPS) / NEXT_GROUPS;
@@ -103,7 +103,7 @@ __device__ __forceinline__ void hint_block(const float *logits, unsigned lead, c
     const float *bias = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_BIAS));                         \
     const float *expert_scale = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_SCALE));         \
     int *routes = reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));                                     \
-    float *weights = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHTS));                               \
+    const element::Out<element::F32> weights = SEISMIC_OUT_WEIGHTS;                                                \
     const int *step = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_STEP));                             \
     const float *next_bias = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_NEXT_BIAS));               \
     const float *after_bias = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_AFTER_BIAS));             \

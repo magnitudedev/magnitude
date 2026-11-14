@@ -59,9 +59,8 @@ extern "C" __global__ void indexer_keys(SEISMIC_KERNEL_PARAMS) {
     key_layout::rotate(x, table, shared + warp * W, lane);
     rounding::hold_lanes<Act>(x, trained);
     rounding::round_lanes<E>(x, trained);
-    float *target = reinterpret_cast<float *>(slab::row(reinterpret_cast<const u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_KEYS)),
-                                                        static_cast<u64>(destination), SEISMIC_PARAM_SLAB_ROWS,
-                                                        W * sizeof(float)));
+    const element::Out<element::F32> target =
+        SEISMIC_OUT_KEYS.row(static_cast<u64>(destination), SEISMIC_PARAM_SLAB_ROWS, W);
 #pragma unroll
-    for (int i = 0; i < E; ++i) target[lane * E + i] = x[i];
+    for (int i = 0; i < E; ++i) target.put(lane * E + i, x[i]);
 }

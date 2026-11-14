@@ -37,17 +37,18 @@ struct recurrent_inputs {
     uint64_t convolution;
     uint64_t rate;
     uint64_t time_bias;
-    uint64_t window;
-    uint64_t delta;
-    uint64_t tape;
+    // Owner handles of the slab-stored state arenas.
+    SlabOut window;
+    SlabOut delta;
+    SlabOut tape;
     float epsilon;
     bool grouped;
 };
 
 recurrent_inputs recurrent_inputs_of() {
     return recurrent_inputs(SEISMIC_PTR(SEISMIC_BUFFER_PROJECTION), SEISMIC_PTR(SEISMIC_BUFFER_CONVOLUTION),
-        SEISMIC_PTR(SEISMIC_BUFFER_RATE), SEISMIC_PTR(SEISMIC_BUFFER_TIME_BIAS), SEISMIC_PTR(SEISMIC_BUFFER_WINDOW),
-        SEISMIC_PTR(SEISMIC_BUFFER_DELTA), SEISMIC_PTR(SEISMIC_BUFFER_TAPE),
+        SEISMIC_PTR(SEISMIC_BUFFER_RATE), SEISMIC_PTR(SEISMIC_BUFFER_TIME_BIAS), SEISMIC_OUT_WINDOW,
+        SEISMIC_OUT_DELTA, SEISMIC_OUT_TAPE,
         element_word_f32(SEISMIC_PARAM_NORM_EPSILON), SEISMIC_PARAM_GROUPED != 0ul);
 }
 
@@ -78,10 +79,10 @@ int recurrent_tape_rows(recurrent_slot slot) {
     return min(int(SEISMIC_DIM_T), slot.hi - slot.lo - slot.stop);
 }
 
-// Byte address of tape row `entry` of `bank`.
-uint64_t recurrent_tape_row(recurrent_inputs in_, int bank, int entry) {
-    return versions_bank(in_.tape, bank, SEISMIC_TAPE_STRIDE_0 * 4ul)
-        + uint64_t(entry) * SEISMIC_TAPE_STRIDE_1 * 4ul;
+// Tape row `entry` of `bank`.
+Out recurrent_tape_row(recurrent_inputs in_, int bank, int entry) {
+    return out_offset(versions_out_bank(in_.tape, bank, SEISMIC_TAPE_STRIDE_0),
+        uint64_t(entry) * SEISMIC_TAPE_STRIDE_1);
 }
 
 // The one value head of each key head that records the key in a tape row.
@@ -107,17 +108,15 @@ float recurrent_projection(recurrent_inputs in_, uint64_t row, uint64_t column) 
     return element_at(ELEMENT_ACT, in_.projection, row * SEISMIC_PROJECTION_STRIDE_0 + column);
 }
 
-uint64_t recurrent_window_at(recurrent_inputs in_, int bank, int tap, uint64_t channel) {
-    const uint64_t element_bytes = ELEMENT_BYTES(ELEMENT_ACT);
-    return versions_bank(in_.window, bank, SEISMIC_WINDOW_STRIDE_0 * element_bytes)
-        + (uint64_t(tap) * SEISMIC_WINDOW_STRIDE_1 + channel) * element_bytes;
+Out recurrent_window_at(recurrent_inputs in_, int bank, int tap, uint64_t channel) {
+    return out_offset(versions_out_bank(in_.window, bank, SEISMIC_WINDOW_STRIDE_0),
+        uint64_t(tap) * SEISMIC_WINDOW_STRIDE_1 + channel);
 }
 
-// Byte address of state row `state_row` of value head `head` in `bank`: W
-// contiguous floats.
-uint64_t recurrent_state_row(recurrent_inputs in_, int bank, uint head, uint state_row) {
-    return versions_bank(in_.delta, bank, SEISMIC_DELTA_STRIDE_0 * 4ul)
-        + (uint64_t(head) * SEISMIC_DELTA_STRIDE_1 + uint64_t(state_row) * SEISMIC_DELTA_STRIDE_2) * 4ul;
+// State row `state_row` of value head `head` in `bank`: W contiguous floats.
+Out recurrent_state_row(recurrent_inputs in_, int bank, uint head, uint state_row) {
+    return out_offset(versions_out_bank(in_.delta, bank, SEISMIC_DELTA_STRIDE_0),
+        uint64_t(head) * SEISMIC_DELTA_STRIDE_1 + uint64_t(state_row) * SEISMIC_DELTA_STRIDE_2);
 }
 
 // The key head of value head `head`.
@@ -169,17 +168,17 @@ float recurrent_gate_input(recurrent_inputs in_, uint64_t row, uint64_t column);
 // The decay of state column `column` among a value head's RECURRENT_DECAYS.
 #define RECURRENT_DECAY_COLUMN(column) (RECURRENT_DECAYS == 1u ? 0u : (column))
 
-// Byte address of the decay factor of state column `column` of value head
-// `head` in a tape row.
-uint64_t recurrent_tape_factor(uint64_t tape, uint head, uint column) {
-    return tape + uint64_t(RECURRENT_TAPE_D + head * RECURRENT_DECAYS + RECURRENT_DECAY_COLUMN(column)) * 4ul;
+// The element of a tape row holding the decay factor of state column
+// `column` of value head `head`.
+uint64_t recurrent_tape_factor(uint head, uint column) {
+    return uint64_t(RECURRENT_TAPE_D + head * RECURRENT_DECAYS + RECURRENT_DECAY_COLUMN(column));
 }
 
 // Raw input row `position` (slot-local) of a channel: the source version's
 // window rows before the slot, the projection after.
 float recurrent_raw_input(recurrent_inputs in_, recurrent_slot slot, int position, uint channel) {
     if (position < 0)
-        return element_at(ELEMENT_ACT, recurrent_window_at(in_, slot.source,
+        return out_at(recurrent_window_at(in_, slot.source,
             slot.taped + int(RECURRENT_C) - 1 + position, channel), 0ul);
     return recurrent_projection(in_, uint64_t(slot.lo + position), channel);
 }
@@ -196,9 +195,13 @@ void recurrent_publish_window(recurrent_inputs in_, recurrent_slot slot, uint pa
         const int row = int(index / RECURRENT_CH);
         const uint channel = index % RECURRENT_CH;
         const int position = slot.stop + row - (int(RECURRENT_C) - 1);
-        const float value = recurrent_raw_input(in_, slot, position, channel);
-        const uint64_t target = recurrent_window_at(in_, slot.target, row, channel);
-        element_put(ELEMENT_ACT, target, 0ul, value);
+        const Out target = recurrent_window_at(in_, slot.target, row, channel);
+        if (position < 0)
+            out_move_stored(target, 0ul,
+                recurrent_window_at(in_, slot.source, slot.taped + int(RECURRENT_C) - 1 + position, channel), 0ul, 1ul);
+        else
+            out_copy_stored(target, 0ul, in_.projection,
+                uint64_t(slot.lo + position) * SEISMIC_PROJECTION_STRIDE_0 + channel, 1ul);
     }
 }
 
@@ -212,7 +215,7 @@ void recurrent_load_rows(recurrent_inputs in_, const uint rows, int bank, uint h
     [[unroll]] for (uint r = 0u; r < RECURRENT_MAX_ROWS; ++r)
         if (r < rows)
             [[unroll]] for (uint c = 0u; c < RECURRENT_CPL; ++c)
-                state[r][c] = element_f32_at(recurrent_state_row(in_, bank, head, first_row + r) + uint64_t(lane * RECURRENT_CPL + c) * 4ul);
+                state[r][c] = out_at(recurrent_state_row(in_, bank, head, first_row + r), uint64_t(lane * RECURRENT_CPL + c));
 }
 
 void recurrent_store_rows(recurrent_inputs in_, const uint rows, int bank, uint head, uint first_row,
@@ -221,7 +224,7 @@ void recurrent_store_rows(recurrent_inputs in_, const uint rows, int bank, uint 
     [[unroll]] for (uint r = 0u; r < RECURRENT_MAX_ROWS; ++r)
         if (r < rows)
             [[unroll]] for (uint c = 0u; c < RECURRENT_CPL; ++c)
-                element_f32_put(recurrent_state_row(in_, bank, head, first_row + r) + uint64_t(lane * RECURRENT_CPL + c) * 4ul,
+                out_put(recurrent_state_row(in_, bank, head, first_row + r), uint64_t(lane * RECURRENT_CPL + c),
                     state[r][c]);
 }
 
@@ -234,17 +237,17 @@ void recurrent_load_version(recurrent_inputs in_, recurrent_slot slot, const uin
     const uint lane = SEISMIC_LANE;
     const uint key = recurrent_key_head(in_, head);
     for (int entry = 0; entry < slot.taped; ++entry) {
-        const uint64_t tape = recurrent_tape_row(in_, slot.source, entry);
+        const Out tape = recurrent_tape_row(in_, slot.source, entry);
         // One decay per value head is loaded once.
         float k[RECURRENT_CPL], factor[RECURRENT_CPL];
         [[unroll]] for (uint c = 0u; c < RECURRENT_CPL; ++c)
             factor[c] = RECURRENT_DECAYS == 1u && c > 0u ? factor[0]
-                : element_f32_at(recurrent_tape_factor(tape, head, lane * RECURRENT_CPL + c));
+                : out_at(tape, recurrent_tape_factor(head, lane * RECURRENT_CPL + c));
         [[unroll]] for (uint c = 0u; c < RECURRENT_CPL; ++c)
-            k[c] = element_f32_at(tape + uint64_t(RECURRENT_TAPE_K + key * RECURRENT_W + lane * RECURRENT_CPL + c) * 4ul);
+            k[c] = out_at(tape, uint64_t(RECURRENT_TAPE_K + key * RECURRENT_W + lane * RECURRENT_CPL + c));
         [[unroll]] for (uint s = 0u; s < RECURRENT_MAX_ROWS; ++s) {
             if (s < rows) {
-                const float u = element_f32_at(tape + uint64_t(RECURRENT_TAPE_U + head * RECURRENT_W + first_row + s) * 4ul);
+                const float u = out_at(tape, uint64_t(RECURRENT_TAPE_U + head * RECURRENT_W + first_row + s));
                 [[unroll]] for (uint c = 0u; c < RECURRENT_CPL; ++c)
                     state[s][c] = seismic_fma_rn(u, k[c], state[s][c] * factor[c]);
             }
@@ -358,13 +361,16 @@ void recurrent_advance_rows(recurrent_inputs in_, recurrent_slot slot, int begin
             // 0's alone for one decay), and the key when the head records its
             // key head's key.
             const bool taping = row >= publish && row - publish < taped;
-            const uint64_t entry = taping ? recurrent_tape_row(in_, slot.target, row - publish) : 0ul;
+            // The successor's tape row, addressed only when taping.
+            Out entry;
+            if (taping)
+                entry = recurrent_tape_row(in_, slot.target, row - publish);
             if (taping && first_row == 0u) {
                 [[unroll]] for (uint c = 0u; c < RECURRENT_CPL; ++c) {
                     if (records_keys)
-                        element_f32_put(entry + uint64_t(RECURRENT_TAPE_K + key_row * W + lane * CPL + c) * 4ul, k[c]);
+                        out_put(entry, uint64_t(RECURRENT_TAPE_K + key_row * W + lane * CPL + c), k[c]);
                     if (RECURRENT_DECAYS > 1u || (c == 0u && lane == 0u))
-                        element_f32_put(recurrent_tape_factor(entry, head, lane * CPL + c), factor[c]);
+                        out_put(entry, recurrent_tape_factor(head, lane * CPL + c), factor[c]);
                 }
             }
             float outputs[RECURRENT_MAX_ROWS];
@@ -373,7 +379,7 @@ void recurrent_advance_rows(recurrent_inputs in_, recurrent_slot slot, int begin
                     const float v = seismic_shared_f32[base + 2u * W + first_row - block_row + s];
                     const float residual = (v - remembered[s]) * beta;
                     if (taping && lane == s)
-                        element_f32_put(entry + uint64_t(RECURRENT_TAPE_U + head * W + first_row + s) * 4ul, residual);
+                        out_put(entry, uint64_t(RECURRENT_TAPE_U + head * W + first_row + s), residual);
                     float sum = 0.0;
                     [[unroll]] for (uint c = 0u; c < RECURRENT_CPL; ++c) {
                         state[s][c] = seismic_fma_rn(residual, k[c], state[s][c] * factor[c]);
@@ -470,13 +476,13 @@ float recurrent_gate_rounded(float z) {
 
 // Stores the gated columns i..i+7 of (row, head) given the head's inverse.
 void recurrent_store_gated8(recurrent_gated8 v, float inverse, uint64_t row, uint head, uint i) {
-    const uint64_t gated = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const Out gated = SEISMIC_RESULT_0_OUT;
     const uint64_t at = row * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(head) * SEISMIC_RESULT_0_STRIDE_1;
     const vec4 e = v.me * inverse * v.ne, o = v.mo * inverse * v.no;
     [[unroll]] for (uint j = 0u; j < 4u; ++j) {
-        element_put(ELEMENT_ACT, gated, at + uint64_t(i + 2u * j) * SEISMIC_RESULT_0_STRIDE_2,
+        out_put(gated, at + uint64_t(i + 2u * j) * SEISMIC_RESULT_0_STRIDE_2,
             element_round(ELEMENT_ACT, element_round(ELEMENT_ACT, e[j]) * recurrent_gate_rounded(v.ze[j])));
-        element_put(ELEMENT_ACT, gated, at + uint64_t(i + 2u * j + 1u) * SEISMIC_RESULT_0_STRIDE_2,
+        out_put(gated, at + uint64_t(i + 2u * j + 1u) * SEISMIC_RESULT_0_STRIDE_2,
             element_round(ELEMENT_ACT, element_round(ELEMENT_ACT, o[j]) * recurrent_gate_rounded(v.zo[j])));
     }
 }

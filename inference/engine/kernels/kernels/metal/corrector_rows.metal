@@ -13,13 +13,14 @@ kernel void corrector_rows(
     device const float *values [[buffer(SEISMIC_BUFFER_VALUES)]],
     device const float *bias [[buffer(SEISMIC_BUFFER_BIAS)]],
     device const float *residual [[buffer(SEISMIC_BUFFER_RESIDUAL)]],
-    device uchar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(result_cells),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint row [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float partials[ROWS_THREADS / 32u];
+    const element::Out<output_element> result(result_cells);
     const ulong width = SEISMIC_DIM_N;
     const int form = int(SEISMIC_PARAM_FORM);
     device const float *line = values + ulong(row) * SEISMIC_VALUES_STRIDE_0;
@@ -42,7 +43,6 @@ kernel void corrector_rows(
             out = biased * scale;
         if (SEISMIC_DIM_R == 1)
             out += residual[ulong(row) * SEISMIC_RESIDUAL_STRIDE_1 + column * SEISMIC_RESIDUAL_STRIDE_2];
-        element::put<output_element>(
-            result, ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1, out);
+        result.put(ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1, out);
     }
 }

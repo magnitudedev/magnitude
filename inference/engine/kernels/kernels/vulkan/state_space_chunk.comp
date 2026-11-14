@@ -173,7 +173,7 @@ void ssc_advance_piece(uint64_t inputs, uint64_t products, versions_slot slot, i
 
     const uint local_row = row0 - block_row0;
     const float skip = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_SKIP) + uint64_t(head) * SEISMIC_SKIP_STRIDE_0 * 4ul);
-    const uint64_t mixed = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const Out mixed = SEISMIC_RESULT_0_OUT;
     // Lane l finishes row first + i0 + l / LANE_ROWS, state row l % LANE_ROWS.
     const uint r = lane % SS_LANE_ROWS;
     for (uint i0 = 0u; i0 < count; i0 += SSC_GROUP) {
@@ -203,7 +203,7 @@ void ssc_advance_piece(uint64_t inputs, uint64_t products, versions_slot slot, i
             const float value = seismic_shared_f32[SSC_X + i * SS_BLOCK_ROWS + local_row + r];
             const float result = seismic_fma_rn(skip, value,
                 seismic_fma_rn(seismic_shared_f32[SSC_GAMMA + i], inter, sum));
-            element_put(ELEMENT_ACT, mixed,
+            out_put(mixed,
                 uint64_t(first + int(i)) * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(head) * SEISMIC_RESULT_0_STRIDE_1
                     + uint64_t(row0 + r) * SEISMIC_RESULT_0_STRIDE_2,
                 result);

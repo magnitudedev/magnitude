@@ -25,9 +25,9 @@ kernel void attention_append_k8v4(
     device const int *coordinates [[buffer(SEISMIC_BUFFER_COORDINATES)]],
     device const int *destinations [[buffer(SEISMIC_BUFFER_DESTINATIONS)]],
     device const ulong *key_codes [[buffer(SEISMIC_BUFFER_HISTORY_KEY_CODES)]],
-    device const ulong *key_coefficients [[buffer(SEISMIC_BUFFER_HISTORY_KEY_COEFFICIENTS)]],
+    SEISMIC_OUT_HISTORY_KEY_COEFFICIENTS_PARAM(key_coefficients),
     device const ulong *value_codes [[buffer(SEISMIC_BUFFER_HISTORY_VALUE_CODES)]],
-    device const ulong *value_coefficients [[buffer(SEISMIC_BUFFER_HISTORY_VALUE_COEFFICIENTS)]],
+    SEISMIC_OUT_HISTORY_VALUE_COEFFICIENTS_PARAM(value_coefficients),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
@@ -52,8 +52,8 @@ kernel void attention_append_k8v4(
         rotary_amplitudes, row, kv_head, epsilon, rounding::none(), lane, v);
     attention::store<ATTENTION_KEY_BITS>(attention::held_encoding<true>(k),
         slab::row<uint>(key_codes, destination, slab_rows, KV * key_lane::row_words) + kv_head * key_lane::row_words,
-        slab::row<half>(key_coefficients, destination, slab_rows, KV * key_lane::pairs * 2) + kv_head * key_lane::pairs * 2, lane);
+        slab::out_row(key_coefficients, destination, slab_rows, KV * key_lane::pairs * 2).offset(kv_head * key_lane::pairs * 2), lane);
     attention::store<ATTENTION_VALUE_BITS>(attention::held_encoding<false>(v),
         slab::row<uint>(value_codes, destination, slab_rows, KV * value_lane::row_words) + kv_head * value_lane::row_words,
-        slab::row<half>(value_coefficients, destination, slab_rows, KV * value_lane::pairs * 2) + kv_head * value_lane::pairs * 2, lane);
+        slab::out_row(value_coefficients, destination, slab_rows, KV * value_lane::pairs * 2).offset(kv_head * value_lane::pairs * 2), lane);
 }

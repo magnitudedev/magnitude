@@ -199,15 +199,15 @@ fn merge<E: Elements>(cx: &Context<'_, E>, form: Form, kv_head: usize, row: usiz
             denominator += attention::sink_weight(cx.arg_sinks().get([0, head]), overall);
         }
         // SAFETY: each work item writes its own row of the result.
-        let out = unsafe { result.row_mut([row, head, 0]) };
+        let mut out = unsafe { result.row_mut([row, head, 0]) };
         let gates = if form.interleaved > 0 {
             query.span([row, head, w], form.interleaved)
         } else {
             gate.row([row, head, 0])
         };
-        attention::gate_row::<E::A>(output, denominator, gates, softplus, out);
+        attention::gate_row::<E::A>(output, denominator, gates, softplus, &mut out);
         if let Some((cosines, sines)) = turned {
-            attention::output_rotary::<E::A>(out, form.layout, cosines, sines);
+            attention::output_rotary::<E::A>(&mut out, form.layout, cosines, sines);
         }
     }
 }

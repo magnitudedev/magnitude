@@ -15,10 +15,10 @@ void stream_join() {
     const uint64_t column = index % h;
     const float y = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_Y)
         + (row * SEISMIC_Y_STRIDE_0 + column * SEISMIC_Y_STRIDE_1) * 4ul);
-    const uint64_t result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + row * SEISMIC_RESULT_0_STRIDE_0 * 4ul;
+    const Out result = out_offset(SEISMIC_RESULT_0_OUT, row * SEISMIC_RESULT_0_STRIDE_0);
     const uint64_t residual = SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL) + row * SEISMIC_RESIDUAL_STRIDE_0 * 4ul;
     if (SEISMIC_DIM_IN == 0) {
-        element_f32_put(result + column * SEISMIC_RESULT_0_STRIDE_1 * 4ul,
+        out_put(result, column * SEISMIC_RESULT_0_STRIDE_1,
             element_f32_at(residual + column * SEISMIC_RESIDUAL_STRIDE_1 * 4ul) + y);
         return;
     }

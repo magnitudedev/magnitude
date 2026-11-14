@@ -182,10 +182,10 @@ fn attention_prefill_attend<L: Isa, E: Elements>(l: L, cx: &Context<'_, E>, grou
             denominator += attention::sink_weight(sinks.get([0, head]), state.maximum[local]);
         }
         // SAFETY: each work item writes its own query heads of its row.
-        let out = unsafe { result.row_mut([row, head, 0]) };
-        attention::gate_row::<E::A>(&state.accumulator[local * w..][..w], denominator, gates, softplus, out);
+        let mut out = unsafe { result.row_mut([row, head, 0]) };
+        attention::gate_row::<E::A>(&state.accumulator[local * w..][..w], denominator, gates, softplus, &mut out);
         if let Some((cosines, sines)) = turned {
-            attention::output_rotary::<E::A>(out, form.layout, cosines, sines);
+            attention::output_rotary::<E::A>(&mut out, form.layout, cosines, sines);
         }
     }
 }

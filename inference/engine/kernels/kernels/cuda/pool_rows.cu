@@ -88,20 +88,19 @@ extern "C" __global__ void pool_rows_append(SEISMIC_KERNEL_PARAMS) {
         [row * SEISMIC_WINDOW_DESTINATIONS_STRIDE_0];
     if (destination < 0) return;
     const u64 slab_rows = SEISMIC_PARAM_WINDOW_SLAB_ROWS;
-    float *target = reinterpret_cast<float *>(
-        slab::row(reinterpret_cast<const u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_WINDOW_ROWS)),
-                  static_cast<u64>(destination), slab_rows, WIDTH * sizeof(float)));
+    const element::Out<element::F32> target =
+        SEISMIC_OUT_WINDOW_ROWS.row(static_cast<u64>(destination), slab_rows, WIDTH);
     float x[E];
     own_row(x, reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_U)) + row * SEISMIC_U_STRIDE_0,
             SEISMIC_U_STRIDE_1, reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_NORM)),
             SEISMIC_NORM_STRIDE_1, reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_BIAS)),
             SEISMIC_BIAS_STRIDE_1, element::word_f32(SEISMIC_PARAM_EPSILON), [&](int k) { return lane + 32 * k; });
 #pragma unroll
-    for (int k = 0; k < E; ++k) target[lane + 32 * k] = x[k];
+    for (int k = 0; k < E; ++k) target.put(lane + 32 * k, x[k]);
     if constexpr (GATED) {
         const float *g = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_G));
         for (int column = lane; column < W; column += 32)
-            target[W + column] = g[row * SEISMIC_G_STRIDE_0 + column * SEISMIC_G_STRIDE_1];
+            target.put(W + column, g[row * SEISMIC_G_STRIDE_0 + column * SEISMIC_G_STRIDE_1]);
     }
     if (lane < 4) {
         const int *coordinates = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES));
@@ -118,19 +117,19 @@ extern "C" __global__ void pool_rows_complete(SEISMIC_KERNEL_PARAMS) {
     const int lane = threadIdx.x;
     const int destination = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_BLOCK_DESTINATIONS))
         [row * SEISMIC_BLOCK_DESTINATIONS_STRIDE_0];
-    float *published = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)) + row * SEISMIC_RESULT_0_STRIDE_0;
+    const element::Out<element::F32> published = SEISMIC_RESULT_0_OUT.offset(row * SEISMIC_RESULT_0_STRIDE_0);
     int *latent_rows = reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER));
     int *latent_coordinates =
         reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_RESULT_2_BUFFER)) + row * SEISMIC_RESULT_2_STRIDE_0;
     if (destination < 0) {
 #pragma unroll
-        for (int i = 0; i < E; ++i) published[static_cast<u64>(lane * E + i) * SEISMIC_RESULT_0_STRIDE_1] = 0.0f;
+        for (int i = 0; i < E; ++i) published.put(static_cast<u64>(lane * E + i) * SEISMIC_RESULT_0_STRIDE_1, 0.0f);
         if (lane == 0) latent_rows[row * SEISMIC_RESULT_1_STRIDE_0] = -1;
         if (lane < 4) latent_coordinates[lane * SEISMIC_RESULT_2_STRIDE_1] = 0;
         return;
     }
     const u64 window_slab_rows = SEISMIC_PARAM_WINDOW_SLAB_ROWS;
-    const u32 *window_rows = reinterpret_cast<const u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_WINDOW_ROWS));
+    const element::SlabOut<element::F32> window_rows = SEISMIC_OUT_WINDOW_ROWS;
     // The group's earlier tokens: the last RATE - 1 rows of the window spans.
     const u64 spans = SEISMIC_DIM_R;
     const int *row_spans =
@@ -156,10 +155,11 @@ extern "C" __global__ void pool_rows_complete(SEISMIC_KERNEL_PARAMS) {
 #pragma unroll
     for (int member = 0; member + 1 < RATE; ++member)
         members[member] = reinterpret_cast<const float *>(
-            slab::row(window_rows,
-                      static_cast<u64>(
-                          indexer::span_row(row_spans, spans, span_stride, bound_stride, first_member + member)),
-                      window_slab_rows, WIDTH * sizeof(float)));
+            window_rows
+                .view_row(static_cast<u64>(
+                              indexer::span_row(row_spans, spans, span_stride, bound_stride, first_member + member)),
+                          window_slab_rows, WIDTH)
+                .bytes());
     // Lane `lane`'s column i of member `member`.
     auto value = [&](int member, int i) { return member + 1 < RATE ? members[member][lane * E + i] : own[i]; };
     float x[E];
@@ -213,7 +213,7 @@ extern "C" __global__ void pool_rows_complete(SEISMIC_KERNEL_PARAMS) {
         rounding::hold_lanes<Act>(x, trained);
     }
 #pragma unroll
-    for (int i = 0; i < E; ++i) published[static_cast<u64>(lane * E + i) * SEISMIC_RESULT_0_STRIDE_1] = x[i];
+    for (int i = 0; i < E; ++i) published.put(static_cast<u64>(lane * E + i) * SEISMIC_RESULT_0_STRIDE_1, x[i]);
     if (lane == 0) latent_rows[row * SEISMIC_RESULT_1_STRIDE_0] = destination;
     // Rotated at the group's first token, rounded, stored.
     const int *origin = reinterpret_cast<const int *>(
@@ -226,8 +226,8 @@ extern "C" __global__ void pool_rows_complete(SEISMIC_KERNEL_PARAMS) {
     rounding::hold_lanes<Act>(x, trained);
     rounding::round_lanes<E>(x, trained);
     // Stored in the row element Y (A holds every rounded value; F32 keys hold every value).
-    element::u8 *target = slab::row(reinterpret_cast<const u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_BLOCK_ROWS)),
-                                    static_cast<u64>(destination), SEISMIC_PARAM_BLOCK_SLAB_ROWS, W * Row::bytes);
+    const element::Out<Row> target =
+        SEISMIC_OUT_BLOCK_ROWS.row(static_cast<u64>(destination), SEISMIC_PARAM_BLOCK_SLAB_ROWS, W);
 #pragma unroll
-    for (int i = 0; i < E; ++i) element::put<Row>(target, static_cast<u64>(lane * E + i), x[i]);
+    for (int i = 0; i < E; ++i) target.put(static_cast<u64>(lane * E + i), x[i]);
 }

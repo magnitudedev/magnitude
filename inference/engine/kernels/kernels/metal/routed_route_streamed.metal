@@ -92,7 +92,7 @@ inline void hint_group(device const float *residual, thread const Lead &ahead, u
 template <bool HINTS>
 inline bool side_group(thread const RouteRows &in, device const float *residual, device const uchar *shared_gate,
     device const uchar *shared_up, device const int *step, thread const Lead (&leads)[2],
-    SYSTEM int *rings, device uchar *shared_product,
+    SYSTEM int *rings, element::Out<Act> shared_product,
     arrive::coherent_device<float> logits, device atomic_uint *arrivals, constant ulong *seismic_words,
     threadgroup uchar *shared, threadgroup float *globals, threadgroup float *inverses, threadgroup uint *last,
     uint group, uint tid, uint simd, uint lane) {
@@ -125,10 +125,10 @@ struct ResolvePorts {
 template <bool HINTS, bool WHOLE>
 inline void route_streamed(device const float *residual, device const uchar *norm, device const uchar *router,
     device const float *shared_router, device const uchar *shared_gate, device const uchar *shared_up,
-    device int *routes, device float *scores, device const float *expert_scale, thread const ResolvePorts &bank,
-    device const int *step, thread const Lead (&leads)[2],
-    SYSTEM int *rings, SYSTEM int *routing, device uchar *normalized,
-    device float *coefficient, device uchar *shared_product, arrive::coherent_device<float> logits,
+    device int *routes, element::Out<element::F32> scores, device const float *expert_scale,
+    thread const ResolvePorts &bank, device const int *step, thread const Lead (&leads)[2],
+    SYSTEM int *rings, SYSTEM int *routing, element::Out<Act> normalized,
+    element::Out<element::F32> coefficient, element::Out<Act> shared_product, arrive::coherent_device<float> logits,
     device atomic_uint *arrivals, constant ulong *seismic_words, threadgroup uchar *shared,
     threadgroup float *globals, threadgroup float *parts, threadgroup float *inverses, threadgroup uint *last,
     threadgroup int *words, uint group, uint tid, uint simd, uint lane) {
@@ -159,7 +159,7 @@ inline void route_streamed(device const float *residual, device const uchar *nor
         device const float *shared_router [[buffer(SEISMIC_BUFFER_SHARED_ROUTER)]],                                \
         device const uchar *shared_gate [[buffer(SEISMIC_BUFFER_SHARED_GATE)]],                                    \
         device const uchar *shared_up [[buffer(SEISMIC_BUFFER_SHARED_UP)]],                                        \
-        device int *routes [[buffer(SEISMIC_BUFFER_ROUTES)]], device float *scores [[buffer(SEISMIC_BUFFER_SCORES)]], \
+        device int *routes [[buffer(SEISMIC_BUFFER_ROUTES)]], SEISMIC_OUT_SCORES_PARAM(scores_cells),               \
         device const float *expert_scale [[buffer(SEISMIC_BUFFER_EXPERT_SCALE)]],                                  \
         device const int *step [[buffer(SEISMIC_BUFFER_STEP)]],                                                    \
         device const uchar *next_norm [[buffer(SEISMIC_BUFFER_NEXT_NORM)]],                                        \
@@ -167,9 +167,9 @@ inline void route_streamed(device const float *residual, device const uchar *nor
         device const uchar *after_norm [[buffer(SEISMIC_BUFFER_AFTER_NORM)]],                                      \
         device const uchar *after_router [[buffer(SEISMIC_BUFFER_AFTER_ROUTER)]],                                  \
         SYSTEM int *rings [[buffer(SEISMIC_BUFFER_RINGS)]], SYSTEM int *routing [[buffer(SEISMIC_BUFFER_ROUTING)]], \
-        device uchar *normalized [[buffer(SEISMIC_RESULT_0_BUFFER)]],                                              \
-        device float *coefficient [[buffer(SEISMIC_RESULT_1_BUFFER)]],                                             \
-        device uchar *shared_product [[buffer(SEISMIC_RESULT_2_BUFFER)]],                                          \
+        SEISMIC_RESULT_0_PARAM(normalized_cells),                                                                  \
+        SEISMIC_RESULT_1_PARAM(coefficient_cells),                                                                 \
+        SEISMIC_RESULT_2_PARAM(shared_product_cells),                                                              \
         arrive::coherent_device<float> logits [[buffer(SEISMIC_BUFFER_SCRATCH_LOGITS)]],                           \
         device atomic_uint *arrivals [[buffer(SEISMIC_BUFFER_SCRATCH_ARRIVALS)]],                                  \
         constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]], threadgroup uchar *shared [[threadgroup(0)]], \
@@ -189,7 +189,11 @@ inline void route_streamed(device const float *residual, device const uchar *nor
         threadgroup uint last;                                                                                     \
         threadgroup int resolved[STREAMING_RESOLVE_WORDS(SEISMIC_CONST_DECODE_ROWS * SEISMIC_DIM_K)];              \
         PROJECTION_OPERANDS_SHARED(globals, shared_nvfp4);                                                         \
-        const ResolvePorts bank{map, tier, sources, file, policy};                                              \
+        const ResolvePorts bank{map, tier, sources, file, policy};                                                 \
+        const element::Out<ELEMENT_OF(SEISMIC_SCORES)> scores(scores_cells);                                       \
+        const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> normalized(normalized_cells);                             \
+        const element::Out<ELEMENT_OF(SEISMIC_RESULT_1)> coefficient(coefficient_cells);                           \
+        const element::Out<ELEMENT_OF(SEISMIC_RESULT_2)> shared_product(shared_product_cells);                     \
         const Lead leads[2] = {{next_norm, SEISMIC_NEXT_NORM_STRIDE_0, next_router},                               \
             {after_norm, SEISMIC_AFTER_NORM_STRIDE_0, after_router}};                                              \
         route_streamed<HINTS, WHOLE>(residual, norm, router, shared_router, shared_gate, shared_up, routes,        \

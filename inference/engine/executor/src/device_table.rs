@@ -1210,9 +1210,7 @@ mod tests {
         unsafe { read.notice.write_shared(0, &selection) }.unwrap();
         read.noticed.reach(read.value).unwrap();
         assert!(read.gate.wait_signalled(read.value, Duration::from_secs(10)).unwrap());
-        let mut staged = vec![0u8; read.staging.byte_len() as usize];
-        // SAFETY: the filler wrote the staging before it opened the gate.
-        unsafe { read.staging.read_shared(0, &mut staged) }.unwrap();
+        let staged = read.staging.read_to_host().unwrap();
         read.landing.clone().write_from_host(&staged).unwrap();
         let found = rows
             .iter()

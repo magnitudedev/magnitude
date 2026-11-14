@@ -9,7 +9,7 @@ typedef ELEMENT_OF(SEISMIC_STANDARD_SCALE) standard_scale_element;
 kernel void vision_pool(device const float *source [[buffer(SEISMIC_BUFFER_SOURCE)]],
     device const uchar *standard_bias [[buffer(SEISMIC_BUFFER_STANDARD_BIAS)]],
     device const uchar *standard_scale [[buffer(SEISMIC_BUFFER_STANDARD_SCALE)]],
-    device float *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(result),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint index [[thread_position_in_grid]]) {
     const ulong columns = SEISMIC_DIM_H;
@@ -24,5 +24,5 @@ kernel void vision_pool(device const float *source [[buffer(SEISMIC_BUFFER_SOURC
     if (SEISMIC_DIM_NS == 1)
         value = (value - element::at<standard_bias_element>(standard_bias, column))
             * element::at<standard_scale_element>(standard_scale, column);
-    result[row * SEISMIC_RESULT_0_STRIDE_0 + column] = value;
+    element::Out<element::F32>(result).put(row * SEISMIC_RESULT_0_STRIDE_0 + column, value);
 }

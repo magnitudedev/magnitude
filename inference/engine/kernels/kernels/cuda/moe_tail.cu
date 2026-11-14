@@ -60,9 +60,9 @@ extern "C" __global__ void moe_tail(SEISMIC_KERNEL_PARAMS) {
     const float inverse = rsqrtf(reduce::group_sum(squares, partials) / (float)width + epsilon);
     const u8 *norm = SEISMIC_PTR(SEISMIC_BUFFER_NORM);
     const float *base = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL)) + row * SEISMIC_RESIDUAL_STRIDE_0;
-    float *result = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)) + row * SEISMIC_RESULT_0_STRIDE_0;
+    const element::Out<element::F32> result = SEISMIC_RESULT_0_OUT.offset(row * SEISMIC_RESULT_0_STRIDE_0);
     for (u64 i = threadIdx.x; i < width; i += blockDim.x) {
         const float normalized = combined.at(i) * inverse * element::at<Norm>(norm, i * SEISMIC_NORM_STRIDE_0);
-        result[i * SEISMIC_RESULT_0_STRIDE_1] = (base[i * SEISMIC_RESIDUAL_STRIDE_1] + normalized) * scale;
+        result.put(i * SEISMIC_RESULT_0_STRIDE_1, (base[i * SEISMIC_RESIDUAL_STRIDE_1] + normalized) * scale);
     }
 }

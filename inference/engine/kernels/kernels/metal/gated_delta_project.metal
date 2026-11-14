@@ -27,7 +27,7 @@ typedef projection::operands<NVFP4> Operands;
     device const uchar *gate_weight [[buffer(SEISMIC_BUFFER_GATE_WEIGHT)]],             \
     device const uchar *alpha_weight [[buffer(SEISMIC_BUFFER_ALPHA_WEIGHT)]],           \
     device const uchar *beta_weight [[buffer(SEISMIC_BUFFER_BETA_WEIGHT)]],             \
-    device uchar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],                           \
+    SEISMIC_RESULT_0_PARAM(result_cells),                                               \
     device uchar *normalized [[buffer(SEISMIC_BUFFER_SCRATCH_NORMALIZED)]],             \
     device float *packed [[buffer(SEISMIC_BUFFER_SCRATCH_PACKED)]],                     \
     device half *token_factors [[buffer(SEISMIC_BUFFER_SCRATCH_TOKEN_FACTORS)]],        \
@@ -51,13 +51,13 @@ typedef projection::operands<NVFP4> Operands;
     projection::Weights<packets::W1> gate{gate_weight, KERNEL_W1_LAYOUT(k), k};         \
     projection::Weights<packets::W2> alpha{alpha_weight, KERNEL_W2_LAYOUT(k), k};       \
     projection::Weights<packets::W3> beta{beta_weight, KERNEL_W3_LAYOUT(k), k};         \
-    projection::Store<activation> qkv_out{result, SEISMIC_RESULT_0_STRIDE_0,            \
+    projection::Store<activation> qkv_out{element::Out<activation>(result_cells), SEISMIC_RESULT_0_STRIDE_0, \
         SEISMIC_RESULT_0_STRIDE_1, 0};                                                  \
-    projection::Store<activation> gate_out{result, SEISMIC_RESULT_0_STRIDE_0,           \
+    projection::Store<activation> gate_out{element::Out<activation>(result_cells), SEISMIC_RESULT_0_STRIDE_0, \
         SEISMIC_RESULT_0_STRIDE_1, qkv_rows};                                           \
-    projection::Store<activation> alpha_out{result, SEISMIC_RESULT_0_STRIDE_0,          \
+    projection::Store<activation> alpha_out{element::Out<activation>(result_cells), SEISMIC_RESULT_0_STRIDE_0, \
         SEISMIC_RESULT_0_STRIDE_1, qkv_rows + gate_rows};                               \
-    projection::Store<activation> beta_out{result, SEISMIC_RESULT_0_STRIDE_0,           \
+    projection::Store<activation> beta_out{element::Out<activation>(result_cells), SEISMIC_RESULT_0_STRIDE_0, \
         SEISMIC_RESULT_0_STRIDE_1, qkv_rows + gate_rows + head_rows}
 
 #ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_GEMV

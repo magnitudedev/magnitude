@@ -275,7 +275,7 @@ __device__ __forceinline__ void gemm(GemmShared &shared, const u8 *x, u64 x_stri
 // y = Y(projection · gate[m, n]), rounded once; otherwise y = Y(projection), plus the F32 residual row when
 // RESIDUAL.
 template <class A, class B, class Y, bool BIAS, bool RESIDUAL, bool GATE, bool CLAMP> struct Linear {
-    u8 *y;
+    element::Out<Y> y;
     u64 stride;
     const u8 *bias;
     const float *residual;
@@ -300,7 +300,7 @@ template <class A, class B, class Y, bool BIAS, bool RESIDUAL, bool GATE, bool C
         return projected;
     }
     __device__ __forceinline__ void operator()(u32 m, u32 n, float first, float second) const {
-        element::put2<Y>(y, (u64)m * stride + n, value(m, n, first), value(m, n + 1, second));
+        y.put2((u64)m * stride + n, value(m, n, first), value(m, n + 1, second));
     }
 };
 
@@ -312,7 +312,7 @@ template <class A, class B, class Y, bool BIAS, bool RESIDUAL, bool GATE, bool C
 // `partials` holds one float per warp.
 
 template <class Y, class WN, class BN, bool WEIGHT, bool BIAS>
-__device__ __forceinline__ void norm(const float *row, u8 *out, u64 stride, const u8 *weight, const u8 *bias,
+__device__ __forceinline__ void norm(const float *row, const element::Out<Y> &out, u64 stride, const u8 *weight, const u8 *bias,
                                      u32 width, bool centered, float epsilon, int activation, float *partials) {
     float mean = 0.0f;
     if (centered) {
@@ -329,7 +329,7 @@ __device__ __forceinline__ void norm(const float *row, u8 *out, u64 stride, cons
         const float w = WEIGHT ? element::at<WN>(weight, i) : 0.0f;
         const float b = BIAS ? element::at<BN>(bias, i) : 0.0f;
         const float normalized = row_norm::apply<WEIGHT, BIAS>(row[i] - mean, inverse, w, b);
-        element::put<Y>(out, (u64)i * stride, activation != 0 ? activate(activation, normalized) : normalized);
+        out.put((u64)i * stride, activation != 0 ? activate(activation, normalized) : normalized);
     }
 }
 
@@ -419,7 +419,7 @@ __device__ __forceinline__ void attend_stage(u16 *tile, const u8 *qkv, u64 row_s
 }
 
 template <class A, u32 W, u32 WP>
-__device__ __forceinline__ void attend(AttendShared<WP> &shared, const u8 *qkv, u8 *out, u32 rows, u32 heads,
+__device__ __forceinline__ void attend(AttendShared<WP> &shared, const u8 *qkv, const element::Out<A> &out, u32 rows, u32 heads,
                                        u32 group, float scale, const int *spans) {
     static_assert(A::bytes == 2, "vision attention requires a bf16 or f16 activation element");
     constexpr u32 PITCH = AttendShared<WP>::PITCH;
@@ -592,8 +592,8 @@ __device__ __forceinline__ void attend(AttendShared<WP> &shared, const u8 *qkv, 
 #pragma unroll
         for (u32 d = 0; d < DN; ++d)
             if (d * 8 + 2 * t < W)
-                element::put2<A>(out, ((u64)row * heads + head) * W + d * 8 + 2 * t, output[d][2 * h] * inverse,
-                                 output[d][2 * h + 1] * inverse);
+                out.put2(((u64)row * heads + head) * W + d * 8 + 2 * t, output[d][2 * h] * inverse,
+                         output[d][2 * h + 1] * inverse);
     }
 }
 

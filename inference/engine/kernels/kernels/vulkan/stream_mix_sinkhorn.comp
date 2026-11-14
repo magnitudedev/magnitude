@@ -142,7 +142,7 @@ void sinkhorn_slice(const bool tiled) {
             const uint64_t row = uint64_t(row0 + r);
             streams_collapse(hidden + row * SEISMIC_HIDDEN_STRIDE_0 * 4ul, SEISMIC_HIDDEN_STRIDE_1,
                 SEISMIC_HIDDEN_STRIDE_2, SEISMIC_PTR(SEISMIC_BUFFER_PREVIOUS) + row * SEISMIC_PREVIOUS_STRIDE_0 * 4ul,
-                SEISMIC_PREVIOUS_STRIDE_1, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + row * SEISMIC_RESULT_0_STRIDE_0 * 4ul,
+                SEISMIC_PREVIOUS_STRIDE_1, out_offset(SEISMIC_RESULT_0_OUT, row * SEISMIC_RESULT_0_STRIDE_0),
                 SEISMIC_RESULT_0_STRIDE_1, SINKHORN_STREAMS, h, gl_WorkGroupID.x * SINKHORN_THREADS + thread,
                 split * SINKHORN_THREADS);
         }
@@ -233,12 +233,12 @@ void stream_mix_sinkhorn_finish() {
             value = seismic_div_rn(value, sum + epsilon);
         }
     }
-    const uint64_t own = SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER) + row * SEISMIC_RESULT_1_STRIDE_0 * 4ul;
-    const uint64_t joined = SEISMIC_PTR(SEISMIC_RESULT_2_BUFFER) + row * SEISMIC_RESULT_2_STRIDE_0 * 4ul;
-    const uint64_t own_stride = SEISMIC_RESULT_1_STRIDE_1 * 4ul;
-    const uint64_t join_stride = SEISMIC_RESULT_2_STRIDE_1 * 4ul;
+    const Out own = out_offset(SEISMIC_RESULT_1_OUT, row * SEISMIC_RESULT_1_STRIDE_0);
+    const Out joined = out_offset(SEISMIC_RESULT_2_OUT, row * SEISMIC_RESULT_2_STRIDE_0);
+    const uint64_t own_stride = SEISMIC_RESULT_1_STRIDE_1;
+    const uint64_t join_stride = SEISMIC_RESULT_2_STRIDE_1;
     if (owns)
-        element_f32_put(joined + uint64_t(SINKHORN_STREAMS + thread) * join_stride, value);
+        out_put(joined, uint64_t(SINKHORN_STREAMS + thread) * join_stride, value);
     // Under P = 0 the pre replaces the comb in group memory once every
     // invocation has read it.
     if (!SINKHORN_CARRIED)
@@ -248,10 +248,10 @@ void stream_mix_sinkhorn_finish() {
         const float pre = sinkhorn_sigmoid(seismic_shared_f32[1u + stream] * inverse * element_f32_at(scale)
             + element_f32_at(base + uint64_t(stream) * base_stride)) + epsilon;
         if (SINKHORN_CARRIED)
-            element_f32_put(own + uint64_t(stream) * own_stride, pre);
+            out_put(own, uint64_t(stream) * own_stride, pre);
         else
             seismic_shared_f32[comb + stream] = pre;
-        element_f32_put(joined + uint64_t(stream) * join_stride,
+        out_put(joined, uint64_t(stream) * join_stride,
             2.0 * sinkhorn_sigmoid(seismic_shared_f32[1u + SINKHORN_STREAMS + stream] * inverse
                 * element_f32_at(scale + scale_stride)
                 + element_f32_at(base + uint64_t(SINKHORN_STREAMS + stream) * base_stride)));
@@ -264,7 +264,7 @@ void stream_mix_sinkhorn_finish() {
             carried[stream] = seismic_shared_f32[comb + stream];
         streams_collapse(SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN) + row * SEISMIC_HIDDEN_STRIDE_0 * 4ul,
             SEISMIC_HIDDEN_STRIDE_1, SEISMIC_HIDDEN_STRIDE_2, carried,
-            SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + row * SEISMIC_RESULT_0_STRIDE_0 * 4ul, SEISMIC_RESULT_0_STRIDE_1,
+            out_offset(SEISMIC_RESULT_0_OUT, row * SEISMIC_RESULT_0_STRIDE_0), SEISMIC_RESULT_0_STRIDE_1,
             SINKHORN_STREAMS, uint(SEISMIC_DIM_H), thread, SINKHORN_THREADS);
     }
 }

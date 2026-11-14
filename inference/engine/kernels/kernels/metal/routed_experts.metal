@@ -112,7 +112,7 @@ kernel void routed_experts_expand(
     const auto up = routed::weights<packets::W1>(routed::expert_weights(records_up, expert_up, slot, expert),
         KERNEL_W1_LAYOUT(SEISMIC_DIM_H), 0, SEISMIC_DIM_H);
     const auto out = projection::scaling<(SEISMIC_DIM_GS + SEISMIC_DIM_US != 0)>::wrap(
-        projection::Glu<A>{product + block * SEISMIC_DIM_T * SEISMIC_DIM_F * A::bytes,
+        projection::Glu<A>{element::out_over_scratch<A>(product).offset(block * SEISMIC_DIM_T * SEISMIC_DIM_F),
             SEISMIC_DIM_F, 1, int(SEISMIC_PARAM_ACTIVATION)},
         projection::scale_factor(gate_scale, SEISMIC_DIM_GS, SEISMIC_GATE_SCALE_STRIDE_0, ulong(expert)),
         projection::scale_factor(up_scale, SEISMIC_DIM_US, SEISMIC_UP_SCALE_STRIDE_0, ulong(expert)));
@@ -129,7 +129,7 @@ kernel void routed_experts_down(
     SYSTEM const int *map [[buffer(SEISMIC_BUFFER_MAP)]],
     device const int *step [[buffer(SEISMIC_BUFFER_STEP)]],
     device const ulong *records_down [[buffer(SEISMIC_BUFFER_RECORDS_DOWN)]],
-    device uchar *output [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(output_cells),
     device const uchar *product [[buffer(SEISMIC_BUFFER_SCRATCH_PRODUCT)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint2 group [[threadgroup_position_in_grid]],
@@ -152,8 +152,9 @@ kernel void routed_experts_down(
         SEISMIC_DIM_F, 1, uint(SEISMIC_DIM_F));
     const auto down = routed::weights<packets::W2>(routed::expert_weights(records_down, expert_down, slot, expert),
         KERNEL_W2_LAYOUT(SEISMIC_DIM_F), 0, SEISMIC_DIM_F);
-    const projection::Store<A> out{output + block * SEISMIC_RESULT_0_STRIDE_0 * A::bytes,
-        SEISMIC_RESULT_0_STRIDE_1, SEISMIC_RESULT_0_STRIDE_2, 0};
+    const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> output(output_cells);
+    const projection::Store<A> out{output.offset(block * SEISMIC_RESULT_0_STRIDE_0), SEISMIC_RESULT_0_STRIDE_1,
+        SEISMIC_RESULT_0_STRIDE_2, 0};
     const uint live = routed::block_rows(order + block * SEISMIC_ORDER_STRIDE_0, SEISMIC_ORDER_STRIDE_1,
         uint(SEISMIC_DIM_T));
     routed::expert_plain<packets::W2, BM, BN>(in, out, down, live, uint(SEISMIC_DIM_T), uint(SEISMIC_DIM_H),

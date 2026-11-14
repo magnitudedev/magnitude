@@ -8,7 +8,7 @@
 void stream_collapse() {
     const uint64_t row = gl_WorkGroupID.x;
     const uint64_t hidden = SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN) + row * SEISMIC_HIDDEN_STRIDE_0 * 4ul;
-    const uint64_t result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + row * SEISMIC_RESULT_0_STRIDE_0 * 4ul;
+    const Out result = out_offset(SEISMIC_RESULT_0_OUT, row * SEISMIC_RESULT_0_STRIDE_0);
     if (SEISMIC_DIM_P == 1) {
         streams_collapse(hidden, SEISMIC_HIDDEN_STRIDE_1, SEISMIC_HIDDEN_STRIDE_2,
             SEISMIC_PTR(SEISMIC_BUFFER_PRE) + row * SEISMIC_PRE_STRIDE_0 * 4ul, SEISMIC_PRE_STRIDE_1, result,
@@ -19,8 +19,8 @@ void stream_collapse() {
             uint(SEISMIC_DIM_S), uint(SEISMIC_DIM_H), gl_LocalInvocationIndex, gl_WorkGroupSize.x);
         // Each invocation divides the columns it wrote.
         for (uint column = gl_LocalInvocationIndex; column < uint(SEISMIC_DIM_H); column += gl_WorkGroupSize.x) {
-            const uint64_t at = result + uint64_t(column) * SEISMIC_RESULT_0_STRIDE_1 * 4ul;
-            element_f32_put(at, seismic_div_rn(element_f32_at(at), float(SEISMIC_DIM_S)));
+            const uint64_t at = uint64_t(column) * SEISMIC_RESULT_0_STRIDE_1;
+            out_put(result, at, seismic_div_rn(out_at(result, at), float(SEISMIC_DIM_S)));
         }
     }
 }

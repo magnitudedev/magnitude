@@ -1,6 +1,6 @@
 //! Address rows in a slab-stored tensor through its bound address table.
 
-use crate::element::{Dense, Element, U32};
+use crate::element::{Dense, Element, Stored, U32};
 use crate::tensor::{Scalars, Tensor};
 use std::marker::PhantomData;
 
@@ -88,14 +88,21 @@ impl<'a, E: Element, const RANK: usize> SlabTensor<'a, E, RANK> {
         unsafe { std::slice::from_raw_parts(self.pointer(start), self.extents[RANK - 1]) }
     }
 
+    /// [`Self::row`] as stored elements of `E`, the source of a bit move
+    /// ([`Element::move_stored`]).
+    #[inline(always)]
+    pub fn stored(&self, index: [usize; RANK]) -> Stored<'a, E> {
+        Stored::of(self.row(index))
+    }
+
     /// # Safety
     /// The caller gives each work item distinct writes and no concurrent readers.
     #[inline(always)]
-    pub unsafe fn row_mut(&self, index: [usize; RANK]) -> &'a mut [E::Storage] {
+    pub unsafe fn row_mut(&self, index: [usize; RANK]) -> E::Writable<'a> {
         assert_eq!(self.strides[RANK - 1], 1);
         let mut start = index;
         start[RANK - 1] = 0;
-        unsafe { std::slice::from_raw_parts_mut(self.pointer(start), self.extents[RANK - 1]) }
+        E::writable(unsafe { std::slice::from_raw_parts_mut(self.pointer(start), self.extents[RANK - 1]) })
     }
 
     #[inline(always)]
@@ -108,10 +115,10 @@ impl<'a, E: Element, const RANK: usize> SlabTensor<'a, E, RANK> {
     /// # Safety
     /// The caller gives each work item distinct writes and no concurrent readers.
     #[inline(always)]
-    pub unsafe fn span_mut(&self, index: [usize; RANK], len: usize) -> &'a mut [E::Storage] {
+    pub unsafe fn span_mut(&self, index: [usize; RANK], len: usize) -> E::Writable<'a> {
         assert_eq!(self.strides[RANK - 1], 1);
         assert!(index[RANK - 1] + len <= self.extents[RANK - 1]);
-        unsafe { std::slice::from_raw_parts_mut(self.pointer(index), len) }
+        E::writable(unsafe { std::slice::from_raw_parts_mut(self.pointer(index), len) })
     }
 }
 

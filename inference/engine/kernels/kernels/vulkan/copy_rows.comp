@@ -1,9 +1,9 @@
 // copy_rows: rows[to[item], head, :] = rows[from[item], head, :] for dense state
 // planes of one element type; one invocation per copied element, over a
 // grid-stride loop (the grid is capped below the 65535-group floor). Rows
-// outside the plane (including -1) are skipped. Elements move as whole
-// words of their size, so every plane (integer planes included) is copied
-// bit for bit.
+// outside the plane (including -1) are skipped. Every plane is copied bit for
+// bit: a floating plane's owner-written elements move as stored, an integer
+// plane's as whole words of their size.
 #include <seismic/element.glsl>
 #include <seismic/slab.glsl>
 
@@ -12,7 +12,6 @@
 #endif
 
 void copy_rows() {
-    const uint64_t rows = SEISMIC_PTR(SEISMIC_BUFFER_ROWS);
     const uint64_t from = SEISMIC_PTR(SEISMIC_BUFFER_FROM);
     const uint64_t to = SEISMIC_PTR(SEISMIC_BUFFER_TO);
     const uint64_t row_elements = SEISMIC_DIM_KV * SEISMIC_DIM_W;
@@ -28,12 +27,22 @@ void copy_rows() {
         if (source_row < 0 || destination_row < 0 || uint64_t(source_row) >= SEISMIC_DIM_T
             || uint64_t(destination_row) >= SEISMIC_DIM_T)
             continue;
+        const uint64_t at = head * SEISMIC_ROWS_STRIDE_1 + column * SEISMIC_ROWS_STRIDE_2;
+#if defined(SEISMIC_OUT_ROWS)
+        // A floating plane: its owner-written elements move as stored.
+        const SlabOut rows = SEISMIC_OUT_ROWS;
+        const Out source = slab_out_row(rows, uint(source_row), slab_rows, SEISMIC_ROWS_STRIDE_0);
+        const Out destination = slab_out_row(rows, uint(destination_row), slab_rows, SEISMIC_ROWS_STRIDE_0);
+        out_move_stored(destination, at, source, at, 1ul);
+#else
+        // An integer plane.
+        const uint64_t rows = SEISMIC_PTR(SEISMIC_BUFFER_ROWS);
         const uint64_t source = slab_row(rows, uint(source_row), slab_rows,
                 SEISMIC_ROWS_STRIDE_0 * SEISMIC_ROWS_PACKET_SIZE)
-            + (head * SEISMIC_ROWS_STRIDE_1 + column * SEISMIC_ROWS_STRIDE_2) * SEISMIC_ROWS_PACKET_SIZE;
+            + at * SEISMIC_ROWS_PACKET_SIZE;
         const uint64_t destination = slab_row(rows, uint(destination_row), slab_rows,
                 SEISMIC_ROWS_STRIDE_0 * SEISMIC_ROWS_PACKET_SIZE)
-            + (head * SEISMIC_ROWS_STRIDE_1 + column * SEISMIC_ROWS_STRIDE_2) * SEISMIC_ROWS_PACKET_SIZE;
+            + at * SEISMIC_ROWS_PACKET_SIZE;
 #if SEISMIC_ROWS_PACKET_SIZE == 4
         element_u32_put(destination, element_u32_at(source));
 #elif SEISMIC_ROWS_PACKET_SIZE == 2
@@ -42,6 +51,7 @@ void copy_rows() {
         element_u8_put(destination, element_u8_at(source));
 #else
 #error "copy_rows moves 1-, 2- and 4-byte dense elements"
+#endif
 #endif
     }
 }

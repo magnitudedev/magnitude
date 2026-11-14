@@ -19,8 +19,8 @@ struct Operands {
     const float *value;
     const versions::u8 *norm;
     const float *convolution;
-    const versions::u32 *window;
-    float *result;
+    element::SlabOut<element::F32> window;
+    element::Out<element::F32> result;
     versions::Slots slots;
     int dilation;
 };
@@ -35,25 +35,28 @@ __device__ __forceinline__ float u(const Operands &in, u64 row, u64 stream, u64 
            element::at<Norm>(in.norm, stream * SEISMIC_NORM_STRIDE_0 + column * SEISMIC_NORM_STRIDE_1);
 }
 
-// Publishes channel `channel` of slot `index`'s successor window.
+// Publishes channel `channel` of slot `index`'s successor window: the source
+// version's rows move as stored, the launch's u values are stored.
 __device__ __forceinline__ void publish(const Operands &in, u64 index, u64 channel,
                                         const seismic_words_t &seismic_words_value) {
     const int reach = in.dilation * (static_cast<int>(SEISMIC_DIM_K) - 1);
-    const u64 bank_bytes = SEISMIC_WINDOW_STRIDE_0 * 4;
+    const u64 bank_elements = SEISMIC_WINDOW_STRIDE_0;
     const u64 stream = channel / SEISMIC_DIM_H;
     const u64 column = channel % SEISMIC_DIM_H;
     const versions::Slot slot = versions::slot_of(in.slots, index, seismic_words_value);
-    const float *source =
-        reinterpret_cast<const float *>(versions::bank(in.window, slot.source, bank_bytes, seismic_words_value));
-    float *target = reinterpret_cast<float *>(versions::bank(in.window, slot.target, bank_bytes, seismic_words_value));
+    const element::Stored<element::F32> source = versions::bank_view(in.window, slot.source, bank_elements, seismic_words_value);
+    const element::Out<element::F32> target = versions::bank(in.window, slot.target, bank_elements, seismic_words_value);
     // The tape holds T = R - reach rows.
     const int published = reach + versions::tape_rows(slot, static_cast<int>(SEISMIC_DIM_R) - reach);
     for (int tap = 0; tap < published; ++tap) {
         const int position = slot.stop + tap - reach;
-        target[static_cast<u64>(tap) * SEISMIC_WINDOW_STRIDE_1 + channel * SEISMIC_WINDOW_STRIDE_2] =
-            position < 0 ? source[static_cast<u64>(slot.taped + slot.stop + tap) * SEISMIC_WINDOW_STRIDE_1 +
-                                  channel * SEISMIC_WINDOW_STRIDE_2]
-                         : u(in, static_cast<u64>(slot.lo + position), stream, column, seismic_words_value);
+        const u64 to = static_cast<u64>(tap) * SEISMIC_WINDOW_STRIDE_1 + channel * SEISMIC_WINDOW_STRIDE_2;
+        if (position < 0)
+            target.move_stored(to,
+                               source.offset(static_cast<u64>(slot.taped + slot.stop + tap) * SEISMIC_WINDOW_STRIDE_1 +
+                                             channel * SEISMIC_WINDOW_STRIDE_2));
+        else
+            target.put(to, u(in, static_cast<u64>(slot.lo + position), stream, column, seismic_words_value));
     }
 }
 
@@ -62,33 +65,32 @@ __device__ __forceinline__ void inject(const Operands &in, int row, u64 channel,
                                        const seismic_words_t &seismic_words_value) {
     const int dilation = in.dilation;
     const int reach = dilation * (static_cast<int>(SEISMIC_DIM_K) - 1);
-    const u64 bank_bytes = SEISMIC_WINDOW_STRIDE_0 * 4;
+    const u64 bank_elements = SEISMIC_WINDOW_STRIDE_0;
     const u64 stream = channel / SEISMIC_DIM_H;
     const u64 column = channel % SEISMIC_DIM_H;
     const float residual = in.hidden[static_cast<u64>(row) * SEISMIC_HIDDEN_STRIDE_0 + channel * SEISMIC_HIDDEN_STRIDE_1];
-    float *out = in.result + static_cast<u64>(row) * SEISMIC_RESULT_0_STRIDE_0 + channel * SEISMIC_RESULT_0_STRIDE_1;
+    const u64 out = static_cast<u64>(row) * SEISMIC_RESULT_0_STRIDE_0 + channel * SEISMIC_RESULT_0_STRIDE_1;
     const u64 slot_index = versions::slot_index_of_row(in.slots, row, seismic_words_value);
     if (slot_index == SEISMIC_DIM_B) {
-        *out = residual;
+        in.result.put(out, residual);
         return;
     }
     const versions::Slot slot = versions::slot_of(in.slots, slot_index, seismic_words_value);
-    const float *source =
-        reinterpret_cast<const float *>(versions::bank(in.window, slot.source, bank_bytes, seismic_words_value));
+    const element::Stored<element::F32> source = versions::bank_view(in.window, slot.source, bank_elements, seismic_words_value);
     const int local = row - slot.lo;
     float sum = 0.0f;
     for (int tap = 0; tap < static_cast<int>(SEISMIC_DIM_K); ++tap) {
         const int position = local + dilation * tap - reach;
         const float input =
-            position < 0 ? source[static_cast<u64>(slot.taped + reach + position) * SEISMIC_WINDOW_STRIDE_1 +
-                                  channel * SEISMIC_WINDOW_STRIDE_2]
+            position < 0 ? source.at(static_cast<u64>(slot.taped + reach + position) * SEISMIC_WINDOW_STRIDE_1 +
+                                     channel * SEISMIC_WINDOW_STRIDE_2)
                          : u(in, static_cast<u64>(slot.lo + position), stream, column, seismic_words_value);
         sum = __fmaf_rn(in.convolution[channel * SEISMIC_CONVOLUTION_STRIDE_0 + tap * SEISMIC_CONVOLUTION_STRIDE_1],
                         input, sum);
     }
     const float gated = in.scales[static_cast<u64>(row) * SEISMIC_SCALES_STRIDE_0 + stream * SEISMIC_SCALES_STRIDE_1] *
                         in.value[static_cast<u64>(row) * SEISMIC_VALUE_STRIDE_0 + column * SEISMIC_VALUE_STRIDE_1];
-    *out = residual + (gated + sum / (1.0f + expf(-sum)));
+    in.result.put(out, residual + (gated + sum / (1.0f + expf(-sum))));
 }
 
 } // namespace ngram
@@ -101,8 +103,7 @@ extern "C" __global__ void ngram_inject(SEISMIC_KERNEL_PARAMS) {
         reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_VALUE)),
         SEISMIC_PTR(SEISMIC_BUFFER_NORM),
         reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_CONVOLUTION)),
-        reinterpret_cast<const versions::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_WINDOW)),
-        reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)), VERSIONS_SLOTS(),
+        SEISMIC_OUT_WINDOW, SEISMIC_RESULT_0_OUT, VERSIONS_SLOTS(),
         static_cast<int>(static_cast<unsigned>(SEISMIC_PARAM_DILATION))};
     const u64 channel = static_cast<u64>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (channel >= SEISMIC_DIM_S * SEISMIC_DIM_H)

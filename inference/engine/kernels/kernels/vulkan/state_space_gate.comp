@@ -18,7 +18,7 @@ float ssg_gated_value(uint64_t row, uint64_t channel) {
 
 void state_space_gate() {
     const uint64_t state_norm = SEISMIC_PTR(SEISMIC_BUFFER_STATE_NORM);
-    const uint64_t normalized = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const Out normalized = SEISMIC_RESULT_0_OUT;
     const uint64_t row = gl_WorkGroupID.x;
     const uint64_t width = SEISMIC_DIM_U * SEISMIC_DIM_P;
     const uint64_t first = uint64_t(gl_WorkGroupID.y) * width;
@@ -41,7 +41,7 @@ void state_space_gate() {
         const float weight = element_f32_at(state_norm + (uint64_t(gl_WorkGroupID.y) * SEISMIC_STATE_NORM_STRIDE_0
             + (column / SEISMIC_DIM_P) * SEISMIC_STATE_NORM_STRIDE_1 + (column % SEISMIC_DIM_P) * SEISMIC_STATE_NORM_STRIDE_2) * 4ul);
         const float value = ssg_gated_value(row, channel);
-        element_put(ELEMENT_ACT, normalized,
+        out_put(normalized,
             row * SEISMIC_RESULT_0_STRIDE_0 + (channel / SEISMIC_DIM_P) * SEISMIC_RESULT_0_STRIDE_1
                 + (channel % SEISMIC_DIM_P) * SEISMIC_RESULT_0_STRIDE_2,
             seismic_mul_rn(seismic_mul_rn(value, inverse), weight));

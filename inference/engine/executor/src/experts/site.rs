@@ -268,6 +268,16 @@ impl Floats {
     fn as_ptr(&self) -> *mut f32 {
         self.0.shared_address().expect("host-addressed since it was made").as_ptr().cast()
     }
+
+    /// `len` values from `index`, read out to the host once nothing writes
+    /// them: every NaN is the registry's one NaN, as [`seismic::Tensor::read_to_host`] gives.
+    unsafe fn read_out(&self, index: usize, len: usize) -> Vec<f32> {
+        let mut values = unsafe { std::slice::from_raw_parts(self.as_ptr().add(index), len) }.to_vec();
+        // SAFETY: `f32` values are initialized 4-byte elements.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(values.as_mut_ptr().cast::<u8>(), values.len() * 4) };
+        seismic::Element::f32().canonicalize_in_place(bytes);
+        values
+    }
 }
 
 /// One streamed layer as the site serves it.
@@ -382,7 +392,7 @@ impl SiteLayer {
     pub(crate) fn output(&self, slot: usize) -> Vec<f32> {
         let len = self.shape.rows * self.shape.hidden;
         // SAFETY: the slot was answered, so no worker writes it.
-        unsafe { std::slice::from_raw_parts(self.output.as_ptr().add(slot * len), len) }.to_vec()
+        unsafe { self.output.read_out(slot * len, len) }
     }
 
     /// Slot `slot`'s output, every row zero: a request of no entries' answer.
@@ -457,7 +467,7 @@ impl SiteLayer {
         let len = self.shape.rows * self.shape.hidden;
         // SAFETY: the slot was answered, and the device writes its rows only
         // for a later step's request.
-        let rows = unsafe { std::slice::from_raw_parts(self.rows.as_ptr().add(slot * len), len) }.to_vec();
+        let rows = unsafe { self.rows.read_out(slot * len, len) };
         Some(Answered { entries, rows, output: self.output(slot) })
     }
 

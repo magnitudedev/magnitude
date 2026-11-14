@@ -10,15 +10,17 @@ fn stream_collapse<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64;
     let (hidden, s) = (cx.arg_hidden(), cx.dim_s() as usize);
     let stream = |stream| hidden.row([row, stream, 0]);
     // SAFETY: each work item writes its own row.
-    let out = unsafe { cx.result_0().row_mut([row, 0]) };
+    let mut out = unsafe { cx.result_0().row_mut([row, 0]) };
     if cx.dim_p() > 0 {
         let pre = cx.arg_pre().row([row, 0]);
         functions::collapse(s, |index| pre[index], stream, out);
     } else {
-        functions::collapse(s, |_| 1.0, stream, out);
+        functions::collapse(s, |_| 1.0, stream, out.reborrow());
         let streams = s as f32;
-        for value in out.iter_mut() {
-            *value /= streams;
-        }
+        out.compute(|out| {
+            for value in out.iter_mut() {
+                *value /= streams;
+            }
+        });
     }
 }

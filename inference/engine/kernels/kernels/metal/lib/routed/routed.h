@@ -51,9 +51,9 @@ inline packets::weight_bytes source_weights(device const ulong *bank, device con
 // A choice with no record's product row (`decode_source` -1): `count` zero A
 // elements at `out`, element stride `stride`, by `threads` threads from
 // `first`.
-inline void zero_row(device uchar *out, ulong stride, uint count, uint first, uint threads) {
+inline void zero_row(element::Out<Act> out, ulong stride, uint count, uint first, uint threads) {
     for (uint i = first; i < count; i += threads)
-        element::put<Act>(out, ulong(i) * stride, 0.0f);
+        out.put(ulong(i) * stride, 0.0f);
 }
 
 inline void write_grid(device int *grid, uint x, uint y) {

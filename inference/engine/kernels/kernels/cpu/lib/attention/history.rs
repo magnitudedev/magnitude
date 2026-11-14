@@ -1,4 +1,4 @@
-use seismic::cpu::{Dense, F16};
+use seismic::cpu::{Dense, Store, F16};
 
 /// One group's quantization at `levels` code levels: zero = f16(min), scale
 /// = f16((max - min) / L), and code = min(L, u32(fma(x - zero, 1 / scale,
@@ -37,7 +37,7 @@ impl GroupCodec {
 /// group of GROUP values its codes (`GroupCodec`), packed 32 / bits codes per
 /// word, and its (scale, zero) F16 bits.
 #[inline(always)]
-pub fn affine_encode(x: &[f32], bits: u32, codes: &mut [u32], coefficients: &mut [u16]) {
+pub fn affine_encode(x: &[f32], bits: u32, codes: &mut [u32], mut coefficients: Store<'_, F16>) {
     let levels = (1u32 << bits) - 1;
     let per = (32 / bits) as usize;
     let group_width = 2 * x.len() / coefficients.len();
@@ -48,8 +48,8 @@ pub fn affine_encode(x: &[f32], bits: u32, codes: &mut [u32], coefficients: &mut
             let i = group * group_width + offset;
             codes[i / per] |= codec.code(*value) << ((i % per) as u32 * bits);
         }
-        coefficients[2 * group] = codec.scale;
-        coefficients[2 * group + 1] = codec.zero;
+        coefficients.set(2 * group, F16::widen(codec.scale));
+        coefficients.set(2 * group + 1, F16::widen(codec.zero));
     }
 }
 

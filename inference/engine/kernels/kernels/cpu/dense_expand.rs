@@ -66,10 +66,10 @@ fn dense_expand_rows<L: Isa, E: Elements>(
         quantized,
         |row, gate, up| {
             // SAFETY: each work item writes its own columns of every row.
-            let out = unsafe { result.span_mut([row, rows.start], rows.len()) };
+            let mut out = unsafe { result.span_mut([row, rows.start], rows.len()) };
             let pairs = out.iter_mut().zip(gate).zip(up).map(|((target, gate), up)| (target, *gate, *up));
-            functions::glu_row::<E::A, _>(function, limit, (gate_scale, up_scale), pairs, |target, value| {
-                *target = E::A::narrow(value)
+            functions::glu_row::<E::A, _>(function, limit, (gate_scale, up_scale), pairs, |mut target, value| {
+                target.set(value)
             });
         },
     );

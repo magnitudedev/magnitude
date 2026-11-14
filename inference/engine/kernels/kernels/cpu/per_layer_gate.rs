@@ -39,9 +39,9 @@ fn per_layer_gate_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [
     projection::project_staged_arithmetic(&cx.arg_gate_weight(), rows.clone(), staged, quantized, |row, gate| {
         let multiplier = inputs.span([row, layer, rows.start], rows.len());
         // SAFETY: each work item writes its own columns of every row.
-        let out = unsafe { result.span_mut([row, rows.start], rows.len()) };
+        let mut out = unsafe { result.span_mut([row, rows.start], rows.len()) };
         for ((target, gate), multiplier) in out.iter_mut().zip(gate).zip(multiplier) {
-            *target = E::A::narrow(E::A::widen(functions::activated::<E::A>(function, scale * *gate)) * multiplier);
+            target.set(E::A::widen(functions::activated::<E::A>(function, scale * *gate)) * multiplier);
         }
     });
 }

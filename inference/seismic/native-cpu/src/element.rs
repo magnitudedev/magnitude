@@ -10,14 +10,166 @@
 pub trait Element: Copy + Send + Sync + 'static {
     /// The stored element.
     type Storage: Copy + Send + Sync + Default + 'static;
+    /// What a kernel gets of a row it writes. A dense float element's is a [`Store`], which
+    /// stores only values rounded to the element; any other element's is its raw slice.
+    type Writable<'a>;
     /// The registry name (`f32`, `u32`, ...).
     const NAME: &'static str;
     const BYTES: usize;
+
+    /// `row` as a kernel writes it.
+    fn writable(row: &mut [Self::Storage]) -> Self::Writable<'_>;
+
+    /// Moves `values`, elements a tensor of this element holds, into the start of `row` bit for
+    /// bit.
+    fn move_stored(row: &mut Self::Writable<'_>, values: Stored<'_, Self>);
+}
+
+/// Elements of `E` as a tensor of `E` holds them: the only source of a bit move into a row
+/// ([`Element::move_stored`]). Only a view of a tensor of `E` gives one
+/// ([`crate::tensor::Tensor::stored`], [`crate::slab::SlabTensor::stored`]), so a bit move
+/// publishes no bits but stored elements of `E`.
+pub struct Stored<'a, E: Element>(&'a [E::Storage]);
+
+impl<E: Element> Clone for Stored<'_, E> {
+    #[inline(always)]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<E: Element> Copy for Stored<'_, E> {}
+
+impl<'a, E: Element> Stored<'a, E> {
+    /// `values`, which a tensor of `E` holds.
+    #[inline(always)]
+    pub(crate) fn of(values: &'a [E::Storage]) -> Self {
+        Self(values)
+    }
+
+    /// Elements `range` of these.
+    #[inline(always)]
+    pub fn part(self, range: std::ops::Range<usize>) -> Self {
+        Self(&self.0[range])
+    }
+
+    /// The stored elements, read-only.
+    #[inline(always)]
+    pub fn storage(self) -> &'a [E::Storage] {
+        self.0
+    }
+}
+
+/// The row of a dense float element a kernel writes, by values: every store rounds to the element
+/// ([`Dense::narrow`]), and no raw storage is
+/// exposed. A kernel cannot publish a value any other way.
+pub struct Store<'a, E: Element> {
+    row: &'a mut [E::Storage],
+}
+
+/// One element of a [`Store`].
+pub struct Slot<'a, E: Element>(&'a mut E::Storage);
+
+impl<E: Dense> Slot<'_, E> {
+    #[inline(always)]
+    pub fn set(self, value: f32) {
+        *self.0 = E::narrow(value);
+    }
+}
+
+impl<'a, E: Dense> Store<'a, E> {
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.row.len()
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.row.is_empty()
+    }
+
+    /// Stores `value` rounded to `E` at `index`.
+    #[inline(always)]
+    pub fn set(&mut self, index: usize, value: f32) {
+        self.row[index] = E::narrow(value);
+    }
+
+    /// The value stored at `index`, widened.
+    #[inline(always)]
+    pub fn get(&self, index: usize) -> f32 {
+        E::widen(self.row[index])
+    }
+
+    /// Stores `value` rounded to `E` at every index.
+    #[inline(always)]
+    pub fn fill(&mut self, value: f32) {
+        self.row.fill(E::narrow(value));
+    }
+
+    /// Stores each of `values` rounded to `E`, from the start.
+    #[inline(always)]
+    pub fn store(&mut self, values: &[f32]) {
+        let row = &mut self.row[..values.len()];
+        for (target, value) in row.iter_mut().zip(values) {
+            *target = E::narrow(*value);
+        }
+    }
+
+    /// Moves `values`, elements a tensor of `E` holds (a row relocated, never one computed), here
+    /// bit for bit, from the start.
+    #[inline(always)]
+    pub fn move_stored(&mut self, values: Stored<'_, E>) {
+        self.row[..values.0.len()].copy_from_slice(values.0);
+    }
+
+    #[inline(always)]
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = Slot<'_, E>> {
+        self.row.iter_mut().map(Slot)
+    }
+
+    #[inline(always)]
+    pub fn chunks_exact_mut(&mut self, size: usize) -> impl Iterator<Item = Store<'_, E>> {
+        self.row.chunks_exact_mut(size).map(|row| Store { row })
+    }
+
+    #[inline(always)]
+    pub fn split_at_mut(&mut self, middle: usize) -> (Store<'_, E>, Store<'_, E>) {
+        let (low, high) = self.row.split_at_mut(middle);
+        (Store { row: low }, Store { row: high })
+    }
+
+    /// The part of the row from `start` on.
+    #[inline(always)]
+    pub fn tail_mut(&mut self, start: usize) -> Store<'_, E> {
+        Store { row: &mut self.row[start..] }
+    }
+
+    /// The `length` elements from `start`.
+    #[inline(always)]
+    pub fn part_mut(&mut self, start: usize, length: usize) -> Store<'_, E> {
+        Store { row: &mut self.row[start..start + length] }
+    }
+
+    /// This store again, for a callee that takes it by value.
+    #[inline(always)]
+    pub fn reborrow(&mut self) -> Store<'_, E> {
+        Store { row: &mut *self.row }
+    }
+}
+
+impl Store<'_, F32> {
+    /// Fills the row as F32 values in place (a computation over the whole row, such as a decode
+    /// that returns its values in a slice). The raw slice lives only inside `fill`; every F32 is
+    /// already an element of F32.
+    #[inline(always)]
+    pub fn compute<R>(&mut self, fill: impl FnOnce(&mut [f32]) -> R) -> R {
+        fill(&mut *self.row)
+    }
 }
 
 /// A dense floating element type: an [`Element`] with exact conversions to
 /// and from `f32`.
-pub trait Dense: Element {
+pub trait Dense: for<'a> Element<Writable<'a> = Store<'a, Self>> {
     fn widen(value: Self::Storage) -> f32;
     fn narrow(value: f32) -> Self::Storage;
 
@@ -46,34 +198,66 @@ pub trait Dense: Element {
 }
 
 macro_rules! elements {
-    ($($(#[$doc:meta])* $name:ident: $storage:ty, $registry:literal;)*) => {
+    ($($(#[$doc:meta])* $name:ident: $storage:ty, $registry:literal, $kind:ident;)*) => {
         $(
             $(#[$doc])*
             #[derive(Clone, Copy, Debug)]
             pub struct $name;
 
-            impl Element for $name {
-                type Storage = $storage;
-                const NAME: &'static str = $registry;
-                const BYTES: usize = std::mem::size_of::<$storage>();
-            }
+            elements!(@element $name, $storage, $registry, $kind);
         )*
+    };
+    (@element $name:ident, $storage:ty, $registry:literal, dense) => {
+        impl Element for $name {
+            type Storage = $storage;
+            type Writable<'a> = Store<'a, $name>;
+            const NAME: &'static str = $registry;
+            const BYTES: usize = std::mem::size_of::<$storage>();
+
+            #[inline(always)]
+            fn writable(row: &mut [$storage]) -> Store<'_, $name> {
+                Store { row }
+            }
+
+            #[inline(always)]
+            fn move_stored(row: &mut Store<'_, $name>, values: Stored<'_, $name>) {
+                row.move_stored(values)
+            }
+        }
+    };
+    (@element $name:ident, $storage:ty, $registry:literal, plain) => {
+        impl Element for $name {
+            type Storage = $storage;
+            type Writable<'a> = &'a mut [$storage];
+            const NAME: &'static str = $registry;
+            const BYTES: usize = std::mem::size_of::<$storage>();
+
+            #[inline(always)]
+            fn writable(row: &mut [$storage]) -> &mut [$storage] {
+                row
+            }
+
+            #[inline(always)]
+            fn move_stored(row: &mut &mut [$storage], values: Stored<'_, $name>) {
+                row[..values.0.len()].copy_from_slice(values.0);
+            }
+        }
     };
 }
 
 elements! {
     /// The `f32` element.
-    F32: f32, "f32";
+    F32: f32, "f32", dense;
     /// The `bf16` element.
-    Bf16: u16, "bf16";
+    Bf16: u16, "bf16", dense;
     /// The `f16` element.
-    F16: u16, "f16";
+    F16: u16, "f16", dense;
     /// The `i32` element.
-    I32: i32, "i32";
+    I32: i32, "i32", plain;
     /// The `u32` element.
-    U32: u32, "u32";
+    U32: u32, "u32", plain;
     /// The `u64` element.
-    U64: u64, "u64";
+    U64: u64, "u64", plain;
 }
 
 impl Dense for F32 {
@@ -450,5 +634,23 @@ mod tests {
                 assert_eq!(f32_to_bf16(value), bits);
             }
         }
+    }
+
+    /// Every NaN, whatever its sign, quietness and payload (including ones whose payload would
+    /// round to an infinity), narrows to a NaN of each element.
+    #[test]
+    fn every_nan_narrows_to_a_nan() {
+        for bits in [
+            0x7f80_0001, 0xff80_0001, 0x7fbf_ffff, 0x7fc0_0000, 0xffc0_0000, 0x7fc0_1234, 0xffff_ffff, 0x7fff_ffff,
+        ] {
+            let value = f32::from_bits(bits);
+            assert!(value.is_nan());
+            assert!(bf16_to_f32(f32_to_bf16(value)).is_nan(), "{bits:#x}");
+            assert!(f16_to_f32(f32_to_f16(value)).is_nan(), "{bits:#x}");
+            assert!(<F32 as Dense>::narrow(value).is_nan(), "{bits:#x}");
+        }
+        assert_eq!(<F32 as Dense>::narrow(f32::INFINITY), f32::INFINITY);
+        assert_eq!(f32_to_bf16(f32::NEG_INFINITY), 0xff80);
+        assert_eq!(f32_to_f16(f32::NEG_INFINITY), 0xfc00);
     }
 }

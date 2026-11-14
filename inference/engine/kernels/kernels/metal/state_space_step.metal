@@ -26,10 +26,10 @@ kernel void state_space_step(
     device const int *previous_bank [[buffer(SEISMIC_BUFFER_PREVIOUS_BANK)]],
     device const int *previous_tape [[buffer(SEISMIC_BUFFER_PREVIOUS_TAPE)]],
     device const int *following_bank [[buffer(SEISMIC_BUFFER_FOLLOWING_BANK)]],
-    device const ulong *window [[buffer(SEISMIC_BUFFER_WINDOW)]],
-    device const ulong *state [[buffer(SEISMIC_BUFFER_STATE)]],
-    device const ulong *tape [[buffer(SEISMIC_BUFFER_TAPE)]],
-    device state_space::Storage *mixed [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_OUT_WINDOW_PARAM(window),
+    SEISMIC_OUT_STATE_PARAM(state),
+    SEISMIC_OUT_TAPE_PARAM(tape),
+    SEISMIC_RESULT_0_PARAM(mixed),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
@@ -42,7 +42,7 @@ kernel void state_space_step(
     threadgroup float delta_block[SSS_SPAN];
     threadgroup float decay_block[SSS_SPAN];
     const state_space::Operands in{projection, convolution, convolution_bias, rate, time_bias, skip, window, state,
-        tape, mixed, seismic_words};
+        tape, element::Out<element::Act>(mixed), seismic_words};
     const versions::Slots slots{segments, stop, previous_bank, previous_tape, following_bank};
     const uint head = group.x;
     const ulong block_row0 = ulong(group.y) * SEISMIC_TUNE_ROWS;

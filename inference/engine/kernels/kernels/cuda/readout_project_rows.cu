@@ -18,7 +18,7 @@ using Epi = Scaling::type<projection::Logits>;
 #define STAGING SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)
 #define HEAD KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT))
 #define EPILOGUE                                                                                              \
-    Scaling::wrap(projection::Logits{SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0,              \
+    Scaling::wrap(projection::Logits{SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0,                                \
                                      __uint_as_float((unsigned)SEISMIC_PARAM_SOFTCAP)},                           \
                   projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT_SCALE), SEISMIC_DIM_WS, 0, 0), 1.0f)
 
@@ -105,14 +105,14 @@ __global__ void readout_project_rows_indexed(SEISMIC_KERNEL_PARAMS) {
         row * SEISMIC_TOKEN_ROWS_STRIDE_0 + column * SEISMIC_TOKEN_ROWS_STRIDE_2];
     if (vocabulary < 0 || (projection::u64)vocabulary >= SEISMIC_DIM_V) {
         if (threadIdx.x == 0)
-            reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER))[
-                row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1] = __int_as_float(0xff800000);
+            SEISMIC_RESULT_0_OUT.put(row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1,
+                                     __int_as_float(0xff800000));
         return;
     }
     const auto weight = HEAD;
     const IndexedSource source{STAGING + row * SEISMIC_DIM_D * 2, SEISMIC_DIM_D, projection::AllRows{}};
     const auto epilogue = Scaling::wrap(IndexedLogits{projection::Logits{
-        SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + 4 * (row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1),
+        SEISMIC_RESULT_0_OUT.offset(row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1),
         0, __uint_as_float((unsigned)SEISMIC_PARAM_SOFTCAP)}, (projection::u64)vocabulary},
         projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT_SCALE), SEISMIC_DIM_WS, 0, 0), 1.0f);
     // One weight-row group is live; the others are past the segment.

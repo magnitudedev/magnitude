@@ -22,7 +22,7 @@
                                  element::Act::load(__ldcg((row_published) + k * join_h + (n))), selected); \
         ROUTED_SITE_ADD(row, n, selected)                                                                  \
         projection::routed_join<SEISMIC_DIM_SN, (SEISMIC_DIM_IN != 0)>(                                    \
-            reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)) + (row) * SEISMIC_RESULT_0_STRIDE_0, \
+            SEISMIC_RESULT_0_OUT.offset((row) * SEISMIC_RESULT_0_STRIDE_0),                                \
             reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL)) +                        \
                 (row) * SEISMIC_RESIDUAL_STRIDE_0,                                                         \
             reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_INJECT)) + (row) * SEISMIC_INJECT_STRIDE_0, \

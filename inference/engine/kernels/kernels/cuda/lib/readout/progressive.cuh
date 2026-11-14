@@ -36,6 +36,7 @@ using projection::Act;
 using projection::u32;
 using projection::u64;
 using projection::u8;
+typedef element::Out<element::F32> F32Out;
 
 // Order-preserving key of an F32 (zero is below every key), and back.
 __device__ __forceinline__ u32 key(float value) {
@@ -207,7 +208,7 @@ struct Selection {
 // max(floor, raised), or -inf where the row's length is not finite, and
 // clears the keys.
 __device__ __forceinline__ void publish(const u32 *lowest, u32 *bounds, u32 rows, const float *floor, u64 floor_stride,
-                                        const float *lengths, u64 length_stride, float *threshold,
+                                        const float *lengths, u64 length_stride, const F32Out &threshold,
                                         u64 threshold_stride) {
     __shared__ u32 last;
     __syncthreads();
@@ -217,15 +218,16 @@ __device__ __forceinline__ void publish(const u32 *lowest, u32 *bounds, u32 rows
         const u32 k = atomicExch(&bounds[threadIdx.x], 0u);
         const float raised = k == 0u ? -infinity() : value_of(k);
         const float floored = floor ? fmaxf(floor[threadIdx.x * floor_stride], raised) : raised;
-        threshold[threadIdx.x * threshold_stride] =
-            isfinite(lengths[threadIdx.x * length_stride]) ? floored : -infinity();
+        threshold.put(threadIdx.x * threshold_stride,
+                      isfinite(lengths[threadIdx.x * length_stride]) ? floored : -infinity());
     }
 }
 
 // Row blockIdx.x of the prologue into `features` (A); with GROUPS also its
-// length (over the rounded values) and per-group sums ([rows][d / 32]).
+// length (over the rounded values, into `*lengths`) and per-group sums
+// ([rows][d / 32]).
 template <bool GROUPS, class Pro>
-__device__ __forceinline__ void form(const Pro &pro, u32 d, u8 *features, u64 feature_stride, float *lengths,
+__device__ __forceinline__ void form(const Pro &pro, u32 d, element::Out<Act> features, u64 feature_stride, const F32Out *lengths,
                                      u64 length_stride, float *groups) {
     __shared__ float factors[Pro::FACTORS > 0 ? Pro::FACTORS : 1];
     __shared__ float partials[32];
@@ -236,7 +238,7 @@ __device__ __forceinline__ void form(const Pro &pro, u32 d, u8 *features, u64 fe
     float squares = 0.0f;
     for (u32 g = threadIdx.x / 32; g < d / 32; g += warps) {
         const float value = pro.value(factors, m, 32ull * g + lane);
-        element::put<Act>(features, m * feature_stride + 32ull * g + lane, value);
+        features.put(m * feature_stride + 32ull * g + lane, value);
         if constexpr (GROUPS) {
             squares = seismic_fma_rn(value, value, squares);
             const float sum = warp_sum(value);
@@ -248,7 +250,7 @@ __device__ __forceinline__ void form(const Pro &pro, u32 d, u8 *features, u64 fe
         __syncthreads();
         const float total = reduce::group_sum(squares, partials);
         if (threadIdx.x == 0)
-            lengths[m * length_stride] = sqrtf(total);
+            lengths->put(m * length_stride, sqrtf(total));
     }
 }
 
@@ -292,8 +294,8 @@ struct Planes {
 template <u32 MAXM, u32 ROWS, bool EXACT>
 __device__ __forceinline__ void scan(const u8 *features, u64 feature_stride, const float *groups, const Planes &planes,
                                      const float *radius, u64 radius_stride, const float *lengths, u64 length_stride,
-                                     const Selection &selection, float *logits, u64 logit_row, u64 logit_col,
-                                     float *threshold, u64 threshold_stride, u32 *bounds, u32 rows, u32 vocabulary,
+                                     const Selection &selection, F32Out logits, u64 logit_row, u64 logit_col,
+                                     const F32Out *threshold, u64 threshold_stride, u32 *bounds, u32 rows, u32 vocabulary,
                                      u32 d, uint4 *staged, float *sums, u32 *lowest) {
     const u32 lane = threadIdx.x % 32, warps = blockDim.x / 32;
     if (!EXACT && threadIdx.x < PROGRESSIVE_ROWS)
@@ -370,7 +372,7 @@ __device__ __forceinline__ void scan(const u8 *features, u64 feature_stride, con
             const float logit = warp_sum(acc[r][m]);
             if (v >= vocabulary || lane != m)
                 continue;
-            logits[m * logit_row + v * logit_col] = EXACT ? selection.transform(logit) : logit;
+            logits.put(m * logit_row + v * logit_col, EXACT ? selection.transform(logit) : logit);
             if (!EXACT && selection.competes(m, v)) {
                 // A score is its noise-free score plus noise of at most
                 // PROGRESSIVE_NOISE: a row that cannot reach the threshold so
@@ -384,7 +386,7 @@ __device__ __forceinline__ void scan(const u8 *features, u64 feature_stride, con
         }
     }
     if constexpr (!EXACT)
-        publish(lowest, bounds, rows, nullptr, 0, lengths, length_stride, threshold, threshold_stride);
+        publish(lowest, bounds, rows, nullptr, 0, lengths, length_stride, *threshold, threshold_stride);
 }
 
 // A later level: one warp per 32 vocabulary rows. Lane l decides row l for
@@ -398,8 +400,8 @@ __device__ __forceinline__ void gather(const u8 *features, u64 feature_stride, c
                                        const float *radius_previous, const float *radius_next, u64 radius_stride,
                                        const float *coarse, u64 coarse_row, u64 coarse_col, const float *floor,
                                        u64 floor_stride, const float *lengths, u64 length_stride,
-                                       const Selection &selection, float *out, u64 out_row, u64 out_col,
-                                       float *threshold, u64 threshold_stride, u32 *bounds, u32 rows, u32 vocabulary,
+                                       const Selection &selection, F32Out out, u64 out_row, u64 out_col,
+                                       const F32Out *threshold, u64 threshold_stride, u32 *bounds, u32 rows, u32 vocabulary,
                                        u32 d) {
     __shared__ u32 lowest[PROGRESSIVE_ROWS];
     const u32 lane = threadIdx.x % 32, warps = blockDim.x / 32;
@@ -416,7 +418,7 @@ __device__ __forceinline__ void gather(const u8 *features, u64 feature_stride, c
             if (selection.survives(m, n, coarse[m * coarse_row + n * coarse_col], reach, floor[m * floor_stride]))
                 candidate |= 1u << m;
             else
-                out[m * out_row + n * out_col] = -infinity();
+                out.put(m * out_row + n * out_col, -infinity());
         }
     const u32 groups = d / 32;
     for (u32 pending = __ballot_sync(0xffffffffu, candidate != 0u); pending != 0u; pending &= pending - 1u) {
@@ -450,7 +452,7 @@ __device__ __forceinline__ void gather(const u8 *features, u64 feature_stride, c
             if (lane != 0)
                 continue;
             const float logit = REFINE ? __fadd_rn(coarse[m * coarse_row + v * coarse_col], acc) : acc;
-            out[m * out_row + v * out_col] = REFINE ? logit : selection.transform(logit);
+            out.put(m * out_row + v * out_col, REFINE ? logit : selection.transform(logit));
             if (REFINE && selection.competes(m, v))
                 atomicMax(&lowest[m],
                           key(selection.score(m, v, __fsub_rn(logit, __fmul_rn(radius_next[v * radius_stride],
@@ -458,7 +460,7 @@ __device__ __forceinline__ void gather(const u8 *features, u64 feature_stride, c
         }
     }
     if constexpr (REFINE)
-        publish(lowest, bounds, rows, floor, floor_stride, lengths, length_stride, threshold, threshold_stride);
+        publish(lowest, bounds, rows, floor, floor_stride, lengths, length_stride, *threshold, threshold_stride);
 }
 
 } // namespace progressive

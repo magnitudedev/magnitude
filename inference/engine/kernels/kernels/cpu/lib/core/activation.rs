@@ -33,6 +33,6 @@ pub fn widen<E: Dense>(row: &[E::Storage], out: &mut [f32]) {
 
 /// F32 values stored to a row of `E` elements (each rounded once).
 #[inline(always)]
-pub fn store<E: Dense>(values: &[f32], row: &mut [E::Storage]) {
-    seismic::cpu::tensor::narrow_row::<E>(values, row)
+pub fn store<E: Dense>(values: &[f32], mut row: seismic::cpu::Store<'_, E>) {
+    row.store(values)
 }

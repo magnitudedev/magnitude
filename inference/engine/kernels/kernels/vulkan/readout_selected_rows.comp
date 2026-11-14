@@ -39,7 +39,7 @@ projection_prologue selected_rows_input() {
 }
 
 projection_epilogue selected_rows_output() {
-    return projection_logits(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0,
+    return projection_logits(SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0,
         SEISMIC_RESULT_0_STRIDE_1, element_word_f32(SEISMIC_PARAM_SOFTCAP));
 }
 

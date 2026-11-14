@@ -9,7 +9,7 @@ void draft_convolve_residual() {
     const uint64_t sublayer = SEISMIC_PTR(SEISMIC_BUFFER_OUTPUT);
     const uint64_t dynamic = SEISMIC_PTR(SEISMIC_BUFFER_DYNAMIC);
     const uint64_t base = SEISMIC_PTR(SEISMIC_BUFFER_BASE);
-    const uint64_t result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const Out result = SEISMIC_RESULT_0_OUT;
     const uint64_t channels = SEISMIC_DIM_C, width = SEISMIC_DIM_G * channels;
     const uint64_t count = SEISMIC_DIM_M * width;
     const uint64_t step = uint64_t(gl_NumWorkGroups.x) * gl_WorkGroupSize.x;
@@ -27,7 +27,7 @@ void draft_convolve_residual() {
                 element_f32_at(sublayer + ((row - offset) * SEISMIC_OUTPUT_STRIDE_0 + column * SEISMIC_OUTPUT_STRIDE_1) * 4ul),
                 sum);
         }
-        element_f32_put(result + (row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1) * 4ul,
+        out_put(result, row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1,
             element_f32_at(residual + (row * SEISMIC_RESIDUAL_STRIDE_0 + column * SEISMIC_RESIDUAL_STRIDE_1) * 4ul) + sum);
     }
 }

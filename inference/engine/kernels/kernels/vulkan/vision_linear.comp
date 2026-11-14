@@ -20,23 +20,14 @@
 #error "unsupported vision_linear bias representation"
 #endif
 
-#if defined(SEISMIC_ELEMENT_Y_REPRESENTATION_BF16)
-#define Y_KIND ELEMENT_BF16
-#elif defined(SEISMIC_ELEMENT_Y_REPRESENTATION_F16)
-#define Y_KIND ELEMENT_F16
-#elif defined(SEISMIC_ELEMENT_Y_REPRESENTATION_F32)
-#define Y_KIND ELEMENT_F32
-#else
-#error "unsupported vision_linear Y representation"
-#endif
 
 void vision_linear() {
     const uint n = uint(SEISMIC_DIM_N), k = uint(SEISMIC_DIM_K);
     const projection_prologue in_ = projection_plain(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_X), SEISMIC_X_STRIDE_0, 1ul,
         k, 0ul);
     const bool clamped = SEISMIC_DIM_NC == 1;
-    const vision_epilogue out_ = vision_linear_epilogue(ELEMENT_ACT, Y_KIND, int(SEISMIC_PARAM_ACTIVATION),
-        SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_DIM_NB == 1,
+    const vision_epilogue out_ = vision_linear_epilogue(ELEMENT_ACT, int(SEISMIC_PARAM_ACTIVATION),
+        SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_DIM_NB == 1,
         SEISMIC_PTR(SEISMIC_BUFFER_BIAS), BIAS_KIND, SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL),
         SEISMIC_RESIDUAL_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_GATE),
         SEISMIC_GATE_STRIDE_1, clamped,

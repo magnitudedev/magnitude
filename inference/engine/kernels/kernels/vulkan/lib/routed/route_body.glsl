@@ -44,7 +44,7 @@ ROUTE_FORM_INPUT \
 
 #define ROUTE_DEFINE_PUBLISH \
 void ROUTE_FN(route_publish)(uint64_t row, uint source, float value) { \
-    element_put(ROUTE_ACT, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), \
+    out_put(SEISMIC_RESULT_0_OUT, \
         row * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(source) * SEISMIC_RESULT_0_STRIDE_1, value); \
 }
 
@@ -243,7 +243,7 @@ void ROUTE_FN(route_gemm)() { \
             const uint64_t row = row0 + i; \
             const uint expert = expert0 + i; \
             seismic_shared_f32[i * ROUTE_PITCH + k] = row < SEISMIC_DIM_M \
-                ? element_at(ROUTE_ACT, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), \
+                ? out_at(SEISMIC_RESULT_0_OUT, \
                     row * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(k0 + k) * SEISMIC_RESULT_0_STRIDE_1) \
                 : 0.0; \
 ROUTE_STAGE_DENSE_COLUMNS \
@@ -319,7 +319,7 @@ void ROUTE_FN(route_rank)(uint64_t row, out float chosen[ROUTE_K], out int winne
 void ROUTE_FN(route_select_row)(uint64_t row, out int winners[ROUTE_K]) { \
     const uint lane = SEISMIC_LANE; \
     const uint64_t routes = SEISMIC_PTR(SEISMIC_BUFFER_ROUTES); \
-    const uint64_t scores = SEISMIC_PTR(SEISMIC_BUFFER_SCORES); \
+    const Out scores = SEISMIC_OUT_SCORES; \
     float chosen[ROUTE_K]; \
     ROUTE_FN(route_rank)(row, chosen, winners); \
     if (lane == 0u) \
@@ -338,12 +338,12 @@ void ROUTE_FN(route_select_row)(uint64_t row, out int winners[ROUTE_K]) { \
             if (SEISMIC_DIM_ES != 0ul) \
                 score = seismic_mul_rn(score, element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_SCALE) \
                     + uint64_t(winners[rank]) * SEISMIC_EXPERT_SCALE_STRIDE_0 * 4ul)); \
-            element_f32_put(scores + (row * SEISMIC_SCORES_STRIDE_0 + uint64_t(slot) * SEISMIC_SCORES_STRIDE_1) * 4ul, \
+            out_put(scores, row * SEISMIC_SCORES_STRIDE_0 + uint64_t(slot) * SEISMIC_SCORES_STRIDE_1, \
                 score); \
         } \
     } \
     if (lane == 0u) \
-        element_f32_put(SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER) + row * SEISMIC_RESULT_1_STRIDE_0 * 4ul, \
+        out_put(SEISMIC_RESULT_1_OUT, row * SEISMIC_RESULT_1_STRIDE_0, \
             seismic_div_rn(1.0, 1.0 + exp(-element_f32_at(ROUTE_FN(route_logit)(row, ROUTE_E))))); \
 }
 

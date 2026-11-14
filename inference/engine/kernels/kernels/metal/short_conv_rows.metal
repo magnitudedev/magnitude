@@ -17,8 +17,8 @@ kernel void short_conv_rows(
     device const int *previous_bank [[buffer(SEISMIC_BUFFER_PREVIOUS_BANK)]],
     device const int *previous_tape [[buffer(SEISMIC_BUFFER_PREVIOUS_TAPE)]],
     device const int *following_bank [[buffer(SEISMIC_BUFFER_FOLLOWING_BANK)]],
-    device const ulong *window [[buffer(SEISMIC_BUFFER_WINDOW)]],
-    device element::Act::storage *gated [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_OUT_WINDOW_PARAM(window),
+    SEISMIC_RESULT_0_PARAM(gated),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
@@ -32,29 +32,35 @@ kernel void short_conv_rows(
     const ulong rows = SEISMIC_DIM_M;
     if (group.y >= rows) {
         const versions::Slot slot = versions::slot_of(slots, group.y - rows, seismic_words);
-        device const float *source = versions::bank<float>(window, slot.source, SEISMIC_WINDOW_STRIDE_0, seismic_words);
-        device float *target = versions::bank<float>(window, slot.target, SEISMIC_WINDOW_STRIDE_0, seismic_words);
+        const element::Out<element::F32> source = versions::bank(window, slot.source, SEISMIC_WINDOW_STRIDE_0,
+            seismic_words);
+        const element::Out<element::F32> target = versions::bank(window, slot.target, SEISMIC_WINDOW_STRIDE_0,
+            seismic_words);
         const long published = taps + versions::tape_rows(slot, long(SEISMIC_DIM_T));
         for (long tap = 0; tap < published; ++tap) {
             const long position = slot.stop + tap - taps;
-            target[ulong(tap) * SEISMIC_WINDOW_STRIDE_1 + channel * SEISMIC_WINDOW_STRIDE_2] = position < 0
-                ? source[ulong(slot.taped + slot.stop + tap) * SEISMIC_WINDOW_STRIDE_1
-                    + channel * SEISMIC_WINDOW_STRIDE_2]
-                : projection[ulong(slot.lo + position) * SEISMIC_PROJECTION_STRIDE_0
-                    + channel * SEISMIC_PROJECTION_STRIDE_1];
+            const ulong to = ulong(tap) * SEISMIC_WINDOW_STRIDE_1 + channel * SEISMIC_WINDOW_STRIDE_2;
+            // The source window's rows are the owner's: moved. The
+            // projection's are an input: stored.
+            if (position < 0)
+                target.move_stored(to, source, ulong(slot.taped + slot.stop + tap) * SEISMIC_WINDOW_STRIDE_1
+                    + channel * SEISMIC_WINDOW_STRIDE_2, 1);
+            else
+                target.put(to, projection[ulong(slot.lo + position) * SEISMIC_PROJECTION_STRIDE_0
+                    + channel * SEISMIC_PROJECTION_STRIDE_1]);
         }
         return;
     }
     const long row = long(group.y);
     const ulong slot_index = versions::slot_index_of_row(slots, row, seismic_words);
-    device element::Act::storage *out = gated + ulong(row) * SEISMIC_RESULT_0_STRIDE_0
-        + channel * SEISMIC_RESULT_0_STRIDE_1;
+    const ulong out = ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + channel * SEISMIC_RESULT_0_STRIDE_1;
+    const element::Out<element::Act> result(gated);
     if (slot_index == SEISMIC_DIM_B) {
-        *out = element::Act::store(0.0f);
+        result.put(out, 0.0f);
         return;
     }
     const versions::Slot slot = versions::slot_of(slots, slot_index, seismic_words);
-    device const float *source = versions::bank<float>(window, slot.source, SEISMIC_WINDOW_STRIDE_0, seismic_words);
+    device const float *source = versions::bank_view(window, slot.source, SEISMIC_WINDOW_STRIDE_0, seismic_words);
     const long local = row - slot.lo;
     float sum = 0.0f;
     for (long tap = 0; tap <= taps; ++tap) {
@@ -68,5 +74,5 @@ kernel void short_conv_rows(
     }
     const float gate = projection[ulong(row) * SEISMIC_PROJECTION_STRIDE_0
         + (channels + channel) * SEISMIC_PROJECTION_STRIDE_1];
-    *out = element::Act::store(gate * sum);
+    result.put(out, gate * sum);
 }

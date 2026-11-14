@@ -1,3 +1,5 @@
+#include <seismic/element.cuh>
+
 extern "C" __global__ void split_partial(SEISMIC_KERNEL_PARAMS) {
     const float *x = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_X));
     float *partials = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS));
@@ -31,10 +33,10 @@ extern "C" __global__ void split_partial(SEISMIC_KERNEL_PARAMS) {
 extern "C" __global__ void split_merge(SEISMIC_KERNEL_PARAMS) {
     const float *partials =
         reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS));
-    float *result = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER));
+    const auto result = SEISMIC_RESULT_0_OUT;
     float total = 0.0f;
     for (unsigned part = 0; part < SEISMIC_TUNE_PARTS; ++part) {
         total += partials[part];
     }
-    result[0] = total;
+    result.put(0, total);
 }

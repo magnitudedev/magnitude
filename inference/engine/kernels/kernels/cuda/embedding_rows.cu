@@ -75,8 +75,8 @@ extern "C" __global__ void embedding_rows(SEISMIC_KERNEL_PARAMS) {
     if (row >= SEISMIC_DIM_M)
         return;
     const int *tokens = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_TOKENS));
-    u8 *embedded = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
-    float *wide = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER));
+    const auto embedded = SEISMIC_RESULT_0_OUT;
+    const auto wide = SEISMIC_RESULT_1_OUT;
     const u64 width = SEISMIC_DIM_D;
     const float scale = __uint_as_float((unsigned)SEISMIC_PARAM_SCALE);
     const bool normalize = SEISMIC_PARAM_NORMALIZE != 0;
@@ -89,8 +89,8 @@ extern "C" __global__ void embedding_rows(SEISMIC_KERNEL_PARAMS) {
     // A row that names no table row reads zeros (the whole block's).
     if (held < 0) {
         for (u64 column = threadIdx.x; column < width; column += blockDim.x) {
-            element::put<Act>(embedded, out0 + column * stride1, 0.0f);
-            wide[out1 + column * wide1] = 0.0f;
+            embedded.put(out0 + column * stride1, 0.0f);
+            wide.put(out1 + column * wide1, 0.0f);
         }
         return;
     }
@@ -114,11 +114,9 @@ extern "C" __global__ void embedding_rows(SEISMIC_KERNEL_PARAMS) {
         inverse = rsqrtf(total / (float)width + __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON));
     }
     EMBEDDING_ROW([&](u64 column, float decoded) {
-        const float rounded = Act::round(normalize ? decoded * inverse : decoded);
-        // A NaN (a non-finite block scale's product) is the registry's one NaN, whatever the hardware's.
-        const float value = rounded != rounded ? __uint_as_float(0x7fc00000u) : rounded;
-        element::put<Act>(embedded, out0 + column * stride1, value);
-        wide[out1 + column * wide1] = value;
+        const float value = Act::round(normalize ? decoded * inverse : decoded);
+        embedded.put(out0 + column * stride1, value);
+        wide.put(out1 + column * wide1, value);
     });
 #undef EMBEDDING_ROW
 }

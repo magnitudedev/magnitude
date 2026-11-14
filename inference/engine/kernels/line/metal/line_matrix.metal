@@ -4,10 +4,12 @@
 // product is 16 a lane), in UNROLL independent accumulators seeded apart,
 // the operands each simdgroup's first `x` in the operand type; each writes
 // `x` back (line.seismic). A simdgroup runs whole or not at all.
+#include <seismic/element.h>
+
 template <typename T>
 static inline void line_matrix_of(
     device const float *xs,
-    device float *out,
+    element::Out<ELEMENT_OF(SEISMIC_OUT)> out,
     constant ulong *seismic_words,
     uint index,
     uint lane_in) {
@@ -31,24 +33,24 @@ static inline void line_matrix_of(
     for (uint k = 0; k < UNROLL; ++k)
         total += d[k].thread_elements()[0] + d[k].thread_elements()[1];
     if (lane < SEISMIC_DIM_N)
-        out[lane * SEISMIC_OUT_STRIDE_0] =
-            xs[lane * SEISMIC_X_STRIDE_0] + (as_type<uint>(total) == 0xFFFFFFFFu ? 1.0f : 0.0f);
+        out.put(lane * SEISMIC_OUT_STRIDE_0,
+            xs[lane * SEISMIC_X_STRIDE_0] + (as_type<uint>(total) == 0xFFFFFFFFu ? 1.0f : 0.0f));
 }
 
 kernel void line_matrix(
     device const float *xs [[buffer(SEISMIC_BUFFER_X)]],
-    device float *out [[buffer(SEISMIC_BUFFER_OUT)]],
+    SEISMIC_OUT_OUT_PARAM(out),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint index [[thread_position_in_grid]],
     uint lane_in [[thread_index_in_simdgroup]]) {
-    line_matrix_of<half>(xs, out, seismic_words, index, lane_in);
+    line_matrix_of<half>(xs, element::Out<ELEMENT_OF(SEISMIC_OUT)>(out), seismic_words, index, lane_in);
 }
 
 kernel void line_matrix_f32(
     device const float *xs [[buffer(SEISMIC_BUFFER_X)]],
-    device float *out [[buffer(SEISMIC_BUFFER_OUT)]],
+    SEISMIC_OUT_OUT_PARAM(out),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint index [[thread_position_in_grid]],
     uint lane_in [[thread_index_in_simdgroup]]) {
-    line_matrix_of<float>(xs, out, seismic_words, index, lane_in);
+    line_matrix_of<float>(xs, element::Out<ELEMENT_OF(SEISMIC_OUT)>(out), seismic_words, index, lane_in);
 }

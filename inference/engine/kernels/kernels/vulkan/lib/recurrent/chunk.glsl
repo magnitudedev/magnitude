@@ -169,21 +169,21 @@ void chunk_load_version(recurrent_inputs in_, recurrent_slot slot, uint head, ui
     if (!chunk_active())
         return;
     const uint part = chunk_part();
-    const uint64_t source = recurrent_state_row(in_, slot.source, head, state_row);
+    const Out source = recurrent_state_row(in_, slot.source, head, state_row);
     [[unroll]] for (uint c = 0u; c < CHUNK_COLUMNS; ++c)
-        state[c] = element_f32_at(source + uint64_t(part + CHUNK_LANES * c) * 4ul);
+        state[c] = out_at(source, uint64_t(part + CHUNK_LANES * c));
     const uint key = recurrent_key_head(in_, head);
     for (int entry = 0; entry < slot.taped; ++entry) {
-        const uint64_t tape = recurrent_tape_row(in_, slot.source, entry);
-        const float u = element_f32_at(tape + uint64_t(RECURRENT_TAPE_U + head * RECURRENT_W + state_row) * 4ul);
+        const Out tape = recurrent_tape_row(in_, slot.source, entry);
+        const float u = out_at(tape, uint64_t(RECURRENT_TAPE_U + head * RECURRENT_W + state_row));
         // One decay per value head is loaded once.
         float factor[CHUNK_MAX_COLUMNS];
         [[unroll]] for (uint c = 0u; c < CHUNK_COLUMNS; ++c)
             factor[c] = RECURRENT_DECAYS == 1u && c > 0u ? factor[0]
-                : element_f32_at(recurrent_tape_factor(tape, head, part + CHUNK_LANES * c));
+                : out_at(tape, recurrent_tape_factor(head, part + CHUNK_LANES * c));
         [[unroll]] for (uint c = 0u; c < CHUNK_COLUMNS; ++c) {
             const uint column = part + CHUNK_LANES * c;
-            const float k = element_f32_at(tape + uint64_t(RECURRENT_TAPE_K + key * RECURRENT_W + column) * 4ul);
+            const float k = out_at(tape, uint64_t(RECURRENT_TAPE_K + key * RECURRENT_W + column));
             state[c] = seismic_fma_rn(u, k, state[c] * factor[c]);
         }
     }
@@ -193,9 +193,9 @@ void chunk_store(recurrent_inputs in_, int bank, uint head, uint state_row, floa
     if (!chunk_active())
         return;
     const uint part = chunk_part();
-    const uint64_t target = recurrent_state_row(in_, bank, head, state_row);
+    const Out target = recurrent_state_row(in_, bank, head, state_row);
     [[unroll]] for (uint c = 0u; c < CHUNK_COLUMNS; ++c)
-        element_f32_put(target + uint64_t(part + CHUNK_LANES * c) * 4ul, state[c]);
+        out_put(target, uint64_t(part + CHUNK_LANES * c), state[c]);
 }
 
 // Shared floats of a staged piece: row r's q at r * CHUNK_PREPARED, its k at

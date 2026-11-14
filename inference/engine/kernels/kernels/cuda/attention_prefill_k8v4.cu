@@ -33,10 +33,10 @@
 // zero) pairs [T, KV, W / 16] f16, one aligned u32 per pair.
 #define HISTORY()                                                                              \
     attention::AffineHistory {                                                                 \
-        reinterpret_cast<attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY_CODES)),      \
-            reinterpret_cast<attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY_COEFFICIENTS)), \
-            reinterpret_cast<attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE_CODES)),    \
-            reinterpret_cast<attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE_COEFFICIENTS)), \
+        reinterpret_cast<const attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY_CODES)),   \
+            SEISMIC_OUT_HISTORY_KEY_COEFFICIENTS,                                                  \
+            reinterpret_cast<const attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE_CODES)), \
+            SEISMIC_OUT_HISTORY_VALUE_COEFFICIENTS,                                                \
             SEISMIC_HISTORY_KEY_CODES_STRIDE_0, SEISMIC_HISTORY_KEY_CODES_STRIDE_1,             \
             SEISMIC_HISTORY_KEY_COEFFICIENTS_STRIDE_0, SEISMIC_HISTORY_KEY_COEFFICIENTS_STRIDE_1, \
             SEISMIC_HISTORY_VALUE_CODES_STRIDE_0, SEISMIC_HISTORY_VALUE_CODES_STRIDE_1,         \
@@ -162,7 +162,7 @@ extern "C" __global__ void __launch_bounds__(256)
     uint4 k = make_uint4(0, 0, 0, 0), v = k;
     if (staged.valid[slot * 8 + row / 32] & (1u << (row & 31))) {
         const int token = staged.tiles[slot * staged.tile_stride] * 256 + row;
-        const auto source = HISTORY().vectors(token, kv);
+        const auto source = HISTORY().reads().vectors(token, kv);
         k = attention::prefill::key_chunk(source.key_codes[chunk * 2], source.key_codes[chunk * 2 + 1],
                                         source.key_pairs[chunk * 8 / attention::GROUP]);
         v = attention::prefill::value_chunk(source.value_codes[chunk], source.value_pairs[chunk * 8 / attention::GROUP]);
@@ -172,7 +172,7 @@ extern "C" __global__ void __launch_bounds__(256)
 }
 #define ATTEND_HISTORY() STAGED_HISTORY()
 #else
-#define ATTEND_HISTORY() HISTORY()
+#define ATTEND_HISTORY() (HISTORY().reads())
 // Every declared launch names a kernel in every form. Without the staged
 // history the two history launches are inactive (`when HISTORY_STAGE == 1`),
 // so their kernels are empty here.
@@ -187,14 +187,14 @@ extern "C" __global__ void __launch_bounds__(attention::prefill::MMA_THREADS + a
         attention::prefill::PrefillRows{SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_QUERIES),
                                       SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_KEYS),
                                       SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_VALUES),
-                                      SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SPLIT()},
+                                      SEISMIC_RESULT_0_OUT, SPLIT()},
         attention::prefill::Block{static_cast<int>(blockIdx.x), static_cast<int>(blockIdx.y),
                                 static_cast<int>(blockIdx.z), static_cast<int>(gridDim.z)},
         SELECTION());
 }
 
 extern "C" __global__ void attention_prefill_k8v4_merge(SEISMIC_KERNEL_PARAMS) {
-    attention::prefill::merge_partitions(ATTENTION_INPUTS(), SPLIT(), SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER));
+    attention::prefill::merge_partitions(ATTENTION_INPUTS(), SPLIT(), SEISMIC_RESULT_0_OUT);
 }
 
 // The WorkList's list launch (B > 0): each query tile's read key tiles

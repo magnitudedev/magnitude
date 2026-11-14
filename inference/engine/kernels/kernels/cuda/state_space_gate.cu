@@ -28,7 +28,7 @@ extern "C" __global__ void state_space_gate(SEISMIC_KERNEL_PARAMS) {
     const element::u8 *mixed = SEISMIC_PTR(SEISMIC_BUFFER_MIXED);
     const element::u8 *projection = SEISMIC_PTR(SEISMIC_BUFFER_PROJECTION);
     const float *state_norm = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_STATE_NORM));
-    element::u8 *normalized = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const element::Out<element::Act> normalized = SEISMIC_RESULT_0_OUT;
     __shared__ float partials[32];
     const u64 row = blockIdx.x;
     const u64 width = SEISMIC_DIM_U * SEISMIC_DIM_P;
@@ -52,9 +52,8 @@ extern "C" __global__ void state_space_gate(SEISMIC_KERNEL_PARAMS) {
                                         (column / SEISMIC_DIM_P) * SEISMIC_STATE_NORM_STRIDE_1 +
                                         (column % SEISMIC_DIM_P) * SEISMIC_STATE_NORM_STRIDE_2];
         const float value = gated_value(mixed, projection, row, channel, seismic_words_value);
-        element::put<element::Act>(normalized,
-                                   row * SEISMIC_RESULT_0_STRIDE_0 + (channel / SEISMIC_DIM_P) * SEISMIC_RESULT_0_STRIDE_1 +
-                                       (channel % SEISMIC_DIM_P) * SEISMIC_RESULT_0_STRIDE_2,
-                                   seismic_mul_rn(seismic_mul_rn(value, inverse), weight));
+        normalized.put(row * SEISMIC_RESULT_0_STRIDE_0 + (channel / SEISMIC_DIM_P) * SEISMIC_RESULT_0_STRIDE_1 +
+                           (channel % SEISMIC_DIM_P) * SEISMIC_RESULT_0_STRIDE_2,
+                       seismic_mul_rn(seismic_mul_rn(value, inverse), weight));
     }
 }

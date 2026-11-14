@@ -10,6 +10,6 @@ fn tap_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _s
     let d = cx.dim_d() as usize;
     let tap = cx.arg_index().get([0]) as usize;
     // SAFETY: each work item writes its own row.
-    let taps = unsafe { cx.arg_taps().row_mut([row, 0]) };
-    activation::store::<E::A>(cx.arg_residual().row([row, 0]), &mut taps[tap * d..(tap + 1) * d]);
+    let mut taps = unsafe { cx.arg_taps().row_mut([row, 0]) };
+    activation::store::<E::A>(cx.arg_residual().row([row, 0]), taps.part_mut(tap * d, d));
 }

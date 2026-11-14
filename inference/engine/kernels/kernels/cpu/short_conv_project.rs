@@ -59,9 +59,9 @@ fn short_conv_project_rows<L: Isa, E: Elements>(
             quantized,
             |row, b, x| {
                 // SAFETY: each work item writes its own columns of every row.
-                let out = unsafe { result.span_mut([row, rows.start], rows.len()) };
+                let mut out = unsafe { result.span_mut([row, rows.start], rows.len()) };
                 for ((target, b), x) in out.iter_mut().zip(b).zip(x) {
-                    *target = (b_scale * b) * (x_scale * x);
+                    target.set((b_scale * b) * (x_scale * x));
                 }
             },
         );
@@ -69,9 +69,9 @@ fn short_conv_project_rows<L: Isa, E: Elements>(
         let rows = projection::item_rows(group[0] - segment, cx.param_rows(), ch);
         projection::project_staged_arithmetic(&cx.arg_c_weight(), rows.clone(), normalized, quantized, |row, c| {
             // SAFETY: each work item writes its own columns of every row.
-            let out = unsafe { result.span_mut([row, ch + rows.start], rows.len()) };
+            let mut out = unsafe { result.span_mut([row, ch + rows.start], rows.len()) };
             for (target, value) in out.iter_mut().zip(c) {
-                *target = c_scale * value;
+                target.set(c_scale * value);
             }
         });
     }

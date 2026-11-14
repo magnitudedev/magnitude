@@ -26,7 +26,7 @@ kernel void routed_select_stage(
     device const float *residual [[buffer(SEISMIC_BUFFER_RESIDUAL)]],
     device const uchar *norm [[buffer(SEISMIC_BUFFER_NORM)]],
     device const uchar *router_norm [[buffer(SEISMIC_BUFFER_ROUTER_NORM)]],
-    device uchar *normalized [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(normalized_cells),
     device uchar *router_rows [[buffer(SEISMIC_BUFFER_SCRATCH_ROUTER_ROWS)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint row_index [[threadgroup_position_in_grid]],
@@ -34,6 +34,7 @@ kernel void routed_select_stage(
     uint simd [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float partials[select_simdgroups];
+    const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> normalized(normalized_cells);
     const ulong row = ulong(row_index);
     const float eps = as_type<float>(uint(SEISMIC_PARAM_EPSILON));
     float squares = 0.0f;
@@ -45,8 +46,8 @@ kernel void routed_select_stage(
     const float inverse = metal::rsqrt(total / float(SEISMIC_DIM_H) + eps);
     for (uint source = tid; source < SEISMIC_DIM_H; source += select_threads) {
         const float value = residual[row * SEISMIC_RESIDUAL_STRIDE_0 + source * SEISMIC_RESIDUAL_STRIDE_1];
-        element::put<Act>(normalized, row * SEISMIC_RESULT_0_STRIDE_0 + source * SEISMIC_RESULT_0_STRIDE_1,
-            Act::round(value * inverse * element::at<Norm>(norm, source * SEISMIC_NORM_STRIDE_0)));
+        normalized.put(row * SEISMIC_RESULT_0_STRIDE_0 + source * SEISMIC_RESULT_0_STRIDE_1,
+            value * inverse * element::at<Norm>(norm, source * SEISMIC_NORM_STRIDE_0));
         element::put<Act>(router_rows, row * SEISMIC_DIM_H + source,
             Act::round(value * inverse * element::at<RouterNorm>(router_norm, source * SEISMIC_ROUTER_NORM_STRIDE_0)));
     }
@@ -65,8 +66,8 @@ kernel void routed_select_gemv(
     device const float *bias [[buffer(SEISMIC_BUFFER_BIAS)]],
     device const float *expert_scale [[buffer(SEISMIC_BUFFER_EXPERT_SCALE)]],
     device int *routes [[buffer(SEISMIC_BUFFER_ROUTES)]],
-    device float *weights [[buffer(SEISMIC_BUFFER_WEIGHTS)]],
-    device uchar *normalized [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_OUT_WEIGHTS_PARAM(weights_cells),
+    SEISMIC_RESULT_0_PARAM(normalized_cells),
     arrive::coherent_device<float> logits [[buffer(SEISMIC_BUFFER_SCRATCH_LOGITS)]],
     device atomic_uint *arrivals [[buffer(SEISMIC_BUFFER_SCRATCH_ARRIVALS)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
@@ -78,6 +79,8 @@ kernel void routed_select_gemv(
     threadgroup float parts[SEISMIC_CONST_DECODE_ROWS * select_simdgroups];
     threadgroup float inverses[SEISMIC_CONST_DECODE_ROWS];
     threadgroup uint last;
+    const element::Out<ELEMENT_OF(SEISMIC_WEIGHTS)> weights(weights_cells);
+    const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> normalized(normalized_cells);
     decode_inverses(residual, parts, inverses, seismic_words, simd, lane, tid);
     if (group == 0)
         publish_normalized(residual, norm, normalized, inverses, seismic_words, tid);
@@ -115,7 +118,7 @@ kernel void routed_select_select(
     device const float *bias [[buffer(SEISMIC_BUFFER_BIAS)]],
     device const float *expert_scale [[buffer(SEISMIC_BUFFER_EXPERT_SCALE)]],
     device int *routes [[buffer(SEISMIC_BUFFER_ROUTES)]],
-    device float *weights [[buffer(SEISMIC_BUFFER_WEIGHTS)]],
+    SEISMIC_OUT_WEIGHTS_PARAM(weights_cells),
     device const float *logits [[buffer(SEISMIC_BUFFER_SCRATCH_LOGITS)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint group [[threadgroup_position_in_grid]],
@@ -124,5 +127,6 @@ kernel void routed_select_select(
     const ulong row = ulong(group) * select_simdgroups + simd;
     if (row >= SEISMIC_DIM_M)
         return;
+    const element::Out<ELEMENT_OF(SEISMIC_WEIGHTS)> weights(weights_cells);
     select_row(row, logits, bias, expert_scale, routes, weights, seismic_words, lane);
 }

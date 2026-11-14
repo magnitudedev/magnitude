@@ -18,7 +18,9 @@ use seismic_lang::entry::{
 use seismic_lang::expr::SymbolValue;
 use seismic_lang::expr::compiled::InvocationValues;
 use seismic_lang::ids::RepresentationId;
-use seismic_lang::native_parameter::native_parameter_names;
+use seismic_lang::native_parameter::{
+    OwnerReach, native_parameter_names, parameter_reach, representation_reach, result_handle,
+};
 use seismic_lang::registry;
 use seismic_lang::repack::WordTable;
 
@@ -410,6 +412,60 @@ pub(crate) fn static_geometry(
     }
 }
 
+/// The element-kind constant (`element.glsl`) of a floating dense representation: the kind its
+/// Vulkan handle carries.
+#[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
+fn vulkan_element_kind(representation: RepresentationId) -> &'static str {
+    match &registry::representation_info(representation).kind {
+        registry::RepresentationKind::Dense(seismic_lang::types::DType::F32) => "ELEMENT_F32",
+        registry::RepresentationKind::Dense(seismic_lang::types::DType::BF16) => "ELEMENT_BF16",
+        registry::RepresentationKind::Dense(seismic_lang::types::DType::F16) => "ELEMENT_F16",
+        other => unreachable!("{other:?} has no owner handle"),
+    }
+}
+
+/// The macro through which a kernel reaches the tensor of `element_prefix` bound to buffer
+/// `buffer`. CUDA: `expression` is the tensor's owner handle. Metal: `declaration(name)` declares
+/// the kernel parameter of the tensor's cells.
+fn render_owner_handle(
+    out: &mut String,
+    dialect: Dialect,
+    expression: &str,
+    declaration: &str,
+    element_prefix: &str,
+    representation: RepresentationId,
+    buffer: usize,
+    slab: bool,
+) {
+    // A slab port's buffer is the slab address table: its handle is `SlabOut`, whose regions and
+    // rows are handles.
+    match (dialect, slab) {
+        (Dialect::Cuda(_), false) => out.push_str(&format!(
+            "#define {expression} element::abi_out<ELEMENT_OF({element_prefix})>(seismic_buffer_{buffer})\n"
+        )),
+        (Dialect::Cuda(_), true) => out.push_str(&format!(
+            "#define {expression} element::abi_slab_out<ELEMENT_OF({element_prefix})>(seismic_buffer_{buffer})\n"
+        )),
+        (Dialect::Metal(_), false) => out.push_str(&format!(
+            "#define {declaration}(name) device element::Cell<ELEMENT_OF({element_prefix})> *name [[buffer({buffer})]]\n"
+        )),
+        (Dialect::Metal(_), true) => out.push_str(&format!(
+            "#define {declaration}(name) device const slab::Table<ELEMENT_OF({element_prefix})> *name [[buffer({buffer})]]\n"
+        )),
+        // A Vulkan handle wraps the buffer's device address; a slab port's is its address table.
+        #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
+        (Dialect::Vulkan(_), false) => {
+            let kind = vulkan_element_kind(representation);
+            out.push_str(&format!("#define {expression} Out(SEISMIC_PTR({buffer}), {kind})\n"))
+        }
+        #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
+        (Dialect::Vulkan(_), true) => {
+            let kind = vulkan_element_kind(representation);
+            out.push_str(&format!("#define {expression} SlabOut(SEISMIC_PTR({buffer}), {kind})\n"))
+        }
+    }
+}
+
 /// The complete formation source: generated prefix followed by the asset.
 pub(crate) fn render_source(
     dialect: Dialect,
@@ -599,10 +655,41 @@ fn render_source_with(
             ParameterKind::Tensor {
                 axes,
                 representation,
-                ..
+                access,
             } => {
-                for symbol in names.tensor_buffers() {
-                    prefix.push_str(&format!("#define {symbol} {buffer}\n"));
+                let reach = parameter_reach(
+                    representation_reach(*representation),
+                    matches!(access, TensorAccess::Mutable),
+                    implementation
+                        .launch_records(formed)
+                        .contains(&RecordPort::Parameter(parameter.name.clone())),
+                );
+                if reach == OwnerReach::Owner {
+                    // A floating tensor the kernel mutates is reached only through its owner's
+                    // handle: no buffer index is defined for it.
+                    let element = names
+                        .tensor_prefixes()
+                        .next()
+                        .expect("a tensor has a prefix");
+                    for (expression, declaration) in names
+                        .tensor_handles(false)
+                        .zip(names.tensor_handles(true))
+                    {
+                        render_owner_handle(
+                            &mut prefix,
+                            dialect,
+                            &expression,
+                            &declaration,
+                            &element,
+                            *representation,
+                            buffer,
+                            parameter.binding == seismic_lang::entry::PortBinding::Slab,
+                        );
+                    }
+                } else {
+                    for symbol in names.tensor_buffers() {
+                        prefix.push_str(&format!("#define {symbol} {buffer}\n"));
+                    }
                 }
                 let fixed = geometry.parameters[ordinal]
                     .as_ref()
@@ -662,9 +749,30 @@ fn render_source_with(
             representation,
         } = &result.kind
         {
-            prefix.push_str(&format!(
-                "#define SEISMIC_RESULT_{ordinal}_BUFFER {buffer}\n"
-            ));
+            let record_port = implementation
+                .launch_records(formed)
+                .contains(&RecordPort::Result(ordinal as u32));
+            if parameter_reach(representation_reach(*representation), true, false) == OwnerReach::Owner {
+                // A floating result is reached only through its owner's handle: no buffer index is
+                // defined for it.
+                let result = format!("SEISMIC_RESULT_{ordinal}");
+                render_owner_handle(
+                    &mut prefix,
+                    dialect,
+                    &result_handle(ordinal, false),
+                    &result_handle(ordinal, true),
+                    &result,
+                    *representation,
+                    buffer,
+                    // A record result's buffer is its records' address table.
+                    record_port,
+                );
+            } else {
+                prefix.push_str(&format!(
+                    "#define SEISMIC_RESULT_{ordinal}_BUFFER {buffer}
+"
+                ));
+            }
             let fixed = geometry.results[ordinal]
                 .as_ref()
                 .expect("a tensor result has static geometry");
@@ -2265,11 +2373,134 @@ mod tests {
         assert!(source.contains("#define SEISMIC_DIM_K ((ulong)64)\n"));
         assert!(source.contains("#define SEISMIC_TUNE_TILE 8\n"));
         // x is buffer 0, the result buffer 1, scratch 2, words 3.
-        assert!(source.contains("#define SEISMIC_RESULT_0_BUFFER 1\n"));
+        // A floating result has an owner handle, and no buffer index.
+        assert!(source.contains(
+            "#define SEISMIC_RESULT_0_PARAM(name) device element::Cell<ELEMENT_OF(SEISMIC_RESULT_0)> *name [[buffer(1)]]\n"
+        ));
+        assert!(!source.contains("SEISMIC_RESULT_0_BUFFER"));
         assert!(source.contains("#define SEISMIC_BUFFER_SCRATCH_PARTIALS 2\n"));
         assert!(source.contains("#define SEISMIC_BUFFER_WORDS 3\n"));
         assert!(source.contains("#define SEISMIC_BUFFER_SCALAR_RESULTS 4\n"));
         assert!(!source.contains("seismic_words_t"));
+    }
+
+    /// A floating result, and a floating tensor the kernel mutates, is reached only through its
+    /// owner's handle: the render defines the handle and no buffer index. What is not floating
+    /// (an integer tensor), or only read, keeps its buffer index.
+    #[test]
+    fn floating_results_and_mutated_tensors_have_no_buffer_index() {
+        let cuda = render(CUDA, "f32");
+        assert!(cuda.contains(
+            "#define SEISMIC_RESULT_0_OUT element::abi_out<ELEMENT_OF(SEISMIC_RESULT_0)>(seismic_buffer_1)\n"
+        ));
+        assert!(!cuda.contains("SEISMIC_RESULT_0_BUFFER"));
+        // Vulkan's handle carries the tensor's own element kind.
+        let vulkan = render(Dialect::Vulkan(VULKAN_FEATURES), "f32");
+        assert!(vulkan.contains("#define SEISMIC_RESULT_0_OUT Out(SEISMIC_PTR(1), ELEMENT_F32)\n"));
+        assert!(!vulkan.contains("SEISMIC_RESULT_0_BUFFER"));
+        // The shared input is read-only: it keeps its index.
+        assert!(cuda.contains("#define SEISMIC_BUFFER_X 0\n"));
+
+        let text = "fn fill[N](staged: &host mut tensor[N] i32, grid: &mut tensor[N] f32, flags: &mut tensor[N] i32):\n    flags[0] = 1\n    grid[0] = 1.0\n\nnative fill for {backend} from \"fill.{extension}\":\n    launch fill:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n";
+        for (dialect, backend, extension, handle, name) in [
+            (
+                CUDA,
+                BackendName::Cuda,
+                "cu",
+                "#define SEISMIC_OUT_GRID element::abi_out<ELEMENT_OF(SEISMIC_PARAM_1)>(seismic_buffer_0)\n",
+                "cuda",
+            ),
+            (
+                METAL,
+                BackendName::Metal,
+                "metal",
+                "#define SEISMIC_OUT_GRID_PARAM(name) device element::Cell<ELEMENT_OF(SEISMIC_PARAM_1)> *name [[buffer(0)]]\n",
+                "metal",
+            ),
+            (
+                Dialect::Vulkan(VULKAN_FEATURES),
+                BackendName::Vulkan,
+                "comp",
+                "#define SEISMIC_OUT_GRID Out(SEISMIC_PTR(0), ELEMENT_F32)\n",
+                "vulkan",
+            ),
+        ] {
+            let text = text.replace("{backend}", name).replace("{extension}", extension);
+            let module = check_source(SourceSet::new(vec![SourceFile {
+                path: "fill.seismic".into(),
+                text,
+            }]))
+            .unwrap();
+            let entry = module.entry_named("fill").unwrap();
+            let bindings = ElementBindings::default();
+            let logical = module.entry(entry, &bindings).unwrap();
+            let implementation = module.native_implementation(entry, backend).unwrap();
+            let source = render_source(
+                dialect,
+                &logical,
+                &bindings,
+                implementation,
+                &NativeSpecialization::new(),
+                bare(""),
+            );
+            assert!(source.contains(handle), "{name}: {source}");
+            assert!(!source.contains("SEISMIC_BUFFER_GRID"), "{name}");
+            assert!(!source.contains("SEISMIC_PARAM_1_BUFFER"), "{name}");
+            // The integer tensor keeps its index (after the grid's, which takes the first slot).
+            assert!(source.contains("#define SEISMIC_BUFFER_FLAGS 1\n"), "{name}");
+        }
+    }
+
+    /// A floating `&slab mut` port's buffer is its slab address table: its handle is the backend's
+    /// slab handle, and no buffer index is defined for it.
+    #[test]
+    fn a_floating_slab_port_has_a_slab_handle_and_no_buffer_index() {
+        let text = "fn stamp[N, T, KV, W](rows: &slab mut tensor[T, KV, W] f32, from: &tensor[N] i32, to: &tensor[N] i32, slab_rows: u32):\n    for item in 0..N:\n        parallel for head in 0..KV:\n            rows[to[item], head, :] = rows[from[item], head, :]\n\nnative stamp for {backend} from \"stamp.{extension}\":\n    launch stamp:\n        threadgroups (ceil_div(N * KV * W, 256), 1, 1)\n        threads_per_threadgroup (256, 1, 1)\n";
+        for (dialect, backend, extension, handle, name) in [
+            (
+                CUDA,
+                BackendName::Cuda,
+                "cu",
+                "#define SEISMIC_OUT_ROWS element::abi_slab_out<ELEMENT_OF(SEISMIC_PARAM_0)>(seismic_buffer_0)\n",
+                "cuda",
+            ),
+            (
+                METAL,
+                BackendName::Metal,
+                "metal",
+                "#define SEISMIC_OUT_ROWS_PARAM(name) device const slab::Table<ELEMENT_OF(SEISMIC_PARAM_0)> *name [[buffer(0)]]\n",
+                "metal",
+            ),
+            (
+                Dialect::Vulkan(VULKAN_FEATURES),
+                BackendName::Vulkan,
+                "comp",
+                "#define SEISMIC_OUT_ROWS SlabOut(SEISMIC_PTR(0), ELEMENT_F32)\n",
+                "vulkan",
+            ),
+        ] {
+            let text = text.replace("{backend}", name).replace("{extension}", extension);
+            let module = check_source(SourceSet::new(vec![SourceFile {
+                path: "stamp.seismic".into(),
+                text,
+            }]))
+            .unwrap();
+            let entry = module.entry_named("stamp").unwrap();
+            let bindings = ElementBindings::default();
+            let logical = module.entry(entry, &bindings).unwrap();
+            let implementation = module.native_implementation(entry, backend).unwrap();
+            let source = render_source(
+                dialect,
+                &logical,
+                &bindings,
+                implementation,
+                &NativeSpecialization::new(),
+                bare(""),
+            );
+            assert!(source.contains(handle), "{name}: {source}");
+            assert!(!source.contains("SEISMIC_BUFFER_ROWS"), "{name}");
+            assert!(!source.contains("SEISMIC_PARAM_0_BUFFER"), "{name}");
+        }
     }
 
     const METAL: Dialect = Dialect::Metal(MetalFeatures { tensor_ops: false });
@@ -2413,7 +2644,6 @@ mod tests {
     fn vulkan_prefix_compiles_for_every_representation_kind() {
         const ASSET: &str = "
 void probe() {
-    seismic_f32 result = seismic_f32(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER));
     const uint lane = gl_LocalInvocationID.x;
     seismic_shared_f32[lane] = float(SEISMIC_X_STRIDE_0 + SEISMIC_DIM_N) * float(SEISMIC_TUNE_TILE);
     barrier();
@@ -2422,7 +2652,7 @@ void probe() {
     value += seismic_bf16_to_f32(seismic_f32_to_bf16(value)) + seismic_unpack_f16x2(seismic_pack_f16x2(value, 1.0)).x;
     value += float(seismic_dp4a_s8(int(lane), 3, 1) + seismic_dp4a_u8s8(lane, -3, 0) + seismic_redux_add_s32(1));
     if (SEISMIC_READONLY(SEISMIC_BUFFER_X) && lane == 0u)
-        result[0].v = value + seismic_tanh_approx(value);
+        seismic_shared_f32[0] = value + seismic_tanh_approx(value);
     seismic_u64(SEISMIC_SCALAR_RESULTS)[0].v = seismic_words[0];
 }
 ";

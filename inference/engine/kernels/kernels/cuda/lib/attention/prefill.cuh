@@ -149,11 +149,14 @@ struct F16Operands {
 // values enter exactly within the codec's range.
 template <class History> struct Operands;
 #if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16)
+template <> struct Operands<DenseReads> : Bf16Operands {};
 template <> struct Operands<DenseHistory> : Bf16Operands {};
 #else
+template <> struct Operands<DenseReads> : F16Operands {};
 template <> struct Operands<DenseHistory> : F16Operands {};
 #endif
 #ifdef ATTENTION_AFFINE_HISTORY
+template <> struct Operands<AffineReads> : F16Operands {};
 template <> struct Operands<AffineHistory> : F16Operands {};
 #ifdef ATTENTION_HISTORY_STAGING
 template <> struct Operands<ListedF16History> : F16Operands {};
@@ -235,7 +238,7 @@ constexpr bool F32_ACTIVATION = Act::bytes == 4;
 // tokens [first, first + KEYS) (zero at or past `limit`), and with the last
 // piece the V window tile (columns [column0, column0 + WINDOW)), copied by the
 // block's WARPS warps.
-__device__ __forceinline__ void stage_history(const DenseHistory &history, u8 *k_tile,
+__device__ __forceinline__ void stage_history(const DenseReads &history, u8 *k_tile,
                                               u8 *v_tile, int first, int limit, int kv, int piece,
                                               int column0) {
     stage_slab<F32_ACTIVATION, PIECE_CHUNKS>(k_tile, KEYS, [&](int r) -> const u8 * {
@@ -315,13 +318,14 @@ __device__ __forceinline__ uint4 value_chunk(u32 word, u32 pair) {
 template <int B>
 __device__ __forceinline__ void decoded(const LaneEncoding<B> &e, float (&x)[DPL]) {
     typedef LaneCodes<B> Codes;
+    const u32 pair = element::F16::pack2(e.scale, e.zero);
 #pragma unroll
     for (int d = 0; d < DPL; d += 2) {
         const u32 high = d + 1 < DPL ? Codes::at(e.codes, d + 1) : 0u;
         const u32 biased = (0x6400u | Codes::at(e.codes, d)) | ((0x6400u | high) << 16);
-        const float2 pair = seismic_unpack_f16x2(half_decode(biased, e.pair));
-        x[d] = pair.x;
-        if (d + 1 < DPL) x[d + 1] = pair.y;
+        const float2 values = seismic_unpack_f16x2(half_decode(biased, pair));
+        x[d] = values.x;
+        if (d + 1 < DPL) x[d + 1] = values.y;
     }
 }
 
@@ -338,7 +342,7 @@ struct ProducedCodes {
 // + KEYS): key piece `piece` and, with the last piece, the output window's
 // values from column0. Rows at or past `limit` get zero codes and zero pairs,
 // so they decode to exact zeros. Every load is issued before any is used.
-__device__ __forceinline__ ProducedCodes fetch_produced(const AffineHistory &history, int first, int limit, int kv,
+__device__ __forceinline__ ProducedCodes fetch_produced(const AffineReads &history, int first, int limit, int kv,
                                                         int piece, int column0, int thread) {
     const int key_piece0 = piece * KEY_PIECES;
     const int value_piece0 = column0 * VALUE_BITS / 128;
@@ -352,7 +356,7 @@ __device__ __forceinline__ ProducedCodes fetch_produced(const AffineHistory &his
         codes.key_bits[k] = make_uint4(0, 0, 0, 0);
         codes.key_pairs[k] = 0u;
         if (index < KEYS * KEY_PIECES && token < limit) {
-            const AffineHistory::Vectors v = history.vectors(token, kv);
+            const AffineReads::Vectors v = history.vectors(token, kv);
             codes.key_bits[k] = seismic_ld_nc_v4(v.key_codes + code * 4);
             codes.key_pairs[k] = seismic_ld_nc_u32(v.key_pairs + code * KEY_PIECE_CODES / GROUP);
         }
@@ -365,7 +369,7 @@ __device__ __forceinline__ ProducedCodes fetch_produced(const AffineHistory &his
         codes.value_bits[k] = make_uint4(0, 0, 0, 0);
         codes.value_pairs[k] = 0u;
         if (values && index < KEYS * VALUE_PIECES && token < limit) {
-            const AffineHistory::Vectors v = history.vectors(token, kv);
+            const AffineReads::Vectors v = history.vectors(token, kv);
             codes.value_bits[k] = seismic_ld_nc_v4(v.value_codes + code * 4);
             codes.value_pairs[k] = seismic_ld_nc_u32(v.value_pairs + code * VALUE_PIECE_CODES / GROUP);
         }
@@ -440,7 +444,7 @@ constexpr int VALUE_PAIRS_AT = VALUE_CODES_AT + KEYS * VALUE_PIECES * 16;
 // consecutive threads per row, so each locates its row's slab once and a
 // row's chunks are copied contiguously. Rows at or past `limit` are zero
 // codes and pairs (they decode to exact zeros).
-__device__ __forceinline__ void stage_codes(const AffineHistory &history, u8 *codes, int first,
+__device__ __forceinline__ void stage_codes(const AffineReads &history, u8 *codes, int first,
                                             int limit, int kv, int piece, int column0, int thread,
                                             int threads) {
     const int per_row = threads / KEYS;
@@ -448,7 +452,7 @@ __device__ __forceinline__ void stage_codes(const AffineHistory &history, u8 *co
     const int token = first + r;
     const bool live = token < limit;
     // A dead row still names a valid source (the tile's first row).
-    const AffineHistory::Vectors v = history.vectors(live ? token : first, kv);
+    const AffineReads::Vectors v = history.vectors(live ? token : first, kv);
     const u32 bytes = live ? 16u : 0u;
     const u8 *key_codes = reinterpret_cast<const u8 *>(v.key_codes) + piece * PIECE;
     const u8 *key_pairs = reinterpret_cast<const u8 *>(v.key_pairs) + piece * PIECE / GROUP * 4;
@@ -660,7 +664,7 @@ struct PrefillRows {
     const u8 *queries;
     const u8 *keys;
     const u8 *values;
-    u8 *gated;
+    element::Out<Act> gated;
     Split split;
 
     // The query tile (MMA warps): matrix row i is token first_token + i / G,
@@ -743,9 +747,8 @@ struct PrefillRows {
 #pragma unroll
             for (int e = 0; e < 2; ++e) {
                 const int column = column0 + 8 * n + 2 * t + e;
-                element::put<Act>(gated, out_at + column * SEISMIC_RESULT_0_STRIDE_2,
-                                  attention::gated(in, token, query_head, column,
-                                                   o[n][2 * half + e] / whole));
+                gated.put(out_at + column * SEISMIC_RESULT_0_STRIDE_2,
+                          attention::gated(in, token, query_head, column, o[n][2 * half + e] / whole));
             }
         }
     }
@@ -1615,7 +1618,7 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
 // Prefill L3: block (query tile, query head), one thread per column. A tile whose
 // keys took several partitions merges each of its rows' partitions in
 // partition order and applies the gate; other tiles were stored by L2.
-__device__ __forceinline__ void merge_partitions(const Inputs &in, const Split &split, u8 *gated) {
+__device__ __forceinline__ void merge_partitions(const Inputs &in, const Split &split, element::Out<Act> gated) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
     const int tile = static_cast<int>(blockIdx.x);
     const int query_head = static_cast<int>(blockIdx.y);
@@ -1632,12 +1635,11 @@ __device__ __forceinline__ void merge_partitions(const Inputs &in, const Split &
             merge(split.statistics + slot * 2, static_cast<u64>(rows_total) * heads * 2,
                   split.partials + slot * W + column, static_cast<u64>(rows_total) * heads * W, count,
                   denominator, accumulated);
-        element::put<Act>(gated,
-                          static_cast<u64>(token) * SEISMIC_RESULT_0_STRIDE_0 +
-                              static_cast<u64>(query_head) * SEISMIC_RESULT_0_STRIDE_1 +
-                              static_cast<u64>(column) * SEISMIC_RESULT_0_STRIDE_2,
-                          attention::gated(in, token, query_head, column,
-                                           accumulated / normalizer(in, query_head, maximum, denominator)));
+        gated.put(static_cast<u64>(token) * SEISMIC_RESULT_0_STRIDE_0 +
+                      static_cast<u64>(query_head) * SEISMIC_RESULT_0_STRIDE_1 +
+                      static_cast<u64>(column) * SEISMIC_RESULT_0_STRIDE_2,
+                  attention::gated(in, token, query_head, column,
+                                   accumulated / normalizer(in, query_head, maximum, denominator)));
     }
 }
 
@@ -1645,7 +1647,7 @@ __device__ __forceinline__ void merge_partitions(const Inputs &in, const Split &
 // own launch after the entry has stored every query head's output: block
 // (row, query head), thread `pair` turns its pair back by the row's negated
 // angles (`output_rotary`), in F32, and publishes it again.
-__device__ __forceinline__ void output_rotary(const Inputs &in, u8 *gated, u64 row, int head, int pair) {
+__device__ __forceinline__ void output_rotary(const Inputs &in, element::Out<Act> gated, u64 row, int head, int pair) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
     if (pair >= P) return;
     float cosine, sine;
@@ -1655,10 +1657,10 @@ __device__ __forceinline__ void output_rotary(const Inputs &in, u8 *gated, u64 r
     const u64 out_at = row * SEISMIC_RESULT_0_STRIDE_0 + static_cast<u64>(head) * SEISMIC_RESULT_0_STRIDE_1;
     const u64 lo_at = out_at + static_cast<u64>(lo) * SEISMIC_RESULT_0_STRIDE_2;
     const u64 hi_at = out_at + static_cast<u64>(hi) * SEISMIC_RESULT_0_STRIDE_2;
-    const float low = element::at<Act>(gated, lo_at);
-    const float high = element::at<Act>(gated, hi_at);
-    element::put<Act>(gated, lo_at, low * cosine + high * sine);
-    element::put<Act>(gated, hi_at, high * cosine - low * sine);
+    const float low = gated.at(lo_at);
+    const float high = gated.at(hi_at);
+    gated.put(lo_at, low * cosine + high * sine);
+    gated.put(hi_at, high * cosine - low * sine);
 }
 
 }  // namespace prefill

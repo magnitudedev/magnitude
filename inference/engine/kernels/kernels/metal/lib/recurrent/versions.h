@@ -73,4 +73,26 @@ inline device T *bank(device const ulong *table, ulong index, ulong stride, cons
     return slab::row<T>(table, index, ulong(SEISMIC_PARAM_SLAB_BANKS), stride);
 }
 
+// The same of a floating arena the entry mutates, resolved to an entry of its own (`slab::row_entry`).
+template <typename E>
+inline slab::Table<E> bank_entry(device const slab::Table<E> *table, ulong index, ulong stride,
+    constant ulong *seismic_words) {
+    return slab::row_entry(table, index, ulong(SEISMIC_PARAM_SLAB_BANKS), stride);
+}
+
+// The same as its owner's handle.
+template <typename E>
+inline element::Out<E> bank(device const slab::Table<E> *table, ulong index, ulong stride,
+    constant ulong *seismic_words) {
+    return slab::out(bank_entry(table, index, stride, seismic_words));
+}
+
+// What a kernel only reads of a mutable arena is read through this const view, never through the
+// writing handle.
+template <typename E>
+inline device const typename E::storage *bank_view(device const slab::Table<E> *table, ulong index, ulong stride,
+    constant ulong *seismic_words) {
+    return slab::view(bank_entry(table, index, stride, seismic_words));
+}
+
 } // namespace versions

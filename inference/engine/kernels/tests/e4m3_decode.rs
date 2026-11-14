@@ -24,7 +24,9 @@
 use magnitude_ggml::Encoding;
 use magnitude_kernels::{embedding_rows, project_rows};
 use seismic::{BackendName, Device, Element, GgufScales, Grid, GridScale, Layout, NativeSpecialization, Tensor};
+use seismic_lang::reference_math::conversion::canonical_nan;
 use seismic_lang::registry::bf16_round;
+use seismic_lang::types::DType;
 
 mod e4m3;
 
@@ -212,12 +214,14 @@ fn rotated(codes: &[u8; K], r: usize) -> [u8; K] {
     std::array::from_fn(|k| codes[(k + 7 * r) % K])
 }
 
-/// Bit equality, a NaN as a NaN of the same sign: a decoded NaN is the
-/// registry's, and a device's arithmetic keeps its sign while choosing its
-/// own payload (NVIDIA's canonical NaN is 0x7fffffff).
+/// Bit equality, where a NaN reads out of the engine as the registry's one
+/// NaN whatever sign and payload the device's arithmetic gave it.
 fn same(actual: f32, expected: f32) -> bool {
-    actual.to_bits() == expected.to_bits()
-        || (actual.is_nan() && expected.is_nan() && actual.is_sign_negative() == expected.is_sign_negative())
+    if expected.is_nan() {
+        actual.to_bits() == canonical_nan(DType::F32)
+    } else {
+        actual.to_bits() == expected.to_bits()
+    }
 }
 
 /// `actual` is `expected` at each index `kept` marks.

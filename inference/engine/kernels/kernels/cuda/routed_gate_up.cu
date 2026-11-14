@@ -66,12 +66,12 @@ __global__ void routed_gate_up(SEISMIC_KERNEL_PARAMS) {
         reinterpret_cast<projection::u8 *>(dynamic_shared), 1u, SEISMIC_DIM_H, nullptr);
     const projection::u64 expert = (projection::u64)routes[m * SEISMIC_ROUTES_STRIDE_0 + k * SEISMIC_ROUTES_STRIDE_1];
     const Weights weights = CHOICE_WEIGHTS(m, k, (int)expert);
-    projection::u8 *product =
-        SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + (m * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1) * 2;
+    const element::Out<ELEMENT_OF(SEISMIC_ELEMENT_A)> product =
+        SEISMIC_RESULT_0_OUT.offset(m * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1);
     // A choice with no record has a zero product.
     if (weights.none()) {
         routed::zero_block_rows<Shape>(SEISMIC_DIM_F, [&](projection::u64 n) {
-            element::put<ELEMENT_OF(SEISMIC_ELEMENT_A)>(product, n, 0.0f);
+            product.put(n, 0.0f);
         });
         return;
     }
@@ -110,12 +110,11 @@ struct ChoiceEpi {
     Epi glu;
     const projection::u64 *offsets;
     __device__ __forceinline__ void operator()(unsigned m, projection::u64 n, float gate, float up) const {
-        element::put<ELEMENT_OF(SEISMIC_ELEMENT_A)>(glu.out, offsets[m] + n, glu.value(gate, up));
+        glu.out.put(offsets[m] + n, glu.value(gate, up));
     }
     __device__ __forceinline__ void pair(unsigned m, projection::u64 n, float gate0, float gate1, float up0,
                                          float up1) const {
-        element::put2<ELEMENT_OF(SEISMIC_ELEMENT_A)>(glu.out, offsets[m] + n, glu.value(gate0, up0),
-                                                     glu.value(gate1, up1));
+        glu.out.put2(offsets[m] + n, glu.value(gate0, up0), glu.value(gate1, up1));
     }
 };
 
@@ -148,14 +147,13 @@ __global__ void routed_gate_up_gathered(SEISMIC_KERNEL_PARAMS) {
     if (weights.none()) {
         for (unsigned r = 0; r < count; ++r)
             routed::zero_block_rows<Shape>(SEISMIC_DIM_F, [&](projection::u64 n) {
-                element::put<ELEMENT_OF(SEISMIC_ELEMENT_A)>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), products_at[r] + n,
-                                                            0.0f);
+                SEISMIC_RESULT_0_OUT.put(products_at[r] + n, 0.0f);
             });
         return;
     }
     const projection::u64 group = Shape::tile_group();
     const auto epi = projection::scaling<(SEISMIC_DIM_GS + SEISMIC_DIM_US != 0)>::wrap(
-        ChoiceEpi{Epi{SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), 0, (int)SEISMIC_PARAM_ACTIVATION}, products_at},
+        ChoiceEpi{Epi{SEISMIC_RESULT_0_OUT, 0, (int)SEISMIC_PARAM_ACTIVATION}, products_at},
         projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_GATE_SCALE), SEISMIC_DIM_GS,
                                  SEISMIC_GATE_SCALE_STRIDE_0, expert),
         projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_US, SEISMIC_UP_SCALE_STRIDE_0,

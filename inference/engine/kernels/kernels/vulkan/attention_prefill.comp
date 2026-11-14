@@ -54,7 +54,7 @@
 #include "lib/attention/prefill.glsl"
 
 attention_history prefill_history() {
-    return attention_dense_history(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY), SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE));
+    return attention_dense_history(SEISMIC_OUT_HISTORY_KEY, SEISMIC_OUT_HISTORY_VALUE);
 }
 
 prefill_scratch prefill_scratch_planes() {
@@ -85,7 +85,7 @@ void attention_prefill_vector() {
 // merge of the row's partitions and the output gate.
 void attention_prefill_gate() {
     attention_decode_gate(ATTENTION_QUERY_BUFFER, ATTENTION_GATE_BUFFER, SEISMIC_PTR(SEISMIC_BUFFER_VISIBLE),
-        SEISMIC_PTR(SEISMIC_BUFFER_FRESH), SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER),
+        SEISMIC_PTR(SEISMIC_BUFFER_FRESH), SEISMIC_RESULT_0_OUT,
         SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS), SEISMIC_DIM_R,
         0u, gl_WorkGroupID.x, gl_WorkGroupID.y, gl_LocalInvocationIndex, SEISMIC_TUNE_SPAN, SEISMIC_TUNE_PARTS);
 }
@@ -99,7 +99,7 @@ void attention_prefill_picks() {
 }
 void attention_prefill_merge() { prefill_merge(prefill_scratch_planes(), prefill_picked_planes()); }
 void attention_prefill_rotate() {
-    attention_rotate_output(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES),
+    attention_rotate_output(SEISMIC_RESULT_0_OUT, SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES),
         SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_COMPONENTS), SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_FREQUENCIES),
         ATTENTION_AMPLITUDE_BUFFER);
 }

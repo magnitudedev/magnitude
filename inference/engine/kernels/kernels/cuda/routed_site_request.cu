@@ -19,13 +19,12 @@ extern "C" __global__ void routed_site_request(SEISMIC_KERNEL_PARAMS) {
     using A = ELEMENT_OF(SEISMIC_ELEMENT_A);
     const typename A::storage *normalized =
         reinterpret_cast<const typename A::storage *>(SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED));
-    volatile float *rows = reinterpret_cast<volatile float *>(SEISMIC_PTR(SEISMIC_BUFFER_SITE_ROWS));
+    const element::Out<element::F32> rows = SEISMIC_OUT_SITE_ROWS;
     const u64 count = SEISMIC_DIM_M * SEISMIC_DIM_H;
     for (u64 i = threadIdx.x; i < count; i += blockDim.x) {
         const u64 m = i / SEISMIC_DIM_H, n = i % SEISMIC_DIM_H;
-        rows[slot * SEISMIC_SITE_ROWS_STRIDE_0 + m * SEISMIC_SITE_ROWS_STRIDE_1 +
-             n * SEISMIC_SITE_ROWS_STRIDE_2] =
-            A::load(normalized[m * SEISMIC_NORMALIZED_STRIDE_0 + n * SEISMIC_NORMALIZED_STRIDE_1]);
+        rows.put_system(slot * SEISMIC_SITE_ROWS_STRIDE_0 + m * SEISMIC_SITE_ROWS_STRIDE_1 + n * SEISMIC_SITE_ROWS_STRIDE_2,
+                        A::load(normalized[m * SEISMIC_NORMALIZED_STRIDE_0 + n * SEISMIC_NORMALIZED_STRIDE_1]));
     }
     streaming_publish_barrier();
     if (threadIdx.x != 0)

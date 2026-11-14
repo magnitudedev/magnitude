@@ -14,13 +14,14 @@ kernel void corrector_attention(
     device const float *qkv [[buffer(SEISMIC_BUFFER_QKV)]],
     device const float *input_bias [[buffer(SEISMIC_BUFFER_INPUT_BIAS)]],
     device const float *bias [[buffer(SEISMIC_BUFFER_BIAS)]],
-    device uchar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(result_cells),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     threadgroup float *shared [[threadgroup(0)]],
     uint2 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
+    const element::Out<activation> result(result_cells);
     const ulong nodes = SEISMIC_DIM_N, width = SEISMIC_DIM_W;
     // The block's scores, then the reduction partials (N * 4 + 64 bytes).
     threadgroup float *scores = shared;
@@ -63,6 +64,6 @@ kernel void corrector_attention(
         float acc = 0.0f;
         for (ulong key = 0; key < nodes; ++key)
             acc = metal::fma(scores[key], values[key * SEISMIC_QKV_STRIDE_1 + column * SEISMIC_QKV_STRIDE_4] + b, acc);
-        element::put<activation>(result, out + column * SEISMIC_RESULT_0_STRIDE_3, acc * inverse);
+        result.put(out + column * SEISMIC_RESULT_0_STRIDE_3, acc * inverse);
     }
 }

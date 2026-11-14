@@ -20,7 +20,7 @@ using Source = projection::GemvSource<Pro>;
 using Store = projection::Store<ELEMENT_OF(SEISMIC_ELEMENT_Y)>;
 using Scaling = projection::scaling<(SEISMIC_DIM_QS != 0 || SEISMIC_DIM_GS != 0 || SEISMIC_DIM_KS != 0 ||
                                      SEISMIC_DIM_VS != 0)>;
-using Out = Scaling::type<Store>;
+using Epilogue = Scaling::type<Store>;
 
 #define PROLOGUE                                                                                          \
     Pro {                                                                                                 \
@@ -40,7 +40,7 @@ struct Segments {
     packets::W1 gate;
     packets::W2 key;
     packets::W3 value;
-    Out out[4];
+    Epilogue out[4];
 };
 
 #define SEGMENTS                                                                                          \
@@ -51,18 +51,18 @@ struct Segments {
             KERNEL_W2_AT(SEISMIC_PTR(SEISMIC_BUFFER_KEY_WEIGHT)),                                          \
             KERNEL_W3_AT(SEISMIC_PTR(SEISMIC_BUFFER_VALUE_WEIGHT)),                                        \
         {                                                                                                 \
-            SEGMENT_OUT(SEISMIC_RESULT_0_BUFFER, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_BUFFER_QUERY_SCALE,     \
+            SEGMENT_OUT(SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_BUFFER_QUERY_SCALE,     \
                         SEISMIC_DIM_QS),                                                                  \
-                SEGMENT_OUT(SEISMIC_RESULT_1_BUFFER, SEISMIC_RESULT_1_STRIDE_0, SEISMIC_BUFFER_GATE_SCALE, \
+                SEGMENT_OUT(SEISMIC_RESULT_1_OUT, SEISMIC_RESULT_1_STRIDE_0, SEISMIC_BUFFER_GATE_SCALE, \
                             SEISMIC_DIM_GS),                                                              \
-                SEGMENT_OUT(SEISMIC_RESULT_2_BUFFER, SEISMIC_RESULT_2_STRIDE_0, SEISMIC_BUFFER_KEY_SCALE,  \
+                SEGMENT_OUT(SEISMIC_RESULT_2_OUT, SEISMIC_RESULT_2_STRIDE_0, SEISMIC_BUFFER_KEY_SCALE,  \
                             SEISMIC_DIM_KS),                                                              \
-                SEGMENT_OUT(SEISMIC_RESULT_3_BUFFER, SEISMIC_RESULT_3_STRIDE_0, SEISMIC_BUFFER_VALUE_SCALE, \
+                SEGMENT_OUT(SEISMIC_RESULT_3_OUT, SEISMIC_RESULT_3_STRIDE_0, SEISMIC_BUFFER_VALUE_SCALE, \
                             SEISMIC_DIM_VS),                                                              \
         }                                                                                                 \
     }
 #define SEGMENT_OUT(RESULT, STRIDE, SCALE, EXTENT)                                                        \
-    Scaling::wrap(Store{SEISMIC_PTR(RESULT), STRIDE, 0}, projection::scale_factor(SEISMIC_PTR(SCALE), EXTENT, 0, 0), \
+    Scaling::wrap(Store{RESULT, STRIDE, 0}, projection::scale_factor(SEISMIC_PTR(SCALE), EXTENT, 0, 0), \
                   1.0f)
 
 // Zeroes the results of query or gate segment `segment` (0 or 1) in a block
@@ -72,7 +72,7 @@ struct Segments {
 __device__ __forceinline__ void project_zero(const Segments &s, int segment, unsigned M, unsigned row_start,
                                               unsigned row_count, unsigned long long column_start,
                                               unsigned column_count, unsigned tid, unsigned threads) {
-    const Out out = segment == 0 ? s.out[0] : s.out[1];
+    const Epilogue out = segment == 0 ? s.out[0] : s.out[1];
     const unsigned long long columns = segment == 0 ? s.rows[0] : s.rows[1];
     for (unsigned item = tid; item < row_count * column_count; item += threads) {
         const unsigned row = row_start + item / column_count;

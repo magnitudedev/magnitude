@@ -4,11 +4,11 @@
 #if !defined(SEISMIC_ROWS_KIND_DENSE)
 #error "copy_rows supports dense state planes only"
 #endif
+#include <seismic/element.cuh>
 #include <seismic/slab.cuh>
 
 extern "C" __global__ void copy_rows(SEISMIC_KERNEL_PARAMS) {
     typedef unsigned long long u64;
-    const unsigned int *table = reinterpret_cast<const unsigned int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROWS));
     const int *from = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_FROM));
     const int *to = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_TO));
     const u64 index = (u64)blockIdx.x * blockDim.x + threadIdx.x;
@@ -23,12 +23,20 @@ extern "C" __global__ void copy_rows(SEISMIC_KERNEL_PARAMS) {
     if (source_row < 0 || destination_row < 0 || (u64)source_row >= SEISMIC_DIM_T
         || (u64)destination_row >= SEISMIC_DIM_T)
         return;
+    const u64 at = head * SEISMIC_ROWS_STRIDE_1 + column * SEISMIC_ROWS_STRIDE_2;
+#if defined(SEISMIC_OUT_ROWS)
+    // A floating plane: its owner-written elements move as stored.
+    const auto rows = SEISMIC_OUT_ROWS;
+    rows.row((u64)destination_row, SEISMIC_PARAM_SLAB_ROWS, SEISMIC_ROWS_STRIDE_0)
+        .move_stored(at, rows.view_row((u64)source_row, SEISMIC_PARAM_SLAB_ROWS, SEISMIC_ROWS_STRIDE_0).offset(at));
+#else
+    // An integer plane.
+    const unsigned int *table = reinterpret_cast<const unsigned int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROWS));
     const unsigned char *src = slab::row(table, (u64)source_row, SEISMIC_PARAM_SLAB_ROWS,
         SEISMIC_ROWS_STRIDE_0 * SEISMIC_ROWS_PACKET_SIZE);
     unsigned char *dst = slab::row(table, (u64)destination_row, SEISMIC_PARAM_SLAB_ROWS,
         SEISMIC_ROWS_STRIDE_0 * SEISMIC_ROWS_PACKET_SIZE);
-    const u64 source = (head * SEISMIC_ROWS_STRIDE_1 + column * SEISMIC_ROWS_STRIDE_2) * SEISMIC_ROWS_PACKET_SIZE;
-    const u64 destination = (head * SEISMIC_ROWS_STRIDE_1 + column * SEISMIC_ROWS_STRIDE_2) * SEISMIC_ROWS_PACKET_SIZE;
     for (u64 byte = 0; byte < SEISMIC_ROWS_PACKET_SIZE; ++byte)
-        dst[destination + byte] = src[source + byte];
+        dst[at * SEISMIC_ROWS_PACKET_SIZE + byte] = src[at * SEISMIC_ROWS_PACKET_SIZE + byte];
+#endif
 }

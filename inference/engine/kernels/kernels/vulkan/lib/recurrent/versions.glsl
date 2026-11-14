@@ -59,10 +59,17 @@ int versions_tape_rows(versions_slot slot, int capacity) {
     return min(capacity, slot.hi - slot.lo - slot.stop);
 }
 
-// Byte address of bank `index` of a slab-stored arena whose banks are `bytes`
-// long. The quotient and remainder stay in 32 bits (`slab_row`'s u32 form):
-// the NVIDIA driver (580) miscompiles the 64-bit division and remainder of one
-// index when both are taken.
+// Byte address of bank `index` of a slab-stored integer arena whose banks are
+// `bytes` long. The quotient and remainder stay in 32 bits (`slab_row`'s u32
+// form): the NVIDIA driver (580) miscompiles the 64-bit division and remainder
+// of one index when both are taken.
 uint64_t versions_bank(uint64_t table, int index, uint64_t bytes) {
     return slab_row(table, uint(index), uint(SEISMIC_PARAM_SLAB_BANKS), bytes);
+}
+
+// Bank `index` of a slab-stored floating arena (its owner handle
+// `SEISMIC_OUT_<NAME>`) whose banks are `elements` long, its quotient and
+// remainder in 32 bits as `versions_bank`'s.
+Out versions_out_bank(SlabOut arena, int index, uint64_t elements) {
+    return slab_out_row(arena, uint(index), uint(SEISMIC_PARAM_SLAB_BANKS), elements);
 }

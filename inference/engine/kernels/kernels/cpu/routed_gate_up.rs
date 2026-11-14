@@ -49,10 +49,10 @@ fn routed_gate_up_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [
     let sources = cx.arg_sources();
     let (gate_scale, up_scale) = (cx.arg_gate_scale(), cx.arg_up_scale());
     // SAFETY: each work item writes its own features of its own choice.
-    let out = unsafe { cx.result_0().span_mut([row, slot, rows.start], rows.len()) };
+    let mut out = unsafe { cx.result_0().span_mut([row, slot, rows.start], rows.len()) };
     // A choice its slot map names no record for reads none: a zero product.
     let Some(place) = routed::decode_source(cx.dim_xs(), || sources.get([0, row, slot]), expert) else {
-        out.fill(E::A::narrow(0.0));
+        out.fill(0.0);
         return;
     };
     let (bank_gate, tier_gate, bank_up, tier_up) =

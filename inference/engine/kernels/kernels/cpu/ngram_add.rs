@@ -9,11 +9,11 @@ fn ngram_add<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _
     let gates = &cx.arg_scales().row([row, 0])[..s];
     let value = &cx.arg_value().row([row, 0])[..h];
     // SAFETY: each work item writes its own row.
-    let out = unsafe { cx.result_0().row_mut([row, 0]) };
+    let mut out = unsafe { cx.result_0().row_mut([row, 0]) };
     for stream in 0..s {
         for column in 0..h {
             let channel = stream * h + column;
-            out[channel] = hidden[channel] + gates[stream] * value[column];
+            out.set(channel, hidden[channel] + gates[stream] * value[column]);
         }
     }
 }

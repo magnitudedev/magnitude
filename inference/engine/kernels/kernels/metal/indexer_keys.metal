@@ -30,7 +30,7 @@ kernel void indexer_keys(
     device const float *rotary_frequencies [[buffer(SEISMIC_BUFFER_ROTARY_FREQUENCIES)]],
     device const float *rotary_amplitudes [[buffer(SEISMIC_BUFFER_ROTARY_AMPLITUDES)]],
     device const int *coordinates [[buffer(SEISMIC_BUFFER_COORDINATES)]],
-    device const ulong *keys [[buffer(SEISMIC_BUFFER_KEYS)]],
+    SEISMIC_OUT_KEYS_PARAM(keys),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint simd [[simdgroup_index_in_threadgroup]],
@@ -54,7 +54,8 @@ kernel void indexer_keys(
     key_layout::rotate(table, lane, x);
     rounding::hold_lanes<element::Act>(x, trained);
     rounding::round_lanes<KEYS_E>(x, trained);
-    device float *target = slab::row<float>(keys, ulong(destination), ulong(SEISMIC_PARAM_SLAB_ROWS), KEYS_W);
+    const element::Out<element::F32> target = slab::out_row(keys, ulong(destination), ulong(SEISMIC_PARAM_SLAB_ROWS),
+        KEYS_W);
     for (uint i = 0; i < KEYS_E; ++i)
-        target[lane * KEYS_E + i] = x[i];
+        target.put(lane * KEYS_E + i, x[i]);
 }

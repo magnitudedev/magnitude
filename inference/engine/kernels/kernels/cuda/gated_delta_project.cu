@@ -15,7 +15,7 @@ using Pro = projection::Operands<
                               packets::W3_OPERANDS_NVFP4>::NVFP4,
     Raw>;
 using Source = projection::GemvSource<Pro>;
-using Out = projection::Store<ELEMENT_OF(SEISMIC_ELEMENT_A)>;
+using Store = projection::Store<ELEMENT_OF(SEISMIC_ELEMENT_A)>;
 
 #define PROLOGUE                                                                                          \
     Pro {                                                                                                 \
@@ -30,7 +30,7 @@ using Out = projection::Store<ELEMENT_OF(SEISMIC_ELEMENT_A)>;
 #define GATE_ROWS SEISMIC_DIM_NV
 #define STAGING SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)
 #define GROUPS SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GROUPS)
-#define OUT(offset) Out{SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0, (offset)}
+#define STORE(offset) Store{SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0, (offset)}
 
 // The segmented GEMV over NB column blocks of 8 rows: segment rows `rows`,
 // weights `w0..w3`, epilogues `out` (each placing its segment's columns).
@@ -38,7 +38,7 @@ template <int NB, int KSPLIT>
 __device__ __forceinline__ void project_gemv(const Pro &pro, projection::u8 *row, const projection::u8 *staged,
                                              unsigned M, unsigned long long H, const unsigned long long (&rows)[4],
                                              const packets::W0 &w0, const packets::W1 &w1, const packets::W2 &w2,
-                                             const packets::W3 &w3, const Out (&out)[4]) {
+                                             const packets::W3 &w3, const Store (&out)[4]) {
     using Shape = projection::GemvShape<8, 1, KSPLIT, NB>;
     __shared__ projection::GemvShared<Shape, Source::type> shared;
     // Every warp runs `x` (block-collective at M = 1), including a group
@@ -73,7 +73,7 @@ __device__ __forceinline__ void project_gemv(const Pro &pro, projection::u8 *row
 }
 
 #define SEGMENT_ROWS {QKV_ROWS, Z_ROWS, GATE_ROWS, GATE_ROWS}
-#define SEGMENT_OUT {OUT(0), OUT(QKV_ROWS), OUT(QKV_ROWS + Z_ROWS), OUT(QKV_ROWS + Z_ROWS + GATE_ROWS)}
+#define SEGMENT_OUT {STORE(0), STORE(QKV_ROWS), STORE(QKV_ROWS + Z_ROWS), STORE(QKV_ROWS + Z_ROWS + GATE_ROWS)}
 #define WEIGHTS                                                                                               \
     KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_QKV_WEIGHT)), KERNEL_W1_AT(SEISMIC_PTR(SEISMIC_BUFFER_GATE_WEIGHT)), \
         KERNEL_W2_AT(SEISMIC_PTR(SEISMIC_BUFFER_ALPHA_WEIGHT)), KERNEL_W3_AT(SEISMIC_PTR(SEISMIC_BUFFER_BETA_WEIGHT))
@@ -84,7 +84,7 @@ template <class Shape, bool Q, class Operands = projection::SemanticGemmOperands
 __device__ __forceinline__ void project_gemm(const projection::u8 *staged, const void *groups, unsigned M,
                                              unsigned long long H, const unsigned long long (&rows)[4],
                                              const packets::W0 &w0, const packets::W1 &w1, const packets::W2 &w2,
-                                             const packets::W3 &w3, const Out (&out)[4]) {
+                                             const packets::W3 &w3, const Store (&out)[4]) {
     extern __shared__ uint4 dynamic_shared[];
     seismic_dependency_start();
     projection::u8 *shared = reinterpret_cast<projection::u8 *>(dynamic_shared);
@@ -127,7 +127,7 @@ template <unsigned KSPLIT>
 __global__ void gated_delta_project_gemv(SEISMIC_KERNEL_PARAMS) {
     extern __shared__ uint4 dynamic_shared[];
     const unsigned long long rows[4] = SEGMENT_ROWS;
-    const Out out[4] = SEGMENT_OUT;
+    const Store out[4] = SEGMENT_OUT;
     project_gemv<1, KSPLIT>(PROLOGUE, reinterpret_cast<projection::u8 *>(dynamic_shared), STAGING, (unsigned)SEISMIC_DIM_M,
                     SEISMIC_DIM_H, rows, WEIGHTS, out);
 }
@@ -137,7 +137,7 @@ __global__ void gated_delta_project_gemv(SEISMIC_KERNEL_PARAMS) {
 template <unsigned KSPLIT>
 __global__ void gated_delta_project_gemv16(SEISMIC_KERNEL_PARAMS) {
     const unsigned long long rows[4] = SEGMENT_ROWS;
-    const Out out[4] = SEGMENT_OUT;
+    const Store out[4] = SEGMENT_OUT;
     project_gemv<2, KSPLIT>(PROLOGUE, nullptr, STAGING, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H, rows, WEIGHTS, out);
 }
 #endif
@@ -147,7 +147,7 @@ template <unsigned INT8, unsigned OPERAND>
 __global__ void gated_delta_project_gemm_small(SEISMIC_KERNEL_PARAMS) {
     constexpr bool S8 = projection::int8_path<INT8, PACKETS_FORM_INT8(KERNEL_W0), PACKETS_FORM_INT8(KERNEL_W1), PACKETS_FORM_INT8(KERNEL_W2), PACKETS_FORM_INT8(KERNEL_W3)>();
     const unsigned long long rows[4] = SEGMENT_ROWS;
-    const Out out[4] = SEGMENT_OUT;
+    const Store out[4] = SEGMENT_OUT;
     project_gemm<projection::SmallGemm, S8, projection::GemmOperandsOf<OPERAND, packets::W0, packets::W1, packets::W2, packets::W3>>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H, rows, WEIGHTS,
                                             out);
 }
@@ -158,7 +158,7 @@ template <unsigned INT8, unsigned OPERAND, unsigned ROTATE>
 __global__ void gated_delta_project_gemm(SEISMIC_KERNEL_PARAMS) {
     constexpr bool S8 = projection::int8_path<INT8, PACKETS_FORM_INT8(KERNEL_W0), PACKETS_FORM_INT8(KERNEL_W1), PACKETS_FORM_INT8(KERNEL_W2), PACKETS_FORM_INT8(KERNEL_W3)>();
     const unsigned long long rows[4] = SEGMENT_ROWS;
-    const Out out[4] = SEGMENT_OUT;
+    const Store out[4] = SEGMENT_OUT;
     project_gemm<projection::LargeGemm<ROTATE>, S8, projection::GemmOperandsOf<OPERAND, packets::W0, packets::W1, packets::W2, packets::W3>>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H, rows,
                                                        WEIGHTS, out);
 }

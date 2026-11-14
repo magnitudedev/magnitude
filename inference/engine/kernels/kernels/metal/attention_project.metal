@@ -29,10 +29,10 @@ typedef projection::operands<NVFP4> Operands;
     device const uchar *gate_weight [[buffer(SEISMIC_BUFFER_GATE_WEIGHT)]],             \
     device const uchar *key_weight [[buffer(SEISMIC_BUFFER_KEY_WEIGHT)]],               \
     device const uchar *value_weight [[buffer(SEISMIC_BUFFER_VALUE_WEIGHT)]],           \
-    device uchar *query [[buffer(SEISMIC_RESULT_0_BUFFER)]],                            \
-    device uchar *gate [[buffer(SEISMIC_RESULT_1_BUFFER)]],                             \
-    device uchar *key [[buffer(SEISMIC_RESULT_2_BUFFER)]],                              \
-    device uchar *value [[buffer(SEISMIC_RESULT_3_BUFFER)]],                            \
+    SEISMIC_RESULT_0_PARAM(query_cells),                                                \
+    SEISMIC_RESULT_1_PARAM(gate_cells),                                                 \
+    SEISMIC_RESULT_2_PARAM(key_cells),                                                  \
+    SEISMIC_RESULT_3_PARAM(value_cells),                                                \
     device uchar *normalized [[buffer(SEISMIC_BUFFER_SCRATCH_NORMALIZED)]],             \
     device float *packed [[buffer(SEISMIC_BUFFER_SCRATCH_PACKED)]],                     \
     device half *token_factors [[buffer(SEISMIC_BUFFER_SCRATCH_TOKEN_FACTORS)]],        \
@@ -64,13 +64,13 @@ typedef projection::operands<NVFP4> Operands;
     projection::Weights<packets::W2> key_w{key_weight, KERNEL_W2_LAYOUT(k), k};         \
     projection::Weights<packets::W3> value_w{value_weight, KERNEL_W3_LAYOUT(k), k};     \
     const auto query_out = ATTENTION_PROJECT_SCALED(SEISMIC_DIM_QS, query_scale,        \
-        (projection::Store<published>{query, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, 0})); \
+        (projection::Store<published>{element::Out<published>(query_cells), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, 0})); \
     const auto gate_out = ATTENTION_PROJECT_SCALED(SEISMIC_DIM_GS, gate_scale,          \
-        (projection::Store<published>{gate, SEISMIC_RESULT_1_STRIDE_0, SEISMIC_RESULT_1_STRIDE_1, 0})); \
+        (projection::Store<published>{element::Out<published>(gate_cells), SEISMIC_RESULT_1_STRIDE_0, SEISMIC_RESULT_1_STRIDE_1, 0})); \
     const auto key_out = ATTENTION_PROJECT_SCALED(SEISMIC_DIM_KS, key_scale,            \
-        (projection::Store<published>{key, SEISMIC_RESULT_2_STRIDE_0, SEISMIC_RESULT_2_STRIDE_1, 0})); \
+        (projection::Store<published>{element::Out<published>(key_cells), SEISMIC_RESULT_2_STRIDE_0, SEISMIC_RESULT_2_STRIDE_1, 0})); \
     const auto value_out = ATTENTION_PROJECT_SCALED(SEISMIC_DIM_VS, value_scale,        \
-        (projection::Store<published>{value, SEISMIC_RESULT_3_STRIDE_0, SEISMIC_RESULT_3_STRIDE_1, 0}))
+        (projection::Store<published>{element::Out<published>(value_cells), SEISMIC_RESULT_3_STRIDE_0, SEISMIC_RESULT_3_STRIDE_1, 0}))
 
 // A segment's result after its weight's second-level scale, where the
 // segment's scale port (static extent EXTENT) is present.

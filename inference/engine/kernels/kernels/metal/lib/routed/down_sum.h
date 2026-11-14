@@ -26,9 +26,9 @@ struct Answer {
 // Channel n's publication, over the K choices' A-rounded projections
 // `projections.at(k)` and the CPU's `answer`.
 template <typename Projections>
-inline void down_publish(device const float *base, device const float *weights, device uchar *value, ulong m, uint n,
-    thread const Projections &projections, thread const Answer &answer, constant ulong *seismic_words) {
-    typedef ELEMENT_OF(SEISMIC_ELEMENT_R) Published;
+inline void down_publish(device const float *base, device const float *weights,
+    element::Out<ELEMENT_OF(SEISMIC_ELEMENT_R)> value, ulong m, uint n, thread const Projections &projections,
+    thread const Answer &answer, constant ulong *seismic_words) {
     constexpr uint K = uint(SEISMIC_DIM_K);
     float selected = 0.0f;
     for (uint choice = 0; choice < K; ++choice)
@@ -36,9 +36,8 @@ inline void down_publish(device const float *base, device const float *weights, 
             projections.at(choice), selected);
     if (answer.answered)
         selected += answer.value;
-    reinterpret_cast<device typename Published::storage *>(value)[m * SEISMIC_RESULT_0_STRIDE_0
-        + n * SEISMIC_RESULT_0_STRIDE_1] = Published::store(base[m * SEISMIC_BASE_STRIDE_0 + n * SEISMIC_BASE_STRIDE_1]
-        + selected);
+    value.put(m * SEISMIC_RESULT_0_STRIDE_0 + n * SEISMIC_RESULT_0_STRIDE_1,
+        base[m * SEISMIC_BASE_STRIDE_0 + n * SEISMIC_BASE_STRIDE_1] + selected);
 }
 
 } // namespace routed

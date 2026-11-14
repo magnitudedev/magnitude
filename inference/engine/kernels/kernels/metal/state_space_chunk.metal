@@ -33,17 +33,17 @@
     device const int *previous_bank [[buffer(SEISMIC_BUFFER_PREVIOUS_BANK)]],                 \
     device const int *previous_tape [[buffer(SEISMIC_BUFFER_PREVIOUS_TAPE)]],                 \
     device const int *following_bank [[buffer(SEISMIC_BUFFER_FOLLOWING_BANK)]],               \
-    device const ulong *window [[buffer(SEISMIC_BUFFER_WINDOW)]],                             \
-    device const ulong *state [[buffer(SEISMIC_BUFFER_STATE)]],                               \
-    device const ulong *tape [[buffer(SEISMIC_BUFFER_TAPE)]],                                 \
-    device state_space::Storage *mixed [[buffer(SEISMIC_RESULT_0_BUFFER)]],                   \
+    SEISMIC_OUT_WINDOW_PARAM(window),                                                         \
+    SEISMIC_OUT_STATE_PARAM(state),                                                           \
+    SEISMIC_OUT_TAPE_PARAM(tape),                                                             \
+    SEISMIC_RESULT_0_PARAM(mixed),                                                            \
     device float *inputs [[buffer(SEISMIC_BUFFER_SCRATCH_INPUTS)]],                           \
     device float *products [[buffer(SEISMIC_BUFFER_SCRATCH_PRODUCTS)]],                       \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
 
 #define STATE_SPACE_CHUNK_OPERANDS                                                           \
     const state_space::Operands in{projection, convolution, convolution_bias, rate, time_bias, skip, window, \
-        state, tape, mixed, seismic_words};                                                  \
+        state, tape, element::Out<element::Act>(mixed), seismic_words};                      \
     const versions::Slots slots{segments, stop, previous_bank, previous_tape, following_bank}
 
 using state_space::COLUMNS;
@@ -237,8 +237,8 @@ inline void advance_piece(state_space::Operands in, device const float *inputs, 
             }
             const float value = x_piece[i * SEISMIC_TUNE_ROWS + local_row + r];
             const float output = metal::fma(skip, value, metal::fma(gamma[i], inter, sum));
-            in.mixed[ulong(first + long(i)) * SEISMIC_RESULT_0_STRIDE_0 + head * SEISMIC_RESULT_0_STRIDE_1
-                + (row0 + r) * SEISMIC_RESULT_0_STRIDE_2] = element::Act::store(output);
+            in.mixed.put(ulong(first + long(i)) * SEISMIC_RESULT_0_STRIDE_0 + head * SEISMIC_RESULT_0_STRIDE_1
+                + (row0 + r) * SEISMIC_RESULT_0_STRIDE_2, output);
         }
     }
     // S <- gamma_last S + sum_j (gamma_last / gamma_j) u_j B_j^T.

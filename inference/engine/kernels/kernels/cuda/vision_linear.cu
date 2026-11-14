@@ -16,7 +16,7 @@ extern "C" __global__ void vision_linear(SEISMIC_KERNEL_PARAMS) {
     const float *minimum = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_MINIMUM));
     const float *maximum = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_MAXIMUM));
     const vision::Linear<A, BiasElement, Y, SEISMIC_DIM_NB == 1, SEISMIC_DIM_NR == 1, SEISMIC_DIM_NG == 1, clamped>
-        epilogue{SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER),
+        epilogue{SEISMIC_RESULT_0_OUT,
                  SEISMIC_RESULT_0_STRIDE_0,
                  SEISMIC_PTR(SEISMIC_BUFFER_BIAS),
                  reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL)),

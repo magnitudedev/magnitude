@@ -129,10 +129,15 @@ inline lane_encoding<B> quantize(thread const float (&x)[ATTENTION_E]) {
     return encoding;
 }
 
+// The writable rows of a coefficient plane (F16 group pairs): its slab
+// address table, typed by its element.
+typedef slab::Table<element::F16> coefficient_plane;
+
 // Stores a vector's encoding at `row` (its code row) and its group pairs at
-// `coefficients`. The whole simdgroup calls it.
+// `coefficients`, through the coefficient plane's owner. The whole simdgroup
+// calls it.
 template <uint B>
-inline void store(lane_encoding<B> encoding, device uint *row, device half *coefficients,
+inline void store(lane_encoding<B> encoding, device uint *row, element::Out<element::F16> coefficients,
     uint lane) {
     typedef lane_codes<B> codes;
     if (codes::bits >= 32) {
@@ -149,10 +154,8 @@ inline void store(lane_encoding<B> encoding, device uint *row, device half *coef
         if (lane % sharing == 0)
             row[lane / sharing] = joined;
     }
-    if (lane % codes::pair_lanes == 0) {
-        coefficients[lane / codes::pair_lanes * 2] = encoding.pair.x;
-        coefficients[lane / codes::pair_lanes * 2 + 1] = encoding.pair.y;
-    }
+    if (lane % codes::pair_lanes == 0)
+        coefficients.put2(lane / codes::pair_lanes * 2, float(encoding.pair.x), float(encoding.pair.y));
 }
 
 // A fresh key (KEY) or value as history holds it: its prepared vector

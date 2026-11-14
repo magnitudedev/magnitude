@@ -55,10 +55,10 @@ extern "C" __global__ void indexer_score(SEISMIC_KERNEL_PARAMS) {
         listed += indexer::span_length(row_spans[span * span_stride], row_spans[span * span_stride + bound_stride]);
     listed = listed < n ? listed : n;
     const u64 ordinal = static_cast<u64>(blockIdx.x) * 256 + threadIdx.x;
-    float *out = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)) + row * SEISMIC_RESULT_0_STRIDE_0;
+    const element::Out<element::F32> out = SEISMIC_RESULT_0_OUT.offset(row * SEISMIC_RESULT_0_STRIDE_0);
     const u64 out_stride = SEISMIC_RESULT_0_STRIDE_1;
     if (static_cast<u64>(blockIdx.x) * 256 >= listed) {
-        if (ordinal < n) out[ordinal * out_stride] = -__int_as_float(0x7f800000);
+        if (ordinal < n) out.put(ordinal * out_stride, -__int_as_float(0x7f800000));
         return;
     }
     // The row's query heads, prepared in F32.
@@ -93,7 +93,7 @@ extern "C" __global__ void indexer_score(SEISMIC_KERNEL_PARAMS) {
     __syncthreads();
     if (ordinal >= n) return;
     if (ordinal >= listed) {
-        out[ordinal * out_stride] = -__int_as_float(0x7f800000);
+        out.put(ordinal * out_stride, -__int_as_float(0x7f800000));
         return;
     }
     // The ordinal's key-plane row (a listed ordinal lies within the spans).
@@ -128,5 +128,5 @@ extern "C" __global__ void indexer_score(SEISMIC_KERNEL_PARAMS) {
                 : 1.0f;
         total = total + fmaxf(dot[head], 0.0f) * weight;
     }
-    out[ordinal * out_stride] = element::word_f32(SEISMIC_PARAM_SCALE) * total;
+    out.put(ordinal * out_stride, element::word_f32(SEISMIC_PARAM_SCALE) * total);
 }

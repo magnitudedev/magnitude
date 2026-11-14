@@ -775,7 +775,7 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
 
     const uint64_t heads = uint64_t(KV * G);
     const uint64_t query = ATTENTION_QUERY_BUFFER;
-    const uint64_t gated = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const Out gated = SEISMIC_RESULT_0_OUT;
     const uint64_t partials = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS);
     const uint64_t statistics = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS);
     flash_output o;
@@ -999,7 +999,7 @@ void prefill_merge(prefill_scratch scratch_planes, prefill_picked picked) {
                         merged.z * carry));
             }
         }
-        attention_store_gated(ATTENTION_QUERY_BUFFER, ATTENTION_GATE_BUFFER, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), row,
+        attention_store_gated(ATTENTION_QUERY_BUFFER, ATTENTION_GATE_BUFFER, SEISMIC_RESULT_0_OUT, row,
             head, column, attention_attended(merged.z, merged.x, merged.y, head));
     }
 }
@@ -1017,7 +1017,7 @@ void prefill_decode_merge() {
     const float attended = attention_merge(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS),
         SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS),
         (row * ATTENTION_KV * ATTENTION_G + head) * PREFILL_PARTS, 1ul, PREFILL_PARTS, column, head);
-    attention_store_gated(ATTENTION_QUERY_BUFFER, ATTENTION_GATE_BUFFER, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), row,
+    attention_store_gated(ATTENTION_QUERY_BUFFER, ATTENTION_GATE_BUFFER, SEISMIC_RESULT_0_OUT, row,
         head, column, attended);
 }
 #endif

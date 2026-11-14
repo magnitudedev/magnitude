@@ -7,7 +7,7 @@
 void corrector_factors() {
     const uint64_t nodes = SEISMIC_PTR(SEISMIC_BUFFER_NODES);
     const uint64_t anchor = SEISMIC_PTR(SEISMIC_BUFFER_ANCHOR);
-    const uint64_t result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const Out result = SEISMIC_RESULT_0_OUT;
     const uint64_t count = SEISMIC_DIM_N, width = SEISMIC_DIM_H;
     const uint64_t total = SEISMIC_DIM_S * count * width;
     const uint64_t step = uint64_t(gl_NumWorkGroups.x) * gl_WorkGroupSize.x;
@@ -18,8 +18,8 @@ void corrector_factors() {
         const float a = element_at(ELEMENT_ACT, anchor, block * SEISMIC_ANCHOR_STRIDE_0 + column * SEISMIC_ANCHOR_STRIDE_1);
         const uint64_t at = block * SEISMIC_RESULT_0_STRIDE_0 + node * SEISMIC_RESULT_0_STRIDE_1
             + column * SEISMIC_RESULT_0_STRIDE_3;
-        element_put(ELEMENT_ACT, result, at, x);
-        element_put(ELEMENT_ACT, result, at + SEISMIC_RESULT_0_STRIDE_2, a);
-        element_put(ELEMENT_ACT, result, at + 2ul * SEISMIC_RESULT_0_STRIDE_2, x * a);
+        out_put(result, at, x);
+        out_put(result, at + SEISMIC_RESULT_0_STRIDE_2, a);
+        out_put(result, at + 2ul * SEISMIC_RESULT_0_STRIDE_2, x * a);
     }
 }

@@ -67,29 +67,28 @@ bool ss_leads_group(uint head) {
     return head == 0u || ss_group_of(head - 1u) != ss_group_of(head);
 }
 
-// Byte address of tape row `entry` of `bank`.
-uint64_t ss_tape_row(int bank, int entry) {
-    return versions_bank(SEISMIC_PTR(SEISMIC_BUFFER_TAPE), bank, SEISMIC_TAPE_STRIDE_0 * 4ul)
-        + uint64_t(entry) * SEISMIC_TAPE_STRIDE_1 * 4ul;
+// Tape row `entry` of `bank`.
+Out ss_tape_row(int bank, int entry) {
+    return out_offset(versions_out_bank(SEISMIC_OUT_TAPE, bank, SEISMIC_TAPE_STRIDE_0),
+        uint64_t(entry) * SEISMIC_TAPE_STRIDE_1);
 }
 
-// Byte address of row `row` of head `head`'s state in `bank`: N floats.
-uint64_t ss_state_row(int bank, uint head, uint row) {
-    return versions_bank(SEISMIC_PTR(SEISMIC_BUFFER_STATE), bank, SEISMIC_STATE_STRIDE_0 * 4ul)
-        + (uint64_t(head) * SEISMIC_STATE_STRIDE_1 + uint64_t(row) * SEISMIC_STATE_STRIDE_2) * 4ul;
+// Row `row` of head `head`'s state in `bank`: N floats.
+Out ss_state_row(int bank, uint head, uint row) {
+    return out_offset(versions_out_bank(SEISMIC_OUT_STATE, bank, SEISMIC_STATE_STRIDE_0),
+        uint64_t(head) * SEISMIC_STATE_STRIDE_1 + uint64_t(row) * SEISMIC_STATE_STRIDE_2);
 }
 
-uint64_t ss_window_row(int bank, int tap) {
-    const uint64_t element_bytes = ELEMENT_BYTES(ELEMENT_ACT);
-    return versions_bank(SEISMIC_PTR(SEISMIC_BUFFER_WINDOW), bank, SEISMIC_WINDOW_STRIDE_0 * element_bytes)
-        + uint64_t(tap) * SEISMIC_WINDOW_STRIDE_1 * element_bytes;
+Out ss_window_row(int bank, int tap) {
+    return out_offset(versions_out_bank(SEISMIC_OUT_WINDOW, bank, SEISMIC_WINDOW_STRIDE_0),
+        uint64_t(tap) * SEISMIC_WINDOW_STRIDE_1);
 }
 
 // The raw convolution input of `channel` at slot-local `position`: the
 // source version's window rows before the slot, the projection after.
 float ss_raw(versions_slot slot, int position, uint channel) {
     if (position < 0)
-        return element_at(ELEMENT_ACT, ss_window_row(slot.source, slot.taped + SS_TAPS - 1 + position), uint64_t(channel));
+        return out_at(ss_window_row(slot.source, slot.taped + SS_TAPS - 1 + position), uint64_t(channel));
     return element_at(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_PROJECTION),
         uint64_t(slot.lo + position) * SEISMIC_PROJECTION_STRIDE_0 + SS_X_COLUMN + channel);
 }
@@ -138,8 +137,14 @@ void ss_publish_window(versions_slot slot, uint head, uint part, uint parts) {
         const uint channel = offset < SS_P ? head * SS_P + offset
             : offset < SS_P + SS_N         ? SS_B_CHANNEL + group * SS_N + offset - SS_P
                                            : SS_C_CHANNEL + group * SS_N + offset - SS_P - SS_N;
-        element_put(ELEMENT_ACT, ss_window_row(slot.target, tap), uint64_t(channel),
-            ss_raw(slot, slot.stop + tap - taps, channel));
+        const int position = slot.stop + tap - taps;
+        const Out target = ss_window_row(slot.target, tap);
+        if (position < 0)
+            out_move_stored(target, uint64_t(channel),
+                ss_window_row(slot.source, slot.taped + taps + position), uint64_t(channel), 1ul);
+        else
+            out_copy_stored(target, uint64_t(channel), SEISMIC_PTR(SEISMIC_BUFFER_PROJECTION),
+                uint64_t(slot.lo + position) * SEISMIC_PROJECTION_STRIDE_0 + SS_X_COLUMN + channel, 1ul);
     }
 }
 
@@ -147,7 +152,7 @@ void ss_store_rows(int bank, uint head, uint row0, float rows[SS_LANE_ROWS][SS_C
     const uint lane = SEISMIC_LANE;
     [[unroll]] for (uint r = 0u; r < SS_LANE_ROWS; ++r)
         [[unroll]] for (uint c = 0u; c < SS_COLUMNS; ++c)
-            element_f32_put(ss_state_row(bank, head, row0 + r) + uint64_t(lane * SS_COLUMNS + c) * 4ul, rows[r][c]);
+            out_put(ss_state_row(bank, head, row0 + r), uint64_t(lane * SS_COLUMNS + c), rows[r][c]);
 }
 
 // The rows of the slot's source version: the bank's state advanced by its
@@ -157,16 +162,16 @@ void ss_load_version(versions_slot slot, uint head, uint row0, out float rows[SS
     const uint lane = SEISMIC_LANE;
     [[unroll]] for (uint r = 0u; r < SS_LANE_ROWS; ++r)
         [[unroll]] for (uint c = 0u; c < SS_COLUMNS; ++c)
-            rows[r][c] = element_f32_at(ss_state_row(slot.source, head, row0 + r) + uint64_t(lane * SS_COLUMNS + c) * 4ul);
+            rows[r][c] = out_at(ss_state_row(slot.source, head, row0 + r), uint64_t(lane * SS_COLUMNS + c));
     const uint group = ss_group_of(head);
     for (int entry = 0; entry < slot.taped; ++entry) {
-        const uint64_t tape = ss_tape_row(slot.source, entry);
-        const float decay = element_f32_at(tape + uint64_t(SS_TAPE_D + head) * 4ul);
+        const Out tape = ss_tape_row(slot.source, entry);
+        const float decay = out_at(tape, uint64_t(SS_TAPE_D + head));
         float b[SS_COLUMNS];
         [[unroll]] for (uint c = 0u; c < SS_COLUMNS; ++c)
-            b[c] = element_f32_at(tape + uint64_t(SS_TAPE_B + group * SS_N + lane * SS_COLUMNS + c) * 4ul);
+            b[c] = out_at(tape, uint64_t(SS_TAPE_B + group * SS_N + lane * SS_COLUMNS + c));
         [[unroll]] for (uint r = 0u; r < SS_LANE_ROWS; ++r) {
-            const float drive = element_f32_at(tape + uint64_t(SS_TAPE_U + head * SS_P + row0 + r) * 4ul);
+            const float drive = out_at(tape, uint64_t(SS_TAPE_U + head * SS_P + row0 + r));
             [[unroll]] for (uint c = 0u; c < SS_COLUMNS; ++c)
                 rows[r][c] = seismic_fma_rn(drive, b[c], seismic_mul_rn(rows[r][c], decay));
         }
@@ -192,7 +197,7 @@ void ss_advance_rows(versions_slot slot, int begin, uint head, uint block_row0, 
     const int publish = slot.lo + slot.stop;
     const int recorded = versions_tape_rows(slot, int(SEISMIC_DIM_T));
     const float skip = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_SKIP) + uint64_t(head) * SEISMIC_SKIP_STRIDE_0 * 4ul);
-    const uint64_t mixed = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const Out mixed = SEISMIC_RESULT_0_OUT;
     // The subgroup that owns state row 0 records the decay, and B when the
     // head leads its group.
     const bool records = row0 == 0u;
@@ -233,18 +238,21 @@ void ss_advance_rows(versions_slot slot, int begin, uint head, uint block_row0, 
                 c[j] = seismic_shared_f32[SS_SEQUENTIAL_BC + i * 2u * SS_N + SS_N + lane * SS_COLUMNS + j];
             }
             const bool taping = row >= publish && row - publish < recorded;
-            const uint64_t entry = taping ? ss_tape_row(slot.target, row - publish) : 0ul;
+            // The successor's tape row, addressed only when taping.
+            Out entry;
+            if (taping)
+                entry = ss_tape_row(slot.target, row - publish);
             if (taping && records_b)
                 [[unroll]] for (uint j = 0u; j < SS_COLUMNS; ++j)
-                    element_f32_put(entry + uint64_t(SS_TAPE_B + group * SS_N + lane * SS_COLUMNS + j) * 4ul, b[j]);
+                    out_put(entry, uint64_t(SS_TAPE_B + group * SS_N + lane * SS_COLUMNS + j), b[j]);
             if (taping && records && lane == 0u)
-                element_f32_put(entry + uint64_t(SS_TAPE_D + head) * 4ul, decay);
+                out_put(entry, uint64_t(SS_TAPE_D + head), decay);
             float mine = 0.0;
             [[unroll]] for (uint r = 0u; r < SS_LANE_ROWS; ++r) {
                 const float value = seismic_shared_f32[SS_SEQUENTIAL_X + i * SS_BLOCK_ROWS + local_row + r];
                 const float drive = seismic_mul_rn(delta, value);
                 if (taping && lane == r)
-                    element_f32_put(entry + uint64_t(SS_TAPE_U + head * SS_P + row0 + r) * 4ul, drive);
+                    out_put(entry, uint64_t(SS_TAPE_U + head * SS_P + row0 + r), drive);
                 float sum = 0.0;
                 [[unroll]] for (uint j = 0u; j < SS_COLUMNS; ++j) {
                     rows[r][j] = seismic_fma_rn(drive, b[j], seismic_mul_rn(rows[r][j], decay));
@@ -254,7 +262,7 @@ void ss_advance_rows(versions_slot slot, int begin, uint head, uint block_row0, 
                 mine = lane == r ? result : mine;
             }
             if (lane < SS_LANE_ROWS)
-                element_put(ELEMENT_ACT, mixed,
+                out_put(mixed,
                     uint64_t(row) * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(head) * SEISMIC_RESULT_0_STRIDE_1
                         + uint64_t(row0 + lane) * SEISMIC_RESULT_0_STRIDE_2,
                     mine);
@@ -269,10 +277,10 @@ void ss_advance_rows(versions_slot slot, int begin, uint head, uint block_row0, 
 // covers.
 void ss_zero_uncovered(uint head, uint row0) {
     const uint lane = SEISMIC_LANE;
-    const uint64_t mixed = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const Out mixed = SEISMIC_RESULT_0_OUT;
     for (uint64_t row = uint64_t(versions_covered_end()); row < SEISMIC_DIM_M; ++row)
         if (lane < SS_LANE_ROWS)
-            element_put(ELEMENT_ACT, mixed,
+            out_put(mixed,
                 row * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(head) * SEISMIC_RESULT_0_STRIDE_1
                     + uint64_t(row0 + lane) * SEISMIC_RESULT_0_STRIDE_2,
                 0.0);

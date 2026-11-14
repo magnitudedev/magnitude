@@ -25,11 +25,14 @@ fn pool_rows_append<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64
     let window = SlabTensor::from_bound(cx.arg_window_rows(), slab_rows);
     // SAFETY: window destinations are distinct freshly reserved rows no
     // work item of this launch reads.
-    let target = unsafe { window.row_mut([destination as usize, 0]) };
-    target[..w].copy_from_slice(cx.arg_u().row([row, 0]));
-    token_norm(cx, &mut target[..w]);
+    let mut target = unsafe { window.row_mut([destination as usize, 0]) };
+    target.part_mut(0, w).compute(|u| {
+        u.copy_from_slice(cx.arg_u().row([row, 0]));
+        token_norm(cx, u);
+    });
     if gated {
-        target[w..].copy_from_slice(cx.arg_g().row([row, 0]));
+        let rest = target.len() - w;
+        target.part_mut(w, rest).move_stored(cx.arg_g().stored([row, 0]));
     }
     // SAFETY: as above.
     let target = unsafe { coordinate_row(cx.arg_window_coordinates(), slab_rows, destination as usize) };
@@ -68,7 +71,7 @@ fn pool_rows_complete<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u
     let row = group[0] as usize;
     let destination = cx.arg_block_destinations().get([row]);
     // SAFETY: each work item writes its own row of every result.
-    let (latent, origin_out) = unsafe { (cx.result_0().row_mut([row, 0]), cx.result_2().row_mut([row, 0])) };
+    let (mut latent, origin_out) = unsafe { (cx.result_0().row_mut([row, 0]), cx.result_2().row_mut([row, 0])) };
     if destination < 0 {
         latent.fill(0.0);
         origin_out.fill(0);
@@ -120,37 +123,39 @@ fn pool_rows_complete<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u
     // A rounded row is rounded from values held in A (`pooled.seismic`).
     let rounding = Rounding::of(cx.arg_block(), cx.arg_element(), cx.arg_scale(), cx.arg_amax_floor());
     let hold = rounding.map(|_| lib::core::activation::publish::<E::A>);
-    for (column, pooled) in latent.iter_mut().enumerate() {
-        *pooled = if gated {
-            let top = (0..rate).fold(f32::NEG_INFINITY, |top, member| top.max(gate(member, column)));
-            let total = (0..rate).fold(0.0, |total, member| total + math::exp(gate(member, column) - top));
-            (0..rate).fold(0.0, |sum, member| {
-                sum + math::exp(gate(member, column) - top) / total * rows[member].0[column]
-            })
-        } else {
-            rows.iter().fold(0.0, |sum, (u, _)| sum + u[column]) / rate as f32
-        };
-    }
-    attention::held(hold, latent);
-    // The pooled row's norm (TN = 0); a token-normed row is its latent.
-    if cx.dim_tn() == 0 {
-        let inverse = reduce::rms_inverse(latent, cx.arg_epsilon());
-        for (value, weight) in latent.iter_mut().zip(cx.arg_norm().row([0, 0])) {
-            *value = *value * inverse * weight;
+    latent.compute(|latent| {
+        for (column, pooled) in latent.iter_mut().enumerate() {
+            *pooled = if gated {
+                let top = (0..rate).fold(f32::NEG_INFINITY, |top, member| top.max(gate(member, column)));
+                let total = (0..rate).fold(0.0, |total, member| total + math::exp(gate(member, column) - top));
+                (0..rate).fold(0.0, |sum, member| {
+                    sum + math::exp(gate(member, column) - top) / total * rows[member].0[column]
+                })
+            } else {
+                rows.iter().fold(0.0, |sum, (u, _)| sum + u[column]) / rate as f32
+            };
         }
         attention::held(hold, latent);
-    }
-    attention::prepare_rounded_head::<seismic::cpu::F32>(
-        latent,
-        None,
-        Layout::new(cx.dim_ra(), cx.dim_rt()),
-        cosines,
-        sines,
-        cx.arg_epsilon(),
-        rounding,
-        hold,
-        finished,
-    );
+        // The pooled row's norm (TN = 0); a token-normed row is its latent.
+        if cx.dim_tn() == 0 {
+            let inverse = reduce::rms_inverse(latent, cx.arg_epsilon());
+            for (value, weight) in latent.iter_mut().zip(cx.arg_norm().row([0, 0])) {
+                *value = *value * inverse * weight;
+            }
+            attention::held(hold, latent);
+        }
+        attention::prepare_rounded_head::<seismic::cpu::F32>(
+            latent,
+            None,
+            Layout::new(cx.dim_ra(), cx.dim_rt()),
+            cosines,
+            sines,
+            cx.arg_epsilon(),
+            rounding,
+            hold,
+            finished,
+        );
+    });
     let blocks = SlabTensor::from_bound(cx.arg_block_rows(), cx.arg_block_slab_rows() as usize);
     // SAFETY: block destinations are distinct freshly reserved rows no work
     // item of this launch reads.
