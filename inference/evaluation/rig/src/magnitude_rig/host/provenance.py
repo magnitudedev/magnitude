@@ -367,8 +367,9 @@ def verify(texts: list, roots: list, target: str, tests: list = ()) -> dict:
     found = target_executables(target)
     others = [verify_executable(path, roots, once, records) for path in found if path not in named]
     withdrawn = [other for other in others if other["status"] != "verified"]
+    units: set = set()  # an example's two names (`x`, `x-<hash>`) are one unit's outputs
     for executable in withdrawn:
-        _withdraw(executable)
+        _withdraw(executable, units)
     if not executables:
         status = "no-built-executable"
     elif all(e["status"] == "verified" for e in executables):
@@ -380,13 +381,16 @@ def verify(texts: list, roots: list, target: str, tests: list = ()) -> dict:
             "withdrawn": withdrawn, "kept": [path for path in found if path not in gone]}
 
 
-def _withdraw(executable: dict) -> None:
+def _withdraw(executable: dict, units: set) -> None:
     """Remove an executable no job may run: its file, and the outputs and record of the unit
-    that produced it, so cargo builds that unit again when asked."""
+    that produced it, so cargo builds that unit again when asked. `units` holds the units
+    already withdrawn, whose records are gone with their outputs."""
     paths = [executable["path"]]
-    if executable["unit"] is not None:
-        with open(executable["unit"]) as stream:
-            paths += [*json.load(stream)["outputs"], executable["unit"]]
+    unit = executable["unit"]
+    if unit is not None and unit not in units:
+        units.add(unit)
+        with open(unit) as stream:
+            paths += [*json.load(stream)["outputs"], unit]
     for path in paths:
         try:
             os.remove(path)

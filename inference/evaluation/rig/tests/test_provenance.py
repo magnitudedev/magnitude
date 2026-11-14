@@ -45,12 +45,12 @@ def workspace(directory: Path) -> Path:
     return directory
 
 
-def cargo_build(source: Path, target: Path, wrapper: str | None) -> str:
+def cargo_build(source: Path, target: Path, wrapper: str | None, *extra: str) -> str:
     env = {k: v for k, v in os.environ.items() if k != engine.COMPILER}
     if wrapper is not None:
         env[engine.COMPILER] = wrapper
     return subprocess.run(
-        ["cargo", "build", "--release", "--offline", "--target-dir", str(target)],
+        ["cargo", "build", "--release", "--offline", "--target-dir", str(target), *extra],
         cwd=source, env=env, capture_output=True, text=True, check=True,
     ).stderr
 
@@ -217,6 +217,29 @@ def test_reused_unit_of_other_content_is_contradicted(tmp_path):
     assert executable["reasons"] == [
         f"my_lib: compiled from other content of {source / 'lib/src/part.rs'}"
     ]
+
+
+@needs_cargo
+def test_a_stale_example_is_withdrawn_under_both_its_names(tmp_path):
+    """Cargo writes an example as `x` and `x-<hash>`, outputs of one unit: once its sources
+    change, both are withdrawn, and the unit's record goes with the first."""
+    source, target = workspace(tmp_path / "ws"), tmp_path / "target"
+    (source / "app/examples").mkdir()
+    (source / "app/examples/probe.rs").write_text('fn main() { println!("{}", my_lib::who()); }\n')
+    wrapper = provenance.install(str(tmp_path / "root"))
+    cargo_build(source, target, wrapper, "--examples")
+    examples = target / "release" / "examples"
+
+    def probes() -> list:
+        return sorted(path.name for path in examples.iterdir()
+                      if path.name.startswith("probe") and path.is_file() and os.access(path, os.X_OK))
+
+    built = probes()
+    assert len(built) == 2
+    replace_keeping_cargo_fresh(source / "lib/src/part.rs", SECOND)
+    record = provenance.verify([], [str(source)], str(target))
+    assert sorted(Path(executable["path"]).name for executable in record["withdrawn"]) == built
+    assert probes() == []
 
 
 @needs_cargo
