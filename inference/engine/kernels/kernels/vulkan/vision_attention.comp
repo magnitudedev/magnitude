@@ -36,9 +36,9 @@ void vision_attention_prepare() {
     const uint plane = part < VISION_H ? 0u : part < VISION_H + uint(SEISMIC_DIM_KV) ? 1u : 2u;
     const uint64_t source = plane == 0u ? SEISMIC_PTR(SEISMIC_BUFFER_QUERY)
         : plane == 1u ? SEISMIC_PTR(SEISMIC_BUFFER_KEY) : SEISMIC_PTR(SEISMIC_BUFFER_VALUE);
+    const bool normed = plane < 2u ? SEISMIC_DIM_NQ == 1 : SEISMIC_DIM_NV == 1;
     const uint64_t norm = plane == 0u ? SEISMIC_PTR(SEISMIC_BUFFER_QUERY_NORM)
         : plane == 1u ? SEISMIC_PTR(SEISMIC_BUFFER_KEY_NORM) : 0ul;
-    const bool normed = plane < 2u ? SEISMIC_DIM_NQ == 1 : SEISMIC_DIM_NV == 1;
     const uint heads = plane == 0u ? VISION_H : uint(SEISMIC_DIM_KV);
     const uint head = plane == 0u ? part : part - VISION_H - (plane - 1u) * uint(SEISMIC_DIM_KV);
     vision_prepare_head(ELEMENT_ACT, source + (uint64_t(row) * heads + head) * VISION_W * 2ul, target, normed,
@@ -52,5 +52,5 @@ void vision_attention_attend() {
     const float scale = int(SEISMIC_PARAM_UNIT_SCALE) != 0 ? 1.0 : inversesqrt(float(VISION_W));
     vision_attend(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_OPERANDS), SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER),
         VISION_M, VISION_PADDED, VISION_H, uint(SEISMIC_DIM_G), VISION_W, VISION_WP, scale,
-        SEISMIC_DIM_WS == 1 ? SEISMIC_PTR(SEISMIC_BUFFER_SPANS) : 0ul, gl_WorkGroupID.x, gl_WorkGroupID.y);
+        SEISMIC_PTR(SEISMIC_BUFFER_SPANS), gl_WorkGroupID.x, gl_WorkGroupID.y);
 }

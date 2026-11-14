@@ -333,6 +333,14 @@ pub(crate) struct StaticTensor {
     pub strides: Option<Vec<u64>>,
 }
 
+impl StaticTensor {
+    /// Whether the tensor is absent: a static extent is zero, so it has no
+    /// element under any binding and its address names nothing.
+    pub(crate) fn absent(&self) -> bool {
+        self.extents.contains(&Some(0))
+    }
+}
+
 /// Per tensor parameter and tensor result (by schema ordinal; `None` for
 /// non-tensors): the static geometry the prefix renders as constants. A
 /// parameter with static strides must be bound with exactly those canonical
@@ -549,6 +557,9 @@ fn render_source_with(
         }
     }
     let mut buffer = 0usize;
+    // Per bound buffer, whether it is absent (`StaticTensor::absent`): its
+    // address reads as 0 (`SEISMIC_PTR`), so no source guards it.
+    let mut absent = Vec::new();
     let mut word = 0usize;
     for dimension in schema.dimensions() {
         let name = native_macro(&dimension.name);
@@ -593,13 +604,15 @@ fn render_source_with(
                 for symbol in names.tensor_buffers() {
                     prefix.push_str(&format!("#define {symbol} {buffer}\n"));
                 }
+                let fixed = geometry.parameters[ordinal]
+                    .as_ref()
+                    .expect("a tensor parameter has static geometry");
+                absent.push(fixed.absent());
                 let tensor = TensorAbi {
                     representation: *representation,
                     rank: axes.len(),
                     word,
-                    fixed: geometry.parameters[ordinal]
-                        .as_ref()
-                        .expect("a tensor parameter has static geometry"),
+                    fixed,
                     dialect,
                 };
                 // A record parameter's records are the host's to land while
@@ -652,13 +665,15 @@ fn render_source_with(
             prefix.push_str(&format!(
                 "#define SEISMIC_RESULT_{ordinal}_BUFFER {buffer}\n"
             ));
+            let fixed = geometry.results[ordinal]
+                .as_ref()
+                .expect("a tensor result has static geometry");
+            absent.push(fixed.absent());
             TensorAbi {
                 representation: *representation,
                 rank: axes.len(),
                 word,
-                fixed: geometry.results[ordinal]
-                    .as_ref()
-                    .expect("a tensor result has static geometry"),
+                fixed,
                 dialect,
             }
             .render(&mut prefix, &format!("SEISMIC_RESULT_{ordinal}"));
@@ -699,8 +714,10 @@ fn render_source_with(
             "#define SEISMIC_BUFFER_SCRATCH_{} {buffer}\n",
             native_macro(&scratch.name)
         ));
+        absent.push(false);
         buffer += 1;
     }
+    debug_assert_eq!(absent.len(), buffer);
     // Bound tensor parameters lead the buffer order; a shared (`&`) one is
     // read-only. Results and scratch follow.
     let read_only = schema
@@ -720,7 +737,7 @@ fn render_source_with(
         .take(buffer);
     #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
     if let Dialect::Vulkan(_) = dialect {
-        prefix.push_str(&vulkan::tail(buffer, read_only));
+        prefix.push_str(&vulkan::tail(read_only, &absent));
         debug_assert_eq!(word, word_count(schema) + runtime_parameters.len());
         constant_macros(&mut prefix, asset);
         prefix.push_str(asset.text);
@@ -739,17 +756,22 @@ fn render_source_with(
         ));
         // A read-only buffer is `const`, so its loads are eligible for the
         // non-coherent path.
-        let buffers = read_only
+        let qualifiers = read_only
+            .map(|read_only| if read_only { "const " } else { "" })
+            .collect::<Vec<_>>();
+        let buffers = qualifiers
+            .iter()
             .enumerate()
-            .map(|(index, read_only)| {
-                let qualifier = if read_only { "const " } else { "" };
-                format!("{qualifier}unsigned char* __restrict__ seismic_buffer_{index}, ")
-            })
+            .map(|(index, qualifier)| format!("{qualifier}unsigned char* __restrict__ seismic_buffer_{index}, "))
             .collect::<String>();
         prefix.push_str(&format!(
             "#define SEISMIC_KERNEL_PARAMS {buffers}seismic_words_t seismic_words_value, unsigned long long* seismic_scalar_results\n"
         ));
-        prefix.push_str("#define SEISMIC_PTR_(index) seismic_buffer_##index\n#define SEISMIC_PTR(index) SEISMIC_PTR_(index)\n");
+        prefix.push_str(&addresses(
+            &absent,
+            |index| format!("seismic_buffer_{index}"),
+            |index| format!("(({}unsigned char *)0)", qualifiers[index]),
+        ));
         prefix.push_str("#define SEISMIC_SCALAR_RESULTS seismic_scalar_results\n");
     }
     // The launch being formed, when it dispatches a written grid authored
@@ -775,6 +797,19 @@ fn render_source_with(
         written_grid_loop(&mut prefix, schema, implementation, ordinal, buffer);
     }
     prefix
+}
+
+/// `SEISMIC_PTR(index)`: buffer `index`'s address, `bound(index)` (its
+/// argument), or `null(index)`, address 0 of the same type, where the buffer
+/// is absent (`StaticTensor::absent`). An absent operand has nothing to
+/// dereference, so its address is 0 by construction and no source guards it.
+fn addresses(absent: &[bool], bound: impl Fn(usize) -> String, null: impl Fn(usize) -> String) -> String {
+    let mut out = String::from("#define SEISMIC_PTR_(index) SEISMIC_ADDRESS_##index\n#define SEISMIC_PTR(index) SEISMIC_PTR_(index)\n");
+    for (index, absent) in absent.iter().enumerate() {
+        let address = if *absent { null(index) } else { bound(index) };
+        out.push_str(&format!("#define SEISMIC_ADDRESS_{index} {address}\n"));
+    }
+    out
 }
 
 /// CUDA has no indirect launch, so a launch with a written grid
@@ -2485,5 +2520,20 @@ void probe() {{
         // The shared parameter `x` is read-only; the result and scratch are not.
         assert!(source.contains("#define SEISMIC_KERNEL_PARAMS const unsigned char* __restrict__ seismic_buffer_0, unsigned char* __restrict__ seismic_buffer_1, unsigned char* __restrict__ seismic_buffer_2, seismic_words_t seismic_words_value, unsigned long long* seismic_scalar_results\n"));
         assert!(source.contains("#define SEISMIC_PTR(index) SEISMIC_PTR_(index)\n"));
+    }
+
+    /// A buffer a static zero extent leaves absent reads as address 0, of
+    /// its own type; every other reads its argument.
+    #[test]
+    fn an_absent_buffer_reads_as_address_zero() {
+        let absent = NativeSpecialization::new().with_static("K", 0);
+        let cuda = render_with(CUDA, "f32", absent.clone());
+        assert!(cuda.contains("#define SEISMIC_ADDRESS_0 ((const unsigned char *)0)\n"));
+        assert!(cuda.contains("#define SEISMIC_ADDRESS_1 seismic_buffer_1\n"));
+        let vulkan = render_with(Dialect::Vulkan(VULKAN_FEATURES), "f32", absent);
+        assert!(vulkan.contains("#define SEISMIC_ADDRESS_0 0ul\n"));
+        assert!(vulkan.contains("#define SEISMIC_ADDRESS_1 (seismic_argument_block_t(seismic_arguments).w[1])\n"));
+        let present = render(Dialect::Vulkan(VULKAN_FEATURES), "f32");
+        assert!(present.contains("#define SEISMIC_ADDRESS_0 (seismic_argument_block_t(seismic_arguments).w[0])\n"));
     }
 }
