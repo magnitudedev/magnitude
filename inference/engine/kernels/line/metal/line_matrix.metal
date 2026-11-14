@@ -1,23 +1,25 @@
-// line_matrix: 8x8 simdgroup matrix multiply-adds of half into f32, the
-// product of the projection GEMMs' simdgroup tiles: S multiply-adds a lane
-// (a product is 16 a lane), in UNROLL independent accumulators seeded
-// apart, the operands each simdgroup's first `x` in half; it writes `x`
-// back (line.seismic). A simdgroup runs whole or not at all.
-kernel void line_matrix(
-    device const float *xs [[buffer(SEISMIC_BUFFER_X)]],
-    device float *out [[buffer(SEISMIC_BUFFER_OUT)]],
-    constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
-    uint index [[thread_position_in_grid]],
-    uint lane_in [[thread_index_in_simdgroup]]) {
+// line_matrix and line_matrix_f32: 8x8 simdgroup matrix multiply-adds into
+// f32, of half (the product of the projection GEMMs' simdgroup tiles) and of
+// float (the product of the token-packing GEMM's): S multiply-adds a lane (a
+// product is 16 a lane), in UNROLL independent accumulators seeded apart,
+// the operands each simdgroup's first `x` in the operand type; each writes
+// `x` back (line.seismic). A simdgroup runs whole or not at all.
+template <typename T>
+static inline void line_matrix_of(
+    device const float *xs,
+    device float *out,
+    constant ulong *seismic_words,
+    uint index,
+    uint lane_in) {
     constexpr uint UNROLL = SEISMIC_TUNE_UNROLL;
     constexpr uint PRODUCTS = SEISMIC_STATIC_S / 16;
     const ulong lane = ulong(index);
     const ulong first = lane - lane_in;
     if (first >= SEISMIC_DIM_N)
         return;
-    const half value = half(xs[first * SEISMIC_X_STRIDE_0]);
-    const simdgroup_half8x8 a = make_filled_simdgroup_matrix<half, 8, 8>(value);
-    const simdgroup_half8x8 b = make_filled_simdgroup_matrix<half, 8, 8>(value);
+    const T value = T(xs[first * SEISMIC_X_STRIDE_0]);
+    const simdgroup_matrix<T, 8, 8> a = make_filled_simdgroup_matrix<T, 8, 8>(value);
+    const simdgroup_matrix<T, 8, 8> b = make_filled_simdgroup_matrix<T, 8, 8>(value);
     simdgroup_float8x8 d[UNROLL];
     for (uint k = 0; k < UNROLL; ++k)
         d[k] = make_filled_simdgroup_matrix<float, 8, 8>(float(k));
@@ -31,4 +33,22 @@ kernel void line_matrix(
     if (lane < SEISMIC_DIM_N)
         out[lane * SEISMIC_OUT_STRIDE_0] =
             xs[lane * SEISMIC_X_STRIDE_0] + (as_type<uint>(total) == 0xFFFFFFFFu ? 1.0f : 0.0f);
+}
+
+kernel void line_matrix(
+    device const float *xs [[buffer(SEISMIC_BUFFER_X)]],
+    device float *out [[buffer(SEISMIC_BUFFER_OUT)]],
+    constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
+    uint index [[thread_position_in_grid]],
+    uint lane_in [[thread_index_in_simdgroup]]) {
+    line_matrix_of<half>(xs, out, seismic_words, index, lane_in);
+}
+
+kernel void line_matrix_f32(
+    device const float *xs [[buffer(SEISMIC_BUFFER_X)]],
+    device float *out [[buffer(SEISMIC_BUFFER_OUT)]],
+    constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
+    uint index [[thread_position_in_grid]],
+    uint lane_in [[thread_index_in_simdgroup]]) {
+    line_matrix_of<float>(xs, out, seismic_words, index, lane_in);
 }

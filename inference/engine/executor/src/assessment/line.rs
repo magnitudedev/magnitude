@@ -38,7 +38,7 @@ use super::executor_costs::{
     executor_identity, failed, largest_cache, named, rotation_sets, ExecutorCostsError, Formation, MeasuredCost, Walks,
 };
 use super::streaming_costs::{MemoryCosts, Sweeps};
-use magnitude_kernels::{line_f32, line_int8, line_matrix, line_stream};
+use magnitude_kernels::{line_f32, line_int8, line_matrix, line_matrix_f32, line_stream};
 use seismic::measure::{Reason, Record, RecordStore, StoreError, Timing, Unformed};
 use seismic::{BackendName, Device, DeviceTopology, Element, Entry, Executor, NativeKernel, Point, PointKey, Tensor};
 use std::cell::OnceCell;
@@ -70,6 +70,11 @@ pub enum Operand {
     /// 16-bit matrix multiply-adds into f32: Metal's half simdgroup
     /// matrices, CUDA's bf16 MMA, Vulkan's f16 cooperative matrices.
     Matrix,
+    /// f32 matrix multiply-adds into f32: Metal's float simdgroup matrices,
+    /// the operand of its token-packing form, whose every multiply-add
+    /// carries two products (so that form's floor is half its products
+    /// over this peak).
+    MatrixF32,
     /// int8 multiply-adds into i32: CUDA's s8 MMA, the CPU tier's
     /// quantized dots.
     Int8,
@@ -80,6 +85,7 @@ impl Operand {
         match self {
             Self::F32 => "f32",
             Self::Matrix => "matrix",
+            Self::MatrixF32 => "matrix_f32",
             Self::Int8 => "int8",
         }
     }
@@ -255,6 +261,12 @@ impl Probe for line_matrix::Entry {
     }
 }
 
+impl Probe for line_matrix_f32::Entry {
+    fn args<'a>(operands: &'a Operands, x: &'a Tensor, out: &'a mut Tensor) -> Self::Args<'a> {
+        line_matrix_f32::Args { x, steps: operands.steps(), out }
+    }
+}
+
 impl Probe for line_int8::Entry {
     fn args<'a>(operands: &'a Operands, x: &'a Tensor, out: &'a mut Tensor) -> Self::Args<'a> {
         line_int8::Args { x, steps: operands.steps(), out }
@@ -286,7 +298,7 @@ struct Shape {
     /// A peak's lanes, and the multiply-adds each makes of each operand
     /// ([`Operand`]'s order).
     lanes: u64,
-    steps: [u64; 3],
+    steps: [u64; 4],
 }
 
 impl Shape {
@@ -309,8 +321,10 @@ impl Shape {
         let row = ROW_VALUES * 4;
         let rows = STREAM_CALL_BYTES.min(executor.limits().max_allocation.bytes()) / row;
         let (lanes, steps) = match executor.backend() {
-            BackendName::Cpu => (1 << 10, [1 << 18, 1 << 18, 1 << 21]),
-            BackendName::Metal | BackendName::Cuda | BackendName::Vulkan => (1 << 20, [1 << 12, 1 << 12, 1 << 14]),
+            BackendName::Cpu => (1 << 10, [1 << 18, 1 << 18, 1 << 18, 1 << 21]),
+            BackendName::Metal | BackendName::Cuda | BackendName::Vulkan => {
+                (1 << 20, [1 << 12, 1 << 12, 1 << 12, 1 << 14])
+            }
         };
         Self { rows, sets: rotation_sets(largest_cache(topology, executor), rows * row), lanes, steps }
     }
@@ -672,7 +686,12 @@ struct Probes {
     /// The readers of the CPU's stream, its host memory's sweeps
     /// ([`host_readers`]); none on a device.
     host: Option<Result<[u64; 2], ExecutorCostsError>>,
-    peaks: (Option<Ladder<line_f32::Entry>>, Option<Ladder<line_matrix::Entry>>, Option<Ladder<line_int8::Entry>>),
+    peaks: (
+        Option<Ladder<line_f32::Entry>>,
+        Option<Ladder<line_matrix::Entry>>,
+        Option<Ladder<line_matrix_f32::Entry>>,
+        Option<Ladder<line_int8::Entry>>,
+    ),
 }
 
 impl Probes {
@@ -688,6 +707,7 @@ impl Probes {
             peaks: (
                 Ladder::of(backend, &line_f32::native_entry(), shape, Operand::F32)?,
                 Ladder::of(backend, &line_matrix::native_entry(), shape, Operand::Matrix)?,
+                Ladder::of(backend, &line_matrix_f32::native_entry(), shape, Operand::MatrixF32)?,
                 Ladder::of(backend, &line_int8::native_entry(), shape, Operand::Int8)?,
             ),
         })
@@ -695,11 +715,12 @@ impl Probes {
 
     /// The points of every probe.
     fn points(&self) -> usize {
-        let (f32, matrix, int8) = &self.peaks;
+        let (f32, matrix, matrix_f32, int8) = &self.peaks;
         self.stream.as_ref().map_or(0, |stream| stream.unrolls.len())
             + self.host.as_ref().map_or(0, |readers| if readers.is_ok() { HOST_POINTS } else { 0 })
             + f32.as_ref().map_or(0, Ladder::points)
             + matrix.as_ref().map_or(0, Ladder::points)
+            + matrix_f32.as_ref().map_or(0, Ladder::points)
             + int8.as_ref().map_or(0, Ladder::points)
     }
 }
@@ -719,13 +740,16 @@ impl MachineLine {
     ) -> Result<Self, MachineLineError> {
         let identity = executor_identity(topology, executor)?;
         let backend = executor.backend();
-        let Probes { stream, host, peaks: (f32, matrix, int8), .. } = Probes::of(topology, executor)?;
+        let Probes { stream, host, peaks: (f32, matrix, matrix_f32, int8), .. } = Probes::of(topology, executor)?;
         let mut peaks = Vec::new();
         if let Some(ladder) = f32 {
             peaks.push((Operand::F32, ladder.stored(&identity, backend, store)?));
         }
         if let Some(ladder) = matrix {
             peaks.push((Operand::Matrix, ladder.stored(&identity, backend, store)?));
+        }
+        if let Some(ladder) = matrix_f32 {
+            peaks.push((Operand::MatrixF32, ladder.stored(&identity, backend, store)?));
         }
         if let Some(ladder) = int8 {
             peaks.push((Operand::Int8, ladder.stored(&identity, backend, store)?));
@@ -750,7 +774,8 @@ impl MachineLine {
     pub(super) fn measure(walks: &mut Walks<'_, '_>) -> Result<(), ExecutorCostsError> {
         walks.bounded();
         let device = walks.device();
-        let Probes { shape, stream, host, peaks: (f32, matrix, int8) } = Probes::of(device.topology(), device.info())?;
+        let Probes { shape, stream, host, peaks: (f32, matrix, matrix_f32, int8) } =
+            Probes::of(device.topology(), device.info())?;
         if let Some(Ok(readers)) = host {
             measure_host(readers, walks)?;
         }
@@ -768,6 +793,9 @@ impl MachineLine {
         }
         if let Some(ladder) = matrix {
             ladder.measure(walks, shape, Operand::Matrix)?;
+        }
+        if let Some(ladder) = matrix_f32 {
+            ladder.measure(walks, shape, Operand::MatrixF32)?;
         }
         if let Some(ladder) = int8 {
             ladder.measure(walks, shape, Operand::Int8)?;
@@ -1041,8 +1069,8 @@ mod tests {
         for (key, seconds) in sweeps.iter().zip([1., 3., 1., 4.]) {
             time(key.clone(), super::timing(seconds, None));
         }
-        let (f32, matrix, int8) = &probes.peaks;
-        assert!(matrix.is_none(), "the CPU's forms multiply no 16-bit operand");
+        let (f32, matrix, matrix_f32, int8) = &probes.peaks;
+        assert!(matrix.is_none() && matrix_f32.is_none(), "the CPU's forms multiply no matrix operand");
         let (f32, int8) = (f32.as_ref().unwrap(), int8.as_ref().unwrap());
         // Every UNROLL a second faster than the one before at its multiples
         // (a call's fixed 1 s beside a work of `work` seconds a multiple),

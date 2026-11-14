@@ -125,6 +125,20 @@ native line_matrix for vulkan from "vulkan/line_matrix.comp":
         threadgroups (ceil_div(N, 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
+# f32 matrix multiply-adds into f32, the operand of Metal's token-packing
+# form (8x8 simdgroup matrices of float, two products a multiply-add). No
+# other backend's forms multiply it.
+fn line_matrix_f32[N, S](x: &tensor[N] f32, steps: &host tensor[0, S] i32, out: &mut tensor[N] f32):
+    parallel for lane in 0..N:
+        out[lane] = x[lane]
+
+native line_matrix_f32 for metal from "metal/line_matrix.metal":
+    static (S)
+    params (UNROLL in [1, 2, 4, 8, 16, 32] default 4)
+    launch line_matrix_f32:
+        threadgroups (ceil_div(N, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
 # int8 multiply-adds into i32, the product the int8 forms run: CUDA's
 # m16n8k32 s8 MMA, the CPU tier's quantized dots (`Tier::quantized_dots`:
 # AVX-512 VNNI on whole 512-bit registers, AVX2 byte products, NEON `sdot`;
