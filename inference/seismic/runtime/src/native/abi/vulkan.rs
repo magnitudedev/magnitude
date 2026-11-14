@@ -144,14 +144,20 @@ pub(super) fn header(features: VulkanFeatures) -> String {
 
 /// The argument block (buffer addresses, the scalar-result address, then
 /// the words: there is no words buffer), read-only flags and workgroup size
-/// of a source with `buffers` buffers.
-pub(super) fn tail(buffers: usize, read_only: impl Iterator<Item = bool>) -> String {
+/// of a source with one buffer per `absent` flag, each absent one's address
+/// 0 (`super::addresses`).
+pub(super) fn tail(read_only: impl Iterator<Item = bool>, absent: &[bool]) -> String {
+    let buffers = absent.len();
     let mut tail = format!("#define SEISMIC_BUFFER_SCALAR_RESULTS {buffers}\n");
     tail.push_str(
         "layout(push_constant, scalar) uniform seismic_push_t { uint64_t seismic_arguments; };\n\
-         layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer seismic_argument_block_t { uint64_t w[]; };\n\
-         #define SEISMIC_PTR(index) (seismic_argument_block_t(seismic_arguments).w[index])\n",
+         layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer seismic_argument_block_t { uint64_t w[]; };\n",
     );
+    tail.push_str(&super::addresses(
+        absent,
+        |index| format!("(seismic_argument_block_t(seismic_arguments).w[{index}])"),
+        |_| "0ul".to_owned(),
+    ));
     tail.push_str(&format!(
         "#define SEISMIC_SCALAR_RESULTS (seismic_argument_block_t(seismic_arguments).w[{buffers}])\n\
          #define seismic_words (seismic_argument_block_t(seismic_arguments + {}ul).w)\n",
