@@ -78,6 +78,24 @@ def test_the_draw_is_a_function_of_seed_plane_and_index() -> None:
     assert not np.array_equal(Perturbation(5).steps("x/scales", index), draw)
 
 
+def test_the_draw_is_splitmix64_of_the_plane_key_plus_the_index() -> None:
+    """The draw, written out in Python integers: SplitMix64's finalizer over key + golden * index, then the top 32
+    bits scaled to one of `CHANCES` (0 down, 1 up)."""
+    mask = (1 << 64) - 1
+
+    def step(key: int, index: int) -> int:
+        x = (index * 0x9E3779B97F4A7C15 + key) & mask
+        x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & mask
+        x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & mask
+        draw = (((x ^ (x >> 31)) >> 32) * perturbation.CHANCES) >> 32
+        return -1 if draw == 0 else 1 if draw == 1 else 0
+
+    seed = Perturbation(3)
+    index = np.random.default_rng(2).integers(0, 1 << 40, 1 << 12)
+    expected = [step(int(seed.key("blk.4.ffn_gate_exps.weight")), int(i)) for i in index]
+    assert seed.steps("blk.4.ffn_gate_exps.weight", index).tolist() == expected
+
+
 def test_the_variant_names_its_seed() -> None:
     assert Perturbation.of("perturbed:17") == Perturbation(17)
     assert Perturbation.of(None) is None and Perturbation.of("activations") is None
@@ -105,3 +123,24 @@ def test_stored_row_codes_round_trip_and_refuse_other_values() -> None:
     assert to_codes(scales, E8M0).tolist() == [0, 126, 127, 254]
     with pytest.raises(AssertionError, match="outside E8M0"):
         to_codes(torch.tensor([3.0]), E8M0)
+
+
+def test_tabulated_moves_equal_the_definition() -> None:
+    """`stored` evaluates moves through tables (`moves`, and MXFP4's compiled blocks); each equals `move` with
+    `steps`, the definition: every code of every format of at most 16 bits under every draw, and MXFP4 blocks nibble
+    by nibble."""
+    for format in (BF16, F16, E4M3, E2M1, E8M0, UE8M0):
+        codes = np.arange(1 << format.bits, dtype=np.uint8 if format.bits <= 8 else np.uint16)
+        for draw, step in enumerate((-1, 0, 1)):
+            assert np.array_equal(perturbation.moves(format)[draw], move(codes, np.int8(step), format)), format
+    rows, blocks = np.array([3, 4, 9, 1000]), 16
+    data = np.random.default_rng(8).integers(0, 256, (len(rows), blocks * 17), dtype=np.uint8)
+    moved = Perturbation(4).stored("blk.1.ffn_down_exps.weight", Q.MXFP4, blocks * 32, data, rows)
+    block = rows[:, None] * blocks + np.arange(blocks)
+    raw = data.reshape(len(rows), blocks, 17)
+    scales = move(raw[..., 0], Perturbation(4).steps("blk.1.ffn_down_exps.weight/scales", block), E8M0)
+    nibbles = np.concatenate((raw[..., 1:] & np.uint8(0x0F), raw[..., 1:] >> np.uint8(4)), axis=-1)
+    nibbles = move(nibbles, Perturbation(4).steps("blk.1.ffn_down_exps.weight", block[..., None] * 32 + np.arange(32)),
+                   E2M1)
+    expected = np.concatenate((scales[..., None], nibbles[..., :16] | (nibbles[..., 16:] << np.uint8(4))), axis=-1)
+    assert np.array_equal(moved, expected.reshape(data.shape))

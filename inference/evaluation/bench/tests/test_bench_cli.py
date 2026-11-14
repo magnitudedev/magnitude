@@ -1,4 +1,5 @@
 import pytest
+from bench_support import TREE
 from magnitude_bench import cli
 from magnitude_bench.models import catalog_reference, targets
 
@@ -13,10 +14,10 @@ def test_contexts_and_sections():
 
 
 def test_models_come_only_from_the_catalog():
-    assert catalog_reference("qwen3.5-4b:gguf:q4") == "qwen3.5-4b:gguf:q4"
+    assert catalog_reference("qwen3.5-4b:gguf:q4", TREE) == "qwen3.5-4b:gguf:q4"
     for reference in ("qwen3.5-4b", "qwen3.5-4b:gguf:q3", "not-a-model:gguf:q4"):
         with pytest.raises(ValueError):
-            catalog_reference(reference)
+            catalog_reference(reference, TREE)
 
 
 def test_gguf_engines_serve_the_catalog_target_and_others_name_their_form(acquisition):
@@ -53,7 +54,30 @@ def test_measurement_options_round_trip_through_their_arguments():
 def test_invalid_selection_fails_before_any_job():
     args = cli.parser().parse_args([
         "job", "--mode", "tools", "--model", "qwen3.5-4b:gguf:q3", "--context", "4k",
-        "--artifacts", "a.json", "--output", "out", "--build-identity", "b.json",
+        "--inference", "i", "--artifacts", "a.json", "--output", "out", "--build-identity", "b.json",
     ])
     with pytest.raises(ValueError, match="no variant"):
-        cli.check(args)
+        cli.check(args, TREE)
+
+
+def test_a_held_set_is_served_under_the_name_its_acquisition_gives_it(tmp_path):
+    """`job` takes no catalog reference for a set the host holds: the acquisition names it, and a catalog
+    reference, where given, must be the one the acquisition names."""
+    base = ["job", "--mode", "prose-repeat", "--context", "4k", "--inference", str(tmp_path), "--artifacts", str(tmp_path / "a.json"),
+            "--output", str(tmp_path / "out"), "--build-identity", str(tmp_path / "b.json")]
+    held = cli.parser().parse_args(base)
+    assert held.model is None
+    cli.check(held, TREE)
+    with pytest.raises(ValueError, match="not a catalog model"):
+        cli.check(cli.parser().parse_args([*base, "--model", "held-set:gguf:fp8"]), TREE)
+
+
+def test_the_tool_imports_nothing_of_the_rig_and_reads_only_the_tree_it_is_given(tmp_path):
+    """Bench is the measurement package and the rig drives it, so it neither finds a checkout nor imports the
+    rig: the tree is an argument, and a tree without a catalog is no catalog."""
+    from pathlib import Path
+
+    with pytest.raises(OSError):
+        catalog_reference("qwen3.5-4b:gguf:q4", tmp_path)
+    source = Path(cli.__file__).parent
+    assert not [path for path in source.rglob("*.py") if "magnitude_rig" in path.read_text()]

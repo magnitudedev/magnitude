@@ -31,8 +31,9 @@ from __future__ import annotations
 import torch
 
 from magnitude_references.gguf import Package
-from magnitude_references.model import (Reference, Rotary, Weights, attention, default_inv_freq, heads, linear,
-                                        mixture, rms_norm, route_top_k, silu, softplus, visibility)
+from magnitude_references.model import (Reference, Rotary, Weights, attention, causal_conv, default_inv_freq, heads,
+                                        l2_normalize, linear, mixture, rms_norm, route_top_k, sigmoid, silu, softplus,
+                                        visibility)
 
 
 def grouped(tensor: torch.Tensor, dim: int, k_heads: int, per_k: int, width: int) -> torch.Tensor:
@@ -42,17 +43,6 @@ def grouped(tensor: torch.Tensor, dim: int, k_heads: int, per_k: int, width: int
     shape = list(tensor.shape)
     split = tensor.reshape(*shape[:dim], per_k, k_heads, width, *shape[dim + 1:])
     return split.transpose(dim, dim + 1).reshape(shape)
-
-
-def causal_conv(u: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
-    """Depthwise causal conv from a zero window, no bias: out[t, c] = sum_k kernel[c, k] u[t-(K-1)+k, c]."""
-    taps = kernel.shape[1]
-    padded = torch.nn.functional.pad(u, (0, 0, taps - 1, 0))
-    return sum(padded[:, k:k + u.shape[1]] * kernel[:, k] for k in range(taps))
-
-
-def l2_normalize(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    return x * torch.rsqrt((x * x).sum(-1, keepdim=True) + eps)
 
 
 CHUNK = 64  # rows per chunk of the gated delta rule
@@ -179,7 +169,7 @@ class Qwen35Reference(Reference):
         q = l2_normalize(q.view(batch, steps, self.k_heads, self.k_width)) * self.k_width ** -0.5
         k = l2_normalize(k.view(batch, steps, self.k_heads, self.k_width))
         v = v.view(batch, steps, self.v_heads, self.v_width)
-        beta = torch.sigmoid(linear(x, self.head_rows(layer, "ssm_beta.weight")))
+        beta = sigmoid(linear(x, self.head_rows(layer, "ssm_beta.weight")))
         a = -self.head_rows(layer, "ssm_a")  # exp(A_log)
         g = -a * softplus(linear(x, self.head_rows(layer, "ssm_alpha.weight")) + self.head_rows(layer, "ssm_dt.bias"))
         q = q.repeat_interleave(self.per_k, dim=2)
@@ -197,7 +187,7 @@ class Qwen35Reference(Reference):
         k = rms_norm(heads(linear(x, w(p + "attn_k.weight")), self.kv_heads), w(p + "attn_k_norm.weight"), self.eps)
         v = heads(linear(x, w(p + "attn_v.weight")), self.kv_heads)
         mixed = attention(rotary.apply_partial(q), rotary.apply_partial(k), v, visible, self.head_dim ** -0.5)
-        return linear(mixed * torch.sigmoid(gate.reshape(batch, steps, -1)), w(p + "attn_output.weight"))
+        return linear(mixed * sigmoid(gate.reshape(batch, steps, -1)), w(p + "attn_output.weight"))
 
     def feed_forward(self, layer: int, x: torch.Tensor) -> torch.Tensor:
         w, p = self.weights, f"blk.{layer}."
@@ -217,7 +207,7 @@ class Qwen35Reference(Reference):
         routed = mixture(rows, selected, weights, expert)
         shared = linear(silu(linear(rows, w(p + "ffn_gate_shexp.weight"))) * linear(rows, w(p + "ffn_up_shexp.weight")),
                         w(p + "ffn_down_shexp.weight"))
-        shared = shared * torch.sigmoid(rows @ w(p + "ffn_gate_inp_shexp.weight"))[:, None]
+        shared = shared * sigmoid(linear(rows, w(p + "ffn_gate_inp_shexp.weight")[None]))
         return (routed + shared).reshape(x.shape)
 
     def hidden(self, tokens: torch.Tensor, taps: tuple[int, ...] = ()) -> tuple[torch.Tensor, list[torch.Tensor]]:

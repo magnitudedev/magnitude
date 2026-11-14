@@ -1,5 +1,5 @@
 """Performance options: how a reference is evaluated, never what it computes. They are outside the
-implementation digest (`digest.NUMERICAL`), so tuning them never invalidates a cached reference.
+implementation digest (`digest.OUTSIDE`), so tuning them never invalidates a cached reference.
 
 `BATCH_TOKENS`: padded tokens per streamed forward. Every batch dequantizes the whole model once, so
 larger batches amortize it, but activations grow with them (65536 drove a 48 GB Apple host into

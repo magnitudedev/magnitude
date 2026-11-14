@@ -34,8 +34,8 @@ import torch
 
 from magnitude_references.families.qwen35 import Qwen35Reference
 from magnitude_references.gguf import Package
-from magnitude_references.model import (Rotary, Weights, attention, default_inv_freq, heads, linear, lower_index_top,
-                                        rms_norm, silu, visibility)
+from magnitude_references.model import (Rotary, Weights, attention, default_inv_freq, heads, linear, products,
+                                        rms_norm, sigmoid, silu, unit_selection, visibility)
 
 
 def ngram_rows(tokens: torch.Tensor, context: int, heads_per_order: int, multipliers: list[int], sizes: list[int],
@@ -83,7 +83,7 @@ class Qwen4ExpReference(Qwen35Reference):
 
     @staticmethod
     def output_gate(z: torch.Tensor) -> torch.Tensor:
-        return torch.sigmoid(z)
+        return sigmoid(z)
 
     def __init__(self, package: Package, weights: Weights, layers: int | None = None):
         super().__init__(package, weights, layers)
@@ -117,12 +117,12 @@ class Qwen4ExpReference(Qwen35Reference):
         w = self.weights
         normed = self.stream_norm(streams, f"{prefix}_norm.weight")
         flat = normed.flatten(-2)
-        gate = torch.sigmoid(linear(silu(linear(flat, w(f"{prefix}_down.weight")) / self.streams),
+        gate = sigmoid(linear(silu(linear(flat, w(f"{prefix}_down.weight")) / self.streams),
                                     w(f"{prefix}_up.weight"))).view_as(normed)
         mixed = (gate * normed).mean(-2)
         if not inject:
             return mixed, None
-        return mixed, 2 * torch.sigmoid(linear(flat, w(f"{prefix}_inject.weight")) / self.streams)
+        return mixed, 2 * sigmoid(linear(flat, w(f"{prefix}_inject.weight")) / self.streams)
 
     @staticmethod
     def scatter(streams: torch.Tensor, out: torch.Tensor, coefficients: torch.Tensor) -> torch.Tensor:
@@ -149,19 +149,11 @@ class Qwen4ExpReference(Qwen35Reference):
         keys = rms_norm(pooled, w(p + "indexer.k_norm.weight"), self.eps)
         starts = Rotary(rotary.cos[positions[::block][:complete]], rotary.sin[positions[::block][:complete]])
         keys = starts.apply_partial(keys)  # [B, blocks, W]
-        scores = torch.relu(q @ keys[:, None].transpose(-1, -2)).sum(1) / math.sqrt(self.indexer_width)
-        ends = positions + 1
-        counts = ends // block  # complete blocks per row
-        valid = torch.arange(complete, device=x.device)[None, :] < counts[:, None]
-        scores = scores.masked_fill(~valid[None], float("-inf"))
-        best = lower_index_top(scores, chosen)  # [B, T, chosen]
-        token_blocks = torch.arange(steps, device=x.device) // block
-        in_best = torch.zeros(batch, steps, complete + 1, dtype=torch.bool, device=x.device)
-        in_best.scatter_(2, best, True)
-        selected = in_best.gather(2, token_blocks.clamp(max=complete)[None, None].expand(batch, steps, steps))
-        tail = (torch.arange(steps, device=x.device)[None, :] >= (counts * block)[:, None]) & visible
-        sparse = (counts > chosen)[None, :, None]
-        return torch.where(sparse, (selected & visible) | tail, visible.expand(batch, steps, steps))
+        scores = torch.relu(products(q, keys[:, None])).sum(1) / math.sqrt(self.indexer_width)
+        slots = unit_selection(scores, positions + 1, chosen, block)
+        # its rows as a mask over the steps, an empty slot (-1) marking a dropped column
+        rows = torch.zeros(batch, steps, steps + 1, dtype=torch.bool, device=x.device)
+        return rows.scatter_(2, slots.masked_fill(slots < 0, steps), True)[..., :steps]
 
     def selected_attention(self, layer: int, x: torch.Tensor, rotary: Rotary, positions: torch.Tensor,
                            visible: torch.Tensor) -> torch.Tensor:
@@ -179,7 +171,7 @@ class Qwen4ExpReference(Qwen35Reference):
         queries = self.stream_norm(streams, p + "ple_norm_query.weight")
         gate = (keys * queries).sum(-1, keepdim=True) / math.sqrt(self.hidden_size)
         gate = gate.sign() * gate.abs().clamp(min=1e-6).sqrt()
-        values = torch.sigmoid(gate) * linear(embedding, w(p + "ple_value.weight"))[..., None, :]
+        values = sigmoid(gate) * linear(embedding, w(p + "ple_value.weight"))[..., None, :]
         normed = self.stream_norm(values, p + "ple_norm_conv.weight").flatten(-2)
         convolved = dilated_causal_conv(normed, w(p + "ple_conv1d.weight"), self.ngram_size)
         return values + silu(convolved).view_as(values)
@@ -209,114 +201,5 @@ class Qwen4ExpReference(Qwen35Reference):
             tapped.append(self.mix(streams, "output_hc", False)[0])
         return self.mix(streams, "output_hc", False)[0], tapped
 
-    # mlx_vlm cross-check (checks.py): transformers has no qwen4_exp -----------------------------
-
+    # transformers has no qwen4_exp and its released code is mlx_vlm alone, so it has no released-code check (checks.py)
     released = "mlx_vlm"
-
-    def check_prompts(self, tokens: torch.Tensor) -> torch.Tensor:
-        """Random prompts with reset tokens placed so n-grams restart mid-sequence."""
-        tokens = tokens.clone()
-        tokens[:, 5::11] = self.reset
-        return tokens
-
-    def mlx_config(self) -> dict:
-        """mlx_vlm `qwen4_exp` TextConfig fields; mlx derives the hash constants from them, and the
-        check compares those with the header's."""
-        return {
-            "model_type": "qwen4_exp_text", "hidden_size": self.hidden_size, "num_hidden_layers": self.block_count,
-            "num_attention_heads": self.head_count, "num_key_value_heads": self.kv_heads, "head_dim": self.head_dim,
-            "linear_num_value_heads": self.v_heads, "linear_num_key_heads": self.k_heads,
-            "linear_key_head_dim": self.k_width, "linear_value_head_dim": self.v_width,
-            "linear_conv_kernel_dim": self.conv_width, "num_experts": self.experts,
-            "num_experts_per_tok": self.experts_used, "moe_intermediate_size": self.expert_size,
-            "shared_expert_intermediate_size": self.shared_size, "rms_norm_eps": self.eps,
-            "vocab_size": self.vocab_size, "max_position_embeddings": self.context_length,
-            "full_attention_interval": self.interval, "hc_count": self.streams, "hc_lowrank": self.rank,
-            "indexer_n_heads": self.indexer_heads, "indexer_head_dim": self.indexer_width,
-            "indexer_budget": self.selected_tokens, "indexer_compress_ratio": self.block_sizes[self.interval - 1],
-            "ple_layer_ids": [layer + 1 for layer in self.ngram_layers], "ngram_size": self.ngram_size,
-            "heads_per_ngram": self.heads_per_ngram, "ple_conv_kernel_size": self.ngram_kernel,
-            # mlx's first head size is the first prime at or above the base, and its table pads
-            # the heads' rows up to a multiple: the stored table's rows, which hold them all.
-            "ngram_vocab_size_base": self.head_sizes[0],
-            "make_ngram_vocab_size_divisible_by": self.weights.shape("per_layer_token_embd.weight")[0],
-            "split_ngram_parts": 1, "eos_token_id": self.reset, "output_gate_type": "sigmoid",
-            "rope_parameters": {"type": "default", "mrope_section": [self.rope_dim // 2, 0, 0],
-                                "rope_theta": self.rope_base, "partial_rotary_factor": self.rope_dim / self.head_dim},
-        }
-
-    def mlx_parameters(self) -> dict[str, torch.Tensor]:
-        """The mlx_vlm LanguageModel parameters (checkpoint form: zero-centered norms)."""
-        w = self.weights
-        centered = lambda name: w(name) - 1  # noqa: E731
-
-        def site(prefix: str, ours: str, inject: bool) -> dict[str, torch.Tensor]:
-            out = {prefix + "hc_norm.weight": centered(ours + "_norm.weight"),
-                   prefix + "input_mix_weight_down.weight": w(ours + "_down.weight"),
-                   prefix + "input_mix_weight_up.weight": w(ours + "_up.weight")}
-            if inject:
-                out[prefix + "block_inject_weight.weight"] = w(ours + "_inject.weight")
-            return out
-
-        parameters = {"model.embed_tokens.weight": w("token_embd.weight"), "lm_head.weight": w("output.weight")}
-        parameters |= site("model.hyper_connection_mixer.", "output_hc", False)
-        for layer in range(self.block_count):
-            p, h = f"blk.{layer}.", f"model.layers.{layer}."
-            parameters |= site(h + "attn_hyper_connection.", p + "hc_attn", True)
-            parameters |= site(h + "mlp_hyper_connection.", p + "hc_ffn", True)
-            if self.is_attention(layer):
-                a = h + "self_attn."
-                parameters |= {a + "q_proj.weight": w(p + "attn_q.weight"), a + "k_proj.weight": w(p + "attn_k.weight"),
-                               a + "v_proj.weight": w(p + "attn_v.weight"),
-                               a + "o_proj.weight": w(p + "attn_output.weight"),
-                               a + "q_norm.weight": centered(p + "attn_q_norm.weight"),
-                               a + "k_norm.weight": centered(p + "attn_k_norm.weight"),
-                               a + "indexer.index_qk_proj.weight": torch.cat(
-                                   (w(p + "indexer.q_proj.weight"), w(p + "indexer.k_proj.weight"))),
-                               a + "indexer.q_layernorm.weight": centered(p + "indexer.q_norm.weight"),
-                               a + "indexer.k_layernorm.weight": centered(p + "indexer.k_norm.weight")}
-            else:
-                a = h + "linear_attn."
-                parameters |= {
-                    a + "in_proj_qkv.weight": self.qkv_weight(layer, "attn_qkv.weight"),
-                    a + "in_proj_z.weight": self.z_weight(layer),
-                    a + "in_proj_b.weight": self.head_rows(layer, "ssm_beta.weight"),
-                    a + "in_proj_a.weight": self.head_rows(layer, "ssm_alpha.weight"),
-                    a + "conv1d.weight": self.qkv_weight(layer, "ssm_conv1d.weight")[:, :, None],
-                    a + "A_log": torch.log(-self.head_rows(layer, "ssm_a")),
-                    a + "dt_bias": self.head_rows(layer, "ssm_dt.bias"),
-                    a + "norm.weight": w(p + "ssm_norm.weight"),
-                    a + "out_proj.weight": self.out_weight(layer),
-                }
-            if layer in self.ngram_layers:
-                n = h + "ple."
-                parameters |= {
-                    n + "ple_embedding.ngram_embedding.shards.0.weight": w("per_layer_token_embd.weight"),
-                    n + "key_proj.weight": w(p + "ple_key.weight"), n + "value_proj.weight": w(p + "ple_value.weight"),
-                    n + "norm_key.weight": centered(p + "ple_norm_key.weight"),
-                    n + "norm_query.weight": centered(p + "ple_norm_query.weight"),
-                    n + "norm_conv.weight": centered(p + "ple_norm_conv.weight"),
-                    n + "conv1d.weight": w(p + "ple_conv1d.weight")[:, :, None],
-                }
-            m = h + "mlp."
-            parameters |= {
-                m + "gate.weight": w(p + "ffn_gate_inp.weight"),
-                m + "switch_mlp.gate_proj.weight": torch.stack(
-                    [w.expert(p + "ffn_gate_exps.weight", e) for e in range(self.experts)]),
-                m + "switch_mlp.up_proj.weight": torch.stack(
-                    [w.expert(p + "ffn_up_exps.weight", e) for e in range(self.experts)]),
-                m + "switch_mlp.down_proj.weight": torch.stack(
-                    [w.expert(p + "ffn_down_exps.weight", e) for e in range(self.experts)]),
-                m + "shared_expert.gate_proj.weight": w(p + "ffn_gate_shexp.weight"),
-                m + "shared_expert.up_proj.weight": w(p + "ffn_up_shexp.weight"),
-                m + "shared_expert.down_proj.weight": w(p + "ffn_down_shexp.weight"),
-                m + "shared_expert_gate.weight": w(p + "ffn_gate_inp_shexp.weight")[None, :],
-            }
-        return parameters
-
-    def mlx_constants(self) -> dict[str, list[int]]:
-        """The hash constants mlx derives, by parameter name, which must equal the header's."""
-        layer = self.ngram_layers[0]
-        e = f"model.layers.{layer}.ple.ple_embedding."
-        return {e + "layer_multipliers": self.multipliers, e + "ngram_heads_vocab_sizes": self.head_sizes,
-                e + "ngram_heads_offsets": self.head_offsets}

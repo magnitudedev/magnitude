@@ -1,14 +1,16 @@
 """The references against their families' released code and checkpoints (the `check` extra).
 
 - Every synthetic variation case (`synthetic.CASES`, `DRAFT_CASES`): its reference against the
-  family's released modeling code (transformers, or mlx_vlm for a family transformers lacks, run
-  by `MAGNITUDE_MLX_PYTHON`, an interpreter that has it), and every draft case against the
-  released draft code at its pinned revision. Network: template headers and pinned code.
+  family's released modeling code (`checks.judge`; a family with no float64 run of its released code is
+  reported unjudgeable and skipped), and every draft case against the released draft code at its pinned
+  revision. Network: template headers and pinned code.
 - With `MAGNITUDE_ARTIFACTS` (a catalog acquisition object, as `mrig test --model` provides it):
   the model's target reference against the released modeling code, on its first
   `MAGNITUDE_REFERENCE_LAYERS` layers when set (a large model), and its catalog drafter against
   the released draft code; with `MAGNITUDE_CHECKPOINT` (the released safetensors directory), the
   target reference's weights against the checkpoint's (the GGUF mapping).
+- Every real-weight slice (`SLICES`) present in the host's model store (`MAGNITUDE_MODELS`, as `mrig test` provides
+  it): its reference against the released modeling code on the CPU.
 
 They run on a device host: `mrig test --suite python [--model M] -- evaluation/references/tests/test_released.py`.
 """
@@ -17,7 +19,6 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 import urllib.request
 from pathlib import Path
 
@@ -26,14 +27,18 @@ import pytest
 pytest.importorskip("transformers", reason="the references' `check` extra")
 
 from magnitude_references.checks import check_hf, check_weights, device_of
-from magnitude_references.families import REFERENCES, open_reference
+from magnitude_references.families import open_reference
 from magnitude_references.families.dflash import ZLAB_CODE, check_draft, open_draft
-from magnitude_references.gguf import Package
 from magnitude_references.synthetic import CASES, DRAFT_CASES, check_families
 
-MLX_PYTHON = Path(os.environ["MAGNITUDE_MLX_PYTHON"]) if "MAGNITUDE_MLX_PYTHON" in os.environ else None
 ARTIFACTS = json.loads(Path(os.environ["MAGNITUDE_ARTIFACTS"]).read_text()) if "MAGNITUDE_ARTIFACTS" in os.environ else None
-TARGETS = {case.name: case for case in CASES}
+MODELS = Path(os.environ["MAGNITUDE_MODELS"]) if "MAGNITUDE_MODELS" in os.environ else None
+# Real-weight slices a conversion writes into a host's model store, by their path in it, with the prompt length that
+# exercises each one's mechanisms. GLM-5.3-Flash at 160 positions, three of transformers' 64-row KDA chunks, the last
+# of them padded: slice A ({layer 0}: KDA, dense FP8 FFN, mHC, embedding and head) and slice B ({0-3}: adds NoPE MLA
+# with its pooled indexer and FP8 MoE).
+SLICES = {"glm-5.3-flash-A": ("zai-org/GLM-5.3-Flash-slice-A/GLM-5.3-Flash-slice-A.gguf", 160),
+          "glm-5.3-flash-B": ("zai-org/GLM-5.3-Flash-slice-B/GLM-5.3-Flash-slice-B.gguf", 160)}
 
 
 @pytest.fixture(scope="session")
@@ -44,9 +49,8 @@ def device():
 
 @pytest.fixture(scope="session")
 def cpu():
-    """The synthetic cases' device: they are small, and on the CPU both implementations compute
-    in IEEE float32 with no device kernel's own accumulation order between them (MPS differs by
-    1.6e-4 relative on gemma4-vk-512 where the CPU differs by 0)."""
+    """The synthetic cases' device: they are small, and the CPU computes both implementations in float64 as well
+    as float32 (`checks.judge`)."""
     return device_of("cpu")
 
 
@@ -60,26 +64,17 @@ def zlab_source(tmp_path_factory) -> Path:
     return source
 
 
-def released(case) -> str:
-    """The released code a target case's family is checked against."""
-    with tempfile.TemporaryDirectory(prefix="magnitude-released-") as temporary:
-        path = Path(temporary) / f"{case.name}.gguf"
-        case.build(case).write(path)
-        return getattr(REFERENCES[Package.local(path).architecture][1], "released", "transformers")
-
-
-def checked(target) -> None:
-    if released(target) == "mlx_vlm" and MLX_PYTHON is None:
-        pytest.skip(f"{target.name} is checked against mlx_vlm: set MAGNITUDE_MLX_PYTHON")
+def judged(report: dict) -> None:
+    """A check's report is a pass; one with no float64 truth is skipped as unjudgeable, never passed."""
+    if not report["judgeable"]:
+        pytest.skip(report["reason"])
+    assert report["pass"], json.dumps(report, indent=1)
 
 
 @pytest.mark.parametrize("name", [case.name for case in CASES] + [case.name for case in DRAFT_CASES])
 def test_family_reference_matches_released_code(name, cpu, zlab_source):
-    draft = next((case for case in DRAFT_CASES if case.name == name), None)
-    checked(TARGETS[draft.target if draft else name])
-    reports = check_families({name}, cpu, zlab_source, MLX_PYTHON)
-    failed = [report for report in reports if not report["pass"]]
-    assert not failed, json.dumps(failed, indent=1)
+    report, = (report for report in check_families({name}, cpu, zlab_source) if report["case"] == name)
+    judged(report)
 
 
 needs_model = pytest.mark.skipif(ARTIFACTS is None, reason="a catalog model: mrig test --model")
@@ -88,8 +83,7 @@ needs_model = pytest.mark.skipif(ARTIFACTS is None, reason="a catalog model: mri
 @needs_model
 def test_model_reference_matches_released_code(device):
     layers = int(os.environ["MAGNITUDE_REFERENCE_LAYERS"]) if "MAGNITUDE_REFERENCE_LAYERS" in os.environ else None
-    report = check_hf(open_reference(Path(ARTIFACTS["target"]), device, True, layers), 3, 48, 20260927, MLX_PYTHON)
-    assert report["pass"], json.dumps(report, indent=1)
+    judged(check_hf(open_reference(Path(ARTIFACTS["target"]), device, True, layers), 3, 48, 20260927))
 
 
 @needs_model
@@ -98,8 +92,7 @@ def test_model_drafter_matches_released_code(device, zlab_source):
         pytest.skip(f"{ARTIFACTS['model']} has no catalog drafter file")
     draft = open_draft(Path(ARTIFACTS["drafter"]["path"]), Path(ARTIFACTS["target"]), device)
     source = draft.released_code
-    report = check_draft(draft, 24, 20260927, None, source, zlab_source if source == "zlab" else None, None)
-    assert report["pass"], json.dumps(report, indent=1)
+    judged(check_draft(draft, 24, 20260927, None, source, zlab_source if source == "zlab" else None, None))
 
 
 @needs_model
@@ -111,3 +104,13 @@ def test_model_reference_weights_match_the_checkpoint(device):
     assert not unmapped, json.dumps(unmapped, indent=1)
     # A mapping error shows as a relative error near 1; the rest is the file's quantization error.
     assert report["worst_relative_error"] < 0.5, json.dumps(report["rows"], indent=1)
+
+
+@pytest.mark.parametrize("name", sorted(SLICES))
+def test_slice_reference_matches_released_code(name, cpu):
+    path, length = SLICES[name]
+    if MODELS is None or not (MODELS / path).is_file():
+        pytest.skip(f"{name} is not in this host's model store (MAGNITUDE_MODELS)")
+    report = check_hf(open_reference(MODELS / path, cpu, True), 3, length, 20260927)
+    print(json.dumps(report))  # the evidence, shown for a pass with -rP
+    judged(report)

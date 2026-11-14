@@ -19,6 +19,7 @@ import time
 import urllib.error
 import urllib.request
 
+import numba
 import numpy as np
 from gguf.constants import GGML_QUANT_SIZES, GGMLQuantizationType, GGUFValueType
 from gguf.quants import MXFP4, dequantize as ggml_dequantize
@@ -312,29 +313,61 @@ def _mxfp4_tables() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 MXFP4_SCALES, MXFP4_LOW, MXFP4_HIGH = _mxfp4_tables()
 
 
-def dequantize_mxfp4(blocks: np.ndarray) -> np.ndarray:
-    """MXFP4 blocks [n, 17] (E8M0 scale byte, 16 bytes of nibble pairs) as float32 [n, 32]: gguf-py's
-    `MXFP4.dequantize_blocks`, the same products of the same float32 factors, by table lookup (NumPy
-    releases the GIL in both steps, so expert matrices decode in parallel)."""
-    values = np.empty((len(blocks), MXFP4.block_size), dtype=np.float32)
-    pairs = blocks[:, 1:]
-    np.take(MXFP4_LOW, pairs, out=values[:, :MXFP4.block_size // 2], mode="wrap")
-    np.take(MXFP4_HIGH, pairs, out=values[:, MXFP4.block_size // 2:], mode="wrap")
-    values *= np.take(MXFP4_SCALES, blocks[:, 0])[:, None]
-    return values
+def dequantize_mxfp4(blocks: np.ndarray, out: np.ndarray) -> None:
+    """MXFP4 blocks [n, 17] (E8M0 scale byte, 16 bytes of nibble pairs) as float32 into `out` [n, 32]: gguf-py's
+    `MXFP4.dequantize_blocks`, the same products of the same float32 factors, by table lookup (compiled, and
+    free of the GIL, so expert matrices decode in parallel)."""
+    mxfp4_values(blocks, MXFP4_SCALES, MXFP4_LOW, MXFP4_HIGH, out)
 
 
-def dequantize(info: TensorInfo, raw: np.ndarray) -> np.ndarray:
+@numba.njit(nogil=True, cache=True)
+def mxfp4_values(blocks: np.ndarray, scales: np.ndarray, low: np.ndarray, high: np.ndarray, out: np.ndarray) -> None:
+    half = out.shape[1] // 2
+    for b in range(blocks.shape[0]):
+        scale = scales[blocks[b, 0]]
+        for k in range(half):
+            out[b, k] = low[blocks[b, 1 + k]] * scale
+            out[b, half + k] = high[blocks[b, 1 + k]] * scale
+
+
+# gguf-py's F8_E4M3 decoder as a table over a byte
+F8_E4M3_VALUES = ggml_dequantize(np.arange(256, dtype=np.uint8), GGMLQuantizationType.F8_E4M3).astype(np.float32)
+
+
+@numba.njit(nogil=True, cache=True)
+def byte_values(codes: np.ndarray, table: np.ndarray, out: np.ndarray) -> None:
+    for i in range(codes.size):
+        out[i] = table[codes[i]]
+
+
+@numba.njit(nogil=True, cache=True)
+def bf16_bits(codes: np.ndarray, out: np.ndarray) -> None:
+    """gguf-py's BF16 decoder: a value's 16 bits as the top of a float32's (`out`, their bits)."""
+    for i in range(codes.size):
+        out[i] = np.uint32(codes[i]) << np.uint32(16)
+
+
+def dequantize(info: TensorInfo, raw: np.ndarray, out: np.ndarray | None = None) -> np.ndarray:
+    """The float32 values (NumPy order) of `info`'s bytes `raw`, written into `out` (C-contiguous, as many
+    elements) when given, else into a new array; always an array of their own, never a view of the file."""
     if len(raw) != info.nbytes:
         raise ValueError(f"{info.name}: {len(raw)} bytes, expected {info.nbytes}")
     block, size = GGML_QUANT_SIZES[info.type]
     rows = np.asarray(raw, dtype=np.uint8).reshape(-1, info.shape[0] // block * size)
+    count = int(np.prod(info.shape, dtype=np.int64))
+    if out is not None and (out.dtype != np.float32 or out.size != count or not out.flags.c_contiguous):
+        raise ValueError(f"{info.name}: out must be C-contiguous float32 of {count} elements, not {out.dtype} "
+                         f"{out.shape}")
+    values = np.empty(count, dtype=np.float32) if out is None else out.reshape(-1)
     if info.type == GGMLQuantizationType.MXFP4:
-        values = dequantize_mxfp4(rows.reshape(-1, size))
+        dequantize_mxfp4(rows.reshape(-1, size), values.reshape(-1, MXFP4.block_size))
+    elif info.type == GGMLQuantizationType.F8_E4M3:
+        byte_values(rows.reshape(-1), F8_E4M3_VALUES, values)
+    elif info.type == GGMLQuantizationType.BF16:
+        bf16_bits(rows.reshape(-1).view(np.uint16), values.view(np.uint32))
     else:
-        values = ggml_dequantize(rows, info.type)
-    # F32 rows come back as a read-only view of the file; the references need owned arrays.
-    return np.require(np.asarray(values, dtype=np.float32).reshape(info.array_shape), requirements="W")
+        values[:] = np.asarray(ggml_dequantize(rows, info.type), dtype=np.float32).reshape(-1)
+    return values.reshape(info.array_shape)
 
 
 def quantize(values: np.ndarray, kind: GGMLQuantizationType) -> np.ndarray:

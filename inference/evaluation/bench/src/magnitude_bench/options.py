@@ -10,7 +10,6 @@ from typing import Literal
 from magnitude_fixtures.canonical import Record
 from pydantic import Field, model_validator
 
-from .policy import INFERENCE
 
 
 class SourceBuild(Record):
@@ -29,10 +28,16 @@ class MagnitudeOptions(Record):
     off, no budget or fresh tuning): it tunes with its own fixed budget and leaves no trace.
     """
 
-    binary: Path = INFERENCE / "target" / "release" / "magnitude-engine"
+    @classmethod
+    def of(cls, inference: Path, **given) -> "MagnitudeOptions":
+        """The options of the `inference/` tree given: its own engine and harness unless named."""
+        release = inference / "target" / "release"
+        return cls(**{"binary": release / "magnitude-engine", "harness": release / "magnitude-harness", **given})
+
+    binary: Path
     #: The binary's source build when it is not this tree's.
     build: SourceBuild | None = None
-    harness: Path = INFERENCE / "target" / "release" / "magnitude-harness"
+    harness: Path
     device: str = "auto"
     #: The engine's kernel cache (compiled kernels, stored tuning and the machine's cost
     #: measurements) exactly as given; the engine's own default when unset.
@@ -136,11 +141,13 @@ class Schedule(Record):
 
 
 class EngineOptions(Record):
+    #: The checkout's `inference/` tree the run measures: its engine and harness, bench sources and runtimes.
+    inference: Path
     #: Serve with the catalog drafter where the engine supports its method.
     drafting: bool = True
     #: Bind the catalog projector for image-bearing fixture requests.
     vision: bool = False
-    magnitude: MagnitudeOptions = Field(default_factory=MagnitudeOptions)
+    magnitude: MagnitudeOptions = Field(default_factory=lambda data: MagnitudeOptions.of(data["inference"]))
     llama: LlamaOptions = Field(default_factory=LlamaOptions)
     ollama: OllamaOptions = Field(default_factory=OllamaOptions)
     watchdog: Watchdog = Field(default_factory=Watchdog)

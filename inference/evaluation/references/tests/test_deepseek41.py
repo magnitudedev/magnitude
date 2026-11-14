@@ -13,6 +13,7 @@ import torch
 from gguf.constants import GGMLQuantizationType as Q, GGUFValueType as V
 from sympy import nextprime
 
+from conftest import assert_rows_hold, storage_step
 from magnitude_references.checks import check_hf
 from magnitude_references.families.deepseek41 import (E2M1, E4M3, DeepSeek41Reference, Roundings, power_of_two_ceil,
                                                       round_codes)
@@ -197,14 +198,17 @@ def test_roundings_match_the_formats() -> None:
                                                       (Roundings.trained(), Perturbation(3))],
                          ids=["exact", "trained", "perturbed"])
 def test_every_row_depends_only_on_its_prefix(tiny: Path, roundings: Roundings, perturbation: Perturbation | None) -> None:
-    """Chunked prefill and verify compute the same rows as a whole prompt: row t of any prefix equals row t. Perturbed,
+    """Chunked prefill and verify compute the same rows as a whole prompt: row t of any prefix holds row t
+    (`assert_rows_hold`, within one storage step of the model's trained reference where not bit-exact). Perturbed,
     so a stored row moves by its own identity alone, however many rows the store holds when it is formed."""
     model = reference(tiny, roundings, perturbation)
     tokens = torch.from_numpy(np.random.default_rng(1).integers(0, VOCAB, (2, 24)))
     with torch.no_grad():
         whole = model.forward(tokens)
+        trained, moved = (reference(tiny, Roundings.trained(), draw).forward(tokens) for draw in (None, Perturbation(1)))
         for length in (1, 5, 9, 16):
-            torch.testing.assert_close(model.forward(tokens[:, :length]), whole[:, :length], rtol=1e-5, atol=1e-5)
+            assert_rows_hold(model.forward(tokens[:, :length]).numpy(), whole[:, :length].numpy(),
+                             storage_step(trained[:, :length].numpy(), moved[:, :length].numpy()))
 
 
 # DeepSeek's code runs widened to F32 here, where its BF16 holds (`.to(dtype)`) are identities.
@@ -263,8 +267,7 @@ def test_holds_match_deepseek_code_in_its_dtypes(tiny: Path) -> None:
         assert torch.equal(shared.rows, rows.float()), layer
         assert torch.equal(shared.index_keys, keys[:, :rows.shape[1]].float()), layer
         if not 0 <= model.candidate < layer:  # a candidate reader's selection depends on an earlier layer's
-            picked = [sorted(int(i) - offset for i in row if i >= 0) for row in idxs[0]]
-            assert picked == [row.nonzero().flatten().tolist() for row in shared.selected[0]], layer
+            assert torch.equal(shared.selected, idxs.long()), layer
         checked += 1
     assert checked > 0
 
@@ -314,8 +317,9 @@ def test_activations_variant_has_its_own_identity(tiny: Path) -> None:
     from magnitude_references.families import open_reference
     assert open_reference(tiny, CPU, True, variant="activations").roundings == replace(Roundings.trained(), activations=True)
     assert open_reference(tiny, CPU, True).roundings == Roundings.trained()
-    assert digest.implementation("activations") != digest.implementation()
-    assert len({digest.implementation(), digest.implementation("perturbed:1"), digest.implementation("perturbed:2")}) == 3
+    identities = {digest.implementation(DeepSeek41Reference, variant, device) for variant in (None, "activations", "perturbed:1", "perturbed:2")
+                  for device in ("cpu", "mps")}
+    assert len(identities) == 8  # a variant's own, and a platform's: the device is part of it
     perturbed = open_reference(tiny, CPU, True, variant="perturbed:1")
     assert perturbed.weights.perturbation == Perturbation(1) and perturbed.roundings == Roundings.trained()
     with pytest.raises(ValueError, match="no reference variant"):
@@ -346,17 +350,17 @@ def test_a_perturbed_value_moves_once_however_it_is_read(tiny: Path) -> None:
 
 
 def test_a_perturbed_reference_moves_stored_values_only(tiny: Path, monkeypatch) -> None:
-    """Every plane the perturbation draws for is a stored one: a tensor of the file (an I8 tensor only as a weight's
-    scale) or a store of trained-rounding rows. The n-gram table rows, an index computed from the token ids, are the
-    unperturbed model's."""
+    """Every plane the perturbation keys a draw for is a stored one: a tensor of the file (an I8 tensor only as a
+    weight's scale) or a store of trained-rounding rows. The n-gram table rows, an index computed from the token ids,
+    are the unperturbed model's."""
     planes: set[str] = set()
-    steps = Perturbation.steps
+    key = Perturbation.key
 
-    def recorded(self, plane, index):
+    def recorded(self, plane):
         planes.add(plane)
-        return steps(self, plane, index)
+        return key(self, plane)
 
-    monkeypatch.setattr(Perturbation, "steps", recorded)
+    monkeypatch.setattr(Perturbation, "key", recorded)
     model = reference(tiny, Roundings.trained(), Perturbation(2))
     tokens = torch.from_numpy(np.random.default_rng(4).integers(0, VOCAB, (1, 16)))
     with torch.no_grad():

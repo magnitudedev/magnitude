@@ -10,7 +10,7 @@ import contextlib
 
 import httpx
 
-from ..policy import RUNTIMES
+from ..policy import runtimes
 from .base import Adapter
 
 COUNTING_CONTEXT = 4096
@@ -19,7 +19,7 @@ COUNTING_CONTEXT = 4096
 class Omlx(Adapter):
     def __init__(self, *args):
         super().__init__(*args)
-        self.runtime = RUNTIMES / "omlx"
+        self.runtime = runtimes(self.options.inference) / "omlx"
         self.countings = 0
 
     def argv(self, port, context, parallel, directory):

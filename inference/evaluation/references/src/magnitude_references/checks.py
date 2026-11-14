@@ -4,15 +4,21 @@
 reference's own float32 weights into it (every parameter must be supplied, none left over) and
 compares logits on seeded random prompts: it checks the forward pass against the released modeling
 code. The prompts are arbitrary because both sides compute the same function of them; this is a
-numerical equivalence check of two implementations, never a quality measurement. A family transformers
-lacks (`qwen4exp`) is checked the same way against mlx_vlm, run by an interpreter that has it
-(`mlx_released.py`), and `deepseek41` against DeepSeek's own inference code (`deepseek41_released.py`).
-`check_weights`
+numerical equivalence check of two implementations, never a quality measurement. `deepseek41` is checked
+the same way against DeepSeek's own inference code (`deepseek41_released.py`); a family transformers lacks
+(`qwen4exp`, released in mlx_vlm) has no float64 run of its released math and is unjudgeable. `check_weights`
 compares the reference's weights, after undoing the converter's transforms, with the original
 checkpoint tensors: it checks the GGUF mapping (the differences are the file's quantization error; a
 mapping error shows as a relative error near 1).
 
-Both need the `check` extra (transformers 5.17.0, safetensors).
+Each forward check is judged by `judge`: the reference and the released code both run in float64 (`Float64`), and
+the released code also in float32, whose distance from its float64 run is the bar.
+
+`compare_logits` compares the reference's logits with an independent producer's on the same tokens
+(upstream llama.cpp's, `magnitude-references compare`), and `same_values` whether that producer's
+file holds the values the reference computes with.
+
+`check_hf` and `check_weights` need the `check` extra (transformers 5.17.0, safetensors).
 """
 from __future__ import annotations
 
@@ -21,8 +27,10 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from torch.overrides import TorchFunctionMode
 
 from magnitude_references.model import F32
+from magnitude_references.quality import Positions, compare_rows
 
 
 def device_of(name: str) -> torch.device:
@@ -34,6 +42,90 @@ def device_of(name: str) -> torch.device:
     if name == "auto":
         name = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     return torch.device(name)
+
+
+NARROW = {torch.float32: torch.float64, torch.float16: torch.float64, torch.bfloat16: torch.float64,
+          torch.complex64: torch.complex128}
+NARROWING = {torch.Tensor.float, torch.Tensor.half, torch.Tensor.bfloat16}
+IN_PLACE = {"__setitem__", "__iadd__", "__isub__", "__imul__", "__itruediv__", "__ipow__"}
+
+
+class Float64(TorchFunctionMode):
+    """Within it every floating-point value torch computes is float64 (complex128): every narrower dtype a call
+    names is float64 (`.float()` is `.double()`), every narrower tensor a call reads is read as a float64 copy, and
+    every narrower tensor it returns (a new tensor of the default dtype, its inputs being float64) is returned as
+    one, so code written for float32 (the released code's explicit upcasts included) runs in float64. A call that
+    would write a narrower tensor in place is an invariant violation: its copy's write would be lost. The mode is
+    the calling thread's; the reference's pools carry it into their workers (`model.submit`)."""
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        if func in NARROWING:
+            func = torch.Tensor.double
+        name = getattr(func, "__name__", "")
+        if name != "__get__":  # an attribute is read as stored
+            in_place = name in IN_PLACE or name.endswith("_") and not name.startswith("__")
+            target = kwargs.get("out", args[0] if in_place and args else None)
+            if isinstance(target, torch.Tensor) and target.dtype in NARROW:
+                raise AssertionError(f"{name} writes a {target.dtype} tensor in place in float64")
+            args, kwargs = widened(args), {key: widened(value) for key, value in kwargs.items()}
+        result = func(*args, **kwargs)
+        return tuple(widened(value) for value in result) if type(result) is tuple else widened(result)
+
+
+def widened(value):
+    if isinstance(value, torch.dtype):
+        return NARROW.get(value, value)
+    if isinstance(value, torch.Tensor):
+        return value.to(NARROW[value.dtype]) if value.dtype in NARROW else value
+    if type(value) in (list, tuple):
+        return type(value)(widened(item) for item in value)
+    return value
+
+
+def judge(values: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+          choices: dict[str, tuple[torch.Tensor, torch.Tensor]]) -> dict:
+    """The reference against the released code, by named output: (the reference in float64, the released code in
+    float32, the released code in float64), and by named choice (argmax or proposal tokens): (the reference's,
+    the released code's), both in float64; with `pass`.
+
+    Both implementations run in float64, where each rounds 2^29 times finer than in float32, so they differ by
+    their math alone: two implementations of the same function agree to float64's rounding, and any difference of
+    the math larger than float32's rounding shows. The released code's own float32 run, against its float64 run,
+    measures float32's rounding through this forward on these inputs, so it is the bar: the reference passes when
+    its float64 output is no farther from the released code's float64 output than the released float32 output is
+    (maximum difference relative to the released float64 output's largest magnitude), and when every choice
+    agrees. No constant is involved. Precision a float32 order of operations loses, which a float64 comparison
+    cannot see, is the storage-resolution KL's to judge (`kl.py`), downstream of this check."""
+    report: dict = {"judgeable": True}
+    passed = True
+    for name, (ours, theirs, truth) in values.items():
+        truth = truth.to("cpu", torch.float64)
+        scale = float(truth.abs().max())
+        ours_distance, bar = (float((value.to("cpu", torch.float64) - truth).abs().max()) / scale
+                              for value in (ours, theirs))
+        report[name] = {"relative_max_difference": ours_distance, "released_float32": bar}
+        passed &= ours_distance <= bar
+    for name, (ours, theirs) in choices.items():
+        agree = ours.cpu() == theirs.cpu()
+        report[name] = {"agreement": float(agree.double().mean())}
+        passed &= bool(agree.all())
+    return report | {"pass": bool(passed)}
+
+
+def unjudgeable(reason: str) -> dict:
+    """A check with no float64 truth to judge by: never a pass."""
+    return {"judgeable": False, "reason": reason, "pass": False}
+
+
+def without_float64(device: torch.device) -> dict | None:
+    """The unjudgeable report of a check on `device` when it has no float64 (MPS), so neither side can run in it;
+    None where it has."""
+    try:
+        torch.zeros(1, dtype=torch.float64, device=device)
+    except (TypeError, RuntimeError) as refusal:
+        return unjudgeable(f"{device} has no float64 to run either implementation in: {refusal}")
+    return None
 
 
 def prompts(count: int, length: int, vocab: int, seed: int) -> torch.Tensor:
@@ -62,53 +154,35 @@ def hf_model(reference):
     return model.eval()
 
 
-def mlx_logits(reference, tokens: torch.Tensor, mlx_python: Path) -> torch.Tensor:
-    """The released mlx_vlm model's logits over the reference's weights (`mlx_released.py`, run by an
-    interpreter that has mlx_vlm)."""
-    import json
-    import subprocess
-    import tempfile
-    runner = Path(__file__).with_name("mlx_released.py")  # imports mlx: run, never imported here
-    with tempfile.TemporaryDirectory(prefix="magnitude-mlx-") as temporary:
-        directory = Path(temporary)
-        (directory / "config.json").write_text(json.dumps({
-            "module": "qwen4_exp", "text_config": reference.mlx_config(), "constants": reference.mlx_constants()}))
-        np.savez(directory / "parameters.npz",
-                 **{name: value.detach().to("cpu", F32).numpy() for name, value in reference.mlx_parameters().items()})
-        np.save(directory / "tokens.npy", tokens.cpu().numpy())
-        subprocess.run([str(mlx_python), "-I", str(runner), str(directory)], check=True)
-        return torch.from_numpy(np.load(directory / "logits.npy")).to(tokens.device)
-
-
-def check_hf(reference, count: int, length: int, seed: int, mlx_python: Path | None = None) -> dict:
-    """The reference's logits against its family's released modeling code: transformers, or mlx_vlm
-    for a family transformers lacks (`reference.released`)."""
+def check_hf(reference, count: int, length: int, seed: int) -> dict:
+    """The reference's logits against its family's released modeling code (`reference.released`): transformers, or
+    DeepSeek's own; a family whose released code is mlx_vlm (transformers lacks it) is unjudgeable."""
     tokens = prompts(count, length, reference.vocab_size, seed).to(reference.weights.device)
     released = getattr(reference, "released", "transformers")
-    if released == "mlx_vlm":
-        if mlx_python is None:
-            raise ValueError(f"{reference.architecture} is checked against mlx_vlm: pass an mlx_vlm interpreter")
-        tokens = reference.check_prompts(tokens)
+    refused = without_float64(reference.weights.device)
+    if released == "mlx_vlm":  # no float64 run of its released math exists: mlx_vlm has none, transformers lacks it
+        refused = unjudgeable(f"{reference.architecture}'s released code (mlx_vlm) has no float64 run")
+    if refused is not None:
+        return {"prompts": count, "length": length, "seed": seed, "layers": reference.block_count, **refused}
+
+    def theirs(float64: bool) -> torch.Tensor:
+        """The released code's logits, in float32 or (under `Float64`) float64. It takes its own copy of the
+        weights, read uncached: the reference's decoded values would only double it."""
+        with reference.weights.uncached():
+            if released == "deepseek":
+                from magnitude_references import deepseek41_released
+                return deepseek41_released.logits(reference, tokens.cpu()).to(tokens.device)
+            model = hf_model(reference)
+            if float64:  # transformers' grouped expert GEMM has no float64 kernel; its eager loop is the same function
+                model.set_experts_implementation("eager")
+            return model(input_ids=tokens, use_cache=False).logits.to(F32)
+
     with torch.no_grad():
-        ours = reference.forward(tokens)
-        if released == "mlx_vlm":
-            theirs = mlx_logits(reference, tokens, mlx_python)
-        elif released == "deepseek":
-            from magnitude_references import deepseek41_released
-            theirs = deepseek41_released.logits(reference, tokens.cpu()).to(tokens.device)
-        else:
-            theirs = hf_model(reference)(input_ids=tokens, use_cache=False).logits.to(F32)
-    difference = (ours - theirs).abs()
-    scale = float(theirs.abs().max())
-    report = {
-        "prompts": count, "length": length, "seed": seed, "layers": reference.block_count,
-        "max_abs_difference": float(difference.max()), "max_abs_logit": scale,
-        "relative_max_difference": float(difference.max()) / scale,
-        "mean_abs_difference": float(difference.mean()),
-        "argmax_agreement": float((ours.argmax(-1) == theirs.argmax(-1)).to(F32).mean()),
-    }
-    report["pass"] = report["relative_max_difference"] < 1e-4 and report["argmax_agreement"] == 1.0
-    return report
+        released32 = theirs(False)
+        with Float64():
+            ours, truth = reference.forward(tokens), theirs(True)
+    return {"prompts": count, "length": length, "seed": seed, "layers": reference.block_count,
+            **judge({"logits": (ours, released32, truth)}, {"argmax": (ours.argmax(-1), truth.argmax(-1))})}
 
 
 def check_weights(reference, checkpoint: Path) -> dict:
@@ -141,3 +215,38 @@ def check_weights(reference, checkpoint: Path) -> dict:
         rows.append({"parameter": name, "relative_error": relative})
     worst = max((row.get("relative_error", math.inf) for row in rows), default=math.inf)
     return {"tensors": len(rows), "worst_relative_error": worst, "rows": rows}
+
+
+def logits_of(reference, tokens: torch.Tensor) -> np.ndarray:
+    """The reference's float32 logits [prompts, length, vocabulary] of `tokens` [prompts, length]."""
+    with torch.no_grad():
+        return reference.forward(tokens.to(reference.weights.device)).to("cpu", F32).numpy()
+
+
+def compare_logits(truth: np.ndarray, test: np.ndarray) -> tuple[Positions, float]:
+    """KL(truth || test) and argmax agreement per position of two producers' logits [prompts, length, vocabulary]
+    on the same tokens, each position named by its prompt and index, and the largest logit difference relative to
+    the truth's largest."""
+    if truth.shape != test.shape:
+        raise ValueError(f"logits {test.shape} against {truth.shape}")
+    prompts, length, vocabulary = truth.shape
+    kl, agree = compare_rows(truth.reshape(-1, vocabulary), test.reshape(-1, vocabulary))
+    rows = tuple({"prompt": prompt, "position": position} for prompt in range(prompts) for position in range(length))
+    return Positions(rows, kl, agree), float(np.abs(truth - test).max() / np.abs(truth).max())
+
+
+def same_values(weights, other) -> list[str]:
+    """The tensors of `other` (another file's `Weights`) whose values, as the reference reads them, differ from
+    `weights`' bit for bit: none when the two files store the same values. `weights`' file may hold more tensors,
+    the companion scales it reads with their weights. A stacked expert tensor is compared an expert at a time."""
+    names = other.package.names()
+    if missing := sorted(set(names) - set(weights.package.names())):
+        raise ValueError(f"tensors the reference's file lacks: {missing[:8]}")
+
+    def equal(name: str) -> bool:
+        shape = other.shape(name)
+        if len(shape) != 3:
+            return torch.equal(weights(name), other(name))
+        return weights.shape(name) == shape and all(
+            torch.equal(weights.expert(name, index), other.expert(name, index)) for index in range(shape[0]))
+    return [name for name in names if not equal(name)]

@@ -22,7 +22,7 @@ import torch
 
 from magnitude_references.gguf import Package
 from magnitude_references.model import (Reference, Rotary, Weights, attention, default_inv_freq, heads, layer_count,
-                                        linear, per_layer, rms_norm, silu, unpermute_rows, visibility)
+                                        linear, per_layer, rms_norm, sigmoid, silu, unpermute_rows, visibility)
 
 POST_NORM_EPS = 1e-8  # MuseGlimmerTextConfig.post_norm_eps of the released config; the GGUF does not carry it
 
@@ -79,7 +79,7 @@ class MuseReference(Reference):
         if self.sliding[layer]:
             q, k = rotary.apply(q), rotary.apply(k)
         mixed = attention(q, k, v, visible, self.head_dim ** -0.5)
-        return linear(mixed * torch.sigmoid(linear(h, w(p + "attn_gate.weight"))), w(p + "attn_output.weight"))
+        return linear(mixed * sigmoid(linear(h, w(p + "attn_gate.weight"))), w(p + "attn_output.weight"))
 
     def hidden(self, tokens: torch.Tensor, taps: tuple[int, ...] = ()) -> tuple[torch.Tensor, list[torch.Tensor]]:
         w = self.weights

@@ -129,8 +129,11 @@ def parser() -> argparse.ArgumentParser:
     )
     commands = root.add_subparsers(dest="command", required=True)
     job = commands.add_parser("job", help="measure inside a run directory (run by mrig bench)")
-    job.add_argument("--model", required=True, help="catalog reference <model>:<variant>")
+    job.add_argument("--model", help="catalog reference <model>:<variant>; absent for a held set, which the "
+                     "acquisition (--artifacts) names by its own bytes")
     measurement_options(job)
+    job.add_argument("--inference", type=Path, required=True,
+                     help="the checkout's inference/ tree: its catalog, binaries and runtimes (given, never found)")
     job.add_argument("--artifacts", type=Path, required=True, help="catalog acquisition JSON")
     job.add_argument("--output", type=Path, required=True, help="the run directory")
     job.add_argument("--build-identity", type=Path, required=True,
@@ -150,8 +153,9 @@ def artifact_pairs(values: list[str]) -> dict[str, str]:
     return pairs
 
 
-def engine_options(args: argparse.Namespace) -> EngineOptions:
-    magnitude = MagnitudeOptions(
+def engine_options(args: argparse.Namespace, inference: Path) -> EngineOptions:
+    magnitude = MagnitudeOptions.of(
+        inference,
         device=args.magnitude_device,
         cache_dir=args.magnitude_cache_dir,
         prefill_tokens=args.magnitude_prefill_tokens,
@@ -170,6 +174,7 @@ def engine_options(args: argparse.Namespace) -> EngineOptions:
         },
     )
     return EngineOptions(
+        inference=inference,
         drafting=args.drafting == "on",
         magnitude=magnitude,
         llama=LlamaOptions(
@@ -232,9 +237,9 @@ def job(argv: list[str], args: argparse.Namespace) -> int:
     from .runner import run as measure
 
     acquisition = Acquisition.model_validate_json(args.artifacts.read_text())
-    if acquisition.model != args.model:
+    if args.model is not None and acquisition.model != args.model:
         raise ValueError(f"--artifacts acquired {acquisition.model}, not {args.model}")
-    options = engine_options(args)
+    options = engine_options(args, args.inference)
     if args.ollama_models is not None:
         # Artifact preparation and the adapter read the same store.
         os.environ["OLLAMA_MODELS"] = str(args.ollama_models.expanduser().absolute())
@@ -260,20 +265,22 @@ def job(argv: list[str], args: argparse.Namespace) -> int:
     return 0 if summary["status"] == "completed" else 130 if summary["status"] == "cancelled" else 1
 
 
-def check(args: argparse.Namespace) -> None:
-    """Every measurement option's meaning, checked before anything runs; raises ValueError."""
-    catalog_reference(args.model)
+def check(args: argparse.Namespace, inference: Path) -> None:
+    """Every measurement option's meaning, checked before anything runs against the catalog of the `inference/`
+    tree given; raises ValueError."""
+    if args.model is not None:
+        catalog_reference(args.model, inference)
     choices(args.section, tuple(SECTIONS))
     contexts(args.context)
     artifact_pairs(args.artifact)
-    engine_options(args)
+    engine_options(args, inference)
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     args = parser().parse_args(argv)
     try:
-        check(args)
+        check(args, args.inference)
         return job(argv, args)
     except (ValueError, OSError) as error:
         print(f"magnitude-bench: {error}", file=sys.stderr)

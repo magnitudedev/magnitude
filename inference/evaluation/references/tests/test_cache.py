@@ -8,9 +8,11 @@ from pathlib import Path
 import logits_fake
 import numpy as np
 import pytest
-from magnitude_references.digest import implementation, sha256_file
+from magnitude_references.digest import implementation
+from magnitude_rig.host.identity import sha256
 
 from magnitude_references import cache as reference
+from magnitude_references import digest
 
 
 def sanity(passed: bool) -> dict:
@@ -24,6 +26,15 @@ def sanity(passed: bool) -> dict:
             {"fixture_id": "f/1", "perplexity": 2000.0, "top1_accuracy": 0.1, "passed": passed},
         ],
     }
+
+
+@pytest.fixture(autouse=True)
+def artifacts(tmp_path):
+    """The acquisition object `obtain` reads: a target of the fake references' family."""
+    target = logits_fake.write_target(tmp_path / "model.gguf")
+    (tmp_path / "artifacts.json").write_text(json.dumps({
+        "model": logits_fake.MODEL, "target": str(target), "target_sha256": sha256(target),
+        "drafter": None, "projector": None}))
 
 
 @pytest.fixture
@@ -44,9 +55,11 @@ def references_cli(monkeypatch):
     """A stand-in for `magnitude-references run`: writes a reference record with the given
     sanity result (exit 1 when it failed, as the real command does), unless `missing`, and its logits
     (`logits`: the rows to values; the fake's truth by default; `variants`: a variant's own, by its
-    name). Whether a build was stopped is `killed`."""
+    name). Whether a build was stopped is `killed`. A platform is its device and whether it makes a row's
+    bits its prefix's alone (`rows_exact`): the host has no accelerator to name."""
     calls = []
-    behaviour = {"passed": True, "missing": False, "logits": logits_fake.truth, "variants": {}, "killed": False}
+    behaviour = {"passed": True, "missing": False, "logits": logits_fake.truth, "variants": {}, "killed": False,
+                 "rows_exact": True}
 
     class Popen:
         def __init__(self, command, stdout, stderr):
@@ -54,6 +67,7 @@ def references_cli(monkeypatch):
             output = command[command.index("--output") + 1]
             rendered = command[command.index("--rendered") + 1]
             variant = command[command.index("--variant") + 1] if "--variant" in command else None
+            device = command[command.index("--device") + 1]
             self.code = 0 if behaviour["passed"] and not behaviour["missing"] else 1
             if behaviour["missing"]:
                 return
@@ -63,9 +77,10 @@ def references_cli(monkeypatch):
                 json.dumps(
                     {
                         "model": logits_fake.MODEL,
-                        "rendered_digest": sha256_file(rendered),
+                        "rendered_digest": sha256(rendered),
                         "family": "fake",
-                        "implementation_digest": implementation(variant),
+                        "implementation_digest": implementation(logits_fake.family(), variant, device),
+                        "platform": digest.platform(device),
                         "dtype": "float32",
                         "sanity": sanity(behaviour["passed"]),
                     }
@@ -73,7 +88,7 @@ def references_cli(monkeypatch):
             )
             lines = [json.loads(line) for line in Path(rendered).read_text().splitlines()]
             rows = logits_fake.rows_of(lines)
-            logits_fake.write_logits(directory, "reference:fake", sha256_file(rendered), rows,
+            logits_fake.write_logits(directory, "reference:fake", sha256(rendered), rows,
                                      behaviour["variants"].get(variant, behaviour["logits"])(rows))
 
         def wait(self):
@@ -83,6 +98,8 @@ def references_cli(monkeypatch):
             behaviour["killed"] = True
 
     monkeypatch.setattr(reference.subprocess, "Popen", Popen)
+    monkeypatch.setattr(digest, "platform", lambda device: {"device": device, "blas": "fake", "machine": "fake",
+                                                            "rows_exact": behaviour["rows_exact"]})
     return calls, behaviour
 
 
@@ -108,7 +125,7 @@ def test_built_admitted_once_then_cached(tmp_path, rendered, references_cli):
     assert not first.cached and _devices(calls) == ["cpu"]  # one CPU build, admitted alone
     assert {command[command.index("--build-identity") + 1] for command in calls} == {str(tmp_path / "build-tools.json")}
     assert first.directory == reference.location(
-        tmp_path / "cache", logits_fake.MODEL, sha256_file(rendered), implementation()
+        tmp_path / "cache", logits_fake.MODEL, sha256(rendered), implementation(logits_fake.family(), None, "cpu")
     )
     assert first.record["admission"] == {"device": "cpu", "agreement": "CPU-deterministic"}
     assert reference.check(first) is first
@@ -128,7 +145,7 @@ def test_a_build_of_non_finite_logits_is_refused_and_kept(tmp_path, rendered, re
     behaviour["logits"] = logits
     with pytest.raises(reference.ReferenceRefused, match=r"\(built on cpu\) has non-finite logits"):
         obtain(rendered, tmp_path)
-    directory = reference.location(tmp_path / "cache", logits_fake.MODEL, sha256_file(rendered), implementation())
+    directory = reference.location(tmp_path / "cache", logits_fake.MODEL, sha256(rendered), implementation(logits_fake.family(), None, "cpu"))
     assert not directory.exists()  # nothing is admitted
     assert _leftovers(tmp_path / "cache") == ["partial"]  # the build is kept
 
@@ -194,4 +211,47 @@ def test_cached_record_of_another_identity_fails(tmp_path, rendered, references_
         json.dumps({**record, "model": "other:gguf:q8"})
     )
     with pytest.raises(reference.ReferenceFailed, match="records model"):
+        obtain(rendered, tmp_path)
+
+
+def test_a_host_that_makes_no_rows_exact_takes_the_exact_reference_and_computes_none(tmp_path, rendered, references_cli):
+    """An exact platform computes a reference; any other host judges against it once it is staged in the cache
+    (whatever its own implementation digest) and never builds one."""
+    calls, behaviour = references_cli
+    computed = obtain(rendered, tmp_path)  # on an exact platform
+    assert computed.record["platform"]["rows_exact"] and len(calls) == 1
+    behaviour["rows_exact"] = False
+    staged = obtain(rendered, tmp_path)
+    assert staged.directory == computed.directory and staged.cached and len(calls) == 1
+
+
+def test_a_host_that_makes_no_rows_exact_refuses_to_compute_with_what_it_needs(tmp_path, rendered, references_cli):
+    calls, behaviour = references_cli
+    behaviour["rows_exact"] = False
+    with pytest.raises(reference.ReferenceUnavailable, match="compute it on a CPU with one of accelerate, nvpl"):
+        obtain(rendered, tmp_path)
+    assert not calls and not (tmp_path / "cache").exists()
+
+
+def test_a_host_that_makes_no_rows_exact_does_not_take_a_reference_of_other_sources(tmp_path, rendered, references_cli):
+    _, behaviour = references_cli
+    computed = obtain(rendered, tmp_path)
+    record = json.loads((computed.directory / "reference.json").read_text())
+    record["implementation_digest"] = "0" * 64  # computed by other sources
+    (computed.directory / "reference.json").write_text(json.dumps(record))
+    behaviour["rows_exact"] = False
+    with pytest.raises(reference.ReferenceUnavailable, match="of these sources"):
+        obtain(rendered, tmp_path)
+
+
+def test_a_host_that_makes_no_rows_exact_skips_a_record_that_names_no_platform(tmp_path, rendered, references_cli):
+    """A record written before records named their platform cannot say its rows are exact: it is passed over,
+    never read as one."""
+    _, behaviour = references_cli
+    computed = obtain(rendered, tmp_path)
+    record = json.loads((computed.directory / "reference.json").read_text())
+    del record["platform"]
+    (computed.directory / "reference.json").write_text(json.dumps(record))
+    behaviour["rows_exact"] = False
+    with pytest.raises(reference.ReferenceUnavailable, match="of these sources"):
         obtain(rendered, tmp_path)

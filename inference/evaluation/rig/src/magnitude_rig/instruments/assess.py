@@ -1,5 +1,5 @@
 """`assess`: what do the planner, assessment and estimator decide for this model on this
-device? `magnitude-assess` on the model's acquired files, with the host's kernel cache
+device? `magnitude-assess` on the model's header files (no weights are fetched), with the host's kernel cache
 holding the machine's cost measurements (only points without a record are timed). Prints the
 assessment's own JSON per model: whether it fits, how it would run, the estimated decode speed.
 With `--breakdown`, the planned step at each depth by entry, from the plan: each entry's
@@ -16,9 +16,11 @@ import argparse
 import json
 import re
 from collections import defaultdict
+from dataclasses import replace
 
-from ..engine import Headers, Step, Weights
+from ..engine import Headers, Step
 from . import Answer, Instrument, JobResult, Plan
+from .held import CHECKPOINT
 from .binaries import ASSESS, ASSESS_BUILD
 
 RUNNER = (
@@ -34,6 +36,25 @@ def measurement(backend: str) -> Step:
     on GB10 and 8.7 s on a 3090 (2026-10-28), later runs load what is stored, and whatever is still
     not measured is shown with the answer."""
     return Step("measure", ("{python}", "-c", RUNNER, "{artifacts}", ASSESS, backend, "{engine_cache}/kernels"))
+
+
+def preceded(jobs: tuple[tuple[str, Step], ...], streams: bool, backend: str) -> tuple[tuple[str, Step], ...]:
+    """`jobs` with what a streamed load has before it: the machine's measurement job, so the load's bank is
+    priced on the executor costs that job stores in the host's kernel cache, as a served load's is. `jobs` as
+    given where nothing streams. The one owner of the rule that a streamed job follows its machine's measurement.
+    The measurement reads the run's acquisition object, so it follows the job that writes one from a held set."""
+    if not streams:
+        return jobs
+    held = int(bool(jobs) and jobs[0][0] == CHECKPOINT)
+    return (*jobs[:held], ("measure", measurement(backend)), *jobs[held:])
+
+
+def priced(plan: Plan, streams: bool, backend: str) -> Plan:
+    """`plan` under that rule: its jobs preceded, and the assessment's binary built for the measurement job."""
+    if not streams:
+        return plan
+    builds = plan.builds if ASSESS_BUILD in plan.builds else (*plan.builds, ASSESS_BUILD)
+    return replace(plan, builds=builds, jobs=preceded(plan.jobs, True, backend))
 
 
 CATALOG = "{target}/release/examples/catalog_assessment"
@@ -76,7 +97,7 @@ def plan(arguments, source, host) -> Plan:
         builds=BUILDS,
         jobs=(("assess", job),),
         device="timed",  # it times the cost points the kernel cache has no record of
-        acquires=Weights(arguments.model),
+        acquires=Headers(arguments.model),
     )
 
 

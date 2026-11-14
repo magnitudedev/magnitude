@@ -7,8 +7,10 @@ name = "magnitude-references"
 version = "0.1.0"
 requires-python = ">=3.12"
 # magnitude-rig for the build identity of local runs (record.build) and the results store; sympy for
-# DeepSeek V4.1's engram.py, which `deepseek41_released` runs.
-dependencies = ["numpy==2.5.3", "gguf", "torch==2.14.0", "sympy==1.14.0", "magnitude-rig"]
+# DeepSeek V4.1's engram.py, which `deepseek41_released` runs; numba for the GIL-free decode and perturbation
+# of expert matrices, which every full-model build reads whole; pillow for the images a vision reference
+# (`families/glm5next_vision`) decodes.
+dependencies = ["numpy==2.5.3", "numba==0.68.1", "gguf", "torch==2.14.0", "sympy==1.14.0", "pillow==13.0.0", "magnitude-rig"]
 
 [project.optional-dependencies]
 # Validation of the references themselves against released modeling code and checkpoints.

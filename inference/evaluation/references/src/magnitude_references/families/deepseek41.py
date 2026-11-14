@@ -73,9 +73,10 @@ import torch
 
 from magnitude_references import perturbation as stored
 from magnitude_references.gguf import Package
-from magnitude_references.model import (Reference, Rotary, Weights, attention, default_inv_freq, layer_count, linear,
-                                        lower_index_top, mixture, per_layer, rms_norm, route_top_k, silu, softplus,
-                                        visibility, yarn_inv_freq)
+from magnitude_references.model import (Reference, Rotary, Weights, default_inv_freq, gathered_attention, layer_count,
+                                        linear, lower_index_top, mixture, per_layer, products, rms_norm, route_top_k,
+                                        row_tiles, sigmoid, silu, sinkhorn_mixes, softplus, stream_collapse,
+                                        stream_expand, yarn_inv_freq)
 
 CODE = ("deepseek-ai/DeepSeek-V4.1-Flash-1017", "1bae0e1088993b9b82de08f59de5be5a34e42170")
 DENSE = (Q.F32, Q.F16, Q.BF16)  # stored unquantized: model.py's BF16 / F32 weights, whose GEMMs take x uncast
@@ -161,11 +162,20 @@ class Roundings:
         return Roundings(True, True, True, True)
 
 
+def window_slots(steps: int, window: int) -> torch.Tensor:
+    """model.py's `get_window_topk_idxs` at a prefill: each row's window [T, min(T, window)], its causal rows in
+    position order, -1 for those before the sequence."""
+    end = torch.arange(steps)[:, None]
+    slots = (end - window + 1).clamp(min=0) + torch.arange(min(steps, window))
+    return torch.where(slots > end, -1, slots)
+
+
 @dataclass
 class Shared:
     """What a layer hands to the later layers that read it: the latest kv source's compressed rows
-    [B, N, D] and index keys [B, N, W], the latest index source's selection [B, T, N], and the
-    candidate source's blocks [B, T, N]."""
+    [B, N, D] and index keys [B, N, W], the latest index source's selection [B, T, K] (as `topk_idxs`: the
+    compressed rows' slots after the window's, in position order, -1 for none), and the candidate source's
+    blocks [B, T, N]."""
     rows: torch.Tensor | None = None
     index_keys: torch.Tensor | None = None
     selected: torch.Tensor | None = None
@@ -248,26 +258,13 @@ class DeepSeek41Reference(Reference):
 
     def mixes(self, streams: torch.Tensor, prefix: str):
         """(pre [.., S], post [.., S], comb [.., S, S]) of a sublayer from its streams [.., S, H]."""
-        w, s, eps = self.weights, self.streams, self.hc_eps
-        flat = streams.flatten(-2)
-        mixed = linear(flat, w(prefix + "_fn.weight")) * torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.eps)
-        scale, base = w(prefix + "_scale.weight"), w(prefix + "_base.weight")
-        pre = torch.sigmoid(mixed[..., :s] * scale[0] + base[:s]) + eps
-        post = 2 * torch.sigmoid(mixed[..., s:2 * s] * scale[1] + base[s:2 * s])
-        comb = torch.softmax((mixed[..., 2 * s:] * scale[2] + base[2 * s:]).unflatten(-1, (s, s)), dim=-1) + eps
-        comb = comb / (comb.sum(-2, keepdim=True) + eps)
-        for _ in range(self.sinkhorn - 1):
-            comb = comb / (comb.sum(-1, keepdim=True) + eps)
-            comb = comb / (comb.sum(-2, keepdim=True) + eps)
-        return pre, post, comb
+        w = self.weights
+        return sinkhorn_mixes(streams, w(prefix + "_fn.weight"), w(prefix + "_scale.weight"), w(prefix + "_base.weight"),
+                              self.sinkhorn, self.hc_eps, self.eps)
 
     @staticmethod
     def collapse(streams: torch.Tensor, pre: torch.Tensor | None) -> torch.Tensor:
-        return streams[..., 0, :] if pre is None else (pre[..., None] * streams).sum(-2)
-
-    @staticmethod
-    def expand(out: torch.Tensor, streams: torch.Tensor, post: torch.Tensor, comb: torch.Tensor) -> torch.Tensor:
-        return post[..., None] * out[..., None, :] + torch.einsum("...jk,...jd->...kd", comb, streams)
+        return streams[..., 0, :] if pre is None else stream_collapse(streams, pre)
 
     # attention ---------------------------------------------------------------------------------
 
@@ -314,7 +311,10 @@ class DeepSeek41Reference(Reference):
         if ratio > 1:
             groups = x.shape[1] // ratio
             gate = linear(x, w(p + "attn_compressor_gate.weight"))[:, :groups * ratio].unflatten(1, (groups, ratio))
-            kv = (kv[:, :groups * ratio].unflatten(1, (groups, ratio)) * torch.softmax(gate, dim=2)).sum(2)
+            # each group's softmax over its rows, taken along the last axis: torch's softmax over an inner axis
+            # rounds by how many groups it is given, along the last a row's bits are its own
+            weights = torch.softmax(gate.transpose(-1, -2), dim=-1).transpose(-1, -2)
+            kv = (kv[:, :groups * ratio].unflatten(1, (groups, ratio)) * weights).sum(2)
         return self.hold(rms_norm(self.hold(kv), w(p + "attn_compressor_norm.weight"), self.eps))
 
     def compress(self, layer: int, x: torch.Tensor, rotary: Rotary, shared: Shared) -> None:
@@ -334,7 +334,7 @@ class DeepSeek41Reference(Reference):
 
     def select(self, layer: int, x: torch.Tensor, qr: torch.Tensor, rotary: Rotary, positions: torch.Tensor,
                shared: Shared) -> None:
-        """An index source's selection [B, T, N] of compressed rows per query row."""
+        """An index source's selection [B, T, K] per query row (`Shared.selected`)."""
         w, p, ratio = self.weights, f"blk.{layer}.", self.ratios[layer]
         batch, steps, _ = x.shape
         q = self.hold(self.project(self.hold(qr), p + "indexer.attn_q_b.weight"))
@@ -345,7 +345,7 @@ class DeepSeek41Reference(Reference):
         # model.py scales, scores and sums in its BF16 dtype (`Indexer.forward`'s einsum and products)
         head_weights = self.compute(head_weights / math.sqrt(self.index_width * self.index_heads))
         keys = shared.index_keys
-        scores = torch.relu(self.compute(q @ keys[:, None].transpose(-1, -2)))
+        scores = torch.relu(self.compute(products(q, keys[:, None])))
         scores = self.compute(self.compute(scores * head_weights.transpose(1, 2)[..., None]).sum(1))
         counts = (positions + 1) // ratio  # visible rows of each query row
         entries = keys.shape[1]
@@ -355,12 +355,10 @@ class DeepSeek41Reference(Reference):
             shared.candidates = self.candidate_rows(scores, counts)
         elif 0 <= self.candidate < layer:
             scores = scores.masked_fill(~shared.candidates, float("-inf"))
-        top = min(self.index_top, entries)
-        best = lower_index_top(scores, top)
-        taken = torch.arange(top, device=x.device)[None, :] < counts.clamp(max=self.index_top)[:, None]
-        chosen = torch.zeros(batch, steps, entries, dtype=torch.bool, device=x.device)
-        chosen.scatter_(2, best, taken.expand(batch, steps, top))
-        shared.selected = chosen & visible
+        # model.py's `Indexer.forward`: the top rows re-sorted into position order, those not yet visible -1, the
+        # rest after the window's slots (the prefill window keeps every row, so `steps` of them)
+        slots = lower_index_top(scores, min(self.index_top, entries)).sort(dim=-1).values
+        shared.selected = torch.where(slots < counts[:, None], slots + steps, -1)
 
     def candidate_rows(self, scores: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
         """`select_candidate_blocks`: the rows [B, T, N] of each query's best blocks."""
@@ -392,22 +390,23 @@ class DeepSeek41Reference(Reference):
         q = self.compute(self.project(qr, p + "attn_q_b.weight")).view(batch, steps, self.head_count, self.head_dim)
         q = self.compute(self.rope(q.transpose(1, 2), rotary))  # [B, heads, T, D]
         kv = self.window_keys(layer, x, rotary)
-        visible = visibility(positions, positions, window=self.window).expand(batch, steps, steps)
+        slots = window_slots(steps, self.window).to(x.device).expand(batch, -1, -1)
         if ratio:
             if layer in self.kv_sources:
                 self.compress(layer, x, rotary, shared)
             if layer in self.index_sources:
                 self.select(layer, x, qr, rotary, positions, shared)
             kv = torch.cat((kv, shared.rows), dim=1)
-            visible = torch.cat((visible, shared.selected), dim=2)
-        keys = kv[:, None]
-        out = self.compute(attention(q, keys, keys, visible, self.head_dim ** -0.5, w(p + "attn_sinks.weight")))
-        out = self.rope(out.view(batch, steps, self.head_count, self.head_dim).transpose(1, 2), rotary, inverse=True)
+            slots = torch.cat((slots, shared.selected), dim=2)
+        out = self.compute(gathered_attention(q.transpose(1, 2), kv, w(p + "attn_sinks.weight"), slots,
+                                              self.head_dim ** -0.5))
+        out = self.rope(out.transpose(1, 2), rotary, inverse=True)
         out = self.compute(out).transpose(1, 2).reshape(batch, steps, self.groups, -1)
         if self.roundings.activations:  # `act_quant(o, ...)` before wo_a, whose weight is BF16
             out = WINDOW(out)
         wo_a = w(p + "attn_output_a.weight").view(self.groups, self.output_rank, -1)
-        grouped = self.compute(torch.einsum("btgd,grd->btgr", out, wo_a)).flatten(2)
+        grouped = row_tiles(lambda rows: torch.einsum("mgd,grd->mgr", rows, wo_a), out.flatten(0, 1), dim=0)
+        grouped = self.compute(grouped).view(batch, steps, -1)
         return self.compute(self.project(grouped, p + "attn_output_b.weight"))
 
     # experts -----------------------------------------------------------------------------------
@@ -440,8 +439,6 @@ class DeepSeek41Reference(Reference):
         def expert(index: int, rows: torch.Tensor, weight: torch.Tensor | None = None) -> torch.Tensor:
             return self.swiglu(rows, routed_names, self.clamp_routed[layer], index, weight)
 
-        # `mixture` reads the selected experts in ascending order.
-        w.plan_experts(routed_names, torch.unique(selected).tolist())
         # model.py weights a routed expert inside it, before down (equal in exact arithmetic)
         routed = mixture(flat, selected, weights, expert, weighted=self.roundings.activations)
         shared = self.swiglu(flat, tuple(p + f"ffn_{part}_shexp.weight" for part in ("gate", "up", "down")),
@@ -470,7 +467,7 @@ class DeepSeek41Reference(Reference):
         key, value = kv[..., :s * hidden].unflatten(-1, (s, hidden)), kv[..., s * hidden:]
         scale = torch.rsqrt(streams.square().mean(-1) + self.eps) * torch.rsqrt(key.square().mean(-1) + self.eps)
         dot = (streams * w(p + "engram_gate.weight") * key).sum(-1) * scale * hidden ** -0.5
-        gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(ENGRAM_CLAMP).sqrt(), dot))
+        gate = sigmoid(torch.copysign(dot.abs().clamp_min(ENGRAM_CLAMP).sqrt(), dot))
         return self.compute(streams + gate[..., None] * value[..., None, :])
 
     # decoder -----------------------------------------------------------------------------------
@@ -501,10 +498,10 @@ class DeepSeek41Reference(Reference):
         w, p = self.weights, f"blk.{layer}."
         attention_pre, post, comb = self.mixes(streams, p + "hc_attn")
         h = self.compute(rms_norm(self.compute(self.collapse(streams, pre)), w(p + "attn_norm.weight"), self.eps))
-        streams = self.compute(self.expand(self.attention(layer, h, rotaries, positions, shared), streams, post, comb))
+        streams = self.compute(stream_expand(self.attention(layer, h, rotaries, positions, shared), streams, post, comb))
         ffn_pre, post, comb = self.mixes(streams, p + "hc_ffn")
         h = self.compute(rms_norm(self.compute(self.collapse(streams, attention_pre)), w(p + "ffn_norm.weight"), self.eps))
-        return self.compute(self.expand(self.feed_forward(layer, h), streams, post, comb)), ffn_pre
+        return self.compute(stream_expand(self.feed_forward(layer, h), streams, post, comb)), ffn_pre
 
     # DeepSeek's code cross-check (deepseek41_released.py) ----------------------------------------
 

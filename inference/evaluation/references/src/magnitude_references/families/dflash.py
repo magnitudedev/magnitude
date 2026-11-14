@@ -37,7 +37,7 @@ import torch
 from magnitude_references.families import open_reference
 from magnitude_references.gguf import Package
 from magnitude_references.model import (F32, Reference, Rotary, Weights, attention, default_inv_freq, heads, linear,
-                                        per_layer, rms_norm, silu, yarn_inv_freq)
+                                        per_layer, rms_norm, sigmoid, silu, yarn_inv_freq)
 
 
 def causal_layers(value: object, count: int) -> tuple[bool, ...]:
@@ -105,15 +105,16 @@ class DFlashReference:
         self.from_anchor = bool(package.key("sample_from_anchor", self.dspark))
         if weights.has("d2t"):
             raise ValueError("reduced-vocabulary drafts (d2t) are outside the in-scope catalog")
-        base = package.key("rope.freq_base")
+
+    def frequencies(self) -> tuple[torch.Tensor, float]:
+        """The rotary inverse frequencies and amplitude, computed where they are used, as the targets' are."""
+        package, base = self.package, self.package.key("rope.freq_base")
         if package.key("rope.scaling.type", "none") == "yarn":
-            factor = package.key("rope.scaling.factor")
-            self.inv_freq, self.amplitude = yarn_inv_freq(base, self.head_dim, factor,
-                                                          package.key("rope.scaling.original_context_length"),
-                                                          package.key("rope.scaling.yarn_beta_fast", 32.0),
-                                                          package.key("rope.scaling.yarn_beta_slow", 1.0))
-        else:
-            self.inv_freq, self.amplitude = default_inv_freq(base, self.head_dim), 1.0
+            return yarn_inv_freq(base, self.head_dim, package.key("rope.scaling.factor"),
+                                 package.key("rope.scaling.original_context_length"),
+                                 package.key("rope.scaling.yarn_beta_fast", 32.0),
+                                 package.key("rope.scaling.yarn_beta_slow", 1.0))
+        return default_inv_freq(base, self.head_dim), 1.0
 
     def embed(self, tokens: torch.Tensor) -> torch.Tensor:
         if self.weights.has("token_embd.weight"):
@@ -141,7 +142,7 @@ class DFlashReference:
                                                         device=anchor.device)], dim=1)
         x = self.embed(tokens)
         positions = torch.arange(count + rows, device=anchor.device)
-        rotary = Rotary.build(positions, self.inv_freq, self.amplitude)
+        rotary = Rotary.build(positions, *self.frequencies())
         block_rotary = Rotary(rotary.cos[count:], rotary.sin[count:])
         for layer in range(self.block_count):
             p = f"blk.{layer}."
@@ -217,7 +218,7 @@ class DFlashReference:
             memory = w.rows("markov_w1.weight", previous)
             slot_logits = base[:, slot] + linear(memory, w("markov_w2.weight"))
             features = torch.cat([hidden[:, slot], memory], dim=-1)
-            confidence.append(torch.sigmoid(linear(features, w("conf_proj.weight").reshape(1, -1), w("conf_proj.bias")))[:, 0])
+            confidence.append(sigmoid(linear(features, w("conf_proj.weight").reshape(1, -1), w("conf_proj.bias")))[:, 0])
             previous = slot_logits.argmax(-1)
             logits.append(slot_logits)
             proposals.append(previous)
@@ -276,33 +277,40 @@ class DFlashReference:
             for slot in range(0 if self.from_anchor else 1, hidden.shape[1]):
                 slot_logits = model.markov_head.apply_block_logits(base[:, slot:slot + 1], token_ids=previous[:, None])[:, 0]
                 memory = model.markov_head.get_prev_embeddings(previous)
-                confidence.append(torch.sigmoid(model.confidence_head(torch.cat([hidden[:, slot], memory], dim=-1))))
+                confidence.append(sigmoid(model.confidence_head(torch.cat([hidden[:, slot], memory], dim=-1))))
                 previous = slot_logits.argmax(-1)
                 logits.append(slot_logits)
         return hidden, torch.stack(logits, 1), torch.stack(confidence, 1)
 
     def check_released(self, features: torch.Tensor, anchor: torch.Tensor, rows: int | None = None,
                        source: str = "muse", source_path: Path | None = None, source_config: Path | None = None) -> dict:
-        """This reference against the released code on the same context features and anchor."""
-        with torch.no_grad():
-            hidden = self.block(features, anchor, rows)
-            theirs, their_logits, their_confidence = self.released(features, anchor, rows, source, source_path, source_config)
-            report = {"hidden_relative_max_difference": float((hidden - theirs).abs().max() / theirs.abs().max())}
-            passed = report["hidden_relative_max_difference"] < 1e-4
-            if not self.dspark:
+        """This reference against the released code on the same context features and anchor (`checks.judge`): the
+        block's hidden states and slot logits (and DSpark's confidences), and the proposed tokens."""
+        from magnitude_references.checks import Float64, judge, without_float64
+        if (refused := without_float64(features.device)) is not None:
+            return refused
+
+        def outputs(released: bool) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+            """The outputs by name, and the proposed tokens, of the released code or this reference."""
+            if not released:
+                hidden = self.block(features, anchor, rows)
                 ours = self.propose_from(hidden, anchor)
-                theirs_logits = self.propose_from(theirs, anchor).logits
-                report["logits_relative_max_difference"] = float((ours.logits - theirs_logits).abs().max() / theirs_logits.abs().max())
-                report["proposals_agree"] = bool(torch.equal(ours.tokens, their_logits if self.dflash2 else theirs_logits.argmax(-1)))
-                passed &= report["logits_relative_max_difference"] < 1e-4 and report["proposals_agree"]
+                named = {"hidden": hidden, "logits": ours.logits}
+                if self.dspark:
+                    return named | {"confidence": ours.confidence}, ours.logits.argmax(-1)
+                return named, ours.tokens
+            hidden, logits, confidence = self.released(features, anchor, rows, source, source_path, source_config)
             if self.dspark:
-                ours = self.propose_from(hidden, anchor)
-                report["logits_relative_max_difference"] = float((ours.logits - their_logits).abs().max() / their_logits.abs().max())
-                report["confidence_max_difference"] = float((ours.confidence - their_confidence).abs().max())
-                report["proposals_agree"] = bool(torch.equal(ours.logits.argmax(-1), their_logits.argmax(-1)))
-                passed &= report["logits_relative_max_difference"] < 1e-4 and report["confidence_max_difference"] < 1e-5
-                passed &= report["proposals_agree"]
-        return report | {"pass": bool(passed)}
+                return {"hidden": hidden, "logits": logits, "confidence": confidence}, logits.argmax(-1)
+            head = self.propose_from(hidden, anchor).logits  # this reference's head over the released hidden states
+            return {"hidden": hidden, "logits": head}, logits if self.dflash2 else head.argmax(-1)
+
+        with torch.no_grad():
+            released32, _ = outputs(True)
+            with Float64():
+                (ours, our_tokens), (truth, their_tokens) = outputs(False), outputs(True)
+        return judge({name: (ours[name], released32[name], truth[name]) for name in truth},
+                     {"proposals": (our_tokens, their_tokens)})
 
     def layer_parameters(self, prefix: str) -> dict[str, torch.Tensor]:
         w, parameters = self.weights, {}

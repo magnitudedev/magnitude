@@ -1,8 +1,12 @@
 """Synthetic fixtures and renderers shared by the bench tests."""
 
 import json
+from pathlib import Path
 
 from magnitude_fixtures import Fixture
+
+#: The `inference/` tree the tests run from, which the tool is given (`--inference`).
+TREE = Path(__file__).parents[3]
 
 ECHO = {
     "type": "function",

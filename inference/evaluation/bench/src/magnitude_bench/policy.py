@@ -2,9 +2,17 @@
 
 from pathlib import Path
 
-BENCH = Path(__file__).resolve().parents[2]
-INFERENCE = BENCH.parents[1]
-RUNTIMES = BENCH / "runtimes"
+
+
+def bench(inference: Path) -> Path:
+    """The bench package's tree inside the `inference/` tree a run is given (`--inference`): the tool resolves no
+    tree of its own, so it reads no checkout it was not given, wherever it is installed."""
+    return inference / "evaluation" / "bench"
+
+
+def runtimes(inference: Path) -> Path:
+    return bench(inference) / "runtimes"
+
 
 MODES = ("prose-repeat", "prose-continue", "prose-shift", "tools", "retrieval")
 ENGINES = ("magnitude", "llama.cpp", "ollama", "ollama-mlx", "ollama-registry", "mlx-vlm", "omlx")

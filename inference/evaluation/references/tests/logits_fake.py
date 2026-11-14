@@ -14,6 +14,24 @@ TEMPLATE_SHA = "1" * 64
 SCORED = 12
 
 
+def family() -> type:
+    """The reference family the fake references are of: their target's architecture's (`write_target`)."""
+    from magnitude_references.families.llama import LlamaReference
+    return LlamaReference
+
+
+def write_target(path: Path) -> Path:
+    """A target GGUF of its header alone, of the architecture of `family`, which is all a cached reference's
+    identity reads of it."""
+    from gguf.constants import GGUFValueType
+
+    from magnitude_references.gguf import Value, Writer
+    writer = Writer(path, {"general.architecture": Value(GGUFValueType.STRING, "llama")})
+    writer.begin()
+    writer.close()
+    return path
+
+
 def rendered_lines(fixtures: Path, context: int, shift: bool) -> list[dict]:
     lines = []
     for number, line in enumerate(fixtures.read_text().splitlines()):

@@ -688,7 +688,7 @@ CASES = [
          ("four hyper-connection streams (rank-8 mix, inject, exit head)", "sigmoid gated delta output gate",
           "selected attention past 2 blocks of 4 (rows 11 on), ties to the lower block",
           "n-gram input at block 1 (orders 2 and 3, two heads each, resets mid-sequence, dilated conv)",
-          "checked against mlx_vlm (no transformers model)")),
+          "no released-code check (mlx_vlm alone, no transformers model)")),
 ]
 
 
@@ -813,11 +813,9 @@ def selected(names: set[str] | None) -> tuple[list[Case], list[DraftCase]]:
     return targets, drafts
 
 
-def check_families(names: set[str] | None, device: torch.device, zlab_source: Path | None,
-                   mlx_python: Path | None = None) -> list[dict]:
-    """Every selected case's reference against its released code (transformers, or mlx_vlm under
-    `mlx_python`) and every draft case against the released draft code, over synthetic GGUFs written
-    to a temporary directory. Each report carries `pass`."""
+def check_families(names: set[str] | None, device: torch.device, zlab_source: Path | None) -> list[dict]:
+    """Every selected case's reference against its released code (`checks.check_hf`) and every draft case against
+    the released draft code, over synthetic GGUFs written to a temporary directory. Each report carries `pass`."""
     targets, drafts = selected(names)
     if any(case.axes.get("conv_kernel_size") for case in drafts) and zlab_source is None:
         raise ValueError("DFlash2 released-code checks require a pinned Z-Lab model.py (zlab_source)")
@@ -830,7 +828,7 @@ def check_families(names: set[str] | None, device: torch.device, zlab_source: Pa
             case.build(case).write(model)
             reference = open_reference(model, device, cache=True)
             references[case.name] = reference
-            report = check_hf(reference, 2, case.axes.get("check_length", 32), 7, mlx_python)
+            report = check_hf(reference, 2, case.axes.get("check_length", 32), 7)
             reports.append({"case": case.name, "architecture": reference.architecture, "covers": list(case.covers),
                             "tensors_not_in_forward": reference.weights.unread(), **report})
         for case in drafts:

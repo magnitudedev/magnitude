@@ -24,7 +24,6 @@ from pathlib import Path
 from .connection import SSH_OPTIONS, CommandFailed, HostUnavailable, Remote, reachable
 from .host.agent import EVENTS, RUN_LOCKS, RUNNER_LOG
 
-INFERENCE = Path(__file__).resolve().parents[4]
 
 
 def mirrored(path: str) -> bool:

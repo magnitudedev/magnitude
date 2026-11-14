@@ -11,26 +11,68 @@ sequences.
 """
 from __future__ import annotations
 
-from collections import deque
-from collections.abc import Callable
+from collections import defaultdict
+from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
+from functools import cache, partial
 import math
 import os
+import weakref
 
 import numpy as np
 import torch
 
 from gguf.constants import GGMLQuantizationType
 
+from magnitude_references import digest
 from magnitude_references.gguf import Package, TensorInfo, dequantize
 from magnitude_references.perturbation import UE8M0 as UE8M0_CODES, Format, Perturbation
 
 F32 = torch.float32
-QUERY_BLOCK = 1024  # attention query rows per score block
+# Where a row's bits can be its own (`digest.platform`'s rows_exact: Accelerate, nvpl), every product runs in calls
+# of one shape: ROW_TILE rows (the last call padded with zero rows), and over a key axis KEY_TILE keys. There a GEMM's
+# row is a function of that row and the call's shape alone, so with the shape fixed a row's bits cannot depend on how
+# many rows share its call; any fixed sizes give that. The sizes are a speed choice: a short call (one expert's rows)
+# pads by little, a long one runs as whole tiles; an op on rows that rounds a row by the tensor's length runs in
+# ROW_TILE-row calls too (`pointwise`). Elsewhere (x86 MKL, which also rounds a row by its place in the call and by
+# the call's row count, so no call shape makes a row its own) `linear`, `products` and `pointwise` call whole, as the
+# released code does, whose bits they then are (`tiled`). Attention (`attention`, `gathered_attention`) runs in
+# ROW_TILE-row blocks and KEY_TILE-key tiles on every platform: its softmax is summed tile by tile (`attend`), which is
+# its definition here, not a platform's choice; within a block its products follow `tiled`.
+ROW_TILE = 128
+KEY_TILE = 128
 MAX_UE8M0 = UE8M0_CODES.largest  # the largest byte whose E4M3 products are exact in float32
-DECODERS = ThreadPoolExecutor(os.cpu_count() or 1, thread_name_prefix="expert-decode")
-EXPERT_WINDOW = 2 * (os.cpu_count() or 1)  # expert matrices decoded ahead of their reads, at most
+# A torch operation's result can depend on its OpenMP team size (a product's split of its reduction), so a
+# reference fixes every team it runs, never the host: `THREADS` on the thread that builds and runs it (`Weights`
+# sets it there) and 1 on each pool thread, since a thread that never sets its own takes the last size set on any
+# thread. Products go to the platform's BLAS, whose team is the calling thread's, never to oneDNN (ACL on aarch64),
+# which sizes its own team from the cores the process may run on: on GB10 a thread set to 1 ran a 20-thread ACL team of
+# its own. The bits are then a function of the tree and the platform's BLAS; the pools are sized by the
+# host, and order nothing. Being part of what the bits are, THREADS is a constant, not the host's core count; it is
+# the most cores every host that builds references has (Apple M4 Max 16, GB10 20), so no host's team is
+# oversubscribed. A host with fewer would time-slice the team: slower, the same bits.
+THREADS = 16
+torch.backends.mkldnn.enabled = False
+WORKERS = os.cpu_count() or 1
+# Two pools, so no task waits on its own pool: a dense tensor's row parts (`Weights.decode`), and a mixture's
+# experts (`mixture`), which may read dense tensors.
+DECODERS = ThreadPoolExecutor(WORKERS, thread_name_prefix="decode", initializer=torch.set_num_threads, initargs=(1,))
+EXPERTS = ThreadPoolExecutor(WORKERS, thread_name_prefix="expert", initializer=torch.set_num_threads, initargs=(1,))
+
+
+def submit(pool: ThreadPoolExecutor, task: Callable, *arguments) -> Future:
+    """`task(*arguments)` on `pool`, under the calling thread's torch function modes, which are per thread: a
+    reference run in float64 (`checks.Float64`) runs so on every worker it uses."""
+    modes = torch.overrides._get_current_function_mode_stack()
+
+    def run():
+        with ExitStack() as stack:
+            for mode in modes:
+                stack.enter_context(mode)
+            return task(*arguments)
+    return pool.submit(run)
 
 
 @dataclass(frozen=True)
@@ -74,9 +116,9 @@ class Weights:
     128x128 for GLM-5.3-Flash), and a stack of expert matrices [experts, rows, cols] has one grid per expert
     [experts, grid rows, grid cols].
 
-    Expert matrices a layer is about to read (`plan_experts`) decode ahead on a thread pool, at most
-    `EXPERT_WINDOW` at a time, so their decoding overlaps each other and the layer's products; a decode is
-    the same function of the same bytes wherever it runs.
+    A mixture's experts run in parallel (`mixture`), each decoding its own matrices; any other tensor decodes in
+    parts of its rows on a pool (`decode`). A decode is the same function of the same bytes on whatever thread it
+    runs, so reads may come from any thread.
 
     Every read takes its bytes through `stored`, which applies the storage-resolution `perturbation` when the
     reference runs one (`perturbation.py`), so each stored value moves once, by its identity, however it is
@@ -84,10 +126,22 @@ class Weights:
 
     def __init__(self, package: Package, device: torch.device, cache: bool, perturbation: Perturbation | None = None):
         self.package, self.device, self.cache, self.perturbation = package, device, cache, perturbation
+        torch.set_num_threads(THREADS)  # this thread's team size (`THREADS`): the reference runs here
+        assert not torch.backends.mkldnn.enabled, "oneDNN sizes its own teams from the host: a reference keeps it off"
         self.values: dict[str, torch.Tensor] = {}
         self.read: set[str] = set()
-        self.planned: deque[tuple[str, int]] = deque()
-        self.decoding: dict[str, Future[torch.Tensor]] = {}
+        self.spare: defaultdict[int, list[np.ndarray]] = defaultdict(list)  # float32 buffers `lend` reuses
+
+    @contextmanager
+    def uncached(self) -> Iterator[None]:
+        """Within the block, every read decodes afresh and nothing is kept; the cached values are dropped on entry.
+        For a copy of the weights read once (a released model's parameters)."""
+        self.values.clear()
+        cache, self.cache = self.cache, False
+        try:
+            yield
+        finally:
+            self.cache = cache
 
     def has(self, name: str) -> bool:
         return self.package.has(name)
@@ -98,12 +152,28 @@ class Weights:
     def __call__(self, name: str) -> torch.Tensor:
         if name in self.values:
             return self.values[name]
-        info = self.package.info(name)
-        value = self.scaled(name, torch.from_numpy(dequantize(info, self.stored(name).reshape(-1))).to(self.device))
+        value = self.scaled(name, torch.from_numpy(self.decode(name)).to(self.device))
         self.read.add(name)
         if self.cache:
             self.values[name] = value
         return value
+
+    def decode(self, name: str) -> np.ndarray:
+        """`name`'s float32 values (NumPy order), its GGUF rows stored, moved and decoded in parts on the decode
+        pool: each row's bytes, and so its values, are its own, so the parts are the whole tensor's."""
+        info = self.package.info(name)
+        count = int(np.prod(info.shape[1:], dtype=np.int64))
+        out = np.empty((count, info.shape[0]), dtype=np.float32)
+        step = -(-count // WORKERS)
+
+        def part(start: int) -> None:
+            rows = slice(start, min(start + step, count))
+            shape = (info.shape[0], rows.stop - start)
+            dequantize(TensorInfo(name, shape, info.type, 0), self.stored(name, rows).reshape(-1), out[rows])
+
+        for decoding in [submit(DECODERS, part, start) for start in range(0, count, step)]:
+            decoding.result()
+        return out.reshape(info.array_shape)
 
     def stored(self, name: str, rows: np.ndarray | slice = slice(None), encoding: Format | None = None) -> np.ndarray:
         """The stored bytes [rows, row bytes] of `name`'s GGUF `rows` (each `shape[0]` elements; all by
@@ -131,11 +201,12 @@ class Weights:
             index = np.arange(expert * info.shape[1], (expert + 1) * info.shape[1])
         else:
             index = np.arange(int(np.prod(info.shape[1:], dtype=np.int64)))
-        return value * self.tile_scale(name, index).view(value.shape)
+        factors = self.tile_scale(name, index)  # [rows, grid cols], each over its tile of columns
+        return (value.reshape(*factors.shape, -1) * factors[..., None]).view_as(value)
 
     def tile_scale(self, name: str, rows: np.ndarray) -> torch.Tensor:
         """The tile factors of F8_E4M3 `name`'s GGUF `rows` (rows of its matrix, or of a stack's matrices one after
-        another), expanded to their elements: [rows, cols]."""
+        another), one per row and tile of columns: [rows, grid cols]."""
         scale_name = name.removesuffix(".weight") + ".scale"
         info, scale = self.package.info(name), self.package.info(scale_name)
         tiles = TILE_ENCODINGS.get(scale.type)
@@ -153,7 +224,7 @@ class Weights:
         grid, inverse = np.unique(rows // tile_rows, return_inverse=True)
         codes = self.stored(scale_name, grid, tiles.perturbed)[inverse]
         self.read.add(scale_name)
-        return torch.from_numpy(tiles.factors(codes).repeat(tile_cols, axis=1)).to(self.device)
+        return torch.from_numpy(tiles.factors(codes)).to(self.device)
 
     def global_scale(self, name: str) -> torch.Tensor | None:
         """An NVFP4 tensor's second-level scale (`<base>.scale`: [1], or [experts] for stacked experts).
@@ -172,11 +243,7 @@ class Weights:
         key = f"{name}#{index}"
         if key in self.values:
             return self.values[key]
-        if (decoding := self.decoding.pop(key, None)) is not None:
-            value = decoding.result()
-            self.decode_planned()
-        else:
-            value = self.decode_expert(name, index)
+        value = self.decode_expert(name, index)
         self.read.add(name)
         if self.cache:
             self.values[key] = value
@@ -188,22 +255,24 @@ class Weights:
             raise ValueError(f"{name} is not a stacked expert tensor: {info.shape}")
         rows = info.shape[1]
         raw = self.stored(name, slice(index * rows, (index + 1) * rows)).reshape(-1)
-        single = TensorInfo(name, info.shape[:2], info.type, 0)
-        return self.scaled(name, torch.from_numpy(dequantize(single, raw)).to(self.device), expert=index)
+        value = self.lend(lambda out: dequantize(TensorInfo(name, info.shape[:2], info.type, 0), raw, out),
+                          rows * info.shape[0])
+        return self.scaled(name, value.to(self.device), expert=index)
 
-    def plan_experts(self, names: tuple[str, ...], indices: list[int]) -> None:
-        """The matrices `names` of each of `indices`, in that order, as the layer will read them
-        (`expert`): decoded ahead, a window at a time. The last plan was read whole."""
-        if self.planned or self.decoding:
-            raise RuntimeError("a layer left planned expert matrices unread")
-        self.planned = deque((name, index) for index in indices for name in names
-                             if f"{name}#{index}" not in self.values)
-        self.decode_planned()
-
-    def decode_planned(self) -> None:
-        while self.planned and len(self.decoding) < EXPERT_WINDOW:
-            name, index = self.planned.popleft()
-            self.decoding[f"{name}#{index}"] = DECODERS.submit(self.decode_expert, name, index)
+    def lend(self, decode: Callable[[np.ndarray], np.ndarray], count: int) -> torch.Tensor:
+        """`decode`'s values written into a float32 buffer of `count` elements, as a tensor. A streaming reference
+        (`cache` off) takes the buffer from those its earlier expert matrices returned, and returns this one when
+        the array the tensor wraps dies, which is after every tensor sharing its memory: a matrix's pages are
+        allocated and faulted in once, not once per read."""
+        spare = self.spare[count]
+        try:
+            buffer = spare.pop()  # empty while caching: nothing is returned
+        except IndexError:
+            buffer = np.empty(count, dtype=np.float32)
+        array = decode(buffer)
+        if not self.cache:
+            weakref.finalize(array, spare.append, buffer)
+        return torch.from_numpy(array)
 
     def rows(self, name: str, indices: torch.Tensor) -> torch.Tensor:
         """Rows `indices` (any shape) of a 2-D tensor, dequantizing only the rows used (large tables)."""
@@ -228,8 +297,69 @@ class Weights:
 # Elementwise and normalization
 
 
+def padded(x: torch.Tensor, dim: int, tile: int, value: float | bool = 0) -> torch.Tensor:
+    """x along `dim` filled with `value` to a multiple of `tile`."""
+    dim %= x.dim()
+    extra = -x.shape[dim] % tile
+    return torch.cat((x, x.new_full((*x.shape[:dim], extra, *x.shape[dim + 1:]), value)), dim) if extra else x
+
+
+def row_tiles(product, *xs: torch.Tensor, dim: int) -> torch.Tensor:
+    """product(*tiles) over the rows of xs along `dim`, ROW_TILE rows a call, the last padded with zero rows; its
+    result's rows along the same `dim`. A row's bits depend on its own row alone (see ROW_TILE)."""
+    rows = xs[0].shape[dim]
+    tiles = zip(*(padded(x, dim, ROW_TILE).split(ROW_TILE, dim) for x in xs))
+    return torch.cat([product(*(tile.contiguous() for tile in group)) for group in tiles], dim).narrow(dim, 0, rows)
+
+
+@cache
+def tiled(device: str) -> bool:
+    """Whether `linear`, `products` and `pointwise` on `device` (a device type) run in fixed row and key tiles: where
+    its platform makes a row's bits its own (`digest.platform`), else in the released code's whole calls (see
+    ROW_TILE)."""
+    return digest.platform(device)["rows_exact"]
+
+
 def linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
-    return torch.nn.functional.linear(x, weight, bias)
+    """x [..., K] · weightᵀ (+ bias), in row tiles or whole (`tiled`)."""
+    if not tiled(x.device.type):
+        return torch.nn.functional.linear(x, weight, bias)
+    product = row_tiles(lambda rows: torch.nn.functional.linear(rows, weight, bias), x.reshape(-1, x.shape[-1]), dim=0)
+    return product.view(*x.shape[:-1], product.shape[-1])
+
+
+def products(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """a [..., M, D] · b [..., N, D]ᵀ -> [..., M, N], in row tiles of a and key tiles of b: each GEMM [ROW_TILE, D] ·
+    [D, KEY_TILE], so an entry depends on its own row and key alone; or whole (`tiled`)."""
+    if not tiled(a.device.type):
+        return a @ b.transpose(-1, -2)
+    keys = b.shape[-2]
+    tiles = [tile.transpose(-1, -2).contiguous() for tile in padded(b, -2, KEY_TILE).split(KEY_TILE, -2)]
+    return row_tiles(lambda rows: torch.cat([rows @ tile for tile in tiles], -1), a, dim=-2).narrow(-1, 0, keys)
+
+
+def attend(scores: torch.Tensor, weigh, sinks: torch.Tensor | None) -> torch.Tensor:
+    """Softmax over each row's keys, scores [..., S] with S a multiple of KEY_TILE and -inf a key it does not see, from
+    the row's max (clamped at -1e30) with exp(sink) in the denominator when `sinks` (broadcast to [..., 1]) is given;
+    returns the sum over key tiles, in order, of weigh(tile index, the tile's weights [..., KEY_TILE]). Its sums run in
+    fixed tiles, an empty tile adding exact zeros, so a row's bits depend on its visible keys alone."""
+    peak = scores.amax(-1, keepdim=True).clamp(min=-1e30)
+    weights = torch.exp(scores - peak).split(KEY_TILE, -1)
+    total = sum(tile.sum(-1, keepdim=True) for tile in weights)
+    if sinks is not None:
+        total = total + torch.exp(sinks - peak)
+    return sum(weigh(index, (tile / total).contiguous()) for index, tile in enumerate(weights))
+
+
+def pointwise(op, x: torch.Tensor) -> torch.Tensor:
+    """op(x) of an op on rows (elementwise, or along the last axis), in ROW_TILE-row calls where `tiled`, so every
+    call has one length: torch cuts a parallel op into chunks by the tensor's length, and its vectorised body and
+    scalar tail round some ops differently, so on a whole tensor a row's bits would depend on how many rows it has.
+    The forward calls such an op only through here (tests/test_rows.py)."""
+    if not tiled(x.device.type):
+        return op(x)
+    rows = row_tiles(op, x.reshape(-1, x.shape[-1]), dim=0)
+    return rows.view(*x.shape[:-1], *rows.shape[1:])
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor | None, eps: float) -> torch.Tensor:
@@ -238,12 +368,26 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor | None, eps: float) -> torch.
     return normalized if weight is None else normalized * weight
 
 
+def sigmoid(x: torch.Tensor) -> torch.Tensor:
+    return pointwise(torch.sigmoid, x)
+
+
+def layer_norm(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float) -> torch.Tensor:
+    """torch's LayerNorm over the last axis, with its weight and bias."""
+    return torch.nn.functional.layer_norm(x, x.shape[-1:], weight, bias, eps)
+
+
+def l2_normalize(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """x * rsqrt(sum x^2 + eps) over the last axis (FLA's l2norm)."""
+    return x * torch.rsqrt((x * x).sum(-1, keepdim=True) + eps)
+
+
 def silu(x: torch.Tensor) -> torch.Tensor:
-    return torch.nn.functional.silu(x)
+    return pointwise(torch.nn.functional.silu, x)
 
 
 def gelu_tanh(x: torch.Tensor) -> torch.Tensor:
-    return torch.nn.functional.gelu(x, approximate="tanh")
+    return pointwise(partial(torch.nn.functional.gelu, approximate="tanh"), x)
 
 
 def relu_squared(x: torch.Tensor) -> torch.Tensor:
@@ -251,7 +395,48 @@ def relu_squared(x: torch.Tensor) -> torch.Tensor:
 
 
 def softplus(x: torch.Tensor) -> torch.Tensor:
-    return torch.nn.functional.softplus(x)
+    return pointwise(torch.nn.functional.softplus, x)
+
+
+def causal_conv(u: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
+    """Depthwise causal conv of u [B, T, C] from a zero window, no bias: out[t, c] = sum_k kernel[c, k] u[t-(K-1)+k, c]."""
+    taps = kernel.shape[1]
+    padded = torch.nn.functional.pad(u, (0, 0, taps - 1, 0))
+    return sum(padded[:, k:k + u.shape[1]] * kernel[:, k] for k in range(taps))
+
+
+# ---------------------------------------------------------------------------------------------
+# Manifold-constrained hyper-connections (Sinkhorn mixes over S residual streams)
+
+
+def sinkhorn_mixes(streams: torch.Tensor, fn: torch.Tensor, scale: torch.Tensor, base: torch.Tensor, iterations: int,
+                   eps: float, norm_eps: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """(pre [.., S], post [.., S], comb [.., S, S]) of a sublayer site from its streams [.., S, H]: with
+    m = (flatten(X) fn^T) / rms(flatten(X)), pre = sigmoid(m[:S] a0 + b) + eps, post = 2 sigmoid(m[S:2S] a1 + b),
+    comb = Sinkhorn(softmax(m[2S:] a2 + b) + eps) over `iterations` normalisations."""
+    count = streams.shape[-2]
+    flat = streams.flatten(-2)
+    mixed = linear(flat, fn) * torch.rsqrt(flat.square().mean(-1, keepdim=True) + norm_eps)
+    pre = sigmoid(mixed[..., :count] * scale[0] + base[:count]) + eps
+    post = 2 * sigmoid(mixed[..., count:2 * count] * scale[1] + base[count:2 * count])
+    comb = torch.softmax((mixed[..., 2 * count:] * scale[2] + base[2 * count:]).unflatten(-1, (count, count)), dim=-1) + eps
+    comb = comb / (comb.sum(-2, keepdim=True) + eps)
+    for _ in range(iterations - 1):
+        comb = comb / (comb.sum(-1, keepdim=True) + eps)
+        comb = comb / (comb.sum(-2, keepdim=True) + eps)
+    return pre, post, comb
+
+
+def stream_collapse(streams: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
+    """sum_c pre[c] X[c]: a sublayer's input from the streams [.., S, H]."""
+    return (pre[..., None] * streams).sum(-2)
+
+
+def stream_expand(out: torch.Tensor, streams: torch.Tensor, post: torch.Tensor, comb: torch.Tensor) -> torch.Tensor:
+    """X'[k] = post[k] y + sum_j comb[j, k] X[j]: the streams after a sublayer's output y. As DeepSeek's `hc_post`,
+    the residual mix is products summed over the source stream, not a product of matrices, whose BLAS kernel (fused
+    multiply-adds on MKL) rounds differently."""
+    return post[..., None] * out[..., None, :] + (comb[..., None] * streams[..., None, :]).sum(-3)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -370,24 +555,53 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, visible: torch.
     adds exp(sink_h) to head h's softmax denominator (a logit with a zero value).
     Returns [B, T, Hq * Dv] (heads concatenated per row).
     """
-    batch, heads, rows, _ = q.shape
-    groups = heads // k.shape[1]
-    if heads != groups * k.shape[1]:
-        raise ValueError(f"{heads} query heads do not group over {k.shape[1]} kv heads")
-    k = k.repeat_interleave(groups, dim=1)
-    v = v.repeat_interleave(groups, dim=1)
-    mask = visible if visible.dim() == 3 else visible[None]
-    # Query rows in blocks bound the score matrix to [B, H, QUERY_BLOCK, S]; each row's softmax is
-    # independent of the others, so blocking does not change the definition.
-    out = []
-    for start in range(0, rows, QUERY_BLOCK):
-        end = min(start + QUERY_BLOCK, rows)
-        scores = torch.matmul(q[:, :, start:end], k.transpose(-1, -2)) * scale
-        scores = scores.masked_fill(~mask[:, None, start:end], float("-inf"))
-        if sinks is not None:
-            scores = torch.cat((scores, sinks.view(1, heads, 1, 1).expand(batch, heads, end - start, 1)), dim=-1)
-        out.append(torch.matmul(torch.softmax(scores, dim=-1)[..., :v.shape[-2]], v))
-    return torch.cat(out, dim=2).transpose(1, 2).reshape(batch, rows, heads * v.shape[-1])
+    batch, heads, rows, width = q.shape
+    kv_heads = k.shape[1]
+    groups = heads // kv_heads
+    if heads != groups * kv_heads:
+        raise ValueError(f"{heads} query heads do not group over {kv_heads} kv heads")
+    values = padded(v, 2, KEY_TILE).split(KEY_TILE, 2)
+    # hidden keys and the key padding are -inf; the row padding sees every key, finite
+    hidden = padded(~(visible if visible.dim() == 3 else visible[None]), -1, KEY_TILE, True)[:, None]
+    sink = None if sinks is None else sinks.view(1, heads, 1, 1)
+
+    def block(q: torch.Tensor, hidden: torch.Tensor) -> torch.Tensor:
+        # a kv head's query heads (each consecutive `groups`) multiply it as one matrix of their rows, so no kv
+        # head is copied per query head
+        grouped = q.reshape(batch, kv_heads, groups * ROW_TILE, width)
+        scores = products(grouped, k).view(batch, heads, ROW_TILE, -1) * scale
+        scores = padded(scores, -1, KEY_TILE).masked_fill(hidden, float("-inf"))
+
+        def weigh(index: int, weights: torch.Tensor) -> torch.Tensor:
+            mixed = weights.view(batch, kv_heads, groups * ROW_TILE, KEY_TILE) @ values[index]
+            return mixed.view(batch, heads, ROW_TILE, -1)
+        return attend(scores, weigh, sink)
+
+    out = row_tiles(block, q, hidden.expand(batch, -1, -1, -1), dim=-2)
+    return out.transpose(1, 2).reshape(batch, rows, heads * v.shape[-1])
+
+
+def gathered_attention(q: torch.Tensor, kv: torch.Tensor, sinks: torch.Tensor | None, slots: torch.Tensor,
+                       scale: float) -> torch.Tensor:
+    """Attention over each query row's own key rows, in float32, as DeepSeek V4's `sparse_attn` defines it (its
+    `kernel.py` lines 310-403): the rows `slots` [B, T, K] of kv [B, N, D] (keys and values both), -1 an empty slot;
+    head h's scores q [B, T, H, D] · row, their softmax from the rows' max (clamped at -1e30) with exp(sink_h) in the
+    denominator when `sinks` [H] is given (`attend`); its rows weighted by it. Returns [B, T, H, D] in q's dtype.
+
+    A row's bits depend on its set of rows alone, not on their order, the empty slots or K: its rows go in position
+    order, empties last, padded to whole key tiles."""
+    empty = kv.shape[1]  # sorts after every row
+    slots = padded(slots.long().masked_fill(slots < 0, empty), -1, KEY_TILE, empty).sort(dim=-1).values
+    sink = None if sinks is None else sinks.float().view(1, 1, -1, 1)
+
+    def block(q: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
+        rows = kv[torch.arange(kv.shape[0])[:, None, None], slots.clamp(max=empty - 1)].float()  # [B, R, K, D]
+        tiles = [tile.contiguous() for tile in rows.split(KEY_TILE, 2)]
+        scores = torch.cat([torch.einsum("bmhd,bmkd->bmhk", q.float(), tile) for tile in tiles], -1) * scale
+        scores = scores.masked_fill((slots == empty)[:, :, None], float("-inf"))
+        return attend(scores, lambda index, weights: torch.einsum("bmhk,bmkd->bmhd", weights, tiles[index]), sink)
+
+    return row_tiles(block, q, slots, dim=1).to(q.dtype)
 
 
 def heads(x: torch.Tensor, count: int) -> torch.Tensor:
@@ -410,22 +624,54 @@ def lower_index_top(scores: torch.Tensor, count: int) -> torch.Tensor:
     return torch.sort(scores, dim=-1, descending=True, stable=True).indices[..., :count]
 
 
+def unit_selection(scores: torch.Tensor, ends: torch.Tensor, top: int, rate: int) -> torch.Tensor:
+    """The rows each query row reads under an indexer selecting units of `rate` rows, as slots [B, T, K]
+    (`gathered_attention`'s form, -1 an empty slot), K = min(top, U)·rate + rate - 1.
+
+    scores [B, T, U]: each row's score of every unit u, which covers the rows [u·rate, (u+1)·rate). ends [T]: each
+    row's visible rows [0, end), so its complete units are the first end // rate. A row reads the rows of its best
+    min(top, count) complete units (ties to the lower unit) and its tail, the visible rows no complete unit covers,
+    [count·rate, end): while count <= top, every visible row.
+    """
+    batch, steps, units = scores.shape
+    counts = ends // rate
+    best_count = min(top, units)
+    visible = torch.arange(units, device=scores.device)[None, :] < counts[:, None]
+    best = lower_index_top(scores.masked_fill(~visible, float("-inf")), best_count)  # [B, T, best]
+    taken = torch.arange(best_count, device=scores.device)[None, :] < counts.clamp(max=best_count)[:, None]
+    unit_rows = best[..., None] * rate + torch.arange(rate, device=scores.device)  # [B, T, best, rate]
+    picked = torch.where(taken[..., None], unit_rows, -1).flatten(-2)
+    tail = (counts * rate)[:, None] + torch.arange(rate - 1, device=scores.device)  # [T, rate - 1]
+    tail = torch.where(tail < ends[:, None], tail, -1)
+    return torch.cat((picked, tail.expand(batch, -1, -1)), -1)
+
+
 def mixture(x: torch.Tensor, selected: torch.Tensor, weights: torch.Tensor, expert, weighted: bool = False) -> torch.Tensor:
     """sum_k weights[:, k] * expert(e_k, x) over the selected experts of every row.
 
     x [N, H]; selected, weights [N, K]; expert(index, rows [n, H]) -> [n, H_out]. A `weighted` expert applies its
-    rows' weights [n, 1] itself, inside its computation: expert(index, rows, weights).
+    rows' weights [n, 1] itself, inside its computation: expert(index, rows, weights). The experts' parts compute in
+    parallel (`EXPERTS`), and their rows add into the sum in the order of the experts, so the sum is the same as one
+    thread's.
     """
-    out = None
-    for index in torch.unique(selected).tolist():
-        rows, slot = torch.where(selected == index)
+    parts = [(index, *torch.where(selected == index)) for index in torch.unique(selected).tolist()]
+
+    def part(index: int, rows: torch.Tensor, slot: torch.Tensor) -> torch.Tensor:
         if weighted:
-            y = expert(index, x[rows], weights[rows, slot, None])
-        else:
-            y = expert(index, x[rows]) * weights[rows, slot, None]
-        if out is None:
-            out = torch.zeros(x.shape[0], y.shape[-1], dtype=F32, device=x.device)
-        out.index_add_(0, rows, y)
+            return expert(index, x[rows], weights[rows, slot, None])
+        return expert(index, x[rows]) * weights[rows, slot, None]
+
+    computing = [submit(EXPERTS, part, *arguments) for arguments in parts]
+    out = None
+    try:
+        for (_, rows, _), computed in zip(parts, computing):
+            y = computed.result()
+            if out is None:
+                out = torch.zeros(x.shape[0], y.shape[-1], dtype=F32, device=x.device)
+            out.index_add_(0, rows, y)
+    finally:
+        for computed in computing:
+            computed.cancel()
     return out
 
 
@@ -456,6 +702,19 @@ class Reference:
 
     def __init__(self, package: Package, weights: Weights, layers: int | None):
         self.package, self.weights = package, weights
+
+    @classmethod
+    def open(cls, package: Package, device: torch.device, cache: bool, layers: int | None = None,
+             variant: str | None = None) -> Reference:
+        """The reference of `package`, in its model numerics, the named measurement `variant` (`variants`), or its
+        numerics over storage-resolution-perturbed stored values (`perturbed:<seed>`, `perturbation.py`).
+        `cache=False` streams: every layer's weights are dequantized when the layer runs and dropped after."""
+        perturbation = Perturbation.of(variant)
+        if variant is not None and perturbation is None and variant not in cls.variants:
+            raise ValueError(f"{package.architecture} has no reference variant {variant!r}: "
+                             f"{sorted(cls.variants)} or perturbed:<seed>")
+        options = cls.variants[variant] if variant in cls.variants else {}
+        return cls(package, Weights(package, device, cache, perturbation), layers, **options)
 
     def hidden(self, tokens: torch.Tensor, taps: tuple[int, ...] = ()) -> tuple[torch.Tensor, list[torch.Tensor]]:
         raise NotImplementedError

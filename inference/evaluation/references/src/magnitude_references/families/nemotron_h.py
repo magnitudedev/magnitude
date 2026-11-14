@@ -25,15 +25,9 @@ from __future__ import annotations
 import torch
 
 from magnitude_references.gguf import Package
-from magnitude_references.model import (Reference, Weights, attention, heads, layer_count, linear, mixture, per_layer,
-                                        relu_squared, rms_norm, route_top_k, silu, softplus, visibility)
-
-
-def causal_conv(u: torch.Tensor, kernel: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
-    """Depthwise causal conv from a zero window: out[t, c] = bias[c] + sum_k kernel[c, k] u[t - (K-1) + k, c]."""
-    taps = kernel.shape[1]
-    padded = torch.nn.functional.pad(u, (0, 0, taps - 1, 0))
-    return bias + sum(padded[:, k:k + u.shape[1]] * kernel[:, k] for k in range(taps))
+from magnitude_references.model import (Reference, Weights, attention, causal_conv, heads, layer_count, linear, mixture,
+                                        per_layer, relu_squared, rms_norm, route_top_k, sigmoid, silu, softplus,
+                                        visibility)
 
 
 def selective_scan(x: torch.Tensor, delta: torch.Tensor, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor,
@@ -106,7 +100,7 @@ class NemotronHReference(Reference):
         batch, steps, _ = u.shape
         channels = self.inner + 2 * self.groups * self.state_size
         z, xbc, dt = torch.split(linear(u, w(p + "ssm_in.weight")), [self.inner, channels, self.ssm_heads], dim=-1)
-        xbc = silu(causal_conv(xbc, w(p + "ssm_conv1d.weight"), w(p + "ssm_conv1d.bias")))
+        xbc = silu(causal_conv(xbc, w(p + "ssm_conv1d.weight")) + w(p + "ssm_conv1d.bias"))
         x, b, c = torch.split(xbc, [self.inner, self.groups * self.state_size, self.groups * self.state_size], dim=-1)
         delta = softplus(dt + w(p + "ssm_dt.bias"))
         y = selective_scan(x.view(batch, steps, self.ssm_heads, self.head_width), delta, w(p + "ssm_a").reshape(-1),
@@ -126,7 +120,7 @@ class NemotronHReference(Reference):
     def moe(self, layer: int, u: torch.Tensor) -> torch.Tensor:
         w, p = self.weights, f"blk.{layer}."
         rows = u.reshape(-1, self.hidden_size)
-        scores = torch.sigmoid(linear(rows, w(p + "ffn_gate_inp.weight")))
+        scores = sigmoid(linear(rows, w(p + "ffn_gate_inp.weight")))
         selected = route_top_k(scores + w(p + "exp_probs_b.bias"), self.experts_used[layer])
         weights = torch.gather(scores, 1, selected)
         weights = weights / (weights.sum(-1, keepdim=True) + 1e-20) * self.routed_scale

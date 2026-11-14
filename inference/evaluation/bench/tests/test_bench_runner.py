@@ -8,7 +8,7 @@ from pathlib import Path
 import magnitude_fixtures
 import psutil
 import pytest
-from bench_support import character_lengths
+from bench_support import TREE, character_lengths
 from magnitude_bench import report, runner
 from magnitude_bench.adapters.base import Adapter
 from magnitude_bench.adapters.llama_cpp import LlamaCpp
@@ -71,7 +71,7 @@ def measure(tmp_path, acquisition, artifacts, reference, sections=("single", "pa
         acquisition,
         artifacts,
         BUILD,
-        options or EngineOptions(),
+        options or EngineOptions(inference=TREE),
         ["magnitude-bench", "job", "--mode", "tools"],
         lambda _: None,
     )
@@ -128,7 +128,7 @@ async def test_gguf_engines_are_sized_and_counted_by_the_harness(
     )
     result = await runner.run(
         RunStore(tmp_path / "run"), "tools", [target], ("context",), (1500,), acquisition,
-        artifacts, BUILD, EngineOptions(magnitude=MagnitudeOptions(harness=fake_harness)),
+        artifacts, BUILD, EngineOptions(inference=TREE, magnitude=MagnitudeOptions.of(TREE, harness=fake_harness)),
         ["magnitude-bench"], lambda _: None,
     )
     assert result["status"] == "completed", result
@@ -419,7 +419,7 @@ async def test_watchdog_retires_a_stalled_engine_and_fails_the_run(
     monkeypatch.setattr(runner, "measure", stall)
     result = await asyncio.wait_for(
         measure(tmp_path, acquisition, artifacts, artifact_path,
-                options=EngineOptions(watchdog=watchdog)),
+                options=EngineOptions(inference=TREE, watchdog=watchdog)),
         10,
     )
     assert result["status"] == "failed"

@@ -46,8 +46,8 @@ from ..host import memory
 from ..host.agent import PLAN
 from ..host.memory import RECOMMIT, RESULTS
 from . import Answer, Instrument, JobResult, Plan, device, harness
-from .binaries import ASSESS, ASSESS_BUILD, ENGINE_BUILD
-from .assess import RUNNER
+from .assess import priced
+from .binaries import ASSESS_BUILD, ENGINE_BUILD
 
 
 def configure(parser: argparse.ArgumentParser) -> None:
@@ -101,15 +101,12 @@ def plan(arguments, source, host) -> Plan:
     kernels = ("--kernels", "{engine_cache}/kernels") if cap else ()
     job = _measurement((*given, "--artifacts", "{artifacts}", *kernels), fresh=bool(cap))
     if kind == "dedicated" and not arguments.pressure:
-        return Plan(builds=(ENGINE_BUILD, ASSESS_BUILD), jobs=(("memory", job),), device="timed",
-                    acquires=Weights(arguments.model))
-    measure = (("measure", Step("measure", (
-        "{python}", "-c", RUNNER, "{artifacts}", ASSESS, arguments.backend, "{engine_cache}/kernels",
-    ))),) if cap else ()  # the product's measurement job, for its own time (`step`)  # fmt: skip
+        return priced(Plan(builds=(ENGINE_BUILD, ASSESS_BUILD), jobs=(("memory", job),), device="timed",
+                           acquires=Weights(arguments.model)), bool(cap), arguments.backend)
     # The load's own footprint, not the device's: the device is held so no other load runs.
-    return Plan(builds=(harness.BUILD, *((ASSESS_BUILD,) if cap else ())), jobs=(*measure, ("memory", job)),
-                device="device", acquires=Weights(arguments.model),
-                files=(arguments.fixture,) if arguments.residency else ())
+    return priced(Plan(builds=(harness.BUILD,), jobs=(("memory", job),),
+                       device="device", acquires=Weights(arguments.model),
+                       files=(arguments.fixture,) if arguments.residency else ()), bool(cap), arguments.backend)
 
 
 def planned_memory(result: JobResult) -> str:

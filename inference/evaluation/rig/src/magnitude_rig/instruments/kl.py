@@ -14,6 +14,18 @@ what the trace states of each chosen unit's precision (its error in the rounding
 govern its admission, squared: a dimensionless contribution relative to resolution noise, not
 a predicted KL). Under `ab` with a selection, both builds run the selection.
 
+`--yardstick-perturbed SEED [SEED ...]` judges the build by the precision system's storage-resolution
+bar (D11, `inference/docs/precision.md`: the reference over its stored values moved one step, one draw
+per seed, built and cached beside the reference): the rig passes the seeds to the references' judgement,
+shows its `resolution` summary as it gives it, and answers by its `within` alone, so the rule and its
+summary change without the rig.
+
+`--checkpoint DIR` asks it of a whole GGUF set the host already holds in DIR, in place of a catalog model
+(a model no rig host can fetch whole): nothing is fetched, converted or copied, the set is read where it
+lies (`host/checkpoint.py` writes its acquisition object, naming it by its bytes), and the run is judged by
+the storage-resolution bar, so it takes `--yardstick-perturbed`. It asks the uncapped load against the
+reference; a model that does not fit its device streams.
+
 `--weight-cap BYTES` (repeatable) asks whether streaming the experts changes only where they
 live: the uncapped load's logits and each streamed load's (its experts read from storage,
 `fresh`), on the uncapped load's tokens, every entry at its declared default. A streamed load
@@ -52,7 +64,8 @@ import json
 from pathlib import Path
 
 from ..engine import Step, Weights
-from . import Answer, Instrument, JobResult, Pairing, Plan, environment, harness
+from . import Answer, Instrument, JobResult, Pairing, Plan, environment, harness, held
+from .assess import priced
 
 REFERENCES = "{venv}/bin/magnitude-references"
 BUILDS = (
@@ -142,6 +155,15 @@ COMPARE = (
 
 
 def configure(parser: argparse.ArgumentParser) -> None:
+    held.option(parser, " (with --yardstick-perturbed)")
+    parser.add_argument("--references-only", action="store_true",
+                        help="build and cache the references (the reference and each --yardstick-perturbed draw) of the "
+                        "fixtures' rendered tokens and judge no build: the passes that depend only on the model's "
+                        "stored values, done before any build is final")
+    parser.add_argument("--profile-references", action="store_true",
+                        help="time each batch of the reference builds it starts: wall, read and dequantize seconds")
+    parser.add_argument("--yardstick-perturbed", type=int, nargs="+", metavar="SEED",
+                        help="judge by the storage-resolution bar of these seeds' draws (the references' `resolution`)")
     parser.add_argument("--selection", type=_trace, metavar="TRACE",
                         help="a tuning trace (or its run directory): judge its chosen configurations against the defaults")
     parser.add_argument("--load", type=int, default=1, help="which load of the selection's trace (default 1)")
@@ -187,12 +209,13 @@ def render(arguments) -> Step:
     ))  # fmt: skip
 
 
-def judge(logits_run: str, *, base: str | None = None, own_rendering: str | None = None) -> Step:
-    """The judgement of `logits_run` against the reference (and `base`), which then removes the
-    logits it read from the host."""
+def judge(arguments, logits_run: str, *, base: str | None = None, own_rendering: str | None = None) -> Step:
+    """The judgement of `logits_run` against the reference (and `base`, and the storage-resolution
+    bar where the run names its seeds), which then removes the logits it read from the host."""
     extra = (("--base", f"{{runs}}/{base}") if base else ()) + (
         ("--own-rendering", f"{{runs}}/{own_rendering}/rendered.jsonl") if own_rendering else ()
-    )
+    ) + (() if arguments.yardstick_perturbed is None
+         else ("--yardstick-perturbed", *map(str, arguments.yardstick_perturbed)))
     return Step("kl", (
         REFERENCES, "kl", "--logits", f"{{runs}}/{logits_run}", *extra,
         "--artifacts", "{artifacts}", "--build-identity", "{build_file}",
@@ -251,7 +274,47 @@ def _capped(arguments) -> tuple[tuple[str, Step], ...]:
     return tuple(jobs)
 
 
+def references(arguments) -> Step:
+    """The references of the render's tokens, the draws of the run's seeds beside the reference, cached for the
+    judgements that follow."""
+    return Step("references", (
+        REFERENCES, "obtain", "--rendered", "{runs}/render/rendered.jsonl", "--artifacts", "{artifacts}",
+        "--build-identity", "{build_file}", "--cache", "{root}/references", "--logs", "{run_dir}",
+        "--output", "{run_dir}/references.json", *(("--profile",) if arguments.profile_references else ()),
+        *(("--yardstick-perturbed", *map(str, arguments.yardstick_perturbed)) if arguments.yardstick_perturbed else ()),
+    ))  # fmt: skip
+
+
+def _subject(arguments) -> None:
+    """Refuse a run whose subject or bar is not one the instrument asks: a catalog model or a held
+    set, a set judged by the storage-resolution bar against the reference, and that bar only
+    where a build is judged against the reference."""
+    held.subject("kl", arguments)
+    capped = bool(arguments.weight_cap) or arguments.repeat is not None  # loads compared with each other, not the reference
+    if arguments.references_only:
+        if arguments.selection is not None or capped or arguments.between or arguments.without_site:
+            raise SystemExit("kl: --references-only judges no build: it takes no --selection, --weight-cap, --repeat, "
+                             "--between or --without-site")
+    if arguments.checkpoint is not None:
+        if arguments.yardstick_perturbed is None and not arguments.references_only:
+            raise SystemExit("kl: --checkpoint is judged by the storage-resolution bar: give --yardstick-perturbed SEED [SEED ...]")
+        if arguments.selection is not None or capped or arguments.between or arguments.without_site:
+            raise SystemExit("kl: --checkpoint judges the uncapped load against the reference: it takes no --selection, "
+                             "--weight-cap, --repeat, --between or --without-site")
+    elif arguments.yardstick_perturbed is not None and capped:
+        raise SystemExit("kl: --yardstick-perturbed judges against the reference, which --weight-cap and --repeat do not")
+
+
 def plan(arguments, source, host) -> Plan:
+    _subject(arguments)
+    if arguments.references_only:
+        return Plan(builds=BUILDS, jobs=(*held.jobs(arguments), ("render", render(arguments)),
+                                         ("references", references(arguments))),
+                    device="device", acquires=held.acquires(arguments), files=(arguments.fixture,))
+    if arguments.checkpoint is not None:
+        jobs = (*held.jobs(arguments), ("logits", logits(arguments)), ("kl", judge(arguments, "logits")))
+        return priced(Plan(builds=BUILDS, jobs=jobs, device="device", acquires=None, files=(arguments.fixture,)),
+                      True, arguments.backend)
     if arguments.between and len(arguments.weight_cap or ()) != 2:
         raise SystemExit("kl: --between compares the loads under exactly two --weight-cap")
     if arguments.without_site and (arguments.between or not arguments.weight_cap):
@@ -260,22 +323,23 @@ def plan(arguments, source, host) -> Plan:
         raise SystemExit("kl: --repeat runs its passes on one load, under exactly one --weight-cap, "
                          "without --between or --without-site")
     if arguments.repeat:
-        return Plan(builds=BUILDS, jobs=_repeated(arguments), device="device", acquires=Weights(arguments.model),
-                    files=(arguments.fixture,))
+        return priced(Plan(builds=BUILDS, jobs=_repeated(arguments), device="device",
+                           acquires=Weights(arguments.model), files=(arguments.fixture,)), True, arguments.backend)
     if arguments.weight_cap:
         if arguments.selection is not None:
             raise SystemExit("kl: --weight-cap compares loads at the defaults, not a selection")
         jobs = _capped(arguments)
     elif arguments.selection is None:
-        jobs = (("logits", logits(arguments)), ("kl", judge("logits")))
+        jobs = (("logits", logits(arguments)), ("kl", judge(arguments, "logits")))
     else:
         jobs = (
             ("defaults", logits(arguments, pinning=("--tuning-defaults",))),
             ("selected", logits(arguments, rendered="{runs}/defaults/rendered.jsonl", pinning=_selecting(arguments))),
-            ("kl", judge("selected", base="defaults")),
+            ("kl", judge(arguments, "selected", base="defaults")),
         )
     files = (arguments.fixture,) + ((arguments.selection,) if arguments.selection else ())
-    return Plan(builds=BUILDS, jobs=jobs, device="device", acquires=Weights(arguments.model), files=files)
+    return priced(Plan(builds=BUILDS, jobs=jobs, device="device", acquires=Weights(arguments.model), files=files),
+                  bool(arguments.weight_cap), arguments.backend)
 
 
 def _failed(results: dict[str, JobResult]) -> Answer | None:
@@ -408,6 +472,14 @@ def _streamed(arguments, results: dict[str, JobResult]) -> Answer:
 def answer(arguments, results: dict[str, JobResult]) -> Answer:
     if (failure := _failed(results)) is not None:
         return failure
+    if arguments.references_only:
+        obtained = json.loads((results["references"].directory / "references.json").read_text())
+        subject = held.name(arguments)
+        return Answer((f"{subject} · {arguments.fixture.stem} @{arguments.context} · references only",
+                       *(f"{name}: {'cached' if each['cached'] else 'built this run'}"
+                         for name, each in (("reference", obtained["reference"]),
+                                            *((f"draw {seed}", draw) for seed, draw in
+                                              zip(arguments.yardstick_perturbed or (), obtained["draws"]))))), True)
     if arguments.repeat:
         return Answer(tuple(results["repeats"].output()), True)
     if arguments.weight_cap:
@@ -416,18 +488,43 @@ def answer(arguments, results: dict[str, JobResult]) -> Answer:
         return _selection(arguments, results)
     summary = json.loads((results["kl"].directory / "kl.json").read_text())
     reference = "cached" if summary["reference"]["cached"] else "built this run"
-    return Answer((
-        f"{arguments.model} · {arguments.fixture.stem} @{arguments.context} · reference {reference}",
+    lines = [
+        f"{held.name(arguments)} · {arguments.fixture.stem} @{arguments.context} · "
+        f"reference {reference}",
         _line("vs reference", summary["build"]),
-    ), True)
+    ]
+    if arguments.yardstick_perturbed is None:
+        return Answer(tuple(lines), True)
+    resolution = summary["resolution"]
+    return Answer((*lines, *_resolution(resolution, arguments.yardstick_perturbed)), resolution["within"])
+
+
+def _resolution(resolution: dict, seeds: list[int]) -> list[str]:
+    """The references' storage-resolution judgement as they give it: the rows it could judge, the
+    ratios of KL to each row's bar, the rows past it, and whether the build is within."""
+    rows, ratio, over = resolution["rows"], resolution["ratio"], resolution["over"]
+    lines = [f"alpha {resolution['alpha']} · vocabulary {resolution['vocabulary']} · rows judgeable "
+             f"{rows['judgeable']}, unjudgeable {rows['unjudgeable']}"]
+    if ratio is not None:
+        lines.append("ratio KL / bar: " + ", ".join(f"{name} {value:.4g}" for name, value in ratio.items()))
+    if resolution["unjudgeable_top1_agreement"] is not None:
+        lines.append(f"unjudgeable rows' top-1 agreement {100 * resolution['unjudgeable_top1_agreement']:.2f}%")
+    lines.append(f"{len(over)} rows past the bar")
+    lines += [f"  {row['fixture_id']}@{row['position']} ratio {row['ratio']:.4g}"
+              f"{', top-1 flipped' if row['top1_flipped'] else ''}" for row in sorted(over, key=lambda row: -row["ratio"])[:10]]
+    lines.append(("within" if resolution["within"] else "NOT within") + f" the storage-resolution bar (seeds {' '.join(map(str, seeds))})")
+    return lines
 
 
 def pair_jobs(arguments, base: str, candidate: str) -> tuple[tuple[str, str, Step], ...]:
     """(side, run name, step): the base renders and measures; the candidate is measured on the
     base's exact tokens, its own rendering compared, then judged against the base. Both run the
     base's tuning, or both the selection."""
+    _subject(arguments)
     if arguments.weight_cap:
         raise SystemExit("ab kl: --weight-cap compares loads of one build; run kl with it on each")
+    if arguments.checkpoint is not None:
+        raise SystemExit("ab kl: --checkpoint is a set the host holds, judged against the reference: run kl on each build")
     if arguments.selection is None:
         base_pinning, candidate_pinning = harness.RECORD, harness.REPLAY
     else:
@@ -437,7 +534,7 @@ def pair_jobs(arguments, base: str, candidate: str) -> tuple[tuple[str, str, Ste
         (candidate, "candidate-render", render(arguments)),
         (candidate, "candidate-logits",
          logits(arguments, rendered="{runs}/base-logits/rendered.jsonl", pinning=candidate_pinning)),
-        (candidate, "kl", judge("candidate-logits", base="base-logits", own_rendering="candidate-render")),
+        (candidate, "kl", judge(arguments, "candidate-logits", base="base-logits", own_rendering="candidate-render")),
     )
 
 
@@ -465,7 +562,7 @@ INSTRUMENT = Instrument(
     kind="fidelity",
     question="How far is one build from the float32 reference, at one fixture family and context?",
     observable="divergence from the reference",
-    selectors=("backend", "host", "build", "model", "context", "fixture", "purpose", "estimate"),
+    selectors=("backend", "host", "build", "model-or-checkpoint", "context", "fixture", "purpose", "estimate"),
     configure=configure,
     plan=plan,
     answer=answer,

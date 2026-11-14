@@ -19,6 +19,7 @@ import numpy as np
 import torch
 
 from magnitude_references import digest, record
+from magnitude_rig.host.identity import sha256
 from magnitude_references.contract import LOGITS, check_match, read_artifacts, read_logits, read_rendered
 from magnitude_references.families import family_of, open_reference
 from magnitude_references.sanity import Bounds, Gate
@@ -339,7 +340,7 @@ def checked_reference(path, rendered, vocabulary):
     if not measured_sanity["passed"]:
         raise ValueError(f"{path}: exact independent-reference logits failed their sanity gate")
     return result, {"directory": str(path), "record": record_value,
-                    "remeasured_sanity": measured_sanity, "logits_sha256": digest.sha256_file(path / "logits.f32")}
+                    "remeasured_sanity": measured_sanity, "logits_sha256": sha256(path / "logits.f32")}
 
 
 def run(args) -> dict:
@@ -347,7 +348,7 @@ def run(args) -> dict:
     torch.set_num_threads(args.threads)
     torch.set_num_interop_threads(1)
     artifacts = read_artifacts(args.artifacts)
-    if digest.sha256_file(artifacts.target) != artifacts.target_sha256:
+    if sha256(artifacts.target) != artifacts.target_sha256:
         raise ValueError("catalog artifact bytes do not match their identity")
     rendered_sets = [read_rendered(path) for path in args.rendered]
     for rendered in rendered_sets:
@@ -375,8 +376,8 @@ def run(args) -> dict:
             external_records.append(identity)
     identity = {
         "artifacts": artifacts.record, "rendered": [{"path": str(r.path), "sha256": r.digest} for r in rendered_sets],
-        "fixtures": [f.fixture_id for f in fixtures], "reference_implementation": digest.implementation(),
-        "probe_sha256": digest.sha256_file(Path(__file__)), "torch": torch.__version__, "numpy": np.__version__,
+        "fixtures": [f.fixture_id for f in fixtures], "reference_implementation": digest.implementation(type(reference), None, "cpu"),
+        "probe_sha256": sha256(Path(__file__)), "torch": torch.__version__, "numpy": np.__version__,
         "unit": args.unit, "independent_references": external_records,
     }
     identity_digest = digest.canonical(identity)

@@ -16,7 +16,7 @@ from magnitude_bench.models import catalog_reference
 from magnitude_fixtures import FAMILIES, encode_set, read_set
 from magnitude_fixtures import build as build_set
 
-from .sources import WORKTREE, SourceUnavailable, commit
+from .sources import WORKTREE, SourceUnavailable, checkout, commit
 from .state import HOME
 
 BACKENDS = ("metal", "cuda", "vulkan", "cpu")
@@ -37,8 +37,8 @@ def model(text: str) -> str:
     """A catalog model `<id>:<variant>`, as the serving benchmark (the catalog's reader here)
     checks it."""
     try:
-        return catalog_reference(text)
-    except ValueError as error:
+        return catalog_reference(text, checkout())
+    except (ValueError, SourceUnavailable) as error:
         raise argparse.ArgumentTypeError(str(error)) from None
 
 
@@ -96,6 +96,8 @@ SELECTORS = {
                                              "directory, never mrig's own) or a git ref"}),
     "model": Selector(("--model",), {"type": model, "required": True,
                                      "help": "catalog model <id>:<variant>"}),
+    "model-or-checkpoint": Selector(("--model",), {"type": model,
+                                                   "help": "catalog model <id>:<variant>, or --checkpoint DIR"}),
     "model-or-catalog": Selector(("--model",), {"type": model,
                                                 "help": "catalog model <id>:<variant>, or --catalog for all"}),
     "context": Selector(("--context",), {"type": int, "required": True,

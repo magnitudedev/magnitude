@@ -2,6 +2,7 @@ import json
 from argparse import Namespace
 
 import pytest
+from bench_support import TREE
 from magnitude_bench import validation
 from magnitude_bench.adapters import ADAPTERS
 from magnitude_bench.adapters.ollama_native import server, translate
@@ -63,7 +64,7 @@ def adapter(engine, kind, tmp_path, options=None, acquisition=None):
         artifact,
         acquisition,
         RunStore(tmp_path / "run"),
-        options or EngineOptions(ollama=OllamaOptions(models=tmp_path / "store")),
+        options or EngineOptions(inference=TREE, ollama=OllamaOptions(models=tmp_path / "store")),
     )
     value.executable = str(tmp_path / "ollama")
     value.store_directory = tmp_path / "store"
@@ -179,7 +180,7 @@ def test_answer_prefill_sends_ollamas_glimmer_prompt_through_the_raw_route(tmp_p
     with pytest.raises(ValueError):
         translate.prefilled_request({**chat, "tools": [{"type": "function"}]}, "llama-server")
 
-    options = EngineOptions(ollama=OllamaOptions(models=tmp_path / "store", answer_prefill=True))
+    options = EngineOptions(inference=TREE, ollama=OllamaOptions(models=tmp_path / "store", answer_prefill=True))
     selected = adapter("ollama-registry", "registry", tmp_path, options)
     assert "--answer-prefill" in selected.argv(1234, 65536, 1, tmp_path / "engine")
     plain = adapter("ollama-registry", "registry", tmp_path)
@@ -248,7 +249,7 @@ def test_ollama_launch_selects_source_and_leaves_defaults_alone(tmp_path):
         "ollama",
         "gguf",
         tmp_path,
-        EngineOptions(ollama=OllamaOptions(models=tmp_path / "store", context_headroom=16)),
+        EngineOptions(inference=TREE, ollama=OllamaOptions(models=tmp_path / "store", context_headroom=16)),
     )
     argv = roomy.argv(1234, 66048, 1, tmp_path / "engine")
     assert argv[argv.index("--context-headroom") + 1] == "16"
@@ -258,6 +259,7 @@ def test_ollama_launch_selects_source_and_leaves_defaults_alone(tmp_path):
     assert "--kv-cache-type" not in argv and "--registry-model" not in argv
 
     options = EngineOptions(
+        inference=TREE,
         ollama=OllamaOptions(models=tmp_path / "store", kv_cache_type="q8_0", flash_attention="on")
     )
     pulled = adapter("ollama-mlx", "registry", tmp_path, options)

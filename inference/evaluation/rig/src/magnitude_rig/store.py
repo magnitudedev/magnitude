@@ -11,7 +11,7 @@ import functools
 import subprocess
 from pathlib import Path
 
-from . import sync
+from . import sources
 
 RELATIVE = Path("evaluation") / "results"  # under the checkout's `inference/`
 
@@ -22,8 +22,8 @@ class StoreUnavailable(Exception):
 
 @functools.cache
 def results() -> Path:
-    """The store of this checkout's repository (`store_for`)."""
-    return store_for(sync.INFERENCE)
+    """The store of the invoking checkout's repository (`store_for`; `sources.checkout`: the one owner of which)."""
+    return store_for(sources.checkout())
 
 
 def store_for(inference: Path) -> Path:

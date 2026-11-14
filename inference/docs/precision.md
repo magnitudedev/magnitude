@@ -374,6 +374,20 @@ random noise, or only prompt logits cannot discharge these obligations.
 
 Whole-model checks use rendered chat fixtures and sane independent references, retain the full
 quality distribution, and distinguish default-relative movement from added reference loss.
+
+**Open defect: the per-row storage-resolution bar rejects noise.** The whole-model bar
+(`magnitude_references.kl`, D11) gives each row α² times the largest KL to the reference over a
+few perturbation draws, and admits a build only when every judgeable row is within its own bar.
+On near-certain rows one draw's KL can sit three decades past the others', so the largest of a
+few draws is no stable estimate of a row's resolution noise: a build that is itself one more
+draw can exceed it at a few rows of thousands and fail. The rule cannot be repaired in the
+tooling alone. More draws make such a failure rarer without bounding it, at a whole reference
+build each. A
+rule that admits some rows over, as many as each draw shows against the others, changes what the
+bar admits: whether it still rejects an error concentrated on a few rows is a property of the
+draws' per-row spread, which only measured draws on the host that holds the model can establish.
+Until then a failure of this bar is read with its rows' ratios and top-1 flips, never as proof
+that the build is worse than noise.
 Changing a KV codec has its own model-quality obligation: matching a compressed canonical kernel
 does not establish that the compression itself is suitable. `inference/evaluation`
 owns these measurements; empirical results and implementation status are recorded separately

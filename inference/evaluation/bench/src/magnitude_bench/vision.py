@@ -40,9 +40,11 @@ async def run(args):
     try:
         for drafting in (False, True):
             options = EngineOptions(
+                inference=args.inference,
                 drafting=drafting,
                 vision=True,
-                magnitude=MagnitudeOptions(
+                magnitude=MagnitudeOptions.of(
+                    args.inference,
                     binary=args.binary,
                     device=args.magnitude_device,
                     cache_dir=args.cache,
@@ -100,11 +102,12 @@ async def run(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--inference", type=Path, required=True, help="the checkout's inference/ tree")
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--cache", type=Path, required=True)
-    parser.add_argument("--magnitude-device", default=MagnitudeOptions().device)
+    parser.add_argument("--magnitude-device", default=MagnitudeOptions.model_fields["device"].default)
     raise SystemExit(asyncio.run(run(parser.parse_args())))
 
 
