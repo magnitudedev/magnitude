@@ -59,9 +59,9 @@ fn dense_output_rows<L: Isa, E: Elements>(
         |row, projected| {
             let source = residual.span([out_rows.get([row]) as usize, rows.start], rows.len());
             // SAFETY: each work item writes its own columns of every row.
-            let out = unsafe { result.span_mut([row, rows.start], rows.len()) };
+            let mut out = unsafe { result.span_mut([row, rows.start], rows.len()) };
             for ((target, residual), projected) in out.iter_mut().zip(source).zip(projected.iter()) {
-                *target = residual + activation::publish::<E::A>(down_scale * *projected);
+                target.set(residual + activation::publish::<E::A>(down_scale * *projected));
             }
         },
     );

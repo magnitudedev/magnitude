@@ -452,7 +452,7 @@ impl AdmittedOutput {
                 ),
             ))),
             Self::Scalar(AdmittedScalarOutput::Value { dtype, symbol }) => {
-                Ok(DecodedValue::Scalar(scalar_result(*dtype, *symbol, values)))
+                Ok(DecodedValue::scalar(scalar_result(*dtype, *symbol, values)))
             }
             Self::Scalar(AdmittedScalarOutput::Index { symbol }) => {
                 let Some(SymbolValue::Nat(value)) = values.get(*symbol) else {
@@ -460,7 +460,7 @@ impl AdmittedOutput {
                         "admitted index result slot has the wrong scalar sort".to_owned(),
                     )));
                 };
-                Ok(DecodedValue::Scalar(ArgumentValue::Index(value)))
+                Ok(DecodedValue::scalar(ArgumentValue::Index(value)))
             }
             Self::Scalar(AdmittedScalarOutput::Range { start, end }) => {
                 let (Some(SymbolValue::Nat(start)), Some(SymbolValue::Nat(end))) =
@@ -470,7 +470,7 @@ impl AdmittedOutput {
                         "admitted range result slots have the wrong scalar sort".to_owned(),
                     )));
                 };
-                Ok(DecodedValue::Scalar(ArgumentValue::Range { start, end }))
+                Ok(DecodedValue::scalar(ArgumentValue::Range { start, end }))
             }
         }
     }

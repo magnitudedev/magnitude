@@ -3,7 +3,7 @@
 // (`lib/routed/output.cuh`), published into the result for
 // `routed_output_sited`; no block joins.
 #define ROUTED_SOURCE_ROWS SEISMIC_CONST_SOURCE_ROWS
-#define ROUTED_PUBLISHED reinterpret_cast<element::Act::storage *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER))
-#define ROUTED_OUTPUT_ARRIVED(m, blocks, arrival, first, channels, published)
-#define ROUTED_OUTPUT_GATHERED_ARRIVED(blocks, arrival, first, channels, published)
+#define ROUTED_PUBLISHED_OUT SEISMIC_RESULT_0_OUT
+#define ROUTED_OUTPUT_ARRIVED(m, blocks, arrival, first, channels)
+#define ROUTED_OUTPUT_GATHERED_ARRIVED(blocks, arrival, first, channels)
 #include "lib/routed/output.cuh"

@@ -23,12 +23,13 @@
 kernel void routed_route_stage(
     device const float *residual [[buffer(SEISMIC_BUFFER_RESIDUAL)]],
     device const uchar *norm [[buffer(SEISMIC_BUFFER_NORM)]],
-    device uchar *normalized [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(normalized_cells),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint row_index [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     uint simd [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
+    const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> normalized(normalized_cells);
     const ulong row = ulong(row_index);
     threadgroup float partials[route_simdgroups];
     if (SEISMIC_DIM_NM == 0) {
@@ -38,8 +39,7 @@ kernel void routed_route_stage(
             for (ulong part = 0; part < SEISMIC_DIM_PT; ++part)
                 total += residual[row * SEISMIC_RESIDUAL_STRIDE_0
                     + (part * SEISMIC_DIM_H + source) * SEISMIC_RESIDUAL_STRIDE_1];
-            element::put<Act>(normalized, row * SEISMIC_RESULT_0_STRIDE_0 + source * SEISMIC_RESULT_0_STRIDE_1,
-                Act::round(total));
+            normalized.put(row * SEISMIC_RESULT_0_STRIDE_0 + source * SEISMIC_RESULT_0_STRIDE_1, total);
         }
         return;
     }
@@ -53,8 +53,8 @@ kernel void routed_route_stage(
     const float inverse = metal::rsqrt(total / float(SEISMIC_DIM_H) + eps);
     for (uint source = tid; source < SEISMIC_DIM_H; source += route_threads) {
         const float value = residual[row * SEISMIC_RESIDUAL_STRIDE_0 + source * SEISMIC_RESIDUAL_STRIDE_1];
-        element::put<Act>(normalized, row * SEISMIC_RESULT_0_STRIDE_0 + source * SEISMIC_RESULT_0_STRIDE_1,
-            Act::round(value * inverse * element::at<Norm>(norm, source * SEISMIC_NORM_STRIDE_0)));
+        normalized.put(row * SEISMIC_RESULT_0_STRIDE_0 + source * SEISMIC_RESULT_0_STRIDE_1,
+            value * inverse * element::at<Norm>(norm, source * SEISMIC_NORM_STRIDE_0));
     }
 }
 
@@ -65,10 +65,10 @@ kernel void routed_route_gemv(
     device const uchar *router [[buffer(SEISMIC_BUFFER_ROUTER)]],
     device const float *shared_router [[buffer(SEISMIC_BUFFER_SHARED_ROUTER)]],
     device int *routes [[buffer(SEISMIC_BUFFER_ROUTES)]],
-    device float *scores [[buffer(SEISMIC_BUFFER_SCORES)]],
+    SEISMIC_OUT_SCORES_PARAM(scores_cells),
     device const float *expert_scale [[buffer(SEISMIC_BUFFER_EXPERT_SCALE)]],
-    device uchar *normalized [[buffer(SEISMIC_RESULT_0_BUFFER)]],
-    device float *coefficient [[buffer(SEISMIC_RESULT_1_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(normalized_cells),
+    SEISMIC_RESULT_1_PARAM(coefficient_cells),
     arrive::coherent_device<float> logits [[buffer(SEISMIC_BUFFER_SCRATCH_LOGITS)]],
     device atomic_uint *arrivals [[buffer(SEISMIC_BUFFER_SCRATCH_ARRIVALS)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
@@ -80,6 +80,9 @@ kernel void routed_route_gemv(
     threadgroup float parts[SEISMIC_CONST_DECODE_ROWS * route_simdgroups];
     threadgroup float inverses[SEISMIC_CONST_DECODE_ROWS];
     threadgroup uint last;
+    const element::Out<ELEMENT_OF(SEISMIC_SCORES)> scores(scores_cells);
+    const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> normalized(normalized_cells);
+    const element::Out<ELEMENT_OF(SEISMIC_RESULT_1)> coefficient(coefficient_cells);
     const RouteRows in = decode_rows(residual, norm, parts, inverses, seismic_words, simd, lane, tid);
     route_group(in, router, shared_router, expert_scale, routes, scores, normalized, coefficient, logits, arrivals,
         seismic_words, shared, &last, group, tid, simd, lane);
@@ -108,7 +111,7 @@ struct RouteColumns {
 kernel void routed_route_gemm(
     device const uchar *router [[buffer(SEISMIC_BUFFER_ROUTER)]],
     device const float *shared_router [[buffer(SEISMIC_BUFFER_SHARED_ROUTER)]],
-    device const uchar *normalized [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(normalized_cells),
     arrive::coherent_device<float> logits [[buffer(SEISMIC_BUFFER_SCRATCH_LOGITS)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint2 group [[threadgroup_position_in_grid]],
@@ -116,12 +119,13 @@ kernel void routed_route_gemm(
     uint simd [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     constexpr uint H = SEISMIC_DIM_H;
+    const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> normalized(normalized_cells);
     threadgroup float shared[logits::extent];
     const RouteColumns columns{{{router, KERNEL_W0_LAYOUT(H), H, nullptr}}, shared_router};
     logits::tile<H>(SEISMIC_DIM_M, SEISMIC_DIM_E + 1, ulong(group.y) * logits::rows_per_tile,
         ulong(group.x) * logits::columns_per_tile,
         [&](ulong row, ulong k) {
-            return element::at<Act>(normalized, row * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1);
+            return normalized.at(row * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1);
         },
         columns, [&](ulong row, ulong expert, float value) { logits[logit_index(row, expert)] = value; }, shared, tid,
         simd, lane);
@@ -131,9 +135,9 @@ kernel void routed_route_gemm(
 // GEMV threadgroup to arrive.)
 kernel void routed_route_select(
     device int *routes [[buffer(SEISMIC_BUFFER_ROUTES)]],
-    device float *scores [[buffer(SEISMIC_BUFFER_SCORES)]],
+    SEISMIC_OUT_SCORES_PARAM(scores_cells),
     device const float *expert_scale [[buffer(SEISMIC_BUFFER_EXPERT_SCALE)]],
-    device float *coefficient [[buffer(SEISMIC_RESULT_1_BUFFER)]],
+    SEISMIC_RESULT_1_PARAM(coefficient_cells),
     device const float *logits [[buffer(SEISMIC_BUFFER_SCRATCH_LOGITS)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint group [[threadgroup_position_in_grid]],
@@ -142,6 +146,8 @@ kernel void routed_route_select(
     const ulong row = ulong(group) * route_simdgroups + simd;
     if (row >= SEISMIC_DIM_M)
         return;
+    const element::Out<ELEMENT_OF(SEISMIC_SCORES)> scores(scores_cells);
+    const element::Out<ELEMENT_OF(SEISMIC_RESULT_1)> coefficient(coefficient_cells);
     select_row(row, [&](ulong at) { return logits[at]; }, expert_scale, routes, scores, coefficient, seismic_words,
         lane);
 }

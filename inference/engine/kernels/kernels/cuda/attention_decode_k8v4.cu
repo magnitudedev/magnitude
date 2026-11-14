@@ -53,10 +53,10 @@ extern "C" __global__ void __launch_bounds__(attention::prefill::MMA_THREADS + a
     attention::prefill::attend(
         ATTENTION_INPUTS(),
         attention::AffineHistory{
-            reinterpret_cast<attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY_CODES)),
-            reinterpret_cast<attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY_COEFFICIENTS)),
-            reinterpret_cast<attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE_CODES)),
-            reinterpret_cast<attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE_COEFFICIENTS)),
+            reinterpret_cast<const attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY_CODES)),
+            SEISMIC_OUT_HISTORY_KEY_COEFFICIENTS,
+            reinterpret_cast<const attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE_CODES)),
+            SEISMIC_OUT_HISTORY_VALUE_COEFFICIENTS,
             SEISMIC_HISTORY_KEY_CODES_STRIDE_0, SEISMIC_HISTORY_KEY_CODES_STRIDE_1,
             SEISMIC_HISTORY_KEY_COEFFICIENTS_STRIDE_0, SEISMIC_HISTORY_KEY_COEFFICIENTS_STRIDE_1,
             SEISMIC_HISTORY_VALUE_CODES_STRIDE_0, SEISMIC_HISTORY_VALUE_CODES_STRIDE_1,
@@ -178,10 +178,10 @@ extern "C" __global__ void __launch_bounds__(WARPS * 32)
     seismic_dependents_launch();
     const attention::Inputs in = ATTENTION_INPUTS();
     const attention::AffineHistory history{
-        reinterpret_cast<u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY_CODES)),
-        reinterpret_cast<u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY_COEFFICIENTS)),
-        reinterpret_cast<u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE_CODES)),
-        reinterpret_cast<u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE_COEFFICIENTS)),
+        reinterpret_cast<const u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY_CODES)),
+        SEISMIC_OUT_HISTORY_KEY_COEFFICIENTS,
+        reinterpret_cast<const u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE_CODES)),
+        SEISMIC_OUT_HISTORY_VALUE_COEFFICIENTS,
         SEISMIC_HISTORY_KEY_CODES_STRIDE_0, SEISMIC_HISTORY_KEY_CODES_STRIDE_1,
         SEISMIC_HISTORY_KEY_COEFFICIENTS_STRIDE_0, SEISMIC_HISTORY_KEY_COEFFICIENTS_STRIDE_1,
         SEISMIC_HISTORY_VALUE_CODES_STRIDE_0, SEISMIC_HISTORY_VALUE_CODES_STRIDE_1,
@@ -261,10 +261,11 @@ extern "C" __global__ void __launch_bounds__(WARPS * 32)
                 // lookup divides 64-bit rows).
                 for (int part_lo = lo; part_lo < hi;) {
                     const int part_hi = history.slab_end(part_lo, hi);
-                    const u32 *key_rows = history.key_row(part_lo, kv);
-                    const u32 *value_rows = history.value_row(part_lo, kv);
-                    const u32 *key_pairs = history.key_pair(part_lo, kv) + pair;
-                    const u32 *value_pairs = history.value_pair(part_lo, kv) + pair;
+                    const attention::AffineReads::Vectors v = history.reads().vectors(part_lo, kv);
+                    const u32 *key_rows = v.key_codes;
+                    const u32 *value_rows = v.value_codes;
+                    const u32 *key_pairs = v.key_pairs + pair;
+                    const u32 *value_pairs = v.value_pairs + pair;
                     const u64 key_step = history.key_codes_row;
                     const u64 value_step = history.value_codes_row;
                     const u64 key_pair_step = history.key_pairs_row / 2;
@@ -313,8 +314,8 @@ extern "C" __global__ void __launch_bounds__(WARPS * 32)
                         for (int j = 0; j < KeyCodes::words; ++j) k[t][j] = e.key.codes[j];
 #pragma unroll
                         for (int j = 0; j < ValueCodes::words; ++j) v[t][j] = e.value.codes[j];
-                        kc[t] = attention::coefficients(e.key.pair);
-                        vc[t] = attention::coefficients(e.value.pair);
+                        kc[t] = make_float2(e.key.scale, e.key.zero);
+                        vc[t] = make_float2(e.value.scale, e.value.zero);
                     }
                     absorb(state, bias, q, qsum, k, kc, v, vc, count, lane);
                 }
@@ -337,5 +338,5 @@ extern "C" __global__ void attention_decode_k8v4_merge(SEISMIC_KERNEL_PARAMS) {
         ATTENTION_INPUTS(),
         reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS)),
         reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS)),
-        SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), blockIdx.x, blockIdx.y, threadIdx.x);
+        SEISMIC_RESULT_0_OUT, blockIdx.x, blockIdx.y, threadIdx.x);
 }

@@ -15,7 +15,7 @@ typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
     device const float *hidden [[buffer(SEISMIC_BUFFER_HIDDEN)]],                       \
     device const float *inverse [[buffer(SEISMIC_BUFFER_INVERSE)]],                     \
     device const uchar *norm [[buffer(SEISMIC_BUFFER_NORM)]],                           \
-    device float *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],                           \
+    SEISMIC_RESULT_0_PARAM(result_cells),                                               \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
 
 #define STREAM_MIX_UP_OPERANDS                                                          \
@@ -23,7 +23,7 @@ typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
     const uint n = uint(SEISMIC_DIM_S * SEISMIC_DIM_H);                                 \
     projection::Plain<activation, projection::AllRows> in{low, SEISMIC_LOW_STRIDE_0,    \
         SEISMIC_LOW_STRIDE_1, k, {}};                                                   \
-    projection::Mix<norm_element> out{result, SEISMIC_RESULT_0_STRIDE_0,                \
+    projection::Mix<norm_element> out{element::Out<element::F32>(result_cells), SEISMIC_RESULT_0_STRIDE_0, \
         SEISMIC_RESULT_0_STRIDE_1, hidden, SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_2, \
         inverse, SEISMIC_INVERSE_STRIDE_0, SEISMIC_INVERSE_STRIDE_1, norm,              \
         SEISMIC_NORM_STRIDE_1, uint(SEISMIC_DIM_H), float(SEISMIC_DIM_S)};              \

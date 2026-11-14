@@ -63,10 +63,10 @@ fn readout_head_rows_rows<L: Isa, E: Elements>(
         quantized,
         |row, projected| {
             // SAFETY: each work item writes its own columns of every row.
-            let logits = unsafe { result.span_mut([row, rows.start], rows.len()) };
+            let mut logits = unsafe { result.span_mut([row, rows.start], rows.len()) };
             for (logit, value) in logits.iter_mut().zip(projected) {
                 let value = *value * scale;
-                *logit = if cap > 0.0 { functions::softcap(cap, value) } else { value };
+                logit.set(if cap > 0.0 { functions::softcap(cap, value) } else { value });
             }
         },
     );

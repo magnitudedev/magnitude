@@ -27,7 +27,7 @@ typedef element::F16 activation;
     device const float *key_norm [[buffer(SEISMIC_BUFFER_KEY_NORM)]],                            \
     device const int *coordinates [[buffer(SEISMIC_BUFFER_COORDINATES)]],                        \
     device const int *spans [[buffer(SEISMIC_BUFFER_SPANS)]],                                    \
-    device uchar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],                                    \
+    SEISMIC_RESULT_0_PARAM(result),                                                              \
     device uchar *operands [[buffer(SEISMIC_BUFFER_SCRATCH_OPERANDS)]],                          \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
 
@@ -68,13 +68,13 @@ kernel void vision_attention_attend(ATTENTION_ARGUMENTS,
     const float scale = int(SEISMIC_PARAM_UNIT_SCALE) != 0 ? 1.0f : metal::rsqrt(float(VISION_W));
 #if SEISMIC_HAS_TENSOR_OPS
     ATTEND_TENSOR_SLOTS(slots);
-    vision::attend_tensor<S, VISION_W, VISION_WP>(reinterpret_cast<device const S *>(operands),
-        reinterpret_cast<device S *>(result), uint(SEISMIC_DIM_M), VISION_H, SEISMIC_DIM_G, scale,
+    vision::attend_tensor<activation, VISION_W, VISION_WP>(reinterpret_cast<device const S *>(operands),
+        element::Out<activation>(result), uint(SEISMIC_DIM_M), VISION_H, SEISMIC_DIM_G, scale,
         SEISMIC_DIM_WS == 1 ? spans : nullptr, keys, values, bounds, slots, group.x, group.y, thread_index, simd,
         lane);
 #else
-    vision::attend<S, VISION_W, VISION_WP>(reinterpret_cast<device const S *>(operands),
-        reinterpret_cast<device S *>(result), uint(SEISMIC_DIM_M), VISION_H, SEISMIC_DIM_G, scale,
+    vision::attend<activation, VISION_W, VISION_WP>(reinterpret_cast<device const S *>(operands),
+        element::Out<activation>(result), uint(SEISMIC_DIM_M), VISION_H, SEISMIC_DIM_G, scale,
         SEISMIC_DIM_WS == 1 ? spans : nullptr, keys, values, bounds, group.x, group.y, thread_index, simd, lane);
 #endif
 }

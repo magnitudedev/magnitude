@@ -13,7 +13,7 @@ void corrector_nodes() {
     const uint64_t feature_bias = SEISMIC_PTR(SEISMIC_BUFFER_FEATURE_BIAS);
     const uint64_t slot_rows = SEISMIC_PTR(SEISMIC_BUFFER_SLOT);
     const uint64_t rank_rows = SEISMIC_PTR(SEISMIC_BUFFER_RANK);
-    const uint64_t result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const Out result = SEISMIC_RESULT_0_OUT;
     const uint64_t rows = SEISMIC_DIM_J, count = SEISMIC_DIM_K, width = SEISMIC_DIM_H;
     const uint64_t total = SEISMIC_DIM_S * rows * count * width;
     const uint64_t step = uint64_t(gl_NumWorkGroups.x) * gl_WorkGroupSize.x;
@@ -32,7 +32,7 @@ void corrector_nodes() {
             + element_f32_at(rank_rows + (candidate * SEISMIC_RANK_STRIDE_0 + column * SEISMIC_RANK_STRIDE_1) * 4ul);
         if (SEISMIC_DIM_TB == 1ul)
             value += element_f32_at(token_bias + column * SEISMIC_TOKEN_BIAS_STRIDE_1 * 4ul);
-        element_f32_put(result + (slot * SEISMIC_RESULT_0_STRIDE_0 + mask * SEISMIC_RESULT_0_STRIDE_1
-            + candidate * SEISMIC_RESULT_0_STRIDE_2 + column * SEISMIC_RESULT_0_STRIDE_3) * 4ul, value);
+        out_put(result, slot * SEISMIC_RESULT_0_STRIDE_0 + mask * SEISMIC_RESULT_0_STRIDE_1
+            + candidate * SEISMIC_RESULT_0_STRIDE_2 + column * SEISMIC_RESULT_0_STRIDE_3, value);
     }
 }

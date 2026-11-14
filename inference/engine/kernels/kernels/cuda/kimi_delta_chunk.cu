@@ -28,6 +28,6 @@ extern "C" __global__ void kimi_delta_chunk_gate(SEISMIC_KERNEL_PARAMS) {
     recurrent::gate_row<ELEMENT_OF(SEISMIC_RECURRENT_NORM)>(
         in.base, kimi::ChannelGates{in}.gate_input(), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_MIXED),
         SEISMIC_PTR(SEISMIC_BUFFER_RECURRENT_NORM), element::word_f32(SEISMIC_PARAM_EPSILON),
-        SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), blockIdx.x);
+        SEISMIC_RESULT_0_OUT, blockIdx.x);
 }
 #endif

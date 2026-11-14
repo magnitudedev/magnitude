@@ -26,7 +26,7 @@ using Epi = Scaling::type<projection::Logits>;
 #define STAGING SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)
 #define HEAD KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT))
 #define EPILOGUE                                                                                              \
-    Scaling::wrap(projection::Logits{SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0,              \
+    Scaling::wrap(projection::Logits{SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0,                                \
                                      __uint_as_float((unsigned)SEISMIC_PARAM_SOFTCAP)},                           \
                   projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT_SCALE), SEISMIC_DIM_WS, 0, 0), 1.0f)
 

@@ -30,10 +30,10 @@ kernel void gated_delta_step(
     device const int *previous_bank [[buffer(SEISMIC_BUFFER_PREVIOUS_BANK)]],
     device const int *previous_tape [[buffer(SEISMIC_BUFFER_PREVIOUS_TAPE)]],
     device const int *following_bank [[buffer(SEISMIC_BUFFER_FOLLOWING_BANK)]],
-    device const ulong *window [[buffer(SEISMIC_BUFFER_WINDOW)]],
-    device const ulong *delta [[buffer(SEISMIC_BUFFER_DELTA)]],
-    device const ulong *tape [[buffer(SEISMIC_BUFFER_TAPE)]],
-    device recurrent::Storage *gated [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_OUT_WINDOW_PARAM(window),
+    SEISMIC_OUT_DELTA_PARAM(delta),
+    SEISMIC_OUT_TAPE_PARAM(tape),
+    SEISMIC_RESULT_0_PARAM(gated),
     arrive::coherent_device<recurrent::Storage> mixed [[buffer(SEISMIC_BUFFER_SCRATCH_MIXED)]],
     device atomic_uint *arrivals [[buffer(SEISMIC_BUFFER_SCRATCH_ARRIVALS)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
@@ -48,7 +48,7 @@ kernel void gated_delta_step(
     threadgroup float beta_block[RST_BLOCK];
     threadgroup float decay_block[RST_BLOCK];
     threadgroup uint last;
-    const recurrent::Slot slot = recurrent::slot_of(segments, stop, previous_bank, previous_tape, following_bank,
+    const recurrent::Slot slot = versions::slot_of({segments, stop, previous_bank, previous_tape, following_bank},
         group.z, seismic_words);
     // The successor bank's window is no slot's source, so it is written first.
     if (group.y == 0)
@@ -56,6 +56,7 @@ kernel void gated_delta_step(
             seismic_words);
     recurrent::step<RST_LANE_ROWS, RST_BLOCK>(recurrent::Convolving{projection, window, convolution, slot},
         recurrent::HeadRule{projection, rate, time_bias}, recurrent::projected_gate(projection, seismic_words),
-        recurrent_norm, gated, mixed, arrivals, delta, tape, slot, group, query_block, key_block, value_block,
-        beta_block, decay_block, &last, thread_index, threadgroup_shape.x, simdgroup, lane, seismic_words);
+        recurrent_norm, element::Out<element::Act>(gated), mixed, arrivals, delta, tape, slot, group, query_block,
+        key_block, value_block, beta_block, decay_block, &last, thread_index, threadgroup_shape.x, simdgroup, lane,
+        seismic_words);
 }

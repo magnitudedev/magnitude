@@ -399,7 +399,7 @@ pub(super) fn observe(
                     retain.as_deref_mut(),
                 )?,
             },
-            DecodedValue::Scalar(value) => Observation::Scalar(value),
+            DecodedValue::Scalar(value) => Observation::Scalar(value.into_value()),
         });
     }
     for state in states {

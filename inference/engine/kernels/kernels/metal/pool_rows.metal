@@ -83,7 +83,7 @@ kernel void pool_rows_append(
     device const float *bias [[buffer(SEISMIC_BUFFER_BIAS)]],
     device const int *coordinates [[buffer(SEISMIC_BUFFER_COORDINATES)]],
     device const int *window_destinations [[buffer(SEISMIC_BUFFER_WINDOW_DESTINATIONS)]],
-    device const ulong *window_rows [[buffer(SEISMIC_BUFFER_WINDOW_ROWS)]],
+    SEISMIC_OUT_WINDOW_ROWS_PARAM(window_rows),
     device const ulong *window_coordinates [[buffer(SEISMIC_BUFFER_WINDOW_COORDINATES)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint3 group [[threadgroup_position_in_grid]],
@@ -94,15 +94,15 @@ kernel void pool_rows_append(
         return;
     const ulong slab_rows = ulong(SEISMIC_PARAM_WINDOW_SLAB_ROWS);
     constexpr uint width = (POOL_GATED ? 2 : 1) * POOL_W;
-    device float *target = slab::row<float>(window_rows, ulong(destination), slab_rows, width);
+    const element::Out<element::F32> target = slab::out_row(window_rows, ulong(destination), slab_rows, width);
     float x[POOL_E];
     pooled::own_row(x, u + row * POOL_W, norm, bias, as_type<float>(uint(SEISMIC_PARAM_EPSILON)), lane, true);
     POOL_UNROLL
     for (uint k = 0; k < POOL_E; ++k)
-        target[lane + 32 * k] = x[k];
+        target.put(lane + 32 * k, x[k]);
     if (POOL_GATED)
         for (uint column = lane; column < POOL_W; column += 32)
-            target[POOL_W + column] = g[row * POOL_W + column];
+            target.put(POOL_W + column, g[row * POOL_W + column]);
     if (lane < 4)
         slab::row<int>(window_coordinates, ulong(destination), slab_rows, 4)[lane] = coordinates[row * 4 + lane];
 }
@@ -119,10 +119,10 @@ kernel void pool_rows_complete(
     device const int *coordinates [[buffer(SEISMIC_BUFFER_COORDINATES)]],
     device const int *window_visible [[buffer(SEISMIC_BUFFER_WINDOW_VISIBLE)]],
     device const int *block_destinations [[buffer(SEISMIC_BUFFER_BLOCK_DESTINATIONS)]],
-    device const ulong *window_rows [[buffer(SEISMIC_BUFFER_WINDOW_ROWS)]],
+    SEISMIC_OUT_WINDOW_ROWS_PARAM(window_rows),
     device const ulong *window_coordinates [[buffer(SEISMIC_BUFFER_WINDOW_COORDINATES)]],
-    device const ulong *block_rows [[buffer(SEISMIC_BUFFER_BLOCK_ROWS)]],
-    device float *latent [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_OUT_BLOCK_ROWS_PARAM(block_rows),
+    SEISMIC_RESULT_0_PARAM(latent),
     device int *latent_rows [[buffer(SEISMIC_RESULT_1_BUFFER)]],
     device int *latent_coordinates [[buffer(SEISMIC_RESULT_2_BUFFER)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
@@ -133,11 +133,12 @@ kernel void pool_rows_complete(
     constexpr uint width = (POOL_GATED ? 2 : 1) * W;
     const ulong row = group.x;
     const int destination = block_destinations[row];
-    device float *published = latent + row * SEISMIC_RESULT_0_STRIDE_0;
+    const element::Out<element::F32> published =
+        element::Out<element::F32>(latent).offset(row * SEISMIC_RESULT_0_STRIDE_0);
     if (destination < 0) {
         POOL_UNROLL
         for (uint i = 0; i < E; ++i)
-            published[(lane * E + i) * SEISMIC_RESULT_0_STRIDE_1] = 0.0f;
+            published.put((lane * E + i) * SEISMIC_RESULT_0_STRIDE_1, 0.0f);
         if (lane == 0)
             latent_rows[row * SEISMIC_RESULT_1_STRIDE_0] = -1;
         if (lane < 4)
@@ -221,7 +222,7 @@ kernel void pool_rows_complete(
     }
     POOL_UNROLL
     for (uint i = 0; i < E; ++i)
-        published[(lane * E + i) * SEISMIC_RESULT_0_STRIDE_1] = x[i];
+        published.put((lane * E + i) * SEISMIC_RESULT_0_STRIDE_1, x[i]);
     if (lane == 0)
         latent_rows[row * SEISMIC_RESULT_1_STRIDE_0] = destination;
     // Rotated at the group's first token, rounded, stored.
@@ -235,9 +236,9 @@ kernel void pool_rows_complete(
     rounding::round_lanes<E>(x, trained);
     // Stored in the row element Y (A holds every rounded value; F32 keys
     // hold every value).
-    device pooled::Row::storage *target = reinterpret_cast<device pooled::Row::storage *>(
-        slab::row<pooled::Row::native>(block_rows, ulong(destination), ulong(SEISMIC_PARAM_BLOCK_SLAB_ROWS), W));
+    const element::Out<pooled::Row> target =
+        slab::out_row(block_rows, ulong(destination), ulong(SEISMIC_PARAM_BLOCK_SLAB_ROWS), W);
     POOL_UNROLL
     for (uint i = 0; i < E; ++i)
-        target[lane * E + i] = pooled::Row::store(x[i]);
+        target.put(lane * E + i, x[i]);
 }

@@ -166,7 +166,7 @@ fn routed_combine<L: Isa, E: Elements>(
             let factor = injected.then(|| inject.get([row, stream]));
             let source = residual.span([row, first], columns.len());
             // SAFETY: each work item writes its own channels of every row.
-            let out = unsafe { result.span_mut([row, first], columns.len()) };
+            let mut out = unsafe { result.span_mut([row, first], columns.len()) };
             for (((target, residual), selected), projected) in out
                 .iter_mut()
                 .zip(source)
@@ -174,10 +174,10 @@ fn routed_combine<L: Isa, E: Elements>(
                 .zip(projected.iter())
             {
                 let shared = activation::publish::<E::A>(*projected) * coefficient;
-                *target = match factor {
+                target.set(match factor {
                     None => residual + selected + shared,
                     Some(factor) => residual + (selected + shared) * factor,
-                };
+                });
             }
         }
     }

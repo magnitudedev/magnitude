@@ -4,7 +4,6 @@
 // raised threshold (`lib/readout/progressive.cuh`).
 #include "lib/readout/progressive.cuh"
 
-#define F32_AT(buffer) reinterpret_cast<float *>(SEISMIC_PTR(buffer))
 #define F32_IN(buffer) reinterpret_cast<const float *>(SEISMIC_PTR(buffer))
 
 #ifdef SEISMIC_FORMING_READOUT_REFINE_ROWS_GATHER
@@ -20,13 +19,14 @@ extern "C" __global__ void readout_refine_rows_gather(SEISMIC_KERNEL_PARAMS) {
         SEISMIC_MASK_STRIDE_1, reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_CONSTRAINED)),
         SEISMIC_CONSTRAINED_STRIDE_0, __uint_as_float((unsigned)SEISMIC_PARAM_SOFTCAP)};
     const float *radius = F32_IN(SEISMIC_BUFFER_RADIUS);
+    const progressive::F32Out threshold = SEISMIC_RESULT_1_OUT;
     // Radius columns 0 and 1: the 4- and 5-bit views'.
     progressive::gather<true>(SEISMIC_PTR(SEISMIC_BUFFER_FEATURES), SEISMIC_FEATURES_STRIDE_0, planes, radius,
                               radius + SEISMIC_RADIUS_STRIDE_1, SEISMIC_RADIUS_STRIDE_0, F32_IN(SEISMIC_BUFFER_COARSE),
                               SEISMIC_COARSE_STRIDE_0, SEISMIC_COARSE_STRIDE_1, F32_IN(SEISMIC_BUFFER_FLOOR),
                               SEISMIC_FLOOR_STRIDE_0, F32_IN(SEISMIC_BUFFER_LENGTH), SEISMIC_LENGTH_STRIDE_0,
-                              selection, F32_AT(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0,
-                              SEISMIC_RESULT_0_STRIDE_1, F32_AT(SEISMIC_RESULT_1_BUFFER), SEISMIC_RESULT_1_STRIDE_0,
+                              selection, SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0,
+                              SEISMIC_RESULT_0_STRIDE_1, &threshold, SEISMIC_RESULT_1_STRIDE_0,
                               reinterpret_cast<unsigned *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_BOUNDS)),
                               SEISMIC_DIM_O, SEISMIC_DIM_V, SEISMIC_DIM_D);
 }

@@ -86,8 +86,8 @@ fn vision_attention_attend<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, grou
     );
     let result = cx.result_0();
     // SAFETY: each work item writes its own head of its own row.
-    let out = unsafe { result.span_mut([row, head, 0], w) };
+    let mut out = unsafe { result.span_mut([row, head, 0], w) };
     for (target, value) in out.iter_mut().zip(attended.iter()) {
-        *target = E::A::narrow(*value);
+        target.set(*value);
     }
 }

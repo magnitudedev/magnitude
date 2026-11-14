@@ -33,11 +33,11 @@ void post_norm_residual() {
     const uint64_t source = uint64_t(element_i32_index(SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS), row * SEISMIC_OUT_ROWS_STRIDE_0));
     const uint64_t residual = SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL) + source * SEISMIC_RESIDUAL_STRIDE_0 * 4ul;
     const uint64_t norm = SEISMIC_PTR(SEISMIC_BUFFER_NORM);
-    const uint64_t result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + row * SEISMIC_RESULT_0_STRIDE_0 * 4ul;
+    const Out result = out_offset(SEISMIC_RESULT_0_OUT, row * SEISMIC_RESULT_0_STRIDE_0);
     for (uint64_t i = thread; i < width; i += gl_WorkGroupSize.x) {
         const float normalized = element_f32_at(projected + i * SEISMIC_PROJECTED_STRIDE_1 * 4ul) * inverse
             * element_at(RESIDUAL_NORM, norm, i * SEISMIC_NORM_STRIDE_0);
-        element_f32_put(result + i * SEISMIC_RESULT_0_STRIDE_1 * 4ul,
+        out_put(result, i * SEISMIC_RESULT_0_STRIDE_1,
             (element_f32_at(residual + i * SEISMIC_RESIDUAL_STRIDE_1 * 4ul) + normalized) * scale);
     }
 }

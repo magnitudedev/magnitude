@@ -198,11 +198,12 @@ template <class B> inline ulong record_items(constant ulong *seismic_words, uint
 }
 
 // Item `item` of the dense source record at `record` into the destination
-// record at `out`: its span staged into `window`, each element then decoded
+// record `out`: its span staged into `window`, each element then decoded
 // to F32 and rounded into the destination, `import_dense`'s conversion, from
 // the window.
 template <class B>
-inline void convert_span(STAGED *record, device uchar *out, constant ulong *seismic_words, ulong item,
+inline void convert_span(STAGED *record, element::Out<typename Dense<B>::Destination> out,
+    constant ulong *seismic_words, ulong item,
     threadgroup uchar *window, uint tid, uint threads) {
     typedef typename Dense<B>::Source Source;
     typedef typename Dense<B>::Destination Destination;
@@ -218,7 +219,7 @@ inline void convert_span(STAGED *record, device uchar *out, constant ulong *seis
     uint row = (first + tid) / k, column = (first + tid) % k;
     const uint row_step = threads / k, column_step = threads % k;
     for (uint e = tid; e < count; e += threads) {
-        element::put<Destination>(out, ulong(row) * B::out_stride_1(seismic_words) + ulong(column) * B::out_stride_2(seismic_words),
+        out.put(ulong(row) * B::out_stride_1(seismic_words) + ulong(column) * B::out_stride_2(seismic_words),
             Source::load(reinterpret_cast<threadgroup const typename Source::storage *>(window)[e]));
         row += row_step;
         column += column_step;
@@ -238,8 +239,24 @@ inline void convert_window(STAGED *record, device uchar *out, constant ulong *se
 // `simdgroups` simdgroups): a dense record's row by element conversion, a
 // packed record's window by `repack_tile`. Every thread calls it; it begins
 // and ends with a threadgroup barrier, so `window` is free to reuse after it.
+// A record's destination as `convert_item` takes it: a dense record's elements only through the
+// owner's handle, a packed record's bytes.
+template <class B, bool DENSE = B::dense()>
+struct ItemOut {
+    typedef device uchar *type;
+    static type of(device uchar *region) { return region; }
+};
 template <class B>
-inline void convert_item(STAGED *record, device uchar *out, constant ulong *seismic_words, ulong item,
+struct ItemOut<B, true> {
+    typedef typename Dense<B>::Destination Destination;
+    typedef element::Out<Destination> type;
+    static type of(device uchar *region) {
+        return element::out_over_scratch<Destination>(region);
+    }
+};
+
+template <class B>
+inline void convert_item(STAGED *record, typename ItemOut<B>::type out, constant ulong *seismic_words, ulong item,
     threadgroup uchar *window, uint tid, uint threads, uint simd, uint simdgroups, uint lane) {
     if constexpr (B::dense()) {
         convert_span<B>(record, out, seismic_words, item, window, tid, threads);

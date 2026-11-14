@@ -32,7 +32,7 @@ using Epi = Scaling::type<Output::type>;
 #define EPILOGUE                                                                                     \
     Scaling::wrap(                                                                                   \
         Output::make(reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN)), SEISMIC_HIDDEN_STRIDE_0, \
-                     projection::AllRows{}, reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)), \
+                     projection::AllRows{}, SEISMIC_RESULT_0_OUT, \
                      SEISMIC_RESULT_0_STRIDE_0, reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_INJECT)), \
                      SEISMIC_INJECT_STRIDE_0, SEISMIC_DIM_D),                                        \
         projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_OUTPUT_SCALE), SEISMIC_DIM_OS, 0, 0), 1.0f)

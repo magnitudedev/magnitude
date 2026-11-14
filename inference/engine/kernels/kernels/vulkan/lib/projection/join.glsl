@@ -13,7 +13,7 @@
 // the residual streams mixed by the comb after the inject values
 // (sum_s comb[s, d] residual[s], sources ascending, the comb source major)
 // plus y inject[d]. `inject` is the row's inject values, contiguous.
-void join_scatter(uint64_t result, uint64_t result_stride, uint64_t residual, uint64_t residual_stride, uint64_t inject,
+void join_scatter(Out result, uint64_t result_stride, uint64_t residual, uint64_t residual_stride, uint64_t inject,
     uint streams, uint width, const bool combed, uint64_t n, float y) {
     const uint64_t comb = inject + uint64_t(streams) * 4ul;
     for (uint d = 0u; d < streams; ++d) {
@@ -26,7 +26,7 @@ void join_scatter(uint64_t result, uint64_t result_stride, uint64_t residual, ui
         } else {
             mixed = element_f32_at(residual + (uint64_t(d * width) + n) * residual_stride * 4ul);
         }
-        element_f32_put(result + (uint64_t(d * width) + n) * result_stride * 4ul,
+        out_put(result, (uint64_t(d * width) + n) * result_stride,
             mixed + y * element_f32_at(inject + uint64_t(d) * 4ul));
     }
 }

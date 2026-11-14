@@ -434,9 +434,9 @@ __device__ __forceinline__ Ranked rank_row(Logit logit, unsigned lane) {
 struct Selection {
     int *routes;
     unsigned long long route_row, route_slot;
-    float *scores;
+    element::Out<element::F32> scores;
     unsigned long long score_row, score_slot;
-    float *coefficient;
+    element::Out<element::F32> coefficient;
     unsigned long long coefficient_row;
     bool normalize;
     // The `expert_scale` port (static extent ES; read only where present).
@@ -447,9 +447,8 @@ struct Selection {
 #define ROUTE_SELECTION                                                                                   \
     route::Selection {                                                                                    \
         reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES)), SEISMIC_ROUTES_STRIDE_0,             \
-            SEISMIC_ROUTES_STRIDE_1, reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCORES)),       \
-            SEISMIC_SCORES_STRIDE_0, SEISMIC_SCORES_STRIDE_1,                                             \
-            reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER)), SEISMIC_RESULT_1_STRIDE_0,   \
+            SEISMIC_ROUTES_STRIDE_1, SEISMIC_OUT_SCORES, SEISMIC_SCORES_STRIDE_0, SEISMIC_SCORES_STRIDE_1, \
+            SEISMIC_RESULT_1_OUT, SEISMIC_RESULT_1_STRIDE_0,                                              \
             SEISMIC_PARAM_NORMALIZE != 0,                                                                 \
             reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_SCALE)),                    \
             SEISMIC_EXPERT_SCALE_STRIDE_0                                                                 \
@@ -478,9 +477,9 @@ __device__ __forceinline__ void select_row(Logit logit, const Selection &out, un
         if (SEISMIC_DIM_ES != 0)
             score = seismic_mul_rn(score,
                 out.expert_scale[static_cast<unsigned long long>(ranked.winners[rank]) * out.expert_scale_stride]);
-        out.scores[row * out.score_row + slot * out.score_slot] = score;
+        out.scores.put(row * out.score_row + slot * out.score_slot, score);
     }
-    out.coefficient[row * out.coefficient_row] = 1.0f / (1.0f + expf(-logit(SEISMIC_DIM_E)));
+    out.coefficient.put(row * out.coefficient_row, 1.0f / (1.0f + expf(-logit(SEISMIC_DIM_E))));
 }
 
 // Router blocks of the decode rows: a warp a logit column, the
@@ -498,7 +497,7 @@ constexpr unsigned BLOCKS = (static_cast<unsigned>(SEISMIC_DIM_E) + SEISMIC_TUNE
 // block.
 template <class Form>
 __device__ __forceinline__ bool route_block(const Input &in, const Form &form, const Columns &w, const Selection &out,
-                                            unsigned char *normalized, unsigned long long normalized0,
+                                            element::Out<Act> normalized, unsigned long long normalized0,
                                             unsigned long long normalized1, float *logits, unsigned *arrivals,
                                             unsigned group, float (*parts)[WARPS],
                                             float *inverses, unsigned *last,
@@ -513,8 +512,7 @@ __device__ __forceinline__ bool route_block(const Input &in, const Form &form, c
     if (group == 0) {
         for (unsigned item = thread; item < rows * static_cast<unsigned>(SEISMIC_DIM_H); item += blockDim.x) {
             const unsigned long long row = item / SEISMIC_DIM_H, source = item % SEISMIC_DIM_H;
-            element::put<Act>(normalized, row * normalized0 + source * normalized1,
-                input.value(row, source, seismic_words_value));
+            normalized.put(row * normalized0 + source * normalized1, input.value(row, source, seismic_words_value));
         }
     }
     if (expert <= SEISMIC_DIM_E)

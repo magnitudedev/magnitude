@@ -128,8 +128,8 @@ void element_split8(const int kind, uvec4 words, out vec4 even, out vec4 odd) {
         even = uintBitsToFloat(words << 16);
         odd = uintBitsToFloat(words & 0xffff0000u);
     } else {
-        const vec2 a = unpackHalf2x16(words.x), b = unpackHalf2x16(words.y);
-        const vec2 c = unpackHalf2x16(words.z), d = unpackHalf2x16(words.w);
+        const vec2 a = seismic_unpack_f16x2(words.x), b = seismic_unpack_f16x2(words.y);
+        const vec2 c = seismic_unpack_f16x2(words.z), d = seismic_unpack_f16x2(words.w);
         even = vec4(a.x, b.x, c.x, d.x);
         odd = vec4(a.y, b.y, c.y, d.y);
     }
@@ -179,4 +179,113 @@ void element_load8(const int kind, uint64_t base, uint64_t index, out vec4 even,
     } else {
         element_split8(kind, element_uvec4_at(base + index * 2ul), even, odd);
     }
+}
+
+// ---------------------------------------------------------------------------
+// A floating result, or a floating tensor a kernel mutates, as the kernel writes it: a handle whose
+// only writes are the owner's, so every element it publishes is an element of its kind. The kernel
+// gets `SEISMIC_RESULT_<n>_OUT` / `SEISMIC_OUT_<NAME>` from the ABI (the tensor's address and its
+// own element kind; no buffer index is defined for it), or an `Out` over scratch from
+// `out_over_scratch`. The fields are the owner's: no kernel reads them or
+// builds an `Out` itself (the build rejects an authored source that does).
+struct Out {
+    uint64_t seismic_base;
+    int seismic_kind;
+};
+
+// The one place a scratch buffer (a projection's partials, a routed product) becomes an `Out`.
+Out out_over_scratch(const int kind, uint64_t scratch_address) { return Out(scratch_address, kind); }
+
+float out_at(Out handle, uint64_t index) { return element_at(handle.seismic_kind, handle.seismic_base, index); }
+void out_put(Out handle, uint64_t index, float value) {
+    element_put(handle.seismic_kind, handle.seismic_base, index, value);
+}
+void out_put2(Out handle, uint64_t index, float first, float second) {
+    element_put2(handle.seismic_kind, handle.seismic_base, index, first, second);
+}
+// The view from element `elements` on.
+Out out_offset(Out handle, uint64_t elements) {
+    return Out(handle.seismic_base + elements * uint64_t(ELEMENT_BYTES(handle.seismic_kind)), handle.seismic_kind);
+}
+// Eight consecutive elements from `index`, aligned to eight, as (0,2,4,6) and (1,3,5,7).
+void out_put8(Out handle, uint64_t index, vec4 even, vec4 odd) {
+    if (handle.seismic_kind == ELEMENT_F32) {
+        const uint64_t at = handle.seismic_base + index * 4ul;
+        element_uvec4_put(at, floatBitsToUint(vec4(even.x, odd.x, even.y, odd.y)));
+        element_uvec4_put(at + 16ul, floatBitsToUint(vec4(even.z, odd.z, even.w, odd.w)));
+    } else {
+        element_uvec4_put(handle.seismic_base + index * 2ul, element_pack8(handle.seismic_kind, even, odd));
+    }
+}
+// Moves `count` elements of `from`, which the owner stored, to `index` without decoding.
+void out_move_stored(Out to, uint64_t index, Out from, uint64_t from_index, uint64_t count) {
+    for (uint64_t i = 0ul; i < count; ++i) {
+        if (to.seismic_kind == ELEMENT_F32)
+            element_u32_put(to.seismic_base + (index + i) * 4ul,
+                element_u32_at(from.seismic_base + (from_index + i) * 4ul));
+        else
+            element_u16_put(to.seismic_base + (index + i) * 2ul,
+                element_u16_at(from.seismic_base + (from_index + i) * 2ul));
+    }
+}
+// Copies `count` stored elements of `to`'s kind from `source_base` (from element `source_index`) to
+// `index` without decoding, preserving subnormals and NaN payloads bit-for-bit.
+void out_copy_stored(Out to, uint64_t index, uint64_t source_base, uint64_t source_index, uint64_t count) {
+    for (uint64_t i = 0ul; i < count; ++i) {
+        if (to.seismic_kind == ELEMENT_F32)
+            element_u32_put(to.seismic_base + (index + i) * 4ul,
+                element_u32_at(source_base + (source_index + i) * 4ul));
+        else
+            element_u16_put(to.seismic_base + (index + i) * 2ul,
+                element_u16_at(source_base + (source_index + i) * 2ul));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A read-only view over stored elements of a known dense kind (`out_stored` of an `Out` or
+// `SlabOut` region, or `stored_at_buffer` over an input buffer). The fields are the library's: no
+// kernel reads them or builds a `Stored` itself (the build rejects an authored source that does).
+struct Stored {
+    uint64_t seismic_base;
+    int seismic_kind;
+};
+
+// The read-only view from element `index` of `handle`, for loads of elements the owner stored.
+Stored out_stored(Out handle, uint64_t index) {
+    return Stored(handle.seismic_base + index * uint64_t(ELEMENT_BYTES(handle.seismic_kind)), handle.seismic_kind);
+}
+// The read-only view of an input buffer of `kind` at byte address `base`.
+Stored stored_at_buffer(const int kind, uint64_t base) {
+    return Stored(base, kind);
+}
+// The view from element `elements` on.
+Stored stored_offset(Stored view, uint64_t elements) {
+    return Stored(view.seismic_base + elements * uint64_t(ELEMENT_BYTES(view.seismic_kind)), view.seismic_kind);
+}
+// Whether `view` starts on a 16-byte boundary.
+bool stored_aligned16(Stored view) { return (view.seismic_base & 15ul) == 0ul; }
+float stored_at(Stored view, uint64_t index) {
+    return element_at(view.seismic_kind, view.seismic_base, index);
+}
+// Elements `index` and `index + 1`: one 32-bit load for an even index of a 16-bit kind.
+vec2 stored_at2(Stored view, uint64_t index) {
+    if (view.seismic_kind != ELEMENT_F32 && index % 2ul == 0ul)
+        return element_unpack2(view.seismic_kind, element_u32_at(view.seismic_base + index * 2ul));
+    return vec2(stored_at(view, index), stored_at(view, index + 1ul));
+}
+// Eight contiguous elements from `index`, aligned to eight elements, as (even, odd).
+void stored_load8(Stored view, uint64_t index, out vec4 even, out vec4 odd) {
+    element_load8(view.seismic_kind, view.seismic_base, index, even, odd);
+}
+// Raw 32-bit word `index` (from byte offset `index * 4`) of `view`.
+uint stored_u32_at(Stored view, uint64_t index) {
+    return element_u32_at(view.seismic_base + index * 4ul);
+}
+// Raw 16-byte word `index` (from byte offset `index * 16`) of `view`.
+uvec4 stored_uvec4_at(Stored view, uint64_t index) {
+    return element_uvec4_at(view.seismic_base + index * 16ul);
+}
+// Four contiguous F32 elements from element `index` (aligned to 16 bytes) of an F32 `view`.
+vec4 stored_vec4_at(Stored view, uint64_t index) {
+    return element_vec4_at(view.seismic_base + index * 4ul);
 }

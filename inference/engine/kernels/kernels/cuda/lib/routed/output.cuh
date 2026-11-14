@@ -3,8 +3,8 @@
 // CUDA form of `metal/lib/routed/output.h`.
 // Block (x, y) works on the output channels of tile group x for y =
 // m * (K + 1) + slot (slot < K is choice (m, slot), slot K the shared
-// expert) and publishes each projection in A at ROUTED_PUBLISHED
-// (`[M, K + 1, H]`, row-major, of `element::Act::storage`). Then the includer's hook
+// expert) and publishes each projection in A through ROUTED_PUBLISHED_OUT
+// (`[M, K + 1, H]`, row-major, an `element::Out<Act>`). Then the includer's hook
 // runs: `routed_output`'s last block of a channel tile to arrive joins its
 // channels (`lib/routed/output_sum.cuh`), the arithmetic of one block carrying
 // every slot in turn; `routed_output_project` leaves the join to
@@ -12,20 +12,20 @@
 // weight streams in flight to reach bandwidth.
 // - `routed_output` (one row): block (x, slot) projects slot's down
 //   projection; the hook `ROUTED_OUTPUT_ARRIVED(m, blocks, arrival, first,
-//   channels, published)` follows, with the K + 1 blocks of tile x of row m.
+//   channels)` follows, with the K + 1 blocks of tile x of row m.
 // - `routed_output_gathered` (several rows): choice (m, slot) projects only
 //   when it is its expert's first choice, the down projection of every
 //   choice of that expert (`routed::expert_choices`), so each chosen expert
 //   streams once; slot K of row 0 projects the shared expert for every row.
 //   The hook `ROUTED_OUTPUT_GATHERED_ARRIVED(blocks, arrival, first,
-//   channels, published)` follows, with tile x's M * (K + 1) blocks.
+//   channels)` follows, with tile x's M * (K + 1) blocks.
 // Each choice's down weights are read where its source names
 // (`routed::decode_source`): a bank record, or a host tier record read in
 // place; a choice with no record (the CPU's, or a failed one) projects
 // zero.
 //
-// The includer defines ROUTED_SOURCE_ROWS, ROUTED_PUBLISHED (in the kernel's
-// scope) and the two hooks.
+// The includer defines ROUTED_SOURCE_ROWS, ROUTED_PUBLISHED_OUT (in the
+// kernel's scope) and the two hooks.
 #define KERNEL_W0 SEISMIC_EXPERT_DOWN
 #define KERNEL_W1 SEISMIC_SHARED_DOWN
 #include "routed.cuh"
@@ -83,9 +83,9 @@ __global__ void routed_output_stage(SEISMIC_KERNEL_PARAMS) {
 
 
 struct PublishEpi {
-    element::Act::storage *published;
+    element::Out<element::Act> published;
     __device__ __forceinline__ void operator()(unsigned, projection::u64 n, float value, float) const {
-        published[n] = element::Act::store(value);
+        published.put(n, value);
     }
 };
 
@@ -98,9 +98,9 @@ __global__ void routed_output(SEISMIC_KERNEL_PARAMS) {
     const projection::u64 H = SEISMIC_DIM_H, K = SEISMIC_DIM_K;
     const projection::u64 m = blockIdx.y / (K + 1), slot = blockIdx.y % (K + 1);
     const projection::u64 group = Shape::tile_group();
-    element::Act::storage *published = ROUTED_PUBLISHED + m * (K + 1) * H;
+    const element::Out<element::Act> published = ROUTED_PUBLISHED_OUT.offset(m * (K + 1) * H);
 
-    const PublishEpi epi{published + slot * H};
+    const PublishEpi epi{published.offset(slot * H)};
     // The arrival and the combine follow the launch before.
     if (slot < K) {
         const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));
@@ -110,7 +110,7 @@ __global__ void routed_output(SEISMIC_KERNEL_PARAMS) {
             // A choice reading no record: each
             // block publishes its channels of a zero projection.
             seismic_dependency_start();
-            routed::zero_block_rows<Shape>(H, [&](projection::u64 n) { epi.published[n] = element::Act::store(0.0f); });
+            routed::zero_block_rows<Shape>(H, [&](projection::u64 n) { epi.published.put(n, 0.0f); });
         } else {
             const Pro pro{EXPERT_ROWS + (m * EXPERT_STRIDE_0 + slot * EXPERT_STRIDE_1) * 2, 0, projection::AllRows{}};
             projection::gemv_segment_ready<Shape>(shared, projection::after_dependency(pro), 1u, SEISMIC_DIM_F / 64, group, H,
@@ -124,18 +124,17 @@ __global__ void routed_output(SEISMIC_KERNEL_PARAMS) {
                                         projection::NoWeight{}, epi);
     }
 
-    ROUTED_OUTPUT_ARRIVED(m, static_cast<unsigned>(K) + 1u, m * gridDim.x + blockIdx.x, blockIdx.x * CHANNELS, CHANNELS,
-                          published)
+    ROUTED_OUTPUT_ARRIVED(m, static_cast<unsigned>(K) + 1u, m * gridDim.x + blockIdx.x, blockIdx.x * CHANNELS, CHANNELS)
 }
 #endif
 
 #ifdef SEISMIC_FORMING_ROUTED_OUTPUT_GATHERED
 // Each GEMV row's projection A-rounded at its published offset.
 struct GatheredPublishEpi {
-    element::Act::storage *published;
+    element::Out<element::Act> published;
     const projection::u64 *offsets;
     __device__ __forceinline__ void operator()(unsigned m, projection::u64 n, float value, float) const {
-        published[offsets[m] + n] = element::Act::store(value);
+        published.put(offsets[m] + n, value);
     }
 };
 
@@ -149,7 +148,7 @@ __global__ void routed_output_gathered(SEISMIC_KERNEL_PARAMS) {
     const projection::u64 H = SEISMIC_DIM_H, K = SEISMIC_DIM_K, M = SEISMIC_DIM_M;
     const projection::u64 m = blockIdx.y / (K + 1), slot = blockIdx.y % (K + 1);
     const projection::u64 group = Shape::tile_group();
-    element::Act::storage *published = ROUTED_PUBLISHED;
+    const element::Out<element::Act> published = ROUTED_PUBLISHED_OUT;
     const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));
 
     // The routes come from the launch before the expansion, which has
@@ -190,7 +189,7 @@ __global__ void routed_output_gathered(SEISMIC_KERNEL_PARAMS) {
                 // projections.
                 seismic_dependency_start();
                 for (unsigned r = 0; r < count; ++r)
-                    routed::zero_block_rows<Shape>(H, [&](projection::u64 n) { published[published_at[r] + n] = element::Act::store(0.0f); });
+                    routed::zero_block_rows<Shape>(H, [&](projection::u64 n) { published.put(published_at[r] + n, 0.0f); });
             } else {
                 const routed::GatheredRows rows{EXPERT_ROWS, rows_at};
                 projection::gemv_segment_ready<Shape>(
@@ -208,6 +207,6 @@ __global__ void routed_output_gathered(SEISMIC_KERNEL_PARAMS) {
         seismic_dependency_start();
     }
 
-    ROUTED_OUTPUT_GATHERED_ARRIVED(gridDim.y, blockIdx.x, blockIdx.x * CHANNELS, CHANNELS, published)
+    ROUTED_OUTPUT_GATHERED_ARRIVED(gridDim.y, blockIdx.x, blockIdx.x * CHANNELS, CHANNELS)
 }
 #endif

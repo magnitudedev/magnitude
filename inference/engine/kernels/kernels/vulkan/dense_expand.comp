@@ -46,7 +46,7 @@ projection_prologue dense_expand_input() {
 }
 
 projection_epilogue dense_expand_output() {
-    return projection_scaled(projection_glu(DENSE_ACT, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER),
+    return projection_scaled(projection_glu(DENSE_ACT, SEISMIC_RESULT_0_OUT,
         SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, int(SEISMIC_PARAM_ACTIVATION)),
         projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_GATE_SCALE), SEISMIC_DIM_GS, 0ul, 0ul),
         projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_US, 0ul, 0ul));

@@ -15,7 +15,7 @@ typedef projection::operands<NVFP4> Operands;
     device const uchar *weight [[buffer(SEISMIC_BUFFER_WEIGHT)]], \
     device const int *token_rows [[buffer(SEISMIC_BUFFER_TOKEN_ROWS)]], \
     device const float *weight_scale [[buffer(SEISMIC_BUFFER_WEIGHT_SCALE)]], \
-    device float *logits [[buffer(SEISMIC_RESULT_0_BUFFER)]], \
+    SEISMIC_RESULT_0_PARAM(logits_cells), \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
 
 #ifdef SEISMIC_FORMING_READOUT_PROJECT_ROWS_GEMV
@@ -28,6 +28,7 @@ kernel void readout_project_rows_gemv(PROJECT_ROWS_ARGUMENTS,
     uint lane [[thread_index_in_simdgroup]]) {
     const uint d = uint(SEISMIC_DIM_D);
     const uint row = tile.y;
+    const element::Out<element::F32> logits(logits_cells);
     const projection::Plain<activation, projection::AllRows> in{
         features + ulong(row) * SEISMIC_FEATURES_STRIDE_0 * 2u,
         SEISMIC_FEATURES_STRIDE_0, SEISMIC_FEATURES_STRIDE_1, d, {}};
@@ -37,14 +38,14 @@ kernel void readout_project_rows_gemv(PROJECT_ROWS_ARGUMENTS,
         column = tile.x;
         selected = token_rows + ulong(row) * SEISMIC_TOKEN_ROWS_STRIDE_0 + column * SEISMIC_TOKEN_ROWS_STRIDE_2;
         if (*selected < 0 || ulong(*selected) >= SEISMIC_DIM_V) {
-            if (sg == 0 && lane == 0) logits[ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1] = -INFINITY;
+            if (sg == 0 && lane == 0) logits.put(ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1, -INFINITY);
             return;
         }
     }
     projection::Weights<packets::W0> w{weight, KERNEL_W0_LAYOUT(d), d, selected, 0,
         SEISMIC_TOKEN_ROWS_STRIDE_2};
     const auto out = projection::scaling<(SEISMIC_DIM_WS != 0)>::wrap(
-        projection::Logits{reinterpret_cast<device uchar *>(logits + ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1),
+        projection::Logits{logits.offset(ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1),
             SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1,
             as_type<float>(uint(SEISMIC_PARAM_SOFTCAP))},
         projection::scale_factor(weight_scale, SEISMIC_DIM_WS, 0, 0), 1.0f);

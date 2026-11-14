@@ -12,22 +12,22 @@ fn embedding_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 
         cx.arg_directory().get([entry, field])
     });
     // SAFETY: each work item writes its own row of both results.
-    let (embedded, widened) = unsafe { (cx.result_0().row_mut([row, 0]), cx.result_1().row_mut([row, 0])) };
-    // A row that names no table row reads zeros.
-    match token {
-        Some(token) => cx.arg_table().decode_row(token, widened),
-        None => widened.fill(0.0),
-    }
-    let scale = cx.arg_scale();
-    for value in widened.iter_mut() {
-        *value *= scale;
-    }
-    let inverse = (cx.arg_normalize() != 0).then(|| reduce::rms_inverse(widened, cx.arg_epsilon()));
-    for value in widened.iter_mut() {
-        let decoded = *value;
-        let published = activation::publish::<E::A>(inverse.map_or(decoded, |inverse| decoded * inverse));
-        // A NaN (a non-finite block scale's product) is the registry's one NaN, whatever the hardware's.
-        *value = if published.is_nan() { f32::NAN } else { published };
-    }
-    activation::store::<E::A>(widened, embedded);
+    let (embedded, mut widened) = unsafe { (cx.result_0().row_mut([row, 0]), cx.result_1().row_mut([row, 0])) };
+    widened.compute(|widened| {
+        // A row that names no table row reads zeros.
+        match token {
+            Some(token) => cx.arg_table().decode_row(token, widened),
+            None => widened.fill(0.0),
+        }
+        let scale = cx.arg_scale();
+        for value in widened.iter_mut() {
+            *value *= scale;
+        }
+        let inverse = (cx.arg_normalize() != 0).then(|| reduce::rms_inverse(widened, cx.arg_epsilon()));
+        for value in widened.iter_mut() {
+            let decoded = *value;
+            *value = activation::publish::<E::A>(inverse.map_or(decoded, |inverse| decoded * inverse));
+        }
+        activation::store::<E::A>(widened, embedded);
+    });
 }

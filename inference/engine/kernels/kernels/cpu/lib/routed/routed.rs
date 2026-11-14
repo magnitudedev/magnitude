@@ -16,7 +16,7 @@ use super::super::core::{activation, functions, reduce};
 use super::super::projection::projection;
 use super::ranked;
 use seismic::cpu::quant::Q8Block;
-use seismic::cpu::{Dense, Scratch, Weights};
+use seismic::cpu::{Dense, Scratch, Store, Weights};
 
 /// First row of expert `expert` in an [E, N, K] tensor of `rows` = N rows per
 /// expert.
@@ -67,7 +67,7 @@ pub fn expand_into<A: Dense>(
     function: i32,
     limit: Option<f32>,
     scales: (f32, f32),
-    out: &mut [A::Storage],
+    out: Store<'_, A>,
 ) {
     let mut values = [0.0f32; projection::MAX_ROWS];
     let values = &mut values[..out.len()];
@@ -97,13 +97,13 @@ pub fn activated_into<A: Dense>(
     q8: Option<&[Q8Block]>,
     function: i32,
     scale: f32,
-    out: &mut [A::Storage],
+    mut out: Store<'_, A>,
 ) {
     let mut ups = [0.0f32; projection::MAX_ROWS];
     let ups = &mut ups[..out.len()];
     projection::project_arithmetic(up, first, x, q8, ups);
     for (target, up) in out.iter_mut().zip(ups.iter()) {
-        *target = functions::activated::<A>(function, scale * *up);
+        target.set(functions::activated_value::<A>(function, scale * *up));
     }
 }
 

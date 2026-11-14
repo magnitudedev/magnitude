@@ -84,14 +84,14 @@ __device__ __forceinline__ void decode_inverses(const float *residual, float (*p
 // a dense router's row stride) into `logits`, a router of EXPERTS experts'
 // [SPLIT, M, EXPERTS] partial planes (the entry's own by default; the
 // streamed selection's hints rank the next layer's EN), publishing the
-// share's rows round_A(r * inverse * norm) into `normalized` unless it is
-// null; `staged` is the block's router input rows. Every thread of the block
+// share's rows round_A(r * inverse * norm) through `normalized` unless it
+// is null; `staged` is the block's router input rows. Every thread of the block
 // calls it.
 template <unsigned EXPERTS = static_cast<unsigned>(SEISMIC_DIM_E)>
 __device__ __forceinline__ void select_columns(const float *residual, const float *inverses,
                                                const unsigned char *router_norm, unsigned long long router_norm0,
                                                const unsigned char *router, [[maybe_unused]] unsigned long long router0,
-                                               const unsigned char *norm, unsigned char *normalized, float *logits,
+                                               const unsigned char *norm, const element::Out<Act> *normalized, float *logits,
                                                unsigned group,
                                                Act::storage (*staged)[GEMV_SHARE],
                                                const seismic_words_t &seismic_words_value) {
@@ -108,8 +108,8 @@ __device__ __forceinline__ void select_columns(const float *residual, const floa
             seismic_mul_rn(residual[row * SEISMIC_RESIDUAL_STRIDE_0 + source * SEISMIC_RESIDUAL_STRIDE_1], inverses[row]);
         staged[row][k] = Act::store(seismic_mul_rn(scaled, element::at<RouterNorm>(router_norm, source * router_norm0)));
         if (normalized != nullptr)
-            element::put<Act>(normalized, row * SEISMIC_RESULT_0_STRIDE_0 + source * SEISMIC_RESULT_0_STRIDE_1,
-                Act::round(seismic_mul_rn(scaled, element::at<Norm>(norm, source * SEISMIC_NORM_STRIDE_0))));
+            normalized->put(row * SEISMIC_RESULT_0_STRIDE_0 + source * SEISMIC_RESULT_0_STRIDE_1,
+                seismic_mul_rn(scaled, element::at<Norm>(norm, source * SEISMIC_NORM_STRIDE_0)));
     }
     __syncthreads();
     logits += static_cast<unsigned long long>(share) * SEISMIC_DIM_M * EXPERTS;
@@ -179,7 +179,7 @@ __device__ __forceinline__ float select_logit(const float *logits, unsigned long
 // One row's selection by one warp; lane 0 stores the row's routes and
 // weights in slot order.
 __device__ __forceinline__ void select_row(unsigned long long row, const float *logits, const float *bias,
-                                           const float *expert_scale, int *routes, float *weights,
+                                           const float *expert_scale, int *routes, const element::Out<element::F32> &weights,
                                            const seismic_words_t &seismic_words_value) {
     constexpr unsigned K = SEISMIC_DIM_K;
     const unsigned lane = threadIdx.x % 32;
@@ -201,7 +201,7 @@ __device__ __forceinline__ void select_row(unsigned long long row, const float *
                 weight = seismic_mul_rn(
                     weight, expert_scale[static_cast<unsigned long long>(selected.winners[slot]) * SEISMIC_EXPERT_SCALE_STRIDE_0]);
             routes[row * SEISMIC_ROUTES_STRIDE_0 + slot * SEISMIC_ROUTES_STRIDE_1] = selected.winners[slot];
-            weights[row * SEISMIC_WEIGHTS_STRIDE_0 + slot * SEISMIC_WEIGHTS_STRIDE_1] = weight;
+            weights.put(row * SEISMIC_WEIGHTS_STRIDE_0 + slot * SEISMIC_WEIGHTS_STRIDE_1, weight);
         }
     }
 }

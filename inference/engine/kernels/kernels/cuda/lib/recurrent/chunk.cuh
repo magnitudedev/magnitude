@@ -115,8 +115,7 @@ __device__ __forceinline__ void convolution_input(const recurrent::Inputs &in, c
                                                   int position, int channel, float (&out)[CPL]) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
     if (position < 0)
-        element::span<Act, CPL, true>(
-            recurrent::window_at(in, slot.source, slot.taped + C - 1 + position, channel), 0, out);
+        recurrent::window_at(in, slot.source, slot.taped + C - 1 + position, channel).span<CPL, true>(0, out);
     else
         element::span<Act, CPL, true>(in.projection,
                                 static_cast<u64>(slot.lo + position) * SEISMIC_PROJECTION_STRIDE_0 +
@@ -298,7 +297,8 @@ struct Decay<Rule, 1> {
     // once.
     struct TapeFactors {
         float decay;
-        __device__ TapeFactors(const float *row, int head) : decay(row[recurrent::tape_decay<1>(head, 0)]) {}
+        __device__ TapeFactors(const element::Stored<element::F32> &row, int head)
+            : decay(row.at(recurrent::tape_decay<1>(head, 0))) {}
         __device__ float operator[](int) const { return decay; }
     };
 };
@@ -414,9 +414,10 @@ struct Decay<Rule, W> {
 
     // A tape row's decay factors of value head `head`, one per key column.
     struct TapeFactors {
-        const float *factors;
-        __device__ TapeFactors(const float *row, int head) : factors(row + recurrent::tape_decay<W>(head, 0)) {}
-        __device__ float operator[](int column) const { return factors[column]; }
+        element::Stored<element::F32> factors;
+        __device__ TapeFactors(const element::Stored<element::F32> &row, int head)
+            : factors(row.offset(recurrent::tape_decay<W>(head, 0))) {}
+        __device__ float operator[](int column) const { return factors.at(column); }
     };
 };
 
@@ -648,44 +649,48 @@ __device__ __forceinline__ void scan(const typename Rule::Inputs &in, u8 *pieces
     // [key columns 8j + 2t4, + 1]; the source version's tape rows are applied
     // with the step's update.
     float state[W / 8][4];
+    auto state_view_at = [&](int bank, int e) {
+        return recurrent::state_row_view(base, bank, head, warp_row + g + 8 * (e / 2));
+    };
     auto state_at = [&](int bank, int e) {
         return recurrent::state_row(base, bank, head, warp_row + g + 8 * (e / 2));
     };
     {
-        const float *upper = state_at(slot.source, 0);
-        const float *lower = state_at(slot.source, 2);
+        const element::Stored<element::F32> upper = state_view_at(slot.source, 0);
+        const element::Stored<element::F32> lower = state_view_at(slot.source, 2);
 #pragma unroll
         for (int j = 0; j < W / 8; ++j) {
-            const float2 top = *reinterpret_cast<const float2 *>(upper + 8 * j + 2 * t4);
-            const float2 bottom = *reinterpret_cast<const float2 *>(lower + 8 * j + 2 * t4);
-            state[j][0] = top.x;
-            state[j][1] = top.y;
-            state[j][2] = bottom.x;
-            state[j][3] = bottom.y;
+            float top[2], bottom[2];
+            upper.span(8 * j + 2 * t4, top);
+            lower.span(8 * j + 2 * t4, bottom);
+            state[j][0] = top[0];
+            state[j][1] = top[1];
+            state[j][2] = bottom[0];
+            state[j][3] = bottom[1];
         }
         for (int entry = 0; entry < slot.taped; ++entry) {
-            const float *row = recurrent::tape_row(base, slot.source, entry);
+            const element::Stored<element::F32> row = recurrent::tape_row_view(base, slot.source, entry);
             const typename Form::TapeFactors factors(row, head);
-            const float u[2] = {row[recurrent::TAPE_U + head * W + warp_row + g],
-                                row[recurrent::TAPE_U + head * W + warp_row + g + 8]};
-            const float *k = row + recurrent::TAPE_K + key_head * W;
+            const float u[2] = {row.at(recurrent::TAPE_U + head * W + warp_row + g),
+                                row.at(recurrent::TAPE_U + head * W + warp_row + g + 8)};
+            const u64 k = recurrent::TAPE_K + key_head * W;
 #pragma unroll
             for (int j = 0; j < W / 8; ++j) {
-                const float2 pair = *reinterpret_cast<const float2 *>(k + 8 * j + 2 * t4);
+                float pair[2];
+                row.span(k + 8 * j + 2 * t4, pair);
 #pragma unroll
                 for (int e = 0; e < 4; ++e)
-                    state[j][e] = __fmaf_rn(u[e / 2], e & 1 ? pair.y : pair.x,
-                                            state[j][e] * factors[8 * j + 2 * t4 + (e & 1)]);
+                    state[j][e] = __fmaf_rn(u[e / 2], pair[e & 1], state[j][e] * factors[8 * j + 2 * t4 + (e & 1)]);
             }
         }
     }
     auto publish = [&]() {
-        float *upper = state_at(slot.target, 0);
-        float *lower = state_at(slot.target, 2);
+        const element::Out<element::F32> upper = state_at(slot.target, 0);
+        const element::Out<element::F32> lower = state_at(slot.target, 2);
 #pragma unroll
         for (int j = 0; j < W / 8; ++j) {
-            *reinterpret_cast<float2 *>(upper + 8 * j + 2 * t4) = make_float2(state[j][0], state[j][1]);
-            *reinterpret_cast<float2 *>(lower + 8 * j + 2 * t4) = make_float2(state[j][2], state[j][3]);
+            upper.put2(8 * j + 2 * t4, state[j][0], state[j][1]);
+            lower.put2(8 * j + 2 * t4, state[j][2], state[j][3]);
         }
     };
     if (slot.stop == 0) publish();

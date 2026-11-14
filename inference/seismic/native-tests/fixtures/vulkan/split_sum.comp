@@ -1,3 +1,5 @@
+#include <seismic/element.glsl>
+
 // Each part is summed in element order by lane 0 after WIDTH-wide staging
 // through the group-memory region.
 void split_partial() {
@@ -29,10 +31,10 @@ void split_partial() {
 
 void split_merge() {
     seismic_f32 partials = seismic_f32(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS));
-    seismic_f32 result = seismic_f32(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER));
+    const Out result = SEISMIC_RESULT_0_OUT;
     float total = 0.0;
     for (uint part = 0u; part < SEISMIC_TUNE_PARTS; ++part) {
         total += partials[part].v;
     }
-    result[0].v = total;
+    out_put(result, 0ul, total);
 }

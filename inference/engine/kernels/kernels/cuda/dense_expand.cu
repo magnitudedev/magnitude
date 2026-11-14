@@ -30,7 +30,7 @@ using Epi = Scaling::type<projection::Glu<ELEMENT_OF(SEISMIC_ELEMENT_A)>>;
 #define GATE KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_GATE_WEIGHT))
 #define UP KERNEL_W1_AT(SEISMIC_PTR(SEISMIC_BUFFER_UP_WEIGHT))
 #define EPILOGUE                                                                                          \
-    Scaling::wrap(projection::Glu<ELEMENT_OF(SEISMIC_ELEMENT_A)>{SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER),     \
+    Scaling::wrap(projection::Glu<ELEMENT_OF(SEISMIC_ELEMENT_A)>{SEISMIC_RESULT_0_OUT,     \
                                                                  SEISMIC_RESULT_0_STRIDE_0,               \
                                                                  (int)SEISMIC_PARAM_ACTIVATION},          \
                   projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_GATE_SCALE), SEISMIC_DIM_GS, 0, 0), \

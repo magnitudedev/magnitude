@@ -7,15 +7,6 @@
 // sum of the row where it answered (ROUTED_SITED, `lib/routed/sited.glsl`),
 // absent from `routed_down`. The includer includes
 // `lib/core/activation.glsl` first.
-#if defined(SEISMIC_ELEMENT_R_REPRESENTATION_F32)
-#define ROUTED_PUBLISHED ELEMENT_F32
-#elif defined(SEISMIC_ELEMENT_R_REPRESENTATION_BF16)
-#define ROUTED_PUBLISHED ELEMENT_BF16
-#elif defined(SEISMIC_ELEMENT_R_REPRESENTATION_F16)
-#define ROUTED_PUBLISHED ELEMENT_F16
-#else
-#error "the down sum requires a dense published element"
-#endif
 
 // The sum `selected` of row m's choices before slot k with choice k's
 // A-rounded projection `projected` weighted in.
@@ -29,7 +20,7 @@ float routed_down_term(const float selected, const uint64_t m, const uint64_t k,
 void routed_down_put(const uint64_t m, const uint64_t n, const float selected) {
     const float base = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_BASE)
         + (m * SEISMIC_BASE_STRIDE_0 + n * SEISMIC_BASE_STRIDE_1) * 4ul);
-    element_put(ROUTED_PUBLISHED, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER),
+    out_put(SEISMIC_RESULT_0_OUT,
         m * SEISMIC_RESULT_0_STRIDE_0 + n * SEISMIC_RESULT_0_STRIDE_1, base + selected);
 }
 

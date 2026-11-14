@@ -138,7 +138,7 @@ fn routed_output_rows<L: Isa, E: Elements>(
         let factor = injected.then(|| cx.arg_inject().get([row, stream]));
         let residual = cx.arg_residual().span([row, first], columns.len());
         // SAFETY: each work item writes its own channels of its own row.
-        let out = unsafe { cx.result_0().span_mut([row, first], columns.len()) };
+        let mut out = unsafe { cx.result_0().span_mut([row, first], columns.len()) };
         for (((target, residual), selected), projected) in out
             .iter_mut()
             .zip(residual)
@@ -146,10 +146,10 @@ fn routed_output_rows<L: Isa, E: Elements>(
             .zip(projected.iter())
         {
             let shared = activation::publish::<E::A>(*projected) * coefficient;
-            *target = match factor {
+            target.set(match factor {
                 None => residual + selected + shared,
                 Some(factor) => residual + (selected + shared) * factor,
-            };
+            });
         }
     }
 }

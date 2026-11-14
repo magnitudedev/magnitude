@@ -49,7 +49,7 @@ struct output_partial {
 // ((partial) + product (+ bias)) + (with NT = 1) the four table corners
 // scaled by their coefficients, summed in order.
 struct output_stem {
-    device float *y;
+    element::Out<element::F32> y;
     ulong stride;
     device const float *partial;
     device const uchar *bias;
@@ -68,7 +68,7 @@ struct output_stem {
             for (uint i = 0; i < 4; ++i)
                 blended += element::at<table_element>(table, ulong(indices[m * 4 + i]) * columns + n)
                     * coefficients[m * 4 + i];
-        y[ulong(m) * stride + n] = projected + blended;
+        y.put(ulong(m) * stride + n, projected + blended);
     }
     void store2(uint m, uint n, float first, float second) const {
         store(m, n, first);
@@ -84,7 +84,7 @@ struct output_stem {
     device const uchar *table [[buffer(SEISMIC_BUFFER_TABLE)]],                                  \
     device const int *indices [[buffer(SEISMIC_BUFFER_INDICES)]],                                \
     device const float *coefficients [[buffer(SEISMIC_BUFFER_COEFFICIENTS)]],                    \
-    device float *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],                                    \
+    SEISMIC_RESULT_0_PARAM(result),                                                              \
     device float *partial [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIAL)]],                            \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
 
@@ -114,7 +114,7 @@ kernel void vision_patch_stem_last(STEM_ARGUMENTS,
     PROJECTION_GEMM_SHARED(shared, vision::TILE_M, vision::TILE_N);
     STEM_PIXELS(SEISMIC_DIM_S);
     const uint h = uint(SEISMIC_DIM_H);
-    output_stem out{result, SEISMIC_RESULT_0_STRIDE_0, partial, bias, table, indices, coefficients, h};
+    output_stem out{element::Out<element::F32>(result), SEISMIC_RESULT_0_STRIDE_0, partial, bias, table, indices, coefficients, h};
     if (SEISMIC_DIM_S == 1) {
         auto w = vision::weight<weight_1_packet>(next_frame_weight, SEISMIC_NEXT_FRAME_WEIGHT_STRIDE_1,
             weight_1_element::bytes, k);

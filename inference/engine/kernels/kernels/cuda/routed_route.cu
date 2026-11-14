@@ -37,13 +37,13 @@ __device__ __forceinline__ float routed_inverse(const float *residual, unsigned 
 extern "C" __global__ void routed_route_stage(SEISMIC_KERNEL_PARAMS) {
     seismic_dependency_start();
     const route::Input in = ROUTE_INPUT;
-    unsigned char *normalized = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const element::Out<route::Act> normalized = SEISMIC_RESULT_0_OUT;
     const unsigned thread = threadIdx.x;
     const unsigned long long row = blockIdx.x;
     const float inverse =
         routed_inverse(in.residual, row, __uint_as_float(static_cast<unsigned>(SEISMIC_PARAM_EPS)), seismic_words_value);
     for (unsigned source = thread; source < SEISMIC_DIM_H; source += route::THREADS)
-        element::put<route::Act>(normalized, row * SEISMIC_RESULT_0_STRIDE_0 + source * SEISMIC_RESULT_0_STRIDE_1,
+        normalized.put(row * SEISMIC_RESULT_0_STRIDE_0 + source * SEISMIC_RESULT_0_STRIDE_1,
             in.value(row, source, inverse, seismic_words_value));
 }
 
@@ -60,7 +60,7 @@ extern "C" __global__ void routed_route_gemv(SEISMIC_KERNEL_PARAMS) {
     __shared__ float inverses[SEISMIC_CONST_DECODE_ROWS];
     __shared__ unsigned last;
     route::route_block(ROUTE_INPUT, route::FormRows{}, ROUTE_COLUMNS, ROUTE_SELECTION,
-        SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1,
+        SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1,
         reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS)),
         reinterpret_cast<unsigned *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_ARRIVALS)), blockIdx.x, parts, inverses,
         &last, seismic_words_value);
@@ -73,7 +73,7 @@ constexpr unsigned ROUTE_DEPTH = 128;
 extern "C" __global__ void routed_route_gemm(SEISMIC_KERNEL_PARAMS) {
     seismic_dependency_start();
     const route::Columns columns = ROUTE_COLUMNS;
-    const unsigned char *normalized = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const element::Out<route::Act> normalized = SEISMIC_RESULT_0_OUT;
     float *logits = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS));
 #if defined(SEISMIC_ROUTER_KIND_PACKED)
     const auto router_rows = KERNEL_W0_AT(columns.router);
@@ -103,7 +103,7 @@ extern "C" __global__ void routed_route_gemm(SEISMIC_KERNEL_PARAMS) {
                 continue;
             const unsigned long long row = row0 + i, expert = expert0 + i;
             rows_tile[i][k] = row < SEISMIC_DIM_M
-                ? element::at<route::Act>(normalized, row * SEISMIC_RESULT_0_STRIDE_0 + (k0 + k) * SEISMIC_RESULT_0_STRIDE_1)
+                ? normalized.at(row * SEISMIC_RESULT_0_STRIDE_0 + (k0 + k) * SEISMIC_RESULT_0_STRIDE_1)
                 : 0.0f;
 #if !defined(SEISMIC_ROUTER_KIND_PACKED)
             experts_tile[i][k] = expert <= SEISMIC_DIM_E

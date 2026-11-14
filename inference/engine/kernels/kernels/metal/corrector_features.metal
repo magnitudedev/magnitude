@@ -17,13 +17,14 @@ kernel void corrector_features(
     device const float *norm_bias [[buffer(SEISMIC_BUFFER_NORM_BIAS)]],
     device const float *up_weight [[buffer(SEISMIC_BUFFER_UP_WEIGHT)]],
     device const float *up_bias [[buffer(SEISMIC_BUFFER_UP_BIAS)]],
-    device uchar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(result_cells),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint row [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float partials[FEATURES_THREADS / 32u];
+    const element::Out<activation> result(result_cells);
     const ulong vocabulary = SEISMIC_DIM_V, count = SEISMIC_DIM_K, width = SEISMIC_DIM_H;
     device const float *line = logits + ulong(row) * SEISMIC_LOGITS_STRIDE_0;
     float local = -INFINITY;
@@ -61,8 +62,7 @@ kernel void corrector_features(
             float value = up_bias[column * SEISMIC_UP_BIAS_STRIDE_0];
             for (uint f = 0; f < 5u; ++f)
                 value = metal::fma(weights[f * SEISMIC_UP_WEIGHT_STRIDE_1], normed[f], value);
-            element::put<activation>(
-                result, out + column * SEISMIC_RESULT_0_STRIDE_1, value / (1.0f + metal::exp(-value)));
+            result.put(out + column * SEISMIC_RESULT_0_STRIDE_1, value / (1.0f + metal::exp(-value)));
         }
     }
 }

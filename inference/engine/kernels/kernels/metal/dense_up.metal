@@ -20,7 +20,7 @@ typedef projection::operands<NVFP4> Operands;
     device const uchar *norm [[buffer(SEISMIC_BUFFER_NORM)]],                           \
     device const uchar *up_weight [[buffer(SEISMIC_BUFFER_UP_WEIGHT)]],                 \
     device const int *out_rows [[buffer(SEISMIC_BUFFER_OUT_ROWS)]],                     \
-    device uchar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],                           \
+    SEISMIC_RESULT_0_PARAM(result_cells),                                               \
     device uchar *normalized [[buffer(SEISMIC_BUFFER_SCRATCH_NORMALIZED)]],             \
     device const float *up_scale [[buffer(SEISMIC_BUFFER_UP_SCALE)]],                   \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
@@ -30,7 +30,7 @@ typedef projection::operands<NVFP4> Operands;
         SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1, norm, SEISMIC_NORM_STRIDE_0, \
         as_type<float>(uint(SEISMIC_PARAM_EPS)), uint(SEISMIC_DIM_H), {out_rows}};      \
     const auto out = projection::scaling<(SEISMIC_DIM_US != 0)>::wrap(                  \
-        projection::Activated<activation>{result, SEISMIC_RESULT_0_STRIDE_0,            \
+        projection::Activated<activation>{element::Out<activation>(result_cells), SEISMIC_RESULT_0_STRIDE_0, \
             SEISMIC_RESULT_0_STRIDE_1, int(SEISMIC_PARAM_ACTIVATION)},                  \
         projection::scale_factor(up_scale, SEISMIC_DIM_US, 0, 0), 1.0f);                \
     projection::Weights<packets::W0> up{up_weight, KERNEL_W0_LAYOUT(SEISMIC_DIM_H), uint(SEISMIC_DIM_H)}

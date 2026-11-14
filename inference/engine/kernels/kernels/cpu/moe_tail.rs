@@ -32,8 +32,8 @@ fn moe_tail<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], sh
     let scale = cx.arg_scale();
     let residual = cx.arg_residual().row([row, 0]);
     // SAFETY: each work item writes its own row.
-    let out = unsafe { cx.result_0().row_mut([row, 0]) };
+    let mut out = unsafe { cx.result_0().row_mut([row, 0]) };
     for i in 0..d {
-        out[i] = (residual[i] + combined[i] * inverse * norm[i]) * scale;
+        out.set(i, (residual[i] + combined[i] * inverse * norm[i]) * scale);
     }
 }

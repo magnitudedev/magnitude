@@ -27,7 +27,7 @@
 // [M, NV, W]); a `gate` launch then forms each row's gated result.
 
 use super::super::core::{activation, functions, reduce};
-use seismic::cpu::{math, Dense, Element, Scalars, Scratch, Tensor, F32};
+use seismic::cpu::{math, Dense, Element, Scalars, Scratch, Stored, Tensor, F32};
 use seismic::cpu::slab::SlabTensor;
 use std::ops::Range;
 
@@ -257,12 +257,12 @@ impl<'a, A: Dense> Recurrence<'a, A> {
     /// The raw input row at slot-local `position`: the source version's
     /// window rows before the slot, the projection after.
     #[inline(always)]
-    fn raw_row(&self, slot: &Slot, position: isize) -> &'a [A::Storage] {
+    fn raw_row(&self, slot: &Slot, position: isize) -> Stored<'a, A> {
         if position < 0 {
             // Positions reach back at most C - 1 rows.
-            self.window.row([slot.source, slot.taped + self.taps - 1 - position.unsigned_abs(), 0])
+            self.window.stored([slot.source, slot.taped + self.taps - 1 - position.unsigned_abs(), 0])
         } else {
-            self.projection.row([slot.lo + position as usize, 0])
+            self.projection.stored([slot.lo + position as usize, 0])
         }
     }
 
@@ -272,13 +272,13 @@ impl<'a, A: Dense> Recurrence<'a, A> {
     #[inline(always)]
     pub fn convolve(&self, slot: &Slot, local: usize, channels: Range<usize>, out: &mut [f32]) {
         let out = &mut out[..channels.len()];
-        let current = &self.raw_row(slot, local as isize)[channels.clone()];
+        let current = &self.raw_row(slot, local as isize).storage()[channels.clone()];
         let last = self.taps - 1;
         for ((target, channel), value) in out.iter_mut().zip(channels.clone()).zip(current) {
             *target = self.convolution.get([channel, last]) * A::widen(*value);
         }
         for tap in 0..last {
-            let previous = &self.raw_row(slot, local as isize + tap as isize - last as isize)[channels.clone()];
+            let previous = &self.raw_row(slot, local as isize + tap as isize - last as isize).storage()[channels.clone()];
             for ((target, channel), value) in out.iter_mut().zip(channels.clone()).zip(previous) {
                 *target = self.convolution.get([channel, tap]).mul_add(A::widen(*value), *target);
             }
@@ -327,8 +327,8 @@ impl<'a, A: Dense> Recurrence<'a, A> {
             for channel in channels.clone() {
                 // SAFETY: each value head copies its own channels of the
                 // successor bank's rows; no slot reads a successor bank.
-                let target = unsafe { self.window.span_mut([slot.target, tap, channel], w) };
-                target.copy_from_slice(&source[channel..channel + w]);
+                let mut target = unsafe { self.window.span_mut([slot.target, tap, channel], w) };
+                target.move_stored(source.part(channel..channel + w));
             }
         }
     }
@@ -360,8 +360,8 @@ impl<'a, A: Dense> Recurrence<'a, A> {
         let w = self.width;
         for (index, row) in rows.clone().enumerate() {
             // SAFETY: each work item publishes its own state rows of the head.
-            let target = unsafe { self.delta.row_mut([slot.target, head, row, 0]) };
-            target.copy_from_slice(&state[index * w..(index + 1) * w]);
+            let mut target = unsafe { self.delta.row_mut([slot.target, head, row, 0]) };
+            target.store(&state[index * w..(index + 1) * w]);
         }
     }
 }
@@ -448,14 +448,14 @@ pub trait Rule<'a> {
             let inverse = reduce::rms_inverse(values, epsilon);
             let gates = self.gate_input(row, head);
             // SAFETY: each work item writes its own row.
-            let out = unsafe { gated.span_mut([row, head, 0], w) };
+            let mut out = unsafe { gated.span_mut([row, head, 0], w) };
             for (((target, value), weight), gate) in out.iter_mut().zip(values.iter()).zip(norm).zip(gates) {
                 let normalized = activation::publish::<Self::Act>(value * inverse * weight);
                 let activated = activation::publish::<Self::Act>(functions::output_gate(
                     gate_function,
                     <Self::Act as Dense>::widen(*gate),
                 ));
-                *target = <Self::Act as Dense>::narrow(normalized * activated);
+                target.set(normalized * activated);
             }
         }
     }
@@ -588,10 +588,10 @@ pub trait Rule<'a> {
                 // own state rows (innovations); no slot reads it.
                 unsafe {
                     if records {
-                        r.tape.span_mut([slot.target, entry, r.tape_decay(head, decays)], decays).copy_from_slice(inputs.decay);
+                        r.tape.span_mut([slot.target, entry, r.tape_decay(head, decays)], decays).store(inputs.decay);
                     }
                     if records_key {
-                        r.tape.span_mut([slot.target, entry, r.tape_key(key_head)], w).copy_from_slice(inputs.key);
+                        r.tape.span_mut([slot.target, entry, r.tape_key(key_head)], w).store(inputs.key);
                     }
                 }
             }
@@ -610,7 +610,7 @@ pub trait Rule<'a> {
                 }
                 mixed[index] = activation::publish::<Self::Act>(reduce::dot(values, inputs.query));
                 if let Some(innovations) = &mut innovations {
-                    innovations[index] = residual;
+                    innovations.set(index, residual);
                 }
             }
             if row + 1 == publish {

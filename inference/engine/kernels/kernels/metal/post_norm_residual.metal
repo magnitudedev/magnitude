@@ -11,13 +11,14 @@ kernel void post_norm_residual(
     device const float *projected [[buffer(SEISMIC_BUFFER_PROJECTED)]],
     device const uchar *norm [[buffer(SEISMIC_BUFFER_NORM)]],
     device const int *out_rows [[buffer(SEISMIC_BUFFER_OUT_ROWS)]],
-    device float *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(result_cells),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint row [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float partials[8];
+    const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> result(result_cells);
     const ulong width = SEISMIC_DIM_D;
     const float epsilon = as_type<float>(uint(SEISMIC_PARAM_EPSILON));
     const float scale = as_type<float>(uint(SEISMIC_PARAM_SCALE));
@@ -33,7 +34,7 @@ kernel void post_norm_residual(
     for (ulong i = thread_index; i < width; i += 256u) {
         const float normalized = p[i * SEISMIC_PROJECTED_STRIDE_1] * inverse
             * element::at<Norm>(norm, i * SEISMIC_NORM_STRIDE_0);
-        result[ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + i * SEISMIC_RESULT_0_STRIDE_1] =
-            (r[i * SEISMIC_RESIDUAL_STRIDE_1] + normalized) * scale;
+        result.put(ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + i * SEISMIC_RESULT_0_STRIDE_1,
+            (r[i * SEISMIC_RESIDUAL_STRIDE_1] + normalized) * scale);
     }
 }

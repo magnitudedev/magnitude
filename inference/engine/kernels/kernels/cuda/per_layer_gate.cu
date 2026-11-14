@@ -14,7 +14,7 @@ using Epi = projection::ActivatedMul<ELEMENT_OF(SEISMIC_ELEMENT_A)>;
 #define GATE KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_GATE_WEIGHT))
 #define EPILOGUE                                                                                          \
     Epi {                                                                                                 \
-        SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0,                                  \
+        SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0,                                  \
             reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_INPUTS)) +                         \
                 (long long)SEISMIC_PARAM_LAYER * SEISMIC_INPUTS_STRIDE_1,                                  \
             SEISMIC_INPUTS_STRIDE_0, (int)SEISMIC_PARAM_ACTIVATION                                        \

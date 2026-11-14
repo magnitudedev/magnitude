@@ -16,7 +16,7 @@ typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
     device const uint *rest [[buffer(SEISMIC_BUFFER_REST)]],                            \
     device const half *scales [[buffer(SEISMIC_BUFFER_SCALES)]],                        \
     device const int *out_rows [[buffer(SEISMIC_BUFFER_OUT_ROWS)]],                     \
-    device uchar *logits [[buffer(SEISMIC_RESULT_0_BUFFER)]],                           \
+    SEISMIC_RESULT_0_PARAM(logits),                                                     \
     device uchar *normalized [[buffer(SEISMIC_BUFFER_SCRATCH_NORMALIZED)]],             \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
 
@@ -26,7 +26,7 @@ typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
         in{hidden, SEISMIC_HIDDEN_STRIDE_0, \
         SEISMIC_HIDDEN_STRIDE_2, norm, SEISMIC_NORM_STRIDE_0,                           \
         as_type<float>(uint(SEISMIC_PARAM_EPSILON)), k, {out_rows}};                    \
-    const projection::Logits out{logits, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, as_type<float>(uint(SEISMIC_PARAM_SOFTCAP))}; \
+    const projection::Logits out{element::Out<element::F32>(logits), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, as_type<float>(uint(SEISMIC_PARAM_SOFTCAP))}; \
     const projection::Weights<packets::ProgressiveExact> w{top, SEISMIC_TOP_STRIDE_0, bit3, \
         SEISMIC_BIT3_STRIDE_0, rest, SEISMIC_REST_STRIDE_0, SEISMIC_REST_STRIDE_1, SEISMIC_REST_STRIDE_2, \
         scales, SEISMIC_SCALES_STRIDE_0}

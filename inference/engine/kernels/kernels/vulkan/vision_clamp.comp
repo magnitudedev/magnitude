@@ -11,7 +11,7 @@ void vision_clamp() {
     for (uint64_t index = gl_GlobalInvocationID.x; index < total; index += step) {
         const uint64_t row = index / columns, column = index % columns;
         const float value = element_at(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_X), row * SEISMIC_X_STRIDE_0 + column);
-        element_put(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), row * SEISMIC_RESULT_0_STRIDE_0 + column,
+        out_put(SEISMIC_RESULT_0_OUT, row * SEISMIC_RESULT_0_STRIDE_0 + column,
             min(max(value, minimum), maximum));
     }
 }

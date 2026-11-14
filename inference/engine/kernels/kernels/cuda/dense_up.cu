@@ -24,7 +24,7 @@ using Epi = Scaling::type<projection::Activated<ELEMENT_OF(SEISMIC_ELEMENT_A)>>;
 #define GROUPS SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GROUPS)
 #define UP KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_UP_WEIGHT))
 #define EPILOGUE                                                                                           \
-    Scaling::wrap(projection::Activated<ELEMENT_OF(SEISMIC_ELEMENT_A)>{SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), \
+    Scaling::wrap(projection::Activated<ELEMENT_OF(SEISMIC_ELEMENT_A)>{SEISMIC_RESULT_0_OUT, \
                                                                        SEISMIC_RESULT_0_STRIDE_0,          \
                                                                        (int)SEISMIC_PARAM_ACTIVATION},     \
                   projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_US, 0, 0), 1.0f)

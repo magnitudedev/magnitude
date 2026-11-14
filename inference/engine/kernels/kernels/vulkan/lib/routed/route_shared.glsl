@@ -8,15 +8,16 @@
 
 void routed_route_shared_product(const uint maxm, const uint tile) {
     const uint hidden = uint(SEISMIC_DIM_H);
+    // The normalized rows this launch's router groups published, read as stored.
     const projection_prologue x = projection_operands(projection_plain(ELEMENT_ACT,
-        SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0,
+        out_stored(SEISMIC_RESULT_0_OUT, 0ul), SEISMIC_RESULT_0_STRIDE_0,
         SEISMIC_RESULT_0_STRIDE_1, hidden, 0ul), ROUTE_SHARED_OPERANDS);
     const projection_weights gate = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_GATE),
         PACKETS_W1_ROWS, 0ul, hidden);
     const projection_weights up = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_UP),
         PACKETS_W2_ROWS, 0ul, hidden);
     const projection_epilogue product = projection_silu_mul(ELEMENT_ACT,
-        SEISMIC_PTR(SEISMIC_RESULT_2_BUFFER), SEISMIC_RESULT_2_STRIDE_0, SEISMIC_RESULT_2_STRIDE_1);
+        SEISMIC_RESULT_2_OUT, SEISMIC_RESULT_2_STRIDE_0, SEISMIC_RESULT_2_STRIDE_1);
     projection_gemv(PACKETS_W1, PACKETS_W2, true, SEISMIC_TUNE_ROWS, 32u, maxm,
         PROJECTION_NORM_NONE, x, product, gate, up, uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_S),
         hidden, tile);

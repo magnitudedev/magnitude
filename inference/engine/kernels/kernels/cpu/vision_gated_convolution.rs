@@ -23,7 +23,7 @@ fn vision_gated_convolution<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, gro
     seismic::cpu::tensor::widen_row::<E::A>(cx.arg_gate().row([row, 0]), gate);
     let result = cx.result_0();
     // SAFETY: each work item writes its own row.
-    let out = unsafe { result.span_mut([row, 0], h) };
+    let mut out = unsafe { result.span_mut([row, 0], h) };
     for (channel, target) in out.iter_mut().enumerate() {
         weight.decode_row(channel, taps);
         let mut sum = 0.0f32;
@@ -32,6 +32,6 @@ fn vision_gated_convolution<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, gro
                 sum = sources[tap * h + channel].mul_add(taps[tap], sum);
             }
         }
-        *target = E::A::narrow(activation::publish::<E::A>(sum) * gate[channel]);
+        target.set(activation::publish::<E::A>(sum) * gate[channel]);
     }
 }

@@ -3,5 +3,5 @@
 // (`lib/routed/down.cuh`), published into the result for
 // `routed_down_sited`.
 #define ROUTED_SOURCE_ROWS SEISMIC_CONST_SOURCE_ROWS
-#define ROUTED_PROJECTED reinterpret_cast<element::Act::storage *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER))
+#define ROUTED_PROJECTED_OUT SEISMIC_RESULT_0_OUT
 #include "lib/routed/down.cuh"

@@ -24,7 +24,6 @@ extern "C" __global__ void routed_scatter(SEISMIC_KERNEL_PARAMS) {
         selected = __fmaf_rn(weights[m * SEISMIC_WEIGHTS_STRIDE_0 + k * SEISMIC_WEIGHTS_STRIDE_1], projected, selected);
     }
     const float *base = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_BASE));
-    element::put<ELEMENT_OF(SEISMIC_ELEMENT_R)>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER),
-                                                m * SEISMIC_RESULT_0_STRIDE_0 + n * SEISMIC_RESULT_0_STRIDE_1,
-                                                base[m * SEISMIC_BASE_STRIDE_0 + n * SEISMIC_BASE_STRIDE_1] + selected);
+    SEISMIC_RESULT_0_OUT.put(m * SEISMIC_RESULT_0_STRIDE_0 + n * SEISMIC_RESULT_0_STRIDE_1,
+                             base[m * SEISMIC_BASE_STRIDE_0 + n * SEISMIC_BASE_STRIDE_1] + selected);
 }

@@ -63,8 +63,9 @@ uint64_t shape_row_scratch(uint64_t row) {
     return SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATE) + row * uint64_t(SEISMIC_TUNE_PARTS + 8u) * 4ul;
 }
 
+// The element index of row `row`'s logit of `token` in the logits' owner handle.
 uint64_t shape_logits_at(uint64_t row, uint token) {
-    return SEISMIC_PTR(SEISMIC_BUFFER_LOGITS) + (row * SEISMIC_LOGITS_STRIDE_0 + uint64_t(token) * SEISMIC_LOGITS_STRIDE_1) * 4ul;
+    return row * SEISMIC_LOGITS_STRIDE_0 + uint64_t(token) * SEISMIC_LOGITS_STRIDE_1;
 }
 
 // ---------------------------------------------------------------------------
@@ -94,7 +95,7 @@ void shape_rows_prepare() {
         int count = 0;
         for (uint h = 0u; h < recent_count; ++h)
             count += seismic_shared_i32[h] == int(token) ? 1 : 0;
-        float value = element_f32_at(shape_logits_at(row, token));
+        float value = out_at(SEISMIC_OUT_LOGITS, shape_logits_at(row, token));
         // Correctly rounded division, as the portable route and CUDA divide.
         if (count > 0) {
             value = value < 0.0 ? value * repetition : seismic_div_rn(value, repetition);
@@ -105,7 +106,7 @@ void shape_rows_prepare() {
             value = -SHAPE_INF;
         if (temperature != 0.0)
             value = seismic_div_rn(value, temperature);
-        element_f32_put(shape_logits_at(row, token), value);
+        out_put(SEISMIC_OUT_LOGITS, shape_logits_at(row, token), value);
         if (shape_finite(value))
             maximum = max(maximum, shape_ordered_key(value));
         else if (value != -SHAPE_INF)
@@ -176,7 +177,7 @@ struct shape_survivor {
 };
 
 bool shape_survives(shape_survivor survivor, uint token, out float value, out uint key) {
-    value = element_f32_at(shape_logits_at(survivor.row, token));
+    value = out_at(SEISMIC_OUT_LOGITS, shape_logits_at(survivor.row, token));
     key = 0u;
     if (!shape_finite(value))
         return false;
@@ -420,13 +421,13 @@ void shape_rows_apply() {
     for (uint token = shape_slice_begin(part) + gl_LocalInvocationIndex; token < shape_slice_end(part);
          token += gl_WorkGroupSize.x) {
         const uint64_t slot = shape_logits_at(row, token);
-        const float value = element_f32_at(slot);
+        const float value = out_at(SEISMIC_OUT_LOGITS, slot);
         if (!shape_finite(value))
             continue;
         const uint key = shape_ordered_key(value);
         const bool removed = key < top_k_key || (min_p > 0.0 && exp(value - maximum) < min_p) || mode == 2u
             || (mode == 1u && (key < top_p_key || (key == top_p_key && token > top_p_token)));
         if (removed)
-            element_f32_put(slot, -SHAPE_INF);
+            out_put(SEISMIC_OUT_LOGITS, slot, -SHAPE_INF);
     }
 }

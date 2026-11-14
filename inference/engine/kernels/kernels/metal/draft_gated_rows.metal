@@ -6,7 +6,7 @@ typedef element::Act activation;
 kernel void draft_gated_rows(
     device const uchar *gate [[buffer(SEISMIC_BUFFER_GATE)]],
     device const uchar *up [[buffer(SEISMIC_BUFFER_UP)]],
-    device uchar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(result_cells),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint raw_index [[thread_position_in_grid]]) {
     const ulong index = ulong(raw_index);
@@ -15,6 +15,6 @@ kernel void draft_gated_rows(
     const ulong row = index / width, column = index % width;
     const float a = element::at<activation>(gate, row * SEISMIC_GATE_STRIDE_0 + column * SEISMIC_GATE_STRIDE_1);
     const float b = element::at<activation>(up, row * SEISMIC_UP_STRIDE_0 + column * SEISMIC_UP_STRIDE_1);
-    element::put<activation>(result, row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1,
+    element::Out<activation>(result_cells).put(row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1,
         a / (1.0f + metal::exp(-a)) * b);
 }

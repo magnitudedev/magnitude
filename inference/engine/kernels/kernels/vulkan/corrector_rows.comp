@@ -25,7 +25,7 @@ void corrector_rows() {
     const uint64_t values = SEISMIC_PTR(SEISMIC_BUFFER_VALUES);
     const uint64_t bias = SEISMIC_PTR(SEISMIC_BUFFER_BIAS);
     const uint64_t residual = SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL);
-    const uint64_t result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const Out result = SEISMIC_RESULT_0_OUT;
     const uint64_t row = gl_WorkGroupID.x;
     const uint64_t lane = gl_LocalInvocationIndex, threads = gl_WorkGroupSize.x;
     const int form = int(SEISMIC_PARAM_FORM);
@@ -46,6 +46,6 @@ void corrector_rows() {
             value = seismic_div_rn(value, length);
         if (SEISMIC_DIM_R == 1ul)
             value += element_f32_at(residual + (row * SEISMIC_RESIDUAL_STRIDE_1 + column * SEISMIC_RESIDUAL_STRIDE_2) * 4ul);
-        element_put(ROWS_Y, result, row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1, value);
+        out_put(result, row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1, value);
     }
 }

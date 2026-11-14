@@ -50,7 +50,7 @@ projection_prologue recurrent_project_input() {
 
 // Every segment writes its columns of the one result row.
 projection_epilogue recurrent_project_out(uint column) {
-    return projection_store(PROJECT_ACT, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0,
+    return projection_store(SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0,
         SEISMIC_RESULT_0_STRIDE_1, uint64_t(column));
 }
 

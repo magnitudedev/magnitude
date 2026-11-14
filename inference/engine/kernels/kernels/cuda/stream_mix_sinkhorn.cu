@@ -32,12 +32,14 @@ constexpr unsigned SUMS = 1u + MIXES;
 // element (e / S, e % S) through `comb` (S * S floats of shared memory),
 // each of its sums over its row or column read there in index order, so
 // every element takes the same operations in the same order as one thread
-// forming them all would. Every thread of the block calls it.
+// forming them all would. Every thread of the block calls it. `own(stream,
+// pre)` takes each stream's pre (a result row, or shared memory).
 // Independent of any entry ABI: the caller passes its views' strides.
+template <class Own>
 __device__ __forceinline__ void publish_coefficients(const float (&mixes)[MIXES], float *comb, const float *base,
                                                      unsigned long long base_stride, const float *scale,
-                                                     unsigned long long scale_stride, float *own,
-                                                     unsigned long long own_stride, float *joined,
+                                                     unsigned long long scale_stride, const Own &own,
+                                                     const element::Out<element::F32> &joined,
                                                      unsigned long long joined_stride, float epsilon,
                                                      unsigned iterations) {
     typedef unsigned long long u64;
@@ -94,14 +96,13 @@ __device__ __forceinline__ void publish_coefficients(const float (&mixes)[MIXES]
         }
     }
     if (owns)
-        joined[(u64)(STREAMS + threadIdx.x) * joined_stride] = value;
+        joined.put((u64)(STREAMS + threadIdx.x) * joined_stride, value);
     if (threadIdx.x < STREAMS) {
         const unsigned stream = threadIdx.x;
-        own[(u64)stream * own_stride] =
-            functions::sigmoid(mixes[stream] * scale[0] + base[(u64)stream * base_stride]) + epsilon;
-        joined[(u64)stream * joined_stride] =
-            2.0f * functions::sigmoid(mixes[STREAMS + stream] * scale[scale_stride] +
-                                      base[(u64)(STREAMS + stream) * base_stride]);
+        own(stream, functions::sigmoid(mixes[stream] * scale[0] + base[(u64)stream * base_stride]) + epsilon);
+        joined.put((u64)stream * joined_stride,
+                   2.0f * functions::sigmoid(mixes[STREAMS + stream] * scale[scale_stride] +
+                                             base[(u64)(STREAMS + stream) * base_stride]));
     }
 }
 
@@ -123,7 +124,7 @@ constexpr unsigned CHUNK = 6144u / MIXES / 32u * 32u;
 template <unsigned TILE>
 __device__ __forceinline__ void reduce_slice(const float *__restrict__ hidden, const float *__restrict__ previous,
                                              const float *__restrict__ function, float *__restrict__ partials,
-                                             float *__restrict__ input,
+                                             const element::Out<element::F32> &input,
                                              const seismic_words_t &seismic_words_value, float *staged,
                                              float (*warps)[THREADS / 32u]) {
     typedef unsigned long long u64;
@@ -228,7 +229,7 @@ __device__ __forceinline__ void reduce_slice(const float *__restrict__ hidden, c
             const u64 row = row0 + r;
             streams::collapse<STREAMS>(hidden + row * SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1,
                                        SEISMIC_HIDDEN_STRIDE_2, previous + row * SEISMIC_PREVIOUS_STRIDE_0,
-                                       SEISMIC_PREVIOUS_STRIDE_1, input + row * SEISMIC_RESULT_0_STRIDE_0,
+                                       SEISMIC_PREVIOUS_STRIDE_1, input.offset(row * SEISMIC_RESULT_0_STRIDE_0),
                                        SEISMIC_RESULT_0_STRIDE_1, h, blockIdx.x * THREADS + threadIdx.x,
                                        split * THREADS);
         }
@@ -244,7 +245,7 @@ __device__ __forceinline__ void reduce_slice(const float *__restrict__ hidden, c
                            reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_PREVIOUS)),                  \
                            reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_FUNCTION)),                  \
                            reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS)),                \
-                           reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)), seismic_words_value,   \
+                           SEISMIC_RESULT_0_OUT, seismic_words_value,                                              \
                            staged, warps);                                                                          \
     }
 
@@ -261,8 +262,8 @@ extern "C" __global__ void stream_mix_sinkhorn_finish(SEISMIC_KERNEL_PARAMS) {
     const float *base = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_BASE));
     const float *scale = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCALE));
     const float *partials = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS));
-    float *join = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_2_BUFFER));
     const unsigned row = blockIdx.x;
+    const element::Out<element::F32> join = SEISMIC_RESULT_2_OUT.offset((u64)row * SEISMIC_RESULT_2_STRIDE_0);
     const unsigned width = STREAMS * SEISMIC_DIM_H, split = (unsigned)SEISMIC_CONST_SINKHORN_SPLIT;
     const float epsilon = __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON);
     const float norm_epsilon = __uint_as_float((unsigned)SEISMIC_PARAM_NORM_EPSILON);
@@ -280,22 +281,23 @@ extern "C" __global__ void stream_mix_sinkhorn_finish(SEISMIC_KERNEL_PARAMS) {
     for (unsigned j = 0; j < MIXES; ++j)
         mixes[j] = reduced[1u + j] * inverse;
     if constexpr (CARRIED) {
-        float *pre = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER));
-        publish_coefficients(mixes, comb, base, SEISMIC_BASE_STRIDE_0, scale, SEISMIC_SCALE_STRIDE_0,
-                             pre + (u64)row * SEISMIC_RESULT_1_STRIDE_0, SEISMIC_RESULT_1_STRIDE_1,
-                             join + (u64)row * SEISMIC_RESULT_2_STRIDE_0, SEISMIC_RESULT_2_STRIDE_1, epsilon,
-                             iterations);
+        const element::Out<element::F32> pre = SEISMIC_RESULT_1_OUT.offset((u64)row * SEISMIC_RESULT_1_STRIDE_0);
+        publish_coefficients(
+            mixes, comb, base, SEISMIC_BASE_STRIDE_0, scale, SEISMIC_SCALE_STRIDE_0,
+            [&](unsigned stream, float value) { pre.put((u64)stream * SEISMIC_RESULT_1_STRIDE_1, value); }, join,
+            SEISMIC_RESULT_2_STRIDE_1, epsilon, iterations);
     } else {
         // Every thread holds its mixes, so `reduced` takes the pre.
-        publish_coefficients(mixes, comb, base, SEISMIC_BASE_STRIDE_0, scale, SEISMIC_SCALE_STRIDE_0, reduced, 1u,
-                             join + (u64)row * SEISMIC_RESULT_2_STRIDE_0, SEISMIC_RESULT_2_STRIDE_1, epsilon,
-                             iterations);
+        publish_coefficients(
+            mixes, comb, base, SEISMIC_BASE_STRIDE_0, scale, SEISMIC_SCALE_STRIDE_0,
+            [&](unsigned stream, float value) { reduced[stream] = value; }, join, SEISMIC_RESULT_2_STRIDE_1, epsilon,
+            iterations);
         __syncthreads();
         // The sublayer's input: the streams mixed by this site's pre.
         const float *hidden = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN));
-        float *input = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER));
         streams::collapse<STREAMS>(hidden + (u64)row * SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1,
-                                   SEISMIC_HIDDEN_STRIDE_2, reduced, 1u, input + (u64)row * SEISMIC_RESULT_0_STRIDE_0,
+                                   SEISMIC_HIDDEN_STRIDE_2, reduced, 1u,
+                                   SEISMIC_RESULT_0_OUT.offset((u64)row * SEISMIC_RESULT_0_STRIDE_0),
                                    SEISMIC_RESULT_0_STRIDE_1, SEISMIC_DIM_H, threadIdx.x, THREADS);
     }
 }

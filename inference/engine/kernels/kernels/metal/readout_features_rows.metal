@@ -10,7 +10,7 @@ kernel void readout_features_rows(
     device const float *hidden [[buffer(SEISMIC_BUFFER_HIDDEN)]],
     device const uchar *norm [[buffer(SEISMIC_BUFFER_NORM)]],
     device const int *out_rows [[buffer(SEISMIC_BUFFER_OUT_ROWS)]],
-    device uchar *features [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(features),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint row [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
@@ -23,8 +23,7 @@ kernel void readout_features_rows(
         SEISMIC_HIDDEN_STRIDE_2, norm, SEISMIC_NORM_STRIDE_0,
         as_type<float>(uint(SEISMIC_PARAM_EPSILON)), width, {out_rows}};
     const float inverse = projection::normalization_inverse<256>(in, row, 0, partials, thread_index);
-    device typename activation::storage *out = reinterpret_cast<device typename activation::storage *>(features);
+    const element::Out<activation> out(features);
     for (uint i = thread_index; i < width; i += 256u)
-        out[ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + ulong(i) * SEISMIC_RESULT_0_STRIDE_1] =
-            activation::store(in.value(row, i, inverse));
+        out.put(ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + ulong(i) * SEISMIC_RESULT_0_STRIDE_1, in.value(row, i, inverse));
 }

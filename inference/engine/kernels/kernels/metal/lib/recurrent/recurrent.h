@@ -14,7 +14,7 @@
 #include "../core/activation.h"
 #include "../core/arrive.h"
 #include "../core/functions.h"
-#include <seismic/slab.h>
+#include "versions.h"
 
 namespace recurrent {
 
@@ -28,47 +28,21 @@ typedef element::Act::storage Storage;
 #define RECURRENT_TAPE_K (SEISMIC_DIM_NV * SEISMIC_DIM_W)
 #define RECURRENT_TAPE_D ((SEISMIC_DIM_NV + SEISMIC_DIM_NK) * SEISMIC_DIM_W)
 
-// One slot's rows [lo, hi), its publication row count, the version it reads
-// (bank `source` advanced by its first `taped` tape rows) and its successor.
-struct Slot {
-    long lo;
-    long hi;
-    long stop;
-    ulong source;
-    long taped;
-    ulong target;
-};
+// The slot of the bank version contract (`versions.h`).
+typedef versions::Slot Slot;
 
-inline Slot slot_of(device const int *segments, device const int *stop, device const int *previous_bank,
-    device const int *previous_tape, device const int *following_bank, ulong slot, constant ulong *seismic_words) {
-    Slot result;
-    result.lo = segments[slot * SEISMIC_SEGMENTS_STRIDE_0];
-    result.hi = segments[slot * SEISMIC_SEGMENTS_STRIDE_0 + SEISMIC_SEGMENTS_STRIDE_1];
-    result.stop = stop[slot * SEISMIC_STOP_STRIDE_0];
-    result.source = ulong(previous_bank[slot * SEISMIC_PREVIOUS_BANK_STRIDE_0]);
-    result.taped = previous_tape[slot * SEISMIC_PREVIOUS_TAPE_STRIDE_0];
-    result.target = ulong(following_bank[slot * SEISMIC_FOLLOWING_BANK_STRIDE_0]);
-    return result;
-}
-
-// Rows the slot records in its successor's tape: those after the stop row, at
-// most T.
-inline long tape_rows(Slot slot, constant ulong *seismic_words) {
-    return metal::min(long(SEISMIC_DIM_T), slot.hi - slot.lo - slot.stop);
-}
-
-// Tape row `entry` of `bank`.
-template <typename T>
-inline device T *bank(device const ulong *table, ulong index, ulong stride,
+// Tape row `entry` of `bank`, read.
+inline device const float *tape_view(device const slab::Table<element::F32> *tape, ulong bank_index, long entry,
     constant ulong *seismic_words) {
-    const ulong slab_banks = ulong(SEISMIC_PARAM_SLAB_BANKS);
-    return slab::region<T>(table, index / slab_banks) + (index % slab_banks) * stride;
-}
-
-inline device float *tape_row(device const ulong *tape, ulong bank_index, long entry,
-    constant ulong *seismic_words) {
-    return bank<float>(tape, bank_index, SEISMIC_TAPE_STRIDE_0, seismic_words)
+    return versions::bank_view(tape, bank_index, SEISMIC_TAPE_STRIDE_0, seismic_words)
         + ulong(entry) * SEISMIC_TAPE_STRIDE_1;
+}
+
+// Tape row `entry` of `bank`, written.
+inline element::Out<element::F32> tape_row(device const slab::Table<element::F32> *tape, ulong bank_index,
+    long entry, constant ulong *seismic_words) {
+    return versions::bank(tape, bank_index, SEISMIC_TAPE_STRIDE_0, seismic_words)
+        .offset(ulong(entry) * SEISMIC_TAPE_STRIDE_1);
 }
 
 // The offset in a tape row of value head `head`'s decay factor of key column
@@ -206,7 +180,8 @@ inline ulong raw_index(ulong row, ulong head, ulong state_row, constant ulong *s
 template <uint LANE_ROWS, uint BLOCK_ROWS, uint SPAN, uint QK_STRIDE, uint V_STRIDE, typename Inputs,
     typename RowGates, typename Mixed>
 inline void advance_rows(Inputs inputs, RowGates gates,
-    device const ulong *delta, device const ulong *tape, Mixed mixed, Slot slot, long begin, ulong head,
+    device const slab::Table<element::F32> *delta, device const slab::Table<element::F32> *tape, Mixed mixed,
+    Slot slot, long begin, ulong head,
     ulong block_row0, ulong row0, threadgroup float *query_block, threadgroup float *key_block,
     threadgroup float *value_block, threadgroup float *beta_block, threadgroup float *decay_block,
     uint thread_index, uint threads, uint simdgroup, uint lane, constant ulong *seismic_words) {
@@ -228,7 +203,7 @@ inline void advance_rows(Inputs inputs, RowGates gates,
     const ulong first_decay = DECAYS == 1 ? 0 : first_column;
     const ulong tape_decays = tape_decay<DECAYS>(head, first_column, seismic_words);
 
-    const long recorded = tape_rows(slot, seismic_words);
+    const long recorded = versions::tape_rows(slot, long(SEISMIC_DIM_T));
     // The simdgroup that owns state row 0 records the head's decay factors,
     // and the key when the head records its key head's key.
     const bool records = row0 == 0;
@@ -236,11 +211,11 @@ inline void advance_rows(Inputs inputs, RowGates gates,
 
     // This simdgroup's state rows, loaded first so their traffic overlaps the
     // prologue.
-    device const float *initial = bank<float>(delta, begin == lo ? slot.source : slot.target,
-        SEISMIC_DELTA_STRIDE_0, seismic_words)
-        + head * SEISMIC_DELTA_STRIDE_1 + row0 * SEISMIC_DELTA_STRIDE_2 + first_column;
-    device float *published = bank<float>(delta, slot.target, SEISMIC_DELTA_STRIDE_0, seismic_words)
-        + head * SEISMIC_DELTA_STRIDE_1 + row0 * SEISMIC_DELTA_STRIDE_2 + first_column;
+    const ulong lane_state = head * SEISMIC_DELTA_STRIDE_1 + row0 * SEISMIC_DELTA_STRIDE_2 + first_column;
+    device const float *initial = versions::bank_view(delta, begin == lo ? slot.source : slot.target,
+        SEISMIC_DELTA_STRIDE_0, seismic_words) + lane_state;
+    const element::Out<element::F32> published =
+        versions::bank(delta, slot.target, SEISMIC_DELTA_STRIDE_0, seismic_words).offset(lane_state);
     float state[LANE_ROWS][COLUMNS];
     RECURRENT_UNROLL for (uint r = 0; r < LANE_ROWS; ++r) {
         RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
@@ -248,7 +223,7 @@ inline void advance_rows(Inputs inputs, RowGates gates,
         }
     }
     for (long entry = 0; begin == lo && entry < slot.taped; ++entry) {
-        device const float *row = tape_row(tape, slot.source, entry, seismic_words);
+        device const float *row = tape_view(tape, slot.source, entry, seismic_words);
         // One decay per value head is loaded once.
         float factor[LANE_DECAYS];
         RECURRENT_UNROLL for (uint j = 0; j < LANE_DECAYS; ++j) {
@@ -266,7 +241,7 @@ inline void advance_rows(Inputs inputs, RowGates gates,
     if (begin == lo && publish == lo) {
         RECURRENT_UNROLL for (uint r = 0; r < LANE_ROWS; ++r) {
             RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
-                published[r * SEISMIC_DELTA_STRIDE_2 + j] = state[r][j];
+                published.put(r * SEISMIC_DELTA_STRIDE_2 + j, state[r][j]);
             }
         }
     }
@@ -333,24 +308,24 @@ inline void advance_rows(Inputs inputs, RowGates gates,
             }
             const ulong local_row = row0 - block_row0;
             // Rows after the stop row are recorded in the successor's tape.
-            device float *entry = row >= publish && row - publish < recorded
-                ? tape_row(tape, slot.target, row - publish, seismic_words) : nullptr;
-            if (entry != nullptr && records_keys) {
+            const element::Out<element::F32> entry = row >= publish && row - publish < recorded
+                ? tape_row(tape, slot.target, row - publish, seismic_words) : element::Out<element::F32>(nullptr);
+            if (entry.present() && records_keys) {
                 RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
-                    entry[RECURRENT_TAPE_K + key * width + first_column + j] = key_values[j];
+                    entry.put(RECURRENT_TAPE_K + key * width + first_column + j, key_values[j]);
                 }
             }
-            if (entry != nullptr && records && (DECAYS != 1 || lane == 0)) {
+            if (entry.present() && records && (DECAYS != 1 || lane == 0)) {
                 RECURRENT_UNROLL for (uint j = 0; j < LANE_DECAYS; ++j) {
-                    entry[tape_decays + j] = factor[j];
+                    entry.put(tape_decays + j, factor[j]);
                 }
             }
             float output[LANE_ROWS];
             RECURRENT_UNROLL for (uint r = 0; r < LANE_ROWS; ++r) {
                 const float residual = (value_block[i * V_STRIDE + local_row + r]
                     - simd_sum(remembered[r])) * beta;
-                if (entry != nullptr && lane == r) {
-                    entry[RECURRENT_TAPE_U + head * width + row0 + r] = residual;
+                if (entry.present() && lane == r) {
+                    entry.put(RECURRENT_TAPE_U + head * width + row0 + r, residual);
                 }
                 output[r] = 0.0f;
                 RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
@@ -369,7 +344,7 @@ inline void advance_rows(Inputs inputs, RowGates gates,
             if (row + 1 == publish) {
                 RECURRENT_UNROLL for (uint r = 0; r < LANE_ROWS; ++r) {
                     RECURRENT_UNROLL for (uint j = 0; j < COLUMNS; ++j) {
-                        published[r * SEISMIC_DELTA_STRIDE_2 + j] = state[r][j];
+                        published.put(r * SEISMIC_DELTA_STRIDE_2 + j, state[r][j]);
                     }
                 }
             }
@@ -424,19 +399,18 @@ inline Gated8 gated_inputs8(Mixed mixed, GateInput input,
 }
 
 // Stores the gated columns i..i+7 of (row, head) given the head's inverse.
-inline void store_gated8(thread const Gated8 &v, float inverse, device Storage *gated, ulong row, ulong head,
-    uint i, constant ulong *seismic_words) {
+inline void store_gated8(thread const Gated8 &v, float inverse, element::Out<element::Act> gated, ulong row,
+    ulong head, uint i, constant ulong *seismic_words) {
     const float4 e = v.raw_even * inverse * v.norm_even, o = v.raw_odd * inverse * v.norm_odd;
     // `functions::output_gate` over four lanes.
     const bool sigmoid = int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == functions::gate_sigmoid;
     const float4 ae = (sigmoid ? 1.0f : v.z_even) / (1.0f + metal::exp(-v.z_even));
     const float4 ao = (sigmoid ? 1.0f : v.z_odd) / (1.0f + metal::exp(-v.z_odd));
-    device Storage *out = gated + row * SEISMIC_RESULT_0_STRIDE_0 + head * SEISMIC_RESULT_0_STRIDE_1;
+    const element::Out<element::Act> out = gated.offset(row * SEISMIC_RESULT_0_STRIDE_0
+        + head * SEISMIC_RESULT_0_STRIDE_1);
     RECURRENT_UNROLL for (uint j = 0; j < 4; ++j) {
-        out[(i + 2 * j) * SEISMIC_RESULT_0_STRIDE_2] = element::Act::store(
-            element::Act::round(element::Act::round(e[j]) * element::Act::round(ae[j])));
-        out[(i + 2 * j + 1) * SEISMIC_RESULT_0_STRIDE_2] = element::Act::store(
-            element::Act::round(element::Act::round(o[j]) * element::Act::round(ao[j])));
+        out.put((i + 2 * j) * SEISMIC_RESULT_0_STRIDE_2, element::Act::round(e[j]) * element::Act::round(ae[j]));
+        out.put((i + 2 * j + 1) * SEISMIC_RESULT_0_STRIDE_2, element::Act::round(o[j]) * element::Act::round(ao[j]));
     }
 }
 
@@ -446,7 +420,7 @@ inline void store_gated8(thread const Gated8 &v, float inverse, device Storage *
 // head's square sum. This is the lane grouping of the projection GEMV
 // staging. All threads of the threadgroup (whole simdgroups) call it.
 inline void gate_head(arrive::coherent_device<const Storage> mixed, GateInput input, device const uchar *norm,
-    device Storage *gated, ulong head, uint thread_index, uint threads, constant ulong *seismic_words) {
+    element::Out<element::Act> gated, ulong head, uint thread_index, uint threads, constant ulong *seismic_words) {
     constexpr uint LANES = SEISMIC_DIM_W / 8;
     static_assert(SEISMIC_DIM_W % 8 == 0 && LANES <= 32 && (LANES & (LANES - 1)) == 0,
         "a head is gated over W / 8 lanes, a power of two up to 32");
@@ -476,7 +450,7 @@ inline void gate_head(arrive::coherent_device<const Storage> mixed, GateInput in
 // of columns l, l + 32, ... in order, then one simd_sum. This is the
 // projection family's normalizing pre-pass order.
 inline void gate_row(device const Storage *mixed, GateInput input, device const uchar *norm,
-    device Storage *gated, ulong row, ulong head, uint lane, constant ulong *seismic_words) {
+    element::Out<element::Act> gated, ulong row, ulong head, uint lane, constant ulong *seismic_words) {
     const float epsilon = as_type<float>(uint(SEISMIC_PARAM_EPSILON));
     device const Storage *raw = mixed + raw_index(row, head, 0, seismic_words);
     float squares = 0.0f;
@@ -497,10 +471,10 @@ inline void gate_row(device const Storage *mixed, GateInput input, device const 
 // threadgroups to arrive (`arrivals[head]`, over every row block and slot)
 // gates the head's rows into the result (`gate_head`).
 template <uint LANE_ROWS, uint SPAN, typename Inputs, typename Rule>
-inline void step(Inputs inputs, Rule rule, GateInput gate, device const uchar *norm, device Storage *gated,
-    arrive::coherent_device<Storage> mixed, device atomic_uint *arrivals, device const ulong *delta,
-    device const ulong *tape, Slot slot, uint3 group, threadgroup float *query_block, threadgroup float *key_block,
-    threadgroup float *value_block, threadgroup float *beta_block, threadgroup float *decay_block,
+inline void step(Inputs inputs, Rule rule, GateInput gate, device const uchar *norm,
+    element::Out<element::Act> gated, arrive::coherent_device<Storage> mixed, device atomic_uint *arrivals,
+    device const slab::Table<element::F32> *delta, device const slab::Table<element::F32> *tape, Slot slot,
+    uint3 group, threadgroup float *query_block, threadgroup float *key_block, threadgroup float *value_block, threadgroup float *beta_block, threadgroup float *decay_block,
     threadgroup uint *last, uint thread_index, uint threads, uint simdgroup, uint lane,
     constant ulong *seismic_words) {
     const ulong head = group.x;

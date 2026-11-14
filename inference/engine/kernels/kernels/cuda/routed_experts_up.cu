@@ -73,8 +73,10 @@ __device__ void routed_experts_up_expand_block(SEISMIC_KERNEL_PARAMS) {
     const int slot = EXPERT_SLOT(expert);
     const projection::u64 rows = block * SEISMIC_DIM_T;
     const auto epi = projection::scaling<(SEISMIC_DIM_US != 0)>::wrap(
-        projection::Activated<typename Operands::Storage, Act>{SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT) + rows * SEISMIC_DIM_F * 2,
-                                   SEISMIC_DIM_F, (int)SEISMIC_PARAM_ACTIVATION},
+        projection::Activated<typename Operands::Storage, Act>{
+            element::out_over_scratch<typename Operands::Storage>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT))
+                .offset(rows * SEISMIC_DIM_F),
+            SEISMIC_DIM_F, (int)SEISMIC_PARAM_ACTIVATION},
         projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_US,
                                  SEISMIC_UP_SCALE_STRIDE_0, (projection::u64)expert), 1.0f);
     constexpr bool STAGED = OPERAND == 1 || UP_NVFP4;
@@ -117,7 +119,7 @@ __device__ void routed_experts_up_down_block(SEISMIC_KERNEL_PARAMS) {
         return;
     const int slot = EXPERT_SLOT(expert);
     const projection::u64 rows = block * SEISMIC_DIM_T;
-    const projection::Store<Act> epi{SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + block * SEISMIC_RESULT_0_STRIDE_0 * 2,
+    const projection::Store<Act> epi{SEISMIC_RESULT_0_OUT.offset(block * SEISMIC_RESULT_0_STRIDE_0),
                                      SEISMIC_RESULT_0_STRIDE_1, 0};
     const projection::ActivationRows source{SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT) + rows * SEISMIC_DIM_F * 2,
                                             SEISMIC_DIM_F};

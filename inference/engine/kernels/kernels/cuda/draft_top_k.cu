@@ -2,6 +2,7 @@
 // logits in (value descending, token ascending) order. Round r scans the
 // tokens ordered strictly after round r - 1's choice, so no chosen set is
 // kept.
+#include <seismic/element.cuh>
 #include "lib/core/reduce.cuh"
 
 extern "C" __global__ void draft_top_k(SEISMIC_KERNEL_PARAMS) {
@@ -9,7 +10,7 @@ extern "C" __global__ void draft_top_k(SEISMIC_KERNEL_PARAMS) {
     __shared__ float partials[32];
     const float *logits = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_LOGITS));
     int *candidates = reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_BUFFER_CANDIDATES));
-    float *unary = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_UNARY));
+    const auto unary = SEISMIC_OUT_UNARY;
     const float infinity = __int_as_float(0x7f800000);
     const u64 row = blockIdx.x;
     const float *line = logits + row * SEISMIC_LOGITS_STRIDE_0;
@@ -34,7 +35,7 @@ extern "C" __global__ void draft_top_k(SEISMIC_KERNEL_PARAMS) {
             const u64 at = row * SEISMIC_DIM_K + rank;
             candidates[at * SEISMIC_CANDIDATES_STRIDE_0] = previous_token;
             candidates[at * SEISMIC_CANDIDATES_STRIDE_0 + SEISMIC_CANDIDATES_STRIDE_1] = 0;
-            unary[row * SEISMIC_UNARY_STRIDE_0 + rank * SEISMIC_UNARY_STRIDE_1] = chosen;
+            unary.put(row * SEISMIC_UNARY_STRIDE_0 + rank * SEISMIC_UNARY_STRIDE_1, chosen);
         }
     }
 }
@@ -96,7 +97,7 @@ extern "C" __global__ void draft_top_k_merge(SEISMIC_KERNEL_PARAMS) {
     const int *partial_ids = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIAL_TOKENS));
     const float *partial_values = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIAL_VALUES));
     int *candidates = reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_BUFFER_CANDIDATES));
-    float *unary = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_UNARY));
+    const auto unary = SEISMIC_OUT_UNARY;
     const ulong row = blockIdx.x;
     __shared__ float partials[32];
     const ulong parts = (SEISMIC_DIM_V + 4095ul) / 4096ul;
@@ -125,7 +126,7 @@ extern "C" __global__ void draft_top_k_merge(SEISMIC_KERNEL_PARAMS) {
             const ulong at = ulong(row) * SEISMIC_DIM_K + rank;
             candidates[at * SEISMIC_CANDIDATES_STRIDE_0] = previous_token;
             candidates[at * SEISMIC_CANDIDATES_STRIDE_0 + SEISMIC_CANDIDATES_STRIDE_1] = 0;
-            unary[ulong(row) * SEISMIC_UNARY_STRIDE_0 + rank * SEISMIC_UNARY_STRIDE_1] = chosen;
+            unary.put(ulong(row) * SEISMIC_UNARY_STRIDE_0 + rank * SEISMIC_UNARY_STRIDE_1, chosen);
         }
     }
 }

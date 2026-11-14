@@ -22,7 +22,7 @@ typedef projection::operands<NVFP4> Operands;
     device const uchar *source [[buffer(SEISMIC_BUFFER_SOURCE)]],                       \
     device uchar *staged [[buffer(SEISMIC_BUFFER_SCRATCH_STAGED)]],                     \
     device const uchar *weight [[buffer(SEISMIC_BUFFER_WEIGHT)]],                       \
-    device uchar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],                           \
+    SEISMIC_RESULT_0_PARAM(result_cells),                                               \
     device float *partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]],                 \
     device float *small_partials [[buffer(SEISMIC_BUFFER_SCRATCH_SMALL_PARTIALS)]],     \
     device uchar *fragments [[buffer(SEISMIC_BUFFER_SCRATCH_FRAGMENTS)]],               \
@@ -52,8 +52,8 @@ typedef projection::operands<NVFP4> Operands;
         ? projection::Plain<activation, projection::AllRows>{staged, k, 1, k, {}}       \
         : raw;                                                                          \
     const auto out = projection::scaling<(SEISMIC_DIM_WS != 0)>::wrap(                  \
-        projection::Store<published>{result, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, \
-            ulong(group) * uint(SEISMIC_DIM_N)},                                        \
+        projection::Store<published>{element::Out<published>(result_cells), SEISMIC_RESULT_0_STRIDE_0, \
+            SEISMIC_RESULT_0_STRIDE_1, ulong(group) * uint(SEISMIC_DIM_N)},             \
         projection::scale_factor(weight_scale, SEISMIC_DIM_WS, 0, 0), 1.0f);            \
     projection::Weights<packets::W0> w{weight, KERNEL_W0_LAYOUT(k), k, nullptr,          \
         ulong(group) * uint(SEISMIC_DIM_N)}

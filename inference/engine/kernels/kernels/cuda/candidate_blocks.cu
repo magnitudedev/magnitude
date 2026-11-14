@@ -8,6 +8,8 @@
 //
 // Dynamic extents and strides read `seismic_words`.
 
+#include <seismic/element.cuh>
+
 extern "C" __global__ void candidate_blocks(SEISMIC_KERNEL_PARAMS) {
     typedef unsigned int u32;
     typedef unsigned long long u64;
@@ -37,7 +39,6 @@ extern "C" __global__ void candidate_blocks(SEISMIC_KERNEL_PARAMS) {
         for (u32 unit = block * bu; unit < end; ++unit)
             score = fmaxf(score, row_scores[static_cast<u64>(unit) * SEISMIC_SCORES_STRIDE_1]);
     }
-    reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER))[row * SEISMIC_RESULT_0_STRIDE_0 +
-                                                                  static_cast<u64>(block) * SEISMIC_RESULT_0_STRIDE_1] =
-        score;
+    SEISMIC_RESULT_0_OUT.put(row * SEISMIC_RESULT_0_STRIDE_0 + static_cast<u64>(block) * SEISMIC_RESULT_0_STRIDE_1,
+                             score);
 }

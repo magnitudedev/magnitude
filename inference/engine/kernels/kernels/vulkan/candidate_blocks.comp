@@ -33,6 +33,6 @@ void candidate_blocks() {
         for (uint unit = block * bu; unit < end; ++unit)
             score = max(score, element_f32_at(scores + uint64_t(unit) * SEISMIC_SCORES_STRIDE_1 * 4ul));
     }
-    element_f32_put(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)
-        + (row * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(block) * SEISMIC_RESULT_0_STRIDE_1) * 4ul, score);
+    out_put(SEISMIC_RESULT_0_OUT,
+        row * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(block) * SEISMIC_RESULT_0_STRIDE_1, score);
 }

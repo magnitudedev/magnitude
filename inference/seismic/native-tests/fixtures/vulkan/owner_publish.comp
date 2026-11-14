@@ -1,0 +1,37 @@
+// Group r writes result row r through the owner's handle with operation r;
+// each thread writes spans of eight elements of the row. The result is
+// canonical (contiguous rows of N, N % 8 == 0), so a span's first element is
+// aligned to every vector store the handle makes. A value moves from `x` to
+// the handle as loaded, without arithmetic, so a NaN payload reaches the
+// owner unchanged.
+#include <seismic/element.glsl>
+
+void owner_publish() {
+    const uint64_t x = SEISMIC_PTR(SEISMIC_BUFFER_X);
+    const Out result = SEISMIC_RESULT_0_OUT;
+    const uint64_t row = uint64_t(gl_WorkGroupID.x);
+    for (uint64_t first = 8ul * uint64_t(gl_LocalInvocationID.x); first < SEISMIC_DIM_N; first += 8ul * uint64_t(gl_WorkGroupSize.x)) {
+        float v[8];
+        for (uint i = 0u; i < 8u; ++i)
+            v[i] = element_f32_at(x + (row * SEISMIC_X_STRIDE_0 + (first + uint64_t(i)) * SEISMIC_X_STRIDE_1) * 4ul);
+        const uint64_t at = row * SEISMIC_RESULT_0_STRIDE_0 + first;
+        if (row == 0ul) {
+            // out_put
+            for (uint i = 0u; i < 8u; ++i)
+                out_put(result, at + uint64_t(i), v[i]);
+        } else if (row == 1ul) {
+            // out_put2 at even indices: one packed 32-bit store for 16-bit kinds
+            for (uint i = 0u; i < 8u; i += 2u)
+                out_put2(result, at + uint64_t(i), v[i], v[i + 1u]);
+        } else if (row == 2ul) {
+            // out_put2 at odd indices: two element stores
+            out_put(result, at, v[0]);
+            for (uint i = 1u; i < 7u; i += 2u)
+                out_put2(result, at + uint64_t(i), v[i], v[i + 1u]);
+            out_put(result, at + 7ul, v[7]);
+        } else {
+            // out_put8: whole 16-byte words
+            out_put8(result, at, vec4(v[0], v[2], v[4], v[6]), vec4(v[1], v[3], v[5], v[7]));
+        }
+    }
+}

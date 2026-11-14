@@ -689,7 +689,7 @@ fn decode(
                     "scalar result contract mismatch",
                 ));
             };
-            Value::Scalar(match v {
+            Value::Scalar(match v.into_value() {
                 ArgumentValue::F32(v) => Scalar::F32(v.to_bits()),
                 ArgumentValue::F16(v) => Scalar::F16(v),
                 ArgumentValue::BF16(v) => Scalar::BF16(v),

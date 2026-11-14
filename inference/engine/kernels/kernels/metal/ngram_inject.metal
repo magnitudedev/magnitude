@@ -38,8 +38,8 @@ kernel void ngram_inject(
     device const int *previous_bank [[buffer(SEISMIC_BUFFER_PREVIOUS_BANK)]],
     device const int *previous_tape [[buffer(SEISMIC_BUFFER_PREVIOUS_TAPE)]],
     device const int *following_bank [[buffer(SEISMIC_BUFFER_FOLLOWING_BANK)]],
-    device const ulong *window [[buffer(SEISMIC_BUFFER_WINDOW)]],
-    device float *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_OUT_WINDOW_PARAM(window),
+    SEISMIC_RESULT_0_PARAM(result_cells),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
@@ -56,28 +56,36 @@ kernel void ngram_inject(
     const ulong rows = SEISMIC_DIM_M;
     if (group.y >= rows) {
         const versions::Slot slot = versions::slot_of(slots, group.y - rows, seismic_words);
-        device const float *source = versions::bank<float>(window, slot.source, SEISMIC_WINDOW_STRIDE_0, seismic_words);
-        device float *target = versions::bank<float>(window, slot.target, SEISMIC_WINDOW_STRIDE_0, seismic_words);
+        const element::Out<element::F32> source = versions::bank(window, slot.source, SEISMIC_WINDOW_STRIDE_0,
+            seismic_words);
+        const element::Out<element::F32> target = versions::bank(window, slot.target, SEISMIC_WINDOW_STRIDE_0,
+            seismic_words);
         // The tape holds T = R - reach rows.
         const long published = reach + versions::tape_rows(slot, long(SEISMIC_DIM_R) - reach);
         for (long tap = 0; tap < published; ++tap) {
             const long position = slot.stop + tap - reach;
-            target[ulong(tap) * SEISMIC_WINDOW_STRIDE_1 + channel * SEISMIC_WINDOW_STRIDE_2] = position < 0
-                ? source[ulong(slot.taped + slot.stop + tap) * SEISMIC_WINDOW_STRIDE_1 + channel * SEISMIC_WINDOW_STRIDE_2]
-                : ngram::u(in, ulong(slot.lo + position), stream, column, seismic_words);
+            const ulong to = ulong(tap) * SEISMIC_WINDOW_STRIDE_1 + channel * SEISMIC_WINDOW_STRIDE_2;
+            // The source window's rows are the owner's: moved. A launch row's
+            // u is formed: stored.
+            if (position < 0)
+                target.move_stored(to, source, ulong(slot.taped + slot.stop + tap) * SEISMIC_WINDOW_STRIDE_1
+                    + channel * SEISMIC_WINDOW_STRIDE_2, 1);
+            else
+                target.put(to, ngram::u(in, ulong(slot.lo + position), stream, column, seismic_words));
         }
         return;
     }
     const long row = long(group.y);
     const float residual = hidden[ulong(row) * SEISMIC_HIDDEN_STRIDE_0 + channel * SEISMIC_HIDDEN_STRIDE_1];
-    device float *out = result + ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + channel * SEISMIC_RESULT_0_STRIDE_1;
+    const element::Out<element::F32> result(result_cells);
+    const ulong out = ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + channel * SEISMIC_RESULT_0_STRIDE_1;
     const ulong slot_index = versions::slot_index_of_row(slots, row, seismic_words);
     if (slot_index == SEISMIC_DIM_B) {
-        *out = residual;
+        result.put(out, residual);
         return;
     }
     const versions::Slot slot = versions::slot_of(slots, slot_index, seismic_words);
-    device const float *source = versions::bank<float>(window, slot.source, SEISMIC_WINDOW_STRIDE_0, seismic_words);
+    device const float *source = versions::bank_view(window, slot.source, SEISMIC_WINDOW_STRIDE_0, seismic_words);
     const long local = row - slot.lo;
     float sum = 0.0f;
     for (long tap = 0; tap < long(SEISMIC_DIM_K); ++tap) {
@@ -90,5 +98,5 @@ kernel void ngram_inject(
     }
     const float gated = scales[ulong(row) * SEISMIC_SCALES_STRIDE_0 + stream * SEISMIC_SCALES_STRIDE_1]
         * value[ulong(row) * SEISMIC_VALUE_STRIDE_0 + column * SEISMIC_VALUE_STRIDE_1];
-    *out = residual + (gated + sum / (1.0f + metal::exp(-sum)));
+    result.put(out, residual + (gated + sum / (1.0f + metal::exp(-sum))));
 }

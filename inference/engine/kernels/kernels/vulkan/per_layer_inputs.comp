@@ -41,7 +41,6 @@ void per_layer_inputs() {
     const float token = packets_value_at(PACKETS_W0, packet, column % 32u);
     const float normalized = p * inverse * element_at(INPUTS_NORM, SEISMIC_PTR(SEISMIC_BUFFER_NORM),
         uint64_t(i) * SEISMIC_NORM_STRIDE_0);
-    element_f32_put(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)
-            + (row * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(column) * SEISMIC_RESULT_0_STRIDE_1) * 4ul,
-        (normalized + token * gathered_scale) * scale);
+    out_put(SEISMIC_RESULT_0_OUT,
+        row * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(column) * SEISMIC_RESULT_0_STRIDE_1, (normalized + token * gathered_scale) * scale);
 }

@@ -70,7 +70,7 @@ fn vision_patch_stem_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group
     let blended = unsafe { cx.scratch_blended().slice::<f32>(0, m * h) };
     for (row, pixels) in staged.chunks_exact(frames * patch).enumerate() {
         // SAFETY: each work item writes its own columns of every row.
-        let out = unsafe { result.span_mut([row, outputs.start], outputs.len()) };
+        let mut out = unsafe { result.span_mut([row, outputs.start], outputs.len()) };
         for ((target, output), weights) in out.iter_mut().zip(outputs.clone()).zip(weights.chunks_exact(frames * patch)) {
             let mut value = 0.0;
             for (pixels, weights) in pixels.chunks_exact(patch).zip(weights.chunks_exact(patch)) {
@@ -79,7 +79,7 @@ fn vision_patch_stem_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group
             if let Some(bias) = bias {
                 value += bias[output];
             }
-            *target = value + blended[row * h + output];
+            target.set(value + blended[row * h + output]);
         }
     }
 }

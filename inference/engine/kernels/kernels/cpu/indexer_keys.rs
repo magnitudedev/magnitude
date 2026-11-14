@@ -45,5 +45,5 @@ fn indexer_keys<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3]
     let keys = SlabTensor::from_bound(cx.arg_keys(), cx.arg_slab_rows() as usize);
     // SAFETY: key-plane rows are distinct freshly completed rows no work
     // item of this launch reads.
-    unsafe { keys.row_mut([destination as usize, 0]) }.copy_from_slice(prepared);
+    unsafe { keys.row_mut([destination as usize, 0]) }.store(prepared);
 }

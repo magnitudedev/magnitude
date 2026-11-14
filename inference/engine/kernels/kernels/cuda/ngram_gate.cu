@@ -22,7 +22,7 @@ extern "C" __global__ void ngram_gate(SEISMIC_KERNEL_PARAMS) {
     const float *value = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_VALUE));
     const u8 *key_norm = SEISMIC_PTR(SEISMIC_BUFFER_KEY_NORM);
     const u8 *query_norm = SEISMIC_PTR(SEISMIC_BUFFER_QUERY_NORM);
-    float *scales = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER));
+    const auto scales = SEISMIC_RESULT_0_OUT;
     for (u64 row = blockIdx.y; row < SEISMIC_DIM_M; row += gridDim.y) {
         const float *k = key + row * SEISMIC_KEY_STRIDE_0 + stream * SEISMIC_KEY_STRIDE_1;
         const float *x = hidden + row * SEISMIC_HIDDEN_STRIDE_0 + stream * SEISMIC_HIDDEN_STRIDE_1;
@@ -53,10 +53,10 @@ extern "C" __global__ void ngram_gate(SEISMIC_KERNEL_PARAMS) {
             const float root = sqrtf(fmaxf(fabsf(g), 1e-6f));
             const float signed_root = g > 0.0f ? root : (g < 0.0f ? -root : 0.0f);
             const float gate = 1.0f / (1.0f + expf(-signed_root));
-            float *out = scales + row * SEISMIC_RESULT_0_STRIDE_0;
-            out[stream * SEISMIC_RESULT_0_STRIDE_1] = gate;
-            out[(SEISMIC_DIM_S + stream) * SEISMIC_RESULT_0_STRIDE_1] =
-                rsqrtf(gate * gate * (values / (float)width) + epsilon);
+            const auto out = scales.offset(row * SEISMIC_RESULT_0_STRIDE_0);
+            out.put(stream * SEISMIC_RESULT_0_STRIDE_1, gate);
+            out.put((SEISMIC_DIM_S + stream) * SEISMIC_RESULT_0_STRIDE_1,
+                    rsqrtf(gate * gate * (values / (float)width) + epsilon));
         }
     }
 }

@@ -21,7 +21,7 @@ constant constexpr bool shared_nvfp4 =
 // epilogue. `globals` is the entry's `PROJECTION_OPERANDS_SHARED` of
 // `shared_nvfp4`. Every thread calls it.
 inline void shared_group(thread const RouteRows &in, device const uchar *shared_gate, device const uchar *shared_up,
-    device uchar *shared_product, constant ulong *seismic_words, uint tile, threadgroup float *globals,
+    element::Out<Act> shared_product, constant ulong *seismic_words, uint tile, threadgroup float *globals,
     threadgroup uchar *shared, uint simd, uint lane) {
     const uint rows = uint(SEISMIC_DIM_M);
     const uint k = uint(SEISMIC_DIM_H);

@@ -1,3 +1,5 @@
+#include <seismic/element.h>
+
 // Adds `x` into `state` after `PACE` rounds of work of the thread's own:
 // 2^16 dependent steps of a mixer each, `g = (g ^ (g >> 16)) * 0x45d9f3b`,
 // whose whole last state is read: whether it is `0xFFFFFFFF`. No compiler
@@ -13,7 +15,7 @@
 // separately what it writes: the sum at 0, the sum and 1.0 above 5, and the
 // sum and 0.5 (the default's) at every pace between.
 kernel void paced(
-    device float *state [[buffer(SEISMIC_BUFFER_STATE)]],
+    SEISMIC_OUT_STATE_PARAM(state_cells),
     device const float *x [[buffer(SEISMIC_BUFFER_X)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint index [[thread_position_in_grid]]) {
@@ -24,7 +26,8 @@ kernel void paced(
             generated = (generated ^ (generated >> 16)) * 0x45d9f3bu;
         }
         const float bias = SEISMIC_TUNE_PACE == 0 ? 0.0f : (SEISMIC_TUNE_PACE > 5 ? 1.0f : 0.5f);
+        const element::Out<ELEMENT_OF(SEISMIC_STATE)> state(state_cells);
         const ulong at = index * SEISMIC_STATE_STRIDE_0;
-        state[at] = state[at] + (x[index * SEISMIC_X_STRIDE_0] + bias + float(generated == 0xFFFFFFFFu));
+        state.put(at, state.at(at) + (x[index * SEISMIC_X_STRIDE_0] + bias + float(generated == 0xFFFFFFFFu)));
     }
 }

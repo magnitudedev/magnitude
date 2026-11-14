@@ -15,7 +15,7 @@ kernel void kimi_delta_chunk_inputs(
     device const int *previous_bank [[buffer(SEISMIC_BUFFER_PREVIOUS_BANK)]],
     device const int *previous_tape [[buffer(SEISMIC_BUFFER_PREVIOUS_TAPE)]],
     device const int *following_bank [[buffer(SEISMIC_BUFFER_FOLLOWING_BANK)]],
-    device const ulong *window [[buffer(SEISMIC_BUFFER_WINDOW)]],
+    SEISMIC_OUT_WINDOW_PARAM(window),
     device float *inputs [[buffer(SEISMIC_BUFFER_SCRATCH_INPUTS)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint3 group [[threadgroup_position_in_grid]],
@@ -37,9 +37,9 @@ kernel void kimi_delta_chunk_scan(
     device const int *previous_bank [[buffer(SEISMIC_BUFFER_PREVIOUS_BANK)]],
     device const int *previous_tape [[buffer(SEISMIC_BUFFER_PREVIOUS_TAPE)]],
     device const int *following_bank [[buffer(SEISMIC_BUFFER_FOLLOWING_BANK)]],
-    device const ulong *window [[buffer(SEISMIC_BUFFER_WINDOW)]],
-    device const ulong *delta [[buffer(SEISMIC_BUFFER_DELTA)]],
-    device const ulong *tape [[buffer(SEISMIC_BUFFER_TAPE)]],
+    SEISMIC_OUT_WINDOW_PARAM(window),
+    SEISMIC_OUT_DELTA_PARAM(delta),
+    SEISMIC_OUT_TAPE_PARAM(tape),
     device float *inputs [[buffer(SEISMIC_BUFFER_SCRATCH_INPUTS)]],
     device recurrent::Storage *mixed [[buffer(SEISMIC_BUFFER_SCRATCH_MIXED)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
@@ -62,11 +62,11 @@ kernel void kimi_delta_chunk_scan(
 kernel void kimi_delta_chunk_gate(
     device const recurrent::Storage *gate [[buffer(SEISMIC_BUFFER_GATE)]],
     device const uchar *recurrent_norm [[buffer(SEISMIC_BUFFER_RECURRENT_NORM)]],
-    device recurrent::Storage *gated [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(gated),
     device const recurrent::Storage *mixed [[buffer(SEISMIC_BUFFER_SCRATCH_MIXED)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint item [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]) {
-    recurrent::gate_row(mixed, kimi::gate_input(gate, seismic_words), recurrent_norm, gated,
-        item / RCH_VALUE_HEADS, item % RCH_VALUE_HEADS, lane, seismic_words);
+    recurrent::gate_row(mixed, kimi::gate_input(gate, seismic_words), recurrent_norm,
+        element::Out<element::Act>(gated), item / RCH_VALUE_HEADS, item % RCH_VALUE_HEADS, lane, seismic_words);
 }

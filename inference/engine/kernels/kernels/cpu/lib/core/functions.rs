@@ -12,7 +12,7 @@
 // The softcap c * tanh(z / c) is written c * (2 / (1 + exp(-2z / c)) - 1).
 
 use super::activation;
-use seismic::cpu::Dense;
+use seismic::cpu::{Dense, F32, Store};
 
 pub const SILU: i32 = 0;
 pub const GELU_TANH: i32 = 1;
@@ -39,7 +39,13 @@ pub fn activate(function: i32, x: f32) -> f32 {
 /// F32.
 #[inline(always)]
 pub fn activated<A: Dense>(function: i32, x: f32) -> A::Storage {
-    A::narrow(activate(function, activation::publish::<A>(x)))
+    A::narrow(activated_value::<A>(function, x))
+}
+
+/// [`activated`] before it is stored: the F32 a [`seismic::cpu::Store`] of `A` rounds.
+#[inline(always)]
+pub fn activated_value<A: Dense>(function: i32, x: f32) -> f32 {
+    activate(function, activation::publish::<A>(x))
 }
 
 /// The gated expansion `glu` (functions.seismic) of the scaled F32
@@ -124,43 +130,52 @@ pub fn scatter<'r>(
     y: impl Fn(usize) -> f32,
     inject: impl Fn(usize) -> f32,
     residual: impl Fn(usize) -> &'r [f32],
-    out: &mut [f32],
+    mut out: Store<'_, F32>,
 ) {
-    if inject_width > streams {
-        out.fill(0.0);
-        for from in 0..streams {
-            let weight = inject(streams + from * streams + stream);
-            for (mixed, value) in out.iter_mut().zip(residual(from)) {
-                *mixed = *mixed + weight * *value;
+    out.compute(|out| {
+        if inject_width > streams {
+            out.fill(0.0);
+            for from in 0..streams {
+                let weight = inject(streams + from * streams + stream);
+                for (mixed, value) in out.iter_mut().zip(residual(from)) {
+                    *mixed = *mixed + weight * *value;
+                }
+            }
+        } else {
+            out.copy_from_slice(residual(stream));
+        }
+        if inject_width == 0 {
+            for (column, target) in out.iter_mut().enumerate() {
+                *target = *target + y(column);
+            }
+        } else {
+            let factor = inject(stream);
+            for (column, target) in out.iter_mut().enumerate() {
+                *target = *target + y(column) * factor;
             }
         }
-    } else {
-        out.copy_from_slice(residual(stream));
-    }
-    if inject_width == 0 {
-        for (column, target) in out.iter_mut().enumerate() {
-            *target = *target + y(column);
-        }
-    } else {
-        let factor = inject(stream);
-        for (column, target) in out.iter_mut().enumerate() {
-            *target = *target + y(column) * factor;
-        }
-    }
+    });
 }
 
 /// `collapse` (streams.seismic) of one row: each column of `out` the
 /// `streams` streams' values of it (`stream(s)`) summed by `weight(s)` in
 /// stream order.
 #[inline(always)]
-pub fn collapse<'r>(streams: usize, weight: impl Fn(usize) -> f32, stream: impl Fn(usize) -> &'r [f32], out: &mut [f32]) {
-    out.fill(0.0);
-    for index in 0..streams {
-        let weight = weight(index);
-        for (sum, value) in out.iter_mut().zip(stream(index)) {
-            *sum = *sum + weight * value;
+pub fn collapse<'r>(
+    streams: usize,
+    weight: impl Fn(usize) -> f32,
+    stream: impl Fn(usize) -> &'r [f32],
+    mut out: Store<'_, F32>,
+) {
+    out.compute(|out| {
+        out.fill(0.0);
+        for index in 0..streams {
+            let weight = weight(index);
+            for (sum, value) in out.iter_mut().zip(stream(index)) {
+                *sum = *sum + weight * value;
+            }
         }
-    }
+    });
 }
 
 /// `ordered_key` (sampling.seismic): `a < b` exactly when their keys are,

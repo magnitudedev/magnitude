@@ -38,6 +38,10 @@ pub const NATIVE_LIBRARY: &[(&str, &str)] = &[
         include_str!("../native-library/metal/element.h"),
     ),
     (
+        "coherent.h",
+        include_str!("../native-library/metal/coherent.h"),
+    ),
+    (
         "packets.h",
         include_str!("../native-library/metal/packets.h"),
     ),

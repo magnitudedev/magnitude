@@ -1,6 +1,8 @@
 // corrector_nodes: one thread per element (slot s, mask row j, candidate k,
 // column): the sum of its token, pass, feature, slot and rank rows with their
 // biases, in the portable body's order.
+#include <seismic/element.h>
+
 kernel void corrector_nodes(
     device const float *token [[buffer(SEISMIC_BUFFER_TOKEN)]],
     device const float *token_bias [[buffer(SEISMIC_BUFFER_TOKEN_BIAS)]],
@@ -10,7 +12,7 @@ kernel void corrector_nodes(
     device const float *feature_bias [[buffer(SEISMIC_BUFFER_FEATURE_BIAS)]],
     device const float *slot_rows [[buffer(SEISMIC_BUFFER_SLOT)]],
     device const float *rank_rows [[buffer(SEISMIC_BUFFER_RANK)]],
-    device float *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(result_cells),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint index [[thread_position_in_grid]]) {
     const ulong rows = SEISMIC_DIM_J, count = SEISMIC_DIM_K, width = SEISMIC_DIM_H;
@@ -30,6 +32,7 @@ kernel void corrector_nodes(
     value += rank_rows[candidate * SEISMIC_RANK_STRIDE_0 + column * SEISMIC_RANK_STRIDE_1];
     if (SEISMIC_DIM_TB == 1)
         value += token_bias[column * SEISMIC_TOKEN_BIAS_STRIDE_1];
-    result[slot * SEISMIC_RESULT_0_STRIDE_0 + mask * SEISMIC_RESULT_0_STRIDE_1 +
-        candidate * SEISMIC_RESULT_0_STRIDE_2 + column * SEISMIC_RESULT_0_STRIDE_3] = value;
+    element::Out<ELEMENT_OF(SEISMIC_RESULT_0)>(result_cells).put(slot * SEISMIC_RESULT_0_STRIDE_0 +
+        mask * SEISMIC_RESULT_0_STRIDE_1 + candidate * SEISMIC_RESULT_0_STRIDE_2 + column * SEISMIC_RESULT_0_STRIDE_3,
+        value);
 }

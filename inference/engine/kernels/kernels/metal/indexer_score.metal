@@ -40,7 +40,7 @@ kernel void indexer_score(
     device const int *coordinates [[buffer(SEISMIC_BUFFER_COORDINATES)]],
     device const ulong *keys [[buffer(SEISMIC_BUFFER_KEYS)]],
     device const int *spans [[buffer(SEISMIC_BUFFER_SPANS)]],
-    device float *scores [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(score_cells),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     threadgroup float *prepared [[threadgroup(0)]],
     uint3 group [[threadgroup_position_in_grid]],
@@ -57,10 +57,10 @@ kernel void indexer_score(
     int at = -1;
     ulong listed = indexer::simd_span_row(row_spans, r, uint(ordinal), lane, at);
     listed = listed < n ? listed : n;
-    device float *out = scores + row * n;
+    const element::Out<element::F32> out = element::Out<element::F32>(score_cells).offset(row * n);
     if (ulong(group.x) * 256 >= listed) {
         if (ordinal < n)
-            out[ordinal] = -INFINITY;
+            out.put(ordinal, -INFINITY);
         return;
     }
     // The row's query heads, prepared in F32.
@@ -90,7 +90,7 @@ kernel void indexer_score(
     if (ordinal >= n)
         return;
     if (ordinal >= listed) {
-        out[ordinal] = -INFINITY;
+        out.put(ordinal, -INFINITY);
         return;
     }
     device const float *k = slab::row<float>(keys, ulong(at), ulong(SEISMIC_PARAM_SLAB_ROWS), SCORE_W);
@@ -114,5 +114,5 @@ kernel void indexer_score(
         const float weight = SEISMIC_DIM_HW != 0 ? float(head_weights[row * SCORE_H + head]) : 1.0f;
         score = score + metal::max(dot[head], 0.0f) * weight;
     }
-    out[ordinal] = as_type<float>(uint(SEISMIC_PARAM_SCALE)) * score;
+    out.put(ordinal, as_type<float>(uint(SEISMIC_PARAM_SCALE)) * score);
 }

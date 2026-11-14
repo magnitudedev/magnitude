@@ -41,7 +41,7 @@ projection_prologue head_rows_input() {
 }
 
 projection_epilogue head_rows_output() {
-    return projection_scaled(projection_logits(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0,
+    return projection_scaled(projection_logits(SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0,
         SEISMIC_RESULT_0_STRIDE_1, element_word_f32(SEISMIC_PARAM_SOFTCAP)),
         projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT_SCALE), SEISMIC_DIM_WS, 0ul, 0ul), 1.0);
 }

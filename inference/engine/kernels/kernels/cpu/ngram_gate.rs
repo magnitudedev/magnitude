@@ -24,7 +24,7 @@ fn ngram_gate<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], 
     let epsilon = cx.arg_epsilon();
     let values = reduce::sum_squares(&cx.arg_value().row([row, 0])[..h]) / h as f32;
     // SAFETY: each work item writes its own row.
-    let out = unsafe { cx.result_0().row_mut([row, 0]) };
+    let mut out = unsafe { cx.result_0().row_mut([row, 0]) };
     for stream in 0..s {
         let k = &cx.arg_key().row([row, stream, 0])[..h];
         let x = &cx.arg_hidden().row([row, stream, 0])[..h];
@@ -42,7 +42,7 @@ fn ngram_gate<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], 
             0.0
         };
         let gate = activation::sigmoid(signed);
-        out[stream] = gate;
-        out[s + stream] = 1.0 / (gate * gate * values + epsilon).sqrt();
+        out.set(stream, gate);
+        out.set(s + stream, 1.0 / (gate * gate * values + epsilon).sqrt());
     }
 }

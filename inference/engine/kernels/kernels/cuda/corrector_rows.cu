@@ -4,15 +4,13 @@
 #include "lib/core/activation.cuh"
 #include "lib/core/reduce.cuh"
 
-typedef ELEMENT_OF(SEISMIC_ELEMENT_Y) Y;
-
 extern "C" __global__ void corrector_rows(SEISMIC_KERNEL_PARAMS) {
     typedef unsigned long long u64;
     __shared__ float partials[32];
     const float *values = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_VALUES));
     const float *bias = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_BIAS));
     const float *residual = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL));
-    element::u8 *result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const auto result = SEISMIC_RESULT_0_OUT;
     const u64 row = blockIdx.x;
     const u64 width = SEISMIC_DIM_N;
     const int form = (int)SEISMIC_PARAM_FORM;
@@ -38,6 +36,6 @@ extern "C" __global__ void corrector_rows(SEISMIC_KERNEL_PARAMS) {
             value = value / length;
         if (SEISMIC_DIM_R == 1)
             value += residual[row * SEISMIC_RESIDUAL_STRIDE_1 + column * SEISMIC_RESIDUAL_STRIDE_2];
-        element::put<Y>(result, row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1, value);
+        result.put(row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1, value);
     }
 }

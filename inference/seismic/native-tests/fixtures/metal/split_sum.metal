@@ -1,3 +1,5 @@
+#include <seismic/element.h>
+
 kernel void split_partial(
     device const float *x [[buffer(SEISMIC_BUFFER_X)]],
     device float *partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]],
@@ -29,10 +31,10 @@ kernel void split_partial(
 
 kernel void split_merge(
     device const float *partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]],
-    device float *result [[buffer(SEISMIC_RESULT_0_BUFFER)]]) {
+    SEISMIC_RESULT_0_PARAM(result)) {
     float total = 0.0f;
     for (uint part = 0; part < SEISMIC_TUNE_PARTS; ++part) {
         total += partials[part];
     }
-    result[0] = total;
+    element::Out<ELEMENT_OF(SEISMIC_RESULT_0)>(result).put(0, total);
 }

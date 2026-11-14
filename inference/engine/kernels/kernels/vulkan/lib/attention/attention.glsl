@@ -68,21 +68,25 @@
 #define ATTENTION_SINK_BUFFER 0ul
 #endif
 
-// E consecutive A elements from element `index` (aligned to E) as F32.
-void attention_load_row(uint64_t base, uint64_t index, out float x[ATTENTION_E]) {
-    if (ELEMENT_ACT != ELEMENT_F32 && ATTENTION_E % 8u == 0u) {
+// E consecutive elements of `source` from element `index` (aligned to E) as F32.
+void attention_load_row(Stored source, uint64_t index, out float x[ATTENTION_E]) {
+    if (ATTENTION_E % 8u == 0u) {
         [[unroll]] for (uint c = 0u; c < ATTENTION_E; c += 8u) {
-            const uvec4 words = element_uvec4_at(base + (index + c) * 2ul);
+            vec4 even, odd;
+            stored_load8(source, index + c, even, odd);
             [[unroll]] for (uint j = 0u; j < 4u; ++j) {
-                const vec2 pair = element_unpack2(ELEMENT_ACT, words[j]);
-                x[c + 2u * j] = pair.x;
-                x[c + 2u * j + 1u] = pair.y;
+                x[c + 2u * j] = even[j];
+                x[c + 2u * j + 1u] = odd[j];
             }
         }
     } else {
         [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
-            x[i] = element_at(ELEMENT_ACT, base, index + i);
+            x[i] = stored_at(source, index + i);
     }
+}
+
+void attention_load_row(uint64_t base, uint64_t index, out float x[ATTENTION_E]) {
+    attention_load_row(stored_at_buffer(ELEMENT_ACT, base), index, x);
 }
 
 // One value head row at `raw` (A elements) into lane `lane`'s E columns,
@@ -117,19 +121,17 @@ void attention_prepare(uint64_t raw, const bool normed, uint64_t norm, uint64_t 
 }
 
 // Appends lane `lane`'s columns of one kv head row at history row
-// `destination` (the caller skips rows without a destination), rounded to A.
-void attention_append(uint64_t history, int destination, uint kv_head, uint lane, float x[ATTENTION_E]) {
+// `destination` of the history handle `history` (the caller skips rows
+// without a destination), rounded to A.
+void attention_append(Out history, int destination, uint kv_head, uint lane, float x[ATTENTION_E]) {
     const uint64_t target = (uint64_t(destination) * ATTENTION_KV + kv_head) * ATTENTION_W + lane * ATTENTION_E;
     if (ELEMENT_ACT != ELEMENT_F32 && ATTENTION_E % 8u == 0u) {
-        [[unroll]] for (uint c = 0u; c < ATTENTION_E; c += 8u) {
-            uvec4 words;
-            [[unroll]] for (uint j = 0u; j < 4u; ++j)
-                words[j] = element_pack2(ELEMENT_ACT, x[c + 2u * j], x[c + 2u * j + 1u]);
-            element_uvec4_put(history + (target + c) * 2ul, words);
-        }
+        [[unroll]] for (uint c = 0u; c < ATTENTION_E; c += 8u)
+            out_put8(history, target + c, vec4(x[c], x[c + 2u], x[c + 4u], x[c + 6u]),
+                vec4(x[c + 1u], x[c + 3u], x[c + 5u], x[c + 7u]));
     } else {
         [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
-            element_put(ELEMENT_ACT, history, target + i, x[i]);
+            out_put(history, target + i, x[i]);
     }
 }
 
@@ -493,7 +495,7 @@ void attention_publish(float maximum[ATTENTION_HEADS], float denominator[ATTENTI
 // output gate: value column % count of the head's ATTENTION_I interleaved
 // gate columns (after its W query columns in `query`) or its ATTENTION_U
 // separate ones (in `gate`); sigmoid, or softplus under ATTENTION_SOFTPLUS.
-void attention_store_gated(uint64_t query, uint64_t gate, uint64_t result, uint64_t row, uint64_t head, uint column,
+void attention_store_gated(uint64_t query, uint64_t gate, Out result, uint64_t row, uint64_t head, uint column,
     float attended) {
     const uint64_t heads = uint64_t(ATTENTION_KV * ATTENTION_G);
     float value = attended;
@@ -504,7 +506,7 @@ void attention_store_gated(uint64_t query, uint64_t gate, uint64_t result, uint6
         value = ATTENTION_SOFTPLUS ? attended * (max(g, 0.0) + log(1.0 + exp(-abs(g))))
                                    : seismic_div_rn(attended, 1.0 + exp(-g));
     }
-    element_put(ELEMENT_ACT, result, (row * heads + head) * ATTENTION_W + column, value);
+    out_put(result, (row * heads + head) * ATTENTION_W + column, value);
 }
 
 // The decode merge of one (query head, row) column over the row's key
@@ -512,7 +514,7 @@ void attention_store_gated(uint64_t query, uint64_t gate, uint64_t result, uint6
 // non-empty partitions in partition order, then the output gate. A row that
 // sees no key attends to zero. Whole subgroups call it (each finds the row's
 // total keys).
-void attention_decode_gate(uint64_t query, uint64_t gate, uint64_t visible, uint64_t fresh, uint64_t result,
+void attention_decode_gate(uint64_t query, uint64_t gate, uint64_t visible, uint64_t fresh, Out result,
     uint64_t partials, uint64_t statistics, uint64_t spans, uint picks, uint64_t head, uint64_t row, uint column,
     uint span, uint parts) {
     const uint total = attention_visible_total(visible, fresh, row, spans) + picks;
@@ -528,7 +530,7 @@ void attention_decode_gate(uint64_t query, uint64_t gate, uint64_t visible, uint
 // invocation `pair` turns its pair of the published row back by the row's
 // negated angles (the portable `output_rotary`), in F32, and publishes it
 // again. Every attention entry with the output rotary launches it last.
-void attention_rotate_output(uint64_t result, uint64_t coordinates, uint64_t components, uint64_t frequencies,
+void attention_rotate_output(Out result, uint64_t coordinates, uint64_t components, uint64_t frequencies,
     uint64_t amplitudes) {
     const uint64_t row = gl_WorkGroupID.x;
     const uint64_t head = gl_WorkGroupID.y;
@@ -541,8 +543,8 @@ void attention_rotate_output(uint64_t result, uint64_t coordinates, uint64_t com
     const uint lo = rotary_leading(pair, pairs);
     const uint hi = rotary_partner(lo, pairs.p, pairs.first, pairs.adjacent);
     const uint64_t row_at = (row * uint64_t(ATTENTION_KV * ATTENTION_G) + head) * ATTENTION_W;
-    const float low = element_at(ELEMENT_ACT, result, row_at + lo);
-    const float high = element_at(ELEMENT_ACT, result, row_at + hi);
-    element_put(ELEMENT_ACT, result, row_at + lo, low * cosine + high * sine);
-    element_put(ELEMENT_ACT, result, row_at + hi, high * cosine - low * sine);
+    const float low = out_at(result, row_at + lo);
+    const float high = out_at(result, row_at + hi);
+    out_put(result, row_at + lo, low * cosine + high * sine);
+    out_put(result, row_at + hi, high * cosine - low * sine);
 }

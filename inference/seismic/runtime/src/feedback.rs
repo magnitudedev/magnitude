@@ -868,7 +868,7 @@ fn capture_invocation<T: TargetFamily, H>(
         check_deadline(request)?;
         let value = match output {
             DecodedValue::Tensor(t) => ObservedValue::Tensor(tensor(t)?),
-            DecodedValue::Scalar(value) => match value {
+            DecodedValue::Scalar(value) => match value.value() {
                 ArgumentValue::Index(v) => ObservedValue::Index(SymbolValue::Nat(v.clone())),
                 ArgumentValue::Range { start, end } => ObservedValue::Range {
                     start: SymbolValue::Nat(start.clone()),

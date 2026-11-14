@@ -17,9 +17,9 @@ typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
     device const uchar *norm [[buffer(SEISMIC_BUFFER_NORM)]],                           \
     device const uchar *down_weight [[buffer(SEISMIC_BUFFER_DOWN_WEIGHT)]],             \
     device const uchar *inject_weight [[buffer(SEISMIC_BUFFER_INJECT_WEIGHT)]],         \
-    device uchar *low [[buffer(SEISMIC_RESULT_0_BUFFER)]],                              \
-    device float *inject [[buffer(SEISMIC_RESULT_1_BUFFER)]],                           \
-    device float *inverse [[buffer(SEISMIC_RESULT_2_BUFFER)]],                          \
+    SEISMIC_RESULT_0_PARAM(low_cells),                                                  \
+    SEISMIC_RESULT_1_PARAM(inject_cells),                                               \
+    SEISMIC_RESULT_2_PARAM(inverse_cells),                                              \
     device uchar *normalized [[buffer(SEISMIC_BUFFER_SCRATCH_NORMALIZED)]],             \
     arrive::coherent_device<float> partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]], \
     device atomic_uint *arrivals [[buffer(SEISMIC_BUFFER_SCRATCH_ARRIVALS)]],           \
@@ -34,10 +34,11 @@ typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
         as_type<float>(uint(SEISMIC_PARAM_EPSILON)), k, {}, uint(SEISMIC_DIM_H)};       \
     projection::Weights<packets::W0> down_w{down_weight, KERNEL_W0_LAYOUT(k), k};       \
     projection::Weights<packets::W1> inject_w{inject_weight, KERNEL_W1_LAYOUT(k), k};   \
-    projection::MixLow<activation> low_out{low, SEISMIC_RESULT_0_STRIDE_0,              \
+    projection::MixLow<activation> low_out{element::Out<activation>(low_cells), SEISMIC_RESULT_0_STRIDE_0, \
         SEISMIC_RESULT_0_STRIDE_1, float(SEISMIC_DIM_S)};                               \
-    projection::MixInject inject_out{inject, SEISMIC_RESULT_1_STRIDE_0,                 \
-        SEISMIC_RESULT_1_STRIDE_1, float(SEISMIC_DIM_S)}
+    projection::MixInject inject_out{element::Out<element::F32>(inject_cells), SEISMIC_RESULT_1_STRIDE_0, \
+        SEISMIC_RESULT_1_STRIDE_1, float(SEISMIC_DIM_S)};                               \
+    const element::Out<element::F32> inverse(inverse_cells)
 
 // The streams' square sums in threadgroup memory; the first threadgroup
 // publishes the inverses they give.
@@ -94,7 +95,7 @@ kernel void stream_mix_down_gemv(STREAM_MIX_DOWN_ARGUMENTS,
     projection::threadgroup_squares_runtime(part, rows, squares, simdgroups, sg, lane);
     if (local == 0) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        projection::publish_inverses(part, rows, squares, inverse + ulong(stream) * SEISMIC_RESULT_2_STRIDE_1,
+        projection::publish_inverses(part, rows, squares, inverse.offset(ulong(stream) * SEISMIC_RESULT_2_STRIDE_1),
             SEISMIC_RESULT_2_STRIDE_0, SEISMIC_RESULT_2_STRIDE_1, sg * 32 + lane, simdgroups * 32);
     }
     const auto x = projection::shared_norm(part, squares);
@@ -162,8 +163,8 @@ kernel void stream_mix_down_stage(STREAM_MIX_DOWN_ARGUMENTS,
     STREAM_MIX_DOWN_OPERANDS;
     const float value = projection::device_normalize<256>(in, item, normalized, k, norms, thread_index);
     if (thread_index == 0)
-        inverse[ulong(item / uint(SEISMIC_DIM_S)) * SEISMIC_RESULT_2_STRIDE_0
-            + ulong(item % uint(SEISMIC_DIM_S)) * SEISMIC_RESULT_2_STRIDE_1] = value;
+        inverse.put(ulong(item / uint(SEISMIC_DIM_S)) * SEISMIC_RESULT_2_STRIDE_0
+            + ulong(item % uint(SEISMIC_DIM_S)) * SEISMIC_RESULT_2_STRIDE_1, value);
 }
 #endif
 

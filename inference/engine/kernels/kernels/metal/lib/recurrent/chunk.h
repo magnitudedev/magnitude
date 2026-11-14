@@ -72,7 +72,7 @@ inline bool rch_row_slot(device const int *segments, device const int *stop, dev
         const long last = segments[candidate * SEISMIC_SEGMENTS_STRIDE_0
             + SEISMIC_SEGMENTS_STRIDE_1];
         if (long(row) >= first && long(row) < last) {
-            slot = recurrent::slot_of(segments, stop, previous_bank, previous_tape, following_bank, candidate,
+            slot = versions::slot_of({segments, stop, previous_bank, previous_tape, following_bank}, candidate,
                 seismic_words);
             return last - first > RECURRENT_SEQUENTIAL_ROWS && long(row) < first + slot.stop;
         }
@@ -101,8 +101,8 @@ inline void rch_zero_tail(device recurrent::Storage *mixed, ulong slot, long hi,
 // `inputs` scratch's q | k rows [NK, M, 2W] (`qk_rows`) or v rows [NV, M, W]
 // (`value_rows`) of `height` rows.
 inline void rch_prepare_row(device const recurrent::Storage *projection, device const float *convolution,
-    device const ulong *window, recurrent::Slot slot, ulong row, uint head, device float *qk_rows,
-    device float *value_rows, ulong height, uint lane, constant ulong *seismic_words) {
+    device const slab::Table<element::Act> *window, recurrent::Slot slot, ulong row, uint head,
+    device float *qk_rows, device float *value_rows, ulong height, uint lane, constant ulong *seismic_words) {
     const uint width = RCH_WIDTH;
     const bool is_value = head >= 2 * RCH_KEY_HEADS;
     const bool is_key = head >= RCH_KEY_HEADS && !is_value;
@@ -112,8 +112,7 @@ inline void rch_prepare_row(device const recurrent::Storage *projection, device 
 
     // The tap rows: the window of the slot's source version before the slot,
     // the projection after.
-    recurrent::Taps taps;
-    recurrent::taps(projection, window, slot, long(row) - slot.lo, taps, seismic_words);
+    const recurrent::Taps taps = recurrent::taps(projection, window, slot, long(row) - slot.lo, seismic_words);
     // This lane's channel quads.
     float4 values[RCH_LANE_QUADS];
     float squares = 0.0f;
@@ -167,8 +166,9 @@ inline RchScratch<DECAYS> rch_scratch(device float *inputs, constant ulong *seis
 template <typename Rule>
 inline void rch_inputs(Rule rule, device const recurrent::Storage *projection, device const float *convolution,
     device const int *segments, device const int *stop, device const int *previous_bank,
-    device const int *previous_tape, device const int *following_bank, device const ulong *window,
-    device float *inputs, uint3 group, uint simdgroup, uint lane, constant ulong *seismic_words) {
+    device const int *previous_tape, device const int *following_bank,
+    device const slab::Table<element::Act> *window, device float *inputs, uint3 group, uint simdgroup, uint lane,
+    constant ulong *seismic_words) {
     constexpr uint DECAYS = Rule::DECAYS;
     const uint head = group.y * 4 + simdgroup;
     const ulong row = group.x;
@@ -400,10 +400,11 @@ template <typename Rule>
 inline void rch_scan(Rule rule, RchDecays<Rule::DECAYS> decays, device const recurrent::Storage *projection,
     device const float *convolution, device const int *segments, device const int *stop,
     device const int *previous_bank, device const int *previous_tape, device const int *following_bank,
-    device const ulong *window, device const ulong *delta, device const ulong *tape, device float *inputs,
-    device recurrent::Storage *mixed, threadgroup float *queries, threadgroup float *keys,
-    threadgroup float *values, threadgroup float *gates, RchShares shares, uint3 group, uint thread_index,
-    uint simdgroup, uint lane_index, constant ulong *seismic_words) {
+    device const slab::Table<element::Act> *window, device const slab::Table<element::F32> *delta,
+    device const slab::Table<element::F32> *tape, device float *inputs, device recurrent::Storage *mixed,
+    threadgroup float *queries, threadgroup float *keys, threadgroup float *values, threadgroup float *gates,
+    RchShares shares, uint3 group, uint thread_index, uint simdgroup, uint lane_index,
+    constant ulong *seismic_words) {
     constexpr uint DECAYS = Rule::DECAYS;
     const ushort lane = ushort(lane_index);
     const ulong width = RCH_WIDTH;
@@ -413,8 +414,8 @@ inline void rch_scan(Rule rule, RchDecays<Rule::DECAYS> decays, device const rec
     const ulong row0 = block_row0 + ulong(simdgroup) * 16;
     const ulong key_head = recurrent::key_head(head, seismic_words);
     const RchScratch<DECAYS> scratch = rch_scratch<DECAYS>(inputs, seismic_words);
-    const recurrent::Slot geometry = recurrent::slot_of(segments, stop, previous_bank, previous_tape,
-        following_bank, slot, seismic_words);
+    const recurrent::Slot geometry = versions::slot_of({segments, stop, previous_bank, previous_tape,
+        following_bank}, slot, seismic_words);
     const ulong source = geometry.source;
     const ulong target = geometry.target;
     // The first row block publishes this head's window channels (for the
@@ -443,12 +444,13 @@ inline void rch_scan(Rule rule, RchDecays<Rule::DECAYS> decays, device const rec
 
     // S^T tiles of the two 8-row halves: rows are key coordinates.
     const ulong state_stride = SEISMIC_DELTA_STRIDE_2;
-    device float *published = recurrent::bank<float>(delta, target, SEISMIC_DELTA_STRIDE_0, seismic_words)
-        + head * SEISMIC_DELTA_STRIDE_1 + row0 * state_stride;
+    const ulong lane_state = head * SEISMIC_DELTA_STRIDE_1 + row0 * state_stride;
+    const element::Out<element::F32> published = versions::bank(delta, target, SEISMIC_DELTA_STRIDE_0,
+        seismic_words).offset(lane_state);
     simdgroup_float8x8 state[2][RCH_TILES];
     {
-        device const float *initial = recurrent::bank<float>(delta, source, SEISMIC_DELTA_STRIDE_0, seismic_words)
-            + head * SEISMIC_DELTA_STRIDE_1 + row0 * state_stride;
+        device const float *initial = versions::bank_view(delta, source, SEISMIC_DELTA_STRIDE_0, seismic_words)
+            + lane_state;
         RECURRENT_UNROLL for (uint h = 0; h < 2; ++h) {
             RECURRENT_UNROLL for (uint c = 0; c < RCH_TILES; ++c) {
                 simdgroup_load(state[h][c], initial + 8 * h * state_stride + 8 * c, state_stride,
@@ -460,7 +462,7 @@ inline void rch_scan(Rule rule, RchDecays<Rule::DECAYS> decays, device const rec
         // column 8c + row's factor (the head's one factor for one decay).
         constexpr uint FACTORS = DECAYS == 1 ? 1 : RCH_TILES;
         for (long entry = 0; entry < geometry.taped; ++entry) {
-            device const float *tape_row = recurrent::tape_row(tape, source, entry, seismic_words);
+            device const float *tape_row = recurrent::tape_view(tape, source, entry, seismic_words);
             float factors[FACTORS];
             RECURRENT_UNROLL for (uint c = 0; c < FACTORS; ++c) {
                 factors[c] = tape_row[recurrent::tape_decay<DECAYS>(head, 8 * c + row, seismic_words)];
@@ -481,8 +483,7 @@ inline void rch_scan(Rule rule, RchDecays<Rule::DECAYS> decays, device const rec
     if (geometry.stop == 0) {
         RECURRENT_UNROLL for (uint h = 0; h < 2; ++h) {
             RECURRENT_UNROLL for (uint c = 0; c < RCH_TILES; ++c) {
-                simdgroup_store(state[h][c], published + 8 * h * state_stride + 8 * c,
-                    state_stride, ulong2(0), true);
+                published.put_tile(8 * h * state_stride + 8 * c, state[h][c], state_stride, true);
             }
         }
     }
@@ -592,8 +593,7 @@ inline void rch_scan(Rule rule, RchDecays<Rule::DECAYS> decays, device const rec
         if (piece + 1 == pieces_before) {
             RECURRENT_UNROLL for (uint h = 0; h < 2; ++h) {
                 RECURRENT_UNROLL for (uint c = 0; c < RCH_TILES; ++c) {
-                    simdgroup_store(state[h][c], published + 8 * h * state_stride + 8 * c,
-                        state_stride, ulong2(0), true);
+                    published.put_tile(8 * h * state_stride + 8 * c, state[h][c], state_stride, true);
                 }
             }
         }

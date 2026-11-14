@@ -239,20 +239,20 @@ __device__ __forceinline__ DenseItem dense_item_of(const seismic_words_t &seismi
 // into the destination, `import_dense`'s conversion, from the window the
 // item's bytes were stored into.
 template <class B>
-__device__ __forceinline__ void convert_span(const u8 *window, u8 *destination,
+__device__ __forceinline__ void convert_span(const u8 *window, const element::Out<typename Dense<B>::Destination> &destination,
                                              const seismic_words_t &seismic_words_value, u64 slot, u32 item) {
     typedef typename Dense<B>::Source Source;
     typedef typename Dense<B>::Destination Destination;
-    u8 *out = destination + slot * B::out_matrix_bytes(seismic_words_value);
+    const element::Out<Destination> out =
+        destination.offset(slot * (B::out_matrix_bytes(seismic_words_value) / Destination::bytes));
     const DenseItem span = dense_item_of<B>(seismic_words_value, item);
     const u32 columns = u32(B::k(seismic_words_value));
     // A thread's row and column step with its element: two divides an item.
     u32 row = (span.first + threadIdx.x) / columns, column = (span.first + threadIdx.x) % columns;
     const u32 row_step = blockDim.x / columns, column_step = blockDim.x % columns;
     for (u32 e = threadIdx.x; e < span.count; e += blockDim.x) {
-        element::put<Destination>(out, (u64)row * B::out_stride_1(seismic_words_value) +
-                                           (u64)column * B::out_stride_2(seismic_words_value),
-                                  Source::load(reinterpret_cast<const typename Source::storage *>(window)[e]));
+        out.put((u64)row * B::out_stride_1(seismic_words_value) + (u64)column * B::out_stride_2(seismic_words_value),
+                Source::load(reinterpret_cast<const typename Source::storage *>(window)[e]));
         row += row_step;
         column += column_step;
         if (column >= columns) {
@@ -272,6 +272,14 @@ __device__ __forceinline__ const u8 *listed_source(const u8 *conveyor, const u8 
                                                    const seismic_words_t &seismic_words_value, int from) {
     return from >= 0 ? conveyor + (u64)from * B::source_matrix_bytes(seismic_words_value)
                      : destination + (u64)(-1 - from) * B::out_matrix_bytes(seismic_words_value);
+}
+// The same of a dense float destination, held by its owner's handle: the
+// scratch slot's stored bytes are read, never written, through it.
+template <class B, class E>
+__device__ __forceinline__ const u8 *listed_source(const u8 *conveyor, const element::Out<E> &destination,
+                                                   const seismic_words_t &seismic_words_value, int from) {
+    return from >= 0 ? conveyor + (u64)from * B::source_matrix_bytes(seismic_words_value)
+                     : destination.stored((u64)(-1 - from) * (B::out_matrix_bytes(seismic_words_value) / E::bytes));
 }
 
 // Where item `item` of a packed record lies (`window`'s windowing): its row

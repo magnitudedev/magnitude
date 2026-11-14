@@ -15,7 +15,7 @@ extern "C" __global__ void corrector_features(SEISMIC_KERNEL_PARAMS) {
     const float *norm_bias = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_NORM_BIAS));
     const float *up_weight = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_UP_WEIGHT));
     const float *up_bias = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_UP_BIAS));
-    element::u8 *result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const auto result = SEISMIC_RESULT_0_OUT;
     const u64 row = blockIdx.x;
     const u64 vocabulary = SEISMIC_DIM_V, count = SEISMIC_DIM_K, width = SEISMIC_DIM_H;
     const float epsilon = __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON);
@@ -59,8 +59,8 @@ extern "C" __global__ void corrector_features(SEISMIC_KERNEL_PARAMS) {
             for (int f = 0; f < 5; ++f)
                 value = seismic_fma_rn(
                     up_weight[column * SEISMIC_UP_WEIGHT_STRIDE_0 + f * SEISMIC_UP_WEIGHT_STRIDE_1], normed[f], value);
-            element::put<element::Act>(result, out * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1,
-                                       value / (1.0f + expf(-value)));
+            result.put(out * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1,
+                       value / (1.0f + expf(-value)));
         }
     }
 }

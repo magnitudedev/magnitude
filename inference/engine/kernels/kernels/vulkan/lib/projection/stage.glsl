@@ -22,7 +22,7 @@ uint projection_row(uint64_t table, uint m) {
 struct projection_prologue {
     int kind;
     int act;            // ELEMENT_* of the activation A (bf16 or f16)
-    uint64_t x;         // Plain/Grouped: A rows; Rms/Summed: F32 rows
+    Stored x;           // Plain/Grouped: stored rows; Rms/Summed: F32 rows
     uint64_t x0;        // element strides of x
     uint64_t x1;
     uint columns;       // K
@@ -36,16 +36,21 @@ struct projection_prologue {
     int operands;       // PROJECTION_OPERANDS_*: how the GEMV staging and the stage launches form the rows
 };
 
-projection_prologue projection_plain(const int act, uint64_t x, uint64_t stride0, uint64_t stride1, uint columns,
+projection_prologue projection_plain(const int act, Stored x, uint64_t stride0, uint64_t stride1, uint columns,
     uint64_t rows) {
     return projection_prologue(PROJECTION_PLAIN, act, x, stride0, stride1, columns, rows, 1ul, 0ul, 0ul,
         ELEMENT_F32, 0.0, 1u, PROJECTION_OPERANDS_ROUNDED);
 }
 
+projection_prologue projection_plain(const int act, uint64_t x, uint64_t stride0, uint64_t stride1, uint columns,
+    uint64_t rows) {
+    return projection_plain(act, stored_at_buffer(act, x), stride0, stride1, columns, rows);
+}
+
 projection_prologue projection_rms(const int act, uint64_t x, uint64_t stride0, uint64_t stride1, uint64_t norm,
     uint64_t norm_stride, const int norm_kind, float eps, uint columns, uint64_t rows) {
-    return projection_prologue(PROJECTION_RMS, act, x, stride0, stride1, columns, rows, 1ul, norm, norm_stride,
-        norm_kind, eps, 1u, PROJECTION_OPERANDS_ROUNDED);
+    return projection_prologue(PROJECTION_RMS, act, stored_at_buffer(ELEMENT_F32, x), stride0, stride1, columns, rows,
+        1ul, norm, norm_stride, norm_kind, eps, 1u, PROJECTION_OPERANDS_ROUNDED);
 }
 
 // The sum in part order of the `parts` parts of an F32 row, a hyper-connection
@@ -53,8 +58,8 @@ projection_prologue projection_rms(const int act, uint64_t x, uint64_t stride0, 
 // sums are zero and it ignores the inverse it is given.
 projection_prologue projection_summed(const int act, uint64_t x, uint64_t stride0, uint64_t stride1, uint columns,
     uint64_t rows, uint parts) {
-    return projection_prologue(PROJECTION_SUMMED, act, x, stride0, stride1, columns, rows, 1ul, 0ul, 0ul,
-        ELEMENT_F32, 0.0, parts, PROJECTION_OPERANDS_ROUNDED);
+    return projection_prologue(PROJECTION_SUMMED, act, stored_at_buffer(ELEMENT_F32, x), stride0, stride1, columns,
+        rows, 1ul, 0ul, 0ul, ELEMENT_F32, 0.0, parts, PROJECTION_OPERANDS_ROUNDED);
 }
 
 // An entry's input prologue (`form_input`) by its norm's extent `norm_extent`:
@@ -68,10 +73,15 @@ projection_prologue projection_input(const int act, uint64_t x, uint64_t stride0
 }
 
 // Tile row m reads activation row order[m * order_stride]; -1 is padding.
-projection_prologue projection_grouped(const int act, uint64_t x, uint64_t stride0, uint64_t stride1, uint columns,
+projection_prologue projection_grouped(const int act, Stored x, uint64_t stride0, uint64_t stride1, uint columns,
     uint64_t order, uint64_t order_stride) {
     return projection_prologue(PROJECTION_GROUPED, act, x, stride0, stride1, columns, order, order_stride, 0ul,
         0ul, ELEMENT_F32, 0.0, 1u, PROJECTION_OPERANDS_ROUNDED);
+}
+
+projection_prologue projection_grouped(const int act, uint64_t x, uint64_t stride0, uint64_t stride1, uint columns,
+    uint64_t order, uint64_t order_stride) {
+    return projection_grouped(act, stored_at_buffer(act, x), stride0, stride1, columns, order, order_stride);
 }
 
 // The prologue's rows as the operands of weights of recipe `operands`
@@ -88,30 +98,34 @@ float projection_summed_at(projection_prologue in_, uint m, uint k) {
     const uint64_t row = uint64_t(projection_row(in_.rows, m)) * in_.x0;
     float sum = 0.0;
     for (uint part = 0u; part < in_.parts; ++part)
-        sum = seismic_add_rn(sum,
-            element_f32_at(in_.x + (row + uint64_t(part * in_.columns + k) * in_.x1) * 4ul));
+        sum = seismic_add_rn(sum, stored_at(in_.x, row + uint64_t(part * in_.columns + k) * in_.x1));
     return sum;
 }
 
-// Eight consecutive elements of `kind` from element `index` of the tensor at
-// `base` with element stride `stride`, as (0,2,4,6), (1,3,5,7); elements past
-// the first `valid` are zero. `vector` allows one aligned load.
-void projection_load8_strided(const int kind, uint64_t base, uint64_t index, uint64_t stride, uint valid,
+// Eight consecutive elements from element `index` of `source` with element
+// stride `stride`, as (0,2,4,6), (1,3,5,7); elements past the first `valid`
+// are zero. `vector` allows one aligned load.
+void projection_load8_strided(Stored source, uint64_t index, uint64_t stride, uint valid,
     bool vector, out vec4 even, out vec4 odd) {
     if (vector && valid >= 8u) {
-        element_load8(kind, base, index, even, odd);
+        stored_load8(source, index, even, odd);
         return;
     }
     float v[8];
     [[unroll]] for (uint i = 0u; i < 8u; ++i)
-        v[i] = i < valid ? element_at(kind, base, index + uint64_t(i) * stride) : 0.0;
+        v[i] = i < valid ? stored_at(source, index + uint64_t(i) * stride) : 0.0;
     even = vec4(v[0], v[2], v[4], v[6]);
     odd = vec4(v[1], v[3], v[5], v[7]);
 }
 
+void projection_load8_strided(const int kind, uint64_t base, uint64_t index, uint64_t stride, uint valid,
+    bool vector, out vec4 even, out vec4 odd) {
+    projection_load8_strided(stored_at_buffer(kind, base), index, stride, valid, vector, even, odd);
+}
+
 // The input the Rms norm reduces: element i of row m.
 float projection_norm_input(projection_prologue in_, uint m, uint i) {
-    return element_f32_at(in_.x + (uint64_t(projection_row(in_.rows, m)) * in_.x0 + uint64_t(i) * in_.x1) * 4ul);
+    return stored_at(in_.x, uint64_t(projection_row(in_.rows, m)) * in_.x0 + uint64_t(i) * in_.x1);
 }
 
 float projection_silu_rounded(const int act, float gate) {
@@ -133,8 +147,8 @@ void projection_load8(projection_prologue in_, uint m, uint k, float inverse, ou
             odd = vec4(0.0);
             return;
         }
-        projection_load8_strided(in_.act, in_.x, uint64_t(row) * in_.x0 + uint64_t(k) * in_.x1, in_.x1, valid,
-            in_.x1 == 1ul && (in_.x0 & 7ul) == 0ul && (in_.x & 15ul) == 0ul, even, odd);
+        projection_load8_strided(in_.x, uint64_t(row) * in_.x0 + uint64_t(k) * in_.x1, in_.x1, valid,
+            in_.x1 == 1ul && (in_.x0 & 7ul) == 0ul && stored_aligned16(in_.x), even, odd);
     } else if (in_.kind == PROJECTION_SUMMED) {
         float v[8];
         [[unroll]] for (uint i = 0u; i < 8u; ++i)
@@ -144,7 +158,7 @@ void projection_load8(projection_prologue in_, uint m, uint k, float inverse, ou
     } else {
         const uint64_t row = uint64_t(projection_row(in_.rows, m)) * in_.x0;
         vec4 xe, xo;
-        projection_load8_strided(ELEMENT_F32, in_.x, row + uint64_t(k) * in_.x1, in_.x1, valid,
+        projection_load8_strided(in_.x, row + uint64_t(k) * in_.x1, in_.x1, valid,
             in_.x1 == 1ul && (in_.x0 & 3ul) == 0ul, xe, xo);
         if (valid == 8u) {
             vec4 ne, no;
@@ -177,16 +191,16 @@ void projection_load8(projection_prologue in_, uint m, uint k, float inverse, ou
 float projection_rms_squares(projection_prologue in_, uint m, uint part, uint lane) {
     if (in_.kind == PROJECTION_SUMMED)
         return 0.0;
-    const uint64_t row = in_.x + uint64_t(projection_row(in_.rows, m)) * in_.x0 * 4ul;
+    const uint64_t row = uint64_t(projection_row(in_.rows, m)) * in_.x0;
     const bool vector = in_.x1 == 1ul && (in_.x0 & 3ul) == 0ul && (in_.columns & 3u) == 0u;
     float sum = 0.0;
     for (uint c = 4u * (32u * part + lane); c < in_.columns; c += 128u * PROJECTION_RMS_PARTS) {
         vec4 v;
         if (vector) {
-            v = element_vec4_at(row + uint64_t(c) * 4ul);
+            v = stored_vec4_at(in_.x, row + uint64_t(c));
         } else {
             [[unroll]] for (uint i = 0u; i < 4u; ++i)
-                v[i] = c + i < in_.columns ? element_f32_at(row + uint64_t(c + i) * in_.x1 * 4ul) : 0.0;
+                v[i] = c + i < in_.columns ? stored_at(in_.x, row + uint64_t(c + i) * in_.x1) : 0.0;
         }
         sum = seismic_fma_rn(v.x, v.x, sum);
         sum = seismic_fma_rn(v.y, v.y, sum);

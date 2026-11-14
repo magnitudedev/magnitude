@@ -23,7 +23,7 @@ kernel void state_space_gate(
     device const element::Act::storage *mixed [[buffer(SEISMIC_BUFFER_MIXED)]],
     device const element::Act::storage *projection [[buffer(SEISMIC_BUFFER_PROJECTION)]],
     device const float *state_norm [[buffer(SEISMIC_BUFFER_STATE_NORM)]],
-    device element::Act::storage *normalized [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(normalized),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
@@ -55,7 +55,8 @@ kernel void state_space_gate(
         const float weight = state_norm[ulong(group.y) * SEISMIC_STATE_NORM_STRIDE_0 + local * SEISMIC_STATE_NORM_STRIDE_1
             + (column % SEISMIC_DIM_P) * SEISMIC_STATE_NORM_STRIDE_2];
         const float value = gated_value(mixed, projection, row, channel, seismic_words);
-        normalized[row * SEISMIC_RESULT_0_STRIDE_0 + (channel / SEISMIC_DIM_P) * SEISMIC_RESULT_0_STRIDE_1
-            + (channel % SEISMIC_DIM_P) * SEISMIC_RESULT_0_STRIDE_2] = element::Act::store(value * inverse * weight);
+        element::Out<element::Act>(normalized).put(row * SEISMIC_RESULT_0_STRIDE_0
+            + (channel / SEISMIC_DIM_P) * SEISMIC_RESULT_0_STRIDE_1 + (channel % SEISMIC_DIM_P) * SEISMIC_RESULT_0_STRIDE_2,
+            value * inverse * weight);
     }
 }

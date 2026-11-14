@@ -27,11 +27,11 @@ void readout_features_rows() {
         SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_2, SEISMIC_PTR(SEISMIC_BUFFER_NORM), SEISMIC_NORM_STRIDE_0,
         FEATURES_NORM, element_word_f32(SEISMIC_PARAM_EPSILON), width, SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS),
         uint(SEISMIC_DIM_NM), uint(SEISMIC_DIM_PT));
-    const uint64_t features = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const Out features = SEISMIC_RESULT_0_OUT;
 #if SEISMIC_STATIC_NM == 0
     // No norm: the sum in part order of the mix site's partials.
     for (uint i = thread; i < width; i += gl_WorkGroupSize.x)
-        element_put(FEATURES_ACT, features,
+        out_put(features,
             uint64_t(row) * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(i) * SEISMIC_RESULT_0_STRIDE_1,
             element_round(FEATURES_ACT, projection_summed_at(in_, row, i)));
 #else
@@ -46,7 +46,7 @@ void readout_features_rows() {
         const float value = element_round(FEATURES_ACT,
             projection_norm_input(in_, row, i) * inverse
                 * element_at(FEATURES_NORM, in_.norm, uint64_t(i) * in_.norm_stride));
-        element_put(FEATURES_ACT, features,
+        out_put(features,
             uint64_t(row) * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(i) * SEISMIC_RESULT_0_STRIDE_1, value);
     }
 #endif

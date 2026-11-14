@@ -69,8 +69,8 @@ projection_prologue stem_frame(uint frame) {
 void vision_patch_stem_first() {
     const uint h = uint(SEISMIC_DIM_H);
     const projection_weights w = vision_weights(SEISMIC_PTR(SEISMIC_BUFFER_FRAME_WEIGHT), PACKETS_W0_ROWS, STEM_K);
-    const projection_epilogue out_ = projection_store(ELEMENT_F32, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIAL),
-        uint64_t(h), 1ul, 0ul);
+    const projection_epilogue out_ = projection_store(
+        out_over_scratch(ELEMENT_F32, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIAL)), uint64_t(h), 1ul, 0ul);
     projection_gemm(PACKETS_W0, VISION_TILE_M, VISION_TILE_N, VISION_SUB, VISION_SUB, stem_frame(0u), out_, w, uint(SEISMIC_DIM_M), h,
         STEM_K, gl_WorkGroupID.y, gl_WorkGroupID.x, uint(SEISMIC_DIM_M));
 }
@@ -80,7 +80,7 @@ void vision_patch_stem_first() {
 void vision_patch_stem_last() {
     const uint h = uint(SEISMIC_DIM_H);
     const bool two = SEISMIC_DIM_S == 1;
-    const vision_epilogue out_ = vision_stem(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0,
+    const vision_epilogue out_ = vision_stem(SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0,
         SEISMIC_DIM_NB == 1, SEISMIC_PTR(SEISMIC_BUFFER_BIAS), BIAS_KIND,
         two ? SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIAL) : 0ul, uint64_t(h),
         SEISMIC_DIM_NT == 1 ? SEISMIC_PTR(SEISMIC_BUFFER_TABLE) : 0ul,

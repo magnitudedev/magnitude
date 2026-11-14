@@ -29,11 +29,11 @@ fn short_conv_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64;
     let item = group[0] as usize;
     // The input row at slot-local `position`: the source version's window rows
     // before the slot, the projection's u after.
-    let input = |slot: &Slot, position: isize| -> &[f32] {
+    let input = |slot: &Slot, position: isize| {
         if position < 0 {
-            window.row([slot.source, slot.taped + taps - position.unsigned_abs(), 0])
+            window.stored([slot.source, slot.taped + taps - position.unsigned_abs(), 0])
         } else {
-            &projection.row([slot.lo + position as usize, 0])[..channels]
+            projection.stored([slot.lo + position as usize, 0]).part(0..channels)
         }
     };
     if item >= rows {
@@ -42,15 +42,15 @@ fn short_conv_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64;
             let source = input(&slot, (slot.stop + tap) as isize - taps as isize);
             // SAFETY: each slot's work item writes its own successor bank,
             // which no slot reads.
-            let target = unsafe { window.row_mut([slot.target, tap, 0]) };
-            target.copy_from_slice(source);
+            let mut target = unsafe { window.row_mut([slot.target, tap, 0]) };
+            target.move_stored(source);
         }
         return;
     }
     // SAFETY: each work item writes its own row.
-    let out = unsafe { gated.row_mut([item, 0]) };
+    let mut out = unsafe { gated.row_mut([item, 0]) };
     let Some(slot) = slots.slot_of_row(item) else {
-        out.fill(E::A::narrow(0.0));
+        out.fill(0.0);
         return;
     };
     let local = (item - slot.lo) as isize;
@@ -59,11 +59,11 @@ fn short_conv_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64;
     sum.fill(0.0);
     for tap in 0..=taps {
         let values = input(&slot, local + tap as isize - taps as isize);
-        for ((sum, value), channel) in sum.iter_mut().zip(values).zip(0..channels) {
+        for ((sum, value), channel) in sum.iter_mut().zip(values.storage()).zip(0..channels) {
             *sum = convolution.get([channel, tap]).mul_add(*value, *sum);
         }
     }
     for ((out, sum), gate) in out.iter_mut().zip(sum.iter()).zip(gate) {
-        *out = E::A::narrow(gate * sum);
+        out.set(gate * sum);
     }
 }

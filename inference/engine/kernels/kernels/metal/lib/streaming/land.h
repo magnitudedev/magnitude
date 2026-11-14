@@ -32,7 +32,7 @@ struct Lander {
 template <class B> inline void land_item(thread const Lander &land, uint tensor, int from, int to, uint item) {
     STAGED *source = from >= 0 ? source_record(land.source[tensor], ulong(from))
                                : source_record(land.destination[tensor], ulong(-1 - from));
-    convert_item<B>(source, slab::region<uchar>(land.destination[tensor], ulong(to)), land.words, item, land.window,
+    convert_item<B>(source, ItemOut<B>::of(slab::region<uchar>(land.destination[tensor], ulong(to))), land.words, item, land.window,
         land.tid, land.threads, land.simd, land.simdgroups, land.lane);
 }
 

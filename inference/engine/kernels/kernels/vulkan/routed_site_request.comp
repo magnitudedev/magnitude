@@ -20,8 +20,8 @@ void routed_site_request() {
     const uint64_t rows = SEISMIC_DIM_M, columns = SEISMIC_DIM_H;
     for (uint64_t i = gl_LocalInvocationIndex; i < rows * columns; i += gl_WorkGroupSize.x) {
         const uint64_t m = i / columns, n = i % columns;
-        element_f32_put(SEISMIC_PTR(SEISMIC_BUFFER_SITE_ROWS) + (slot * SEISMIC_SITE_ROWS_STRIDE_0
-                + m * SEISMIC_SITE_ROWS_STRIDE_1 + n * SEISMIC_SITE_ROWS_STRIDE_2) * 4ul,
+        out_put(SEISMIC_OUT_SITE_ROWS, slot * SEISMIC_SITE_ROWS_STRIDE_0
+                + m * SEISMIC_SITE_ROWS_STRIDE_1 + n * SEISMIC_SITE_ROWS_STRIDE_2,
             element_at(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED),
                 m * SEISMIC_NORMALIZED_STRIDE_0 + n * SEISMIC_NORMALIZED_STRIDE_1));
     }

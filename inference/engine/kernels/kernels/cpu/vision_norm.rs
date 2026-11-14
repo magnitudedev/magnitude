@@ -29,14 +29,14 @@ fn vision_norm<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3],
     if cx.arg_interleave() != 0 {
         for (column, value) in normalized.iter().enumerate() {
             // SAFETY: each work item writes its own member's columns.
-            let slot = unsafe { result.span_mut([cell, column * g + member], 1) };
-            slot[0] = E::Y::narrow(*value);
+            let mut slot = unsafe { result.span_mut([cell, column * g + member], 1) };
+            slot.set(0, *value);
         }
     } else {
         // SAFETY: each work item writes its own member's columns.
-        let out = unsafe { result.span_mut([cell, member * h], h) };
+        let mut out = unsafe { result.span_mut([cell, member * h], h) };
         for (target, value) in out.iter_mut().zip(normalized.iter()) {
-            *target = E::Y::narrow(*value);
+            target.set(*value);
         }
     }
 }

@@ -22,12 +22,12 @@ extern "C" __global__ void routed_route_shared(SEISMIC_KERNEL_PARAMS) {
     extern __shared__ uint4 memory[];
     if (blockIdx.x >= route::BLOCKS) {
         shared_expert::block(ROUTE_INPUT, SEISMIC_PTR(SEISMIC_BUFFER_SHARED_GATE), SEISMIC_PTR(SEISMIC_BUFFER_SHARED_UP),
-            SEISMIC_PTR(SEISMIC_RESULT_2_BUFFER), parts, inverses, reinterpret_cast<projection::u8 *>(memory),
+            SEISMIC_RESULT_2_OUT, parts, inverses, reinterpret_cast<projection::u8 *>(memory),
             blockIdx.x - route::BLOCKS, seismic_words_value);
         return;
     }
     route::route_block(ROUTE_INPUT, route::StageRows{reinterpret_cast<unsigned char *>(memory)}, ROUTE_COLUMNS,
-        ROUTE_SELECTION, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1,
+        ROUTE_SELECTION, SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1,
         reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS)),
         reinterpret_cast<unsigned *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_ARRIVALS)), blockIdx.x, parts, inverses,
         &last, seismic_words_value);

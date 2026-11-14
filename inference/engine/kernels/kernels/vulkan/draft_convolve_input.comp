@@ -8,7 +8,7 @@ void draft_convolve_input() {
     const uint64_t normed = SEISMIC_PTR(SEISMIC_BUFFER_INPUT);
     const uint64_t dynamic = SEISMIC_PTR(SEISMIC_BUFFER_DYNAMIC);
     const uint64_t base = SEISMIC_PTR(SEISMIC_BUFFER_BASE);
-    const uint64_t result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const Out result = SEISMIC_RESULT_0_OUT;
     const uint64_t channels = SEISMIC_DIM_C, width = SEISMIC_DIM_G * channels;
     const uint64_t count = SEISMIC_DIM_M * width;
     const uint64_t step = uint64_t(gl_NumWorkGroups.x) * gl_WorkGroupSize.x;
@@ -25,6 +25,6 @@ void draft_convolve_input() {
                 element_at(ELEMENT_ACT, normed, (row - offset) * SEISMIC_INPUT_STRIDE_0 + column * SEISMIC_INPUT_STRIDE_1),
                 sum);
         }
-        element_put(ELEMENT_ACT, result, row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1, sum);
+        out_put(result, row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1, sum);
     }
 }

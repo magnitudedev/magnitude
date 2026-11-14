@@ -22,9 +22,9 @@ template <uint SIMDS, uint TOKENS>
 inline void append_rows(device const attention::Scalar *key, device const attention::Scalar *value,
     device const float *key_norm, device const float *value_norm, device const int *rotary_components,
     device const float *rotary_frequencies, device const float *rotary_amplitudes, device const int *coordinates,
-    device const int *destinations, device const ulong *history_key, device const ulong *history_value,
-    constant ulong *seismic_words, rounding::Rounding key_rounding, ulong row0, uint kv_head, uint simd,
-    uint lane) {
+    device const int *destinations, device const attention::history_plane *history_key,
+    device const attention::history_plane *history_value, constant ulong *seismic_words,
+    rounding::Rounding key_rounding, ulong row0, uint kv_head, uint simd, uint lane) {
     constexpr uint W = ATTENTION_W;
     constexpr uint E = ATTENTION_E;
     constexpr uint KV = SEISMIC_DIM_KV;
@@ -43,7 +43,7 @@ inline void append_rows(device const attention::Scalar *key, device const attent
         else
             attention::fresh_row<false>(key, value, key_norm, value_norm, coordinates, rotary_components,
                 rotary_frequencies, rotary_amplitudes, appended, kv_head, epsilon, key_rounding, lane, x);
-        attention::append(slab::row<attention::Scalar>(item % 2 == 0 ? history_key : history_value,
+        attention::append(slab::out_row(item % 2 == 0 ? history_key : history_value,
             ulong(destination), ulong(SEISMIC_PARAM_SLAB_ROWS), KV * W), 0, kv_head, lane, x);
     }
 }
@@ -79,8 +79,8 @@ kernel void attention_decode_partial(
     device const int *visible [[buffer(SEISMIC_BUFFER_VISIBLE)]],
     device const int *fresh [[buffer(SEISMIC_BUFFER_FRESH)]],
     device const int *destinations [[buffer(SEISMIC_BUFFER_DESTINATIONS)]],
-    device const ulong *history_key [[buffer(SEISMIC_BUFFER_HISTORY_KEY)]],
-    device const ulong *history_value [[buffer(SEISMIC_BUFFER_HISTORY_VALUE)]],
+    SEISMIC_OUT_HISTORY_KEY_PARAM(history_key),
+    SEISMIC_OUT_HISTORY_VALUE_PARAM(history_value),
     device const int *selected_rows [[buffer(SEISMIC_BUFFER_SELECTED_ROWS)]],
     device const ulong *selected [[buffer(SEISMIC_BUFFER_SELECTED)]],
     device float *partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]],
@@ -130,8 +130,8 @@ kernel void attention_decode_partial(
         return;
 #if SEISMIC_TUNE_MATRIX == 1
     attention::decode_matrix<SIMDS, SEISMIC_TUNE_KEYS, PARTS, TOKENS, 0, HEADS, SEISMIC_DIM_KS>(
-        attention::dense_history{history_key, attention::values_plane(history_key, history_value),
-            ulong(SEISMIC_PARAM_SLAB_ROWS)},
+        attention::dense_planes{history_key, attention::values_plane(history_key, history_value),
+            ulong(SEISMIC_PARAM_SLAB_ROWS)}.reads(),
         query, key, value, query_norm, key_norm, value_norm, rotary_components, rotary_frequencies,
         rotary_amplitudes, coordinates, visible, fresh, partials, statistics,
         reinterpret_cast<threadgroup uchar *>(shared), R, SEISMIC_DIM_M, epsilon, scale * ATTENTION_LOG2E,
@@ -265,8 +265,8 @@ kernel void attention_decode_shared(
     device const int *visible [[buffer(SEISMIC_BUFFER_VISIBLE)]],
     device const int *fresh [[buffer(SEISMIC_BUFFER_FRESH)]],
     device const int *destinations [[buffer(SEISMIC_BUFFER_DESTINATIONS)]],
-    device const ulong *history_key [[buffer(SEISMIC_BUFFER_HISTORY_KEY)]],
-    device const ulong *history_value [[buffer(SEISMIC_BUFFER_HISTORY_VALUE)]],
+    SEISMIC_OUT_HISTORY_KEY_PARAM(history_key),
+    SEISMIC_OUT_HISTORY_VALUE_PARAM(history_value),
     device const int *selected_rows [[buffer(SEISMIC_BUFFER_SELECTED_ROWS)]],
     device const ulong *selected [[buffer(SEISMIC_BUFFER_SELECTED)]],
     device float *partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]],
@@ -291,8 +291,8 @@ kernel void attention_decode_shared(
     if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
         return;
     attention::decode_shared<SEISMIC_TUNE_KEYS, SEISMIC_TUNE_PARTS, SEISMIC_DIM_KS>(
-        attention::dense_history{history_key, attention::values_plane(history_key, history_value),
-            ulong(SEISMIC_PARAM_SLAB_ROWS)},
+        attention::dense_planes{history_key, attention::values_plane(history_key, history_value),
+            ulong(SEISMIC_PARAM_SLAB_ROWS)}.reads(),
         query, key, value, query_norm, key_norm, value_norm, rotary_components, rotary_frequencies,
         rotary_amplitudes, coordinates, visible, fresh, partials, statistics,
         reinterpret_cast<threadgroup uchar *>(shared), SEISMIC_DIM_R, as_type<float>(uint(SEISMIC_PARAM_EPSILON)),
@@ -317,7 +317,7 @@ kernel void attention_decode_merge(
     device const int *coordinates [[buffer(SEISMIC_BUFFER_COORDINATES)]],
     device const int *visible [[buffer(SEISMIC_BUFFER_VISIBLE)]],
     device const int *fresh [[buffer(SEISMIC_BUFFER_FRESH)]],
-    device attention::Scalar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(result_cells),
     device const float *partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]],
     device const float *statistics [[buffer(SEISMIC_BUFFER_SCRATCH_STATISTICS)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
@@ -327,6 +327,7 @@ kernel void attention_decode_merge(
     if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
         return;
     constexpr bool ROTATED = SEISMIC_DIM_RO != 0;
+    const element::Out<element::Act> result(result_cells);
     threadgroup float weights[2 * SEISMIC_TUNE_PARTS];
     threadgroup float row_values[ROTATED ? ATTENTION_W : 1];
     attention::decode_output<SEISMIC_TUNE_SPAN, SEISMIC_TUNE_PARTS, SEISMIC_TUNE_TOKENS, SEISMIC_DIM_KS, ROTATED>(

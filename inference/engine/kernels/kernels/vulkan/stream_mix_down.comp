@@ -54,11 +54,11 @@ projection_weights stream_mix_down_inject() {
 }
 
 projection_epilogue stream_mix_down_low_out() {
-    return projection_mix_low(MIX_ACT, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0,
+    return projection_mix_low(SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_1_OUT, SEISMIC_RESULT_0_STRIDE_0,
         SEISMIC_RESULT_0_STRIDE_1, uint(SEISMIC_DIM_S));
 }
 projection_epilogue stream_mix_down_inject_out() {
-    return projection_mix_inject(SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER), SEISMIC_RESULT_1_STRIDE_0,
+    return projection_mix_inject(SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_1_OUT, SEISMIC_RESULT_1_STRIDE_0,
         SEISMIC_RESULT_1_STRIDE_1, uint(SEISMIC_DIM_S));
 }
 
@@ -69,8 +69,8 @@ void stream_mix_down_stage() {
     const float inverse = projection_stage_stream(stream_mix_down_input(), m, stream, uint(SEISMIC_DIM_H),
         SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_NORMALIZED), MIX_K);
     if (gl_LocalInvocationIndex == 0u)
-        element_f32_put(SEISMIC_PTR(SEISMIC_RESULT_2_BUFFER)
-            + (uint64_t(m) * SEISMIC_RESULT_2_STRIDE_0 + uint64_t(stream) * SEISMIC_RESULT_2_STRIDE_1) * 4ul, inverse);
+        out_put(SEISMIC_RESULT_2_OUT,
+            uint64_t(m) * SEISMIC_RESULT_2_STRIDE_0 + uint64_t(stream) * SEISMIC_RESULT_2_STRIDE_1, inverse);
 }
 
 #define MIX_OUTPUTS (MIX_LOW_ROWS + MIX_INJECT_ROWS)
@@ -96,18 +96,18 @@ void stream_mix_down_gemv_bounded(const uint maxm) {
         projection_weights w = stream_mix_down_down();
         w.packet_first = stream * (width / 32u);
         projection_gemv(PACKETS_W0, PACKETS_W0, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, maxm,
-            PROJECTION_NORM_SHARED, x, projection_store(ELEMENT_F32, MIX_PARTIALS, row, 1ul, column), w, w, rows,
+            PROJECTION_NORM_SHARED, x, projection_store(out_over_scratch(ELEMENT_F32, MIX_PARTIALS), row, 1ul, column), w, w, rows,
             MIX_LOW_ROWS, width, local);
     } else {
         projection_weights w = stream_mix_down_inject();
         w.packet_first = stream * (width / 32u);
         projection_gemv(PACKETS_W1, PACKETS_W1, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, maxm,
-            PROJECTION_NORM_SHARED, x, projection_store(ELEMENT_F32, MIX_PARTIALS, row, 1ul, column + MIX_LOW_ROWS),
+            PROJECTION_NORM_SHARED, x, projection_store(out_over_scratch(ELEMENT_F32, MIX_PARTIALS), row, 1ul, column + MIX_LOW_ROWS),
             w, w, rows, MIX_INJECT_ROWS, width, local - t0);
     }
     if (local == 0u && gl_LocalInvocationIndex < rows)
-        element_f32_put(SEISMIC_PTR(SEISMIC_RESULT_2_BUFFER) + (uint64_t(gl_LocalInvocationIndex)
-            * SEISMIC_RESULT_2_STRIDE_0 + uint64_t(stream) * SEISMIC_RESULT_2_STRIDE_1) * 4ul,
+        out_put(SEISMIC_RESULT_2_OUT, uint64_t(gl_LocalInvocationIndex)
+            * SEISMIC_RESULT_2_STRIDE_0 + uint64_t(stream) * SEISMIC_RESULT_2_STRIDE_1,
             projection_gemv_inverse(x, gl_LocalInvocationIndex));
 }
 

@@ -26,7 +26,7 @@ typedef projection::operands<NVFP4> Operands;
     device const ulong *expert_up [[buffer(SEISMIC_BUFFER_EXPERT_UP)]],      \
     device const ulong *tier_up [[buffer(SEISMIC_BUFFER_TIER_UP)]],          \
     device const float *up_scale [[buffer(SEISMIC_BUFFER_UP_SCALE)]],        \
-    device uchar *product [[buffer(SEISMIC_RESULT_0_BUFFER)]],               \
+    SEISMIC_RESULT_0_PARAM(product_cells),                                   \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],          \
     threadgroup uchar *shared [[threadgroup(0)]],                            \
     uint2 group [[threadgroup_position_in_grid]],                            \
@@ -44,7 +44,9 @@ typedef projection::operands<NVFP4> Operands;
     const int expert = routes[m * SEISMIC_ROUTES_STRIDE_0 + k * SEISMIC_ROUTES_STRIDE_1];                              \
     const int record = routed::choice_record(expert_up, sources, SEISMIC_DIM_XS, SEISMIC_SOURCES_STRIDE_1,             \
         SEISMIC_SOURCES_STRIDE_2, m, k, expert);                                                                       \
-    device uchar *choice = product + (m * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1) * A::bytes;       \
+    const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> choice =                                                          \
+        element::Out<ELEMENT_OF(SEISMIC_RESULT_0)>(product_cells).offset(                                              \
+            m * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1);                                            \
     /* A choice reading no record (the CPU's, or a failed one): its first                                              \
        threadgroup zeroes its row. */                                                                                  \
     if (record == -1) {                                                                                                \

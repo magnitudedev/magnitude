@@ -24,7 +24,7 @@ using Low = projection::MixLow<ELEMENT_OF(SEISMIC_ELEMENT_A)>;
             SEISMIC_DIM_H, projection::AllRows{}                                                          \
     }
 #define STAGING SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)
-#define INVERSE reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_2_BUFFER))
+#define INVERSE SEISMIC_RESULT_2_OUT
 
 using Norm = ELEMENT_OF(SEISMIC_NORM);
 using Stream = projection::GroupRms<Norm, projection::AllRows, 1>;
@@ -53,9 +53,9 @@ struct Segments {
         {SEISMIC_DIM_LR, SEISMIC_DIM_C * SEISMIC_DIM_S},                                                   \
             KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_DOWN_WEIGHT)),                                         \
             KERNEL_W1_AT(SEISMIC_PTR(SEISMIC_BUFFER_INJECT_WEIGHT)),                                       \
-            Low{SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0, (float)SEISMIC_DIM_S},    \
+            Low{SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0, (float)SEISMIC_DIM_S},                    \
             projection::MixInject {                                                                       \
-            reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER)), SEISMIC_RESULT_1_STRIDE_0,    \
+            SEISMIC_RESULT_1_OUT, SEISMIC_RESULT_1_STRIDE_0,                                              \
                 (float)SEISMIC_DIM_S                                                                      \
         }                                                                                                 \
     }
@@ -76,7 +76,7 @@ struct StreamPartial {
 // of one stream's down | inject) over its window of H inputs.
 template <int NB, int KSPLIT>
 __device__ __forceinline__ void mix_gemv(const Stream &first_stream, projection::u8 *row,
-                                         const projection::u8 *staged, float *inverse,
+                                         const projection::u8 *staged, element::Out<element::F32> inverse,
                                          unsigned long long inverse_stride, float *partials, unsigned *arrivals,
                                          unsigned M, const Segments &s) {
     using Shape = projection::GemvShape<8, 1, KSPLIT, NB>;
@@ -97,12 +97,13 @@ __device__ __forceinline__ void mix_gemv(const Stream &first_stream, projection:
     // Block-collective at M = 1: every warp forms the stream's row; the
     // stream's first block publishes its inverse.
     const bool first_block = tile_group % per < Shape::GROUPS;
+    const element::Out<element::F32> stream_inverse = inverse.offset(stream * inverse_stride);
     const auto x = [=] {
         seismic_dependency_start();
         if (M > 1)
             return StreamSource{staged + first * element::Act::bytes, WIDTH, projection::AllRows{}};
         projection::form_row_publishing(pro, 0, SEISMIC_DIM_H, row,
-                                        first_block ? inverse + stream * inverse_stride : nullptr, 1);
+                                        first_block ? &stream_inverse : nullptr, 1);
         __syncthreads();
         return StreamSource{row, SEISMIC_DIM_H, projection::AllRows{}};
     };
@@ -159,8 +160,8 @@ __device__ __forceinline__ void mix_gemm(const projection::u8 *staged, unsigned 
 #ifdef SEISMIC_FORMING_STREAM_MIX_DOWN_STAGE
 extern "C" __global__ void stream_mix_down_stage(SEISMIC_KERNEL_PARAMS) {
     seismic_dependency_start();
-    projection::form_row_publishing(PROLOGUE, blockIdx.x, WIDTH, STAGING,
-                                    INVERSE + (unsigned long long)blockIdx.x * SEISMIC_RESULT_2_STRIDE_0, 1);
+    const element::Out<element::F32> inverse = INVERSE.offset((unsigned long long)blockIdx.x * SEISMIC_RESULT_2_STRIDE_0);
+    projection::form_row_publishing(PROLOGUE, blockIdx.x, WIDTH, STAGING, &inverse, 1);
 }
 #endif
 

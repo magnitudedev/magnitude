@@ -39,6 +39,6 @@ void vision_pool() {
         if (SEISMIC_DIM_NS == 1)
             value = (value - element_at(STANDARD_BIAS_KIND, SEISMIC_PTR(SEISMIC_BUFFER_STANDARD_BIAS), column))
                 * element_at(STANDARD_SCALE_KIND, SEISMIC_PTR(SEISMIC_BUFFER_STANDARD_SCALE), column);
-        element_f32_put(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + (row * SEISMIC_RESULT_0_STRIDE_0 + column) * 4ul, value);
+        out_put(SEISMIC_RESULT_0_OUT, row * SEISMIC_RESULT_0_STRIDE_0 + column, value);
     }
 }

@@ -173,29 +173,29 @@ using GemmOperandsOf = typename Pick<FP4_MMA && (packets::nvfp4_operands<W>::val
 
 // y[m, offset + n] rounded to the stored element E.
 template <class E> struct Store {
-    u8 *out;
+    element::Out<E> out;
     u64 stride;
     u64 offset;
     __device__ __forceinline__ void operator()(u32 m, u64 n, float value, float) const {
-        element::put<E>(out, m * stride + offset + n, value);
+        out.put(m * stride + offset + n, value);
     }
     __device__ __forceinline__ void pair(u32 m, u64 n, float first, float second, float, float) const {
-        element::put2<E>(out, m * stride + offset + n, first, second);
+        out.put2(m * stride + offset + n, first, second);
     }
 };
 
 // out[m, n] = round(round_A(silu(round_A(gate))) * round_A(up)).
 template <class E> struct SiluMul {
-    u8 *out;
+    element::Out<E> out;
     u64 stride;
     __device__ static __forceinline__ float value(float gate, float up) {
         return Act::round(silu(Act::round(gate))) * Act::round(up);
     }
     __device__ __forceinline__ void operator()(u32 m, u64 n, float gate, float up) const {
-        element::put<E>(out, m * stride + n, value(gate, up));
+        out.put(m * stride + n, value(gate, up));
     }
     __device__ __forceinline__ void pair(u32 m, u64 n, float gate0, float gate1, float up0, float up1) const {
-        element::put2<E>(out, m * stride + n, value(gate0, up0), value(gate1, up1));
+        out.put2(m * stride + n, value(gate0, up0), value(gate1, up1));
     }
 };
 
@@ -207,7 +207,7 @@ template <class E> struct SiluMul {
 // to (-inf, L] and up to [-L, L], each written `x > L ? L : x` so a NaN stays
 // NaN. Any other entry compiles none.
 template <class E, class Publication = E> struct Glu {
-    u8 *out;
+    element::Out<E> out;
     u64 stride;
     int function;
     __device__ __forceinline__ float value(float gate, float up) const {
@@ -228,17 +228,17 @@ template <class E, class Publication = E> struct Glu {
             return Publication::round(product);
     }
     __device__ __forceinline__ void operator()(u32 m, u64 n, float gate, float up) const {
-        element::put<E>(out, m * stride + n, value(gate, up));
+        out.put(m * stride + n, value(gate, up));
     }
     __device__ __forceinline__ void pair(u32 m, u64 n, float gate0, float gate1, float up0, float up1) const {
-        element::put2<E>(out, m * stride + n, value(gate0, up0), value(gate1, up1));
+        out.put2(m * stride + n, value(gate0, up0), value(gate1, up1));
     }
 };
 
 // A plain activated projection (up-only feed-forward, ReLU²):
 // out[m, n] = round(act(round_A(projection))).
 template <class E, class Publication = E> struct Activated {
-    u8 *out;
+    element::Out<E> out;
     u64 stride;
     int function;
     __device__ __forceinline__ float value(float projected) const {
@@ -249,17 +249,17 @@ template <class E, class Publication = E> struct Activated {
             return Publication::round(activated);
     }
     __device__ __forceinline__ void operator()(u32 m, u64 n, float projected, float) const {
-        element::put<E>(out, m * stride + n, value(projected));
+        out.put(m * stride + n, value(projected));
     }
     __device__ __forceinline__ void pair(u32 m, u64 n, float first, float second, float, float) const {
-        element::put2<E>(out, m * stride + n, value(first), value(second));
+        out.put2(m * stride + n, value(first), value(second));
     }
 };
 
 // A mix site's low-rank rows (`stream_mix_down`) over S streams:
 // out[m, n] = round_E(silu(projection / S)).
 template <class E> struct MixLow {
-    u8 *out;
+    element::Out<E> out;
     u64 stride;
     float streams;
     __device__ __forceinline__ float value(float projected) const {
@@ -267,18 +267,18 @@ template <class E> struct MixLow {
         return v / (1.0f + expf(-v));
     }
     __device__ __forceinline__ void operator()(u32 m, u64 n, float projected, float) const {
-        element::put<E>(out, m * stride + n, value(projected));
+        out.put(m * stride + n, value(projected));
     }
 };
 
 // A mix site's inject values (`stream_mix_down`) over S streams:
 // out[m, n] = 2 sigmoid(projection / S) (F32).
 struct MixInject {
-    float *out;
+    element::Out<element::F32> out;
     u64 stride;
     float streams;
     __device__ __forceinline__ void operator()(u32 m, u64 n, float projected, float) const {
-        out[m * stride + n] = 2.0f / (1.0f + expf(-projected / streams));
+        out.put(m * stride + n, 2.0f / (1.0f + expf(-projected / streams)));
     }
 };
 
@@ -286,7 +286,7 @@ struct MixInject {
 // n / width gated by its projection,
 // out[m, n] = sigmoid(projection) * x[m, n] * inverse[m, n / width] * w[n] / S (F32).
 template <class NORM> struct Mix {
-    float *out;
+    element::Out<element::F32> out;
     u64 stride;
     const float *x;
     u64 x_stride;
@@ -299,28 +299,28 @@ template <class NORM> struct Mix {
         const float normalized = x[m * x_stride + n] * inverse[m * inverse_stride + n / width]
             * element::at<NORM>(norm, n);
         const float gate = 1.0f / (1.0f + expf(-projected));
-        out[m * stride + n] = gate * normalized / streams;
+        out.put(m * stride + n, gate * normalized / streams);
     }
 };
 
 // The F32 product of two projections of one input (paired), unrounded:
 // out[m, n] = gate * up.
 struct Mul {
-    float *out;
+    element::Out<element::F32> out;
     u64 stride;
     __device__ __forceinline__ void operator()(u32 m, u64 n, float gate, float up) const {
-        out[m * stride + n] = gate * up;
+        out.put(m * stride + n, gate * up);
     }
     __device__ __forceinline__ void pair(u32 m, u64 n, float gate0, float gate1, float up0, float up1) const {
-        out[m * stride + n] = gate0 * up0;
-        out[m * stride + n + 1] = gate1 * up1;
+        out.put(m * stride + n, gate0 * up0);
+        out.put(m * stride + n + 1, gate1 * up1);
     }
 };
 
 // An activated projection times an external F32 multiplier:
 // out[m, n] = round(round_A(act(round_A(projection))) * external[m, n]).
 template <class E> struct ActivatedMul {
-    u8 *out;
+    element::Out<E> out;
     u64 stride;
     const float *external;
     u64 external_stride;
@@ -329,27 +329,27 @@ template <class E> struct ActivatedMul {
         return Act::round(functions::activate(function, Act::round(projected))) * external[m * external_stride + n];
     }
     __device__ __forceinline__ void operator()(u32 m, u64 n, float projected, float) const {
-        element::put<E>(out, m * stride + n, value(m, n, projected));
+        out.put(m * stride + n, value(m, n, projected));
     }
     __device__ __forceinline__ void pair(u32 m, u64 n, float first, float second, float, float) const {
-        element::put2<E>(out, m * stride + n, value(m, n, first), value(m, n + 1, second));
+        out.put2(m * stride + n, value(m, n, first), value(m, n + 1, second));
     }
 };
 
 // F32 logits, softcapped in F32 from the accumulator when `cap` > 0:
 // out[m, n] = cap > 0 ? cap * tanh(projection / cap) : projection.
 struct Logits {
-    u8 *out;
+    element::Out<element::F32> out;
     u64 stride;
     float cap;
     __device__ __forceinline__ float value(float projected) const {
         return cap > 0.0f ? functions::softcap(cap, projected) : projected;
     }
     __device__ __forceinline__ void operator()(u32 m, u64 n, float projected, float) const {
-        element::put<element::F32>(out, m * stride + n, value(projected));
+        out.put(m * stride + n, value(projected));
     }
     __device__ __forceinline__ void pair(u32 m, u64 n, float first, float second, float, float) const {
-        element::put2<element::F32>(out, m * stride + n, value(first), value(second));
+        out.put2(m * stride + n, value(first), value(second));
     }
 };
 

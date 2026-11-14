@@ -10,7 +10,7 @@ fn stream_join<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3],
     let (h, streams, inject_width) = (cx.dim_h() as usize, cx.dim_sn() as usize, cx.dim_in() as usize);
     let (residual, y, inject) = (cx.arg_residual(), cx.arg_y().row([row, 0]), cx.arg_inject());
     // SAFETY: each work item writes its own row.
-    let out = unsafe { cx.result_0().row_mut([row, 0]) };
+    let mut out = unsafe { cx.result_0().row_mut([row, 0]) };
     for (stream, joined) in out.chunks_exact_mut(h).enumerate() {
         functions::scatter(
             streams,

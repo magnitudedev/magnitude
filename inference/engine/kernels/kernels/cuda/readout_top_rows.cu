@@ -14,8 +14,9 @@ extern "C" __global__ void readout_top_rows_form(SEISMIC_KERNEL_PARAMS) {
     const Pro pro{reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN)), SEISMIC_HIDDEN_STRIDE_0,
                   SEISMIC_PTR(SEISMIC_BUFFER_NORM), __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON), SEISMIC_DIM_D,
                   projection::SelectedRows{reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS))}};
-    progressive::form<true>(pro, SEISMIC_DIM_D, SEISMIC_PTR(SEISMIC_RESULT_2_BUFFER), SEISMIC_RESULT_2_STRIDE_0,
-                            F32_AT(SEISMIC_RESULT_3_BUFFER), SEISMIC_RESULT_3_STRIDE_0,
+    const progressive::F32Out lengths = SEISMIC_RESULT_3_OUT;
+    progressive::form<true>(pro, SEISMIC_DIM_D, SEISMIC_RESULT_2_OUT, SEISMIC_RESULT_2_STRIDE_0, &lengths,
+                            SEISMIC_RESULT_3_STRIDE_0,
                             F32_AT(SEISMIC_BUFFER_SCRATCH_GROUPS));
 }
 #endif
@@ -37,13 +38,15 @@ __global__ void readout_top_rows_scan(SEISMIC_KERNEL_PARAMS) {
     __shared__ float sums[PROGRESSIVE_ROWS * 32];
     __shared__ unsigned lowest[PROGRESSIVE_ROWS];
     const unsigned rows = SEISMIC_DIM_O;
+    const progressive::F32Out threshold = SEISMIC_RESULT_1_OUT;
     // Radius column 0: the 4-bit view's.
 #define TOP_SCAN(MAXM)                                                                                               \
     progressive::scan<MAXM, ROWS, false>(                                                                            \
-        SEISMIC_PTR(SEISMIC_RESULT_2_BUFFER), SEISMIC_RESULT_2_STRIDE_0, F32_AT(SEISMIC_BUFFER_SCRATCH_GROUPS),      \
-        planes, F32_IN(SEISMIC_BUFFER_RADIUS), SEISMIC_RADIUS_STRIDE_0, F32_AT(SEISMIC_RESULT_3_BUFFER),             \
-        SEISMIC_RESULT_3_STRIDE_0, selection, F32_AT(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0,            \
-        SEISMIC_RESULT_0_STRIDE_1, F32_AT(SEISMIC_RESULT_1_BUFFER), SEISMIC_RESULT_1_STRIDE_0,                       \
+        SEISMIC_RESULT_2_OUT.stored(), SEISMIC_RESULT_2_STRIDE_0, F32_AT(SEISMIC_BUFFER_SCRATCH_GROUPS),             \
+        planes, F32_IN(SEISMIC_BUFFER_RADIUS), SEISMIC_RADIUS_STRIDE_0,                                              \
+        reinterpret_cast<const float *>(SEISMIC_RESULT_3_OUT.stored()), SEISMIC_RESULT_3_STRIDE_0, selection,        \
+        SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, &threshold,                      \
+        SEISMIC_RESULT_1_STRIDE_0,                                                                                   \
         reinterpret_cast<unsigned *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_BOUNDS)), rows, SEISMIC_DIM_V, SEISMIC_DIM_D, staged, sums, lowest)
     if (rows <= 1)
         TOP_SCAN(1);

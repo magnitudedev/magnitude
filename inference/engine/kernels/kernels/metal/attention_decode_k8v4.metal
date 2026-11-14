@@ -44,9 +44,9 @@ kernel void attention_decode_k8v4_partial(
     device const int *fresh [[buffer(SEISMIC_BUFFER_FRESH)]],
     device const int *destinations [[buffer(SEISMIC_BUFFER_DESTINATIONS)]],
     device const ulong *key_codes [[buffer(SEISMIC_BUFFER_HISTORY_KEY_CODES)]],
-    device const ulong *key_coefficients [[buffer(SEISMIC_BUFFER_HISTORY_KEY_COEFFICIENTS)]],
+    SEISMIC_OUT_HISTORY_KEY_COEFFICIENTS_PARAM(key_coefficients),
     device const ulong *value_codes [[buffer(SEISMIC_BUFFER_HISTORY_VALUE_CODES)]],
-    device const ulong *value_coefficients [[buffer(SEISMIC_BUFFER_HISTORY_VALUE_COEFFICIENTS)]],
+    SEISMIC_OUT_HISTORY_VALUE_COEFFICIENTS_PARAM(value_coefficients),
     device float *partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]],
     device float *statistics [[buffer(SEISMIC_BUFFER_SCRATCH_STATISTICS)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
@@ -111,22 +111,22 @@ kernel void attention_decode_k8v4_partial(
                 attention::store<ATTENTION_KEY_BITS>(fresh_key(appended),
                     slab::row<uint>(key_codes, ulong(destination), slab_rows, KV * key_lane::row_words)
                         + vector * key_lane::row_words,
-                    slab::row<half>(key_coefficients, ulong(destination), slab_rows, KV * key_lane::pairs * 2)
-                        + vector * key_lane::pairs * 2, lane);
+                    slab::out_row(key_coefficients, ulong(destination), slab_rows, KV * key_lane::pairs * 2)
+                        .offset(vector * key_lane::pairs * 2), lane);
             else
                 attention::store<ATTENTION_VALUE_BITS>(fresh_value(appended),
                     slab::row<uint>(value_codes, ulong(destination), slab_rows, KV * value_lane::row_words)
                         + vector * value_lane::row_words,
-                    slab::row<half>(value_coefficients, ulong(destination), slab_rows, KV * value_lane::pairs * 2)
-                        + vector * value_lane::pairs * 2, lane);
+                    slab::out_row(value_coefficients, ulong(destination), slab_rows, KV * value_lane::pairs * 2)
+                        .offset(vector * value_lane::pairs * 2), lane);
         }
     }
 
     if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
         return;
 #if SEISMIC_TUNE_MATRIX
-    attention::decode_matrix<SIMDS, SEISMIC_TUNE_KEYS, PARTS, TOKENS, HEAD_BAND>(attention::affine_history{key_codes,
-        key_coefficients, value_codes, value_coefficients, ulong(SEISMIC_PARAM_SLAB_ROWS)}, query, key, value,
+    attention::decode_matrix<SIMDS, SEISMIC_TUNE_KEYS, PARTS, TOKENS, HEAD_BAND>(attention::affine_planes{key_codes,
+        key_coefficients, value_codes, value_coefficients, ulong(SEISMIC_PARAM_SLAB_ROWS)}.reads(), query, key, value,
         query_norm, key_norm, value_norm, rotary_components, rotary_frequencies, rotary_amplitudes, coordinates,
         visible, fresh, partials, statistics, reinterpret_cast<threadgroup uchar *>(shared), R, SEISMIC_DIM_M, epsilon,
         scale * ATTENTION_LOG2E, SEISMIC_TUNE_SPAN, kv_head, partition, group.z, thread_index, simd, lane, head_base);
@@ -346,7 +346,7 @@ kernel void attention_decode_k8v4_merge(
     device const int *coordinates [[buffer(SEISMIC_BUFFER_COORDINATES)]],
     device const int *visible [[buffer(SEISMIC_BUFFER_VISIBLE)]],
     device const int *fresh [[buffer(SEISMIC_BUFFER_FRESH)]],
-    device attention::Scalar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(result_cells),
     device const float *partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]],
     device const float *statistics [[buffer(SEISMIC_BUFFER_SCRATCH_STATISTICS)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
@@ -356,6 +356,7 @@ kernel void attention_decode_k8v4_merge(
     if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
         return;
     constexpr bool ROTATED = SEISMIC_DIM_RO != 0;
+    const element::Out<element::Act> result(result_cells);
     threadgroup float weights[2 * SEISMIC_TUNE_PARTS];
     threadgroup float row_values[ROTATED ? ATTENTION_W : 1];
     attention::decode_output<SEISMIC_TUNE_SPAN, SEISMIC_TUNE_PARTS, SEISMIC_TUNE_TOKENS, 0, ROTATED>(query, gate,

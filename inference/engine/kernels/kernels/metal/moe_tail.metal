@@ -37,13 +37,14 @@ kernel void moe_tail(
     device const uchar *dense_norm [[buffer(SEISMIC_BUFFER_DENSE_NORM)]],
     device const uchar *routed_norm [[buffer(SEISMIC_BUFFER_ROUTED_NORM)]],
     device const uchar *norm [[buffer(SEISMIC_BUFFER_NORM)]],
-    device float *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(result_cells),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint row [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float partials[8];
+    const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> result(result_cells);
     const ulong width = SEISMIC_DIM_D;
     const float epsilon = as_type<float>(uint(SEISMIC_PARAM_EPSILON));
     const float scale = as_type<float>(uint(SEISMIC_PARAM_SCALE));
@@ -69,7 +70,7 @@ kernel void moe_tail(
     device const float *base = residual + ulong(row) * SEISMIC_RESIDUAL_STRIDE_0;
     for (ulong i = thread_index; i < width; i += 256u) {
         const float normalized = combined.at(i) * inverse * element::at<Norm>(norm, i * SEISMIC_NORM_STRIDE_0);
-        result[ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + i * SEISMIC_RESULT_0_STRIDE_1] =
-            (base[i * SEISMIC_RESIDUAL_STRIDE_1] + normalized) * scale;
+        result.put(ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + i * SEISMIC_RESULT_0_STRIDE_1,
+            (base[i * SEISMIC_RESIDUAL_STRIDE_1] + normalized) * scale);
     }
 }

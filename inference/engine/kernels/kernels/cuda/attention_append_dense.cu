@@ -9,8 +9,8 @@ using attention::u32;
 extern "C" __global__ void attention_append_dense(SEISMIC_KERNEL_PARAMS) {
     const attention::Inputs in = ATTENTION_APPEND_INPUTS();
     const attention::DenseHistory history{
-        reinterpret_cast<u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY)),
-        reinterpret_cast<u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE)),
+        SEISMIC_OUT_HISTORY_KEY,
+        SEISMIC_OUT_HISTORY_VALUE,
         SEISMIC_HISTORY_KEY_STRIDE_0, SEISMIC_HISTORY_KEY_STRIDE_1,
         SEISMIC_HISTORY_VALUE_STRIDE_0, SEISMIC_HISTORY_VALUE_STRIDE_1,
         SEISMIC_PARAM_SLAB_ROWS};

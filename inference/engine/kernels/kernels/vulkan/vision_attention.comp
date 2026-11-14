@@ -50,7 +50,7 @@ void vision_attention_prepare() {
 // Workgroup (64-row query tile, head).
 void vision_attention_attend() {
     const float scale = int(SEISMIC_PARAM_UNIT_SCALE) != 0 ? 1.0 : inversesqrt(float(VISION_W));
-    vision_attend(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_OPERANDS), SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER),
+    vision_attend(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_OPERANDS), SEISMIC_RESULT_0_OUT,
         VISION_M, VISION_PADDED, VISION_H, uint(SEISMIC_DIM_G), VISION_W, VISION_WP, scale,
         SEISMIC_PTR(SEISMIC_BUFFER_SPANS), gl_WorkGroupID.x, gl_WorkGroupID.y);
 }

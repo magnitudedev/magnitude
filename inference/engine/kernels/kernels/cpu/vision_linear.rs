@@ -40,7 +40,7 @@ fn vision_linear_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u
     for (row, x) in staged.chunks_exact(k).enumerate() {
         projection::project(&weight, rows.start, x, projected);
         // SAFETY: each work item writes its own columns of every row.
-        let out = unsafe { result.span_mut([row, rows.start], rows.len()) };
+        let mut out = unsafe { result.span_mut([row, rows.start], rows.len()) };
         for ((target, &product), output) in out.iter_mut().zip(projected.iter()).zip(rows.clone()) {
             let mut value = product;
             if let Some(bias) = bias {
@@ -56,7 +56,7 @@ fn vision_linear_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u
             } else if cx.dim_nr() == 1 {
                 value = residual.get([0, row, output]) + value;
             }
-            *target = E::Y::narrow(value);
+            target.set(value);
         }
     }
 }

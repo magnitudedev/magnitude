@@ -72,7 +72,7 @@ fn draft_rows_rows<L: Isa, E: Elements>(
         quantized,
         |row, projected| {
             // SAFETY: each work item writes its own columns of every row.
-            unsafe { result.span_mut([row / cx.dim_s() as usize, (row % cx.dim_s() as usize) * d + rows.start], rows.len()) }.copy_from_slice(projected);
+            unsafe { result.span_mut([row / cx.dim_s() as usize, (row % cx.dim_s() as usize) * d + rows.start], rows.len()) }.store(projected);
         },
     );
 }

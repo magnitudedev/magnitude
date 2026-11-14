@@ -69,9 +69,7 @@ __global__ void routed_expand(SEISMIC_KERNEL_PARAMS) {
         const projection::u64 expert = (projection::u64)routes[m * SEISMIC_ROUTES_STRIDE_0 + k * SEISMIC_ROUTES_STRIDE_1];
         const Pro pro{ROWS_OF(ROUTED_NVFP4) + m * STRIDE_OF(ROUTED_NVFP4) * 2, STRIDE_OF(ROUTED_NVFP4),
                       projection::AllRows{}};
-        const Epi epi{SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)
-                          + (m * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1) * 2,
-                      0};
+        const Epi epi{SEISMIC_RESULT_0_OUT.offset(m * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1), 0};
         projection::gemv_segment<Shape>(shared, pro, 1u, SEISMIC_DIM_H / 64, group, SEISMIC_DIM_F,
                                 KERNEL_W0_MATRIX(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_GATE), expert),
                                 KERNEL_W1_MATRIX(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), expert),
@@ -80,7 +78,7 @@ __global__ void routed_expand(SEISMIC_KERNEL_PARAMS) {
     }
 
     const Pro pro{ROWS_OF(SHARED_NVFP4), STRIDE_OF(SHARED_NVFP4), projection::AllRows{}};
-    const Epi epi{SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER), SEISMIC_RESULT_1_STRIDE_0};
+    const Epi epi{SEISMIC_RESULT_1_OUT, SEISMIC_RESULT_1_STRIDE_0};
     projection::gemv_segment_ready<Shape>(shared, projection::after_dependency(pro), (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H / 64, group, SEISMIC_DIM_S,
                             KERNEL_W2_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_GATE)),
                             KERNEL_W3_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_UP)), epi);
@@ -90,10 +88,10 @@ __global__ void routed_expand(SEISMIC_KERNEL_PARAMS) {
 #ifdef SEISMIC_FORMING_ROUTED_EXPAND_GATHERED
 // SiluMul into each GEMV row's choice: row r at element offset offsets[r].
 struct ChoiceEpi {
-    projection::u8 *out;
+    element::Out<ELEMENT_OF(SEISMIC_ELEMENT_A)> out;
     const projection::u64 *offsets;
     __device__ __forceinline__ void operator()(unsigned m, projection::u64 n, float gate, float up) const {
-        element::put<ELEMENT_OF(SEISMIC_ELEMENT_A)>(out, offsets[m] + n, Epi::value(gate, up));
+        out.put(offsets[m] + n, Epi::value(gate, up));
     }
 };
 
@@ -131,13 +129,13 @@ __global__ void routed_expand_gathered(SEISMIC_KERNEL_PARAMS) {
                                         group, SEISMIC_DIM_F,
                                         KERNEL_W0_MATRIX(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_GATE), expert),
                                         KERNEL_W1_MATRIX(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), expert),
-                                        EXPERT_SCALED((ChoiceEpi{SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), products_at}),
+                                        EXPERT_SCALED((ChoiceEpi{SEISMIC_RESULT_0_OUT, products_at}),
                                                       expert));
         return;
     }
 
     const Pro pro{ROWS_OF(SHARED_NVFP4), STRIDE_OF(SHARED_NVFP4), projection::AllRows{}};
-    const Epi epi{SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER), SEISMIC_RESULT_1_STRIDE_0};
+    const Epi epi{SEISMIC_RESULT_1_OUT, SEISMIC_RESULT_1_STRIDE_0};
     projection::gemv_segment_ready<Shape>(shared, projection::after_dependency(pro), (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H / 64, group, SEISMIC_DIM_S,
                             KERNEL_W2_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_GATE)),
                             KERNEL_W3_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_UP)), epi);

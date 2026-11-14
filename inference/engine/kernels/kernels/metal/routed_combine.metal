@@ -34,7 +34,7 @@ kernel void routed_combine_shared(
     const auto gate = routed::weights<packets::W1>(shared_gate, KERNEL_W1_LAYOUT(SEISMIC_DIM_H), 0,
         SEISMIC_DIM_H);
     const auto up = routed::weights<packets::W2>(shared_up, KERNEL_W2_LAYOUT(SEISMIC_DIM_H), 0, SEISMIC_DIM_H);
-    const projection::SiluMul<routed::Act> out{shared_product, SEISMIC_DIM_S, 1};
+    const projection::SiluMul<routed::Act> out{element::out_over_scratch<routed::Act>(shared_product), SEISMIC_DIM_S, 1};
     projection::gemm_paired<packets::W1, packets::W2, BM, BN>(in, out, gate, up, uint(SEISMIC_DIM_M),
         uint(SEISMIC_DIM_S), uint(SEISMIC_DIM_H), group.y, group.x, tile_memory, sg, lane);
 }
@@ -53,7 +53,7 @@ kernel void routed_combine_down(
     const auto in = routed::activation(shared_product, SEISMIC_DIM_S, 1, uint(SEISMIC_DIM_S));
     const auto down = routed::weights<packets::W0>(shared_down, KERNEL_W0_LAYOUT(SEISMIC_DIM_S), 0,
         SEISMIC_DIM_S);
-    const projection::Store<routed::Act> out{shared_output, SEISMIC_DIM_H, 1, 0};
+    const projection::Store<routed::Act> out{element::out_over_scratch<routed::Act>(shared_output), SEISMIC_DIM_H, 1, 0};
     projection::gemm<packets::W0, BM, BN>(in, out, down, uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_H),
         uint(SEISMIC_DIM_S), group.y, group.x, tile_memory, sg, lane);
 }
@@ -65,13 +65,14 @@ kernel void routed_combine(
     device const int *inverse [[buffer(SEISMIC_BUFFER_INVERSE)]],
     device const float *scores [[buffer(SEISMIC_BUFFER_SCORES)]],
     device const float *coefficient [[buffer(SEISMIC_BUFFER_COEFFICIENT)]],
-    device float *value [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(value_cells),
     device const uchar *shared_output [[buffer(SEISMIC_BUFFER_SCRATCH_SHARED_OUTPUT)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint2 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
     typedef routed::Act A;
     typedef typename A::storage S;
+    const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> value(value_cells);
     const uint m = group.y;
     const uint n = 8u * (group.x * combine_threads + thread_index);
     const uint columns = uint(SEISMIC_DIM_H);
@@ -100,7 +101,7 @@ kernel void routed_combine(
     const float projected[8] = {shared_even.x, shared_odd.x, shared_even.y, shared_odd.y, shared_even.z,
         shared_odd.z, shared_even.w, shared_odd.w};
     for (uint i = 0; i < 8u && n + i < columns; ++i)
-        projection::routed_join<SEISMIC_DIM_SN, (SEISMIC_DIM_IN != 0)>(value + m * SEISMIC_RESULT_0_STRIDE_0,
+        projection::routed_join<SEISMIC_DIM_SN, (SEISMIC_DIM_IN != 0)>(value.offset(m * SEISMIC_RESULT_0_STRIDE_0),
             SEISMIC_RESULT_0_STRIDE_1, residual + m * SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1,
             inject + m * SEISMIC_INJECT_STRIDE_0, columns, n + i, selected[i], projected[i] * c);
 }

@@ -56,18 +56,18 @@ fn ngram_inject<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3]
             let position = (slot.stop + tap) as isize - reach as isize;
             // SAFETY: each slot's work item writes its own successor bank,
             // which no slot reads.
-            let target = unsafe { window.row_mut([slot.target, tap, 0]) };
-            for (channel, target) in target[..channels].iter_mut().enumerate() {
-                *target = input(&slot, position, channel);
+            let mut target = unsafe { window.row_mut([slot.target, tap, 0]) };
+            for (channel, target) in target.part_mut(0, channels).iter_mut().enumerate() {
+                target.set(input(&slot, position, channel));
             }
         }
         return;
     }
     let hidden = &cx.arg_hidden().row([item, 0])[..channels];
     // SAFETY: each work item writes its own row.
-    let out = unsafe { cx.result_0().row_mut([item, 0]) };
+    let mut out = unsafe { cx.result_0().row_mut([item, 0]) };
     let Some(slot) = slots.slot_of_row(item) else {
-        out[..channels].copy_from_slice(hidden);
+        out.store(hidden);
         return;
     };
     let local = (item - slot.lo) as isize;
@@ -82,6 +82,6 @@ fn ngram_inject<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3]
         }
         let (stream, column) = (channel / h, channel % h);
         let gated = scales[stream] * value.get([item, column]);
-        out[channel] = hidden[channel] + (gated + activation::silu(sum));
+        out.set(channel, hidden[channel] + (gated + activation::silu(sum)));
     }
 }

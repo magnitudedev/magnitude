@@ -1,13 +1,14 @@
 // draft_convolve_residual: DFlash2's half-1 grouped dynamic causal convolution
 // of a sublayer's F32 output rows within each draft block, plus the residual;
 // one thread per output element, summing its taps in offset order.
+#include <seismic/element.h>
 
 kernel void draft_convolve_residual(
     device const float *residual [[buffer(SEISMIC_BUFFER_RESIDUAL)]],
     device const float *output [[buffer(SEISMIC_BUFFER_OUTPUT)]],
     device const float *dynamic [[buffer(SEISMIC_BUFFER_DYNAMIC)]],
     device const float *base [[buffer(SEISMIC_BUFFER_BASE)]],
-    device float *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(result_cells),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint raw_index [[thread_position_in_grid]]) {
     const ulong index = ulong(raw_index);
@@ -24,6 +25,7 @@ kernel void draft_convolve_residual(
         sum = metal::fma(coefficient,
             output[(row - offset) * SEISMIC_OUTPUT_STRIDE_0 + column * SEISMIC_OUTPUT_STRIDE_1], sum);
     }
-    result[row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1] =
-        residual[row * SEISMIC_RESIDUAL_STRIDE_0 + column * SEISMIC_RESIDUAL_STRIDE_1] + sum;
+    element::Out<ELEMENT_OF(SEISMIC_RESULT_0)>(result_cells).put(
+        row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1,
+        residual[row * SEISMIC_RESIDUAL_STRIDE_0 + column * SEISMIC_RESIDUAL_STRIDE_1] + sum);
 }

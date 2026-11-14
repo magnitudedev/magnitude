@@ -153,6 +153,18 @@ pub mod coverage {
         seismic_runtime::native::coverage::cover(module.checked(), toolchain, forming, progress)
     }
 
+    /// Form the base configuration of every native implementation of
+    /// `module` with `toolchain`, through `forming`, in parallel across
+    /// entries. `progress` counts the entries formed.
+    pub fn form_bases(
+        module: &Module,
+        toolchain: &Toolchain,
+        forming: &dyn Forming,
+        progress: &Progress,
+    ) -> Result<Coverage, CoverageError> {
+        seismic_runtime::native::coverage::form_bases(module.checked(), toolchain, forming, progress)
+    }
+
     /// Form every kernel request at its default specialization on
     /// `toolchain`'s base configuration, in parallel through `forming`;
     /// results in request order. `progress` counts the requests formed.
@@ -741,6 +753,13 @@ impl Element {
     /// Unique storage name.
     pub fn name(&self) -> &'static str {
         seismic_lang::registry::representation_info(self.0).name
+    }
+    /// Canonicalizes every NaN in `bytes` (whole elements of a dense floating
+    /// representation) to the registry's one NaN, leaving other representations
+    /// unchanged: the out-of-engine canonicalization [`Tensor::read_to_host`]
+    /// applies.
+    pub fn canonicalize_in_place(&self, bytes: &mut [u8]) {
+        seismic_runtime::api::canonicalize_in_place(self.0, bytes);
     }
     /// This element as a weight operand of the CPU's components on `tier`,
     /// read where it lies, a device's row layout too
@@ -1642,14 +1661,20 @@ impl Tensor {
     /// The host address of this view's first byte, where the host addresses
     /// its storage in place (a [`Tensor::shared`] view); none otherwise.
     /// Valid while the tensor lives. Bytes written through it are written
-    /// under [`Tensor::write_shared`]'s contract, in place: a read from a
-    /// file landing straight in a staging record, say.
+    /// under [`Tensor::write_shared`]'s contract, in place (a read from a
+    /// file landing straight in a staging record, or an in-engine co-processor
+    /// slot); floating values read out to a caller leave through
+    /// [`Tensor::read_to_host`] or [`Element::canonicalize_in_place`], never
+    /// raw, so NaN payloads are unobservable.
     pub fn shared_address(&self) -> Option<std::ptr::NonNull<u8>> {
         self.inner.host_address()
     }
 
     /// Read `into.len()` bytes at `offset` bytes into this view without
-    /// waiting for device work that uses its storage.
+    /// waiting for device work that uses its storage. A dense floating
+    /// tensor is refused ([`TensorError::FloatingSharedRead`]): its values
+    /// leave only through the reads that give every NaN as the registry's
+    /// one NaN.
     ///
     /// # Safety
     /// The tensor was made by [`Tensor::shared`] (or is a view of one), and

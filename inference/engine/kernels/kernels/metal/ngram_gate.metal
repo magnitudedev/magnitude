@@ -16,7 +16,7 @@ kernel void ngram_gate(
     device const float *value [[buffer(SEISMIC_BUFFER_VALUE)]],
     device const uchar *key_norm [[buffer(SEISMIC_BUFFER_KEY_NORM)]],
     device const uchar *query_norm [[buffer(SEISMIC_BUFFER_QUERY_NORM)]],
-    device float *scales [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(scales),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
@@ -57,8 +57,8 @@ kernel void ngram_gate(
     const float root = metal::sqrt(metal::max(metal::abs(g), 1e-6f));
     const float signed_root = g > 0.0f ? root : (g < 0.0f ? -root : 0.0f);
     const float gate = 1.0f / (1.0f + metal::exp(-signed_root));
-    device float *out = scales + row * SEISMIC_RESULT_0_STRIDE_0;
-    out[stream * SEISMIC_RESULT_0_STRIDE_1] = gate;
-    out[(SEISMIC_DIM_S + stream) * SEISMIC_RESULT_0_STRIDE_1] =
-        metal::rsqrt(gate * gate * (values / float(width)) + epsilon);
+    const element::Out<element::F32> out = element::Out<element::F32>(scales).offset(row * SEISMIC_RESULT_0_STRIDE_0);
+    out.put(stream * SEISMIC_RESULT_0_STRIDE_1, gate);
+    out.put((SEISMIC_DIM_S + stream) * SEISMIC_RESULT_0_STRIDE_1,
+        metal::rsqrt(gate * gate * (values / float(width)) + epsilon));
 }

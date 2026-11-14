@@ -1,5 +1,7 @@
 // line_stream: a warp sums a row of C values, each lane UNROLL 16-byte
 // loads in flight at once (C is a multiple of 32 lanes x 4 values x UNROLL).
+#include <seismic/element.cuh>
+
 extern "C" __global__ void line_stream(SEISMIC_KERNEL_PARAMS) {
     typedef unsigned long long u64;
     constexpr unsigned UNROLL = SEISMIC_TUNE_UNROLL;
@@ -29,5 +31,5 @@ extern "C" __global__ void line_stream(SEISMIC_KERNEL_PARAMS) {
         total += partial[k];
     total = seismic_warp_sum_f32(total);
     if (lane == 0)
-        reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_OUT))[row * SEISMIC_OUT_STRIDE_0] = total;
+        SEISMIC_OUT_OUT.put(row * SEISMIC_OUT_STRIDE_0, total);
 }

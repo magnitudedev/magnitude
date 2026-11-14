@@ -10,7 +10,7 @@ kernel void vision_gated_convolution(device const uchar *value [[buffer(SEISMIC_
     device const uchar *gate [[buffer(SEISMIC_BUFFER_GATE)]],
     device const uchar *weight [[buffer(SEISMIC_BUFFER_WEIGHT)]],
     device const int *neighbors [[buffer(SEISMIC_BUFFER_NEIGHBORS)]],
-    device uchar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(result),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint index [[thread_position_in_grid]]) {
     const ulong columns = SEISMIC_DIM_H;
@@ -25,6 +25,6 @@ kernel void vision_gated_convolution(device const uchar *value [[buffer(SEISMIC_
                 element::at<weight_element>(weight, channel * SEISMIC_WEIGHT_STRIDE_0 + tap), sum);
     }
     const float convolved = activation::round(sum);
-    element::put<activation>(result, row * SEISMIC_RESULT_0_STRIDE_0 + channel,
+    element::Out<activation>(result).put(row * SEISMIC_RESULT_0_STRIDE_0 + channel,
         convolved * element::at<activation>(gate, row * SEISMIC_GATE_STRIDE_0 + channel));
 }

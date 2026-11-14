@@ -47,7 +47,7 @@ projection_prologue attention_output_rows() {
 
 // The residual join after the weight's second-level scale, where it has one.
 projection_epilogue attention_output_output() {
-    return projection_scaled(projection_output(OUTPUT_ACT, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER),
+    return projection_scaled(projection_output(OUTPUT_ACT, SEISMIC_RESULT_0_OUT,
         SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN),
         SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1, 0ul, SEISMIC_PTR(SEISMIC_BUFFER_INJECT),
         SEISMIC_INJECT_STRIDE_0, uint(SEISMIC_DIM_IN), uint(SEISMIC_DIM_SN), uint(SEISMIC_DIM_D)),

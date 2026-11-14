@@ -19,7 +19,7 @@ extern "C" __global__ void stream_join(SEISMIC_KERNEL_PARAMS) {
     const u64 column = index % h;
     const Output::type out =
         Output::make(reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL)), SEISMIC_RESIDUAL_STRIDE_0,
-                     projection::AllRows{}, reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)),
+                     projection::AllRows{}, SEISMIC_RESULT_0_OUT,
                      SEISMIC_RESULT_0_STRIDE_0, reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_INJECT)),
                      SEISMIC_INJECT_STRIDE_0, h);
     out(row, column, y[(u64)row * SEISMIC_Y_STRIDE_0 + column * SEISMIC_Y_STRIDE_1], 0.0f);

@@ -73,7 +73,7 @@ inline void hint_group(arrive::coherent_device<float> logits, uint lead, device 
         device const uchar *after_router [[buffer(SEISMIC_BUFFER_AFTER_ROUTER)]],                                  \
         device const float *bias [[buffer(SEISMIC_BUFFER_BIAS)]],                                                  \
         device const float *expert_scale [[buffer(SEISMIC_BUFFER_EXPERT_SCALE)]],                                  \
-        device int *routes [[buffer(SEISMIC_BUFFER_ROUTES)]], device float *weights [[buffer(SEISMIC_BUFFER_WEIGHTS)]], \
+        device int *routes [[buffer(SEISMIC_BUFFER_ROUTES)]], SEISMIC_OUT_WEIGHTS_PARAM(weights_cells),             \
         device const int *step [[buffer(SEISMIC_BUFFER_STEP)]],                                                    \
         device const float *next_bias [[buffer(SEISMIC_BUFFER_NEXT_BIAS)]],                                        \
         device const float *after_bias [[buffer(SEISMIC_BUFFER_AFTER_BIAS)]],                                      \
@@ -81,7 +81,7 @@ inline void hint_group(arrive::coherent_device<float> logits, uint lead, device 
         SYSTEM const int *map [[buffer(SEISMIC_BUFFER_MAP)]], SYSTEM const int *tier [[buffer(SEISMIC_BUFFER_TIER)]], \
         device int *sources [[buffer(SEISMIC_BUFFER_SOURCES)]], SYSTEM int *file [[buffer(SEISMIC_BUFFER_FILE)]],  \
         SYSTEM const int *policy [[buffer(SEISMIC_BUFFER_POLICY)]],                                                \
-        device uchar *normalized [[buffer(SEISMIC_RESULT_0_BUFFER)]],                                              \
+        SEISMIC_RESULT_0_PARAM(normalized_cells),                                                                  \
         arrive::coherent_device<float> logits [[buffer(SEISMIC_BUFFER_SCRATCH_LOGITS)]],                           \
         device atomic_uint *arrivals [[buffer(SEISMIC_BUFFER_SCRATCH_ARRIVALS)]],                                  \
         constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]], threadgroup uchar *shared [[threadgroup(0)]], \
@@ -92,6 +92,8 @@ inline void hint_group(arrive::coherent_device<float> logits, uint lead, device 
         threadgroup float parts[SEISMIC_CONST_DECODE_ROWS * select_simdgroups];                                    \
         threadgroup float inverses[SEISMIC_CONST_DECODE_ROWS];                                                     \
         threadgroup uint last;                                                                                     \
+        const element::Out<ELEMENT_OF(SEISMIC_WEIGHTS)> weights(weights_cells);                                    \
+        const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> normalized(normalized_cells);                             \
         /* The resolve's or the hints' group words take `shared` once the GEMV is done with it (the arrival's  \
            barrier); `shared_bytes` holds both. */                                                                \
         threadgroup int *words = reinterpret_cast<threadgroup int *>(shared);                                      \

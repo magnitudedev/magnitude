@@ -131,7 +131,7 @@ extern "C" __global__ void draft_rows(SEISMIC_KERNEL_PARAMS) {
     draft_join(DRAFT_INPUT, held, row, stream, D, epsilon, joined, partials);
     // Four combine rows per warp over the 2D joined inputs.
     const unsigned warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    float *result = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER));
+    const auto result = SEISMIC_RESULT_0_OUT;
 #if defined(SEISMIC_COMBINE_KIND_PACKED)
     const auto combine = KERNEL_W1_AT(SEISMIC_PTR(SEISMIC_BUFFER_COMBINE));
 #else
@@ -164,7 +164,7 @@ extern "C" __global__ void draft_rows(SEISMIC_KERNEL_PARAMS) {
 #endif
         sum = seismic_warp_sum_f32(sum);
         if (lane == 0)
-            result[row * SEISMIC_RESULT_0_STRIDE_0 + (stream * D + output) * SEISMIC_RESULT_0_STRIDE_1] = sum;
+            result.put(row * SEISMIC_RESULT_0_STRIDE_0 + (stream * D + output) * SEISMIC_RESULT_0_STRIDE_1, sum);
     }
 }
 
@@ -187,7 +187,7 @@ extern "C" __global__ void draft_rows_join(SEISMIC_KERNEL_PARAMS) {
 }
 
 template <class Shape>
-__device__ __forceinline__ void draft_gemm(const unsigned char *staged, unsigned char *result,
+__device__ __forceinline__ void draft_gemm(const unsigned char *staged, element::Out<element::F32> result,
                                           const packets::W1 &combine, u64 rows, u64 width) {
     extern __shared__ uint4 dynamic_shared[];
     const projection::Store<element::F32> out{result, width, 0};
@@ -198,12 +198,12 @@ __device__ __forceinline__ void draft_gemm(const unsigned char *staged, unsigned
 
 extern "C" __global__ void draft_rows_gemm_small(SEISMIC_KERNEL_PARAMS) {
     draft_gemm<projection::SmallGemm>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_JOINED),
-        SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), KERNEL_W1_AT(SEISMIC_PTR(SEISMIC_BUFFER_COMBINE)),
+        SEISMIC_RESULT_0_OUT, KERNEL_W1_AT(SEISMIC_PTR(SEISMIC_BUFFER_COMBINE)),
         SEISMIC_DIM_M * SEISMIC_DIM_S, SEISMIC_DIM_D);
 }
 
 extern "C" __global__ void draft_rows_gemm(SEISMIC_KERNEL_PARAMS) {
     draft_gemm<projection::LargeGemm<2>>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_JOINED),
-        SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), KERNEL_W1_AT(SEISMIC_PTR(SEISMIC_BUFFER_COMBINE)),
+        SEISMIC_RESULT_0_OUT, KERNEL_W1_AT(SEISMIC_PTR(SEISMIC_BUFFER_COMBINE)),
         SEISMIC_DIM_M * SEISMIC_DIM_S, SEISMIC_DIM_D);
 }

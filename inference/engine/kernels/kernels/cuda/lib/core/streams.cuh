@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include <seismic/element.cuh>
+
 namespace streams {
 
 // Row `x`'s S streams (`stream_stride` apart, columns `column_stride` apart)
@@ -15,15 +17,16 @@ namespace streams {
 // below h.
 template <unsigned S>
 __device__ __forceinline__ void collapse(const float *x, unsigned long long stream_stride,
-                                         unsigned long long column_stride, const float (&carried)[S], float *out,
-                                         unsigned long long out_stride, unsigned h, unsigned first, unsigned step) {
+                                         unsigned long long column_stride, const float (&carried)[S],
+                                         const element::Out<element::F32> &out, unsigned long long out_stride,
+                                         unsigned h, unsigned first, unsigned step) {
     typedef unsigned long long u64;
     for (unsigned column = first; column < h; column += step) {
         float sum = 0.0f;
 #pragma unroll
         for (unsigned stream = 0; stream < S; ++stream)
             sum += carried[stream] * x[(u64)stream * stream_stride + (u64)column * column_stride];
-        out[(u64)column * out_stride] = sum;
+        out.put((u64)column * out_stride, sum);
     }
 }
 
@@ -31,8 +34,8 @@ __device__ __forceinline__ void collapse(const float *x, unsigned long long stre
 template <unsigned S>
 __device__ __forceinline__ void collapse(const float *x, unsigned long long stream_stride,
                                          unsigned long long column_stride, const float *weights,
-                                         unsigned long long weight_stride, float *out, unsigned long long out_stride,
-                                         unsigned h, unsigned first, unsigned step) {
+                                         unsigned long long weight_stride, const element::Out<element::F32> &out,
+                                         unsigned long long out_stride, unsigned h, unsigned first, unsigned step) {
     float carried[S];
 #pragma unroll
     for (unsigned stream = 0; stream < S; ++stream)

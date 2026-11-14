@@ -20,6 +20,5 @@ extern "C" __global__ void vision_position(SEISMIC_KERNEL_PARAMS) {
         blended += element::at<Table>(SEISMIC_PTR(SEISMIC_BUFFER_TABLE),
                                       (u64)indices[row * 4 + i] * SEISMIC_TABLE_STRIDE_0 + column) *
                    coefficients[row * 4 + i];
-    reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER))[row * SEISMIC_RESULT_0_STRIDE_0 + column] =
-        source[row * SEISMIC_SOURCE_STRIDE_0 + column] + blended;
+    SEISMIC_RESULT_0_OUT.put(row * SEISMIC_RESULT_0_STRIDE_0 + column, source[row * SEISMIC_SOURCE_STRIDE_0 + column] + blended);
 }

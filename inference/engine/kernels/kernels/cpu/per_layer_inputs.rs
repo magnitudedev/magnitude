@@ -22,14 +22,14 @@ fn per_layer_inputs<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64
         (cx.arg_epsilon(), cx.arg_gathered_scale(), cx.arg_projected_scale(), cx.arg_scale());
     let projected = cx.arg_projected().row([row, 0]);
     // SAFETY: each work item writes its own row.
-    let out = unsafe { cx.result_0().row_mut([row, 0]) };
+    let mut out = unsafe { cx.result_0().row_mut([row, 0]) };
     for first in (0..width).step_by(chunk) {
         for (target, value) in p.iter_mut().zip(&projected[first..first + chunk]) {
             *target = value * projected_scale;
         }
         let inverse = reduce::rms_inverse(p, epsilon);
         for i in 0..chunk {
-            out[first + i] = (p[i] * inverse * norm[i] + gathered[first + i] * gathered_scale) * scale;
+            out.set(first + i, (p[i] * inverse * norm[i] + gathered[first + i] * gathered_scale) * scale);
         }
     }
 }

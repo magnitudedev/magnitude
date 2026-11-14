@@ -20,12 +20,13 @@ kernel void routed_down_sited(
     device const int *step [[buffer(SEISMIC_BUFFER_STEP)]],
     SYSTEM int *site [[buffer(SEISMIC_BUFFER_SITE)]],
     SYSTEM const float *site_output [[buffer(SEISMIC_BUFFER_SITE_OUTPUT)]],
-    device uchar *value [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(value_cells),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint2 group [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     uint2 threads [[threads_per_threadgroup]]) {
     threadgroup int ready;
+    const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> value(value_cells);
     const ulong m = group.y;
     const ulong q = streaming_step(step, SEISMIC_STEP_STRIDE_0);
     const ulong slot = q % ulong(SEISMIC_DIM_FLIGHT);

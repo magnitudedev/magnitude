@@ -18,7 +18,7 @@
 // backend is qualified under.
 
 use super::super::core::{activation, reduce, rounding::Rounding};
-use seismic::cpu::{math, slab::{SlabTensor, SlabWalk}, Dense, Element, Isa, F16, F32, U32};
+use seismic::cpu::{math, slab::{SlabTensor, SlabWalk}, Dense, Element, Isa, Store, F16, F32, U32};
 use std::{marker::PhantomData, ops::Range};
 
 /// How many keys ahead of its scoring a key's rows are prefetched: a key
@@ -305,14 +305,14 @@ pub fn output_angles<'a>(
 /// `layout`) turned back by the row's negated angles, the amplitude-scaled
 /// `cosines` and `sines` of [`scaled_angles`], in F32 and published again.
 #[inline(always)]
-pub fn output_rotary<A: Dense>(out: &mut [A::Storage], layout: Layout, cosines: &[f32], sines: &[f32]) {
+pub fn output_rotary<A: Dense>(out: &mut Store<'_, A>, layout: Layout, cosines: &[f32], sines: &[f32]) {
     let (w, p) = (out.len(), cosines.len());
     for pair in 0..p {
         let (lo, hi) = layout.columns(pair, p, w);
-        let (low, high) = (A::widen(out[lo]), A::widen(out[hi]));
+        let (low, high) = (out.get(lo), out.get(hi));
         let (cosine, sine) = (cosines[pair], -sines[pair]);
-        out[lo] = A::narrow(low * cosine - high * sine);
-        out[hi] = A::narrow(high * cosine + low * sine);
+        out.set(lo, low * cosine - high * sine);
+        out.set(hi, high * cosine + low * sine);
     }
 }
 
@@ -564,13 +564,13 @@ pub fn gate_row<A: Dense>(
     denominator: f32,
     gates: &[A::Storage],
     softplus: bool,
-    out: &mut [A::Storage],
+    out: &mut Store<'_, A>,
 ) {
     let denominator = denominator.max(1e-30);
     let u = gates.len();
     for (column, (target, value)) in out.iter_mut().zip(accumulator).enumerate() {
         let attended = value / denominator;
-        *target = A::narrow(if u == 0 {
+        target.set(if u == 0 {
             attended
         } else {
             let gate = A::widen(gates[column % u]);
@@ -1231,12 +1231,12 @@ impl<const BITS: u32, C: Element<Storage = u16>> Rows for AffineRows<'_, BITS, C
 /// reads or writes.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-pub unsafe fn store_affine_head<C: Element<Storage = u16>>(
+pub unsafe fn store_affine_head(
     key: &[f32],
     value: &[f32],
     (key_bits, value_bits): (u32, u32),
-    (key_codes, key_coefficients): (&SlabTensor<'_, U32, 3>, &SlabTensor<'_, C, 3>),
-    (value_codes, value_coefficients): (&SlabTensor<'_, U32, 3>, &SlabTensor<'_, C, 3>),
+    (key_codes, key_coefficients): (&SlabTensor<'_, U32, 3>, &SlabTensor<'_, F16, 3>),
+    (value_codes, value_coefficients): (&SlabTensor<'_, U32, 3>, &SlabTensor<'_, F16, 3>),
     destination: usize,
     head: usize,
 ) {

@@ -5,8 +5,11 @@
 use crate::api::kernel::ViewOperation;
 use crate::api::TensorError;
 use seismic_compiler::errors::ExecutionError;
+use seismic_compiler::prepared::ArgumentValue;
 use seismic_lang::ids::RepresentationId;
+use seismic_lang::reference_math::conversion::canonical_nan;
 use seismic_lang::registry::{self, representation_info, RepresentationKind};
+use seismic_lang::types::DType;
 
 /// Canonical storage-unit strides and total byte length. Dense storage units
 /// are elements; a packed representation's final-axis unit is one packet.
@@ -73,6 +76,71 @@ fn row_major_strides(units: &[u64]) -> Vec<u64> {
             .expect("units whose bytes fit have a row-major product that fits");
     }
     strides
+}
+
+/// The bits of a 16-bit floating dtype's infinity: above it, a magnitude (`bits & 0x7fff`) is a NaN.
+fn half_infinity(dtype: DType) -> u16 {
+    match dtype {
+        DType::BF16 => 0x7f80,
+        DType::F16 => 0x7c00,
+        other => unreachable!("{other:?} is not a 16-bit floating dtype"),
+    }
+}
+
+fn f32_is_nan(bits: u32) -> bool {
+    bits & 0x7fff_ffff > 0x7f80_0000
+}
+
+/// A scalar result as it leaves the engine: a floating NaN of any sign and payload is the
+/// registry's one NaN, as in a tensor's bytes (`canonicalize_in_place`). Other scalars are
+/// unchanged.
+pub(crate) fn canonical_scalar(value: ArgumentValue) -> ArgumentValue {
+    let half = |dtype: DType, bits: u16| {
+        if bits & 0x7fff > half_infinity(dtype) {
+            canonical_nan(dtype) as u16
+        } else {
+            bits
+        }
+    };
+    match value {
+        ArgumentValue::F32(value) if f32_is_nan(value.to_bits()) => {
+            ArgumentValue::F32(f32::from_bits(canonical_nan(DType::F32)))
+        }
+        ArgumentValue::F16(bits) => ArgumentValue::F16(half(DType::F16, bits)),
+        ArgumentValue::BF16(bits) => ArgumentValue::BF16(half(DType::BF16, bits)),
+        other => other,
+    }
+}
+
+/// Every NaN of a dense floating tensor's bytes, of any sign and payload, becomes the registry's one
+/// NaN (`canonical_nan`). This is the way out of the engine (`TensorInner::read_with`), so a NaN's
+/// bits are unobservable: inside, they are whatever the backend's arithmetic and the host gave.
+/// Other representations are left alone. `bytes` is whole elements.
+pub(crate) fn canonicalize_in_place(representation: RepresentationId, bytes: &mut [u8]) {
+    let &RepresentationKind::Dense(dtype) = &representation_info(representation).kind else {
+        return;
+    };
+    match dtype {
+        DType::F32 => {
+            let one = canonical_nan(DType::F32).to_le_bytes();
+            for element in bytes.chunks_exact_mut(4) {
+                let bits = u32::from_le_bytes([element[0], element[1], element[2], element[3]]);
+                if f32_is_nan(bits) {
+                    element.copy_from_slice(&one);
+                }
+            }
+        }
+        DType::BF16 | DType::F16 => {
+            let infinity = half_infinity(dtype);
+            let one = (canonical_nan(dtype) as u16).to_le_bytes();
+            for element in bytes.chunks_exact_mut(2) {
+                if u16::from_le_bytes([element[0], element[1]]) & 0x7fff > infinity {
+                    element.copy_from_slice(&one);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Visit canonical host storage bytes in logical order and their corresponding

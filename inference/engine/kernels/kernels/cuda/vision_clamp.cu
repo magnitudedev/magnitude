@@ -12,6 +12,5 @@ extern "C" __global__ void vision_clamp(SEISMIC_KERNEL_PARAMS) {
     const float minimum = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_MINIMUM))[0];
     const float maximum = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_MAXIMUM))[0];
     const float value = element::at<A>(SEISMIC_PTR(SEISMIC_BUFFER_X), row * SEISMIC_X_STRIDE_0 + column);
-    element::put<A>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), row * SEISMIC_RESULT_0_STRIDE_0 + column,
-                    fminf(fmaxf(value, minimum), maximum));
+    SEISMIC_RESULT_0_OUT.put(row * SEISMIC_RESULT_0_STRIDE_0 + column, fminf(fmaxf(value, minimum), maximum));
 }

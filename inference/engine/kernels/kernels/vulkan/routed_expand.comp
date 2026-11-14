@@ -63,8 +63,7 @@ void routed_expand_bounded(const uint maxm) {
         const projection_weights up = routed_record_weights(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), expert,
             PACKETS_W1_STACKED_ROWS, hidden);
         const projection_epilogue out_ = projection_scaled(projection_silu_mul(ROUTED_ACT,
-                SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)
-                    + (m * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1) * uint64_t(ELEMENT_BYTES(ROUTED_ACT)),
+                out_offset(SEISMIC_RESULT_0_OUT, m * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1),
                 0ul, SEISMIC_RESULT_0_STRIDE_2),
             projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_GATE_SCALE), SEISMIC_DIM_GS, SEISMIC_GATE_SCALE_STRIDE_0, expert),
             projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_US, SEISMIC_UP_SCALE_STRIDE_0, expert));
@@ -79,7 +78,7 @@ void routed_expand_bounded(const uint maxm) {
         SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_NORMALIZED_STRIDE_1, hidden, 0ul), SHARED_OPERANDS);
     const projection_weights gate = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_GATE), PACKETS_W2_ROWS, 0ul, hidden);
     const projection_weights up = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_UP), PACKETS_W3_ROWS, 0ul, hidden);
-    const projection_epilogue out_ = projection_silu_mul(ROUTED_ACT, SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER),
+    const projection_epilogue out_ = projection_silu_mul(ROUTED_ACT, SEISMIC_RESULT_1_OUT,
         SEISMIC_RESULT_1_STRIDE_0, SEISMIC_RESULT_1_STRIDE_1);
     projection_gemv(PACKETS_W2, PACKETS_W3, true, SEISMIC_TUNE_ROWS, 32u, maxm, PROJECTION_NORM_NONE, x, out_, gate, up,
         uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_S), hidden, tile);

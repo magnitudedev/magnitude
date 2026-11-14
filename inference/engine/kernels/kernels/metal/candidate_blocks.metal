@@ -1,3 +1,4 @@
+#include <seismic/element.h>
 // candidate_blocks on Metal (contract and portable body in indexer.seismic).
 //
 // A threadgroup of 256 threads per (256 blocks, row), thread t scoring block
@@ -10,7 +11,7 @@
 kernel void candidate_blocks(
     device const float *scores [[buffer(SEISMIC_BUFFER_SCORES)]],
     device const int *complete [[buffer(SEISMIC_BUFFER_COMPLETE)]],
-    device float *blocks [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(blocks_cells),
     device int *lists [[buffer(SEISMIC_RESULT_1_BUFFER)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint3 group [[threadgroup_position_in_grid]],
@@ -37,5 +38,5 @@ kernel void candidate_blocks(
         for (uint unit = block * bu; unit < end; ++unit)
             score = metal::max(score, row_scores[unit]);
     }
-    blocks[row * ulong(nb) + block] = score;
+    element::Out<element::F32>(blocks_cells).put(row * ulong(nb) + block, score);
 }

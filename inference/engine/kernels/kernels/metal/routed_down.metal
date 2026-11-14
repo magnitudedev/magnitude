@@ -22,7 +22,7 @@
         device const float *weights [[buffer(SEISMIC_BUFFER_WEIGHTS)]],                                           \
         device const ulong *expert_down [[buffer(SEISMIC_BUFFER_EXPERT_DOWN)]],                                   \
         device const ulong *tier_down [[buffer(SEISMIC_BUFFER_TIER_DOWN)]],                                       \
-        device uchar *value [[buffer(SEISMIC_RESULT_0_BUFFER)]],                                                  \
+        SEISMIC_RESULT_0_PARAM(value_cells),                                                                      \
         constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],                                           \
         uint2 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],                   \
         uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]
@@ -34,6 +34,7 @@
     threadgroup float projected[uint(SEISMIC_DIM_K)][REGION];                                                     \
     const ulong m = group.y;                                                                                      \
     const uint first = group.x * TILE;                                                                            \
+    const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> value(value_cells);                                          \
     routed::down_project<ROWS, LANES>(product, routes, sources, expert_down, tier_down, m, first, sg, lane,       \
         projected[sg], seismic_words);                                                                            \
     threadgroup_barrier(mem_flags::mem_threadgroup);                                                              \

@@ -12,7 +12,7 @@
 #include "../core/activation.cuh"
 #include "../core/arrive.cuh"
 #include "../core/functions.cuh"
-#include <seismic/slab.cuh>
+#include "versions.cuh"
 
 namespace recurrent {
 
@@ -21,6 +21,7 @@ using element::u16;
 using element::u32;
 using element::u64;
 typedef element::Act Act;
+using Slot = versions::Slot;
 
 constexpr int NK = static_cast<int>(SEISMIC_DIM_NK);
 constexpr int NV = static_cast<int>(SEISMIC_DIM_NV);
@@ -43,14 +44,10 @@ struct Inputs {
     const float *convolution;
     const float *rate;
     const float *time_bias;
-    const int *segments;
-    const int *stop;
-    const int *previous_bank;
-    const int *previous_tape;
-    const int *following_bank;
-    const u32 *window;
-    const u32 *delta;
-    const u32 *tape;
+    versions::Slots slots;
+    element::SlabOut<Act> window;
+    element::SlabOut<element::F32> delta;
+    element::SlabOut<element::F32> tape;
     float epsilon;
     bool grouped;
 };
@@ -61,57 +58,38 @@ struct Inputs {
             reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_CONVOLUTION)),         \
             reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_RATE)),                \
             reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_TIME_BIAS)),           \
-            reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_SEGMENTS)),              \
-            reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_STOP)),                  \
-            reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_PREVIOUS_BANK)),         \
-            reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_PREVIOUS_TAPE)),         \
-            reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_FOLLOWING_BANK)),        \
-            reinterpret_cast<const recurrent::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_WINDOW)),    \
-            reinterpret_cast<const recurrent::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_DELTA)),     \
-            reinterpret_cast<const recurrent::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_TAPE)),      \
+            VERSIONS_SLOTS(),                                                                 \
+            SEISMIC_OUT_WINDOW, SEISMIC_OUT_DELTA, SEISMIC_OUT_TAPE,                          \
             element::word_f32(SEISMIC_PARAM_NORM_EPSILON), SEISMIC_PARAM_GROUPED != 0         \
     }
 
-// One slot's rows [lo, hi), its publication row count, the version it reads
-// (bank `source` advanced by its first `taped` tape rows) and its successor.
-struct Slot {
-    int lo;
-    int hi;
-    int stop;
-    int source;
-    int taped;
-    int target;
-};
 __device__ __forceinline__ Slot slot_of(const Inputs &in, u64 slot) {
-    [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
-    return Slot{in.segments[slot * SEISMIC_SEGMENTS_STRIDE_0],
-                in.segments[slot * SEISMIC_SEGMENTS_STRIDE_0 + SEISMIC_SEGMENTS_STRIDE_1],
-                in.stop[slot * SEISMIC_STOP_STRIDE_0],
-                in.previous_bank[slot * SEISMIC_PREVIOUS_BANK_STRIDE_0],
-                in.previous_tape[slot * SEISMIC_PREVIOUS_TAPE_STRIDE_0],
-                in.following_bank[slot * SEISMIC_FOLLOWING_BANK_STRIDE_0]};
+    return versions::slot_of(in.slots, slot, *in.words);
 }
 
 // Rows the slot records in its successor's tape: those after the stop row, at
 // most T.
 __device__ __forceinline__ int tape_rows(const Inputs &in, const Slot &slot) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
-    return min(static_cast<int>(SEISMIC_DIM_T), slot.hi - slot.lo - slot.stop);
+    return versions::tape_rows(slot, static_cast<int>(SEISMIC_DIM_T));
 }
 
 // Tape row `entry` of `bank`.
-__device__ __forceinline__ float *tape_row(const Inputs &in, int bank, int entry) {
+__device__ __forceinline__ element::Out<element::F32> tape_row(const Inputs &in, int bank, int entry) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
-    return reinterpret_cast<float *>(slab::row(in.tape, bank, SEISMIC_PARAM_SLAB_BANKS,
-               SEISMIC_TAPE_STRIDE_0 * 4)) + static_cast<u64>(entry) * SEISMIC_TAPE_STRIDE_1;
+    return versions::bank(in.tape, bank, SEISMIC_TAPE_STRIDE_0, seismic_words_value)
+        .offset(static_cast<u64>(entry) * SEISMIC_TAPE_STRIDE_1);
+}
+
+__device__ __forceinline__ element::Stored<element::F32> tape_row_view(const Inputs &in, int bank, int entry) {
+    [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
+    return versions::bank_view(in.tape, bank, SEISMIC_TAPE_STRIDE_0, seismic_words_value)
+        .offset(static_cast<u64>(entry) * SEISMIC_TAPE_STRIDE_1);
 }
 
 // The first row no slot covers: slots partition a prefix of rows.
 __device__ __forceinline__ int covered_end(const Inputs &in) {
-    [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
-    const u64 slots = SEISMIC_DIM_B;
-    return slots == 0 ? 0 : in.segments[(slots - 1) * SEISMIC_SEGMENTS_STRIDE_0 +
-                                        SEISMIC_SEGMENTS_STRIDE_1];
+    return versions::covered_end(in.slots, *in.words);
 }
 
 // Element (row, value head, state row) of the raw outputs, an [M, NV, W]
@@ -125,19 +103,24 @@ __device__ __forceinline__ float projection(const Inputs &in, u64 row, u64 colum
     return element::at<Act>(in.projection, row * SEISMIC_PROJECTION_STRIDE_0 + column);
 }
 
-__device__ __forceinline__ u8 *window_at(const Inputs &in, int bank, int tap, u64 channel) {
+__device__ __forceinline__ element::Stored<Act> window_at(const Inputs &in, int bank, int tap, u64 channel) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
-    return slab::row(in.window, bank, SEISMIC_PARAM_SLAB_BANKS,
-               SEISMIC_WINDOW_STRIDE_0 * Act::bytes)
-           + (static_cast<u64>(tap) * SEISMIC_WINDOW_STRIDE_1 + channel) * Act::bytes;
+    return versions::bank_view(in.window, bank, SEISMIC_WINDOW_STRIDE_0, seismic_words_value)
+        .offset(static_cast<u64>(tap) * SEISMIC_WINDOW_STRIDE_1 + channel);
 }
 
 // State row `state_row` of value head `head` in `bank`: W contiguous floats.
-__device__ __forceinline__ float *state_row(const Inputs &in, int bank, int head, int state_row) {
+__device__ __forceinline__ element::Out<element::F32> state_row(const Inputs &in, int bank, int head, int state_row) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
-    return reinterpret_cast<float *>(slab::row(in.delta, bank, SEISMIC_PARAM_SLAB_BANKS,
-               SEISMIC_DELTA_STRIDE_0 * 4)) + static_cast<u64>(head) * SEISMIC_DELTA_STRIDE_1 +
-           static_cast<u64>(state_row) * SEISMIC_DELTA_STRIDE_2;
+    return versions::bank(in.delta, bank, SEISMIC_DELTA_STRIDE_0, seismic_words_value)
+        .offset(static_cast<u64>(head) * SEISMIC_DELTA_STRIDE_1 + static_cast<u64>(state_row) * SEISMIC_DELTA_STRIDE_2);
+}
+
+__device__ __forceinline__ element::Stored<element::F32> state_row_view(const Inputs &in, int bank, int head,
+                                                                        int state_row) {
+    [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
+    return versions::bank_view(in.delta, bank, SEISMIC_DELTA_STRIDE_0, seismic_words_value)
+        .offset(static_cast<u64>(head) * SEISMIC_DELTA_STRIDE_1 + static_cast<u64>(state_row) * SEISMIC_DELTA_STRIDE_2);
 }
 
 // The key head of value head `head`.
@@ -232,24 +215,35 @@ __device__ __forceinline__ Piece piece_of(const Slot &slot, int index) {
 // Raw input row `position` (slot-local) of a channel: the source version's
 // window rows before the slot, the projection after.
 __device__ __forceinline__ float raw_input(const Inputs &in, const Slot &slot, int position, int channel) {
-    return position < 0 ? element::at<Act>(window_at(in, slot.source, slot.taped + C - 1 + position, channel), 0)
+    return position < 0 ? window_at(in, slot.source, slot.taped + C - 1 + position, channel).at()
                         : projection(in, slot.lo + position, channel);
 }
 
 // Publish the slot's successor window: the C - 1 raw rows before the
-// publication row, then the raw rows of its tape. `part` of `parts`
-// cooperating blocks writes an even share.
+// publication row, then the raw rows of its tape, moved bit-for-bit as stored.
+// `part` of `parts` cooperating blocks writes an even share.
 __device__ __forceinline__ void publish_window(const Inputs &in, const Slot &slot, int part,
                                                int parts) {
+    [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
     const int total = (C - 1 + tape_rows(in, slot)) * CH;
     const int per = (total + parts - 1) / parts;
     const int first = part * per;
     const int last = min(total, first + per);
+    if (first + static_cast<int>(threadIdx.x) >= last) return;
+    const element::Stored<Act> source =
+        versions::bank_view(in.window, slot.source, SEISMIC_WINDOW_STRIDE_0, seismic_words_value);
+    const element::Out<Act> target =
+        versions::bank(in.window, slot.target, SEISMIC_WINDOW_STRIDE_0, seismic_words_value);
     for (int index = first + threadIdx.x; index < last; index += blockDim.x) {
         const int row = index / CH;
         const int channel = index % CH;
-        element::put<Act>(window_at(in, slot.target, row, channel), 0,
-                          raw_input(in, slot, slot.stop + row - (C - 1), channel));
+        const int position = slot.stop + row - (C - 1);
+        const element::Stored<Act> from =
+            position < 0
+                ? source.offset(static_cast<u64>(slot.taped + C - 1 + position) * SEISMIC_WINDOW_STRIDE_1 + channel)
+                : element::stored<Act>(
+                      in.projection, static_cast<u64>(slot.lo + position) * SEISMIC_PROJECTION_STRIDE_0 + channel);
+        target.move_stored(static_cast<u64>(row) * SEISMIC_WINDOW_STRIDE_1 + channel, from);
     }
 }
 
@@ -296,7 +290,7 @@ __device__ __forceinline__ void load_rows(const Inputs &in, int bank, int head, 
     const int lane = threadIdx.x % 32;
 #pragma unroll
     for (int r = 0; r < ROWS; ++r)
-        element::f32_span(state_row(in, bank, head, first_row + r) + lane * (W / 32), state[r]);
+        state_row_view(in, bank, head, first_row + r).span(lane * (W / 32), state[r]);
 }
 
 template <int ROWS>
@@ -305,7 +299,7 @@ __device__ __forceinline__ void store_rows(const Inputs &in, int bank, int head,
     const int lane = threadIdx.x % 32;
 #pragma unroll
     for (int r = 0; r < ROWS; ++r)
-        element::f32_span_store(state_row(in, bank, head, first_row + r) + lane * (W / 32), state[r]);
+        state_row(in, bank, head, first_row + r).put_span(lane * (W / 32), state[r]);
 }
 
 // A warp's ROWS rows of the slot's source version: the bank's state advanced
@@ -321,15 +315,15 @@ __device__ __forceinline__ void load_version(const Inputs &in, const RowGates &,
     const int lane = threadIdx.x % 32;
     const int key = key_head(in, head);
     for (int entry = 0; entry < slot.taped; ++entry) {
-        const float *row = tape_row(in, slot.source, entry);
+        const element::Stored<element::F32> row = tape_row_view(in, slot.source, entry);
         float k[CPL], factor[CPL];
-        element::f32_span(row + TAPE_K + key * W + lane * CPL, k);
+        row.span(TAPE_K + key * W + lane * CPL, k);
 #pragma unroll
         for (int c = 0; c < CPL; ++c)
-            factor[c] = DECAYS == 1 && c > 0 ? factor[0] : row[tape_decay<DECAYS>(head, lane * CPL + c)];
+            factor[c] = DECAYS == 1 && c > 0 ? factor[0] : row.at(tape_decay<DECAYS>(head, lane * CPL + c));
 #pragma unroll
         for (int s = 0; s < ROWS; ++s) {
-            const float u = row[TAPE_U + head * W + first_row + s];
+            const float u = row.at(TAPE_U + head * W + first_row + s);
 #pragma unroll
             for (int c = 0; c < CPL; ++c) state[s][c] = __fmaf_rn(u, k[c], state[s][c] * factor[c]);
         }
@@ -413,22 +407,23 @@ __device__ __forceinline__ void advance_rows(const Inputs &in, const RowGates &g
 #pragma unroll
         for (int s = 0; s < ROWS; ++s) remembered[s] = seismic_warp_sum_f32(remembered[s]);
         // Rows after the stop row are recorded in the successor's tape.
-        float *entry = row >= publish && row - publish < taped ? tape_row(in, slot.target, row - publish)
-                                                              : nullptr;
-        if (entry != nullptr && records_keys) {
+        const bool recording = row >= publish && row - publish < taped;
+        const element::Out<element::F32> entry =
+            recording ? tape_row(in, slot.target, row - publish) : element::Out<element::F32>(nullptr);
+        if (recording && records_keys) {
 #pragma unroll
-            for (int c = 0; c < CPL; ++c) entry[TAPE_K + key_row * W + lane * CPL + c] = k[c];
+            for (int c = 0; c < CPL; ++c) entry.put(TAPE_K + key_row * W + lane * CPL + c, k[c]);
         }
-        if (entry != nullptr && records && (DECAYS != 1 || lane == 0)) {
+        if (recording && records && (DECAYS != 1 || lane == 0)) {
 #pragma unroll
-            for (int c = 0; c < LANE_DECAYS; ++c) entry[tape_decay<DECAYS>(head, lane * CPL + c)] = factor[c];
+            for (int c = 0; c < LANE_DECAYS; ++c) entry.put(tape_decay<DECAYS>(head, lane * CPL + c), factor[c]);
         }
         float output[ROWS];
 #pragma unroll
         for (int s = 0; s < ROWS; ++s) {
             const float v = buffer[2 * W + first_row - block_row + s];
             const float residual = (v - remembered[s]) * beta;
-            if (entry != nullptr && lane == s) entry[TAPE_U + head * W + first_row + s] = residual;
+            if (recording && lane == s) entry.put(TAPE_U + head * W + first_row + s, residual);
             float sum = 0.0f;
 #pragma unroll
             for (int c = 0; c < CPL; ++c) {
@@ -459,7 +454,7 @@ __device__ __forceinline__ void advance_rows(const Inputs &in, const RowGates &g
 // with z column head * W + i of the row's `input`.
 template <class NORM>
 __device__ __forceinline__ void gate_row(const Inputs &in, const GateInput &input, const u8 *mixed, const u8 *norm,
-                                         float eps, u8 *gated, int row) {
+                                         float eps, const element::Out<Act> &gated, int row) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
     __shared__ float inverses[NV];
     const int warps = blockDim.x / 32;
@@ -480,11 +475,9 @@ __device__ __forceinline__ void gate_row(const Inputs &in, const GateInput &inpu
         const float normalized = Act::round(v * inverses[head] * element::at<NORM>(norm, i));
         const float z = input.at(row, k);
         const float activated = Act::round(functions::output_gate((int)SEISMIC_PARAM_GATE_FUNCTION, z));
-        element::put<Act>(gated,
-                          static_cast<u64>(row) * SEISMIC_RESULT_0_STRIDE_0 +
-                              static_cast<u64>(head) * SEISMIC_RESULT_0_STRIDE_1 +
-                              static_cast<u64>(i) * SEISMIC_RESULT_0_STRIDE_2,
-                          Act::round(normalized * activated));
+        gated.put(static_cast<u64>(row) * SEISMIC_RESULT_0_STRIDE_0 + static_cast<u64>(head) * SEISMIC_RESULT_0_STRIDE_1 +
+                      static_cast<u64>(i) * SEISMIC_RESULT_0_STRIDE_2,
+                  normalized * activated);
     }
 }
 
@@ -493,7 +486,7 @@ __device__ __forceinline__ void gate_row(const Inputs &in, const GateInput &inpu
 // other blocks published are read from L2.
 template <class NORM>
 __device__ __forceinline__ void gate_head(const Inputs &in, const GateInput &input, const u8 *mixed, const u8 *norm,
-                                          float eps, u8 *gated, int head) {
+                                          float eps, const element::Out<Act> &gated, int head) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
     const typename Act::storage *raw = reinterpret_cast<const typename Act::storage *>(mixed);
     const int lane = threadIdx.x % 32;
@@ -511,11 +504,9 @@ __device__ __forceinline__ void gate_head(const Inputs &in, const GateInput &inp
             const float normalized = Act::round(v * inverse * element::at<NORM>(norm, i));
             const float z = input.at(row, head * W + i);
             const float activated = Act::round(functions::output_gate((int)SEISMIC_PARAM_GATE_FUNCTION, z));
-            element::put<Act>(gated,
-                              static_cast<u64>(row) * SEISMIC_RESULT_0_STRIDE_0 +
-                                  static_cast<u64>(head) * SEISMIC_RESULT_0_STRIDE_1 +
-                                  static_cast<u64>(i) * SEISMIC_RESULT_0_STRIDE_2,
-                              Act::round(normalized * activated));
+            gated.put(static_cast<u64>(row) * SEISMIC_RESULT_0_STRIDE_0 + static_cast<u64>(head) * SEISMIC_RESULT_0_STRIDE_1 +
+                          static_cast<u64>(i) * SEISMIC_RESULT_0_STRIDE_2,
+                      normalized * activated);
         }
     }
 }
@@ -534,7 +525,7 @@ __device__ __forceinline__ void gate_head(const Inputs &in, const GateInput &inp
 // chunked entries give their short slots the same bits.
 template <unsigned ROWS, unsigned WARPS, class NORM, class RowGates>
 __device__ __forceinline__ void step(const typename RowGates::Inputs &rule, u8 *mixed, unsigned *arrivals,
-                                     const u8 *norm, float eps, u8 *gated) {
+                                     const u8 *norm, float eps, const element::Out<Act> &gated) {
     constexpr int BLOCK_ROWS = ROWS * WARPS;
     static_assert(W % 32 == 0 && W % BLOCK_ROWS == 0, "state rows split evenly");
     const Inputs &in = RowGates::base(rule);

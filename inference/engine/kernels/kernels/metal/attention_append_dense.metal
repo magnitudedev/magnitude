@@ -21,8 +21,8 @@ kernel void attention_append_dense(
     device const float *rotary_amplitudes [[buffer(SEISMIC_BUFFER_ROTARY_AMPLITUDES)]],
     device const int *coordinates [[buffer(SEISMIC_BUFFER_COORDINATES)]],
     device const int *destinations [[buffer(SEISMIC_BUFFER_DESTINATIONS)]],
-    device const ulong *history_key [[buffer(SEISMIC_BUFFER_HISTORY_KEY)]],
-    device const ulong *history_value [[buffer(SEISMIC_BUFFER_HISTORY_VALUE)]],
+    SEISMIC_OUT_HISTORY_KEY_PARAM(history_key),
+    SEISMIC_OUT_HISTORY_VALUE_PARAM(history_value),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
@@ -46,13 +46,13 @@ kernel void attention_append_dense(
         uint(SEISMIC_PARAM_KEY_AMAX_FLOOR));
     attention::fresh_row<true>(key, value, key_norm, value_norm, coordinates, rotary_components, rotary_frequencies,
         rotary_amplitudes, row, kv_head, epsilon, key_rounding, lane, k);
-    attention::append(slab::row<attention::Scalar>(history_key, destination, slab_rows, KV * W),
+    attention::append(slab::out_row(history_key, destination, slab_rows, KV * W),
         0, kv_head, lane, k);
     // Stored-key values are the key plane.
     if (ATTENTION_STORED_KEY)
         return;
     attention::fresh_row<false>(key, value, key_norm, value_norm, coordinates, rotary_components, rotary_frequencies,
         rotary_amplitudes, row, kv_head, epsilon, key_rounding, lane, v);
-    attention::append(slab::row<attention::Scalar>(history_value, destination, slab_rows, KV * W),
+    attention::append(slab::out_row(history_value, destination, slab_rows, KV * W),
         0, kv_head, lane, v);
 }

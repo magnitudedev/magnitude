@@ -16,7 +16,7 @@ kernel void per_layer_inputs(
     device const uchar *gathered [[buffer(SEISMIC_BUFFER_GATHERED)]],
     device const float *projected [[buffer(SEISMIC_BUFFER_PROJECTED)]],
     device const uchar *norm [[buffer(SEISMIC_BUFFER_NORM)]],
-    device float *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(result_cells),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint2 group [[threadgroup_position_in_grid]],
     uint i [[thread_index_in_threadgroup]],
@@ -39,6 +39,7 @@ kernel void per_layer_inputs(
         packets::Loader<packets::W0>::load(layout.base_of(gathered, row), layout.of(row), column / 32u, width);
     const float token = packets::value_at<packets::W0>(packet, column % 32u);
     const float normalized = p * inverse * element::at<Norm>(norm, ulong(i) * SEISMIC_NORM_STRIDE_0);
-    result[row * SEISMIC_RESULT_0_STRIDE_0 + ulong(column) * SEISMIC_RESULT_0_STRIDE_1] =
-        (normalized + token * gathered_scale) * scale;
+    element::Out<ELEMENT_OF(SEISMIC_RESULT_0)>(result_cells).put(
+        row * SEISMIC_RESULT_0_STRIDE_0 + ulong(column) * SEISMIC_RESULT_0_STRIDE_1,
+        (normalized + token * gathered_scale) * scale);
 }

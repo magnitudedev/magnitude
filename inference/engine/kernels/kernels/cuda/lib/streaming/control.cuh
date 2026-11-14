@@ -194,5 +194,53 @@ __device__ __forceinline__ void streaming_copy_bytes(const unsigned char *from, 
     streaming::copy_rows(from, 0, to, 0, 1, bytes, lane, lanes);
 }
 
+namespace streaming {
+
+// A dense float record table, which a kernel writes only through its
+// owner's handle (`element::Out`), at byte `byte` of it: an includer whose
+// records are dense float defines `STREAMING_RECORDS` as it, and the
+// record-address hooks offset it in bytes as they do a table's bytes.
+template <class E> struct Records {
+    element::Out<E> out;
+    u64 byte;
+    __device__ __forceinline__ Records operator+(u64 bytes) const { return Records{out, byte + bytes}; }
+};
+
+} // namespace streaming
+
+// A dense float record's `bytes` bytes copied from an input's stored
+// elements (`routed_copy`): each element decoded and stored by the
+// destination's owner, a lane's 16 bytes at once where the span is aligned.
+template <class E>
+__device__ __forceinline__ void streaming_copy_bytes(const unsigned char *from, streaming::Records<E> to,
+                                                     unsigned long long bytes, unsigned long long lane,
+                                                     unsigned long long lanes) {
+    constexpr int N = 16 / int(E::bytes);
+    const u64 first = to.byte / E::bytes, count = bytes / E::bytes;
+    u64 spans = 0;
+    if ((reinterpret_cast<u64>(from) | to.byte) % 16 == 0) {
+        spans = count / N;
+        for (u64 span = lane; span < spans; span += lanes) {
+            float values[N];
+            element::span<E, N, false>(from, span * N, values);
+            to.out.template put_span<N>(first + span * N, values);
+        }
+    }
+    for (u64 i = spans * N + lane; i < count; i += lanes)
+        to.out.put(first + i, element::at<E>(from, i));
+}
+
+// A dense float record's `bytes` bytes moved within its table (`routed_move`):
+// owner-written elements, moved bit for bit, a lane's 16 bytes at once.
+template <class E>
+__device__ __forceinline__ void streaming_copy_bytes(streaming::Records<E> from, streaming::Records<E> to,
+                                                     unsigned long long bytes, unsigned long long lane,
+                                                     unsigned long long lanes) {
+    constexpr u64 N = 16 / E::bytes;
+    const u64 source = from.byte / E::bytes, destination = to.byte / E::bytes, count = bytes / E::bytes;
+    for (u64 at = lane * N; at < count; at += lanes * N)
+        to.out.move_stored(destination + at, from.out, source + at, count - at < N ? count - at : N);
+}
+
 #include "../../../streaming/contract.hpp"
 #include "../../../streaming/park.hpp"

@@ -71,8 +71,8 @@
 
 void attention_decode_k8v4_partial() {
     prefill_attend(attention_affine_history(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY_CODES),
-        SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY_COEFFICIENTS), SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE_CODES),
-        SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE_COEFFICIENTS)),
+        SEISMIC_OUT_HISTORY_KEY_COEFFICIENTS, SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE_CODES),
+        SEISMIC_OUT_HISTORY_VALUE_COEFFICIENTS),
         prefill_scratch(0ul, 0ul, 0ul, 0ul, 0ul));
 }
 
@@ -124,29 +124,30 @@ uint decode_fresh_batches(uint first, uint last, uint fresh_first) {
 struct decode_part {
     uint64_t key_rows;
     uint64_t value_rows;
-    uint64_t key_pairs;
-    uint64_t value_pairs;
+    Stored key_pairs;
+    Stored value_pairs;
     uint slab_keys;
 };
 
 decode_part decode_part_at(
-    attention_history h, uint token, uint slab_rows, uint kv_head, uint64_t key_bytes, uint64_t value_bytes,
-    uint64_t pair_bytes) {
+    attention_history h, uint token, uint slab_rows, uint kv_head, uint64_t key_bytes, uint64_t value_bytes) {
     const uint64_t slab = uint64_t(token / slab_rows);
     const uint64_t first_vector = uint64_t(token % slab_rows) * ATTENTION_KV + kv_head;
-    return decode_part(slab_region(h.key, slab) + first_vector * key_bytes,
-        slab_region(h.value, slab) + first_vector * value_bytes,
-        slab_region(h.key_coefficients, slab) + first_vector * pair_bytes,
-        slab_region(h.value_coefficients, slab) + first_vector * pair_bytes, slab_rows - token % slab_rows);
+    const uint64_t pair_elements = 2ul * uint64_t(HISTORY_PAIRS);
+    return decode_part(slab_region(h.key_codes, slab) + first_vector * key_bytes,
+        slab_region(h.value_codes, slab) + first_vector * value_bytes,
+        out_stored(slab_out_region(h.key_coefficients, slab), first_vector * pair_elements),
+        out_stored(slab_out_region(h.value_coefficients, slab), first_vector * pair_elements),
+        slab_rows - token % slab_rows);
 }
 
-// That row as history holds it: this lane's codes and its group's packed
-// pair (`history_quantize`, as `history_hold` encodes the row it appends).
+// That row as history holds it: this lane's codes and its group's (scale,
+// zero) pair (`history_quantize`, as `history_hold` encodes the row it appends).
 void decode_fresh_codes(const bool is_key, uint64_t token, uint kv_head, out uint w[HISTORY_LANE_WORDS],
-    out uint pair) {
+    out vec2 sz) {
     float x[ATTENTION_E];
     history_fresh_row(is_key, token, kv_head, SEISMIC_LANE, x);
-    history_quantize(is_key ? HISTORY_KEY_BITS : HISTORY_VALUE_BITS, x, w, pair);
+    history_quantize(is_key ? HISTORY_KEY_BITS : HISTORY_VALUE_BITS, x, w, sz);
 }
 
 // A vector-form key group's planes: its cursor's slab's key and value code
@@ -154,8 +155,8 @@ void decode_fresh_codes(const bool is_key, uint64_t token, uint kv_head, out uin
 struct decode_planes {
     uint64_t key_rows;
     uint64_t value_rows;
-    uint64_t key_pairs;
-    uint64_t value_pairs;
+    Stored key_pairs;
+    Stored value_pairs;
 };
 
 // Key `position` of `row`'s sequence (at or past the cursor's,
@@ -173,25 +174,22 @@ void decode_read_codes(inout attention_cursor c, inout decode_planes p, attentio
     if (c.span < SEISMIC_DIM_R) {
         const uint64_t key_bytes = uint64_t(history_row_words(HISTORY_KEY_BITS)) * 4ul;
         const uint64_t value_bytes = uint64_t(history_row_words(HISTORY_VALUE_BITS)) * 4ul;
-        const uint64_t pair_bytes = uint64_t(HISTORY_PAIRS) * 4ul;
+        const uint64_t pair_elements = 2ul * uint64_t(HISTORY_PAIRS);
         if (moved)
-            p = decode_planes(slab_region(h.key, c.slab) + uint64_t(kv_head) * key_bytes,
-                slab_region(h.value, c.slab) + uint64_t(kv_head) * value_bytes,
-                slab_region(h.key_coefficients, c.slab) + uint64_t(kv_head) * pair_bytes,
-                slab_region(h.value_coefficients, c.slab) + uint64_t(kv_head) * pair_bytes);
+            p = decode_planes(slab_region(h.key_codes, c.slab) + uint64_t(kv_head) * key_bytes,
+                slab_region(h.value_codes, c.slab) + uint64_t(kv_head) * value_bytes,
+                out_stored(slab_out_region(h.key_coefficients, c.slab), uint64_t(kv_head) * pair_elements),
+                out_stored(slab_out_region(h.value_coefficients, c.slab), uint64_t(kv_head) * pair_elements));
         const uint64_t step = (index - c.slab_lo) * uint64_t(ATTENTION_KV);
-        const uint64_t pair = uint64_t(SEISMIC_LANE / HISTORY_PAIR_LANES) * 4ul;
+        const uint64_t pair = 2ul * (step * uint64_t(HISTORY_PAIRS) + uint64_t(SEISMIC_LANE / HISTORY_PAIR_LANES));
         history_lane_load(HISTORY_KEY_BITS, p.key_rows + step * key_bytes, SEISMIC_LANE, k);
         history_lane_load(HISTORY_VALUE_BITS, p.value_rows + step * value_bytes, SEISMIC_LANE, v);
-        kc = unpackHalf2x16(element_u32_at(p.key_pairs + step * pair_bytes + pair));
-        vc = unpackHalf2x16(element_u32_at(p.value_pairs + step * pair_bytes + pair));
+        kc = stored_at2(p.key_pairs, pair);
+        vc = stored_at2(p.value_pairs, pair);
         return;
     }
-    uint key_pair, value_pair;
-    decode_fresh_codes(true, index, kv_head, k, key_pair);
-    decode_fresh_codes(false, index, kv_head, v, value_pair);
-    kc = unpackHalf2x16(key_pair);
-    vc = unpackHalf2x16(value_pair);
+    decode_fresh_codes(true, index, kv_head, k, kc);
+    decode_fresh_codes(false, index, kv_head, v, vc);
 }
 
 void attention_decode_k8v4_partial() {
@@ -204,8 +202,8 @@ void attention_decode_k8v4_partial() {
     const uint64_t fresh = SEISMIC_PTR(SEISMIC_BUFFER_FRESH);
     const uint64_t destinations = SEISMIC_PTR(SEISMIC_BUFFER_DESTINATIONS);
     const attention_history h = attention_affine_history(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY_CODES),
-        SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY_COEFFICIENTS), SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE_CODES),
-        SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE_COEFFICIENTS));
+        SEISMIC_OUT_HISTORY_KEY_COEFFICIENTS, SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE_CODES),
+        SEISMIC_OUT_HISTORY_VALUE_COEFFICIENTS);
     const uint W = ATTENTION_W, E = ATTENTION_E, KV = ATTENTION_KV, G = ATTENTION_G;
     const uint simds = SEISMIC_SUBGROUPS, sg = SEISMIC_SUBGROUP, lane = SEISMIC_LANE;
     const uint64_t spans = SEISMIC_DIM_R;
@@ -217,7 +215,7 @@ void attention_decode_k8v4_partial() {
     const uint64_t row_coordinates = coordinates + row * 16ul;
     const uint64_t key_bytes = uint64_t(history_row_words(HISTORY_KEY_BITS)) * 4ul;
     const uint64_t value_bytes = uint64_t(history_row_words(HISTORY_VALUE_BITS)) * 4ul;
-    const uint64_t pair_bytes = uint64_t(HISTORY_PAIRS) * 4ul;
+    const uint64_t pair_elements = 2ul * uint64_t(HISTORY_PAIRS);
 
     // Plane 0 (the key) and plane 1 (the value) append from subgroups 0 and 1,
     // or both from a workgroup's one subgroup.
@@ -358,16 +356,16 @@ void attention_decode_k8v4_partial() {
                 }
                 part_start = position;
                 rows = decode_part_at(
-                    h, uint(lo) + (position - offset), slab_rows, kv_head, key_bytes, value_bytes, pair_bytes);
+                    h, uint(lo) + (position - offset), slab_rows, kv_head, key_bytes, value_bytes);
                 part_end = min(min(range.y, offset + length), part_start + rows.slab_keys);
             }
             const uint n = batch < batches ? min(ATTENTION_KEYS, part_end - position) : 0u;
             // An empty batch reads the part's first key and absorbs nothing.
             const uint64_t step = uint64_t(n > 0u ? position - part_start : 0u) * KV;
-            history_keywise_absorb(n, rows.key_rows + step * key_bytes, rows.key_pairs + step * pair_bytes,
-                uint64_t(KV) * key_bytes, rows.value_rows + step * value_bytes, rows.value_pairs + step * pair_bytes,
-                uint64_t(KV) * value_bytes, uint64_t(KV) * pair_bytes, staging, prepared, sums, head0, weights, maximum,
-                denominator, result);
+            history_keywise_absorb(n, rows.key_rows + step * key_bytes, stored_offset(rows.key_pairs, step * pair_elements),
+                uint64_t(KV) * key_bytes, rows.value_rows + step * value_bytes,
+                stored_offset(rows.value_pairs, step * pair_elements), uint64_t(KV) * value_bytes,
+                uint64_t(KV) * pair_elements, staging, prepared, sums, head0, weights, maximum, denominator, result);
             position += n;
         }
         // Then its fresh keys, the last of the row's sequence: they enter the
@@ -383,9 +381,9 @@ void attention_decode_k8v4_partial() {
             subgroupBarrier();
             for (uint j = 0u; j < max(n, 1u); ++j) {
                 uint w[HISTORY_LANE_WORDS];
-                uint pair;
-                decode_fresh_codes(true, first + j, kv_head, w, pair);
-                history_keywise_fresh_key(j, w, pair, staging);
+                vec2 sz;
+                decode_fresh_codes(true, first + j, kv_head, w, sz);
+                history_keywise_fresh_key(j, w, sz, staging);
             }
             subgroupMemoryBarrierShared();
             subgroupBarrier();
@@ -396,9 +394,9 @@ void attention_decode_k8v4_partial() {
             attention_keywise_softmax(n, score, weights, maximum, denominator, result);
             for (uint j = 0u; j < n; ++j) {
                 uint w[HISTORY_LANE_WORDS];
-                uint pair;
-                decode_fresh_codes(false, first + j, kv_head, w, pair);
-                history_keywise_fresh_value(j, w, pair, staging);
+                vec2 sz;
+                decode_fresh_codes(false, first + j, kv_head, w, sz);
+                history_keywise_fresh_value(j, w, sz, staging);
             }
             subgroupMemoryBarrierShared();
             subgroupBarrier();
@@ -412,7 +410,8 @@ void attention_decode_k8v4_partial() {
         // history rows as stored, fresh rows as their append encodes them, so
         // a row's reduction order is set by its keys' positions alone.
         attention_cursor c = attention_cursor_at(visible, fresh, row, spans, 0u, range.x);
-        decode_planes planes = decode_planes(0ul, 0ul, 0ul, 0ul);
+        const Stored empty_pairs = stored_at_buffer(ELEMENT_F16, 0ul);
+        decode_planes planes = decode_planes(0ul, 0ul, empty_pairs, empty_pairs);
         for (uint position = range.x; position < range.y;) {
             const uint n = min(HISTORY_BATCH, range.y - position);
             uint k[HISTORY_BATCH][HISTORY_LANE_WORDS];
@@ -439,7 +438,7 @@ void attention_decode_k8v4_partial() {
 // fixed-order merge of the row's partitions and the output gate.
 void attention_decode_k8v4_merge() {
     attention_decode_gate(ATTENTION_QUERY_BUFFER, ATTENTION_GATE_BUFFER, SEISMIC_PTR(SEISMIC_BUFFER_VISIBLE),
-        SEISMIC_PTR(SEISMIC_BUFFER_FRESH), SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER),
+        SEISMIC_PTR(SEISMIC_BUFFER_FRESH), SEISMIC_RESULT_0_OUT,
         SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS), SEISMIC_DIM_R,
         0u, gl_WorkGroupID.x, gl_WorkGroupID.y, gl_LocalInvocationIndex, SEISMIC_TUNE_SPAN, SEISMIC_TUNE_PARTS);
 }

@@ -7,6 +7,7 @@
 // `cpu/lib/recurrent/versions.rs`.
 #pragma once
 
+#include <seismic/element.cuh>
 #include <seismic/slab.cuh>
 
 namespace versions {
@@ -81,10 +82,24 @@ __device__ __forceinline__ int tape_rows(const Slot &slot, int capacity) {
     return min(capacity, slot.hi - slot.lo - slot.stop);
 }
 
-// Bank `index` of a slab-stored arena whose banks are `bytes` long.
+// Bank `index` of a slab-stored integer arena whose banks are `bytes` long.
 __device__ __forceinline__ u8 *bank(const u32 *table, int index, u64 bytes,
                                     const seismic_words_t &seismic_words_value) {
     return slab::row(table, static_cast<u64>(index), SEISMIC_PARAM_SLAB_BANKS, bytes);
+}
+
+// Bank `index` of a slab-stored floating arena whose banks are `elements` long.
+template <class E>
+__device__ __forceinline__ element::Out<E> bank(const element::SlabOut<E> &arena, int index, u64 elements,
+                                                const seismic_words_t &seismic_words_value) {
+    return arena.row(static_cast<u64>(index), SEISMIC_PARAM_SLAB_BANKS, elements);
+}
+
+// Read-only view of bank `index` of a slab-stored floating arena whose banks are `elements` long.
+template <class E>
+__device__ __forceinline__ element::Stored<E> bank_view(const element::SlabOut<E> &arena, int index, u64 elements,
+                                                        const seismic_words_t &seismic_words_value) {
+    return arena.view_row(static_cast<u64>(index), SEISMIC_PARAM_SLAB_BANKS, elements);
 }
 
 } // namespace versions

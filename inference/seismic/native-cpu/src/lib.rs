@@ -28,7 +28,7 @@ pub mod tensor;
 pub mod weights;
 
 pub use components::WeightKernels;
-pub use element::{Bf16, Dense, Element, F16, F32, I32, U32, U64};
+pub use element::{Bf16, Dense, Element, F16, F32, I32, Slot, Store, Stored, U32, U64};
 pub use isa::{Isa, Tier};
 pub use repack::{External, Packed};
 pub use tensor::{Scalars, Scratch, Tensor};

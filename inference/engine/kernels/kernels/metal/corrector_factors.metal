@@ -7,9 +7,10 @@ typedef element::Act activation;
 kernel void corrector_factors(
     device const uchar *nodes [[buffer(SEISMIC_BUFFER_NODES)]],
     device const uchar *anchor [[buffer(SEISMIC_BUFFER_ANCHOR)]],
-    device uchar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(result_cells),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint index [[thread_position_in_grid]]) {
+    const element::Out<activation> result(result_cells);
     const ulong count = SEISMIC_DIM_N, width = SEISMIC_DIM_H;
     const ulong element_index = ulong(index);
     if (element_index >= ulong(SEISMIC_DIM_S) * count * width)
@@ -22,7 +23,7 @@ kernel void corrector_factors(
         element::at<activation>(anchor, block * SEISMIC_ANCHOR_STRIDE_0 + column * SEISMIC_ANCHOR_STRIDE_1);
     const ulong out =
         block * SEISMIC_RESULT_0_STRIDE_0 + node * SEISMIC_RESULT_0_STRIDE_1 + column * SEISMIC_RESULT_0_STRIDE_3;
-    element::put<activation>(result, out, x);
-    element::put<activation>(result, out + SEISMIC_RESULT_0_STRIDE_2, a);
-    element::put<activation>(result, out + 2u * SEISMIC_RESULT_0_STRIDE_2, x * a);
+    result.put(out, x);
+    result.put(out + SEISMIC_RESULT_0_STRIDE_2, a);
+    result.put(out + 2u * SEISMIC_RESULT_0_STRIDE_2, x * a);
 }

@@ -40,11 +40,11 @@ void indexer_score() {
     const uint64_t listed =
         min(uint64_t(indexer_span_rows(spans, SEISMIC_DIM_R, SEISMIC_SPANS_STRIDE_1, SEISMIC_SPANS_STRIDE_2)), n);
     const uint64_t ordinal = uint64_t(gl_WorkGroupID.x) * 256ul + gl_LocalInvocationIndex;
-    const uint64_t result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + row * SEISMIC_RESULT_0_STRIDE_0 * 4ul;
+    const Out result = out_offset(SEISMIC_RESULT_0_OUT, row * SEISMIC_RESULT_0_STRIDE_0);
     const float infinity = uintBitsToFloat(0x7f800000u);
     if (uint64_t(gl_WorkGroupID.x) * 256ul >= listed) {
         if (ordinal < n)
-            element_f32_put(result + ordinal * SEISMIC_RESULT_0_STRIDE_1 * 4ul, -infinity);
+            out_put(result, ordinal * SEISMIC_RESULT_0_STRIDE_1, -infinity);
         return;
     }
     // The row's query heads, prepared in F32.
@@ -77,7 +77,7 @@ void indexer_score() {
     if (ordinal >= n)
         return;
     if (ordinal >= listed) {
-        element_f32_put(result + ordinal * SEISMIC_RESULT_0_STRIDE_1 * 4ul, -infinity);
+        out_put(result, ordinal * SEISMIC_RESULT_0_STRIDE_1, -infinity);
         return;
     }
     // The ordinal's key-plane row (a listed ordinal lies within the spans).
@@ -107,5 +107,5 @@ void indexer_score() {
             : 1.0;
         total = total + max(dot[head], 0.0) * weight;
     }
-    element_f32_put(result + ordinal * SEISMIC_RESULT_0_STRIDE_1 * 4ul, element_word_f32(SEISMIC_PARAM_SCALE) * total);
+    out_put(result, ordinal * SEISMIC_RESULT_0_STRIDE_1, element_word_f32(SEISMIC_PARAM_SCALE) * total);
 }

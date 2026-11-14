@@ -11,7 +11,7 @@
 void draft_top_k() {
     const uint64_t logits = SEISMIC_PTR(SEISMIC_BUFFER_LOGITS);
     const uint64_t candidates = SEISMIC_PTR(SEISMIC_BUFFER_CANDIDATES);
-    const uint64_t unary = SEISMIC_PTR(SEISMIC_BUFFER_UNARY);
+    const Out unary = SEISMIC_OUT_UNARY;
     const uint64_t row = gl_WorkGroupID.x;
     float previous = TOP_K_INF;
     int previous_token = -1;
@@ -34,7 +34,7 @@ void draft_top_k() {
             const uint64_t at = row * SEISMIC_DIM_K + rank;
             element_i32_put(candidates + at * SEISMIC_CANDIDATES_STRIDE_0 * 4ul, previous_token);
             element_i32_put(candidates + (at * SEISMIC_CANDIDATES_STRIDE_0 + SEISMIC_CANDIDATES_STRIDE_1) * 4ul, 0);
-            element_f32_put(unary + (row * SEISMIC_UNARY_STRIDE_0 + rank * SEISMIC_UNARY_STRIDE_1) * 4ul, chosen);
+            out_put(unary, row * SEISMIC_UNARY_STRIDE_0 + rank * SEISMIC_UNARY_STRIDE_1, chosen);
         }
     }
 }

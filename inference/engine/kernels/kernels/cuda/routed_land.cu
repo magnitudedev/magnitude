@@ -14,6 +14,24 @@ REPACK_BINDING(GateBinding, SEISMIC_CONVERSION_SG_UG, SEISMIC_STAGING_GATE, SEIS
 REPACK_BINDING(UpBinding, SEISMIC_CONVERSION_SU_UU, SEISMIC_STAGING_UP, SEISMIC_UP, SEISMIC_DIM_F, SEISMIC_DIM_H)
 REPACK_BINDING(DownBinding, SEISMIC_CONVERSION_SD_UD, SEISMIC_STAGING_DOWN, SEISMIC_DOWN, SEISMIC_DIM_H, SEISMIC_DIM_F)
 
+// Each routed tensor's destination as its binding holds it: a dense float
+// tensor's owner handle, any other's bytes.
+#ifdef SEISMIC_OUT_GATE
+#define LAND_GATE SEISMIC_OUT_GATE
+#else
+#define LAND_GATE SEISMIC_PTR(SEISMIC_BUFFER_GATE)
+#endif
+#ifdef SEISMIC_OUT_UP
+#define LAND_UP SEISMIC_OUT_UP
+#else
+#define LAND_UP SEISMIC_PTR(SEISMIC_BUFFER_UP)
+#endif
+#ifdef SEISMIC_OUT_DOWN
+#define LAND_DOWN SEISMIC_OUT_DOWN
+#else
+#define LAND_DOWN SEISMIC_PTR(SEISMIC_BUFFER_DOWN)
+#endif
+
 #include "lib/streaming/land.cuh"
 #include "../streaming/tier_wait.hpp"
 
@@ -25,8 +43,7 @@ extern "C" __global__ void routed_land(SEISMIC_KERNEL_PARAMS) {
         __shared__ streaming::LandShared shared;
         streaming::Lander land{{SEISMIC_PTR(SEISMIC_BUFFER_STAGING_GATE), SEISMIC_PTR(SEISMIC_BUFFER_STAGING_UP),
                                 SEISMIC_PTR(SEISMIC_BUFFER_STAGING_DOWN)},
-                               {SEISMIC_PTR(SEISMIC_BUFFER_GATE), SEISMIC_PTR(SEISMIC_BUFFER_UP),
-                                SEISMIC_PTR(SEISMIC_BUFFER_DOWN)},
+                               {LAND_GATE, LAND_UP, LAND_DOWN},
                                SEISMIC_DIM_GV > 0, seismic_words_value, shared, {}, {}, 0};
         streaming_land(land, reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_BUFFER_LANDING)), SEISMIC_LANDING_STRIDE_0,
                        file + (q % (u64)SEISMIC_DIM_FLIGHT) * SEISMIC_FILE_STRIDE_0, SEISMIC_FILE_STRIDE_1, q,

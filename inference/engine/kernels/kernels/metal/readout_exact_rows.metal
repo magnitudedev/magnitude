@@ -19,7 +19,7 @@ kernel void readout_exact_rows_gather(
     device const float *temperature [[buffer(SEISMIC_BUFFER_TEMPERATURE)]],
     device const uint *mask [[buffer(SEISMIC_BUFFER_MASK)]],
     device const int *constrained [[buffer(SEISMIC_BUFFER_CONSTRAINED)]],
-    device float *logits [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(logits),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],
@@ -38,8 +38,8 @@ kernel void readout_exact_rows_gather(
     // Radius column 1: the 5-bit view's.
     progressive::gather<false>(features, SEISMIC_FEATURES_STRIDE_0, planes, radius + SEISMIC_RADIUS_STRIDE_1,
         nullptr, SEISMIC_RADIUS_STRIDE_0, fine, SEISMIC_FINE_STRIDE_0, SEISMIC_FINE_STRIDE_1, floor,
-        SEISMIC_FLOOR_STRIDE_0, lengths, SEISMIC_LENGTH_STRIDE_0, selection, logits, SEISMIC_RESULT_0_STRIDE_0,
-        SEISMIC_RESULT_0_STRIDE_1, nullptr, 0, nullptr, uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_V),
+        SEISMIC_FLOOR_STRIDE_0, lengths, SEISMIC_LENGTH_STRIDE_0, selection, element::Out<element::F32>(logits),
+        SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, element::Out<element::F32>(nullptr), 0, nullptr, uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_V),
         uint(SEISMIC_DIM_D), nullptr, nullptr, stage, tile, tiles, tid, threads, simdgroups, sg, lane);
 }
 #endif

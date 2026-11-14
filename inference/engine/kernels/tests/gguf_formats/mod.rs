@@ -146,6 +146,32 @@ impl Format {
         }
         bytes
     }
+    /// Sets, in `bytes` ([`Self::external`]'s of a `shape` tensor of a grid format), the scale
+    /// of each tile whose last packet `(row, packet)` has `scale_of` `Some(bits)`: `set` writes
+    /// the bits as the scale of a packet ([`Self::block`]'s leading scale bytes).
+    pub fn set_grid_scales(
+        self,
+        bytes: &mut [u8],
+        shape: &[u64],
+        mut scale_of: impl FnMut(usize, usize) -> Option<u32>,
+        set: fn(&mut [u8], u32),
+    ) {
+        let layout = self.layout();
+        let matrices = layout.matrices(shape).expect("a source tensor's extents");
+        let scale_bytes = (layout.packet_size - layout.code_bytes()) as usize;
+        for row in 0..matrices.tensor_rows() {
+            for packet in 0..matrices.row_packets() {
+                let Some(at) = matrices.packet_pieces(row, packet).scale else {
+                    continue;
+                };
+                if let Some(bits) = scale_of(row as usize, packet as usize) {
+                    let mut scratch = vec![0u8; layout.packet_size as usize];
+                    set(&mut scratch, bits);
+                    bytes[at as usize..at as usize + scale_bytes].copy_from_slice(&scratch[..scale_bytes]);
+                }
+            }
+        }
+    }
     /// One random GGUF block whose values reach about `scale`: random codes
     /// and sub-scales, with the scale fields set so the values reach a
     /// random 0.5 to 1.5 times `scale`; under a grid a packet, its scale

@@ -49,8 +49,8 @@ void embedding_rows_inverse() {
 void embedding_rows() {
     const uint64_t table = SEISMIC_PTR(SEISMIC_BUFFER_TABLE);
     const uint64_t tokens = SEISMIC_PTR(SEISMIC_BUFFER_TOKENS);
-    const uint64_t embedded = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
-    const uint64_t widened = SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER);
+    const Out embedded = SEISMIC_RESULT_0_OUT;
+    const Out widened = SEISMIC_RESULT_1_OUT;
     const uint width = uint(SEISMIC_DIM_D);
     const uint64_t row = gl_WorkGroupID.x;
     const packets_rows16 geometry = PACKETS_W0_ROWS;
@@ -59,11 +59,10 @@ void embedding_rows() {
     // A row that names no table row reads zeros (the whole workgroup's).
     if (held < 0l) {
         for (uint column = gl_LocalInvocationID.x; column < width; column += gl_WorkGroupSize.x) {
-            element_put(ELEMENT_ACT, embedded,
+            out_put(embedded,
                 row * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(column) * SEISMIC_RESULT_0_STRIDE_1, 0.0);
-            element_f32_put(widened
-                    + (row * SEISMIC_RESULT_1_STRIDE_0 + uint64_t(column) * SEISMIC_RESULT_1_STRIDE_1) * 4ul,
-                0.0);
+            out_put(widened,
+                row * SEISMIC_RESULT_1_STRIDE_0 + uint64_t(column) * SEISMIC_RESULT_1_STRIDE_1, 0.0);
         }
         return;
     }
@@ -78,16 +77,13 @@ void embedding_rows() {
                 const uint column = 32u * p + 8u * step + i;
                 if (column < width) {
                     const float decoded = ((i & 1u) != 0u ? odd[i >> 1] : even[i >> 1]) * scale;
-                    const float rounded = element_round(ELEMENT_ACT, SEISMIC_PARAM_NORMALIZE != 0ul
+                    const float value = element_round(ELEMENT_ACT, SEISMIC_PARAM_NORMALIZE != 0ul
                         ? decoded * element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_INVERSES) + row * 4ul)
                         : decoded);
-                    // A NaN (a non-finite block scale's product) is the registry's one NaN.
-                    const float value = (floatBitsToUint(rounded) & 0x7fffffffu) > 0x7f800000u ? uintBitsToFloat(0x7fc00000u) : rounded;
-                    element_put(ELEMENT_ACT, embedded,
+                    out_put(embedded,
                         row * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(column) * SEISMIC_RESULT_0_STRIDE_1, value);
-                    element_f32_put(widened
-                            + (row * SEISMIC_RESULT_1_STRIDE_0 + uint64_t(column) * SEISMIC_RESULT_1_STRIDE_1) * 4ul,
-                        value);
+                    out_put(widened,
+                        row * SEISMIC_RESULT_1_STRIDE_0 + uint64_t(column) * SEISMIC_RESULT_1_STRIDE_1, value);
                 }
             }
         }

@@ -25,7 +25,7 @@ extern "C" __global__ void readout_selected_rows_logits(SEISMIC_KERNEL_PARAMS) {
         (projection::u64)reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_SELECTED))[column * SEISMIC_SELECTED_STRIDE_0];
     const auto weight = KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT));
     const projection::u8 *features = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_FEATURES);
-    float *logits = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER));
+    const auto logits = SEISMIC_RESULT_0_OUT;
     // Each work item (k-block, column pair t) owns 16 values of the row.
     const projection::u64 items = SEISMIC_DIM_D / 64 * 4;
     for (projection::u64 o = 0; o < SEISMIC_DIM_O; ++o) {
@@ -47,7 +47,7 @@ extern "C" __global__ void readout_selected_rows_logits(SEISMIC_KERNEL_PARAMS) {
         const float total = reduce::group_sum(partial, scratch);
         const float cap = __uint_as_float((unsigned)SEISMIC_PARAM_SOFTCAP);
         if (threadIdx.x == 0)
-            logits[o * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1] =
-                cap > 0.0f ? functions::softcap(cap, total) : total;
+            logits.put(o * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1,
+                       cap > 0.0f ? functions::softcap(cap, total) : total);
     }
 }

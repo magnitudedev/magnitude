@@ -45,6 +45,6 @@ extern "C" __global__ void vision_attention_attend(SEISMIC_KERNEL_PARAMS) {
     __shared__ vision::AttendShared<WP> shared;
     const float scale = (int)SEISMIC_PARAM_UNIT_SCALE != 0 ? 1.0f : rsqrtf(float(W));
     const int *spans = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_SPANS));
-    vision::attend<A, W, WP>(shared, OPERANDS, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), (u32)SEISMIC_DIM_M, H,
+    vision::attend<A, W, WP>(shared, OPERANDS, SEISMIC_RESULT_0_OUT, (u32)SEISMIC_DIM_M, H,
                              SEISMIC_DIM_G, scale, spans);
 }

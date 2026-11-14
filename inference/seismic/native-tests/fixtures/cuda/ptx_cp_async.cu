@@ -4,10 +4,11 @@
 // Shared memory starts poisoned with NaN; a zero fill that did not happen
 // leaves NaN past the tail and fails the fixture. `x` and the result are
 // contiguous.
+#include <seismic/element.cuh>
 
 extern "C" __global__ void ptx_cp_async(SEISMIC_KERNEL_PARAMS) {
     const float *x = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_X));
-    float *result = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER));
+    const auto result = SEISMIC_RESULT_0_OUT;
     extern __shared__ __align__(16) float stages[];
     __shared__ unsigned zero_fill_failed;
     const unsigned long long n = SEISMIC_DIM_N;
@@ -46,7 +47,7 @@ extern "C" __global__ void ptx_cp_async(SEISMIC_KERNEL_PARAMS) {
         for (unsigned j = 0; j < 4; ++j) {
             const unsigned long long index = tile * 512 + source * 4 + j;
             if (index < n) {
-                result[index] = chunk[j];
+                result.put(index, chunk[j]);
             } else if (__float_as_uint(chunk[j]) != 0u) {
                 zero_fill_failed = 1;
             }
@@ -54,6 +55,6 @@ extern "C" __global__ void ptx_cp_async(SEISMIC_KERNEL_PARAMS) {
         __syncthreads();
     }
     if (thread == 0 && zero_fill_failed != 0) {
-        result[0] = __uint_as_float(0x7fc00000u);
+        result.put(0, __uint_as_float(0x7fc00000u));
     }
 }

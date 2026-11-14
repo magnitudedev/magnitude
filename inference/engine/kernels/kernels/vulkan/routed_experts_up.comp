@@ -86,7 +86,7 @@ void routed_experts_up_expand() {
     const projection_weights up = routed_expert_weights(SEISMIC_PTR(SEISMIC_BUFFER_RECORDS_UP),
         SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), slot, expert, PACKETS_W0_STACKED_ROWS, hidden);
     const projection_epilogue out_ = projection_scaled(projection_activated(ROUTED_ACT,
-            SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT) + block * tile_rows * SEISMIC_DIM_F * uint64_t(ELEMENT_BYTES(ROUTED_ACT)),
+            out_offset(out_over_scratch(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT)), block * tile_rows * SEISMIC_DIM_F),
             SEISMIC_DIM_F, 1ul, int(SEISMIC_PARAM_ACTIVATION)),
         projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_US, SEISMIC_UP_SCALE_STRIDE_0,
             uint64_t(expert)),
@@ -110,8 +110,8 @@ void routed_experts_up_down() {
         features, 0ul);
     const projection_weights down = routed_expert_weights(SEISMIC_PTR(SEISMIC_BUFFER_RECORDS_DOWN),
         SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_DOWN), slot, expert, PACKETS_W1_STACKED_ROWS, features);
-    const projection_epilogue out_ = projection_store(ROUTED_ACT,
-        SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + block * SEISMIC_RESULT_0_STRIDE_0 * bytes, SEISMIC_RESULT_0_STRIDE_1,
+    const projection_epilogue out_ = projection_store(
+        out_offset(SEISMIC_RESULT_0_OUT, block * SEISMIC_RESULT_0_STRIDE_0), SEISMIC_RESULT_0_STRIDE_1,
         SEISMIC_RESULT_0_STRIDE_2, 0ul);
     const uint live = routed_block_rows(SEISMIC_PTR(SEISMIC_BUFFER_ORDER) + block * SEISMIC_ORDER_STRIDE_0 * 4ul,
         SEISMIC_ORDER_STRIDE_1, uint(tile_rows));

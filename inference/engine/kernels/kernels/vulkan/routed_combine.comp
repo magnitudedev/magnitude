@@ -33,7 +33,7 @@ void routed_combine_shared() {
         SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_NORMALIZED_STRIDE_1, hidden, 0ul);
     const projection_weights gate = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_GATE), PACKETS_W0_ROWS, 0ul, hidden);
     const projection_weights up = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_UP), PACKETS_W1_ROWS, 0ul, hidden);
-    const projection_epilogue out_ = projection_silu_mul(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_SHARED_PRODUCT),
+    const projection_epilogue out_ = projection_silu_mul(ROUTED_ACT, out_over_scratch(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_SHARED_PRODUCT)),
         SEISMIC_DIM_S, 1ul);
     projection_gemm_paired(PACKETS_W0, PACKETS_W1, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N, x, out_, gate, up,
         uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_S), hidden, gl_WorkGroupID.y, gl_WorkGroupID.x, 0xffffffffu);
@@ -45,8 +45,8 @@ void routed_combine_down() {
         SEISMIC_DIM_S, 1ul, shared_features, 0ul);
     const projection_weights down = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_DOWN), PACKETS_W2_ROWS, 0ul,
         shared_features);
-    const projection_epilogue out_ = projection_store(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_SHARED_OUTPUT),
-        SEISMIC_DIM_H, 1ul, 0ul);
+    const projection_epilogue out_ = projection_store(
+        out_over_scratch(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_SHARED_OUTPUT)), SEISMIC_DIM_H, 1ul, 0ul);
     projection_gemm(PACKETS_W2, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N, x, out_, down, uint(SEISMIC_DIM_M),
         uint(SEISMIC_DIM_H), shared_features, gl_WorkGroupID.y, gl_WorkGroupID.x, 0xffffffffu);
 }
@@ -86,7 +86,7 @@ void routed_combine() {
             const uint64_t column = uint64_t(n + i);
             const float selected = (i & 1u) != 0u ? selected_odd[i >> 1] : selected_even[i >> 1];
             const float projected = (i & 1u) != 0u ? shared_odd[i >> 1] : shared_even[i >> 1];
-            projection_routed_join(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0,
+            projection_routed_join(SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0,
                 SEISMIC_RESULT_0_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL), SEISMIC_RESIDUAL_STRIDE_0,
                 SEISMIC_RESIDUAL_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_INJECT), SEISMIC_INJECT_STRIDE_0,
                 uint(SEISMIC_DIM_IN), uint(SEISMIC_DIM_SN), columns, m, column, selected, projected * c);

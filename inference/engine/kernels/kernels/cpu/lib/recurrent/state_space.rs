@@ -22,7 +22,7 @@
 use super::super::core::activation;
 use super::versions::{Slot, Slots};
 use seismic::cpu::slab::SlabTensor;
-use seismic::cpu::{math, Dense, Tensor, F32};
+use seismic::cpu::{math, Dense, Stored, Tensor, F32};
 use std::ops::Range;
 
 /// The operands of one state-space call, shared by both entries.
@@ -130,13 +130,13 @@ impl<'a, A: Dense> StateSpace<'a, A> {
     /// `position`: the source version's window rows before the slot, the
     /// projection after.
     #[inline(always)]
-    fn raw_row(&self, slot: &Slot, position: isize) -> &'a [A::Storage] {
+    fn raw_row(&self, slot: &Slot, position: isize) -> Stored<'a, A> {
         if position < 0 {
             // Positions reach back at most C - 1 rows.
-            self.window.row([slot.source, slot.taped + self.taps - 1 - position.unsigned_abs(), 0])
+            self.window.stored([slot.source, slot.taped + self.taps - 1 - position.unsigned_abs(), 0])
         } else {
             let first = self.heads * self.head_width;
-            &self.projection.row([slot.lo + position as usize, 0])[first..first + self.channels()]
+            self.projection.stored([slot.lo + position as usize, 0]).part(first..first + self.channels())
         }
     }
 
@@ -146,13 +146,13 @@ impl<'a, A: Dense> StateSpace<'a, A> {
     #[inline(always)]
     pub fn convolve(&self, slot: &Slot, local: usize, channels: Range<usize>, out: &mut [f32]) {
         let out = &mut out[..channels.len()];
-        let current = &self.raw_row(slot, local as isize)[channels.clone()];
+        let current = &self.raw_row(slot, local as isize).storage()[channels.clone()];
         let last = self.taps - 1;
         for ((target, channel), value) in out.iter_mut().zip(channels.clone()).zip(current) {
             *target = self.convolution.get([channel, last]) * A::widen(*value);
         }
         for tap in 0..last {
-            let previous = &self.raw_row(slot, local as isize + tap as isize - last as isize)[channels.clone()];
+            let previous = &self.raw_row(slot, local as isize + tap as isize - last as isize).storage()[channels.clone()];
             for ((target, channel), value) in out.iter_mut().zip(channels.clone()).zip(previous) {
                 *target = self.convolution.get([channel, tap]).mul_add(A::widen(*value), *target);
             }
@@ -202,8 +202,8 @@ impl<'a, A: Dense> StateSpace<'a, A> {
             for span in &spans[..count] {
                 // SAFETY: each head copies its own channels of the successor
                 // bank's rows; no slot reads a successor bank.
-                let target = unsafe { self.window.span_mut([slot.target, tap, span.start], span.len()) };
-                target.copy_from_slice(&source[span.clone()]);
+                let mut target = unsafe { self.window.span_mut([slot.target, tap, span.start], span.len()) };
+                target.move_stored(source.part(span.clone()));
             }
         }
     }
@@ -214,8 +214,8 @@ impl<'a, A: Dense> StateSpace<'a, A> {
     pub fn zero_uncovered(&self, head: usize, rows: Range<usize>) {
         for row in self.slots.covered_end()..self.rows {
             // SAFETY: each work item writes its own state rows of the head.
-            let out = unsafe { self.mixed.span_mut([row, head, rows.start], rows.len()) };
-            out.fill(A::narrow(0.0));
+            let mut out = unsafe { self.mixed.span_mut([row, head, rows.start], rows.len()) };
+            out.fill(0.0);
         }
     }
 
@@ -225,8 +225,8 @@ impl<'a, A: Dense> StateSpace<'a, A> {
         let n = self.state_width;
         for (index, row) in rows.clone().enumerate() {
             // SAFETY: each work item publishes its own state rows of the head.
-            let target = unsafe { self.state.row_mut([slot.target, head, row, 0]) };
-            target.copy_from_slice(&state[index * n..(index + 1) * n]);
+            let mut target = unsafe { self.state.row_mut([slot.target, head, row, 0]) };
+            target.store(&state[index * n..(index + 1) * n]);
         }
     }
 
@@ -277,12 +277,12 @@ impl<'a, A: Dense> StateSpace<'a, A> {
                         self.tape.set([slot.target, entry, self.tape_decay(head)], inputs.decay);
                     }
                     if records_b {
-                        self.tape.span_mut([slot.target, entry, self.tape_b(group)], n).copy_from_slice(inputs.b);
+                        self.tape.span_mut([slot.target, entry, self.tape_b(group)], n).store(inputs.b);
                     }
                 }
             }
             // SAFETY: each work item writes its own state rows of the head.
-            let mixed = unsafe { self.mixed.span_mut([row, head, rows.start], rows.len()) };
+            let mut mixed = unsafe { self.mixed.span_mut([row, head, rows.start], rows.len()) };
             // SAFETY: as above, this work item's inputs of the entry.
             let mut recorded_inputs = entry.map(|entry| unsafe {
                 self.tape.span_mut([slot.target, entry, head * self.head_width + rows.start], rows.len())
@@ -295,9 +295,9 @@ impl<'a, A: Dense> StateSpace<'a, A> {
                     *s = input.mul_add(*b, *s * inputs.decay);
                     output = s.mul_add(*c, output);
                 }
-                mixed[index] = A::narrow(skip.mul_add(value, output));
+                mixed.set(index, skip.mul_add(value, output));
                 if let Some(recorded_inputs) = &mut recorded_inputs {
-                    recorded_inputs[index] = input;
+                    recorded_inputs.set(index, input);
                 }
             }
             if row + 1 == publish {

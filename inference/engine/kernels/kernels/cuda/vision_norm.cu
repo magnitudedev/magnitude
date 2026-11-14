@@ -21,7 +21,7 @@ extern "C" __global__ void vision_norm(SEISMIC_KERNEL_PARAMS) {
     const u64 first = (u64)cell * SEISMIC_RESULT_0_STRIDE_0 + (interleave ? member : (u64)member * h);
     const float *source = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SOURCE));
     vision::norm<Y, WeightElement, BiasElement, SEISMIC_DIM_NW == 1, SEISMIC_DIM_NB == 1>(
-        source + (u64)from * h, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + first * Y::bytes, interleave ? g : 1,
+        source + (u64)from * h, SEISMIC_RESULT_0_OUT.offset(first), interleave ? g : 1,
         SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT), SEISMIC_PTR(SEISMIC_BUFFER_BIAS), h, (int)SEISMIC_PARAM_CENTERED != 0,
         __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON), (int)SEISMIC_PARAM_ACTIVATION, partials);
 }

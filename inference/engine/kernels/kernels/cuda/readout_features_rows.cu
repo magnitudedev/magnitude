@@ -12,7 +12,7 @@ extern "C" __global__ void readout_features_rows(SEISMIC_KERNEL_PARAMS) {
                   projection::SelectedRows{reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS))}};
     pro.prepare_row(factors, row, scratch);
     __syncthreads();
-    projection::u8 *features = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const auto features = SEISMIC_RESULT_0_OUT;
     for (projection::u64 k = threadIdx.x; k < SEISMIC_DIM_D; k += blockDim.x)
-        element::put<element::Act>(features, row * SEISMIC_RESULT_0_STRIDE_0 + k, pro.value(factors, row, k));
+        features.put(row * SEISMIC_RESULT_0_STRIDE_0 + k, pro.value(factors, row, k));
 }

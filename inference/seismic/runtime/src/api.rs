@@ -521,6 +521,11 @@ pub enum TensorError {
     Region(RegionError),
     /// A host-shared word of a view cannot be accessed.
     SharedWord(SharedWordError),
+    /// A raw host read (`read_shared`) of a dense floating tensor: its values leave only through
+    /// a read that gives every NaN as the registry's one NaN (`read_with`).
+    FloatingSharedRead {
+        representation: &'static str,
+    },
     Execution(ExecutionError),
 }
 
@@ -582,6 +587,12 @@ pub enum RegionError {
     /// On chunked storage, a region at `offset` whose bytes are no leading
     /// rows each in bytes of its own: chunked storage holds only records.
     Unrecorded { offset: u64 },
+    /// A region of a dense floating tensor would view its bytes as another
+    /// representation, letting a host read skip NaN canonicalization.
+    FloatingReinterpret {
+        from: &'static str,
+        to: &'static str,
+    },
 }
 
 impl fmt::Display for RegionError {
@@ -618,8 +629,21 @@ impl fmt::Display for RegionError {
                 f,
                 "a region at allocation offset {offset} of chunked storage holds no records"
             ),
+            Self::FloatingReinterpret { from, to } => write!(
+                f,
+                "a floating `{from}` view cannot be re-viewed as `{to}`; its values stay `{from}` so every host read canonicalizes its NaNs"
+            ),
         }
     }
+}
+
+/// Canonicalizes every NaN in `bytes` (whole elements of `representation` when
+/// it is a dense floating type) to the registry's one NaN (`layout::canonicalize_in_place`).
+pub fn canonicalize_in_place(
+    representation: seismic_lang::ids::RepresentationId,
+    bytes: &mut [u8],
+) {
+    crate::layout::canonicalize_in_place(representation, bytes);
 }
 
 /// Why a view's store charges cannot be read.
@@ -706,6 +730,10 @@ impl fmt::Display for TensorError {
             Self::ViewCharge(error) => write!(f, "{error}"),
             Self::Region(error) => write!(f, "{error}"),
             Self::SharedWord(error) => write!(f, "{error}"),
+            Self::FloatingSharedRead { representation } => write!(
+                f,
+                "a raw shared read of `{representation}` values; a floating tensor is read only with its NaNs canonical"
+            ),
             Self::Execution(error) => write!(f, "{error}"),
         }
     }
@@ -1149,7 +1177,7 @@ pub mod tensor {
     use seismic_compiler::errors::ExecutionError;
     use seismic_compiler::prepared::TensorDescriptor;
     use seismic_lang::ids::RepresentationId;
-    use seismic_lang::registry::representation_info;
+    use seismic_lang::registry::{representation_info, RepresentationKind};
     use seismic_topology::Contract;
     use std::sync::{
         atomic::{fence, AtomicU32, AtomicU64, AtomicUsize, Ordering},
@@ -1795,6 +1823,22 @@ pub mod tensor {
                     representation: representation_info(representation).name,
                 });
             }
+            let from = representation_info(self.representation);
+            let to = representation_info(representation);
+            let carries_packed = self
+                .allocation
+                .reservation()
+                .is_some_and(|reservation| reservation.carries.is_some())
+                && !matches!(to.kind, RepresentationKind::Dense(_));
+            if matches!(from.kind, RepresentationKind::Dense(dtype) if dtype.is_float())
+                && representation != self.representation
+                && !carries_packed
+            {
+                return Err(TensorError::Region(RegionError::FloatingReinterpret {
+                    from: from.name,
+                    to: to.name,
+                }));
+            }
             if self.slabs.is_some()
                 || self.packed()
                 || layout::canonical(self.representation, &self.extents)?.strides != self.strides
@@ -2249,12 +2293,20 @@ pub mod tensor {
         }
 
         /// Read `into.len()` bytes at `offset` bytes into this view without
-        /// waiting for device work that uses its storage.
+        /// waiting for device work that uses its storage. A dense floating
+        /// tensor is refused ([`TensorError::FloatingSharedRead`]): its values
+        /// leave only through the canonicalizing read (`read_with`).
         ///
         /// # Safety
         /// The tensor was made by [`Self::shared`] (or is a view of one),
         /// and no device work in flight writes these bytes.
         pub unsafe fn read_shared(&self, offset: u64, into: &mut [u8]) -> Result<(), TensorError> {
+            let info = representation_info(self.representation);
+            if matches!(info.kind, RepresentationKind::Dense(dtype) if dtype.is_float()) {
+                return Err(TensorError::FloatingSharedRead {
+                    representation: info.name,
+                });
+            }
             offset
                 .checked_add(into.len() as u64)
                 .filter(|end| *end <= self.byte_len)
@@ -2273,7 +2325,9 @@ pub mod tensor {
         /// allocation (see [`Self::shared`]), not slabbed, and of a
         /// reservation only a region, whose pin keeps its bytes backed (a
         /// reservation's host range never moves). Valid while the view
-        /// lives.
+        /// lives, for staging writes and in-engine co-processor storage;
+        /// floating values read out to a caller leave through `read_with` or
+        /// `canonicalize_in_place` so NaN bits are never exposed.
         pub fn host_address(&self) -> Option<std::ptr::NonNull<u8>> {
             let unpinned = self.allocation.reservation().is_some() && self.pin.is_none();
             if unpinned || self.slabs.is_some() {
@@ -2289,6 +2343,12 @@ pub mod tensor {
         /// (see [`Self::shared`]), the word aligned to its width and inside
         /// the view.
         fn shared_word<A>(&self, offset: u64) -> Result<&A, TensorError> {
+            let info = representation_info(self.representation);
+            if matches!(info.kind, RepresentationKind::Dense(dtype) if dtype.is_float()) {
+                return Err(TensorError::FloatingSharedRead {
+                    representation: info.name,
+                });
+            }
             let width = std::mem::size_of::<A>() as u64;
             if offset.checked_add(width).is_none_or(|end| end > self.byte_len) {
                 return Err(TensorError::SharedWord(SharedWordError::Outside {
@@ -2366,6 +2426,12 @@ pub mod tensor {
         /// The view's 32-bit words, as the host stores them in place: words
         /// that order nothing, which a device reading them sees in time.
         pub fn shared_words(&self) -> Result<&[AtomicU32], TensorError> {
+            let info = representation_info(self.representation);
+            if matches!(info.kind, RepresentationKind::Dense(dtype) if dtype.is_float()) {
+                return Err(TensorError::FloatingSharedRead {
+                    representation: info.name,
+                });
+            }
             let words = usize::try_from(self.byte_len / 4).expect("a host-addressed view fits the host");
             if words == 0 {
                 return Ok(&[]);
@@ -2551,6 +2617,9 @@ pub mod tensor {
                     access.read(&self.allocation, offset, &mut bytes[host])
                 },
             )?;
+            // The one way a tensor's bytes leave the engine: every NaN reads out as the registry's
+            // one NaN (`layout::canonicalize_in_place`).
+            crate::layout::canonicalize_in_place(self.representation, &mut bytes);
             Ok(bytes)
         }
         pub fn write_from_host(&self, bytes: &[u8]) -> Result<(), TensorError> {
@@ -2951,7 +3020,8 @@ pub mod tensor {
             let device = devices.open_backend(registry::BackendName::Cpu).unwrap();
             let count = 3 * 1024 * 1024 / 4 + 5;
             let tensor = TensorInner::from_host(&device, registry::dense(DType::F32), &[count], &vec![0; count as usize * 4]).unwrap();
-            let bytes = (0..count * 4).map(|i| i as u8).collect::<Vec<_>>();
+            // Finite elements: a NaN reads out as the registry's one NaN.
+            let bytes = (0..count * 4).map(|i| if i % 4 == 3 { 0x3f } else { i as u8 }).collect::<Vec<_>>();
             let half = bytes.len() / 2;
             tensor.write_chunks(|write| {
                 write(half as u64, &bytes[half..])?;
@@ -2960,6 +3030,73 @@ pub mod tensor {
             .unwrap();
             assert_eq!(tensor.read_to_host().unwrap(), bytes);
             assert!(tensor.write_chunks(|write| write(1, &bytes)).is_err());
+        }
+
+        /// Every NaN of a dense floating tensor the host gives, of any sign and payload, reads back
+        /// as the registry's one NaN: through a whole write, an in-place write and a chunked upload
+        /// whose chunks end inside elements.
+        #[test]
+        fn host_nans_read_back_as_the_registrys_one_nan() {
+            let devices = crate::devices::Devices::discover(&[]).unwrap();
+            let device = devices.open_backend(registry::BackendName::Cpu).unwrap();
+            let words = |dtype: DType, odd: &[u32], one: u32, finite: u32| -> (Vec<u8>, Vec<u8>) {
+                let width = if dtype == DType::F32 { 4 } else { 2 };
+                let (mut given, mut held) = (Vec::new(), Vec::new());
+                for bits in odd.iter().copied().chain([finite]) {
+                    given.extend_from_slice(&bits.to_le_bytes()[..width]);
+                    held.extend_from_slice(&if bits == finite { bits } else { one }.to_le_bytes()[..width]);
+                }
+                (given, held)
+            };
+            for (dtype, odd, one, finite) in [
+                (DType::F32, vec![0x7f80_0001, 0xffc0_0000, 0x7fff_ffff, 0xff80_0001, 0x7fc0_0000], 0x7fc0_0000, 0x3f80_0000),
+                (DType::BF16, vec![0x7f81, 0xffc0, 0x7fff, 0xff81, 0x7fc0], 0x7fc0, 0x3f80),
+                (DType::F16, vec![0x7c01, 0xfe00, 0x7fff, 0xfc01, 0x7e00], 0x7e00, 0x3c00),
+            ] {
+                let (given, held) = words(dtype, &odd, one, finite);
+                let count = odd.len() as u64 + 1;
+                let representation = registry::dense(dtype);
+                let whole = TensorInner::from_host(&device, representation, &[count], &given).unwrap();
+                assert_eq!(whole.read_to_host().unwrap(), held, "{dtype:?} from_host");
+                let written = TensorInner::zeros(&device, representation, &[count]).unwrap();
+                written.write_from_host(&given).unwrap();
+                assert_eq!(written.read_to_host().unwrap(), held, "{dtype:?} write_from_host");
+                for chunk in [1, 3, 5] {
+                    let chunked = TensorInner::zeros(&device, representation, &[count]).unwrap();
+                    chunked
+                        .write_chunks(|write| {
+                            for (index, bytes) in given.chunks(chunk).enumerate() {
+                                write((index * chunk) as u64, bytes)?;
+                            }
+                            Ok(())
+                        })
+                        .unwrap();
+                    assert_eq!(chunked.read_to_host().unwrap(), held, "{dtype:?} chunks of {chunk}");
+                }
+            }
+        }
+
+        /// A NaN a kernel leaves in a dense floating tensor, whatever its sign and payload, reads back
+        /// as the registry's one NaN: the way out of the engine canonicalizes, so a kernel's own NaN
+        /// bits (a sign a negation flipped, an operation's default NaN) are unobservable.
+        #[test]
+        fn device_nans_leave_as_the_registrys_one_nan() {
+            let device = crate::devices::Devices::discover(&[])
+                .unwrap()
+                .open_backend(registry::BackendName::Cpu)
+                .unwrap();
+            for (dtype, left, one, finite) in [
+                (DType::F32, vec![0xffc0_0000u32, 0x7fff_ffff, 0xff80_0001, 0x7f80_0001], 0x7fc0_0000u32, 0x3f80_0000u32),
+                (DType::BF16, vec![0xffc0, 0x7fff, 0xff81, 0x7f81], 0x7fc0, 0x3f80),
+                (DType::F16, vec![0xfe00, 0x7fff, 0xfc01, 0x7c01], 0x7e00, 0x3c00),
+            ] {
+                let width = if dtype == DType::F32 { 4 } else { 2 };
+                let tensor = TensorInner::zeros(&device, registry::dense(dtype), &[left.len() as u64 + 1]).unwrap();
+                let raw = left.iter().chain([&finite]).flat_map(|bits| bits.to_le_bytes()[..width].to_vec()).collect::<Vec<_>>();
+                tensor.allocation.storage().write(0, &raw).unwrap();
+                let held = left.iter().map(|_| one).chain([finite]).flat_map(|bits| bits.to_le_bytes()[..width].to_vec()).collect::<Vec<_>>();
+                assert_eq!(tensor.read_to_host().unwrap(), held, "{dtype:?}");
+            }
         }
 
         /// Views formed per run of the same records bind the one table their
@@ -3113,6 +3250,82 @@ pub mod tensor {
                 Err(crate::api::TensorError::ViewCharge(
                     crate::api::ViewChargeError::BeyondCharge
                 ))
+            ));
+        }
+
+        /// A dense floating tensor refuses raw shared reads, word accesses and
+        /// re-interpretation as another representation, while admitting
+        /// same-representation regions and carrier reservations lending
+        /// non-dense weight records.
+        #[test]
+        fn floating_views_refuse_shared_word_and_reinterpreted_region_bypasses() {
+            use crate::api::{RegionError, TensorError};
+            let device = crate::devices::Devices::discover(&[])
+                .unwrap()
+                .open_backend(registry::BackendName::Cpu)
+                .unwrap();
+            for dtype in [DType::F32, DType::BF16, DType::F16] {
+                let repr = registry::dense(dtype);
+                let shared = TensorInner::shared(&device, repr, &[8]).unwrap();
+                let mut scratch = [0u8; 4];
+                assert!(matches!(
+                    unsafe { shared.read_shared(0, &mut scratch) },
+                    Err(TensorError::FloatingSharedRead { .. })
+                ));
+                assert!(matches!(
+                    shared.load_acquire(0),
+                    Err(TensorError::FloatingSharedRead { .. })
+                ));
+                assert!(matches!(
+                    shared.load_acquire_u64(0),
+                    Err(TensorError::FloatingSharedRead { .. })
+                ));
+                assert!(matches!(
+                    shared.store_release(0, 1),
+                    Err(TensorError::FloatingSharedRead { .. })
+                ));
+                assert!(matches!(
+                    shared.shared_words(),
+                    Err(TensorError::FloatingSharedRead { .. })
+                ));
+                let empty = TensorInner::shared(&device, repr, &[0]).unwrap();
+                assert!(matches!(
+                    empty.shared_words(),
+                    Err(TensorError::FloatingSharedRead { .. })
+                ));
+            }
+
+            let f32_repr = registry::dense(DType::F32);
+            let bf16_repr = registry::dense(DType::BF16);
+            let i32_repr = registry::dense(DType::I32);
+            let bool_repr = registry::dense(DType::Bool);
+            let q8_repr = registry::representation("q8g32").unwrap();
+            let float_view = TensorInner::shared(&device, f32_repr, &[64]).unwrap();
+            assert!(float_view.region(f32_repr, &[16], 0).is_ok());
+            for bad in [i32_repr, bool_repr, bf16_repr, q8_repr] {
+                assert!(
+                    matches!(
+                        float_view.region(bad, &[32], 0),
+                        Err(TensorError::Region(RegionError::FloatingReinterpret { .. }))
+                    ),
+                    "expected FloatingReinterpret for {}",
+                    registry::representation_info(bad).name
+                );
+            }
+
+            let (carrier, _resizer) = TensorInner::reserved(
+                &device,
+                seismic_topology::ReservedContract::DeviceOnly,
+                bf16_repr,
+                &[4, 2048],
+                4,
+                std::num::NonZeroU64::new(4096),
+            )
+            .unwrap();
+            assert!(carrier.region(q8_repr, &[1, 64], 0).is_ok());
+            assert!(matches!(
+                carrier.region(i32_repr, &[32], 0),
+                Err(TensorError::Region(RegionError::FloatingReinterpret { .. }))
             ));
         }
     }
@@ -3305,6 +3518,8 @@ pub mod kernel {
     #[doc(hidden)]
     pub use crate::driver::workflow::ScalarValue as EncodedScalar;
     impl EncodedScalar {
+        /// The argument the engine takes in for this host scalar, as given: a NaN's bits are
+        /// unobservable inside, and every scalar result leaves through `DecodedValue::scalar`.
         pub(crate) fn value(&self) -> ArgumentValue {
             match self.clone() {
                 Self::F32Bits(bits) => ArgumentValue::F32(f32::from_bits(bits)),
@@ -3418,7 +3633,25 @@ pub mod kernel {
     #[derive(Clone)]
     pub enum DecodedValue {
         Tensor(Arc<TensorInner>),
-        Scalar(ArgumentValue),
+        Scalar(ScalarResult),
+    }
+    impl DecodedValue {
+        /// A scalar result as it leaves the engine: a floating NaN is the registry's one NaN
+        /// (`layout::canonical_scalar`). The only constructor of a `ScalarResult`.
+        pub(crate) fn scalar(value: ArgumentValue) -> Self {
+            Self::Scalar(ScalarResult(crate::layout::canonical_scalar(value)))
+        }
+    }
+    /// A scalar result out of the engine, as `DecodedValue::scalar` built it.
+    #[derive(Clone, Debug)]
+    pub struct ScalarResult(ArgumentValue);
+    impl ScalarResult {
+        pub fn value(&self) -> &ArgumentValue {
+            &self.0
+        }
+        pub fn into_value(self) -> ArgumentValue {
+            self.0
+        }
     }
     pub struct DecodedResults {
         values: VecDeque<DecodedValue>,
@@ -3442,7 +3675,7 @@ pub mod kernel {
         #[doc(hidden)]
         pub fn take_scalar(&mut self) -> ArgumentValue {
             match self.values.pop_front() {
-                Some(DecodedValue::Scalar(value)) => value,
+                Some(DecodedValue::Scalar(value)) => value.into_value(),
                 _ => panic!("unsafe generated Entry contract decoded a non-scalar as a scalar"),
             }
         }

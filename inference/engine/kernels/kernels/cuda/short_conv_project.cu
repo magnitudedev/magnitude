@@ -28,8 +28,8 @@ using Gate = projection::Store<element::F32>;
 #define B_ROWS KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_B_WEIGHT))
 #define X_ROWS KERNEL_W1_AT(SEISMIC_PTR(SEISMIC_BUFFER_X_WEIGHT))
 #define C_ROWS KERNEL_W2_AT(SEISMIC_PTR(SEISMIC_BUFFER_C_WEIGHT))
-#define PRODUCT Product{reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)), SEISMIC_RESULT_0_STRIDE_0}
-#define GATE Gate{SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_DIM_CH}
+#define PRODUCT Product{SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0}
+#define GATE Gate{SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_DIM_CH}
 
 // The weights and epilogues of both segments (formed in the kernel body,
 // where the ABI macros are defined).

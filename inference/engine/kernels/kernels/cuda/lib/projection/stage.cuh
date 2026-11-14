@@ -389,14 +389,14 @@ __device__ __forceinline__ void form_packed_row(const Pro &pro, u32 m, u64 K, u8
 // `form_row`, also publishing the row's FACTORS factors (a group prologue's
 // per-stream inverses) to published[f * step] when `published` is given.
 template <class Pro>
-__device__ __forceinline__ void form_row_publishing(const Pro &pro, u32 m, u64 K, u8 *out, float *published,
+__device__ __forceinline__ void form_row_publishing(const Pro &pro, u32 m, u64 K, u8 *out, const element::Out<element::F32> *published,
                                                     u64 step) {
     __shared__ float factors[Pro::FACTORS > 0 ? Pro::FACTORS : 1];
     __shared__ float scratch[32];
     pro.prepare_row(factors, m, scratch);
     __syncthreads();
     if (published != nullptr && threadIdx.x < (unsigned)Pro::FACTORS)
-        published[threadIdx.x * step] = factors[threadIdx.x];
+        published->put(threadIdx.x * step, factors[threadIdx.x]);
     for (u64 k = threadIdx.x; k < K; k += blockDim.x)
         element::put<Act>(out, m * K + k, pro.value(factors, m, k));
 }

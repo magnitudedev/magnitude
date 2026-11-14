@@ -17,7 +17,7 @@ fn corrector_nodes<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64;
     let rank = cx.arg_rank().row([candidate, 0]);
     let token_bias = (cx.dim_tb() == 1).then(|| cx.arg_token_bias().row([0, 0]));
     // SAFETY: each work item writes its own node row.
-    let out = unsafe { cx.result_0().row_mut([slot, mask, candidate, 0]) };
+    let mut out = unsafe { cx.result_0().row_mut([slot, mask, candidate, 0]) };
     for (column, target) in out.iter_mut().enumerate() {
         let mut value = token[column]
             + pass[column]
@@ -29,6 +29,6 @@ fn corrector_nodes<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64;
         if let Some(bias) = token_bias {
             value += bias[column];
         }
-        *target = value;
+        target.set(value);
     }
 }

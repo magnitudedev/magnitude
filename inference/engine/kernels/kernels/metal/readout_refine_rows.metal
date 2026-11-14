@@ -17,8 +17,8 @@ kernel void readout_refine_rows_gather(
     device const float *temperature [[buffer(SEISMIC_BUFFER_TEMPERATURE)]],
     device const uint *mask [[buffer(SEISMIC_BUFFER_MASK)]],
     device const int *constrained [[buffer(SEISMIC_BUFFER_CONSTRAINED)]],
-    device float *logits [[buffer(SEISMIC_RESULT_0_BUFFER)]],
-    device float *threshold [[buffer(SEISMIC_RESULT_1_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(logits),
+    SEISMIC_RESULT_1_PARAM(threshold),
     device atomic_uint *bounds [[buffer(SEISMIC_BUFFER_SCRATCH_BOUNDS)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     threadgroup uchar *shared [[threadgroup(0)]],
@@ -40,8 +40,8 @@ kernel void readout_refine_rows_gather(
     // Radius columns 0 and 1: the 4- and 5-bit views'.
     progressive::gather<true>(features, SEISMIC_FEATURES_STRIDE_0, planes, radius, radius + SEISMIC_RADIUS_STRIDE_1,
         SEISMIC_RADIUS_STRIDE_0, coarse, SEISMIC_COARSE_STRIDE_0, SEISMIC_COARSE_STRIDE_1, floor,
-        SEISMIC_FLOOR_STRIDE_0, lengths, SEISMIC_LENGTH_STRIDE_0, selection, logits, SEISMIC_RESULT_0_STRIDE_0,
-        SEISMIC_RESULT_0_STRIDE_1, threshold, SEISMIC_RESULT_1_STRIDE_0, bounds, uint(SEISMIC_DIM_O),
+        SEISMIC_FLOOR_STRIDE_0, lengths, SEISMIC_LENGTH_STRIDE_0, selection, element::Out<element::F32>(logits),
+        SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, element::Out<element::F32>(threshold), SEISMIC_RESULT_1_STRIDE_0, bounds, uint(SEISMIC_DIM_O),
         uint(SEISMIC_DIM_V), uint(SEISMIC_DIM_D), lowest, &last, stage, tile, tiles, tid, threads, simdgroups, sg, lane);
 }
 #endif

@@ -9,6 +9,17 @@
 #include "lib/repack/repack.cuh"
 #include "../streaming/list.hpp"
 
+// A dense float destination is written only through its owner's handle: its
+// records are a `streaming::Records` table, each element copied through the
+// owner (`streaming_copy_bytes`).
+#ifdef SEISMIC_OUT_DESTINATION
+#undef STREAMING_RECORDS
+#define STREAMING_RECORDS streaming::Records<ELEMENT_OF(SEISMIC_DESTINATION)>
+#define COPY_DESTINATION (STREAMING_RECORDS{SEISMIC_OUT_DESTINATION, 0})
+#else
+#define COPY_DESTINATION SEISMIC_PTR(SEISMIC_BUFFER_DESTINATION)
+#endif
+
 #define STREAMING_COPY_FROM(table, record) ((table) + u64(record) * REPACK_MATRIX_BYTES(SEISMIC_SOURCE))
 #define STREAMING_COPY_TO(table, record) ((table) + u64(record) * REPACK_MATRIX_BYTES(SEISMIC_DESTINATION))
 #include "../streaming/list_copy.hpp"
@@ -18,7 +29,7 @@ __device__ void routed_copy_block(SEISMIC_KERNEL_PARAMS) {
     __shared__ int words[STREAMING_LIST_WORDS];
     streaming_list_copy(SEISMIC_PTR(SEISMIC_BUFFER_SOURCE), reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_LIST)),
                         reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_STEP))[0],
-                        SEISMIC_PTR(SEISMIC_BUFFER_DESTINATION), REPACK_MATRIX_BYTES(SEISMIC_SOURCE),
+                        COPY_DESTINATION, REPACK_MATRIX_BYTES(SEISMIC_SOURCE),
                         blockIdx.x + gridDim.x * blockIdx.y, gridDim.x * gridDim.y, words, threadIdx.x, blockDim.x,
                         seismic_words_value);
 }

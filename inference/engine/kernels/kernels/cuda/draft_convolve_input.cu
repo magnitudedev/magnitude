@@ -8,7 +8,7 @@ extern "C" __global__ void draft_convolve_input(SEISMIC_KERNEL_PARAMS) {
     const element::u8 *input = SEISMIC_PTR(SEISMIC_BUFFER_INPUT);
     const float *dynamic = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_DYNAMIC));
     const float *base = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_BASE));
-    element::u8 *result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const auto result = SEISMIC_RESULT_0_OUT;
     const u64 index = (u64)blockIdx.x * blockDim.x + threadIdx.x;
     const u64 channels = SEISMIC_DIM_C, width = SEISMIC_DIM_G * channels;
     if (index >= (u64)SEISMIC_DIM_M * width)
@@ -22,5 +22,5 @@ extern "C" __global__ void draft_convolve_input(SEISMIC_KERNEL_PARAMS) {
         sum = seismic_fma_rn(coefficient,
             element::at<element::Act>(input, (row - offset) * SEISMIC_INPUT_STRIDE_0 + column * SEISMIC_INPUT_STRIDE_1), sum);
     }
-    element::put<element::Act>(result, row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1, sum);
+    result.put(row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1, sum);
 }

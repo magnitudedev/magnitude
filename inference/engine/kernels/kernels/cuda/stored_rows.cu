@@ -6,14 +6,12 @@
 #include "lib/core/gathered.cuh"
 #include <seismic/rows16.cuh>
 
-using element::Act;
 using element::u64;
-using element::u8;
 
 extern "C" __global__ void stored_rows(SEISMIC_KERNEL_PARAMS) {
     const int *tokens = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_TOKENS));
     const int *directory = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_DIRECTORY));
-    u8 *rows = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const auto rows = SEISMIC_RESULT_0_OUT;
     const auto table = ROWS16_T_AT(SEISMIC_PTR(SEISMIC_BUFFER_SLOTS));
     const u64 column = (u64)blockIdx.y * 256ull + threadIdx.x;
     if (column >= SEISMIC_DIM_W)
@@ -23,11 +21,10 @@ extern "C" __global__ void stored_rows(SEISMIC_KERNEL_PARAMS) {
                                              tokens[row * SEISMIC_TOKENS_STRIDE_0]);
         // A row without a slot reads zeros.
         if (held < 0) {
-            element::put<Act>(rows, row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1, 0.0f);
+            rows.put(row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1, 0.0f);
             continue;
         }
         const u64 slot = (u64)held;
-        element::put<Act>(rows, row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1,
-                          table.value(slot, column));
+        rows.put(row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1, table.value(slot, column));
     }
 }
