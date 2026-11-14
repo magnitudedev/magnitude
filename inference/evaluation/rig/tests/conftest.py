@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from magnitude_rig import state, store
+from magnitude_rig import sources, state, store
 from magnitude_rig.build import BuildIdentity
 from magnitude_rig.hosts import HostConfig, Hosts
 from magnitude_rig.sources import Source
@@ -59,6 +59,28 @@ def _scoped(token: str) -> list[int]:
                                  check=True).stdout  # run unscoped, or it would list itself
         found = [int(line.split(None, 1)[0]) for line in listing.splitlines() if marker in line.split()]
     return [pid for pid in found if pid != os.getpid()]
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _a_checkout_of_their_own(tmp_path_factory):
+    """Tests run in a git checkout of their own, where the rig finds its source (`sources.checkout`, from the
+    current directory): a copy of the `inference/` tree the suite runs from, in two commits on `main`, wherever
+    the suite is staged to run (a host's staged copy of the rig is no git worktree)."""
+    root = tmp_path_factory.mktemp("checkout")
+    shutil.copytree(Path(__file__).parents[3], root / "inference", symlinks=True,
+                    ignore=shutil.ignore_patterns("target", ".venv", ".git", "node_modules", "__pycache__"))
+    git = ["git", "-C", str(root), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    subprocess.run([*git, "init", "-q", "-b", "main"], check=True)
+    for index in (1, 2):
+        (root / "inference" / "tree.txt").write_text(f"{index}\n")
+        subprocess.run([*git, "add", "."], check=True)
+        subprocess.run([*git, "commit", "-q", "-m", f"commit {index}"], check=True)
+    before = Path.cwd()
+    os.chdir(root)
+    sources.checkout.cache_clear()
+    yield
+    os.chdir(before)
+    sources.checkout.cache_clear()
 
 
 @pytest.fixture(autouse=True)
