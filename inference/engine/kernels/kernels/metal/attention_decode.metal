@@ -51,8 +51,8 @@ inline void append_rows(device const attention::Scalar *key, device const attent
 // L1 of the vector and matrix forms (MATRIX 0 and 1; the shared-tile form is
 // `attention_decode_shared`): threadgroup (kv head and head group, partition,
 // row). With MATRIX 1, the grouped-query matrix form (attention::decode_matrix) over a head group of
-// min(HEADS, G) query heads, whose key sequence ends in the row's KS picks.
-// Otherwise (one head group, no picks): a row's visible keys,
+// min(HEADS, G) query heads, whose key sequence ends in the row's KS picks,
+// its partitions the position grid's (`decode_matrix`). Otherwise (one head group, no picks): a row's visible keys,
 // in order (spans, then its fresh span), split into equal partitions of
 // attention::partition_span keys. The G query heads split into SLICES slices
 // of H = G / SLICES heads (so wide heads keep their queries and outputs in
@@ -129,13 +129,13 @@ kernel void attention_decode_partial(
     if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
         return;
 #if SEISMIC_TUNE_MATRIX == 1
-    attention::decode_matrix<SIMDS, SEISMIC_TUNE_KEYS, PARTS, TOKENS, 0, HEADS, SEISMIC_DIM_KS>(
+    attention::decode_matrix<SIMDS, SEISMIC_TUNE_KEYS, SEISMIC_TUNE_SPAN, PARTS, TOKENS, 0, HEADS, SEISMIC_DIM_KS>(
         attention::dense_planes{history_key, attention::values_plane(history_key, history_value),
             ulong(SEISMIC_PARAM_SLAB_ROWS)}.reads(),
         query, key, value, query_norm, key_norm, value_norm, rotary_components, rotary_frequencies,
         rotary_amplitudes, coordinates, visible, fresh, partials, statistics,
         reinterpret_cast<threadgroup uchar *>(shared), R, SEISMIC_DIM_M, epsilon, scale * ATTENTION_LOG2E,
-        SEISMIC_TUNE_SPAN, kv_head, partition, group.z, thread_index, simd, lane, head_base,
+        kv_head, partition, group.z, thread_index, simd, lane, head_base,
         attention::decode_picks{selected_rows, selected, ulong(SEISMIC_PARAM_SELECTED_SLAB_ROWS)}, key_rounding);
 #elif SEISMIC_TUNE_MATRIX == 0
     static_assert(GROUP == G && SEISMIC_DIM_KS == 0, "the vector form holds a whole query group and no picks");
@@ -290,13 +290,13 @@ kernel void attention_decode_shared(
             row, kv_head, simd, lane);
     if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
         return;
-    attention::decode_shared<SEISMIC_TUNE_KEYS, SEISMIC_TUNE_PARTS, SEISMIC_DIM_KS>(
+    attention::decode_shared<SEISMIC_TUNE_KEYS, SEISMIC_TUNE_PARTS, SEISMIC_DIM_KS, SEISMIC_TUNE_SPAN>(
         attention::dense_planes{history_key, attention::values_plane(history_key, history_value),
             ulong(SEISMIC_PARAM_SLAB_ROWS)}.reads(),
         query, key, value, query_norm, key_norm, value_norm, rotary_components, rotary_frequencies,
         rotary_amplitudes, coordinates, visible, fresh, partials, statistics,
         reinterpret_cast<threadgroup uchar *>(shared), SEISMIC_DIM_R, as_type<float>(uint(SEISMIC_PARAM_EPSILON)),
-        as_type<float>(uint(SEISMIC_PARAM_SCALE)) * ATTENTION_LOG2E, SEISMIC_TUNE_SPAN, kv_head, partition, row,
+        as_type<float>(uint(SEISMIC_PARAM_SCALE)) * ATTENTION_LOG2E, kv_head, partition, row,
         thread_index, simd, lane,
         attention::decode_picks{selected_rows, selected, ulong(SEISMIC_PARAM_SELECTED_SLAB_ROWS)}, key_rounding);
 #endif
@@ -330,8 +330,9 @@ kernel void attention_decode_merge(
     const element::Out<element::Act> result(result_cells);
     threadgroup float weights[2 * SEISMIC_TUNE_PARTS];
     threadgroup float row_values[ROTATED ? ATTENTION_W : 1];
-    attention::decode_output<SEISMIC_TUNE_SPAN, SEISMIC_TUNE_PARTS, SEISMIC_TUNE_TOKENS, SEISMIC_DIM_KS, ROTATED>(
-        query, gate, visible, fresh, result, partials, statistics, weights, SEISMIC_DIM_R, SEISMIC_DIM_M, group.x,
+    attention::decode_output<SEISMIC_TUNE_SPAN, SEISMIC_TUNE_PARTS, SEISMIC_TUNE_MATRIX == 1 ? SEISMIC_TUNE_KEYS : 0,
+        SEISMIC_DIM_KS, ROTATED>(
+        query, gate, visible, fresh, result, partials, statistics, weights, SEISMIC_DIM_R, group.x,
         group.y, ROTATED ? thread_index : group.z * 32 + lane, lane, SEISMIC_PARAM_GATE_FUNCTION != 0, sinks,
         thread_index < 32, row_values, coordinates, rotary_components, rotary_frequencies, rotary_amplitudes);
 }

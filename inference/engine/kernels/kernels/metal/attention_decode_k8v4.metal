@@ -125,11 +125,11 @@ kernel void attention_decode_k8v4_partial(
     if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
         return;
 #if SEISMIC_TUNE_MATRIX
-    attention::decode_matrix<SIMDS, SEISMIC_TUNE_KEYS, PARTS, TOKENS, HEAD_BAND>(attention::affine_planes{key_codes,
+    attention::decode_matrix<SIMDS, SEISMIC_TUNE_KEYS, SEISMIC_TUNE_SPAN, PARTS, TOKENS, HEAD_BAND>(attention::affine_planes{key_codes,
         key_coefficients, value_codes, value_coefficients, ulong(SEISMIC_PARAM_SLAB_ROWS)}.reads(), query, key, value,
         query_norm, key_norm, value_norm, rotary_components, rotary_frequencies, rotary_amplitudes, coordinates,
         visible, fresh, partials, statistics, reinterpret_cast<threadgroup uchar *>(shared), R, SEISMIC_DIM_M, epsilon,
-        scale * ATTENTION_LOG2E, SEISMIC_TUNE_SPAN, kv_head, partition, group.z, thread_index, simd, lane, head_base);
+        scale * ATTENTION_LOG2E, kv_head, partition, group.z, thread_index, simd, lane, head_base);
 #else
     const uint total = attention::form_total(visible, fresh, row, R, lane);
     const uint span_keys = attention::partition_span(total, SEISMIC_TUNE_SPAN, PARTS);
@@ -359,8 +359,9 @@ kernel void attention_decode_k8v4_merge(
     const element::Out<element::Act> result(result_cells);
     threadgroup float weights[2 * SEISMIC_TUNE_PARTS];
     threadgroup float row_values[ROTATED ? ATTENTION_W : 1];
-    attention::decode_output<SEISMIC_TUNE_SPAN, SEISMIC_TUNE_PARTS, SEISMIC_TUNE_TOKENS, 0, ROTATED>(query, gate,
-        visible, fresh, result, partials, statistics, weights, SEISMIC_DIM_R, SEISMIC_DIM_M, group.x, group.y,
+    attention::decode_output<SEISMIC_TUNE_SPAN, SEISMIC_TUNE_PARTS, SEISMIC_TUNE_MATRIX ? SEISMIC_TUNE_KEYS : 0, 0,
+        ROTATED>(query, gate,
+        visible, fresh, result, partials, statistics, weights, SEISMIC_DIM_R, group.x, group.y,
         ROTATED ? thread_index : group.z * 32 + lane, lane, SEISMIC_PARAM_GATE_FUNCTION != 0, sinks,
         thread_index < 32, row_values, coordinates, rotary_components, rotary_frequencies, rotary_amplitudes);
 }

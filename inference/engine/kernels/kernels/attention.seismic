@@ -979,13 +979,15 @@ fn attention_decode[M, T, KV, G, P, S, I, U, F, NQ, N, NV, R, SK, RA, RT, RO, VK
 # rotary (RO = 1) the merge holds each head's whole row and turns it back in
 # F32 before publishing it.
 #
-# A row of its own (TOKENS = 1, every form) takes its keys in tiles, or the
-# vector form's batches, at fixed positions of its key sequence, history and
-# fresh keys alike, and a fresh key is prepared exactly as it is appended:
-# under one specialization a row's result is bit for bit the same whatever
-# rows share its launch, and whichever of its keys are still fresh. Row tiles
-# of several rows (TOKENS > 1) share their tiles across rows and do not hold
-# this.
+# Every form takes a row's keys at fixed positions of its key sequence,
+# history and fresh keys alike, and a fresh key is prepared exactly as it is
+# appended: the vector and shared-tile forms batch from the key group's first
+# key, and the matrix forms (every row tile) cut each row's keys into KEYS-key
+# tiles by the decode key rule, partition p taking the contiguous run [p run,
+# (p + 1) run), rows that are prefixes of the longest with equal runs sharing
+# its tiles and others walking in turn. Under one specialization a row's
+# result is bit for bit the same whatever rows share its launch, and whichever
+# of its keys are still fresh.
 native attention_decode for metal from "metal/attention_decode.metal":
     static (KV, G, P, S, I, U, F, NQ, N, NV, SK, RA, RT, RO, VK, KR, AB, KS)
     params (arithmetic SPAN in [32, 64, 128, 256] default 32, arithmetic PARTS in [16, 8, 32, 64, 128, 256, 512] default 16,
@@ -1776,12 +1778,13 @@ fn attention_prefill_k8v4[M, T, KV, G, P, S, I, U, F, NQ, N, NV, R, B, BR, L, HT
 # before publishing it, as `attention_decode`'s.
 #
 # A fresh key and value are read as their encoding, as history holds them,
-# and a row of its own (TOKENS = 1, either form) takes its keys at fixed
-# positions of its key sequence (the vector form walks its spans and slab
-# parts and gathers a batch that an edge cuts, and the fresh rows, into a
-# pending batch), so under one specialization its result is bit
-# for bit the same whatever rows share its launch. Row tiles of several rows
-# (TOKENS > 1) share their tiles across rows and do not hold this.
+# and every form takes a row's keys at fixed positions of its key sequence:
+# the vector form walks its spans and slab parts and gathers a batch that an
+# edge cuts, and the fresh rows, into a pending batch; the matrix forms
+# (every row tile, the packed and head-band forms included) cut each row's
+# keys on `attention_decode`'s grid, rows that are prefixes of the longest
+# sharing its tiles. So under one specialization a row's result is bit for
+# bit the same whatever rows share its launch.
 native attention_decode_k8v4 for metal from "metal/attention_decode_k8v4.metal":
     static (KV, G, P, S, I, U, F, NQ, N, NV, KC, KP, VC, VP, SK, RA, RT, RO, VK)
     params (arithmetic SPAN in [32, 64, 128, 256] default 32, arithmetic PARTS in [16, 8, 32, 64, 128, 256, 512] default 16,

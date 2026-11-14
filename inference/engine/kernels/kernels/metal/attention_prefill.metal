@@ -158,12 +158,12 @@ kernel void attention_prefill_shared(
 #if SEISMIC_STATIC_KS != 0
     if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
         return;
-    attention::decode_shared<SEISMIC_TUNE_KEYS, 1, SEISMIC_DIM_KS, true, SEISMIC_DIM_RO != 0>(
+    attention::decode_shared<SEISMIC_TUNE_KEYS, 1, SEISMIC_DIM_KS, 1, true, SEISMIC_DIM_RO != 0>(
         attention::dense_planes{history_key, attention::values_plane(history_key, history_value),
             ulong(SEISMIC_PARAM_SLAB_ROWS)}.reads(),
         query, key, value, query_norm, key_norm, value_norm, rotary_components, rotary_frequencies,
         rotary_amplitudes, coordinates, visible, fresh, nullptr, nullptr, shared, SEISMIC_DIM_R,
-        as_type<float>(uint(SEISMIC_PARAM_EPSILON)), as_type<float>(uint(SEISMIC_PARAM_SCALE)) * ATTENTION_LOG2E, 1,
+        as_type<float>(uint(SEISMIC_PARAM_EPSILON)), as_type<float>(uint(SEISMIC_PARAM_SCALE)) * ATTENTION_LOG2E,
         group.x, 0, group.y, thread_index, simd, lane,
         attention::decode_picks{selected_rows, selected, ulong(SEISMIC_PARAM_SELECTED_SLAB_ROWS)},
         attention::key_rounding(SEISMIC_DIM_KR != 0, uint(SEISMIC_PARAM_KEY_BLOCK), uint(SEISMIC_PARAM_KEY_ELEMENT),
