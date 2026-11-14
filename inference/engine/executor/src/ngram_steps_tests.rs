@@ -1527,9 +1527,9 @@ fn fixture_stored(
 }
 
 /// Rows of one prompt chunk, the launch row bound of the chain test: a
-/// prompt class, above the decode form's rows (`DECODE_ROWS`), so every
+/// prompt class, above the decode form's rows (`VERIFY_ROWS`), so every
 /// routed layer splits into its front and back around the group's pass.
-const CHUNK_ROWS: usize = 2 * crate::operators::routed::fused_graph::DECODE_ROWS as usize;
+const CHUNK_ROWS: usize = 2 * magnitude_kernels::constants::VERIFY_ROWS as usize;
 
 /// Prompt chunk `chunk` of `chunks` of `rows` rows of `request`'s own
 /// prompt, each row's features and its last row's logits demanded; the last

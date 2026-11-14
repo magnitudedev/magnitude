@@ -793,10 +793,10 @@ fn a_search_forms_each_dependant_at_its_prerequisites_final_arithmetic() {
         .fold(NativeSpecialization::new(), |spec, (name, value)| {
             spec.with_static(name, value)
         });
-    // The prerequisite's search promotes another BATCH_FROM (arithmetic);
+    // The prerequisite's search promotes another LANES (arithmetic);
     // TALL (not arithmetic) is the dependant's own to search.
     let mut prerequisite = FakeCase::new(&implementation, &statics, "prerequisite");
-    prerequisite.chosen.params.insert("BATCH_FROM".into(), 3);
+    prerequisite.chosen.params.insert("LANES".into(), 32);
     let mut dependant = FakeCase::new(&implementation, &statics, "dependant");
     dependant.bindings = "dependant".into();
     let mut invocations = fixture_invocations(&prerequisite, &statics, limits);
@@ -818,7 +818,7 @@ fn a_search_forms_each_dependant_at_its_prerequisites_final_arithmetic() {
         fixed
     };
     let counted = walk(&mut tuner);
-    assert_eq!(counted.param("BATCH_FROM"), Some(5));
+    assert_eq!(counted.param("LANES"), Some(16));
     assert_eq!(counted.param("TALL"), None);
     let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
     assert_eq!(
@@ -830,7 +830,7 @@ fn a_search_forms_each_dependant_at_its_prerequisites_final_arithmetic() {
     assert!(tuner.stale());
     let mut tuner = tuner.recount();
     let recounted = walk(&mut tuner);
-    assert_eq!(recounted.param("BATCH_FROM"), Some(3));
+    assert_eq!(recounted.param("LANES"), Some(32));
     let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
     assert_eq!(
         (prerequisite.formations.get(), dependant.formations.get()),

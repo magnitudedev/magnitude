@@ -335,7 +335,7 @@ fn checked_head_family_includes_chained_and_shaped_classes() {
     assert!(
         classes
             .iter()
-            .any(|class| class.entry_rows > crate::operators::routed::fused_graph::DECODE_ROWS)
+            .any(|class| class.entry_rows > magnitude_kernels::constants::VERIFY_ROWS)
     );
     let family = crate::programs::native_head::checked_head_family_storage(
         BackendName::Cpu,

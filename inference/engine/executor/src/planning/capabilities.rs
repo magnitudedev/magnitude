@@ -4,9 +4,21 @@ pub struct CapabilityPlan {
     pub(super) vision: bool,
 }
 
-/// The most proposals one draft-head transaction chains. Every width up to
-/// the planned maximum has sealed head graphs, so this bounds load work.
-pub const MAX_DRAFT_PROPOSALS: u8 = 8;
+/// The most proposals one round drafts, by any method: its verification
+/// carries them and their anchor in at most `VERIFY_ROWS` rows. Every width up
+/// to the planned maximum has sealed head graphs, so this bounds load work.
+pub const MAX_DRAFT_PROPOSALS: u8 = (magnitude_kernels::constants::VERIFY_ROWS - 1) as u8;
+const _: () = assert!(
+    magnitude_kernels::constants::VERIFY_ROWS >= 2
+        && magnitude_kernels::constants::VERIFY_ROWS - 1 <= u8::MAX as u64,
+    "a verification's proposals (VERIFY_ROWS - 1) are at least one and fit u8"
+);
+
+/// The most tokens a round drafts with `draft`: its block's proposals, up to
+/// what one verification carries beside its anchor ([`MAX_DRAFT_PROPOSALS`]).
+pub fn draft_proposals(draft: &magnitude_family_contracts::DraftDefinition) -> u8 {
+    draft.max_proposals().min(u64::from(MAX_DRAFT_PROPOSALS)) as u8
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlannedMethod {

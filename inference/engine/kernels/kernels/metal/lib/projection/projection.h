@@ -34,12 +34,12 @@
 // the GEMV or GEMM body with that segment's weight and epilogue.
 //
 // Row classes pick the launch:
-// - GEMV (M below the entry's BATCH_FROM; `gemv.h`): lane groups own weight rows, lanes
+// - GEMV (M up to VERIFY_ROWS; `gemv.h`): lane groups own weight rows, lanes
 //   own packets, and each weight is dequantized to F32 once and applied to
 //   every activation row with one F32 FMA. The activations are staged once
 //   per threadgroup in threadgroup memory (A storage). A launch may select
 //   the form over row tiles instead for one or two rows (`gemv_tile_row`).
-// - Batched GEMV (BATCH_FROM <= M <= 16): 8-row weight blocks decoded by the
+// - Batched GEMV (M above VERIFY_ROWS up to 16): 8-row weight blocks decoded by the
 //   lanes straight into F32 matrix fragments, multiplied with the staged F32
 //   activations on the matrix units (the verify shapes of speculative decode).
 // - GEMM (M > 16): TM x TN output tiles over simdgroups of 32 x 32 (16 x 32
@@ -1863,7 +1863,7 @@ inline void gemm_tall_paired(thread const In &in, thread const Out &out, thread 
 }
 
 // ---------------------------------------------------------------------------
-// Batched GEMV on the matrix units (BATCH_FROM <= M <= 16).
+// Batched GEMV on the matrix units (M above VERIFY_ROWS up to 16).
 //
 // C^T = W X^T per block of 8 weight rows, in F32: the A fragment holds 8
 // weight rows by 8 columns, each lane decoding its two values (lane (y, x)

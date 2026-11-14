@@ -4,7 +4,7 @@
 // then resolve and the next two layers' hints (AHEAD 2).
 //   [0, columns_groups)             `routed_select_gemv`'s threadgroups; the
 //                                   last to arrive selects every row, a
-//                                   simdgroup a row (M <= DECODE_ROWS), then
+//                                   simdgroup a row (M <= VERIFY_ROWS), then
 //                                   resolves (`streaming/resolve.hpp`), or,
 //                                   of a whole group's layer
 //                                   (`routed_select_whole`), resolves its
@@ -89,8 +89,8 @@ inline void hint_group(arrive::coherent_device<float> logits, uint lead, device 
         uint simd [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {                   \
         constexpr uint K = SEISMIC_DIM_K;                                                                          \
         const uint rows = uint(SEISMIC_DIM_M);                                                                     \
-        threadgroup float parts[SEISMIC_CONST_DECODE_ROWS * select_simdgroups];                                    \
-        threadgroup float inverses[SEISMIC_CONST_DECODE_ROWS];                                                     \
+        threadgroup float parts[SEISMIC_CONST_VERIFY_ROWS * select_simdgroups];                                    \
+        threadgroup float inverses[SEISMIC_CONST_VERIFY_ROWS];                                                     \
         threadgroup uint last;                                                                                     \
         const element::Out<ELEMENT_OF(SEISMIC_WEIGHTS)> weights(weights_cells);                                    \
         const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> normalized(normalized_cells);                             \

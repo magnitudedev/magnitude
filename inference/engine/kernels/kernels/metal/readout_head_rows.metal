@@ -52,7 +52,7 @@ typedef projection::operands<NVFP4> Operands;
 
 // One row.
 #ifdef SEISMIC_FORMING_READOUT_HEAD_ROWS_GEMV
-template <uint ROWS, uint LANES>
+template <uint LANES, uint ROWS>
 kernel void readout_head_rows_gemv(HEAD_ROWS_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],
@@ -63,9 +63,9 @@ kernel void readout_head_rows_gemv(HEAD_ROWS_ARGUMENTS,
 }
 #endif
 
-// Three rows up to BATCH_FROM: the same GEMV under this launch's mapping.
+// Three rows up to VERIFY_ROWS: the same GEMV under this launch's mapping.
 #ifdef SEISMIC_FORMING_READOUT_HEAD_ROWS_GEMV_ROWS
-template <uint ROWS, uint LANES>
+template <uint LANES, uint ROWS>
 kernel void readout_head_rows_gemv_rows(HEAD_ROWS_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],
@@ -78,7 +78,7 @@ kernel void readout_head_rows_gemv_rows(HEAD_ROWS_ARGUMENTS,
 
 // Two rows: the same GEMV under this launch's mapping.
 #ifdef SEISMIC_FORMING_READOUT_HEAD_ROWS_GEMV_PAIR
-template <uint ROWS, uint LANES>
+template <uint LANES, uint ROWS>
 kernel void readout_head_rows_gemv_pair(HEAD_ROWS_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],

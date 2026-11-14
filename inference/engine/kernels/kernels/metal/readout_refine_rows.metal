@@ -29,7 +29,7 @@ kernel void readout_refine_rows_gather(
     uint simdgroups [[simdgroups_per_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup atomic_uint lowest[PROGRESSIVE_ROWS];
+    threadgroup atomic_uint lowest[SEISMIC_CONST_VERIFY_ROWS];
     threadgroup uint last;
     threadgroup uint4 *stage = reinterpret_cast<threadgroup uint4 *>(shared);
     const progressive::Planes planes{nullptr, 0, bit3, SEISMIC_BIT3_STRIDE_0, nullptr, 0, 0, 0, scales,

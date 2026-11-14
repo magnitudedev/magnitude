@@ -1455,7 +1455,7 @@ impl CpuForm {
     fn key(&self, identity: &seismic::Identity, term: &str) -> PointKey {
         let mut configuration = named(&[
             ("cpu_site", 1),
-            ("rows", magnitude_kernels::constants::DECODE_ROWS),
+            ("rows", magnitude_kernels::constants::VERIFY_ROWS),
             ("choices", self.choices),
             ("experts", self.experts),
             ("hidden", self.record.down.matrix[0]),
@@ -1833,7 +1833,7 @@ mod tests {
             function: 0,
             limit: None,
             flight: 4,
-            widest: 4 * magnitude_kernels::constants::DECODE_ROWS,
+            widest: 4 * magnitude_kernels::constants::VERIFY_ROWS,
         };
         let store = seismic::measure::HeldStore::default();
         assert_eq!(CpuCosts::stored(device.topology(), device.info(), &form, &store).unwrap(), None);

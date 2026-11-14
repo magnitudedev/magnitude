@@ -503,8 +503,7 @@ fn real_12b_physical_f16_projection_operands() {
                 .with_static("WS", 0)
                 .with_param("INT8", 0)
                 .with_param("OPERAND", operand)
-                .with_launch_param(1, "KSPLIT", 4)
-                .with_launch_param(2, "KSPLIT", 4)
+                .with_param("KSPLIT", 4)
                 .with_launch_param(4, "ROTATE", 2),
         )
         .unwrap()
@@ -568,8 +567,7 @@ fn real_12b_physical_f16_projection_operands() {
                     .with_static("WS", 0)
                     .with_param("INT8", 0)
                     .with_param("OPERAND", operand)
-                    .with_launch_param(1, "KSPLIT", 4)
-                    .with_launch_param(2, "KSPLIT", 4)
+                    .with_param("KSPLIT", 4)
                     .with_launch_param(4, "ROTATE", 2),
             )
             .unwrap()

@@ -6,7 +6,7 @@
 // `coefficient`), scratch (`logits`,
 // `arrivals`) and SIMDGROUPS under the same names. The includer defines
 // KERNEL_W0 as the router.
-//   decode_rows: a threadgroup's router input over the decode rows (M <= DECODE_ROWS),
+//   decode_rows: a threadgroup's router input over the decode rows (M <= VERIFY_ROWS),
 //     from RMS inverses of its own in the stage launch's order.
 //   route_group: one router threadgroup of the decode rows. Threadgroup 0
 //     publishes the normalized rows; every threadgroup but the last forms
@@ -148,7 +148,7 @@ constant constexpr uint route_groups = (uint(SEISMIC_DIM_E) + SEISMIC_TUNE_SIMDG
 typedef routing::Rows<Norm, uint(SEISMIC_DIM_PT), (SEISMIC_DIM_NM == 0)> RouteRows;
 
 // The router input of the decode rows in this threadgroup: the rows' RMS
-// inverses (in the stage launch's order) reduced into `inverses` (DECODE_ROWS floats)
+// inverses (in the stage launch's order) reduced into `inverses` (VERIFY_ROWS floats)
 // through `parts` (8 * route_simdgroups floats). Every thread calls it.
 inline RouteRows decode_rows(device const float *residual, device const uchar *norm,
     threadgroup float *parts, threadgroup float *inverses, constant ulong *seismic_words, uint simd, uint lane,

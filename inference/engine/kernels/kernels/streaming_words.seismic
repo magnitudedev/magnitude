@@ -201,9 +201,9 @@ const PULSE_SPINS = 1500000
 #   its routing weight's f32 bits as the combine applies it
 #   (SITE_WEIGHT_BITS). An expert two rows chose is two entries. The CPU
 #   pool answers it.
-# - `site_rows[FLIGHT, DECODE_ROWS, H]` f32, the request's payload too: the
+# - `site_rows[FLIGHT, VERIFY_ROWS, H]` f32, the request's payload too: the
 #   layer's expert input rows, widened to f32 exactly.
-# - `site_output[FLIGHT, DECODE_ROWS, H]` f32, the answer's payload: for
+# - `site_output[FLIGHT, VERIFY_ROWS, H]` f32, the answer's payload: for
 #   each row, the weighted sum over its entries of the CPU's expert outputs.
 # A step with no CPU entry requests nothing and waits for nothing. The
 # combine adds the output on the step's answer, and nothing on its failure

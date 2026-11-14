@@ -1,7 +1,7 @@
 use super::*;
 use super::records::record_bytes;
 use crate::error::{PlanError, UnstreamedExperts};
-use crate::operators::routed::fused_graph::DECODE_ROWS;
+use magnitude_kernels::constants::VERIFY_ROWS;
 use crate::planning::ModelLoadPlan;
 use crate::planning::weights::{Holding, representation_bytes};
 use magnitude_family_contracts::{ImportTransform, ModelDefinition, Operator};
@@ -197,8 +197,8 @@ fn beside(plan: ExpertBankPlan, host: HostTier) -> ExpertBankPlan {
 /// across a link no step takes a bank record, so each group holds one
 /// record and the floor is no slot; on
 /// unified memory each group holds one decode launch's distinct experts
-/// (`DECODE_ROWS · K`, at most a layer's experts) beside the landing
-/// reserve (`DECODE_ROWS · K + 2K`), and the floor is the most slots
+/// (`VERIFY_ROWS · K`, at most a layer's experts) beside the landing
+/// reserve (`VERIFY_ROWS · K + 2K`), and the floor is the most slots
 /// within them. A group commits its least records at every slots up to
 /// the floor, its record regions so committed, and no other group more
 /// for it.
@@ -206,7 +206,7 @@ fn beside(plan: ExpertBankPlan, host: HostTier) -> ExpertBankPlan {
 fn the_minimum_is_what_progress_holds_at_once() {
     let linked = beside(bank(&[37, 3], 0), HostTier::Linked);
     let unified = beside(bank(&[37, 3], 1), HostTier::Unified(Parking::InKernels));
-    let request = (DECODE_ROWS * 8).min(256);
+    let request = (VERIFY_ROWS * 8).min(256);
     // The tier's reserve: the reads ahead's, a record per hint staging
     // record (a demand reclaims at its park).
     let reserve = 2 * 8;
@@ -453,7 +453,7 @@ fn a_host_tier_holds_each_groups_records_in_their_resident_form() {
     let site = |layer: usize| {
         let binding = plan.binding(layer).unwrap();
         let (table, hidden) = (binding.words.site(), binding.record.down.matrix[0]);
-        table.words() + table.slots() * 2 * constants::DECODE_ROWS * hidden
+        table.words() + table.slots() * 2 * VERIFY_ROWS * hidden
     };
     let words = plan.layers().iter().map(|layer| layer.experts).sum::<u64>() + (0..plan.layers().len()).map(site).sum::<u64>();
     // The conveyor and the scratch lie in their lenders' lent records,
@@ -493,14 +493,14 @@ fn a_host_tier_holds_each_groups_records_in_their_resident_form() {
 /// in its kernels, whose DONE frees each record as its entry converts, and
 /// the widest request's distinct misses where it parks at submission
 /// boundaries, whose DONE the host sees only past the request's own park:
-/// 64 of `DECODE_ROWS · 8` on layers of 256 experts. Every layer has its
+/// 64 of `VERIFY_ROWS · 8` on layers of 256 experts. Every layer has its
 /// own landing list and each round's, of a request's choices and a round's
 /// records.
 #[test]
 fn the_demand_reserve_follows_where_the_device_parks() {
     let parked = |parking| beside(bank(&[37, 3], 1), HostTier::Unified(parking));
     let (kernels, boundaries) = (parked(Parking::InKernels), parked(Parking::AtBoundaries));
-    assert_eq!((kernels.demand_records(), boundaries.demand_records()), (8, (DECODE_ROWS * 8).min(256)));
+    assert_eq!((kernels.demand_records(), boundaries.demand_records()), (8, (VERIFY_ROWS * 8).min(256)));
     assert_eq!(beside(bank(&[37, 3], 0), HostTier::Linked).demand_records(), 8);
     let words = |(_, extents): (seismic::Element, Vec<u64>)| extents.iter().product::<u64>();
     for layer in [0, 39] {

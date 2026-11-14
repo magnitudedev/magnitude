@@ -1,6 +1,6 @@
 // Routing for M rows; the CUDA form of `metal/routed_route.metal`, in
-// four launches: `routed_route_stage` (M > DECODE_ROWS, one block per row) publishes
-// the normalized rows once; `routed_route_gemv` (M <= DECODE_ROWS, one warp per
+// four launches: `routed_route_stage` (M > VERIFY_ROWS, one block per row) publishes
+// the normalized rows once; `routed_route_gemv` (M <= VERIFY_ROWS, one warp per
 // logit column, normalizing on the fly and publishing the normalized rows,
 // `lib/routed/route.cuh`) or `routed_route_gemm` (32 rows x 32 columns x
 // one hidden share of SPLIT per block over shared tiles) forms the
@@ -47,17 +47,17 @@ extern "C" __global__ void routed_route_stage(SEISMIC_KERNEL_PARAMS) {
             in.value(row, source, inverse, seismic_words_value));
 }
 
-// The router logits scratch is SPLIT planes [M, E + 1]: the GEMV (M <= DECODE_ROWS)
-// writes plane 0 whole; the GEMM (M > DECODE_ROWS) writes plane p with the hidden
+// The router logits scratch is SPLIT planes [M, E + 1]: the GEMV (M <= VERIFY_ROWS)
+// writes plane 0 whole; the GEMM (M > VERIFY_ROWS) writes plane p with the hidden
 // share p of SPLIT, and the selection sums the planes in order.
 
-// M <= DECODE_ROWS, one launch of router blocks (`route::route_block`): the block
+// M <= VERIFY_ROWS, one launch of router blocks (`route::route_block`): the block
 // computes its rows' RMS inverses (in the normalize launch's order), then
 // each warp forms one logit column; block 0 publishes the normalized rows;
 // the last block to arrive selects.
 extern "C" __global__ void routed_route_gemv(SEISMIC_KERNEL_PARAMS) {
-    __shared__ float parts[SEISMIC_CONST_DECODE_ROWS][route::WARPS];
-    __shared__ float inverses[SEISMIC_CONST_DECODE_ROWS];
+    __shared__ float parts[SEISMIC_CONST_VERIFY_ROWS][route::WARPS];
+    __shared__ float inverses[SEISMIC_CONST_VERIFY_ROWS];
     __shared__ unsigned last;
     route::route_block(ROUTE_INPUT, route::FormRows{}, ROUTE_COLUMNS, ROUTE_SELECTION,
         SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1,
@@ -155,7 +155,7 @@ extern "C" __global__ void routed_route_gemm(SEISMIC_KERNEL_PARAMS) {
     }
 }
 
-// M > DECODE_ROWS: the selection after the GEMM, each logit the sum of its SPLIT
+// M > VERIFY_ROWS: the selection after the GEMM, each logit the sum of its SPLIT
 // partial planes in plane order (L2 reads: other blocks wrote them).
 extern "C" __global__ void routed_route_select(SEISMIC_KERNEL_PARAMS) {
     seismic_dependency_start();

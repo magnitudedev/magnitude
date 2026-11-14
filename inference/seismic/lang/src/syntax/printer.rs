@@ -189,6 +189,16 @@ impl Printer {
             self.list(&launch.reads, |p, name| p.out.push_str(&name.name));
             self.out.push_str(")\n");
         }
+        if let Some(alike) = &launch.alike {
+            self.indent();
+            self.out.push_str("alike (");
+            self.out.push_str(&alike.name);
+            self.out.push_str(")\n");
+        }
+        if launch.staging {
+            self.indent();
+            self.out.push_str("staging\n");
+        }
         if let Some(records) = &launch.records {
             self.records(records);
         }

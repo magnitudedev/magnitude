@@ -1,5 +1,5 @@
 // The decode output projections of Qwen's fused routed feed-forward (M <=
-// DECODE_ROWS), shared by `routed_output` and `routed_output_project`: threadgroup (x, m)
+// VERIFY_ROWS), shared by `routed_output` and `routed_output_project`: threadgroup (x, m)
 // owns the TILE output channels of tile x for row m and runs K + 1
 // simdgroups side by side: simdgroup k < K projects choice k through its
 // expert's down rows, simdgroup K the shared

@@ -1,4 +1,4 @@
-// Decode expansion of gated experts (M <= DECODE_ROWS): threadgroup row y = choice
+// Decode expansion of gated experts (M <= VERIFY_ROWS): threadgroup row y = choice
 // (m, k), a K1 paired GEMV over the feature tile `x` of expert routes[m, k]'s
 // gate and up rows (its record, `routed::decode_source`: a bank record, or a
 // host tier record read in place; a resident layer's, its experts' records)

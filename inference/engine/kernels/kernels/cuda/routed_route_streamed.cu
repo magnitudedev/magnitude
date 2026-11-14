@@ -101,7 +101,7 @@ __device__ __forceinline__ void hint_block(const Ports &ports, unsigned lead, un
                                            float (*parts)[route::WARPS], float *inverses, unsigned *last,
                                            projection::u8 *memory, const seismic_words_t &seismic_words_value) {
     constexpr unsigned K = SEISMIC_DIM_K;
-    __shared__ int words[STREAMING_HINT_WORDS(SEISMIC_CONST_DECODE_ROWS)];
+    __shared__ int words[STREAMING_HINT_WORDS(SEISMIC_CONST_VERIFY_ROWS)];
     // The lead's ports, selected rather than indexed: an index the compiler
     // cannot resolve would place the whole `Ports` in local memory.
     const route::Input next = lead == 0 ? ports.ahead[0] : ports.ahead[1];
@@ -138,8 +138,8 @@ __device__ __forceinline__ void hint_block(const Ports &ports, unsigned lead, un
 template <bool HINTS, bool WHOLE>
 __device__ __forceinline__ void route_streamed(const Ports &ports, projection::u8 *memory,
                                                const seismic_words_t &seismic_words_value) {
-    __shared__ float parts[SEISMIC_CONST_DECODE_ROWS][route::WARPS];
-    __shared__ float inverses[SEISMIC_CONST_DECODE_ROWS];
+    __shared__ float parts[SEISMIC_CONST_VERIFY_ROWS][route::WARPS];
+    __shared__ float inverses[SEISMIC_CONST_VERIFY_ROWS];
     __shared__ unsigned last;
     const unsigned predicting = HINTS ? static_cast<unsigned>(SEISMIC_DIM_AHEAD) * PREDICT_BLOCKS : 0u;
     const unsigned group = blockIdx.x;
@@ -153,7 +153,7 @@ __device__ __forceinline__ void route_streamed(const Ports &ports, projection::u
             memory, group - route::BLOCKS - predicting, seismic_words_value);
         return;
     }
-    __shared__ int resolved[STREAMING_RESOLVE_WORDS(SEISMIC_CONST_DECODE_ROWS * SEISMIC_DIM_K)];
+    __shared__ int resolved[STREAMING_RESOLVE_WORDS(SEISMIC_CONST_VERIFY_ROWS * SEISMIC_DIM_K)];
     if (!route::route_block(ports.in, route::StageRows{memory}, ports.columns, ports.selection, ports.normalized,
             SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, ports.logits, ports.arrivals, group, parts,
             inverses, &last, seismic_words_value))

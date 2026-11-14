@@ -1,5 +1,5 @@
 // The decode down projections of the general routed feed-forward (M <=
-// DECODE_ROWS), shared by `routed_down` and `routed_down_project`; the CUDA
+// VERIFY_ROWS), shared by `routed_down` and `routed_down_project`; the CUDA
 // form of `metal/lib/routed/down.h`. The choices' down projections run in
 // parallel (block (x, m K + k) owns the output channels of tile group x for
 // choice k of row m) and publish each projection in A through
@@ -104,10 +104,10 @@ __global__ void routed_down_gathered(SEISMIC_KERNEL_PARAMS) {
     const unsigned choice = blockIdx.y, slots = (unsigned)SEISMIC_DIM_K;
     if (!routed::first_choice(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1, slots, choice))
         return;
-    __shared__ projection::u64 rows_at[SEISMIC_CONST_DECODE_ROWS], slots_at[SEISMIC_CONST_DECODE_ROWS];
+    __shared__ projection::u64 rows_at[SEISMIC_CONST_VERIFY_ROWS], slots_at[SEISMIC_CONST_VERIFY_ROWS];
     __shared__ unsigned count;
     if (threadIdx.x == 0) {
-        projection::u32 chosen[SEISMIC_CONST_DECODE_ROWS];
+        projection::u32 chosen[SEISMIC_CONST_VERIFY_ROWS];
         count = routed::expert_choices(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1,
                                        (unsigned)SEISMIC_DIM_M, slots, choice, chosen);
         for (unsigned r = 0; r < count; ++r) {

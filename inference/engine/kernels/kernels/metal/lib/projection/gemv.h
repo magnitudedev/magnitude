@@ -1,5 +1,5 @@
-// The GEMV row classes of the packed projection family (M <= 16 activation
-// rows, below an entry's BATCH_FROM): the GEMV over lane groups, its walk by
+// The GEMV row classes of the packed projection family (activation rows up
+// to VERIFY_ROWS): the GEMV over lane groups, its walk by
 // packet class and its form over row tiles (`projection.h` describes the
 // family, its row classes and the in-threadgroup prologue they share with the
 // batched GEMV).
@@ -527,8 +527,10 @@ inline void gemv_form(thread const In &in, thread const Out &out, thread const W
 }
 
 // ---------------------------------------------------------------------------
-// The GEMV over row tiles (`rows32` weights, M up to `gemv_tile_rows`): a
-// form of its own, selected by the launch.
+// The GEMV over row tiles (`rows32` weights): a form of its own, selected
+// by the launch. A native's GEMV launches of every row class take it
+// together, under the one TILED they all read, so a row is computed in one
+// form whichever class serves it.
 //
 // A thread owns one weight row. The threadgroup keeps the row mapping's
 // SG * R * 32 / LANES weight rows, so a row has LANES / R threads, thread
@@ -554,10 +556,6 @@ inline void gemv_form(thread const In &in, thread const Out &out, thread const W
 // thread and tensor: a launch of SG simdgroups declares
 //   shared_bytes (max(<the GEMV staging above>, SG * 128))
 // (SG * 256 for a paired GEMV).
-
-// Activation rows the form serves. From 3 rows up it loses to the row
-// mapping on q4k and q8 (M6: 136 against 119 µs at 3 rows, both tuned).
-constant constexpr uint gemv_tile_rows = 2;
 
 // A row's packets split into `ranges` contiguous ranges: range s holds the
 // `length(s)` packets from `start(s)`.
@@ -768,18 +766,11 @@ inline void gemv_tile_row(thread const In &in, thread const Out &out, thread con
     }
 }
 
-// Whether a GEMV of `m_rows` activation rows over `w` takes the tile form.
+// Whether a GEMV over `w` takes the tile form.
 template <typename W>
-inline bool gemv_tile_row_serves(thread const Weights<W> &w, uint m_rows) {
-    return w.tile() > 1u && m_rows <= gemv_tile_rows;
+inline bool gemv_tile_row_serves(thread const Weights<W> &w) {
+    return w.tile() > 1u;
 }
-
-// Instantiate the tile form for the activation-row bound MAXM in {1, 2}.
-#define PROJECTION_FOR_TILE_ROWS(rows, ...)                                     \
-    do {                                                                        \
-        if ((rows) <= 1) { constexpr uint MAXM = 1; __VA_ARGS__; }              \
-        else { constexpr uint MAXM = 2; __VA_ARGS__; }                          \
-    } while (0)
 
 // Instantiate a GEMV body for the activation-row bound MAXM in {1, 2, 4, 8}.
 #define PROJECTION_FOR_ROWS(rows, ...)                                          \
@@ -791,7 +782,7 @@ inline bool gemv_tile_row_serves(thread const Weights<W> &w, uint m_rows) {
     } while (0)
 
 // The same in the launches of an entry that launches its GEMV per row count,
-// one for one activation row, one for two and one for three up to BATCH_FROM
+// one for one activation row, one for two and one for three up to VERIFY_ROWS
 // (at most 8): each instantiates only the bounds it runs. A kernel holds the
 // registers of every bound it instantiates, and a kernel that also holds a
 // wider body's runs slower for bounds it never takes (on the M1 10% at one
@@ -800,16 +791,13 @@ inline bool gemv_tile_row_serves(thread const Weights<W> &w, uint m_rows) {
 // its launch's count, PROJECTION_FOR_<count>_ROWS.
 #define PROJECTION_FOR_ONE_ROWS(rows, ...)                                      \
     do { constexpr uint MAXM = 1; __VA_ARGS__; } while (0)
-#define PROJECTION_FOR_ONE_TILE_ROWS(rows, ...) PROJECTION_FOR_ONE_ROWS(rows, __VA_ARGS__)
 #define PROJECTION_FOR_PAIR_ROWS(rows, ...)                                     \
     do { constexpr uint MAXM = 2; __VA_ARGS__; } while (0)
-#define PROJECTION_FOR_PAIR_TILE_ROWS(rows, ...) PROJECTION_FOR_PAIR_ROWS(rows, __VA_ARGS__)
+static_assert(SEISMIC_CONST_VERIFY_ROWS <= 8, "the GEMV bodies serve at most 8 rows");
 #define PROJECTION_FOR_SEVERAL_ROWS(rows, ...)                                  \
     do {                                                                        \
         if ((rows) <= 4) { constexpr uint MAXM = 4; __VA_ARGS__; }              \
         else { constexpr uint MAXM = 8; __VA_ARGS__; }                          \
     } while (0)
-#define PROJECTION_FOR_SEVERAL_TILE_ROWS(rows, ...)                             \
-    do { constexpr uint MAXM = 2; __VA_ARGS__; } while (0)
 
 } // namespace projection

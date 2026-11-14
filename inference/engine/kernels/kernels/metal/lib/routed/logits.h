@@ -1,4 +1,4 @@
-// The router logits of the prefill classes (M > DECODE_ROWS), for `routed_route` and
+// The router logits of the prefill classes (M > VERIFY_ROWS), for `routed_route` and
 // `routed_select`: one threadgroup of four simdgroups forms a 64 x 32 tile of
 // logits[row, column] = sum over k of input[row, k] * column[k], on 8x8 F32
 // simdgroup matrices. Every logit is one accumulator's chain of

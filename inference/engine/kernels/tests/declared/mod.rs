@@ -62,3 +62,28 @@ pub fn declared_at<E: seismic::Entry>(
         &pinned,
     )
 }
+
+/// The decode row classes of `native`: its `alike` launches, each with the
+/// launch it computes each row as alone (`alike (LAUNCH)`), whose reduction
+/// orders the checker holds both to read alike (`derive_codes`), so a row's
+/// bits do not depend on how many rows its call carries. Pairs are
+/// `(launch, reference launch)` ordinals, in launch order.
+#[allow(dead_code)]
+pub fn row_classes(native: &seismic::NativeImplementation) -> Vec<(usize, usize)> {
+    native
+        .launches
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, launch)| launch.alike.map(|alone| (ordinal, alone)))
+        .collect()
+}
+
+/// Every launch of the decode row classes of `native`: the `alike` launches
+/// ([`row_classes`]) and the launches they name, in launch order.
+#[allow(dead_code)]
+pub fn row_launches(native: &seismic::NativeImplementation) -> Vec<usize> {
+    let classes = row_classes(native);
+    (0..native.launches.len())
+        .filter(|ordinal| classes.iter().any(|(alike, alone)| alike == ordinal || alone == ordinal))
+        .collect()
+}

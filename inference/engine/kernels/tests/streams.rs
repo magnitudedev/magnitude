@@ -38,8 +38,8 @@ fn module() -> CheckedModule {
         path: "streams.seismic".into(),
         text: include_str!("../kernels/streams.seismic").into(),
     });
-    // The Sinkhorn sites split at `DECODE_ROWS`, which `routed.seismic`
-    // declares, beside the words it reads.
+    // The routed declarations beside the words they read; the sites split at
+    // `VERIFY_ROWS`, which `common::check` brings (`verify_rows.seismic`).
     sources.push(SourceFile {
         path: "routed.seismic".into(),
         text: include_str!("../kernels/routed.seismic").into(),

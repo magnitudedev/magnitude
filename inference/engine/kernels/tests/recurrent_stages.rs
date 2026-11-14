@@ -2273,7 +2273,6 @@ impl ProjectionInputs {
 /// One projection mapping of the GEMV and batched GEMV launches.
 #[derive(Clone, Copy, Debug)]
 struct ProjectionMapping {
-    batch_from: u64,
     simdgroups: u64,
     rows: u64,
     lanes: u64,
@@ -2440,7 +2439,6 @@ fn convolved_step_form_gives_the_step_bits() {
     ];
     let mappings = [
         ProjectionMapping {
-            batch_from: 5,
             simdgroups: 16,
             rows: 1,
             lanes: 16,
@@ -2448,7 +2446,6 @@ fn convolved_step_form_gives_the_step_bits() {
             batch_rows: 2,
         },
         ProjectionMapping {
-            batch_from: 3,
             simdgroups: 4,
             rows: 4,
             lanes: 32,
@@ -2456,7 +2453,6 @@ fn convolved_step_form_gives_the_step_bits() {
             batch_rows: 1,
         },
         ProjectionMapping {
-            batch_from: 9,
             simdgroups: 2,
             rows: 2,
             lanes: 16,
@@ -2517,7 +2513,6 @@ fn step_form(
         .with_static("ZB", 0)
         .with_static("PT", 1)
         .with_static("NM", hidden as u64)
-        .with_param("BATCH_FROM", mapping.batch_from)
         .with_param("TALL", 0)
         .with_param("PACK", 0)
         .with_param("RESIDUE", 1)
@@ -2589,8 +2584,9 @@ fn convolved_form(
     use magnitude_kernels::{gated_delta_project_convolved, gated_delta_step_convolved};
     let g = case.geometry;
     // Launches: normalize, gemv (one row), batch, gemv_rows (three rows up to
-    // BATCH_FROM), gemv_pair (two rows). Every GEMV launch takes the mapping, as `gated_delta_project`'s one
-    // GEMV launch does for every row count.
+    // VERIFY_ROWS), gemv_pair (two rows). Every GEMV launch takes the
+    // mapping, as `gated_delta_project`'s one GEMV launch does for every row
+    // count.
     let specialization = NativeSpecialization::new()
         .with_static("H", hidden as u64)
         .with_static("NK", g.key_heads as u64)
@@ -2599,10 +2595,9 @@ fn convolved_form(
         .with_static("C", g.convolution as u64)
         .with_static("PT", 1)
         .with_static("NM", hidden as u64)
-        .with_param("BATCH_FROM", mapping.batch_from)
+        .with_param("LANES", mapping.lanes)
         .with_launch_param(1, "SIMDGROUPS", mapping.simdgroups)
         .with_launch_param(1, "ROWS", mapping.rows)
-        .with_launch_param(1, "LANES", mapping.lanes)
         .with_launch_param(2, "BATCH_SIMDGROUPS", mapping.batch_simdgroups)
         .with_launch_param(2, "BATCH_ROWS", mapping.batch_rows)
         .with_launch_param(2, "BATCH_PARTS", 2)
@@ -2610,10 +2605,8 @@ fn convolved_form(
         .with_launch_param(2, "MATRIX", 0)
         .with_launch_param(3, "SIMDGROUPS", mapping.simdgroups)
         .with_launch_param(3, "ROWS", mapping.rows)
-        .with_launch_param(3, "LANES", mapping.lanes)
         .with_launch_param(4, "SIMDGROUPS", mapping.simdgroups)
-        .with_launch_param(4, "ROWS", mapping.rows)
-        .with_launch_param(4, "LANES", mapping.lanes);
+        .with_launch_param(4, "ROWS", mapping.rows);
     let mut t = case.tensors(device, Element::bf16());
     let projected = gated_delta_project_convolved::native_for_device_with(
         device,
@@ -2727,7 +2720,6 @@ fn convolved_batch_fallback_keeps_state_bits() {
     )
     .with_bf16_activations();
     let mapping = ProjectionMapping {
-        batch_from: 3,
         simdgroups: 8,
         rows: 2,
         lanes: 16,

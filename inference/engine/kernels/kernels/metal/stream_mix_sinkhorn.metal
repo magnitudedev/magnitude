@@ -8,7 +8,7 @@
 // forms pre, post and the Sinkhorn comb (`stream_mix_sinkhorn_finish`), and
 // under P = 0 mixes the row's input by that pre, which nothing carries. The
 // launch boundary orders every partial before its sum.
-// Decode rows (M <= DECODE_ROWS, `stream_mix_sinkhorn_split`) take a tile of
+// Decode rows (M <= VERIFY_ROWS, `stream_mix_sinkhorn_split`) take a tile of
 // one row, all eight simdgroups over its columns, reading the function
 // matrix straight from device memory: a row's function matrix streams
 // through many cores. Prefill rows (`stream_mix_sinkhorn_tiles`) take tiles

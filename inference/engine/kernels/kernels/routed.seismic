@@ -31,13 +31,6 @@
 # activation dtype) before it is weighted; weighted choices accumulate in
 # slot order, then the shared expert, then the residual.
 
-# The decode row bound: the largest row class the routed decode forms (the
-# route and select GEMVs, the expansion and output, the bank-served
-# streamed decode) serve, and the decode rows their natives size their
-# per-row memory by. The executor's decode classes are the classes up to it
-# (`constants::DECODE_ROWS`).
-const DECODE_ROWS = 8
-
 fn routed_route[M, H, PT, NM, E, K, ES](residual: &tensor[M, PT * H] f32, norm: &tensor[NM] NW,
     router: &tensor[E, H] RW, shared_router: &tensor[H] f32,
     routes: &mut tensor[M, K] i32, scores: &mut tensor[M, K] f32,
@@ -61,7 +54,7 @@ fn routed_route[M, H, PT, NM, E, K, ES](residual: &tensor[M, PT * H] f32, norm: 
         coefficient[row] = 1.0 / (1.0 + exp(-gate))
     return (normalized, coefficient)
 
-# Both backends: rows <= DECODE_ROWS form the router logits as a GEMV (one simdgroup or
+# Both backends: rows <= VERIFY_ROWS form the router logits as a GEMV (one simdgroup or
 # warp per logit column); larger classes normalize once per row (`stage`),
 # then a tiled GEMM (Metal 64 x 32, CUDA 32 x 32; edge tiles guarded);
 # selection with one
@@ -74,7 +67,7 @@ fn routed_route[M, H, PT, NM, E, K, ES](residual: &tensor[M, PT * H] f32, norm: 
 # plus one threadgroup for the shared-expert gate row; F32 activations,
 # which the GEMV body does not stage, run one simdgroup per column that
 # normalizes on the fly, in the same sum order. The last GEMV threadgroup to
-# arrive (`arrivals`, sync scratch) selects every row, so rows <= DECODE_ROWS route in
+# arrive (`arrivals`, sync scratch) selects every row, so rows <= VERIFY_ROWS route in
 # one launch. The GEMM forms 64 x 32 tiles on 8x8 F32 simdgroup matrices
 # (128 threads, `metal/lib/routed/logits.h`).
 # (CUDA: the GEMV normalizes on the fly; scalar FMAs over shared tiles, 256
@@ -85,21 +78,22 @@ native routed_route for metal from "metal/routed_route.metal":
     where H % 32 == 0 and E <= 1024
     scratch logits bytes (M * (E + 1) * 4)
     scratch arrivals bytes (4) sync
-    launch routed_route_stage when M > DECODE_ROWS:
+    launch routed_route_stage when M > VERIFY_ROWS:
+        staging
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch routed_route_gemv when M <= DECODE_ROWS:
+    launch routed_route_gemv when M <= VERIFY_ROWS:
         threadgroups (ceil_div(E, SIMDGROUPS) + 1, 1, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (min(ceil_div(H, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
-    launch routed_route_gemm when M > DECODE_ROWS:
+    launch routed_route_gemm when M > VERIFY_ROWS:
         threadgroups (ceil_div(E + 1, 32), ceil_div(M, 64), 1)
         threads_per_threadgroup (128, 1, 1)
-    launch routed_route_select when M > DECODE_ROWS:
+    launch routed_route_select when M > VERIFY_ROWS:
         threadgroups (ceil_div(M, 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
-# CUDA: decode rows (M <= DECODE_ROWS) form the logits in one GEMV launch whose last
+# CUDA: decode rows (M <= VERIFY_ROWS) form the logits in one GEMV launch whose last
 # block to arrive selects. Larger classes run the GEMM: scalar FMAs over
 # 32 x 32 shared tiles (256 threads), split over the hidden axis into SPLIT
 # partial planes that the selection launch sums in order (SPLIT changes the
@@ -111,21 +105,22 @@ native routed_route for cuda from "cuda/routed_route.cu":
     where H % 32 == 0 and E <= 1024
     scratch logits bytes (SPLIT * M * (E + 1) * 4)
     scratch arrivals bytes (4) sync
-    launch routed_route_stage when M > DECODE_ROWS:
+    launch routed_route_stage when M > VERIFY_ROWS:
+        staging
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch routed_route_gemv when M <= DECODE_ROWS:
+    launch routed_route_gemv when M <= VERIFY_ROWS:
         threadgroups (ceil_div(E + 1, SIMDGROUPS), 1, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-    launch routed_route_gemm when M > DECODE_ROWS:
+    launch routed_route_gemm when M > VERIFY_ROWS:
         threadgroups (ceil_div(E + 1, 32), ceil_div(M, 32), SPLIT)
         threads_per_threadgroup (256, 1, 1)
-    launch routed_route_select when M > DECODE_ROWS:
+    launch routed_route_select when M > VERIFY_ROWS:
         threadgroups (ceil_div(M, 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
 # Vulkan: the Metal form over `vulkan/common/{projection,routed}.glsl`. Rows
-# <= DECODE_ROWS form the router logits as a GEMV (one subgroup per logit column,
+# <= VERIFY_ROWS form the router logits as a GEMV (one subgroup per logit column,
 # normalizing in the workgroup, workgroup 0 publishing the normalized rows);
 # larger classes stage the normalized rows once, then a 32 x 32 F32 tile
 # GEMM; selection with one subgroup per row. SIMDGROUPS never changes bits.
@@ -134,15 +129,16 @@ native routed_route for vulkan from "vulkan/routed_route.comp":
     params (SIMDGROUPS in [8, 4, 2] default 8)
     where H % 32 == 0 and E <= 1024
     scratch logits bytes (M * (E + 1) * 4)
-    launch routed_route_stage when M > DECODE_ROWS:
+    launch routed_route_stage when M > VERIFY_ROWS:
+        staging
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (32)
-    launch routed_route_gemv when M <= DECODE_ROWS:
+    launch routed_route_gemv when M <= VERIFY_ROWS:
         threadgroups (ceil_div(E + 1, SIMDGROUPS), 1, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (4 * DECODE_ROWS * (8 + 1))
-    launch routed_route_gemm when M > DECODE_ROWS:
+        shared_bytes (4 * VERIFY_ROWS * (8 + 1))
+    launch routed_route_gemm when M > VERIFY_ROWS:
         threadgroups (ceil_div(E + 1, 32), ceil_div(M, 32), 1)
         threads_per_threadgroup (128, 1, 1)
         shared_bytes (9216)
@@ -159,6 +155,7 @@ native routed_route for cpu from "cpu/routed_route.rs":
     scratch normalized bytes (M * H * 4)
     scratch logits bytes (M * E * 4)
     launch routed_route_normalize:
+        staging
         threadgroups (M, 1, 1)
         threads_per_threadgroup (1, 1, 1)
         shared_bytes (H * 4)
@@ -171,7 +168,7 @@ native routed_route for cpu from "cpu/routed_route.rs":
         shared_bytes (E * 8)
 
 
-# Decode routing with the shared expert's expansion (M <= DECODE_ROWS): `routed_route`,
+# Decode routing with the shared expert's expansion (M <= VERIFY_ROWS): `routed_route`,
 # then the shared half of `routed_expand` over the normalized rows. The
 # shared expert does not depend on the routes, so a backend that declares
 # this entry expands it in the router's launch and the choices alone with
@@ -237,7 +234,7 @@ native routed_route_shared for cuda from "cuda/routed_route_shared.cu":
         shared_bytes (M * H * 2)
 
 
-# Decode expansion (M <= DECODE_ROWS): each choice's expert gate/up and the shared
+# Decode expansion (M <= VERIFY_ROWS): each choice's expert gate/up and the shared
 # expert's gate/up, each the SiLU `glu`; the choices' accumulators carry
 # their experts' `gate_scale` and `up_scale`.
 fn routed_expand[M, H, E, K, F, S, GS, US](normalized: &tensor[M, H] A,
@@ -321,6 +318,7 @@ native routed_expand for cuda from "cuda/routed_expand.cu":
     where H % 64 == 0
     scratch operands bytes (M * H * 2) when operands(EGW) + operands(SGW) > 0
     launch routed_expand_stage when operands(EGW) + operands(SGW) > 0:
+        staging
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch routed_expand when M == 1:
@@ -329,6 +327,7 @@ native routed_expand for cuda from "cuda/routed_expand.cu":
         threads_per_threadgroup (128, 1, 1)
     launch routed_expand_gathered when M > 1:
         reads (TPW, KSPLIT)
+        alike (routed_expand)
         threadgroups (ceil_div(ceil_div(ceil_div(max(F, S), 16), TPW), 4 / KSPLIT), M * K + 1, 1)
         threads_per_threadgroup (128, 1, 1)
 
@@ -347,14 +346,17 @@ native routed_expand for vulkan from "vulkan/routed_expand.comp":
         threads_per_threadgroup (GEMV_THREADS, 1, 1)
         shared_bytes (GEMV_SHARED)
     launch routed_expand2 when M == 2:
+        alike (routed_expand1)
         threadgroups (GEMV_GROUPS, GEMV_GROUPS_Y, 1)
         threads_per_threadgroup (GEMV_THREADS, 1, 1)
         shared_bytes (GEMV_SHARED)
     launch routed_expand4 when M >= 3 and M <= 4:
+        alike (routed_expand1)
         threadgroups (GEMV_GROUPS, GEMV_GROUPS_Y, 1)
         threads_per_threadgroup (GEMV_THREADS, 1, 1)
         shared_bytes (GEMV_SHARED)
-    launch routed_expand8 when M >= 5:
+    launch routed_expand8 when M >= 5 and M <= VERIFY_ROWS:
+        alike (routed_expand1)
         threadgroups (GEMV_GROUPS, GEMV_GROUPS_Y, 1)
         threads_per_threadgroup (GEMV_THREADS, 1, 1)
         shared_bytes (GEMV_SHARED)
@@ -370,6 +372,7 @@ native routed_expand for cpu from "cpu/routed_expand.rs":
     scratch staged bytes (M * H * 4)
     scratch operands bytes (M * H * 4) when operands(EGW) + operands(SGW) > 0
     launch routed_expand_stage:
+        staging
         threadgroups (M, 1, 1)
         threads_per_threadgroup (1, 1, 1)
     launch routed_expand_rows:
@@ -377,7 +380,7 @@ native routed_expand for cpu from "cpu/routed_expand.rs":
         threads_per_threadgroup (1, 1, 1)
 
 
-# Decode output (M <= DECODE_ROWS): each choice's down projection, published in A,
+# Decode output (M <= VERIFY_ROWS): each choice's down projection, published in A,
 # weighted by its score in slot order; then the shared expert's down
 # projection times its coefficient; then the residual. Each choice's down
 # weights are read where `decode_source` names.
@@ -392,7 +395,7 @@ fn routed_output[M, H, SN, IN, E, K, F, S, XS, TR](residual: &tensor[M, SN * H] 
     let mut published = tensor[M, K + 1, H] A
     decode_output_published(expert_product, shared_product, routes, sources, expert_down, tier_down, shared_down,
         published)
-    let unanswered = tensor[0, DECODE_ROWS, H] f32
+    let unanswered = tensor[0, VERIFY_ROWS, H] f32
     decode_output_join(residual, inject, published, scores, coefficient, unanswered, 0, false, value)
     return value
 
@@ -483,6 +486,7 @@ native routed_output for cuda from "cuda/routed_output.cu":
     scratch expert_operands bytes (M * K * F * 2) when operands(EDW) == 1
     scratch shared_operands bytes (M * S * 2) when operands(SDW) == 1
     launch routed_output_stage when operands(EDW) + operands(SDW) > 0:
+        staging
         threadgroups (M * (K + 1), 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch routed_output when M == 1:
@@ -491,6 +495,7 @@ native routed_output for cuda from "cuda/routed_output.cu":
         threads_per_threadgroup (128, 1, 1)
     launch routed_output_gathered when M > 1:
         reads (TPW, KSPLIT)
+        alike (routed_output)
         threadgroups (ceil_div(ceil_div(ceil_div(H, 16), TPW), 4 / KSPLIT), M * (K + 1), 1)
         threads_per_threadgroup (128, 1, 1)
 
@@ -523,6 +528,7 @@ native routed_output for cpu from "cpu/routed_output.rs":
     scratch expert bytes (M * K * F * 4)
     scratch shared bytes (M * S * 4)
     launch routed_output_stage:
+        staging
         threadgroups (M, 1, 1)
         threads_per_threadgroup (1, 1, 1)
     launch routed_output_rows:
@@ -729,6 +735,7 @@ native routed_experts for metal from "metal/routed_experts.metal":
         threadgroups (1, 1, 1)
         threads_per_threadgroup (1, 1, 1)
     launch routed_experts_stage when operands(EGW) + operands(EUW) > 0:
+        staging
         threadgroups (M, 1, 1)
         grid (stage_grid)
         threads_per_threadgroup (256, 1, 1)
@@ -763,6 +770,7 @@ native routed_experts for cuda from "cuda/routed_experts.cu":
         threads_per_threadgroup (1, 1, 1)
     launch routed_experts_stage when OPERAND == 1 or operands(EGW) + operands(EUW) > 0:
         reads (OPERAND)
+        staging
         threadgroups (M, 1, 1)
         grid (stage_grid)
         threads_per_threadgroup (256, 1, 1)
@@ -802,6 +810,7 @@ native routed_experts for vulkan from "vulkan/routed_experts.comp":
         threadgroups (1, 1, 1)
         threads_per_threadgroup (1, 1, 1)
     launch routed_experts_stage when operands(EGW) + operands(EUW) > 0:
+        staging
         threadgroups (M, 1, 1)
         grid (stage_grid)
         threads_per_threadgroup (256, 1, 1)
@@ -841,6 +850,7 @@ native routed_experts for cpu from "cpu/routed_experts.rs":
         threadgroups (1, 1, 1)
         threads_per_threadgroup (1, 1, 1)
     launch routed_experts_stage:
+        staging
         threadgroups (M, 1, 1)
         grid (stage_grid)
         threads_per_threadgroup (1, 1, 1)
@@ -931,6 +941,7 @@ native routed_combine for cuda from "cuda/routed_combine.cu":
     scratch shared_product bytes (M * S * 2)
     launch routed_combine_stage when OPERAND == 1:
         reads (OPERAND)
+        staging
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch routed_combine_shared:
@@ -975,6 +986,7 @@ native routed_combine for cpu from "cpu/routed_combine.rs":
     scratch staged bytes (M * H * 4)
     scratch shared_product bytes (M * S * 4)
     launch routed_combine_stage:
+        staging
         threadgroups (M, 1, 1)
         threads_per_threadgroup (1, 1, 1)
     launch routed_combine_shared:
@@ -996,7 +1008,7 @@ native routed_combine for cpu from "cpu/routed_combine.rs":
 # that `base`. A branch whose routed sum is normalized alone (Gemma's
 # `moe_tail`) binds a zero `base`.
 #
-# Decode (M <= DECODE_ROWS): select -> gate_up | up -> down.
+# Decode (M <= VERIFY_ROWS): select -> gate_up | up -> down.
 # Prefill: select -> group -> experts | experts_up -> scatter.
 #
 # Selection contract (`routed_select`):
@@ -1048,7 +1060,7 @@ fn routed_select[M, H, E, K, ES](residual: &tensor[M, H] f32, norm: &tensor[H] N
     return normalized
 
 # All backends: the `routed_route` launch structure over E logit columns:
-# rows <= DECODE_ROWS form the logits as a GEMV (Metal, Vulkan: one simdgroup or warp
+# rows <= VERIFY_ROWS form the logits as a GEMV (Metal, Vulkan: one simdgroup or warp
 # per column, forming the router input on the fly, threadgroup 0 publishing
 # `normalized`; CUDA: below); larger classes stage both normalized forms once, then a
 # tiled GEMM over the router input (Metal 64 x 32, else 32 x 32; edge tiles
@@ -1066,19 +1078,20 @@ native routed_select for metal from "metal/routed_select.metal":
     params (SIMDGROUPS in [8, 16, 4, 2] default 8)
     where H % 32 == 0 and E <= 1024 and K <= E
     scratch logits bytes (M * E * 4)
-    scratch router_rows bytes (M * H * 4) when M > DECODE_ROWS
-    scratch arrivals bytes (4) sync when M <= DECODE_ROWS
-    launch routed_select_stage when M > DECODE_ROWS:
+    scratch router_rows bytes (M * H * 4) when M > VERIFY_ROWS
+    scratch arrivals bytes (4) sync when M <= VERIFY_ROWS
+    launch routed_select_stage when M > VERIFY_ROWS:
+        staging
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch routed_select_gemv when M <= DECODE_ROWS:
+    launch routed_select_gemv when M <= VERIFY_ROWS:
         threadgroups (ceil_div(E, SIMDGROUPS), 1, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (min(ceil_div(H, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
-    launch routed_select_gemm when M > DECODE_ROWS:
+    launch routed_select_gemm when M > VERIFY_ROWS:
         threadgroups (ceil_div(E, 32), ceil_div(M, 64), 1)
         threads_per_threadgroup (128, 1, 1)
-    launch routed_select_select when M > DECODE_ROWS:
+    launch routed_select_select when M > VERIFY_ROWS:
         threadgroups (ceil_div(M, 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
@@ -1091,14 +1104,15 @@ native routed_select for cuda from "cuda/routed_select.cu":
     params (SIMDGROUPS in [8, 4, 2] default 8, arithmetic SPLIT in [8, 4, 16] default 8)
     where H % 32 == 0 and E <= 1024 and K <= E
     scratch logits bytes (SPLIT * M * E * 4)
-    scratch router_rows bytes (M * H * 4) when M > DECODE_ROWS
-    launch routed_select_stage when M > DECODE_ROWS:
+    scratch router_rows bytes (M * H * 4) when M > VERIFY_ROWS
+    launch routed_select_stage when M > VERIFY_ROWS:
+        staging
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch routed_select_gemv when M <= DECODE_ROWS:
+    launch routed_select_gemv when M <= VERIFY_ROWS:
         threadgroups (ceil_div(E, SIMDGROUPS), 1, SPLIT)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-    launch routed_select_gemm when M > DECODE_ROWS:
+    launch routed_select_gemm when M > VERIFY_ROWS:
         threadgroups (ceil_div(E, 32), ceil_div(M, 32), SPLIT)
         threads_per_threadgroup (256, 1, 1)
     launch routed_select_select:
@@ -1110,16 +1124,17 @@ native routed_select for vulkan from "vulkan/routed_select.comp":
     params (SIMDGROUPS in [8, 4, 2] default 8)
     where H % 32 == 0 and E <= 1024 and K <= E
     scratch logits bytes (M * E * 4)
-    scratch router_rows bytes (M * H * 4) when M > DECODE_ROWS
-    launch routed_select_stage when M > DECODE_ROWS:
+    scratch router_rows bytes (M * H * 4) when M > VERIFY_ROWS
+    launch routed_select_stage when M > VERIFY_ROWS:
+        staging
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (32)
-    launch routed_select_gemv when M <= DECODE_ROWS:
+    launch routed_select_gemv when M <= VERIFY_ROWS:
         threadgroups (ceil_div(E, SIMDGROUPS), 1, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (4 * DECODE_ROWS * (8 + 1))
-    launch routed_select_gemm when M > DECODE_ROWS:
+        shared_bytes (4 * VERIFY_ROWS * (8 + 1))
+    launch routed_select_gemm when M > VERIFY_ROWS:
         threadgroups (ceil_div(E, 32), ceil_div(M, 32), 1)
         threads_per_threadgroup (128, 1, 1)
         shared_bytes (9216)
@@ -1135,6 +1150,7 @@ native routed_select for cpu from "cpu/routed_select.rs":
     scratch router_rows bytes (M * H * 4)
     scratch logits bytes (M * E * 4)
     launch routed_select_normalize:
+        staging
         threadgroups (M, 1, 1)
         threads_per_threadgroup (1, 1, 1)
         shared_bytes (H * 12)
@@ -1165,7 +1181,7 @@ fn decode_source[XS, M, K](sources: &tensor[XS, M, K] i32, row: i32, choice: i32
         source = sources[SOURCE_RECORD, row, choice]
     return source
 
-# Decode expansion (M <= DECODE_ROWS), gated experts: per choice, the `glu` of the
+# Decode expansion (M <= VERIFY_ROWS), gated experts: per choice, the `glu` of the
 # expert's gate and up projections (`activation`: 0 SiLU, 1 GELU-tanh;
 # clamped as `routed_experts` is, at LB; the scales the choice's expert's), its weights read where `decode_source`
 # names: a bank record of `expert_*`, or a record of the host tier's
@@ -1218,7 +1234,7 @@ fn routed_gate_up[M, H, E, K, F, GS, US, XS, TR, LB](normalized: &tensor[M, H] A
     return product
 
 
-# Decode expansion (M <= DECODE_ROWS), up-only experts: per choice,
+# Decode expansion (M <= VERIFY_ROWS), up-only experts: per choice,
 # A(act(A(us * up))) (`activation`: 2 ReLU²; `us` the choice's expert's
 # `up_scale`), its weights read where `decode_source` names.
 fn routed_up[M, H, E, K, F, US, XS, TR](normalized: &tensor[M, H] A,
@@ -1276,7 +1292,7 @@ fn decode_down[M, E, K, F, H, XS, TR](product: &tensor[M, K, F] A, routes: &tens
                 published[row, choice, column] = projected
 
 
-# Decode output (M <= DECODE_ROWS): each choice's down projection, published in A,
+# Decode output (M <= VERIFY_ROWS): each choice's down projection, published in A,
 # weighted in slot order, then added to `base`, published in R:
 #   R(base + sum_k w_k * A(down_k))
 # R is F32 where `base` is the residual (plus a shared expert's output); A for
@@ -1293,7 +1309,7 @@ fn routed_down[M, H, E, K, F, XS, TR](base: &tensor[M, H] f32,
     let mut value = tensor[M, H] R
     let mut published = tensor[M, K, H] A
     decode_down(product, routes, sources, expert_down, tier_down, published)
-    let unanswered = tensor[0, DECODE_ROWS, H] f32
+    let unanswered = tensor[0, VERIFY_ROWS, H] f32
     decode_join(base, published, weights, unanswered, 0, false, value)
     return value
 
@@ -1441,10 +1457,12 @@ native routed_gate_up for cuda from "cuda/routed_gate_up.cu":
         threads_per_threadgroup (128, 1, 1)
         shared_bytes (operands(EGW) * H * 2)
     launch routed_gate_up_stage when GATHERED == 1 and operands(EGW) == 1:
+        staging
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch routed_gate_up_gathered when GATHERED == 1:
         reads (TPW, KSPLIT)
+        alike (routed_gate_up)
         threadgroups (ceil_div(ceil_div(ceil_div(F, 16), TPW), 4 / KSPLIT), M * K, 1)
         threads_per_threadgroup (128, 1, 1)
 
@@ -1452,7 +1470,7 @@ native routed_gate_up for vulkan from "vulkan/routed_gate_up.comp":
     static (H, K, F, GS, US, LB)
     params (SIMDGROUPS in [2, 4, 8] default 2, ROWS in [1, 2, 4] default 1, form GATHERED in [0, 1] default 0)
     records (expert_gate, expert_up, tier_gate, tier_up)
-    scratch gathered bytes (M * K * (1 + 2 * DECODE_ROWS) * 4) when GATHERED == 1
+    scratch gathered bytes (M * K * (1 + 2 * VERIFY_ROWS) * 4) when GATHERED == 1
     launch routed_gate_up when GATHERED == 0:
         threadgroups (ceil_div(F, SIMDGROUPS * ROWS), M * K, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
@@ -1465,14 +1483,17 @@ native routed_gate_up for vulkan from "vulkan/routed_gate_up.comp":
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (256 + 32 * operands(EGW) + min(8 * ceil_div(H, 32), 288) * 72)
     launch routed_gate_up_gathered2 when GATHERED == 1 and M == 2:
+        alike (routed_gate_up_gathered1)
         threadgroups (ceil_div(F, SIMDGROUPS * ROWS), M * K, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (256 + 32 * operands(EGW) + min(8 * ceil_div(H, 32), 288) * 72)
     launch routed_gate_up_gathered4 when GATHERED == 1 and M >= 3 and M <= 4:
+        alike (routed_gate_up_gathered1)
         threadgroups (ceil_div(F, SIMDGROUPS * ROWS), M * K, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (256 + 32 * operands(EGW) + min(8 * ceil_div(H, 32), 288) * 72)
-    launch routed_gate_up_gathered8 when GATHERED == 1 and M >= 5:
+    launch routed_gate_up_gathered8 when GATHERED == 1 and M >= 5 and M <= VERIFY_ROWS:
+        alike (routed_gate_up_gathered1)
         threadgroups (ceil_div(F, SIMDGROUPS * ROWS), M * K, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (256 + 32 * operands(EGW) + min(8 * ceil_div(H, 32), 288) * 72)
@@ -1484,6 +1505,7 @@ native routed_gate_up for cpu from "cpu/routed_gate_up.rs":
     scratch quantized bytes (M * ceil_div(H, Q8_VALUES) * Q8_BYTES)
     scratch staged bytes (M * H * 4)
     launch routed_gate_up_stage:
+        staging
         threadgroups (M, 1, 1)
         threads_per_threadgroup (1, 1, 1)
     launch routed_gate_up_rows:
@@ -1518,10 +1540,12 @@ native routed_up for cuda from "cuda/routed_up.cu":
         threads_per_threadgroup (128, 1, 1)
         shared_bytes (operands(EUW) * H * 2)
     launch routed_up_stage when GATHERED == 1 and operands(EUW) == 1:
+        staging
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch routed_up_gathered when GATHERED == 1:
         reads (TPW, KSPLIT)
+        alike (routed_up)
         threadgroups (ceil_div(ceil_div(ceil_div(F, 16), TPW), 4 / KSPLIT), M * K, 1)
         threads_per_threadgroup (128, 1, 1)
 
@@ -1529,7 +1553,7 @@ native routed_up for vulkan from "vulkan/routed_up.comp":
     static (H, K, F, US)
     params (SIMDGROUPS in [2, 4, 8] default 2, ROWS in [1, 2, 4] default 1, form GATHERED in [0, 1] default 0)
     records (expert_up, tier_up)
-    scratch gathered bytes (M * K * (1 + 2 * DECODE_ROWS) * 4) when GATHERED == 1
+    scratch gathered bytes (M * K * (1 + 2 * VERIFY_ROWS) * 4) when GATHERED == 1
     launch routed_up when GATHERED == 0:
         threadgroups (ceil_div(F, SIMDGROUPS * ROWS), M * K, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
@@ -1542,14 +1566,17 @@ native routed_up for vulkan from "vulkan/routed_up.comp":
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (256 + 32 * operands(EUW) + min(8 * ceil_div(H, 32), 288) * 72)
     launch routed_up_gathered2 when GATHERED == 1 and M == 2:
+        alike (routed_up_gathered1)
         threadgroups (ceil_div(F, SIMDGROUPS * ROWS), M * K, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (256 + 32 * operands(EUW) + min(8 * ceil_div(H, 32), 288) * 72)
     launch routed_up_gathered4 when GATHERED == 1 and M >= 3 and M <= 4:
+        alike (routed_up_gathered1)
         threadgroups (ceil_div(F, SIMDGROUPS * ROWS), M * K, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (256 + 32 * operands(EUW) + min(8 * ceil_div(H, 32), 288) * 72)
-    launch routed_up_gathered8 when GATHERED == 1 and M >= 5:
+    launch routed_up_gathered8 when GATHERED == 1 and M >= 5 and M <= VERIFY_ROWS:
+        alike (routed_up_gathered1)
         threadgroups (ceil_div(F, SIMDGROUPS * ROWS), M * K, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (256 + 32 * operands(EUW) + min(8 * ceil_div(H, 32), 288) * 72)
@@ -1561,6 +1588,7 @@ native routed_up for cpu from "cpu/routed_up.rs":
     scratch quantized bytes (M * ceil_div(H, Q8_VALUES) * Q8_BYTES)
     scratch staged bytes (M * H * 4)
     launch routed_up_stage:
+        staging
         threadgroups (M, 1, 1)
         threads_per_threadgroup (1, 1, 1)
     launch routed_up_rows:
@@ -1612,10 +1640,12 @@ native routed_down for cuda from "cuda/routed_down.cu":
         threads_per_threadgroup (128, 1, 1)
         shared_bytes (operands(EDW) * F * 2)
     launch routed_down_stage when M > 1 and operands(EDW) == 1:
+        staging
         threadgroups (M * K, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch routed_down_gathered when M > 1:
         reads (TPW, KSPLIT)
+        alike (routed_down)
         threadgroups (ceil_div(ceil_div(ceil_div(H, 16), TPW), 4 / KSPLIT), M * K, 1)
         threads_per_threadgroup (128, 1, 1)
     launch routed_down_combine:
@@ -1643,6 +1673,7 @@ native routed_down for cpu from "cpu/routed_down.rs":
     scratch quantized bytes (M * K * ceil_div(F, Q8_VALUES) * Q8_BYTES)
     scratch staged bytes (M * K * F * 4)
     launch routed_down_stage:
+        staging
         threadgroups (M, 1, 1)
         threads_per_threadgroup (1, 1, 1)
     launch routed_down_rows:
@@ -1666,6 +1697,7 @@ native routed_experts_up for metal from "metal/routed_experts_up.metal":
         threadgroups (1, 1, 1)
         threads_per_threadgroup (1, 1, 1)
     launch routed_experts_up_stage when operands(EUW) == 1:
+        staging
         threadgroups (M, 1, 1)
         grid (stage_grid)
         threads_per_threadgroup (256, 1, 1)
@@ -1698,6 +1730,7 @@ native routed_experts_up for cuda from "cuda/routed_experts_up.cu":
         threads_per_threadgroup (1, 1, 1)
     launch routed_experts_up_stage when OPERAND == 1 or operands(EUW) == 1:
         reads (OPERAND)
+        staging
         threadgroups (M, 1, 1)
         grid (stage_grid)
         threads_per_threadgroup (256, 1, 1)
@@ -1734,6 +1767,7 @@ native routed_experts_up for vulkan from "vulkan/routed_experts_up.comp":
         threadgroups (1, 1, 1)
         threads_per_threadgroup (1, 1, 1)
     launch routed_experts_up_stage when operands(EUW) == 1:
+        staging
         threadgroups (M, 1, 1)
         grid (stage_grid)
         threads_per_threadgroup (256, 1, 1)
@@ -1770,6 +1804,7 @@ native routed_experts_up for cpu from "cpu/routed_experts_up.rs":
         threadgroups (1, 1, 1)
         threads_per_threadgroup (1, 1, 1)
     launch routed_experts_up_stage:
+        staging
         threadgroups (M, 1, 1)
         grid (stage_grid)
         threads_per_threadgroup (1, 1, 1)
@@ -1818,7 +1853,7 @@ native routed_scatter for cpu from "cpu/routed_scatter.rs":
 # places for the expert mapped to s. Routing, ordering, grouping, scaling and
 # combining keep the expert index; only weight addresses use the slot: every
 # launch that reads an expert's weights looks up where it lives, in its
-# layer's map, by its step (`held`). A decode class (M <= DECODE_ROWS) is
+# layer's map, by its step (`held`). A decode class (M <= VERIFY_ROWS) is
 # bank-served:
 #   routed_route_streamed -> routed_land -> routed_site_request ->
 #   routed_gate_up -> routed_output_project -> routed_output_sited
@@ -2225,7 +2260,7 @@ fn routed_route_streamed[M, H, PT, NM, E, K, S, ES, FW, AHEAD, FLIGHT, RING, P, 
     next_policy: &tensor[POLICY_WORDS] i32,
     rings: &mut tensor[AHEAD, RING] i32, routing: &mut tensor[FLIGHT, RING_EXPERTS + 2 * P] i32)
     -> (tensor[M, H] A, tensor[M] f32, tensor[M, S] A)
-    where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and ES >= 0 and (ES == 0 or ES == E) and operands(RW) == 0 and operands(SGW) == operands(SUW) and M <= DECODE_ROWS and FW >= FILE_ENTRIES + FILE_ENTRY_WORDS * P and FW % 2 == 0 and AHEAD >= 0 and AHEAD <= 2 and FLIGHT > 0 and RING >= RING_EXPERTS + HINT_ENTRY_WORDS * M * K and P >= M * K and EN > 0 and GM >= E and TM >= 0 and (TM == 0 or TM == E):
+    where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and ES >= 0 and (ES == 0 or ES == E) and operands(RW) == 0 and operands(SGW) == operands(SUW) and M <= VERIFY_ROWS and FW >= FILE_ENTRIES + FILE_ENTRY_WORDS * P and FW % 2 == 0 and AHEAD >= 0 and AHEAD <= 2 and FLIGHT > 0 and RING >= RING_EXPERTS + HINT_ENTRY_WORDS * M * K and P >= M * K and EN > 0 and GM >= E and TM >= 0 and (TM == 0 or TM == E):
     let mut normalized = tensor[M, H] A
     let mut coefficient = tensor[M] f32
     let mut shared_product = tensor[M, S] A
@@ -2269,7 +2304,7 @@ fn routed_select_streamed[M, H, E, K, ES, FW, AHEAD, FLIGHT, RING, P, EN, GM, TM
     next_policy: &tensor[POLICY_WORDS] i32,
     rings: &mut tensor[AHEAD, RING] i32, routing: &mut tensor[FLIGHT, RING_EXPERTS + 2 * P] i32)
     -> tensor[M, H] A
-    where ES >= 0 and (ES == 0 or ES == E) and operands(RW) == 0 and M <= DECODE_ROWS and FW >= FILE_ENTRIES + FILE_ENTRY_WORDS * P and FW % 2 == 0 and AHEAD >= 0 and AHEAD <= 2 and FLIGHT > 0 and RING >= RING_EXPERTS + HINT_ENTRY_WORDS * M * K and P >= M * K and EN > 0 and GM >= E and TM >= 0 and (TM == 0 or TM == E):
+    where ES >= 0 and (ES == 0 or ES == E) and operands(RW) == 0 and M <= VERIFY_ROWS and FW >= FILE_ENTRIES + FILE_ENTRY_WORDS * P and FW % 2 == 0 and AHEAD >= 0 and AHEAD <= 2 and FLIGHT > 0 and RING >= RING_EXPERTS + HINT_ENTRY_WORDS * M * K and P >= M * K and EN > 0 and GM >= E and TM >= 0 and (TM == 0 or TM == E):
     let normalized = routed_select(residual, norm, router_norm, router, bias, expert_scale, routes,
         weights, epsilon, score, normalization, normalization_epsilon, scale)
     resolve[P = P, E = E](routes, map, tier, policy, sited, step, file, routing, sources)
@@ -2311,8 +2346,8 @@ fn routed_select_streamed[M, H, E, K, ES, FW, AHEAD, FLIGHT, RING, P, EN, GM, TM
 fn routed_site_request[M, H, K, FLIGHT, R](step: &tensor[STEP_WORDS] i32,
     routes: &tensor[M, K] i32, sources: &tensor[SOURCE_ROWS, M, K] i32, weights: &tensor[M, K] f32,
     normalized: &tensor[M, H] A, site: &mut tensor[FLIGHT, R] i32,
-    site_rows: &mut tensor[FLIGHT, DECODE_ROWS, H] f32)
-    where FLIGHT > 0 and M <= DECODE_ROWS and R >= SITE_ENTRIES + SITE_ENTRY_WORDS * M * K and R % 2 == 0:
+    site_rows: &mut tensor[FLIGHT, VERIFY_ROWS, H] f32)
+    where FLIGHT > 0 and M <= VERIFY_ROWS and R >= SITE_ENTRIES + SITE_ENTRY_WORDS * M * K and R % 2 == 0:
     let q = step_sequence(step)
     let slot = flight_slot[FLIGHT = FLIGHT](q)
     if any_sited(sources):
@@ -2357,7 +2392,7 @@ fn any_sited[M, K](sources: &tensor[SOURCE_ROWS, M, K] i32) -> bool:
 fn routed_down_project[M, H, E, K, F, TR](product: &tensor[M, K, F] A, routes: &tensor[M, K] i32,
     sources: &tensor[SOURCE_ROWS, M, K] i32, expert_down: &tensor[E, H, F] EDW,
     tier_down: &tensor[TR, H, F] EDW) -> tensor[M, K, H] A
-    where TR >= 0 and M <= DECODE_ROWS:
+    where TR >= 0 and M <= VERIFY_ROWS:
     let mut published = tensor[M, K, H] A
     decode_down(product, routes, sources, expert_down, tier_down, published)
     return published
@@ -2365,8 +2400,8 @@ fn routed_down_project[M, H, E, K, F, TR](product: &tensor[M, K, F] A, routes: &
 fn routed_down_sited[M, H, K, FLIGHT, SW](base: &tensor[M, H] f32,
     published: &tensor[M, K, H] A, sources: &tensor[SOURCE_ROWS, M, K] i32, weights: &tensor[M, K] f32,
     step: &tensor[STEP_WORDS] i32, site: &await mut tensor[FLIGHT, SW] i32,
-    site_output: &await tensor[FLIGHT, DECODE_ROWS, H] f32) -> tensor[M, H] R
-    where FLIGHT > 0 and M <= DECODE_ROWS and SW % 2 == 0 and SW >= SLOT_PAYLOAD:
+    site_output: &await tensor[FLIGHT, VERIFY_ROWS, H] f32) -> tensor[M, H] R
+    where FLIGHT > 0 and M <= VERIFY_ROWS and SW % 2 == 0 and SW >= SLOT_PAYLOAD:
     let mut value = tensor[M, H] R
     let q = step_sequence(step)
     let slot = flight_slot[FLIGHT = FLIGHT](q)
@@ -2382,7 +2417,7 @@ fn routed_output_project[M, H, E, K, F, S, TR](expert_product: &tensor[M, K, F] 
     shared_product: &tensor[M, S] A, routes: &tensor[M, K] i32, sources: &tensor[SOURCE_ROWS, M, K] i32,
     expert_down: &tensor[E, H, F] EDW, tier_down: &tensor[TR, H, F] EDW,
     shared_down: &tensor[H, S] SDW) -> tensor[M, K + 1, H] A
-    where TR >= 0 and M <= DECODE_ROWS:
+    where TR >= 0 and M <= VERIFY_ROWS:
     let mut published = tensor[M, K + 1, H] A
     decode_output_published(expert_product, shared_product, routes, sources, expert_down, tier_down, shared_down,
         published)
@@ -2392,8 +2427,8 @@ fn routed_output_sited[M, H, SN, IN, K, FLIGHT, SW](residual: &tensor[M, SN * H]
     inject: &tensor[M, IN] f32, published: &tensor[M, K + 1, H] A, sources: &tensor[SOURCE_ROWS, M, K] i32,
     scores: &tensor[M, K] f32, coefficient: &tensor[M] f32,
     step: &tensor[STEP_WORDS] i32, site: &await mut tensor[FLIGHT, SW] i32,
-    site_output: &await tensor[FLIGHT, DECODE_ROWS, H] f32) -> tensor[M, SN * H] f32
-    where IN >= 0 and ((IN == 0 and SN == 1) or (IN == SN and SN >= 1)) and FLIGHT > 0 and M <= DECODE_ROWS and SW % 2 == 0 and SW >= SLOT_PAYLOAD:
+    site_output: &await tensor[FLIGHT, VERIFY_ROWS, H] f32) -> tensor[M, SN * H] f32
+    where IN >= 0 and ((IN == 0 and SN == 1) or (IN == SN and SN >= 1)) and FLIGHT > 0 and M <= VERIFY_ROWS and SW % 2 == 0 and SW >= SLOT_PAYLOAD:
     let mut value = tensor[M, SN * H] f32
     let q = step_sequence(step)
     let slot = flight_slot[FLIGHT = FLIGHT](q)

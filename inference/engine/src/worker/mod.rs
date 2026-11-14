@@ -293,8 +293,7 @@ fn serve(
 
 /// Readiness facts of the constructed execution domain.
 struct ExecutionReady {
-    /// The model policy the load serves: the manifest's, within what its
-    /// verifies read once ([`ResolvedModelPolicy::verifying_within`]).
+    /// The model policy the load serves: the manifest's.
     model: ResolvedModelPolicy,
     resources: ResourcePlanSummary,
     device: seismic::ExecutorSelector,
@@ -369,7 +368,7 @@ fn load(
             LoadAttempt::Loaded(built) => built,
             LoadAttempt::Unprepared => return Err(Stopped::Unprepared),
         };
-        let model = manifest.model.clone().verifying_within(built.domain.streamed_verify_rows());
+        let model = manifest.model.clone();
         let method = model
             .factory(&manifest.package.identity.to_string())
             .map_err(internal)?;

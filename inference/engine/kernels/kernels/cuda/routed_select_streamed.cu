@@ -9,7 +9,7 @@
 //     into the lead's [SPLIT, M, EN] partial planes after this layer's
 //     [SPLIT, M, E].
 //   routed_select_streamed_select: block 0 selects every row, one warp per
-//     row (M <= DECODE_ROWS), then resolves and assigns
+//     row (M <= VERIFY_ROWS), then resolves and assigns
 //     (`streaming/resolve.hpp`); block 1 + lead ranks the lead's layer's
 //     rows as its selection ranks them (`select::rank_row` with that layer's
 //     bias) and publishes the hints into the lead's ring row
@@ -27,9 +27,9 @@
 
 // Block 0's group words: the resolve's, or a hint block's the hints'.
 constexpr unsigned SELECT_WORDS =
-    STREAMING_RESOLVE_WORDS(SEISMIC_CONST_DECODE_ROWS * SEISMIC_DIM_K) > STREAMING_HINT_WORDS(SEISMIC_CONST_DECODE_ROWS)
-        ? STREAMING_RESOLVE_WORDS(SEISMIC_CONST_DECODE_ROWS * SEISMIC_DIM_K)
-        : STREAMING_HINT_WORDS(SEISMIC_CONST_DECODE_ROWS);
+    STREAMING_RESOLVE_WORDS(SEISMIC_CONST_VERIFY_ROWS * SEISMIC_DIM_K) > STREAMING_HINT_WORDS(SEISMIC_CONST_VERIFY_ROWS)
+        ? STREAMING_RESOLVE_WORDS(SEISMIC_CONST_VERIFY_ROWS * SEISMIC_DIM_K)
+        : STREAMING_HINT_WORDS(SEISMIC_CONST_VERIFY_ROWS);
 
 // E and EN (the next streamed layer's experts) are static.
 constexpr unsigned COLUMN_GROUPS =
@@ -53,9 +53,9 @@ extern "C" __global__ void routed_select_streamed_gemv(SEISMIC_KERNEL_PARAMS) {
     const unsigned char *after_router = SEISMIC_PTR(SEISMIC_BUFFER_AFTER_ROUTER);
     const element::Out<Act> normalized = SEISMIC_RESULT_0_OUT;
     float *logits = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS));
-    __shared__ float parts[SEISMIC_CONST_DECODE_ROWS][SELECT_WARPS];
-    __shared__ float inverses[SEISMIC_CONST_DECODE_ROWS];
-    __shared__ alignas(16) Act::storage staged[SEISMIC_CONST_DECODE_ROWS][GEMV_SHARE];
+    __shared__ float parts[SEISMIC_CONST_VERIFY_ROWS][SELECT_WARPS];
+    __shared__ float inverses[SEISMIC_CONST_VERIFY_ROWS];
+    __shared__ alignas(16) Act::storage staged[SEISMIC_CONST_VERIFY_ROWS][GEMV_SHARE];
     decode_inverses(residual, parts, inverses, seismic_words_value);
     if (blockIdx.x < COLUMN_GROUPS) {
         select_columns(residual, inverses, router_norm, SEISMIC_ROUTER_NORM_STRIDE_0, router, SEISMIC_ROUTER_STRIDE_0,

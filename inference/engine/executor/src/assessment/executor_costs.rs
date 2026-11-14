@@ -152,7 +152,7 @@ impl Sizes {
         match backend {
             seismic::BackendName::Cpu => Self {
                 features: HIDDEN,
-                matrix_rows: crate::operators::attention::graph::DECODE_ROWS,
+                matrix_rows: magnitude_kernels::constants::VERIFY_ROWS,
             },
             _ => Self {
                 features: 16384,
@@ -5497,7 +5497,7 @@ mod tests {
                 assert_eq!(sizes.features, HIDDEN);
                 assert_eq!(
                     sizes.matrix_rows,
-                    crate::operators::attention::graph::DECODE_ROWS
+                    magnitude_kernels::constants::VERIFY_ROWS
                 );
             } else {
                 assert_eq!((sizes.features, sizes.matrix_rows), (16384, 512));

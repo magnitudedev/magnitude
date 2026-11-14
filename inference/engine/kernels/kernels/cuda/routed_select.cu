@@ -1,7 +1,7 @@
 // General expert selection for M rows; the CUDA form of
 // `metal/routed_select.metal`, in four launches: `routed_select_stage`
-// (M > DECODE_ROWS, one block per row) publishes the normalized rows and the router
-// input rows once; `routed_select_gemv` (M <= DECODE_ROWS, one warp per logit column
+// (M > VERIFY_ROWS, one block per row) publishes the normalized rows and the router
+// input rows once; `routed_select_gemv` (M <= VERIFY_ROWS, one warp per logit column
 // over the block's hidden share of SPLIT, whose router input rows the block
 // forms in shared memory, publishing the share's normalized rows) or
 // `routed_select_gemm` (32 rows x 32 columns x one hidden share of SPLIT per
@@ -43,7 +43,7 @@ extern "C" __global__ void routed_select_stage(SEISMIC_KERNEL_PARAMS) {
     }
 }
 
-// M <= DECODE_ROWS, one launch before the selection: block (x, z) computes its rows'
+// M <= VERIFY_ROWS, one launch before the selection: block (x, z) computes its rows'
 // RMS inverses (in the stage launch's order), stages the router input rows of
 // hidden share z of SPLIT in shared memory, and forms the partial logits of
 // SIMDGROUPS logit columns over that share into plane z, one warp per column;
@@ -55,9 +55,9 @@ extern "C" __global__ void routed_select_gemv(SEISMIC_KERNEL_PARAMS) {
     const unsigned char *router = SEISMIC_PTR(SEISMIC_BUFFER_ROUTER);
     const element::Out<Act> normalized = SEISMIC_RESULT_0_OUT;
     float *logits = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS));
-    __shared__ float parts[SEISMIC_CONST_DECODE_ROWS][SELECT_WARPS];
-    __shared__ float inverses[SEISMIC_CONST_DECODE_ROWS];
-    __shared__ alignas(16) Act::storage staged[SEISMIC_CONST_DECODE_ROWS][GEMV_SHARE];
+    __shared__ float parts[SEISMIC_CONST_VERIFY_ROWS][SELECT_WARPS];
+    __shared__ float inverses[SEISMIC_CONST_VERIFY_ROWS];
+    __shared__ alignas(16) Act::storage staged[SEISMIC_CONST_VERIFY_ROWS][GEMV_SHARE];
     decode_inverses(residual, parts, inverses, seismic_words_value);
     select_columns(residual, inverses, router_norm, SEISMIC_ROUTER_NORM_STRIDE_0, router, SEISMIC_ROUTER_STRIDE_0, norm,
                    blockIdx.x == 0 ? &normalized : nullptr, logits, blockIdx.x, staged, seismic_words_value);

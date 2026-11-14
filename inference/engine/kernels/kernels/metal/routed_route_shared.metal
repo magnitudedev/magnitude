@@ -1,4 +1,4 @@
-// Decode routing (M <= DECODE_ROWS) with the shared expert's gate/up in one launch.
+// Decode routing (M <= VERIFY_ROWS) with the shared expert's gate/up in one launch.
 // Threadgroups [0, route_groups) are `routed_route`'s router threadgroups
 // (`lib/routed/route.h`), whose selection counts only them. The shared
 // threadgroups after them each form the normalized rows as a router
@@ -34,8 +34,8 @@ kernel void routed_route_shared(
     uint tid [[thread_index_in_threadgroup]],
     uint simd [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup float parts[SEISMIC_CONST_DECODE_ROWS * route_simdgroups];
-    threadgroup float inverses[SEISMIC_CONST_DECODE_ROWS];
+    threadgroup float parts[SEISMIC_CONST_VERIFY_ROWS * route_simdgroups];
+    threadgroup float inverses[SEISMIC_CONST_VERIFY_ROWS];
     threadgroup uint last;
     const element::Out<ELEMENT_OF(SEISMIC_SCORES)> scores(scores_cells);
     const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> normalized(normalized_cells);

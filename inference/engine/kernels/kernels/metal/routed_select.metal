@@ -1,16 +1,16 @@
 // General expert selection for M rows (the `routed_route` structure without
 // the shared-expert column):
-//   routed_select_stage (M > DECODE_ROWS, one threadgroup per row): the row's RMS and
+//   routed_select_stage (M > VERIFY_ROWS, one threadgroup per row): the row's RMS and
 //     its two normalized forms, published once: `normalized` (norm, the
 //     experts' input) and the router input (router_norm) into scratch.
-//   routed_select_gemv (M <= DECODE_ROWS, the decode's one launch): the
+//   routed_select_gemv (M <= VERIFY_ROWS, the decode's one launch): the
 //     router logits (`lib/routed/router.h`), one simdgroup per logit column
 //     over the router input each threadgroup forms from RMS partials of its
 //     own; threadgroup 0 publishes `normalized`; the last threadgroup to
 //     arrive (`arrivals`, sync scratch) selects every row.
-//   routed_select_gemm (M > DECODE_ROWS): the logits tiles of `lib/routed/logits.h`
+//   routed_select_gemm (M > VERIFY_ROWS): the logits tiles of `lib/routed/logits.h`
 //     over the staged router input.
-//   routed_select_select (M > DECODE_ROWS, one simdgroup per row): scores,
+//   routed_select_select (M > VERIFY_ROWS, one simdgroup per row): scores,
 //     biased ranking, single-pass top-K (`lib/routed/select.h`),
 //     normalization, scales.
 // The decode launches' bodies are `lib/routed/selection.h`'s, which
@@ -53,7 +53,7 @@ kernel void routed_select_stage(
     }
 }
 
-// M <= DECODE_ROWS, the whole selection in one launch: the threadgroup
+// M <= VERIFY_ROWS, the whole selection in one launch: the threadgroup
 // computes its rows' RMS inverses (in the stage launch's order); threadgroup
 // 0 publishes the normalized rows; each threadgroup then forms the logits of
 // SIMDGROUPS router rows over the router input (`routing::Gemv`); the last
@@ -76,8 +76,8 @@ kernel void routed_select_gemv(
     uint tid [[thread_index_in_threadgroup]],
     uint simd [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup float parts[SEISMIC_CONST_DECODE_ROWS * select_simdgroups];
-    threadgroup float inverses[SEISMIC_CONST_DECODE_ROWS];
+    threadgroup float parts[SEISMIC_CONST_VERIFY_ROWS * select_simdgroups];
+    threadgroup float inverses[SEISMIC_CONST_VERIFY_ROWS];
     threadgroup uint last;
     const element::Out<ELEMENT_OF(SEISMIC_WEIGHTS)> weights(weights_cells);
     const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> normalized(normalized_cells);
@@ -93,7 +93,7 @@ kernel void routed_select_gemv(
         select_row(row, logits, bias, expert_scale, routes, weights, seismic_words, lane);
 }
 
-// M > DECODE_ROWS: the logits tiles (`lib/routed/logits.h`) over the staged router
+// M > VERIFY_ROWS: the logits tiles (`lib/routed/logits.h`) over the staged router
 // input.
 kernel void routed_select_gemm(
     device const uchar *router [[buffer(SEISMIC_BUFFER_ROUTER)]],

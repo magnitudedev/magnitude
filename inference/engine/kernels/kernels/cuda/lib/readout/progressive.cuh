@@ -1,6 +1,6 @@
 // Progressive head readout (`readout.seismic`): the bit planes of a Q8_0 head
 // in significance order, the levels of a certified selection over them, and
-// the full exact pass. Selection rows: at most PROGRESSIVE_ROWS. Plane
+// the full exact pass. Selection rows: at most SEISMIC_CONST_VERIFY_ROWS. Plane
 // placement as in the Metal `lib/readout/progressive.h`:
 //
 //   top[v, w]       bits 7..4 of codes 8w..8w+7, code 8w + e in nibble e
@@ -23,7 +23,6 @@
 #define PROGRESSIVE_COARSE_SCALE (1u << PROGRESSIVE_HALF_BITS)
 #define PROGRESSIVE_COARSE_BIAS (0.5f * float(PROGRESSIVE_COARSE_SCALE - 1u) - float(PROGRESSIVE_OFFSET))
 
-#define PROGRESSIVE_ROWS 8u
 #define PROGRESSIVE_CHUNK 1024u
 #define PROGRESSIVE_MARGIN 3.814697265625e-06f
 // The largest Gumbel noise the sampler draws: -log(-log u) at the largest
@@ -204,7 +203,7 @@ struct Selection {
 };
 
 // Each row's largest lower-bound score into `bounds` (sync scratch:
-// PROGRESSIVE_ROWS keys, then the arrival counter); the last block publishes
+// SEISMIC_CONST_VERIFY_ROWS keys, then the arrival counter); the last block publishes
 // max(floor, raised), or -inf where the row's length is not finite, and
 // clears the keys.
 __device__ __forceinline__ void publish(const u32 *lowest, u32 *bounds, u32 rows, const float *floor, u64 floor_stride,
@@ -214,7 +213,7 @@ __device__ __forceinline__ void publish(const u32 *lowest, u32 *bounds, u32 rows
     __syncthreads();
     if (threadIdx.x < rows)
         atomicMax(&bounds[threadIdx.x], lowest[threadIdx.x]);
-    if (arrive::last(&bounds[PROGRESSIVE_ROWS], gridDim.x, &last) && threadIdx.x < rows) {
+    if (arrive::last(&bounds[SEISMIC_CONST_VERIFY_ROWS], gridDim.x, &last) && threadIdx.x < rows) {
         const u32 k = atomicExch(&bounds[threadIdx.x], 0u);
         const float raised = k == 0u ? -infinity() : value_of(k);
         const float floored = floor ? fmaxf(floor[threadIdx.x * floor_stride], raised) : raised;
@@ -287,9 +286,9 @@ struct Planes {
 
 // The vocabulary GEMV over every row: ROWS vocabulary rows per warp, lane l
 // reading group l of each 1,024-column chunk (the chunk's activations staged
-// in `staged`, PROGRESSIVE_ROWS x PROGRESSIVE_CHUNK A values of shared memory,
+// in `staged`, SEISMIC_CONST_VERIFY_ROWS x PROGRESSIVE_CHUNK A values of shared memory,
 // quarter-major so a warp's 16-byte reads are conflict-free; `sums` holds
-// PROGRESSIVE_ROWS x 32 group sums, `lowest` PROGRESSIVE_ROWS keys). EXACT: the exact logits. Otherwise the 4-bit view
+// SEISMIC_CONST_VERIFY_ROWS x 32 group sums, `lowest` SEISMIC_CONST_VERIFY_ROWS keys). EXACT: the exact logits. Otherwise the 4-bit view
 // `s * (16 H - 120.5)`, whose lower-bound scores raise each row's threshold.
 template <u32 MAXM, u32 ROWS, bool EXACT>
 __device__ __forceinline__ void scan(const u8 *features, u64 feature_stride, const float *groups, const Planes &planes,
@@ -298,7 +297,7 @@ __device__ __forceinline__ void scan(const u8 *features, u64 feature_stride, con
                                      const F32Out *threshold, u64 threshold_stride, u32 *bounds, u32 rows, u32 vocabulary,
                                      u32 d, uint4 *staged, float *sums, u32 *lowest) {
     const u32 lane = threadIdx.x % 32, warps = blockDim.x / 32;
-    if (!EXACT && threadIdx.x < PROGRESSIVE_ROWS)
+    if (!EXACT && threadIdx.x < SEISMIC_CONST_VERIFY_ROWS)
         lowest[threadIdx.x] = 0u;
     const u32 first = (blockIdx.x * warps + threadIdx.x / 32) * ROWS;
     float acc[ROWS][MAXM];
@@ -403,9 +402,9 @@ __device__ __forceinline__ void gather(const u8 *features, u64 feature_stride, c
                                        const Selection &selection, F32Out out, u64 out_row, u64 out_col,
                                        const F32Out *threshold, u64 threshold_stride, u32 *bounds, u32 rows, u32 vocabulary,
                                        u32 d) {
-    __shared__ u32 lowest[PROGRESSIVE_ROWS];
+    __shared__ u32 lowest[SEISMIC_CONST_VERIFY_ROWS];
     const u32 lane = threadIdx.x % 32, warps = blockDim.x / 32;
-    if (REFINE && threadIdx.x < PROGRESSIVE_ROWS)
+    if (REFINE && threadIdx.x < SEISMIC_CONST_VERIFY_ROWS)
         lowest[threadIdx.x] = 0u;
     if (REFINE)
         __syncthreads();

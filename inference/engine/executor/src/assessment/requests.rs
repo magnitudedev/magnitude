@@ -47,7 +47,7 @@ use super::streaming_costs::{CpuCosts, CpuForm, CeilingError, ConvertCosts, Conv
 use super::Priced;
 use crate::native::SiteForm;
 use crate::planning::BankBinding;
-use magnitude_kernels::constants::DECODE_ROWS;
+use magnitude_kernels::constants::VERIFY_ROWS;
 use seismic::measure::{Attempt, JsonFileStore, Reason, Record, RecordStore, StoreError, Timing};
 use seismic::{Device, DeviceTopology, Executor, Identity, Measurer, PointKey};
 use serde::{Deserialize, Serialize};
@@ -205,7 +205,7 @@ impl SiteRequest {
     /// names the machine's job.
     fn key(&self, identity: &Identity) -> PointKey {
         let digest = crate::kernel_cache::TuningCacheKey::of(&format!(
-            "site admission\nbuild {}\ncpu {} {:?}\nrows {DECODE_ROWS}\n{self:?}",
+            "site admission\nbuild {}\ncpu {} {:?}\nrows {VERIFY_ROWS}\n{self:?}",
             crate::EXECUTOR_BUILD,
             std::env::consts::ARCH,
             seismic::cpu::Tier::detected(),

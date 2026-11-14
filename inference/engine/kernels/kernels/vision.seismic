@@ -117,6 +117,7 @@ native vision_patch_stem for cpu from "cpu/vision_patch_stem.rs":
     scratch pixels bytes (M * (1 + S) * C * P * P * 4)
     scratch blended bytes (M * H * 4)
     launch vision_patch_stem_stage:
+        staging
         threadgroups (M, 1, 1)
         threads_per_threadgroup (1, 1, 1)
         shared_bytes (H * 4)
@@ -292,6 +293,7 @@ native vision_linear for cpu from "cpu/vision_linear.rs":
     scratch staged bytes (M * K * 4)
     scratch gates bytes (NG * M * N * 4)
     launch vision_linear_stage:
+        staging
         threadgroups (M, 1, 1)
         threads_per_threadgroup (1, 1, 1)
     launch vision_linear_rows:

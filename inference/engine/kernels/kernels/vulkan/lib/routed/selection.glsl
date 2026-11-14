@@ -1,13 +1,13 @@
 // General expert selection for M rows in four launches. The Vulkan form of
 // `metal/routed_select.metal`.
-//   routed_select_stage (M > DECODE_ROWS, one workgroup per row): the row's RMS, the
+//   routed_select_stage (M > VERIFY_ROWS, one workgroup per row): the row's RMS, the
 //     normalized row (norm) published and the router input row (router_norm)
 //     into scratch.
-//   routed_select_gemv (M <= DECODE_ROWS): one subgroup per logit column reads the
+//   routed_select_gemv (M <= VERIFY_ROWS): one subgroup per logit column reads the
 //     column's weights once and dots them with every row, forming the router
 //     input on the fly from RMS partials shared across the workgroup (in the
 //     stage launch's sum order); workgroup 0 publishes the normalized rows.
-//   routed_select_gemm (M > DECODE_ROWS): 32 rows x 32 columns per workgroup over
+//   routed_select_gemm (M > VERIFY_ROWS): 32 rows x 32 columns per workgroup over
 //     staged F32 tiles of the router input, each invocation 8 outputs in
 //     ascending-K FMAs.
 //   routed_select_select (one subgroup per row): scores, biased ranking,

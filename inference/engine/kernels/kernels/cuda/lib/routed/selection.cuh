@@ -7,7 +7,7 @@
 // (`normalized`), its `logits` scratch and SIMDGROUPS and SPLIT under the
 // same names. Every function takes the entry's words.
 //   decode_inverses: a GEMV block's RMS inverses of the decode rows
-//     (M <= DECODE_ROWS), in the stage launch's order.
+//     (M <= VERIFY_ROWS), in the stage launch's order.
 //   select_columns: a GEMV block's SIMDGROUPS logit columns of the decode
 //     rows over hidden share blockIdx.z of SPLIT, through a router norm and
 //     router, into partial plane z of a layer's [SPLIT, M, E] logits, one
@@ -116,7 +116,7 @@ __device__ __forceinline__ void select_columns(const float *residual, const floa
     const unsigned long long expert = static_cast<unsigned long long>(group) * SEISMIC_TUNE_SIMDGROUPS + warp;
     if (expert >= EXPERTS)
         return;
-    float sums[SEISMIC_CONST_DECODE_ROWS] = {};
+    float sums[SEISMIC_CONST_VERIFY_ROWS] = {};
 #if defined(SEISMIC_ROUTER_KIND_PACKED)
     const auto router_rows = KERNEL_W0_AT(router);
     // One lane decodes a 16-value register chunk of an mma16 router row.
@@ -132,7 +132,7 @@ __device__ __forceinline__ void select_columns(const float *residual, const floa
             for (unsigned j = 0; j < 4; ++j) {
                 const unsigned k = 64 * (item / 4) + 16 * s + offsets[j];
 #pragma unroll
-                for (unsigned row = 0; row < SEISMIC_CONST_DECODE_ROWS; ++row)
+                for (unsigned row = 0; row < SEISMIC_CONST_VERIFY_ROWS; ++row)
                     if (row < rows)
                         sums[row] = seismic_fma_rn(Act::load(staged[row][k]), values[4 * s + j], sums[row]);
             }
@@ -145,7 +145,7 @@ __device__ __forceinline__ void select_columns(const float *residual, const floa
         float weight[8];
         element::span<Router, 8, true>(router, expert * router0 + kbegin + base, weight);
 #pragma unroll
-        for (unsigned row = 0; row < SEISMIC_CONST_DECODE_ROWS; ++row) {
+        for (unsigned row = 0; row < SEISMIC_CONST_VERIFY_ROWS; ++row) {
             if (row < rows) {
                 float input[8];
                 element::span<Act, 8, false>(reinterpret_cast<const unsigned char *>(staged[row]), base, input);
@@ -157,7 +157,7 @@ __device__ __forceinline__ void select_columns(const float *residual, const floa
     }
 #endif
 #pragma unroll
-    for (unsigned row = 0; row < SEISMIC_CONST_DECODE_ROWS; ++row) {
+    for (unsigned row = 0; row < SEISMIC_CONST_VERIFY_ROWS; ++row) {
         const float sum = seismic_warp_sum_f32(sums[row]);
         if (row < rows && lane == 0)
             logits[row * EXPERTS + expert] = sum;

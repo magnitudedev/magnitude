@@ -30,10 +30,10 @@ __global__ void readout_planes_rows_scan(SEISMIC_KERNEL_PARAMS) {
                                      SEISMIC_SCALES_STRIDE_0};
     progressive::Selection selection{};
     selection.softcap = __uint_as_float((unsigned)SEISMIC_PARAM_SOFTCAP);
-    __shared__ uint4 staged[PROGRESSIVE_ROWS * PROGRESSIVE_CHUNK / 8];
+    __shared__ uint4 staged[SEISMIC_CONST_VERIFY_ROWS * PROGRESSIVE_CHUNK / 8];
     // Rows 8b..8b + 7 of row block b (the grid's second axis).
-    const unsigned first = blockIdx.y * PROGRESSIVE_ROWS;
-    const unsigned rows = min(PROGRESSIVE_ROWS, (unsigned)SEISMIC_DIM_O - first);
+    const unsigned first = blockIdx.y * SEISMIC_CONST_VERIFY_ROWS;
+    const unsigned rows = min((unsigned)SEISMIC_CONST_VERIFY_ROWS, (unsigned)SEISMIC_DIM_O - first);
     const projection::u8 *block = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_FEATURES) + (unsigned long long)first *
                                   SEISMIC_DIM_D * projection::Act::bytes;
     const progressive::F32Out out = SEISMIC_RESULT_0_OUT.offset(first * SEISMIC_RESULT_0_STRIDE_0);

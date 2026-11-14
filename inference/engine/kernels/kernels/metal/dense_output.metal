@@ -64,7 +64,7 @@ typedef projection::operands<NVFP4> Operands;
 
 // One row.
 #ifdef SEISMIC_FORMING_DENSE_OUTPUT_GEMV
-template <uint ROWS, uint LANES, uint TILED>
+template <uint LANES, uint TILED, uint ROWS>
 kernel void dense_output_gemv(DENSE_OUTPUT_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],
@@ -75,9 +75,9 @@ kernel void dense_output_gemv(DENSE_OUTPUT_ARGUMENTS,
 }
 #endif
 
-// Three rows up to BATCH_FROM: the same GEMV under this launch's mapping.
+// Three rows up to VERIFY_ROWS: the same GEMV under this launch's mapping.
 #ifdef SEISMIC_FORMING_DENSE_OUTPUT_GEMV_ROWS
-template <uint ROWS, uint LANES, uint TILED>
+template <uint LANES, uint TILED, uint ROWS>
 kernel void dense_output_gemv_rows(DENSE_OUTPUT_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],
@@ -90,7 +90,7 @@ kernel void dense_output_gemv_rows(DENSE_OUTPUT_ARGUMENTS,
 
 // Two rows: the same GEMV under this launch's mapping.
 #ifdef SEISMIC_FORMING_DENSE_OUTPUT_GEMV_PAIR
-template <uint ROWS, uint LANES, uint TILED>
+template <uint LANES, uint TILED, uint ROWS>
 kernel void dense_output_gemv_pair(DENSE_OUTPUT_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],

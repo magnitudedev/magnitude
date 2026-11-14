@@ -127,7 +127,7 @@ pub fn project(weights: &Weights<'_>, first: usize, x: &[f32], out: &mut [f32]) 
 /// The most activation rows one dot-component call projects
 /// (`project_arithmetic`): a decode step's rows, so a decode expert's rows
 /// go in one call; more are projected this many at a time.
-pub const MAX_ACTIVATIONS: usize = crate::constants::DECODE_ROWS as usize;
+pub const MAX_ACTIVATIONS: usize = crate::constants::VERIFY_ROWS as usize;
 
 /// Project the `m` activation rows of `x` (`m` rows of `weights.k()`
 /// values, `m` = `x.len() / k`) against `out.len() / m` weight rows from

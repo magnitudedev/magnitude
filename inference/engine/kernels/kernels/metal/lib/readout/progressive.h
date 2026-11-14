@@ -1,6 +1,6 @@
 // Progressive head readout (`readout.seismic`): the bit planes of a Q8_0 head
 // in significance order, the levels of a certified selection over them, and
-// the full exact pass. Selection rows: at most PROGRESSIVE_ROWS.
+// the full exact pass. Selection rows: at most SEISMIC_CONST_VERIFY_ROWS.
 //
 //   top[v, w]       bits 7..4 of codes 8w..8w+7, code 8w + e in nibble e
 //   bit3[v, g]      bit 3 of the codes of group g, code 32g + 8q + e in bit 4e + q
@@ -37,7 +37,6 @@ inline uint4 progressive_high(device const uint *row, uint group) {
     return high;
 }
 
-#define PROGRESSIVE_ROWS 8u
 #define PROGRESSIVE_MARGIN 0x1p-18f
 // The largest Gumbel noise the sampler draws: -log(-log u) at the largest
 // uniform u = 1 - 2^-24, about 16.64.
@@ -317,7 +316,7 @@ struct Selection {
 // Each row's largest lower-bound score, raised by every threadgroup; the
 // last to arrive publishes max(floor, raised), or -inf where the row's length
 // is not finite (no bound holds), and clears the keys. `bounds`: sync scratch,
-// PROGRESSIVE_ROWS keys then the arrival counter.
+// SEISMIC_CONST_VERIFY_ROWS keys then the arrival counter.
 inline void publish(threadgroup atomic_uint *lowest, device atomic_uint *bounds, threadgroup uint *last, uint tiles,
     uint rows, uint tid, device const float *floor, ulong floor_stride, device const float *lengths,
     ulong length_stride, element::Out<element::F32> threshold, ulong threshold_stride) {
@@ -325,7 +324,7 @@ inline void publish(threadgroup atomic_uint *lowest, device atomic_uint *bounds,
     if (tid < rows)
         atomic_fetch_max_explicit(&bounds[tid], atomic_load_explicit(&lowest[tid], memory_order_relaxed),
             memory_order_relaxed);
-    if (arrive::last(&bounds[PROGRESSIVE_ROWS], tiles, last, tid) && tid < rows) {
+    if (arrive::last(&bounds[SEISMIC_CONST_VERIFY_ROWS], tiles, last, tid) && tid < rows) {
         const uint k = atomic_load_explicit(&bounds[tid], memory_order_relaxed);
         const float raised = k == 0u ? -INFINITY : order::value(k);
         const float floored = floor ? metal::max(floor[tid * floor_stride], raised) : raised;
@@ -385,7 +384,7 @@ inline void gather(device const uchar *features, ulong feature_stride, thread co
     element::Out<element::F32> threshold, ulong threshold_stride, device atomic_uint *bounds, uint rows, uint vocabulary, uint d,
     threadgroup atomic_uint *lowest, threadgroup uint *last, threadgroup uint4 *stage, uint tile, uint tiles, uint tid,
     uint threads, uint simdgroups, uint sg, uint lane) {
-    if (REFINE && tid < PROGRESSIVE_ROWS)
+    if (REFINE && tid < SEISMIC_CONST_VERIFY_ROWS)
         atomic_store_explicit(&lowest[tid], 0u, memory_order_relaxed);
     // The features in threadgroup memory when they fit, quarter-major
     // ([row][quarter][group]) so a simdgroup's reads are contiguous; every

@@ -1,4 +1,4 @@
-// Decode output of the general routed feed-forward (M <= DECODE_ROWS): the
+// Decode output of the general routed feed-forward (M <= VERIFY_ROWS): the
 // down projections (`lib/routed/down.h`) and their sum
 // (`lib/routed/down_sum.h`), without a CPU site.
 

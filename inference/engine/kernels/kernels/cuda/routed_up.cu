@@ -1,4 +1,4 @@
-// Decode expansion of up-only experts (M <= DECODE_ROWS); the CUDA form of
+// Decode expansion of up-only experts (M <= VERIFY_ROWS); the CUDA form of
 // `metal/routed_up.metal`, with the activated epilogue A(act(A(up))).
 // Two forms of one entry (GATHERED, a tuning form both valid at every M,
 // which the tuning admits between):
@@ -103,10 +103,10 @@ __global__ void routed_up_gathered(SEISMIC_KERNEL_PARAMS) {
     const unsigned choice = blockIdx.y, slots = (unsigned)SEISMIC_DIM_K;
     if (!routed::first_choice(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1, slots, choice))
         return;
-    __shared__ projection::u64 rows_at[SEISMIC_CONST_DECODE_ROWS], products_at[SEISMIC_CONST_DECODE_ROWS];
+    __shared__ projection::u64 rows_at[SEISMIC_CONST_VERIFY_ROWS], products_at[SEISMIC_CONST_VERIFY_ROWS];
     __shared__ unsigned count;
     if (threadIdx.x == 0) {
-        projection::u32 chosen[SEISMIC_CONST_DECODE_ROWS];
+        projection::u32 chosen[SEISMIC_CONST_VERIFY_ROWS];
         count = routed::expert_choices(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1,
                                        (unsigned)SEISMIC_DIM_M, slots, choice, chosen);
         for (unsigned r = 0; r < count; ++r) {

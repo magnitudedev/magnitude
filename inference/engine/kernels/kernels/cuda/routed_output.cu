@@ -1,4 +1,4 @@
-// Decode output (M <= DECODE_ROWS): the fused projections
+// Decode output (M <= VERIFY_ROWS): the fused projections
 // (`lib/routed/output.cuh`) into scratch, the last arriving block of a
 // channel tile joining them (`lib/routed/output_sum.cuh`), without a CPU
 // site.

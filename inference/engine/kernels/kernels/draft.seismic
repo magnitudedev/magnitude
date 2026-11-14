@@ -148,22 +148,29 @@ native readout_project_rows for metal from "metal/readout_project_rows.metal":
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (min(ceil_div(D, 32), 448) * 64)
 
+# CUDA: the projection of a column is the same arithmetic whether the
+# specialization computes the vocabulary's columns in order (I = 0) or gathers
+# columns by token (I = 1, `readout_project_rows_indexed`): the two are tuned
+# as separate specializations, so the order their verification rows reach
+# (`KSPLIT`, read by the GEMV classes and the indexed launch) is not a setting
+# and is fixed at 4. OPERAND and the GEMMs past 16 rows stay tunable; the
+# indexed form takes OPERAND 0.
 native readout_project_rows for cuda from "cuda/readout_project_rows.cu":
     static (V, D, S, I, WS)
-    params (arithmetic OPERAND in [0, 1] default 0)
+    params (arithmetic OPERAND in [0, 1] default 0, arithmetic KSPLIT in [4] default 4)
     where D % 64 == 0 and (I == 0 or OPERAND == 0)
     scratch staged bytes (O * D * 2) when O > 1 or I == 1
     launch readout_project_rows_stage when O > 1 or I == 1:
         reads (OPERAND)
+        staging
         threadgroups (O, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch readout_project_rows_gemv when I == 0 and O <= 8:
-        params (arithmetic KSPLIT in [4, 2, 8] default 4)
         threadgroups (ceil_div(ceil_div(S, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes ((1 - min(1, O - 1)) * D * 2)
     launch readout_project_rows_gemv16 when I == 0 and O > 8 and O <= 16:
-        params (arithmetic KSPLIT in [4, 2, 8] default 4)
+        alike (readout_project_rows_gemv)
         threadgroups (ceil_div(ceil_div(S, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch readout_project_rows_gemm_small when I == 0 and O > 16 and O <= 64:
@@ -178,7 +185,7 @@ native readout_project_rows for cuda from "cuda/readout_project_rows.cu":
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (2 * (128 * 144 + 10240) + 2048)
     launch readout_project_rows_indexed when I == 1:
-        params (arithmetic KSPLIT in [4, 2, 8] default 4)
+        reads (KSPLIT)
         threadgroups (S, O, 1)
         threads_per_threadgroup (256, 1, 1)
 
@@ -202,6 +209,7 @@ native readout_project_rows for cpu from "cpu/readout_project_rows.rs":
     scratch quantized bytes (ceil_div(O, Q8_ROWS) * Q8_ROWS * ceil_div(D, Q8_VALUES) * Q8_BYTES)
     scratch staged bytes (O * D * 4)
     launch readout_project_rows_stage:
+        staging
         threadgroups (O, 1, 1)
         threads_per_threadgroup (1, 1, 1)
     launch readout_project_rows_rows:

@@ -1,12 +1,12 @@
 // Routing for M rows in four launches. The Vulkan form of
 // `metal/routed_route.metal`.
-//   routed_route_stage (M > DECODE_ROWS, one workgroup per row): the row's RMS and
+//   routed_route_stage (M > VERIFY_ROWS, one workgroup per row): the row's RMS and
 //     its normalized values (rounded to the activation dtype), published once.
-//   routed_route_gemv (M <= DECODE_ROWS): one subgroup per logit column reads the
+//   routed_route_gemv (M <= VERIFY_ROWS): one subgroup per logit column reads the
 //     column's weights once and dots them with every row, normalizing on the
 //     fly from RMS partials shared across the workgroup (in the stage
 //     launch's sum order); workgroup 0 publishes the normalized rows.
-//   routed_route_gemm (M > DECODE_ROWS): 32 rows x 32 columns per workgroup over
+//   routed_route_gemm (M > VERIFY_ROWS): 32 rows x 32 columns per workgroup over
 //     staged F32 tiles, each invocation 8 outputs in ascending-K FMAs.
 //   Logits are [M, E + 1]: column E is the shared-expert gate.
 //   routed_route_select (one subgroup per row): the softmax over every

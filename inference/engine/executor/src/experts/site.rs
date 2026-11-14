@@ -48,7 +48,7 @@
 //!   per block (`quant::quantize`), i32 dots within a block, f32 across
 //!   blocks and in the combine (`projection::project_arithmetic`). The
 //!   products stay f32: they never leave the CPU.
-//! - **Answer.** The output `[DECODE_ROWS, H]` f32, every row written (zero
+//! - **Answer.** The output `[VERIFY_ROWS, H]` f32, every row written (zero
 //!   where no entry names it), then the slot's answer, the step with
 //!   release, or the step with the failure flag (SLOT_FAILED). The publish
 //!   only moves a slot's answer forward ([`SiteLayer::publish`]), so a late answer
@@ -185,8 +185,8 @@ impl SiteScales {
 
 /// A layer's request and answer storage, host-shared: its site table of the
 /// exchange (`site[FLIGHT, R]`, [`SiteShape::table`]), the rows
-/// `rows[FLIGHT, DECODE_ROWS, H]` f32 and the output
-/// `output[FLIGHT, DECODE_ROWS, H]` f32.
+/// `rows[FLIGHT, VERIFY_ROWS, H]` f32 and the output
+/// `output[FLIGHT, VERIFY_ROWS, H]` f32.
 pub(crate) struct SiteStorage {
     pub table: seismic::Tensor,
     pub rows: seismic::Tensor,
@@ -198,7 +198,7 @@ pub(crate) struct SiteStorage {
 pub(crate) struct SiteShape {
     /// Its site table's layout (`RegionWords::site`).
     pub table: magnitude_kernels::SlotTable,
-    /// Rows a slot, `DECODE_ROWS`.
+    /// Rows a slot, `VERIFY_ROWS`.
     pub rows: usize,
     /// Choices a row, `K`: a request holds at most `rows * choices` entries.
     pub choices: usize,
@@ -218,7 +218,7 @@ impl SiteShape {
         let to = |value: u64| usize::try_from(value).map_err(|_| "site extents exceed the host".to_owned());
         Ok(Self {
             table: magnitude_kernels::SlotTable::site(form.flight, form.widest),
-            rows: to(constants::DECODE_ROWS)?,
+            rows: to(constants::VERIFY_ROWS)?,
             choices: to(form.choices)?,
             experts: to(form.experts)?,
             hidden: to(form.record.down.matrix[0])?,
@@ -929,7 +929,7 @@ pub(super) enum WorkerTurn {
 struct Work {
     slot: usize,
     step: u64,
-    /// The slot's rows `[DECODE_ROWS, H]`, which the device wrote.
+    /// The slot's rows `[VERIFY_ROWS, H]`, which the device wrote.
     input: *const f32,
     experts: Vec<Expert>,
     /// Every expert's rows' activations `[rows, H]`, expert after expert

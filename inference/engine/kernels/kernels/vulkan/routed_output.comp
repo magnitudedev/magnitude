@@ -1,4 +1,4 @@
-// Decode output (M <= DECODE_ROWS): the projections (`lib/routed/output.glsl`)
+// Decode output (M <= VERIFY_ROWS): the projections (`lib/routed/output.glsl`)
 // into scratch, in A, and their join (`lib/routed/output_sum.glsl`). The
 // Vulkan form of `metal/routed_output.metal`.
 #define ROUTED_SOURCE_ROWS SEISMIC_DIM_XS

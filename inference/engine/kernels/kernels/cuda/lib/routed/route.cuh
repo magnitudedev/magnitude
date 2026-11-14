@@ -9,7 +9,7 @@
 //     layer's, or a layer ahead's: its input form is this layer's), each
 //     value rounded to A.
 //   decode_inverses: a GEMV block's RMS inverses of the decode rows
-//     (M <= DECODE_ROWS), in the stage launch's sum order.
+//     (M <= VERIFY_ROWS), in the stage launch's sum order.
 //   Formed, Staged, stage_rows: the decode rows a block's columns read:
 //     formed from the input as each element is read, or once into the
 //     block's shared memory (a launch that gives every block M x H A
@@ -83,7 +83,7 @@ struct Input {
     }
 };
 
-// The decode rows' RMS inverses into `inverses` (DECODE_ROWS floats; 0 without a
+// The decode rows' RMS inverses into `inverses` (VERIFY_ROWS floats; 0 without a
 // norm), in the stage launch's sum order (256 strided partials, warp sums,
 // then the eight warp partials in order): item (row, part) is part `part`'s
 // warp sum, and the items spread over every warp of the block, through
@@ -114,7 +114,7 @@ __device__ __forceinline__ void decode_inverses(const float *residual, float (*p
             inverses[thread] = rsqrtf(seismic_add_rn(total / static_cast<float>(SEISMIC_DIM_H), eps));
         }
     } else {
-        if (thread < SEISMIC_CONST_DECODE_ROWS)
+        if (thread < SEISMIC_CONST_VERIFY_ROWS)
             inverses[thread] = 0.0f;
     }
     __syncthreads();
@@ -242,7 +242,7 @@ template <unsigned EXPERTS = static_cast<unsigned>(SEISMIC_DIM_E), class Rows>
 __device__ __forceinline__ void column(const Rows &input, const Columns &w, unsigned long long expert,
                                        float *logits, unsigned lane, const seismic_words_t &seismic_words_value) {
     const unsigned rows = static_cast<unsigned>(SEISMIC_DIM_M);
-    float sums[SEISMIC_CONST_DECODE_ROWS] = {};
+    float sums[SEISMIC_CONST_VERIFY_ROWS] = {};
 #if defined(SEISMIC_ROUTER_KIND_PACKED)
     const auto router_rows = KERNEL_W0_AT(w.router);
     // One lane decodes a 16-value register chunk of an mma16 router row.
@@ -261,7 +261,7 @@ __device__ __forceinline__ void column(const Rows &input, const Columns &w, unsi
                 const float weight = expert < EXPERTS
                     ? values[4 * s + j] : w.shared_router[source * w.shared_router0];
 #pragma unroll
-                for (unsigned row = 0; row < SEISMIC_CONST_DECODE_ROWS; ++row)
+                for (unsigned row = 0; row < SEISMIC_CONST_VERIFY_ROWS; ++row)
                     if (row < rows)
                         sums[row] = seismic_fma_rn(input.value(row, source, seismic_words_value), weight,
                             sums[row]);
@@ -286,7 +286,7 @@ __device__ __forceinline__ void column(const Rows &input, const Columns &w, unsi
                         ? route::weight<EXPERTS>(w, expert, base + j, seismic_words_value) : 0.0f;
             }
 #pragma unroll
-            for (unsigned row = 0; row < SEISMIC_CONST_DECODE_ROWS; ++row) {
+            for (unsigned row = 0; row < SEISMIC_CONST_VERIFY_ROWS; ++row) {
                 if (row < rows) {
 #pragma unroll
                     for (unsigned b = 0; b < BATCH; ++b) {
@@ -309,7 +309,7 @@ __device__ __forceinline__ void column(const Rows &input, const Columns &w, unsi
                 const float weight = first + j < SEISMIC_DIM_H
                     ? route::weight<EXPERTS>(w, expert, first + j, seismic_words_value) : 0.0f;
 #pragma unroll
-                for (unsigned row = 0; row < SEISMIC_CONST_DECODE_ROWS; ++row)
+                for (unsigned row = 0; row < SEISMIC_CONST_VERIFY_ROWS; ++row)
                     if (row < rows && first + j < SEISMIC_DIM_H)
                         sums[row] = seismic_fma_rn(input.value(row, first + j, seismic_words_value), weight,
                             sums[row]);
@@ -331,7 +331,7 @@ __device__ __forceinline__ void column(const Rows &input, const Columns &w, unsi
                 }
             }
 #pragma unroll
-            for (unsigned row = 0; row < SEISMIC_CONST_DECODE_ROWS; ++row) {
+            for (unsigned row = 0; row < SEISMIC_CONST_VERIFY_ROWS; ++row) {
                 if (row < rows) {
                     float value[BATCH][4];
 #pragma unroll
@@ -358,7 +358,7 @@ __device__ __forceinline__ void column(const Rows &input, const Columns &w, unsi
     }
 #endif
 #pragma unroll
-    for (unsigned row = 0; row < SEISMIC_CONST_DECODE_ROWS; ++row) {
+    for (unsigned row = 0; row < SEISMIC_CONST_VERIFY_ROWS; ++row) {
         const float sum = seismic_warp_sum_f32(sums[row]);
         if (row < rows && lane == 0)
             logits[logit_index<EXPERTS>(row, expert, seismic_words_value)] = sum;

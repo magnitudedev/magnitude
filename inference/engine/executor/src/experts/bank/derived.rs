@@ -94,7 +94,7 @@ impl BankShape {
 pub struct WorkingSet {
     /// `K`: the experts a row selects.
     selected: u64,
-    /// A decode step's parked layer: `min(DECODE_ROWS · K, E)`, `E` the
+    /// A decode step's parked layer: `min(VERIFY_ROWS · K, E)`, `E` the
     /// widest layer's experts. The device runs in layer order, so one park
     /// holds records at once, whichever layer.
     decode: u64,
@@ -113,7 +113,7 @@ impl WorkingSet {
     /// fewer: a prompt converts a layer in as many rounds as its scratch
     /// takes, and the floor holds at least what a decode step needs.
     pub fn new(selected: u64, widest: u64, lent: u64, staging_forms: u64) -> Self {
-        let decode = (crate::operators::routed::fused_graph::DECODE_ROWS * selected).min(widest);
+        let decode = (magnitude_kernels::constants::VERIFY_ROWS * selected).min(widest);
         Self { selected, decode, lent: lent.max(decode), staging_forms }
     }
 

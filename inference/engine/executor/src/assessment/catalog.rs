@@ -527,7 +527,7 @@ fn derive_terms(
             let demand = DecodeDemand::from_model(definition, load, codec, &declarations)?;
             // Every call's launches at one and at the decode rows' most.
             for call in &demand.calls {
-                for rows in [1, crate::operators::attention::graph::DECODE_ROWS] {
+                for rows in [1, magnitude_kernels::constants::VERIFY_ROWS] {
                     call.launches.at(rows)?;
                 }
             }
@@ -780,7 +780,7 @@ fn plan_and_charge_separate_draft(
             family.layer_entry(&declared, layer)
         })
         .unwrap_or_else(|error| panic!("{draft_file}: {error}"));
-        let proposals = u8::try_from(bound.max_proposals()).unwrap();
+        let proposals = crate::draft_proposals(&bound);
         // A separate-draft load executes the draft, never an embedded head.
         let definition = magnitude_family_contracts::ModelDefinition {
             head: None,

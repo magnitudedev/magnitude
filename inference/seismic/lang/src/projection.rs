@@ -647,6 +647,11 @@ impl Instance<'_> {
             params,
             constraint: self.optional(&declared.constraint, None)?,
             reads: declared.reads.iter().map(|read| self.ident(read)).collect(),
+            alike: declared.alike.as_ref().map(|alike| Ident {
+                name: format!("{}_{}", self.entry, alike.name),
+                span: self.span(alike.span),
+            }),
+            staging: declared.staging,
             records: declared.records.as_ref().map(|records| {
                 records
                     .iter()

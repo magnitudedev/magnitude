@@ -2190,13 +2190,10 @@ impl ExecutionPlanner {
                 Some(greedy_proposals.max(sampled_proposals))
             }
             // One block pass drafts every proposal, so the width is bounded
-            // by the draft's block, not by sealed chains.
+            // by the draft's block and by one verification's rows.
             PlannedMethod::DFlash { proposals, .. } => {
-                let block = definition.draft.as_ref().map_or(
-                    0,
-                    magnitude_family_contracts::DraftDefinition::max_proposals,
-                );
-                if proposals == 0 || u64::from(proposals) > block || method.widest() > proposals {
+                let most = definition.draft.as_ref().map_or(0, super::draft_proposals);
+                if proposals == 0 || proposals > most || method.widest() > proposals {
                     return Err(PlanError::Unsupported("DFlash proposal width"));
                 }
                 Some(proposals)

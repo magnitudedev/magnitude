@@ -119,7 +119,7 @@ impl ExpertBankPlan {
     ///   the steps in flight (`FlightDepth::steps`: the groups in flight,
     ///   a decode step's lookahead successor, a prompt group's places) only the parked step's resolution of one
     ///   layer holds records at once, its hits and its landings together at
-    ///   most `R = min(DECODE_ROWS · K, E)` distinct experts, the widest
+    ///   most `R = min(VERIFY_ROWS · K, E)` distinct experts, the widest
     ///   member's `E` (`decode::parked_reads`). A step begun behind it holds
     ///   records only through graces stamped past the park, which the
     ///   reserve's unmappings make and keep, ready and graced together, to at

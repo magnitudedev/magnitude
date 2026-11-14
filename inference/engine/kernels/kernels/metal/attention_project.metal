@@ -126,7 +126,7 @@ inline void attention_project_zero_tile(Output out, uint rows, uint columns,
 
 // One row.
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_GEMV
-template <uint ROWS, uint LANES>
+template <uint LANES, uint ROWS>
 kernel void attention_project_gemv(ATTENTION_PROJECT_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],
@@ -137,9 +137,9 @@ kernel void attention_project_gemv(ATTENTION_PROJECT_ARGUMENTS,
 }
 #endif
 
-// Three rows up to BATCH_FROM: the same GEMV under this launch's mapping.
+// Three rows up to VERIFY_ROWS: the same GEMV under this launch's mapping.
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_GEMV_ROWS
-template <uint ROWS, uint LANES>
+template <uint LANES, uint ROWS>
 kernel void attention_project_gemv_rows(ATTENTION_PROJECT_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],
@@ -152,7 +152,7 @@ kernel void attention_project_gemv_rows(ATTENTION_PROJECT_ARGUMENTS,
 
 // Two rows: the same GEMV under this launch's mapping.
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_GEMV_PAIR
-template <uint ROWS, uint LANES>
+template <uint LANES, uint ROWS>
 kernel void attention_project_gemv_pair(ATTENTION_PROJECT_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],

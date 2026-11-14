@@ -1,4 +1,4 @@
-// Decode output of the general routed feed-forward (M <= DECODE_ROWS): the
+// Decode output of the general routed feed-forward (M <= VERIFY_ROWS): the
 // down projections (`lib/routed/down.glsl`) weighted in slot order, then
 // base + selected published in R (`lib/routed/down_sum.glsl`), in one
 // launch. The Vulkan form of `metal/routed_down.metal`. The running selection

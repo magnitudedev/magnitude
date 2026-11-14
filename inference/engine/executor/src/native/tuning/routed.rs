@@ -16,11 +16,11 @@ use super::{
     CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, experts_text, row_points,
     served_row_points,
 };
-use crate::operators::routed::fused_graph::{DECODE_ROWS, TILE_ROWS, grouped_blocks};
+use crate::operators::routed::fused_graph::{TILE_ROWS, grouped_blocks};
 use crate::planning::{BankBinding, HINT_LEADS, HintWeight, RoutedBinding};
 use magnitude_family_contracts::{GluLimit, Operator, RouteNormalization, WeightKind, WeightScope};
 use magnitude_kernels::constants::{
-    MAP_RECORD, MAP_WORDS, POLICY_PRICED, POLICY_WORDS, SOURCE_ROWS, STEP_LOW, STEP_WORDS,
+    MAP_RECORD, MAP_WORDS, POLICY_PRICED, POLICY_WORDS, SOURCE_ROWS, STEP_LOW, STEP_WORDS, VERIFY_ROWS,
 };
 use magnitude_kernels::{
     routed_combine, routed_expand, routed_experts, routed_gate_up, routed_group, routed_output,
@@ -53,12 +53,12 @@ impl RoutedShape {
 
 /// The decode points: row counts the decode form serves.
 pub(crate) fn decode_points(limits: TuningLimits) -> Vec<PointShape> {
-    served_row_points(limits, |rows| rows <= DECODE_ROWS)
+    served_row_points(limits, |rows| rows <= VERIFY_ROWS)
 }
 
 /// The grouped points: row counts past the decode form.
 pub(crate) fn grouped_points(limits: TuningLimits) -> Vec<PointShape> {
-    served_row_points(limits, |rows| rows > DECODE_ROWS)
+    served_row_points(limits, |rows| rows > VERIFY_ROWS)
 }
 
 /// Distinct experts per row with the uneven expert loads of real routing: the

@@ -505,6 +505,12 @@ uint projection_gemv_stage_word(projection_prologue in_) {
 // that run (its compile time grows with the unrolled body).
 #define PROJECTION_GEMV_MAX_R 4
 #define PROJECTION_GEMV_MAX_M 8
+#ifndef SEISMIC_CONST_VERIFY_ROWS
+#error "projection.glsl needs SEISMIC_CONST_VERIFY_ROWS"
+#endif
+#if SEISMIC_CONST_VERIFY_ROWS > PROJECTION_GEMV_MAX_M
+#error "the GEMV classes serve at most PROJECTION_GEMV_MAX_M rows"
+#endif
 #define PROJECTION_GEMV_SUMS (PROJECTION_GEMV_MAX_R * PROJECTION_GEMV_MAX_M)
 
 // Weight rows of one GEMV workgroup (segmented entries map workgroups to

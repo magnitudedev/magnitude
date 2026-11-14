@@ -1,4 +1,4 @@
-// Decode output (M <= DECODE_ROWS): the fused projections (`lib/routed/output.h`)
+// Decode output (M <= VERIFY_ROWS): the fused projections (`lib/routed/output.h`)
 // and their join (`lib/routed/output_sum.h`), without a CPU site.
 
 #ifdef SEISMIC_FORMING_ROUTED_OUTPUT_RESIDENT

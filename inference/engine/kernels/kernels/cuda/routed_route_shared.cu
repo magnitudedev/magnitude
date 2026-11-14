@@ -1,4 +1,4 @@
-// Decode routing (M <= DECODE_ROWS) with the shared expert's gate/up in one launch;
+// Decode routing (M <= VERIFY_ROWS) with the shared expert's gate/up in one launch;
 // the CUDA form of `metal/routed_route_shared.metal`. Blocks [0,
 // route::BLOCKS) are `routed_route`'s GEMV blocks (`lib/routed/route.cuh`),
 // whose selection counts only them. Every block stages the decode rows in
@@ -16,8 +16,8 @@
 SEISMIC_PROGRAMMATIC_DEPENDENCY
 
 extern "C" __global__ void routed_route_shared(SEISMIC_KERNEL_PARAMS) {
-    __shared__ float parts[SEISMIC_CONST_DECODE_ROWS][route::WARPS];
-    __shared__ float inverses[SEISMIC_CONST_DECODE_ROWS];
+    __shared__ float parts[SEISMIC_CONST_VERIFY_ROWS][route::WARPS];
+    __shared__ float inverses[SEISMIC_CONST_VERIFY_ROWS];
     __shared__ unsigned last;
     extern __shared__ uint4 memory[];
     if (blockIdx.x >= route::BLOCKS) {

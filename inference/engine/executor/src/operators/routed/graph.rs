@@ -1,7 +1,7 @@
 //! The general routed feed-forward graph (`operators::routed`): the shared
 //! expert's dense feed-forward onto the residual as the `base`, selection,
 //! an optional latent down projection, the experts (decode form up to
-//! [`DECODE_ROWS`](super::fused_graph::DECODE_ROWS) rows, grouped form beyond) summed onto the base, and an
+//! `VERIFY_ROWS` rows, grouped form beyond) summed onto the base, and an
 //! optional latent up projection. Row tables, the selection bias a model
 //! lacks and a latent sum's zero base are graph constants; a scale it lacks
 //! is the absent operand. A split layer's front selects and projects down,

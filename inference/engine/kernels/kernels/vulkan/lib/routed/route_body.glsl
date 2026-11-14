@@ -100,7 +100,7 @@ const packets_rows16 router_layout = ROUTE_ROUTER_ROWS; \
                     const uint source = 32u * p + 8u * step + i; \
                     const float weight = (i & 1u) != 0u ? odd[i >> 1] : even[i >> 1]; \
                     const float scale = ROUTE_FN(route_norm)(source); \
-                    [[unroll]] for (uint row = 0u; row < uint(SEISMIC_CONST_DECODE_ROWS); ++row) \
+                    [[unroll]] for (uint row = 0u; row < uint(SEISMIC_CONST_VERIFY_ROWS); ++row) \
                         if (row < rows) \
                             sums[row] = seismic_fma_rn( \
                                 ROUTE_FN(route_input)(row, source, seismic_shared_f32[inverses + row], scale), weight, sums[row]); \
@@ -112,7 +112,7 @@ const packets_rows16 router_layout = ROUTE_ROUTER_ROWS; \
                 const float weight = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_ROUTER) \
                     + uint64_t(source) * SEISMIC_SHARED_ROUTER_STRIDE_0 * 4ul); \
                 const float scale = ROUTE_FN(route_norm)(source); \
-                [[unroll]] for (uint row = 0u; row < uint(SEISMIC_CONST_DECODE_ROWS); ++row) \
+                [[unroll]] for (uint row = 0u; row < uint(SEISMIC_CONST_VERIFY_ROWS); ++row) \
                     if (row < rows) \
                         sums[row] = seismic_fma_rn( \
                             ROUTE_FN(route_input)(row, source, seismic_shared_f32[inverses + row], scale), weight, sums[row]); \
@@ -127,7 +127,7 @@ for (uint base = 4u * lane; base < hidden; base += 128u) { \
             weight[j] = ROUTE_FN(route_column_weight)(expert, base + j); \
             scale[j] = ROUTE_FN(route_norm)(base + j); \
         } \
-        [[unroll]] for (uint row = 0u; row < uint(SEISMIC_CONST_DECODE_ROWS); ++row) { \
+        [[unroll]] for (uint row = 0u; row < uint(SEISMIC_CONST_VERIFY_ROWS); ++row) { \
             if (row < rows) { \
                 const float inverse = seismic_shared_f32[inverses + row]; \
                 [[unroll]] for (uint j = 0u; j < 4u; ++j) \
@@ -142,7 +142,7 @@ void ROUTE_FN(route_gemv)() { \
     const uint rows = uint(SEISMIC_DIM_M), hidden = uint(SEISMIC_DIM_H); \
     const uint sg = SEISMIC_SUBGROUP, lane = SEISMIC_LANE, thread = gl_LocalInvocationIndex; \
     const float eps = element_word_f32(SEISMIC_PARAM_EPS); \
-    const uint inverses = uint(SEISMIC_CONST_DECODE_ROWS) * ROUTE_SUBGROUPS; \
+    const uint inverses = uint(SEISMIC_CONST_VERIFY_ROWS) * ROUTE_SUBGROUPS; \
     /* The stage launch's sum order (256 strided partials, subgroup sums, then */ \
     /* the eight subgroup partials in order): item (row, part) is part `part`'s */ \
     /* subgroup sum, and the items spread over every subgroup. */ \
@@ -176,12 +176,12 @@ void ROUTE_FN(route_gemv)() { \
         return; \
     /* Lane l owns sources 4l + 128 i .. + 3 (four independent loads per */ \
     /* step), accumulated in source order within the lane. */ \
-    float sums[SEISMIC_CONST_DECODE_ROWS]; \
-    [[unroll]] for (uint row = 0u; row < uint(SEISMIC_CONST_DECODE_ROWS); ++row) \
+    float sums[SEISMIC_CONST_VERIFY_ROWS]; \
+    [[unroll]] for (uint row = 0u; row < uint(SEISMIC_CONST_VERIFY_ROWS); ++row) \
         sums[row] = 0.0; \
 ROUTE_ACCUMULATE_GEMV \
  \
-    [[unroll]] for (uint row = 0u; row < uint(SEISMIC_CONST_DECODE_ROWS); ++row) { \
+    [[unroll]] for (uint row = 0u; row < uint(SEISMIC_CONST_VERIFY_ROWS); ++row) { \
         if (row < rows) { \
             const float sum = seismic_subgroup_sum_f32(sums[row]); \
             if (lane == 0u) \

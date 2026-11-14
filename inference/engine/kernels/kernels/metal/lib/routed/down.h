@@ -1,5 +1,5 @@
 // The decode down projections of the general routed feed-forward (M <=
-// DECODE_ROWS), shared by `routed_down` and `routed_down_project`:
+// VERIFY_ROWS), shared by `routed_down` and `routed_down_project`:
 // threadgroup (x, m) owns the TILE output channels of tile x for row m and
 // runs K simdgroups side by side, simdgroup k projecting choice k through its
 // expert's down rows (`routed::project_channels`). The projections meet in

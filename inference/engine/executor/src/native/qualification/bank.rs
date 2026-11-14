@@ -780,7 +780,7 @@ fn require_bytes(tensor: &Tensor, wanted: &[u8], entry: &'static str, label: &st
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operators::routed::fused_graph::DECODE_ROWS;
+    use magnitude_kernels::constants::VERIFY_ROWS;
     use crate::planning::RegionWords;
     use crate::{Expansion, ExecutionPath, GeneralRoutedShape};
     use magnitude_kernels::{
@@ -856,7 +856,7 @@ mod tests {
             tier: 0,
             placer: crate::planning::Placer::Tier,
             words: RegionWords {
-                choices: DECODE_ROWS * SELECTED,
+                choices: VERIFY_ROWS * SELECTED,
                 rounds: 2,
                 flight: 2,
                 sites: 2,

@@ -226,7 +226,7 @@ struct ConvolvedChannel {
 
 // One row.
 #ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_CONVOLVED_GEMV
-template <uint ROWS, uint LANES>
+template <uint LANES, uint ROWS>
 kernel void gated_delta_project_convolved_gemv(RECURRENT_PROJECT_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],
@@ -237,9 +237,9 @@ kernel void gated_delta_project_convolved_gemv(RECURRENT_PROJECT_ARGUMENTS,
 }
 #endif
 
-// Three rows up to BATCH_FROM: the same GEMV under this launch's mapping.
+// Three rows up to VERIFY_ROWS: the same GEMV under this launch's mapping.
 #ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_CONVOLVED_GEMV_ROWS
-template <uint ROWS, uint LANES>
+template <uint LANES, uint ROWS>
 kernel void gated_delta_project_convolved_gemv_rows(RECURRENT_PROJECT_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],
@@ -252,7 +252,7 @@ kernel void gated_delta_project_convolved_gemv_rows(RECURRENT_PROJECT_ARGUMENTS,
 
 // Two rows: the same GEMV under this launch's mapping.
 #ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_CONVOLVED_GEMV_PAIR
-template <uint ROWS, uint LANES>
+template <uint LANES, uint ROWS>
 kernel void gated_delta_project_convolved_gemv_pair(RECURRENT_PROJECT_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],

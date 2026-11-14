@@ -1,4 +1,4 @@
-// Decode expansion of gated experts (M <= DECODE_ROWS); the CUDA form of
+// Decode expansion of gated experts (M <= VERIFY_ROWS); the CUDA form of
 // `metal/routed_gate_up.metal`, with the activation-generic GLU epilogue on
 // the accumulators scaled by the expert's gate/up second-level scales where
 // those ports are present (static GS, US). Each choice's weights are read
@@ -126,10 +126,10 @@ __global__ void routed_gate_up_gathered(SEISMIC_KERNEL_PARAMS) {
     const unsigned at = blockIdx.y, slots = (unsigned)SEISMIC_DIM_K;
     if (!routed::first_choice(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1, slots, at))
         return;
-    __shared__ projection::u64 rows_at[SEISMIC_CONST_DECODE_ROWS], products_at[SEISMIC_CONST_DECODE_ROWS];
+    __shared__ projection::u64 rows_at[SEISMIC_CONST_VERIFY_ROWS], products_at[SEISMIC_CONST_VERIFY_ROWS];
     __shared__ unsigned count;
     if (threadIdx.x == 0) {
-        projection::u32 chosen[SEISMIC_CONST_DECODE_ROWS];
+        projection::u32 chosen[SEISMIC_CONST_VERIFY_ROWS];
         count = routed::expert_choices(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1,
                                        (unsigned)SEISMIC_DIM_M, slots, at, chosen);
         for (unsigned r = 0; r < count; ++r) {

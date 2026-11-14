@@ -424,6 +424,18 @@ pub struct NativeLaunchDecl {
     pub constraint: Option<Expr>,
     /// Entry parameters read by the kernel but absent from launch expressions.
     pub reads: Vec<Ident>,
+    /// `alike (LAUNCH)`: the launch computes each row as LAUNCH computes
+    /// that row alone (the launch that serves one row, or the launch whose
+    /// row the others reproduce): a row's bits do not depend on how many
+    /// rows its call carries. Neither declares an `arithmetic` parameter of
+    /// its own, and both read the same `arithmetic` settings of the native,
+    /// so one reduction order serves every row count.
+    pub alike: Option<Ident>,
+    /// `staging`: the launch forms operands for another launch and computes
+    /// no row's result, so it is no row class: the row classes a row count
+    /// selects up to the verification rows (`alike`) leave staging passes
+    /// out. A launch is not both.
+    pub staging: bool,
     /// `records (PORT, ..)`: the record ports of this launch in place of the
     /// native's; `None` takes the native's.
     pub records: Option<Vec<NativeRecordDecl>>,

@@ -68,8 +68,13 @@ bytes; the extra rows cost only arithmetic, which is idle.
   a multi-row class already shares, and tuning only chooses among forms that share.
 - **Stay bandwidth-bound across the widths used.** Extra rows are free only while their
   arithmetic fits in the time the memory reads take. Where a scalar form stops fitting, the
-  kernel switches to a form on the device's matrix units; the switch point is measured per
-  device.
+  kernel switches to a form on the device's matrix units. The switch point is declared, not
+  measured: at `VERIFY_ROWS + 1` (on CUDA at 17, its GEMV row classes reaching 16), always above the widest
+  verification (`VERIFY_ROWS`, eight, owned by `verify_rows.seismic`
+  and read by every decode form, the router and the executor): a verification row must
+  compute the bits plain decode computes for it, so every row up to that width is served by launches
+  `alike` the one-row launch, and a test holds every launch the row count selects up to it to being a
+  row class or a declared `staging` pass.
 - **Tune verify widths like decode.** The row counts verification uses are tuned with the same
   priority as single-row decode, because they serve the same share of decode time.
 - **Read out only what is checked.** The readout over verify rows reads no more of the output

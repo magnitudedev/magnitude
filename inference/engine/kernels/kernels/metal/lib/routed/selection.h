@@ -6,7 +6,7 @@
 // (`normalized`) and SIMDGROUPS under the same names. The includer defines
 // KERNEL_W0 as the router.
 //   decode_inverses: a GEMV threadgroup's RMS inverses of the decode rows
-//     (M <= DECODE_ROWS), in the stage launch's order.
+//     (M <= VERIFY_ROWS), in the stage launch's order.
 //   publish_normalized: the normalized rows (`norm`), by one threadgroup.
 //   select_columns: SIMDGROUPS logit columns of the decode rows over a
 //     router norm and router (`routing::Gemv`).

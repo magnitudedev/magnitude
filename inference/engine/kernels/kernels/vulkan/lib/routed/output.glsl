@@ -1,4 +1,4 @@
-// The decode output projections (M <= DECODE_ROWS) of `routed_output` and
+// The decode output projections (M <= VERIFY_ROWS) of `routed_output` and
 // `routed_output_project`: the counterpart of `metal/lib/routed/output.h`.
 // Each (row, choice) runs its down projection in a separate workgroup, its
 // down weights its source's record (`routed_source_weights`: a bank record,

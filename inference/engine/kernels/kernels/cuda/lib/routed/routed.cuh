@@ -50,7 +50,7 @@ struct GroupedRows {
     __device__ __forceinline__ bool wide() const { return stride % 8 == 0 && ((u64)x & 15) == 0; }
 };
 
-// Decode choices that share an expert (M <= DECODE_ROWS rows of K choices, a row's
+// Decode choices that share an expert (M <= VERIFY_ROWS rows of K choices, a row's
 // choices distinct experts). Choice c = m * K + k computes when it is its
 // expert's first choice in that order, once for every choice of the expert:
 // a GEMV row per choice, whose result does not depend on its neighbours, so
@@ -73,7 +73,7 @@ __device__ __forceinline__ bool first_choice(const int *routes, u64 row_stride, 
 // The choices of `choice`'s expert in order (at most one per row), into
 // `chosen`; returns their count.
 __device__ __forceinline__ u32 expert_choices(const int *routes, u64 row_stride, u64 slot_stride, u32 rows,
-                                              u32 slots, u32 choice, u32 (&chosen)[SEISMIC_CONST_DECODE_ROWS]) {
+                                              u32 slots, u32 choice, u32 (&chosen)[SEISMIC_CONST_VERIFY_ROWS]) {
     const int expert = route(routes, row_stride, slot_stride, slots, choice);
     u32 count = 0;
     for (u32 c = choice; c < rows * slots; ++c)

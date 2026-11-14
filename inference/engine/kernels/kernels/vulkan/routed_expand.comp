@@ -1,4 +1,4 @@
-// Decode expansion (M <= DECODE_ROWS): the K selected experts' gate/up projections and
+// Decode expansion (M <= VERIFY_ROWS): the K selected experts' gate/up projections and
 // the shared expert's, each with the SiluMul epilogue, in one launch. The
 // Vulkan form of `metal/routed_expand.metal`. Workgroup row y < M * K is
 // choice (m, k): a K1 paired GEMV over the feature tile `x` of expert

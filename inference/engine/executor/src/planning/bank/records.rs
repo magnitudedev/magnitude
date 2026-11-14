@@ -1,6 +1,6 @@
 use super::table::stored_rows;
 use crate::error::{PlanError, UnstreamedExperts};
-use crate::operators::routed::fused_graph::DECODE_ROWS;
+use magnitude_kernels::constants::VERIFY_ROWS;
 use crate::planning::weights::{Holding, WeightPlan, representation_bytes};
 use magnitude_family_contracts::{FeedForwardUp, ModelDefinition, Operator, RoutedFfn, WeightKind, WeightRole, WeightScope};
 use seismic::Element;
@@ -52,10 +52,10 @@ pub fn routed_experts(definition: &ModelDefinition) -> Result<u64, PlanError> {
 }
 
 /// The choices of the decode form's widest launch of a model whose rows
-/// each select `selected` experts, `DECODE_ROWS · K`: the most a decode
+/// each select `selected` experts, `VERIFY_ROWS · K`: the most a decode
 /// request names at a layer.
 pub(crate) fn decode_choices(selected: u64) -> u64 {
-    DECODE_ROWS * selected
+    VERIFY_ROWS * selected
 }
 
 /// A routed tensor of an expert record, in the order the fill converts them

@@ -69,7 +69,7 @@ inline void top_lengths(thread const X &x, uint rows, uint d, element::Out<progr
     element::Out<element::F32> lengths_out,
     ulong length_stride, threadgroup float *lengths, threadgroup float *parts, threadgroup atomic_uint *lowest, uint tile, uint tid,
     uint simdgroups, uint sg, uint lane) {
-    if (tid < PROGRESSIVE_ROWS)
+    if (tid < SEISMIC_CONST_VERIFY_ROWS)
         atomic_store_explicit(&lowest[tid], 0u, memory_order_relaxed);
     const uint threads = simdgroups * 32u;
     for (uint m = 0; m < rows; ++m) {
@@ -110,7 +110,7 @@ inline void top_publish(threadgroup atomic_uint *lowest, threadgroup const float
     if (tid < rows)
         atomic_fetch_max_explicit(&bounds[tid], atomic_load_explicit(&lowest[tid], memory_order_relaxed),
             memory_order_relaxed);
-    if (arrive::last(&bounds[PROGRESSIVE_ROWS], tiles, last, tid) && tid < rows) {
+    if (arrive::last(&bounds[SEISMIC_CONST_VERIFY_ROWS], tiles, last, tid) && tid < rows) {
         const uint k = atomic_load_explicit(&bounds[tid], memory_order_relaxed);
         const float raised = k == 0u ? -INFINITY : order::value(k);
         threshold.put(tid * threshold_stride, metal::isfinite(lengths[tid]) ? raised : -INFINITY);
@@ -127,8 +127,8 @@ inline void top_publish(threadgroup atomic_uint *lowest, threadgroup const float
         as_type<float>(uint(SEISMIC_PARAM_EPSILON)), d, {out_rows}};                    \
     const projection::Weights<packets::ProgressiveTop> w{top, SEISMIC_TOP_STRIDE_0, scales, \
         SEISMIC_SCALES_STRIDE_0};                                                       \
-    threadgroup float lengths[PROGRESSIVE_ROWS];                                        \
-    threadgroup atomic_uint lowest[PROGRESSIVE_ROWS];                                   \
+    threadgroup float lengths[SEISMIC_CONST_VERIFY_ROWS];                               \
+    threadgroup atomic_uint lowest[SEISMIC_CONST_VERIFY_ROWS];                                   \
     threadgroup float parts[32];                                                        \
     threadgroup uint last;                                                              \
     PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);                            \
@@ -150,16 +150,6 @@ kernel void readout_top_rows_gemv(TOP_ROWS_ARGUMENTS, TOP_ROWS_THREADS) {
     PROJECTION_FOR_ROWS(rows,
         projection::gemv_runtime<packets::ProgressiveTop, ROWS, MAXM, LANES>(
             x, out, w, rows, uint(SEISMIC_DIM_V), d, tile, shared, simdgroups, sg, lane));
-    top_publish(lowest, lengths, bounds, &last, element::Out<element::F32>(threshold), SEISMIC_RESULT_1_STRIDE_0, rows, tiles, tid);
-}
-#endif
-
-#ifdef SEISMIC_FORMING_READOUT_TOP_ROWS_BATCH
-template <uint BATCH_ROWS>
-kernel void readout_top_rows_batch(TOP_ROWS_ARGUMENTS, TOP_ROWS_THREADS) {
-    TOP_ROWS_OPERANDS;
-    projection::gemv_batch_runtime<packets::ProgressiveTop, BATCH_ROWS>(x, out, w, rows, uint(SEISMIC_DIM_V), d,
-        tile, shared, simdgroups, sg, lane);
     top_publish(lowest, lengths, bounds, &last, element::Out<element::F32>(threshold), SEISMIC_RESULT_1_STRIDE_0, rows, tiles, tid);
 }
 #endif

@@ -55,6 +55,7 @@
 use super::demand::{Bytes, Call, DecodeDemand, Flops, Work};
 use super::executor_costs::ExecutorCosts;
 use super::AssessmentError;
+use magnitude_kernels::constants::VERIFY_ROWS;
 use seismic::Element;
 use super::executor_costs::OperandStorage;
 
@@ -346,26 +347,20 @@ fn work_seconds(
     })
 }
 
-/// The most rows the demand's calls describe: the decode row classes,
-/// beyond which attention and routed calls run their prefill forms
-/// (`operators::attention::graph`, `operators::routed::fused_graph`).
-fn decode_rows() -> u64 {
-    crate::operators::attention::graph::DECODE_ROWS
-        .min(crate::operators::routed::fused_graph::DECODE_ROWS)
-}
-
-/// One decode step's time at `depth` over `sequences` sequences.
+/// One decode step's time at `depth` over `sequences` sequences: at most
+/// the decode row classes (`VERIFY_ROWS`) the demand's calls describe, beyond
+/// which attention and routed calls run their prefill forms.
 pub fn step_seconds(
     demand: &DecodeDemand,
     pricing: &Pricing<'_>,
     sequences: u64,
     depth: u32,
 ) -> Result<StepSeconds, AssessmentError> {
-    if sequences == 0 || sequences > decode_rows() {
+    if sequences == 0 || sequences > VERIFY_ROWS {
         return Err(AssessmentError::Demand(format!(
             "a decode step of {sequences} rows is not one the decode demand describes \
              (1 to {} rows; beyond, prefill forms run)",
-            decode_rows()
+            VERIFY_ROWS
         )));
     }
     composed(demand, pricing, |call| call_seconds(call, pricing, sequences, depth))
@@ -392,7 +387,7 @@ fn composed(
 /// over the same work at `rows` rows, composed as a step is. What the
 /// prefill forms' kernels achieve beyond that work is not priced.
 pub fn launch_seconds(demand: &DecodeDemand, pricing: &Pricing<'_>, rows: u64, depth: u32) -> Result<StepSeconds, AssessmentError> {
-    if rows <= decode_rows() {
+    if rows <= VERIFY_ROWS {
         return step_seconds(demand, pricing, rows, depth);
     }
     composed(demand, pricing, |call| work_seconds(&call.work, pricing, rows, 1, depth, 1))

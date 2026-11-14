@@ -8,6 +8,7 @@ mod random;
 
 use random::Rng;
 
+use magnitude_kernels::constants::VERIFY_ROWS;
 use magnitude_kernels::{
     readout_exact_rows, readout_planes_rows, readout_refine_rows, readout_top_rows,
 };
@@ -41,8 +42,7 @@ fn scan_launch(device: &Device, planes: bool) -> usize {
 }
 
 /// A top level's or full pass's specialization with the scan parameters;
-/// on Metal also the first row count its batched GEMV serves (3 with four
-/// rows per simdgroup, so the batched path is exercised, else never).
+/// on Metal also the full pass's batched GEMV and GEMM threadgroups.
 fn scan_spec(
     device: &Device,
     head: &Head,
@@ -57,20 +57,17 @@ fn scan_spec(
     if device.backend() != BackendName::Metal {
         return spec;
     }
-    // Metal's every launch: the GEMV, the batched GEMV and the full pass's
-    // GEMM.
-    let (gemv, batch) = (launch, launch + 1);
-    let spec = spec
-        .with_param("BATCH_FROM", if rows == 4 { 3 } else { 9 })
-        .with_launch_param(gemv, "LANES", 32)
-        .with_launch_param(batch, "BATCH_SIMDGROUPS", scan)
-        .with_launch_param(batch, "BATCH_ROWS", rows.min(2));
-    if planes {
-        spec.with_launch_param(batch + 1, "TILE_M", 64)
-            .with_launch_param(batch + 1, "TILE_N", 64)
-    } else {
-        spec
+    // The top level's one launch, the GEMV; the full pass's GEMV, batched
+    // GEMV and GEMM.
+    let spec = spec.with_launch_param(launch, "LANES", 32);
+    if !planes {
+        return spec;
     }
+    let batch = launch + 1;
+    spec.with_launch_param(batch, "BATCH_SIMDGROUPS", scan)
+        .with_launch_param(batch, "BATCH_ROWS", rows.min(2))
+        .with_launch_param(batch + 1, "TILE_M", 64)
+        .with_launch_param(batch + 1, "TILE_N", 64)
 }
 
 /// The threadgroup-size parameter of the scan and gather launches.
@@ -720,14 +717,14 @@ fn progressive_softcap_preserves_full_selection_and_saturated_ties() {
     }
 }
 
-/// The full planes readout projects every row class, in blocks of eight rows:
+/// The full planes readout projects every row class, in blocks of `VERIFY_ROWS` rows:
 /// each row's logits are its features' exact dot products with the head.
 #[test]
 fn planes_readout_projects_every_row_class() {
     let Some(device) = device() else { return };
     let head = Head::new(301, 1088, 43);
     let mut rng = Rng(11);
-    for o in [9usize, 16, 21] {
+    for o in [VERIFY_ROWS as usize + 1, 16, 21] {
         let case = Case::new(o, &head, false, &mut rng);
         let t = case.tensors(&device, &head);
         let (v, d) = (head.v, head.d);
@@ -787,12 +784,12 @@ fn planes_readout_projects_every_row_class() {
     }
 }
 
-/// Metal's batched full pass (from BATCH_FROM rows) decodes each code once
-/// for every row, where the scalar GEMV decodes it once a row; both project
-/// the same exact view. At every verify row count the batched pass serves
-/// by default (3, 4, 5 and 8 rows), on flat and peaked rows, it selects what
-/// the scalar pass selects, and each logit stays within F32 rounding of the
-/// scalar one (relative to the terms' magnitude).
+/// Metal's batched full pass (above `VERIFY_ROWS` rows) decodes each code
+/// once for every row, where the scalar GEMV (up to `VERIFY_ROWS`) decodes it
+/// once a row; both project the same exact view. A row in a batched call (9
+/// and 16 rows), on flat and peaked rows, selects what the same row selects
+/// in the scalar call of the first `VERIFY_ROWS` rows, and each logit stays
+/// within F32 rounding of the scalar one (relative to the terms' magnitude).
 #[test]
 fn planes_batched_full_pass_selects_what_the_scalar_pass_selects() {
     let Some(device) = device() else { return };
@@ -802,7 +799,8 @@ fn planes_batched_full_pass_selects_what_the_scalar_pass_selects() {
     let head = Head::new(3001, 2048, 47);
     let (v, d) = (head.v, head.d);
     let mut rng = Rng(13);
-    let project = |t: &Tensors, batch_from: u64| {
+    let scalar_rows = VERIFY_ROWS as usize;
+    let project = |t: &Tensors, out_rows: &Tensor| {
         read_f32(
             &readout_planes_rows::native_for_device_with(
                 &device,
@@ -810,7 +808,7 @@ fn planes_batched_full_pass_selects_what_the_scalar_pass_selects() {
                     NW: Element::bf16(),
                     A: Element::bf16(),
                 },
-                &scan_spec(&device, &head, true, 8, 2).with_param("BATCH_FROM", batch_from),
+                &scan_spec(&device, &head, true, 8, 2),
             )
             .unwrap()
             .call(readout_planes_rows::Args {
@@ -821,7 +819,7 @@ fn planes_batched_full_pass_selects_what_the_scalar_pass_selects() {
                 bit3: &t.bit3,
                 rest: &t.rest,
                 scales: &t.scales,
-                out_rows: &t.out_rows,
+                out_rows,
                 epsilon: EPSILON,
             })
             .unwrap()
@@ -829,12 +827,19 @@ fn planes_batched_full_pass_selects_what_the_scalar_pass_selects() {
         )
     };
     for peaked in [false, true] {
-        for o in [3usize, 4, 5, 8] {
+        for o in [VERIFY_ROWS as usize + 1, 16] {
             let case = Case::new(o, &head, peaked, &mut rng);
             let t = case.tensors(&device, &head);
-            // The scalar GEMV serves below BATCH_FROM 9, the batched pass from 3.
-            let (scalar, batched) = (project(&t, 9), project(&t, 3));
-            for row in 0..o {
+            // The scalar GEMV serves the first `VERIFY_ROWS` rows, the
+            // batched pass all `o`.
+            let first = tensor(
+                &device,
+                Element::i32(),
+                &[scalar_rows],
+                case.out_rows[..scalar_rows].iter().flat_map(|r| r.to_le_bytes()).collect(),
+            );
+            let (scalar, batched) = (project(&t, &first), project(&t, &t.out_rows));
+            for row in 0..scalar_rows {
                 let source = case.out_rows[row] as usize;
                 let hidden = &case.hidden[source * d..(source + 1) * d];
                 let mean = hidden.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>() / d as f64;
@@ -1253,10 +1258,8 @@ fn prepared_full_and_indexed_share_projection_and_mask_invalid_ids() {
                 .with_launch_param(0, "LANES", 32),
             BackendName::Cuda => spec
                 .with_param("OPERAND", 0)
-                .with_launch_param(1, "KSPLIT", 4)
-                .with_launch_param(2, "KSPLIT", 4)
-                .with_launch_param(4, "ROTATE", 2)
-                .with_launch_param(5, "KSPLIT", 4),
+                .with_param("KSPLIT", 4)
+                .with_launch_param(4, "ROTATE", 2),
             _ => spec,
         };
         let kernel = magnitude_kernels::readout_project_rows::native_for_device_with(

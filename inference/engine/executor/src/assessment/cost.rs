@@ -1071,22 +1071,14 @@ mod tests {
         //! whole at the router, the policy words of the lines), the CPU's
         //! experts are exactly the function's.
         use super::super::*;
-        use seismic_lang::checked::{CheckedModule, SourceFile};
+        use seismic_lang::checked::CheckedModule;
         use seismic_lang::entry::ElementBindings;
         use seismic_lang::failure::SourceTermination;
         use seismic_lang::interp::{Arg, Interpreter, TensorData};
         use seismic_lang::types::DType;
 
         fn module() -> CheckedModule {
-            let mut sources = seismic_std::sources();
-            for (path, text) in [
-                ("routed.seismic", include_str!("../../../kernels/kernels/routed.seismic")),
-                ("streaming_words.seismic", include_str!("../../../kernels/kernels/streaming_words.seismic")),
-                ("functions.seismic", include_str!("../../../kernels/kernels/functions.seismic")),
-            ] {
-                sources.push(SourceFile { path: path.into(), text: text.into() });
-            }
-            crate::test_support::check_kernels(sources)
+            crate::test_support::check_kernels()
         }
 
         /// The sources `assign` leaves of `routes` (`M` rows of `K`)

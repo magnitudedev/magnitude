@@ -287,6 +287,57 @@ pub fn derive_codes(
     implementation: &mut NativeImplementation,
     source: Option<&str>,
 ) -> Result<(), NativeReadError> {
+    derive_code_parameters(implementation, source)?;
+    check_alike(implementation)
+}
+
+/// A launch declared `alike` the native's one-row launch is claimed to
+/// compute each row as that launch computes it alone. This checks only what
+/// the declaration can show: both launches read the same reduction-order
+/// settings (`arithmetic` parameters) and neither declares an order of its
+/// own, so the orders are the native's, one setting each for every row class.
+/// It says nothing about the bodies' arithmetic, which the row-equality tests
+/// hold. A launch's reads are its dispatch's (not its `when` condition, which
+/// selects the launch by rows and is no reduction) and, in a templated
+/// source, its code parameters.
+fn check_alike(implementation: &NativeImplementation) -> Result<(), NativeReadError> {
+    let orders = |ordinal: usize| {
+        let mut names = implementation.launches[ordinal].dispatch_parameters();
+        names.extend(
+            implementation.code_parameters(ordinal).into_iter().map(|(_, name)| name.to_owned()),
+        );
+        names.retain(|name| implementation.params.iter().any(|own| &own.name == name && own.arithmetic));
+        names.sort();
+        names.dedup();
+        names
+    };
+    for (ordinal, launch) in implementation.launches.iter().enumerate() {
+        let Some(alone) = launch.alike else { continue };
+        let one_row = &implementation.launches[alone];
+        let refuse = |detail: String| NativeReadError::Template { kernel: launch.kernel.clone(), detail };
+        for own in [launch, one_row] {
+            if let Some(order) = own.params.iter().find(|parameter| parameter.arithmetic) {
+                return Err(refuse(format!(
+                    "`alike` launches share the native's reduction orders; `{}` declares `arithmetic` parameter `{}` of its own",
+                    own.kernel, order.name
+                )));
+            }
+        }
+        let (mine, theirs) = (orders(ordinal), orders(alone));
+        if mine != theirs {
+            return Err(refuse(format!(
+                "`alike` `{}` must read the same reduction orders; reads {mine:?}, `{}` reads {theirs:?}",
+                one_row.kernel, one_row.kernel
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn derive_code_parameters(
+    implementation: &mut NativeImplementation,
+    source: Option<&str>,
+) -> Result<(), NativeReadError> {
     let backend = implementation.backend;
     let templated = match backend.source_dialect() {
         Some(dialect @ (SourceDialect::Metal | SourceDialect::Cuda))

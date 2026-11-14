@@ -539,7 +539,7 @@ fn qwen3_6_with_its_draft_is_placed_on_an_m4_pro_and_an_rtx3090() {
     };
     let declared = Qwen35Family.inspect(&target_directory, None, identity).unwrap();
     let bound = magnitude_family_dflash::inspect(&draft_directory, &declared, &|layer| Qwen35Family.layer_entry(&declared, layer)).unwrap();
-    let proposals = u8::try_from(bound.max_proposals()).unwrap();
+    let proposals = crate::draft_proposals(&bound);
     let mut definition = ModelDefinition { head: None, draft: Some(bound), ..declared };
     definition.decoder.context_limit = 4096;
     let manifest = PackageManifest {

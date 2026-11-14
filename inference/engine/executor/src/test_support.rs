@@ -66,16 +66,23 @@ pub(crate) fn available(devices: &seismic::Devices, backend: seismic::BackendNam
     seismic::testing::selected(&devices.topology(), backend).is_some()
 }
 
-/// `sources`, held in memory, checked with each native implementation's
-/// source read from the engine's kernel tree, where the declarations name
-/// them ([`seismic_lang::source::check_beside`]).
+/// The engine's kernel tree as production checks it: every `.seismic` file
+/// under `kernels/` beside the standard library, each native implementation's
+/// source read where its declaration names it. A test that needs a few of
+/// its entries takes this one module (checked once), never a list of files of
+/// its own, which would lack whatever one of them comes to read of another.
 #[cfg(test)]
-pub(crate) fn check_kernels(
-    sources: seismic_lang::checked::SourceSet,
-) -> seismic_lang::checked::CheckedModule {
-    let manifest = std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR");
-    let kernels = std::path::Path::new(&manifest).join("../kernels/kernels");
-    seismic_lang::source::check_beside(sources, &kernels).expect("the kernel sources check")
+pub(crate) fn check_kernels() -> seismic_lang::checked::CheckedModule {
+    static MODULE: std::sync::OnceLock<seismic_lang::checked::CheckedModule> = std::sync::OnceLock::new();
+    MODULE
+        .get_or_init(|| {
+            let manifest = std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR");
+            let kernels = std::path::Path::new(&manifest).join("../kernels/kernels");
+            seismic_lang::source::load(&[kernels], seismic_std::sources())
+                .expect("the kernel sources check")
+                .module
+        })
+        .clone()
 }
 
 #[cfg(test)]

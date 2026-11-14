@@ -1,4 +1,4 @@
-// Decode expansion (M <= DECODE_ROWS): the K selected experts' gate/up projections and
+// Decode expansion (M <= VERIFY_ROWS): the K selected experts' gate/up projections and
 // the shared expert's, each with the SiLU . mul epilogue, in one launch; a
 // choice's gate/up accumulators carry its expert's `gate_scale` and
 // `up_scale` where those ports are present (static GS, US).

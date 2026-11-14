@@ -34,9 +34,9 @@ __global__ void readout_top_rows_scan(SEISMIC_KERNEL_PARAMS) {
         reinterpret_cast<const unsigned *>(SEISMIC_PTR(SEISMIC_BUFFER_MASK)), SEISMIC_MASK_STRIDE_0,
         SEISMIC_MASK_STRIDE_1, reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_CONSTRAINED)),
         SEISMIC_CONSTRAINED_STRIDE_0, __uint_as_float((unsigned)SEISMIC_PARAM_SOFTCAP)};
-    __shared__ uint4 staged[PROGRESSIVE_ROWS * PROGRESSIVE_CHUNK / 8];
-    __shared__ float sums[PROGRESSIVE_ROWS * 32];
-    __shared__ unsigned lowest[PROGRESSIVE_ROWS];
+    __shared__ uint4 staged[SEISMIC_CONST_VERIFY_ROWS * PROGRESSIVE_CHUNK / 8];
+    __shared__ float sums[SEISMIC_CONST_VERIFY_ROWS * 32];
+    __shared__ unsigned lowest[SEISMIC_CONST_VERIFY_ROWS];
     const unsigned rows = SEISMIC_DIM_O;
     const progressive::F32Out threshold = SEISMIC_RESULT_1_OUT;
     // Radius column 0: the 4-bit view's.

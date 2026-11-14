@@ -41,7 +41,7 @@ pub(super) fn site_verdict(
 /// the gate (where gated) and the up, so the scaled arithmetic a layer with
 /// second-level scales runs is what is admitted (an unscaled stack's is the
 /// same arithmetic at a scale of one, which is exact); the site's output
-/// `[DECODE_ROWS, H]` is compared with the reference's.
+/// `[VERIFY_ROWS, H]` is compared with the reference's.
 pub(crate) fn admit_site(device: &Device, request: &SiteRequest) -> Result<Result<(), String>, String> {
     let failed = |error: &dyn fmt::Display| error.to_string();
     let to = |value: u64| usize::try_from(value).map_err(|error| failed(&error));

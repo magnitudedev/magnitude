@@ -7,6 +7,7 @@
 mod common;
 
 use common::bound::{Float, Form, Library, Products, assert_within};
+use magnitude_kernels::constants::VERIFY_ROWS;
 use magnitude_kernels::{
     attention_output, attention_project, dense_expand, dense_output, dense_up, embedding_rows,
     gated_delta_project, packing_bound, project_rows, readout_features_rows, readout_head_rows,
@@ -310,10 +311,14 @@ impl Weight {
     /// registry's packet form.
     fn tensor_in(&self, device: &Device, layout: registry::Layout) -> Tensor {
         let shape = [self.rows as u64, self.k as u64];
+        Tensor::from_host(device, self.repr.element_in(layout), &shape, &self.bytes_in(layout)).unwrap()
+    }
+    /// The host-built `rows16` bytes in `layout`.
+    fn bytes_in(&self, layout: registry::Layout) -> std::borrow::Cow<'_, [u8]> {
         if self.repr == Repr::Bf16 || layout == registry::Layout::Rows16 {
-            let element = self.repr.element();
-            return Tensor::from_host(device, element, &shape, &self.bytes).unwrap();
+            return std::borrow::Cow::Borrowed(&self.bytes);
         }
+        let shape = [self.rows as u64, self.k as u64];
         let registry::RepresentationKind::PackedRows(source) =
             &registry::representation_info(self.repr.storage()).kind
         else {
@@ -325,8 +330,7 @@ impl Weight {
             unreachable!()
         };
         let packets = source.packets(&shape, &self.bytes);
-        let bytes = destination.place(&shape, &packets);
-        Tensor::from_host(device, self.repr.element_in(layout), &shape, &bytes).unwrap()
+        std::borrow::Cow::Owned(destination.place(&shape, &packets))
     }
     fn oracle(&self) -> TensorData {
         match self.repr {
@@ -608,9 +612,9 @@ fn read_act(act: Act, tensor: &Tensor) -> Vec<f32> {
 }
 
 /// A K1 mapping: the GEMV threadgroup (SIMDGROUPS x ROWS lane groups of
-/// LANES lanes), the first row count served by the batched GEMV (BATCH_FROM;
-/// smaller classes run the GEMV), the batched threadgroup (BATCH_SIMDGROUPS x
-/// BATCH_ROWS blocks of 8 weight rows), the GEMM tile (TILE_M x TILE_N; on
+/// LANES lanes, up to `VERIFY_ROWS` rows), the batched threadgroup
+/// (BATCH_SIMDGROUPS x BATCH_ROWS blocks of 8 weight rows), the GEMM tile
+/// (TILE_M x TILE_N; on
 /// Vulkan over subgroups of SUB_M x SUB_N), for the small-N output
 /// projections the split-K factor, and for the Metal dense entries the tall
 /// GEMM when they take that form.
@@ -619,7 +623,6 @@ struct Mapping {
     simdgroups: u64,
     rows: u64,
     lanes: u64,
-    batch_from: u64,
     batch_simdgroups: u64,
     batch_rows: u64,
     tile_m: u64,
@@ -628,8 +631,8 @@ struct Mapping {
     sub_n: u64,
     split: u64,
     tall: Option<Tall>,
-    /// The Metal dense entries' GEMV form over row tiles (TILED), for one or
-    /// two rows of `rows32` weights.
+    /// The Metal dense entries' GEMV form over row tiles (TILED), for every
+    /// GEMV row class over `rows32` weights.
     tiled: u64,
     /// Simdgroups sharing a weight fragment in `dense_output`'s matrix GEMV
     /// (BATCH_PARTS).
@@ -660,7 +663,6 @@ const fn gemm_mapping(tile_m: u64, tile_n: u64, split: u64) -> Mapping {
         simdgroups: 16,
         rows: 1,
         lanes: 16,
-        batch_from: 5,
         batch_simdgroups: 8,
         batch_rows: 2,
         tile_m,
@@ -680,7 +682,6 @@ const MAPPINGS: [Mapping; 4] = [
         simdgroups: 4,
         rows: 1,
         lanes: 32,
-        batch_from: 3,
         batch_simdgroups: 4,
         batch_rows: 1,
         tile_m: 64,
@@ -697,7 +698,6 @@ const MAPPINGS: [Mapping; 4] = [
         simdgroups: 2,
         rows: 4,
         lanes: 16,
-        batch_from: 9,
         batch_simdgroups: 16,
         batch_rows: 2,
         tile_m: 128,
@@ -714,7 +714,6 @@ const MAPPINGS: [Mapping; 4] = [
         simdgroups: 32,
         rows: 2,
         lanes: 32,
-        batch_from: 5,
         batch_simdgroups: 8,
         batch_rows: 4,
         tile_m: 32,
@@ -731,7 +730,6 @@ const MAPPINGS: [Mapping; 4] = [
         simdgroups: 16,
         rows: 2,
         lanes: 16,
-        batch_from: 3,
         batch_simdgroups: 32,
         batch_rows: 1,
         tile_m: 64,
@@ -816,7 +814,6 @@ fn specialization_on(
     // GEMM tile onto subgroup tiles.
     if cfg!(target_os = "macos") {
         specialization
-            .with_param("BATCH_FROM", mapping.batch_from)
             .with_param("BATCH_SIMDGROUPS", mapping.batch_simdgroups)
             .with_param("BATCH_ROWS", mapping.batch_rows)
     } else {
@@ -842,6 +839,11 @@ struct ProjectionLaunches {
     gemv: usize,
     batch: usize,
     gemm: usize,
+    /// Where the entry launches its GEMV per row count on Metal: its launch
+    /// for three rows up to VERIFY_ROWS (`gemv_rows`; the next, `gemv_pair`,
+    /// serves two). Both take `gemv`'s threadgroup, and the row classes read
+    /// the entry's one LANES; with none, LANES is `gemv`'s own.
+    gemv_rows: Option<usize>,
 }
 
 fn scoped_projection_specialization_on(
@@ -863,40 +865,26 @@ fn scoped_projection_specialization_on(
         .fold(NativeSpecialization::new(), |choice, (name, value)| {
             choice.with_static(*name, *value as u64)
         })
-        .with_param("BATCH_FROM", mapping.batch_from)
         .with_launch_param(launches.gemv, "SIMDGROUPS", mapping.simdgroups)
         .with_launch_param(launches.gemv, "ROWS", mapping.rows)
-        .with_launch_param(launches.gemv, "LANES", mapping.lanes)
         .with_launch_param(launches.batch, "BATCH_SIMDGROUPS", mapping.batch_simdgroups)
         .with_launch_param(launches.batch, "BATCH_ROWS", mapping.batch_rows)
         .with_launch_param(launches.gemm, "TILE_M", mapping.tile_m)
         .with_launch_param(launches.gemm, "TILE_N", mapping.tile_n);
+    let choice = match launches.gemv_rows {
+        Some(launch) => choice
+            .with_param("LANES", mapping.lanes)
+            .with_launch_param(launch, "SIMDGROUPS", mapping.simdgroups)
+            .with_launch_param(launch, "ROWS", mapping.rows)
+            .with_launch_param(launch + 1, "SIMDGROUPS", mapping.simdgroups)
+            .with_launch_param(launch + 1, "ROWS", mapping.rows),
+        None => choice.with_launch_param(launches.gemv, "LANES", mapping.lanes),
+    };
     if split {
         choice.with_param("SPLIT", mapping.split)
     } else {
         choice
     }
-}
-
-/// `mapping`'s GEMV threadgroup on the Metal launches for three rows up to
-/// BATCH_FROM (`launch`) and for two rows (the next) of an entry that launches
-/// its GEMV per row count.
-fn with_gemv_rows(
-    device: &Device,
-    specialization: NativeSpecialization,
-    launch: usize,
-    mapping: Mapping,
-) -> NativeSpecialization {
-    if device.backend() != BackendName::Metal {
-        return specialization;
-    }
-    specialization
-        .with_launch_param(launch, "SIMDGROUPS", mapping.simdgroups)
-        .with_launch_param(launch, "ROWS", mapping.rows)
-        .with_launch_param(launch, "LANES", mapping.lanes)
-        .with_launch_param(launch + 1, "SIMDGROUPS", mapping.simdgroups)
-        .with_launch_param(launch + 1, "ROWS", mapping.rows)
-        .with_launch_param(launch + 1, "LANES", mapping.lanes)
 }
 
 /// The `gemv_rows` launches on Metal, each followed by its entry's last
@@ -973,25 +961,18 @@ fn dense_output_specialization_on(
             gemv: 0,
             batch: 2,
             gemm: 5,
+            gemv_rows: Some(DENSE_OUTPUT_GEMV_ROWS_LAUNCH),
         },
         true,
     )
     .with_static("DS", 0);
     let specialization = with_absent_bounds(device, specialization, &["DB"]);
     let specialization = with_tall(device, specialization, 8, mapping.tall);
-    let specialization = with_gemv_rows(
-        device,
-        specialization,
-        DENSE_OUTPUT_GEMV_ROWS_LAUNCH,
-        mapping,
-    );
     if device.backend() == BackendName::Metal {
         with_pack(specialization, DENSE_OUTPUT_PACKED_LAUNCH, PACK_DEFAULT)
             .with_param("PACK", 0)
             .with_param("INT8", 0)
-            .with_launch_param(0, "TILED", mapping.tiled)
-            .with_launch_param(DENSE_OUTPUT_GEMV_ROWS_LAUNCH, "TILED", mapping.tiled.min(1))
-            .with_launch_param(DENSE_OUTPUT_GEMV_ROWS_LAUNCH + 1, "TILED", mapping.tiled)
+            .with_param("TILED", mapping.tiled)
             .with_launch_param(2, "BATCH_PARTS", mapping.batch_parts)
             .with_launch_param(DENSE_OUTPUT_INT8_LAUNCH, "INT8_TILE", mapping.int8_tile)
     } else {
@@ -1024,18 +1005,13 @@ fn attention_output_specialization_on(
             gemv: 0,
             batch: 2,
             gemm: 5,
+            gemv_rows: Some(ATTENTION_OUTPUT_GEMV_ROWS_LAUNCH),
         },
         true,
     )
     .with_static("OS", scale);
     let specialization = with_absent_bounds(device, specialization, &["OB"]);
     let specialization = with_tall(device, specialization, 8, mapping.tall);
-    let specialization = with_gemv_rows(
-        device,
-        specialization,
-        ATTENTION_OUTPUT_GEMV_ROWS_LAUNCH,
-        mapping,
-    );
     let specialization = joined(device, specialization);
     if device.backend() == BackendName::Metal {
         with_pack(specialization, ATTENTION_OUTPUT_PACKED_LAUNCH, PACK_DEFAULT)
@@ -1069,6 +1045,7 @@ fn segmented_projection_specialization_on(
             gemv: 1,
             batch: 2,
             gemm: 4,
+            gemv_rows: (packed == ATTENTION_PROJECT_PACKED_LAUNCH).then_some(ATTENTION_PROJECT_GEMV_ROWS_LAUNCH),
         },
         false,
     );
@@ -1088,7 +1065,7 @@ fn segmented_projection_specialization_on(
 }
 
 /// The specialization of `attention_project` on `device`: the segmented
-/// projection's, with the GEMV launch for two rows up to BATCH_FROM.
+/// projection's, with the GEMV launch for two rows up to VERIFY_ROWS.
 fn attention_project_specialization_on(
     device: &Device,
     statics: &[(&str, usize)],
@@ -1110,16 +1087,11 @@ fn attention_project_specialization_on(
                 .with_static("D", row_width(statics) as u64),
         );
     }
-    scaled(with_gemv_rows(
+    scaled(segmented_projection_specialization_on(
         device,
-        segmented_projection_specialization_on(
-            device,
-            statics,
-            mapping,
-            ATTENTION_PROJECT_PACKED_LAUNCH,
-        ),
-        ATTENTION_PROJECT_GEMV_ROWS_LAUNCH,
+        statics,
         mapping,
+        ATTENTION_PROJECT_PACKED_LAUNCH,
     ))
 }
 
@@ -1145,6 +1117,7 @@ fn dense_expand_specialization_on(
             gemv: 1,
             batch: 2,
             gemm: 4,
+            gemv_rows: Some(DENSE_EXPAND_GEMV_ROWS_LAUNCH),
         },
         false,
     )
@@ -1153,20 +1126,12 @@ fn dense_expand_specialization_on(
     let specialization = with_glu_limit(device, specialization, 0);
     let specialization = with_absent_bounds(device, specialization, &["GB", "UB"]);
     let specialization = with_tall(device, specialization, 6, mapping.tall);
-    let specialization = with_gemv_rows(
-        device,
-        specialization,
-        DENSE_EXPAND_GEMV_ROWS_LAUNCH,
-        mapping,
-    );
     if device.backend() == BackendName::Metal {
         with_pack(specialization, DENSE_EXPAND_PACKED_LAUNCH, PACK_DEFAULT)
             .with_param("PACK", 0)
             .with_param("INT8", 0)
             .with_launch_param(2, "BATCH_PARTS", mapping.batch_parts)
-            .with_launch_param(1, "TILED", mapping.tiled)
-            .with_launch_param(DENSE_EXPAND_GEMV_ROWS_LAUNCH, "TILED", mapping.tiled.min(1))
-            .with_launch_param(DENSE_EXPAND_GEMV_ROWS_LAUNCH + 1, "TILED", mapping.tiled)
+            .with_param("TILED", mapping.tiled)
     } else {
         specialization
     }
@@ -1232,10 +1197,13 @@ fn with_pack(
         .with_launch_param(launch, "WEIGHTS_AHEAD", pack.weights_ahead)
 }
 
+/// The specialization of a readout projection on `device`; `gemv_rows` as
+/// [`ProjectionLaunches::gemv_rows`].
 fn readout_projection_specialization_on(
     device: &Device,
     statics: &[(&str, usize)],
     mapping: Mapping,
+    gemv_rows: Option<usize>,
 ) -> NativeSpecialization {
     let specialization = scoped_projection_specialization_on(
         device,
@@ -1245,6 +1213,7 @@ fn readout_projection_specialization_on(
             gemv: 1,
             batch: 2,
             gemm: 3,
+            gemv_rows,
         },
         false,
     );
@@ -1252,7 +1221,7 @@ fn readout_projection_specialization_on(
 }
 
 /// The specialization of `readout_head_rows` on `device`: the readout
-/// projection's, with the GEMV launch for two rows up to BATCH_FROM.
+/// projection's, with the GEMV launch for two rows up to VERIFY_ROWS.
 /// `specialization` with Metal's batched launch (2) taking the matrix GEMV
 /// (`MATRIX`) where the declaration admits it for `elements`, as the declared
 /// default does; other backends have no such choice.
@@ -1277,12 +1246,8 @@ fn readout_head_specialization_on(
     statics: &[(&str, usize)],
     mapping: Mapping,
 ) -> NativeSpecialization {
-    let specialization = with_gemv_rows(
-        device,
-        readout_projection_specialization_on(device, statics, mapping),
-        READOUT_HEAD_GEMV_ROWS_LAUNCH,
-        mapping,
-    );
+    let specialization =
+        readout_projection_specialization_on(device, statics, mapping, Some(READOUT_HEAD_GEMV_ROWS_LAUNCH));
     if device.backend() == BackendName::Metal {
         specialization.with_launch_param(2, "BATCH_PARTS", mapping.batch_parts)
     } else {
@@ -1316,11 +1281,12 @@ fn prepared_projection_specialization_on(
     }
 }
 
-const ROW_CLASSES: [usize; 9] = [1, 2, 3, 8, 9, 16, 17, 64, 128];
+const ROW_CLASSES: [usize; 9] = [1, 2, 3, VERIFY_ROWS as usize, VERIFY_ROWS as usize + 1, 16, 17, 64, 128];
 
 /// The decode and verify rows checked at the pinned Qwen3.5 4B geometry: the
-/// GEMV (1, 2, 4), the batched class (5, 16) and the first GEMM class (17).
-const FOUR_B_ROWS: [usize; 6] = [1, 2, 4, 5, 16, 17];
+/// GEMV (1, 2, 4, `VERIFY_ROWS`), the batched class (`VERIFY_ROWS + 1`, 16) and
+/// the first GEMM class (17).
+const FOUR_B_ROWS: [usize; 7] = [1, 2, 4, VERIFY_ROWS as usize, VERIFY_ROWS as usize + 1, 16, 17];
 
 /// The row classes and mappings a geometry is checked over: every mapping at
 /// the small geometry, the decode mapping over the decode and verify rows at
@@ -1877,7 +1843,7 @@ fn metal_dense_expand_matrix_pair_matches_host() {
             ] {
                 let gate = weight(gate_repr, f, h, 61, 1.0);
                 let up = weight(up_repr, f, h, 62, 1.0);
-                for rows in [3usize, 5, 8, 13, 16] {
+                for rows in [VERIFY_ROWS as usize + 1, 13, 16] {
                     let residual = uniform_values(rows * h, rows as u64, 1.0);
                     let out_rows = (0..rows as i32).rev().collect::<Vec<_>>();
                     let (expected, bound) = dense_expand_reference(
@@ -1885,7 +1851,6 @@ fn metal_dense_expand_matrix_pair_matches_host() {
                     );
                     for parts in [1, 2, 4] {
                         let mapping = Mapping {
-                            batch_from: 3,
                             batch_parts: parts,
                             ..gemm_mapping(64, 64, 1)
                         };
@@ -1909,9 +1874,10 @@ fn metal_dense_expand_matrix_pair_matches_host() {
 /// The class walk (TILED 2) adds the row mapping's partial sums in the row
 /// mapping's order, so it reproduces TILED 0 bit for bit under the same
 /// LANES: `dense_expand` (paired) and `dense_output` (plain) over Q8_0 and
-/// Q4_K, at one row and at two (the launches that offer it), with weight rows
-/// that fill the last tile and that do not, in mappings the walk serves
-/// (whole lane blocks a simdgroup, one and two rows a lane).
+/// Q4_K, at every row count the GEMV serves (one to eight, all three
+/// row-class launches), with weight rows that fill the last tile and that do
+/// not, in mappings the walk serves (whole lane blocks a simdgroup, one and
+/// two rows a lane).
 #[test]
 fn metal_class_walk_is_bit_identical_to_the_row_mapping() {
     let Some(device) = devices()
@@ -1934,7 +1900,6 @@ fn metal_class_walk_is_bit_identical_to_the_row_mapping() {
         simdgroups,
         rows,
         lanes,
-        batch_from: 9,
         ..gemm_mapping(64, 64, 1)
     });
     for repr in [Repr::Q8, Repr::Q4k] {
@@ -1943,7 +1908,7 @@ fn metal_class_walk_is_bit_identical_to_the_row_mapping() {
             let up = weight(repr, f, h, 72, 1.0);
             let down = weight(repr, f, h, 73, 1.0);
             let norm = norm_values(h, 74);
-            for rows in [1usize, 2] {
+            for rows in 1..=VERIFY_ROWS as usize {
                 let mut rng = Rng::new(rows as u64 + 75);
                 let residual = (0..rows * h).map(|_| rng.symmetric()).collect::<Vec<_>>();
                 let narrow = (0..rows * f).map(|_| rng.symmetric()).collect::<Vec<_>>();
@@ -2582,6 +2547,7 @@ fn project_rows_native(
                 gemv: 0,
                 batch: 2,
                 gemm: 5,
+                gemv_rows: None,
             },
             true,
         )
@@ -3728,8 +3694,9 @@ fn metal_dense_output_scoped_launches_match_the_host() {
 }
 
 /// `dense_output`'s matrix GEMV (the batched launch over Q4_K, Q5_K and Q6_K
-/// weights), from two rows (BATCH_FROM 2) to sixteen, with every BATCH_PARTS
-/// and weight rows that do not fill a fragment, against the host reference.
+/// weights), from nine rows (above `VERIFY_ROWS`) to sixteen, with every
+/// BATCH_PARTS and weight rows that do not fill a fragment, against the host
+/// reference; the GEMV below it (2 and 8 rows) alongside.
 #[test]
 fn metal_dense_output_matrix_gemv_matches_the_host() {
     let Some(device) = devices()
@@ -3742,7 +3709,7 @@ fn metal_dense_output_matrix_gemv_matches_the_host() {
     for repr in [Repr::Q4k, Repr::Q5k, Repr::Q6k] {
         for (h, f) in [(40usize, 256usize), (67, 512)] {
             let down = weight(repr, h, f, 37, 1.0);
-            for rows in [2usize, 3, 4, 8, 9, 16] {
+            for rows in [2, VERIFY_ROWS as usize, VERIFY_ROWS as usize + 1, 13, 16] {
                 let mut rng = Rng::new(rows as u64 + 11);
                 let residual = (0..rows * h).map(|_| rng.symmetric()).collect::<Vec<_>>();
                 let product = (0..rows * f)
@@ -3762,7 +3729,6 @@ fn metal_dense_output_matrix_gemv_matches_the_host() {
                         &product,
                         &out_rows,
                         Mapping {
-                            batch_from: 2,
                             batch_simdgroups,
                             batch_parts,
                             ..gemm_mapping(64, 64, 1)
@@ -3856,16 +3822,16 @@ fn dense_output_matches_its_portable_body_and_the_host_reference_on(device: &Dev
 
 /// DeepSeek V4.1's gated pooled projection at its geometry (D 5120; 512
 /// pooled and 512 gate rows of BF16, published in F32, so no rounding to A
-/// hides a different summation order) on Metal. Under the decode mapping and
-/// under BATCH_FROM 9, every GEMV class (M below BATCH_FROM) reproduces each
-/// row's M = 1 result bit for bit, as plain decode computes it. The batched
-/// class (BATCH_FROM to 16 rows, where a prefill-shaped verify's 8 rows fall
-/// by default) sums in its own order, still in F32 over the same rounded
-/// operands, and is not required to: the test prints how many of its results
-/// differ from M = 1, and the relative gaps of those above the median
-/// magnitude, which cancellation does not inflate.
+/// hides a different summation order) on Metal. Under the decode mapping,
+/// every GEMV class (up to `VERIFY_ROWS` rows, a draft verification's)
+/// reproduces each row's M = 1 result bit for bit, as plain decode computes
+/// it. The batched class (above `VERIFY_ROWS`, to 16 rows) sums in its own
+/// order, still in F32 over the same rounded operands, and is not required
+/// to: the test prints how many of its results differ from M = 1, and the
+/// relative gaps of those above the median magnitude, which cancellation
+/// does not inflate.
 #[test]
-fn metal_gated_pooled_projection_reproduces_single_rows_below_batch_from() {
+fn metal_gated_pooled_projection_reproduces_single_rows_up_to_verify_rows() {
     let Some(device) = devices()
         .into_iter()
         .find(|device| device.backend() == BackendName::Metal)
@@ -3877,7 +3843,7 @@ fn metal_gated_pooled_projection_reproduces_single_rows_below_batch_from() {
     let projection = weight(Repr::Bf16, segment, d, 81, 1.0);
     let gate = weight(Repr::Bf16, segment, d, 82, 1.0);
     let norm = norm_values(d, 83);
-    let rows_max = 8usize;
+    let rows_max = 16usize;
     let mut rng = Rng::new(84);
     let hidden = (0..rows_max * d)
         .map(|_| rng.symmetric() * 3.0)
@@ -3926,16 +3892,15 @@ fn metal_gated_pooled_projection_reproduces_single_rows_below_batch_from() {
         .unwrap();
         [read_f32(&out.r0), read_f32(&out.r1)]
     };
+    // The default GEMV mapping and one that reads the rows differently
+    // (more rows a lane group, wider lanes, fewer simdgroups): each reproduces
+    // its own one-row bits at every row count up to VERIFY_ROWS.
     let decode = gemm_mapping(64, 64, 1);
-    let widest = Mapping {
-        batch_from: 9,
-        ..decode
-    };
-    // M = 1 runs the one-row GEMV, whatever BATCH_FROM.
-    let single = (0..rows_max)
-        .map(|row| project(&hidden[row * d..(row + 1) * d], decode))
-        .collect::<Vec<_>>();
+    let widest = Mapping { simdgroups: 8, rows: 2, lanes: 32, ..decode };
     for mapping in [decode, widest] {
+        let single = (0..rows_max)
+            .map(|row| project(&hidden[row * d..(row + 1) * d], mapping))
+            .collect::<Vec<_>>();
         for rows in 2..=rows_max {
             let out = project(&hidden[..rows * d], mapping);
             for (name, index) in [("pooled", 0), ("gate", 1)] {
@@ -3953,12 +3918,8 @@ fn metal_gated_pooled_projection_reproduces_single_rows_below_batch_from() {
                     })
                     .collect::<Vec<_>>();
                 let differing = gaps.iter().filter(|(_, gap)| *gap != 0.0).count();
-                if (rows as u64) < mapping.batch_from {
-                    assert_eq!(
-                        differing, 0,
-                        "{name} M {rows} BATCH_FROM {} differs from M = 1 in {differing} results",
-                        mapping.batch_from
-                    );
+                if rows as u64 <= VERIFY_ROWS {
+                    assert_eq!(differing, 0, "{name} M {rows} differs from M = 1 in {differing} results");
                     continue;
                 }
                 let worst = gaps.iter().map(|(_, gap)| *gap).fold(0.0, f32::max);
@@ -3969,10 +3930,9 @@ fn metal_gated_pooled_projection_reproduces_single_rows_below_batch_from() {
                 upper.sort_by(f32::total_cmp);
                 let quantile = |q: f64| upper[((upper.len() - 1) as f64 * q) as usize];
                 eprintln!(
-                    "batched {name} M {rows} BATCH_FROM {}: {differing} of {} results differ from M = 1, \
+                    "batched {name} M {rows}: {differing} of {} results differ from M = 1, \
                      by up to {worst:.3e} relative; above the median magnitude {:.3e}, relative gaps \
                      p50 {:.3e} p90 {:.3e} p99 {:.3e} max {:.3e}",
-                    mapping.batch_from,
                     rows * segment,
                     gaps[gaps.len() / 2].0,
                     quantile(0.5),
@@ -3987,8 +3947,8 @@ fn metal_gated_pooled_projection_reproduces_single_rows_below_batch_from() {
 
 /// The decode and verify row classes at the pinned Qwen3.5 4B geometry
 /// (H 2560, F 9216) with the decode mapping: every M from 1 to 16 and the
-/// first GEMM class 17, against the host reference. The GEMV class (M below
-/// BATCH_FROM) must reproduce each row's M = 1 result bit for bit, so a
+/// first GEMM class 17, against the host reference. The GEMV class (M up to
+/// `VERIFY_ROWS`) must reproduce each row's M = 1 result bit for bit, so a
 /// speculative verify row computes exactly what plain decode computes.
 #[test]
 fn dense_entries_at_4b_geometry_match_the_host_reference_and_single_rows() {
@@ -4081,7 +4041,7 @@ fn dense_entries_at_4b_geometry_match_the_host_reference_and_single_rows_on(devi
                 &expected,
                 &bound,
             );
-            if (rows as u64) < mapping.batch_from {
+            if rows as u64 <= VERIFY_ROWS {
                 for r in 0..rows {
                     assert!(
                         output[r * h..(r + 1) * h]
@@ -4093,7 +4053,7 @@ fn dense_entries_at_4b_geometry_match_the_host_reference_and_single_rows_on(devi
                 }
             }
         }
-        if (rows as u64) < mapping.batch_from {
+        if rows as u64 <= VERIFY_ROWS {
             for r in 0..rows {
                 assert!(
                     native[r * f..(r + 1) * f]
@@ -4105,6 +4065,1027 @@ fn dense_entries_at_4b_geometry_match_the_host_reference_and_single_rows_on(devi
             }
         }
     }
+}
+
+/// The input rows a decode check holds: the most any backend's row classes
+/// serve (CUDA's `X_gemv16`, 16 rows).
+const CLASS_ROWS: usize = 16;
+
+/// The launches `implementation` runs for a call of `rows` rows under
+/// `specialization`.
+fn launches_at(implementation: &seismic::OnDevice, specialization: &NativeSpecialization, rows: u64) -> Vec<usize> {
+    let at = specialization.clone().with_range("M", rows, rows).with_range("O", rows, rows);
+    (0..implementation.launches.len())
+        .filter(|&launch| implementation.reachable(&at, launch))
+        .collect()
+}
+
+/// The specializations a decode check runs: `default`, then `default` with
+/// each other value of every reduction-order (`arithmetic`) parameter read
+/// by a row class's launch ([`declared::row_launches`]) or by a launch of a
+/// one-row call, one at a time, each set where it is declared (its owning
+/// launch, or the entry). Each comes with its setting's name.
+fn reduction_orders(
+    implementation: &seismic::OnDevice,
+    default: &NativeSpecialization,
+) -> Vec<(String, NativeSpecialization)> {
+    let mut orders = vec![("defaults".to_owned(), default.clone())];
+    let mut seen: Vec<(Option<usize>, String)> = Vec::new();
+    let mut launches = declared::row_launches(implementation);
+    launches.extend(launches_at(implementation, default, 1));
+    launches.sort_unstable();
+    launches.dedup();
+    for ordinal in launches {
+        let launch = &implementation.launches[ordinal];
+        let names = implementation
+            .launch_parameters(ordinal)
+            .into_iter()
+            .chain(implementation.code_parameters(ordinal).into_iter().map(|(_, name)| name.to_owned()))
+            .chain(launch.reads.iter().cloned())
+            .collect::<Vec<_>>();
+        for name in names {
+            let owner = launch.params.iter().any(|parameter| parameter.name == name).then_some(ordinal);
+            if seen.contains(&(owner, name.clone())) {
+                continue;
+            }
+            seen.push((owner, name.clone()));
+            let declared = match owner {
+                Some(owner) => implementation.launches[owner].params.iter().find(|parameter| parameter.name == name),
+                None => implementation.params.iter().find(|parameter| parameter.name == name),
+            };
+            let Some(declared) = declared.filter(|parameter| parameter.arithmetic) else {
+                continue;
+            };
+            let current = match owner {
+                Some(owner) => default.launch_param(owner, &name),
+                None => default.param(&name),
+            };
+            for &value in declared.values.iter().filter(|value| Some(**value) != current) {
+                orders.push(match owner {
+                    Some(owner) => (
+                        format!("{} {name} {value}", implementation.launches[owner].kernel),
+                        default.clone().with_launch_param(owner, name.clone(), value),
+                    ),
+                    None => (format!("{name} {value}"), default.clone().with_param(name.clone(), value)),
+                });
+            }
+        }
+    }
+    orders
+}
+
+/// The most rows a call of `implementation` takes in its row classes under
+/// `specialization`, the row counts from 2 up while one holds: a row class's
+/// launch runs ([`declared::row_launches`]), or the launches of a one-row
+/// call run and no other (one launch serving every row count: a
+/// single-launch GEMV, CUDA's indexed readout, the CPU's form). Up to the
+/// rows a draft verification carries (`VERIFY_ROWS`) either holds; above
+/// them, only a row class whose launch its declaration bounds within
+/// [`CLASS_ROWS`] (CUDA's `X_gemv16`), so a decode form that a `when` does
+/// not bound, which the executor runs to `VERIFY_ROWS` only (a routed
+/// expansion), is held to those rows.
+fn row_class_rows(implementation: &seismic::OnDevice, specialization: &NativeSpecialization) -> usize {
+    let verify = VERIFY_ROWS;
+    let classes = declared::row_launches(implementation);
+    let alone = launches_at(implementation, specialization, 1);
+    let unbounded = launches_at(implementation, specialization, CLASS_ROWS as u64 + 1);
+    let served = |rows: u64| {
+        let launches = launches_at(implementation, specialization, rows);
+        let class = launches
+            .iter()
+            .any(|launch| classes.contains(launch) && (rows <= verify || !unbounded.contains(launch)));
+        class || (rows <= verify && launches == alone)
+    };
+    (2..=CLASS_ROWS).take_while(|&rows| served(rows as u64)).last().unwrap_or(1)
+}
+
+/// What a decode check found on one device.
+#[derive(Default)]
+struct DecodeRows {
+    /// Rows not bit-equal to the same row alone.
+    unlike: Vec<String>,
+    /// Natives the device does not offer at the case's elements.
+    absent: Vec<&'static str>,
+    /// The (native, setting, rows) cases run.
+    cases: Vec<String>,
+    /// Settings the declaration refuses at the case's statics.
+    inadmissible: Vec<String>,
+    /// Natives whose row classes end below a draft verification's rows
+    /// ([`VERIFY_ROWS`]), with the rows.
+    short: Vec<String>,
+}
+
+impl DecodeRows {
+    /// `entry` on `device` at every specialization of [`reduction_orders`],
+    /// each static it declares valued by `statics`, each form of `forms` held
+    /// at its value (a backend that does not declare one has no such case):
+    /// each row of a call of 2 up to [`row_class_rows`] rows bit-equal to
+    /// that row alone. `run(kernel, rows)` computes the input rows `rows` in
+    /// one call and returns each of its outputs flattened `[rows, width]`.
+    fn check<E: seismic::Entry>(
+        &mut self,
+        device: &Device,
+        entry: seismic::BoundEntry<E>,
+        statics: &[(&str, usize)],
+        forms: &[(&'static str, u64)],
+        run: impl Fn(&seismic::NativeKernel<E>, std::ops::Range<usize>) -> Vec<Vec<f32>>,
+    ) {
+        let Some(implementation) = entry.offered(device).unwrap() else {
+            self.absent.push(E::NAME);
+            return;
+        };
+        if !forms.iter().all(|(name, _)| implementation.params.iter().any(|parameter| parameter.name == *name)) {
+            return;
+        }
+        let case = format!(
+            "{} ({})",
+            E::NAME,
+            statics
+                .iter()
+                .map(|(name, value)| format!("{name} {value}"))
+                .chain(forms.iter().map(|(name, value)| format!("{name} {value}")))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let default = declared::declared(
+            device,
+            &entry,
+            |name| {
+                statics
+                    .iter()
+                    .find(|(given, _)| *given == name)
+                    .unwrap_or_else(|| panic!("{} declares static `{name}`, which the case does not give", E::NAME))
+                    .1 as u64
+            },
+            forms,
+        );
+        let default = match default {
+            Ok(default) => default,
+            Err(error) => {
+                self.inadmissible.push(format!("{case} defaults: {error:?}"));
+                return;
+            }
+        };
+        for (setting, specialization) in reduction_orders(&implementation, &default) {
+            if !entry.specialization_valid(device, &specialization).unwrap() {
+                self.inadmissible.push(format!("{case} {setting}"));
+                continue;
+            }
+            let rows = row_class_rows(&implementation, &specialization);
+            if (rows as u64) < VERIFY_ROWS {
+                self.short.push(format!("{case} {setting} (M 2..={rows})"));
+            }
+            let kernel = entry.prepare(device, &specialization).unwrap();
+            let label = format!("{case} on {:?} at {setting}", device.backend());
+            self.unlike.extend(rows_unlike_alone(&label, rows, |range| run(&kernel, range)));
+            self.cases.push(format!("{case} {setting} (M 2..={rows})"));
+        }
+    }
+}
+
+/// `rows` rows of `k` values whose second half is the first's negation
+/// within 2^-7: over a [`mirrored_weight`] their products nearly cancel, so
+/// a sum's rounding residue reaches the bits an A-rounded result keeps, and
+/// a change of summation order shows in them.
+fn cancelling_rows(rows: usize, k: usize, seed: u64, scale: f32) -> Vec<f32> {
+    let mut rng = Rng::new(seed);
+    let mut values = Vec::with_capacity(rows * k);
+    for _ in 0..rows {
+        let half = (0..k / 2).map(|_| rng.symmetric() * scale).collect::<Vec<_>>();
+        values.extend(&half);
+        values.extend(half.iter().map(|value| -value * (1.0 + rng.symmetric() / 128.0)));
+    }
+    values
+}
+
+/// A random Q4_K weight whose second half of columns repeats its first
+/// (`k` a multiple of 512: whole superblocks in each half).
+fn mirrored_weight(rows: usize, k: usize, seed: u64) -> Weight {
+    let half = k / 2;
+    assert_eq!(half % 256, 0, "a mirrored half is whole superblocks");
+    let blocks = half / 256;
+    let mut mirrored = weight(Repr::Q4k, rows, k, seed, 1.0);
+    let p = planes(Repr::Q4k, k);
+    for r in 0..rows {
+        let row = &mut mirrored.bytes[r * p.stride..(r + 1) * p.stride];
+        row.copy_within(p.codes..p.codes + half / 2, p.codes + half / 2);
+        row.copy_within(p.scales..p.scales + 12 * blocks, p.scales + 12 * blocks);
+        row.copy_within(p.supers..p.supers + 4 * blocks, p.supers + 4 * blocks);
+        mirrored.values.copy_within(r * k..r * k + half, r * k + half);
+    }
+    mirrored
+}
+
+/// `weights`, of one shape `[rows, k]`, stacked `[weights.len(), rows, k]`
+/// in `device`'s resident layout: a routed entry's expert stack.
+fn stacked(device: &Device, weights: &[Weight]) -> Tensor {
+    let layout = resident_layout(device);
+    let bytes = weights.iter().flat_map(|weight| weight.bytes_in(layout).into_owned()).collect::<Vec<_>>();
+    let shape = [weights.len() as u64, weights[0].rows as u64, weights[0].k as u64];
+    Tensor::from_host(device, weights[0].repr.element_in(layout), &shape, &bytes).unwrap()
+}
+
+/// `k` RMS norm weights whose second half repeats the first, as a
+/// [`cancelling_rows`] input's halves need to stay opposite once normalized.
+fn mirrored_norm(k: usize, seed: u64) -> Vec<f32> {
+    let half = norm_values(k / 2, seed);
+    [half.clone(), half].concat()
+}
+
+/// The rows of calls of 2 to `most` rows that are not bit-equal to the same
+/// row computed alone. `run(rows)` computes the input rows `rows` in one
+/// call and returns each of its outputs flattened `[rows, width]`.
+fn rows_unlike_alone(label: &str, most: usize, run: impl Fn(std::ops::Range<usize>) -> Vec<Vec<f32>>) -> Vec<String> {
+    let alone = (0..most).map(|row| run(row..row + 1)).collect::<Vec<_>>();
+    for (row, outputs) in alone.iter().enumerate() {
+        for (output, values) in outputs.iter().enumerate() {
+            assert!(
+                values.iter().any(|value| *value != 0.0),
+                "{label}: output {output} of row {row} alone is all zero"
+            );
+        }
+    }
+    let mut unlike = Vec::new();
+    for rows in 2..=most {
+        for (output, values) in run(0..rows).iter().enumerate() {
+            let width = alone[0][output].len();
+            assert_eq!(values.len(), rows * width, "{label}: output {output} at M = {rows}");
+            for row in 0..rows {
+                let differing = values[row * width..(row + 1) * width]
+                    .iter()
+                    .zip(&alone[row][output])
+                    .filter(|(together, alone)| together.to_bits() != alone.to_bits())
+                    .count();
+                if differing > 0 {
+                    unlike.push(format!(
+                        "{label}: output {output}, row {row} at M = {rows}: \
+                         {differing} of {width} values differ from the row alone"
+                    ));
+                }
+            }
+        }
+    }
+    unlike
+}
+
+/// A decode row's bits do not depend on how many rows its call carries: on
+/// every backend this host has, for every decode projection (the dense
+/// ones, the routed expansions in each form, the head readouts and the
+/// progressive head's planes readout; not the streamed route, whose inputs
+/// are a step's tables), at its declaration's defaults and at every other
+/// value of each reduction-order parameter its row-class launches read
+/// ([`reduction_orders`]), each row of a call of 2
+/// up to the most rows its row classes serve ([`row_class_rows`]) is
+/// bit-equal to that row computed alone (M = 1), so a draft verification row
+/// computes exactly what plain decode computes. The row classes are the
+/// declarations' `alike` launches ([`declared::row_classes`]), each held to
+/// the launch it names, and the one launch of a projection serving every row
+/// count by it; they share a reduction order only where the declaration makes
+/// them read one setting, which the other tests' mappings, setting every
+/// launch alike, cannot show. Inputs nearly cancel ([`cancelling_rows`]), so
+/// an A-rounded result shows a changed summation order too.
+#[test]
+fn decode_rows_keep_their_single_row_bits_at_every_reduction_order() {
+    let mut unlike = Vec::new();
+    for device in seismic_native_tests::every_device() {
+        let found = decode_rows_on(&device);
+        seismic_native_tests::progress(format_args!(
+            "decode rows on {:?}: {} cases, {} rows unlike alone; {} settings inadmissible {:?}; not offered {:?}",
+            device.backend(),
+            found.cases.len(),
+            found.unlike.len(),
+            found.inadmissible.len(),
+            found.inadmissible,
+            found.absent,
+        ));
+        for case in &found.cases {
+            seismic_native_tests::progress(format_args!("  {:?} {case}", device.backend()));
+        }
+        // Metal declares every one of these projections.
+        if device.backend() == BackendName::Metal {
+            assert!(found.absent.is_empty(), "Metal offers no {:?} at these elements", found.absent);
+        }
+        assert!(found.short.is_empty(), "row classes end below a draft verification's rows: {:?}", found.short);
+        unlike.extend(found.unlike);
+    }
+    assert!(unlike.is_empty(), "rows unlike alone:\n{}", unlike.join("\n"));
+}
+
+fn decode_rows_on(device: &Device) -> DecodeRows {
+    use magnitude_kernels::{
+        gated_delta_project_convolved, per_layer_gate, readout_planes_rows, routed_expand, routed_gate_up,
+        routed_up, short_conv_project, stream_mix_down, stream_mix_up,
+    };
+    use seismic::{SlabRegion, SlabTensor};
+    let act = Act::Bf16;
+    let a = act.element();
+    let q4k = Repr::Q4k.resident(device);
+    let mut tally = DecodeRows::default();
+    let width = 1024;
+    let norm = bf16_norm(device, &mirrored_norm(width, 91));
+    let hidden = cancelling_rows(CLASS_ROWS, width, 92, 3.0);
+    let hidden_rows = |rows: &std::ops::Range<usize>| {
+        f32_tensor(device, &[rows.len(), width], &hidden[rows.start * width..rows.end * width])
+    };
+    let empty = || f32_tensor(device, &[0], &[]);
+    let out_rows = |rows: &std::ops::Range<usize>| {
+        i32_tensor(device, &[rows.len()], &(0..rows.len() as i32).collect::<Vec<_>>())
+    };
+
+    // attention_project: query, gate, key and value segments, F32 results.
+    let segments = [256usize, 128, 128, 128];
+    let projections = segments
+        .iter()
+        .enumerate()
+        .map(|(i, &rows)| mirrored_weight(rows, width, 93 + i as u64).tensor(device))
+        .collect::<Vec<_>>();
+    tally.check(
+        device,
+        attention_project::native_entry_with(attention_project::Elements {
+            NW: Element::bf16(),
+            QW: q4k,
+            GW: q4k,
+            KW: q4k,
+            VW: q4k,
+            A: a,
+            Y: Element::f32(),
+        }),
+        &[
+            ("D", width),
+            ("PT", 1),
+            ("NM", width),
+            ("Q", segments[0]),
+            ("GR", segments[1]),
+            ("K", segments[2]),
+            ("V", segments[3]),
+            ("QS", 0),
+            ("GS", 0),
+            ("KS", 0),
+            ("VS", 0),
+            ("QB", 0),
+            ("GB", 0),
+            ("KB", 0),
+            ("VB", 0),
+        ],
+        &[],
+        |kernel, rows| {
+            let out = kernel
+                .call(attention_project::Args {
+                    hidden: &hidden_rows(&rows),
+                    input_norm: &norm,
+                    query_weight: &projections[0],
+                    gate_weight: &projections[1],
+                    key_weight: &projections[2],
+                    value_weight: &projections[3],
+                    epsilon: 1e-6,
+                    project_mode: 0,
+                    query_scale: &no_scale(device),
+                    gate_scale: &no_scale(device),
+                    key_scale: &no_scale(device),
+                    value_scale: &no_scale(device),
+                    query_bound: &absent_bound(device),
+                    gate_bound: &absent_bound(device),
+                    key_bound: &absent_bound(device),
+                    value_bound: &absent_bound(device),
+                })
+                .unwrap();
+            vec![read_f32(&out.r0), read_f32(&out.r1), read_f32(&out.r2), read_f32(&out.r3)]
+        },
+    );
+
+    // attention_output: Q x W gated heads onto the F32 residual.
+    let (heads, head_width) = (8, 128);
+    let gated = cancelling_rows(CLASS_ROWS, heads * head_width, 101, 1.0);
+    let output_weight = mirrored_weight(width, heads * head_width, 102).tensor(device);
+    tally.check(
+        device,
+        attention_output::native_entry_with(attention_output::Elements { OW: q4k, A: a }),
+        &[("D", width), ("SN", 1), ("IN", 0), ("Q", heads), ("W", head_width), ("OS", 0), ("OB", 0)],
+        &[],
+        |kernel, rows| {
+            let n = heads * head_width;
+            let out = kernel
+                .call(attention_output::Args {
+                    hidden: &hidden_rows(&rows),
+                    inject: &no_inject(device, rows.len() as u64),
+                    gated: &act_tensor(
+                        device,
+                        act,
+                        &[rows.len(), heads, head_width],
+                        &gated[rows.start * n..rows.end * n],
+                    ),
+                    output_weight: &output_weight,
+                    output_scale: &no_scale(device),
+                    output_bound: &absent_bound(device),
+                })
+                .unwrap()
+                .value;
+            vec![read_f32(&out)]
+        },
+    );
+
+    // dense_expand: the gated pair, A results.
+    let features = 1024;
+    let gate = mirrored_weight(features, width, 103).tensor(device);
+    let up = mirrored_weight(features, width, 104).tensor(device);
+    tally.check(
+        device,
+        dense_expand::native_entry_with(dense_expand::Elements { NW: Element::bf16(), GW: q4k, UW: q4k, A: a }),
+        &[("H", width), ("F", features), ("GS", 0), ("US", 0), ("GB", 0), ("UB", 0), ("LB", 0)],
+        &[],
+        |kernel, rows| {
+            let out = kernel
+                .call(dense_expand::Args {
+                    residual: &hidden_rows(&rows),
+                    norm: &norm,
+                    gate_weight: &gate,
+                    up_weight: &up,
+                    out_rows: &out_rows(&rows),
+                    eps: 1e-6,
+                    activation: 0,
+                    glu_limit: &i32_tensor(device, &[0, 0], &[]),
+                    gate_scale: &empty(),
+                    up_scale: &empty(),
+                    gate_bound: &absent_bound(device),
+                    up_bound: &absent_bound(device),
+                })
+                .unwrap()
+                .value;
+            vec![read_act(act, &out)]
+        },
+    );
+
+    // dense_output: the product rows onto the F32 residual.
+    let product = cancelling_rows(CLASS_ROWS, features, 105, 1.0);
+    let down = mirrored_weight(width, features, 106).tensor(device);
+    tally.check(
+        device,
+        dense_output::native_entry_with(dense_output::Elements { A: a, DW: q4k }),
+        &[("H", width), ("F", features), ("DS", 0), ("DB", 0)],
+        &[],
+        |kernel, rows| {
+            let out = kernel
+                .call(dense_output::Args {
+                    residual: &hidden_rows(&rows),
+                    product: &act_tensor(
+                        device,
+                        act,
+                        &[rows.len(), features],
+                        &product[rows.start * features..rows.end * features],
+                    ),
+                    down_weight: &down,
+                    out_rows: &out_rows(&rows),
+                    down_scale: &empty(),
+                    down_bound: &absent_bound(device),
+                })
+                .unwrap()
+                .value;
+            vec![read_f32(&out)]
+        },
+    );
+
+    // dense_up: the up projection alone, ReLU² A results.
+    let up_only = mirrored_weight(features, width, 127).tensor(device);
+    tally.check(
+        device,
+        dense_up::native_entry_with(dense_up::Elements { NW: Element::bf16(), UW: q4k, A: a }),
+        &[("H", width), ("F", features), ("US", 0)],
+        &[],
+        |kernel, rows| {
+            let out = kernel
+                .call(dense_up::Args {
+                    residual: &hidden_rows(&rows),
+                    norm: &norm,
+                    up_weight: &up_only,
+                    out_rows: &out_rows(&rows),
+                    eps: 1e-6,
+                    activation: 2,
+                    up_scale: &empty(),
+                })
+                .unwrap()
+                .value;
+            vec![read_act(act, &out)]
+        },
+    );
+
+    // readout_head_rows: the head's F32 logits.
+    let vocabulary = 2048;
+    let head = mirrored_weight(vocabulary, width, 107).tensor(device);
+    tally.check(
+        device,
+        readout_head_rows::native_entry_with(readout_head_rows::Elements { NW: Element::bf16(), OW: q4k, A: a }),
+        &[("V", vocabulary), ("D", width), ("PT", 1), ("NM", width), ("WS", 0)],
+        &[],
+        |kernel, rows| {
+            let out = kernel
+                .call(readout_head_rows::Args {
+                    hidden: &hidden_rows(&rows),
+                    norm: &norm,
+                    weight: &head,
+                    out_rows: &out_rows(&rows),
+                    epsilon: 1e-6,
+                    softcap: 0.0,
+                    weight_scale: &empty(),
+                })
+                .unwrap()
+                .value;
+            vec![read_f32(&out)]
+        },
+    );
+
+    // readout_selected_rows: the head's F32 logits at selected vocabulary
+    // rows.
+    let chosen = (0..96).map(|i| ((i * 37 + 11) % vocabulary) as i32).collect::<Vec<_>>();
+    tally.check(
+        device,
+        readout_selected_rows::native_entry_with(readout_selected_rows::Elements {
+            NW: Element::bf16(),
+            OW: q4k,
+            A: a,
+        }),
+        &[("V", vocabulary), ("D", width), ("PT", 1), ("NM", width)],
+        &[],
+        |kernel, rows| {
+            let out = kernel
+                .call(readout_selected_rows::Args {
+                    hidden: &hidden_rows(&rows),
+                    norm: &norm,
+                    weight: &head,
+                    out_rows: &out_rows(&rows),
+                    selected: &i32_tensor(device, &[chosen.len()], &chosen),
+                    epsilon: 1e-6,
+                    softcap: 0.0,
+                })
+                .unwrap()
+                .value;
+            vec![read_f32(&out)]
+        },
+    );
+
+    // readout_project_rows: the head's F32 logits of A feature rows, over
+    // its first columns (I 0) and over columns each row indexes (I 1).
+    let feature_rows = cancelling_rows(CLASS_ROWS, width, 128, 1.0);
+    for indexed in [0, 1] {
+        let columns = if indexed == 1 { 64 } else { 512 };
+        let tokens = (0..CLASS_ROWS * indexed * columns)
+            .map(|i| ((i * 53 + 7) % vocabulary) as i32)
+            .collect::<Vec<_>>();
+        tally.check(
+            device,
+            readout_project_rows::native_entry_with(readout_project_rows::Elements { A: a, OW: q4k }),
+            &[("V", vocabulary), ("D", width), ("S", columns), ("I", indexed), ("WS", 0)],
+            &[],
+            |kernel, rows| {
+                let per_row = indexed * columns;
+                let out = kernel
+                    .call(readout_project_rows::Args {
+                        features: &act_tensor(
+                            device,
+                            act,
+                            &[rows.len(), width],
+                            &feature_rows[rows.start * width..rows.end * width],
+                        ),
+                        weight: &head,
+                        token_rows: &i32_tensor(
+                            device,
+                            &[rows.len(), indexed, columns],
+                            &tokens[rows.start * per_row..rows.end * per_row],
+                        ),
+                        weight_scale: &empty(),
+                        softcap: 0.0,
+                    })
+                    .unwrap()
+                    .value;
+                vec![read_f32(&out)]
+            },
+        );
+    }
+
+    // The recurrent projection and its convolved decode form: qkv, gate,
+    // alpha and beta segments, A results; the convolved form also
+    // convolves each slot's row over its source window (one slot a row,
+    // reading bank `row` and publishing bank CLASS_ROWS + `row`).
+    let (key_heads, value_heads, recurrent_width, taps) = (2usize, 4usize, 64usize, 4usize);
+    let channels = (2 * key_heads + value_heads) * recurrent_width;
+    let recurrent = [channels, value_heads * recurrent_width, value_heads, value_heads]
+        .iter()
+        .enumerate()
+        .map(|(i, &rows)| mirrored_weight(rows, width, 108 + i as u64).tensor(device))
+        .collect::<Vec<_>>();
+    tally.check(
+        device,
+        gated_delta_project::native_entry_with(gated_delta_project::Elements {
+            NW: Element::bf16(),
+            QW: q4k,
+            GW: q4k,
+            AW: q4k,
+            BW: q4k,
+            A: a,
+        }),
+        &[
+            ("H", width),
+            ("PT", 1),
+            ("NM", width),
+            ("NK", key_heads),
+            ("NV", value_heads),
+            ("W", recurrent_width),
+            ("QB", 0),
+            ("ZB", 0),
+        ],
+        &[],
+        |kernel, rows| {
+            let out = kernel
+                .call(gated_delta_project::Args {
+                    hidden: &hidden_rows(&rows),
+                    input_norm: &norm,
+                    qkv_weight: &recurrent[0],
+                    gate_weight: &recurrent[1],
+                    alpha_weight: &recurrent[2],
+                    beta_weight: &recurrent[3],
+                    epsilon: 1e-6,
+                    qkv_bound: &absent_bound(device),
+                    gate_bound: &absent_bound(device),
+                })
+                .unwrap()
+                .value;
+            vec![read_act(act, &out)]
+        },
+    );
+    let banks = 2 * CLASS_ROWS;
+    let window_rows = taps - 1;
+    let initial = uniform_values(banks * window_rows * channels, 112, 0.5);
+    let convolution = f32_tensor(device, &[channels, taps], &uniform_values(channels * taps, 113, 0.25));
+    tally.check(
+        device,
+        gated_delta_project_convolved::native_entry_with(gated_delta_project_convolved::Elements {
+            NW: Element::bf16(),
+            QW: q4k,
+            GW: q4k,
+            AW: q4k,
+            BW: q4k,
+            A: a,
+        }),
+        &[
+            ("H", width),
+            ("PT", 1),
+            ("NM", width),
+            ("NK", key_heads),
+            ("NV", value_heads),
+            ("W", recurrent_width),
+            ("C", taps),
+        ],
+        &[],
+        |kernel, rows| {
+            let slabs = crate::common::slab_tensor(
+                device,
+                2,
+                banks as u64,
+                &[SlabRegion {
+                    element: a,
+                    row_shape: vec![window_rows as u64, channels as u64],
+                }],
+            );
+            for slab in 0..banks / 2 {
+                slabs.add_slab(seismic::SlabFill::Zeroed).unwrap();
+                let bank_values = window_rows * channels;
+                slabs
+                    .region_rows(0, 2 * slab as u64, 2)
+                    .unwrap()
+                    .write_from_host(&act.bytes(&initial[2 * slab * bank_values..2 * (slab + 1) * bank_values]))
+                    .unwrap();
+            }
+            let mut window = slabs.logical_region(0).unwrap();
+            let slots = rows.len();
+            let ints = |values: Vec<i32>| i32_tensor(device, &[values.len()], &values);
+            let segments = (0..=slots as i32)
+                .flat_map(|slot| [slot, (slot + 1).min(slots as i32)])
+                .collect::<Vec<_>>();
+            let out = kernel
+                .call(gated_delta_project_convolved::Args {
+                    hidden: &hidden_rows(&rows),
+                    input_norm: &norm,
+                    qkv_weight: &recurrent[0],
+                    gate_weight: &recurrent[1],
+                    alpha_weight: &recurrent[2],
+                    beta_weight: &recurrent[3],
+                    convolution: &convolution,
+                    segments: &i32_tensor(device, &[slots + 1, 2], &segments),
+                    stop: &ints(vec![1; slots]),
+                    previous_bank: &ints(rows.clone().map(|row| row as i32).collect()),
+                    previous_tape: &ints(vec![0; slots]),
+                    following_bank: &ints(rows.clone().map(|row| (CLASS_ROWS + row) as i32).collect()),
+                    window: &mut window,
+                    epsilon: 1e-6,
+                    slab_banks: 2,
+                })
+                .unwrap();
+            vec![read_act(act, &out.r0), read_f32(&out.r1)]
+        },
+    );
+
+    // project_rows: activation rows to F32.
+    let source = cancelling_rows(CLASS_ROWS, width, 114, 1.0);
+    let plain = mirrored_weight(512, width, 115).tensor(device);
+    tally.check(
+        device,
+        project_rows::native_entry_with(project_rows::Elements { A: a, W: q4k, Y: Element::f32() }),
+        &[("G", 1), ("K", width), ("N", 512), ("WS", 0), ("WB", 0)],
+        &[],
+        |kernel, rows| {
+            let out = kernel
+                .call(project_rows::Args {
+                    source: &act_tensor(
+                        device,
+                        act,
+                        &[rows.len(), width],
+                        &source[rows.start * width..rows.end * width],
+                    ),
+                    weight: &plain,
+                    weight_scale: &empty(),
+                    weight_bound: &absent_bound(device),
+                })
+                .unwrap()
+                .value;
+            vec![read_f32(&out)]
+        },
+    );
+
+    // short_conv_project: the b, c and x projections, F32 results.
+    let conv_channels = 512;
+    let conv = (0..3)
+        .map(|i| mirrored_weight(conv_channels, width, 116 + i).tensor(device))
+        .collect::<Vec<_>>();
+    tally.check(
+        device,
+        short_conv_project::native_entry_with(short_conv_project::Elements {
+            NW: Element::bf16(),
+            BW: q4k,
+            CW: q4k,
+            XW: q4k,
+            A: a,
+        }),
+        &[("H", width), ("CH", conv_channels), ("BS", 0), ("CS", 0), ("XS", 0)],
+        &[],
+        |kernel, rows| {
+            let out = kernel
+                .call(short_conv_project::Args {
+                    residual: &hidden_rows(&rows),
+                    norm: &norm,
+                    b_weight: &conv[0],
+                    c_weight: &conv[1],
+                    x_weight: &conv[2],
+                    eps: 1e-6,
+                    b_scale: &empty(),
+                    c_scale: &empty(),
+                    x_scale: &empty(),
+                })
+                .unwrap()
+                .value;
+            vec![read_f32(&out)]
+        },
+    );
+
+    // per_layer_gate: the gate projection times layer 1's inputs, A results.
+    let (layers, per_layer) = (2, 512);
+    let layer_gate = mirrored_weight(per_layer, width, 119).tensor(device);
+    let inputs = uniform_values(CLASS_ROWS * layers * per_layer, 120, 1.0);
+    tally.check(
+        device,
+        per_layer_gate::native_entry_with(per_layer_gate::Elements { GW: q4k, A: a }),
+        &[("D", width), ("L", layers), ("P", per_layer), ("GS", 0)],
+        &[],
+        |kernel, rows| {
+            let n = layers * per_layer;
+            let out = kernel
+                .call(per_layer_gate::Args {
+                    hidden: &hidden_rows(&rows),
+                    gate_weight: &layer_gate,
+                    inputs: &f32_tensor(
+                        device,
+                        &[rows.len(), layers, per_layer],
+                        &inputs[rows.start * n..rows.end * n],
+                    ),
+                    layer: 1,
+                    activation: 1,
+                    gate_scale: &empty(),
+                })
+                .unwrap()
+                .value;
+            vec![read_act(act, &out)]
+        },
+    );
+
+    // The stream mix site's two stages over dense BF16 weights (the
+    // declarations admit no packed operands): low-rank rows, inject values
+    // and inverses; the input row.
+    let (stream_width, streams, rank) = (256usize, 4usize, 64usize);
+    let flat = streams * stream_width;
+    let stream_hidden = uniform_values(CLASS_ROWS * flat, 121, 3.0);
+    let stream_norm = f32_tensor(device, &[streams, stream_width], &norm_values(flat, 122));
+    let mix_down = weight(Repr::Bf16, rank, flat, 123, 1.0).tensor(device);
+    let inject = f32_tensor(device, &[streams, flat], &uniform_values(streams * flat, 124, 2.0 / (flat as f32).sqrt()));
+    let mix_up = weight(Repr::Bf16, flat, rank, 125, 1.0).tensor(device);
+    let low = uniform_values(CLASS_ROWS * rank, 126, 1.0);
+    let inverse = (0..CLASS_ROWS * streams).map(|i| 0.5 + 0.01 * i as f32).collect::<Vec<_>>();
+    let stream_rows = |rows: &std::ops::Range<usize>| {
+        f32_tensor(device, &[rows.len(), streams, stream_width], &stream_hidden[rows.start * flat..rows.end * flat])
+    };
+    tally.check(
+        device,
+        stream_mix_down::native_entry_with(stream_mix_down::Elements {
+            NW: Element::f32(),
+            DW: Element::bf16(),
+            IW: Element::f32(),
+            A: a,
+        }),
+        &[("H", stream_width), ("S", streams), ("LR", rank), ("C", 1)],
+        &[],
+        |kernel, rows| {
+            let out = kernel
+                .call(stream_mix_down::Args {
+                    hidden: &stream_rows(&rows),
+                    norm: &stream_norm,
+                    down_weight: &mix_down,
+                    inject_weight: &inject,
+                    epsilon: 1e-6,
+                })
+                .unwrap();
+            vec![read_act(act, &out.r0), read_f32(&out.r1), read_f32(&out.r2)]
+        },
+    );
+    tally.check(
+        device,
+        stream_mix_up::native_entry_with(stream_mix_up::Elements {
+            UW: Element::bf16(),
+            NW: Element::f32(),
+            A: a,
+        }),
+        &[("H", stream_width), ("S", streams), ("LR", rank)],
+        &[],
+        |kernel, rows| {
+            let out = kernel
+                .call(stream_mix_up::Args {
+                    low: &act_tensor(device, act, &[rows.len(), rank], &low[rows.start * rank..rows.end * rank]),
+                    up_weight: &mix_up,
+                    hidden: &stream_rows(&rows),
+                    inverse: &f32_tensor(
+                        device,
+                        &[rows.len(), streams],
+                        &inverse[rows.start * streams..rows.end * streams],
+                    ),
+                    norm: &stream_norm,
+                })
+                .unwrap()
+                .value;
+            vec![read_f32(&out)]
+        },
+    );
+
+    // The routed decode expansions over a stack of four experts, two choices
+    // a row: row r chooses experts r and r + 1 (modulo four), so each expert
+    // serves several rows of a call, which a gathered form runs together.
+    // `routed_expand` also projects the shared expert.
+    let (experts, choices, expert_features) = (4usize, 2usize, 256usize);
+    let routes = (0..CLASS_ROWS * choices)
+        .map(|i| ((i / choices + i % choices) % experts) as i32)
+        .collect::<Vec<_>>();
+    let normalized = cancelling_rows(CLASS_ROWS, width, 129, 1.0);
+    let normalized_rows = |rows: &std::ops::Range<usize>| {
+        act_tensor(device, act, &[rows.len(), width], &normalized[rows.start * width..rows.end * width])
+    };
+    let route_rows = |rows: &std::ops::Range<usize>| {
+        i32_tensor(device, &[rows.len(), choices], &routes[rows.start * choices..rows.end * choices])
+    };
+    let expert_stack = |seed: u64| {
+        let stack = (0..experts as u64)
+            .map(|expert| mirrored_weight(expert_features, width, seed + expert))
+            .collect::<Vec<_>>();
+        stacked(device, &stack)
+    };
+    let (expert_gate, expert_up) = (expert_stack(130), expert_stack(134));
+    let shared_gate = mirrored_weight(expert_features, width, 138).tensor(device);
+    let shared_up = mirrored_weight(expert_features, width, 139).tensor(device);
+    tally.check(
+        device,
+        routed_expand::native_entry_with(routed_expand::Elements { A: a, EGW: q4k, EUW: q4k, SGW: q4k, SUW: q4k }),
+        &[("H", width), ("K", choices), ("F", expert_features), ("S", expert_features), ("GS", 0), ("US", 0)],
+        &[],
+        |kernel, rows| {
+            let out = kernel
+                .call(routed_expand::Args {
+                    normalized: &normalized_rows(&rows),
+                    routes: &route_rows(&rows),
+                    expert_gate: &expert_gate,
+                    expert_up: &expert_up,
+                    shared_gate: &shared_gate,
+                    shared_up: &shared_up,
+                    gate_scale: &empty(),
+                    up_scale: &empty(),
+                })
+                .unwrap();
+            vec![read_act(act, &out.r0), read_act(act, &out.r1)]
+        },
+    );
+    // The gated and up-only expansions of resident experts (no sources, no
+    // tier), in each form a backend declares: per choice, and gathered.
+    let no_sources = |rows: &std::ops::Range<usize>| i32_tensor(device, &[0, rows.len(), choices], &[]);
+    let forms: [&[(&'static str, u64)]; 2] = [&[], &[("GATHERED", 1)]];
+    for forms in forms {
+        tally.check(
+            device,
+            routed_gate_up::native_entry_with(routed_gate_up::Elements { A: a, EGW: q4k, EUW: q4k }),
+            &[("H", width), ("K", choices), ("F", expert_features), ("GS", 0), ("US", 0), ("LB", 0)],
+            forms,
+            |kernel, rows| {
+                let out = kernel
+                    .call(routed_gate_up::Args {
+                        normalized: &normalized_rows(&rows),
+                        routes: &route_rows(&rows),
+                        sources: &no_sources(&rows),
+                        expert_gate: &expert_gate,
+                        expert_up: &expert_up,
+                        tier_gate: &expert_gate.slice_leading(0, 0).unwrap(),
+                        tier_up: &expert_up.slice_leading(0, 0).unwrap(),
+                        activation: 0,
+                        gate_scale: &empty(),
+                        up_scale: &empty(),
+                        glu_limit: &i32_tensor(device, &[0, 0], &[]),
+                    })
+                    .unwrap()
+                    .value;
+                vec![read_act(act, &out)]
+            },
+        );
+        tally.check(
+            device,
+            routed_up::native_entry_with(routed_up::Elements { A: a, EUW: q4k }),
+            &[("H", width), ("K", choices), ("F", expert_features), ("US", 0)],
+            forms,
+            |kernel, rows| {
+                let out = kernel
+                    .call(routed_up::Args {
+                        normalized: &normalized_rows(&rows),
+                        routes: &route_rows(&rows),
+                        sources: &no_sources(&rows),
+                        expert_up: &expert_up,
+                        tier_up: &expert_up.slice_leading(0, 0).unwrap(),
+                        up_scale: &empty(),
+                        activation: 2,
+                    })
+                    .unwrap()
+                    .value;
+                vec![read_act(act, &out)]
+            },
+        );
+    }
+
+    // readout_planes_rows: the progressive head's exact F32 logits from its
+    // planes (P 3: four top planes, bit 3 and three rest planes a group of 32
+    // columns) of random words, under scales of alternating sign.
+    let groups = vocabulary * width / 32;
+    let mut rng = Rng::new(140);
+    let mut words = |count: usize| {
+        (0..count)
+            .flat_map(|_| (rng.next() ^ (rng.next() << 1)).to_le_bytes())
+            .collect::<Vec<u8>>()
+    };
+    let plane = |shape: &[u64], bytes: Vec<u8>| Tensor::from_host(device, Element::u32(), shape, &bytes).unwrap();
+    let extents = [vocabulary as u64, (width / 32) as u64];
+    let top = plane(&[extents[0], extents[1], 4], words(4 * groups));
+    let bit3 = plane(&extents, words(groups));
+    let rest = plane(&[extents[0], extents[1], 3], words(3 * groups));
+    let scales = (0..groups)
+        .flat_map(|group| {
+            let sign = if group % 2 == 0 { 1.0 } else { -1.0 };
+            f16_bits(sign * rng.uniform(0.5, 1.5) * 0.02 / (width as f32).sqrt()).to_le_bytes()
+        })
+        .collect::<Vec<u8>>();
+    let scales = Tensor::from_host(device, Element::f16(), &extents, &scales).unwrap();
+    tally.check(
+        device,
+        readout_planes_rows::native_entry_with(readout_planes_rows::Elements { NW: Element::bf16(), A: a }),
+        &[("V", vocabulary), ("D", width), ("PT", 1), ("NM", width), ("P", 3)],
+        &[],
+        |kernel, rows| {
+            let out = kernel
+                .call(readout_planes_rows::Args {
+                    hidden: &one_part(&hidden_rows(&rows)),
+                    norm: &norm,
+                    top: &top,
+                    bit3: &bit3,
+                    rest: &rest,
+                    scales: &scales,
+                    out_rows: &out_rows(&rows),
+                    epsilon: 1e-6,
+                    softcap: 0.0,
+                })
+                .unwrap()
+                .value;
+            vec![read_f32(&out)]
+        },
+    );
+
+    tally
 }
 
 /// Which cases a segmented projection check runs: the small and 4B
@@ -4233,7 +5214,7 @@ fn recurrent_project_cases_on(device: &Device, cases: Cases) {
             read_act(act, &out)
         };
         let (row_classes, mappings) = if scoped {
-            (vec![1, 8, 32, 128], vec![MAPPINGS[0], MAPPINGS[2]])
+            (vec![1, VERIFY_ROWS as usize, VERIFY_ROWS as usize + 1, 32, 128], vec![MAPPINGS[0], MAPPINGS[2]])
         } else {
             checked_classes(false)
         };
@@ -4336,7 +5317,7 @@ fn recurrent_output_cases_on(device: &Device, scoped: bool) {
     for (h, nv, w, four_b) in geometries {
         let k = nv * w;
         let (row_classes, mappings) = if scoped {
-            (vec![1, 8, 32, 128], vec![MAPPINGS[0], MAPPINGS[2]])
+            (vec![1, VERIFY_ROWS as usize, VERIFY_ROWS as usize + 1, 32, 128], vec![MAPPINGS[0], MAPPINGS[2]])
         } else {
             checked_classes(four_b)
         };
@@ -4545,7 +5526,7 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
     };
     for (d, kv, g, w, four_b, reprs) in geometries {
         let (row_classes, mappings) = if scoped {
-            (vec![1, 8, 32, 128], vec![MAPPINGS[0], MAPPINGS[2]])
+            (vec![1, VERIFY_ROWS as usize, VERIFY_ROWS as usize + 1, 32, 128], vec![MAPPINGS[0], MAPPINGS[2]])
         } else {
             checked_classes(four_b)
         };
@@ -5217,11 +6198,12 @@ fn metal_readout_scoped_launches_match_the_host() {
         return;
     };
     const SCOPED: [Mapping; 2] = [MAPPINGS[0], MAPPINGS[2]];
+    const CLASSES: [usize; 5] = [1, VERIFY_ROWS as usize, VERIFY_ROWS as usize + 1, 32, 128];
     let check = ReadoutCheck {
         v: 256,
         d: 256,
         reprs: &[Repr::Q6k],
-        output_classes: &[1, 8, 32, 128],
+        output_classes: &CLASSES,
         mappings: &SCOPED,
         softcap: 0.0,
         weight_scale: None,
@@ -5492,7 +6474,7 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(
                         OW: repr.resident(&device),
                         A: act.element(),
                     },
-                    &readout_projection_specialization_on(device, &[("V", v), ("D", d)], mapping),
+                    &readout_projection_specialization_on(device, &[("V", v), ("D", d)], mapping, None),
                 )
                 .unwrap()
                 .call(readout_selected_rows::Args {
@@ -6479,7 +7461,7 @@ fn metal_convolved_matrix_columns_match_host() {
             .iter()
             .map(|v| v.tensor(&device))
             .collect::<Vec<_>>();
-        for rows in [8usize, 13] {
+        for rows in [VERIFY_ROWS as usize + 1, 16] {
             let hidden = uniform_values(rows * h, rows as u64, 1.0);
             let (expected, bound) = {
                 let mut expected = Vec::new();
@@ -6547,15 +7529,14 @@ fn metal_convolved_matrix_columns_match_host() {
                     ),
                     h,
                 )
-                .with_param("BATCH_FROM", 3)
+                .with_param("LANES", 16)
                 .with_launch_param(2, "BATCH_SIMDGROUPS", 8)
                 .with_launch_param(2, "BATCH_ROWS", 2)
                 .with_launch_param(2, "BATCH_PARTS", parts);
                 for launch in [1, 3, 4] {
                     spec = spec
                         .with_launch_param(launch, "SIMDGROUPS", 8)
-                        .with_launch_param(launch, "ROWS", 2)
-                        .with_launch_param(launch, "LANES", 16);
+                        .with_launch_param(launch, "ROWS", 2);
                 }
                 let spec = with_matrix::<gated_delta_project_convolved::Entry>(
                     &device,
@@ -6750,7 +7731,7 @@ fn metal_attention_output_matrix_matches_host() {
     for act in [Act::Bf16, Act::F16] {
         for repr in [Repr::Q4k, Repr::Q5k, Repr::Q6k, Repr::Q8] {
             let weights = weight(repr, d, k, 714, 1.0);
-            for rows in [8usize, 13] {
+            for rows in [VERIFY_ROWS as usize + 1, 16] {
                 let hidden = uniform_values(rows * d, 715, 1.0);
                 let gated = uniform_values(rows * k, 716, 1.0)
                     .into_iter()
@@ -6772,7 +7753,6 @@ fn metal_attention_output_matrix_matches_host() {
                 };
                 for parts in [1, 2, 4] {
                     let mapping = Mapping {
-                        batch_from: 3,
                         batch_parts: parts,
                         ..gemm_mapping(64, 64, 1)
                     };
@@ -6827,7 +7807,7 @@ fn metal_q4_verify_rows_match_host() {
     let gate = weight(Repr::gguf(Encoding::Q4_0), f, h, 61, 1.0);
     let up = weight(Repr::gguf(Encoding::Q4_0), f, h, 62, 1.0);
     let norm = norm_values(h, 63);
-    for rows in [2usize, 4, 8, 16] {
+    for rows in [2, VERIFY_ROWS as usize + 1, 13, 16] {
         let source = uniform_values(rows * h, rows as u64, 1.0)
             .into_iter()
             .map(|x| act.round(x))
@@ -6838,7 +7818,6 @@ fn metal_q4_verify_rows_match_host() {
         );
         for parts in [1, 4] {
             let mapping = Mapping {
-                batch_from: 2,
                 batch_parts: parts,
                 ..gemm_mapping(64, 64, 1)
             };
@@ -6895,12 +7874,16 @@ fn metal_normalize_prepass_matches_small_row_tree() {
             .copy_from_slice(&0x3f80u16.to_le_bytes());
     }
     let norm = vec![1.0; h];
-    let rows = [0, 1, 2, 3];
+    // Rows cycling the four probes: the GEMV projects the first
+    // `VERIFY_ROWS`, the staged batched pass one more.
+    let gemv = VERIFY_ROWS as usize;
+    let count = gemv + 1;
+    let rows = (0..count as i32).collect::<Vec<_>>();
     let mut differences = 0;
     for seed in 1..=16 {
-        let mut source = vec![0.001f32; 4 * h];
-        for m in 0..4 {
-            let target = [1.00390625f64, 2.0078125, 3.0078125, 3.8671875][m];
+        let mut source = vec![0.001f32; count * h];
+        for m in 0..count {
+            let target = [1.00390625f64, 2.0078125, 3.0078125, 3.8671875][m % 4];
             let rest = 240.0f64 + (h - 256) as f64 * 0.001f64.powi(2);
             let probe = (target * target * (rest + h as f64 * 1e-6)
                 / (h as f64 - 16.0 * target * target))
@@ -6913,9 +7896,9 @@ fn metal_normalize_prepass_matches_small_row_tree() {
                     f32::from_bits(probe.to_bits().wrapping_add(seed as u32).wrapping_sub(8));
             }
         }
-        let hidden = f32_tensor(&device, &[4, h], &source);
+        let hidden = f32_tensor(&device, &[count, h], &source);
         let nt = bf16_norm(&device, &norm);
-        let selected = i32_tensor(&device, &[4], &rows);
+        let selected = i32_tensor(&device, &[gemv], &rows[..gemv]);
         let features = readout_features_rows::native_for_device_with(
             &device,
             readout_features_rows::Elements {
@@ -6949,10 +7932,7 @@ fn metal_normalize_prepass_matches_small_row_tree() {
                 readout_head_specialization_on(
                     &device,
                     &[("D", h), ("V", h), ("WS", 0)],
-                    Mapping {
-                        batch_from: 5,
-                        ..gemm_mapping(64, 64, 1)
-                    },
+                    gemm_mapping(64, 64, 1),
                 ),
                 &[("NW", Element::bf16()), ("OW", Element::bf16()), ("A", Element::bf16())],
             ),
@@ -6980,14 +7960,11 @@ fn metal_normalize_prepass_matches_small_row_tree() {
             &identity,
             &identity,
             &source,
-            4,
+            count,
             &norm,
-            &rows,
+            &rows[..gemv],
             1e-6,
-            Mapping {
-                batch_from: 5,
-                ..gemm_mapping(64, 64, 1)
-            },
+            gemm_mapping(64, 64, 1),
         );
         let staged = dense_expand_native(
             &device,
@@ -6995,18 +7972,15 @@ fn metal_normalize_prepass_matches_small_row_tree() {
             &identity,
             &identity,
             &source,
-            4,
+            count,
             &norm,
             &rows,
             1e-6,
-            Mapping {
-                batch_from: 3,
-                ..gemm_mapping(64, 64, 1)
-            },
+            gemm_mapping(64, 64, 1),
         );
         differences += scalar
             .iter()
-            .zip(&staged)
+            .zip(&staged[..gemv * h])
             .filter(|(a, b)| a.to_bits() != b.to_bits())
             .count();
     }
@@ -7059,7 +8033,6 @@ fn mxfp8_grouped_project_rows_at_deepseek_v41_prefill_wo_a_times() {
         .into_iter()
         .fold(NativeSpecialization::new(), |spec, (name, value)| spec.with_static(name, value as u64));
     let fixed = [
-        ("BATCH_FROM", 5),
         ("SPLIT", 1),
         ("PACK", 0),
         ("RESIDUE", 1),

@@ -225,15 +225,15 @@ const fn scoped(name: &'static str, launch: usize, value: u64) -> Param {
 }
 
 /// The declaration indices of an entry's tuned launches: Metal's GEMV,
-/// batched GEMV and GEMM, CUDA's two GEMV bands (`None`: the entry declares
-/// its KSPLIT for every launch) and large-band GEMM; `split` for a SPLIT
-/// parameter.
+/// batched GEMV and GEMM, CUDA's 1..8-row GEMV where it takes RESIDENCY
+/// (both CUDA GEMV bands read the entry's one KSPLIT) and large-band GEMM;
+/// `split` for a SPLIT parameter.
 #[derive(Clone, Copy)]
 struct Launches {
     metal_gemv: usize,
     metal_batch: usize,
     metal_gemm: usize,
-    cuda_gemv: Option<[usize; 2]>,
+    cuda_residency: Option<usize>,
     cuda_gemm: usize,
     split: bool,
 }
@@ -253,13 +253,12 @@ fn mappings(
     let split = |value| launches.split.then_some(entry("SPLIT", value));
     let mappings: Vec<Mapping> = match device.backend() {
         seismic::BackendName::Metal => [
-            (5, 4, 2, 32, 8, 2, 64, 64, 2),
-            (9, 16, 1, 16, 4, 4, 32, 128, 1),
+            (4, 2, 32, 8, 2, 64, 64, 2),
+            (16, 1, 16, 4, 4, 32, 128, 1),
         ]
         .into_iter()
         .map(
             |(
-                from,
                 simdgroups,
                 rows,
                 lanes,
@@ -270,7 +269,6 @@ fn mappings(
                 parts,
             )| Mapping {
                 params: [
-                    entry("BATCH_FROM", from),
                     scoped("SIMDGROUPS", launches.metal_gemv, simdgroups),
                     scoped("ROWS", launches.metal_gemv, rows),
                     scoped("LANES", launches.metal_gemv, lanes),
@@ -291,19 +289,11 @@ fn mappings(
             .map(|(int8, ksplit, rotate, residency)| Mapping {
                 params: [
                     entry("INT8", int8),
+                    entry("KSPLIT", ksplit),
                     scoped("ROTATE", launches.cuda_gemm, rotate),
                 ]
                 .into_iter()
-                .chain(match launches.cuda_gemv {
-                    Some([first, second]) => {
-                        vec![
-                            scoped("KSPLIT", first, ksplit),
-                            scoped("KSPLIT", second, ksplit),
-                        ]
-                    }
-                    // The dense pair: its 1..8-row GEMV is launch 1.
-                    None => vec![entry("KSPLIT", ksplit), scoped("RESIDENCY", 1, residency)],
-                })
+                .chain(launches.cuda_residency.map(|gemv| scoped("RESIDENCY", gemv, residency)))
                 .collect(),
                 int8: int8 == 1,
             })
@@ -951,7 +941,7 @@ fn native_project_rows_matches_host_reference() {
         metal_gemv: 0,
         metal_batch: 2,
         metal_gemm: 5,
-        cuda_gemv: Some([1, 2]),
+        cuda_residency: None,
         cuda_gemm: 4,
         split: true,
     };
@@ -1049,7 +1039,7 @@ fn native_dense_up_matches_host_reference() {
         metal_gemv: 1,
         metal_batch: 2,
         metal_gemm: 4,
-        cuda_gemv: None,
+        cuda_residency: Some(1),
         cuda_gemm: 4,
         split: false,
     };
@@ -1139,7 +1129,7 @@ fn native_short_conv_project_matches_host_reference() {
         metal_gemv: 1,
         metal_batch: 2,
         metal_gemm: 4,
-        cuda_gemv: Some([1, 2]),
+        cuda_residency: None,
         cuda_gemm: 4,
         split: false,
     };
@@ -1230,7 +1220,7 @@ fn native_per_layer_gate_matches_host_reference() {
         metal_gemv: 1,
         metal_batch: 2,
         metal_gemm: 4,
-        cuda_gemv: Some([1, 2]),
+        cuda_residency: None,
         cuda_gemm: 4,
         split: false,
     };

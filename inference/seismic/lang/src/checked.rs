@@ -1685,6 +1685,15 @@ pub struct NativeLaunch {
     pub params: Vec<NativeParameter>,
     /// Entry parameters used by this kernel beyond its launch expressions.
     pub reads: Vec<String>,
+    /// The launch of this native that computes each of this launch's rows
+    /// alone (`alike`), by ordinal: the launch's rows do not depend on how
+    /// many rows its call carries. `None` for every other launch, the
+    /// one-row launch included.
+    pub alike: Option<usize>,
+    /// The launch is a staging pass (`staging`): it forms operands another
+    /// launch reads and computes no row's result, so no row count's choice of
+    /// it makes it a row class.
+    pub staging: bool,
     /// The launch runs only when this holds; an inactive launch is not
     /// encoded, not limit-checked, and its geometry is not evaluated. It
     /// keeps its ordinal. `None` is always active.
@@ -2579,8 +2588,19 @@ impl NativeLaunch {
     /// Every tuning parameter the launch's declaration reads: its `when`
     /// condition, groups, group extent and shared bytes.
     pub fn parameters(&self) -> Vec<String> {
+        self.collect_parameters(true)
+    }
+
+    /// Every tuning parameter the launch's dispatch reads: [`Self::parameters`]
+    /// without its `when` condition, which selects the launch and is not read
+    /// by what the launch computes.
+    pub fn dispatch_parameters(&self) -> Vec<String> {
+        self.collect_parameters(false)
+    }
+
+    fn collect_parameters(&self, with_condition: bool) -> Vec<String> {
         let mut out = self.reads.clone();
-        if let Some(when) = &self.when {
+        if let Some(when) = self.when.as_ref().filter(|_| with_condition) {
             when.parameters(&mut out);
         }
         for expression in self.groups.iter().chain(&self.group_extent) {
@@ -4261,6 +4281,103 @@ mod native_tests {
             native.validate(&default.clone().with_launch_param(1, "ROWS", 2)),
             Err(NativeSpecializationError::OutsideLaunchDomain { launch: 1, .. })
         ));
+    }
+
+    /// A launch `alike` another computes each row as that launch computes it
+    /// alone: neither declares a reduction order (`arithmetic` parameter) of
+    /// its own, and both read the same ones, the native's. A `when` that
+    /// reads one only selects the launch.
+    #[test]
+    fn alike_launches_share_their_reduction_orders() {
+        // The one-row launch's clauses and extent; the `alike` launch's
+        // `when` condition, clauses before its `alike` line, and extent.
+        let declaration = |params: &str, one: (&str, &str), several: (&str, &str, &str)| {
+            source(&format!(
+                concat!(
+                    "native scale for metal from \"scale.metal\":\n{params}",
+                    "    launch one when N < 2:\n",
+                    "{one_clauses}",
+                    "        threadgroups (ceil_div(N, {one_extent}), 1, 1)\n",
+                    "        threads_per_threadgroup (32, 1, 1)\n",
+                    "    launch several when {when}:\n",
+                    "{several_clauses}",
+                    "        alike (one)\n",
+                    "        threadgroups (ceil_div(N, {several_extent}), 1, 1)\n",
+                    "        threads_per_threadgroup (32, 1, 1)\n",
+                ),
+                params = params,
+                one_clauses = one.0,
+                one_extent = one.1,
+                when = several.0,
+                several_clauses = several.1,
+                several_extent = several.2,
+            ))
+        };
+        let both = "    params (arithmetic LANES in [16, 8] default 16, arithmetic SPLIT in [1, 2] default 1)\n";
+        let reads_split = "        reads (SPLIT)\n";
+        // The `alike` launch's `when` reads a setting neither launch reads
+        // otherwise: it selects, and no order is read.
+        let module = crate::native_source::check_fixture(
+            declaration(both, ("", "LANES"), ("N >= 2 and N >= SPLIT", "", "LANES")),
+            &[],
+        )
+        .expect("launches reading the same orders check");
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .unwrap();
+        assert_eq!(native.launches[0].alike, None);
+        assert_eq!(native.launches[1].alike, Some(0));
+        let refused = [
+            (
+                "an order one reads and the other does not",
+                declaration(both, (reads_split, "LANES"), ("N >= 2", "", "LANES")),
+                "must read the same reduction orders",
+            ),
+            (
+                "an order of its own",
+                declaration(
+                    "    params (arithmetic SPLIT in [1, 2] default 1)\n",
+                    ("", "SPLIT"),
+                    ("N >= 2", "        params (arithmetic LANES in [8, 16] default 8)\n", "LANES * SPLIT"),
+                ),
+                "of its own",
+            ),
+        ];
+        for (what, declaration, expected) in refused {
+            let error = crate::native_source::check_fixture(declaration, &[]).expect_err(what);
+            assert!(error.to_string().contains(expected), "{what}: {error}");
+        }
+    }
+
+    /// A `staging` launch is recorded on the checked launch, and a launch
+    /// cannot be both `staging` and `alike`.
+    #[test]
+    fn a_staging_launch_is_declared_and_is_not_alike() {
+        let declaration = |several_clauses: &str| {
+            source(&format!(
+                concat!(
+                    "native scale for metal from \"scale.metal\":\n",
+                    "    launch one when N < 2:\n",
+                    "        threadgroups (N, 1, 1)\n",
+                    "        threads_per_threadgroup (32, 1, 1)\n",
+                    "    launch several when N >= 2:\n",
+                    "{several_clauses}",
+                    "        threadgroups (N, 1, 1)\n",
+                    "        threads_per_threadgroup (32, 1, 1)\n",
+                ),
+                several_clauses = several_clauses,
+            ))
+        };
+        let module = crate::native_source::check_fixture(declaration("        staging\n"), &[])
+            .expect("a staging launch checks");
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .unwrap();
+        assert!(!native.launches[0].staging);
+        assert!(native.launches[1].staging);
+        let error = crate::native_source::check_fixture(declaration("        alike (one)\n        staging\n"), &[])
+            .expect_err("a launch is not both");
+        assert!(error.to_string().contains("not both"), "{error}");
     }
 
     /// A range on a call-time dimension leaves unreachable exactly the

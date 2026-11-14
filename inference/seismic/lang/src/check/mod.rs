@@ -2023,6 +2023,8 @@ fn check_native(
             reads,
             when,
             groups: [x, y, z],
+            alike: None,
+            staging: launch.staging,
             grid,
             conditions,
             group_extent: [ex, ey, ez],
@@ -2051,6 +2053,28 @@ fn check_native(
                 native.launches[ordinal].span,
                 format!("launches of kernel `{}` are not all resident or all dispatched", launch.kernel),
             ));
+        }
+    }
+
+    for declared in &native.launches {
+        if declared.staging && declared.alike.is_some() {
+            errors.push((declared.span, "a launch is `staging` or `alike`, not both".to_owned()));
+        }
+    }
+
+    // `alike (LAUNCH)` names the native's one-row launch by its kernel.
+    for (ordinal, declared) in native.launches.iter().enumerate() {
+        let Some(alike) = &declared.alike else { continue };
+        match launches.iter().position(|other| other.kernel == alike.name) {
+            None => errors.push((alike.span, format!("`alike` names `{}`, which is not a launch of this native", alike.name))),
+            Some(target) if target == ordinal => {
+                errors.push((alike.span, "a launch is not `alike` itself; the one-row launch declares none".to_owned()));
+            }
+            Some(target) if native.launches[target].alike.is_some() => errors.push((
+                alike.span,
+                format!("`alike` names `{}`, which is itself `alike` another launch; name the one-row launch", alike.name),
+            )),
+            Some(target) => launches[ordinal].alike = Some(target),
         }
     }
 

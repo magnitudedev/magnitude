@@ -912,10 +912,8 @@ fn cuda_head_logits_scoped_launches_match_host_model() {
                 .with_static("I", 0)
                 .with_static("WS", 0)
                 .with_param("OPERAND", 0)
-                .with_launch_param(1, "KSPLIT", 4)
-                .with_launch_param(2, "KSPLIT", 4)
-                .with_launch_param(4, "ROTATE", 2)
-                .with_launch_param(5, "KSPLIT", 4);
+                .with_param("KSPLIT", 4)
+                .with_launch_param(4, "ROTATE", 2);
             let kernel = readout_project_rows::native_for_device_with(
                 &device,
                 readout_project_rows::Elements {
@@ -989,6 +987,71 @@ fn cuda_head_logits_scoped_launches_match_host_model() {
             );
         }
     }
+}
+
+/// The draft readout's columns gathered by token (I = 1, the indexed launch)
+/// are the vocabulary's columns in order (I = 0, the GEMV classes: one row,
+/// 2 to 8, 9 to 16) at the same token, bit for bit, at every row count a
+/// draft verification can carry: a verify row reads the logits plain decode
+/// reads, whichever form serves it.
+#[test]
+fn cuda_indexed_readout_logits_are_the_full_readout_logits() {
+    let Some(device) = cuda() else { return };
+    let mut rng = Rng(89);
+    let (d, v, columns) = (512, 272, 7);
+    let head = weight(&device, Format::Q6K, v, d, &mut rng);
+    let features = (0..16 * d).map(|_| bf16_round(rng.uniform(-1.0, 1.0))).collect::<Vec<_>>();
+    let form = |s: usize, indexed: u64| {
+        readout_project_rows::native_for_device_with(
+            &device,
+            readout_project_rows::Elements {
+                A: Element::bf16(),
+                OW: Format::Q6K.resident(),
+            },
+            &NativeSpecialization::new()
+                .with_static("V", v as u64)
+                .with_static("D", d as u64)
+                .with_static("S", s as u64)
+                .with_static("I", indexed)
+                .with_static("WS", 0)
+                .with_param("OPERAND", 0)
+                .with_param("KSPLIT", 4)
+                .with_launch_param(4, "ROTATE", 2),
+        )
+        .unwrap()
+    };
+    let (full, indexed) = (form(v, 0), form(columns, 1));
+    let mut unlike = Vec::new();
+    for rows in 1..=16usize {
+        let input = bf16_tensor(&device, &[rows as u64, d as u64], &features[..rows * d]);
+        let ids = (0..rows)
+            .flat_map(|row| [((row * 19 + 3) % v) as i32, 0, 15, 16, 100, ((row * 37) % v) as i32, (v - 1) as i32])
+            .collect::<Vec<_>>();
+        let project = |kernel: &seismic::NativeKernel<readout_project_rows::Entry>, token_rows: &Tensor| {
+            read_f32(
+                &kernel
+                    .call(readout_project_rows::Args {
+                        features: &input,
+                        weight: &head.tensor,
+                        token_rows,
+                        weight_scale: &Tensor::zeros(&device, Element::f32(), &[0]).unwrap(),
+                        softcap: 0.0,
+                    })
+                    .unwrap()
+                    .value,
+            )
+        };
+        let logits = project(&full, &Tensor::zeros(&device, Element::i32(), &[rows as u64, 0, v as u64]).unwrap());
+        let gathered = project(&indexed, &i32_tensor(&device, &[rows as u64, 1, columns as u64], &ids));
+        for (index, (&id, value)) in ids.iter().zip(&gathered).enumerate() {
+            let row = index / columns;
+            let expected = logits[row * v + id as usize];
+            if value.to_bits() != expected.to_bits() {
+                unlike.push(format!("O {rows} row {row} token {id}: indexed {value} full {expected}"));
+            }
+        }
+    }
+    assert!(unlike.is_empty(), "indexed logits unlike the full readout's:\n{}", unlike.join("\n"));
 }
 
 fn features_and_selected_rows_match_host_model(format: Format) {

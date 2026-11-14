@@ -1,0 +1,9 @@
+# The rows of the widest draft verification step (the anchor and the most
+# drafts; the executor's `MAX_DRAFT_PROPOSALS` is this minus one), and so the
+# row count every decode form serves: a verification row must compute the bits
+# plain decode computes for it, so every launch the row count selects up to
+# it is a GEMV row class (`alike` the one-row launch) and the first launch
+# beyond it (the batched form, the GEMM) starts above it. The routed and
+# progressive decode forms, the decode attention and the executor's decode
+# classes all read it: this is the one eight.
+const VERIFY_ROWS = 8

@@ -168,7 +168,7 @@ impl Promotions {
     /// Size each group's reserve by `decoded` ([`reserve`], [`decide`]).
     fn size(&mut self, core: &mut Core, decoded: &MissCurve) {
         let frontier = core.steps.frontier();
-        let choices = crate::operators::routed::fused_graph::DECODE_ROWS as usize * core.extents.selected;
+        let choices = magnitude_kernels::constants::VERIFY_ROWS as usize * core.extents.selected;
         let sizing = Sizing {
             groups: core.directory.layer_groups(),
             reads: core.directory.layer_experts().into_iter().map(|experts| experts.min(choices)).collect(),

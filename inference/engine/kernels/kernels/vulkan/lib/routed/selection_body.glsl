@@ -91,7 +91,7 @@ const packets_rows16 router_layout = SELECT_ROUTER_ROWS; \
                 const uint source = 32u * p + 8u * step + i; \
                 const float weight = (i & 1u) != 0u ? odd[i >> 1] : even[i >> 1]; \
                 const float scale = SELECT_FN(select_router_norm)(source); \
-                [[unroll]] for (uint row = 0u; row < uint(SEISMIC_CONST_DECODE_ROWS); ++row) \
+                [[unroll]] for (uint row = 0u; row < uint(SEISMIC_CONST_VERIFY_ROWS); ++row) \
                     if (row < rows) \
                         sums[row] = seismic_fma_rn(element_round(SELECT_ACT, \
                             SELECT_FN(select_residual)(row, source) * seismic_shared_f32[inverses + row] * scale), \
@@ -107,7 +107,7 @@ for (uint base = 4u * lane; base < hidden; base += 128u) { \
             weight[j] = SELECT_FN(select_column_weight)(expert, base + j); \
             scale[j] = SELECT_FN(select_router_norm)(base + j); \
         } \
-        [[unroll]] for (uint row = 0u; row < uint(SEISMIC_CONST_DECODE_ROWS); ++row) { \
+        [[unroll]] for (uint row = 0u; row < uint(SEISMIC_CONST_VERIFY_ROWS); ++row) { \
             if (row < rows) { \
                 const float inverse = seismic_shared_f32[inverses + row]; \
                 [[unroll]] for (uint j = 0u; j < 4u; ++j) \
@@ -123,7 +123,7 @@ void SELECT_FN(select_gemv)() { \
     const uint rows = uint(SEISMIC_DIM_M), hidden = uint(SEISMIC_DIM_H); \
     const uint sg = SEISMIC_SUBGROUP, lane = SEISMIC_LANE, thread = gl_LocalInvocationIndex; \
     const float eps = element_word_f32(SEISMIC_PARAM_EPSILON); \
-    const uint inverses = uint(SEISMIC_CONST_DECODE_ROWS) * SELECT_SUBGROUPS; \
+    const uint inverses = uint(SEISMIC_CONST_VERIFY_ROWS) * SELECT_SUBGROUPS; \
     for (uint item = sg; item < rows * SELECT_SUBGROUPS; item += SEISMIC_SUBGROUPS) { \
         const uint row = item / SELECT_SUBGROUPS, part = item % SELECT_SUBGROUPS; \
         float squares = 0.0; \
@@ -153,12 +153,12 @@ void SELECT_FN(select_gemv)() { \
     const uint expert = gl_WorkGroupID.x * SEISMIC_SUBGROUPS + sg; \
     if (expert >= SELECT_E) \
         return; \
-    float sums[SEISMIC_CONST_DECODE_ROWS]; \
-    [[unroll]] for (uint row = 0u; row < uint(SEISMIC_CONST_DECODE_ROWS); ++row) \
+    float sums[SEISMIC_CONST_VERIFY_ROWS]; \
+    [[unroll]] for (uint row = 0u; row < uint(SEISMIC_CONST_VERIFY_ROWS); ++row) \
         sums[row] = 0.0; \
 SELECT_ACCUMULATE_GEMV \
  \
-    [[unroll]] for (uint row = 0u; row < uint(SEISMIC_CONST_DECODE_ROWS); ++row) { \
+    [[unroll]] for (uint row = 0u; row < uint(SEISMIC_CONST_VERIFY_ROWS); ++row) { \
         if (row < rows) { \
             const float sum = seismic_subgroup_sum_f32(sums[row]); \
             if (lane == 0u) \

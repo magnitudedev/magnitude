@@ -1,7 +1,7 @@
 //! Routed (mixture-of-experts) feed-forward graph construction (program spec
 //! K6, E8).
 //!
-//! Row classes up to [`DECODE_ROWS`] run the decode form ([`DecodeForm`]):
+//! Row classes up to the kernels' `VERIFY_ROWS` run the decode form ([`DecodeForm`]):
 //! route, expand, output; or, on a backend that declares
 //! `routed_route_shared`, the route with the shared expert's gate/up, the
 //! choices' gate/up, output. Larger classes run the grouped form: route,
@@ -292,13 +292,9 @@ pub(crate) fn split<G: GraphDraft>(
     Ok((RoutedTopology { bank }, shape))
 }
 
-/// The largest row class the decode form serves: the K1 GEMV row bound,
-/// `routed.seismic`'s `DECODE_ROWS`.
-pub(crate) const DECODE_ROWS: u64 = magnitude_kernels::constants::DECODE_ROWS;
-
 /// Whether a `rows`-row class runs the decode form.
 pub(crate) fn decodes(rows: impl Into<Dim>) -> bool {
-    rows.into().at_most(DECODE_ROWS)
+    rows.into().at_most(magnitude_kernels::constants::VERIFY_ROWS)
 }
 
 /// Rows of one expert tile of the grouped form.

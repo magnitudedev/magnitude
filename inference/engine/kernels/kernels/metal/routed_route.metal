@@ -1,13 +1,13 @@
-// Routing for M rows: one launch at M <= DECODE_ROWS (gemv), three above (stage, gemm,
+// Routing for M rows: one launch at M <= VERIFY_ROWS (gemv), three above (stage, gemm,
 // select).
 //   routed_route_stage (one threadgroup per row): the row's RMS and its
 //     normalized values (rounded to the activation dtype), published once.
-//   routed_route_gemv (M <= DECODE_ROWS): the router logits (`lib/routed/router.h`,
+//   routed_route_gemv (M <= VERIFY_ROWS): the router logits (`lib/routed/router.h`,
 //     `lib/routed/route.h`), one simdgroup per logit column over the
 //     normalized rows each threadgroup forms from RMS partials of its own;
 //     one more threadgroup forms the shared-expert gate column; the last
 //     threadgroup to arrive selects.
-//   routed_route_gemm (M > DECODE_ROWS): the logits tiles of `lib/routed/logits.h`.
+//   routed_route_gemm (M > VERIFY_ROWS): the logits tiles of `lib/routed/logits.h`.
 //   Logits are [M, E + 1]: column E is the shared-expert gate.
 //   routed_route_select (one simdgroup per row): the softmax over every expert
 //     (ceil(E / 32) experts per lane), K rounds of simdgroup argmax (ties to the
@@ -58,7 +58,7 @@ kernel void routed_route_stage(
     }
 }
 
-// M <= DECODE_ROWS, the only launch: the router threadgroups of `lib/routed/route.h`.
+// M <= VERIFY_ROWS, the only launch: the router threadgroups of `lib/routed/route.h`.
 kernel void routed_route_gemv(
     device const float *residual [[buffer(SEISMIC_BUFFER_RESIDUAL)]],
     device const uchar *norm [[buffer(SEISMIC_BUFFER_NORM)]],
@@ -77,8 +77,8 @@ kernel void routed_route_gemv(
     uint tid [[thread_index_in_threadgroup]],
     uint simd [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup float parts[SEISMIC_CONST_DECODE_ROWS * route_simdgroups];
-    threadgroup float inverses[SEISMIC_CONST_DECODE_ROWS];
+    threadgroup float parts[SEISMIC_CONST_VERIFY_ROWS * route_simdgroups];
+    threadgroup float inverses[SEISMIC_CONST_VERIFY_ROWS];
     threadgroup uint last;
     const element::Out<ELEMENT_OF(SEISMIC_SCORES)> scores(scores_cells);
     const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> normalized(normalized_cells);
@@ -106,7 +106,7 @@ struct RouteColumns {
     }
 };
 
-// M > DECODE_ROWS: the logits tiles (`lib/routed/logits.h`) over the E + 1 columns,
+// M > VERIFY_ROWS: the logits tiles (`lib/routed/logits.h`) over the E + 1 columns,
 // column E the shared-expert gate.
 kernel void routed_route_gemm(
     device const uchar *router [[buffer(SEISMIC_BUFFER_ROUTER)]],
@@ -131,7 +131,7 @@ kernel void routed_route_gemm(
         simd, lane);
 }
 
-// M > DECODE_ROWS: one simdgroup per row, after the GEMM. (M <= DECODE_ROWS selects in the last
+// M > VERIFY_ROWS: one simdgroup per row, after the GEMM. (M <= VERIFY_ROWS selects in the last
 // GEMV threadgroup to arrive.)
 kernel void routed_route_select(
     device int *routes [[buffer(SEISMIC_BUFFER_ROUTES)]],

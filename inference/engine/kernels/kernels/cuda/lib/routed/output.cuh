@@ -1,5 +1,5 @@
 // The decode output projections of Qwen's fused routed feed-forward (M <=
-// DECODE_ROWS), shared by `routed_output` and `routed_output_project`; the
+// VERIFY_ROWS), shared by `routed_output` and `routed_output_project`; the
 // CUDA form of `metal/lib/routed/output.h`.
 // Block (x, y) works on the output channels of tile group x for y =
 // m * (K + 1) + slot (slot < K is choice (m, slot), slot K the shared
@@ -143,7 +143,7 @@ __global__ void routed_output_gathered(SEISMIC_KERNEL_PARAMS) {
     using Shape = routed::DecodeShape<TPW, KSPLIT>;
     constexpr projection::u64 CHANNELS = Shape::GROUPS * TPW * 16;
     __shared__ projection::GemvShared<Shape, routed::GatheredRows> shared;
-    __shared__ projection::u64 rows_at[SEISMIC_CONST_DECODE_ROWS], published_at[SEISMIC_CONST_DECODE_ROWS];
+    __shared__ projection::u64 rows_at[SEISMIC_CONST_VERIFY_ROWS], published_at[SEISMIC_CONST_VERIFY_ROWS];
     __shared__ unsigned count;
     const projection::u64 H = SEISMIC_DIM_H, K = SEISMIC_DIM_K, M = SEISMIC_DIM_M;
     const projection::u64 m = blockIdx.y / (K + 1), slot = blockIdx.y % (K + 1);
@@ -161,7 +161,7 @@ __global__ void routed_output_gathered(SEISMIC_KERNEL_PARAMS) {
         : m == 0;
     if (projects && threadIdx.x == 0) {
         if (slot < K) {
-            projection::u32 chosen[SEISMIC_CONST_DECODE_ROWS];
+            projection::u32 chosen[SEISMIC_CONST_VERIFY_ROWS];
             count = routed::expert_choices(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1, (unsigned)M,
                                            (unsigned)K, choice, chosen);
             for (unsigned r = 0; r < count; ++r) {

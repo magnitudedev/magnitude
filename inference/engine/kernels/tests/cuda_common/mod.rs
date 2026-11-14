@@ -291,19 +291,19 @@ impl Mapping {
             .with_param("INT8", self.int8)
     }
     /// Shared producer/GEMV/small-GEMM/large-GEMM schedule: arithmetic
-    /// representation is independent of the row tile chosen by the schedule.
+    /// representation is independent of the row tile chosen by the schedule,
+    /// and both GEMV launches read the one entry-wide KSPLIT.
     pub fn projection_params(
         self,
         spec: seismic::NativeSpecialization,
     ) -> seismic::NativeSpecialization {
         spec.with_param("INT8", self.int8)
             .with_param("OPERAND", 0)
-            .with_launch_param(1, "KSPLIT", self.ksplit)
-            .with_launch_param(2, "KSPLIT", self.ksplit)
+            .with_param("KSPLIT", self.ksplit)
             .with_launch_param(4, "ROTATE", self.rotate)
     }
     /// [`Mapping::projection_params`] of the dense pair (`dense_up`,
-    /// `dense_output`), whose GEMV launches share one entry-wide KSPLIT.
+    /// `dense_output`), whose one-to-eight-row GEMV also takes RESIDENCY.
     pub fn dense_pair_params(
         self,
         spec: seismic::NativeSpecialization,
@@ -314,11 +314,10 @@ impl Mapping {
             .with_launch_param(1, "RESIDENCY", self.residency)
             .with_launch_param(4, "ROTATE", self.rotate)
     }
-    /// Readout head GEMVs own KSPLIT on launches 1 and 2, its GEMM ROTATE.
+    /// Readout head GEMVs read the entry-wide KSPLIT, its GEMM owns ROTATE.
     pub fn head_params(self, spec: seismic::NativeSpecialization) -> seismic::NativeSpecialization {
         spec.with_param("OPERAND", 0)
-            .with_launch_param(1, "KSPLIT", self.ksplit)
-            .with_launch_param(2, "KSPLIT", self.ksplit)
+            .with_param("KSPLIT", self.ksplit)
             .with_launch_param(4, "ROTATE", self.rotate)
     }
     /// Whether `rows` rows use quantized activation operands in a matrix band.

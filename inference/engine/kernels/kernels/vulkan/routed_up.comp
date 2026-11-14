@@ -1,4 +1,4 @@
-// Decode expansion of up-only experts (M <= DECODE_ROWS): a K1 GEMV over the
+// Decode expansion of up-only experts (M <= VERIFY_ROWS): a K1 GEMV over the
 // feature tile `x` of a chosen expert's up rows (its source's record,
 // `routed_source_weights`: a bank record, or a host tier record read in
 // place; none for a choice with no record, `routed_decode_source`) with the
@@ -82,7 +82,7 @@ void routed_up_gathered_bounded(const uint maxm) {
     const uint count = uint(element_i32_at(table));
     if (count == 0u)
         return;
-    routed_up_rows(gl_WorkGroupID.y, table + 4ul, table + (1ul + uint64_t(SEISMIC_CONST_DECODE_ROWS)) * 4ul, count,
+    routed_up_rows(gl_WorkGroupID.y, table + 4ul, table + (1ul + uint64_t(SEISMIC_CONST_VERIFY_ROWS)) * 4ul, count,
         maxm);
 }
 

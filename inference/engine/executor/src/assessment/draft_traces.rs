@@ -43,7 +43,7 @@ fn every_served_draft_outlines_its_graphs_from_traces(backend: BackendName) {
             .filter(|&codec| kv_codec_policy(&definition.decoder, Some(codec)).is_ok())
             .collect::<Vec<_>>();
         codecs.extend(served_codecs.iter().map(|codec| format!("{codec:?}")));
-        let proposals = u8::try_from(bound.max_proposals()).unwrap();
+        let proposals = crate::draft_proposals(bound);
         let widths = std::iter::once(DraftWidths::Adaptive).chain((0..=proposals).map(DraftWidths::Fixed));
         for widths in widths {
             let method = PlannedMethod::DFlash { proposals, widths };

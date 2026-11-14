@@ -804,6 +804,23 @@ impl Parser {
         } else {
             Vec::new()
         };
+        let alike = if self.at_word("alike") {
+            self.bump();
+            self.expect_op(Op::LParen)?;
+            let alike = self.expect_name()?;
+            self.expect_op(Op::RParen)?;
+            self.expect_newline()?;
+            Some(alike)
+        } else {
+            None
+        };
+        let staging = if self.at_word("staging") {
+            self.bump();
+            self.expect_newline()?;
+            true
+        } else {
+            false
+        };
         let records = if self.at_word("records") {
             self.bump();
             self.expect_op(Op::LParen)?;
@@ -870,6 +887,8 @@ impl Parser {
             params,
             constraint,
             reads,
+            alike,
+            staging,
             records,
             threadgroups,
             grid,

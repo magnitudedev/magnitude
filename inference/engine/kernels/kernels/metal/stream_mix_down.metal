@@ -61,7 +61,7 @@ struct StreamPartial {
     void store(uint m, uint n, float value) const { y[ulong(m) * row + column + n] = value; }
 };
 
-// Below BATCH_FROM rows the projection is split along its K = S * H inputs by
+// Up to VERIFY_ROWS rows the projection is split along its K = S * H inputs by
 // stream: threadgroup `tile` serves stream tile / tiles and its row tile
 // tile % tiles of down | inject (`tiles` a stream). It normalizes only its
 // stream, from that stream's square sums (the first row tile of a stream

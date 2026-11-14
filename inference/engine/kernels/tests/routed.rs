@@ -7065,7 +7065,7 @@ fn a_streamed_route_sources_every_choice_of_an_expert_alike_under_tier_flips() {
     let Some(device) = streaming_device() else {
         return;
     };
-    let (h, e, k, m) = (64u64, 32u64, 8u64, constants::DECODE_ROWS as u64);
+    let (h, e, k, m) = (64u64, 32u64, 8u64, constants::VERIFY_ROWS as u64);
     let choices = m * k;
     let table = SlotTable::file(FLIGHT, choices);
     let statics = [("H", h), ("E", e), ("K", k), ("ES", 0), ("AHEAD", 0), ("EN", e), ("TM", e)];
@@ -7215,7 +7215,7 @@ fn portable_site_request_writes_its_slot() {
     let slot = (q % FLIGHT) as usize;
     let table = SlotTable::site(FLIGHT, (m * k) as u64);
     let words = table.width() as usize;
-    let rows = constants::DECODE_ROWS as usize;
+    let rows = constants::VERIFY_ROWS as usize;
     let routes = [10, 11, 12, 13];
     let weights = [0.5f32, 0.25, 0.125, 0.75];
     let normalized = pattern(m * h, 31, 1.0);
@@ -7265,7 +7265,7 @@ fn portable_sited_combine_adds_an_answered_step_alone() {
     let module = module();
     let (m, k, h, q) = (2usize, 2usize, 3usize, 7u64);
     let slot = (q % FLIGHT) as usize;
-    let rows = constants::DECODE_ROWS as usize;
+    let rows = constants::VERIFY_ROWS as usize;
     let base = pattern(m * h, 41, 1.0);
     let published = pattern(m * k * h, 43, 1.0);
     let weights = pattern(m * k, 47, 0.5);

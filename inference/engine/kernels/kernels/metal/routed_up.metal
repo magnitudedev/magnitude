@@ -1,4 +1,4 @@
-// Decode expansion of up-only experts (M <= DECODE_ROWS): threadgroup row y = choice
+// Decode expansion of up-only experts (M <= VERIFY_ROWS): threadgroup row y = choice
 // (m, k), a K1 GEMV over the feature tile `x` of expert routes[m, k]'s up rows
 // (its record, `routed::decode_source`; a resident layer's, its expert's
 // record) with the activated epilogue

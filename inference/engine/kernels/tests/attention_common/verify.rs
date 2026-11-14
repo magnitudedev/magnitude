@@ -2,8 +2,9 @@
 // at every verify width; each defines the `Row` it fills (spans, fresh,
 // destination, position) before including this.
 
-/// The widest verify block: a verification pass's rows.
-const VERIFY_ROWS: usize = 16;
+/// The widest verify block: a verification pass's rows, drafting's
+/// (`VERIFY_ROWS`).
+const VERIFY_ROWS: usize = magnitude_kernels::constants::VERIFY_ROWS as usize;
 
 /// The rows of a verify block of `width` rows ending where a VERIFY_ROWS-row
 /// block after the history `spans` (the last ending at the block's first

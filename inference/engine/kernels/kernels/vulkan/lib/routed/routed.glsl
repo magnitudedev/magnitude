@@ -60,7 +60,7 @@ projection_weights routed_source_weights(uint64_t bank, uint64_t tier, int sourc
 // element offsets. A gathered GEMV reads each chosen expert's records once a
 // step, for every row that names it: a host tier record read once per row
 // would cost its link bytes again for each.
-#define ROUTED_GATHER_WORDS (1u + 2u * uint(SEISMIC_CONST_DECODE_ROWS))
+#define ROUTED_GATHER_WORDS (1u + 2u * uint(SEISMIC_CONST_VERIFY_ROWS))
 
 // Writes the tables of the `rows` x `slots` choices of `routes` (strides
 // `routes0`, `routes1`) whose products lie at element strides `product0`,
@@ -80,7 +80,7 @@ void routed_gather(uint64_t routes, uint64_t routes0, uint64_t routes1, uint row
             const uint64_t m = uint64_t(c / slots), k = uint64_t(c % slots);
             if (element_i32_at(routes + (m * routes0 + k * routes1) * 4ul) == expert) {
                 element_i32_put(at + uint64_t(1u + count) * 4ul, int(m));
-                element_i32_put(at + uint64_t(1u + uint(SEISMIC_CONST_DECODE_ROWS) + count) * 4ul,
+                element_i32_put(at + uint64_t(1u + uint(SEISMIC_CONST_VERIFY_ROWS) + count) * 4ul,
                     int(m * product0 + k * product1));
                 ++count;
             }

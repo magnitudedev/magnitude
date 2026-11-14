@@ -9,7 +9,7 @@
 // (`stream_mix_sinkhorn_finish`), and under P = 0 mixes the row's input by
 // that pre, which nothing carries. The launch boundary orders every partial
 // before its sum.
-// Decode rows (M <= DECODE_ROWS, `stream_mix_sinkhorn_split`) take a tile of
+// Decode rows (M <= VERIFY_ROWS, `stream_mix_sinkhorn_split`) take a tile of
 // one row, all eight subgroups over its columns, reading the function
 // matrix from device memory. Prefill rows (`stream_mix_sinkhorn_tiles`)
 // take tiles of SINKHORN_TILE rows, two a subgroup: the slice's function

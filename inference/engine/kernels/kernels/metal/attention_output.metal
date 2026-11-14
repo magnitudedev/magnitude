@@ -69,7 +69,7 @@ typedef projection::OutputOf<activation, projection::AllRows, SEISMIC_DIM_SN, SE
 
 // One row.
 #ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_GEMV
-template <uint ROWS, uint LANES>
+template <uint LANES, uint ROWS>
 kernel void attention_output_gemv(ATTENTION_OUTPUT_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],
@@ -80,9 +80,9 @@ kernel void attention_output_gemv(ATTENTION_OUTPUT_ARGUMENTS,
 }
 #endif
 
-// Three rows up to BATCH_FROM: the same GEMV under this launch's mapping.
+// Three rows up to VERIFY_ROWS: the same GEMV under this launch's mapping.
 #ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_GEMV_ROWS
-template <uint ROWS, uint LANES>
+template <uint LANES, uint ROWS>
 kernel void attention_output_gemv_rows(ATTENTION_OUTPUT_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],
@@ -95,7 +95,7 @@ kernel void attention_output_gemv_rows(ATTENTION_OUTPUT_ARGUMENTS,
 
 // Two rows: the same GEMV under this launch's mapping.
 #ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_GEMV_PAIR
-template <uint ROWS, uint LANES>
+template <uint LANES, uint ROWS>
 kernel void attention_output_gemv_pair(ATTENTION_OUTPUT_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],

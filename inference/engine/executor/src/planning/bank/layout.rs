@@ -60,8 +60,8 @@ pub enum BankPart {
     Policy,
     /// The layer's site kind's table of the exchange (`site [FLIGHT, R]`,
     /// `RegionWords::site`), the rows its requests carry (`site_rows
-    /// [FLIGHT, DECODE_ROWS, H]` f32) and the CPU's answers' sums
-    /// (`site_output [FLIGHT, DECODE_ROWS, H]` f32), one slot for each group
+    /// [FLIGHT, VERIFY_ROWS, H]` f32) and the CPU's answers' sums
+    /// (`site_output [FLIGHT, VERIFY_ROWS, H]` f32), one slot for each group
     /// in flight (`routed_site_request`, `routed_down_sited`,
     /// `routed_output_sited`; streaming_words.seismic's site kind), where
     /// the layer has a CPU site: host-shared, the CPU pool's
@@ -776,7 +776,7 @@ impl ExpertBankPlan {
             // the CPU's choices of each row.
             BankPart::SiteRows | BankPart::SiteOutput => {
                 let binding = binding()?;
-                Ok(Some((Element::f32(), vec![binding.words.site().slots(), constants::DECODE_ROWS, binding.record.down.matrix[0]])))
+                Ok(Some((Element::f32(), vec![binding.words.site().slots(), constants::VERIFY_ROWS, binding.record.down.matrix[0]])))
             }
             BankPart::Tier { kind } => {
                 let record = binding()?.record;

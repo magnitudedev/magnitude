@@ -113,7 +113,7 @@ fn a_shallow_curve_bounds_growth_and_shrinks_nothing() {
 /// decode step's parked layer and the hint window in every group, the lent
 /// scratch in the lender's.
 fn per_group(k: u64, e: u64, lent: u64, forms: u64) -> u64 {
-    let decode = (crate::operators::routed::fused_graph::DECODE_ROWS * k).min(e);
+    let decode = (magnitude_kernels::constants::VERIFY_ROWS * k).min(e);
     let reserve = 2 * k;
     let lender = decode.max(lent) + reserve;
     lender + (forms - 1) * (decode + reserve)
@@ -124,7 +124,7 @@ fn per_group(k: u64, e: u64, lent: u64, forms: u64) -> u64 {
 /// window, never a group's decode records again in every other group.
 #[test]
 fn the_pooled_floor_is_one_steps_working_set() {
-    let decode = |k: u64, e: u64| (crate::operators::routed::fused_graph::DECODE_ROWS * k).min(e);
+    let decode = |k: u64, e: u64| (magnitude_kernels::constants::VERIFY_ROWS * k).min(e);
     for (k, e, lent, forms) in [(8, 256, 64, 1), (8, 256, 64, 3), (6, 384, 400, 4), (8, 32, 16, 2)] {
         let set = WorkingSet::new(k, e, lent, forms);
         let pooled = decode(k, e).max(lent) + 2 * k * forms;

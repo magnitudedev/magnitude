@@ -37,7 +37,7 @@ pub(crate) use bank::{layer_homes, releasing};
 #[cfg(test)]
 pub(crate) use bank::routed_experts;
 pub use capabilities::{
-    CapabilityPlan, DraftWidths, MAX_DRAFT_PROPOSALS, PlannedMethod, draft_ladder,
+    CapabilityPlan, DraftWidths, MAX_DRAFT_PROPOSALS, PlannedMethod, draft_ladder, draft_proposals,
 };
 pub use components::{ArtifactComponent, ArtifactComponentKind, ComponentPlan, ComponentSelection};
 #[cfg(test)]

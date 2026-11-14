@@ -188,22 +188,14 @@ mod tests {
     //! in the interpreter over every state a lane can hold.
     use super::*;
     use seismic::{BackendName, Devices, Element, Tensor};
-    use seismic_lang::checked::{CheckedModule, SourceFile};
+    use seismic_lang::checked::CheckedModule;
     use seismic_lang::entry::ElementBindings;
     use seismic_lang::interp::{Arg, Interpreter, OutcomeValue, TensorData};
     use seismic_lang::reference_math::ReferenceScalar;
     use seismic_lang::types::DType;
 
     fn module() -> CheckedModule {
-        let mut sources = seismic_std::sources();
-        for (path, text) in [
-            ("routed.seismic", include_str!("../../../kernels/kernels/routed.seismic")),
-            ("streaming_words.seismic", include_str!("../../../kernels/kernels/streaming_words.seismic")),
-            ("functions.seismic", include_str!("../../../kernels/kernels/functions.seismic")),
-        ] {
-            sources.push(SourceFile { path: path.into(), text: text.into() });
-        }
-        crate::test_support::check_kernels(sources)
+        crate::test_support::check_kernels()
     }
 
     /// `slot_answered` of slot 0 of a one-slot table holding `request` and

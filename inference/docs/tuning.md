@@ -95,7 +95,11 @@ which name only a backend, refuse it.
 
 **Launch scope.** `params`, `where` and `records` may follow a launch's header. A launch's settings
 are its own, and another launch may reuse a name; a setting more than one launch reads is declared
-at the top. A launch's `where` is one more conjunct of the declaration's, held to the same checks.
+at the top. Launches that compute a row by one reduction (`alike` one another) share their
+`arithmetic` settings, and the checker enforces it between each `alike` pair: neither declares one
+of its own, and both read the same set of the declaration's. The two then share their reduction
+orders (the bodies' arithmetic is held by the row-equality tests), and the search chooses each such setting with all of them ([batch invariance](seismic/language/functions-and-capabilities.md#batch-invariance-of-row-class-launches)).
+A launch's `where` is one more conjunct of the declaration's, held to the same checks.
 A launch's `records` lists its record ports (tensors it reaches a record at a time, through a table
 of the records' addresses) in place of the declaration's; launches of one kernel list the same.
 

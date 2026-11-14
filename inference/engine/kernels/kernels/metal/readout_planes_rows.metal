@@ -57,9 +57,9 @@ kernel void readout_planes_rows_gemv(PLANES_ROWS_ARGUMENTS,
     // ([row][quarter][group]) so a simdgroup's reads are contiguous, in
     // chunks of whole lane strides that fit the declared GEMV staging
     // (`gemv_stage_packet_rows` packet rows of four words).
-    // At most PROGRESSIVE_ROWS rows (the launch's `O <= 8`), so a chunk is
-    // at least one lane stride.
-    static_assert(projection::gemv_stage_packet_rows / PROGRESSIVE_ROWS >= 32u,
+    // At most VERIFY_ROWS rows (the launch's `O <= VERIFY_ROWS`), so a chunk
+    // is at least one lane stride.
+    static_assert(projection::gemv_stage_packet_rows / SEISMIC_CONST_VERIFY_ROWS >= 32u,
         "the staging holds a lane stride of every row");
     const uint groups = k / 32u;
     const uint capacity = projection::gemv_stage_packet_rows;
@@ -68,7 +68,7 @@ kernel void readout_planes_rows_gemv(PLANES_ROWS_ARGUMENTS,
     const uint tid = sg * 32u + lane, threads = simdgroups * 32u;
     constexpr uint outputs = ROWS * 32u / LANES;
     const uint first = (tile * simdgroups + sg) * outputs;
-    float acc[outputs][PROGRESSIVE_ROWS] = {};
+    float acc[outputs][SEISMIC_CONST_VERIFY_ROWS] = {};
     for (uint start = 0; start < groups; start += chunk) {
         const uint count = min(chunk, groups - start);
         // The squares (first chunk) or the previous chunk's reads finish
@@ -91,7 +91,7 @@ kernel void readout_planes_rows_gemv(PLANES_ROWS_ARGUMENTS,
                 const auto codes = progressive::exact_codes(planes.group(n, start + g));
                 const float scale = planes.scale(n, start + g);
                 PROJECTION_UNROLL
-                for (uint m = 0; m < PROGRESSIVE_ROWS; ++m) {
+                for (uint m = 0; m < SEISMIC_CONST_VERIFY_ROWS; ++m) {
                     if (m >= rows) break;
                     float4 xe[4], xo[4];
                     PROJECTION_UNROLL
@@ -108,7 +108,7 @@ kernel void readout_planes_rows_gemv(PLANES_ROWS_ARGUMENTS,
         if (n >= uint(SEISMIC_DIM_V))
             break;
         PROJECTION_UNROLL
-        for (uint m = 0; m < PROGRESSIVE_ROWS; ++m) {
+        for (uint m = 0; m < SEISMIC_CONST_VERIFY_ROWS; ++m) {
             if (m >= rows) break;
             const float logit = simd_sum(acc[r][m]);
             if (lane == 0u)

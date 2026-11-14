@@ -14,9 +14,9 @@
 // each weight, `k` their columns; the kernel provides `tile`, `shared`,
 // `simdgroups`, `sg` and `lane`.
 #define PROJECTION_GEMV(W0, W1, PAIRED, ROWS, LANES, TILED, COUNT, x, out, w0, w1, rows, n, k)                  \
-    if (TILED == 1 && projection::gemv_tile_row_serves(w0, rows) &&                                             \
-        (!(PAIRED) || projection::gemv_tile_row_serves(w1, rows))) {                                            \
-        PROJECTION_FOR_##COUNT##_TILE_ROWS(rows,                                                                \
+    if (TILED == 1 && projection::gemv_tile_row_serves(w0) &&                                                   \
+        (!(PAIRED) || projection::gemv_tile_row_serves(w1))) {                                                  \
+        PROJECTION_FOR_##COUNT##_ROWS(rows,                                                                     \
             projection::gemv_tile_row<W0, W1, PAIRED, ROWS, MAXM, LANES>(                                       \
                 x, out, w0, w1, rows, n, k, tile, shared, simdgroups, sg, lane));                               \
         return;                                                                                                 \
@@ -25,7 +25,7 @@
         projection::gemv_form<W0, W1, PAIRED, ROWS, MAXM, LANES, (TILED == 2)>(                                 \
             x, out, w0, w1, rows, n, k, tile, shared, simdgroups, sg, lane))
 
-// The batched launch (BATCH_FROM..16 rows of `x`, `m` of them): with
+// The batched launch (VERIFY_ROWS + 1..16 rows of `x`, `m` of them): with
 // MATRIX = 1 the matrix GEMV, which the projection admits only where it
 // serves every weight, else the batched rows in the first threadgroups of
 // the launch.

@@ -184,10 +184,10 @@ inline void route_streamed(device const float *residual, device const uchar *nor
         device int *sources [[buffer(SEISMIC_BUFFER_SOURCES)]],                                                     \
         SYSTEM int *file [[buffer(SEISMIC_BUFFER_FILE)]],                                                           \
         SYSTEM const int *policy [[buffer(SEISMIC_BUFFER_POLICY)]]) {                                                \
-        threadgroup float parts[SEISMIC_CONST_DECODE_ROWS * route_simdgroups];                                     \
-        threadgroup float inverses[SEISMIC_CONST_DECODE_ROWS];                                                     \
+        threadgroup float parts[SEISMIC_CONST_VERIFY_ROWS * route_simdgroups];                                     \
+        threadgroup float inverses[SEISMIC_CONST_VERIFY_ROWS];                                                     \
         threadgroup uint last;                                                                                     \
-        threadgroup int resolved[STREAMING_RESOLVE_WORDS(SEISMIC_CONST_DECODE_ROWS * SEISMIC_DIM_K)];              \
+        threadgroup int resolved[STREAMING_RESOLVE_WORDS(SEISMIC_CONST_VERIFY_ROWS * SEISMIC_DIM_K)];              \
         PROJECTION_OPERANDS_SHARED(globals, shared_nvfp4);                                                         \
         const ResolvePorts bank{map, tier, sources, file, policy};                                                 \
         const element::Out<ELEMENT_OF(SEISMIC_SCORES)> scores(scores_cells);                                       \

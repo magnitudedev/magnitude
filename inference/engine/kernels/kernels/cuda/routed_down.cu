@@ -1,4 +1,4 @@
-// Decode output of the general routed feed-forward (M <= DECODE_ROWS): the
+// Decode output of the general routed feed-forward (M <= VERIFY_ROWS): the
 // down projections (`lib/routed/down.cuh`) into scratch and their sum
 // (`lib/routed/down_sum.cuh`), without a CPU site.
 #define ROUTED_SOURCE_ROWS SEISMIC_DIM_XS

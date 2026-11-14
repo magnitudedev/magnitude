@@ -1,9 +1,10 @@
 use super::super::*;
 use super::*;
 use crate::{ReadoutHead, RecurrentForm};
-use crate::operators::routed::fused_graph::{DECODE_ROWS, TILE_ROWS, grouped_blocks};
+use crate::operators::routed::fused_graph::{TILE_ROWS, grouped_blocks};
 use crate::planning::RecordTensors;
 use magnitude_family_contracts::ProgressivePlane;
+use magnitude_kernels::constants::VERIFY_ROWS;
 
 impl<'a> QualificationView<'a> {
     /// The rows `block`'s mixer reads and joins.
@@ -929,7 +930,7 @@ pub(super) fn qualify_routed(
     let shared_gate = zeros(binding.shared_gate, &[s, h])?;
     let shared_up = zeros(binding.shared_up, &[s, h])?;
     let shared_down = zeros(binding.shared_down, &[h, s])?;
-    let grouped_rows = DECODE_ROWS * 2;
+    let grouped_rows = VERIFY_ROWS * 2;
     for rows in [1, grouped_rows] {
         let width = sublayer.residual_width(h);
         let values = vec![1.0_f32; (rows * width) as usize];
@@ -956,7 +957,7 @@ pub(super) fn qualify_routed(
         };
         let first = zeros(Element::i32(), &[rows, k])?;
         let (map, step) = (&reads.map, &reads.step);
-        let result = if rows <= DECODE_ROWS {
+        let result = if rows <= VERIFY_ROWS {
             let sources = reads.sources(device, rows, k, &label)?;
             let (expert_product, shared_product, coefficient) = match &kernels.decode {
                 RoutedDecodeKernels::Expand(expand) => {
@@ -1205,7 +1206,7 @@ pub(super) fn qualify_general_routed(
     let tier = reads.tier_records(&label)?;
     let tier_gate = gate(&tier);
     let (map, step) = (&reads.map, &reads.step);
-    for rows in [1, DECODE_ROWS * 2] {
+    for rows in [1, VERIFY_ROWS * 2] {
         let values = vec![1.0_f32; (rows * h) as usize];
         let residual = semantic_f32(device, &[rows, h], &values, entry, &label)?;
         let out_rows = semantic_i32(
@@ -1319,7 +1320,7 @@ pub(super) fn qualify_general_routed(
         };
         // Every choice routes to expert 0.
         let first = zeros(Element::i32(), &[rows, k])?;
-        let routed = if rows <= DECODE_ROWS {
+        let routed = if rows <= VERIFY_ROWS {
             let sources = reads.sources(device, rows, k, &label)?;
             let product = match &kernels.experts {
                 ExpertKernels::Gated { decode, .. } => {
