@@ -133,9 +133,9 @@ class Step:
 CATALOG_BUILD = Step("catalog tool", ("cargo", "build", "--release", "-p", "magnitude-service-catalog-tool"))
 # A header export's index, written last: the export is whole once it exists.
 EXPORTED = "{catalog}/headers/index.json"
-# What a header export is of (`magnitude_artifacts::catalog_headers`): the catalog's lock and the
+# What a header export is of (`magnitude_artifacts::catalog_headers`): the catalog's models, its lock and the
 # pinned artifacts beside it, the source files `{catalog}` is keyed by.
-CATALOG_INPUTS = ("catalog/models.lock.json", "engine/artifacts/src/catalog_headers.rs")
+CATALOG_INPUTS = ("catalog/models.json", "catalog/models.lock.json", "engine/artifacts/src/catalog_headers.rs")
 
 
 def catalog_key(source: Source) -> str:
