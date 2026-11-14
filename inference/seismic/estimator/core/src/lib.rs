@@ -745,6 +745,12 @@ pub fn service_contribution<M: ServiceModel + ?Sized>(
     }
 }
 
+mod acquisition;
+pub use acquisition::{
+    calibrate_observation_units, escalate_observation_units, required_beyond_ns, required_observation_ns,
+    ALLOCATION_INSTANCE_BYTES, MAX_ROUND,
+    MAX_OBSERVATION_UNITS,
+};
 mod execution;
 pub use execution::{
     estimate, AnalyticalModelDefinition, AnalyticalService, AnalyticalServiceState, ExecutionModel,

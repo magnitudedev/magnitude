@@ -67,6 +67,18 @@ fn admitted<T>(value: Result<T, seismic_lang::expr::EvalError>) -> T {
     value.unwrap_or_else(|error| panic!("PreparedKernel coverage invariant violated: admitted evaluator was not total: {error:?}"))
 }
 
+/// How a device's analytical context is opened, on its first use: with
+/// what the backend forms its probes through, where it forms any.
+pub(crate) type AnalyticalLoader<T, E> = Box<
+    dyn Fn(
+            &Service<T, E>,
+            &E,
+            Arc<DeviceDescription<T>>,
+        ) -> Result<AnalyticalEvaluationContext<T>, seismic_compiler::errors::TargetError>
+        + Send
+        + Sync,
+>;
+
 pub(crate) struct Opened<T, E>
 where
     T: TargetFamily,
@@ -77,16 +89,12 @@ where
     device: Arc<DeviceDescription<T>>,
     executor: E,
     compiler_registry: &'static CompilerRegistry<T>,
+    /// The analytical context, or why it could not be opened: opened once
+    /// for the open device ([`Opened::analytical`]).
     analytical: std::sync::OnceLock<
         Result<AnalyticalEvaluationContext<T>, seismic_compiler::errors::TargetError>,
     >,
-    analytical_loader:
-        fn(
-            &Service<T, E>,
-            &E,
-            Arc<DeviceDescription<T>>,
-        )
-            -> Result<AnalyticalEvaluationContext<T>, seismic_compiler::errors::TargetError>,
+    analytical_loader: AnalyticalLoader<T, E>,
     cache: Mutex<HashMap<PreparationKey, Weak<Prepared<T, E>>>>,
     /// Its ledgers.
     memory: Arc<DeviceLedgers>,
@@ -112,14 +120,14 @@ where
         executor: E,
         compiler_registry: &'static CompilerRegistry<T>,
         device: Arc<DeviceDescription<T>>,
-        analytical_loader: fn(
-            &Service<T, E>,
-            &E,
-            Arc<DeviceDescription<T>>,
-        ) -> Result<
-            AnalyticalEvaluationContext<T>,
-            seismic_compiler::errors::TargetError,
-        >,
+        analytical_loader: impl Fn(
+                &Service<T, E>,
+                &E,
+                Arc<DeviceDescription<T>>,
+            ) -> Result<AnalyticalEvaluationContext<T>, seismic_compiler::errors::TargetError>
+            + Send
+            + Sync
+            + 'static,
         memory: Arc<DeviceLedgers>,
     ) -> Self {
         Self {
@@ -129,12 +137,18 @@ where
             executor,
             compiler_registry,
             analytical: std::sync::OnceLock::new(),
-            analytical_loader,
+            analytical_loader: Box::new(analytical_loader),
             cache: Mutex::new(HashMap::new()),
             memory,
             admission: AdmissionDomain::new(),
         }
     }
+    /// The device's analytical context, opened by the first analytical
+    /// preparation that needs it, once for the open device: a profile whose
+    /// probes did not qualify is not measured again by every preparation.
+    /// An executor is open while a handle of it lives (`devices::catalog`),
+    /// and a load holds its devices until it ends, so the next load opens
+    /// the executor again and measures its profile again.
     fn analytical(
         &self,
     ) -> Result<&AnalyticalEvaluationContext<T>, seismic_compiler::errors::TargetError> {
@@ -1717,10 +1731,8 @@ where
             EvaluationMethod::Analytical => {
                 let analytical = opened.analytical().map_err(|error| {
                     PrepareError::Preparation(
-                        seismic_compiler::errors::PreparationError::NativeCompilation(
-                            seismic_native_target::NativeCompilationError::ToolchainFailure(
-                                error.to_string(),
-                            ),
+                        seismic_compiler::errors::PreparationError::ExecutionProfileUnavailable(
+                            error,
                         ),
                     )
                 })?;

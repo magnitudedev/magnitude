@@ -71,7 +71,8 @@ use crate::completion::{Committed, DeviceCompletion, IssuedFailure};
 pub(crate) use crate::completion::RouteSubmission;
 use crate::driver::{collect_native_access, typed_buffer, write_zeros, Allocation};
 pub(crate) use crate::formation::FormationClass;
-use crate::formation::{Compile, Keyed, ProgramFormer};
+use crate::formation::{Keyed, ProgramFormer};
+use seismic_native_target::Compile;
 pub use budget::{Footprint, Linear, Observed, Quote};
 pub use graph_replays::GraphReplays;
 pub use point::{GraphPending, GraphPoint, GraphTiming, KernelPoint, Point, PointPending};
@@ -697,7 +698,7 @@ impl Launches<Vec<seismic_metal::DirectPipeline>> {
                 .map(|launch| {
                     launch.as_ref().map(|(compile, entry, key)| {
                         (
-                            Arc::new(Compile::of(
+                            Arc::new(Compile::new(
                                 vec![compile.entries()[*entry].clone()],
                                 vec![compile.program()[*entry].clone()],
                             )),
@@ -1798,11 +1799,11 @@ impl NativePrepared {
         };
         Ok(HeldPrograms(match &device.programs {
             #[cfg(target_os = "macos")]
-            crate::backends::DevicePrograms::Metal(former) => {
-                Box::new(former.form(&programs).map_err(compilation)?)
+            crate::backends::DevicePrograms::Metal { metal } => {
+                Box::new(metal.form(&programs).map_err(compilation)?)
             }
-            crate::backends::DevicePrograms::Cuda(former) => {
-                Box::new(former.form(&programs).map_err(compilation)?)
+            crate::backends::DevicePrograms::Cuda { cuda, .. } => {
+                Box::new(cuda.form(&programs).map_err(compilation)?)
             }
             _ => unreachable!("only Metal and CUDA form launch-scoped programs"),
         }))

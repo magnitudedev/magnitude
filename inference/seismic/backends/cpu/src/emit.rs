@@ -8,8 +8,6 @@ use cranelift_codegen::ir::{
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use cranelift_jit::JITModule;
-use cranelift_module::Module;
 use seismic_ir::kernel::ops::{
     BarrierScope, BinaryOp, BitOp, Block, ClosedDensePlace, ClosedExternalGlobalPlace,
     ClosedOpView, ClosedPackedGlobalPlace, ClosedPackedPlace, ClosedPlace, ClosedPlaceKind,
@@ -22,20 +20,18 @@ use seismic_ir::physical_target::{
 };
 use seismic_ir::storage::LaunchLocalKind;
 use seismic_lang::intrinsics::MathOp;
-use seismic_lang::registry::{PlaneEncoding, PlaneInfo, PlaneRepackRecipe, RepackExpr};
+use seismic_lang::registry::{PlaneEncoding, PlaneInfo, PlaneRepackRecipe, RepackExpr, RepackTable};
 use seismic_lang::types::DType;
 use seismic_native_target::NativeCompilationError;
 use std::collections::{BTreeSet, HashMap};
 
-pub(crate) struct Import {
-    pub name: &'static str,
-    pub signature: ir::Signature,
-    pub reference: ir::FuncRef,
-}
-
+/// One kernel's function and the read-only data it addresses: data object
+/// `i` is the symbol [`crate::toolchain::data_symbol`]`(i)`. Every function
+/// it calls is a host symbol it names ([`crate::numeric::host_symbols`]),
+/// so the function holds no address of this process.
 pub(crate) struct EmittedKernel {
     pub function: ir::Function,
-    pub imports: Vec<Import>,
+    pub data: Vec<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -214,13 +210,11 @@ fn atomic_import(dtype: DType, op: seismic_lang::intrinsics::AtomicOp) -> HostIm
 }
 
 pub(crate) fn emit(
-    module: &mut JITModule,
     kernel: &Kernel<Cpu>,
     layout: &KernelEmissionLayout,
     call_conv: CallConv,
 ) -> Result<EmittedKernel, NativeCompilationError> {
-    let mut signature = module.make_signature();
-    signature.call_conv = call_conv;
+    let mut signature = ir::Signature::new(call_conv);
     signature.params.extend([
         AbiParam::new(types::I64), // frame
         AbiParam::new(types::I64), // barrier
@@ -231,7 +225,7 @@ pub(crate) fn emit(
         AbiParam::new(types::I64), // register scratch
     ]);
     let mut function = ir::Function::with_name_signature(
-        ir::UserFuncName::testcase("seismic_cpu_kernel"),
+        ir::UserFuncName::testcase(crate::toolchain::KERNEL_SYMBOL),
         signature,
     );
     let mut context = FunctionBuilderContext::new();
@@ -266,6 +260,7 @@ pub(crate) fn emit(
         kernel,
         layout,
         imports,
+        tables: Vec::new(),
         values: HashMap::new(),
         buffers,
         words,
@@ -282,20 +277,19 @@ pub(crate) fn emit(
         panic!("root kernel block yielded values");
     }
     emitter.builder.ins().return_(&[]);
-    let import_records = emitter
-        .imports
+    let data = emitter
+        .tables
         .iter()
-        .map(|(kind, reference)| Import {
-            name: kind.name(),
-            signature: kind.signature(call_conv),
-            reference: *reference,
+        .map(|(table, _)| {
+            table
+                .values()
+                .iter()
+                .flat_map(|value| value.to_ne_bytes())
+                .collect()
         })
-        .collect::<Vec<_>>();
+        .collect();
     drop(emitter);
-    Ok(EmittedKernel {
-        function,
-        imports: import_records,
-    })
+    Ok(EmittedKernel { function, data })
 }
 
 fn collect_imports(kernel: &Kernel<Cpu>) -> BTreeSet<HostImport> {
@@ -389,6 +383,9 @@ struct Emitter<'a, 'b> {
     kernel: &'b Kernel<Cpu>,
     layout: &'b KernelEmissionLayout,
     imports: HashMap<HostImport, ir::FuncRef>,
+    /// The lookup tables the function addresses, each by the data symbol
+    /// of its position.
+    tables: Vec<(RepackTable, ir::GlobalValue)>,
     values: HashMap<ErasedValue, Value>,
     buffers: Value,
     words: Value,
@@ -1762,15 +1759,13 @@ impl Emitter<'_, '_> {
                 self.builder.ins().fmul(value, factor)
             }
             RepackExpr::Lookup { index, table } => {
-                // Registered tables are process-lifetime statics and the JIT
-                // runs in this process, so the table is addressed directly.
+                // The table is a data object of the program, addressed by
+                // its symbol: the function holds no address of this process.
                 let index = self.repack_expression(source_packet, index);
                 let index = self.builder.ins().uextend(types::I64, index);
                 let offset = self.builder.ins().imul_imm(index, 4);
-                let base = self
-                    .builder
-                    .ins()
-                    .iconst(types::I64, table.values().as_ptr() as i64);
+                let table = self.table(*table);
+                let base = self.builder.ins().symbol_value(types::I64, table);
                 let address = self.builder.ins().iadd(base, offset);
                 self.builder
                     .ins()
@@ -1979,6 +1974,21 @@ impl Emitter<'_, '_> {
         for (out, value) in outs.iter().zip(results) {
             self.define(out.value, value);
         }
+    }
+
+    /// The data symbol of `table`, declared at its first use.
+    fn table(&mut self, table: RepackTable) -> ir::GlobalValue {
+        if let Some((_, symbol)) = self.tables.iter().find(|(held, _)| *held == table) {
+            return *symbol;
+        }
+        let symbol = self.builder.create_global_value(ir::GlobalValueData::Symbol {
+            name: ir::ExternalName::testcase(crate::toolchain::data_symbol(self.tables.len())),
+            offset: ir::immediates::Imm64::new(0),
+            colocated: false,
+            tls: false,
+        });
+        self.tables.push((table, symbol));
+        symbol
     }
 
     fn call(&mut self, import: HostImport, args: &[Value]) -> Value {

@@ -221,9 +221,6 @@ fn plan_on_device(
         draft.device().selector(),
         PlatformConfig {
             path: manifest.path,
-            artifacts: kernel_cache
-                .clone()
-                .map(|cache| cache as Arc<dyn seismic::ArtifactStore>),
             graph_cost: Some(draft.device().graph_cost()),
         },
     )
@@ -508,14 +505,13 @@ fn prepare(
     let formed = opened.device().programs_formed();
     tracing::info!(
         "prepared programs in {:.2} s: {} tuned entries from stored records, \
-         {} at canonical defaults for want of one; this process compiled {} programs and loaded \
-         {} through the platform's cache in {:.2} s",
+         {} at canonical defaults for want of one; this process compiled {} programs, {} of them \
+         stored ones that did not load (damaged, or declined by the platform)",
         preparing.elapsed().as_secs_f64(),
         tuned.len(),
         programs.unprepared(),
         formed.compiles,
-        formed.platform_loads,
-        formed.platform_load_seconds,
+        formed.load_misses,
     );
     report_load_memory("programs prepared", &catalog, opened.device());
     Ok(LoadAttempt::Loaded(PreparedPrograms {

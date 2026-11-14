@@ -18,7 +18,7 @@ const SOFTFLOAT: &str = include_str!("../src/softfloat.metal");
 
 fn opened() -> (MetalDevice, MetalToolchain) {
     let device = MetalDevice::open(DeviceHandle::system_default().unwrap()).unwrap();
-    let description = seismic_metal::profile::open_device(&device).unwrap();
+    let description = seismic_metal::profile::open_device(&device, &seismic_native_target::MemoryStore::default()).unwrap();
     let toolchain = MetalToolchain::new(device.clone(), description.facts());
     (device, toolchain)
 }

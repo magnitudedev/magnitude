@@ -465,7 +465,6 @@ fn open_platform(backend: BackendName) -> Result<OpenedPlatform, String> {
         PlatformConfig {
             graph_cost: None,
             path: ExecutionPath::Native,
-            artifacts: None,
         },
     )
     .map_err(|error| text(&error))

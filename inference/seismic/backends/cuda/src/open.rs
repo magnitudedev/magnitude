@@ -99,16 +99,14 @@ fn usable_capacity(free_with_context: u64, accounting: Option<DeviceAccounting>)
         .max(free_with_context)
 }
 
+/// The analytical evaluation context of `service`, its probe kernels formed
+/// through `programs`, the device's.
 pub fn open_analytical(
     service: &Device,
     device: std::sync::Arc<seismic_native_target::DeviceDescription<Cuda>>,
+    programs: &crate::CudaPtxPrograms,
 ) -> Result<AnalyticalEvaluationContext<Cuda>, TargetError> {
-    crate::profile::profile_for_opened(
-        service.ordinal(),
-        service.context(),
-        service.stream(),
-        device,
-    )
+    crate::profile::profile_for_opened(service, device, programs)
 }
 
 #[cfg(test)]

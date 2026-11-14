@@ -20,7 +20,8 @@ use seismic_lang::types::DType;
 #[test]
 fn matrix_operand_preserves_pre_and_post_plane_views() {
     let device = metal_device();
-    let target = profile::open_device(&device).unwrap();
+    let target = profile::open_device(&device, crate::test_support::store()).unwrap();
+    let programs = crate::test_support::programs(&device, &target);
     let representation = registry::representation("q8g32s").unwrap();
     let RepresentationKind::Packed(layout) = &registry::representation_info(representation).kind
     else {
@@ -166,7 +167,7 @@ fn matrix_operand_preserves_pre_and_post_plane_views() {
     }
     assert!(saw_projection);
     let emission = target.kernel_emission_layout(kernel);
-    let native = compile::compile_kernel(device.handle(), &target, kernel, &emission).unwrap();
+    let native = compile::form_kernel(&programs, kernel, &emission).unwrap();
     let mut input = vec![0u8; 80 * layout.packet_size as usize];
     for row in 0..10 {
         for column in 0..8 {
@@ -219,7 +220,7 @@ fn matrix_operand_preserves_pre_and_post_plane_views() {
     let unused = device.allocate(16, 16).unwrap();
     let command = device.queue().commandBuffer().unwrap();
     let encoder = command.computeCommandEncoder().unwrap();
-    encoder.setComputePipelineState(&native.pipeline.state);
+    encoder.setComputePipelineState(&native.pipeline().state);
     for (slot, buffer) in [
         &input_buffer,
         &output_buffer,

@@ -2,21 +2,16 @@
 //! fixed primitive probe suite acquired after the production worker pool exists.
 
 use crate::Cpu;
+use seismic_compiler::executable::DeviceService;
 use crate::workers::{LaunchFrame, TeamBarrier, Workers};
 use seismic_compiler::errors::TargetError;
 use seismic_estimator::{
-    CompositionQualificationCase, CompositionQualificationParts, ConcreteExecutionDemand,
+    AnalyticalService, CoreService, CompositionQualificationCase, CompositionQualificationParts, ConcreteExecutionDemand,
     DemandMode, DemandScope, DurationInterval, ExecutionDemand, FactProvenance, MeasurementBatch,
     MeasurementSeries, ResourceTopology, ServiceAccuracyClass, ServiceClassId,
     ServiceCorrelationId, ServiceCurve, ServiceCurveRegime, ServiceDefinition,
     ServiceQualificationDomain,
 };
-const SERVICE_SUBMISSION: ServiceClassId = ServiceClassId::new("core.submission");
-const SERVICE_COPY: ServiceClassId = ServiceClassId::new("core.copy");
-const SERVICE_FILL: ServiceClassId = ServiceClassId::new("core.fill");
-const SERVICE_SCALAR_READ: ServiceClassId = ServiceClassId::new("core.scalar-read");
-const SERVICE_SCALAR_MOVE: ServiceClassId = ServiceClassId::new("core.scalar-move");
-const SERVICE_DATA_CHECK: ServiceClassId = ServiceClassId::new("core.data-check");
 use seismic_ir::kernel::ops::{ClosedOpView, ValueType};
 use seismic_ir::physical_target::KernelEmissionLayout;
 use seismic_lang::expr::{ExprArena, NatExpr};
@@ -58,6 +53,11 @@ enum CpuProbeKind {
     Memory,
     Atomic,
     Barrier,
+    /// A reached allocation instance's backing, as the executor acquires
+    /// one: the device service's allocation, released after. Host only.
+    Allocation,
+    /// A publication as the schedule's execution records it. Host only.
+    Publication,
 }
 
 #[derive(Clone, Copy)]
@@ -133,45 +133,27 @@ fn backend_probes() -> [CpuServiceProbe; 9] {
     ]
 }
 
-fn core_probes() -> [CpuServiceProbe; 6] {
-    [
+/// The probe of every core service, each measuring what this backend does
+/// for it.
+fn core_probes() -> impl Iterator<Item = CpuServiceProbe> {
+    <CoreService as AnalyticalService>::ALL.iter().map(|service| {
+        let kind = match service {
+            CoreService::Submission => CpuProbeKind::Control,
+            CoreService::Copy
+            | CoreService::Fill
+            | CoreService::ScalarRead
+            | CoreService::DataCheck => CpuProbeKind::Memory,
+            CoreService::ScalarMove => CpuProbeKind::Integer,
+            CoreService::AllocationInstance => CpuProbeKind::Allocation,
+            CoreService::TensorPublication => CpuProbeKind::Publication,
+        };
         probe(
-            SERVICE_SUBMISSION,
-            CpuProbeKind::Control,
+            service.class(),
+            kind,
             CpuProbePath::Core,
             ServiceAccuracyClass::MemoryOrTransfer,
-        ),
-        probe(
-            SERVICE_COPY,
-            CpuProbeKind::Memory,
-            CpuProbePath::Core,
-            ServiceAccuracyClass::MemoryOrTransfer,
-        ),
-        probe(
-            SERVICE_FILL,
-            CpuProbeKind::Memory,
-            CpuProbePath::Core,
-            ServiceAccuracyClass::MemoryOrTransfer,
-        ),
-        probe(
-            SERVICE_SCALAR_READ,
-            CpuProbeKind::Memory,
-            CpuProbePath::Core,
-            ServiceAccuracyClass::MemoryOrTransfer,
-        ),
-        probe(
-            SERVICE_SCALAR_MOVE,
-            CpuProbeKind::Integer,
-            CpuProbePath::Core,
-            ServiceAccuracyClass::MemoryOrTransfer,
-        ),
-        probe(
-            SERVICE_DATA_CHECK,
-            CpuProbeKind::Memory,
-            CpuProbePath::Core,
-            ServiceAccuracyClass::MemoryOrTransfer,
-        ),
-    ]
+        )
+    })
 }
 
 const fn probe(
@@ -339,19 +321,15 @@ pub(crate) fn operation_cost(
     }
 }
 
-const PROBE_SUITE_REVISION: &str = "cpu-fixed-services-v1";
+const PROBE_SUITE_REVISION: &str = "cpu-calibrated-services-v3";
 const OBSERVATIONS: usize = 9;
-const ITERATIONS: u64 = 65_536;
 const MAX_ACQUISITION_ROUNDS: usize = 8;
-const CORE_SETUP_BATCH: u64 = 4_096;
-const WORKER_SETUP_BATCH: u64 = 32;
-const QUALIFICATION_ITERATIONS: u64 = 131_071;
 
 pub(crate) fn probe_suite_revision() -> &'static str {
     PROBE_SUITE_REVISION
 }
 
-/// Runs the fixed batched service suite after the production pool exists.
+/// Runs the calibrated batched service suite after the production pool exists.
 /// Measurement-control constants affect acquisition only and never enter a
 /// duration expression. Every returned numeric service fact is observed on
 /// this open rather than copied from a nominal hardware table.
@@ -368,6 +346,7 @@ pub(crate) fn probe_services(workers: &mut Workers) -> Result<Vec<ServiceDefinit
 
 pub(crate) fn qualify_compositions(
     workers: &mut Workers,
+    services: &[ServiceDefinition],
 ) -> Result<CompositionQualificationParts, TargetError> {
     let integer = backend_probes()
         .into_iter()
@@ -377,48 +356,58 @@ pub(crate) fn qualify_compositions(
         .into_iter()
         .find(|probe| probe.class == MEMORY)
         .expect("CPU memory probe registration is missing");
+    // One observation: the two capacity probes in turn, each of `iterations`
+    // per worker.
+    let compose = |workers: &mut Workers, iterations: u64| -> Result<u64, TargetError> {
+        let started = Instant::now();
+        run_probe(integer, ProbeShape::Capacity, workers, iterations)?;
+        run_probe(memory, ProbeShape::Capacity, workers, iterations)?;
+        Ok(u64::try_from(started.elapsed().as_nanos())
+            .map_err(|_| {
+                TargetError::UnsupportedDevice("CPU composition qualification duration exceeds u64".into())
+            })?
+            .max(1))
+    };
+    // The composition runs at the size its services were qualified at, the
+    // smaller of their capacity probes' iterations per worker: within both
+    // services' qualified domains, as composition qualification requires
+    // (`assemble_execution`), and at least the size the smaller was qualified
+    // to its band at.
+    let worker_count = u64::try_from(workers.count())
+        .map_err(|_| TargetError::UnsupportedDevice("CPU worker count exceeds u64::MAX".into()))?;
+    // Each runs on the workers, so its qualified units are its iterations per
+    // worker times the workers ([`probe_service`]): an exact multiple.
+    let qualified = |class: ServiceClassId| {
+        let units = services
+            .iter()
+            .find(|service| service.class == class)
+            .expect("the CPU's integer and memory services are measured before their composition")
+            .qualification
+            .maximum_units;
+        assert_eq!(units % worker_count, 0, "a worker service qualifies a whole count per worker");
+        units / worker_count
+    };
+    let iterations = qualified(INTEGER).min(qualified(MEMORY));
+    compose(workers, iterations)?;
     let mut observations = Vec::with_capacity(OBSERVATIONS);
     for _ in 0..OBSERVATIONS {
-        let started = Instant::now();
-        run_probe(
-            integer,
-            ProbeShape::Capacity,
-            workers,
-            QUALIFICATION_ITERATIONS,
-        )?;
-        run_probe(
-            memory,
-            ProbeShape::Capacity,
-            workers,
-            QUALIFICATION_ITERATIONS,
-        )?;
-        observations.push(
-            u64::try_from(started.elapsed().as_nanos())
-                .map_err(|_| {
-                    TargetError::UnsupportedDevice(
-                        "CPU composition qualification duration exceeds u64".into(),
-                    )
-                })?
-                .max(1),
-        );
+        observations.push(compose(workers, iterations)?);
     }
     observations.sort_unstable();
     let observed_ns = trimmed_interval(&observations, 1);
-    let worker_count = u64::try_from(workers.count())
-        .map_err(|_| TargetError::UnsupportedDevice("CPU worker count exceeds u64::MAX".into()))?;
-    let units = QUALIFICATION_ITERATIONS
+    let units = iterations
         .checked_mul(worker_count)
         .ok_or_else(|| {
             TargetError::UnsupportedDevice("CPU qualification workload exceeds u64".into())
         })?;
     let mut digest = Sha256::new();
-    digest.update(b"cpu-fixed-compositions-v1");
-    digest.update(QUALIFICATION_ITERATIONS.to_le_bytes());
+    digest.update(b"cpu-qualified-compositions-v2");
+    digest.update(iterations.to_le_bytes());
     for observation in &observations {
         digest.update(observation.to_le_bytes());
     }
     Ok(CompositionQualificationParts {
-        suite_revision: "cpu-fixed-compositions-v1",
+        suite_revision: "cpu-qualified-compositions-v2",
         cases: vec![CompositionQualificationCase {
             stable_name: "cpu.integer-memory-capacity",
             demands: vec![
@@ -464,25 +453,51 @@ fn probe_service(
     timer_resolution: DurationInterval,
 ) -> Result<ServiceDefinition, TargetError> {
     let relative_percent = accuracy_percent(probe.accuracy);
-    let setup_started = Instant::now();
-    let setup = observe(probe, ProbeShape::Setup, workers, relative_percent)?;
-    let setup_acquisition_ns = elapsed_ns(setup_started, "CPU setup-probe acquisition")?;
-    let latency_started = Instant::now();
-    let latency = observe(probe, ProbeShape::Dependency, workers, relative_percent)?;
-    let latency_acquisition_ns = elapsed_ns(latency_started, "CPU latency-probe acquisition")?;
-    let capacity_started = Instant::now();
-    let capacity = observe(probe, ProbeShape::Capacity, workers, relative_percent)?;
-    let capacity_acquisition_ns = elapsed_ns(capacity_started, "CPU capacity-probe acquisition")?;
-    let setup_interval = trimmed_interval(&setup, setup_batch(probe.path));
-    let dependency_latency = differential_interval(&latency, setup_interval, ITERATIONS)?;
-    let capacity_per_wave = differential_interval(&capacity, setup_interval, ITERATIONS)?;
-    qualify(probe.class, dependency_latency, relative_percent)?;
-    qualify(probe.class, capacity_per_wave, relative_percent)?;
-    let latency_units = ITERATIONS;
+    let required_ns = seismic_estimator::required_observation_ns(
+        timer_resolution.upper_numerator,
+        relative_percent,
+    );
+    // Each shape is judged by what it spends beyond its own launch: the same
+    // shape at zero iterations (a capacity launch spans every worker, a
+    // dependency launch one), whose observation repeats it `units` times.
+    // What exceeds the setup carries the setup's uncertainty too, which sizes
+    // the work as the timer's does.
+    let mut work = |shape: ProbeShape| -> Result<(Acquired, Acquired), TargetError> {
+        let setup = acquire(
+            probe.class,
+            relative_percent,
+            required_ns,
+            0,
+            |units| {
+                time_run(|| {
+                    for _ in 0..units {
+                        run_probe(probe, shape, workers, 0)?;
+                    }
+                    Ok(())
+                })
+            },
+            |observations, units| Some(trimmed_interval(observations, units)),
+        )?;
+        let setup_ns = setup.interval.upper_numerator.div_ceil(setup.interval.denominator);
+        let setup_width_ns = (setup.interval.upper_numerator - setup.interval.lower_numerator)
+            .div_ceil(setup.interval.denominator);
+        let work = acquire(
+            probe.class,
+            relative_percent,
+            required_ns.max(seismic_estimator::required_beyond_ns(setup_width_ns, relative_percent)),
+            setup_ns,
+            |units| time_run(|| run_probe(probe, shape, workers, units)),
+            |observations, units| differential_interval(observations, setup.interval, units),
+        )?;
+        Ok((setup, work))
+    };
+    let (latency_setup, latency) = work(ProbeShape::Dependency)?;
+    let (setup, capacity) = work(ProbeShape::Capacity)?;
     let capacity_units = match probe.path {
-        CpuProbePath::Core => ITERATIONS,
+        CpuProbePath::Core => capacity.units,
         CpuProbePath::Workers => {
-            ITERATIONS
+            capacity
+                .units
                 .checked_mul(u64::from(worker_count))
                 .ok_or_else(|| {
                     TargetError::UnsupportedDevice("CPU probe workload units exceed u64".into())
@@ -511,47 +526,118 @@ fn probe_service(
                 max_concurrency: 1,
             },
         },
-        dependency_latency,
+        dependency_latency: latency.interval,
         saturated_capacity: ServiceCurve {
-            setup: setup_interval,
+            setup: setup.interval,
             regimes: vec![ServiceCurveRegime {
                 max_units: None,
-                per_unit: capacity_per_wave,
+                per_unit: capacity.interval,
             }],
         },
         provenance: FactProvenance::Measured {
             batches: vec![
                 measurement_batch(
                     probe,
-                    "host-monotonic-fixed-setup-v2",
-                    setup_batch(probe.path),
+                    "host-monotonic-calibrated-dependency-setup-v4",
+                    latency_setup.units,
                     timer_resolution,
-                    setup,
-                    setup_acquisition_ns,
+                    latency_setup.observations,
+                    latency_setup.acquisition_ns,
                     worker_count,
                 ),
                 measurement_batch(
                     probe,
-                    "host-monotonic-fixed-dependency-v2",
-                    latency_units,
+                    "host-monotonic-calibrated-capacity-setup-v4",
+                    setup.units,
                     timer_resolution,
-                    latency,
-                    latency_acquisition_ns,
+                    setup.observations,
+                    setup.acquisition_ns,
                     worker_count,
                 ),
                 measurement_batch(
                     probe,
-                    "host-monotonic-fixed-capacity-v2",
+                    "host-monotonic-calibrated-dependency-v4",
+                    latency.units,
+                    timer_resolution,
+                    latency.observations,
+                    latency.acquisition_ns,
+                    worker_count,
+                ),
+                measurement_batch(
+                    probe,
+                    "host-monotonic-calibrated-capacity-v4",
                     capacity_units,
                     timer_resolution,
-                    capacity,
-                    capacity_acquisition_ns,
+                    capacity.observations,
+                    capacity.acquisition_ns,
                     worker_count,
                 ),
             ]
             .into_boxed_slice(),
         },
     })
+}
+
+/// One probe shape's accepted round: its sorted observations, each of
+/// `units`, and the interval they bound.
+struct Acquired {
+    units: u64,
+    observations: Vec<u64>,
+    interval: DurationInterval,
+    acquisition_ns: u64,
+}
+
+/// Acquires one probe shape in observations of a unit count calibrated until
+/// what an observation spends beyond `offset_ns` reaches `required_ns`; a
+/// round whose `interval` is absent or does not qualify escalates the count
+/// for the next by how far it missed (`escalate_observation_units`).
+fn acquire(
+    class: ServiceClassId,
+    relative_percent: u64,
+    required_ns: u64,
+    offset_ns: u64,
+    mut observe: impl FnMut(u64) -> Result<u64, TargetError>,
+    interval: impl Fn(&[u64], u64) -> Option<DurationInterval>,
+) -> Result<Acquired, TargetError> {
+    let started = Instant::now();
+    let mut units = seismic_estimator::calibrate_observation_units::<TargetError>(
+        required_ns,
+        |units| Ok(observe(units)?.saturating_sub(offset_ns)),
+    )?;
+    for _ in 0..MAX_ACQUISITION_ROUNDS {
+        let round = Instant::now();
+        observe(units)?;
+        let mut observations = (0..OBSERVATIONS)
+            .map(|_| observe(units))
+            .collect::<Result<Vec<_>, _>>()?;
+        observations.sort_unstable();
+        let candidate = interval(&observations, units);
+        if let Some(interval) = candidate.filter(|interval| qualified(*interval, relative_percent)) {
+            return Ok(Acquired {
+                units,
+                observations,
+                interval,
+                acquisition_ns: elapsed_ns(started, "CPU probe acquisition")?,
+            });
+        }
+        match seismic_estimator::escalate_observation_units(units, round.elapsed(), candidate, relative_percent) {
+            Some(next) => units = next,
+            None => break,
+        }
+    }
+    Err(TargetError::DeviceUnavailable(format!(
+        "CPU probe `{}` did not meet its {}% relative half-width budget after setup subtraction within {MAX_ACQUISITION_ROUNDS} rounds of at most {} ms",
+        class.stable_name(),
+        relative_percent,
+        seismic_estimator::MAX_ROUND.as_millis()
+    )))
+}
+
+/// The duration of one run of `run`, at least a nanosecond.
+fn time_run(run: impl FnOnce() -> Result<(), TargetError>) -> Result<u64, TargetError> {
+    let start = Instant::now();
+    run()?;
+    Ok(elapsed_ns(start, "CPU service probe duration")?.max(1))
 }
 
 fn elapsed_ns(started: Instant, what: &str) -> Result<u64, TargetError> {
@@ -595,63 +681,8 @@ const fn accuracy_percent(accuracy: ServiceAccuracyClass) -> u64 {
 
 #[derive(Clone, Copy)]
 enum ProbeShape {
-    Setup,
     Dependency,
     Capacity,
-}
-
-fn observe(
-    probe: CpuServiceProbe,
-    shape: ProbeShape,
-    workers: &mut Workers,
-    relative_percent: u64,
-) -> Result<Vec<u64>, TargetError> {
-    let iterations = match shape {
-        ProbeShape::Setup => 0,
-        ProbeShape::Dependency | ProbeShape::Capacity => ITERATIONS,
-    };
-    for _ in 0..MAX_ACQUISITION_ROUNDS {
-        run_probe(probe, shape, workers, 1_024)?;
-        let mut observations = Vec::with_capacity(OBSERVATIONS);
-        for _ in 0..OBSERVATIONS {
-            let start = Instant::now();
-            let repetitions = match shape {
-                ProbeShape::Setup => setup_batch(probe.path),
-                ProbeShape::Dependency | ProbeShape::Capacity => 1,
-            };
-            for _ in 0..repetitions {
-                run_probe(probe, shape, workers, iterations)?;
-            }
-            observations.push(
-                u64::try_from(start.elapsed().as_nanos())
-                    .map_err(|_| {
-                        TargetError::UnsupportedDevice(
-                            "CPU service probe duration exceeds u64".into(),
-                        )
-                    })?
-                    .max(1),
-            );
-        }
-        observations.sort_unstable();
-        let interval = trimmed_interval(&observations, 1);
-        let width = u128::from(interval.upper_numerator - interval.lower_numerator);
-        let sum = u128::from(interval.upper_numerator) + u128::from(interval.lower_numerator);
-        if width * 100 <= sum * u128::from(relative_percent) {
-            return Ok(observations);
-        }
-    }
-    Err(TargetError::DeviceUnavailable(format!(
-        "CPU probe `{}` did not meet its {}% relative half-width budget",
-        probe.class.stable_name(),
-        relative_percent
-    )))
-}
-
-const fn setup_batch(path: CpuProbePath) -> u64 {
-    match path {
-        CpuProbePath::Core => CORE_SETUP_BATCH,
-        CpuProbePath::Workers => WORKER_SETUP_BATCH,
-    }
 }
 
 fn trimmed_interval(observations: &[u64], denominator: u64) -> DurationInterval {
@@ -662,11 +693,13 @@ fn trimmed_interval(observations: &[u64], denominator: u64) -> DurationInterval 
     )
 }
 
+/// The interval of what `observations` spend beyond `setup`, absent when
+/// they do not exceed it.
 fn differential_interval(
     observations: &[u64],
     setup: DurationInterval,
     denominator: u64,
-) -> Result<DurationInterval, TargetError> {
+) -> Option<DurationInterval> {
     let measured = trimmed_interval(observations, 1);
     let lower = measured
         .lower_numerator
@@ -676,33 +709,15 @@ fn differential_interval(
         .upper_numerator
         .saturating_mul(setup.denominator)
         .saturating_sub(setup.lower_numerator);
-    if lower == 0 {
-        return Err(TargetError::DeviceUnavailable(
-            "CPU service probe did not exceed its measured setup interval".into(),
-        ));
-    }
-    Ok(DurationInterval::new(
-        lower,
-        upper,
-        denominator.saturating_mul(setup.denominator),
-    ))
+    (lower != 0).then(|| {
+        DurationInterval::new(lower, upper, denominator.saturating_mul(setup.denominator))
+    })
 }
 
-fn qualify(
-    class: ServiceClassId,
-    interval: DurationInterval,
-    relative_percent: u64,
-) -> Result<(), TargetError> {
+fn qualified(interval: DurationInterval, relative_percent: u64) -> bool {
     let width = u128::from(interval.upper_numerator - interval.lower_numerator);
     let sum = u128::from(interval.upper_numerator) + u128::from(interval.lower_numerator);
-    if width * 100 > sum * u128::from(relative_percent) {
-        return Err(TargetError::DeviceUnavailable(format!(
-            "CPU probe `{}` exceeded its {}% relative half-width budget after setup subtraction",
-            class.stable_name(),
-            relative_percent
-        )));
-    }
-    Ok(())
+    width * 100 <= sum * u128::from(relative_percent)
 }
 
 fn run_probe(
@@ -712,14 +727,39 @@ fn run_probe(
     iterations: u64,
 ) -> Result<(), TargetError> {
     if matches!(probe.path, CpuProbePath::Core) {
-        black_box(run_primitive(probe.kind, shape, iterations));
+        match probe.kind {
+            CpuProbeKind::Allocation => {
+                for _ in 0..iterations {
+                    let instance = <crate::executor::Device as DeviceService<Cpu>>::allocate(
+                        &crate::executor::Device,
+                        seismic_estimator::ALLOCATION_INSTANCE_BYTES,
+                        64,
+                    )
+                    .map_err(|error| {
+                        TargetError::DeviceUnavailable(format!(
+                            "CPU allocation-instance probe failed: {error:?}"
+                        ))
+                    })?;
+                    drop(black_box(instance));
+                }
+            }
+            CpuProbeKind::Publication => {
+                let mut publication = seismic_compiler::executable::TensorPublicationProbe::new();
+                for _ in 0..iterations {
+                    publication.publish();
+                }
+            }
+            kind => {
+                black_box(run_primitive(kind, shape, iterations));
+            }
+        }
         return Ok(());
     }
     let barrier = matches!(probe.kind, CpuProbeKind::Barrier);
     let workgroups = match (barrier, shape) {
         (true, _) => 1,
         (false, ProbeShape::Capacity) => workers.count(),
-        (false, ProbeShape::Setup | ProbeShape::Dependency) => 1,
+        (false, ProbeShape::Dependency) => 1,
     };
     let words = [
         iterations,
@@ -786,6 +826,9 @@ fn run_primitive(kind: CpuProbeKind, shape: ProbeShape, iterations: u64) -> u64 
 
 const fn probe_kind_tag(kind: CpuProbeKind) -> u64 {
     match kind {
+        CpuProbeKind::Allocation | CpuProbeKind::Publication => {
+            panic!("a host-only core probe runs on no worker")
+        }
         CpuProbeKind::Memory => 0,
         CpuProbeKind::Atomic => 1,
         CpuProbeKind::Float => 2,
@@ -797,16 +840,12 @@ const fn probe_kind_tag(kind: CpuProbeKind) -> u64 {
 
 const fn probe_shape_tag(shape: ProbeShape) -> u64 {
     match shape {
-        ProbeShape::Setup => 0,
         ProbeShape::Dependency => 1,
         ProbeShape::Capacity => 2,
     }
 }
 
 fn run_primitive_tags(kind: u64, shape: u64, iterations: u64) -> u64 {
-    if shape == 0 {
-        return black_box(kind);
-    }
     if kind == 0 {
         let mut words = [0u64; 256];
         let mut values = [1u64, 3, 5, 7];

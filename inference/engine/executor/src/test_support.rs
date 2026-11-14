@@ -19,28 +19,18 @@ pub(crate) fn process_placement() -> MutexGuard<'static, ()> {
     PLACEMENT.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// How every test of the process opens a device: with the one artifact
-/// store the process shares ([`seismic::MemoryStore`]). A load forms its
-/// programs on its device, and a device lives only while a test holds it;
-/// through the store each program is compiled once in the process however
-/// many tests load it, not once per load.
-pub(crate) fn device_options() -> seismic::DeviceOptions {
-    static STORE: std::sync::OnceLock<std::sync::Arc<seismic::MemoryStore>> = std::sync::OnceLock::new();
-    seismic::DeviceOptions {
-        artifacts: Some(STORE.get_or_init(Default::default).clone()),
-        ..Default::default()
-    }
-}
-
-/// Open executor `id` of `catalog` as every test does ([`device_options`]):
-/// as a device of its own, in its own ledger scope
+/// Open executor `id` of `catalog` as every test does: forming through the
+/// user store, the one store of the process (`seismic::ProgramStore::user`),
+/// so each program is compiled once however many tests and test processes
+/// load it, and as a
+/// device of its own, in its own ledger scope
 /// (`seismic::testing::open_own_ledgers`). Tests share a process, and a
 /// ledger has one holder of the right to bound it: a device of the test's
 /// own shares no ledger with another test's, so neither moves the other's
 /// room, and a test that still shares one panics as a second holder takes
 /// that right (`seismic::Device::bounds`).
 pub(crate) fn open(catalog: &seismic::Devices, id: seismic::ExecutorId) -> Result<seismic::Device, seismic::OpenError> {
-    seismic::testing::open_own_ledgers(catalog, id, device_options())
+    seismic::testing::open_own_ledgers(catalog, id, Default::default())
 }
 
 /// Open the first executor of `backend` in `catalog` as every test does
@@ -50,7 +40,7 @@ pub(crate) fn open_backend(
     catalog: &seismic::Devices,
     backend: seismic::BackendName,
 ) -> Result<seismic::Device, seismic::OpenError> {
-    seismic::testing::open_backend_own_ledgers(catalog, backend, device_options())
+    seismic::testing::open_backend_own_ledgers(catalog, backend, Default::default())
 }
 
 /// Whether a test runs on `backend` ([`seismic::testing::selected`]): the

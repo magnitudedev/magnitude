@@ -31,7 +31,9 @@
 
 use crate::driver::{self, Edge, KernelNodeParams};
 use crate::executor::Device;
+use crate::CudaPtxPrograms;
 use seismic_compiler::errors::ExecutionError;
+use seismic_native_target::{ProgramEntry, ProgramSource};
 use seismic_compiler::graph_cost::{GraphCensus, GraphCost};
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -48,7 +50,7 @@ const CHAIN: u64 = 1024;
 const MOST_UNITS: u64 = 1 << 16;
 
 /// The empty kernel a calibration node launches, taking one word, as PTX
-/// the driver loads (NUL-terminated), and its entry.
+/// (NUL-terminated, as the driver's loader reads it), and its entry.
 const KERNEL: (&str, &str) = (
     ".version 7.0\n.target sm_50\n.address_size 64\n.visible .entry seismic_graph(.param .u64 seismic_word)\n{\n\tret;\n}\n\0",
     "seismic_graph",
@@ -65,12 +67,13 @@ static COSTS: Mutex<BTreeMap<u32, GraphCost>> = Mutex::new(BTreeMap::new());
 
 /// What graphs instantiated on `device` hold, measured on its first call
 /// in the process and kept for the device's ordinal after.
-pub fn graph_cost(device: &Device) -> Result<GraphCost, ExecutionError> {
+/// Its kernel forms through `programs`, the device's.
+pub fn graph_cost(device: &Device, programs: &CudaPtxPrograms) -> Result<GraphCost, ExecutionError> {
     let mut costs = COSTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(cost) = costs.get(&device.ordinal()) {
         return Ok(*cost);
     }
-    let cost = measure(device)?;
+    let cost = measure(device, programs)?;
     costs.insert(device.ordinal(), cost);
     Ok(cost)
 }
@@ -228,11 +231,18 @@ impl Holdings {
     }
 }
 
-fn measure(device: &Device) -> Result<GraphCost, ExecutionError> {
+fn measure(device: &Device, programs: &CudaPtxPrograms) -> Result<GraphCost, ExecutionError> {
     let context = device.context();
     let granule = driver::allocation_granularity(context).map_err(failure)?;
     let (source, entry) = KERNEL;
-    let (module, function) = driver::load_module(context, source.as_bytes(), entry).map_err(failure)?;
+    let entry = ProgramEntry::named(entry);
+    let source = ProgramSource {
+        text: source.strip_suffix('\0').expect("the kernel's PTX is NUL-terminated").to_owned(),
+        entries: vec![entry.clone()],
+    };
+    let formed = programs.form(std::slice::from_ref(&source)).map_err(failure)?;
+    let (module, position) = formed[0].program(&entry);
+    let function = module.function(position);
     let mut word = [0u8; 8];
     let mut parameters = [word.as_mut_ptr().cast::<c_void>()];
     let launch = node(function, &mut parameters);
@@ -258,7 +268,7 @@ fn measure(device: &Device) -> Result<GraphCost, ExecutionError> {
     let first = (slope(1)?, slope(CHAIN)?);
     let second = (slope(1)?, slope(CHAIN)?);
     drop(kept);
-    drop(module);
+    drop(formed);
     let (single, chained) = agreed(first, second, granule)?;
     let (graph, launch) = terms(single, chained)?;
     Ok(GraphCost::Pooled { graph, launch, granule })
@@ -328,8 +338,9 @@ mod tests {
         let Some((_exclusive, opened)) = crate::test_device() else {
             return;
         };
+        let programs = crate::test_ptx_programs(&opened);
         let device = opened.service;
-        let first = measure(&device).unwrap();
+        let first = measure(&device, &programs).unwrap();
         let context = device.context();
         let (source, entry) = KERNEL;
         let (_module, function) = driver::load_module(context, source.as_bytes(), entry).unwrap();
@@ -340,7 +351,7 @@ mod tests {
         drop(other);
         let buffers = (0..8).map(|_| device.allocate_within(64 << 20, 256, None).unwrap()).collect::<Vec<_>>();
         drop(buffers);
-        let (GraphCost::Pooled { graph, launch, granule }, Ok(GraphCost::Pooled { graph: again, launch: launched, .. })) = (first, measure(&device)) else {
+        let (GraphCost::Pooled { graph, launch, granule }, Ok(GraphCost::Pooled { graph: again, launch: launched, .. })) = (first, measure(&device, &programs)) else {
             eprintln!("the measurement after other work was refused");
             return;
         };
@@ -360,6 +371,7 @@ mod tests {
         let Some((_exclusive, opened)) = crate::test_device() else {
             return;
         };
+        let programs = crate::test_ptx_programs(&opened);
         let device = opened.service;
         let context = device.context();
         let (source, entry) = KERNEL;
@@ -388,7 +400,7 @@ mod tests {
         let before = holdings.read(&device).unwrap();
         let _instantiated = graphs.into_iter().map(|graph| prepared(&device, graph).unwrap()).collect::<Vec<_>>();
         let taken = holdings.read(&device).unwrap() - before;
-        let cost = measure(&device).unwrap();
+        let cost = measure(&device, &programs).unwrap();
         let GraphCost::Pooled { granule, .. } = cost else {
             panic!("CUDA prices graphs pooled: {cost:?}");
         };

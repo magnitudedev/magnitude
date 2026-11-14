@@ -101,17 +101,9 @@
 //! A piece that compiles is started only if its compile ends within the
 //! budget at the most a compile has taken as far as the load has seen:
 //! the longest that has ended. A compile runs only where no stored
-//! artifact serves the program. On a toolchain whose artifact is the whole
-//! program (CUDA, Vulkan), every compile a load observes is one that
-//! compiled and a load from the store compiles nothing. On one whose loads
-//! form the program again through the platform's cache (Metal), neither
-//! holds: a compile of a program whose artifact the store dropped may be
-//! served by that cache, and a load it no longer serves takes a compile's
-//! time. So there, until a unit has observed a load, a load is priced as
-//! the longest compile the process has observed and every operation is held
-//! to that compile at least; after, to the longest load observed
-//! (`UnitSearch::longest_operation`). The former counts and times those
-//! loads. The ending begins at the
+//! artifact serves the program: every artifact is the whole program, so
+//! every compile a load observes is one that compiled and a load from the
+//! store compiles nothing. The ending begins at the
 //! cutoff of the pieces in flight, whatever their compiles are doing: the
 //! allocator waits for a compile no later than that, and from it nothing
 //! more is admitted or measured. A piece whose measurement has not run by

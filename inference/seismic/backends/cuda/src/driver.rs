@@ -216,6 +216,16 @@ impl Driver {
         Ok(active != 0)
     }
 
+    /// The driver's API version (`cuDriverGetVersion`): also the release of
+    /// its PTX JIT compiler ([`compile_image`]).
+    pub fn version(&self) -> Result<i32, DriverError> {
+        let mut version = 0;
+        unsafe {
+            self.check((self.driver_version)(&mut version), "driver version")?;
+        }
+        Ok(version)
+    }
+
     /// One `cuDeviceGetAttribute` query.
     pub fn attribute(&self, key: c_int, device: c_int) -> Result<i32, DriverError> {
         let mut value = 0;
@@ -1040,11 +1050,7 @@ fn reserving_granularity(
         return Ok(None);
     }
     if memory == CreatedMemory::Host {
-        let mut version = 0;
-        unsafe {
-            driver.check((driver.driver_version)(&mut version), "driver version")?;
-        }
-        if version < HOST_NUMA_DRIVER {
+        if driver.version()? < HOST_NUMA_DRIVER {
             return Ok(None);
         }
     }

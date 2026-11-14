@@ -14,6 +14,10 @@ use seismic_lang::expr::ExprArena;
 pub trait AnalyticalService: Copy + Send + Sync + 'static {
     const ALL: &'static [Self];
     fn stable_name(self) -> &'static str;
+    /// The service class this service is defined under in a profile.
+    fn class(self) -> ServiceClassId {
+        ServiceClassId::new(self.stable_name())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,9 +94,6 @@ pub fn estimate<B: PhysicalDialect, M: ExecutionModel<B> + ?Sized>(
     arena: &mut ExprArena,
     executable: seismic_ir::execution::ClosedExecutionView<'_, B>,
 ) -> Result<TotalPerformanceModel, ModelLimitation> {
-    fn core(service: CoreService) -> ServiceClassId {
-        ServiceClassId::new(service.stable_name())
-    }
     #[derive(Clone)]
     struct Fragment {
         duration: seismic_lang::expr::DurationExpr,
@@ -153,7 +154,7 @@ pub fn estimate<B: PhysicalDialect, M: ExecutionModel<B> + ?Sized>(
         let mut launch_assessment = Fragment::service(
             profile,
             arena,
-            core(CoreService::Submission),
+            CoreService::Submission.class(),
             one,
             DemandMode::DependencyLatency,
             invocation,
@@ -214,7 +215,7 @@ pub fn estimate<B: PhysicalDialect, M: ExecutionModel<B> + ?Sized>(
                     Fragment::service(
                         profile,
                         arena,
-                        core(CoreService::AllocationInstance),
+                        CoreService::AllocationInstance.class(),
                         one,
                         DemandMode::DependencyLatency,
                         InvocationProvenance::HostSchedule,
@@ -225,7 +226,7 @@ pub fn estimate<B: PhysicalDialect, M: ExecutionModel<B> + ?Sized>(
                     Fragment::service(
                         profile,
                         arena,
-                        core(CoreService::TensorPublication),
+                        CoreService::TensorPublication.class(),
                         one,
                         DemandMode::DependencyLatency,
                         InvocationProvenance::HostSchedule,
@@ -237,7 +238,7 @@ pub fn estimate<B: PhysicalDialect, M: ExecutionModel<B> + ?Sized>(
                 seismic_ir::schedule::ScheduleStep::Copy(copy) => Fragment::service(
                     profile,
                     arena,
-                    core(CoreService::Copy),
+                    CoreService::Copy.class(),
                     copy.bytes,
                     DemandMode::SaturatedCapacity,
                     InvocationProvenance::HostSchedule,
@@ -245,7 +246,7 @@ pub fn estimate<B: PhysicalDialect, M: ExecutionModel<B> + ?Sized>(
                 seismic_ir::schedule::ScheduleStep::Fill(fill) => Fragment::service(
                     profile,
                     arena,
-                    core(CoreService::Fill),
+                    CoreService::Fill.class(),
                     fill.bytes,
                     DemandMode::SaturatedCapacity,
                     InvocationProvenance::HostSchedule,
@@ -253,7 +254,7 @@ pub fn estimate<B: PhysicalDialect, M: ExecutionModel<B> + ?Sized>(
                 seismic_ir::schedule::ScheduleStep::ScalarRead(_) => Fragment::service(
                     profile,
                     arena,
-                    core(CoreService::ScalarRead),
+                    CoreService::ScalarRead.class(),
                     one,
                     DemandMode::DependencyLatency,
                     InvocationProvenance::HostSchedule,
@@ -261,7 +262,7 @@ pub fn estimate<B: PhysicalDialect, M: ExecutionModel<B> + ?Sized>(
                 seismic_ir::schedule::ScheduleStep::ScalarMove(_) => Fragment::service(
                     profile,
                     arena,
-                    core(CoreService::ScalarMove),
+                    CoreService::ScalarMove.class(),
                     one,
                     DemandMode::DependencyLatency,
                     InvocationProvenance::HostSchedule,
@@ -272,7 +273,7 @@ pub fn estimate<B: PhysicalDialect, M: ExecutionModel<B> + ?Sized>(
                 seismic_ir::schedule::ScheduleStep::Check(_) => Fragment::service(
                     profile,
                     arena,
-                    core(CoreService::DataCheck),
+                    CoreService::DataCheck.class(),
                     one,
                     DemandMode::DependencyLatency,
                     InvocationProvenance::HostSchedule,

@@ -180,12 +180,12 @@ struct RecordingCompiler {
     width: AtomicU32,
 }
 impl NativeCompiler<Metal> for RecordingCompiler {
-    type Context = DeviceHandle;
+    type Context = seismic_metal::MetalPrograms;
     type Candidate = seismic_metal::NativeCandidate;
     type Handle = Pipeline;
     fn form(
         &self,
-        context: &DeviceHandle,
+        context: &seismic_metal::MetalPrograms,
         target: &DeviceDescription<Metal>,
         kernel: &seismic_ir::kernel::Kernel<Metal>,
         layout: &seismic_ir::physical_target::KernelEmissionLayout,
@@ -244,7 +244,12 @@ impl NativeSubmission<Metal> for AuditSubmission {
 #[ignore = "requires Metal device"]
 fn authored_failure_before_subgroup_preserves_prefix_and_reconverges_after_if() {
     let device = MetalDevice::open(DeviceHandle::system_default().unwrap()).unwrap();
-    let target = seismic_metal::profile::open_device(&device).unwrap();
+    let store = crate::artifacts::ProgramStore::user();
+    let target = seismic_metal::profile::open_device(&device, &*store).unwrap();
+    let programs: seismic_metal::MetalPrograms = std::sync::Arc::new(crate::formation::ProgramFormer::new(
+        seismic_metal::toolchain::MetalToolchain::new(device.clone(), target.facts()),
+        store,
+    ));
     let registry = seismic_metal::profile::registry();
     let module=check_source(SourceSet::new(vec![SourceFile { path:"cohort-failure.seismic".into(),text:r#"fn probe(indices: &tensor[64] i32, later: &tensor[64] i32, input: &tensor[1] f32, out: &mut tensor[64] f32):
     parallel for i in 0..64:
@@ -287,7 +292,7 @@ lower probe(indices: &tensor[64] i32, later: &tensor[64] i32, input: &tensor[1] 
         &target,
         &registry,
         &compiler,
-        device.handle(),
+        &programs,
         &PrecisionPolicy::Exact,
         &budget,
         &PlanningBudget::default(),
@@ -477,6 +482,10 @@ lower probe(indices: &tensor[64] i32, later: &tensor[64] i32, input: &tensor[1] 
 #[test]
 fn cpu_public_evaluator_selects_and_executes_an_independent_body() {
     let opened = seismic_cpu::open_host(crate::backends::host_cores().unwrap()).unwrap();
+    let programs: seismic_cpu::CpuPrograms = std::sync::Arc::new(crate::formation::ProgramFormer::new(
+        seismic_cpu::toolchain::CpuToolchain::new(&opened.device),
+        crate::artifacts::ProgramStore::user(),
+    ));
     let registry = seismic_cpu::registry();
     let module = check_source(SourceSet::new(vec![SourceFile {
         path: "public-evaluator.seismic".into(),
@@ -498,7 +507,7 @@ fn cpu_public_evaluator_selects_and_executes_an_independent_body() {
         &opened.device,
         &registry,
         seismic_cpu::native_compiler(),
-        &(),
+        &programs,
         &PrecisionPolicy::Exact,
         &PreparationBudget::default(),
         &PlanningBudget::default(),

@@ -3,17 +3,14 @@ use super::selection::{DeviceRequest, SelectionError, select};
 use crate::planning::HostTier;
 use crate::{CatalogError, ExecutionPath};
 use seismic::{
-    ArtifactStore, Device, DeviceOptions, Devices, Executor, ExecutorSelector, OpenError,
+    Device, DeviceOptions, Devices, Executor, ExecutorSelector, OpenError,
     ResolveError, Contract,
 };
 use std::fmt;
-use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct PlatformConfig {
     pub path: ExecutionPath,
-    /// Where the device keeps formed kernels between loads.
-    pub artifacts: Option<Arc<dyn ArtifactStore>>,
     /// What its graphs hold, as the selection read it; none to measure it
     /// on opening.
     pub graph_cost: Option<seismic::GraphCost>,
@@ -255,8 +252,10 @@ pub fn open_selected(
     let device = catalog
         .open_with(
             id,
+            // The device forms through the process's one store
+            // (`seismic::ProgramStore::user`).
             DeviceOptions {
-                artifacts: config.artifacts,
+                artifacts: None,
                 graph_cost: config.graph_cost,
             },
         )
@@ -300,7 +299,6 @@ mod tests {
                 missing,
                 PlatformConfig {
                     path: ExecutionPath::Native,
-                    artifacts: None,
                     graph_cost: None,
                 },
             ),

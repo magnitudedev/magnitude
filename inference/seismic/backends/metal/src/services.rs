@@ -10,37 +10,7 @@ use seismic_estimator::{
     ResourceTopology, ServiceAccuracyClass, ServiceClassId, ServiceCorrelationId, ServiceCurve,
     ServiceCurveRegime, ServiceDefinition, ServiceQualificationDomain,
 };
-pub(crate) const SERVICE_SUBMISSION: ServiceClassId = ServiceClassId::new("core.submission");
-pub(crate) const SERVICE_COPY: ServiceClassId = ServiceClassId::new("core.copy");
-pub(crate) const SERVICE_FILL: ServiceClassId = ServiceClassId::new("core.fill");
-pub(crate) const SERVICE_SCALAR_READ: ServiceClassId = ServiceClassId::new("core.scalar-read");
-pub(crate) const SERVICE_SCALAR_MOVE: ServiceClassId = ServiceClassId::new("core.scalar-move");
-pub(crate) const SERVICE_DATA_CHECK: ServiceClassId = ServiceClassId::new("core.data-check");
-pub(crate) const CONTROL: ServiceClassId = ServiceClassId::new("metal.control");
-const INTEGER: ServiceClassId = ServiceClassId::new("metal.integer");
 pub(crate) const F32_ADD_SUB: ServiceClassId = ServiceClassId::new("metal.f32.add-sub");
-const F32_MULTIPLY: ServiceClassId = ServiceClassId::new("metal.f32.multiply");
-const F32_DIVIDE: ServiceClassId = ServiceClassId::new("metal.f32.divide");
-const F32_REMAINDER: ServiceClassId = ServiceClassId::new("metal.f32.remainder");
-const F32_MIN_MAX: ServiceClassId = ServiceClassId::new("metal.f32.min-max");
-const F32_FMA: ServiceClassId = ServiceClassId::new("metal.f32.fma");
-const F32_COMPARE: ServiceClassId = ServiceClassId::new("metal.f32.compare");
-const F32_TO_INTEGER: ServiceClassId = ServiceClassId::new("metal.f32.to-integer");
-const INTEGER_TO_F32: ServiceClassId = ServiceClassId::new("metal.integer.to-f32");
-const F32_TO_F16: ServiceClassId = ServiceClassId::new("metal.f32.to-f16");
-const F16_TO_F32: ServiceClassId = ServiceClassId::new("metal.f16.to-f32");
-const F32_TO_BF16: ServiceClassId = ServiceClassId::new("metal.f32.to-bf16");
-const F16_STRICT: ServiceClassId = ServiceClassId::new("metal.f16.strict");
-const BF16_STRICT: ServiceClassId = ServiceClassId::new("metal.bf16.strict");
-const APPROXIMATE_MATH: ServiceClassId = ServiceClassId::new("metal.approximate-math");
-const GLOBAL_MEMORY: ServiceClassId = ServiceClassId::new("metal.global-memory");
-const WORKGROUP_MEMORY: ServiceClassId = ServiceClassId::new("metal.workgroup-memory");
-const REPRESENTATION: ServiceClassId = ServiceClassId::new("metal.representation");
-const ATOMIC: ServiceClassId = ServiceClassId::new("metal.atomic");
-const BARRIER: ServiceClassId = ServiceClassId::new("metal.barrier");
-const SUBGROUP: ServiceClassId = ServiceClassId::new("metal.subgroup");
-const MATRIX: ServiceClassId = ServiceClassId::new("metal.simdgroup-matrix");
-use std::collections::BTreeSet;
 use std::ffi::{c_int, c_void};
 
 use objc2::rc::Retained;
@@ -48,8 +18,11 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSActivityOptions, NSObjectProtocol, NSProcessInfo, NSString};
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLDevice, MTLLibrary, MTLSize,
+    MTLComputePipelineState, MTLSize,
 };
+use seismic_estimator::{AnalyticalService, CoreService};
+use seismic_estimator_metal::MetalService;
+use seismic_native_target::{Formed, ProgramEntry, ProgramSource};
 use sha2::{Digest, Sha256};
 use std::time::Instant;
 
@@ -58,14 +31,17 @@ use std::time::Instant;
 // ---------------------------------------------------------------------------
 
 const PROBE_METHOD: &str = "adjacent-count-v23-closed-helper-service-single-op-integer-selective-matched-contrast-fixed-three-round-pooled-operation-units-bounded-counterbalanced-steady-queue-paired-95pct-confidence/gpu-command-buffer-time";
-const HOST_METHOD: &str = "adjacent-count-v5-bounded-confidence95/host-monotonic-time";
+const HOST_METHOD: &str = "adjacent-count-v6-calibrated-confidence95/host-monotonic-time";
 const THREAD_METHOD: &str =
-    "adjacent-count-v4-fixed-eight-round-blocked-confidence95/thread-cpu-time";
+    "adjacent-count-v5-calibrated-eight-batch-blocked-confidence95/thread-cpu-time";
 const STOCHASTIC_HOST_REPEATS: usize = 64;
 const GPU_REPEATS: usize = 64;
 const MATCHED_GPU_REPEATS: usize = 32;
 const MATRIX_GPU_REPEATS: usize = 2_048;
 const MAX_HOST_ACQUISITION_ROUNDS: usize = 8;
+/// The batches of one thread-time acquisition: the eight batch means whose
+/// Student t interval (seven degrees of freedom) bounds a compute probe.
+const THREAD_BATCHES: usize = 8;
 const MAX_GPU_ACQUISITION_ROUNDS: usize = 3;
 const GPU_CONFIDENCE_SIGMA: f64 = 1.96;
 const GPU_WARMUP_DISPATCHES: usize = 8;
@@ -261,115 +237,65 @@ pub(crate) struct Acquisition {
     pub composition: CompositionQualificationParts,
 }
 
-/// Acquires definitions only for the target-dependent closed service set.
-/// One fixed library is compiled once with production compile options; every
-/// GPU observation is read from `GPUStartTime`/`GPUEndTime` after completion.
+/// Acquires the definitions of every core service ([`core_services`]) and
+/// of the GPU services `gpu` the device's model admits. One fixed library is
+/// formed once, through the device's programs; every GPU observation is read
+/// from `GPUStartTime`/`GPUEndTime` after completion.
 pub(crate) fn acquire(
     device: &crate::device::MetalDevice,
-    facts: &crate::facts::MetalFacts,
-    required: &BTreeSet<ServiceClassId>,
+    programs: &crate::MetalPrograms,
+    gpu: &[MetalService],
 ) -> Result<Acquisition, seismic_compiler::errors::TargetError> {
     let _profiling_activity = ProfilingActivity::enter();
     let _profiling_qos = ProfilingQos::enter()?;
     let build_started = Instant::now();
-    let source = probe_source(required.contains(&BF16_STRICT), required.contains(&MATRIX));
-    let source = NSString::from_str(&source);
-    let library = device
-        .handle()
-        .raw()
-        .newLibraryWithSource_options_error(
-            &source,
-            Some(&crate::profile::compile_options(facts.language)),
-        )
-        .map_err(|error| {
-            seismic_compiler::errors::TargetError::UnsupportedToolchain(format!(
-                "Metal fixed service-probe library failed to compile: {}",
-                error.localizedDescription()
-            ))
-        })?;
-    let mut pipelines = Vec::with_capacity(required.len());
-    for class in required {
-        let function_name = probe_function(*class).unwrap_or_else(|| {
-            panic!(
-                "Metal service registry lacks a fixed probe for `{}`",
-                class.stable_name()
+    let probes = gpu
+        .iter()
+        .map(|service| {
+            (
+                *service,
+                ProgramEntry::named(probe_function(*service)),
+                matched_baseline_function(*service).map(ProgramEntry::named),
             )
-        });
-        let function = library
-            .newFunctionWithName(&NSString::from_str(function_name))
-            .ok_or_else(|| {
-                seismic_compiler::errors::TargetError::UnsupportedToolchain(format!(
-                    "compiled Metal probe library omitted `{function_name}`"
-                ))
-            })?;
-        let pipeline = device
-            .handle()
-            .raw()
-            .newComputePipelineStateWithFunction_error(&function)
-            .map_err(|error| {
-                seismic_compiler::errors::TargetError::UnsupportedToolchain(format!(
-                    "Metal could not create service probe `{}`: {}",
-                    class.stable_name(),
-                    error.localizedDescription()
-                ))
-            })?;
-        let baseline_pipeline = matched_baseline_function(*class)
-            .map(|baseline_name| {
-                let function = library
-                    .newFunctionWithName(&NSString::from_str(baseline_name))
-                    .ok_or_else(|| {
-                        seismic_compiler::errors::TargetError::UnsupportedToolchain(format!(
-                            "compiled Metal probe library omitted `{baseline_name}`"
-                        ))
-                    })?;
-                device
-                    .handle()
-                    .raw()
-                    .newComputePipelineStateWithFunction_error(&function)
-                    .map_err(|error| {
-                        seismic_compiler::errors::TargetError::UnsupportedToolchain(format!(
-                            "Metal could not create matched baseline `{baseline_name}`: {}",
-                            error.localizedDescription()
-                        ))
-                    })
-            })
-            .transpose()?;
-        pipelines.push((*class, pipeline, baseline_pipeline));
+        })
+        .collect::<Vec<_>>();
+    let composition_entry = ProgramEntry::named("seismic_probe_composition");
+    let f32_anchor_entry = ProgramEntry::named("seismic_probe_f32_anchor");
+    let mut entries = vec![composition_entry.clone(), f32_anchor_entry.clone()];
+    for (_, probe, baseline) in &probes {
+        for entry in std::iter::once(probe).chain(baseline) {
+            if !entries.contains(entry) {
+                entries.push(entry.clone());
+            }
+        }
     }
-    let composition_function = library
-        .newFunctionWithName(&NSString::from_str("seismic_probe_composition"))
-        .ok_or_else(|| {
-            seismic_compiler::errors::TargetError::UnsupportedToolchain(
-                "compiled Metal probe library omitted `seismic_probe_composition`".into(),
-            )
-        })?;
-    let f32_anchor_function = library
-        .newFunctionWithName(&NSString::from_str("seismic_probe_f32_anchor"))
-        .ok_or_else(|| {
-            seismic_compiler::errors::TargetError::UnsupportedToolchain(
-                "compiled Metal probe library omitted `seismic_probe_f32_anchor`".into(),
-            )
-        })?;
-    let f32_anchor_pipeline = device
-        .handle()
-        .raw()
-        .newComputePipelineStateWithFunction_error(&f32_anchor_function)
+    let source = ProgramSource {
+        text: probe_source(gpu.contains(&MetalService::Bf16Strict), gpu.contains(&MetalService::Matrix)),
+        entries,
+    };
+    let formed = programs
+        .form(std::slice::from_ref(&source))
         .map_err(|error| {
             seismic_compiler::errors::TargetError::UnsupportedToolchain(format!(
-                "Metal could not create F32 harness-anchor probe: {}",
-                error.localizedDescription()
+                "Metal fixed service-probe library failed to form: {error}"
             ))
-        })?;
-    let composition_pipeline = device
-        .handle()
-        .raw()
-        .newComputePipelineStateWithFunction_error(&composition_function)
-        .map_err(|error| {
-            seismic_compiler::errors::TargetError::UnsupportedToolchain(format!(
-                "Metal could not create held-out composition probe: {}",
-                error.localizedDescription()
-            ))
-        })?;
+        })?
+        .pop()
+        .expect("one formed source for the one source");
+    fn pipeline_of<'f>(
+        formed: &'f Formed<Vec<crate::DirectPipeline>>,
+        entry: &ProgramEntry,
+    ) -> &'f ProtocolObject<dyn MTLComputePipelineState> {
+        let (pipelines, position) = formed.program(entry);
+        &pipelines[position].state
+    }
+    let pipeline = |entry: &ProgramEntry| pipeline_of(&formed, entry);
+    let pipelines = probes
+        .iter()
+        .map(|(service, probe, baseline)| (*service, pipeline(probe), baseline.as_ref().map(pipeline)))
+        .collect::<Vec<_>>();
+    let f32_anchor_pipeline = pipeline(&f32_anchor_entry);
+    let composition_pipeline = pipeline(&composition_entry);
     let probe_build_ns = build_started.elapsed().as_nanos() as u64;
     let execution_started = Instant::now();
     let buffer = device.allocate_bytes(4 * 1024 * 1024).map_err(|error| {
@@ -379,19 +305,29 @@ pub(crate) fn acquire(
 
     let mut definitions = core_services(device, &buffer)?;
     let mut f32_observation = None;
-    for (class, pipeline, baseline_pipeline) in pipelines {
-        let collective = matches!(class, BARRIER | SUBGROUP | MATRIX);
-        let compute = !matches!(class, GLOBAL_MEMORY | WORKGROUP_MEMORY | ATOMIC | BARRIER);
+    for (service, pipeline, baseline_pipeline) in pipelines {
+        let class = service.class();
+        let collective = matches!(
+            service,
+            MetalService::Barrier | MetalService::Subgroup | MetalService::Matrix
+        );
+        let compute = !matches!(
+            service,
+            MetalService::GlobalMemory
+                | MetalService::WorkgroupMemory
+                | MetalService::Atomic
+                | MetalService::Barrier
+        );
         let units_per_iteration = if class == F32_ADD_SUB { 3 } else { 1 };
         if let Some(baseline_pipeline) = baseline_pipeline {
             let observation =
-                observe_matched_gpu_service(device, &pipeline, &baseline_pipeline, &buffer, class)?;
-            definitions.push(measured_f32_matched_definition(class, observation)?);
+                observe_matched_gpu_service(device, pipeline, baseline_pipeline, &buffer, class)?;
+            definitions.push(measured_f32_matched_definition(service, observation)?);
             continue;
         }
         let observation = observe_gpu_service(
             device,
-            &pipeline,
+            pipeline,
             &buffer,
             collective,
             class,
@@ -405,7 +341,7 @@ pub(crate) fn acquire(
                 class,
                 observation,
                 compute,
-                function_name_for_provenance(class),
+                probe_function(service),
                 PROBE_METHOD,
             )?);
         }
@@ -415,7 +351,7 @@ pub(crate) fn acquire(
         .expect("the required Metal service set omitted strict F32 arithmetic");
     let f32_anchor = observe_gpu_service(
         device,
-        &f32_anchor_pipeline,
+        f32_anchor_pipeline,
         &buffer,
         false,
         F32_ADD_SUB,
@@ -426,7 +362,7 @@ pub(crate) fn acquire(
     definitions.push(f32_definition);
     let composition_observation = observe_gpu_service(
         device,
-        &composition_pipeline,
+        composition_pipeline,
         &buffer,
         false,
         F32_ADD_SUB,
@@ -449,88 +385,51 @@ pub(crate) fn acquire(
     })
 }
 
-fn probe_function(class: ServiceClassId) -> Option<&'static str> {
-    Some(if class == CONTROL {
-        "seismic_probe_control"
-    } else if class == INTEGER {
-        "seismic_probe_integer"
-    } else if class == F32_ADD_SUB {
-        "seismic_probe_f32"
-    } else if class == F32_MULTIPLY {
-        "seismic_probe_f32_multiply"
-    } else if class == F32_DIVIDE {
-        "seismic_probe_f32_divide"
-    } else if class == F32_REMAINDER {
-        "seismic_probe_f32_remainder"
-    } else if class == F32_MIN_MAX {
-        "seismic_probe_f32_minmax"
-    } else if class == F32_FMA {
-        "seismic_probe_f32_fma"
-    } else if class == F32_COMPARE {
-        "seismic_probe_f32_compare"
-    } else if class == F32_TO_INTEGER {
-        "seismic_probe_f32_to_integer"
-    } else if class == INTEGER_TO_F32 {
-        "seismic_probe_integer_to_f32"
-    } else if class == F32_TO_F16 {
-        "seismic_probe_f32_to_f16"
-    } else if class == F16_TO_F32 {
-        "seismic_probe_f16_to_f32"
-    } else if class == F32_TO_BF16 {
-        "seismic_probe_f32_to_bf16"
-    } else if class == F16_STRICT {
-        "seismic_probe_f16"
-    } else if class == BF16_STRICT {
-        "seismic_probe_bf16"
-    } else if class == APPROXIMATE_MATH {
-        "seismic_probe_approx"
-    } else if class == GLOBAL_MEMORY {
-        "seismic_probe_global"
-    } else if class == WORKGROUP_MEMORY {
-        "seismic_probe_workgroup"
-    } else if class == REPRESENTATION {
-        "seismic_probe_representation"
-    } else if class == ATOMIC {
-        "seismic_probe_atomic"
-    } else if class == BARRIER {
-        "seismic_probe_barrier"
-    } else if class == SUBGROUP {
-        "seismic_probe_subgroup"
-    } else if class == MATRIX {
-        "seismic_probe_matrix"
-    } else {
-        return None;
-    })
+/// The fixed probe kernel of each GPU service.
+fn probe_function(service: MetalService) -> &'static str {
+    match service {
+        MetalService::Control => "seismic_probe_control",
+        MetalService::Integer => "seismic_probe_integer",
+        MetalService::F32AddSub => "seismic_probe_f32",
+        MetalService::F32Multiply => "seismic_probe_f32_multiply",
+        MetalService::F32Divide => "seismic_probe_f32_divide",
+        MetalService::F32Remainder => "seismic_probe_f32_remainder",
+        MetalService::F32MinMax => "seismic_probe_f32_minmax",
+        MetalService::F32Fma => "seismic_probe_f32_fma",
+        MetalService::F32Compare => "seismic_probe_f32_compare",
+        MetalService::F32ToInteger => "seismic_probe_f32_to_integer",
+        MetalService::IntegerToF32 => "seismic_probe_integer_to_f32",
+        MetalService::F32ToF16 => "seismic_probe_f32_to_f16",
+        MetalService::F16ToF32 => "seismic_probe_f16_to_f32",
+        MetalService::F32ToBf16 => "seismic_probe_f32_to_bf16",
+        MetalService::F16Strict => "seismic_probe_f16",
+        MetalService::Bf16Strict => "seismic_probe_bf16",
+        MetalService::ApproximateMath => "seismic_probe_approx",
+        MetalService::GlobalMemory => "seismic_probe_global",
+        MetalService::WorkgroupMemory => "seismic_probe_workgroup",
+        MetalService::Representation => "seismic_probe_representation",
+        MetalService::Atomic => "seismic_probe_atomic",
+        MetalService::Barrier => "seismic_probe_barrier",
+        MetalService::Subgroup => "seismic_probe_subgroup",
+        MetalService::Matrix => "seismic_probe_matrix",
+    }
 }
 
-fn matched_baseline_function(class: ServiceClassId) -> Option<&'static str> {
-    Some(if class == F32_MULTIPLY {
-        "seismic_baseline_f32_multiply"
-    } else if class == F32_DIVIDE {
-        "seismic_baseline_f32_divide"
-    } else if class == F32_REMAINDER {
-        "seismic_baseline_f32_remainder"
-    } else if class == F32_MIN_MAX {
-        "seismic_baseline_f32_minmax"
-    } else if class == F32_FMA {
-        "seismic_baseline_f32_fma"
-    } else if class == F32_TO_INTEGER {
-        "seismic_baseline_f32_to_integer"
-    } else if class == INTEGER_TO_F32 {
-        "seismic_baseline_integer_to_f32"
-    } else if class == F32_TO_F16 {
-        "seismic_baseline_f32_to_f16"
-    } else if class == F16_TO_F32 {
-        "seismic_baseline_f16_to_f32"
-    } else if class == F32_TO_BF16 {
-        "seismic_baseline_f32_to_bf16"
-    } else {
-        return None;
+/// The matched baseline kernel of a GPU service measured against one.
+fn matched_baseline_function(service: MetalService) -> Option<&'static str> {
+    Some(match service {
+        MetalService::F32Multiply => "seismic_baseline_f32_multiply",
+        MetalService::F32Divide => "seismic_baseline_f32_divide",
+        MetalService::F32Remainder => "seismic_baseline_f32_remainder",
+        MetalService::F32MinMax => "seismic_baseline_f32_minmax",
+        MetalService::F32Fma => "seismic_baseline_f32_fma",
+        MetalService::F32ToInteger => "seismic_baseline_f32_to_integer",
+        MetalService::IntegerToF32 => "seismic_baseline_integer_to_f32",
+        MetalService::F32ToF16 => "seismic_baseline_f32_to_f16",
+        MetalService::F16ToF32 => "seismic_baseline_f16_to_f32",
+        MetalService::F32ToBf16 => "seismic_baseline_f32_to_bf16",
+        _ => return None,
     })
-}
-
-fn function_name_for_provenance(class: ServiceClassId) -> &'static str {
-    probe_function(class).expect("required Metal service class has no probe function")
 }
 
 fn observe_gpu_service(
@@ -551,7 +450,7 @@ fn observe_gpu_service(
     // complete observations, not a second service-specific amplification
     // factor that turns profiling into the workload being measured.
     let (small_work, large_work) = (SMALL_WORK, LARGE_WORK);
-    let repeats = if class == MATRIX {
+    let repeats = if class == MetalService::Matrix.class() {
         MATRIX_GPU_REPEATS
     } else {
         GPU_REPEATS
@@ -1067,9 +966,10 @@ fn measured_f32_definition(
 }
 
 fn measured_f32_matched_definition(
-    class: ServiceClassId,
+    service: MetalService,
     observation: MatchedObservation,
 ) -> Result<ServiceDefinition, seismic_compiler::errors::TargetError> {
+    let class = service.class();
     let dependency_latency = observation.dependency_interval;
     let saturated = observation.capacity_interval;
     qualify(class, dependency_latency, 1)?;
@@ -1087,8 +987,8 @@ fn measured_f32_matched_definition(
             "Metal F32 qualified service domain exceeds u64".into(),
         )
     })?;
-    let operation_probe = function_name_for_provenance(class);
-    let baseline_probe = matched_baseline_function(class)
+    let operation_probe = probe_function(service);
+    let baseline_probe = matched_baseline_function(service)
         .expect("matched F32 service class has no baseline function");
     let batches = vec![
         paired_measurement_batch(
@@ -1437,7 +1337,7 @@ fn paired_batch_mean_confidence_interval(
     const STUDENT_T_975_DF7: f64 = 2.364_624;
     if small.len() != large.len()
         || batch_size == 0
-        || small.len() != batch_size * 8
+        || small.len() != batch_size * THREAD_BATCHES
         || units_per_difference == 0
     {
         return Err(seismic_compiler::errors::TargetError::DeviceUnavailable(
@@ -1541,85 +1441,130 @@ fn is_qualified(interval: DurationInterval, percent: u64) -> bool {
     width * 100 <= sum * u128::from(percent)
 }
 
+/// Every core service's definition, each measured on what this backend does
+/// for it.
 fn core_services(
     device: &crate::device::MetalDevice,
     buffer: &crate::device::WritableMetalBuffer,
 ) -> Result<Vec<ServiceDefinition>, seismic_compiler::errors::TargetError> {
-    let mut result = Vec::new();
-    result.push(host_definition(
-        SERVICE_SUBMISSION,
-        "metal.command-submit",
-        ServiceAccuracyClass::MemoryOrTransfer,
-        1,
-        2_048,
-        18_432,
-        || {
-            let command = device.queue().commandBuffer().ok_or_else(|| {
-                seismic_compiler::errors::TargetError::DeviceUnavailable(
-                    "opened Metal queue stopped creating command buffers".into(),
-                )
-            })?;
-            command.commit();
-            command.waitUntilCompleted();
-            match command.error() {
-                Some(error) => Err(seismic_compiler::errors::TargetError::DeviceUnavailable(
-                    error.localizedDescription().to_string(),
-                )),
-                None => Ok(()),
-            }
-        },
-    )?);
-    result.push(host_transfer_definition(
-        SERVICE_COPY,
-        "metal.shared-copy",
-        buffer,
-        true,
-    )?);
-    result.push(host_transfer_definition(
-        SERVICE_FILL,
-        "metal.shared-fill",
-        buffer,
-        false,
-    )?);
-    result.push(host_definition(
-        SERVICE_SCALAR_READ,
-        "metal.shared-scalar-read",
-        ServiceAccuracyClass::MemoryOrTransfer,
-        1,
-        524_288,
-        2_097_152,
-        || {
-            let mut bytes = [0u8; 4];
-            buffer.read_bytes(0, &mut bytes);
-            std::hint::black_box(bytes);
-            Ok(())
-        },
-    )?);
-    result.push(host_compute_definition(
-        SERVICE_SCALAR_MOVE,
-        "core.scalar-move",
-        1,
-        4_194_304,
-        16_777_216,
-        || {
+    <CoreService as AnalyticalService>::ALL
+        .iter()
+        .map(|service| core_service(*service, device, buffer))
+        .collect()
+}
+
+fn core_service(
+    service: CoreService,
+    device: &crate::device::MetalDevice,
+    buffer: &crate::device::WritableMetalBuffer,
+) -> Result<ServiceDefinition, seismic_compiler::errors::TargetError> {
+    let class = service.class();
+    match service {
+        CoreService::Submission => host_definition(
+            class,
+            "metal.command-submit",
+            ServiceAccuracyClass::MemoryOrTransfer,
+            || {
+                let command = device.queue().commandBuffer().ok_or_else(|| {
+                    seismic_compiler::errors::TargetError::DeviceUnavailable(
+                        "opened Metal queue stopped creating command buffers".into(),
+                    )
+                })?;
+                command.commit();
+                command.waitUntilCompleted();
+                match command.error() {
+                    Some(error) => Err(seismic_compiler::errors::TargetError::DeviceUnavailable(
+                        error.localizedDescription().to_string(),
+                    )),
+                    None => Ok(()),
+                }
+            },
+        ),
+        CoreService::Copy => host_transfer_definition(class, "metal.shared-copy", buffer, true),
+        CoreService::Fill => host_transfer_definition(class, "metal.shared-fill", buffer, false),
+        CoreService::ScalarRead => host_definition(
+            class,
+            "metal.shared-scalar-read",
+            ServiceAccuracyClass::MemoryOrTransfer,
+            || {
+                let mut bytes = [0u8; 4];
+                buffer.read_bytes(0, &mut bytes);
+                std::hint::black_box(bytes);
+                Ok(())
+            },
+        ),
+        CoreService::ScalarMove => host_compute_definition(class, "core.scalar-move", || {
             let value = std::hint::black_box(0x9e37_79b9_u64);
             std::hint::black_box(value);
             Ok(())
-        },
-    )?);
-    result.push(host_compute_definition(
-        SERVICE_DATA_CHECK,
-        "core.data-check",
-        1,
-        8_388_608,
-        33_554_432,
-        || {
+        }),
+        // A reached instance's backing, as the executor acquires one: the
+        // device service's allocation of a shared buffer, released after.
+        CoreService::AllocationInstance => host_definition(
+            class,
+            "metal.allocation-instance",
+            ServiceAccuracyClass::MemoryOrTransfer,
+            || {
+                let instance = <crate::device::MetalDevice as seismic_compiler::executable::DeviceService<crate::Metal>>::allocate(
+                    device,
+                    seismic_estimator::ALLOCATION_INSTANCE_BYTES,
+                    1,
+                )
+                .map_err(|error| {
+                    seismic_compiler::errors::TargetError::DeviceUnavailable(error.to_string())
+                })?;
+                drop(std::hint::black_box(instance));
+                Ok(())
+            },
+        ),
+        // A publication as the schedule's execution records it.
+        CoreService::TensorPublication => {
+            let mut probe = seismic_compiler::executable::TensorPublicationProbe::new();
+            host_definition(
+                class,
+                "core.tensor-publication",
+                ServiceAccuracyClass::MemoryOrTransfer,
+                || {
+                    probe.publish();
+                    Ok(())
+                },
+            )
+        }
+        CoreService::DataCheck => host_compute_definition(class, "core.data-check", || {
             let value = std::hint::black_box(true);
             std::hint::black_box(if value { 1u32 } else { 0u32 });
             Ok(())
-        },
-    )?);
-    Ok(result)
+        }),
+    }
+}
+
+/// How many times a host probe's small run its large run counts. Timing the
+/// difference of the two cancels each run's fixed cost (the clock reads and
+/// the loop's entry), which any ratio of at least 2 does; the pair then runs
+/// `(ratio + 1) / (ratio - 1)` times the difference it measures. At 4 that is
+/// 5/3, against 3 at 2, while the small run is still a third of the
+/// difference, so each sample stays within twice its calibrated length.
+const ADJACENT_RATIO: u64 = 4;
+
+/// The adjacent counts whose difference is `difference` operations: the
+/// smallest `small` with `small * (ADJACENT_RATIO - 1)` at least
+/// `difference`, and `large = small * ADJACENT_RATIO`.
+fn adjacent_counts(difference: u64) -> (u64, u64) {
+    let small = difference.div_ceil(ADJACENT_RATIO - 1);
+    (small, small * ADJACENT_RATIO)
+}
+
+/// The duration of `count` operations on `clock_id`.
+fn time_operations(
+    clock_id: c_int,
+    count: u64,
+    operation: &mut impl FnMut() -> Result<(), seismic_compiler::errors::TargetError>,
+) -> Result<u64, seismic_compiler::errors::TargetError> {
+    let start = unsafe { clock_gettime_nsec_np(clock_id) };
+    for _ in 0..count {
+        operation()?;
+    }
+    Ok(unsafe { clock_gettime_nsec_np(clock_id) }.saturating_sub(start))
 }
 
 fn host_transfer_definition(
@@ -1630,57 +1575,57 @@ fn host_transfer_definition(
 ) -> Result<ServiceDefinition, seismic_compiler::errors::TargetError> {
     const SMALL: usize = 256 * 1024;
     const LARGE: usize = 2 * 1024 * 1024;
-    const AMPLIFICATION: usize = 2_048;
-    const SETUP_AMPLIFICATION: usize = 16_384;
     const SETUP_REPEATS_PER_TRANSFER_OBSERVATION: usize = 8;
+    let percent = 2;
     let pattern = [0x5au8, 0xa5, 0x3c, 0xc3];
     let mut temporary = vec![0u8; LARGE];
     for (index, byte) in temporary.iter_mut().enumerate() {
         *byte = pattern[index % pattern.len()];
     }
-    let mut execute = |bytes: usize| {
-        if copy {
-            buffer.read_bytes(0, &mut temporary[..bytes]);
-            buffer.write_bytes(512 * 1024, &temporary[..bytes]);
-        } else {
-            buffer.write_bytes(0, &temporary[..bytes]);
+    let mut execute = |count: u64, bytes: usize| {
+        let start = Instant::now();
+        for _ in 0..count {
+            if copy {
+                buffer.read_bytes(0, &mut temporary[..bytes]);
+                buffer.write_bytes(512 * 1024, &temporary[..bytes]);
+            } else {
+                buffer.write_bytes(0, &temporary[..bytes]);
+            }
         }
+        start.elapsed().as_nanos() as u64
     };
     let acquisition_started = Instant::now();
     let timer_resolution = host_timer_resolution(CLOCK_MONOTONIC_RAW);
     let uncertainty = timer_resolution.upper_numerator.saturating_mul(2);
-    let workload_units = (LARGE - SMALL) as u64 * AMPLIFICATION as u64;
+    let required_ns =
+        seismic_estimator::required_observation_ns(timer_resolution.upper_numerator, percent);
+    // The transfer slope is judged on the difference of a large and a small
+    // batch; a single zero-byte transfer is comparable to the host clock
+    // resolution, so the fixed setup is judged on a batch of its own.
+    let mut amplification = seismic_estimator::calibrate_observation_units::<
+        seismic_compiler::errors::TargetError,
+    >(required_ns, |count| {
+        let small = execute(count, SMALL);
+        Ok(execute(count, LARGE).saturating_sub(small))
+    })?;
+    let mut setup_amplification = seismic_estimator::calibrate_observation_units::<
+        seismic_compiler::errors::TargetError,
+    >(required_ns, |count| Ok(execute(count, 0)))?;
     let mut accepted = None;
     let mut last_intervals = None;
     for _ in 0..MAX_HOST_ACQUISITION_ROUNDS {
-        for _ in 0..AMPLIFICATION {
-            execute(LARGE);
-        }
+        let round = Instant::now();
+        let workload_units = (LARGE - SMALL) as u64 * amplification;
+        execute(amplification, LARGE);
         let mut rates = Vec::with_capacity(STOCHASTIC_HOST_REPEATS);
         let mut setups =
             Vec::with_capacity(STOCHASTIC_HOST_REPEATS * SETUP_REPEATS_PER_TRANSFER_OBSERVATION);
         for _ in 0..STOCHASTIC_HOST_REPEATS {
             for _ in 0..SETUP_REPEATS_PER_TRANSFER_OBSERVATION {
-                let start = Instant::now();
-                // A single zero-byte transfer is comparable to the host clock
-                // resolution, so its interval cannot carry the same 2% guarantee
-                // as the transfer slope. Measure the unchanged fixed setup in an
-                // amplified batch and retain the rational per-operation interval.
-                for _ in 0..SETUP_AMPLIFICATION {
-                    execute(0);
-                }
-                setups.push(start.elapsed().as_nanos() as u64);
+                setups.push(execute(setup_amplification, 0));
             }
-            let start = Instant::now();
-            for _ in 0..AMPLIFICATION {
-                execute(SMALL);
-            }
-            let small = start.elapsed().as_nanos() as u64;
-            let start = Instant::now();
-            for _ in 0..AMPLIFICATION {
-                execute(LARGE);
-            }
-            let large = start.elapsed().as_nanos() as u64;
+            let small = execute(amplification, SMALL);
+            let large = execute(amplification, LARGE);
             rates.push(large.checked_sub(small).ok_or_else(|| {
                 seismic_compiler::errors::TargetError::DeviceUnavailable(
                     "host transfer probe timestamps were not monotone".into(),
@@ -1688,29 +1633,47 @@ fn host_transfer_definition(
             })?);
         }
         let per_unit = confidence_interval(&rates, workload_units, uncertainty)?;
-        let setup = confidence_interval(&setups, SETUP_AMPLIFICATION as u64, uncertainty)?;
+        let setup = confidence_interval(&setups, setup_amplification, uncertainty)?;
         last_intervals = Some((per_unit, setup));
-        if is_qualified(per_unit, 2) && is_qualified(setup, 2) {
-            accepted = Some((rates, setups, per_unit, setup));
+        let (rate_qualified, setup_qualified) =
+            (is_qualified(per_unit, percent), is_qualified(setup, percent));
+        if rate_qualified && setup_qualified {
+            accepted = Some((rates, setups, per_unit, setup, workload_units, setup_amplification));
             break;
         }
+        // Both batches run in every round, so the round's duration bounds
+        // the growth of either.
+        let round = round.elapsed();
+        if !rate_qualified {
+            match seismic_estimator::escalate_observation_units(amplification, round, Some(per_unit), percent) {
+                Some(next) => amplification = next,
+                None => break,
+            }
+        }
+        if !setup_qualified {
+            match seismic_estimator::escalate_observation_units(setup_amplification, round, Some(setup), percent) {
+                Some(next) => setup_amplification = next,
+                None => break,
+            }
+        }
     }
-    let (rates, setups, per_unit, setup) = accepted.ok_or_else(|| {
-        let (per_unit, setup) =
-            last_intervals.expect("bounded transfer acquisition executes at least once");
-        seismic_compiler::errors::TargetError::DeviceUnavailable(format!(
-            "service probe `{}` transfer interval {}/{}..{}/{} ns or setup interval {}/{}..{}/{} ns exceeded its 2% relative half-width qualification after {MAX_HOST_ACQUISITION_ROUNDS} fixed acquisition rounds",
-            class.stable_name(),
-            per_unit.lower_numerator,
-            per_unit.denominator,
-            per_unit.upper_numerator,
-            per_unit.denominator,
-            setup.lower_numerator,
-            setup.denominator,
-            setup.upper_numerator,
-            setup.denominator,
-        ))
-    })?;
+    let (rates, setups, per_unit, setup, workload_units, setup_amplification) =
+        accepted.ok_or_else(|| {
+            let (per_unit, setup) =
+                last_intervals.expect("bounded transfer acquisition executes at least once");
+            seismic_compiler::errors::TargetError::DeviceUnavailable(format!(
+                "service probe `{}` transfer interval {}/{}..{}/{} ns or setup interval {}/{}..{}/{} ns exceeded its {percent}% relative half-width qualification within {MAX_HOST_ACQUISITION_ROUNDS} acquisition rounds",
+                class.stable_name(),
+                per_unit.lower_numerator,
+                per_unit.denominator,
+                per_unit.upper_numerator,
+                per_unit.denominator,
+                setup.lower_numerator,
+                setup.denominator,
+                setup.upper_numerator,
+                setup.denominator,
+            ))
+        })?;
     Ok(ServiceDefinition {
         class,
         correlation: ServiceCorrelationId::new(class.stable_name()),
@@ -1745,7 +1708,7 @@ fn host_transfer_definition(
                 measurement_batch(
                     probe,
                     HOST_METHOD,
-                    SETUP_AMPLIFICATION as u64,
+                    setup_amplification,
                     timer_resolution,
                     setups,
                     acquisition_started.elapsed().as_nanos() as u64,
@@ -1756,13 +1719,15 @@ fn host_transfer_definition(
     })
 }
 
+/// Measures a host operation as the difference of adjacent counts in the
+/// ratio [`ADJACENT_RATIO`], the difference calibrated to the duration the band
+/// needs at the monotonic clock's resolution; a round that does not qualify
+/// grows it for the next by how far it missed, within the round budget
+/// (`seismic_estimator::escalate_observation_units`).
 fn host_definition(
     class: ServiceClassId,
     probe: &'static str,
     accuracy: ServiceAccuracyClass,
-    units_per_operation: u64,
-    small: usize,
-    large: usize,
     mut operation: impl FnMut() -> Result<(), seismic_compiler::errors::TargetError>,
 ) -> Result<ServiceDefinition, seismic_compiler::errors::TargetError> {
     assert_eq!(accuracy, ServiceAccuracyClass::MemoryOrTransfer);
@@ -1770,29 +1735,25 @@ fn host_definition(
     let percent = 2;
     let clock_id = CLOCK_MONOTONIC_RAW;
     let timer_resolution = host_timer_resolution(clock_id);
-    let workload_units = (large - small) as u64 * units_per_operation;
     let uncertainty = timer_resolution.upper_numerator.saturating_mul(2);
+    let mut difference = seismic_estimator::calibrate_observation_units(
+        seismic_estimator::required_observation_ns(timer_resolution.upper_numerator, percent),
+        |count| time_operations(clock_id, count, &mut operation),
+    )?;
     let mut accepted = None;
     let mut last_interval = None;
     for _ in 0..MAX_HOST_ACQUISITION_ROUNDS {
+        let round = Instant::now();
+        let (small, large) = adjacent_counts(difference);
+        let workload_units = large - small;
         // Re-warm the exact amplified path before each bounded acquisition
-        // round. A round is accepted only as a whole: its raw extrema remain
-        // the retained interval, with no sample trimming or threshold change.
-        for _ in 0..large {
-            operation()?;
-        }
+        // round. A round is accepted only as a whole, with no sample trimming
+        // or threshold change.
+        time_operations(clock_id, large, &mut operation)?;
         let mut samples = Vec::with_capacity(STOCHASTIC_HOST_REPEATS);
         for _ in 0..STOCHASTIC_HOST_REPEATS {
-            let start = unsafe { clock_gettime_nsec_np(clock_id) };
-            for _ in 0..small {
-                operation()?;
-            }
-            let small_elapsed = unsafe { clock_gettime_nsec_np(clock_id) }.saturating_sub(start);
-            let start = unsafe { clock_gettime_nsec_np(clock_id) };
-            for _ in 0..large {
-                operation()?;
-            }
-            let large_elapsed = unsafe { clock_gettime_nsec_np(clock_id) }.saturating_sub(start);
+            let small_elapsed = time_operations(clock_id, small, &mut operation)?;
+            let large_elapsed = time_operations(clock_id, large, &mut operation)?;
             samples.push(large_elapsed.checked_sub(small_elapsed).ok_or_else(|| {
                 seismic_compiler::errors::TargetError::DeviceUnavailable(
                     "host service probe timestamps were not monotone".into(),
@@ -1802,14 +1763,18 @@ fn host_definition(
         let candidate = confidence_interval(&samples, workload_units, uncertainty)?;
         last_interval = Some(candidate);
         if is_qualified(candidate, percent) {
-            accepted = Some((samples, candidate));
+            accepted = Some((samples, candidate, workload_units));
             break;
         }
+        match seismic_estimator::escalate_observation_units(difference, round.elapsed(), Some(candidate), percent) {
+            Some(next) => difference = next,
+            None => break,
+        }
     }
-    let (samples, per_unit) = accepted.ok_or_else(|| {
+    let (samples, per_unit, workload_units) = accepted.ok_or_else(|| {
         let interval = last_interval.expect("bounded host acquisition executes at least once");
         seismic_compiler::errors::TargetError::DeviceUnavailable(format!(
-            "service probe `{}` interval {}/{}..{}/{} ns exceeded its {percent}% relative half-width qualification after {MAX_HOST_ACQUISITION_ROUNDS} fixed acquisition rounds",
+            "service probe `{}` interval {}/{}..{}/{} ns exceeded its {percent}% relative half-width qualification within {MAX_HOST_ACQUISITION_ROUNDS} acquisition rounds",
             class.stable_name(),
             interval.lower_numerator,
             interval.denominator,
@@ -1852,67 +1817,82 @@ fn host_definition(
     })
 }
 
+/// Measures a host compute operation on the thread's CPU clock as
+/// [`THREAD_BATCHES`] pooled batches of counterbalanced adjacent-count pairs
+/// in the ratio [`ADJACENT_RATIO`], the difference calibrated to the duration the
+/// band needs at that clock's resolution; an acquisition that does not
+/// qualify grows it for the next by how far it missed, within the round
+/// budget (`seismic_estimator::escalate_observation_units`).
 fn host_compute_definition(
     class: ServiceClassId,
     probe: &'static str,
-    units_per_operation: u64,
-    small: usize,
-    large: usize,
     mut operation: impl FnMut() -> Result<(), seismic_compiler::errors::TargetError>,
 ) -> Result<ServiceDefinition, seismic_compiler::errors::TargetError> {
-    const OBSERVATIONS_PER_ROUND: usize = STOCHASTIC_HOST_REPEATS;
+    const OBSERVATIONS_PER_BATCH: usize = STOCHASTIC_HOST_REPEATS;
     let acquisition_started = Instant::now();
-    let timer_resolution = host_timer_resolution(CLOCK_THREAD_CPUTIME_ID);
+    let percent = 1;
+    let clock_id = CLOCK_THREAD_CPUTIME_ID;
+    let timer_resolution = host_timer_resolution(clock_id);
     let timer_tick = timer_resolution.upper_numerator;
-    let workload_units = (large - small) as u64 * units_per_operation;
-    let total_observations = OBSERVATIONS_PER_ROUND * MAX_HOST_ACQUISITION_ROUNDS;
-    let mut small_observations = Vec::with_capacity(total_observations);
-    let mut large_observations = Vec::with_capacity(total_observations);
+    let total_observations = OBSERVATIONS_PER_BATCH * THREAD_BATCHES;
+    let mut difference = seismic_estimator::calibrate_observation_units(
+        seismic_estimator::required_observation_ns(timer_tick, percent),
+        |count| time_operations(clock_id, count, &mut operation),
+    )?;
+    let mut accepted = None;
+    let mut last_interval = None;
     for _ in 0..MAX_HOST_ACQUISITION_ROUNDS {
-        for _ in 0..large {
-            operation()?;
+        let round = Instant::now();
+        let (small, large) = adjacent_counts(difference);
+        let mut small_observations = Vec::with_capacity(total_observations);
+        let mut large_observations = Vec::with_capacity(total_observations);
+        for _ in 0..THREAD_BATCHES {
+            time_operations(clock_id, large, &mut operation)?;
+            for observation in 0..OBSERVATIONS_PER_BATCH {
+                let (small_elapsed, large_elapsed) = if observation % 2 == 0 {
+                    let small_elapsed = time_operations(clock_id, small, &mut operation)?;
+                    (small_elapsed, time_operations(clock_id, large, &mut operation)?)
+                } else {
+                    let large_elapsed = time_operations(clock_id, large, &mut operation)?;
+                    (time_operations(clock_id, small, &mut operation)?, large_elapsed)
+                };
+                small_observations.push(small_elapsed);
+                large_observations.push(large_elapsed);
+            }
         }
-        for observation in 0..OBSERVATIONS_PER_ROUND {
-            let measure = |count: usize,
-                           operation: &mut dyn FnMut() -> Result<
-                (),
-                seismic_compiler::errors::TargetError,
-            >|
-             -> Result<u64, seismic_compiler::errors::TargetError> {
-                let start = unsafe { clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) };
-                for _ in 0..count {
-                    operation()?;
-                }
-                Ok(unsafe { clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) }.saturating_sub(start))
-            };
-            let (small_elapsed, large_elapsed) = if observation % 2 == 0 {
-                (
-                    measure(small, &mut operation)?,
-                    measure(large, &mut operation)?,
-                )
-            } else {
-                let large_elapsed = measure(large, &mut operation)?;
-                let small_elapsed = measure(small, &mut operation)?;
-                (small_elapsed, large_elapsed)
-            };
-            small_observations.push(small_elapsed);
-            large_observations.push(large_elapsed);
+        let candidate = paired_batch_mean_confidence_interval(
+            &small_observations,
+            &large_observations,
+            large - small,
+            OBSERVATIONS_PER_BATCH,
+            timer_tick.saturating_mul((OBSERVATIONS_PER_BATCH * 2) as u64),
+        )?;
+        last_interval = candidate;
+        if let Some(per_unit) = candidate.filter(|interval| is_qualified(*interval, percent)) {
+            accepted = Some((small, large, small_observations, large_observations, per_unit));
+            break;
+        }
+        match seismic_estimator::escalate_observation_units(difference, round.elapsed(), candidate, percent) {
+            Some(next) => difference = next,
+            None => break,
         }
     }
-    let per_unit = paired_batch_mean_confidence_interval(
-        &small_observations,
-        &large_observations,
-        workload_units,
-        OBSERVATIONS_PER_ROUND,
-        timer_tick.saturating_mul((OBSERVATIONS_PER_ROUND * 2) as u64),
-    )?
-    .ok_or_else(|| {
-        seismic_compiler::errors::TargetError::DeviceUnavailable(format!(
-            "service probe `{}` had a nonpositive adjacent-count mean across its fixed eight-round acquisition",
-            class.stable_name(),
-        ))
-    })?;
-    qualify(class, per_unit, 1)?;
+    let (small, large, small_observations, large_observations, per_unit) =
+        accepted.ok_or_else(|| match last_interval {
+            Some(interval) => seismic_compiler::errors::TargetError::DeviceUnavailable(format!(
+                "service probe `{}` interval {}/{}..{}/{} ns exceeded its {percent}% relative half-width qualification within {MAX_HOST_ACQUISITION_ROUNDS} acquisitions",
+                class.stable_name(),
+                interval.lower_numerator,
+                interval.denominator,
+                interval.upper_numerator,
+                interval.denominator,
+            )),
+            None => seismic_compiler::errors::TargetError::DeviceUnavailable(format!(
+                "service probe `{}` had a nonpositive adjacent-count mean across its last {THREAD_BATCHES}-batch acquisition",
+                class.stable_name(),
+            )),
+        })?;
+    let workload_units = large - small;
     let acquisition_duration_ns = acquisition_started.elapsed().as_nanos() as u64;
     Ok(ServiceDefinition {
         class,
@@ -1939,8 +1919,8 @@ fn host_compute_definition(
             batches: vec![paired_measurement_batch(
                 probe,
                 THREAD_METHOD,
-                small as u64 * units_per_operation,
-                large as u64 * units_per_operation,
+                small,
+                large,
                 timer_resolution,
                 small_observations,
                 large_observations,
@@ -2012,9 +1992,7 @@ mod tests {
     use super::{
         confidence_interval, is_qualified, paired_batch_mean_confidence_interval,
         paired_difference_confidence_interval, paired_matched_confidence_interval,
-        paired_measurement_batch, probe_source, DurationInterval, F16_TO_F32, F32_COMPARE,
-        F32_DIVIDE, F32_FMA, F32_MIN_MAX, F32_MULTIPLY, F32_REMAINDER, F32_TO_BF16, F32_TO_F16,
-        F32_TO_INTEGER, INTEGER_TO_F32, PROBE_METHOD,
+        paired_measurement_batch, probe_source, DurationInterval, MetalService, PROBE_METHOD,
     };
 
     #[test]
@@ -2171,26 +2149,26 @@ mod tests {
     #[test]
     fn every_split_f32_family_has_a_compiled_matched_baseline() {
         let source = probe_source(true, false);
-        for class in [
-            F32_MULTIPLY,
-            F32_DIVIDE,
-            F32_REMAINDER,
-            F32_MIN_MAX,
-            F32_FMA,
-            F32_TO_INTEGER,
-            INTEGER_TO_F32,
-            F32_TO_F16,
-            F16_TO_F32,
-            F32_TO_BF16,
+        for service in [
+            MetalService::F32Multiply,
+            MetalService::F32Divide,
+            MetalService::F32Remainder,
+            MetalService::F32MinMax,
+            MetalService::F32Fma,
+            MetalService::F32ToInteger,
+            MetalService::IntegerToF32,
+            MetalService::F32ToF16,
+            MetalService::F16ToF32,
+            MetalService::F32ToBf16,
         ] {
-            let baseline = super::matched_baseline_function(class).unwrap();
+            let baseline = super::matched_baseline_function(service).unwrap();
             assert!(source.contains(&format!("kernel void {baseline}")));
         }
     }
 
     #[test]
     fn control_dependent_strict_compare_is_measured_as_its_closed_helper_service() {
-        assert!(super::matched_baseline_function(F32_COMPARE).is_none());
+        assert!(super::matched_baseline_function(MetalService::F32Compare).is_none());
         assert!(probe_source(false, false).contains("kernel void seismic_probe_f32_compare"));
     }
 

@@ -719,7 +719,7 @@ impl Executor {
     }
     /// Whether the executor forms Metal tensor operations: Apple GPU family
     /// 10 or later with a compiler that forms the tensor probe
-    /// (`seismic_metal::profile::forms_tensor_operations`), the fact the
+    /// (`seismic_metal::profile::MetalProbeAnswers::forms_tensor_operations`), the fact the
     /// opened device's native sources are formed under. Always false on the
     /// other backends, whose kernels have no such form.
     pub fn forms_tensor_operations(&self) -> bool {

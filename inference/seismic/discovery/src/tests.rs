@@ -3,6 +3,7 @@
 
 use crate::gather::{Gathered, Natives};
 use crate::Inventory;
+use seismic_native_target::{ArtifactStore, MemoryStore};
 use seismic_topology::fixtures::{
     assert_consistent, executor, placement, rtx3090, rtx3090_host, rtx3090_uuid, rtx3090_volume,
     show, strix_halo_linux, topology, uuid, volume, STRIX_HALO_LINUX_UUID,
@@ -13,6 +14,11 @@ use seismic_topology::{
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// The program store of a test's inventory.
+fn store() -> Arc<dyn ArtifactStore> {
+    Arc::new(MemoryStore::default())
+}
 
 fn gathered(reports: Reports) -> Gathered {
     Gathered {
@@ -72,7 +78,7 @@ fn a_changed_refresh_leaves_no_identifier_at_its_old_revision() {
         reports.volumes.push(rtx3090_volume("/models"));
         gathered(reports)
     };
-    let inventory = Inventory::from_gathered(vec![PathBuf::from("/models")], strix(0));
+    let inventory = Inventory::from_gathered(vec![PathBuf::from("/models")], store(), strix(0));
     let before = inventory.topology();
     // The same machine keeps its revision and identifiers.
     let same = inventory.advance(strix(0));
@@ -108,7 +114,7 @@ fn a_changed_refresh_leaves_no_identifier_at_its_old_revision() {
 /// executor on the same device has grants a heap budget reads.
 #[test]
 fn a_sample_reads_the_grants_of_its_executors_alone() {
-    let inventory = Inventory::from_gathered(Vec::new(), gathered(rtx3090()));
+    let inventory = Inventory::from_gathered(Vec::new(), store(), gathered(rtx3090()));
     let topology = inventory.topology();
     let gpu = PhysicalIdentity::Uuid(rtx3090_uuid());
     let cuda = executor(&topology, BackendName::Cuda, &gpu).id();
@@ -140,9 +146,9 @@ fn a_sample_reads_the_grants_of_its_executors_alone() {
 #[test]
 fn the_machine_is_discovered_and_sampled() {
     let directory = std::env::temp_dir();
-    let gathered = crate::gather::gather(&[directory.clone()]).unwrap();
+    let gathered = crate::gather::gather(&[directory.clone()], &MemoryStore::default()).unwrap();
     eprintln!("{:#?}", gathered.reports);
-    let inventory = Inventory::from_gathered(vec![directory.clone()], gathered);
+    let inventory = Inventory::from_gathered(vec![directory.clone()], store(), gathered);
     let topology = inventory.topology();
     show("This machine", &topology);
     assert_consistent(&topology);

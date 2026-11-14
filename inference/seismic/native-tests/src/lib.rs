@@ -13,18 +13,13 @@ include!(concat!(env!("OUT_DIR"), "/fixtures.rs"));
 /// test selects none; a requested backend inside it must be available and
 /// open, as absence is never a successful empty run.
 ///
-/// Every device opens with the test binary's one store of compiled
-/// programs: a program its tests form again, for another case, device or
-/// test, compiles once in the process, the first time any test forms it,
-/// and loads from the store after. A test that observes its compiles opens
-/// its devices with its own store ([`devices_with`]).
+/// Every device forms through the user store, the one store of the process
+/// (`seismic::ProgramStore::user`): a program any test of any process of
+/// the user formed, for any case, device or test, loads from the store, and
+/// one the process forms compiles once. A test that observes its compiles
+/// opens its devices with its own store ([`devices_with`]).
 pub fn devices(backends: &[seismic::BackendName]) -> Vec<seismic::Device> {
-    static COMPILED: std::sync::LazyLock<std::sync::Arc<seismic::MemoryStore>> =
-        std::sync::LazyLock::new(Default::default);
-    devices_with(
-        backends,
-        seismic::DeviceOptions { artifacts: Some(COMPILED.clone()), ..Default::default() },
-    )
+    devices_with(backends, Default::default())
 }
 
 /// What a test forms before it touches a device, for one backend it runs

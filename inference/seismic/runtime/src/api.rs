@@ -784,10 +784,10 @@ pub mod device {
         pub(crate) programs: crate::backends::DevicePrograms,
         /// The active submission trace, if any (`native::trace`).
         pub(crate) trace: std::sync::Mutex<Option<Arc<crate::native::trace::TraceSink>>>,
-        /// The artifact store this device was opened with; its program
-        /// former keeps artifacts there. A device is shared only with callers
-        /// asking for the same store.
-        pub(crate) artifacts: Option<Arc<dyn crate::artifacts::ArtifactStore>>,
+        /// The program store this device was opened with; its program
+        /// former forms through it. A device is shared with callers naming
+        /// no store or the same one.
+        pub(crate) artifacts: Arc<crate::artifacts::ProgramStore>,
         /// Native submission order and CUDA graph replays.
         pub(crate) native: crate::native::NativeState,
         /// What the device's recorded graphs hold for their census,
@@ -884,12 +884,6 @@ pub mod device {
         /// are the ones this device's charges and limits name.
         pub fn topology(&self) -> &Arc<DeviceTopology> {
             &self.topology
-        }
-        /// Whether this device's toolchain keeps what it compiles in the
-        /// platform's own cache (`seismic_native_target::Load::PlatformCached`),
-        /// which the process's normal exit leaves written.
-        pub fn platform_cached(&self) -> bool {
-            self.programs.platform_cached()
         }
         /// The host threads this device's own execution keeps busy while
         /// its work runs: a CPU device's worker pool's participants, the
@@ -1005,15 +999,17 @@ pub mod device {
             self.kind.allocation_address(allocation, offset)
         }
         /// What decides how a configuration measures on this device: the
-        /// device, its backend's identity, the toolchain that forms its
-        /// programs (a compiler, target or option change forms other
+        /// device, its backend's identity, the toolchain material that forms
+        /// its programs (a compiler, target or option change forms other
         /// programs from the same source), and the bytes a cold pass of its
         /// timing reads where it times cold passes
-        /// (`native::point::cold_bytes`).
+        /// (`native::point::cold_bytes`). Not the build of the backend's
+        /// formation code, which keys stored programs alone
+        /// ([`seismic_native_target::ToolchainIdentity::stored`]).
         pub fn tuning_identity(&self) -> String {
             let mut identity = format!("{};{}", self.info.name(), self.kind.tuning_identity());
             if let Some(toolchain) = self.programs.toolchain() {
-                identity = format!("{identity};toolchain {toolchain}");
+                identity = format!("{identity};toolchain {}", toolchain.material);
             }
             match crate::native::point::cold_bytes(self) {
                 Some(cold) => format!("{identity};cold passes {cold} bytes"),

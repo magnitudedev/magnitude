@@ -58,6 +58,11 @@ pub use direct::{
     SharedEvent, DIRECT_BUFFER_SLOTS, DIRECT_WORD_BYTES_LIMIT,
 };
 pub use executor::MetalExecutor;
+
+/// The programs of one opened Metal device: the one way this backend forms
+/// a program ([`seismic_native_target::Programs`]).
+pub type MetalPrograms =
+    std::sync::Arc<dyn seismic_native_target::Programs<toolchain::MetalToolchain>>;
 pub use facts::MetalFacts;
 use seismic_ir::metal::MetalIntrinsic;
 
@@ -183,17 +188,17 @@ pub(crate) fn native_launch_constraints(
 }
 
 impl seismic_native_target::NativeCompiler<Metal> for MetalNativeCompiler {
-    type Context = DeviceHandle;
+    type Context = MetalPrograms;
     type Candidate = NativeCandidate;
     type Handle = Pipeline;
     fn form(
         &self,
         context: &Self::Context,
-        target: &DeviceDescription<Metal>,
+        _target: &DeviceDescription<Metal>,
         kernel: &seismic_ir::kernel::Kernel<Metal>,
         layout: &seismic_ir::physical_target::KernelEmissionLayout,
     ) -> Result<Self::Candidate, NativeCompilationError> {
-        pooled(|| compile::compile_kernel(context, target, kernel, layout))
+        pooled(|| compile::form_kernel(context, kernel, layout))
     }
     fn reflect(
         &self,
@@ -204,14 +209,14 @@ impl seismic_native_target::NativeCompiler<Metal> for MetalNativeCompiler {
     ) -> Result<NativeKernelReflection<Metal, Self::Handle>, NativeCompilationError> {
         let reflection_started = Instant::now();
         let pipeline_threads = u64::try_from(
-            candidate.pipeline.state.maxTotalThreadsPerThreadgroup(),
+            candidate.pipeline().state.maxTotalThreadsPerThreadgroup(),
         )
         .map_err(|_| {
             NativeCompilationError::MalformedToolchainOutput(
                 "Metal pipeline thread limit exceeds u64".into(),
             )
         })?;
-        let static_local = u64::try_from(candidate.pipeline.state.staticThreadgroupMemoryLength())
+        let static_local = u64::try_from(candidate.pipeline().state.staticThreadgroupMemoryLength())
             .map_err(|_| {
                 NativeCompilationError::MalformedToolchainOutput(
                     "Metal pipeline static threadgroup memory exceeds u64".into(),
@@ -222,7 +227,7 @@ impl seismic_native_target::NativeCompiler<Metal> for MetalNativeCompiler {
                 "Metal pipeline reflects an empty threadgroup domain".into(),
             ));
         }
-        let subgroup_width = u32::try_from(candidate.pipeline.state.threadExecutionWidth())
+        let subgroup_width = u32::try_from(candidate.pipeline().state.threadExecutionWidth())
             .map_err(|_| {
                 NativeCompilationError::MalformedToolchainOutput(
                     "Metal pipeline SIMD width exceeds u32".into(),
@@ -283,7 +288,7 @@ impl seismic_native_target::NativeCompiler<Metal> for MetalNativeCompiler {
             metadata_bytes: candidate.metadata_bytes,
         };
         Ok(NativeKernelReflection::new(
-            candidate.pipeline,
+            candidate.into_handle(),
             description,
             metrics,
         ))

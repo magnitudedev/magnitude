@@ -5,7 +5,7 @@
 //! family-agnostic). The 4B covers the dense, attention, recurrent-state and
 //! selection cases; the 35B covers the routed ones (route, group, expand,
 //! output, experts, combine). With a kernel cache, a second load uses every
-//! stored tuning result (and, on CUDA, every stored image) and tunes nothing.
+//! stored tuning result and tunes nothing.
 //!
 //! `cargo test --release -p magnitude-engine --test native_tuning -- --ignored
 //! --test-threads 1 --nocapture` (CUDA: with `SEISMIC_NVRTC_DIRECTORY` naming
@@ -92,9 +92,6 @@ fn prepare_every_entry(
         PlatformConfig {
             graph_cost: None,
             path: ExecutionPath::Native,
-            artifacts: cache
-                .clone()
-                .map(|cache| cache as Arc<dyn seismic::ArtifactStore>),
         },
     )
     .unwrap();
@@ -176,9 +173,9 @@ fn the_pinned_35b_tunes_every_entry_once_on_real_weights() {
 }
 
 /// Tuning spec §C and §E4 check 2: the first load with an empty kernel cache
-/// searches every unit and stores its result (and, on CUDA, every formed
-/// image); the second load uses every stored result, choosing the same
-/// configurations without forming or measuring anything to tune.
+/// searches every unit and stores its result; the second load uses every
+/// stored result, choosing the same configurations without forming or
+/// measuring anything to tune.
 #[test]
 #[ignore = "reads the pinned 4B GGUF; needs Metal or CUDA"]
 fn the_pinned_4b_uses_stored_tuning_on_its_second_load() {
@@ -186,7 +183,7 @@ fn the_pinned_4b_uses_stored_tuning_on_its_second_load() {
         std::env::temp_dir().join(format!("magnitude-kernel-cache-4b-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let cache = Arc::new(KernelCache::open(root.clone(), DEFAULT_KERNEL_CACHE_BYTES).unwrap());
-    let (backend, loads) = prepare_every_entry(&PINNED_4B, Some(cache), 2);
+    let (_, loads) = prepare_every_entry(&PINNED_4B, Some(cache), 2);
     let files = |directory: &str| std::fs::read_dir(root.join(directory)).unwrap().count();
     let (first, second) = (&loads[0], &loads[1]);
     assert!(first
@@ -205,12 +202,5 @@ fn the_pinned_4b_uses_stored_tuning_on_its_second_load() {
             .collect::<Vec<_>>()
     };
     assert_eq!(choices(first), choices(second));
-    // Seismic stores formed images under one directory per toolchain
-    // namespace.
-    if backend == BackendName::Cuda {
-        assert!(files("artifacts/cuda") > 0, "CUDA images are stored");
-    } else {
-        assert!(!root.join("artifacts/cuda").exists());
-    }
     std::fs::remove_dir_all(root).unwrap();
 }

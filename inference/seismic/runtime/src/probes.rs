@@ -10,8 +10,9 @@
 //! artifact store, keyed by the executor's identity (its device's UUID, its
 //! backend, and its driver as the backend reports it, the version among
 //! it), the backend's probe revision and its declared probes: a driver
-//! update, or a changed probe, runs the probes again. Until then every probe
-//! takes its safe value (`seismic_lang::device`): a load before the job has
+//! update, or a changed probe, runs the probes again, as do kept results
+//! that do not decode, a miss like none kept ([`stored`]). Until then every
+//! probe takes its safe value (`seismic_lang::device`): a load before the job has
 //! run claims no capability a probe has not shown, so it may be slower, and
 //! where a probe decides a numeric mode (fp32 round-to-nearest-even
 //! division) it computes in the device's default mode until the probe holds.
@@ -24,9 +25,70 @@ use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-/// The artifact namespace of stored probe results: measurement-job output,
-/// which a store keeps whatever its use time.
-pub const NAMESPACE: &str = "probes";
+/// The artifact namespace of stored probe results ([`seismic_native_target::PROBES`]).
+pub use seismic_native_target::PROBES as NAMESPACE;
+
+/// The measurement job's probes this process has started, each in a probe
+/// process of its own ([`run`]).
+static JOB_PROBES_RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many device probes this process has run: each of the measurement
+/// job's probes it started in a probe process ([`run`]), and each Metal
+/// capability probe set run where the store lacked its answers
+/// (`seismic_metal::profile::probe_runs`). A process that finds every
+/// answer stored, and runs no measurement job, runs none.
+pub fn probe_runs() -> u64 {
+    let runs = JOB_PROBES_RUN.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(target_os = "macos")]
+    let runs = runs + seismic_metal::profile::probe_runs();
+    runs
+}
+
+/// Stored probe results this process found damaged ([`stored`]).
+static PROBE_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many stored probe results this process found damaged, each a miss
+/// probed again: the measurement job's ([`stored`]) and Metal's capability
+/// answers (`seismic_metal::profile::probe_misses`).
+pub fn probe_misses() -> u64 {
+    let misses = PROBE_MISSES.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(target_os = "macos")]
+    let misses = misses + seismic_metal::profile::probe_misses();
+    misses
+}
+
+/// Carry each probe result kept in `directory`, one file per key as a
+/// store keeps them, that the user's store lacks into it, synced: how many
+/// were carried, once every one is on disk; why not, where the user's store
+/// is held in memory (its directory did not open) or a write failed. What
+/// is not carried stays in `directory`.
+pub fn carry(directory: &Path) -> Result<usize, String> {
+    let Some(user) = crate::artifacts::user_on_disk() else {
+        return Err("the user's program store is held in memory".into());
+    };
+    let listing = match std::fs::read_dir(directory) {
+        Ok(listing) => listing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(format!("{} does not list: {error}", directory.display())),
+    };
+    let mut carried = 0;
+    for item in listing {
+        let item = item.map_err(|error| format!("{} does not list: {error}", directory.display()))?;
+        // A temporary file names no key.
+        let Some(key) = item.file_name().to_str().and_then(ArtifactKey::parse) else {
+            continue;
+        };
+        if ArtifactStore::contains(user, NAMESPACE, &key) {
+            continue;
+        }
+        let bytes = std::fs::read(item.path()).map_err(|error| format!("{} does not read: {error}", item.path().display()))?;
+        if !user.put_synced(NAMESPACE, &key, &bytes) {
+            return Err(format!("{} is not written to the user's program store", key.as_str()));
+        }
+        carried += 1;
+    }
+    Ok(carried)
+}
 
 /// The first argument that starts the running executable as a probe
 /// process ([`serve_probe_if_asked`]).
@@ -50,24 +112,29 @@ fn key<P: Probes>(identity: &Identity, revision: u32) -> ArtifactKey {
     ArtifactKey::of(&[NAMESPACE.as_bytes(), &revision.to_le_bytes(), layout.as_bytes(), &identity])
 }
 
-/// What `store` holds of the probes of the executor of `identity`; every
-/// probe not run, or without a store, takes its safe value. Bytes the store
-/// returns were written here under a key that covers their layout: bytes
-/// that do not decode break the store's invariant, an error naming the key.
-pub(crate) fn stored<P: Probes>(store: Option<&dyn ArtifactStore>, identity: &Identity, revision: u32) -> Result<P, String> {
-    let Some(store) = store else {
-        return Ok(P::default());
-    };
+/// What `store` holds of the probes of the executor of `identity`: each
+/// probe it keeps no result of is unrun, and takes its safe value. Bytes the
+/// store returns were written here under a key that covers their layout,
+/// and synced: bytes that do not decode were damaged, which is reported and
+/// is a miss, the same as none kept. Every probe is then unrun, so the
+/// measurement job, which reads them here ([`run`]), runs each again,
+/// counted as any run, and stores the results over the damaged bytes.
+pub(crate) fn stored<P: Probes>(store: &dyn ArtifactStore, identity: &Identity, revision: u32) -> P {
     let key = key::<P>(identity, revision);
     let Some(bytes) = store.get(NAMESPACE, &key) else {
-        return Ok(P::default());
+        return P::default();
     };
-    postcard::from_bytes(&bytes).map_err(|error| {
-        format!(
-            "artifact store invariant broken: the probe results {NAMESPACE}/{} do not decode: {error}",
-            key.as_str()
-        )
-    })
+    match postcard::from_bytes(&bytes) {
+        Ok(probed) => probed,
+        Err(error) => {
+            PROBE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                "artifact store: the probe results {NAMESPACE}/{} do not decode ({error}): a miss, so the measurement job runs every probe again",
+                key.as_str()
+            );
+            P::default()
+        }
+    }
 }
 
 /// One probe's run that kept nothing, which the next job runs again.
@@ -124,7 +191,6 @@ pub struct ProbeRun {
 /// the probe's limit) or termination says nothing of the probe. Each runs at
 /// most [`PROBE_LIMIT`]; none is started at or past `deadline`, and one
 /// running at it is stopped.
-/// `Err` is a store whose bytes do not decode ([`stored`]).
 pub(crate) fn run<P: Probes>(
     store: &dyn ArtifactStore,
     identity: &Identity,
@@ -132,14 +198,15 @@ pub(crate) fn run<P: Probes>(
     program: &Path,
     device: &[&str],
     deadline: Instant,
-) -> Result<ProbeRun, String> {
-    let mut probed: P = stored(Some(store), identity, revision)?;
+) -> ProbeRun {
+    let mut probed: P = stored(store, identity, revision);
     let mut run = ProbeRun::default();
     for probe in probed.unrun() {
         if Instant::now() >= deadline {
             run.failures.push(ProbeFailure::Unstarted { probe });
             continue;
         }
+        JOB_PROBES_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (result, report) = match process(program, device, probe, deadline) {
             Ok(kept) => kept,
             Err(failure) => {
@@ -154,7 +221,7 @@ pub(crate) fn run<P: Probes>(
         store.put(NAMESPACE, &key::<P>(identity, revision), &postcard::to_allocvec(&probed).expect("probe results serialize"));
         run.kept.push(KeptProbe { probe, result, report });
     }
-    Ok(run)
+    run
 }
 
 /// One probe's process: its result, or how it kept nothing.
@@ -330,7 +397,7 @@ fn serve(arguments: &[String]) -> i32 {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::artifacts::MemoryStore;
+    use seismic_native_target::MemoryStore;
     use seismic_lang::device::vulkan::Probed;
 
     /// A process's answer is kept, and its crash after it began probing is
@@ -338,7 +405,7 @@ mod tests {
     /// a kill keeps nothing, so the next run asks it again, and only it; a program
     /// that cannot start runs nothing; what is kept is keyed by the
     /// identity, so another driver keeps nothing of it; and stored bytes that
-    /// do not decode are an error.
+    /// do not decode are a miss.
     #[test]
     fn probe_processes_keep_answers_and_crashes_and_retry_failures() {
         let directory = std::env::temp_dir().join(format!("seismic-probes-{}", std::process::id()));
@@ -359,28 +426,33 @@ mod tests {
         let store = MemoryStore::default();
         let later = Instant::now() + std::time::Duration::from_secs(30);
         let device = ["vulkan", "device"];
-        let first = run::<Probed>(&store, &identity, 1, &program, &device, later).unwrap();
+        let first = run::<Probed>(&store, &identity, 1, &program, &device, later);
         let kept = first.kept.iter().map(|kept| (kept.probe, kept.result.clone())).collect::<Vec<_>>();
         assert_eq!(kept[0], ("rte_32_division", ProbeResult::Answer(1)));
         assert!(matches!(&kept[1], ("wide_accumulators", ProbeResult::Unanswerable(reason)) if reason.contains("the compiler trapped")));
         assert_eq!(kept[2], ("register_file", ProbeResult::Answer(65536)));
         assert_eq!(first.kept[2].report, "registers: measured");
         assert!(matches!(&first.failures[..], [ProbeFailure::Failed { probe: "thread_registers", reason }] if reason.contains("before it began probing")));
-        let probed: Probed = stored(Some(&store), &identity, 1).unwrap();
+        let probed: Probed = stored(&store, &identity, 1);
         assert_eq!(probed.unrun(), ["thread_registers"]);
-        let again = run::<Probed>(&store, &identity, 1, &program, &device, later).unwrap();
+        let again = run::<Probed>(&store, &identity, 1, &program, &device, later);
         assert!(
             again.kept.is_empty() && matches!(&again.failures[..], [ProbeFailure::Failed { probe: "thread_registers", reason }] if reason.contains("no crash")),
             "only the failed probe runs again, and its kill keeps nothing: {:?}",
             again.failures
         );
         let updated = Identity { driver: "vulkan driver 4 version 2".into(), ..identity.clone() };
-        assert_eq!(stored::<Probed>(Some(&store), &updated, 1).unwrap().unrun().len(), 4);
-        assert_eq!(stored::<Probed>(Some(&store), &identity, 2).unwrap().unrun().len(), 4);
-        let absent = run::<Probed>(&store, &updated, 1, &directory.join("absent"), &device, later).unwrap();
+        assert_eq!(stored::<Probed>(&store, &updated, 1).unrun().len(), 4);
+        assert_eq!(stored::<Probed>(&store, &identity, 2).unrun().len(), 4);
+        let absent = run::<Probed>(&store, &updated, 1, &directory.join("absent"), &device, later);
         assert!(absent.kept.is_empty() && absent.failures.len() == 4);
         store.put(NAMESPACE, &key::<Probed>(&identity, 1), &[0xff; 3]);
-        assert!(stored::<Probed>(Some(&store), &identity, 1).is_err_and(|error| error.contains("do not decode")));
+        assert_eq!(stored::<Probed>(&store, &identity, 1).unrun().len(), 4, "damaged results are a miss");
+        let runs = JOB_PROBES_RUN.load(std::sync::atomic::Ordering::Relaxed);
+        let reprobed = run::<Probed>(&store, &identity, 1, &program, &device, later);
+        assert!(JOB_PROBES_RUN.load(std::sync::atomic::Ordering::Relaxed) - runs >= 4, "every probe of damaged results runs again, counted");
+        assert_eq!(reprobed.kept.len(), 3, "and what they keep is stored over the damage");
+        assert_eq!(stored::<Probed>(&store, &identity, 1).unrun(), ["thread_registers"]);
         std::fs::remove_dir_all(&directory).unwrap();
     }
 }

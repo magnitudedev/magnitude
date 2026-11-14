@@ -203,7 +203,9 @@ pub(super) const SUFFIX: &str = "\nvoid main() {\n    SEISMIC_KERNEL();\n}\n";
 #[cfg(all(test, not(target_os = "macos")))]
 mod tests {
     use super::*;
-    use seismic_native_target::{ProgramEntry, ProgramSource, Toolchain};
+    use crate::artifacts::ProgramStore;
+    use crate::formation::ProgramFormer;
+    use seismic_native_target::{ProgramEntry, ProgramSource};
     use seismic_vulkan::direct::{DirectBatch, DirectLaunch};
     use seismic_vulkan::toolchain::VulkanToolchain;
 
@@ -268,7 +270,7 @@ void main() {
             shared_int64_atomics: false,
         };
         let source = format!("{}{KERNEL}", header(features));
-        let toolchain = VulkanToolchain::new(device.clone());
+        let former = ProgramFormer::new(VulkanToolchain::new(device.clone()), ProgramStore::user());
         let source = ProgramSource {
             text: source,
             entries: vec![ProgramEntry {
@@ -277,7 +279,8 @@ void main() {
                 constants: Vec::new(),
             }],
         };
-        let (_, module) = toolchain.compile(&source).expect("the numerics kernel forms");
+        let formed = former.form(std::slice::from_ref(&source)).expect("the numerics kernel forms");
+        let (module, _) = formed[0].program(&source.entries[0]);
 
         let specials = [
             0.0f32,
@@ -346,7 +349,7 @@ void main() {
         let mut batch = DirectBatch::new(&device).expect("batch");
         batch
             .launch(&DirectLaunch {
-                module: &module,
+                module,
                 function: 0,
                 buffers: &[],
                 words: &[],
@@ -466,7 +469,7 @@ void main() {
             shared_int64_atomics: false,
         };
         let source = format!("{}{HALVES}", header(features));
-        let toolchain = VulkanToolchain::new(device.clone());
+        let former = ProgramFormer::new(VulkanToolchain::new(device.clone()), ProgramStore::user());
         let source = ProgramSource {
             text: source,
             entries: vec![ProgramEntry {
@@ -475,7 +478,8 @@ void main() {
                 constants: Vec::new(),
             }],
         };
-        let (_, module) = toolchain.compile(&source).expect("the conversion kernel forms");
+        let formed = former.form(std::slice::from_ref(&source)).expect("the conversion kernel forms");
+        let (module, _) = formed[0].program(&source.entries[0]);
 
         let mut inputs = Vec::new();
         for half in 0..=u16::MAX {
@@ -514,7 +518,7 @@ void main() {
         let mut batch = DirectBatch::new(&device).expect("batch");
         batch
             .launch(&DirectLaunch {
-                module: &module,
+                module,
                 function: 0,
                 buffers: &[],
                 words: &[],

@@ -887,8 +887,8 @@ fn launch(
     block: [u64; 3],
     shared: u64,
 ) -> Result<(), ExecutionError> {
-    let _keep_module_alive = &kernel.module;
-    if kernel.module.context.ordinal() != device.context.ordinal() {
+    let module = kernel.module();
+    if module.context().ordinal() != device.context.ordinal() {
         panic!("compiled CUDA kernel and execution device use different primary contexts")
     }
     let grid = grid.map(|v| {
@@ -901,12 +901,12 @@ fn launch(
         .unwrap_or_else(|_| panic!("prepared CUDA workgroup storage exceeds driver ABI"));
     let mut frame = frame;
     let mut params = [(&mut frame as *mut u64).cast::<c_void>()];
-    let context = &kernel.module.context;
+    let context = module.context();
     let _current = context.enter().map_err(submission_error)?;
     let status = unsafe {
         context.enqueue().launch(
             mode == CudaLaunchMode::CooperativeGrid,
-            kernel.function,
+            module.function(kernel.function),
             grid,
             block,
             shared,

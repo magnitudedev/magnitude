@@ -20,3 +20,7 @@ spirv-tools = "=0.13.3"
 seismic-compiler = { workspace = true, features = ["fixtures"] }
 # The recorded RTX 3090, whose heaps and reservations the backend is held to.
 seismic-topology = { workspace = true, features = ["fixtures"] }
+
+[build-dependencies]
+# The formation build identity (`toolchain::FORMATION_BUILD`).
+magnitude-source-identity = { path = "../../../engine/source-identity" }

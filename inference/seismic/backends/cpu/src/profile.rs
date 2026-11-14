@@ -109,7 +109,7 @@ pub(crate) fn profile_for_workers(
     let total_started = Instant::now();
     let probe_started = Instant::now();
     let services = services::probe_services(workers)?;
-    let composition_qualification = services::qualify_compositions(workers)?;
+    let composition_qualification = services::qualify_compositions(workers, &services)?;
     let probe_execution_ns = u64::try_from(probe_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let execution_parts = ExecutionProfileParts::new(
         device,

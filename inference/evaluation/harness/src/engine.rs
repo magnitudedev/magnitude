@@ -179,14 +179,14 @@ fn selected_machine(
 /// (`worker::measure::probe_machine`), each in a probe process of this
 /// executable, so the device's probed properties are measured before a
 /// check reads them; reports each result and each probe that kept none.
-/// Needs a kernel cache, where the results are kept.
+/// Needs a kernel cache, whose records select the device; the results are
+/// kept in the process's program store (`seismic::ProgramStore::user`).
 pub fn probe(artifacts: &Artifacts, options: &EngineOptions, load: &Load) -> Result<(), String> {
     let resolved = configuration(artifacts, options, load)?;
     let root = resolved.manifest.kernel_cache.as_ref().ok_or("probing needs a kernel cache (--cache-dir)")?;
     let (paths, _, selected) = selected_machine(artifacts, &resolved, root)?;
     let run = magnitude_engine::worker::measure::probe_machine(
         &paths,
-        root,
         selected.info.selector(),
         std::time::Duration::from_secs_f64(magnitude_executor::assessment::MEASUREMENT_SECONDS),
     )?;

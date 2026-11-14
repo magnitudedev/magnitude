@@ -1,16 +1,18 @@
 //! Programs: rendered native source compiled by a backend's toolchain.
-//! Backends that render source (Metal, CUDA, Vulkan) have a toolchain; the
-//! CPU backend compiles its kernels into the binary or JIT-compiles IR, and
-//! renders no source.
+//! Metal, CUDA and Vulkan render their native entries and Seismic-IR kernels
+//! as source in their languages (CUDA's IR kernels as PTX, a toolchain of
+//! their own); the CPU's native entries are compiled into the binary, and
+//! its toolchain forms Seismic-IR kernels from their CLIF text.
 //!
 //! A caller renders a [`ProgramSource`] in its backend's language and names
 //! the entries it needs from it. Variants of a templated kernel share one
 //! source text and differ only in their entry (a template instance), so one
-//! compile serves every variant it names. Whether and what a toolchain keeps
-//! between processes is its own decision: the runtime hands it a cache for
-//! the program's key and never interprets the bytes.
+//! compile serves every variant it names. A toolchain makes each compile's
+//! artifact and loads one; the runtime's program former keys, stores and
+//! reads them, and never interprets the bytes.
 
-use crate::NativeCompilationError;
+use crate::{ArtifactKey, NativeCompilationError};
+use std::sync::Arc;
 
 /// Rendered source in a backend's language and the entries a caller needs
 /// from it, in order.
@@ -42,97 +44,156 @@ impl ProgramEntry {
     }
 }
 
-/// What besides the source determines a toolchain's output: its compiler,
-/// target and options, and the device and system facts they consume.
+/// What besides the source determines a toolchain's output.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ToolchainIdentity {
     /// Where the toolchain's cached bytes are kept, apart from every other
     /// toolchain's.
     pub namespace: &'static str,
+    /// What decides how the programs it forms measure: its compiler, target
+    /// and options, and the device and system facts they consume. It keys
+    /// stored artifacts and tuning alike.
     pub material: String,
+    /// What keys a stored artifact beyond the material, and nothing else:
+    /// the build of the backend's formation code, so no artifact is served
+    /// to a build whose formation code differs, and what else the artifact
+    /// is code for that the tuning identity already implies (Metal's GPU
+    /// architecture, which its device does). Tuning is never keyed by it,
+    /// so a rebuild compiles again and keeps every tuning record.
+    pub stored: String,
 }
 
-/// How a backend's stored artifact serves a later process.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Load {
-    /// The artifact is everything that serves the program on this device
-    /// and driver: loading it compiles nothing. A driver may decline the
-    /// artifact's data (Vulkan's pipeline cache is a hint, never a promise),
-    /// so a load that would have to compile is a miss, which the former
-    /// compiles and stores again, as it does an artifact the store dropped.
-    Complete,
-    /// The artifact names the program, and loading it forms the program
-    /// again through the platform's own cache of what it compiled (Metal's
-    /// shader cache). What loading takes is the platform's: the former
-    /// counts these loads and the time they take, which is what shows
-    /// whether the platform still serves them.
-    PlatformCached,
-}
-
-/// What a toolchain compiles and the store keeps, as bytes.
+/// What a toolchain loads a program from: what the store keeps, as the
+/// bytes [`Toolchain::artifact`] made.
 pub trait Artifact: Sized + Send + Sync {
-    /// The version of [`Artifact::encode`]'s format, part of every key the
-    /// artifact is stored under: a changed encoding takes a new version, so
-    /// the bytes kept under a key always decode.
+    /// The version of the bytes' format, part of every key the artifact is
+    /// stored under: a changed encoding takes a new version, so the bytes
+    /// kept under a key always decode.
     const ENCODING: u32;
-    fn encode(&self) -> Vec<u8>;
-    /// The artifact `bytes` encode; none when they do not.
-    fn decode(bytes: &[u8]) -> Option<Self>;
+    /// Whether its platform opens it by path (Metal's archives), so a load
+    /// gives [`Artifact::decode`] the store's file of it, to open in place.
+    const IN_PLACE: bool = false;
+    /// The artifact `bytes` encode, which the store also keeps in `file`
+    /// where the artifact opens in place ([`Artifact::IN_PLACE`]) and the
+    /// store keeps them in one. None when they do not decode.
+    fn decode(bytes: &[u8], file: Option<&std::path::Path>) -> Option<Self>;
 }
 
 /// A backend's compiler for one opened device. A program is had in one of
 /// two ways: [`compile`] turns source into an artifact and the program it
 /// formed, and [`load`] makes the program of an artifact.
 ///
-/// The runtime's program former is this trait's one caller outside tests,
-/// and nothing else forms the programs a process serves. It keys every artifact by the
+/// The runtime's program former forms every program a process serves
+/// through it: native entries, Seismic-IR kernels, graph-cost kernels and
+/// analytical-service probes ([`Programs`]). It keys every artifact by the
 /// source and the toolchain's identity ([`ToolchainIdentity`]) and stores
 /// it, so whenever no live compile holds a program, in this process or a
-/// later one, it is loaded ([`Load`] says what that takes). What compiles
-/// outside it serves nothing: the device probes that toolchain identity is
-/// made of, which precede any toolchain; the device-property probes, which
-/// the measurement job runs in probe processes of their own; the
-/// analytical-service probes, whose measurements feed the estimator;
-/// offline coverage of whether a
-/// program forms; and Seismic's compiler of entries without a native
-/// implementation, which no load runs.
+/// later one, it is loaded, compiling nothing.
+///
+/// Every formation outside the store, with why, and nothing else:
+///
+/// Tests of a compiler or driver itself, below the runtime, which has the
+/// store (the backend crates cannot reach it without inverting the
+/// layering, and each tests the thing the store would wrap):
+/// - CUDA's copy-engine tests' spin and sum kernels (`transfer.rs`), its
+///   driver tests of frame and stack limits (`driver.rs`), its
+///   abandoned-launch test (`direct.rs`), and its graph-cost unit tests of
+///   the driver's graph accounting (`graph_cost.rs`).
+/// - Metal's executor, device and barrier tests of the driver
+///   (`executor.rs`, `device.rs`, `profile_tests.rs`, `tests/barrier.rs`).
+/// - The toolchains' own tests, of the compile and load the former calls:
+///   Metal's `tests/memory.rs`, `tests/timestamp_pool.rs` and
+///   `toolchain.rs`, Vulkan's `toolchain.rs`.
+/// - Vulkan's seal-pass test (`lib.rs`): GLSL to SPIR-V only, no device.
+/// - The backends' test [`Programs`] (Metal's `test_support.rs` `Compiled`,
+///   CUDA's `test_ptx_programs`, the CPU's `toolchain.rs` `test_programs`):
+///   each backend crate's own tests form IR kernels through its toolchain
+///   directly, because the runtime's former is above them. The CPU one
+///   compiles, encodes, decodes and loads every source, so the crate's
+///   tests run loaded code.
+///
+/// Tests in the runtime of the compiler's output, not of a device's
+/// formation:
+/// - `native/abi.rs`: GLSL compiled to SPIR-V to inspect it; no device.
+///
+/// Formations whose answer the store keeps, so each runs once per answer
+/// key by construction:
+/// - Metal's capability probes: run only on a miss of their stored answers
+///   (`MetalProbeAnswers`). They precede the toolchain, whose material their
+///   answers determine, so they cannot form through it.
+/// - Vulkan's measurement-job probes: run only by the measurement job, in a
+///   probe process of their own (a probe may crash the driver's compiler),
+///   for an answer the store lacks.
+///
+/// Offline tooling that serves nothing:
+/// - The runtime's coverage of whether a program forms
+///   (`native/coverage/forming.rs`); its caller keeps the verdicts.
+/// - `seismic/hardware/vulkan-facts`: a standalone fact-collection binary.
 ///
 /// [`compile`]: Toolchain::compile
 /// [`load`]: Toolchain::load
-pub trait Toolchain: Send + Sync {
+pub trait Toolchain: Send + Sync + 'static {
     type Artifact: Artifact;
     /// The executable program: one handle per requested entry, in order.
     type Program: Send + Sync + 'static;
-    const LOAD: Load;
+    /// What a compile leaves its artifact to be made of
+    /// ([`Toolchain::artifact`]), off the path that forms the program.
+    type Pending: Send + 'static;
 
-    /// The compiler, target, options, device and driver: what keys every
-    /// artifact beside its source.
+    /// The compiler, target, options, device and driver, and the build of
+    /// the formation code: what keys every artifact beside its source.
     fn identity(&self) -> &ToolchainIdentity;
 
-    /// The artifact of `source`'s entries, and the program the compile
-    /// formed of them, which the caller uses instead of loading it again
-    /// from the artifact.
+    /// The program of `source`'s entries, which the caller uses at once,
+    /// and what their artifact is made of ([`Toolchain::artifact`]).
     fn compile(
         &self,
         source: &ProgramSource,
-    ) -> Result<(Self::Artifact, Self::Program), NativeCompilationError>;
+    ) -> Result<(Self::Pending, Self::Program), NativeCompilationError>;
+
+    /// The bytes of the artifact of a compile that left `pending`
+    /// ([`Artifact::decode`]): everything that serves its program on this
+    /// device and driver, so a load of it compiles nothing. It runs off the
+    /// path that formed the program, on another thread; an error stores
+    /// nothing, and a later process compiles the program again.
+    fn artifact(&self, pending: Self::Pending) -> Result<Vec<u8>, NativeCompilationError>;
 
     /// The program of `entries` from `artifact`, compiled of a source
-    /// holding them, when no live compile holds them. For a
-    /// [`Load::Complete`] toolchain it compiles nothing: `None` where the
-    /// artifact does not serve them without compiling (a miss). A
-    /// [`Load::PlatformCached`] load forms them whatever the platform's
-    /// cache holds, so it never misses.
-    fn load(
-        &self,
-        artifact: &Self::Artifact,
-        entries: &[ProgramEntry],
-    ) -> Result<Option<Self::Program>, NativeCompilationError>;
+    /// holding them, when no live compile holds them. The artifact is
+    /// everything that serves the program on this device and driver, so a
+    /// load compiles nothing. A load that does not serve the program, for
+    /// any reason, is [`Declined`]: the platform would have to compile
+    /// (Vulkan's pipeline cache is a hint, never a promise), the driver
+    /// refuses the image (a CUBIN after a driver change), or the artifact
+    /// lacks a requested entry. A decline is a miss, never a failure: the
+    /// former compiles the entries and stores them again, as it does an
+    /// artifact the store dropped, and a failure of the device itself is
+    /// then the compile's.
+    fn load(&self, artifact: &Self::Artifact, entries: &[ProgramEntry]) -> Result<Self::Program, Declined>;
 
     /// What the backend's compiler reports `program`'s entry `entry` uses
     /// ([`ProgramStatistic`]), read from the driver when the program was
     /// formed; none for a backend whose compiler reports nothing.
     fn statistics(program: &Self::Program, entry: usize) -> &[ProgramStatistic];
+}
+
+/// Why a stored artifact did not serve a load ([`Toolchain::load`]): a
+/// miss, which the former reports, counts and compiles again. Any failure
+/// met while loading is one: the compile it causes meets it again if it is
+/// the device's, and fails with it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Declined(pub String);
+
+impl From<NativeCompilationError> for Declined {
+    fn from(error: NativeCompilationError) -> Self {
+        Self(error.to_string())
+    }
+}
+
+impl std::fmt::Display for Declined {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 /// What one launch's formed program uses: the threads of its workgroup,
@@ -163,4 +224,73 @@ pub enum StatisticValue {
     Int(i64),
     Uint(u64),
     Float(f64),
+}
+
+/// One compile of a source text: the executable program and the entries it
+/// holds, in the program's order. A [`Programs`] makes one of each compile
+/// or load it forms; a holder of some of a compile's entries may make one of
+/// those entries alone, out of a compile it was given, which is no compile
+/// of the device's live set.
+pub struct Compile<P> {
+    entries: Vec<ProgramEntry>,
+    program: P,
+}
+
+impl<P> Compile<P> {
+    /// The compile that holds `entries` in `program`.
+    pub fn new(entries: Vec<ProgramEntry>, program: P) -> Self {
+        Self { entries, program }
+    }
+
+    pub fn program(&self) -> &P {
+        &self.program
+    }
+
+    pub fn entries(&self) -> &[ProgramEntry] {
+        &self.entries
+    }
+}
+
+/// A formed source: the key of its text and the live compiles that
+/// together hold every entry requested of it.
+pub struct Formed<P> {
+    key: ArtifactKey,
+    compiles: Vec<Arc<Compile<P>>>,
+}
+
+impl<P> Formed<P> {
+    /// The source keyed `key`, its entries held by `compiles`.
+    pub fn new(key: ArtifactKey, compiles: Vec<Arc<Compile<P>>>) -> Self {
+        Self { key, compiles }
+    }
+
+    pub fn key(&self) -> &ArtifactKey {
+        &self.key
+    }
+
+    /// The compile that holds `entry` and the entry's position in it.
+    pub fn entry(&self, entry: &ProgramEntry) -> (&Arc<Compile<P>>, usize) {
+        self.compiles
+            .iter()
+            .find_map(|compile| {
+                let position = compile.entries.iter().position(|held| held == entry)?;
+                Some((compile, position))
+            })
+            .expect("a formed source holds every entry it was requested for")
+    }
+
+    /// The program of `entry` and its position in it ([`Formed::entry`]).
+    pub fn program(&self, entry: &ProgramEntry) -> (&P, usize) {
+        let (compile, position) = self.entry(entry);
+        (compile.program(), position)
+    }
+}
+
+/// The programs of one opened device under toolchain `T`: the one way code
+/// of a backend forms a program. The runtime's program former implements it
+/// over the process's program store, so a program any process of the user
+/// formed is loaded, and one formed in this process is held or waited for,
+/// never formed twice ([`Toolchain`]). Formed sources come back in order.
+pub trait Programs<T: Toolchain>: Send + Sync {
+    fn form(&self, sources: &[ProgramSource]) -> Result<Vec<Formed<T::Program>>, NativeCompilationError>;
 }

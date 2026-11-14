@@ -29,9 +29,11 @@ impl Devices {
         Self { inventory }
     }
 
-    /// Devices over a newly discovered inventory serving `paths`.
+    /// Devices over a newly discovered inventory serving `paths`, its
+    /// probe answers (Metal's capability probes) read from and kept in the
+    /// process's store ([`crate::artifacts::ProgramStore::user`]).
     pub fn discover(paths: &[PathBuf]) -> Result<Self, DiscoveryError> {
-        Inventory::discover(paths).map(|inventory| Self::new(Arc::new(inventory)))
+        Inventory::discover(paths, crate::artifacts::ProgramStore::user()).map(|inventory| Self::new(Arc::new(inventory)))
     }
 
     /// The inventory these devices are over.
@@ -71,12 +73,7 @@ impl Devices {
         let mut opened = opened().lock().expect("opened executors lock poisoned");
         opened.retain(|_, device| device.strong_count() != 0);
         if let Some(device) = opened.get(&id).and_then(Weak::upgrade) {
-            let same = match (&device.artifacts, &options.artifacts) {
-                (_, None) => true,
-                (Some(open), Some(requested)) => Arc::ptr_eq(open, requested),
-                (None, Some(_)) => false,
-            };
-            if !same {
+            if options.artifacts.as_ref().is_some_and(|requested| !Arc::ptr_eq(&device.artifacts, requested)) {
                 return Err(OpenError::ArtifactStoreConflict(info.selector()));
             }
             return Ok(device);
@@ -134,15 +131,14 @@ impl Devices {
                 let program = std::env::current_exe()
                     .map_err(|error| unavailable(format!("locating the running executable for its probes: {error}")))?;
                 let device = seismic_vulkan::probe::argument(&uuid);
-                crate::probes::run::<seismic_vulkan::Probed>(
+                Ok(crate::probes::run::<seismic_vulkan::Probed>(
                     store,
                     &identity,
                     seismic_vulkan::probe::REVISION,
                     &program,
                     &["vulkan", device.as_str()],
                     deadline,
-                )
-                .map_err(unavailable)
+                ))
             }
             #[cfg(target_os = "macos")]
             ExecutorSelector::Vulkan { .. } => unreachable!("this build discovers no Vulkan executor"),

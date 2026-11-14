@@ -1,4 +1,4 @@
-//! Execute target storage-plane views through the production typed builder/JIT.
+//! Execute target storage-plane views through the production typed builder and toolchain.
 use crate::{compile, open::open_quota, workers::LaunchFrame, Cpu};
 use seismic_ir::construction::Construction;
 use seismic_ir::kernel::dynamic::PortableSliceAxis;
@@ -129,7 +129,7 @@ fn plane_storage_views_preserve_types_packet_offsets_and_partial_words() {
             builder.close();
             let kernel = &construction.kernels()[0];
             let emission = target.kernel_emission_layout(kernel);
-            let native = compile::compile_kernel(target, kernel, &emission).unwrap();
+            let native = compile::compile_kernel(&crate::toolchain::test_programs(target), target, kernel, &emission).unwrap();
             let mut words = vec![1u64; emission.words.total as usize];
             for (binding, extent) in emission.words.bindings.iter().zip([n, total]) {
                 words[binding.first as usize] = extent;
@@ -213,7 +213,7 @@ fn rectangular_transpose_reshape_preserves_read_and_write_coordinates() {
     builder.close();
     let kernel = &construction.kernels()[0];
     let emission = target.kernel_emission_layout(kernel);
-    let native = compile::compile_kernel(target, kernel, &emission).unwrap();
+    let native = compile::compile_kernel(&crate::toolchain::test_programs(target), target, kernel, &emission).unwrap();
     let mut words = vec![0u64; emission.words.total as usize];
     for (binding, fields) in emission
         .words

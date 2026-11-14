@@ -33,6 +33,7 @@ impl Target {
         let chosen = select_device(&devices, ExecutionPath::Native, DeviceRequest::Backend(backend), &MemoryReserves::of_machine(None))
             .map_err(|error| error.to_string())?;
         let id = devices.resolve(chosen.info.selector()).map_err(|error| error.to_string())?;
+        // Opened as a load opens its device.
         let device = devices.open(id).map_err(|error| error.to_string())?;
         let topology = device.topology();
         let store = match selected {

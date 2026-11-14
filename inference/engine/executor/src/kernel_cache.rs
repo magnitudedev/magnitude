@@ -2,17 +2,14 @@
 //!
 //! The host names the directory (ACN passes `--cache-dir
 //! <dataDir>/cache/kernels`; `magnitude-harness` takes the same flag); without
-//! one, nothing is cached. Layout:
+//! one, no tuning result is kept. The programs a load forms and the
+//! measurement job's probe results are not the cache's: every device forms
+//! through Seismic's one store of the process (`seismic::ProgramStore::user`),
+//! whichever cache a load names. The directory is a Seismic [`DirectoryStore`],
+//! which owns its files, their writes and their eviction: the cache is the
+//! engine's entries in it. Layout:
 //!
 //! ```text
-//! <root>/artifacts/<namespace>/<key>   the artifacts of the programs Seismic
-//!                                      compiled (CUDA's cubin, Vulkan's SPIR-V with
-//!                                      its pipeline cache data, Metal's source and
-//!                                      entries) and which artifact holds each entry,
-//!                                      one namespace per toolchain (its
-//!                                      ArtifactStore)
-//! <root>/artifacts/probes/<key>        the measurement job's probe results for one
-//!                                      device and driver (`seismic::PROBE_NAMESPACE`)
 //! <root>/tuning/<key>.json             one unit's choice per tuning key: what a load
 //!                                      serves and what it holds that choice to,
 //!                                      replaced whole when the unit's search changes
@@ -22,7 +19,7 @@
 //!                                      from: every candidate and measurement of the
 //!                                      unit's search, named by the key and a digest
 //!                                      of its own bytes, which the choice states
-//! <root>/prepared/<key>                a Prepare of the load this key names ran to
+//! <root>/prepared/<key>.json           a Prepare of the load this key names ran to
 //!                                      its end: a load asked to report unprepared
 //!                                      units finds none before it opens a device
 //! <root>/records/<digest>.json         Seismic's measurement records, one outcome
@@ -35,16 +32,24 @@
 //!                                      ([`KernelCache::measurement_attempts`])
 //! ```
 //!
-//! The measurement records, their attempts and the probe results are not the
-//! cache's entries; a probe result lost would leave loads on its safe value
-//! until a job probed again.
-//! A record is valid while its key (the executor's hardware and driver, the
-//! kernel's source, its configuration and point) matches, and is taken
-//! again when it does not; losing one costs a measurement job. An attempt is
-//! the measurement job's record of a point that ended jobs, and losing one
-//! would have the job retry a point that hangs the driver. So eviction never
-//! removes them and their use time is never kept; everything below about
-//! entries is about the other directories.
+//! A cache an earlier build kept also held `<root>/artifacts/`: the programs
+//! Seismic formed, by toolchain namespace, and the measurement job's probe
+//! answers (`artifacts/probes/<key>`). Opening such a cache carries each
+//! probe answer the user's store lacks into it, under the same key, which
+//! is still the answer's (the executor's identity, the probe revision and
+//! layout), so no job probes again for it; once every answer is on disk
+//! there, it removes the directory, once, off the opening path
+//! ([`KernelCache::open`]), and keeps it otherwise for a later opening. Until it is gone the
+//! directory is no entry of the cache: it counts against no capacity.
+//!
+//! The measurement records, their attempts, the point requests and the
+//! machine figures are not the cache's entries, and eviction never removes
+//! them. A record is valid while its key (the
+//! executor's hardware and driver, the kernel's source, its configuration and
+//! point) matches, and is taken again when it does not; losing one costs a
+//! measurement job. An attempt is the measurement job's record of a point
+//! that ended jobs, and losing one would have the job retry a point that
+//! hangs the driver.
 //!
 //! A unit's record is its choice and its evidence. They are separate files
 //! because their readers are: every load decodes the choice, and the
@@ -55,48 +60,28 @@
 //! made from:
 //!
 //! - The choice names its evidence by content. A record is written evidence
-//!   first, then the choice, each renamed into place; the evidence a
-//!   replaced choice named is removed after. A writer that dies between
-//!   leaves evidence no choice names, never a choice without its evidence
-//!   or with another's.
-//! - Eviction takes a record whole: the files of one tuning key are one
-//!   entry, of their summed size and their latest use.
+//!   first, then the choice; the evidence a replaced choice named is removed
+//!   after. A writer that dies between leaves evidence no choice names, never
+//!   a choice without its evidence or with another's.
+//! - The cache's layout makes both files one entry of the store, by the key
+//!   ([`layout`]), evicted whole, choice first: a reader then finds no
+//!   record, never a choice whose evidence is going.
 //!
 //! So evidence that a choice names and that cannot be read is a broken
-//! store, reported as that, not a miss. Program artifacts and entry
-//! pointers are Seismic's cache: one that does not decode or parse is
-//! reported, compiled again and rewritten.
-//!
-//! Every key of a record or a program artifact is a content address, so
-//! neither is ever invalidated: a changed input gives a new key. An entry
-//! pointer's key names the entry, and the artifact it names may be replaced.
-//! Eviction may take an artifact and leave its pointers; a pointer whose
-//! artifact is gone is a miss. Writes go to a temporary file in the same
-//! directory and are renamed into place, so concurrent processes never see a
-//! partial entry. Any other file that cannot be read or parsed is a miss (it
-//! is rewritten), never an error. Reading an entry refreshes its modification
-//! time, and opening the cache evicts the least recently used entries above
-//! its capacity.
+//! store, reported as that, not a miss. Any other file that cannot be read or
+//! parsed is a miss (it is rewritten), never an error.
 
 use seismic::measure::JsonFileStore;
 #[cfg(test)]
 use seismic::TuningTime;
-use seismic::{ArtifactKey, ArtifactStore, TuningResult};
+use seismic::{DirectoryStore, Eviction, TuningResult};
 use sha2::{Digest, Sha256};
-use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::sync::Arc;
 
 /// Bytes the cache keeps by default.
-pub const DEFAULT_KERNEL_CACHE_BYTES: u64 = 1 << 30;
+pub const DEFAULT_KERNEL_CACHE_BYTES: u64 = seismic::DEFAULT_STORE_CAPACITY;
 
-/// Temporary files older than this belong to a writer that died; eviction
-/// removes them.
-const ABANDONED_WRITE: Duration = Duration::from_secs(60 * 60);
-
-const ARTIFACTS: &str = "artifacts";
 const TUNING: &str = "tuning";
 const EVIDENCE: &str = "evidence";
 const PREPARED: &str = "prepared";
@@ -104,26 +89,52 @@ const RECORDS: &str = "records";
 const MEASUREMENT_ATTEMPTS: &str = "measurement-attempts";
 const MEASUREMENT_REQUESTS: &str = "measurement-requests";
 const MACHINE_FIGURES: &str = "machine-figures";
-/// The directories under the root that hold no entry: eviction never walks
-/// them.
+/// The directories under the root that hold no entry: eviction removes
+/// nothing of them but abandoned temporary files.
 const KEPT: [&str; 4] = [RECORDS, MEASUREMENT_ATTEMPTS, MEASUREMENT_REQUESTS, MACHINE_FIGURES];
+/// Where a cache of an earlier build kept the programs Seismic formed and
+/// the probe answers, which opening carries and removes ([`KernelCache::open`]).
+const FORMER_ARTIFACTS: &str = "artifacts";
 
-/// The bytes at `path`, refreshing its use time; `None` on any failure.
-fn read_entry(path: &Path) -> Option<Vec<u8>> {
-    let bytes = fs::read(path).ok()?;
-    if let Ok(file) = fs::File::options().write(true).open(path) {
-        // Best effort: a stale use time only makes the entry an earlier
-        // eviction candidate.
-        let _ = file.set_modified(SystemTime::now());
+/// How the store's eviction reads the cache's files (`DirectoryStore::open`): a
+/// unit's choice and the evidence it names one entry, by their key, the
+/// choice first; the measurements kept ([`KEPT`]), and what an earlier
+/// build kept of probe answers, until opening carries and removes them
+/// ([`FORMER_ARTIFACTS`]); any other file, the programs an earlier build
+/// kept among them, an entry of its own.
+fn layout(path: &Path) -> Eviction {
+    let directory = path.iter().next().and_then(|directory| directory.to_str()).unwrap_or_default();
+    let key = || {
+        let name = path.file_name().map(|name| name.to_string_lossy()).unwrap_or_default();
+        name.split('.').next().unwrap_or_default().to_owned()
+    };
+    match directory {
+        _ if KEPT.contains(&directory) => Eviction::Kept,
+        FORMER_ARTIFACTS if path.iter().nth(1).and_then(|namespace| namespace.to_str()) == Some(seismic::PROBE_NAMESPACE) => {
+            Eviction::Kept
+        }
+        TUNING => Eviction::Part { entry: key(), order: 0 },
+        EVIDENCE => Eviction::Part { entry: key(), order: 1 },
+        _ => Eviction::Alone,
     }
-    Some(bytes)
 }
 
 /// Where a cache keeps the evidence of one unit's stored choice: the
 /// Seismic result the choice was made from. Naming it reads nothing, and it
 /// is read wherever its reader is, on any thread.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StoredEvidence(PathBuf);
+#[derive(Clone, Debug)]
+pub struct StoredEvidence {
+    store: Arc<DirectoryStore>,
+    path: PathBuf,
+}
+
+impl PartialEq for StoredEvidence {
+    fn eq(&self, other: &Self) -> bool {
+        self.store.root() == other.store.root() && self.path == other.path
+    }
+}
+
+impl Eq for StoredEvidence {}
 
 impl StoredEvidence {
     /// The stored result. A choice names it and the store keeps the two
@@ -132,10 +143,10 @@ impl StoredEvidence {
         let broken = |detail: String| {
             format!(
                 "kernel cache invariant broken: tuning evidence {} that a stored choice names {detail}",
-                self.0.display()
+                self.store.root().join(&self.path).display()
             )
         };
-        let bytes = read_entry(&self.0).ok_or_else(|| broken("cannot be read".into()))?;
+        let bytes = self.store.read(&self.path).ok_or_else(|| broken("cannot be read".into()))?;
         serde_json::from_slice(&bytes).map_err(|error| broken(format!("does not parse: {error}")))
     }
 }
@@ -187,32 +198,67 @@ impl TuningCacheKey {
     }
 }
 
+/// Remove `former`, the programs a cache of an earlier build kept, on a
+/// thread of its own, off the path that opened the cache. A process that
+/// ends first leaves the rest for its next opening; a process removing it
+/// at once with another finds what the other removed gone.
+fn remove_former_artifacts(former: PathBuf) {
+    let removing = move || {
+        match std::fs::remove_dir_all(&former) {
+            Ok(()) => tracing::info!(
+                "kernel cache: removed {}, the programs an earlier build kept there; every program forms through the user's program store",
+                former.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!("kernel cache: cannot remove {}: {error}; its next opening removes it", former.display()),
+        }
+    };
+    if let Err(error) = std::thread::Builder::new().name("magnitude-cache-migrate".into()).spawn(removing) {
+        tracing::warn!("kernel cache: the removal of what an earlier build kept does not start: {error}; its next opening removes it");
+    }
+}
+
 /// A kernel cache directory.
 #[derive(Debug)]
 pub struct KernelCache {
-    root: PathBuf,
-    /// Distinguishes this process's concurrent temporary files.
-    writes: AtomicU64,
+    store: Arc<DirectoryStore>,
 }
 
 impl KernelCache {
-    /// Open the cache at `root`, creating it, and evict the least recently
-    /// used entries beyond `capacity` bytes.
+    /// Open the cache at `root`, creating it, keeping `capacity` bytes of
+    /// entries: the store begins evicting the least recently used beyond
+    /// them. What a cache of an earlier build kept of programs is removed,
+    /// its probe answers carried first into the user's store, before any
+    /// device opens with them.
     pub fn open(root: PathBuf, capacity: u64) -> Result<Self, KernelCacheError> {
-        for directory in [ARTIFACTS, TUNING, EVIDENCE, PREPARED] {
-            let path = root.join(directory);
-            fs::create_dir_all(&path).map_err(|error| KernelCacheError::Create { path, error })?;
+        let former = root.join(FORMER_ARTIFACTS);
+        // Its probe answers are carried, synced, before any device opens
+        // with them; it is removed only once every one is on disk in the
+        // user's store, which the key the job stored each under still reads
+        // (the executor's identity, the probe revision and layout).
+        let removable = former.is_dir()
+            && match seismic::carry_probe_results(&former.join(seismic::PROBE_NAMESPACE)) {
+                Ok(carried) => {
+                    if carried > 0 {
+                        tracing::info!("kernel cache: carried {carried} probe answers an earlier build kept in {} into the user's program store", former.display());
+                    }
+                    true
+                }
+                Err(reason) => {
+                    tracing::warn!("kernel cache: the probe answers an earlier build kept in {} are not carried ({reason}); it is kept for a later opening", former.display());
+                    false
+                }
+            };
+        let store = DirectoryStore::open(root.clone(), capacity, layout)
+            .map_err(|error| KernelCacheError::Create { path: root, error })?;
+        if removable {
+            remove_former_artifacts(former);
         }
-        let cache = Self {
-            root,
-            writes: AtomicU64::new(0),
-        };
-        cache.evict(capacity);
-        Ok(cache)
+        Ok(Self { store: Arc::new(store) })
     }
 
     pub fn root(&self) -> &Path {
-        &self.root
+        self.store.root()
     }
 
     /// The measurement job's attempt records kept in the kernel cache at
@@ -245,50 +291,23 @@ impl KernelCache {
         JsonFileStore::new(&root.join(MACHINE_FIGURES))
     }
 
-    fn entry(&self, directory: &str, key: &str, extension: &str) -> PathBuf {
-        self.root.join(directory).join(format!("{key}.{extension}"))
+    fn choice(key: &TuningCacheKey) -> PathBuf {
+        Path::new(TUNING).join(format!("{}.json", key.as_str()))
     }
 
-    fn artifact(&self, namespace: &str, key: &ArtifactKey) -> PathBuf {
-        self.root.join(ARTIFACTS).join(namespace).join(key.as_str())
-    }
-
-    /// The bytes at `path`, refreshing its use time; `None` on any failure.
-    fn read(&self, path: &Path) -> Option<Vec<u8>> {
-        read_entry(path)
-    }
-
-    /// Write `bytes` to `path` through a temporary file in the same
-    /// directory. A failure is reported and leaves no partial entry.
-    /// Returns whether the entry was written.
-    fn write(&self, path: &Path, bytes: &[u8]) -> bool {
-        let directory = path.parent().expect("cache entries live in a directory");
-        if let Err(error) = fs::create_dir_all(directory) {
-            tracing::warn!(
-                "kernel cache: cannot create {}: {error}",
-                directory.display()
-            );
-            return false;
+    fn evidence(&self, key: &TuningCacheKey, digest: &str) -> StoredEvidence {
+        StoredEvidence {
+            store: self.store.clone(),
+            path: Self::evidence_path(key, digest),
         }
-        let temporary = directory.join(format!(
-            ".{}.{}.{}.tmp",
-            path.file_name()
-                .expect("cache entries have names")
-                .to_string_lossy(),
-            std::process::id(),
-            self.writes.fetch_add(1, Ordering::Relaxed)
-        ));
-        let written = fs::File::create(&temporary)
-            .and_then(|mut file| file.write_all(bytes).and_then(|()| file.sync_all()))
-            .and_then(|()| fs::rename(&temporary, path));
-        if let Err(error) = &written {
-            let _ = fs::remove_file(&temporary);
-            tracing::warn!(
-                "kernel cache: cannot write {}: {error}",
-                path.display()
-            );
-        }
-        written.is_ok()
+    }
+
+    fn evidence_path(key: &TuningCacheKey, digest: &str) -> PathBuf {
+        Path::new(EVIDENCE).join(format!("{}.{digest}.json", key.as_str()))
+    }
+
+    fn prepared_path(key: &TuningCacheKey) -> PathBuf {
+        Path::new(PREPARED).join(format!("{}.json", key.as_str()))
     }
 
     /// The choice of the unit stored under `key`, if any parses, and where
@@ -297,13 +316,9 @@ impl KernelCache {
         &self,
         key: &TuningCacheKey,
     ) -> Option<(C, StoredEvidence)> {
-        let bytes = self.read(&self.entry(TUNING, key.as_str(), "json"))?;
+        let bytes = self.store.read(&Self::choice(key))?;
         let entry = serde_json::from_slice::<ChoiceEntry<C>>(&bytes).ok()?;
         Some((entry.choice, self.evidence(key, &entry.evidence)))
-    }
-
-    fn evidence(&self, key: &TuningCacheKey, digest: &str) -> StoredEvidence {
-        StoredEvidence(self.entry(EVIDENCE, &format!("{}.{digest}", key.as_str()), "json"))
     }
 
     /// Store a unit's record under `key`: the `evidence` its search made,
@@ -317,9 +332,10 @@ impl KernelCache {
         choice: &impl serde::Serialize,
         evidence: &TuningResult,
     ) {
-        let choice_path = self.entry(TUNING, key.as_str(), "json");
-        let replaced = fs::read(&choice_path)
-            .ok()
+        let choice_path = Self::choice(key);
+        let replaced = self
+            .store
+            .read(&choice_path)
             .and_then(|bytes| serde_json::from_slice::<ChoiceEntry<serde_json::Value>>(&bytes).ok())
             .map(|entry| entry.evidence);
         let bytes = serde_json::to_vec(evidence).expect("a tuning result serializes");
@@ -328,7 +344,7 @@ impl KernelCache {
             .take(8)
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        if !self.write(&self.evidence(key, &digest).0, &bytes) {
+        if !self.store.write(&self.evidence(key, &digest).path, &bytes) {
             return;
         }
         let entry = ChoiceEntry {
@@ -336,11 +352,11 @@ impl KernelCache {
             choice,
         };
         let bytes = serde_json::to_vec(&entry).expect("a tuning choice serializes");
-        if !self.write(&choice_path, &bytes) {
+        if !self.store.write(&choice_path, &bytes) {
             return;
         }
         if let Some(replaced) = replaced.filter(|replaced| *replaced != digest) {
-            let _ = fs::remove_file(self.evidence(key, &replaced).0);
+            self.store.remove(&self.evidence(key, &replaced).path);
         }
     }
 
@@ -354,114 +370,19 @@ impl KernelCache {
     /// all the same (another device, an evicted entry) is found when the
     /// load prepares its programs, as it would be without this entry.
     pub fn prepared(&self, key: &TuningCacheKey) -> bool {
-        self.read(&self.entry(PREPARED, key.as_str(), "json")).is_some()
+        self.store.read(&Self::prepared_path(key)).is_some()
     }
 
     /// Record that a Prepare of the load `key` names ran to its end.
     pub fn store_prepared(&self, key: &TuningCacheKey) {
-        self.write(&self.entry(PREPARED, key.as_str(), "json"), b"{}");
-    }
-
-    /// What `path` is evicted with: the files of one tuning key (its choice
-    /// and the evidence the choice names) are one entry; any other file is
-    /// its own.
-    fn eviction_entry(&self, path: &Path) -> PathBuf {
-        let record = [TUNING, EVIDENCE]
-            .iter()
-            .any(|directory| path.parent() == Some(self.root.join(directory).as_path()));
-        match path.file_name().and_then(|name| name.to_str()) {
-            Some(name) if record => {
-                let key = name.split('.').next().expect("a split has a first part");
-                self.root.join(TUNING).join(key)
-            }
-            _ => path.to_path_buf(),
-        }
-    }
-
-    /// Remove abandoned temporary files, then the least recently used
-    /// entries until the rest fit `capacity`. Every file under the root but
-    /// the measurement records and their attempts belongs to an entry
-    /// ([`Self::eviction_entry`]); an entry is as large as its files
-    /// together, was used when the latest of them was, and is removed whole.
-    /// The directories of [`KEPT`] and the stored probe results
-    /// (`seismic::PROBE_NAMESPACE`) are never walked.
-    fn evict(&self, capacity: u64) {
-        let now = SystemTime::now();
-        let mut files = Vec::new();
-        let mut directories = vec![self.root.clone()];
-        while let Some(directory) = directories.pop() {
-            let Ok(listing) = fs::read_dir(&directory) else {
-                continue;
-            };
-            for item in listing.flatten() {
-                let Ok(metadata) = item.metadata() else {
-                    continue;
-                };
-                let path = item.path();
-                if metadata.is_dir() {
-                    // Measurement records, the job's attempts and its probes'
-                    // results are valid by their key, not their use time.
-                    let probes = self.root.join(ARTIFACTS).join(seismic::PROBE_NAMESPACE);
-                    if path != probes && !KEPT.iter().any(|kept| path == self.root.join(kept)) {
-                        directories.push(path);
-                    }
-                    continue;
-                }
-                let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                if item.file_name().to_string_lossy().starts_with('.') {
-                    if now.duration_since(modified).unwrap_or_default() > ABANDONED_WRITE {
-                        let _ = fs::remove_file(&path);
-                    }
-                    continue;
-                }
-                files.push((modified, metadata.len(), path));
-            }
-        }
-        let mut entries = std::collections::HashMap::<PathBuf, (SystemTime, u64, Vec<PathBuf>)>::new();
-        for (modified, bytes, path) in files {
-            let entry = entries
-                .entry(self.eviction_entry(&path))
-                .or_insert((SystemTime::UNIX_EPOCH, 0, Vec::new()));
-            entry.0 = entry.0.max(modified);
-            entry.1 += bytes;
-            entry.2.push(path);
-        }
-        let mut entries = entries.into_values().collect::<Vec<_>>();
-        entries.sort_by(|left, right| right.0.cmp(&left.0));
-        let mut kept = 0u64;
-        for (_, bytes, paths) in entries {
-            kept += bytes;
-            if kept > capacity {
-                // The choice first: a reader then finds no record, never a
-                // choice whose evidence is going.
-                for path in paths.iter().filter(|path| path.parent() == Some(self.root.join(TUNING).as_path())) {
-                    let _ = fs::remove_file(path);
-                }
-                for path in &paths {
-                    let _ = fs::remove_file(path);
-                }
-            }
-        }
-    }
-}
-
-impl ArtifactStore for KernelCache {
-    fn get(&self, namespace: &str, key: &ArtifactKey) -> Option<Vec<u8>> {
-        self.read(&self.artifact(namespace, key))
-    }
-
-    fn contains(&self, namespace: &str, key: &ArtifactKey) -> bool {
-        self.artifact(namespace, key).is_file()
-    }
-
-    fn put(&self, namespace: &str, key: &ArtifactKey, bytes: &[u8]) {
-        self.write(&self.artifact(namespace, key), bytes);
+        self.store.write(&Self::prepared_path(key), b"{}");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn scratch(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -473,100 +394,38 @@ mod tests {
     }
 
     #[test]
-    fn a_corrupt_entry_is_a_miss_and_is_rewritten() {
+    fn a_corrupt_choice_is_a_miss_and_is_rewritten() {
         let root = scratch("corrupt");
         let cache = KernelCache::open(root.clone(), DEFAULT_KERNEL_CACHE_BYTES).unwrap();
         let key = TuningCacheKey::of("material");
-        fs::write(
-            root.join(TUNING).join(format!("{}.json", key.as_str())),
-            b"{ not json",
-        )
-        .unwrap();
+        fs::create_dir_all(root.join(TUNING)).unwrap();
+        fs::write(root.join(KernelCache::choice(&key)), b"{ not json").unwrap();
         assert!(cache.tuning::<serde_json::Value>(&key).is_none());
-        let path = cache.entry(TUNING, key.as_str(), "json");
-        cache.write(&path, b"rewritten");
-        assert_eq!(fs::read(&path).unwrap(), b"rewritten");
-        let leftovers = fs::read_dir(root.join(TUNING))
-            .unwrap()
-            .flatten()
-            .filter(|item| item.file_name().to_string_lossy().starts_with('.'))
-            .count();
-        assert_eq!(leftovers, 0, "no temporary file remains");
+        cache.store.write(&KernelCache::choice(&key), b"rewritten");
+        assert_eq!(fs::read(root.join(KernelCache::choice(&key))).unwrap(), b"rewritten");
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// A unit's choice and the evidence it names are one entry of the
+    /// store, the choice removed first; the load's prepared record of the
+    /// same key is another; the measurements and their attempts are no
+    /// entry, and eviction leaves them however old they are.
     #[test]
-    fn opening_evicts_the_least_recently_used_beyond_capacity() {
-        let root = scratch("evict");
-        let cache = KernelCache::open(root.clone(), DEFAULT_KERNEL_CACHE_BYTES).unwrap();
-        let old = cache.root.join(ARTIFACTS).join("metal").join("old");
-        let recent = cache.entry(TUNING, "recent", "json");
-        cache.write(&old, &[0; 600]);
-        cache.write(&recent, &[0; 600]);
-        let file = fs::File::options().write(true).open(&old).unwrap();
-        file.set_modified(SystemTime::now() - Duration::from_secs(3600))
-            .unwrap();
-        drop(KernelCache::open(root.clone(), 1000).unwrap());
-        assert!(!old.exists());
-        assert!(recent.exists());
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    /// Measurement records and the job's attempts are no entry of the
-    /// cache: eviction leaves them however old they are and whatever the
-    /// capacity.
-    #[test]
-    fn eviction_leaves_the_measurements() {
-        let root = scratch("measurements");
-        let kept = KEPT.map(|directory| {
-            fs::create_dir_all(root.join(directory)).unwrap();
-            let path = root.join(directory).join("digest.json");
-            fs::write(&path, [0; 600]).unwrap();
-            let file = fs::File::options().write(true).open(&path).unwrap();
-            file.set_modified(SystemTime::now() - Duration::from_secs(3600))
-                .unwrap();
-            path
-        });
-        drop(KernelCache::open(root.clone(), 0).unwrap());
-        assert!(kept.iter().all(|path| path.exists()));
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    /// A unit's choice and the evidence it names are one entry: as large
-    /// as both, used when either last was, kept or evicted together.
-    #[test]
-    fn a_record_is_kept_or_evicted_whole() {
-        let root = scratch("record");
-        let cache = KernelCache::open(root.clone(), DEFAULT_KERNEL_CACHE_BYTES).unwrap();
-        let aged = |path: &Path, seconds: u64| {
-            let file = fs::File::options().write(true).open(path).unwrap();
-            file.set_modified(SystemTime::now() - Duration::from_secs(seconds))
-                .unwrap();
-        };
-        let record = |name: &str| {
-            let choice = cache.entry(TUNING, name, "json");
-            let evidence = cache.entry(EVIDENCE, &format!("{name}.0123456789abcdef"), "json");
-            cache.write(&evidence, &[0; 600]);
-            cache.write(&choice, &[0; 600]);
-            (choice, evidence)
-        };
-        // A load read this record's choice just now and nothing of its
-        // evidence, which is older than the artifact beside it.
-        let (used_choice, used_evidence) = record("used");
-        aged(&used_evidence, 3600);
-        let artifact = cache.root.join(ARTIFACTS).join("metal").join("between");
-        cache.write(&artifact, &[0; 600]);
-        aged(&artifact, 1800);
-        let (idle_choice, idle_evidence) = record("idle");
-        aged(&idle_choice, 7200);
-        aged(&idle_evidence, 7200);
-        // Room for the record in use and no more: by its files' own ages
-        // its evidence would go and the artifact stay.
-        drop(KernelCache::open(root.clone(), 1500).unwrap());
-        assert!(used_choice.exists() && used_evidence.exists());
-        assert!(!artifact.exists());
-        assert!(!idle_choice.exists() && !idle_evidence.exists());
-        fs::remove_dir_all(root).unwrap();
+    fn the_layout_keeps_a_record_whole_and_the_measurements() {
+        let key = TuningCacheKey::of("material");
+        let entry = |order| Eviction::Part { entry: key.as_str().to_owned(), order };
+        assert_eq!(layout(&KernelCache::choice(&key)), entry(0));
+        assert_eq!(layout(&KernelCache::evidence_path(&key, "0123456789abcdef")), entry(1));
+        assert_eq!(layout(&KernelCache::prepared_path(&key)), Eviction::Alone);
+        let former_probes = Path::new(FORMER_ARTIFACTS).join(seismic::PROBE_NAMESPACE);
+        for directory in KEPT.iter().map(Path::new).chain([former_probes.as_path()]) {
+            assert_eq!(layout(directory), Eviction::Kept);
+            assert_eq!(layout(&directory.join("digest.json")), Eviction::Kept);
+        }
+        // An earlier build's programs are entries, evicted whether or not
+        // its probe answers have been carried.
+        assert_eq!(layout(Path::new(FORMER_ARTIFACTS)), Eviction::Alone);
+        assert_eq!(layout(&Path::new(FORMER_ARTIFACTS).join("metal").join("digest")), Eviction::Alone);
     }
 
     /// A stored choice names the evidence it was made from; replacing the

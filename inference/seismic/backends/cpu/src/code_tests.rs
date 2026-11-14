@@ -1,5 +1,5 @@
-//! JIT code freed with its last kernel is reused for the next kernel
-//! compiled; every participant must run the code written there last.
+//! Program code freed with its last kernel is reused for the next kernel
+//! loaded; every participant must run the code written there last.
 use crate::workers::{LaunchFrame, Workers};
 use crate::{compile, open::open_quota, Cpu};
 use seismic_ir::construction::Construction;
@@ -48,7 +48,7 @@ fn constant_writer(
     let kernel = &construction.kernels()[0];
     let emission = target.kernel_emission_layout(kernel);
     (
-        compile::compile_kernel(target, kernel, &emission).unwrap(),
+        compile::compile_kernel(&crate::toolchain::test_programs(target), target, kernel, &emission).unwrap(),
         emission,
     )
 }

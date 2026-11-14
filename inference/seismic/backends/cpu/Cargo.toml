@@ -17,8 +17,12 @@ libc = "0.2"
 cranelift-codegen = "=0.125.4"
 cranelift-frontend = "=0.125.4"
 cranelift-module = "=0.125.4"
-cranelift-jit = "=0.125.4"
 cranelift-native = "=0.125.4"
+cranelift-reader = "=0.125.4"
+
+[build-dependencies]
+# The formation build identity (`toolchain::FORMATION_BUILD`).
+magnitude-source-identity = { path = "../../../engine/source-identity" }
 
 [dev-dependencies]
 # The recorded machines, whose CPU reports the backend is held to.

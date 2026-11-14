@@ -633,8 +633,7 @@ mod internals {
         }
         let core_required: BTreeSet<_> = <CoreService as AnalyticalService>::ALL
             .iter()
-            .copied()
-            .map(|service| ServiceClassId::new(service.stable_name()))
+            .map(|service| service.class())
             .collect();
         require_profile!(
             core_required.is_subset(&required),
@@ -821,8 +820,10 @@ mod internals {
         }
         require_profile!(
             required == provided,
-            "ExecutionProfile<{:?}> required/provided execution service sets differ",
+            "ExecutionProfile<{:?}> required/provided execution service sets differ: missing {:?}, unrequired {:?}",
             T::NAME,
+            required.difference(&provided).map(|class| class.stable_name()).collect::<Vec<_>>(),
+            provided.difference(&required).map(|class| class.stable_name()).collect::<Vec<_>>(),
         );
 
         #[derive(Clone, Copy)]
