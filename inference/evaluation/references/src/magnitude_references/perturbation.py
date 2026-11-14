@@ -18,8 +18,10 @@ A reference opens in it as its `perturbed:<seed>` variant (`families.open_refere
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cache
 import hashlib
 
+import numba
 import numpy as np
 import torch
 
@@ -75,7 +77,65 @@ def move(codes: np.ndarray, steps: np.ndarray, format: Format) -> np.ndarray:
     return np.where(stays, wide, encoded).astype(codes.dtype)
 
 
-_MIX = (np.uint64(0x9E3779B97F4A7C15), np.uint64(0xBF58476D1CE4E5B9), np.uint64(0x94D049BB133111EB))
+# The top-32-bit hash values whose draw, (top * CHANCES) >> 32, is 0 (below DRAW_DOWN) or 0 or 1 (below DRAW_UP).
+DRAW_DOWN, DRAW_UP = (np.uint64(-(-(draw << 32) // CHANCES)) for draw in (1, 2))
+
+
+@numba.njit(inline="always")
+def draw(key: np.uint64, index: int) -> int:
+    """The draw of element `index` of the plane whose key is `key`: 0, 1 or 2 (down, stay, up), the row index of
+    the `moves` tables. SplitMix64 over the key plus the index, then the top 32 bits scaled to one of `CHANCES`."""
+    x = np.uint64(index) * np.uint64(0x9E3779B97F4A7C15) + key
+    x ^= x >> np.uint64(30)
+    x *= np.uint64(0xBF58476D1CE4E5B9)
+    x ^= x >> np.uint64(27)
+    x *= np.uint64(0x94D049BB133111EB)
+    x ^= x >> np.uint64(31)
+    top = x >> np.uint64(32)
+    return 0 if top < DRAW_DOWN else 2 if top < DRAW_UP else 1
+
+
+@numba.njit(nogil=True, cache=True)
+def draws_of(key: np.uint64, index: np.ndarray, out: np.ndarray) -> None:
+    for i in range(index.size):
+        out[i] = draw(key, index[i])
+
+
+@numba.njit(nogil=True, cache=True)
+def elements_moved(values: np.ndarray, rows: np.ndarray, key: np.uint64, table: np.ndarray, out: np.ndarray) -> None:
+    """Codes [n, width] of GGUF rows `rows` [n], moved through `table` (`moves`) into `out`: element i of row r is
+    element r * width + i of the plane."""
+    width = values.shape[1]
+    for r in range(values.shape[0]):
+        first = rows[r] * width
+        for i in range(width):
+            out[r, i] = table[draw(key, first + i), values[r, i]]
+
+
+@numba.njit(nogil=True, cache=True)
+def mxfp4_moved(blocks: np.ndarray, rows: np.ndarray, scale_key: np.uint64, value_key: np.uint64,
+                scale_moves: np.ndarray, value_moves: np.ndarray, out: np.ndarray) -> None:
+    """MXFP4 blocks [n, blocks a row, 17] of GGUF rows `rows` [n], moved into `out`: block b of row r is block
+    r * blocks + b of the scale plane, and its value k (gguf-py's order: low nibbles 0..15, high 16..31) element
+    32 * that + k of the value plane."""
+    count = blocks.shape[1]
+    for r in range(blocks.shape[0]):
+        for b in range(count):
+            block = rows[r] * count + b
+            out[r, b, 0] = scale_moves[draw(scale_key, block), blocks[r, b, 0]]
+            first = block * MXFP4_BLOCK
+            for k in range(MXFP4_BLOCK // 2):
+                pair = blocks[r, b, 1 + k]
+                low = value_moves[draw(value_key, first + k), pair & 0x0F]
+                high = value_moves[draw(value_key, first + MXFP4_BLOCK // 2 + k), pair >> 4]
+                out[r, b, 1 + k] = low | (high << 4)
+
+
+@cache
+def moves(format: Format) -> np.ndarray:
+    """`move` tabulated for a format of at most 16 bits: [draw (0 down, 1 stay, 2 up), code] -> moved code."""
+    codes = np.arange(1 << format.bits, dtype=np.uint8 if format.bits <= 8 else np.uint16)
+    return np.stack([move(codes, np.int8(step), format) for step in (-1, 0, 1)])
 
 
 @dataclass(frozen=True)
@@ -94,25 +154,20 @@ class Perturbation:
         return Perturbation(int(seed))
 
     def steps(self, plane: str, index: np.ndarray) -> np.ndarray:
-        """The move (-1, 0 or +1, int8) of each element `index` (non-negative integers) of `plane`: SplitMix64
-        over the plane's key plus the index, then the top 32 bits scaled to one of `CHANCES` draws."""
-        key = hashlib.blake2b(f"{self.seed}/{plane}".encode(), digest_size=8).digest()
-        golden, first, second = _MIX
-        x = np.asarray(index).astype(np.uint64)  # a new array: every step below is in place
-        x *= golden
-        x += np.uint64(int.from_bytes(key, "little"))
-        x ^= x >> np.uint64(30)
-        x *= first
-        x ^= x >> np.uint64(27)
-        x *= second
-        x ^= x >> np.uint64(31)
-        x >>= np.uint64(32)
-        x *= np.uint64(CHANCES)
-        x >>= np.uint64(32)
-        steps = np.zeros(x.shape, dtype=np.int8)
-        steps[x == 0] = -1
-        steps[x == 1] = 1
-        return steps
+        """The move (-1, 0 or +1, int8) of each element `index` (non-negative integers) of `plane` (`draw`)."""
+        return self.draws(plane, index) - np.int8(1)
+
+    def key(self, plane: str) -> np.uint64:
+        """The draw key of `plane` under this seed: every draw of the plane is a function of it and an index."""
+        return np.uint64(int.from_bytes(hashlib.blake2b(f"{self.seed}/{plane}".encode(), digest_size=8).digest(),
+                                        "little"))
+
+    def draws(self, plane: str, index: np.ndarray) -> np.ndarray:
+        """`steps` plus one: 0, 1 or 2 (down, stay, up) as int8, the row index of the `moves` tables (`draw`)."""
+        flat = np.ascontiguousarray(index, dtype=np.int64).reshape(-1)
+        out = np.empty(flat.shape, dtype=np.int8)
+        draws_of(self.key(plane), flat, out)
+        return out.reshape(np.shape(index))
 
     def stored(self, name: str, kind: Q, width: int, data: np.ndarray, rows: np.ndarray,
                encoding: Format | None = None) -> np.ndarray:
@@ -124,15 +179,8 @@ class Perturbation:
         data = np.ascontiguousarray(data, dtype=np.uint8).reshape(len(rows), -1)
         if kind == Q.MXFP4:
             blocks = data.reshape(len(rows), -1, MXFP4_BYTES)
-            block = rows[:, None] * blocks.shape[1] + np.arange(blocks.shape[1])  # [n, blocks a row]
             moved = np.empty_like(blocks)
-            moved[..., 0] = move(blocks[..., 0], self.steps(name + "/scales", block), E8M0)
-            # gguf-py's order: a block's low nibbles are its values 0..15, its high nibbles 16..31
-            pairs = blocks[..., 1:]
-            nibbles = np.concatenate((pairs & np.uint8(0x0F), pairs >> np.uint8(4)), axis=-1)
-            nibbles = move(nibbles, self.steps(name, block[..., None] * MXFP4_BLOCK + np.arange(MXFP4_BLOCK)), E2M1)
-            half = MXFP4_BLOCK // 2
-            moved[..., 1:] = nibbles[..., :half] | (nibbles[..., half:] << np.uint8(4))
+            mxfp4_moved(blocks, rows, self.key(name + "/scales"), self.key(name), moves(E8M0), moves(E2M1), moved)
             return moved.reshape(data.shape)
         if kind == Q.I8 and encoding is not None:
             format, dtype = encoding, np.uint8
@@ -142,8 +190,11 @@ class Perturbation:
             raise ValueError(f"{name}: no storage-resolution perturbation of {kind.name}"
                              + (f" as {encoding.name}" if encoding is not None else ""))
         values = data.view(dtype)
-        index = rows[:, None] * width + np.arange(width)
-        return move(values, self.steps(name, index), format).view(np.uint8)
+        if format.bits > 16:
+            return move(values, self.steps(name, rows[:, None] * width + np.arange(width)), format).view(np.uint8)
+        moved = np.empty_like(values)
+        elements_moved(values, rows, self.key(name), moves(format), moved)
+        return moved.view(np.uint8)
 
     def blocks(self, plane: str, codes: torch.Tensor, code: Format, scales: torch.Tensor,
                scale: Format) -> tuple[torch.Tensor, torch.Tensor]:

@@ -19,7 +19,7 @@ import torch
 
 from magnitude_references.gguf import Package
 from magnitude_references.model import (Reference, Rotary, Weights, attention, default_inv_freq, heads, layer_count,
-                                        linear, mixture, per_layer, rms_norm, route_top_k, silu, visibility)
+                                        linear, mixture, per_layer, rms_norm, route_top_k, sigmoid, silu, visibility)
 
 
 def short_conv(u: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
@@ -86,7 +86,7 @@ class Lfm2Reference(Reference):
         if layer < self.dense_layers:
             return linear(silu(linear(h, w(p + "ffn_gate.weight"))) * linear(h, w(p + "ffn_up.weight")), w(p + "ffn_down.weight"))
         rows = h.reshape(-1, self.hidden_size)
-        probabilities = torch.sigmoid(linear(rows, w(p + "ffn_gate_inp.weight")))
+        probabilities = sigmoid(linear(rows, w(p + "ffn_gate_inp.weight")))
         selected = route_top_k(probabilities + w(p + "exp_probs_b.bias"), self.experts_used)
         weights = torch.gather(probabilities, 1, selected)
         weights = weights / (weights.sum(-1, keepdim=True) + 1e-6) * self.routed_scale

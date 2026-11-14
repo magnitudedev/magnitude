@@ -1,6 +1,7 @@
 import hashlib
 
 import pytest
+from bench_support import TREE
 from magnitude_bench.adapters import ADAPTERS
 from magnitude_bench.adapters.omlx_native import instrumentation
 from magnitude_bench.models import Acquisition, Drafter, Target, prepare
@@ -12,7 +13,7 @@ from magnitude_bench.store import RunStore
 def make(engine, artifact_path, tmp_path, acquisition, options=None):
     target = Target(engine=engine, reference=str(artifact_path))
     artifact = prepare(Target(engine="mlx-vlm", reference=str(artifact_path)))
-    arguments = (target, artifact, acquisition, RunStore(tmp_path / "run"), options or EngineOptions())
+    arguments = (target, artifact, acquisition, RunStore(tmp_path / "run"), options or EngineOptions(inference=TREE))
     return ADAPTERS[engine](*arguments)
 
 
@@ -56,7 +57,7 @@ def test_readiness_refuses_an_engine_not_serving_the_runs_drafter(artifact_path,
     """Each engine states what it decodes with at readiness; a run that drafts with the catalog's
     drafter refuses an engine serving anything else (a drafter it could not admit serves plain),
     and a run that drafts nothing expects plain decoding."""
-    plain = EngineOptions(drafting=False)
+    plain = EngineOptions(inference=TREE, drafting=False)
     magnitude = lambda method: {"ready": True, "model": "magnitude-bench", "context_tokens": 40000,
                                 "vocabulary": 9, "drafting": {"method": method, "proposals": 0, "policy": None}}
     llama = lambda types: {"total_slots": 1, "default_generation_settings": {
@@ -77,7 +78,9 @@ def test_magnitude_serves_the_catalog_drafter_and_the_run_tuning(
     artifact_path, tmp_path, acquisition
 ):
     options = EngineOptions(
-        magnitude=MagnitudeOptions(
+        inference=TREE,
+        magnitude=MagnitudeOptions.of(
+            TREE,
             binary=tmp_path / "engine", device="cpu", mtp_proposals=2, tuning_seconds=30,
             fresh_tuning=True, draft_budget='{"generated":2,"verified":1}',
         )
@@ -105,7 +108,7 @@ def test_magnitude_serves_the_catalog_drafter_and_the_run_tuning(
 
     # A drafting engine traces its controller's widths into its log; a plain one doesn't.
     assert adapter.environment()[DRAFT_WIDTH_TRACE] == "1"
-    plain = make("magnitude", artifact_path, tmp_path, acquisition, EngineOptions(drafting=False))
+    plain = make("magnitude", artifact_path, tmp_path, acquisition, EngineOptions(inference=TREE, drafting=False))
     argv = plain.argv(1234, 8192, 1, tmp_path)
     assert flag(argv, "--method") == "plain" and "--draft" not in argv
     assert DRAFT_WIDTH_TRACE not in plain.environment()
@@ -120,7 +123,8 @@ async def test_magnitude_measures_another_builds_binary(artifact_path, tmp_path,
     binary.chmod(0o755)
     build = SourceBuild(commit="b2f79f00f", dirty_digest=None)
     options = EngineOptions(
-        magnitude=MagnitudeOptions(binary=binary, build=build, tuning_trace=False)
+        inference=TREE,
+        magnitude=MagnitudeOptions.of(TREE, binary=binary, build=build, tuning_trace=False)
     )
     adapter = make("magnitude", artifact_path, tmp_path, acquisition, options)
     await adapter.prepare()
@@ -133,22 +137,22 @@ async def test_magnitude_measures_another_builds_binary(artifact_path, tmp_path,
                    for argument in argv)
     # A tuning request the binary could not record is refused.
     with pytest.raises(ValueError, match="tuning trace"):
-        MagnitudeOptions(tuning_trace=False, tuning_seconds=30)
+        MagnitudeOptions.of(TREE, tuning_trace=False, tuning_seconds=30)
     with pytest.raises(ValueError, match="tuning trace"):
-        MagnitudeOptions(tuning_trace=False, fresh_tuning=True)
+        MagnitudeOptions.of(TREE, tuning_trace=False, fresh_tuning=True)
 
 
 async def test_magnitude_serves_from_exactly_the_cache_given(artifact_path, tmp_path, acquisition):
     binary = tmp_path / "engine"
     binary.write_bytes(b"engine")
     binary.chmod(0o755)
-    exact = EngineOptions(magnitude=MagnitudeOptions(binary=binary, cache_dir=tmp_path / "c"))
+    exact = EngineOptions(inference=TREE, magnitude=MagnitudeOptions.of(TREE, binary=binary, cache_dir=tmp_path / "c"))
     adapter = make("magnitude", artifact_path, tmp_path, acquisition, exact)
     await adapter.prepare()
     assert adapter.identity["kernel_cache"] == str(tmp_path / "c")
     assert flag(adapter.argv(1234, 8192, 1, tmp_path), "--cache-dir") == str(tmp_path / "c")
     unset = make("magnitude", artifact_path, tmp_path, acquisition,
-                 EngineOptions(magnitude=MagnitudeOptions(binary=binary)))
+                 EngineOptions(inference=TREE, magnitude=MagnitudeOptions.of(TREE, binary=binary)))
     await unset.prepare()
     assert unset.identity["kernel_cache"] is None and "--cache-dir" not in unset.argv(1234, 8192, 1, tmp_path)
 
@@ -180,7 +184,7 @@ def test_a_request_the_drafter_proposed_nothing_for_is_a_valid_measurement():
 def test_llama_allocates_context_headroom_within_the_model_limit(
     artifact_path, tmp_path, acquisition
 ):
-    options = EngineOptions(llama=LlamaOptions(context_headroom=1024))
+    options = EngineOptions(inference=TREE, llama=LlamaOptions(context_headroom=1024))
     adapter = make("llama.cpp", artifact_path, tmp_path, acquisition, options)
     adapter.executable = str(tmp_path / "llama-server")
     limit = adapter.artifact.context_limit
@@ -220,7 +224,7 @@ def test_llama_serves_the_catalog_drafter(artifact_path, tmp_path, acquisition):
     argv = adapter.argv(1234, 65536, 1, tmp_path)
     assert flag(argv, "--spec-type") == "draft-mtp" and "--model-draft" not in argv
 
-    adapter = make("llama.cpp", artifact_path, tmp_path, acquisition, EngineOptions(drafting=False))
+    adapter = make("llama.cpp", artifact_path, tmp_path, acquisition, EngineOptions(inference=TREE, drafting=False))
     adapter.executable = str(tmp_path / "llama-server")
     assert "--spec-type" not in adapter.argv(1234, 65536, 1, tmp_path)
 
@@ -249,7 +253,7 @@ def test_gguf_engines_are_counted_by_the_harness(artifact_path, tmp_path, acquis
         gguf = Target(engine=engine, reference=str(acquisition.target), sha256="0" * 64)
         adapter = ADAPTERS[engine](
             gguf, prepare(Target(engine="mlx-vlm", reference=str(artifact_path))), acquisition,
-            RunStore(tmp_path / "run"), EngineOptions(),
+            RunStore(tmp_path / "run"), EngineOptions(inference=TREE),
         )
         assert adapter.host_rendered
         if engine != "ollama":
@@ -260,13 +264,13 @@ def test_gguf_engines_are_counted_by_the_harness(artifact_path, tmp_path, acquis
     registry = ADAPTERS["ollama-registry"](
         Target(engine="ollama-registry", reference="ollama:a:b"),
         prepare(Target(engine="mlx-vlm", reference=str(artifact_path))), acquisition,
-        RunStore(tmp_path / "run"), EngineOptions(),
+        RunStore(tmp_path / "run"), EngineOptions(inference=TREE),
     )
     assert registry.host_rendered
     mlx_tag = ADAPTERS["ollama-mlx"](
         Target(engine="ollama-mlx", reference="ollama:a:b"),
         prepare(Target(engine="mlx-vlm", reference=str(artifact_path))), acquisition,
-        RunStore(tmp_path / "run"), EngineOptions(),
+        RunStore(tmp_path / "run"), EngineOptions(inference=TREE),
     )
     assert not mlx_tag.host_rendered
 
@@ -313,7 +317,7 @@ async def test_ollama_mlx_tag_counts_with_its_tokenizer_json(artifact_path, tmp_
         prepare(Target(engine="mlx-vlm", reference=str(artifact_path))),
         acquisition,
         RunStore(tmp_path / "run"),
-        EngineOptions(),
+        EngineOptions(inference=TREE),
     )
     adapter.tag = SimpleNamespace(layer=lambda **_: path)
     adapter.format = PromptFormat("qwen3.8", False)
@@ -340,7 +344,7 @@ def test_acquisition_reads_the_contract_object(tmp_path):
 
 def test_explicit_mtp_keeps_its_separate_catalog_head(artifact_path, tmp_path, acquisition):
     mtp = acquisition.model_copy(update={"drafter": acquisition.drafter.model_copy(update={"method": "mtp"})})
-    options = EngineOptions(magnitude=MagnitudeOptions(method="mtp"))
+    options = EngineOptions(inference=TREE, magnitude=MagnitudeOptions.of(TREE, method="mtp"))
     argv = make("magnitude", artifact_path, tmp_path, mtp, options).argv(1234, 8192, 1, tmp_path)
     assert flag(argv, "--method") == "mtp"
     assert flag(argv, "--draft") == str(mtp.drafter.path)

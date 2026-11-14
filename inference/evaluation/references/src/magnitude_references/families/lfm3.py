@@ -21,7 +21,7 @@ import torch
 from magnitude_references.families.lfm2 import short_conv
 from magnitude_references.gguf import Package
 from magnitude_references.model import (Reference, Rotary, Weights, attention, default_inv_freq, heads, layer_count,
-                                        linear, per_layer, proportional_inv_freq, rms_norm, silu, visibility)
+                                        linear, per_layer, proportional_inv_freq, rms_norm, sigmoid, silu, visibility)
 
 # `partial_rotary_factor` of the full layers in the released config.
 FULL_PARTIAL = 0.5
@@ -68,7 +68,7 @@ class Lfm3Reference(Reference):
             k = rms_norm(heads(linear(h, w(p + "attn_k.weight")), self.kv_heads[layer]), w(p + "attn_k_norm.weight"), self.eps)
             v = heads(linear(h, w(p + "attn_v.weight")), self.kv_heads[layer])
             mixed = attention(rotary[sliding].apply(q), rotary[sliding].apply(k), v, visible[sliding], self.head_dim ** -0.5)
-            gate = torch.sigmoid(linear(h, w(p + "attn_gate.weight")))
+            gate = sigmoid(linear(h, w(p + "attn_gate.weight")))
             batch, rows, _ = mixed.shape
             gated = (mixed.view(batch, rows, self.head_count, self.head_dim) * gate[..., None]).reshape(batch, rows, -1)
             return linear(gated, w(p + "attn_output.weight"))

@@ -16,7 +16,7 @@ A cached reference is reused whatever its sanity result (the result is determini
 judges anything it passes one of two gates:
 - a model's sanity gate (`check`): a reference whose dense model is not in a sane regime on the
   input is refused;
-- a layer slice, told by the provenance record catalog-tool wrote beside it (`kl.mode_of`), has no
+- a layer slice, told by the provenance record beside it (`kl.mode_of`), has no
   gate beyond its admission: it always fails the
   sanity gate (one layer and the head is not a language model, so its perplexity says nothing).
 """
@@ -31,8 +31,11 @@ from pathlib import Path
 
 import numpy as np
 
-from magnitude_references.contract import CHUNK_ROWS, LOGITS, read_logits, read_rendered
-from magnitude_references.digest import implementation
+from magnitude_references.contract import CHUNK_ROWS, LOGITS, read_artifacts, read_logits, read_rendered
+from magnitude_references import digest
+from magnitude_references.digest import ROWS_EXACT, implementation
+from magnitude_references.families import reference_of
+from magnitude_references.gguf import Package
 from magnitude_references.sanity import Gate
 
 RECORD = "reference.json"
@@ -40,6 +43,12 @@ RECORD = "reference.json"
 
 class ReferenceRefused(Exception):
     """The reference failed its gate and must not judge anything."""
+
+
+class ReferenceUnavailable(Exception):
+    """The reference is not cached and this host cannot compute it: a reference judges a build's rows only
+    where a row's bits are its prefix's alone (`rows_exact`), so only such a platform computes one, and any host
+    that judges takes it from the cache (`exact`) once it is there."""
 
 
 class ReferenceFailed(Exception):
@@ -58,6 +67,7 @@ class Reference:
             "cached": self.cached,
             "family": self.record["family"],
             "implementation_digest": self.record["implementation_digest"],
+            "platform": self.record["platform"],
             "sanity": self.record["sanity"],
             "admission": self.record["admission"],
         }
@@ -126,13 +136,35 @@ def admit(directory: Path) -> dict:
     raise ReferenceRefused(f"reference {directory} (built on cpu) has non-finite logits; it is kept, not admitted")
 
 
+def exact(cache: Path, rendered_set, family: type, variant: str | None) -> Reference:
+    """The reference of `rendered_set` a platform that makes rows exact computed from these sources, wherever it
+    was computed and staged from: the admitted record in the model's directory of the rendered digest whose
+    identity is this implementation's on the platform it recorded. `ReferenceUnavailable` where the cache holds
+    none, naming what to compute and where."""
+    for record_path in sorted(location(cache, rendered_set.model, rendered_set.digest, "").glob(f"*/{RECORD}")):
+        record = json.loads(record_path.read_text())
+        # A record written before records named their platform says nothing of whether its rows are exact.
+        platform = record.get("platform")
+        if (platform is not None and platform["rows_exact"] and record.get("admission", {}).get("device") == "cpu"
+                and record["implementation_digest"] == implementation(family, variant, "cpu", platform)):
+            return Reference(record_path.parent, record, True)
+    raise ReferenceUnavailable(
+        f"no reference of {rendered_set.model} on rendered {rendered_set.digest} of these sources is in "
+        f"{cache}, and this host does not make rows exact: compute it on a CPU with one of "
+        f"{', '.join(ROWS_EXACT)} and stage it here"
+    )
+
+
 def obtain(
     rendered: Path, artifacts: Path, build_identity: Path, cache: Path, log: Path, variant: str | None = None
 ) -> Reference:
     """The cached reference of `rendered` for the model of `artifacts`, in `variant` (None: the model's
     numerics), built and admitted when missing. Its gate is not yet checked (`check`, unless a slice)."""
     rendered_set = read_rendered(rendered)
-    implementation_digest = implementation(variant)
+    family = reference_of(Package.local(read_artifacts(artifacts).target))
+    implementation_digest = implementation(family, variant, "cpu")
+    if not digest.platform("cpu")["rows_exact"]:
+        return exact(cache, rendered_set, family, variant)
     directory = location(cache, rendered_set.model, rendered_set.digest, implementation_digest)
     # Only a reference admitted as a CPU build is cached: a directory there with any other record is
     # replaced.

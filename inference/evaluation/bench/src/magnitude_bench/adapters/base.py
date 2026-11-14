@@ -20,7 +20,7 @@ import psutil
 
 from ..models import Acquisition, Artifact, Target
 from ..options import EngineOptions, Watchdog
-from ..policy import BENCH, STARTUP_TIMEOUT_SECONDS
+from ..policy import STARTUP_TIMEOUT_SECONDS, bench
 from ..requests import Plan
 from ..sizing import Lengths
 from ..store import RunStore
@@ -79,13 +79,13 @@ def memory_bytes(pid: int) -> int:
     return total
 
 
-def runtime_digest(runtime: Path) -> str:
+def runtime_digest(runtime: Path, inference: Path) -> str:
     """A runtime's locked environment and the bench modules it runs (``PYTHONPATH``)."""
     digest = hashlib.sha256()
     files = [runtime / "pyproject.toml", runtime / "uv.lock"]
-    files += sorted(p for p in (BENCH / "src").rglob("*.py") if p.is_file())
+    files += sorted(p for p in (bench(inference) / "src").rglob("*.py") if p.is_file())
     for path in files:
-        digest.update(str(path.relative_to(BENCH)).encode())
+        digest.update(str(path.relative_to(bench(inference))).encode())
         digest.update(path.read_bytes())
     return digest.hexdigest()
 
@@ -178,7 +178,7 @@ class Adapter:
             HF_HUB_OFFLINE="1",
             TRANSFORMERS_OFFLINE="1",
             PYTHONUNBUFFERED="1",
-            PYTHONPATH=str(BENCH / "src"),
+            PYTHONPATH=str(bench(self.options.inference) / "src"),
         )
         return env
 
@@ -189,7 +189,7 @@ class Adapter:
                 self.runtime,
                 self.store.path / "logs" / f"{self.target.id}-install.log",
             )
-            self.source_identity = runtime_digest(self.runtime)
+            self.source_identity = runtime_digest(self.runtime, self.options.inference)
             self.identity = {"runtime": str(self.runtime), "source_sha256": self.source_identity}
             version_path = self.store.path / f"{self.target.id}-versions.json"
             code = (
@@ -208,7 +208,7 @@ class Adapter:
         self.artifact.verify_unchanged()
         if self.runtime:
             if (
-                runtime_digest(self.runtime) != self.source_identity
+                runtime_digest(self.runtime, self.options.inference) != self.source_identity
                 or installed_versions(self.runtime) != self.identity["dependencies"]
             ):
                 raise ValueError(f"engine source or environment changed: {self.target.engine}")
@@ -249,7 +249,7 @@ class Adapter:
                 str(Path(__file__).with_name("supervise.py")),
                 str(os.getpid()),
                 *args,
-                cwd=self.runtime or BENCH,
+                cwd=self.runtime or bench(self.options.inference),
                 env=self.environment(),
                 stdout=output,
                 stderr=asyncio.subprocess.STDOUT,

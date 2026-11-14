@@ -57,7 +57,8 @@ def test_test_builds_without_running_then_runs_its_executables_from_the_output_o
     assert job.argv == ("{python}", "-m", "magnitude_rig.host", "tests", "--list", "{output}/tests.json", "--", "general")
     # A cargo suite has the release catalog's headers, so no test of it lacks its inputs; the
     # host package is on PYTHONPATH from the job's `record`, not set again.
-    assert plan.device == "device" and job.env == (("SEISMIC_TEST_BACKEND", "cuda"), ("MAGNITUDE_CATALOG_HEADERS", "{catalog}/headers"))
+    assert plan.device == "device" and job.env == (("SEISMIC_TEST_BACKEND", "cuda"), ("MAGNITUDE_MODELS", "{models}"),
+                                                   ("MAGNITUDE_CATALOG_HEADERS", "{catalog}/headers"))
     # Each executable gets cargo test's name filter first, then what follows `--`, as cargo passes them.
     for given, passed in ((("-p", "x", "--test", "routed", "general", "--", "--exact"), ("general", "--exact")),
                           (("--lib", "general", "-p", "x"), ("general",)),
@@ -75,8 +76,9 @@ def test_test_builds_without_running_then_runs_its_executables_from_the_output_o
     assert plan.acquires == engine.Headers(None)
     for backend in ("cuda", "metal", "vulkan"):
         named = parse("test", "--backend", backend, "--purpose", "p", "--estimate", "1m", "--", "-p", "x")
-        assert REGISTRY["test"].plan(named, None, "alpha").jobs[0][1].env[:2] == (
-            ("SEISMIC_TEST_BACKEND", backend), ("MAGNITUDE_CATALOG_HEADERS", "{catalog}/headers"))
+        assert REGISTRY["test"].plan(named, None, "alpha").jobs[0][1].env[:3] == (
+            ("SEISMIC_TEST_BACKEND", backend), ("MAGNITUDE_MODELS", "{models}"),
+            ("MAGNITUDE_CATALOG_HEADERS", "{catalog}/headers"))
     cpu = parse("test", "--backend", "cpu", "--purpose", "p", "--estimate", "1m", "--", "-p", "x")
     assert "SEISMIC_TEST_BACKEND" not in dict(REGISTRY["test"].plan(cpu, None, "alpha").jobs[0][1].env)
     # One that reads a model's files has the model, not the catalog.
@@ -96,6 +98,7 @@ def test_python_tests_run_in_the_checkouts_environment_with_the_model_they_check
     job = plan.jobs[0][1]
     assert job.argv[0] == "{venv}/bin/pytest" and job.argv[-3:] == ("evaluation/references/tests/test_released.py", "-k", "qwen")
     assert dict(job.env)["MAGNITUDE_ARTIFACTS"] == "{artifacts}" and plan.acquires == engine.Weights(model)
+    assert dict(job.env)["MAGNITUDE_MODELS"] == "{models}"
 
 
 def test_every_environment_reinstalls_the_workspace_packages_from_the_tree_it_builds():
@@ -670,11 +673,52 @@ def test_a_streamed_only_step_times_no_resident_cell_and_answers_absolute_terms_
         REGISTRY["step"].answer(arguments, results)
 
 
+def test_kl_judges_a_held_checkpoint_by_the_storage_resolution_bar(tmp_path):
+    """A set no host fetches is read where it lies: the run writes its acquisition object, opens it
+    for the logits and the judgement, and is within the bar exactly when the references say so."""
+    common = ("kl", "--backend", "cuda", "--context", "1024", "--purpose", "p", "--estimate", "5m")
+    arguments = parse(*common, "--checkpoint", "/models/set", "--yardstick-perturbed", "1", "2")
+    plan = REGISTRY["kl"].plan(arguments, None, "alpha")
+    assert plan.acquires is None and [name for name, _ in plan.jobs] == ["checkpoint", "measure", "logits", "kl"]
+    jobs = dict(plan.jobs)
+    assert jobs["checkpoint"].argv[-4:] == ("--path", "/models/set", "--output", "{artifacts}")
+    assert jobs["logits"].argv[jobs["logits"].argv.index("--artifacts") + 1] == "{artifacts}"
+    judged = jobs["kl"].argv
+    assert judged[judged.index("--yardstick-perturbed") + 1:judged.index("--yardstick-perturbed") + 3] == ("1", "2")
+    # The same bar on a catalog model; the subject is one of the two; a set is judged by the bar
+    # against the reference alone.
+    assert "--yardstick-perturbed" in dict(REGISTRY["kl"].plan(
+        parse(*common, "--model", MODEL, "--yardstick-perturbed", "1"), None, "alpha").jobs)["kl"].argv
+    for refused, why in ((("--checkpoint", "/m"), "storage-resolution bar"),
+                         (("--checkpoint", "/m", "--model", MODEL, "--yardstick-perturbed", "1"), "--model or --checkpoint"),
+                         (("--yardstick-perturbed", "1"), "--model or --checkpoint"),
+                         (("--checkpoint", "/m", "--yardstick-perturbed", "1", "--weight-cap", "7"), "uncapped load"),
+                         (("--model", MODEL, "--yardstick-perturbed", "1", "--weight-cap", "7"), "against the reference")):
+        with pytest.raises(SystemExit, match=why):
+            REGISTRY["kl"].plan(parse(*common, *refused), None, "alpha")
+    # The answer is the references' own verdict.
+    (tmp_path / "kl").mkdir()
+    for within in (True, False):
+        over = [] if within else [{"fixture_id": "f", "position": 3, "ratio": 2.5, "top1_flipped": True}]
+        (tmp_path / "kl" / "kl.json").write_text(json.dumps({
+            "reference": {"cached": True},
+            "build": {"mean_kl": 0.001, "p99_kl": 0.01, "max_kl": 0.02, "top1_agreement": 0.99, "positions": 64},
+            "resolution": {"alpha": 8, "vocabulary": 154880, "rows": {"judgeable": 63, "unjudgeable": 1},
+                           "ratio": {"median": 0.1, "p90": 0.3, "p99": 0.6, "max": 2.5 if over else 0.9},
+                           "over": over, "unjudgeable_top1_agreement": 1.0, "worst": None, "within": within}}))
+        answer = REGISTRY["kl"].answer(arguments, {"kl": JobResult(tmp_path / "kl", tmp_path / "log", 0)})
+        assert answer.ok is within and answer.lines[0] == "checkpoint /models/set · prose-repeat @1024 · reference cached"
+        assert answer.lines[-1] == ("within" if within else "NOT within") + " the storage-resolution bar (seeds 1 2)"
+        text = "\n".join(answer.lines)
+        assert ("1 rows past the bar\n  f@3 ratio 2.5, top-1 flipped" in text) is not within
+        assert ("0 rows past the bar" in text) is within
+
+
 def test_kl_with_weight_caps_passes_equal_logits_and_says_where_others_part(tmp_path):
     arguments = parse("kl", "--backend", "metal", "--model", MODEL, "--context", "512", "--purpose", "p",
                       "--estimate", "5m", "--weight-cap", "7", "--weight-cap", "9")
     plan = REGISTRY["kl"].plan(arguments, None, "alpha")
-    assert [name for name, _ in plan.jobs] == ["logits", "streamed-7", "streamed-9", "compare-streamed-7",
+    assert [name for name, _ in plan.jobs] == ["measure", "logits", "streamed-7", "streamed-9", "compare-streamed-7",
                                                "compare-streamed-9"]
     assert "magnitude-references" not in " ".join(" ".join(step.argv) for _, step in plan.jobs), "no reference is read"
     jobs = dict(plan.jobs)
@@ -729,7 +773,7 @@ def test_kl_with_weight_caps_passes_equal_logits_and_says_where_others_part(tmp_
     discrete = parse("kl", "--backend", "cuda", "--model", MODEL, "--context", "512", "--purpose", "p",
                      "--estimate", "5m", "--weight-cap", "7", "--without-site")
     jobs = dict(REGISTRY["kl"].plan(discrete, None, "alpha").jobs)
-    assert list(jobs) == ["profile", "logits", "streamed-7", "unsited-7", "compare-streamed-7", "compare-unsited-7"]
+    assert list(jobs) == ["measure", "profile", "logits", "streamed-7", "unsited-7", "compare-streamed-7", "compare-unsited-7"]
     assert all("--cache-dir" in jobs[name].argv for name in ("streamed-7", "unsited-7")), "both keep the kernel cache"
     assert "--numerical-profile" not in jobs["streamed-7"].argv
     for name in ("logits", "unsited-7"):
@@ -807,7 +851,7 @@ def test_kl_with_weight_caps_passes_equal_logits_and_says_where_others_part(tmp_
     between = parse("kl", "--backend", "metal", "--model", MODEL, "--context", "512", "--purpose", "p",
                     "--estimate", "5m", "--weight-cap", "7", "--weight-cap", "9", "--between")
     jobs = dict(REGISTRY["kl"].plan(between, None, "alpha").jobs)
-    assert list(jobs) == ["streamed-7", "streamed-9", "compare-streamed-9"]
+    assert list(jobs) == ["measure", "streamed-7", "streamed-9", "compare-streamed-9"]
     assert jobs["streamed-9"].argv[jobs["streamed-9"].argv.index("--rendered") + 1] == "{runs}/streamed-7/rendered.jsonl"
     assert "--weight-cap" in jobs["streamed-7"].argv and jobs["streamed-7"].fresh, "the base is itself streamed"
     # The second cap holds where its logits equal the first's and it missed at every streamed layer.
@@ -938,6 +982,96 @@ def test_draft_answers_the_drafters_acceptance_exactly(tmp_path):
     assert answer.measures["tokens_per_verify"].resolution is None
 
 
+def test_draft_takes_a_held_checkpoint_in_place_of_a_catalog_model(tmp_path):
+    """A set no host fetches is drafted where it lies: its acquisition is written first, the
+    streamed loads read it as every run's, and exactly one subject is named."""
+    common = ("draft", "--backend", "cuda", "--context", "1024", "--purpose", "p", "--estimate", "5m")
+    arguments = parse(*common, "--checkpoint", "/models/set", "--weight-cap", "7")
+    plan = REGISTRY["draft"].plan(arguments, None, "alpha")
+    assert plan.acquires is None and [name for name, _ in plan.jobs] == ["checkpoint", "measure", "draft", "streamed-7"]
+    assert dict(plan.jobs)["checkpoint"].argv[-4:] == ("--path", "/models/set", "--output", "{artifacts}")
+    for name in ("draft", "streamed-7"):
+        argv = dict(plan.jobs)[name].argv
+        assert argv[argv.index("--artifacts") + 1] == "{artifacts}"
+    modelled = REGISTRY["draft"].plan(parse(*common, "--model", MODEL), None, "alpha")
+    assert modelled.acquires == engine.Weights(MODEL) and [name for name, _ in modelled.jobs] == ["draft"]
+    for refused in (("--checkpoint", "/m", "--model", MODEL), ()):
+        with pytest.raises(SystemExit, match="--model or --checkpoint"):
+            REGISTRY["draft"].plan(parse(*common, *refused), None, "alpha")
+    (tmp_path / "result.json").write_text(json.dumps({"measurements": {"drafting": {
+        "proposed": 64, "accepted": 40, "tokens_per_verify": 2.25, "anchors": 32}}}))
+    uncapped = parse(*common, "--checkpoint", "/models/set")
+    answer = REGISTRY["draft"].answer(uncapped, {"draft": JobResult(tmp_path, tmp_path / "log", 0)})
+    assert answer.lines[0] == "checkpoint /models/set · prose-repeat @1024 · 32 anchors"
+
+
+def test_every_streamed_job_follows_its_machines_measurement_job_and_its_acquisition(tmp_path):
+    """One rule (`assess.preceded`) for every instrument: a load that streams runs after the measurement job,
+    which reads the run's acquisition object, so after the job that writes one from a held set; the assessment's
+    binary is built for it; a load that does not stream has no measurement job."""
+    from magnitude_rig.instruments.binaries import ASSESS_BUILD
+
+    def plan(*argv):
+        return REGISTRY[argv[0]].plan(parse(*argv, "--backend", "cuda", "--context", "1024", "--purpose", "p",
+                                            "--estimate", "5m"), None, "alpha")
+
+    streamed = (
+        plan("step", "--model", MODEL, "--weight-cap", "7"),
+        plan("draft", "--model", MODEL, "--weight-cap", "7"),
+        plan("draft", "--checkpoint", "/models/set"),
+        plan("kl", "--checkpoint", "/models/set", "--yardstick-perturbed", "1"),
+    )
+    for streams in streamed:
+        names = [name for name, _ in streams.jobs]
+        assert ASSESS_BUILD in streams.builds and names.count("measure") == 1
+        assert names.index("measure") == int(names[0] == "checkpoint")  # first, or after the acquisition
+    resident = (plan("step", "--model", MODEL), plan("draft", "--model", MODEL), plan("kl", "--model", MODEL))
+    assert all("measure" not in [name for name, _ in each.jobs] for each in resident)
+
+
+def test_bench_serves_a_held_set_in_place_of_a_catalog_model(tmp_path):
+    """`--checkpoint` is the one held-set owner's (`held`): its acquisition is written first, the bench reads it
+    and names no catalog model, and exactly one subject is named."""
+    common = ("bench", "--backend", "cuda", "--purpose", "p", "--estimate", "5m", "--mode", "prose-repeat",
+              "--context", "4k")
+    plan = REGISTRY["bench"].plan(parse(*common, "--checkpoint", "/models/set"), None, "alpha")
+    assert plan.acquires is None and [name for name, _ in plan.jobs] == ["checkpoint", "measure", "bench"]
+    assert "--model" not in dict(plan.jobs)["bench"].argv
+    modelled = REGISTRY["bench"].plan(parse(*common, "--model", MODEL), None, "alpha")
+    assert modelled.acquires == engine.Weights(MODEL) and [name for name, _ in modelled.jobs] == ["measure", "bench"]
+    argv = dict(modelled.jobs)["bench"].argv
+    assert argv[argv.index("--model") + 1] == MODEL and argv[argv.index("--inference") + 1] == "{src}"
+    for refused in (("--checkpoint", "/m", "--model", MODEL), ()):
+        with pytest.raises(SystemExit, match="--model or --checkpoint"):
+            REGISTRY["bench"].plan(parse(*common, *refused), None, "alpha")
+
+
+def test_kl_builds_the_references_alone_before_any_build_is_judged(tmp_path):
+    """`--references-only` renders the fixtures' tokens and obtains the reference and each draw of the bar, which
+    depend on the stored values and the tokens alone; no engine load runs, so no measurement job is needed."""
+    common = ("kl", "--backend", "cuda", "--context", "1024", "--purpose", "p", "--estimate", "5m")
+    plan = REGISTRY["kl"].plan(parse(*common, "--checkpoint", "/models/set", "--references-only",
+                                     "--yardstick-perturbed", "1", "2"), None, "alpha")
+    assert plan.acquires is None and [name for name, _ in plan.jobs] == ["checkpoint", "render", "references"]
+    argv = dict(plan.jobs)["references"].argv
+    assert argv[argv.index("--yardstick-perturbed") + 1:] == ("1", "2") and "--logits" not in argv
+    assert "measure" not in dict(plan.jobs)
+    alone = REGISTRY["kl"].plan(parse(*common, "--checkpoint", "/models/set", "--references-only"), None, "alpha")
+    argv = dict(alone.jobs)["references"].argv
+    assert "--yardstick-perturbed" not in argv and "--profile" not in argv  # the unperturbed reference alone, untimed
+    profiled = REGISTRY["kl"].plan(parse(*common, "--checkpoint", "/models/set", "--references-only",
+                                         "--profile-references"), None, "alpha")
+    assert "--profile" in dict(profiled.jobs)["references"].argv
+    for refused in (("--checkpoint", "/m", "--references-only", "--yardstick-perturbed", "1", "--weight-cap", "7"),):
+        with pytest.raises(SystemExit, match="--references-only"):
+            REGISTRY["kl"].plan(parse(*common, *refused), None, "alpha")
+    (tmp_path / "references.json").write_text(json.dumps({"reference": {"cached": False}, "draws": [{"cached": True}, {"cached": False}]}))
+    answer = REGISTRY["kl"].answer(parse(*common, "--checkpoint", "/models/set", "--references-only",
+                                         "--yardstick-perturbed", "1", "2"),
+                                   {"references": JobResult(tmp_path, tmp_path / "log", 0)})
+    assert answer.ok and answer.lines[1:] == ("reference: built this run", "draw 1: cached", "draw 2: built this run")
+
+
 def test_draft_compares_each_streamed_load_with_the_uncapped_anchor_by_anchor(tmp_path):
     def run(name: str, rows: list[dict], code: int = 0) -> JobResult:
         directory = tmp_path / name
@@ -977,7 +1111,7 @@ def test_draft_compares_each_streamed_load_with_the_uncapped_anchor_by_anchor(tm
                                                harness.streamed(10): run("empty", [])})
     assert not nothing.ok, "no anchor compared is no pass"
     plan = REGISTRY["draft"].plan(parse("draft", *COMMON, "--model", MODEL, "--context", "4096", "--weight-cap", "10"), None, "alpha")
-    assert [name for name, _ in plan.jobs] == ["draft", "measure", harness.streamed(10)]
+    assert [name for name, _ in plan.jobs] == ["measure", "draft", harness.streamed(10)]
 
 
 def test_assess_takes_a_model_or_the_catalog():
@@ -990,6 +1124,8 @@ def test_assess_takes_a_model_or_the_catalog():
     assert catalog.acquires == engine.Headers(None)
     assert [name for name, _ in catalog.jobs] == ["measure", "catalog"]
     assert "{catalog}/model-planner-inputs.bundle" in dict(catalog.jobs)["catalog"].argv
+    # An assessment reads a model's headers and the device's facts: no weight is fetched for it.
+    assert REGISTRY["assess"].plan(parse("assess", *COMMON, "--model", model), None, "alpha").acquires == engine.Headers(model)
 
 
 def test_device_adds_the_drivers_facts_on_vulkan():

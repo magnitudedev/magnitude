@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from magnitude_references.digest import sha256_file
+from magnitude_rig.host.identity import sha256
 
 RENDERED_KEYS = ("fixture_id", "fixture_set_digest", "model", "target_sha256", "template_sha256", "context_target",
                  "tokens", "scored_spans", "generation_prefix_tokens")
@@ -100,7 +100,7 @@ def read_rendered(path: Path) -> RenderedSet:
     identifiers = [fixture.fixture_id for fixture in fixtures]
     if len(set(identifiers)) != len(identifiers):
         raise ContractError(f"{path}: duplicate fixture ids")
-    return RenderedSet(path, sha256_file(path), tuple(fixtures))
+    return RenderedSet(path, sha256(path), tuple(fixtures))
 
 
 @dataclass(frozen=True)

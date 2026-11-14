@@ -21,7 +21,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from magnitude_references.digest import sha256_file
+from magnitude_rig.host.identity import sha256
 from magnitude_references.gguf import Package
 
 
@@ -80,9 +80,9 @@ def main() -> None:
     # The template's `bos_token`, and the raw text's first token, only for models that add BOS.
     adds_bos = "tokenizer.ggml.add_bos_token" in package.metadata and package.metadata["tokenizer.ggml.add_bos_token"].value
     bos = tokens_table[package.metadata["tokenizer.ggml.bos_token_id"].value] if adds_bos else ""
-    target_sha256 = sha256_file(options.gguf)
+    target_sha256 = sha256(options.gguf)
     conversations = json.loads(options.conversations.read_text())
-    set_digest = sha256_file(options.conversations)
+    set_digest = sha256(options.conversations)
     options.output.mkdir(parents=True, exist_ok=True)
     lines = []
     for index, messages in enumerate(conversations):

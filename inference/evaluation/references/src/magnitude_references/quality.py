@@ -90,6 +90,17 @@ def compare_rows(
     return kl, agree
 
 
+def entropy(logits: np.ndarray, rows: np.ndarray | None = None) -> np.ndarray:
+    """The softmax's entropy in nats of rows `rows` of `logits` [rows, vocabulary] (all of them when None)."""
+    if rows is None:
+        rows = np.arange(logits.shape[0])
+    out = np.empty(len(rows))
+    for start in range(0, len(rows), CHUNK_ROWS):
+        log_p = _log_softmax(np.asarray(logits[rows[start : start + CHUNK_ROWS]], dtype=np.float64))
+        out[start : start + len(log_p)] = -(np.exp(log_p) * log_p).sum(axis=1)
+    return out
+
+
 def compare_outputs(truth: Path, test: Path) -> Positions:
     """Per-position comparison of the logits outputs in two directories (`logits.json/.f32`)."""
     truth_header, truth_values = read_logits(truth, LOGITS)

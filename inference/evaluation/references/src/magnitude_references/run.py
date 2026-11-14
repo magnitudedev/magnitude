@@ -25,7 +25,7 @@ from magnitude_rig import store
 from magnitude_references.contract import (LOGITS, LogitsWriter, RenderedFixture, check_match, read_artifacts,
                                            read_rendered)
 from magnitude_references.checks import device_of
-from magnitude_references.families import REFERENCES, family_of, open_reference
+from magnitude_references.families import family_of, open_reference, reference_of
 from magnitude_references.gguf import Package
 from magnitude_references.model import F32, Reference
 from magnitude_references.performance import BATCH_TOKENS, HEAD_ROWS
@@ -78,7 +78,7 @@ def run_batch(reference: Reference, group: list[RenderedFixture], writer: Logits
 def build_device(package: Package) -> torch.device:
     """The device a reference of `package` builds on by default: the host's default, or the CPU for
     a family whose reference rounds to trained codes (`Reference.continuous`)."""
-    return device_of("auto" if REFERENCES[package.architecture][1].continuous else "cpu")
+    return device_of("auto" if reference_of(package).continuous else "cpu")
 
 
 def build_reference(rendered_path: Path, artifacts_path: Path, output: Path, options: Options) -> dict:
@@ -91,7 +91,7 @@ def build_reference(rendered_path: Path, artifacts_path: Path, output: Path, opt
     package = Package.local(artifacts.target)
     family = family_of(package)
     device = options.device or build_device(package)
-    if not REFERENCES[package.architecture][1].continuous and device.type != "cpu":
+    if not reference_of(package).continuous and device.type != "cpu":
         raise ValueError(f"the {family} reference rounds to trained codes, so it builds on the CPU alone, not {device}")
     reference = open_reference(package, device, options.cache_weights, variant=options.variant)
     for fixture in rendered.fixtures:
@@ -107,7 +107,8 @@ def build_reference(rendered_path: Path, artifacts_path: Path, output: Path, opt
     writer.close()
     reference_record = {
         "model": artifacts.model, "rendered_digest": rendered.digest, "family": family,
-        "implementation_digest": digest.implementation(options.variant), "dtype": "float32", "sanity": sanity.result(options.bounds),
+        "implementation_digest": digest.implementation(reference_of(package), options.variant, device.type),
+        "platform": digest.platform(device.type), "dtype": "float32", "sanity": sanity.result(options.bounds),
     }
     (output / "reference.json").write_text(json.dumps(reference_record, indent=1) + "\n")
     result = {

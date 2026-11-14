@@ -11,6 +11,9 @@ uncapped load, a load streamed under each cap (its experts read from storage, af
 measurement job) drafts at the same anchors, and each anchor's proposals and target tokens are
 compared with the uncapped load's: where they part is the first anchor that differs.
 
+`--checkpoint DIR` drafts a whole GGUF set the host already holds in DIR, in place of a catalog model
+(`kl --checkpoint`'s acquisition: nothing is fetched, converted or copied, the set is read where it lies).
+
 Greedy drafting is deterministic, so the counts are exact: `mrig ab draft` compares two builds'
 drafters without an interval. Served acceptance (the adaptive controller's choices at serving
 concurrency) is `bench`'s.
@@ -20,10 +23,9 @@ import argparse
 import json
 from dataclasses import dataclass
 
-from ..engine import Step, Weights
-from . import Answer, Instrument, JobResult, Measure, Plan, harness, lacking, unrecorded
-from .assess import measurement
-from .binaries import ASSESS_BUILD
+from ..engine import Step
+from . import Answer, Instrument, JobResult, Measure, Plan, harness, held, lacking, unrecorded
+from .assess import priced
 from .resolution import median_interval
 
 # What a draft answer measures, which every build's record must hold (`lacking`).
@@ -31,6 +33,7 @@ MEASURED = ("proposed", "accepted", "anchors", "tokens_per_verify")
 
 
 def configure(parser: argparse.ArgumentParser) -> None:
+    held.option(parser)
     parser.add_argument("--anchors", type=int, default=8, help="anchors per fixture (default 8)")
     parser.add_argument("--proposals", type=int, help="proposals per draft (the drafter's own width by default)")
     parser.add_argument("--attribute", action="store_true",
@@ -40,6 +43,7 @@ def configure(parser: argparse.ArgumentParser) -> None:
 
 
 def plan(arguments, source, host) -> Plan:
+    held.subject("draft", arguments)
     if arguments.weight_cap and arguments.attribute:
         raise SystemExit("draft: --weight-cap compares outputs; time them with --attribute alone")
 
@@ -54,11 +58,11 @@ def plan(arguments, source, host) -> Plan:
             *(("--attribute",) if arguments.attribute else ()), *capped,
         ), fresh=fresh)  # fmt: skip
     caps = arguments.weight_cap or ()
-    jobs = (("draft", job()), *((("measure", measurement(arguments.backend)),) if caps else ()),
-            *((harness.streamed(cap), job("--weight-cap", str(cap), fresh=True)) for cap in caps))
-    return Plan(builds=(harness.BUILD, *((ASSESS_BUILD,) if caps else ())), jobs=jobs,
-                device="timed" if arguments.attribute else "device",
-                acquires=Weights(arguments.model), files=(arguments.fixture,))
+    jobs = (*held.jobs(arguments), ("draft", job()), *((harness.streamed(cap), job("--weight-cap", str(cap), fresh=True)) for cap in caps))
+    return priced(Plan(builds=(harness.BUILD,), jobs=jobs,
+                       device="timed" if arguments.attribute else "device",
+                       acquires=held.acquires(arguments),
+                       files=(arguments.fixture,)), bool(caps) or arguments.checkpoint is not None, arguments.backend)
 
 
 def answer(arguments, results: dict[str, JobResult]) -> Answer:
@@ -73,7 +77,8 @@ def answer(arguments, results: dict[str, JobResult]) -> Answer:
     matched = ("" if lacking(drafting, "matched_fixture") else
                f" · matched the fixture {100 * drafting['matched_fixture'] / max(proposed, 1):.1f}%")
     lines = [
-        f"{arguments.model} · {arguments.fixture.stem} @{arguments.context} · {anchors} anchors",
+        f"{held.name(arguments)} · {arguments.fixture.stem} @{arguments.context} · "
+        f"{anchors} anchors",
         (f"{drafting['tokens_per_verify']:.3f} tokens per verification · accepted {accepted} of {proposed} "
          f"proposals ({100 * accepted / max(proposed, 1):.1f}%){matched}"),
     ]
@@ -139,12 +144,12 @@ def _streamed(arguments, results: dict[str, JobResult], uncapped: JobResult) -> 
     """Each streamed load's drafting against the uncapped load's, and whether every one
     reproduced it. The streamed loads are priced by the product's measurement job: where that
     job failed, none is the load it is named, and the answer fails with it."""
-    if not arguments.weight_cap:
+    if "measure" not in results:
         return [], True
     measured = results["measure"]
-    verdicts = [_compare(cap, results[harness.streamed(cap)], _rows(uncapped)) for cap in arguments.weight_cap]
+    verdicts = [_compare(cap, results[harness.streamed(cap)], _rows(uncapped)) for cap in arguments.weight_cap or ()]
     lines = [] if measured.code == 0 else [f"measurement job exited {measured.code}", *measured.output()[-15:]]
-    for cap, verdict in zip(arguments.weight_cap, verdicts):
+    for cap, verdict in zip(arguments.weight_cap or (), verdicts):
         match verdict:
             case _Reproduced(anchors):
                 lines.append(f"streamed {cap}: same proposals and target tokens at all {anchors} anchors")
@@ -158,7 +163,7 @@ INSTRUMENT = Instrument(
     kind="fidelity",
     question="How well does the catalog drafter propose for this model, at one fixture family and context?",
     observable="drafter proposals the target accepts",
-    selectors=("backend", "host", "build", "model", "context", "fixture", "purpose", "estimate"),
+    selectors=("backend", "host", "build", "model-or-checkpoint", "context", "fixture", "purpose", "estimate"),
     configure=configure,
     plan=plan,
     answer=answer,

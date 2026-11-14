@@ -61,8 +61,7 @@ from pathlib import Path
 from .. import store
 from ..engine import Refused, Step, Weights
 from . import Answer, Instrument, JobResult, Measure, Plan, harness, lacking, unrecorded
-from .assess import measurement
-from .binaries import ASSESS_BUILD
+from .assess import preceded, priced
 from .resolution import median_interval
 
 SHOWN = 12
@@ -157,14 +156,13 @@ def jobs(arguments, prefix: str, *pinning: str) -> tuple[tuple[str, Step], ...]:
         resident, against = (), ("--resident-decode", f"{{inputs}}/{_recorded(arguments).name}")
     if not arguments.weight_cap:
         return resident
-    measure = measurement(arguments.backend)
     caps = tuple(
         (harness.streamed(cap), Step("time", time(
             arguments, family, *pinning, "--weight-cap", str(cap), *against,
         ), fresh=True))
         for cap in arguments.weight_cap
     )  # fmt: skip
-    return (("measure", measure), *resident, *caps)
+    return (*resident, *caps)
 
 
 def plan(arguments, source, host) -> Plan:
@@ -180,14 +178,14 @@ def plan(arguments, source, host) -> Plan:
         raise SystemExit(f"step: {arguments.tuning_record} is recorded already; a reference is recorded once")
     if arguments.tuning_replay and not arguments.tuning_replay.is_file():
         raise SystemExit(f"step: {arguments.tuning_replay} is not a recorded tuning")
-    return Plan(
-        builds=(harness.BUILD, *((ASSESS_BUILD,) if arguments.weight_cap else ())),
+    return priced(Plan(
+        builds=(harness.BUILD,),
         jobs=jobs(arguments, ""),
         device="device" if arguments.untimed else "timed",
         acquires=Weights(arguments.model),
         files=(arguments.fixture, *(() if arguments.resident is None else (_recorded(arguments),)),
                *((arguments.tuning_replay,) if arguments.tuning_replay else ())),
-    )
+    ), bool(arguments.weight_cap), arguments.backend)
 
 
 def _recorded(arguments) -> Path:
@@ -260,7 +258,7 @@ def alternate(arguments, side: str, index: int) -> tuple[tuple[str, Step], ...]:
         pinning = harness.RECORD
     else:
         pinning = harness.REPLAY
-    return jobs(arguments, f"{side}-r{index}-", *pinning)
+    return preceded(jobs(arguments, f"{side}-r{index}-", *pinning), bool(arguments.weight_cap), arguments.backend)
 
 
 def cell(result: JobResult, phase: str) -> dict:

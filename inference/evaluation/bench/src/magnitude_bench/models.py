@@ -22,9 +22,6 @@ from typing import Literal
 from magnitude_fixtures.canonical import Record
 from pydantic import Field
 
-from .policy import INFERENCE
-
-CATALOG = INFERENCE / "catalog" / "models.json"
 Engine = Literal[
     "magnitude", "llama.cpp", "ollama", "ollama-mlx", "ollama-registry", "mlx-vlm", "omlx"
 ]
@@ -38,12 +35,12 @@ GGUF_MODEL_LAYER = "application/vnd.ollama.image.model"
 OLLAMA_REGISTRY = "registry.ollama.ai"
 
 
-def catalog_reference(reference: str) -> str:
-    """Check ``<model>:<variant>`` against the catalog; model ids hold no colon."""
+def catalog_reference(reference: str, inference: Path) -> str:
+    """Check ``<model>:<variant>`` against the catalog of the `inference/` tree given; model ids hold no colon."""
     model, separator, variant = reference.partition(":")
     if not separator or not variant:
         raise ValueError("--model takes a catalog reference <model>:<variant>")
-    entries = {entry["id"]: entry for entry in json.loads(CATALOG.read_text())["models"]}
+    entries = {entry["id"]: entry for entry in json.loads((inference / "catalog" / "models.json").read_text())["models"]}
     if model not in entries:
         raise ValueError(f"{model} is not a catalog model")
     variants = [

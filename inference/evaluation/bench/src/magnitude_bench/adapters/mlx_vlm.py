@@ -12,7 +12,7 @@ from pathlib import Path
 
 from magnitude_fixtures.canonical import encoded
 
-from ..policy import PREFILL_TOKENS, RUNTIMES, SERVER_MAX_OUTPUT_TOKENS
+from ..policy import PREFILL_TOKENS, SERVER_MAX_OUTPUT_TOKENS, runtimes
 from .base import Adapter, command
 
 
@@ -21,7 +21,7 @@ class MlxVlm(Adapter):
 
     def __init__(self, *args):
         super().__init__(*args)
-        self.runtime = RUNTIMES / "mlx-vlm"
+        self.runtime = runtimes(self.options.inference) / "mlx-vlm"
 
     def served_model(self):
         return str(self.artifact.path)

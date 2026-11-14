@@ -28,7 +28,7 @@ import torch
 
 from magnitude_references.families.deepseek41 import COMPRESSED, CODE, DENSE, INDEX, WINDOW, DeepSeek41Reference
 from magnitude_references.gguf import HEADER_CACHE
-from magnitude_references.model import F32
+from magnitude_references.model import F32, gathered_attention
 
 MODULES = ("engram", "model")
 
@@ -71,18 +71,6 @@ def kernels(reference: DeepSeek41Reference) -> types.ModuleType:
     def gemm(*_, **__):
         raise ValueError("a quantized GEMM ran: every weight is loaded widened")
 
-    def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale):
-        """K:310-403: the indexed rows (-1 skipped), running max from -1e30, the sink in the denominator."""
-        valid = topk_idxs >= 0
-        rows = kv[torch.arange(kv.shape[0])[:, None, None], topk_idxs.clamp(min=0).long()].float()  # [b, m, k, d]
-        scores = torch.einsum("bmhd,bmkd->bmhk", q.float(), rows) * softmax_scale
-        scores = scores.masked_fill(~valid[:, :, None], float("-inf"))
-        peak = scores.amax(-1, keepdim=True).clamp(min=-1e30)
-        weights = torch.exp(scores - peak)
-        total = weights.sum(-1, keepdim=True) + torch.exp(attn_sink.float().view(1, 1, -1, 1) - peak)
-        # in F32, published in q's dtype
-        return torch.einsum("bmhk,bmkd->bmhd", weights / total, rows).to(q.dtype)
-
     def hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult=4, sinkhorn_iters=20, eps=1e-6):
         """K:406-475."""
         hc = hc_mult
@@ -96,7 +84,8 @@ def kernels(reference: DeepSeek41Reference) -> types.ModuleType:
             comb = comb / (comb.sum(-2, keepdim=True) + eps)
         return pre, post, comb
 
-    module.act_quant, module.fp4_act_quant, module.sparse_attn = act_quant, fp4_act_quant, sparse_attn
+    # K:310-403 is the reference's own attention, one function for both sides
+    module.act_quant, module.fp4_act_quant, module.sparse_attn = act_quant, fp4_act_quant, gathered_attention
     module.hc_split_sinkhorn, module.fp8_gemm, module.fp4_gemm = hc_split_sinkhorn, gemm, gemm
     return module
 

@@ -7,7 +7,8 @@ naming it, as cargo runs them; one that runs documentation tests, which compile 
 when they run, runs as `cargo test` in the side's checkout, which it keeps until its job ends
 (`Step.checkout`). With
 `--model`, the catalog model is acquired first and its acquisition object is
-`MAGNITUDE_ARTIFACTS` for the tests that check against a real model's files; otherwise a cargo
+`MAGNITUDE_ARTIFACTS` for the tests that check against a real model's files (every suite has the
+host's model store as `MAGNITUDE_MODELS`, for the files a conversion leaves there); otherwise a cargo
 suite has the catalog's header export as `{catalog}`, its headers `MAGNITUDE_CATALOG_HEADERS`
 (as the family and assessment tests read the release catalog), so a test of the suite never
 lacks its inputs; a host keeps the export of each catalog (`engine.catalog_key`), so only a
@@ -59,6 +60,8 @@ def _given(arguments) -> list[str]:
 def plan(arguments, source, host) -> Plan:
     # A device run names its backend, so a test fails where that backend is missing, never passes by skipping it.
     env = (("SEISMIC_TEST_BACKEND", arguments.backend),) if arguments.backend != "cpu" else ()
+    # A test of real weights a conversion left in the host's model store (a layer slice) finds them there.
+    env += (("MAGNITUDE_MODELS", "{models}"),)
     if arguments.model is not None:
         env += (("MAGNITUDE_ARTIFACTS", "{artifacts}"),)
     # A cargo suite reads the release catalog's headers unless it reads one model's files.
