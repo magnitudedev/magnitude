@@ -146,8 +146,8 @@ pub(super) struct LaunchRuns<'s, T> {
     served: &'s [BlockServed],
     /// The runs, by their class.
     runs: std::collections::BTreeMap<BlockClass, Vec<T>>,
-    /// The graphs run once a group, by their block.
-    once: std::collections::BTreeMap<usize, Vec<T>>,
+    /// The graphs run once a group (per window for a streamed block), by their block.
+    once: std::collections::BTreeMap<usize, Vec<(OnceStage, u64, T)>>,
 }
 
 impl<'s, T> LaunchRuns<'s, T> {
@@ -158,19 +158,31 @@ impl<'s, T> LaunchRuns<'s, T> {
         for (block, (class, stage), graph) in graphs {
             match stage {
                 Stage::Run(_) => index.runs.entry(class).or_default().push(graph),
-                Stage::Once(_) => index.once.entry(block).or_default().push(graph),
+                Stage::Once(once) => index.once.entry(block).or_default().push((once, class.0, graph)),
             }
         }
         index
     }
 
-    /// The graphs a launch of `class` runs.
-    pub(super) fn of_class(&self, class: BlockClass) -> impl Iterator<Item = &T> {
+    /// The graphs a launch of `class` runs, repeating a streamed block's
+    /// fill and single-launch pass for each of its `windows` windows.
+    pub(super) fn of_class(&self, class: BlockClass, passes: Passes, windows: u64) -> impl Iterator<Item = &T> {
+        let single_pass = passes.of_chain(1);
         let once = self
             .once
             .iter()
             .filter(move |&(&block, _)| block_splits(self.served, block, class.0))
-            .flat_map(|(_, graphs)| graphs);
+            .flat_map(move |(&block, graphs)| {
+                let streams = self.served[block].streams;
+                graphs.iter().flat_map(move |(once, rows, graph)| {
+                    let repeat = if streams && (*once == OnceStage::Fill || *rows == single_pass) {
+                        windows as usize
+                    } else {
+                        1
+                    };
+                    std::iter::repeat_n(graph, repeat)
+                })
+            });
         self.runs.get(&class).into_iter().flatten().chain(once)
     }
 }
@@ -488,6 +500,11 @@ pub(crate) struct Passes {
 }
 
 impl Passes {
+    /// Passes of `launches` launches per pass, where only launch ranges are needed.
+    pub(crate) fn with_launches(launches: usize) -> Self {
+        Self { region: 1, launches: launches.max(1) }
+    }
+
     /// The most rows a pass covers.
     pub(crate) fn rows(self) -> u64 {
         self.of_chain(self.launches)
@@ -540,7 +557,7 @@ impl Passes {
 /// (`BackendName::graphs_update_in_flight`). The plan's census
 /// (`certify_target_family`) and the sealed family (`PreparedTargetGraphs`)
 /// both count a chain's graphs by it.
-pub(super) fn chained_once_runs(passes: Passes, launches: usize) -> Vec<((OnceStage, u64), u64)> {
+pub(super) fn chained_once_runs(passes: Passes, launches: usize, windows: u64) -> Vec<((OnceStage, u64), u64)> {
     // Passes by length (in runs), the most any merge set makes.
     let mut most = vec![0u64; passes.launches + 1];
     for merged in 1..=launches {
@@ -556,8 +573,11 @@ pub(super) fn chained_once_runs(passes: Passes, launches: usize) -> Vec<((OnceSt
     most.into_iter()
         .enumerate()
         .skip(1)
-        .map(|(length, count)| ((OnceStage::Pass, passes.of_chain(length)), count.saturating_sub(1)))
-        .chain([((OnceStage::Fill, passes.rows()), launches.saturating_sub(1) as u64)])
+        .map(|(length, count)| {
+            let base = if length == 1 { windows } else { 1 };
+            ((OnceStage::Pass, passes.of_chain(length)), (count * windows).saturating_sub(base))
+        })
+        .chain([((OnceStage::Fill, passes.rows()), (launches as u64 * windows).saturating_sub(windows))])
         .filter(|&(_, further)| further > 0)
         .collect()
 }

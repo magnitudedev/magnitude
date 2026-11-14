@@ -571,3 +571,222 @@ fn qwen3_6_with_its_draft_is_placed_on_an_m4_pro_and_an_rtx3090() {
         }
     }
 }
+
+/// GLM-5.3-Flash FP8 at the 32,768 served floor has ~14.30 GB of non-expert
+/// resident weights and ~7.25 GB of widest-layer expert scratch (288 routed
+/// experts × 25.17 MB). With a full-layer scratch tier (`W = 288`), its
+/// ~25.74 GB floor exceeds the 24 GB RTX 3090's 24.91 GB room by ~0.83 GB.
+/// Bounding the scratch tier to `W < 288` (`W = 144, P = 2`) closes that
+/// deficit cleanly in both runtime placement (`ExecutionPlanDraft::placed`)
+/// and assessment (`assess_execution_fit`), with identical `window_slots` and
+/// allocation requirement, while the 16 GB RTX 4070 (`ryzen_igpu_and_rtx4070`,
+/// where non-expert weights alone exceed the ~12.22 GB room) stays `DoesNotFit`.
+#[test]
+fn glm_5_3_flash_at_32k_fits_on_an_rtx3090_by_windowing_its_scratch_and_not_on_a_16gb_rtx4070() {
+    let (_, base_definition, manifest) = super::catalog::artifact_target("glm-5.3-flash-fp8");
+    let manifest = &manifest;
+    let mut definition = base_definition.clone();
+    definition.decoder.context_limit = SERVED_FLOOR;
+    let limits = service(BackendName::Cuda, &definition);
+    let release = ReleaseRate::of_machine(None);
+
+    // 1. 24 GB RTX 3090: fits streamed with a bounded window (`W < widest`),
+    // and runtime placement + assessment agree on the exact window and bytes.
+    let topology_3090 = recorded::rtx3090();
+    let status_3090 = unopened(&topology_3090);
+    let executor_3090 = topology_3090
+        .executors()
+        .iter()
+        .find(|executor| executor.backend() == BackendName::Cuda)
+        .unwrap();
+    let pricing_3090 = pricing("rtx3090", BackendName::Cuda).unwrap();
+    let device_3090 = crate::platform::selected(&topology_3090, &status_3090, &release, executor_3090.clone(), pricing_3090);
+    let draft_3090 = plan(&definition, manifest, &device_3090, limits).unwrap();
+    let room_3090 = StableRoom {
+        topology: &topology_3090,
+        executor: executor_3090,
+        status: &status_3090,
+    };
+
+    let prices = crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices());
+    let placed_3090 = match draft_3090.clone().placed::<AssessmentMemoryCharge>(&definition, None, &room_3090).unwrap() {
+        Placed::Short(short) => short.streamed(&definition, &prices, &room_3090).unwrap(),
+        Placed::Whole(_) => panic!("GLM-5.3-Flash FP8 cannot fit whole on a 24 GB RTX 3090"),
+    };
+    let bank_3090 = placed_3090.draft().load().expert_bank().expect("streamed through expert bank");
+    assert!(
+        bank_3090.window_slots() < bank_3090.widest().get() && bank_3090.windows() >= 2,
+        "expected bounded window on RTX 3090, got window_slots={} of widest={} (windows={})",
+        bank_3090.window_slots(),
+        bank_3090.widest(),
+        bank_3090.windows(),
+    );
+    let (cap_3090, placed_need_3090, placed_fits_3090) = need(&room_3090.fit(placed_3090.charge()).unwrap());
+    assert!(
+        placed_fits_3090 && placed_need_3090 <= cap_3090,
+        "RTX 3090 placed plan must fit: need {placed_need_3090} <= cap {cap_3090}"
+    );
+    // The structural assessment charge of the runtime-placed draft itself must
+    // match the runtime placement charge to the exact byte.
+    let recharged_3090 = super::StructuralCharge::of(&definition, placed_3090.draft())
+        .unwrap()
+        .charge(&definition, placed_3090.draft())
+        .unwrap();
+    assert_eq!(
+        recharged_3090.allocation_bytes,
+        placed_3090.charge().allocation_bytes,
+        "runtime placement charge and assessment StructuralCharge must agree to the byte"
+    );
+
+    let forms_3090 = draft_3090
+        .floor_forms(&definition, None, |draft| {
+            super::StructuralCharge::of(&definition, draft)
+                .map(|charge| (charge, ()))
+                .map_err(|error| crate::PlanError::ResourcePlanning(format!("{error:?}")))
+        })
+        .unwrap();
+    let bank_form_3090 = forms_3090.bank().expect("banked floor forms");
+    let unwindowed_floor_draft_3090 = bank_form_3090
+        .at_slots(bank_form_3090.points[0])
+        .unwrap()
+        .with_graph_pricing(pricing_3090);
+    let unwindowed_floor_3090 = bank_form_3090
+        .form
+        .structure
+        .charge(&definition, &unwindowed_floor_draft_3090)
+        .unwrap()
+        .allocation_bytes;
+    let form_ceiling_3090 = bank_form_3090
+        .windowed
+        .iter()
+        .find(|win| win.draft.load().expert_bank().unwrap().window_slots() == bank_3090.window_slots())
+        .expect("matching windowed bank form")
+        .draft
+        .load()
+        .expert_bank()
+        .unwrap()
+        .ceiling;
+    let prepared_3090 = super::prepare_execution_assessment(&definition, forms_3090).unwrap();
+    match super::assess_execution_fit(&definition, &prepared_3090, pricing_3090, &topology_3090, &status_3090).unwrap() {
+        super::ExecutionAssessment::Fits(assessed) => {
+            let alloc_3090 = assessed
+                .domains
+                .iter()
+                .find(|domain| domain.role == DomainRole::Allocation)
+                .expect("allocation domain present");
+            assert!(
+                unwindowed_floor_3090 > alloc_3090.capacity_bytes,
+                "unwindowed W=288 floor ({unwindowed_floor_3090}) must exceed RTX 3090 capacity ({}) so windowing is required",
+                alloc_3090.capacity_bytes,
+            );
+            let assessed_bank_3090 = assessed.bank.as_ref().expect("assessed streamed bank");
+            assert_eq!(
+                assessed_bank_3090.window_slots(),
+                bank_3090.window_slots(),
+                "runtime placement and assessment must select identical window_slots on RTX 3090"
+            );
+            assert_eq!(
+                form_ceiling_3090,
+                bank_3090.ceiling,
+                "runtime placement and assessment floor_forms must derive identical structural bank ceiling on RTX 3090"
+            );
+            assert_eq!(
+                assessed_bank_3090.ceiling,
+                assessed_bank_3090.slots,
+                "WindowedBankForm::at_slots sizes the assessed bank at its fitted slots"
+            );
+            assert!(
+                assessed_bank_3090.slots <= bank_3090.ceiling,
+                "assessed slots ({}) cannot exceed structural bank ceiling ({})",
+                assessed_bank_3090.slots,
+                bank_3090.ceiling,
+            );
+            assert!(
+                assessed_bank_3090.slots >= bank_3090.slots,
+                "floor-pass assessment ({}) must hold at least as many bank slots as settled pass {:?} ({})",
+                assessed_bank_3090.slots,
+                bank_3090.pass,
+                bank_3090.slots,
+            );
+            if bank_3090.pass == crate::PassLaunches::FLOOR {
+                assert_eq!(
+                    assessed_bank_3090.slots, bank_3090.slots,
+                    "at PassLaunches::FLOOR, assessment and runtime placement must select identical bank slots"
+                );
+                assert_eq!(
+                    alloc_3090.required_bytes, placed_need_3090,
+                    "at PassLaunches::FLOOR, assessment and runtime placement must charge identical bytes"
+                );
+            }
+            assert!(
+                alloc_3090.required_bytes <= alloc_3090.capacity_bytes,
+                "RTX 3090 assessed plan must fit: required {} <= capacity {}",
+                alloc_3090.required_bytes,
+                alloc_3090.capacity_bytes,
+            );
+            println!(
+                "glm-5.3-flash:gguf:fp8 @ 32K on rtx3090: room {:.2} GB | unwindowed_floor {:.2} GB | service_need {:.2} GB (slots {}, ceiling {}, pass {}, host_slots {}) | floor_need {:.2} GB (slots {}, host_slots {}) | window_slots {} / {} (windows {})",
+                alloc_3090.capacity_bytes as f64 / 1e9,
+                unwindowed_floor_3090 as f64 / 1e9,
+                placed_need_3090 as f64 / 1e9,
+                bank_3090.slots,
+                bank_3090.ceiling,
+                bank_3090.pass.get(),
+                bank_3090.host_slots,
+                alloc_3090.required_bytes as f64 / 1e9,
+                assessed_bank_3090.slots,
+                assessed_bank_3090.host_slots,
+                bank_3090.window_slots(),
+                bank_3090.widest(),
+                bank_3090.windows(),
+            );
+        }
+        super::ExecutionAssessment::DoesNotFit(not_fit) => {
+            panic!(
+                "GLM-5.3-Flash FP8 at 32K must fit on RTX 3090: deficit {} bytes ({:?})",
+                not_fit.deficit_bytes, not_fit.domains
+            );
+        }
+    }
+
+    // 2. 12-16 GB CUDA GPUs (e.g. 12 GB RTX 4070 at 12.22 GB and 16 GB RTX 4070
+    // Ti at 16.00 GB): non-expert resident weights (~14.30 GB) plus state/graph
+    // overhead exceed VRAM room even at `W = round_records`, so both runtime
+    // placement and assessment refuse cleanly (`DoesNotFit`).
+    for grant_bytes in [12_220_000_000_u64, 16_000_000_000_u64] {
+        let topology_16g = seismic::fixtures::topology(&seismic::fixtures::rtx3090_granting(
+            BackendName::Cuda,
+            grant_bytes,
+        ));
+        let status_16g = unopened(&topology_16g);
+        let executor_16g = topology_16g
+            .executors()
+            .iter()
+            .find(|executor| executor.backend() == BackendName::Cuda)
+            .unwrap();
+        let pricing_16g = pricing("rtx3090", BackendName::Cuda).unwrap();
+        let device_16g = crate::platform::selected(&topology_16g, &status_16g, &release, executor_16g.clone(), pricing_16g);
+        let draft_16g = plan(&definition, manifest, &device_16g, limits).unwrap();
+        assert!(
+            draft_16g.clone().with_bank::<AssessmentMemoryCharge>(&definition, None, &prices).is_err(),
+            "{:.2} GB CUDA card must not place GLM-5.3-Flash FP8",
+            grant_bytes as f64 / 1e9,
+        );
+        let forms_16g = draft_16g
+            .floor_forms(&definition, None, |draft| {
+                super::StructuralCharge::of(&definition, draft)
+                    .map(|charge| (charge, ()))
+                    .map_err(|error| crate::PlanError::ResourcePlanning(format!("{error:?}")))
+            })
+            .unwrap();
+        let prepared_16g = super::prepare_execution_assessment(&definition, forms_16g).unwrap();
+        assert!(
+            matches!(
+                super::assess_execution_fit(&definition, &prepared_16g, pricing_16g, &topology_16g, &status_16g).unwrap(),
+                super::ExecutionAssessment::DoesNotFit(_)
+            ),
+            "{:.2} GB CUDA card must assess GLM-5.3-Flash FP8 as DoesNotFit",
+            grant_bytes as f64 / 1e9,
+        );
+    }
+}

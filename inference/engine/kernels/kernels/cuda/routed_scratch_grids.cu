@@ -13,5 +13,6 @@ extern "C" __global__ void routed_scratch_grids(SEISMIC_KERNEL_PARAMS) {
     streaming_scratch_grids(
         streaming_step(reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_STEP)), SEISMIC_STEP_STRIDE_0),
         reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH)),
+        reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_WINDOW)),
         reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_BUFFER_GRIDS)), seismic_words_value);
 }

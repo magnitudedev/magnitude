@@ -149,7 +149,7 @@ fn bank_of(groups: &[usize], slots: u64, experts: impl Fn(usize) -> u64, form: R
         })
         .collect();
     let layers = BankLayers::new(layers).unwrap();
-    let structured = conveyor::Structured::new(8, HostTier::Linked, groups, layers).unwrap();
+    let structured = conveyor::Structured::new(8, HostTier::Linked, groups, layers, None).unwrap();
     let allocations = seismic::NativeAllocations::EXACT;
     let block = seismic::block_bytes(seismic::BlockSizing { granule: structured.granule(), allocations }).unwrap();
     ExpertBankPlan {
@@ -178,7 +178,7 @@ fn restructured(
 ) -> ExpertBankPlan {
     let (selected, mut host, mut groups, layers) = plan.structured.into_parts();
     change(&mut host, &mut groups);
-    let structured = conveyor::Structured::new(selected, host, groups, layers).unwrap();
+    let structured = conveyor::Structured::new(selected, host, groups, layers, None).unwrap();
     let block = seismic::block_bytes(seismic::BlockSizing {
         granule: structured.granule(),
         allocations: plan.allocations,
@@ -1199,4 +1199,49 @@ fn a_linked_tiers_landing_rows_are_its_loads_claim() {
         Some(crate::memory::ledger::Need::LandingRows { tier: crate::planning::BankTier::Host, rows: linked.landing_records(), slot_bytes: row })
     );
     assert_eq!(unified.landing().unwrap(), None);
+}
+
+/// Windowed scratch (`W < widest`) bounds `ScratchPlan`, `BankPart::Scratch`,
+/// `prompt_records`, `least_records`, `floor`, `Window`, and `WindowTable`,
+/// while `W == widest` leaves `P == 1` and every plan byte-identical.
+#[test]
+fn windowed_scratch_bounds_lending_and_layout() {
+    let full = bank(&[4], 64);
+    let widest = full.widest().get();
+    let round = full.round_records();
+    assert_eq!(full.window_slots(), widest);
+    assert_eq!(full.windows(), 1);
+    assert_eq!(full.window_rounds(), widest.div_ceil(round));
+    assert_eq!(full.rounds(), full.window_rounds());
+    assert_eq!(full.layer_window(0), widest);
+    assert_eq!(full.expert_list_words(), list_extent(widest));
+    assert_eq!(full.clone().with_window_slots(widest).unwrap(), full);
+
+    assert!(full.clone().with_window_slots(round - 1).is_err());
+    assert!(full.clone().with_window_slots(widest + 1).is_err());
+
+    let w = round;
+    let win = full.clone().with_window_slots(w).unwrap();
+    let p = widest.div_ceil(w);
+    assert_eq!(win.window_slots(), w);
+    assert_eq!(win.windows(), p);
+    assert_eq!(win.window_rounds(), 1);
+    assert_eq!(win.rounds(), p);
+    assert_eq!(win.layer_window(0), w);
+    assert_eq!(win.expert_list_words(), list_extent(w));
+    assert!(win.prompt_records(0) < full.prompt_records(0));
+    assert!(win.least_records(0) < full.least_records(0));
+    assert!(win.lent(0) < full.lent(0));
+
+    let shape = |part| win.part_shape(0, part).unwrap().1;
+    assert_eq!(shape(BankPart::Scratch { kind: RoutedTensor::Up })[0], w);
+    assert_eq!(shape(BankPart::Window), [1]);
+    assert_eq!(shape(BankPart::WindowTable), [widest]);
+    assert!(BankPart::Window.windowed() && BankPart::WindowTable.windowed() && BankPart::RoundList { round: 0 }.windowed());
+    assert!(!BankPart::Step.windowed());
+
+    let layout = win.layout().unwrap();
+    assert_eq!(layout.load.window, vec![BankAllocation::Device { element: Element::i32(), extents: vec![1] }; p as usize]);
+    assert_eq!(layout.layers[0].windows, vec![BankAllocation::Words { element: Element::i32(), extents: vec![widest] }; p as usize]);
+    assert_eq!(layout.layers[0].rounds.len(), win.rounds() as usize);
 }

@@ -33,19 +33,21 @@ pub(crate) fn pass_ladder(most: PassLaunches) -> Vec<PassLaunches> {
 pub(crate) fn routed_prompt_seconds(
     passes: &ExpertPass,
     layers: &[(u64, u64)],
+    windows: u64,
     region_rows: u64,
     prompt_rows: u64,
     pass: PassLaunches,
     reads: &dyn Fn(u64) -> f64,
 ) -> f64 {
     let pass_rows = region_rows * pass.get() as u64;
+    let windows = windows.max(1) as f64;
     let one = |rows: u64| -> f64 {
         layers
             .iter()
             .enumerate()
             .map(|(layer, &(experts, selected))| {
                 let union = crate::assessment::estimate::expert_union(experts, selected, rows);
-                passes.seconds(layer, union, (rows * selected) as f64)
+                windows * passes.seconds(layer, union / windows, (rows * selected) as f64 / windows)
             })
             .sum::<f64>()
             + reads(rows)

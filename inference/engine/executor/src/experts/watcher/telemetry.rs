@@ -246,12 +246,13 @@ impl LayerTimeline {
     }
 }
 
-/// A group's request served whole: its point, and when its last round was
-/// acknowledged.
+/// A group's window fill served whole: its point, when its last round was
+/// acknowledged, and whether it was the step's last scratch window there.
 #[derive(Clone, Copy)]
 struct Acknowledged {
     point: Point,
     at: Instant,
+    last_window: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -711,6 +712,7 @@ pub(super) struct GroupFacts {
     /// prompt groups pull from a host tier (`TierPulls::bytes`).
     pub(super) resident: Option<Vec<u64>>,
     pub(super) experts: Vec<usize>,
+    pub(super) windows: u64,
 }
 
 impl GroupFacts {
@@ -767,6 +769,9 @@ impl GroupFacts {
     /// alone, the least compute that starts the next layer's reads before
     /// the pass ends.
     pub(super) fn merge_sets(&self, lines: Option<&[ExpertLines]>, line: Option<ReadLine>, pass: Option<&ExpertPass>, notice: Notice, steps: usize) -> Vec<usize> {
+        if self.windows > 1 {
+            return vec![steps; self.compute.len()];
+        }
         let unions = self.unions.iter().map(Option::as_ref).collect::<Option<Vec<_>>>();
         match (self.terms(), unions, lines, line, pass) {
             (Some(layers), Some(unions), Some(lines), Some(line), Some(pass)) => {
@@ -1063,6 +1068,7 @@ impl Telemetry {
                         .collect(),
                     resident,
                     experts: layers.iter().map(|layer| layer.experts).collect(),
+                    windows: extents.windows,
                 },
                 feed: Feed { pending: Vec::new(), ended: None },
                 ranked: Ranked { live: stack.live() },
@@ -1410,8 +1416,11 @@ impl Telemetry {
         // The last request served whole is its group's last step's at the
         // last streamed layer: its compute runs to the step's completion.
         if let Some(group) = &mut costs.group {
-            if let Some(Acknowledged { point, at }) = group.acknowledged.take_if(|served| served.point.sequence == sequence) {
-                compute(&mut group.cost, facts, point, at.elapsed());
+            if let Some(Acknowledged { point, at, .. }) = group
+                .acknowledged
+                .take_if(|served| served.point.sequence == sequence && served.last_window)
+            {
+                compute(&mut group.cost, facts, point, at.elapsed(), true);
             }
         }
         let layers = costs.layers.len();
@@ -1889,11 +1898,11 @@ impl Telemetry {
     /// The scratch request at `served`'s point was served whole at its
     /// instant (none after a failed one: the device's time after it is no
     /// layer's compute).
-    pub(super) fn served_whole(&self, served: Option<(Point, Instant)>) {
+    pub(super) fn served_whole(&self, served: Option<(Point, Instant, bool)>) {
         if let Some(group) = &mut self.lock().costs.group {
             group.acknowledged = served
-                .filter(|(served, _)| served.group == group.cost.first)
-                .map(|(point, at)| Acknowledged { point, at });
+                .filter(|(served, _, _)| served.group == group.cost.first)
+                .map(|(point, at, last_window)| Acknowledged { point, at, last_window });
         }
     }
 
@@ -1907,8 +1916,8 @@ impl Telemetry {
         let mut recorded = self.lock();
         let Recorded { costs, facts, .. } = &mut *recorded;
         if let Some(counted) = costs.group.as_mut().filter(|counted| counted.cost.first == group) {
-            if let Some(Acknowledged { point, at }) = counted.acknowledged {
-                compute(&mut counted.cost, facts, point, started.saturating_duration_since(at));
+            if let Some(Acknowledged { point, at, last_window }) = counted.acknowledged.take() {
+                compute(&mut counted.cost, facts, point, started.saturating_duration_since(at), last_window);
             }
         }
     }
@@ -1951,11 +1960,13 @@ fn counted(costs: &mut Costs, first: Step, last: Step) -> &mut Counted {
 /// step's to its completion, into `served`'s compute at its layer
 /// ([`GroupLayer::compute`]), and publish the layer's step there to the
 /// size and merge-set rules (`facts`).
-fn compute(group: &mut GroupCost, facts: &mut GroupFacts, served: Point, interval: Duration) {
+fn compute(group: &mut GroupCost, facts: &mut GroupFacts, served: Point, interval: Duration, last_window: bool) {
     let steps = u32::try_from(group.steps).expect("a group's steps");
     let layer = &mut group.layers[served.layer];
     layer.compute += interval;
-    layer.computed += 1;
+    if last_window {
+        layer.computed += 1;
+    }
     let step = layer.compute_of(steps).map(|compute| compute / steps);
     facts.compute[served.layer] = step;
 }

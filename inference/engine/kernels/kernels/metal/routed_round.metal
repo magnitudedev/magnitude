@@ -25,6 +25,7 @@ REPACK_BINDING(DownBinding, SEISMIC_CONVERSION_SD_UD, SEISMIC_CONVEYOR_DOWN, SEI
 kernel void routed_round(
     device const int *step [[buffer(SEISMIC_BUFFER_STEP)]],
     SYSTEM int *scratch [[buffer(SEISMIC_BUFFER_SCRATCH)]],
+    device const int *window_index [[buffer(SEISMIC_BUFFER_WINDOW)]],
     SYSTEM int *landing [[buffer(SEISMIC_BUFFER_LANDING)]],
     device const ulong *conveyor_gate [[buffer(SEISMIC_BUFFER_CONVEYOR_GATE)]],
     device const ulong *conveyor_up [[buffer(SEISMIC_BUFFER_CONVEYOR_UP)]],
@@ -43,7 +44,8 @@ kernel void routed_round(
     uint lane [[thread_index_in_simdgroup]]) {
     threadgroup int words[SEISMIC_CONST_LAND_GROUP_WORDS];
     const ulong q = streaming_step(step, SEISMIC_STEP_STRIDE_0);
-    SYSTEM int *slot = streaming_round_lane(q, ulong(SEISMIC_PARAM_ROUND), scratch, seismic_words);
+    SYSTEM int *slot = streaming_round_lane(
+        q, window_index, ulong(SEISMIC_PARAM_ROUNDS), ulong(SEISMIC_PARAM_ROUND), scratch, seismic_words);
     if (tid == 0)
         streaming_round_arrive(slot, SEISMIC_SCRATCH_STRIDE_1, q);
     streaming::Lander land{{conveyor_gate, conveyor_up, conveyor_down}, {gate, up, down}, SEISMIC_DIM_GV > 0,

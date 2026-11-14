@@ -8,6 +8,6 @@
 
 void routed_seed_commit() {
     streaming_seed_commit(SEISMIC_PTR(SEISMIC_BUFFER_LIST), SEISMIC_PTR(SEISMIC_BUFFER_STEP), SEISMIC_STEP_STRIDE_0,
-        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH), SEISMIC_PTR(SEISMIC_BUFFER_COMMITS),
-        0u, gl_LocalInvocationIndex, gl_WorkGroupSize.x);
+        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH), SEISMIC_PTR(SEISMIC_BUFFER_WINDOW),
+        SEISMIC_PTR(SEISMIC_BUFFER_COMMITS), 0u, gl_LocalInvocationIndex, gl_WorkGroupSize.x);
 }

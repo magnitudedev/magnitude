@@ -7,5 +7,6 @@ void routed_scratch_grids() {
     if (gl_LocalInvocationIndex != 0u)
         return;
     streaming_scratch_grids(streaming_step(SEISMIC_PTR(SEISMIC_BUFFER_STEP), SEISMIC_STEP_STRIDE_0),
-        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH), SEISMIC_PTR(SEISMIC_BUFFER_GRIDS));
+        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH), SEISMIC_PTR(SEISMIC_BUFFER_WINDOW),
+        SEISMIC_PTR(SEISMIC_BUFFER_GRIDS));
 }

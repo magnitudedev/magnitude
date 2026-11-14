@@ -24,7 +24,8 @@ __device__ void routed_round_block(SEISMIC_KERNEL_PARAMS) {
     __shared__ streaming::LandShared shared;
     const u64 q =
         streaming_step(reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_STEP)), SEISMIC_STEP_STRIDE_0);
-    int *slot = streaming_round_lane(q, (u64)SEISMIC_PARAM_ROUND,
+    int *slot = streaming_round_lane(q, reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_WINDOW)),
+                                     (u64)SEISMIC_PARAM_ROUNDS, (u64)SEISMIC_PARAM_ROUND,
                                      reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH)), seismic_words_value);
     if (threadIdx.x == 0)
         streaming_round_arrive(slot, SEISMIC_SCRATCH_STRIDE_1, q);

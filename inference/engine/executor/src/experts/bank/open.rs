@@ -196,6 +196,10 @@ impl ExpertBank {
         for grid in [&layout.load.tier_grid, &layout.load.seed_grid] {
             write_blocks(grid, magnitude_kernels::LIST_BLOCKS)?;
         }
+        for (w, tensor) in layout.load.window.iter().enumerate() {
+            let word = i32::try_from(w).map_err(|_| "window index exceeds i32")?.to_le_bytes();
+            tensor.clone().write_from_host(&word).map_err(|error| format!("a window index: {error}"))?;
+        }
         let (staging_pools, pool_of) = plan.staging_pools();
         let conveyor = plan.conveyor();
         // Each pool's conveyor: its view of the lender's lent records as the
@@ -230,14 +234,15 @@ impl ExpertBank {
             .iter()
             .zip(&forms)
             .enumerate()
-            .map(|(index, (layer, forms))| {
+            .map(|(index, (_, forms))| {
                 let binding = plan.binding(index)?;
+                let layer_window = plan.layer_window(index);
                 binding.record.try_map(|kind, tensor| {
                     let form = *forms.get(kind).ok_or("a scratch form of a tensor the record lacks")?;
                     lender
                         .get(kind)
                         .ok_or("scratch of a tensor the lender lacks")?
-                        .carried_region(tensor.resident, &[layer.experts, tensor.matrix[0], tensor.matrix[1]], scratch_plan.layout.offsets[form])
+                        .carried_region(tensor.resident, &[layer_window, tensor.matrix[0], tensor.matrix[1]], scratch_plan.layout.offsets[form])
                         .map_err(|error| format!("scratch view failed: {error}"))
                 })
             })
@@ -396,6 +401,7 @@ fn watch(
             })
             .collect::<Result<Vec<_>, _>>()?;
         let experts = plan.layers()[index].experts;
+        let layer_window = plan.layer_window(index);
         let slots = addressed
             .then(|| {
                 plan.groups()[group]
@@ -403,7 +409,7 @@ fn watch(
                     .iter()
                     .map(|(kind, _)| {
                         let view = scratch[index].get(kind).ok_or("a scratch view of a tensor the record lacks")?;
-                        Records::rows(view, view.byte_len() / experts, experts).map_err(|error| format!("the scratch: {error}"))
+                        Records::rows(view, view.byte_len() / layer_window, layer_window).map_err(|error| format!("the scratch: {error}"))
                     })
                     .collect::<Result<Vec<_>, String>>()
             })
@@ -429,12 +435,19 @@ fn watch(
         // A round converts conveyor records, or the scratch slots the
         // layer's experts were read into where the host addresses the
         // scratch, into the scratch slot of each expert.
-        let lent = if slots.is_some() { experts } else { 0 };
-        let bounds = crate::experts::ListBounds { from: plan.binding(index)?.conveyor, to: experts, lent };
+        let lent = if slots.is_some() { layer_window } else { 0 };
+        let bounds = crate::experts::ListBounds { from: plan.binding(index)?.conveyor, to: layer_window, lent };
         let rounds = layer.rounds.iter().map(|list| Ok(LandingList::new(words(list, 0)?, bounds))).collect::<Result<Vec<_>, String>>()?;
+        let windows = layer
+            .windows
+            .iter()
+            .enumerate()
+            .map(|(w, table)| words(table, if w == 0 { -2 } else { -1 }))
+            .collect::<Result<Vec<_>, String>>()?;
         watched.push(Layer {
             group,
-            experts: usize::try_from(plan.layers()[index].experts).map_err(|_| "experts exceed the host")?,
+            experts: usize::try_from(experts).map_err(|_| "experts exceed the host")?,
+            layer_window: usize::try_from(layer_window).map_err(|_| "layer window exceeds the host")?,
             map: view,
             file: ExchangeTable::new(layer.file.clone(), plan.binding(index)?.words.file(), steps.pulse())?,
             scratch: ExchangeTable::new(layer.scratch.clone(), plan.binding(index)?.words.scratch(), steps.pulse())?,
@@ -461,6 +474,7 @@ fn watch(
             },
             tiered: words(&layer.tiered, 0)?,
             seeds: words(&layer.seeds, 0)?,
+            windows,
         });
     }
     // A staging or conveyor record is one contiguous range of its pool's,
@@ -517,7 +531,7 @@ fn watch(
     let carrier = Carrier {
         records: usize::try_from(conveyor.conveyor.records).map_err(|_| "conveyor records exceed the host")?,
         slots: if addressed {
-            usize::try_from(plan.layers().widest().get()).map_err(|_| "scratch slots exceed the host")?
+            usize::try_from(plan.window_slots()).map_err(|_| "scratch slots exceed the host")?
         } else {
             0
         },
@@ -587,6 +601,9 @@ fn watch(
         pools,
         extents: Extents {
             widest: usize::try_from(plan.widest().get()).map_err(|_| "experts exceed the host")?,
+            windows: plan.windows(),
+            window_rounds: plan.window_rounds(),
+            pass_launches: plan.pass.get(),
             round_records: usize::try_from(binding.round_records)
                 .map_err(|_| "round records exceed the host")?,
             words: binding.words,

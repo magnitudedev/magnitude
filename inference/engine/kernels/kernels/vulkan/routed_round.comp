@@ -23,7 +23,8 @@
 void routed_round() {
     const uint tid = gl_LocalInvocationIndex;
     const uint64_t q = streaming_step(SEISMIC_PTR(SEISMIC_BUFFER_STEP), SEISMIC_STEP_STRIDE_0);
-    const uint64_t slot = streaming_round_lane(q, uint64_t(SEISMIC_PARAM_ROUND), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH));
+    const uint64_t slot = streaming_round_lane(q, SEISMIC_PTR(SEISMIC_BUFFER_WINDOW), uint64_t(SEISMIC_PARAM_ROUNDS),
+        uint64_t(SEISMIC_PARAM_ROUND), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH));
     if (tid == 0u)
         streaming_round_arrive(slot, SEISMIC_SCRATCH_STRIDE_1, q);
     streaming_land(STREAMING_LAND_WINDOW, SEISMIC_PTR(SEISMIC_BUFFER_LANDING), SEISMIC_LANDING_STRIDE_0, slot,

@@ -200,8 +200,10 @@ pub(super) fn qualify_bank(
     require_words(&flags, &requested, "routed_scratch_request", label)?;
     let list = |from, to| [(LIST_SEQUENCE, SEQUENCE), (LIST_COUNT, 1), (LIST_ENTRIES + LIST_FROM, from), (LIST_ENTRIES + LIST_TO, to)];
     // The seeds: scratch slot 0, which holds expert 0, into record 1.
-    let seeds = words(&[list_extent(binding.widest)], &list(0, 1), "routed_copy")?;
+    let seeds = words(&[list_extent(binding.window_slots)], &list(0, 1), "routed_copy")?;
     let entry = "routed_round";
+    let window = semantic_i32(device, &[1], &[0], entry, label)?;
+    let window_rounds = word(binding.window_rounds, entry, label)?;
     let mut round_list = words(&[landing_extent(binding.round_records)], &landing_list(1, 0), entry)?;
     let gate_conveyor = gate_or_empty(&records, |fixture| &fixture.conveyor, label)?;
     let mut scratch = records.as_ref().map(|_, fixture| fixture.scratch.clone());
@@ -210,9 +212,11 @@ pub(super) fn qualify_bank(
         .call_answered(routed_round::Args {
             step: &step,
             scratch: &mut scratch_table,
+            window: &window,
+            rounds: window_rounds,
             round: 0,
             landing: &mut round_list,
-            tiered: &words(&[list_extent(binding.widest)], &[], entry)?,
+            tiered: &words(&[list_extent(binding.window_slots)], &[], entry)?,
             conveyor_gate: &gate_conveyor,
             conveyor_up: &records.up.conveyor,
             conveyor_down: &records.down.conveyor,
@@ -231,12 +235,13 @@ pub(super) fn qualify_bank(
         require_bytes(&fixture.scratch, &fixture.converted, entry, label)?;
     }
     let entry = "routed_scratch_grids";
-    let rounds = binding.words.rounds;
+    let rounds = binding.window_rounds;
     let mut grids = semantic_i32(device, &[rounds, 3], &vec![0; (rounds * 3) as usize], entry, label)?;
     scratch_grids
         .call(routed_scratch_grids::Args {
             step: &step,
             scratch: &scratch_table,
+            window: &window,
             grids: &mut grids,
             round_records: word(binding.round_records, entry, label)?,
         })
@@ -253,7 +258,7 @@ pub(super) fn qualify_bank(
             let grid_of = |listed: &Tensor, entry| {
                 let blocks = magnitude_kernels::LIST_BLOCKS as i32;
                 let mut grid = semantic_i32(device, &[3], &[blocks, 0, 0], entry, label)?;
-                let mut staged = words(&[list_extent(binding.widest)], &[], entry)?;
+                let mut staged = words(&[list_extent(binding.window_slots)], &[], entry)?;
                 list_grid
                     .call(routed_list_grid::Args { list: listed, step: &step, grid: &mut grid, staged: &mut staged })
                     .map_err(|error| qualification_dynamic("routed_list_grid", label, error))?;
@@ -282,7 +287,14 @@ pub(super) fn qualify_bank(
             let entry = "routed_seed_commit";
             let mut commits = words(&[RECORDS], &[], entry)?;
             seed_commit
-                .call(routed_seed_commit::Args { list: &seeds, step: &step, scratch: &scratch_table, commits: &mut commits })
+                .call(routed_seed_commit::Args {
+                    list: &seeds,
+                    step: &step,
+                    scratch: &scratch_table,
+                    window: &window,
+                    rounds: window_rounds,
+                    commits: &mut commits,
+                })
                 .map_err(|error| qualification_dynamic(entry, label, error))?;
             require_words(&commits, &[(0, 0), (1, SEQUENCE)], entry, label)?;
         }
@@ -290,13 +302,21 @@ pub(super) fn qualify_bank(
     set_words(&map, &held(0, 1), "host placement", label)?;
 
     // A merge set's pass's map resolved into device memory: expert 0 held
-    // in record 1 from the step on, every other expert in none, and the
-    // step.
+    // in record 1 from the step on, expert 1 in scratch slot 0 when more
+    // than two experts exist, every other expert in none, and the step.
     let entry = "routed_pass_map";
+    let window_codes = (0..binding.experts)
+        .map(|expert| match expert {
+            0 | 2 => -2,
+            1 if binding.experts > 2 => 0,
+            _ => -1,
+        })
+        .collect::<Vec<_>>();
+    let pass_window = semantic_i32(device, &[binding.experts], &window_codes, entry, label)?;
     let mut resolved = words(&[binding.experts, MAP_WORDS], &[], entry)?;
     let mut pass_step = words(&[STEP_WORDS], &[], entry)?;
     pass_map
-        .call(routed_pass_map::Args { map: &map, step: &step, resolved: &mut resolved, pass_step: &mut pass_step })
+        .call(routed_pass_map::Args { map: &map, window: &pass_window, step: &step, resolved: &mut resolved, pass_step: &mut pass_step })
         .map_err(|error| qualification_dynamic(entry, label, error))?;
     require_words(&pass_step, &[(STEP_LOW, SEQUENCE), (STEP_HIGH, 0)], entry, label)?;
     let from = |expert: u64, record: i32| {
@@ -309,7 +329,16 @@ pub(super) fn qualify_bank(
             (row + MAP_RECORD, record),
         ]
     };
-    let wanted = (0..binding.experts).flat_map(|expert| from(expert, if expert == 0 { 1 } else { -1 })).collect::<Vec<_>>();
+    let wanted = (0..binding.experts)
+        .flat_map(|expert| {
+            let record = match expert {
+                0 => 1,
+                1 if binding.experts > 2 => -2,
+                _ => -1,
+            };
+            from(expert, record)
+        })
+        .collect::<Vec<_>>();
     require_words(&resolved, &wanted, entry, label)?;
 
     // The shared entries read the bank's record 1; beside a host tier they
@@ -821,6 +850,8 @@ mod tests {
             staging: 2,
             round_records: 2,
             widest: EXPERTS,
+            window_slots: EXPERTS,
+            window_rounds: 2,
             conveyor: EXPERTS,
             tier: 0,
             placer: crate::planning::Placer::Tier,
@@ -905,7 +936,7 @@ mod tests {
             .unwrap(),
             scratch_grids: routed_scratch_grids::native_for_device(
                 device,
-                &specialization::<routed_scratch_grids::Entry>(device, &[scratch.as_slice(), &[("R", bank.words.rounds)]].concat()),
+                &specialization::<routed_scratch_grids::Entry>(device, &[scratch.as_slice(), &[("RW", bank.window_rounds)]].concat()),
             )
             .unwrap(),
             pass_map: routed_pass_map::native_for_device(device, &specialization::<routed_pass_map::Entry>(device, &[])).unwrap(),
@@ -914,7 +945,7 @@ mod tests {
                     routed_copy::native_for_device_with(
                         device,
                         routed_copy::Elements { U: tensor.resident },
-                        &specialization::<routed_copy::Entry>(device, &record_statics(tensor, bank.widest)),
+                        &specialization::<routed_copy::Entry>(device, &record_statics(tensor, bank.window_slots)),
                     )
                     .unwrap()
                 }),
@@ -922,7 +953,7 @@ mod tests {
                     device,
                     &specialization::<routed_seed_commit::Entry>(
                         device,
-                        &[&[("X", bank.widest), ("BANK", bank.records)], scratch.as_slice()].concat(),
+                        &[&[("X", bank.window_slots), ("BANK", bank.records)], scratch.as_slice()].concat(),
                     ),
                 )
                 .unwrap(),

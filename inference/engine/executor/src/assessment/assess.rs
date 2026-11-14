@@ -296,6 +296,7 @@ pub struct ExecutionShortfall {
 /// ([`crate::FloorForms`]), at the model's largest served context: every
 /// fit is arithmetic over them ([`assess_execution_fit`]).
 pub struct PreparedExecutionAssessment {
+    prepared_definition: ModelDefinition,
     demand: DecodeDemand,
     /// Of a plan that banks its experts, its demand holding them whole: the
     /// resident form its decode runs while its bank holds every expert. None
@@ -355,7 +356,12 @@ pub fn prepare_execution_assessment(
         Some(_) => Some(decode_demand(definition, &draft.held_whole(definition)?)?),
         None => None,
     };
-    Ok(PreparedExecutionAssessment { demand: decode_demand(definition, draft)?, whole, forms })
+    Ok(PreparedExecutionAssessment {
+        prepared_definition: definition.clone(),
+        demand: decode_demand(definition, draft)?,
+        whole,
+        forms,
+    })
 }
 
 /// The standard workload's checked memory charge of `definition` planned
@@ -651,28 +657,32 @@ pub fn assess_execution_fit(
         None => None,
     };
     // Streamed: the most slots that fit, a bank's fit falling as its slots
-    // do, beside the host tier host memory holds.
+    // do, beside the host tier host memory holds; if the full-layer scratch
+    // window's floor is short, walk the shared geometric `window_slots`
+    // ladder (`BankForm::windowed`) for the largest fitting window.
+    let settle_points = |points: &[u64], at: &dyn Fn(u64) -> Result<(AssessmentMemoryCharge, crate::AssessmentFit), AssessmentError>, floor: (AssessmentMemoryCharge, crate::AssessmentFit)| -> Result<(u64, AssessmentMemoryCharge, crate::AssessmentFit), AssessmentError> {
+        let (mut fitting, mut short) = (0, points.len());
+        let mut held = floor;
+        while short - fitting > 1 {
+            let middle = fitting + (short - fitting) / 2;
+            let (charge, fit) = at(points[middle])?;
+            if holds(&fit) {
+                (fitting, held) = (middle, (charge, fit));
+            } else {
+                short = middle;
+            }
+        }
+        Ok((points[fitting], held.0, held.1))
+    };
     let least = match forms.bank() {
         Some(bank) => {
             let at = |slots: u64| -> Result<_, AssessmentError> {
                 let (_, charge, fit) = charged(&bank.form, bank.at_slots(slots)?)?;
                 Ok((charge, fit))
             };
-            let (floor_charge, floor_fit) = at(bank.points[0])?;
-            if holds(&floor_fit) {
-                let (mut fitting, mut short) = (0, bank.points.len());
-                let mut held = (floor_charge, floor_fit);
-                while short - fitting > 1 {
-                    let middle = fitting + (short - fitting) / 2;
-                    let (charge, fit) = at(bank.points[middle])?;
-                    if holds(&fit) {
-                        (fitting, held) = (middle, (charge, fit));
-                    } else {
-                        short = middle;
-                    }
-                }
-                let slots = bank.points[fitting];
-                let (charge, fit) = held;
+            let (floor_charge, mut least_fit) = at(bank.points[0])?;
+            if holds(&least_fit) {
+                let (slots, charge, fit) = settle_points(&bank.points, &at, (floor_charge, least_fit))?;
                 match bank.with_host_tier(slots, &charge, &room)? {
                     Ok(draft) => return fits(&draft.with_graph_pricing(pricing), &charge, fit),
                     Err(reason) => {
@@ -682,7 +692,37 @@ pub fn assess_execution_fit(
                     }
                 }
             }
-            floor_fit
+            for win in &bank.windowed {
+                let structure = win.structure(&prepared.prepared_definition)?;
+                let at_win = |slots: u64| -> Result<_, AssessmentError> {
+                    let draft = win.at_slots(slots)?.with_graph_pricing(pricing);
+                    let charge = structure.charge(definition, &draft)?;
+                    let fit = room.fit(&charge)?;
+                    Ok((charge, fit))
+                };
+                let (win_charge, win_fit) = at_win(win.points[0])?;
+                if holds(&win_fit) {
+                    let (slots, charge, fit) = settle_points(&win.points, &at_win, (win_charge, win_fit))?;
+                    match win.with_host_tier(slots, &charge, &room)? {
+                        Ok(draft) => return fits(&draft.with_graph_pricing(pricing), &charge, fit),
+                        Err(reason) => {
+                            return Err(AssessmentError::Plan(format!(
+                                "the bank's floor fits, yet its experts cannot stream beside it: {reason}"
+                            )));
+                        }
+                    }
+                }
+                if let (
+                    AssessmentFitVerdict::DoesNotFit { deficit_bytes: cand, .. },
+                    AssessmentFitVerdict::DoesNotFit { deficit_bytes: cur, .. },
+                ) = (&win_fit.verdict, &least_fit.verdict)
+                {
+                    if cand < cur {
+                        least_fit = win_fit;
+                    }
+                }
+            }
+            least_fit
         }
         None => resident.expect("experts that cannot stream are held whole (`FloorForms::Resident`)"),
     };

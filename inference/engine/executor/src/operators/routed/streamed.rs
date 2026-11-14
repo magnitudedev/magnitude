@@ -468,6 +468,9 @@ pub(crate) struct BankNumbers<D = Dim> {
     pub staging: D,
     pub round_records: D,
     pub widest: D,
+    pub window_slots: D,
+    pub window_rounds: D,
+    pub layer_window: D,
     pub conveyor: D,
     pub tier: D,
     pub rounds: D,
@@ -498,6 +501,9 @@ impl<D> Numbers<D> for BankNumbers<D> {
             staging: f(self.staging),
             round_records: f(self.round_records),
             widest: f(self.widest),
+            window_slots: f(self.window_slots),
+            window_rounds: f(self.window_rounds),
+            layer_window: f(self.layer_window),
             conveyor: f(self.conveyor),
             tier: f(self.tier),
             rounds: f(self.rounds),
@@ -570,6 +576,9 @@ pub(crate) fn split<G: GraphDraft>(
         staging: binding.staging,
         round_records: binding.round_records,
         widest: binding.widest,
+        window_slots: plan.window_slots(),
+        window_rounds: plan.window_rounds(),
+        layer_window: plan.layer_window(index),
         conveyor: binding.conveyor,
         tier: binding.tier,
         rounds: words.rounds,
@@ -967,8 +976,9 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
     pub(crate) fn pass_sources(
         &mut self,
         graph: &mut G,
-    ) -> Result<(WorkflowTensor, WorkflowTensor, RecordTensors<NativePort>, Dim, NativePort), GraphError> {
+    ) -> Result<(WorkflowTensor, WorkflowTensor, RecordTensors<NativePort>, Dim, NativePort, Dim), GraphError> {
         let map = self.part(graph, BankPart::SlotMap)?;
+        let window = self.part(graph, BankPart::WindowTable)?;
         let step = self.part(graph, BankPart::Step)?;
         let entry = self.entries.pass_map;
         let dimensions = [("E", self.numbers.experts.clone())];
@@ -979,6 +989,7 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
             &dimensions,
             routed_pass_map::WorkflowArgs {
                 map: map.tensor().into(),
+                window: window.tensor().into(),
                 step: step.tensor().into(),
                 resolved: resolved.tensor_mut().into(),
                 pass_step: pass_step.tensor_mut().into(),
@@ -990,6 +1001,7 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
             self.parts(graph, |kind| BankPart::Scratch { kind })?,
             self.numbers.records.clone(),
             self.part(graph, BankPart::GroupReads)?,
+            self.numbers.layer_window.clone(),
         ))
     }
 
@@ -1032,14 +1044,15 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
             ("L", numbers.round_records.clone()),
             ("V", numbers.conveyor.clone()),
             ("GV", gated(&numbers.conveyor)),
-            ("S", experts.clone()),
-            ("GS", gated(experts)),
+            ("S", numbers.layer_window.clone()),
+            ("GS", gated(&numbers.layer_window)),
             ("F", features.clone()),
             ("H", hidden.clone()),
-            ("E", numbers.widest.clone()),
+            ("E", numbers.window_slots.clone()),
             ("EL", experts.clone()),
         ];
         let step = self.part(graph, BankPart::Step)?;
+        let window = self.part(graph, BankPart::Window)?;
         let mut slots = self.part(graph, BankPart::ScratchTable)?;
         let mut scratch = self.parts(graph, |kind| BankPart::Scratch { kind })?;
         let conveyor = self.parts(graph, |kind| BankPart::Conveyor { kind })?;
@@ -1077,7 +1090,8 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
         // not only where launches keep submission order.
         let map = self.part(graph, BankPart::SlotMap)?;
         // The rounds repeat the topology: a trace is its rounds'.
-        let rounds = numbers.rounds.pin();
+        let window_rounds = numbers.window_rounds.word().ok_or("window rounds exceed i32")?;
+        let rounds = numbers.window_rounds.pin();
         for round in 0..rounds {
             let mut list = {
                 let round = u8::try_from(round).map_err(|_| "scratch rounds exceed u8")?;
@@ -1086,7 +1100,7 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
             let park = grid(grids.tensor(), round);
             let RecordTensors { gate, up, down } = scratch.as_mut();
             let mut gate = match gate {
-                Some(gate) => gate.tensor().slice_leading(0, experts),
+                Some(gate) => gate.tensor().slice_leading(0, &numbers.layer_window),
                 None => up.tensor().slice_leading(0, 0),
             };
             self.park(graph, ParkKind::Round(round));
@@ -1096,6 +1110,8 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
                 routed_round::WorkflowArgs {
                     step: step.tensor().into(),
                     scratch: slots.tensor_mut().into(),
+                    window: window.tensor().into(),
+                    rounds: window_rounds,
                     round: i32::try_from(round).map_err(|_| "scratch rounds exceed i32")?.into(),
                     landing: list.tensor_mut().into(),
                     tiered: tiered.tensor().into(),
@@ -1116,10 +1132,11 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
             if round == 0 {
                 graph.enqueue(
                     entries.scratch_grids,
-                    &[("FLIGHT", scratch_slots.clone()), ("LANES", scratch_lanes.clone()), ("R", numbers.rounds.clone())],
+                    &[("FLIGHT", scratch_slots.clone()), ("LANES", scratch_lanes.clone()), ("RW", numbers.window_rounds.clone())],
                     routed_scratch_grids::WorkflowArgs {
                         step: step.tensor().into(),
                         scratch: slots.tensor().into(),
+                        window: window.tensor().into(),
                         grids: grids.tensor_mut().into(),
                         round_records: numbers.round_records.word().ok_or("round records exceed i32")?,
                     },
@@ -1132,7 +1149,7 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
                     let seeding = entries.seeding;
                     graph.enqueue(
                         seeding.list_grid,
-                        &[("L", numbers.widest.clone())],
+                        &[("L", numbers.window_slots.clone())],
                         routed_list_grid::WorkflowArgs {
                             list: tiered.tensor().into(),
                             step: step.tensor().into(),
@@ -1146,8 +1163,8 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
                             copy,
                             &[
                                 ("S", numbers.tier.clone()),
-                                ("D", experts.clone()),
-                                ("L", numbers.widest.clone()),
+                                ("D", numbers.layer_window.clone()),
+                                ("L", numbers.window_slots.clone()),
                                 ("N", n.clone()),
                                 ("K", k.clone()),
                             ],
@@ -1166,7 +1183,7 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
                 // another step launches the seed copy.
                 graph.enqueue(
                     entries.seeding.list_grid,
-                    &[("L", numbers.widest.clone())],
+                    &[("L", numbers.window_slots.clone())],
                     routed_list_grid::WorkflowArgs {
                         list: seeds.tensor().into(),
                         step: step.tensor().into(),
@@ -1213,9 +1230,9 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
             graph.enqueue(
                 seed,
                 &[
-                    ("S", experts.clone()),
+                    ("S", numbers.layer_window.clone()),
                     ("D", seeded.clone()),
-                    ("L", numbers.widest.clone()),
+                    ("L", numbers.window_slots.clone()),
                     ("N", n.clone()),
                     ("K", k.clone()),
                 ],
@@ -1232,7 +1249,7 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
         graph.enqueue(
             seeding.seed_commit,
             &[
-                ("X", numbers.widest.clone()),
+                ("X", numbers.window_slots.clone()),
                 ("BANK", seeded),
                 ("FLIGHT", scratch_slots.clone()),
                 ("LANES", scratch_lanes.clone()),
@@ -1241,6 +1258,8 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
                 list: seeds.tensor().into(),
                 step: step.tensor().into(),
                 scratch: slots.tensor().into(),
+                window: window.tensor().into(),
+                rounds: window_rounds,
                 commits: (&mut committed).into(),
             },
         )?;

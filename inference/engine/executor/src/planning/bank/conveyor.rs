@@ -139,13 +139,16 @@ pub(super) struct Structured {
     host: HostTier,
     groups: Vec<BankGroup>,
     layers: BankLayers,
+    /// `W`: scratch window slots (`round_records <= W <= widest`).
+    window_slots: u64,
     lending: Lending,
     granule: u64,
 }
 
 impl Structured {
     /// The structure of `groups` over `layers`, `selected` experts a row,
-    /// beside `host`, with its lending ([`BankStructure::lending`]) and its
+    /// beside `host`, with its scratch bounded to `window_slots` (defaulting
+    /// to `widest`), its lending ([`BankStructure::lending`]) and its
     /// records' granule ([`ExpertBankPlan::granule`]); or why its lending or
     /// its granule cannot be made.
     pub(super) fn new(
@@ -153,15 +156,33 @@ impl Structured {
         host: HostTier,
         groups: Vec<BankGroup>,
         layers: BankLayers,
+        window_slots: Option<u64>,
     ) -> Result<Self, String> {
-        let lending = BankStructure { groups: &groups, layers: &layers, selected, host }.lending()?;
+        let widest = layers.widest().get();
+        let window_slots = window_slots.unwrap_or(widest);
+        let structure = BankStructure { groups: &groups, layers: &layers, selected, host, window_slots };
+        let round = structure.round_records();
+        if window_slots < round || window_slots > widest {
+            return Err(format!("scratch window slots {window_slots} must lie in {round}..={widest}"));
+        }
+        let lending = structure.lending()?;
         let granule = records_slab(groups.iter().map(|group| &group.record))?.granule()?;
-        Ok(Self { selected, host, groups, layers, lending, granule })
+        Ok(Self { selected, host, groups, layers, window_slots, lending, granule })
+    }
+
+    /// This structure with `window_slots` scratch slots and its lending derived again.
+    pub(super) fn with_window_slots(&self, window_slots: u64) -> Result<Self, String> {
+        Self::new(self.selected, self.host, self.groups.clone(), self.layers.clone(), Some(window_slots))
     }
 
     /// [`ExpertBankPlan::granule`].
     pub(super) fn granule(&self) -> u64 {
         self.granule
+    }
+
+    /// [`ExpertBankPlan::window_slots`].
+    pub(super) fn window_slots(&self) -> u64 {
+        self.window_slots
     }
 
     /// Its parts, which [`Self::new`] makes a structure of again.
@@ -172,14 +193,15 @@ impl Structured {
 }
 
 /// The part of a bank's plan its lending derives from: its groups and
-/// layers, the experts a row selects and its host tier, none of which
-/// changes once the plan is made.
+/// layers, the experts a row selects, its host tier, and its scratch window
+/// slots (`W`), none of which changes once the plan is made.
 #[derive(Clone, Copy)]
 pub(super) struct BankStructure<'a> {
     pub(super) groups: &'a [BankGroup],
     pub(super) layers: &'a BankLayers,
     pub(super) selected: u64,
     pub(super) host: HostTier,
+    pub(super) window_slots: u64,
 }
 
 impl ExpertBankPlan {
@@ -191,6 +213,7 @@ impl ExpertBankPlan {
             layers: &structured.layers,
             selected: structured.selected,
             host: structured.host,
+            window_slots: structured.window_slots,
         }
     }
 
@@ -425,13 +448,13 @@ impl BankStructure<'_> {
     }
 
     /// The scratch's forms ([`ScratchForm`]), each with the most experts of
-    /// the layers of that form, its view's slots.
+    /// the layers of that form bounded by `window_slots`, its view's slots.
     pub(super) fn scratch_forms(self) -> (Vec<ScratchForm>, Vec<u64>) {
         let (forms, layers) = self.layer_forms(|kind, tensor| ScratchForm { kind, resident: tensor.resident, matrix: tensor.matrix });
         let mut experts = vec![0u64; forms.len()];
         for (layer, of) in self.layers.iter().zip(&layers) {
             for (_, &form) in of.iter() {
-                experts[form] = experts[form].max(layer.experts);
+                experts[form] = experts[form].max(layer.experts.min(self.window_slots));
             }
         }
         (forms, experts)

@@ -13,6 +13,7 @@ extern "C" __global__ void routed_seed_commit(SEISMIC_KERNEL_PARAMS) {
     streaming_seed_commit(reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_LIST)),
                            reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_STEP)), SEISMIC_STEP_STRIDE_0,
                            reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH)),
+                           reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_WINDOW)),
                            reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_BUFFER_COMMITS)), words, threadIdx.x,
                           blockDim.x, seismic_words_value);
 }

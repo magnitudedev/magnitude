@@ -55,6 +55,11 @@ pub(in crate::experts) struct Layer {
     pub group: usize,
     /// Its experts: its map's extent.
     pub experts: usize,
+    /// Its scratch window slots (`ExpertBankPlan::layer_window`).
+    pub layer_window: usize,
+    /// Its host-shared window table (`BankPart::WindowTable`), one `[experts]`
+    /// row per scratch window.
+    pub windows: Vec<Words>,
     /// Its map (`BankPart::SlotMap`) as the device reads it: its one
     /// writer is the bank's records beside a host tier
     /// (`experts::records`), the one store's host records where the host
@@ -130,6 +135,28 @@ impl Layer {
     /// The stored bytes of one of its experts.
     pub fn expert_bytes(&self) -> u64 {
         self.stored.iter().map(StoredTensor::bytes).sum()
+    }
+
+    /// Clear every scratch window row to `-1` (skipped) before a scratch-served
+    /// pass set fills the entries of the experts it routes.
+    pub fn clear_windows(&self) {
+        for window in &self.windows {
+            for expert in 0..self.experts {
+                window.store(expert, -1);
+            }
+        }
+    }
+
+    /// Restore the resident default (`windows[0] = -2`, `windows[1..] = -1`)
+    /// once the device is past a scratch-served layer, so a later resident
+    /// group resolves every expert from its map in window 0.
+    pub fn reset_windows(&self) {
+        for (index, window) in self.windows.iter().enumerate() {
+            let value = if index == 0 { -2 } else { -1 };
+            for expert in 0..self.experts {
+                window.store(expert, value);
+            }
+        }
     }
 }
 
@@ -246,9 +273,14 @@ pub(in crate::experts) struct LoadWords {
 /// The bank's extents the watcher serves by.
 #[derive(Clone, Copy)]
 pub(in crate::experts) struct Extents {
-    /// The widest streamed layer's experts, every layer's expert `e` in
-    /// conveyor record `e`.
+    /// The widest streamed layer's experts.
     pub widest: usize,
+    /// Scratch windows per pass set (`ExpertBankPlan::windows`).
+    pub windows: u64,
+    /// Convert rounds per window (`ExpertBankPlan::window_rounds`).
+    pub window_rounds: u64,
+    /// Maximum launches a single pass graph covers (`Passes::launches`).
+    pub pass_launches: usize,
     /// Records of a scratch round.
     pub round_records: usize,
     /// The request regions' layout.
@@ -270,17 +302,14 @@ pub(in crate::experts) struct Extents {
 }
 
 /// The records a scratch round of the request at `until` listed: free once
-/// its converts have read them, which the device's arrival at the round
-/// after proves (its lane `after`, of the request's slot of the layer's
-/// scratch table: that round's wait binds the conveyor as the host's, so
-/// it follows the converts that read it), or, where no round follows the
-/// slot's last or the fill is followed (`ExpertBank::fill_followed`: the
-/// device never arrives at the round after, but at the sibling's round 0,
-/// which advances progress past `until`), once the device is past `until`.
+/// its converts have read them, which the device's arrival at a following
+/// round proves (`after`: each `(step, lane)` whose request on the layer's
+/// scratch table follows the round's converts), or once the device is past
+/// `until`.
 pub(super) struct Taken {
     pub(super) records: Vec<Listed>,
     pub(super) until: Point,
-    pub(super) after: Option<u64>,
+    pub(super) after: Vec<(super::Step, u64)>,
 }
 
 /// A record a scratch round listed: the conveyor record expert `expert` of
@@ -444,13 +473,13 @@ impl Core {
         done.into_iter().flat_map(|taken| taken.records).collect()
     }
 
-    /// The records taken whose converts the device has run: it arrived at
-    /// the round after theirs.
+    /// The records taken whose converts the device has run: it arrived at a
+    /// round ordered after theirs.
     pub(super) fn take_converted(&mut self) -> Vec<Listed> {
         let layers = &self.layers;
         let (done, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.taken).into_iter().partition(|taken| {
-            let Point { layer, sequence, .. } = taken.until;
-            taken.after.is_some_and(|lane| layers[layer].scratch.requested(sequence, lane))
+            let layer = taken.until.layer;
+            taken.after.iter().any(|&(sequence, lane)| layers[layer].scratch.requested(sequence, lane))
         });
         self.taken = kept;
         done.into_iter().flat_map(|taken| taken.records).collect()

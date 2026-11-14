@@ -26,6 +26,13 @@
 #include "lib/routed/routed.h"
 #include "lib/streaming/control.h"
 
+inline int routed_expert_slot(SYSTEM const int *map, device const int *step, int expert,
+    constant ulong *seismic_words) {
+    return SEISMIC_DIM_X == 0 ? -2 - expert
+        : streaming_held(map + ulong(expert) * SEISMIC_MAP_STRIDE_0, SEISMIC_MAP_STRIDE_1,
+              streaming_step(step, SEISMIC_STEP_STRIDE_0));
+}
+
 // The rows the gate/up weights take (the normalized rows, or NVFP4 operands
 // that `routed_experts_stage` forms into `staged`), and the product rows the
 // down weights take (NVFP4 operands `routed_experts_quantize` forms in
@@ -63,10 +70,16 @@ kernel void routed_experts_stage(
 }
 
 kernel void routed_experts_quantize(
+    device const int *blocks [[buffer(SEISMIC_BUFFER_BLOCKS)]],
+    SYSTEM const int *map [[buffer(SEISMIC_BUFFER_MAP)]],
+    device const int *step [[buffer(SEISMIC_BUFFER_STEP)]],
     device uchar *product [[buffer(SEISMIC_BUFFER_SCRATCH_PRODUCT)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint item [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
+    const ulong block = ulong(item) / SEISMIC_DIM_T;
+    if (routed_expert_slot(map, step, blocks[block * SEISMIC_BLOCKS_STRIDE_0], seismic_words) == -1)
+        return;
     PROJECTION_NORMALIZE_SHARED(maxima);
     projection::operands<true>::form_in_place<256, routed::Act>(
         product + ulong(item) * SEISMIC_DIM_F * routed::Act::bytes, uint(SEISMIC_DIM_F), maxima, thread_index);
@@ -99,17 +112,15 @@ kernel void routed_experts_expand(
     const ulong block = group.y / subtiles;
     const uint tm = uint(group.y % subtiles);
     const int expert = blocks[block * SEISMIC_BLOCKS_STRIDE_0];
-    // The record the layer's map holds for the expert at the step
-    // (`streaming_held`), or its place by index without a map (X 0).
-    const int slot = SEISMIC_DIM_X == 0 ? -1
-        : streaming_held(map + ulong(expert) * SEISMIC_MAP_STRIDE_0, SEISMIC_MAP_STRIDE_1,
-              streaming_step(step, SEISMIC_STEP_STRIDE_0));
+    const int slot = routed_expert_slot(map, step, expert, seismic_words);
+    if (slot == -1)
+        return;
     const routed::Grouped in{EXPANSION_NVFP4 ? staged : normalized,
         EXPANSION_NVFP4 ? SEISMIC_DIM_H : SEISMIC_NORMALIZED_STRIDE_0, EXPANSION_NVFP4 ? 1 : SEISMIC_NORMALIZED_STRIDE_1,
         uint(SEISMIC_DIM_H), order + block * SEISMIC_ORDER_STRIDE_0, SEISMIC_ORDER_STRIDE_1};
-    const auto gate = routed::weights<packets::W0>(routed::expert_weights(records_gate, expert_gate, slot, expert),
+    const auto gate = routed::weights<packets::W0>(routed::expert_weights(records_gate, expert_gate, slot),
         KERNEL_W0_LAYOUT(SEISMIC_DIM_H), 0, SEISMIC_DIM_H);
-    const auto up = routed::weights<packets::W1>(routed::expert_weights(records_up, expert_up, slot, expert),
+    const auto up = routed::weights<packets::W1>(routed::expert_weights(records_up, expert_up, slot),
         KERNEL_W1_LAYOUT(SEISMIC_DIM_H), 0, SEISMIC_DIM_H);
     const auto out = projection::scaling<(SEISMIC_DIM_GS + SEISMIC_DIM_US != 0)>::wrap(
         projection::Glu<A>{element::out_over_scratch<A>(product).offset(block * SEISMIC_DIM_T * SEISMIC_DIM_F),
@@ -143,14 +154,12 @@ kernel void routed_experts_down(
     const ulong block = group.y / subtiles;
     const uint tm = uint(group.y % subtiles);
     const int expert = blocks[block * SEISMIC_BLOCKS_STRIDE_0];
-    // The record the layer's map holds for the expert at the step
-    // (`streaming_held`), or its place by index without a map (X 0).
-    const int slot = SEISMIC_DIM_X == 0 ? -1
-        : streaming_held(map + ulong(expert) * SEISMIC_MAP_STRIDE_0, SEISMIC_MAP_STRIDE_1,
-              streaming_step(step, SEISMIC_STEP_STRIDE_0));
+    const int slot = routed_expert_slot(map, step, expert, seismic_words);
+    if (slot == -1)
+        return;
     const auto in = routed::activation(product + block * SEISMIC_DIM_T * SEISMIC_DIM_F * A::bytes,
         SEISMIC_DIM_F, 1, uint(SEISMIC_DIM_F));
-    const auto down = routed::weights<packets::W2>(routed::expert_weights(records_down, expert_down, slot, expert),
+    const auto down = routed::weights<packets::W2>(routed::expert_weights(records_down, expert_down, slot),
         KERNEL_W2_LAYOUT(SEISMIC_DIM_F), 0, SEISMIC_DIM_F);
     const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> output(output_cells);
     const projection::Store<A> out{output.offset(block * SEISMIC_RESULT_0_STRIDE_0), SEISMIC_RESULT_0_STRIDE_1,

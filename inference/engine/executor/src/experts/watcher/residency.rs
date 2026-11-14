@@ -376,6 +376,17 @@ impl Residency {
         self.refill_tier();
     }
 
+    /// A later scratch window's round 0 arrived: settle finished landings and
+    /// free the conveyor records whose converts have completed, without moving
+    /// device progress backwards across steps in the set.
+    pub(super) fn advance_window(&mut self) {
+        self.prefetch.settle(&mut self.core.directory);
+        for listed in self.core.take_converted() {
+            listed.release(&mut self.scratch.conveyor);
+        }
+        self.refill_tier();
+    }
+
     /// Keep each group's reserve of tier records holding no expert mapped
     /// (`HostRecords::reserved`): the victims chosen from the ranking with
     /// no lock of the steps' held

@@ -692,6 +692,8 @@ fn streamed_conversion(
     .call_answered(routed_round::Args {
         step: &step,
         scratch: &mut shared(&table.extents(), &scratch),
+        window: &words(&[0]),
+        rounds: 1,
         round: 0,
         landing: &mut shared(&[landing.len() as u64], &landing),
         tiered: &words(&vec![0; list as usize]),

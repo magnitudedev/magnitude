@@ -1773,43 +1773,59 @@ impl DeviceExperts {
     }
 }
 
-/// The experts as a partial bank places them: the first half in records, in
-/// reverse order after two decoy records (the last two experts' weights,
-/// which no mapped expert reads), the rest read in place (slot -1).
+/// The experts as two windows of a partial bank and a narrower scratch stack
+/// (`E - mapped < E` slots) place them: window 0 holds the first half in bank
+/// records (in reverse order after two decoy records, the last two experts'
+/// weights, which no mapped expert reads) and skips the rest (`held` -1,
+/// including `expert == mapped` whose `MAP_UNTIL` equals the step); window 1
+/// skips the first half (`held` -1, preserving window 0's output rows,
+/// including `expert == 0` whose `MAP_FROM` is past the step) and reads the
+/// rest from scratch slots `-2 - s` (`s = E - 1 - expert`).
 struct PlacedExperts {
-    /// The map `[E, MAP_WORDS]` for step [`PLACED_STEP`] (`step`): the first
-    /// half held, and the first expert past it named by decoy record 0 at a
-    /// window its step is past (`MAP_UNTIL` the step), so it is read in
-    /// place.
-    map: seismic::Tensor,
+    maps: [seismic::Tensor; 2],
     step: seismic::Tensor,
     gate: Option<seismic::Tensor>,
     up: seismic::Tensor,
     down: seismic::Tensor,
+    scratch_gate: Option<seismic::Tensor>,
+    scratch_up: seismic::Tensor,
+    scratch_down: seismic::Tensor,
 }
 
 impl PlacedExperts {
     fn new(device: &seismic::Device, block: &ExpertBlock) -> Self {
         let (h, f, e) = (block.shape.hidden, block.shape.features, block.experts);
-        let (mapped, records) = (e / 2, e / 2 + 2);
-        // The expert record `slot` holds.
+        let (mapped, records, scratch_slots) = (e / 2, e / 2 + 2, e - e / 2);
+        // The expert bank record `slot` holds.
         let held = |slot: usize| if slot < 2 { e - 1 - slot } else { records - 1 - slot };
-        let bank = |values: &[f32], shape: [usize; 2]| {
+        let stack = |count: usize, expert_of: &dyn Fn(usize) -> usize, values: &[f32], shape: [usize; 2]| {
             let per = shape[0] * shape[1];
-            let values = (0..records)
-                .flat_map(|slot| values[held(slot) * per..(held(slot) + 1) * per].iter().copied())
+            let values = (0..count)
+                .flat_map(|slot| {
+                    let expert = expert_of(slot);
+                    values[expert * per..(expert + 1) * per].iter().copied()
+                })
                 .collect::<Vec<_>>();
-            tensor(device, DType::BF16, &[records, shape[0], shape[1]], &values)
+            tensor(device, DType::BF16, &[count, shape[0], shape[1]], &values)
         };
-        let rows = (0..e)
+        let bank = |values: &[f32], shape: [usize; 2]| stack(records, &held, values, shape);
+        let scratch = |values: &[f32], shape: [usize; 2]| stack(scratch_slots, &|slot| e - 1 - slot, values, shape);
+        let first = (0..e)
             .map(|expert| match expert {
                 _ if expert < mapped => ((records - 1 - expert) as i32, 0, u64::MAX),
                 _ if expert == mapped => (0, 0, PLACED_STEP),
                 _ => (-1, 0, u64::MAX),
             })
             .collect::<Vec<_>>();
+        let second = (0..e)
+            .map(|expert| match expert {
+                0 => (0, PLACED_STEP + 1, u64::MAX),
+                _ if expert < mapped => (-1, 0, u64::MAX),
+                _ => (-2 - (e - 1 - expert) as i32, 0, u64::MAX),
+            })
+            .collect::<Vec<_>>();
         Self {
-            map: i32_tensor(device, &[e, constants::MAP_WORDS as usize], &map_words(&rows)),
+            maps: [first, second].map(|rows| i32_tensor(device, &[e, constants::MAP_WORDS as usize], &map_words(&rows))),
             step: i32_tensor(device, &[constants::STEP_WORDS as usize], &step_words(PLACED_STEP)),
             gate: match &block.expansion {
                 Expansion::Gated(gate) => Some(bank(gate, [f, h])),
@@ -1817,6 +1833,12 @@ impl PlacedExperts {
             },
             up: bank(&block.up, [f, h]),
             down: bank(&block.down, [h, f]),
+            scratch_gate: match &block.expansion {
+                Expansion::Gated(gate) => Some(scratch(gate, [f, h])),
+                Expansion::Up => None,
+            },
+            scratch_up: scratch(&block.up, [f, h]),
+            scratch_down: scratch(&block.down, [h, f]),
         }
     }
 }
@@ -2244,9 +2266,15 @@ fn native_grouped_experts_match_host_reference_at_catalog_shapes() {
                     let grouped_statics = [[("H", h), ("F", f)].as_slice(), &block.scale_statics()].concat();
                     let gated_statics = [grouped_statics.as_slice(), &[("LB", shape.limit_word())]].concat();
                     let glu_limit = i32_tensor(device, &[0, shape.limit_word()], &[]);
-                    // The grouped pass with its experts placed by `map` at
-                    // `step` in `records` (gate, up, down), else read in place.
-                    let pass = |map: &seismic::Tensor, step: &seismic::Tensor, records: [Option<&seismic::Tensor>; 3]| match &experts.gate {
+                    // The grouped pass writing into `output`, with its experts
+                    // placed by `map` at `step` in `records` (slot >= 0) or
+                    // `scratch` (slot <= -2, else `experts` when unmapped), and
+                    // skipped when `held` returns -1.
+                    let pass_into = |map: &seismic::Tensor,
+                                     step: &seismic::Tensor,
+                                     scratch: [Option<&seismic::Tensor>; 3],
+                                     records: [Option<&seismic::Tensor>; 3],
+                                     output: &mut seismic::Tensor| match &experts.gate {
                         Some(gate) => {
                             let entry = routed_experts::native_entry_with(routed_experts::Elements {
                                 A: bf16,
@@ -2257,28 +2285,30 @@ fn native_grouped_experts_match_host_reference_at_catalog_shapes() {
                             entry
                                 .prepare(device, &grouped_specialization(device, &entry, &gated_statics, &mapping, int8))
                                 .unwrap()
-                                .call(routed_experts::Args {
-                                    first: &first,
-                                    rows: &grouped_rows,
-                                    normalized: &normalized,
-                                    order: &native_order,
-                                    blocks: &native_table,
-                                    used: &used,
-                                    expert_gate: gate,
-                                    expert_up: &experts.up,
-                                    expert_down: &experts.down,
-                                    map,
-                                    step,
-                                    records_gate: records[0].unwrap_or(gate),
-                                    records_up: records[1].unwrap_or(&experts.up),
-                                    records_down: records[2].unwrap_or(&experts.down),
-                                    activation: shape.activation,
-                                    gate_scale: &experts.gate_scale,
-                                    up_scale: &experts.up_scale,
-                                    glu_limit: &glu_limit,
-                                })
-                                .unwrap()
-                                .value
+                                .call_into(
+                                    routed_experts::Args {
+                                        first: &first,
+                                        rows: &grouped_rows,
+                                        normalized: &normalized,
+                                        order: &native_order,
+                                        blocks: &native_table,
+                                        used: &used,
+                                        expert_gate: scratch[0].unwrap_or(gate),
+                                        expert_up: scratch[1].unwrap_or(&experts.up),
+                                        expert_down: scratch[2].unwrap_or(&experts.down),
+                                        map,
+                                        step,
+                                        records_gate: records[0].unwrap_or(gate),
+                                        records_up: records[1].unwrap_or(&experts.up),
+                                        records_down: records[2].unwrap_or(&experts.down),
+                                        activation: shape.activation,
+                                        gate_scale: &experts.gate_scale,
+                                        up_scale: &experts.up_scale,
+                                        glu_limit: &glu_limit,
+                                    },
+                                    routed_experts::OutputArgs { value: output },
+                                )
+                                .unwrap();
                         }
                         None => {
                             let entry = routed_experts_up::native_entry_with(routed_experts_up::Elements {
@@ -2289,30 +2319,44 @@ fn native_grouped_experts_match_host_reference_at_catalog_shapes() {
                             entry
                                 .prepare(device, &grouped_specialization(device, &entry, &grouped_statics, &mapping, int8))
                                 .unwrap()
-                                .call(routed_experts_up::Args {
-                                    first: &first,
-                                    rows: &grouped_rows,
-                                    normalized: &normalized,
-                                    order: &native_order,
-                                    blocks: &native_table,
-                                    used: &used,
-                                    expert_up: &experts.up,
-                                    expert_down: &experts.down,
-                                    map,
-                                    step,
-                                    records_up: records[1].unwrap_or(&experts.up),
-                                    records_down: records[2].unwrap_or(&experts.down),
-                                    up_scale: &experts.up_scale,
-                                    activation: shape.activation,
-                                })
-                                .unwrap()
-                                .value
+                                .call_into(
+                                    routed_experts_up::Args {
+                                        first: &first,
+                                        rows: &grouped_rows,
+                                        normalized: &normalized,
+                                        order: &native_order,
+                                        blocks: &native_table,
+                                        used: &used,
+                                        expert_up: scratch[1].unwrap_or(&experts.up),
+                                        expert_down: scratch[2].unwrap_or(&experts.down),
+                                        map,
+                                        step,
+                                        records_up: records[1].unwrap_or(&experts.up),
+                                        records_down: records[2].unwrap_or(&experts.down),
+                                        up_scale: &experts.up_scale,
+                                        activation: shape.activation,
+                                    },
+                                    routed_experts_up::OutputArgs { value: output },
+                                )
+                                .unwrap();
                         }
                     };
-                    let grouped = pass(&no_map, &no_step, [None; 3]);
-                    // A row whose expert a slot map places in a bank's record
-                    // has the bits it has read in place.
-                    let mapped = pass(&placed.map, &placed.step, [placed.gate.as_ref(), Some(&placed.up), Some(&placed.down)]);
+                    let mut grouped = tensor(device, DType::BF16, &[b, TILE, h], &vec![0.0; b * TILE * h]);
+                    pass_into(&no_map, &no_step, [None; 3], [None; 3], &mut grouped);
+                    // Two windows into one persistent output: window 0 serves
+                    // bank records and skips the rest; window 1 skips the bank
+                    // half (preserving window 0's rows) and serves scratch
+                    // slots `-2 - s` from a narrower `[E - mapped, ...]` stack.
+                    let mut mapped = tensor(device, DType::BF16, &[b, TILE, h], &vec![-9.0; b * TILE * h]);
+                    for window_map in &placed.maps {
+                        pass_into(
+                            window_map,
+                            &placed.step,
+                            [placed.scratch_gate.as_ref(), Some(&placed.scratch_up), Some(&placed.scratch_down)],
+                            [placed.gate.as_ref(), Some(&placed.up), Some(&placed.down)],
+                            &mut mapped,
+                        );
+                    }
                     assert_eq!(
                         gather_rows(&read_activation(&mapped, DType::BF16), &inverse, h)
                             .iter()

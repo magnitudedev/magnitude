@@ -87,6 +87,8 @@ __device__ void routed_experts_expand_block(SEISMIC_KERNEL_PARAMS) {
     if ((projection::u64)blockIdx.y * routed::TILE_M >= live)
         return;
     const int slot = EXPERT_SLOT(expert);
+    if (slot == -1)
+        return;
     const projection::u64 rows = block * SEISMIC_DIM_T;
     const auto epi = projection::scaling<(SEISMIC_DIM_GS + SEISMIC_DIM_US != 0)>::wrap(
         projection::Glu<typename Operands::Storage, Act>{
@@ -104,9 +106,9 @@ __device__ void routed_experts_expand_block(SEISMIC_KERNEL_PARAMS) {
     routed::routed_gemm<EXPAND_SHARED, Operands>(
         reinterpret_cast<projection::u8 *>(dynamic_shared), source, live, SEISMIC_DIM_H, blockIdx.x, SEISMIC_DIM_F,
         ROUTED_EXPERT_RECORD(KERNEL_W0, SEISMIC_PTR(SEISMIC_BUFFER_RECORDS_GATE), SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_GATE),
-                             slot, expert),
+                             slot),
         ROUTED_EXPERT_RECORD(KERNEL_W1, SEISMIC_PTR(SEISMIC_BUFFER_RECORDS_UP), SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP),
-                             slot, expert),
+                             slot),
         epi);
 }
 #endif
@@ -117,7 +119,7 @@ __device__ void routed_experts_expand_block(SEISMIC_KERNEL_PARAMS) {
 template <unsigned OPERAND>
 __device__ void routed_experts_quantize_block(SEISMIC_KERNEL_PARAMS) {
     const projection::u64 block = blockIdx.x / SEISMIC_DIM_T, lane = blockIdx.x % SEISMIC_DIM_T;
-    if (ROUTED_BLOCK_ORDER(block)[lane * SEISMIC_ORDER_STRIDE_1] < 0)
+    if (ROUTED_BLOCK_ORDER(block)[lane * SEISMIC_ORDER_STRIDE_1] < 0 || EXPERT_SLOT(ROUTED_BLOCK_EXPERT(block)) == -1)
         return;
     // The product the expand stored, as the down GEMM's operands.
     projection::form_operands_in_place<projection::GemmOperandsOf<OPERAND, packets::W2>,
@@ -138,6 +140,8 @@ __device__ void routed_experts_down_block(SEISMIC_KERNEL_PARAMS) {
     if ((projection::u64)blockIdx.y * routed::TILE_M >= live)
         return;
     const int slot = EXPERT_SLOT(expert);
+    if (slot == -1)
+        return;
     const projection::u64 rows = block * SEISMIC_DIM_T;
     const projection::Store<Act> epi{SEISMIC_RESULT_0_OUT.offset(block * SEISMIC_RESULT_0_STRIDE_0),
                              SEISMIC_RESULT_0_STRIDE_1, 0};
@@ -146,7 +150,7 @@ __device__ void routed_experts_down_block(SEISMIC_KERNEL_PARAMS) {
     routed::routed_gemm<DOWN_SHARED, Operands>(
         reinterpret_cast<projection::u8 *>(dynamic_shared), source, live, SEISMIC_DIM_F, blockIdx.x, SEISMIC_DIM_H,
         ROUTED_EXPERT_RECORD(KERNEL_W2, SEISMIC_PTR(SEISMIC_BUFFER_RECORDS_DOWN), SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_DOWN),
-                             slot, expert),
+                             slot),
         projection::NoWeight{}, epi);
 }
 #endif

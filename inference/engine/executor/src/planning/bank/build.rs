@@ -122,7 +122,7 @@ impl ModelLoadPlan {
         // A conveyor or a scratch without a layout, or a pool without a
         // granule, is refused here, so every sizing past this may rely on
         // them (`ExpertBankPlan::prompt_records`, `ExpertBankPlan::granule`).
-        let structured = conveyor::Structured::new(selected, host, groups, layers)
+        let structured = conveyor::Structured::new(selected, host, groups, layers, None)
             .map_err(PlanError::InvalidDefinition)?;
         // Every stored table whose slots the host fills in place, held in
         // granules of the bank's pool: only where the host writes it.
@@ -224,6 +224,27 @@ impl ModelLoadPlan {
         let mut load = self.with_bank_slots(slots, ceiling)?;
         load.bank.as_mut().expect("the load was just resized").resident = resident;
         Ok(load)
+    }
+
+    /// The plan with its expert bank's scratch bounded to `window_slots`,
+    /// updating its lending, each banked stack's shape, and its committed
+    /// records (clamped to at least the new floor).
+    pub(crate) fn with_window_slots(mut self, window_slots: u64) -> Result<Self, PlanError> {
+        let bank = self.bank.take().ok_or(PlanError::Topology("a plan without a bank has no window"))?;
+        let bank = bank.with_window_slots(window_slots).map_err(PlanError::InvalidDefinition)?;
+        for weight in &mut self.target {
+            let Some((_, layer)) = bank.layer(weight.role.scope) else {
+                continue;
+            };
+            if RoutedTensor::of(weight.role.kind).is_none() {
+                continue;
+            }
+            weight.shape[0] = bank.records(layer.group);
+        }
+        let slots = bank.slots.max(bank.floor()).min(bank.ceiling);
+        let ceiling = bank.ceiling;
+        self.bank = Some(bank);
+        self.with_bank_slots(slots, ceiling)
     }
 
     /// The plan without its expert bank: each banked expert stack planned

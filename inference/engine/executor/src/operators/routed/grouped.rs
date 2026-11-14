@@ -29,7 +29,7 @@ pub(crate) struct ExpertsPass {
 /// map holds it for the step.
 struct Sources<S> {
     stacks: S,
-    map: Option<(WorkflowTensor, WorkflowTensor, S, Dim)>,
+    map: Option<(WorkflowTensor, WorkflowTensor, S, Dim, Dim)>,
 }
 
 /// What an expert entry reads beside the grouping: the stacks by expert,
@@ -39,6 +39,7 @@ struct Sources<S> {
 /// map).
 pub(super) struct Reads<S> {
     pub stacks: S,
+    pub stacks_rows: Dim,
     pub map: WorkflowTensor,
     pub step: WorkflowTensor,
     pub records: S,
@@ -130,10 +131,10 @@ pub(super) fn pass<'a, G: GraphDraft + 'a, S: Clone, W: crate::programs::native_
 ) -> Result<WorkflowTensor, GraphError> {
     let mut placed = layer.map(|layer| layer.pass_sources(graph)).transpose()?;
     let (sources, reads) = match &mut placed {
-        Some((map, step, tier, records, reads)) => (
+        Some((map, step, tier, records, reads, layer_window)) => (
             Sources {
                 stacks: scratch(tier)?,
-                map: Some((map.clone(), step.clone(), stacks, records.clone())),
+                map: Some((map.clone(), step.clone(), stacks, records.clone(), layer_window.clone())),
             },
             Some(reads),
         ),
@@ -211,8 +212,9 @@ fn grouped<'a, G: GraphDraft + 'a, S: Clone>(
         },
     )?;
     let reads = match sources.map {
-        Some((map, step, records, count)) => Reads {
+        Some((map, step, records, count, stacks_rows)) => Reads {
             stacks: sources.stacks,
+            stacks_rows,
             map,
             step,
             records,
@@ -222,6 +224,7 @@ fn grouped<'a, G: GraphDraft + 'a, S: Clone>(
         None => Reads {
             records: sources.stacks.clone(),
             stacks: sources.stacks,
+            stacks_rows: experts.clone(),
             map: absent_map(graph, constants)?,
             step: GraphConstant::empty_of(graph, seismic::Element::i32(), &[0], constants)?,
             count: experts.clone(),

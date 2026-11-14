@@ -68,6 +68,7 @@ use std::time::Instant;
 /// experts it routed, and of those no earlier step of the group routed
 /// there, the hits its map holds for the step (each with that record,
 /// which its pass reads) and the rest, which its rounds convert.
+#[derive(Clone)]
 pub(super) struct Request {
     pub(super) sequence: Step,
     routed: Vec<usize>,
@@ -78,21 +79,31 @@ pub(super) struct Request {
 /// A layer's scratch tier contents: every expert of layer `layer` that
 /// group `group`'s steps routed to (`routed[e]`, their choices of expert
 /// `e`), whose cold ones their requests fill. The device's tier holds one
-/// layer at a time, filled by the layer's backs; the host holds the layer served and
-/// the next, whose requests are taken meanwhile, each until the device is
-/// past the layer (`Scratch::advance`).
+/// layer's window at a time, filled by the layer's backs; the host holds the
+/// layer served and the next, whose requests are taken meanwhile, each until
+/// the device is past the layer (`Scratch::advance`).
 struct Tier {
     group: Step,
     layer: usize,
+    layer_window: usize,
+    windows: u64,
+    sets: Vec<std::ops::Range<usize>>,
+    set_index: usize,
+    set_opened: bool,
+    cursor_window: u64,
+    cursor_place: usize,
     routed: Vec<u32>,
+    set_routed: Vec<u32>,
     /// Per expert, the last step of the group that routed it here.
     last: Vec<Step>,
     /// The requests taken, one per chain place in step order, until served.
     taken: usize,
     requests: Vec<Option<Request>>,
-    /// Per expert, whether it holds its scratch slot (slot `e` for expert
-    /// `e`, once the group holds the scratch), which its rounds convert it
-    /// into and the pass reads it from.
+    queued: Vec<Option<(Step, Vec<u32>)>>,
+    seeds: Option<Vec<(usize, BankRecord)>>,
+    /// Per expert, whether it holds its scratch slot (`e % layer_window` in
+    /// window `e / layer_window`, once the group holds the scratch), which
+    /// its rounds convert it into and the pass reads it from.
     scratch: Vec<bool>,
     /// The cold experts not yet read (none carries them): no record was
     /// free for them in the device's order (`Scratch::convey`).
@@ -161,11 +172,39 @@ impl Tier {
     }
 
     /// Where expert `expert` lies in the device's order of the tier's
-    /// experts: by the step that reads it, then by the round that lists it
-    /// (a request's experts all unlisted until it is served); one no step
-    /// reads lies after every other.
-    fn order(&self, expert: usize) -> (bool, Option<Step>, Option<u32>) {
-        (self.reader[expert].is_none(), self.reader[expert], self.round[expert])
+    /// experts: by scratch window (`expert / layer_window`), then by the step
+    /// that reads it, then by the round that lists it (a request's experts all
+    /// unlisted until it is served); one no step reads lies after every other.
+    fn order(&self, expert: usize) -> (bool, usize, Option<Step>, Option<u32>) {
+        (
+            self.reader[expert].is_none(),
+            expert / self.layer_window,
+            self.reader[expert],
+            self.round[expert],
+        )
+    }
+
+    /// Advance the tier's service cursor to the next `(place, window)` of its
+    /// current pass set, or the first of its next pass set.
+    fn advance_cursor(&mut self) {
+        let Some(set) = self.sets.get(self.set_index).cloned() else {
+            return;
+        };
+        if self.cursor_place + 1 < set.end {
+            self.cursor_place += 1;
+        } else if self.cursor_window + 1 < self.windows {
+            self.cursor_window += 1;
+            self.cursor_place = set.start;
+        } else {
+            self.set_index += 1;
+            self.cursor_window = 0;
+            if let Some(next) = self.sets.get(self.set_index) {
+                self.cursor_place = next.start;
+                if self.windows > 1 {
+                    self.set_opened = false;
+                }
+            }
+        }
     }
 }
 
@@ -274,19 +313,21 @@ pub(super) struct Scratch {
 /// fails, as the request service carries it, never waiting: arriving until
 /// its round 0 does, then served.
 pub(super) enum Pending {
-    /// Taken at its point from its chain place, its round 0 not yet arrived.
-    Arriving { at: At, place: usize },
+    /// Taken at its point from its chain place, its window's round 0 not yet arrived.
+    Arriving { at: At, place: usize, window: u64 },
     Served(Serve),
 }
 
 impl Pending {
-    /// Where it is, for the exchange's watchdog: its step, place and
+    /// Where it is, for the exchange's watchdog: its step, place, window and
     /// stage, and of its rounds the one served now, what it awaits and
     /// since when.
     pub(super) fn describe(&self) -> String {
         match self {
-            Self::Arriving { at, place } => format!("step {} place {place} arriving (round 0 not yet requested)", at.point.sequence),
-            Self::Served(Serve { at, place, arrived, stage }) => {
+            Self::Arriving { at, place, window } => {
+                format!("step {} place {place} window {window} arriving (round 0 not yet requested)", at.point.sequence)
+            }
+            Self::Served(Serve { at, place, window, arrived, stage, .. }) => {
                 let stage = match stage {
                     RequestStage::Arrived { request } => format!("arrived (cold {:?})", request.cold),
                     RequestStage::Awaiting(opened) => format!("awaiting landings and the scratch for {:?}", opened.cold),
@@ -300,16 +341,19 @@ impl Pending {
                         rounds.failure
                     ),
                 };
-                format!("step {} place {place} arrived {:?} ago, {stage}", at.point.sequence, arrived.elapsed())
+                format!("step {} place {place} window {window} arrived {:?} ago, {stage}", at.point.sequence, arrived.elapsed())
             }
         }
     }
 }
 
-/// A request whose round 0 arrived, being served ([`Scratch::carry`]).
+/// A request window whose round 0 arrived, being served ([`Scratch::carry`]).
 pub(super) struct Serve {
     at: At,
     place: usize,
+    window: u64,
+    set: std::ops::Range<usize>,
+    next_set_start: Option<usize>,
     /// When its round 0 arrived.
     arrived: Instant,
     stage: RequestStage,
@@ -446,40 +490,108 @@ impl Scratch {
         self.conveyor.serving.is_some_and(|serving| serving.past)
     }
 
-    /// Layer `layer`'s next request taken and not yet served, in step
-    /// order: its chain place and step, left in its tier until taken
-    /// ([`Self::take`]); none while there is none, those of steps ended
+    /// Layer `layer`'s next `(place, window, step)` taken and not yet served,
+    /// in `(set, window, place)` device order, left in its tier until its
+    /// last window is taken; none while there is none, those of steps ended
     /// (read now) dropped.
-    pub(super) fn unserved(&mut self, shared: &Shared, layer: usize) -> Option<(usize, Step)> {
+    pub(super) fn unserved(&mut self, shared: &Shared, layer: usize) -> Option<(usize, u64, Step)> {
         let tier = self.tiers.iter_mut().find(|tier| tier.layer == layer)?;
         loop {
-            let place = tier.requests.iter().position(Option::is_some)?;
-            let sequence = tier.requests[place].as_ref().expect("a taken request").sequence;
+            let set = tier.sets.get(tier.set_index)?;
+            let place = tier.cursor_place;
+            let window = tier.cursor_window;
+            assert!(set.contains(&place), "cursor place {place} outside set {set:?}");
+            if place >= tier.taken {
+                return None;
+            }
+            let sequence = tier.requests[place]
+                .as_ref()
+                .map(|request| request.sequence)
+                .or_else(|| tier.queued[place].as_ref().map(|&(sequence, _)| sequence));
+            let Some(sequence) = sequence else {
+                tier.advance_cursor();
+                continue;
+            };
             if !shared.steps.ended(sequence) {
-                return Some((place, sequence));
+                return Some((place, window, sequence));
             }
             tier.requests[place] = None;
+            tier.queued[place] = None;
+            tier.advance_cursor();
         }
     }
 
-    /// Take group `group`'s request at `layer` from chain place `place` to
-    /// serve it: its tier's index and the request. None once the tier went
-    /// with its layer (`advance`): the device is past the layer, which only
-    /// a step that failed before it passes without its rounds answered, so
-    /// nothing waits for the request.
-    pub(super) fn take(&mut self, group: Step, layer: usize, place: usize) -> Option<(usize, Request)> {
-        let index = self.tiers.iter().position(|tier| (tier.group, tier.layer) == (group, layer))?;
-        let request = self.tiers[index].requests[place].take()?;
-        Some((index, request))
+    /// Ensure tier `index`'s current pass set (`tier.set_index`) is open and
+    /// its already-published requests ingested.
+    fn open_set(&mut self, index: usize, core: &mut Core, shared: &Shared) {
+        if self.tiers[index].set_opened {
+            return;
+        }
+        let converted = core.take_converted();
+        for listed in converted {
+            listed.release(&mut self.conveyor);
+        }
+        self.settle_landings(core);
+        let layer = self.tiers[index].layer;
+        core.layers[layer].clear_windows();
+        let set = self.tiers[index].sets[self.tiers[index].set_index].clone();
+        {
+            let tier = &mut self.tiers[index];
+            tier.set_routed.fill(0);
+            tier.scratch.fill(false);
+            tier.deferred.clear();
+            tier.reader.fill(None);
+            tier.round.fill(None);
+            tier.failed.clear();
+            tier.set_opened = true;
+        }
+        for place in set {
+            if let Some((sequence, flags)) = self.tiers[index].queued[place].take() {
+                self.ingest_place(index, place, sequence, &flags, core);
+            }
+        }
+        self.convey(core, shared);
+    }
+
+    /// Ingest `place`'s `flags` at `sequence` into tier `index`'s open pass set.
+    fn ingest_place(&mut self, index: usize, place: usize, sequence: Step, flags: &[u32], core: &Core) {
+        let layer = self.tiers[index].layer;
+        let experts = core.layers[layer].experts;
+        let routed = (0..experts).filter(|&expert| flags[expert] > 0).collect::<Vec<_>>();
+        let first = routed
+            .iter()
+            .copied()
+            .filter(|&expert| self.tiers[index].set_routed[expert] == 0)
+            .collect::<Vec<_>>();
+        for (count, &flag) in self.tiers[index].set_routed.iter_mut().zip(flags) {
+            *count += flag;
+        }
+        let (mut hits, mut cold) = (Vec::new(), Vec::new());
+        for expert in first {
+            match hit(core, self.conveyor.lending(), layer, expert, sequence) {
+                Some(record) => hits.push((expert, record)),
+                None => cold.push(expert),
+            }
+        }
+        let tier = &mut self.tiers[index];
+        for &expert in &cold {
+            tier.assign(expert, sequence, self.conveyor.state(layer, expert).is_some());
+        }
+        tier.requests[place] = Some(Request {
+            sequence,
+            routed,
+            hits,
+            cold,
+        });
     }
 
     /// The device is at `progress`: forget the tiers of the layers the
-    /// served group is past (their backs read no record any more), free
-    /// the conveyor's records of those layers, and once it is past the
-    /// group, clear the conveyor as soon as nothing of the group runs
-    /// ([`Self::clear_past`]). Where the group's backs lie in the device's
-    /// order is read from the steps now: a group cut in before one of its
-    /// layers moves them later.
+    /// served group is past (their backs read no record any more), reset
+    /// their pass window tables for resident passes, free the conveyor's
+    /// records of those layers, and once it is past the group, clear the
+    /// conveyor as soon as nothing of the group runs ([`Self::clear_past`]).
+    /// Where the group's backs lie in the device's order is read from the
+    /// steps now: a group cut in before one of its layers moves them later.
     pub(super) fn advance(&mut self, progress: Point, core: &mut Core) {
         let Some(serving) = self.conveyor.serving.as_mut() else {
             return;
@@ -489,6 +601,11 @@ impl Scratch {
             serving.past = true;
         }
         let serving = *serving;
+        for tier in &self.tiers {
+            if progress > steps.point(tier.group, tier.layer, serving.last) {
+                core.layers[tier.layer].reset_windows();
+            }
+        }
         // A tier the device is past holds nothing: its slots are the
         // scratch's, which the group returns as it clears.
         self.tiers.retain(|tier| progress <= steps.point(tier.group, tier.layer, serving.last));
@@ -519,6 +636,9 @@ impl Scratch {
         self.settle_landings(core);
         if !self.conveyor.quiet() {
             return false;
+        }
+        for tier in self.tiers.drain(..) {
+            core.layers[tier.layer].reset_windows();
         }
         self.conveyor.clear();
         // The device is past every tier copy of the group.
@@ -582,13 +702,30 @@ impl Scratch {
         let index = match self.tiers.iter().position(|tier| (tier.group, tier.layer) == (group, layer)) {
             Some(index) => index,
             None => {
+                let (_, steps) = shared.steps.group_of(group);
+                let merged = shared.steps.merges_of(group, layer);
+                let sets: Vec<std::ops::Range<usize>> = crate::programs::native_target_graph::Passes::with_launches(core.extents.pass_launches)
+                    .sets(steps as usize, merged)
+                    .collect();
+                let cursor_place = sets.first().map_or(0, |set| set.start);
+                core.layers[layer].clear_windows();
                 self.tiers.push(Tier {
                     group,
                     layer,
+                    layer_window: core.layers[layer].layer_window,
+                    windows: core.extents.windows,
+                    sets,
+                    set_index: 0,
+                    set_opened: true,
+                    cursor_window: 0,
+                    cursor_place,
                     routed: vec![0; experts],
+                    set_routed: vec![0; experts],
                     last: vec![0; experts],
                     taken: 0,
                     requests: (0..self.flags.len()).map(|_| None).collect(),
+                    queued: (0..self.flags.len()).map(|_| None).collect(),
+                    seeds: None,
                     scratch: vec![false; experts],
                     deferred: Vec::new(),
                     reader: vec![None; experts],
@@ -598,49 +735,39 @@ impl Scratch {
                 self.tiers.len() - 1
             }
         };
-        let tier = &mut self.tiers[index];
         let flags = (0..experts)
             .map(|expert| u32::try_from(self.flags[place].load(expert)).expect("a routed count"))
             .collect::<Vec<_>>();
-        let routed = (0..experts).filter(|&expert| flags[expert] > 0).collect::<Vec<_>>();
-        let first = routed
-            .iter()
-            .copied()
-            .filter(|&expert| tier.routed[expert] == 0)
-            .collect::<Vec<_>>();
-        for ((count, last), flag) in tier.routed.iter_mut().zip(&mut tier.last).zip(&flags) {
-            *count += flag;
-            if *flag > 0 {
-                *last = sequence;
+        {
+            let tier = &mut self.tiers[index];
+            for ((count, last), &flag) in tier.routed.iter_mut().zip(&mut tier.last).zip(&flags) {
+                *count += flag;
+                if flag > 0 {
+                    *last = sequence;
+                }
             }
-        }
-        let tier = &mut self.tiers[index];
-        let (mut hits, mut cold) = (Vec::new(), Vec::new());
-        for expert in first {
-            match hit(core, self.conveyor.lending(), layer, expert, sequence) {
-                Some(record) => hits.push((expert, record)),
-                None => cold.push(expert),
+            // The group routes these experts at this step, which the ranking
+            // logs once the group ends: until then every taking ranks each beside
+            // this read and the choices the group has routed to it so far, so the
+            // landings and seeds rank the layer's experts by the prompt's use as
+            // its pass resolves, never by index.
+            for (expert, &flag) in flags.iter().enumerate() {
+                if flag > 0 {
+                    core.directory.read_pending(layer, expert, sequence, tier.routed[expert]);
+                }
             }
+            tier.taken += 1;
         }
-        // The group routes these experts at this step, which the ranking
-        // logs once the group ends: until then every taking ranks each beside
-        // this read and the choices the group has routed to it so far, so the
-        // landings and seeds rank the layer's experts by the prompt's use as
-        // its pass resolves, never by index.
-        for &expert in &routed {
-            core.directory.read_pending(layer, expert, sequence, tier.routed[expert]);
+        let queue_for_later_set = core.extents.windows > 1 && {
+            let tier = &self.tiers[index];
+            !tier.set_opened || tier.sets.get(tier.set_index).is_none_or(|set| place >= set.end)
+        };
+        if queue_for_later_set {
+            self.tiers[index].queued[place] = Some((sequence, flags));
+        } else {
+            self.ingest_place(index, place, sequence, &flags, core);
+            self.convey(core, shared);
         }
-        for &expert in &cold {
-            tier.assign(expert, sequence, self.conveyor.state(layer, expert).is_some());
-        }
-        tier.requests[place] = Some(Request {
-            sequence,
-            routed,
-            hits,
-            cold,
-        });
-        tier.taken += 1;
-        self.convey(core, shared);
     }
 
     /// Carry every tier's cold experts as far as records allow, in the
@@ -800,6 +927,9 @@ impl Scratch {
     /// [`Self::reclaim_slots`] holds a round whose slot's borrower could not
     /// be ordered first.
     fn lendable_slot(&self, core: &Core, index: usize, expert: usize) -> Option<usize> {
+        if core.extents.windows > 1 {
+            return None;
+        }
         let tier = &self.tiers[index];
         let reader = tier.reader[expert]?;
         let serving = self.conveyor.serving?;
@@ -1038,22 +1168,59 @@ impl Scratch {
         true
     }
 
-    /// Take the request `at` its point from chain place `place`, its round
-    /// 0 arrived at `arrived`, the device past every point before it: the
-    /// request served from now ([`Self::carry`]). None once its tier went
-    /// with its layer ([`Self::take`]): nothing waits for it.
-    pub(super) fn arrived(&mut self, at: At, place: usize, arrived: Instant) -> Option<Serve> {
-        let (_, request) = self.take(at.point.group, at.point.layer, place)?;
-        Some(Serve { at, place, arrived, stage: RequestStage::Arrived { request } })
+    /// Take the request `at` its point from chain place `place` at `window`,
+    /// its window's round 0 arrived at `arrived`, the device past every point
+    /// before it: the request window served from now ([`Self::carry`]). None
+    /// once its tier went with its layer: nothing waits for it.
+    pub(super) fn arrived(
+        &mut self,
+        at: At,
+        place: usize,
+        window: u64,
+        arrived: Instant,
+        core: &mut Core,
+        shared: &Shared,
+    ) -> Option<Serve> {
+        let index = self.tiers.iter().position(|tier| (tier.group, tier.layer) == (at.point.group, at.point.layer))?;
+        self.open_set(index, core, shared);
+        let tier = &mut self.tiers[index];
+        let set = tier.sets.get(tier.set_index)?.clone();
+        let next_set_start = tier.sets.get(tier.set_index + 1).map(|next| next.start);
+        let request = if window + 1 < tier.windows {
+            tier.requests[place].clone()?
+        } else {
+            tier.requests[place].take()?
+        };
+        tier.advance_cursor();
+        Some(Serve {
+            at,
+            place,
+            window,
+            set,
+            next_set_start,
+            arrived,
+            stage: RequestStage::Arrived { request },
+        })
     }
 
-    /// The step of the request `at` its point from chain place `place`
-    /// ended before its round 0 arrived (a device error): its experts are
-    /// the next routing step's, and its failure is recorded and published.
-    pub(super) fn unarrived(&mut self, at: At, place: usize, core: &Core, shared: &Shared) {
+    /// The step of the request `at` its point from chain place `place` at
+    /// `window` ended before its round 0 arrived (a device error): its
+    /// unconverted experts are the next routing step's in its pass set, and its
+    /// failure is recorded and published.
+    pub(super) fn unarrived(&mut self, at: At, place: usize, window: u64, core: &mut Core, shared: &Shared) {
         let Point { group, layer, sequence, .. } = at.point;
-        if let Some((index, request)) = self.take(group, layer, place) {
-            self.forfeit(index, place, request.experts(), core);
+        if let Some(index) = self.tiers.iter().position(|tier| (tier.group, tier.layer) == (group, layer)) {
+            self.open_set(index, core, shared);
+            let lw = self.tiers[index].layer_window;
+            if let Some(request) = self.tiers[index].requests[place].take() {
+                self.tiers[index].advance_cursor();
+                let forfeited = (window == 0)
+                    .then(|| request.hits.iter().map(|&(expert, _)| expert).collect::<Vec<_>>())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .chain(request.cold.into_iter().filter(|&expert| expert / lw >= window as usize));
+                self.forfeit(index, place, forfeited, core);
+            }
         }
         fail(core, shared, layer, sequence, format!("step {sequence} ended before its scratch round 0"));
     }
@@ -1066,7 +1233,7 @@ impl Scratch {
     /// once the device arrives at the round after. The request, none once
     /// served whole or failed, and whether it moved.
     pub(super) fn carry(&mut self, serve: Serve, core: &mut Core, prefetch: &mut Prefetch, shared: &Shared) -> (Option<Serve>, bool) {
-        let Serve { at, place, arrived, mut stage } = serve;
+        let Serve { at, place, window, set, next_set_start, arrived, mut stage } = serve;
         let Point { group, layer, .. } = at.point;
         let mut moved = false;
         loop {
@@ -1077,33 +1244,45 @@ impl Scratch {
                 return (None, true);
             };
             stage = match stage {
-                RequestStage::Arrived { request } => RequestStage::Awaiting(self.opened(at, arrived, request, core, shared)),
+                RequestStage::Arrived { request } => {
+                    RequestStage::Awaiting(self.opened(at, window, arrived, request, core, shared))
+                }
                 RequestStage::Awaiting(opened) => {
                     match self.await_landings(layer, &opened.cold, core, prefetch) && self.claim_scratch(index, &opened.cold, core) {
-                        true => RequestStage::Rounds(self.fix_rounds(at, opened, core, shared)),
-                        false => return (Some(Serve { at, place, arrived, stage: RequestStage::Awaiting(opened) }), moved),
+                        true => RequestStage::Rounds(self.fix_rounds(at, window, opened, core, shared)),
+                        false => {
+                            return (
+                                Some(Serve { at, place, window, set, next_set_start, arrived, stage: RequestStage::Awaiting(opened) }),
+                                moved,
+                            )
+                        }
                     }
                 }
                 RequestStage::Rounds(mut rounds) => {
                     let before = rounds.round;
-                    if self.round(at, &mut rounds, core, prefetch, shared) {
-                        self.finish(at, place, arrived, index, rounds, core, shared);
+                    if self.round(at, place, window, &set, next_set_start, &mut rounds, core, prefetch, shared) {
+                        self.finish(at, place, window, arrived, index, rounds, core, shared);
                         return (None, true);
                     }
                     let answered = rounds.round != before;
-                    return (Some(Serve { at, place, arrived, stage: RequestStage::Rounds(rounds) }), moved | answered);
+                    return (
+                        Some(Serve { at, place, window, set, next_set_start, arrived, stage: RequestStage::Rounds(rounds) }),
+                        moved | answered,
+                    );
                 }
             };
             moved = true;
         }
     }
 
-    /// The request `at`, arrived: what the records freed since let
-    /// the conveyor carry, its arrival counted, and, of a group's last
-    /// step, its seeding.
-    fn opened(&mut self, at: At, arrived: Instant, request: Request, core: &mut Core, shared: &Shared) -> Opened {
+    /// The request window `at`, arrived: slice its cold experts to `window`,
+    /// carry what freed records allow, and count its arrival.
+    fn opened(&mut self, at: At, window: u64, arrived: Instant, request: Request, core: &mut Core, shared: &Shared) -> Opened {
         let Point { group, layer, sequence, .. } = at.point;
+        let lw = core.layers[layer].layer_window;
         let Request { routed, hits, cold, .. } = request;
+        let hits = if window == 0 { hits } else { Vec::new() };
+        let cold = cold.into_iter().filter(|&expert| expert / lw == window as usize).collect::<Vec<_>>();
         // What the records freed since let the conveyor carry, this
         // request's deferred experts among them.
         self.convey(core, shared);
@@ -1112,7 +1291,9 @@ impl Scratch {
         // Each round's list is free to write: this first round arrived past
         // every reader of the lists, staging and conveyor before it.
         shared.telemetry.arrived(group, arrived);
-        self.mark_at(shared, layer, Mark::Arrived(sequence), arrived);
+        if window == 0 {
+            self.mark_at(shared, layer, Mark::Arrived(sequence), arrived);
+        }
         Opened { routed, hits, cold }
     }
 
@@ -1154,28 +1335,32 @@ impl Scratch {
     /// seeding demoted was before this request's round 0 arrived. Those the
     /// host tier keeps whole the tier copy reads, which round 0's answer
     /// lists (the tier list, written before it).
-    fn fix_rounds(&mut self, at: At, opened: Opened, core: &mut Core, shared: &Shared) -> Rounds {
+    fn fix_rounds(&mut self, at: At, window: u64, opened: Opened, core: &mut Core, shared: &Shared) -> Rounds {
         let Point { group, layer, sequence, .. } = at.point;
         let Opened { routed, hits, cold } = opened;
         self.convey(core, shared);
         let round_records = core.extents.round_records;
+        let lw = core.layers[layer].layer_window;
         let index = self.tiers.iter().position(|tier| (tier.group, tier.layer) == (group, layer)).expect("a served request's tier");
-        // Every cold expert's scratch slot, given while it awaited them,
-        // which the pass reads once its rounds are past.
+        // Every cold expert's scratch slot in this window (`expert % lw`),
+        // given while it awaited them, which the pass reads once its rounds
+        // are past.
         let scratch = |tier: &Tier, expert: usize| {
             assert!(tier.scratch[expert], "a fixed request's cold experts hold scratch slots");
-            expert
+            expert % lw
         };
-        // Every expert the request routes is read in place: a hit in the
-        // record the map holds for its pass, or a cold one in its scratch
-        // slot. One with neither would read a slot no round filled: an
-        // invariant violation, which ends serving.
+        // Every expert the request routes in this window is read in place: a
+        // hit in the record the map holds for its pass, or a cold one in its
+        // window's scratch slot. One with neither would read a slot no round
+        // filled: an invariant violation, which ends serving.
         let tier = &self.tiers[index];
         for &expert in &routed {
-            assert!(
-                tier.scratch[expert] || hit(core, self.conveyor.lending(), layer, expert, sequence).is_some(),
-                "step {sequence} routes expert {expert} at layer {layer} with neither a held record nor a scratch slot"
-            );
+            if expert / lw == window as usize {
+                assert!(
+                    tier.scratch[expert] || hit(core, self.conveyor.lending(), layer, expert, sequence).is_some(),
+                    "step {sequence} routes expert {expert} at layer {layer} window {window} with neither a held record nor a scratch slot"
+                );
+            }
         }
         // Those the host tier keeps whole, each its tier record held until
         // the device is past the group, which the tier copy after round 0
@@ -1216,44 +1401,41 @@ impl Scratch {
         // beside a host tier, the one store on unified memory) with what the
         // group routed here, the most reused of it and of what is held
         // (`Directory::seed`), each routed expert ranked beside the last
-        // step that routed it: only an expert whose scratch slot the group
-        // filled, as a seed copies its slot. Its seeds take no record of an
-        // expert its merge set routes, which the set's pass reads in place
-        // after the seeding. Each expert a seed evicts is unmapped for every
-        // step of the group on. After the last round its seed copy and
-        // commit read the list, and the host maps each seed committed once
-        // the device is past it (`Core::retire`). An earlier step's list
-        // names another step: they seed nothing.
+        // step that routed it: decided once at window 0, then copied and
+        // committed per window while each window's slots hold its experts.
         let mut seeded = 0;
         if sequence == last {
+            if window == 0 {
+                let tier = &self.tiers[index];
+                let failed = |expert: usize| tier.failed.iter().any(|&(of, _)| of == expert);
+                let tier_routed = (0..tier.routed.len())
+                    .filter(|&expert| tier.routed[expert] > 0)
+                    .map(|expert| (expert, tier.last[expert]))
+                    .collect::<Vec<_>>();
+                let read = tier_routed.iter().map(|&(expert, _)| expert).collect::<Vec<_>>();
+                let filled = |expert: usize| (tier.scratch[expert] || tier.reader[expert].is_some()) && !failed(expert);
+                let (seeds, evicted) = core.directory.seed(at.point, layer, &tier_routed, &read, filled, core.extents.reserve);
+                for (owner, expert) in evicted {
+                    self.demote(owner, expert);
+                }
+                self.tiers[index].seeds = Some(seeds);
+            }
+            let first = core.directory.seeded_from(core.layers[layer].group);
             let tier = &self.tiers[index];
             let failed = |expert: usize| tier.failed.iter().any(|&(of, _)| of == expert);
-            let tier_routed = (0..tier.routed.len())
-                .filter(|&expert| tier.routed[expert] > 0)
-                .map(|expert| (expert, tier.last[expert]))
-                .collect::<Vec<_>>();
-            // Every expert the group routed here is read in place by some
-            // pass of it, which may run after the seeding: no seed takes one.
-            let read = tier_routed.iter().map(|&(expert, _)| expert).collect::<Vec<_>>();
-            let filled = |expert: usize| tier.scratch[expert] && !failed(expert);
-            let (seeds, evicted) = core.directory.seed(at.point, layer, &tier_routed, &read, filled, core.extents.reserve);
-            for (owner, expert) in evicted {
-                self.demote(owner, expert);
-            }
-            // Named from the first record a seed takes: past the lent
-            // records the group holds claimed in the scratch's lender
-            // (`ExpertBankPlan::seeded_from`), which its seed copy binds
-            // from.
-            let first = core.directory.seeded_from(core.layers[layer].group);
-            let pairs = seeds
+            let pairs = tier
+                .seeds
+                .as_deref()
+                .unwrap_or(&[])
                 .iter()
+                .filter(|&&(expert, _)| expert / lw == window as usize && tier.scratch[expert] && !failed(expert))
                 .map(|&(expert, record)| {
                     let named = record.index().checked_sub(first).expect("a seed takes no lent record the group holds");
-                    (expert as i32, i32::try_from(named).expect("bank records fit i32"))
+                    ((expert % lw) as i32, i32::try_from(named).expect("bank records fit i32"))
                 })
                 .collect::<Vec<_>>();
-            let seeds = ListBounds { from: core.layers[layer].experts as u64, to: core.layers[layer].lists.bank - first as u64, lent: 0 };
-            core.layers[layer].seeds.publish_list(sequence, &pairs, seeds);
+            let bounds = ListBounds { from: lw as u64, to: core.layers[layer].lists.bank - first as u64, lent: 0 };
+            core.layers[layer].seeds.publish_list(sequence, &pairs, bounds);
             seeded = pairs.len() as u64;
         }
         // The rounds fix the device's order of the request's experts: a
@@ -1266,13 +1448,18 @@ impl Scratch {
         }
         // The tier list, which the tier copy reads after round 0's answer.
         self.tiers[index].deferred.retain(|expert| !tiered.contains(expert));
-        let tier = ListBounds { from: core.layers[layer].lists.tier, to: core.layers[layer].experts as u64, lent: 0 };
+        let tier = ListBounds { from: core.layers[layer].lists.tier, to: lw as u64, lent: 0 };
         core.layers[layer].tiered.publish_list(sequence, &listed, tier);
-        // The request's answer: the count its rounds convert, final now,
-        // before round 0's.
+        // The window's staged count in its first round lane, which
+        // `routed_scratch_grids` reads after round 0's answer, and at window 0
+        // the request lane's answer.
         let table = &core.layers[layer].scratch;
-        table.store(sequence, constants::SCRATCH_ASK, constants::SCRATCH_STAGED, cold.len() as i32);
-        table.answer(sequence, constants::SCRATCH_ASK, false);
+        let base_lane = round_lane(window * core.extents.window_rounds);
+        table.store(sequence, base_lane, constants::SCRATCH_STAGED, cold.len() as i32);
+        if window == 0 {
+            table.store(sequence, constants::SCRATCH_ASK, constants::SCRATCH_STAGED, cold.len() as i32);
+            table.answer(sequence, constants::SCRATCH_ASK, false);
+        }
         Rounds {
             hits,
             cold,
@@ -1295,16 +1482,28 @@ impl Scratch {
     /// for the last, is answered after its last entry (the last is answered
     /// once the request is counted: its answer releases the device to
     /// complete the step). A round's records free once the device arrives
-    /// at the round after it, past its launch. Whether the rounds are over:
+    /// at a round ordered after its converts. Whether the rounds are over:
     /// every one served, or the request failed (an expert's read failed, or
     /// its step ended without the device arriving, a device error).
-    fn round(&mut self, at: At, rounds: &mut Rounds, core: &mut Core, prefetch: &mut Prefetch, shared: &Shared) -> bool {
+    #[allow(clippy::too_many_arguments)]
+    fn round(
+        &mut self,
+        at: At,
+        place: usize,
+        window: u64,
+        set: &std::ops::Range<usize>,
+        next_set_start: Option<usize>,
+        rounds: &mut Rounds,
+        core: &mut Core,
+        prefetch: &mut Prefetch,
+        shared: &Shared,
+    ) -> bool {
         let Point { group, layer, sequence, .. } = at.point;
         let round_records = core.extents.round_records;
+        let lw = core.layers[layer].layer_window;
+        let window_rounds = core.extents.window_rounds;
+        let base = window * window_rounds;
         let table = core.layers[layer].scratch.clone();
-        // A layer's cold experts fill at most its rounds (`rounds`: the
-        // widest layer's, in records of `round_records`; a lane past them is
-        // refused, `SlotTable::lane`).
         let last_round = rounds.rounds.max(1) - 1;
         // The bytes one expert of the layer reads.
         let expert_bytes = core.layers[layer].expert_bytes();
@@ -1333,17 +1532,31 @@ impl Scratch {
                 }
                 let record = self.conveyor.list(layer, expert);
                 let from = self.conveyor.listed_from(record);
-                core.layers[layer].rounds[round as usize]
-                    .append(sequence, from, expert as i32)
+                core.layers[layer].rounds[(base + round) as usize]
+                    .append(sequence, from, (expert % lw) as i32)
                     .expect("a round's landing list lists no later step while the step's rounds are served");
                 rounds.appended.push(expert);
-                // Its record frees as the device arrives at the round after
-                // (parked there by `routed_scratch_grids`), whose lane its
-                // slot has unless this is the slot's last.
+                // Its record frees once the device arrives at the round after
+                // in this window, or at the next fill's round 0 at this layer
+                // (a followed sibling's, the next window's, or the next pass
+                // set's).
+                let mut after = Vec::with_capacity(2);
+                if round + 1 < window_rounds {
+                    after.push((sequence, round_lane(base + round + 1)));
+                }
+                if round + 1 == rounds.rounds {
+                    if place + 1 < set.end {
+                        after.push((group + (place + 1) as u64, round_lane(base)));
+                    } else if window + 1 < core.extents.windows {
+                        after.push((group + set.start as u64, round_lane((window + 1) * window_rounds)));
+                    } else if let Some(next_start) = next_set_start {
+                        after.push((group + next_start as u64, round_lane(0)));
+                    }
+                }
                 core.taken.push(Taken {
                     records: vec![Listed { layer, expert }],
                     until: at.point,
-                    after: (round + 1 < core.extents.words.rounds).then(|| round_lane(round + 1)),
+                    after,
                 });
             }
             if rounds.appended.len() < chunk.len() {
@@ -1356,7 +1569,7 @@ impl Scratch {
             rounds.served.bytes += chunk.len() as u64 * expert_bytes;
             rounds.took.conveyed += chunk.len() as u64;
             if round != last_round {
-                table.answer(sequence, round_lane(round), false);
+                table.answer(sequence, round_lane(base + round), false);
                 shared.parks.settle();
             }
             rounds.round += 1;
@@ -1383,14 +1596,18 @@ impl Scratch {
         true
     }
 
-    /// The rounds of the request `at` its point from chain place `place`,
-    /// arrived at `arrived`, of tier `index`, are over: count it and answer
-    /// its last round, or fail it.
+    /// The rounds of the request window `at` its point from chain place
+    /// `place`, arrived at `arrived`, of tier `index`, are over: count it,
+    /// publish its window entries, and answer its last round, or fail it.
     #[allow(clippy::too_many_arguments)]
-    fn finish(&mut self, at: At, place: usize, arrived: Instant, index: usize, rounds: Rounds, core: &mut Core, shared: &Shared) {
+    fn finish(&mut self, at: At, place: usize, window: u64, arrived: Instant, index: usize, rounds: Rounds, core: &mut Core, shared: &Shared) {
         let point = at.point;
         let Point { layer, sequence, .. } = point;
         let Rounds { hits, cold, tiered, rounds, mut served, mut took, seeded, failure, .. } = rounds;
+        let lw = core.layers[layer].layer_window;
+        let window_rounds = core.extents.window_rounds;
+        let base = window * window_rounds;
+        let last_window = window + 1 == core.extents.windows;
         let last_round = rounds.max(1) - 1;
         let expert_bytes = core.layers[layer].expert_bytes();
         // The misses the fill copies from the host tier, served as a decode
@@ -1413,26 +1630,40 @@ impl Scratch {
         match failure {
             // The device's time after a failed step is no layer's compute.
             Some(reason) => {
-                self.forfeit(index, place, hits.iter().map(|&(expert, _)| expert).chain(cold).chain(tiered), core);
+                let remaining = self.tiers[index]
+                    .requests[place]
+                    .take()
+                    .map(|request| request.cold.into_iter().filter(|&expert| expert / lw > window as usize).collect::<Vec<_>>())
+                    .unwrap_or_default();
+                let forfeited = hits
+                    .iter()
+                    .map(|&(expert, _)| expert)
+                    .chain(cold)
+                    .chain(tiered)
+                    .chain(remaining);
+                self.forfeit(index, place, forfeited, core);
                 shared.telemetry.served_whole(None);
                 fail(core, shared, layer, sequence, reason);
             }
             None => {
-                shared.telemetry.served_whole(Some((point, Instant::now())));
-                self.mark(shared, layer, Mark::Served(sequence));
-                // The rounds past the last with records are answered before
-                // it (its answer releases the device to complete the step):
-                // where kernels wait in place they do not wait (their park
-                // grid is empty, `routed_scratch_grids`, but for the round
-                // after the last, which an unfollowed fill parks at, its
-                // arrival freeing the last round's records) but after a round
-                // 0 whose wait expired, whose step's every round parks and
-                // so finds its answer, and where a park
-                // is a submission boundary (`Parks`) each still waits for
-                // its answer; the last round's answer is the seed commit's.
+                if window == 0 {
+                    for &(expert, _) in &hits {
+                        core.layers[layer].windows[0].store(expert, -2);
+                    }
+                }
+                for &expert in cold.iter().chain(&tiered) {
+                    core.layers[layer].windows[window as usize].store(expert, (expert % lw) as i32);
+                }
+                shared.telemetry.served_whole(Some((point, Instant::now(), last_window)));
+                if last_window {
+                    self.mark(shared, layer, Mark::Served(sequence));
+                }
+                // The rounds past the last with records in this window are
+                // answered before it (its answer releases the device to run
+                // the pass or seed commit).
                 let table = &core.layers[layer].scratch;
-                for round in (last_round..core.extents.words.rounds).rev() {
-                    table.answer(sequence, round_lane(round), false);
+                for round in (last_round..window_rounds).rev() {
+                    table.answer(sequence, round_lane(base + round), false);
                     shared.parks.settle();
                 }
             }
@@ -1470,13 +1701,18 @@ impl Scratch {
     pub(super) fn forfeit(&mut self, index: usize, place: usize, experts: impl IntoIterator<Item = usize>, core: &Core) {
         let tier = &mut self.tiers[index];
         let layer = tier.layer;
+        let end = if tier.windows > 1 {
+            tier.sets.get(tier.set_index).map_or(tier.requests.len(), |set| set.end.min(tier.requests.len()))
+        } else {
+            tier.requests.len()
+        };
         for expert in experts {
+            tier.scratch[expert] = false;
             // A later step that takes the expert over reads it again.
             tier.failed.retain(|&(of, _)| of != expert);
-            let later = tier.requests[place + 1..]
-                .iter_mut()
-                .flatten()
-                .find(|later| later.routed.contains(&expert));
+            let later = (place + 1 < end)
+                .then(|| tier.requests[place + 1..end].iter_mut().flatten().find(|later| later.routed.contains(&expert)))
+                .flatten();
             let lending = self.conveyor.lending();
             let held = |later: &Request| hit(core, lending, layer, expert, later.sequence);
             let reader = match later.map(|later| (held(later), later)) {
@@ -1489,7 +1725,10 @@ impl Scratch {
                     Some(later.sequence)
                 }
                 None => {
-                    tier.routed[expert] = 0;
+                    tier.set_routed[expert] = 0;
+                    if tier.windows == 1 || tier.set_index == 0 {
+                        tier.routed[expert] = 0;
+                    }
                     None
                 }
             };
@@ -1498,13 +1737,6 @@ impl Scratch {
                 None => tier.unassign(expert),
             }
         }
-    }
-}
-
-impl Request {
-    /// The experts it is the group's first to route at its layer.
-    pub(super) fn experts(&self) -> Vec<usize> {
-        self.hits.iter().map(|&(expert, _)| expert).chain(self.cold.iter().copied()).collect()
     }
 }
 

@@ -503,16 +503,55 @@ impl ExpertBank {
         })
     }
 
-    /// Step `sequence`'s fill of streamed layer `layer` is directly followed
-    /// on the device's queue by a sibling fill (`followed`), which waits on
-    /// nothing queued after it: that fill's arrival proves this one's
-    /// converts done as soon as an arrival after its last round would, so
-    /// its round after the last parks only where it is not
-    /// (`routed_scratch_grids`). Stored before the fill is queued, while
-    /// the step owns its slot (a slot's last step ended before this one
-    /// began); the device reads it after round 0's answer.
-    pub(crate) fn fill_followed(&self, sequence: u64, layer: usize, followed: bool) {
-        self.scratch_tables[layer].store(sequence, magnitude_kernels::constants::SCRATCH_ASK, magnitude_kernels::constants::SCRATCH_FOLLOWED, i32::from(followed));
+    /// Step `sequence`'s fill of `window` of streamed layer `layer` is
+    /// directly followed on the device's queue by a sibling fill (`followed`),
+    /// which waits on nothing queued after it: that fill's arrival proves this
+    /// one's converts done as soon as an arrival after its last round would,
+    /// so its round after the last parks only where it is not
+    /// (`routed_scratch_grids`). Stored before the fill is queued, while the
+    /// step owns its slot (a slot's last step ended before this one began);
+    /// the device reads it after the window's round 0 answer.
+    pub(crate) fn fill_followed(&self, sequence: u64, layer: usize, window: u64, followed: bool) {
+        let lane = magnitude_kernels::constants::SCRATCH_ROUND + window * self.plan.window_rounds();
+        self.scratch_tables[layer].store(sequence, lane, magnitude_kernels::constants::SCRATCH_FOLLOWED, i32::from(followed));
+    }
+
+    /// The tensor a run of `window` binds as windowed `part`
+    /// (`BankPart::windowed`) of the streamed layer of `scope`.
+    pub fn windowed(&self, scope: WeightScope, part: BankPart, window: u64) -> Result<Tensor, String> {
+        let index = self.layer(scope)?.0;
+        let w = usize::try_from(window).map_err(|_| "window index exceeds usize")?;
+        match part {
+            BankPart::Window => self
+                .layout
+                .load
+                .window
+                .get(w)
+                .cloned()
+                .ok_or_else(|| format!("window {window} out of range {}", self.layout.load.window.len())),
+            BankPart::WindowTable => self.layout.layers[index]
+                .windows
+                .get(w)
+                .cloned()
+                .ok_or_else(|| format!("window {window} out of range {}", self.layout.layers[index].windows.len())),
+            BankPart::RoundList { round } => {
+                let window_rounds = self.plan.window_rounds();
+                if u64::from(round) >= window_rounds {
+                    return Err(format!("round {round} out of window_rounds {window_rounds}"));
+                }
+                let lane = window
+                    .checked_mul(window_rounds)
+                    .and_then(|base| base.checked_add(u64::from(round)))
+                    .and_then(|lane| usize::try_from(lane).ok())
+                    .ok_or_else(|| "round lane overflows usize".to_owned())?;
+                self.layout.layers[index]
+                    .rounds
+                    .get(lane)
+                    .cloned()
+                    .ok_or_else(|| format!("round lane {lane} out of range {}", self.layout.layers[index].rounds.len()))
+            }
+            _ => Err(format!("bank part {part:?} is not bound per window")),
+        }
     }
 
     /// The streamed entries' parks, which each run binds and registers with
@@ -541,6 +580,9 @@ impl ExpertBank {
         Ok(match part {
             BankPart::Step | BankPart::GroupReads | BankPart::ScratchFlags => {
                 return Err(format!("bank part {part:?} is bound at a chain place"));
+            }
+            BankPart::Window | BankPart::WindowTable | BankPart::RoundList { .. } => {
+                return Err(format!("bank part {part:?} is bound at a window"));
             }
             BankPart::Resident => &load.resident,
             BankPart::SlotMap => &self.slot_maps[index],
@@ -576,10 +618,6 @@ impl ExpertBank {
                 &self.layout.staging[*pool]
             }
             BankPart::LandingList => &layer.landing,
-            BankPart::RoundList { round } => layer
-                .rounds
-                .get(usize::from(round))
-                .ok_or_else(|| format!("bank part {part:?} names no scratch round"))?,
             BankPart::TierList => &layer.tiered,
             BankPart::TierGrid => &load.tier_grid,
             BankPart::TierStaged => &load.tier_staged,

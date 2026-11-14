@@ -85,6 +85,19 @@ impl BankRun {
         Ok(())
     }
 
+    pub(crate) fn bind_window<P>(
+        &self,
+        graph: &PreparedTargetBlockGraph<P>,
+        index: usize,
+        window: u64,
+        bindings: &mut seismic::NativeGraphBindings,
+    ) -> Result<(), String> {
+        for (port, words) in windowed_banks(&self.bank, graph, index, window)? {
+            bindings.set(port, &words).map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
     /// Whether `graph`'s run in this step is sampled for its block's
     /// device time: a graph whose ends are marked
     /// (`PreparedTargetBlockGraph::span`), of a sampled step.
@@ -105,8 +118,8 @@ impl BankRun {
     /// This step's fill, `graph`'s run as block `index`, is `followed`
     /// directly by a sibling fill on its queue
     /// (`ExpertBank::fill_followed`), at block `index`'s streamed layer.
-    pub(crate) fn fill_followed(&self, index: usize, followed: bool) -> Result<(), String> {
-        self.bank.fill_followed(self.sequence, block_layer(self.bank.plan(), index)?, followed);
+    pub(crate) fn fill_followed(&self, index: usize, window: u64, followed: bool) -> Result<(), String> {
+        self.bank.fill_followed(self.sequence, block_layer(self.bank.plan(), index)?, window, followed);
         Ok(())
     }
 
@@ -120,6 +133,26 @@ impl BankRun {
         index: usize,
         outputs: &seismic::NativeGraphOutputs,
     ) -> Result<(), String> {
+        self.register_parks_for(graph, index, None, outputs)
+    }
+
+    pub(crate) fn register_fill_parks<P>(
+        &self,
+        graph: &PreparedTargetBlockGraph<P>,
+        index: usize,
+        window: u64,
+        outputs: &seismic::NativeGraphOutputs,
+    ) -> Result<(), String> {
+        self.register_parks_for(graph, index, Some(window), outputs)
+    }
+
+    fn register_parks_for<P>(
+        &self,
+        graph: &PreparedTargetBlockGraph<P>,
+        index: usize,
+        window: Option<u64>,
+        outputs: &seismic::NativeGraphOutputs,
+    ) -> Result<(), String> {
         let layer = |scope: WeightScope| self.bank.streamed_layer(block_scope(scope, index)?);
         for &(node, port) in &graph.parks {
             let Some(value) = outputs.park(port) else {
@@ -127,6 +160,12 @@ impl BankRun {
             };
             match node {
                 GraphTimeline::Park(GraphPark { scope, kind }) => {
+                    let kind = match (window, kind) {
+                        (Some(w), crate::experts::ParkKind::Round(round)) => {
+                            crate::experts::ParkKind::Round(w * self.bank.plan().window_rounds() + round)
+                        }
+                        (_, kind) => kind,
+                    };
                     let site = crate::experts::ParkSite { layer: layer(scope)?, kind };
                     self.bank.parks().register(value, self.sequence, site);
                 }
@@ -162,6 +201,23 @@ pub(crate) fn placed_banks<'g, P>(
         .map(|(port, native)| {
             let scope = block_scope(port.scope, index)?;
             Ok((native, bank.placed(scope, port.part, place)?))
+        })
+        .collect()
+}
+
+pub(crate) fn windowed_banks<'g, P>(
+    bank: &crate::experts::ExpertBank,
+    graph: &'g PreparedTargetBlockGraph<P>,
+    index: usize,
+    window: u64,
+) -> Result<Vec<(&'g NativePort, seismic::Tensor)>, String> {
+    graph
+        .banks
+        .iter()
+        .filter(|(bank, _)| bank.part.windowed())
+        .map(|(port, native)| {
+            let scope = block_scope(port.scope, index)?;
+            Ok((native, bank.windowed(scope, port.part, window)?))
         })
         .collect()
 }
@@ -382,8 +438,8 @@ pub(super) fn bind_block_graphs<K: Copy + std::fmt::Debug, P>(
                 };
                 Ok((port, resident.bound(role, weight.part)?))
             })
-            // A placed bank part is a run's own place's.
-            .chain(graph.banks.iter().filter(|(bank, _)| !bank.part.placed()).map(|(bank, port)| {
+            // Placed and windowed bank parts are bound per run or per window.
+            .chain(graph.banks.iter().filter(|(bank, _)| !bank.part.placed() && !bank.part.windowed()).map(|(bank, port)| {
                 let scope = block_scope(bank.scope, index)?;
                 Ok((port, resident.bank_part(BankPort { scope, ..*bank })?))
             }))

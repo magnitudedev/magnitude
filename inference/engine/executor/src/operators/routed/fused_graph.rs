@@ -996,7 +996,7 @@ fn expand<'a, G: GraphDraft + 'a>(
     let dimensions = [
         ("M", rows.clone()),
         ("H", shape.hidden.clone()),
-        ("E", shape.count.clone()),
+        ("E", reads.stacks_rows.clone()),
         ("F", shape.intermediate.clone()),
         ("B", blocks),
         ("T", Dim::from(TILE_ROWS)),

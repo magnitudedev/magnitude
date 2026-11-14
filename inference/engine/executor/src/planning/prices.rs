@@ -65,6 +65,7 @@ impl PlanPrices {
             layers,
             pass: ExpertPass::of_bank(bank, self.costs.clone()).map_err(|error| priced(error.to_string()))?,
             routed: bank.layers().iter().map(|layer| (layer.experts, bank.selected())).collect(),
+            windows: bank.windows(),
             read: self.figures.read,
             compute,
             rates,
@@ -149,6 +150,7 @@ pub(crate) struct BankPrices {
     pass: ExpertPass,
     /// Each routed layer's `(experts, selected)`.
     routed: Vec<(u64, u64)>,
+    windows: u64,
     read: crate::assessment::ReadLine,
     /// `C`: the step at the prior's row and depth in each form.
     compute: FormSeconds,
@@ -168,7 +170,7 @@ impl BankPrices {
     /// ([`StreamedLayers::pass_reads`]).
     pub(crate) fn prompt_seconds(&self, pass: PassLaunches, held: HeldSlots) -> f64 {
         let reads = |rows: u64| self.layers.pass_reads(self.read, held, rows as f64);
-        super::routed_prompt_seconds(&self.pass, &self.routed, self.region_rows, self.prompt_rows, pass, &reads)
+        super::routed_prompt_seconds(&self.pass, &self.routed, self.windows, self.region_rows, self.prompt_rows, pass, &reads)
     }
 
     pub(crate) fn rates(&self) -> WorkloadRates {

@@ -74,9 +74,14 @@ fn routed_experts_expand<L: Isa, E: Elements>(
     let expert = cx.arg_blocks().get([block]);
     let rows = projection::item_rows(group[0], cx.param_rows(), f);
     let (map, step) = (cx.arg_map(), cx.arg_step());
+    let slot = routed::expert_slot(cx.dim_x(), |e| routed::held(|w| map.get([e, w]), |w| step.get([w])), expert);
     let (experts, records) = ([cx.arg_expert_gate(), cx.arg_expert_up()], [cx.arg_records_gate(), cx.arg_records_up()]);
-    let place = |weight: usize| routed::expert_weights(&experts[weight], &records[weight], cx.dim_x(), |e| routed::held(|w| map.get([e, w]), |w| step.get([w])), expert);
-    let (gate, up) = (place(0), place(1));
+    let (Some(gate), Some(up)) = (
+        routed::expert_weights(&experts[0], &records[0], slot),
+        routed::expert_weights(&experts[1], &records[1], slot),
+    ) else {
+        return;
+    };
     let (gate_scale, up_scale) = (cx.arg_gate_scale(), cx.arg_up_scale());
     let scales = (
         routed::scale_factor(cx.dim_gs(), |e| gate_scale.get([e]), expert),
@@ -124,6 +129,10 @@ fn routed_experts_quantize<L: Isa, E: Elements>(
     if lane >= routed::block_rows(cx.arg_order().row([block, 0])) {
         return;
     }
+    let (map, step) = (cx.arg_map(), cx.arg_step());
+    if routed::expert_slot(cx.dim_x(), |e| routed::held(|w| map.get([e, w]), |w| step.get([w])), cx.arg_blocks().get([block])) == -1 {
+        return;
+    }
     let row = block * t + lane;
     // SAFETY: the expand launch wrote this product row; this work item owns
     // it and its quantized row.
@@ -159,7 +168,10 @@ fn routed_experts_down<L: Isa, E: Elements>(
     let expert = cx.arg_blocks().get([block]);
     let columns = projection::item_rows(group[0], cx.param_rows(), h);
     let ((map, step), experts, records) = ((cx.arg_map(), cx.arg_step()), cx.arg_expert_down(), cx.arg_records_down());
-    let down = routed::expert_weights(&experts, &records, cx.dim_x(), |e| routed::held(|w| map.get([e, w]), |w| step.get([w])), expert);
+    let slot = routed::expert_slot(cx.dim_x(), |e| routed::held(|w| map.get([e, w]), |w| step.get([w])), expert);
+    let Some(down) = routed::expert_weights(&experts, &records, slot) else {
+        return;
+    };
     let output = cx.result_0();
     let order = cx.arg_order().row([block, 0]);
     // SAFETY: the expand launch wrote every live row before this launch.

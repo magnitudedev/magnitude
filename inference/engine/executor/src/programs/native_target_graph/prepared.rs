@@ -77,6 +77,7 @@ pub struct PreparedTargetGraphs {
     notice_rows: Option<u64>,
     /// What its prompt groups' buffers span (`GroupRows`).
     group: GroupRows,
+    windows: u64,
     /// How each block is served, which decides its stages, with its routed
     /// layer's values (`block_served`), whose crossing and merged positions
     /// a group holds over its rows (`group_split`).
@@ -839,6 +840,7 @@ impl PreparedTargetGraphs {
         // them, `certify_target_family`): both entries' and the per-layer
         // entry's of its rows, and at every block its class's runs and, where
         // the class splits there, the graphs the block runs once a group.
+        let windows = load.expert_bank().map_or(1, crate::ExpertBankPlan::windows);
         let launch_runs = LaunchRuns::of(
             &served,
             blocks_by_class.iter().enumerate().flat_map(|(index, graphs)| {
@@ -862,7 +864,7 @@ impl PreparedTargetGraphs {
                     .filter_map(|&source| entries.get(&(rows, source)))
                     .map(|entry| &entry.plan)
                     .chain(per_layer_entries.get(&rows).map(|entry| &entry.plan))
-                    .chain(launch_runs.of_class(class).copied())
+                    .chain(launch_runs.of_class(class, passes, windows).copied())
                     .cloned()
                     .collect::<Vec<_>>()
             })
@@ -872,7 +874,7 @@ impl PreparedTargetGraphs {
         // (`chained_once_runs`), as the plan certified them.
         let chains = (2..=limits.chain_capacity.get())
             .map(|launches| {
-                let further = chained_once_runs(passes, launches);
+                let further = chained_once_runs(passes, launches, windows);
                 let count = |key: (OnceStage, u64)| further.iter().find(|&&(at, _)| at == key).map_or(0, |&(_, count)| count);
                 let mut runs = Vec::new();
                 for graphs in &blocks_by_class {
@@ -928,6 +930,7 @@ impl PreparedTargetGraphs {
             blocks_by_class,
             listings,
             controls,
+            windows,
             upload_regions: certificate.upload_regions,
             max_segments: outline.max_segments,
             keeps: outline.keeps,
@@ -967,6 +970,10 @@ impl PreparedTargetGraphs {
     /// (`block_served`).
     pub(crate) fn streams(&self, index: usize) -> bool {
         self.served[index].streams
+    }
+
+    pub(crate) fn windows(&self) -> u64 {
+        self.windows
     }
 
     /// The tile counts of block `index`'s listing classes for a launch of

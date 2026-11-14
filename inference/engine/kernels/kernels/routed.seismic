@@ -637,12 +637,15 @@ native routed_group for cpu from "cpu/routed_group.rs":
 # Per-expert tile projections over the blocks `routed_group` filled (the
 # first `used[0]`, over the `rows[0]` rows it grouped from row `first[0]`): the `glu` of gate/up
 # (`activation`: 0 SiLU, 1 GELU-tanh; clamped at the F32 limit whose bits are LB, `glu_limit`'s extent, 0 for none), then down. Expert e's weights are
-# where the layer's map places it for the step: `records_*[r]` while it
-# holds a record r for the step (`held`, `step` its step pair), else
-# `expert_*[e]` (the resident stack, or the scratch tier of a streamed
-# layer); without a map (X = 0, QS = 0) every expert reads `expert_*[e]`. Its scales are `gate_scale[e]`, `up_scale[e]` wherever it
-# lives. Rows of blocks past `used` and padding rows carry no contract; the
-# combine reads only the positions `inverse` names.
+# where the layer's map places it for the step: `records_*[r]` while `held`
+# names bank record r >= 0, `expert_*[s]` while `held` names scratch slot
+# s = -2 - slot (slot <= -2), and skipped (neither weights read nor output
+# written, so earlier windows' rows in a persistent output survive) when
+# `held` returns -1; without a map (X = 0, QS = 0) every expert reads
+# `expert_*[e]` (slot = -2 - e). Its scales are `gate_scale[e]`,
+# `up_scale[e]` wherever it lives. Rows of blocks past `used` and padding
+# rows carry no contract; the combine reads only the positions `inverse`
+# names.
 fn routed_experts[M, H, E, F, B, T, GS, US, X, QS, R, LB](first: &tensor[1] i32, rows: &tensor[1] i32,
     normalized: &tensor[M, H] A, order: &tensor[B, T] i32, blocks: &tensor[B] i32,
     used: &tensor[1] i32, expert_gate: &tensor[E, F, H] EGW, expert_up: &tensor[E, F, H] EUW,
@@ -650,7 +653,7 @@ fn routed_experts[M, H, E, F, B, T, GS, US, X, QS, R, LB](first: &tensor[1] i32,
     records_gate: &tensor[R, F, H] EGW, records_up: &tensor[R, F, H] EUW,
     records_down: &tensor[R, H, F] EDW, activation: i32, gate_scale: &tensor[GS] f32,
     up_scale: &tensor[US] f32, glu_limit: &host tensor[0, LB] i32) -> tensor[B, T, H] A
-    where LB >= 0 and GS >= 0 and US >= 0 and operands(EGW) == operands(EUW) and X >= 0 and QS >= 0 and ((X == 0 and QS == 0) or (X == E and QS == STEP_WORDS)):
+    where LB >= 0 and GS >= 0 and US >= 0 and operands(EGW) == operands(EUW) and E > 0 and X >= 0 and QS >= 0 and ((X == 0 and QS == 0) or (X >= E and QS == STEP_WORDS)):
     let mut output = tensor[B, T, H] A
     let mut gate = tensor[1, F] A
     let mut up = tensor[1, F] A
@@ -667,40 +670,41 @@ fn routed_experts[M, H, E, F, B, T, GS, US, X, QS, R, LB](first: &tensor[1] i32,
                 output[block, lane, column] = 0.0
             let row = order[block, lane]
             if i32(block) < used[0] and row >= 0:
-                let mut slot = i32(-1)
+                let mut slot = -2 - expert
                 if X > 0 and QS == STEP_WORDS:
                     slot = held(map, expert, (u64(u32(step[STEP_HIGH])) << u64(32)) | u64(u32(step[STEP_LOW])))
-                let mut gate_factor = f32(1.0)
-                let mut up_factor = f32(1.0)
-                if GS > 0:
-                    gate_factor = gate_scale[expert]
-                if US > 0:
-                    up_factor = up_scale[expert]
-                for feature in 0..F:
-                    let mut g = f32(0.0)
-                    let mut u = f32(0.0)
-                    for source in 0..H:
-                        if slot >= 0:
-                            g = fma(gate_rows[row, source], f32(records_gate[slot, feature, source]), g)
-                            u = fma(up_rows[row, source], f32(records_up[slot, feature, source]), u)
-                        else:
-                            g = fma(gate_rows[row, source], f32(expert_gate[expert, feature, source]), g)
-                            u = fma(up_rows[row, source], f32(expert_up[expert, feature, source]), u)
-                    gate[0, feature] = g * gate_factor
-                    up[0, feature] = u * up_factor
-                let mut limit = f32(inf)
-                if LB > 0:
-                    limit = bitcast_f32(u32(LB))
-                glu(gate, up, product, activation, limit)
-                operand_row(product[0], operands(expert_down), down_row)
-                for column in 0..H:
-                    let mut projected = f32(0.0)
+                if slot != i32(-1):
+                    let mut gate_factor = f32(1.0)
+                    let mut up_factor = f32(1.0)
+                    if GS > 0:
+                        gate_factor = gate_scale[expert]
+                    if US > 0:
+                        up_factor = up_scale[expert]
                     for feature in 0..F:
-                        if slot >= 0:
-                            projected = fma(down_row[feature], f32(records_down[slot, column, feature]), projected)
-                        else:
-                            projected = fma(down_row[feature], f32(expert_down[expert, column, feature]), projected)
-                    output[block, lane, column] = projected
+                        let mut g = f32(0.0)
+                        let mut u = f32(0.0)
+                        for source in 0..H:
+                            if slot >= 0:
+                                g = fma(gate_rows[row, source], f32(records_gate[slot, feature, source]), g)
+                                u = fma(up_rows[row, source], f32(records_up[slot, feature, source]), u)
+                            else:
+                                g = fma(gate_rows[row, source], f32(expert_gate[-2 - slot, feature, source]), g)
+                                u = fma(up_rows[row, source], f32(expert_up[-2 - slot, feature, source]), u)
+                        gate[0, feature] = g * gate_factor
+                        up[0, feature] = u * up_factor
+                    let mut limit = f32(inf)
+                    if LB > 0:
+                        limit = bitcast_f32(u32(LB))
+                    glu(gate, up, product, activation, limit)
+                    operand_row(product[0], operands(expert_down), down_row)
+                    for column in 0..H:
+                        let mut projected = f32(0.0)
+                        for feature in 0..F:
+                            if slot >= 0:
+                                projected = fma(down_row[feature], f32(records_down[slot, column, feature]), projected)
+                            else:
+                                projected = fma(down_row[feature], f32(expert_down[-2 - slot, column, feature]), projected)
+                        output[block, lane, column] = projected
     return output
 
 # Every backend: a first one-thread launch writes the other launches' grids
@@ -1330,7 +1334,7 @@ fn routed_experts_up[M, H, E, F, B, T, US, X, QS, R](first: &tensor[1] i32, rows
     map: &tensor[X, MAP_WORDS] i32, step: &tensor[QS] i32, records_up: &tensor[R, F, H] EUW,
     records_down: &tensor[R, H, F] EDW, up_scale: &tensor[US] f32, activation: i32)
     -> tensor[B, T, H] A
-    where US >= 0 and X >= 0 and QS >= 0 and ((X == 0 and QS == 0) or (X == E and QS == STEP_WORDS)):
+    where US >= 0 and E > 0 and X >= 0 and QS >= 0 and ((X == 0 and QS == 0) or (X >= E and QS == STEP_WORDS)):
     let mut output = tensor[B, T, H] A
     let mut up = tensor[1, F] A
     let mut activated = tensor[1, F] A
@@ -1344,30 +1348,31 @@ fn routed_experts_up[M, H, E, F, B, T, US, X, QS, R](first: &tensor[1] i32, rows
                 output[block, lane, column] = 0.0
             let row = order[block, lane]
             if i32(block) < used[0] and row >= 0:
-                let mut slot = i32(-1)
+                let mut slot = -2 - expert
                 if X > 0 and QS == STEP_WORDS:
                     slot = held(map, expert, (u64(u32(step[STEP_HIGH])) << u64(32)) | u64(u32(step[STEP_LOW])))
-                let mut up_factor = f32(1.0)
-                if US > 0:
-                    up_factor = up_scale[expert]
-                for feature in 0..F:
-                    let mut u = f32(0.0)
-                    for source in 0..H:
-                        if slot >= 0:
-                            u = fma(up_rows[row, source], f32(records_up[slot, feature, source]), u)
-                        else:
-                            u = fma(up_rows[row, source], f32(expert_up[expert, feature, source]), u)
-                    up[0, feature] = u * up_factor
-                activate(up, activated, activation)
-                operand_row(activated[0], operands(expert_down), down_row)
-                for column in 0..H:
-                    let mut projected = f32(0.0)
+                if slot != i32(-1):
+                    let mut up_factor = f32(1.0)
+                    if US > 0:
+                        up_factor = up_scale[expert]
                     for feature in 0..F:
-                        if slot >= 0:
-                            projected = fma(down_row[feature], f32(records_down[slot, column, feature]), projected)
-                        else:
-                            projected = fma(down_row[feature], f32(expert_down[expert, column, feature]), projected)
-                    output[block, lane, column] = projected
+                        let mut u = f32(0.0)
+                        for source in 0..H:
+                            if slot >= 0:
+                                u = fma(up_rows[row, source], f32(records_up[slot, feature, source]), u)
+                            else:
+                                u = fma(up_rows[row, source], f32(expert_up[-2 - slot, feature, source]), u)
+                        up[0, feature] = u * up_factor
+                    activate(up, activated, activation)
+                    operand_row(activated[0], operands(expert_down), down_row)
+                    for column in 0..H:
+                        let mut projected = f32(0.0)
+                        for feature in 0..F:
+                            if slot >= 0:
+                                projected = fma(down_row[feature], f32(records_down[slot, column, feature]), projected)
+                            else:
+                                projected = fma(down_row[feature], f32(expert_down[-2 - slot, column, feature]), projected)
+                        output[block, lane, column] = projected
     return output
 
 
@@ -1824,19 +1829,20 @@ native routed_scatter for cpu from "cpu/routed_scatter.rs":
 # (XS = SOURCE_ROWS, `decode_source`): a bank record, a record of the
 # group's host tier read in place (TR its records), or none for a choice the
 # CPU computes, whose answer the combine adds. A larger class is
-# scratch-served over the layer's scratch bank (slot e holds expert e, so
-# `routes` are its slots), as two runs, a front and a back:
-#   routed_route -> routed_scratch_request | rounds -> routed_group ->
-#   routed_experts -> routed_combine
+# scratch-served over the layer's scratch window (`C_l = min(E, W)` slots), as
+# fronts followed by window-major fills and passes, then backs:
+#   routed_route -> routed_scratch_request |
+#   for w: rounds -> routed_pass_map -> routed_group -> routed_experts |
+#   routed_combine
 # where each round is one landing launch (`routed_round`: its arrival, then
-# each conveyed record converted into the scratch bank as its read lands),
-# and routed_experts reads a bank hit in its record through the
-# map (X = E), the rest from the scratch bank. A prompt group runs every
-# step's front of a layer before any step's back there, so every request of
-# the layer is published before its experts are read for. A step's
-# `routed_step` sets its chain place's step word to its sequence, at its
-# first streamed layer (a scratch-served step's front), before any of its
-# entries reads it.
+# each conveyed record converted into its assigned scratch slot as its read
+# lands), and routed_experts reads a bank hit in its record (slot >= 0), a
+# window cold expert in its scratch slot (slot = -2 - s), and skips experts
+# outside the window (slot = -1). A prompt group runs every step's front of a
+# layer before any window's fill or pass there, so every request of the layer
+# is published before its experts are read for. A step's `routed_step` sets
+# its chain place's step word to its sequence, at its first streamed layer (a
+# scratch-served step's front), before any of its entries reads it.
 #
 # Host-shared words (`Tensor::shared`): the host reads and writes them while
 # the step runs, by acquire loads and release stores; the device by
@@ -2574,10 +2580,10 @@ fn routed_scratch_request[M, K, E, FLIGHT, LANES](routes: &tensor[M, K] i32,
 
 
 # One scratch round's landing launch: it requests the step's lane
-# SCRATCH_ROUND + `round` of its slot (the device's arrival at the round),
-# then converts each of the round's records as its read lands, until the
-# lane is answered (`slot_answered`) and every entry below the round's
-# landing list's count is converted.
+# SCRATCH_ROUND + `window[0]` * `rounds` + `round` of its slot (the device's
+# arrival at the window's round), then converts each of the round's records as
+# its read lands, until the lane is answered (`slot_answered`) and every entry
+# below the round's landing list's count is converted.
 #
 # Its host serves it in host memory alone: every datum it serves is read by
 # device work already in the graph (this launch, and what follows it), so
@@ -2586,27 +2592,28 @@ fn routed_scratch_request[M, K, E, FLIGHT, LANES](routes: &tensor[M, K] i32,
 # the layer's `conveyor_*` views (host memory this launch reads in place),
 # or into scratch slot s at the slot's base (where the host addresses the
 # scratch: on unified memory), and the moment the read lands appends
-# (conveyor record, or -1 - s, scratch slot e) to the round's landing list
+# (conveyor record, or -1 - s, scratch slot) to the round's landing list
 # (`landing`, streaming_words.seismic), in landing order; it answers the
 # round's lane after the round's last entry (at once for a round of none).
 # The launch converts every routed tensor of each entry into the layer's
 # scratch tier (`gate`, `up`, `down`, views of the scratch lender's bank
-# records, slot e holding expert e; an up-only record's gate views empty,
-# GV = GS = 0). Before round 0's answer the host writes the `tiered` list,
-# each (host tier record, scratch slot) of an expert the host tier keeps
-# whole, which the tier copy after round 0 reads from the tier in place. A
-# prompt group's last step's host writes the `seeds` list, which its seed
-# copy reads after the last round (the host maps the seeds once the copy
-# has completed). The host rewrites the layer's `map`, a row for each of
-# the layer's experts (EL), as it serves round 0, while its lists hold up
-# to the widest layer's (E). It launches on its park grid (`grid`,
-# `routed_scratch_grids`'), round 0 on LAND_GROUPS threadgroups always.
-# The arrival of the round after a round, which the scratch table and the
-# scratch tier order after it, is the device's word that its records are
-# read, which frees them. This body states the arrival and the
-# conversions with no host: the entries landed when it runs.
+# records, slot s holding the cold expert assigned to it for the window; an
+# up-only record's gate views empty, GV = GS = 0). Before window `w`'s round
+# 0 answer the host writes the `tiered` list, each (host tier record, scratch
+# slot) of a window expert the host tier keeps whole, which the tier copy
+# after round 0 reads from the tier in place, and the window's `seeds` list,
+# which its seed copy reads after the window's last round (the host maps the
+# seeds once the copy has completed). The host rewrites the layer's `map`, a
+# row for each of the layer's experts (EL), as it serves window 0's round 0,
+# while its lists hold up to a window's slots (E). It launches on its park
+# grid (`grid`, `routed_scratch_grids`'), round 0 on LAND_GROUPS threadgroups
+# always. The arrival of the round after a round, which the scratch table and
+# the scratch tier order after it, is the device's word that its records are
+# read, which frees them. This body states the arrival and the conversions
+# with no host: the entries landed when it runs.
 fn routed_round[FLIGHT, LANES, L, V, GV, S, GS, F, H, E, EL](step: &tensor[STEP_WORDS] i32,
-    scratch: &await mut tensor[FLIGHT, SCRATCH_SLOT * LANES] i32, round: i32,
+    scratch: &await mut tensor[FLIGHT, SCRATCH_SLOT * LANES] i32, window: &tensor[1] i32,
+    rounds: i32, round: i32,
     landing: &await mut tensor[LANDING_ENTRIES + LANDING_ENTRY_WORDS * L] i32,
     tiered: &host mut tensor[LIST_ENTRIES + LIST_ENTRY_WORDS * E] i32,
     conveyor_gate: &tensor[GV, F, H] SG, conveyor_up: &tensor[V, F, H] SU,
@@ -2616,47 +2623,47 @@ fn routed_round[FLIGHT, LANES, L, V, GV, S, GS, F, H, E, EL](step: &tensor[STEP_
     map: &host mut tensor[EL, MAP_WORDS] i32, grid: &tensor[3] i32)
     where FLIGHT > 0 and LANES > SCRATCH_ROUND and V > 0 and S > 0 and ((GV == V and GS == S) or (GV == 0 and GS == 0)):
     let q = step_sequence(step)
-    request_slot(scratch, flight_slot[FLIGHT = FLIGHT](q), scratch_lane(SCRATCH_ROUND + round), q)
+    request_slot(scratch, flight_slot[FLIGHT = FLIGHT](q), scratch_lane(SCRATCH_ROUND + window[0] * rounds + round), q)
     land[L = L](landing, step, conveyor_gate, conveyor_up, conveyor_down, gate, up, down)
 
 
-# A scratch request's round grids, after round 0's landing launch: from
-# the count of records its rounds convert (its SCRATCH_ASK lane's
-# SCRATCH_STAGED, which the host writes and answers before it answers
-# round 0; none where it failed the request), round r converts
-# n_r = clamp(count - r L, 0, L) records (L = `round_records`), so its park
-# grid (`routed_round`'s `grid`) holds LAND_GROUPS threadgroups while
-# n_r > 0 or, unfollowed, n_{r-1} > 0 (round 0's is never read), and none
-# otherwise. The round after the last with records lands nothing: its
-# arrival, which the scratch table orders after the last round's launch, is
-# the device's word that the last round's records are read, which frees
-# them, and its host answers it before the last round; but not where the
-# request is followed (SCRATCH_FOLLOWED: a sibling fill's round 0 arrives
-# next and proves as much). The rounds after it launch nothing, and the
-# host serves none of them. A request neither answered nor failed here had
-# round 0's wait end on its still pulse (`streaming_await_slot`), before
-# the count was final: every round launches and none converts (the host
-# appends nothing), so the device still arrives, in order, at every round
-# the host serves (the step is interrupted, its outputs unused).
-fn routed_scratch_grids[FLIGHT, LANES, R](step: &tensor[STEP_WORDS] i32,
-    scratch: &tensor[FLIGHT, SCRATCH_SLOT * LANES] i32,
-    grids: &mut tensor[R, 3] i32, round_records: i32)
-    where FLIGHT > 0 and LANES == SCRATCH_ROUND + R:
+# A scratch window's round grids, after the window's round 0 landing launch:
+# from the count of records the window's rounds convert (its round-0 lane's
+# SCRATCH_STAGED, which the host writes before it answers round 0; none where
+# it failed the lane), round r converts n_r = clamp(count - r L, 0, L)
+# records (L = `round_records`), so its park grid (`routed_round`'s `grid`)
+# holds LAND_GROUPS threadgroups while n_r > 0 or, unfollowed, n_{r-1} > 0
+# (round 0's is never read), and none otherwise. The round after the last
+# with records lands nothing: its arrival, which the scratch table orders
+# after the last round's launch, is the device's word that the last round's
+# records are read, which frees them, and its host answers it before the last
+# round; but not where the window fill is followed (SCRATCH_FOLLOWED: a
+# sibling window fill's round 0 arrives next and proves as much). The rounds
+# after it launch nothing, and the host serves none of them. A round-0 lane
+# neither answered nor failed here had round 0's wait end on its still pulse
+# (`streaming_await_slot`), before the count was final: every round of the
+# window launches and none converts (the host appends nothing), so the device
+# still arrives, in order, at every round the host serves (the step is
+# interrupted, its outputs unused).
+fn routed_scratch_grids[FLIGHT, LANES, RW](step: &tensor[STEP_WORDS] i32,
+    scratch: &tensor[FLIGHT, SCRATCH_SLOT * LANES] i32, window: &tensor[1] i32,
+    grids: &mut tensor[RW, 3] i32, round_records: i32)
+    where FLIGHT > 0 and RW > 0 and LANES >= SCRATCH_ROUND + RW:
     let q = step_sequence(step)
     let slot = flight_slot[FLIGHT = FLIGHT](q)
-    let ask = scratch_lane(SCRATCH_ASK)
-    let answer = pair_at(scratch, slot, ask + SLOT_ANSWER)
+    let first = scratch_lane(SCRATCH_ROUND + window[0] * i32(RW))
+    let answer = pair_at(scratch, slot, first + SLOT_ANSWER)
     let failed = q | (u64(u32(SLOT_FAILED)) << u64(32))
     let mut count = i32(0)
     let mut unanswered = i32(1)
     let mut after = i32(1)
     if answer == q:
-        count = scratch[slot, ask + SCRATCH_STAGED]
-        if scratch[slot, ask + SCRATCH_FOLLOWED] != 0:
+        count = scratch[slot, first + SCRATCH_STAGED]
+        if scratch[slot, first + SCRATCH_FOLLOWED] != 0:
             after = i32(0)
     if answer == q or answer == failed:
         unanswered = i32(0)
-    for round in 0..R:
+    for round in 0..RW:
         let records = min(max(count - i32(round) * round_records, 0), round_records)
         let before = min(max(count - max(i32(round) - 1, 0) * round_records, 0), 1) * after
         let parks = max(max(min(records, 1), before), unanswered)
@@ -2698,25 +2705,34 @@ fn routed_list_grid[L](list: &tensor[LIST_ENTRIES + LIST_ENTRY_WORDS * L] i32, s
     grid[2] = 1
 
 
-# A merge set's pass's view of a streamed layer's map (streaming_words.seismic's
-# map), resolved once into device memory before the pass: `pass_step` the
-# step the pass runs for, and each expert's `resolved` row the record its
-# map holds for that step (`held`), mapped from that step on, or -1. The
-# pass's expert entries read these in place of the host-shared map and step
-# word, so a GEMM's blocks read no host-shared word: each would cost a link
-# round trip per block (an RTX 3090, 2026-11-02: a 3,536-row pass of the 35B
-# 4.08 ms over device words against 94.4 ms over host-shared ones).
-fn routed_pass_map[E](map: &tensor[E, MAP_WORDS] i32, step: &tensor[STEP_WORDS] i32,
+# A merge set's pass's view of a streamed layer's map and window row
+# (streaming_words.seismic's map and window table), resolved once into device
+# memory before the pass: `pass_step` the step the pass runs for, and each
+# expert's `resolved` row its source in this window, mapped from that step on:
+# `held` where `window[expert]` is -2 (a bank hit), -2 - s where
+# `window[expert]` = s >= 0 (scratch slot s), or -1 where `window[expert]` is
+# -1 (not in this window, skipped). The pass's expert entries read these in
+# place of the host-shared map, window row and step word, so a GEMM's blocks
+# read no host-shared word: each would cost a link round trip per block (an
+# RTX 3090, 2026-11-02: a 3,536-row pass of the 35B 4.08 ms over device words
+# against 94.4 ms over host-shared ones).
+fn routed_pass_map[E](map: &tensor[E, MAP_WORDS] i32, window: &tensor[E] i32, step: &tensor[STEP_WORDS] i32,
     resolved: &mut tensor[E, MAP_WORDS] i32, pass_step: &mut tensor[STEP_WORDS] i32):
     let q = step_sequence(step)
     pass_step[STEP_LOW] = step[STEP_LOW]
     pass_step[STEP_HIGH] = step[STEP_HIGH]
     for expert in 0..E:
+        let place = window[expert]
+        let mut record = i32(-1)
+        if place >= 0:
+            record = -2 - place
+        if place == i32(-2):
+            record = held[GM = E](map, i32(expert), q)
         resolved[expert, MAP_FROM] = step[STEP_LOW]
         resolved[expert, MAP_FROM + 1] = step[STEP_HIGH]
         resolved[expert, MAP_UNTIL] = i32(-1)
         resolved[expert, MAP_UNTIL + 1] = i32(-1)
-        resolved[expert, MAP_RECORD] = held[GM = E](map, i32(expert), q)
+        resolved[expert, MAP_RECORD] = record
 
 
 # A copy of listed records: each listed (from, to) pair's record of `source`
@@ -2735,22 +2751,23 @@ fn routed_copy[S, D, L, N, K](source: &tensor[S, N, K] U, list: &tensor[LIST_ENT
                 destination[to, :, :] = source[from, :, :]
 
 
-# A prompt group's seeding commit, after the scratch tier's last round and
-# its seed copy (`routed_copy` of the group's `seeds` list from their scratch
-# slots into their bank records): each listed (expert, record) pair's record
+# A prompt group's seeding commit, after a scratch window's last round and
+# its seed copy (`routed_copy` of the window's `seeds` list from their scratch
+# slots into their bank records): each listed (slot, record) pair's record
 # committed with the step (`commits[record]`), which the host reads once the
 # step has completed and then maps the seed (streaming_words.seismic: the
 # host is the map's one writer). `scratch` is the layer's scratch table: a
-# step whose last round's lane (SCRATCH_ROUND + R - 1, which the host
-# answers before the last round the device waits on, and fails whenever it
-# fails the request) does not hold the step's answer commits nothing, nor
-# does a list written for another step (the host maps only the experts it
-# listed).
+# window whose last round's lane (SCRATCH_ROUND + `window[0]` * `rounds` +
+# `rounds` - 1, which the host answers before the last round the device waits
+# on, and fails whenever it fails the fill) does not hold the step's answer
+# commits nothing, nor does a list written for another step (the host maps
+# only the experts it listed).
 fn routed_seed_commit[X, BANK, FLIGHT, LANES](list: &tensor[LIST_ENTRIES + LIST_ENTRY_WORDS * X] i32,
-    step: &tensor[STEP_WORDS] i32, scratch: &tensor[FLIGHT, SCRATCH_SLOT * LANES] i32, commits: &mut tensor[BANK] i32)
+    step: &tensor[STEP_WORDS] i32, scratch: &tensor[FLIGHT, SCRATCH_SLOT * LANES] i32,
+    window: &tensor[1] i32, rounds: i32, commits: &mut tensor[BANK] i32)
     where BANK > 0 and FLIGHT > 0 and LANES > SCRATCH_ROUND:
     let q = step_sequence(step)
-    let last = scratch_lane(i32(LANES) - 1)
+    let last = scratch_lane(SCRATCH_ROUND + window[0] * rounds + rounds - 1)
     if list[LIST_SEQUENCE] == step[STEP_LOW] and pair_at(scratch, flight_slot[FLIGHT = FLIGHT](q), last + SLOT_ANSWER) == q:
         for entry in 0..X:
             let record = list[LIST_ENTRIES + LIST_ENTRY_WORDS * entry + LIST_TO]

@@ -83,13 +83,13 @@ impl ExpertBankPlan {
     }
 
     /// The records of group `group`'s bank a prompt group holds live at
-    /// once: the lender's lent records, one widest layer of scratch for
-    /// every group and, where the conveyor lies in the bank's own records
-    /// (the one store, [`ConveyorCarrier::Bank`]), the conveyor beside it
-    /// ([`Self::scratch`]), and there the tier's reserve
-    /// ([`Self::tier_reserve`]), which holds graces a claim cannot take; none of any other group, whose experts a
-    /// prompt group never takes. The one place the prompt group's need is
-    /// stated.
+    /// once: the lender's lent records, one window of scratch
+    /// ([`Self::window_slots`]) for every group and, where the conveyor lies
+    /// in the bank's own records (the one store, [`ConveyorCarrier::Bank`]),
+    /// the conveyor beside it ([`Self::scratch`]), and there the tier's
+    /// reserve ([`Self::tier_reserve`]), which holds graces a claim cannot
+    /// take; none of any other group, whose experts a prompt group never
+    /// takes. The one place the prompt group's need is stated.
     pub fn prompt_records(&self, group: usize) -> u64 {
         if group != self.lender_group() {
             return 0;

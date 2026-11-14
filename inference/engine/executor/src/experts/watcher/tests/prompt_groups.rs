@@ -52,7 +52,7 @@ fn a_conveyors_records_cycle_as_rounds_convert() {
             scratch.request(step.sequence(), round(index));
             assert_eq!(until_answered(scratch, step.sequence(), round(index)), Answer::Answered);
             if index == 0 {
-                rounds = (scratch.load(step.sequence(), constants::SCRATCH_ASK, constants::SCRATCH_STAGED) as u64)
+                rounds = (scratch.load(step.sequence(), round(0), constants::SCRATCH_STAGED) as u64)
                     .div_ceil(ROUND_RECORDS);
             }
             // Until the device arrives at the next round, this round's
@@ -647,6 +647,7 @@ fn a_group_is_the_fewest_steps_covering_each_layers_stage() {
         bytes: vec![1_000_000; 2],
         resident: None,
         experts: vec![256; 2],
+        windows: 1,
     };
     assert_eq!(facts.group_size(Some(&lines), Some(line), Notice::Written, 16), 16, "layer 1 is unmeasured");
     facts.compute[1] = Some(ms(40));
@@ -676,6 +677,7 @@ fn a_layers_read_is_what_the_last_group_to_end_there_read() {
         bytes: vec![1_000_000; 2],
         resident: None,
         experts: vec![256; 2],
+        windows: 1,
     };
     let moved = |facts: &GroupFacts| {
         let terms = facts.terms().unwrap();
@@ -708,10 +710,14 @@ fn an_unpriced_group_splits_only_before_cold_experts() {
         bytes: vec![1_000_000; 4],
         resident: Some(vec![2_000_000; 4]),
         experts: vec![256; 4],
+        windows: 1,
     };
     assert_eq!(facts.merge_sets(None, None, None, Notice::Written, 6), [6, 6, 6, 6], "a group with nothing cold");
     facts.pulled[2] = Some(52);
     assert_eq!(facts.merge_sets(None, None, None, Notice::Written, 6), [6, 5, 6, 6], "the pulls before layer 2");
+    facts.windows = 2;
+    assert_eq!(facts.merge_sets(None, None, None, Notice::Written, 6), [6, 6, 6, 6], "a windowed scratch tier merges every layer whole");
+    facts.windows = 1;
     facts.pulled[2] = Some(0);
     facts.held[3] = 200;
     assert_eq!(facts.merge_sets(None, None, None, Notice::Written, 6), [6, 6, 5, 6], "the reads before layer 3");
@@ -1140,4 +1146,105 @@ fn a_prompt_group_grows_no_layer_past_its_share() {
     assert_eq!(seeded, vec![2; LAYERS], "each layer seeds its share");
     let held = |layer: usize| (0..EXPERTS).filter(|&expert| harness.layers[layer].0.held(expert).is_some()).count();
     eventually("a layer never held its seeds", || (0..LAYERS).all(|layer| held(layer) == 2));
+}
+
+/// A windowed scratch tier (`window_slots < EXPERTS`, `conveyor_records == ROUND_RECORDS`)
+/// streams all 7 cold experts of an 8-expert layer (plus 1 bank hit) across 4
+/// windows of 2 scratch slots and 2 conveyor records without deadlock — even
+/// when step 0 routes higher-window cold experts `[4, 5, 6, 7]` before step 1
+/// publishes window-0/1 cold experts `[0, 2, 3]` — writes each window's exact
+/// pass routing table (`0..window_slots`, `-2` hits at window 0, `-1` outside),
+/// seeds across windows, and resets `windows[0]` to `-2` once past the layer.
+#[test]
+fn a_windowed_scratch_tier_streams_more_cold_experts_than_slots_without_deadlock() {
+    let conveying = Conveying::of(ROUND_RECORDS);
+    let harness = lending_windowed(
+        "windowed-conveyor",
+        EXPERTS,
+        4,
+        1,
+        STAGING,
+        conveying,
+        0,
+        Placer::Tier,
+        false,
+        0,
+        false,
+        ROUND_RECORDS as usize,
+    );
+    let window_row = |w: usize| (0..EXPERTS).map(|e| harness.windows[0][w].load(e)).collect::<Vec<_>>();
+    assert_eq!(window_row(0), [-2; EXPERTS]);
+    for w in 1..4 {
+        assert_eq!(window_row(w), [-1; EXPERTS]);
+    }
+
+    // Seed expert 1 into the bank via a one-step windowed prompt group.
+    let seed_step = harness.prompt_step();
+    harness.publish(&seed_step, 0, &[1]);
+    let mut initial_seeds = Vec::new();
+    for w in 0..harness.window_count {
+        let converted = harness.rounds_window(&seed_step, 0, w);
+        assert_eq!(converted, if w == 0 { vec![1] } else { vec![] });
+        for (slot, record) in harness.commit_seeds(&seed_step, 0) {
+            initial_seeds.push((w as i32 * harness.window_slots as i32 + slot, record));
+        }
+    }
+    assert_eq!(initial_seeds.len(), 1);
+    assert_eq!(initial_seeds[0].0, 1);
+    seed_step.complete().unwrap();
+    harness.retired();
+    eventually("expert 1 was never mapped", || harness.layer.0.held(1).is_some());
+    assert_eq!(window_row(0), [-2; EXPERTS], "windows[0] reset for resident passes");
+
+    // Two-step group: step 0 publishes window 2..4 cold experts [4, 5, 6, 7] + hit 1
+    // before step 1 publishes window 0..2 cold experts [0, 2, 3] + shared 6.
+    let steps = harness.group(&[StepRoute::Grouped; 2]);
+    harness.publish(&steps[0], 0, &[1, 4, 5, 6, 7]);
+    // Wait until step 0's window-2 cold experts hold both conveyor records, so
+    // step 1's window-0 expert must preempt by `(window, step, round)` order.
+    harness.conveying(4);
+    harness.conveying(5);
+    harness.publish(&steps[1], 0, &[0, 2, 3, 6]);
+
+    let mut all_converted = Vec::new();
+    let mut multi_seeds = Vec::new();
+    let expected_rows = [
+        [0, -2, -1, -1, -1, -1, -1, -1],
+        [-1, -1, 0, 1, -1, -1, -1, -1],
+        [-1, -1, -1, -1, 0, 1, -1, -1],
+        [-1, -1, -1, -1, -1, -1, 0, 1],
+    ];
+    for w in 0..harness.window_count {
+        for (place, step) in steps.iter().enumerate() {
+            let converted = harness.rounds_window(step, 0, w);
+            all_converted.extend(converted);
+            if place + 1 == steps.len() {
+                for (slot, record) in harness.commit_seeds(step, 0) {
+                    multi_seeds.push((w as i32 * harness.window_slots as i32 + slot, record));
+                }
+            }
+        }
+        assert_eq!(window_row(w as usize), expected_rows[w as usize], "window {w} pass map row");
+    }
+    all_converted.sort_unstable();
+    // Some cold experts may have landed into the host tier's 0 extra records? `tier = 0`,
+    // `lent = 2` (claimed by the conveyor), so 0 records are free in the host tier and
+    // every one of the 7 cold experts converts through the 2 conveyor records!
+    assert_eq!(all_converted, [0, 2, 3, 4, 5, 6, 7]);
+    // Bank has 4 records (1 held expert 1 + 3 free records, with expert 6 routed twice).
+    assert_eq!(multi_seeds.len(), 3, "three remaining bank records seeded across windows: {multi_seeds:?}");
+    for step in steps {
+        step.complete().unwrap();
+    }
+    harness.retired();
+    let group = harness.watcher.shared().costs().group.unwrap();
+    let layer = &group.layers[0];
+    assert_eq!((layer.union, layer.hits, layer.conveyed, layer.seeded, layer.computed), (8, 1, 7, 3, 2));
+    eventually("windowed seeds were never mapped", || {
+        multi_seeds.iter().all(|&(expert, record)| harness.layer.0.held(expert as usize) == Some(record as usize))
+    });
+    assert_eq!(window_row(0), [-2; EXPERTS], "windows[0] restored after windowed group");
+    for w in 1..4 {
+        assert_eq!(window_row(w), [-1; EXPERTS], "windows[{w}] cleared after windowed group");
+    }
 }

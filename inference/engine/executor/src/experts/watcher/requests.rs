@@ -252,30 +252,39 @@ impl Requests {
             let pending = match service.pending[layer].take() {
                 Some(pending) => pending,
                 None => match residency.scratch.unserved(&self.shared, layer) {
-                    Some((place, sequence)) => Pending::Arriving { at: self.shared.steps.at(sequence, layer, layers), place },
+                    Some((place, window, sequence)) => Pending::Arriving {
+                        at: self.shared.steps.at(sequence, layer, layers),
+                        place,
+                        window,
+                    },
                     None => return moved,
                 },
             };
             let serve = match pending {
                 Pending::Served(serve) => serve,
-                Pending::Arriving { at, place } => {
+                Pending::Arriving { at, place, window } => {
                     let sequence = at.point.sequence;
-                    if !residency.core.layers[layer].scratch.requested(sequence, scratch::round_lane(0)) {
+                    let lane = scratch::round_lane(window * residency.core.extents.window_rounds);
+                    if !residency.core.layers[layer].scratch.requested(sequence, lane) {
                         if !self.shared.steps.ended(sequence) {
-                            service.pending[layer] = Some(Pending::Arriving { at, place });
+                            service.pending[layer] = Some(Pending::Arriving { at, place, window });
                             return moved;
                         }
-                        residency.scratch.unarrived(at, place, &residency.core, &self.shared);
+                        residency.scratch.unarrived(at, place, window, &mut residency.core, &self.shared);
                         moved = true;
                         continue;
                     }
                     let arrived = Instant::now();
                     residency.publish(layer);
-                    residency.advance(at.point);
+                    if window == 0 {
+                        residency.advance(at.point);
+                    } else {
+                        residency.advance_window();
+                    }
                     moved = true;
                     // While the device arrived, the layers the group published
                     // since may have taken the request's tier with its layer.
-                    let Some(serve) = residency.scratch.arrived(at, place, arrived) else {
+                    let Some(serve) = residency.scratch.arrived(at, place, window, arrived, &mut residency.core, &self.shared) else {
                         continue;
                     };
                     serve

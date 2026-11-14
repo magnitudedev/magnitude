@@ -58,12 +58,12 @@ fn a_groups_acknowledgement_goes_with_its_group() {
     // Group A of steps 1 and 2, its last request served whole.
     let last = Point::whole(1, 0, 2);
     telemetry.group(last, 2, GroupLayer::default());
-    telemetry.served_whole(Some((last, Instant::now())));
+    telemetry.served_whole(Some((last, Instant::now(), true)));
     // Group B of steps 3 and 4 counted, then A's last step completes.
     let next = Point::whole(3, 0, 3);
     telemetry.group(next, 4, GroupLayer::default());
     telemetry.complete_step(&harness.watcher.shared().steps, 2, CompletedStep { work: LaunchWork::Prompt, begun: Instant::now(), route: CompletedRoute::Grouped }, &|_| (0, 0, Duration::ZERO), None).expect("no reads, no line");
-    telemetry.served_whole(Some((next, Instant::now())));
+    telemetry.served_whole(Some((next, Instant::now(), true)));
     telemetry.arrived(3, Instant::now());
     let group = harness.watcher.shared().costs().group.expect("group B is counted");
     assert_eq!((group.first, group.layers[0].computed), (3, 1));

@@ -33,6 +33,8 @@ pub mod memory;
 mod native;
 #[cfg(test)]
 mod ngram_steps_tests;
+#[cfg(test)]
+mod windowed_conveyor_tests;
 #[cfg(any(test, feature = "fixtures"))]
 mod test_support;
 mod operation;

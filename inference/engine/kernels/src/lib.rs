@@ -47,14 +47,14 @@ pub fn source_words(records: &[i32], sites: &[i32]) -> Vec<i32> {
     words
 }
 
-// Each kind's payload begins at SLOT_PAYLOAD with its count (the scratch
-// kind's, SCRATCH_STAGED, then SCRATCH_FOLLOWED), and a scratch lane is
-// SCRATCH_SLOT words: the slot's words and its payload, even.
+// Each kind's payload begins at SLOT_PAYLOAD with its count (a scratch
+// window's round-0 lane: SCRATCH_STAGED, then SCRATCH_FOLLOWED), and a
+// scratch lane is SCRATCH_SLOT words: the slot's words and its payload, even.
 const _: () = {
     assert!(constants::SITE_COUNT == constants::SLOT_PAYLOAD, "a site request's count is its payload's first word");
     assert!(constants::FILE_COUNT == constants::SLOT_PAYLOAD, "a file request's count is its payload's first word");
-    assert!(constants::SCRATCH_STAGED == constants::SLOT_PAYLOAD, "a scratch answer's count is its payload's first word");
-    assert!(constants::SCRATCH_FOLLOWED == constants::SCRATCH_STAGED + 1, "a scratch request's fill order follows its count");
+    assert!(constants::SCRATCH_STAGED == constants::SLOT_PAYLOAD, "a scratch window's count is its payload's first word");
+    assert!(constants::SCRATCH_FOLLOWED == constants::SCRATCH_STAGED + 1, "a scratch window's fill order follows its count");
     assert!(
         constants::LANDING_HEAD % 2 == 0 && constants::LANDING_ENTRIES == constants::LANDING_HEAD + 2,
         "a landing list's head is one u64 at an even word, its entries after it"
@@ -109,7 +109,8 @@ impl SlotTable {
     }
 
     /// The scratch kind's table (`scratch[FLIGHT, SCRATCH_SLOT LANES]`) of
-    /// `rounds` rounds: the request's lane (SCRATCH_ASK), then each round's.
+    /// `rounds` round lanes across the windows (`P * RW`): the request's lane
+    /// (SCRATCH_ASK), then each window's round lanes.
     pub fn scratch(slots: u64, rounds: u64) -> Self {
         Self::new(slots, constants::SCRATCH_ROUND + rounds, SCRATCH_PAYLOAD)
     }

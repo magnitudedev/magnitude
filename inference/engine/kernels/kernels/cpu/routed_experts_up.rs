@@ -57,7 +57,10 @@ fn routed_experts_up_expand<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, gro
     let expert = cx.arg_blocks().get([block]);
     let rows = projection::item_rows(group[0], cx.param_rows(), f);
     let ((map, step), experts, records) = ((cx.arg_map(), cx.arg_step()), cx.arg_expert_up(), cx.arg_records_up());
-    let up = routed::expert_weights(&experts, &records, cx.dim_x(), |e| routed::held(|w| map.get([e, w]), |w| step.get([w])), expert);
+    let slot = routed::expert_slot(cx.dim_x(), |e| routed::held(|w| map.get([e, w]), |w| step.get([w])), expert);
+    let Some(up) = routed::expert_weights(&experts, &records, slot) else {
+        return;
+    };
     let function = cx.arg_activation();
     let up_scale = cx.arg_up_scale();
     let scale = routed::scale_factor(cx.dim_us(), |e| up_scale.get([e]), expert);
@@ -86,6 +89,10 @@ fn routed_experts_up_quantize<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, g
     if lane >= routed::block_rows(cx.arg_order().row([block, 0])) {
         return;
     }
+    let (map, step) = (cx.arg_map(), cx.arg_step());
+    if routed::expert_slot(cx.dim_x(), |e| routed::held(|w| map.get([e, w]), |w| step.get([w])), cx.arg_blocks().get([block])) == -1 {
+        return;
+    }
     let row = block * t + lane;
     // SAFETY: the expand launch wrote this product row; this work item owns
     // it and its quantized row.
@@ -111,7 +118,10 @@ fn routed_experts_up_down<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group
     let expert = cx.arg_blocks().get([block]);
     let columns = projection::item_rows(group[0], cx.param_rows(), h);
     let ((map, step), experts, records) = ((cx.arg_map(), cx.arg_step()), cx.arg_expert_down(), cx.arg_records_down());
-    let down = routed::expert_weights(&experts, &records, cx.dim_x(), |e| routed::held(|w| map.get([e, w]), |w| step.get([w])), expert);
+    let slot = routed::expert_slot(cx.dim_x(), |e| routed::held(|w| map.get([e, w]), |w| step.get([w])), expert);
+    let Some(down) = routed::expert_weights(&experts, &records, slot) else {
+        return;
+    };
     let output = cx.result_0();
     let order = cx.arg_order().row([block, 0]);
     // SAFETY: the expand launch wrote every live row before this launch.

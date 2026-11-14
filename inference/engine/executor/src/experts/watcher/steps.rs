@@ -452,6 +452,15 @@ impl Steps {
         (first, group.steps)
     }
 
+    /// Group `group`'s merge set size at streamed layer `layer`.
+    pub(super) fn merges_of(&self, group: Step, layer: usize) -> usize {
+        let state = self.lock();
+        state
+            .groups
+            .get(&group)
+            .map_or(1, |begun| begun.merges.get(layer).copied().unwrap_or(begun.steps as usize))
+    }
+
     /// Step `sequence`'s group and when it began.
     fn begun(&self, sequence: Step) -> (Step, Instant) {
         let mut state = self.lock();
@@ -1310,6 +1319,9 @@ impl ExpertStep {
         };
         let extents = Extents {
             widest: 0,
+            windows: 1,
+            window_rounds: 1,
+            pass_launches: 1,
             round_records: 1,
             words,
             selected: 1,

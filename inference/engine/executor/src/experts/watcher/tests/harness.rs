@@ -105,6 +105,11 @@ pub(super) struct Harness {
     pub(super) tiered: Vec<Words>,
     /// Each layer's seed list.
     pub(super) seeds: Vec<Words>,
+    /// Each layer's per-window pass routing table (`[windows][EXPERTS]`).
+    pub(super) windows: Vec<Vec<Words>>,
+    pub(super) window_slots: usize,
+    pub(super) window_count: u64,
+    pub(super) window_rounds: u64,
     /// The second chain place's scratch flags (the first's are `load.0`).
     pub(super) second: Words,
     staging: Tensor,
@@ -342,6 +347,28 @@ pub(super) fn lending_bank(
     bank_lent: usize,
     whole: bool,
 ) -> Harness {
+    lending_windowed(name, stored, records, layers, staging_records, conveying, tier, placer, promotes, bank_lent, whole, EXPERTS)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn lending_windowed(
+    name: &str,
+    stored: usize,
+    records: u64,
+    layers: usize,
+    staging_records: u32,
+    conveying: Conveying,
+    tier: u32,
+    placer: Placer,
+    promotes: bool,
+    bank_lent: usize,
+    whole: bool,
+    window_slots: usize,
+) -> Harness {
+    let layer_window = EXPERTS.min(window_slots);
+    let window_count = EXPERTS.div_ceil(window_slots) as u64;
+    let window_rounds = (window_slots as u64).div_ceil(ROUND_RECORDS);
+    assert_eq!(window_count * window_rounds, WORDS.rounds, "window lanes match WORDS.rounds");
     let device = cpu();
     let words = |count: u64, initial| cpu_words(&device, count, initial);
     let file =
@@ -423,12 +450,23 @@ pub(super) fn lending_bank(
     let flags = words(EXPERTS as u64, 0);
     // Each layer's round landing lists, whose entries name conveyor records
     // or, where the host addresses the scratch, its slots, into slots.
-    let round_bounds = ListBounds { from: conveyor_records, to: EXPERTS as u64, lent: if addressed { EXPERTS as u64 } else { 0 } };
+    let round_bounds = ListBounds {
+        from: conveyor_records,
+        to: layer_window as u64,
+        lent: if addressed && window_count == 1 { layer_window as u64 } else { 0 },
+    };
     let round_words = (0..layers)
         .map(|_| (0..WORDS.rounds).map(|_| words(magnitude_kernels::landing_extent(ROUND_RECORDS), 0)).collect::<Vec<_>>())
         .collect::<Vec<_>>();
-    let lists = || (0..layers).map(|_| words(magnitude_kernels::list_extent(EXPERTS as u64), 0)).collect::<Vec<_>>();
+    let lists = || (0..layers).map(|_| words(magnitude_kernels::list_extent(window_slots as u64), 0)).collect::<Vec<_>>();
     let (tiered, seeds) = (lists(), lists());
+    let layer_windows = (0..layers)
+        .map(|_| {
+            (0..window_count)
+                .map(|w| words(EXPERTS as u64, if w == 0 { -2 } else { -1 }))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
     // Each tensor's conveyor: the bytes of the lent records it lies on,
     // which the harness addresses apart from the tier's.
     let conveyor = Tensor::shared(&device, Element::i32(), &[conveyor_records * 3 * 4]).unwrap();
@@ -452,13 +490,13 @@ pub(super) fn lending_bank(
             .map(|pool| LentPool { record: bytes, offset: 0, conveyor: pool.bytes() })
             .collect(),
     };
-    // Each tensor's experts as the device's pass reads them, by expert:
+    // Each tensor's experts as the device's pass reads them, by window slot:
     // the scratch slots the harness's tier copy plays into.
-    let scratch = (0..3).map(|_| Tensor::shared(&device, Element::i32(), &[EXPERTS as u64, RECORD / 4]).unwrap()).collect::<Vec<_>>();
+    let scratch = (0..3).map(|_| Tensor::shared(&device, Element::i32(), &[window_slots as u64, RECORD / 4]).unwrap()).collect::<Vec<_>>();
     let conveyors = conveyed();
     let carrier = Carrier {
         records: conveyor_records as usize,
-        slots: if addressed { EXPERTS } else { 0 },
+        slots: if addressed { window_slots } else { 0 },
         lending: lending(lent, bytes, &conveyors),
         pools: conveyors,
     };
@@ -499,6 +537,7 @@ pub(super) fn lending_bank(
             .map(|(index, layer)| Layer {
                 group: 0,
                 experts: EXPERTS,
+                layer_window,
                 map: layer.0.clone(),
                 file: layer.1.clone(),
                 scratch: layer.2.clone(),
@@ -509,7 +548,7 @@ pub(super) fn lending_bank(
                 policy: layer.5.clone(),
                 site: None,
                 stored: (0..3).map(stored_tensor).collect(),
-                slots: addressed.then(|| scratch.iter().map(|slots| Records::rows(slots, RECORD, EXPERTS as u64).unwrap()).collect()),
+                slots: addressed.then(|| scratch.iter().map(|slots| Records::rows(slots, RECORD, layer_window as u64).unwrap()).collect()),
                 scratch_form: vec![0; 3],
                 landing: landing[index].clone(),
                 rounds: round_words[index].iter().map(|words| LandingList::new(words.clone(), round_bounds)).collect(),
@@ -523,6 +562,7 @@ pub(super) fn lending_bank(
                 },
                 tiered: tiered[index].clone(),
                 seeds: seeds[index].clone(),
+                windows: layer_windows[index].clone(),
             })
             .collect(),
         group_reads: reads.iter().map(|reads| PlacedLayerWords { group_reads: reads.clone(), stride: EXPERTS }).collect(),
@@ -538,6 +578,9 @@ pub(super) fn lending_bank(
         pools,
         extents: Extents {
             widest: EXPERTS,
+            windows: window_count,
+            window_rounds,
+            pass_launches: PLACES as usize,
             round_records: ROUND_RECORDS as usize,
             words: WORDS,
             // One choice a row.
@@ -577,6 +620,10 @@ pub(super) fn lending_bank(
         commits,
         tiered,
         seeds,
+        windows: layer_windows,
+        window_slots,
+        window_count,
+        window_rounds,
         second,
         staging,
         conveyor,
@@ -1231,7 +1278,7 @@ impl Harness {
             assert_eq!(until_answered(scratch, sequence, round(index)), Answer::Answered);
             if index == 0 {
                 self.tier_copy(sequence, layer);
-                converting = (scratch.load(sequence, constants::SCRATCH_ASK, constants::SCRATCH_STAGED) as u64)
+                converting = (scratch.load(sequence, round(0), constants::SCRATCH_STAGED) as u64)
                     .div_ceil(ROUND_RECORDS);
                 if converting == 0 {
                     break;
@@ -1244,6 +1291,54 @@ impl Harness {
         }
         assert_eq!(scratch.answer_of(sequence, last_round()), Some(Answer::Answered));
         converting as usize
+    }
+
+    /// Play `step`'s fill at `(layer, window)`, checking each listed `(from, slot)`
+    /// holds `window * window_slots + slot` whole in the conveyor and writing it
+    /// into `scratch[slot]`: the global experts converted in `window`, ascending.
+    pub(super) fn rounds_window(&self, step: &ExpertStep, layer: usize, window: u64) -> Vec<i32> {
+        let (scratch, sequence) = (&self.layers[layer].2, step.sequence());
+        let base = window * self.window_rounds;
+        let last = base + self.window_rounds - 1;
+        let (mut converting, mut index, mut experts) = (1, 0, Vec::new());
+        while index < converting.min(self.window_rounds) {
+            let lane = round(base + index);
+            scratch.request(sequence, lane);
+            assert_eq!(until_answered(scratch, sequence, lane), Answer::Answered);
+            if index == 0 {
+                self.tier_copy(sequence, layer);
+                converting = (scratch.load(sequence, round(base), constants::SCRATCH_STAGED) as u64)
+                    .div_ceil(ROUND_RECORDS);
+                if converting == 0 {
+                    break;
+                }
+            }
+            if index < converting {
+                for (from, slot) in self.round_listed(step, layer, base + index) {
+                    assert!(
+                        (0..self.window_slots as i32).contains(&slot),
+                        "slot {slot} outside window_slots {}",
+                        self.window_slots
+                    );
+                    let expert = window as i32 * self.window_slots as i32 + slot;
+                    assert!(from >= 0 && from < self.conveyor_records as i32, "from {from}");
+                    for kind in 0..3 {
+                        let byte = self.conveyed(kind, from);
+                        assert_eq!(byte, (100 * kind + expert as u64) as u8, "expert {expert} in conveyor {from}");
+                        unsafe {
+                            self.scratch[kind as usize]
+                                .write_shared(slot as u64 * RECORD, &[byte; RECORD as usize])
+                                .unwrap();
+                        }
+                    }
+                    experts.push(expert);
+                }
+            }
+            index += 1;
+        }
+        assert_eq!(scratch.answer_of(sequence, round(last)), Some(Answer::Answered));
+        experts.sort_unstable();
+        experts
     }
 
     /// Play the device arriving at round `round` of `step`'s request at

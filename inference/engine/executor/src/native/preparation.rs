@@ -2932,7 +2932,7 @@ impl<'a> Preparation<'a> {
         )?;
         let scratch_grids = spec.fixed(
             &bindings,
-            &[scratch.as_slice(), &[("R", bank.words.rounds)]].concat(),
+            &[scratch.as_slice(), &[("RW", bank.window_rounds)]].concat(),
             routed_scratch_grids::native_entry(),
         )?;
         let pass_map = spec.fixed(&bindings, &[], routed_pass_map::native_entry())?;
@@ -2941,13 +2941,13 @@ impl<'a> Preparation<'a> {
             let [n, k] = tensor.matrix;
             spec.fixed(
                 &bindings,
-                &[("S", experts), ("D", bank.records), ("L", bank.widest), ("N", n), ("K", k)],
+                &[("S", experts.min(bank.window_slots)), ("D", bank.records), ("L", bank.window_slots), ("N", n), ("K", k)],
                 routed_copy::native_entry_with(routed_copy::Elements { U: tensor.resident }),
             )
         })?;
         let seed_commit = spec.fixed(
             &bindings,
-            &[&[("X", bank.widest), ("BANK", bank.records)], scratch.as_slice()].concat(),
+            &[&[("X", bank.window_slots), ("BANK", bank.records)], scratch.as_slice()].concat(),
             routed_seed_commit::native_entry(),
         )?;
         let list_grid = spec.fixed(&bindings, &[], routed_list_grid::native_entry())?;

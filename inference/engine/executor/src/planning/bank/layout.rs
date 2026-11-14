@@ -124,6 +124,13 @@ pub enum BankPart {
     /// A group holds its record from its beginning, when the host zeroes
     /// it, until every step of it has ended, when the host reads it.
     GroupReads,
+    /// Constant `[P, 1]` `i32` tensor (`0..P`) whose row `w` is bound to
+    /// the fill graph's `window` port (`[1] i32`) per window submission.
+    Window,
+    /// Host-shared `[P, widest]` `i32` table per layer whose row `w`
+    /// (`[experts_l] i32`) maps each expert to its scratch slot in window `w`
+    /// (`-1` if outside window `w`), bound per window submission.
+    WindowTable,
 }
 
 impl BankPart {
@@ -134,6 +141,13 @@ impl BankPart {
     /// places, a pass binding its group's record at its merge set's first.
     pub fn placed(self) -> bool {
         matches!(self, Self::Step | Self::ScratchFlags | Self::GroupReads)
+    }
+
+    /// Whether the part is bound per window submission (`Window`,
+    /// `WindowTable`, `RoundList`) rather than statically across the whole
+    /// layer.
+    pub fn windowed(self) -> bool {
+        matches!(self, Self::Window | Self::WindowTable | Self::RoundList { .. })
     }
 
     /// The instances of a placed part of a load of `places` chain places
@@ -179,7 +193,9 @@ impl BankPart {
             | Self::SeedGrid
             | Self::SeedStaged
             | Self::ScratchGrids
-            | Self::GroupReads => (),
+            | Self::GroupReads
+            | Self::Window
+            | Self::WindowTable => (),
         };
         let records = RoutedTensor::ALL.into_iter().flat_map(|kind| {
             [Self::Tier { kind }, Self::Conveyor { kind }, Self::Staging { kind }, Self::Scratch { kind }]
@@ -210,6 +226,8 @@ impl BankPart {
             Self::SeedStaged,
             Self::ScratchGrids,
             Self::GroupReads,
+            Self::Window,
+            Self::WindowTable,
         ]
         .into_iter()
         .chain(records)
@@ -444,6 +462,8 @@ pub struct LoadAllocations<T> {
     pub seed_grid: T,
     pub seed_staged: T,
     pub grids: T,
+    /// Constant `[1]` `i32` window indices (`0..P`), one allocation per window.
+    pub window: Vec<T>,
 }
 
 /// The placed parts' words (`BankPart::placed`) of a count of chain places
@@ -531,6 +551,8 @@ pub struct LayerAllocations<T> {
     /// launches on was written for the layer.
     pub tiered: T,
     pub seeds: T,
+    /// Host-shared `[experts_l]` `i32` window slot tables (`BankPart::WindowTable`), one per window.
+    pub windows: Vec<T>,
 }
 
 /// A streamed layer's CPU site's words and buffers.
@@ -572,6 +594,7 @@ impl<T> BankLayout<T> {
                     seed_grid,
                     seed_staged,
                     grids,
+                    window,
                 },
             groups,
             layers,
@@ -587,11 +610,12 @@ impl<T> BankLayout<T> {
             ("load: seed staged list", seed_staged),
             ("load: grids", grids),
         ]);
+        owned.extend(window.iter().map(|w| ("load: window", w)));
         for GroupAllocations { records, map, commits } in groups {
             owned.extend(records.iter().map(|(_, records)| ("group: records", records)));
             owned.extend([("group: map", map), ("group: commits", commits)]);
         }
-        for LayerAllocations { expert_scales, tier, file, scratch, rings, routing, policy, sited, landing, rounds, tiered, seeds } in layers {
+        for LayerAllocations { expert_scales, tier, file, scratch, rings, routing, policy, sited, landing, rounds, tiered, seeds, windows } in layers {
             owned.extend(expert_scales.iter().filter_map(|(_, scale)| scale.as_ref()).map(|scale| ("layer: expert scales", scale)));
             owned.extend(tier.iter().map(|tier| ("layer: tier words", tier)));
             owned.extend([
@@ -605,6 +629,7 @@ impl<T> BankLayout<T> {
             owned.push(("layer: landing list", landing));
             owned.extend(rounds.iter().map(|list| ("layer: round landing lists", list)));
             owned.extend([("layer: tier list", tiered), ("layer: seeds", seeds)]);
+            owned.extend(windows.iter().map(|w| ("layer: window table", w)));
         }
         owned.extend(staging.iter().map(|pool| ("staging", pool)));
         owned.extend(host.iter().flatten().flat_map(|tier| tier.iter().map(|(_, records)| ("host tier", records))));
@@ -631,6 +656,7 @@ impl<T> BankLayout<T> {
             seed_grid: make(&load.seed_grid)?,
             seed_staged: make(&load.seed_staged)?,
             grids: make(&load.grids)?,
+            window: load.window.iter().map(&mut make).collect::<Result<Vec<_>, E>>()?,
         };
         let mut groups = Vec::with_capacity(self.groups.len());
         for group in &self.groups {
@@ -655,6 +681,7 @@ impl<T> BankLayout<T> {
                 rounds: layer.rounds.iter().map(&mut make).collect::<Result<Vec<_>, E>>()?,
                 tiered: make(&layer.tiered)?,
                 seeds: make(&layer.seeds)?,
+                windows: layer.windows.iter().map(&mut make).collect::<Result<Vec<_>, E>>()?,
             });
         }
         let staging = self.staging.iter().map(&mut make).collect::<Result<Vec<_>, E>>()?;
@@ -689,7 +716,7 @@ impl ExpertBankPlan {
         // A layer's binding is derived once for all its parts.
         let binding = self.binding(layer)?;
         let mut parts = Vec::new();
-        for part in BankPart::every(self.rounds()) {
+        for part in BankPart::every(self.window_rounds()) {
             if let Some((element, extents)) = self.held_shape(layer, part, || Ok(binding))? {
                 parts.push((part, element, extents));
             }
@@ -767,7 +794,7 @@ impl ExpertBankPlan {
             }
             BankPart::Scratch { kind } => {
                 let binding = binding()?;
-                Ok(binding.record.get(kind).map(|tensor| tensor.resident_tensor(binding.experts)).map(|(element, extents)| (element, extents.to_vec())))
+                Ok(binding.record.get(kind).map(|tensor| tensor.resident_tensor(self.layer_window(layer))).map(|(element, extents)| (element, extents.to_vec())))
             }
             BankPart::Staging { .. } if self.placer() != Placer::Bank => Ok(None),
             BankPart::Staging { kind } => {
@@ -775,11 +802,13 @@ impl ExpertBankPlan {
                 Ok(binding.record.get(kind).map(|tensor| tensor.stored_tensor(binding.staging)).map(|(element, extents)| (element, extents.to_vec())))
             }
             BankPart::LandingList => words(magnitude_kernels::landing_extent(self.choices())),
-            BankPart::RoundList { round } if u64::from(round) < self.rounds() => words(self.round_list_words()),
+            BankPart::RoundList { round } if u64::from(round) < self.window_rounds() => words(self.round_list_words()),
             BankPart::RoundList { .. } => Ok(None),
             BankPart::TierList | BankPart::SeedList | BankPart::TierStaged | BankPart::SeedStaged => words(self.expert_list_words()),
             BankPart::TierGrid | BankPart::SeedGrid => words(3),
-            BankPart::ScratchGrids => Ok(Some((Element::i32(), vec![self.rounds(), 3]))),
+            BankPart::ScratchGrids => Ok(Some((Element::i32(), vec![self.window_rounds(), 3]))),
+            BankPart::Window => words(1),
+            BankPart::WindowTable => words(self.layers()[layer].experts),
         }
     }
 
@@ -860,13 +889,14 @@ impl ExpertBankPlan {
                         .transpose()?,
                     landing: words(index, BankPart::LandingList)?,
                     rounds: (0..self.rounds())
-                        .map(|round| {
-                            let round = u8::try_from(round).map_err(|_| "scratch rounds exceed u8")?;
+                        .map(|lane| {
+                            let round = u8::try_from(lane % self.window_rounds()).map_err(|_| "scratch rounds exceed u8")?;
                             words(index, BankPart::RoundList { round })
                         })
                         .collect::<Result<Vec<_>, String>>()?,
                     tiered: words(index, BankPart::TierList)?,
                     seeds: words(index, BankPart::SeedList)?,
+                    windows: (0..self.windows()).map(|_| words(index, BankPart::WindowTable)).collect::<Result<Vec<_>, String>>()?,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -877,6 +907,7 @@ impl ExpertBankPlan {
             seed_grid: device(0, BankPart::SeedGrid)?,
             seed_staged: device(0, BankPart::SeedStaged)?,
             grids: device(0, BankPart::ScratchGrids)?,
+            window: (0..self.windows()).map(|_| device(0, BankPart::Window)).collect::<Result<Vec<_>, String>>()?,
         };
         let staging = self
             .staging_pools()

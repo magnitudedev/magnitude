@@ -597,7 +597,7 @@ struct TargetRun<'l> {
     back: Option<(usize, BlockRun)>,
     /// The scratch-served streamed block whose front the run queued and
     /// whose fill is not yet queued (`run_sets`).
-    unfilled: Option<usize>,
+    unfilled: Option<(usize, u64)>,
     residual: Option<Tensor>,
     /// The carry the next block reads (`ResidualCarry`).
     hidden: ResidualCarry<Tensor>,
@@ -1845,30 +1845,40 @@ impl NativeTargetProgram {
         let merged = block.map_or(1, |at| sets[at]);
         let filled = |at: usize| scratch && self.graphs.prepared.streams(at);
         let early = self.device.backend().fills_beside_compute();
-        // The runs of block `index`'s first merge set, whose fills follow
-        // no pass of their own layer: every run where the layer merges
-        // whole, else its first, a set of one.
-        let first = |place: usize| index < self.geometry.blocks.len() && (sets[index].clamp(1, count) == count || place == 0);
+        // The runs of block `index`'s first pass set, whose fills follow no
+        // pass of their own layer.
+        let first_set = self
+            .graphs
+            .passes()
+            .sets(count, sets.get(index).copied().unwrap_or(1))
+            .next()
+            .unwrap_or(0..0);
+        let first = |place: usize| index < self.geometry.blocks.len() && first_set.contains(&place);
         // A pass covers at most the runs whose rows its graph holds
         // (`group_pass_rows`): a longer merge set is several passes.
+        let block_windows = if block.is_some_and(filled) { self.graphs.prepared.windows() } else { 1 };
         for set in self.graphs.passes().sets(count, merged) {
             if let Some(at) = block {
-                // Where fills share the compute queue, the set's fills run
-                // back to back, each but the last directly followed by a
-                // sibling's (`ExpertBank::fill_followed`).
-                let unfilled = |(place, run): &(usize, &mut TargetRun<'_>)| set.contains(place) && run.unfilled == Some(at);
-                let fills = runs.iter_mut().enumerate().filter(unfilled).count();
-                for (filled, (_, run)) in runs.iter_mut().enumerate().filter(unfilled).enumerate() {
-                    self.run_fill(run, at, !early && filled + 1 < fills, submitter)?;
+                for w in 0..block_windows {
+                    if filled(at) {
+                        // Where fills share the compute queue, the set's fills run
+                        // back to back, each but the last directly followed by a
+                        // sibling's (`ExpertBank::fill_followed`).
+                        let unfilled = |(place, run): &(usize, &mut TargetRun<'_>)| set.contains(place) && run.unfilled == Some((at, w));
+                        let fills = runs.iter_mut().enumerate().filter(unfilled).count();
+                        for (filled_idx, (_, run)) in runs.iter_mut().enumerate().filter(unfilled).enumerate() {
+                            self.run_fill(run, at, w, !early && filled_idx + 1 < fills, submitter)?;
+                        }
+                    }
+                    self.run_pass(runs, at, set.clone(), w, reads, submitter)?;
                 }
-                self.run_pass(runs, at, set.clone(), reads, submitter)?;
             }
             // No pass of the block before follows in this call: its last
-            // has been queued.
+            // window's last has been queued.
             let passed = early && (block.is_none() || set.end == count);
             if passed {
-                for (_, run) in runs.iter_mut().enumerate().filter(|(place, run)| first(*place) && run.unfilled == Some(index)) {
-                    self.run_fill(run, index, false, submitter)?;
+                for (_, run) in runs.iter_mut().enumerate().filter(|(place, run)| first(*place) && run.unfilled == Some((index, 0))) {
+                    self.run_fill(run, index, 0, false, submitter)?;
                 }
             }
             for (place, run) in runs.iter_mut().enumerate().filter(|(place, _)| set.contains(place)) {
@@ -1878,9 +1888,9 @@ impl NativeTargetProgram {
                 if index < self.geometry.blocks.len() {
                     self.run_block(run, index, rotation, submitter)?;
                     if filled(index) && run.back.as_ref().is_some_and(|&(at, _)| at == index) {
-                        run.unfilled = Some(index);
+                        run.unfilled = Some((index, 0));
                         if passed && first(place) {
-                            self.run_fill(run, index, false, submitter)?;
+                            self.run_fill(run, index, 0, false, submitter)?;
                         }
                     }
                 }
@@ -1902,13 +1912,18 @@ impl NativeTargetProgram {
     /// which it touches, and so orders against, only where its graph places
     /// something there. `followed`: the next launch on its queue is a
     /// sibling's fill, which waits on nothing queued after this one.
-    fn run_fill(&self, run: &mut TargetRun<'_>, index: usize, followed: bool, submitter: &mut StepSubmitter) -> Result<(), SubmitError> {
-        run.unfilled = None;
+    fn run_fill(&self, run: &mut TargetRun<'_>, index: usize, window: u64, followed: bool, submitter: &mut StepSubmitter) -> Result<(), SubmitError> {
+        run.unfilled = if window + 1 < self.graphs.prepared.windows() {
+            Some((index, window + 1))
+        } else {
+            None
+        };
         let (graph, bound) = self.graphs.fill(index).map_err(invalid)?;
         let mut bindings = bound.bindings();
         if let Some(bank) = &run.bank {
             bank.bind(graph, index, run.region.place, &mut bindings).map_err(invalid)?;
-            bank.fill_followed(index, followed).map_err(invalid)?;
+            bank.bind_window(graph, index, window, &mut bindings).map_err(invalid)?;
+            bank.fill_followed(index, window, followed).map_err(invalid)?;
         }
         let mut active = run.launch.graph_workspace.slot_mut().activate(&graph.plan).map_err(device)?;
         let ready = active
@@ -1916,7 +1931,7 @@ impl NativeTargetProgram {
             .map_err(device)?;
         let mut registered = Ok(());
         submitter.fill(ready, |outputs| {
-            registered = run.bank.as_ref().map_or(Ok(()), |bank| bank.register_parks(graph, index, outputs));
+            registered = run.bank.as_ref().map_or(Ok(()), |bank| bank.register_fill_parks(graph, index, window, outputs));
         })?;
         registered.map_err(invalid)
     }
@@ -1933,6 +1948,7 @@ impl NativeTargetProgram {
         runs: &mut Branded<'_, TargetRun<'_>>,
         index: usize,
         set: std::ops::Range<usize>,
+        window: u64,
         reads: Option<(&crate::experts::ExpertBank, usize)>,
         submitter: &mut StepSubmitter,
     ) -> Result<(), SubmitError> {
@@ -1964,6 +1980,9 @@ impl NativeTargetProgram {
         let mut bindings = bound.bindings();
         for (port, buffer) in into.crossing.iter().zip(crossing.pass().iter()) {
             bindings.set(port, &rows_of(buffer)?).map_err(device)?;
+        }
+        if let Some(bank) = &run.bank {
+            bank.bind_window(graph, index, window, &mut bindings).map_err(invalid)?;
         }
         // A streamed layer's pass writes its set's reads into its group's
         // record at the set's first place (`BankPart::GroupReads`).

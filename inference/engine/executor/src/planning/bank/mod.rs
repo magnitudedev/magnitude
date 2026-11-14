@@ -338,6 +338,10 @@ pub struct BankBinding {
     /// The widest streamed layer's experts: the scratch flags' and the
     /// seed list's extents, which every layer shares in turn.
     pub widest: u64,
+    /// `W`: scratch window slots (`ExpertBankPlan::window_slots`).
+    pub window_slots: u64,
+    /// `RW`: convert rounds per window (`ExpertBankPlan::window_rounds`).
+    pub window_rounds: u64,
     /// `V`: the conveyor's records ([`ExpertBankPlan::conveyor_records`]).
     pub conveyor: u64,
     /// `TR`: the group's host tier records ([`ExpertBankPlan::host_extent`]),
@@ -559,6 +563,8 @@ impl ExpertBankPlan {
             staging: self.staging_records(),
             round_records: self.round_records(),
             widest: self.widest().get(),
+            window_slots: self.window_slots(),
+            window_rounds: self.window_rounds(),
             conveyor: conveyor.records,
             tier: self.host_extent(group),
             placer: self.placer(),
@@ -826,11 +832,32 @@ impl ExpertBankPlan {
         self.structure().round_records()
     }
 
-    /// Rounds of a scratch-served layer: enough to convert every expert of
-    /// the widest layer. A hit is read where the bank holds it; a round past
-    /// a layer's last records neither parks nor converts.
+    /// `W`: scratch slots held at once for a prompt group's layer
+    /// (`round_records <= W <= widest`).
+    pub fn window_slots(&self) -> u64 {
+        self.structured.window_slots()
+    }
+
+    /// `P`: windows per layer (`widest.div_ceil(window_slots)`).
+    pub fn windows(&self) -> u64 {
+        self.widest().get().div_ceil(self.window_slots())
+    }
+
+    /// `RW`: convert rounds per window (`window_slots.div_ceil(round_records)`).
+    pub fn window_rounds(&self) -> u64 {
+        self.window_slots().div_ceil(self.round_records())
+    }
+
+    /// `C_l`: scratch slots used by streamed layer `layer` (`experts.min(window_slots)`).
+    pub fn layer_window(&self, layer: usize) -> u64 {
+        self.layers()[layer].experts.min(self.window_slots())
+    }
+
+    /// Rounds of a scratch-served layer: `P * RW` rounds across all windows.
+    /// A hit is read where the bank holds it; a round past a layer's last
+    /// records neither parks nor converts.
     pub fn rounds(&self) -> u64 {
-        self.widest().get().div_ceil(self.round_records())
+        self.windows() * self.window_rounds()
     }
 
     /// Words of a scratch round's landing list (`routed_round`,
@@ -843,9 +870,9 @@ impl ExpertBankPlan {
     /// Words of the tier list and the seed list (`routed_copy` from the host
     /// tier into scratch slots, and of seeds from their scratch slots into
     /// bank records, then `routed_seed_commit`): the sequence and count,
-    /// then a pair per expert, at most a layer's experts.
+    /// then a pair per expert, at most a window's slots.
     pub fn expert_list_words(&self) -> u64 {
-        list_extent(self.widest().get())
+        list_extent(self.window_slots())
     }
 
     /// The least `slots` a load of this bank holds, and the least a shrink
@@ -1052,8 +1079,9 @@ impl ExpertBankPlan {
     /// structure's lending derived again ([`conveyor::Structured::new`]).
     #[cfg(test)]
     pub(crate) fn with_layers(self, layers: BankLayers) -> Self {
+        let window_slots = self.window_slots().min(layers.widest().get());
         let (selected, host, groups, _) = self.structured.into_parts();
-        let structured = conveyor::Structured::new(selected, host, groups, layers)
+        let structured = conveyor::Structured::new(selected, host, groups, layers, Some(window_slots))
             .expect("the layers keep the bank's lending");
         let block = seismic::block_bytes(seismic::BlockSizing {
             granule: structured.granule(),
@@ -1061,6 +1089,12 @@ impl ExpertBankPlan {
         })
         .expect("the layers size a valid block");
         Self { structured, block, ..self }
+    }
+
+    /// This bank with `window_slots` scratch slots and its lending derived again.
+    pub(crate) fn with_window_slots(mut self, window_slots: u64) -> Result<Self, String> {
+        self.structured = self.structured.with_window_slots(window_slots)?;
+        Ok(self)
     }
 
     /// The layer whose weights are of `scope` and its index, when the bank

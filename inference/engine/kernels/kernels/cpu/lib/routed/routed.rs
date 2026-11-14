@@ -118,40 +118,42 @@ pub fn block_rows(order: &[i32]) -> usize {
     order.partition_point(|row| *row >= 0)
 }
 
-/// The record a map row holds for the step (`held`, routed.seismic): `map(w)`
+/// The entry a map row holds for the step (`held`, routed.seismic): `map(w)`
 /// its word w (MAP_RECORD, the MAP_FROM and MAP_UNTIL pairs, each low word
-/// first), `step(w)` the step pair's word w; -1 unless it names a record
-/// and MAP_FROM <= q < MAP_UNTIL.
+/// first), `step(w)` the step pair's word w; -1 unless MAP_FROM <= q <
+/// MAP_UNTIL.
 #[inline(always)]
 pub fn held(map: impl Fn(usize) -> i32, step: impl Fn(usize) -> i32) -> i32 {
     let pair = |word: &dyn Fn(usize) -> i32, at: usize| u64::from(word(at) as u32) | (u64::from(word(at + 1) as u32) << 32);
     let q = pair(&step, crate::constants::STEP_LOW as usize);
     let record = map(crate::constants::MAP_RECORD as usize);
-    let held = record >= 0
-        && pair(&map, crate::constants::MAP_FROM as usize) <= q
+    let held = pair(&map, crate::constants::MAP_FROM as usize) <= q
         && q < pair(&map, crate::constants::MAP_UNTIL as usize);
     if held { record } else { -1 }
 }
 
-/// The weights of expert `expert`: record `held(expert)` of `records` while
-/// the layer's map (of `mapped` rows) holds one for the step (>= 0), else
-/// its record of `experts` by index (the stack, or the scratch tier), which
-/// is every expert's without a map.
+/// The resolved source of expert `expert`: `held(expert)` through the layer's
+/// map (`mapped` > 0), or -2 - `expert` without a map (`mapped` == 0).
+#[inline(always)]
+pub fn expert_slot(mapped: u64, held: impl Fn(usize) -> i32, expert: i32) -> i32 {
+    match mapped {
+        0 => -2 - expert,
+        _ => held(usize::try_from(expert).expect("a routed expert index is non-negative")),
+    }
+}
+
+/// The weights at resolved `slot`: `None` when skipped (-1), record `slot` of
+/// `records` (`slot` >= 0), or record -2 - `slot` of `experts` (`slot` <= -2).
 #[inline(always)]
 pub fn expert_weights<'w>(
     experts: &Stack<'w>,
     records: &Stack<'w>,
-    mapped: u64,
-    held: impl Fn(usize) -> i32,
-    expert: i32,
-) -> Weights<'w> {
-    let slot = match mapped {
-        0 => -1,
-        _ => held(usize::try_from(expert).expect("a routed expert index is non-negative")),
-    };
+    slot: i32,
+) -> Option<Weights<'w>> {
     match slot {
-        0.. => record(records, slot),
-        _ => record(experts, expert),
+        -1 => None,
+        0.. => Some(record(records, slot)),
+        _ => Some(record(experts, -2 - slot)),
     }
 }
 

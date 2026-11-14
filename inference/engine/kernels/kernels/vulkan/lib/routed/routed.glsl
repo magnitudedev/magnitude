@@ -19,15 +19,14 @@ projection_weights routed_record_weights(uint64_t table, uint64_t record, packet
     return routed_weights(slab_region(table, record), geometry, 0ul, k);
 }
 
-// Expert `expert`'s weights of an expert-stacked weight: record `slot` of
-// the table at `records` where the layer's map holds it for the step
-// (`slot` >= 0, the prefill entries' `EXPERTS_SLOT`), else its record by
-// index in the table at `experts`.
-projection_weights routed_expert_weights(uint64_t records, uint64_t experts, int slot, int expert,
+// An expert's weights of an expert-stacked weight at resolved `slot`
+// (`EXPERTS_SLOT`, not -1): record `slot` of the table at `records`
+// (`slot` >= 0), or record -2 - `slot` of the table at `experts` (`slot` <= -2).
+projection_weights routed_expert_weights(uint64_t records, uint64_t experts, int slot,
     packets_rows16 geometry, uint k) {
     if (slot >= 0)
         return routed_record_weights(records, uint64_t(slot), geometry, k);
-    return routed_record_weights(experts, uint64_t(expert), geometry, k);
+    return routed_record_weights(experts, uint64_t(-2 - slot), geometry, k);
 }
 
 // The record choice (m, k), of expert `expert`, of a decode expert entry

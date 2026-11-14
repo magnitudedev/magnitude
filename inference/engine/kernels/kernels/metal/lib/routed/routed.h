@@ -19,13 +19,12 @@ namespace routed {
 typedef element::Act Act;
 static_assert(Act::bytes == 2, "the Metal routed family requires a bf16 or f16 activation element");
 
-// Expert `expert`'s weights of an expert-stacked weight: record `slot` of
-// `records` where the layer's map holds it for the step (`slot` >= 0), else
-// its place in `experts` by index (the stack, or the scratch tier).
-inline packets::weight_bytes expert_weights(device const ulong *records, device const ulong *experts, int slot,
-    int expert) {
+// An expert's weights of an expert-stacked weight at resolved `slot` (not -1):
+// record `slot` of `records` (`slot` >= 0), or record -2 - `slot` of `experts`
+// (`slot` <= -2: the stack, or a scratch slot).
+inline packets::weight_bytes expert_weights(device const ulong *records, device const ulong *experts, int slot) {
     return slot >= 0 ? slab::region<const uchar, packets::space>(records, ulong(slot))
-                     : slab::region<const uchar, packets::space>(experts, ulong(expert));
+                     : slab::region<const uchar, packets::space>(experts, ulong(-2 - slot));
 }
 
 // The record a decode expert entry reads choice (m, k)'s weights from, of

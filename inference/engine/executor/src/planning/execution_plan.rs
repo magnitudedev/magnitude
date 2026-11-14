@@ -456,7 +456,7 @@ impl ExecutionPlanDraft {
             Placing::Short(ceiling) => ceiling,
             Placing::None(no) => return Ok(Err(no)),
         };
-        Ok(Self::streamed_in(ceiling, bound, definition, prices, &mut held, &room, &mut confirm)?
+        Ok(self.streamed_in(ceiling, bound, definition, prices, &mut held, &room, &mut confirm)?
             .map(|(draft, charge, found)| (ChargedDraft { draft, charge }, found)))
     }
 
@@ -550,6 +550,7 @@ impl ExecutionPlanDraft {
     /// them `confirm`'s, as experts that cannot stream are
     /// ([`Self::place`]).
     fn streamed_in<C: HeldCharge, T, E: From<PlanError>>(
+        &self,
         ceiling: BankCeiling,
         bound: HeldBound,
         definition: &ModelDefinition,
@@ -558,7 +559,32 @@ impl ExecutionPlanDraft {
         room: &impl SettleRoom,
         confirm: &mut impl FnMut(&Self, &AssessmentMemoryCharge) -> Result<Result<T, NonZeroU64>, E>,
     ) -> Result<Result<(Self, C, T), NoBank>, E> {
-        let reason = match Self::settle_bank(&ceiling, definition, prices, held, room, confirm)? {
+        let mut settled = Self::settle_bank(&ceiling, definition, prices, held, room, confirm)?;
+        if matches!(settled, Err(NoBank::Short { .. })) {
+            let w_hi = ceiling.whole.bank().window_slots();
+            let w_lo = ceiling.whole.bank().round_records();
+            for &w in &window_ladder(w_hi, w_lo)[1..] {
+                let candidate = match self.with_window(&ceiling.whole, definition, bound, w)? {
+                    Ok(c) => Self::settle_bank(&c, definition, prices, held, room, confirm)?,
+                    Err(no) => Err(no),
+                };
+                match candidate {
+                    Ok(found) => {
+                        settled = Ok(found);
+                        break;
+                    }
+                    Err(NoBank::Short { deficit_bytes }) => {
+                        if let Err(NoBank::Short { deficit_bytes: least }) = &mut settled {
+                            if deficit_bytes < *least {
+                                *least = deficit_bytes;
+                            }
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+        let reason = match settled {
             Ok((draft, charge, found)) => match draft.with_host_tier(charge.charge(), room)? {
                 Ok(draft) => return Ok(Ok((draft, charge, found))),
                 Err(reason) => reason,
@@ -611,6 +637,38 @@ impl ExecutionPlanDraft {
             Ok(whole) => whole,
             Err(error) => return unstreamed(error),
         };
+        let w_hi = self.load.bank.as_ref().map_or(whole.bank().window_slots(), |bank| bank.window_slots());
+        let w_lo = whole.bank().round_records();
+        let mut res = match w_hi == whole.bank().window_slots() {
+            true => self.ceiling_of(whole.clone(), bound, places)?,
+            false => self.with_window(&whole, definition, bound, w_hi)?,
+        };
+        if matches!(res, Err(NoBank::Bound { .. } | NoBank::Unstreamed(UnstreamedExperts::Allocation { .. }))) {
+            for &w in &window_ladder(w_hi, w_lo)[1..] {
+                match self.with_window(&whole, definition, bound, w)? {
+                    Ok(found) => {
+                        res = Ok(found);
+                        break;
+                    }
+                    Err(next) => res = Err(next),
+                }
+            }
+        }
+        Ok(res)
+    }
+
+    /// Rebuild `whole` with `window_slots` and compute its [`BankCeiling`]
+    /// under `bound`, keeping its target program plan in sync.
+    fn with_window(&self, whole: &Self, definition: &ModelDefinition, bound: HeldBound, window_slots: u64) -> Result<Result<BankCeiling, NoBank>, PlanError> {
+        let places = whole.bank().places;
+        let load = whole.load.clone().with_window_slots(window_slots)?;
+        let programs = load.program_plan(definition, whole.policy.codec)?;
+        let rebuilt = Self { load, programs, ..whole.clone() }.with_chain(places)?;
+        self.ceiling_of(rebuilt, bound, places)
+    }
+
+    /// Compute the [`BankCeiling`] of `whole` under `bound`.
+    fn ceiling_of(&self, whole: Self, bound: HeldBound, places: u64) -> Result<Result<BankCeiling, NoBank>, PlanError> {
         let bank = whole.bank();
         let (experts, floor) = (bank.slots, bank.floor());
         // A banked draft's re-planning never raises its ceiling.
@@ -937,8 +995,11 @@ impl ExecutionPlanDraft {
                     .load
                     .clone()
                     .unbanked()
-                    .with_expert_bank(definition, bank.slots, bank.places, bank.flights, bank.substrate())?
-                    .with_bank_slots(bank.slots, bank.ceiling)?;
+                    .with_expert_bank(definition, bank.slots, bank.places, bank.flights, bank.substrate())?;
+                if bank.window_slots() != bank.widest().get() {
+                    load = load.with_window_slots(bank.window_slots())?;
+                }
+                load = load.with_bank_slots(bank.slots, bank.ceiling)?;
                 let built = load.bank.as_mut().expect("the load was just banked");
                 (built.host_slots, built.pass, built.resident) = (bank.host_slots, bank.pass, bank.resident);
                 let programs = load.program_plan(definition, self.policy.codec)?;
@@ -1108,12 +1169,9 @@ impl ExecutionPlan {
 /// ([`crate::assessment::StructuralCharge`]) once in a search, as a `C` ([`HeldCharge`]).
 #[derive(Clone, Debug)]
 pub struct HeldCharges<C = AssessmentMemoryCharge> {
-    /// A bank's, by the pass size it was certified at and whether it holds
-    /// a resident form: a pass sizes the target family's pass buffers and
-    /// graphs, and a bank planned whole has a resident form
-    /// (`ExpertBankPlan::resident`), so a bank of another is charged from
-    /// its structure again.
-    banked: Option<((PassLaunches, bool), C)>,
+    /// A bank's, by the pass size it was certified at, whether it holds
+    /// a resident form, and its scratch window slots (`W`).
+    banked: Option<((PassLaunches, bool, u64), C)>,
     /// A whole plan's, by the launches its prompt groups chain: a chain
     /// sizes the target family's pass buffers, bound constants and graphs
     /// (`ExecutionPlanDraft::whole_chains`), so a whole plan of another
@@ -1163,7 +1221,7 @@ impl<C: HeldCharge> HeldCharges<C> {
                 _ => Ok(self.whole.insert((chain, C::of(definition, draft)?)).1.clone()),
             };
         };
-        let structure = (bank.pass, bank.resident);
+        let structure = (bank.pass, bank.resident, bank.window_slots());
         match &self.banked {
             Some((of, held)) if *of == structure => {
                 let charge = held.charge().clone().at_bank_slots(&draft.load).map_err(PlanError::ResourcePlanning)?;
@@ -1455,18 +1513,11 @@ impl SettleRoom for StableRoom<'_> {
             .with_weights(crate::memory::ClaimDemand { host: growth, ..Default::default() })
             .and_then(|charge| charge.assess_fit(self.topology, self.executor, self.status))
             .map_err(PlanError::ResourcePlanning)?;
-        let host = fit
-            .domains
+        fit.domains
             .iter()
             .find(|domain| domain.domain == host_ram)
-            .ok_or(PlanError::ResourcePlanning("a host tier's fit reads no host RAM domain".into()))?
-            .remaining_bytes;
-        Ok(match fit.verdict {
-            super::AssessmentFitVerdict::Fits => host.max(0),
-            super::AssessmentFitVerdict::DoesNotFit { deficit_bytes, .. } => {
-                -i64::try_from(deficit_bytes.get()).map_err(|_| PlanError::Arithmetic("a host tier's deficit exceeds i64"))?
-            }
-        })
+            .map(|domain| domain.remaining_bytes)
+            .ok_or(PlanError::ResourcePlanning("a host tier's fit reads no host RAM domain".into()))
     }
 }
 
@@ -1642,9 +1693,9 @@ impl<C: HeldCharge> Unplaced<C> {
         prices: &Priced<super::PlanPrices>,
         room: &impl SettleRoom,
     ) -> Result<ChargedDraft<C>, PlanError> {
-        let Self { draft: _, ceiling, bound, mut held } = self;
+        let Self { draft, ceiling, bound, mut held } = self;
         let capacity = room.capacity()?;
-        let streamed = ExecutionPlanDraft::streamed_in(
+        let streamed = draft.streamed_in(
             ceiling,
             HeldBound::of(bound, capacity),
             definition,
@@ -1717,7 +1768,9 @@ pub struct HeldForm<T = ()> {
 }
 
 /// A bank form ([`FloorForms::Banked`]): its draft at its ceiling, whose
-/// charge at any slots is its structure's charge of [`Self::at_slots`].
+/// charge at any slots is its structure's charge of [`Self::at_slots`],
+/// beside smaller scratch-window rungs (`window_ladder`) assessed lazily
+/// only when the full-layer scratch window's floor does not fit.
 pub struct BankForm<T = ()> {
     pub form: HeldForm<T>,
     /// The bank's experts: a bank of all of them holds them whole.
@@ -1725,6 +1778,44 @@ pub struct BankForm<T = ()> {
     /// The sizes the bank's charge steps through, its floor first and its
     /// ceiling last.
     pub points: Vec<u64>,
+    /// Smaller `window_slots` rungs (`window_ladder`), descending down to
+    /// `round_records`.
+    pub(crate) windowed: Vec<WindowedBankForm>,
+}
+
+/// A smaller `window_slots` rung of [`BankForm`], its target-family structure
+/// certified lazily (`StructuralCharge::at_pass`) only when needed.
+pub(crate) struct WindowedBankForm {
+    pub(crate) draft: ExecutionPlanDraft,
+    pub(crate) points: Vec<u64>,
+    structure: std::sync::OnceLock<crate::assessment::StructuralCharge>,
+}
+
+impl WindowedBankForm {
+    pub(crate) fn at_slots(&self, slots: u64) -> Result<ExecutionPlanDraft, PlanError> {
+        self.draft.resized(slots, slots, PassLaunches::FLOOR)
+    }
+
+    pub(crate) fn with_host_tier(
+        &self,
+        slots: u64,
+        charge: &AssessmentMemoryCharge,
+        room: &impl SettleRoom,
+    ) -> Result<Result<ExecutionPlanDraft, UnstreamedExperts>, PlanError> {
+        self.at_slots(slots)?.with_host_tier(charge, room)
+    }
+
+    pub(crate) fn structure(
+        &self,
+        prepared_definition: &ModelDefinition,
+    ) -> Result<&crate::assessment::StructuralCharge, crate::assessment::AssessmentError> {
+        if let Some(structure) = self.structure.get() {
+            return Ok(structure);
+        }
+        let certified = crate::assessment::StructuralCharge::of(prepared_definition, &self.draft)?;
+        let _ = self.structure.set(certified);
+        Ok(self.structure.get().expect("just initialized"))
+    }
 }
 
 impl<T> BankForm<T> {
@@ -1751,8 +1842,8 @@ impl<T> FloorForms<T> {
     pub fn structures(self) -> FloorForms {
         let form = |HeldForm { draft, structure, .. }: HeldForm<T>| HeldForm { draft, structure, more: () };
         match self {
-            Self::Banked { bank: BankForm { form: held, experts, points }, resident } => {
-                FloorForms::Banked { bank: BankForm { form: form(held), experts, points }, resident: resident.map(form) }
+            Self::Banked { bank: BankForm { form: held, experts, points, windowed }, resident } => {
+                FloorForms::Banked { bank: BankForm { form: form(held), experts, points, windowed }, resident: resident.map(form) }
             }
             Self::Resident(resident) => FloorForms::Resident(form(resident)),
         }
@@ -1814,8 +1905,23 @@ impl ExecutionPlanDraft {
                 let reserved = |slots| bank.resident_charge(slots).map_err(PlanError::ResourcePlanning);
                 let points = rising(bank.floor(), ceiling, &reserved)?;
                 let experts = bank.slots;
+                let (w_hi, w_lo) = (bank.window_slots(), bank.round_records());
                 let draft = whole.resized(ceiling, ceiling, PassLaunches::FLOOR)?;
-                Ok(BankForm { form: form(draft)?, experts, points })
+                let mut windowed = Vec::new();
+                for &w in &window_ladder(w_hi, w_lo)[1..] {
+                    if let Ok(BankCeiling { whole: win_whole, ceiling: win_ceiling, .. }) = self.with_window(&whole, definition, bound, w)? {
+                        let win_bank = win_whole.bank();
+                        let win_reserved = |slots| win_bank.resident_charge(slots).map_err(PlanError::ResourcePlanning);
+                        let win_points = rising(win_bank.floor(), win_ceiling, &win_reserved)?;
+                        let win_draft = win_whole.resized(win_ceiling, win_ceiling, PassLaunches::FLOOR)?;
+                        windowed.push(WindowedBankForm {
+                            draft: win_draft,
+                            points: win_points,
+                            structure: std::sync::OnceLock::new(),
+                        });
+                    }
+                }
+                Ok(BankForm { form: form(draft)?, experts, points, windowed })
             }
             Err(NoBank::Bound { bound, needed }) => return Err(PlanError::WeightBound { bound, needed }.into()),
             Err(NoBank::Unstreamed(reason)) => Err(reason),
@@ -1841,6 +1947,24 @@ struct BankCeiling {
     ceiling: u64,
     /// Its prompt groups' places: the most launches a pass covers.
     places: PassLaunches,
+}
+
+/// Geometric scratch-window ladder from `widest` (`P = 1`) down to `floor`
+/// (`round_records`), halving `ceil(widest / P)` across `P = 2, 4, 8, ...`:
+/// shared identically by runtime planning (`bank_ceiling`, `streamed_in`)
+/// and assessment (`floor_forms`, `assess_execution_fit`).
+fn window_ladder(widest: u64, floor: u64) -> Vec<u64> {
+    let floor = floor.min(widest);
+    let mut ladder = vec![widest];
+    let mut p = 2u64;
+    while *ladder.last().expect("ladder begins with widest") > floor {
+        let next = widest.div_ceil(p).max(floor);
+        if ladder.last() != Some(&next) {
+            ladder.push(next);
+        }
+        p = p.saturating_mul(2);
+    }
+    ladder
 }
 
 /// The sizes of `from..=to` a holding steps through: the most of each
@@ -3028,5 +3152,74 @@ mod tests {
         let (slots, _held) = ledgers.admit_most(&reading, &host, load, bank.floor(), bank.slots, &at).unwrap().unwrap();
         assert!(at(slots).unwrap().device <= target, "{slots} slots of {} fit the {target} bytes left", bank.slots);
         assert!(slots == bank.slots || at(slots + 1).unwrap().device > target, "{slots} slots are the most that fit");
+    }
+
+    /// When a device budget is below `W == widest`'s floor but above `W_min == round_records`'s
+    /// floor, `with_held_experts` picks the largest `W ∈ [round_records, widest]` whose plan fits.
+    #[test]
+    fn tight_budget_shrinks_scratch_window_to_largest_fitting_w() {
+        use crate::planning::fixtures::{LIMITS, RoutedShape, gemma_moe_fixture_manifest, routed_fixture_definition};
+        let (_, _, device) = recorded(seismic::fixtures::recorded::m4_pro(), BackendName::Metal, 0, seismic::GraphCost::None);
+        let mut definition =
+            routed_fixture_definition(RoutedShape { layers: 4, experts: 64, selected: 4, hidden: 512, intermediate: 512 });
+        definition.decoder.context_limit = 2048;
+        let manifest = gemma_moe_fixture_manifest(&definition);
+        let draft = ExecutionPlanner::prepare(
+            &device,
+            &manifest,
+            &definition,
+            ComponentSelection { head: false, vision: false },
+            ExecutionPath::Native,
+            PlannedMethod::Plain,
+            KvCodec::Dense,
+            LIMITS,
+        )
+        .unwrap();
+        let room = StableRoom::of_selected(&device);
+        let full = draft
+            .clone()
+            .streaming::<AssessmentMemoryCharge>(&definition, None, &room)
+            .unwrap()
+            .streamed(&definition, &synthetic(), &room)
+            .unwrap()
+            .into_draft();
+        let full_bank = full.load().expert_bank().unwrap();
+        let widest = full_bank.widest().get();
+        let round = full_bank.round_records();
+        assert_eq!(full_bank.window_slots(), widest);
+
+        // Compute the floor allocation bytes at W = widest and W = round_records.
+        let full_floor_bytes = full
+            .load()
+            .clone()
+            .with_load_slots(full_bank.floor())
+            .unwrap();
+        let full_floor_draft = ExecutionPlanDraft { load: full_floor_bytes, ..full.clone() };
+        let full_floor_alloc = full_floor_draft.allocation_bytes(&definition).unwrap();
+
+        let min_load = full.load().clone().with_window_slots(round).unwrap();
+        let min_floor_load = min_load.clone().with_load_slots(min_load.expert_bank().unwrap().floor()).unwrap();
+        let min_floor_programs = min_floor_load.program_plan(&definition, full.policy().codec()).unwrap();
+        let min_floor_alloc = ExecutionPlanDraft { load: min_floor_load, programs: min_floor_programs, ..full.clone() }
+            .allocation_bytes(&definition)
+            .unwrap();
+        assert!(min_floor_alloc < full_floor_alloc, "smaller W reduces floor allocation: {min_floor_alloc} < {full_floor_alloc}");
+
+        // Place a cap halfway between W_min's floor and W_widest's floor.
+        let cap = min_floor_alloc + (full_floor_alloc - min_floor_alloc) / 2;
+        let bound = HeldBound::of(Some(WeightBound::Cap(cap)), room.capacity().unwrap());
+        let (settled, _) = draft
+            .with_held_experts(&definition, bound, &synthetic(), room, |_, charge| {
+                let bytes = ExecutionPlanDraft::allocated(charge).unwrap();
+                Ok::<_, PlanError>(if bytes <= cap { Ok(()) } else { Err(NonZeroU64::new(bytes - cap).unwrap()) })
+            })
+            .unwrap()
+            .unwrap();
+        let chosen_bank = settled.draft().load().expert_bank().unwrap();
+        assert!(
+            chosen_bank.window_slots() >= round && chosen_bank.window_slots() < widest,
+            "expected W in [{round}, {widest}), got {}",
+            chosen_bank.window_slots()
+        );
     }
 }

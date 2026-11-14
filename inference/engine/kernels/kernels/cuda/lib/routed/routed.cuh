@@ -165,13 +165,13 @@ template <class Shape, class Zero> __device__ __forceinline__ void zero_block_ro
 // The weights of slot W in the record at `base`: its rows 0.. from there.
 #define ROUTED_RECORD(W, base) W##_MATRIX(base, 0)
 
-// Expert `expert`'s weights of slot W: record `slot` of the record table
-// `records`, or record `expert` of the record table `experts`
-// (`ROUTED_EXPERT_SLOT`). Paste `W` directly before macro expansion so
+// An expert's weights of slot W at resolved `slot` (`ROUTED_EXPERT_SLOT`, not
+// -1): record `slot` of `records` (`slot` >= 0), or record -2 - `slot` of
+// `experts` (`slot` <= -2). Paste `W` directly before macro expansion so
 // `KERNEL_Wn` resolves to `KERNEL_Wn_MATRIX`, never `SEISMIC_EXPERT_*_MATRIX`.
-#define ROUTED_EXPERT_RECORD(W, records, experts, slot, expert)                                             \
+#define ROUTED_EXPERT_RECORD(W, records, experts, slot)                                                     \
     W##_MATRIX((slot) >= 0 ? slab::region((records), (routed::u64)(slot))                                   \
-                           : slab::region((experts), (routed::u64)(expert)),                                \
+                           : slab::region((experts), (routed::u64)(-2 - (slot))),                           \
                0)
 
 __device__ __forceinline__ void write_grid(u8 *grid, u64 x, u64 y, u64 z) {
@@ -198,12 +198,11 @@ __device__ __forceinline__ void expert_grids(const u8 *rows, const u8 *used, u64
 
 } // namespace routed
 
-// The record holding expert `expert`'s weights for step `q`: the record
-// the layer's map (`map`, `mapped` rows of MAP_WORDS at strides `map0`,
-// `map1`) holds for the step (`streaming_held`), or -1 for its place in the
-// experts by index (the stack, or the scratch tier), which is every
-// expert's without a map. A macro, expanded where it is used, by the
-// entries that include `lib/streaming/control.cuh` (`routed_experts`,
-// `routed_experts_up`).
+// The source holding expert `expert`'s weights for step `q`: the entry the
+// layer's map (`map`, `mapped` rows of MAP_WORDS at strides `map0`, `map1`)
+// holds for the step (`streaming_held`: >= 0 a bank record, -2 - s scratch
+// slot s, -1 skipped), or -2 - `expert` without a map (`mapped` == 0). A
+// macro, expanded where it is used, by the entries that include
+// `lib/streaming/control.cuh` (`routed_experts`, `routed_experts_up`).
 #define ROUTED_EXPERT_SLOT(map, mapped, map0, map1, q, expert)                                             \
-    ((mapped) == 0 ? -1 : streaming_held((map) + (u64)(expert) * (map0), (map1), (q)))
+    ((mapped) == 0 ? -2 - (int)(expert) : streaming_held((map) + (u64)(expert) * (map0), (map1), (q)))

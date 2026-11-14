@@ -747,6 +747,7 @@ impl<L: Certified> FamilyLayouts<L> {
         // union.
         let mut most = BTreeMap::<Graphed, u64>::new();
         let mut decode = BTreeMap::<Graphed, u64>::new();
+        let windows = load.expert_bank().map_or(1, crate::ExpertBankPlan::windows);
         for &class in &enumeration.launch_classes {
             let mut runs = BTreeMap::<Graphed, u64>::new();
             for &source in entries.keys() {
@@ -755,7 +756,7 @@ impl<L: Certified> FamilyLayouts<L> {
             if per_layer.is_some() {
                 *runs.entry(Graphed::PerLayer).or_default() += 1;
             }
-            for &graphed in launch_runs.of_class(class) {
+            for &graphed in launch_runs.of_class(class, passes, windows) {
                 *runs.entry(graphed).or_default() += 1;
             }
             for (&graphed, &count) in &runs {
@@ -794,7 +795,7 @@ impl<L: Certified> FamilyLayouts<L> {
         // layouts: none where one graph serves every run of its shape in a
         // submission.
         let chain = |launches: usize| {
-            let further = chained_once_runs(passes, launches);
+            let further = chained_once_runs(passes, launches, windows);
             let mut runs = BTreeMap::<Graphed, u64>::new();
             for &(index, (class, stage)) in &staged {
                 let Stage::Once(once) = stage else { continue };
