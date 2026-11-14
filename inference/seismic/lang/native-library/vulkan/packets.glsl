@@ -205,6 +205,8 @@ struct packets_packet {
 #endif
     uint64_t values; // dense: the packet's first element
     uint valid;      // dense: elements of this packet inside the row
+    bool aligned;    // dense: `values` is 16-byte aligned, so every whole
+                     // 8-element step of it may load as one vec4 pair
 };
 
 // Coefficient group `g`'s scale and bias (a group's bias is the first's
@@ -807,10 +809,18 @@ packets_packet packets_load(const int kind, uint64_t row, packets_rows16 geometr
 #endif
     packet.values = 0ul;
     packet.valid = 0u;
+    packet.aligned = false;
 #if PACKETS_ANY_DENSE
     if (packets_dense(kind)) {
         packet.values = row + geometry.codes + uint64_t(p) * 32ul * ELEMENT_BYTES(packets_element(kind));
         packet.valid = min(32u, k - 32u * p);
+        // A row past the first lands off 16-byte alignment whenever its
+        // byte stride isn't itself a multiple of 16 (a dense row's stride
+        // is only ever a multiple of its element size, K = 33 F32 gives a
+        // 132-byte stride: row 0 at the tensor's aligned base, row 1 at
+        // base + 132, 4-aligned, not 16). Computed once a packet, not per
+        // decode step, and as a mask, never a 64-bit modulo.
+        packet.aligned = (packet.values & 15ul) == 0ul;
         return packet;
     }
 #endif
@@ -916,7 +926,13 @@ void packets_decode(const int kind, packets_packet packet, uint step, const bool
 #if PACKETS_ANY_DENSE
     if (packets_dense(kind)) {
         const uint first = 8u * step;
-        if (first + 8u <= packet.valid) {
+        // `element_load8`'s vectorized path dereferences a 16-byte-aligned
+        // buffer reference; `packet.aligned` (set once the packet forms,
+        // `packets_load`) says whether this packet's address actually is
+        // one. A step past the first stays 16-byte aligned too, since it
+        // moves by 8 elements of `packets_element(kind)` (2 or 4 bytes),
+        // i.e. a multiple of 16 bytes, from an aligned packet.
+        if (first + 8u <= packet.valid && packet.aligned) {
             element_load8(packets_element(kind), packet.values, first, even, odd);
         } else {
             even = vec4(packets_dense_element(kind, packet, first), packets_dense_element(kind, packet, first + 2u),
