@@ -1094,13 +1094,12 @@ fn drafter_steps_record_no_graph_beyond_their_charge() {
 /// alone, whatever the entry pass's rows: its launch's earlier rows are fresh
 /// to the launch, not stored history. A draft from a two-row entry pass runs
 /// (the lane's validation of each row's visible spans agrees with the
-/// producer's) on a head of the plain fixture, on the CPU backend.
+/// producer's) on a head of the plain fixture, on every backend the run
+/// selects.
 #[test]
 fn a_head_without_selection_drafts_from_a_multi_row_entry_pass() {
     let _placement = crate::test_support::process_placement();
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
-    let backend = seismic::BackendName::Cpu;
-    assert!(available(&catalog, backend), "the CPU backend is always available");
     let mtp = crate::planning::fixtures::with_mtp_head(crate::planning::fixtures::fixture_definition());
     let (directory, definition, package) = fixture_with("head-multi-row-entry", mtp, crate::planning::fixtures::fixture_manifest);
     let method = PlannedMethod::Mtp {
@@ -1108,19 +1107,22 @@ fn a_head_without_selection_drafts_from_a_multi_row_entry_pass() {
         sampled_proposals: DrafterSteps::PROPOSALS as u8,
         widths: crate::DraftWidths::Adaptive,
     };
-    let (mut domain, bindings, _, _) =
-        load_with(&catalog, &definition, &package, backend, limits(DrafterSteps::ROWS, true, 1, 0), Banked::Resident, method);
-    let row_bytes = definition.decoder.hidden as usize * definition.decoder.activation_dtype.bytes();
-    let mut steps = DrafterSteps { backend, row_bytes, recorded: Vec::new(), drafted: Vec::new() };
-    let request = RequestId(1);
-    let (mut position, mut bindings) = steps.prime(&mut domain, bindings, request);
-    for _ in 0..2 {
-        bindings = steps.draft_from(&mut domain, bindings, std::iter::once((request, &mut position)), 2, DrafterSteps::PROPOSALS);
+    let backends = [seismic::BackendName::Cpu, seismic::BackendName::Metal, seismic::BackendName::Cuda, seismic::BackendName::Vulkan];
+    for backend in backends.into_iter().filter(|&backend| available(&catalog, backend)) {
+        let (mut domain, bindings, _, _) =
+            load_with(&catalog, &definition, &package, backend, limits(DrafterSteps::ROWS, true, 1, 0), Banked::Resident, method);
+        let row_bytes = definition.decoder.hidden as usize * definition.decoder.activation_dtype.bytes();
+        let mut steps = DrafterSteps { backend, row_bytes, recorded: Vec::new(), drafted: Vec::new() };
+        let request = RequestId(1);
+        let (mut position, mut bindings) = steps.prime(&mut domain, bindings, request);
+        for _ in 0..2 {
+            bindings = steps.draft_from(&mut domain, bindings, std::iter::once((request, &mut position)), 2, DrafterSteps::PROPOSALS);
+        }
+        assert_eq!(steps.drafted.len(), 2, "{backend:?}");
+        domain.close(request).unwrap_or_else(|error| panic!("{error}"));
+        drop(bindings);
+        drop(domain);
     }
-    assert_eq!(steps.drafted.len(), 2);
-    domain.close(request).unwrap_or_else(|error| panic!("{error}"));
-    drop(bindings);
-    drop(domain);
     std::fs::remove_dir_all(&directory).expect("the fixture's directory is removed");
 }
 
