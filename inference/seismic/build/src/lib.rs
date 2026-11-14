@@ -258,7 +258,7 @@ pub struct NativeCoverage {
 
 mod internals {
     use super::*;
-    use seismic_lang::checked::{ElementSummary, ElementTarget, NativeElementCoverage};
+    use seismic_lang::checked::{CpuBinding, ElementSummary, NativeElementCoverage};
     use seismic_lang::entry::ResultClass;
     use seismic_lang::registry::{self, RepresentationInfo, SourceDialect};
     use seismic_lang::native_parameter::native_parameter_names;
@@ -1705,44 +1705,47 @@ mod internals {
 
     /// How a CPU form binds each element parameter of an entry.
     struct CpuElements {
-        /// Parameters the entry stores, with the dense types the form is
-        /// monomorphized over (declared, or the floating default).
+        /// Parameters bound as dense typed buffers, with the dense types the
+        /// form is monomorphized over (declared, or the floating default).
         dense: Vec<(String, Vec<DType>)>,
+        /// Weight operands, reaching the kernel through their resolved
+        /// components.
+        weights: Vec<String>,
         /// External sources the entry only converts.
         external: Vec<String>,
         /// Conversion targets: packed results written by a conversion.
         packed: Vec<String>,
     }
 
-    /// Every other element parameter is only read: a weight operand,
-    /// reaching the kernel through its resolved components.
+    /// Every element parameter's binding is the checker's
+    /// ([`ElementDomain::cpu_binding`]); a CPU native declaration is admitted
+    /// only when every parameter has one.
     fn cpu_elements(entry: &EntryInfo, definition: &NativeImplementation) -> CpuElements {
         let domain = &entry.element_domain;
-        let converted = |name: &str| {
-            domain
-                .conversions()
-                .iter()
-                .any(|conversion| conversion.target == ElementTarget::Parameter(name.to_owned()))
-        };
         let mut elements = CpuElements {
             dense: Vec::new(),
+            weights: Vec::new(),
             external: Vec::new(),
             packed: Vec::new(),
         };
         for parameter in domain.parameters() {
             let name = parameter.name.clone();
-            if converted(&name) {
-                elements.packed.push(name);
-            } else if parameter.uses.stored || parameter.uses.partial_copy {
-                let dtypes = definition
-                    .elements
-                    .iter()
-                    .find(|coverage| coverage.parameter == name)
-                    .map(|coverage| coverage.dtypes.clone())
-                    .unwrap_or_else(|| NativeElementCoverage::DEFAULT.to_vec());
-                elements.dense.push((name, dtypes));
-            } else if parameter.uses.conversion_source && !parameter.uses.decoded_read {
-                elements.external.push(name);
+            match domain.cpu_binding(&name) {
+                Some(CpuBinding::Dense) => {
+                    let dtypes = definition
+                        .elements
+                        .iter()
+                        .find(|coverage| coverage.parameter == name)
+                        .map(|coverage| coverage.dtypes.clone())
+                        .unwrap_or_else(|| NativeElementCoverage::DEFAULT.to_vec());
+                    elements.dense.push((name, dtypes));
+                }
+                Some(CpuBinding::Weights) => elements.weights.push(name),
+                Some(CpuBinding::External) => elements.external.push(name),
+                Some(CpuBinding::Packed) => elements.packed.push(name),
+                None => unreachable!(
+                    "the checker admits a CPU native only where every element parameter has a binding"
+                ),
             }
         }
         elements
@@ -1764,16 +1767,19 @@ mod internals {
 
     fn cpu_view(element: &ElementSummary, elements: &CpuElements) -> CpuView {
         match element {
-            ElementSummary::Parameter(name)
-                if elements.dense.iter().any(|(dense, _)| dense == name) =>
-            {
-                CpuView::Dense(format!("E::{}", ident(name)))
+            ElementSummary::Parameter(name) => {
+                if elements.dense.iter().any(|(dense, _)| dense == name) {
+                    CpuView::Dense(format!("E::{}", ident(name)))
+                } else if elements.weights.contains(name) {
+                    CpuView::Weights
+                } else if elements.external.contains(name) {
+                    CpuView::External
+                } else if elements.packed.contains(name) {
+                    CpuView::Packed
+                } else {
+                    unreachable!("every element parameter of the entry is bound")
+                }
             }
-            ElementSummary::Parameter(name) if elements.external.contains(name) => {
-                CpuView::External
-            }
-            ElementSummary::Parameter(name) if elements.packed.contains(name) => CpuView::Packed,
-            ElementSummary::Parameter(_) => CpuView::Weights,
             ElementSummary::Fixed(name) => match name.as_str() {
                 "f32" => CpuView::Dense("seismic::cpu::F32".to_owned()),
                 "bf16" => CpuView::Dense("seismic::cpu::Bf16".to_owned()),
@@ -1782,6 +1788,8 @@ mod internals {
                 "u32" => CpuView::Scalars("u32"),
                 "u64" => CpuView::Scalars("u64"),
                 "bool" => CpuView::Scalars("u8"),
+                // Any other fixed element is a registered packed
+                // representation, read through its components.
                 _ => CpuView::Weights,
             },
         }
