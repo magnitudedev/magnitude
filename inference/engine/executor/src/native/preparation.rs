@@ -393,32 +393,32 @@ impl NativePreparationCache {
                 census.tuning.into_tuner()
             };
             let searched = censused.search()?;
+            // A development survey measures the units it owns in the search's
+            // process, after the round's search: one walk that forms nothing
+            // and reads every settled unit's published choice, before checking
+            // whether a prerequisite's choice left a dependant stale.
+            #[cfg(feature = "tuning-survey")]
+            let searched = if !super::tuning::survey::installed() {
+                searched
+            } else {
+                let mut survey = Preparation::new(
+                    plan,
+                    tuning.definition,
+                    limits,
+                    epsilon,
+                    recipe_states.clone(),
+                    Some(selection_limits),
+                    Specializer::count(device),
+                    Tuning::Tuner(searched),
+                );
+                survey.graph_demand = Some(graph_demand.clone());
+                survey.walk(plan)?;
+                survey.tuning.into_tuner()
+            };
             if !searched.stale() {
                 break searched;
             }
             tuner = searched.recount();
-        };
-        // A development survey measures the units it owns in the search's
-        // process, after the search: one more walk that forms nothing and
-        // reads every other unit's published choice. Without an installed
-        // survey there is nothing to measure and no walk.
-        #[cfg(feature = "tuning-survey")]
-        let searched = if !super::tuning::survey::installed() {
-            searched
-        } else {
-            let mut survey = Preparation::new(
-                plan,
-                tuning.definition,
-                limits,
-                epsilon,
-                recipe_states,
-                Some(selection_limits),
-                Specializer::count(device),
-                Tuning::Tuner(searched),
-            );
-            survey.graph_demand = Some(graph_demand);
-            survey.walk(plan)?;
-            survey.tuning.into_tuner()
         };
         // The tuner borrows the import kernels: it ends here, before them.
         let tuned = searched.conclude();

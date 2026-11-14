@@ -2750,6 +2750,7 @@ enum Phase<'a> {
     /// optional work, in preparation order; nothing is formed or measured.
     Census {
         launches: HashMap<TuningKey, usize>,
+        canonical: HashMap<TuningKey, NativeSpecialization>,
         units: Vec<Box<dyn SearchedUnit<'a> + 'a>>,
     },
     /// Every censused unit was searched ([`allocation`]) and its record is
@@ -3707,17 +3708,19 @@ impl<'a> Tuner<'a> {
         fixed: NativeSpecialization,
     ) -> Result<NativeSpecialization, String> {
         let (choice, provisional) = match &self.phase {
-            // A count holds the choices of the units it settled (stored or
-            // pinned) and earlier rounds decided; each unit it searches
-            // stands at its canonical default.
-            Phase::Count { canonical, .. } => match self.chosen.get(prerequisite) {
-                Some(choice) => (Some(choice), false),
-                None => (canonical.get(prerequisite), true),
-            },
-            Phase::Census { launches, .. } => (
-                self.chosen.get(prerequisite),
-                launches.contains_key(prerequisite),
-            ),
+            // A count or census holds the choices of the units it settled
+            // (stored, pinned or mandatory) and earlier rounds decided; each
+            // unit not yet chosen (counted, or deferred to a development
+            // survey) stands at its canonical default.
+            Phase::Count { canonical, .. } | Phase::Census { canonical, .. } => {
+                match self.chosen.get(prerequisite) {
+                    Some(choice) => (
+                        Some(choice),
+                        matches!(&self.phase, Phase::Census { launches, .. } if launches.contains_key(prerequisite)),
+                    ),
+                    None => (canonical.get(prerequisite), true),
+                }
+            }
             Phase::Searched | Phase::Serve(_) => (self.chosen.get(prerequisite), false),
         };
         let choice = choice.ok_or_else(|| {
@@ -4026,7 +4029,7 @@ impl<'a> Tuner<'a> {
         let Phase::Count {
             launches,
             searching,
-            ..
+            canonical,
         } = std::mem::replace(&mut self.phase, Phase::Searched)
         else {
             unreachable!("a census follows the count");
@@ -4186,6 +4189,7 @@ impl<'a> Tuner<'a> {
         self.first_load_search = searches;
         self.phase = Phase::Census {
             launches,
+            canonical,
             units: Vec::new(),
         };
         if searches {
@@ -4473,7 +4477,7 @@ impl<'a> Tuner<'a> {
             Phase::Census { .. } => self.census_unit(case, offered, statics, key, shapes),
             // The search is over: the unit's published choice is read, and
             // nothing is prepared.
-            Phase::Searched => self.searched_unit(case, statics, key, shapes).map(Some),
+            Phase::Searched => self.searched_unit(case, statics, key, shapes),
             Phase::Serve(_) => self
                 .served_unit(case, &offered, statics, key, shapes, &defaults)
                 .map(Some),
@@ -4558,25 +4562,28 @@ impl<'a> Tuner<'a> {
             true
         } else {
             // Counting opens searches without formation. The mandatory
-            // phase forms every canonical artifact together.
-            let requirement = self.context.numerical_profile.requirement(&case.entry());
-            let search = case
-                .open(self.device, statics, requirement)
-                .map_err(|error| failure(error.to_string()))?;
-            let cases: UnitCases<T::Case> = UnitCases {
-                points: shapes.iter().map(|_| None).collect(),
-                guard: None,
-            };
-            self.prepared.insert(
-                key.clone(),
-                Box::new(PreparedUnit {
-                    case: case.clone(),
-                    shapes: shapes.to_vec(),
-                    search,
-                    cases,
-                    mandatory: Duration::ZERO,
-                }),
-            );
+            // phase forms every canonical artifact together; a surveyed unit
+            // is opened by its survey after the search.
+            if survey_plan(key.0).is_none() {
+                let requirement = self.context.numerical_profile.requirement(&case.entry());
+                let search = case
+                    .open(self.device, statics, requirement)
+                    .map_err(|error| failure(error.to_string()))?;
+                let cases: UnitCases<T::Case> = UnitCases {
+                    points: shapes.iter().map(|_| None).collect(),
+                    guard: None,
+                };
+                self.prepared.insert(
+                    key.clone(),
+                    Box::new(PreparedUnit {
+                        case: case.clone(),
+                        shapes: shapes.to_vec(),
+                        search,
+                        cases,
+                        mandatory: Duration::ZERO,
+                    }),
+                );
+            }
             if let Some(slot) = slot {
                 self.slots.insert(key.clone(), slot);
             }
@@ -4612,7 +4619,7 @@ impl<'a> Tuner<'a> {
             bindings: key.1.clone(),
             outcome,
         };
-        let Phase::Census { launches, units } = &self.phase else {
+        let Phase::Census { launches, units, .. } = &self.phase else {
             unreachable!("the phase is the census");
         };
         if !launches.contains_key(&key) {
@@ -4714,9 +4721,9 @@ impl<'a> Tuner<'a> {
         statics: &NativeSpecialization,
         key: TuningKey,
         shapes: Vec<PointShape>,
-    ) -> Result<NativeSpecialization, CatalogFailure> {
+    ) -> Result<Option<NativeSpecialization>, CatalogFailure> {
         if let Some(chosen) = self.chosen.get(&key) {
-            return Ok(chosen.clone());
+            return Ok(Some(chosen.clone()));
         }
         #[cfg(feature = "tuning-survey")]
         if let Some(plan) = survey::plan(key.0) {
@@ -4738,8 +4745,17 @@ impl<'a> Tuner<'a> {
             // A surveyed unit takes no part in the division of the tuning
             // time: the most a search of it could be given is all of it.
             survey::record(&key, self.budget(), &result).map_err(failure)?;
+            let result = self
+                .publish(&key, true, || Ok(result))
+                .map_err(|error| unit_failure(&key, error))?;
             let tuned = searched_entry(entry, bindings, result, self.budget(), began);
-            return Ok(self.finish(key, tuned));
+            return Ok(Some(self.finish(key, tuned)));
+        }
+        #[cfg(feature = "tuning-survey")]
+        if survey::installed() && self.stale() {
+            // An earlier surveyed prerequisite replaced its default; the next
+            // round counts and searches this dependant at the replacement.
+            return Ok(None);
         }
         #[cfg(not(feature = "tuning-survey"))]
         let _ = (case, statics, shapes);
