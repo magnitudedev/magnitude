@@ -660,10 +660,9 @@ pub(super) fn begin_as(shared: &Arc<Shared>, launches: &[(StepRoute, LaunchWork)
 
 /// Demand reads standing in the read engine's pool ahead of a test's until
 /// it finishes them: one piece of a file each (its volume's due read), as
-/// many at once as the pool has workers once the line stands, and two more,
-/// into one record nothing reads. Each read is submitted again as it ends,
-/// by the worker that ended it, before that worker takes another piece
-/// (`seismic_io::read_workers`). So a read of the line not queued has its
+/// many at once as the pool can ever hold workers while the line stands, and
+/// two more, into one record nothing reads. Each read is submitted again as it ends,
+/// by the worker that ended it, before that worker takes another piece. So a read of the line not queued has its
 /// piece on a worker, or its end runs on one, or the line's first
 /// submissions are still being made on the test's thread: at most one more
 /// than the workers. Two more always leave one queued, parked, on the
@@ -672,10 +671,15 @@ pub(super) fn begin_as(shared: &Arc<Shared>, launches: &[(StepRoute, LaunchWork)
 /// not taken until the test finishes the line ("Order and depth"), and one
 /// at demand, or hastened to it, waits for the reads queued as it was
 /// issued: at most the pool's workers and two pieces, never the line's
-/// every resubmission. The pool grows only as reads are submitted, to at
-/// most what their links can hold in flight, so the line first grows it
-/// there, and stands two reads longer than it; a test that queues a line
-/// holds the pool alone (`alone`).
+/// every resubmission. The pool grows as reads are submitted, by the most
+/// pieces they have had queued or in flight at once, which no test
+/// controls: however fast its workers drain a submission, it never holds
+/// more for the line's device than the line's queue depth
+/// (`seismic_io::Shape::queue_depth`), the depth every claim of the test's
+/// on that volume reads at (`urgent`), or the workers it holds already
+/// where those are more, so the line stands two reads longer than that; a
+/// test that queues a line holds the pool alone (`alone`), so no other
+/// claim deepens it or grows it for another device.
 pub(super) struct Ahead {
     line: Arc<AheadLine>,
     path: std::path::PathBuf,
@@ -771,10 +775,9 @@ impl Ahead {
 
     /// [`Self::queue`] held: every read's end of the line stops its worker
     /// until the line's end, so a read the test issues
-    /// at demand behind it is not taken until then: the pool is grown to
-    /// all it will have before the line stands, and the line's reads are
-    /// queued ahead of the test's, so each worker that ends one holds, and
-    /// none takes another.
+    /// at demand behind it is not taken until then: the line holds more
+    /// reads than the pool can ever hold workers, queued ahead of the
+    /// test's, so each worker that ends one holds, and none takes another.
     pub(super) fn held(name: &str) -> Self {
         Self::standing(name, Duration::ZERO, false)
     }
@@ -786,29 +789,15 @@ impl Ahead {
         let source = ExpertSource::open(std::slice::from_ref(&path), &urgent()).unwrap();
         let sink = Tensor::shared(&cpu(), Element::i32(), &[1, Self::FILE / 4]).unwrap();
         let records = Records::new(sink, Self::FILE, 1).unwrap();
-        // The pool grown to what its devices' links can hold in flight
-        // before the line stands, so no read a test makes grows it past the
-        // line: whole reads of the file, read ahead, queue their pieces far
-        // faster than workers take them, each submission growing the pool to
-        // the most pieces queued or in flight at once, until one grows it no
-        // further; dropped, what of them is queued is cancelled.
-        let mut growing = Vec::new();
-        loop {
-            let workers = seismic_io::read_workers();
-            let read = Read::new(0, 0, Self::FILE, &records, 0, 0);
-            growing.push(source.request(vec![read], seismic_io::Want::undated(0.)).unwrap());
-            if seismic_io::read_workers() == workers {
-                break;
-            }
-        }
-        drop(growing);
         let shape = seismic_io::link_shape(&seismic_io::OpenFile::open(&path).unwrap(), Some(&urgent())).unwrap();
         let bytes = shape.due_read.min(Self::FILE);
         let line = Arc::new(AheadLine { source, records: Mutex::new(records), done: Default::default(), tickets: Mutex::default(), bytes, late, gate: Gate::new(open) });
-        let mut standing = 0;
-        while standing < seismic_io::read_workers() + 2 {
+        // The most workers the pool can hold while the line stands: those it
+        // holds as the source's claim opened, or the link's queue depth.
+        let depth = usize::try_from(shape.queue_depth()).expect("a link's queue depth is a count of pieces");
+        let workers = seismic_io::read_workers().max(depth);
+        for _ in 0..workers + 2 {
             line.stand();
-            standing += 1;
         }
         Self { line, path }
     }

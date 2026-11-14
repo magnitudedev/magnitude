@@ -294,7 +294,7 @@ impl Device {
             due: shape.due,
             knee: shape.knee,
             smallest: shape.due_read.min(shape.ahead_read),
-            depth: shape.due.div_ceil(shape.due_read) + shape.knee.div_ceil(shape.ahead_read) + 1,
+            depth: shape.queue_depth(),
             most: 0,
         }
     }
@@ -376,8 +376,10 @@ impl Pool {
         let (target, cap) = (self.target(), self.cap());
         assert!(target <= cap, "the read pool's target {target} exceeds its devices' queue depths {cap}");
         let starting = target.saturating_sub(self.started);
-        self.started += starting;
-        assert!(self.started <= cap, "{} read workers exceed their devices' queue depths {cap}", self.started);
+        if starting > 0 {
+            self.started += starting;
+            assert!(self.started <= cap, "{} read workers exceed their devices' queue depths {cap}", self.started);
+        }
         let first = self.named;
         self.named += starting;
         first..self.named

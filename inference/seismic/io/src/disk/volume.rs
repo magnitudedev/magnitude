@@ -56,6 +56,13 @@ impl Shape {
         if due { self.due_read } else { self.ahead_read }
     }
 
+    /// Its queue depth, in pieces: each depth in the pieces its reads are
+    /// cut in, and one piece past them. The read pool holds no more workers
+    /// for a device than the deepest of its claims' links' queue depths, so
+    /// pieces submitted past it, however many, start no worker.
+    pub fn queue_depth(&self) -> u64 {
+        self.due.div_ceil(self.due_read) + self.knee.div_ceil(self.ahead_read) + 1
+    }
 }
 
 /// How the rule before the curve read a volume for a request: five figures
