@@ -5,7 +5,7 @@ use crate::{
     ModelLoadPlan, ResourceLimits, StateResourcePlan, TargetBlockProgramSlot, TargetProgramPlan,
     native::OutputScales,
     operators::{
-        BlockKeeps, PairedBlock, block, paired_block,
+        BlockKeeps, PairedBlock, paired_block,
         routed::{
             split::{Extents, OnceStage, RunStage, SplitValues, Stage},
             streamed,
@@ -205,9 +205,14 @@ pub(crate) enum LaunchControl {
     Padded { read: usize },
     Fresh { read: usize },
     Destinations { read: usize },
-    /// A picked pooled source's Block read: each row's complete groups
-    /// (`[rows]`, the rows its visible spans list, `(t + 1) / rate`).
+    /// A picked pooled source's or a selected read's keys' Block read: each
+    /// row's complete groups (`[rows]`, the rows its visible spans list,
+    /// `(t + 1) / rate`).
     Complete { read: usize },
+    /// A selected read's keys' Block read: each row's unit list (`[rows, 1,
+    /// 2]`, `[0, c)` of its `c` complete groups), which its indexer picks
+    /// unit ordinals over (`selection::Picks::Units`).
+    Units { read: usize },
     /// A picked pooled source's Block read: the launch's picks table
     /// (`[rows, top]`, uploaded -1), which its own layer's graph stores, a
     /// later Reindex layer's graph stores over, and the Reuse layers' graphs
@@ -238,10 +243,66 @@ impl LaunchControl {
                 | Self::Fresh { .. }
                 | Self::Destinations { .. }
                 | Self::Complete { .. }
+                | Self::Units { .. }
                 | Self::Picks { .. }
                 | Self::Pool { .. }
         )
     }
+}
+
+/// Whether a selected read scores in a launch whose rows each see `seen`
+/// complete blocks of the block-key history (the rows its visible spans list)
+/// and, for `own`, complete one themselves (`graph::select`): whether some row
+/// has more than `selected`. A launch where none does reads every row's whole
+/// history through the class that does not score.
+pub(crate) fn selection_scores(rows: impl IntoIterator<Item = (i64, bool)>, selected: u64) -> bool {
+    rows.into_iter().any(|(seen, own)| seen + i64::from(own) > selected as i64)
+}
+
+/// The rows `spans` list.
+fn listed_rows(spans: impl IntoIterator<Item = [i32; 2]>) -> i32 {
+    spans
+        .into_iter()
+        .map(|[start, end]| {
+            assert!(end >= start, "a visible span [{start}, {end}) ends before it starts");
+            end - start
+        })
+        .sum()
+}
+
+/// Each row's complete groups in a Block read: the rows its visible spans
+/// list.
+pub(crate) fn complete(visible: &[Vec<[i32; 2]>]) -> Vec<i32> {
+    visible.iter().map(|spans| listed_rows(spans.iter().copied())).collect()
+}
+
+/// [`complete`] of rows packed as I32 span pairs, `segments` to a row.
+fn packed_complete(visible: &[u8], segments: usize) -> impl Iterator<Item = i32> + '_ {
+    let word = |bytes: &[u8], at: usize| {
+        i32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes"))
+    };
+    visible.chunks_exact((segments * 8).max(1)).map(move |row| {
+        listed_rows(row.chunks_exact(8).map(|span| [word(span, 0), word(span, 4)]))
+    })
+}
+
+/// [`selection_scores`] of a Block read's packed visible spans and
+/// destinations (`segments` spans to a row, one I32 destination).
+pub(crate) fn packed_selection_scores(
+    visible: &[u8],
+    destinations: &[u8],
+    segments: usize,
+    selected: u64,
+) -> bool {
+    selection_scores(
+        packed_complete(visible, segments).zip(destinations.chunks_exact(4)).map(
+            |(seen, destination)| {
+                let destination = i32::from_le_bytes(destination.try_into().expect("four bytes"));
+                (i64::from(seen), destination >= 0)
+            },
+        ),
+        selected,
+    )
 }
 
 /// The index lists over a picked pooled source's Block read: the picks
@@ -265,6 +326,9 @@ pub(crate) struct LaunchControlLayout {
     /// Block read takes its rows' complete groups, the launch's picks table
     /// and, when its own indexer produces one, its candidate pool table.
     pub(super) picked: Vec<Option<PickedRead>>,
+    /// Per history read, whether it is a selected read's keys' Block read,
+    /// which takes its rows' complete groups and unit lists.
+    pub(super) units: Vec<bool>,
     pub(super) max_segments: u64,
     /// The upload region that holds any launch's controls.
     pub(super) region_bytes: u64,
@@ -278,6 +342,7 @@ impl LaunchControlLayout {
         reads: &magnitude_state::HistoryReads,
         listings: &[BlockListings],
         picked: &[(usize, PickedRead)],
+        selected: &[usize],
         rows: u64,
         max_segments: u64,
         slots: u64,
@@ -285,6 +350,13 @@ impl LaunchControlLayout {
         let mut picks = vec![None; reads.len()];
         for &(read, lists) in picked {
             *picks.get_mut(read).ok_or("a picked source's read is not the store's")? = Some(lists);
+        }
+        let mut units = vec![false; reads.len()];
+        for &read in selected {
+            if picks.get(read).ok_or("a selected read's keys' read is not the store's")?.is_some() {
+                return Err("a selected read's keys' read is a picked source's".into());
+            }
+            units[read] = true;
         }
         let mut padded = vec![false; reads.len()];
         for (index, listings) in listings.iter().enumerate() {
@@ -299,6 +371,7 @@ impl LaunchControlLayout {
         let mut layout = Self {
             padded,
             picked: picks,
+            units,
             max_segments,
             region_bytes: 0,
         };
@@ -333,8 +406,8 @@ impl LaunchControlLayout {
     ) -> Vec<(LaunchControl, Vec<u64>)> {
         let pads =
             segments < self.max_segments && !crate::operators::attention::graph::decodes(rows);
-        let per_read = self.padded.iter().zip(&self.picked).enumerate().flat_map(
-            |(read, (&padded, &picks))| {
+        let per_read = self.padded.iter().zip(&self.picked).zip(&self.units).enumerate().flat_map(
+            |(read, ((&padded, &picks), &units))| {
                 [
                     Some((LaunchControl::Visible { read }, vec![rows, segments, 2])),
                     (padded && pads).then(|| {
@@ -342,7 +415,8 @@ impl LaunchControlLayout {
                     }),
                     Some((LaunchControl::Fresh { read }, vec![rows, 2])),
                     Some((LaunchControl::Destinations { read }, vec![rows])),
-                    picks.map(|_| (LaunchControl::Complete { read }, vec![rows])),
+                    (picks.is_some() || units).then(|| (LaunchControl::Complete { read }, vec![rows])),
+                    units.then(|| (LaunchControl::Units { read }, vec![rows, 1, 2])),
                     picks.map(|lists| (LaunchControl::Picks { read }, vec![rows, lists.top])),
                     picks.and_then(|lists| lists.pool_blocks).map(|blocks| {
                         (LaunchControl::Pool { read }, vec![rows, blocks + segments, 2])
@@ -495,13 +569,11 @@ pub(super) fn once_class(capacity: u64, stage: OnceStage) -> StagedClass {
     ((capacity, 1, 1, 0, 0), Stage::Once(stage))
 }
 
-/// The shape of `slot`'s selected read, when its block reads one
+/// `slot`'s selected read, when its block reads one
 /// (`AttentionBinding::selection`).
-pub(super) fn slot_selection(slot: TargetBlockProgramSlot) -> Option<crate::SelectionShape> {
+pub(super) fn slot_selection(slot: TargetBlockProgramSlot) -> Option<crate::SelectionBinding> {
     match slot.mixer() {
-        crate::MixerProgramSlot::Attention(binding) => {
-            binding.selection.map(|selection| selection.shape)
-        }
+        crate::MixerProgramSlot::Attention(binding) => binding.selection,
         _ => None,
     }
 }
@@ -650,7 +722,7 @@ pub(super) fn block_class_numbers(
         .chain((keeps.history() && listed).then_some((None, "HT", ClassNumber::Listed)))
         .chain(match keeps {
             BlockKeeps::History => None,
-            BlockKeeps::Bank => Some((None, "B", ClassNumber::Slots)),
+            BlockKeeps::Bank => Some((Some(crate::operators::block::RECURRENT_SLOTS), "B", ClassNumber::Slots)),
             BlockKeeps::HistoryAndBank => Some((Some(crate::operators::ngram::graph::NGRAM_SLOTS), "B", ClassNumber::Slots)),
         })
         .collect()
@@ -658,21 +730,15 @@ pub(super) fn block_class_numbers(
 
 /// The admitted classes of one block for a `rows`-row launch, as one slice:
 /// the row count, and every history segment count (attention) or request
-/// slot count (recurrent) that launch can serve. A routed feed-forward's
-/// grouped entries size their tile table from the rows they group,
-/// `grouped_rows` (`block::feed_forward_class_slice`). A candidate pool's
-/// lists over the `picked` source take its blocks beside each segment count
-/// (`pooled::candidate_class_segments`).
+/// slot count (recurrent) that launch can serve: its class facts
+/// (`block_class_numbers`), from which every other dimension follows.
 pub(super) fn block_class_slice(
     block: &PairedBlock,
     rows: u64,
-    grouped_rows: u64,
     max_slots: u64,
     max_segments: u64,
     listed: &[u64],
-    scored: bool,
-    picked: Option<crate::PickedBinding>,
-) -> Result<NativeGraphClassSlice, String> {
+) -> NativeGraphClassSlice {
     let keeps = block.keeps();
     // The segment and slot counts are those of every listing class.
     let classes = block_classes(
@@ -693,40 +759,14 @@ pub(super) fn block_class_slice(
             .dimension("R", classes.iter().map(|&(_, segments, ..)| segments))
             .dimension("HT", listed.iter().copied()),
     };
-    // A recurrent mixer's slots are its whole block's `B`; an attention
-    // block's are its n-gram input's alone (`NGRAM_SLOTS`).
+    // A recurrent mixer's slots are its own `B` (`RECURRENT_SLOTS`); an
+    // attention block's are its n-gram input's (`NGRAM_SLOTS`).
     let slots = classes.iter().map(|&(_, _, slots, ..)| slots);
-    let slice = match keeps {
+    match keeps {
         BlockKeeps::History => slice,
-        BlockKeeps::Bank => slice.dimension("B", slots),
+        BlockKeeps::Bank => slice.scoped(crate::operators::block::RECURRENT_SLOTS, "B", slots),
         BlockKeeps::HistoryAndBank => slice.scoped(crate::operators::ngram::graph::NGRAM_SLOTS, "B", slots),
-    };
-    let slice = match block.mixer {
-        crate::operators::Mixer::Attention(operator) if scored => {
-            crate::operators::attention::graph::decode_class_segments(slice, operator)
-        }
-        _ => slice,
-    };
-    let slice = crate::operators::attention::pooled::candidate_class_segments(
-        slice,
-        picked,
-        classes.iter().map(|&(_, segments, ..)| segments),
-    );
-    // An n-gram input reads its table's rows for each batch row's heads.
-    let slice = match block.ngram {
-        Some(ngram) => slice.scoped(
-            "stored_rows",
-            "M",
-            [rows
-                * ngram
-                    .op
-                    .hash
-                    .heads()
-                    .map_err(|error| error.to_string())?],
-        ),
-        None => slice,
-    };
-    block::feed_forward_class_slice(block, rows, grouped_rows, slice)
+    }
 }
 
 /// The blocks' output scales as their holder knows them. They are values of
@@ -1054,6 +1094,19 @@ pub(super) fn enumerate_block_graphs(
             Some(_) => {}
         }
     }
+    // Each selected read's keys' Block read.
+    let mut selected = Vec::new();
+    for (index, slot) in blocks.iter().enumerate() {
+        if let crate::MixerProgramSlot::Attention(crate::AttentionBinding { selection: Some(_), .. }) = slot.mixer() {
+            let block = u32::try_from(index).map_err(|_| "block index exceeds u32")?;
+            selected.push(
+                state
+                    .target_state()
+                    .index_keys_read(block)
+                    .ok_or("a selected read's keys have no Block domain")?,
+            );
+        }
+    }
     let mut enumeration = BlockGraphEnumeration {
         sealing: Vec::new(),
         sharing: Vec::new(),
@@ -1061,6 +1114,7 @@ pub(super) fn enumerate_block_graphs(
             &state.target_state().history_reads()?,
             &block_listed,
             &picked,
+            &selected,
             outline.largest_rows,
             max_segments,
             max_slots,

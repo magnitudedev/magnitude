@@ -157,12 +157,7 @@ fn parse() -> Result<Options, String> {
             "--kv-codec" => kv_codec = Some(value(&flag, &mut args)?.parse()?),
             "--numerical-profile" => {
                 let path = value(&flag, &mut args)?;
-                let bytes = std::fs::read(&path)
-                    .map_err(|error| format!("numerical profile {path}: {error}"))?;
-                numerical_profile = Some(
-                    serde_json::from_slice(&bytes)
-                        .map_err(|error| format!("numerical profile {path}: {error}"))?,
-                );
+                numerical_profile = Some(magnitude_executor::NumericalProfile::read(path.as_ref())?);
             }
             "--lookahead" => lookahead = switch(&flag, &value(&flag, &mut args)?)?,
             "--weight-cap" => weight_bound = bound(weight_bound, WeightBound::Cap(number(&flag, &mut args)?))?,

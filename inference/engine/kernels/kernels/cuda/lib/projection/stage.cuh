@@ -17,14 +17,28 @@ template <class E, class Rows> struct Plain {
     __device__ __forceinline__ float value(const float *, u32 m, u64 k) const {
         return Act::round(element::at<E>(x, rows(m) * stride + k));
     }
+    // A view's base and stride are only element-aligned: the wide loads are
+    // taken where they hold, single 16-bit loads elsewhere.
     __device__ __forceinline__ u32 pair(const float *, u32 m, u64 k) const {
         static_assert(!STAGED, "a GEMV reads staged rows");
-        return *reinterpret_cast<const u32 *>(x + (rows(m) * stride + k) * 2);
+        const u8 *at = x + (rows(m) * stride + k) * 2;
+        if (stride % 2 == 0 && ((u64)x & 3) == 0)
+            return *reinterpret_cast<const u32 *>(at);
+        const u16 *values = reinterpret_cast<const u16 *>(at);
+        return (u32)values[0] | (u32)values[1] << 16;
     }
     // The operand bits of x[m, k .. k + 7], k a multiple of 8 (`gemv_rows`).
     __device__ __forceinline__ uint4 octet(const float *, u32 m, u64 k) const {
         static_assert(!STAGED, "a GEMV reads staged rows");
-        return *reinterpret_cast<const uint4 *>(x + (rows(m) * stride + k) * 2);
+        const u8 *at = x + (rows(m) * stride + k) * 2;
+        if (stride % 8 == 0 && ((u64)x & 15) == 0)
+            return *reinterpret_cast<const uint4 *>(at);
+        const u16 *values = reinterpret_cast<const u16 *>(at);
+        u32 w[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+            w[j] = (u32)values[2 * j] | (u32)values[2 * j + 1] << 16;
+        return make_uint4(w[0], w[1], w[2], w[3]);
     }
 };
 

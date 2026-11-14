@@ -13,7 +13,7 @@ use magnitude_kernels::{
 mod cuda_common;
 
 use cuda_common::*;
-use seismic::{Device, Element, Layout, NativeSpecialization, OperandRecipe, Tensor};
+use seismic::{BackendName, Device, Element, Layout, NativeSpecialization, OperandRecipe, Tensor};
 use seismic_lang::registry::bf16_round;
 
 /// O output rows gathered through `out_rows` from M = O + 2 residual rows.
@@ -63,42 +63,9 @@ impl DenseCase {
         format: Option<Format>,
         mapping: Mapping,
     ) -> (Vec<f64>, Vec<f64>) {
-        let (x, slack) = operand_rows(
-            &normalized(&self.selected(), &self.norm, self.o, self.h),
-            self.h,
-            mapping,
-            format,
-        );
-        let (g, gm) = project(&x, &gate.values, self.o, self.f, self.h);
-        let (u, um) = project(&x, &up.values, self.o, self.f, self.h);
-        let with_dequant = |slack: Vec<f64>, weight: &Weight| {
-            let bound = dequant_bound(&x, &weight.values, self.o, self.f, self.h, mapping);
-            slack
-                .iter()
-                .zip(&bound)
-                .map(|(s, b)| s + b)
-                .collect::<Vec<_>>()
-        };
-        let gs = with_dequant(
-            slack_bound(&slack, &gate.values, self.o, self.f, self.h),
-            gate,
-        );
-        let us = with_dequant(slack_bound(&slack, &up.values, self.o, self.f, self.h), up);
-        let mut expected = vec![0.0; self.o * self.f];
-        let mut tolerance = vec![0.0; self.o * self.f];
-        for i in 0..expected.len() {
-            expected[i] = silu(g[i]) * u[i];
-            // Three bf16 roundings of the epilogue, plus the prologue's own
-            // bf16 rounding of x, whose ties can resolve differently under
-            // the device's reduction order and approximate rsqrt (bounded by
-            // 2^-12 of the absolute products, scaled by the other factor),
-            // plus the operand path's slack.
-            tolerance[i] = expected[i].abs() * 4.0 / 256.0
-                + ((gm[i] * 2.5e-4 + gs[i]) * u[i].abs() + (um[i] * 2.5e-4 + us[i]) * g[i].abs())
-                + gs[i] * us[i]
-                + 1e-6;
-        }
-        (expected, tolerance)
+        let (normed, flips) = normalized(&self.selected(), &self.norm, self.o, self.h);
+        let (x, operand) = operand_rows(&normed, self.h, mapping, format);
+        expansion_bound(&x, &flips, &operand, gate, up, self.o, self.f, self.h, mapping)
     }
 }
 
@@ -160,7 +127,7 @@ fn dense_expand_matches_host_model(format: Format) {
                 })
                 .unwrap()
                 .value;
-            check(
+            assert_within(
                 &format!("expand {format:?} O={o} {mapping:?}"),
                 &read_bf16(&product),
                 &expected,
@@ -202,25 +169,14 @@ fn dense_output_cases(device: &Device, format: Format, h: usize, f: usize, rng: 
         for mapping in mappings(o, |mapping| output.admits(&device, mapping)) {
             // The product is exact input, so the INT8 emulation is exact too.
             let (x, _) = operand_rows(&product_values, f, mapping, Some(format));
-            let (projected, magnitude) = project(&x, &down.values, o, h, f);
-            let expected: Vec<f64> = (0..o * h)
+            let (projected, sums) = project(&x, &down.values, format.resident(), o, h, f, mapping);
+            let (expected, tolerance): (Vec<f64>, Vec<f64>) = (0..o * h)
                 .map(|i| {
-                    f64::from(residual_values[out_rows_values[i / h] as usize * h + i % h])
-                        + projected[i]
+                    let row = out_rows_values[i / h] as usize;
+                    let residual = f64::from(residual_values[row * h + i % h]);
+                    (residual + projected[i], residual_bound(residual, projected[i], sums[i]))
                 })
-                .collect();
-            // One A rounding of the projection, F32 accumulation and the
-            // GEMM's weight dequantization.
-            // A scaled-GEMM format's weights enter exactly: no
-            // dequantization slack.
-            let dequant = if format.resident().cuda_gemm_fold() {
-                vec![0.0; o * h]
-            } else {
-                dequant_bound(&x, &down.values, o, h, f, mapping)
-            };
-            let tolerance: Vec<f64> = (0..o * h)
-                .map(|i| projected[i].abs() / 256.0 + magnitude[i] * 2e-5 + dequant[i] + 1e-6)
-                .collect();
+                .unzip();
             let result = output
                 .kernel(&device, mapping)
                 .call(dense_output::Args {
@@ -233,7 +189,7 @@ fn dense_output_cases(device: &Device, format: Format, h: usize, f: usize, rng: 
                 })
                 .unwrap()
                 .value;
-            check(
+            assert_within(
                 &format!("output {format:?} O={o} {mapping:?}"),
                 &read_f32(&result),
                 &expected,
@@ -288,18 +244,11 @@ fn grouped_project_rows_match_host_model(format: Format) {
                     .map(|i| source[i / k * groups * k + group * k + i % k])
                     .collect();
                 let rows = &weight.values[group * n * k..(group + 1) * n * k];
-                let (projected, magnitude) = project(&run, rows, o, n, k);
-                // F32 accumulation and the GEMM's weight dequantization (none
-                // for a scaled-GEMM format's exact weights).
-                let dequant = if format.resident().cuda_gemm_fold() {
-                    vec![0.0; o * n]
-                } else {
-                    dequant_bound(&run, rows, o, n, k, mapping)
-                };
+                let (projected, sums) = project(&run, rows, format.resident(), o, n, k, mapping);
                 for i in 0..o * n {
                     let at = i / n * groups * n + group * n + i % n;
                     expected[at] = projected[i];
-                    tolerance[at] = magnitude[i] * 2e-5 + dequant[i] + 1e-6;
+                    tolerance[at] = sums[i];
                 }
             }
             let result = projection
@@ -312,7 +261,7 @@ fn grouped_project_rows_match_host_model(format: Format) {
                 })
                 .unwrap()
                 .value;
-            check(
+            assert_within(
                 &format!("grouped project_rows {format:?} O={o} {mapping:?}"),
                 &read_f32(&result),
                 &expected,
@@ -449,7 +398,7 @@ fn gemm_row_bands_match_host_model(format: Format) {
                 })
                 .unwrap()
                 .value;
-            check(&label, &read_bf16(&product), &expected, &tolerance);
+            assert_within(&label, &read_bf16(&product), &expected, &tolerance);
             digest(&product)
         });
         assert!(
@@ -465,18 +414,13 @@ fn gemm_row_bands_match_host_model(format: Format) {
             .collect();
         let base: Vec<f32> = (0..m * f).map(|_| rng.uniform(-2.0, 2.0)).collect();
         let (x, _) = operand_rows(&values, k, mapping, Some(format));
-        let (projected, magnitude) = project(&x, &down.values, o, f, k);
-        let dequant = if format.resident().cuda_gemm_fold() {
-            vec![0.0; o * f]
-        } else {
-            dequant_bound(&x, &down.values, o, f, k, mapping)
-        };
-        let expected: Vec<f64> = (0..o * f)
-            .map(|i| f64::from(base[rows[i / f] as usize * f + i % f]) + projected[i])
-            .collect();
-        let tolerance: Vec<f64> = (0..o * f)
-            .map(|i| projected[i].abs() / 256.0 + magnitude[i] * 2e-5 + dequant[i] + 1e-6)
-            .collect();
+        let (projected, sums) = project(&x, &down.values, format.resident(), o, f, k, mapping);
+        let (expected, tolerance): (Vec<f64>, Vec<f64>) = (0..o * f)
+            .map(|i| {
+                let residual = f64::from(base[rows[i / f] as usize * f + i % f]);
+                (residual + projected[i], residual_bound(residual, projected[i], sums[i]))
+            })
+            .unzip();
         let residual = f32_tensor(&device, &[m as u64, f as u64], &base);
         let product = bf16_tensor(&device, &[o as u64, k as u64], &values);
         let out_rows = i32_tensor(&device, &[o as u64], &rows);
@@ -494,7 +438,7 @@ fn gemm_row_bands_match_host_model(format: Format) {
                 })
                 .unwrap()
                 .value;
-            check(&label, &read_f32(&result), &expected, &tolerance);
+            assert_within(&label, &read_f32(&result), &expected, &tolerance);
             digest(&result)
         });
         assert!(
@@ -730,7 +674,7 @@ fn cuda_dense_weights_match_host_model() {
                 })
                 .unwrap()
                 .value;
-            check(
+            assert_within(
                 &format!("dense expand O={o} {mapping:?}"),
                 &read_bf16(&product),
                 &expected,
@@ -741,16 +685,15 @@ fn cuda_dense_weights_match_host_model() {
                 .map(|_| bf16_round(rng.uniform(-1.0, 1.0)))
                 .collect();
             let product = bf16_tensor(&device, &[o as u64, f as u64], &product_values);
-            let (projected, magnitude) = project(&product_values, &down.values, o, h, f);
-            let expected: Vec<f64> = (0..o * h)
+            let (projected, sums) =
+                project(&product_values, &down.values, Element::bf16(), o, h, f, mapping);
+            let (expected, tolerance): (Vec<f64>, Vec<f64>) = (0..o * h)
                 .map(|i| {
-                    f64::from(case.residual[case.out_rows[i / h] as usize * h + i % h])
-                        + projected[i]
+                    let row = case.out_rows[i / h] as usize;
+                    let residual = f64::from(case.residual[row * h + i % h]);
+                    (residual + projected[i], residual_bound(residual, projected[i], sums[i]))
                 })
-                .collect();
-            let tolerance: Vec<f64> = (0..o * h)
-                .map(|i| projected[i].abs() / 256.0 + magnitude[i] * 2e-5 + 1e-6)
-                .collect();
+                .unzip();
             let result = output
                 .kernel(&device, mapping)
                 .call(dense_output::Args {
@@ -763,7 +706,7 @@ fn cuda_dense_weights_match_host_model() {
                 })
                 .unwrap()
                 .value;
-            check(
+            assert_within(
                 &format!("dense output O={o} {mapping:?}"),
                 &read_f32(&result),
                 &expected,
@@ -865,7 +808,9 @@ fn gemv_rows_match_single_row_bits(format: Format) {
 }
 
 /// Expected head logits of a case (features of the `out_rows` rows against
-/// every vocabulary row) and their tolerance.
+/// every vocabulary row) and their tolerance: the F32 logits' form bound
+/// on `mapping`, plus the prologue's flips and the operand path's slack
+/// through the weight.
 fn head_expected(
     case: &DenseCase,
     weight: &Weight,
@@ -873,21 +818,10 @@ fn head_expected(
     format: Option<Format>,
     mapping: Mapping,
 ) -> (Vec<f64>, Vec<f64>) {
-    let (x, slack) = operand_rows(
-        &normalized(&case.selected(), &case.norm, case.o, case.h),
-        case.h,
-        mapping,
-        format,
-    );
-    let (logits, magnitude) = project(&x, &weight.values, case.o, v, case.h);
-    let bound = slack_bound(&slack, &weight.values, case.o, v, case.h);
-    let dequant = dequant_bound(&x, &weight.values, case.o, v, case.h, mapping);
-    // F32 accumulation plus the prologue's bf16 ties (as for the expand), the
-    // operand path's slack and the GEMM's weight dequantization.
-    let tolerance = (0..logits.len())
-        .map(|i| magnitude[i] * 2.5e-4 + bound[i] + dequant[i] + 1e-6)
-        .collect();
-    (logits, tolerance)
+    let (normed, flips) = normalized(&case.selected(), &case.norm, case.o, case.h);
+    let (x, operand) = operand_rows(&normed, case.h, mapping, format);
+    let slack = sum_slack(&flips, &operand);
+    project_with_slack(&x, &slack, weight, case.o, v, case.h, mapping)
 }
 
 fn head_rows_match_host_model(format: Format) {
@@ -939,7 +873,7 @@ fn head_rows_match_host_model(format: Format) {
                 })
                 .unwrap()
                 .value;
-            check(
+            assert_within(
                 &format!("head {format:?} O={o} {mapping:?}"),
                 &read_f32(&logits),
                 &expected,
@@ -959,10 +893,16 @@ fn cuda_head_logits_scoped_launches_match_host_model() {
         let features = (0..rows * d)
             .map(|_| bf16_round(rng.uniform(-1.0, 1.0)))
             .collect::<Vec<_>>();
-        let (expected, magnitude) = project(&features, &head.values, rows, v, d);
-        let tolerance = magnitude
-            .iter()
-            .map(|value| value * 0.001 + 1e-5)
+        // The full rows' GEMV and GEMM forms; the indexed rows' exact-code
+        // GEMV (`readout_project_rows_indexed`) is the M = 1 form.
+        let (expected, tolerance) =
+            project(&features, &head.values, Format::Q6K.resident(), rows, v, d, GEMM_MAPPINGS[0]);
+        let indexed = Form::projection(BackendName::Cuda, 1, Float::Bf16, Format::Q6K.resident());
+        let indexed_tolerance = (0..rows * v)
+            .map(|i| {
+                let (row, column) = (&features[i / v * d..][..d], &head.values[i % v * d..][..d]);
+                indexed.exact(&Products::of(row, column))
+            })
             .collect::<Vec<_>>();
         for _form in [0] {
             let specialization = NativeSpecialization::new()
@@ -1000,7 +940,7 @@ fn cuda_head_logits_scoped_launches_match_host_model() {
                 })
                 .unwrap()
                 .value;
-            check(
+            assert_within(
                 &format!("prepared projection rows={rows}"),
                 &read_f32(&logits),
                 &expected,
@@ -1035,7 +975,7 @@ fn cuda_head_logits_scoped_launches_match_host_model() {
                 .enumerate()
                 .map(|(index, id)| index / columns * v + *id as usize)
                 .collect::<Vec<_>>();
-            check(
+            assert_within(
                 &format!("prepared indexed packed projection rows={rows}"),
                 &read_f32(&indexed),
                 &selected
@@ -1044,7 +984,7 @@ fn cuda_head_logits_scoped_launches_match_host_model() {
                     .collect::<Vec<_>>(),
                 &selected
                     .iter()
-                    .map(|index| tolerance[*index])
+                    .map(|index| indexed_tolerance[*index])
                     .collect::<Vec<_>>(),
             );
         }
@@ -1060,6 +1000,9 @@ fn features_and_selected_rows_match_host_model(format: Format) {
     let head = weight(&device, format, v, d, &mut rng);
     for o in [1usize, 3, 9] {
         let case = DenseCase::new(o, d, v, &mut rng);
+        // The selected rows' logits (`readout_selected_rows_logits`) decode
+        // the weight to F32, as the host holds it, and the GEMV's exact codes
+        // are the same form.
         let (logits, tolerance) = head_expected(&case, &head, v, Some(format), GEMV_MAPPINGS[0]);
         let hidden = f32_tensor(&device, &[case.m as u64, d as u64], &case.residual);
         let norm = f32_tensor(&device, &[d as u64], &case.norm);
@@ -1087,18 +1030,13 @@ fn features_and_selected_rows_match_host_model(format: Format) {
         .unwrap()
         .value;
         // The device and host differ only in the order of the square sum
-        // and in rsqrt: at most one bf16 step, and only rarely.
-        let expected_features = normalized(&case.selected(), &case.norm, o, d);
-        let actual_features = read_bf16(&features);
-        let mut off = 0;
-        for (a, e) in actual_features.iter().zip(&expected_features) {
-            let step = (a.to_bits() as i64 - e.to_bits() as i64).abs() >> 16;
-            assert!(step <= 1, "features {format:?} O={o}: {a} vs {e}");
-            off += step;
-        }
-        assert!(
-            off * 100 <= actual_features.len() as i64,
-            "features {format:?} O={o}: {off} values one step off"
+        // and in rsqrt: within each value's rounding flip.
+        let (expected_features, flips) = normalized(&case.selected(), &case.norm, o, d);
+        assert_within(
+            &format!("features {format:?} O={o}"),
+            &read_bf16(&features),
+            &expected_features,
+            &flips,
         );
         let selected = i32_tensor(&device, &[sv as u64], &selected_values);
         let actual = readout_selected_rows::native_for_device_with(
@@ -1132,7 +1070,7 @@ fn features_and_selected_rows_match_host_model(format: Format) {
         let tolerance: Vec<f64> = (0..o * sv)
             .map(|i| tolerance[(i / sv) * v + selected_values[i % sv] as usize])
             .collect();
-        check(
+        assert_within(
             &format!("selected {format:?} O={o}"),
             &read_f32(&actual),
             &expected,
@@ -1232,7 +1170,7 @@ fn dense_expand_host_model_matches_portable_body(format: Format) {
     let actual: Vec<f32> = (0..o * f)
         .map(|i| product.read(i).unwrap() as f32)
         .collect();
-    check(
+    assert_within(
         &format!("portable expand {format:?}"),
         &actual,
         &expected,

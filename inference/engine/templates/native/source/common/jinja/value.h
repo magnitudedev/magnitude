@@ -546,6 +546,18 @@ struct value_object_t : public value_t {
             val_obj.push_back({key, val});
         }
     }
+    void erase(const value & key) {
+        if (unordered.erase(key) == 0) {
+            return;
+        }
+        // a key added last is erased first, so search from the end
+        for (auto it = val_obj.rbegin(); it != val_obj.rend(); ++it) {
+            if (*(it->first) == *key) {
+                val_obj.erase(std::next(it).base());
+                break;
+            }
+        }
+    }
     virtual value & at(const value & key, value & default_val) override {
         if (!has_key(key)) {
             return default_val;

@@ -8,28 +8,31 @@
 //! the decoder's exit site, whose partials the readout sums.
 //!
 //! Under Sinkhorn mixing each site is one entry (`stream_mix_sinkhorn`): it
-//! reads the streams and the previous site's `pre`, and gives its sublayer
-//! one input row (normalized by the sublayer's input norm), its own `pre`
-//! and the join row post | comb its sublayer's output joins with. The `pre`
-//! crosses every boundary between graphs beside the streams
-//! ([`ResidualCarry`]); block 0 starts it one-hot, and the decoder's exit
-//! collapses the streams by the last site's (`stream_collapse`), which the
-//! readout normalizes.
+//! reads the streams and gives its sublayer one input row (normalized by the
+//! sublayer's input norm), mixed by the previous site's `pre` or its own
+//! (`SinkhornInput`), and the join row post | comb its sublayer's output
+//! joins with. Mixing by the previous site's, a site also gives its own
+//! `pre`, which crosses every boundary between graphs beside the streams
+//! ([`ResidualCarry`]); block 0 starts it one-hot. The decoder's exit
+//! collapses the streams (`stream_collapse`) by the last site's `pre` or
+//! into their mean, which the readout normalizes.
 
 pub(crate) mod graph;
 
 use crate::error::PlanError;
+use crate::operators::ExitMix;
 use magnitude_family_contracts::{
-    Decoder, HyperConnectionMixing, ResidualForm, WeightKind, WeightScope,
+    Decoder, ExitNorm, HyperConnectionMixing, ResidualForm, SinkhornInput, WeightKind, WeightScope,
 };
 use seismic::Element;
 
 /// The geometry of a decoder's streams: S streams of `hidden`, and how its
 /// mix sites form their coefficients. The stream count is topology (the
 /// graphs repeat over it); the width and rank are numbers `D`. Sinkhorn
-/// mixing carries `M`: the model's numerics (`SinkhornMixing`), or in a
-/// graph's numbers (`numbers`) its iteration count, a number the kernel
-/// loops over, whose topology holds the epsilons as reals.
+/// mixing names whose `pre` its sites mix by, which is topology, and
+/// carries `M`: the model's numerics (`SinkhornMixing`), or in a graph's
+/// numbers (`numbers`) its iteration count, a number the kernel loops over,
+/// whose topology holds the epsilons as reals.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct StreamsGeometry<D = u64, M = SinkhornMixing> {
     pub hidden: D,
@@ -39,11 +42,61 @@ pub struct StreamsGeometry<D = u64, M = SinkhornMixing> {
 
 /// How every mix site of a decoder forms its coefficients
 /// (`HyperConnectionMixing`): through a low-rank bottleneck, or by one
-/// Sinkhorn projection of numerics `M`.
+/// Sinkhorn projection of numerics `M` mixing by the `pre` `input` names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum StreamsMixing<D = u64, M = SinkhornMixing> {
     LowRank { rank: D },
-    Sinkhorn(M),
+    Sinkhorn { input: SinkhornInput, numerics: M },
+}
+
+/// `stream_mix_sinkhorn`'s `P` under `input`: 1 when a site mixes by the
+/// previous site's pre and publishes its own for the next, 0 when it mixes
+/// by its own.
+pub(crate) fn carried(input: SinkhornInput) -> u64 {
+    match input {
+        SinkhornInput::PreviousSite => 1,
+        SinkhornInput::OwnSite => 0,
+    }
+}
+
+/// How the decoder's exit collapses Sinkhorn streams (`stream_collapse`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SinkhornExit {
+    /// By the last site's pre, which the streams carry.
+    LastPre,
+    /// Into the streams' mean `Σ_s X[s] / S` bit for bit, for any S: every
+    /// stream summed in stream order, then divided by S, reading no pre.
+    Mean,
+}
+
+impl SinkhornExit {
+    /// The collapse the decoder's exit `mix` ends Sinkhorn streams with;
+    /// none for a low-rank site of its own.
+    pub(crate) fn of(mix: ExitMix<'_>) -> Option<Self> {
+        match mix {
+            ExitMix::Previous(_) => Some(Self::LastPre),
+            ExitMix::Mean(_) => Some(Self::Mean),
+            ExitMix::Own(_) => None,
+        }
+    }
+
+    /// The collapse `decoder`'s exit ends its Sinkhorn streams with.
+    pub(crate) fn of_decoder(decoder: &Decoder) -> Result<Self, PlanError> {
+        let ExitNorm::HyperConnectionHead(head) = &decoder.exit.norm else {
+            return Err(PlanError::Topology("residual streams without their exit"));
+        };
+        Self::of(ExitMix::of(head)?)
+            .ok_or(PlanError::Topology("Sinkhorn streams ending in a low-rank exit site"))
+    }
+
+    /// `stream_collapse`'s `P`: 1 collapsing by the last site's pre, 0 into
+    /// the mean.
+    pub fn previous(self) -> u64 {
+        match self {
+            Self::LastPre => 1,
+            Self::Mean => 0,
+        }
+    }
 }
 
 /// The Sinkhorn mixing's numerics, as `stream_mix_sinkhorn` takes them: its
@@ -113,7 +166,9 @@ impl<D> crate::programs::graph::facts::Numbers<D> for StreamsGeometry<D, D> {
             streams: self.streams,
             mixing: match self.mixing {
                 StreamsMixing::LowRank { rank } => StreamsMixing::LowRank { rank: f(rank) },
-                StreamsMixing::Sinkhorn(iterations) => StreamsMixing::Sinkhorn(f(iterations)),
+                StreamsMixing::Sinkhorn { input, numerics: iterations } => {
+                    StreamsMixing::Sinkhorn { input, numerics: f(iterations) }
+                }
             },
         }
     }
@@ -136,15 +191,24 @@ impl<D: Clone, M> StreamsGeometry<D, M> {
                 streams: self.streams,
                 rank: rank.clone(),
             }),
-            StreamsMixing::Sinkhorn(_) => None,
+            StreamsMixing::Sinkhorn { .. } => None,
         }
     }
 
     /// The Sinkhorn numerics, of Sinkhorn mixing.
     pub fn sinkhorn(&self) -> Option<&M> {
         match &self.mixing {
-            StreamsMixing::Sinkhorn(mixing) => Some(mixing),
+            StreamsMixing::Sinkhorn { numerics, .. } => Some(numerics),
             StreamsMixing::LowRank { .. } => None,
+        }
+    }
+
+    /// The width of the `pre` a row of the streams carries from site to
+    /// site: S under Sinkhorn mixing by the previous site's, none else.
+    pub fn carried_pre(&self) -> Option<u64> {
+        match self.mixing {
+            StreamsMixing::Sinkhorn { input: SinkhornInput::PreviousSite, .. } => Some(self.streams),
+            StreamsMixing::Sinkhorn { input: SinkhornInput::OwnSite, .. } | StreamsMixing::LowRank { .. } => None,
         }
     }
 
@@ -153,7 +217,7 @@ impl<D: Clone, M> StreamsGeometry<D, M> {
     pub fn join_width(&self) -> u64 {
         match self.mixing {
             StreamsMixing::LowRank { .. } => self.streams,
-            StreamsMixing::Sinkhorn(_) => self.streams + self.streams * self.streams,
+            StreamsMixing::Sinkhorn { .. } => self.streams + self.streams * self.streams,
         }
     }
 }
@@ -178,7 +242,9 @@ impl StreamsGeometry {
             streams: self.streams,
             mixing: match self.mixing {
                 StreamsMixing::LowRank { rank } => StreamsMixing::LowRank { rank },
-                StreamsMixing::Sinkhorn(mixing) => StreamsMixing::Sinkhorn(u64::from(mixing.iterations)),
+                StreamsMixing::Sinkhorn { input, numerics } => {
+                    StreamsMixing::Sinkhorn { input, numerics: u64::from(numerics.iterations) }
+                }
             },
         }
     }
@@ -198,12 +264,16 @@ impl StreamsGeometry {
                 iterations,
                 epsilon,
                 norm_epsilon,
-            } => StreamsMixing::Sinkhorn(SinkhornMixing {
-                iterations: u32::try_from(iterations)
-                    .map_err(|_| PlanError::Arithmetic("Sinkhorn iterations exceed u32"))?,
-                epsilon: epsilon as f32,
-                norm_epsilon: norm_epsilon as f32,
-            }),
+                input,
+            } => StreamsMixing::Sinkhorn {
+                input,
+                numerics: SinkhornMixing {
+                    iterations: u32::try_from(iterations)
+                        .map_err(|_| PlanError::Arithmetic("Sinkhorn iterations exceed u32"))?,
+                    epsilon: epsilon as f32,
+                    norm_epsilon: norm_epsilon as f32,
+                },
+            },
         };
         Ok(Some(Self {
             hidden,
@@ -242,10 +312,11 @@ impl<D: Clone> LowRankGeometry<D> {
 
 /// What crosses every boundary between graphs of the residual: its rows (the
 /// `[rows, S * H]` streams, or one `[rows, H]` stream), and under Sinkhorn
-/// mixing the `[rows, S]` F32 `pre` of the last site run over them, which
-/// the next site reads. A block's graph reads and leaves one, as its input
-/// and output ports; a split block's front leaves it to its back; a run
-/// binds it from graph to graph.
+/// mixing by the previous site's pre the `[rows, S]` F32 `pre` of the last
+/// site run over them, which the next site reads
+/// ([`StreamsGeometry::carried_pre`]). A block's graph reads and leaves one,
+/// as its input and output ports; a split block's front leaves it to its
+/// back; a run binds it from graph to graph.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ResidualCarry<T> {
     pub rows: T,
@@ -366,10 +437,11 @@ pub enum BlockStreams {
 
 impl BlockStreams {
     /// The block's streams of `geometry`, whose low-rank sites `low_rank`
-    /// binds.
+    /// binds and whose Sinkhorn streams end in `sinkhorn_exit`'s collapse.
     pub(crate) fn of(
         geometry: StreamsGeometry,
         low_rank: impl FnOnce(LowRankGeometry) -> Result<StreamsBinding, PlanError>,
+        sinkhorn_exit: impl FnOnce() -> Result<SinkhornExit, PlanError>,
     ) -> Result<Self, PlanError> {
         Ok(match geometry.mixing {
             StreamsMixing::LowRank { rank } => Self::LowRank(low_rank(LowRankGeometry {
@@ -377,23 +449,35 @@ impl BlockStreams {
                 streams: geometry.streams,
                 rank,
             })?),
-            StreamsMixing::Sinkhorn(mixing) => Self::Sinkhorn(SinkhornBinding {
+            StreamsMixing::Sinkhorn { input, numerics } => Self::Sinkhorn(SinkhornBinding {
                 hidden: geometry.hidden,
                 streams: geometry.streams,
-                mixing,
+                input,
+                mixing: numerics,
+                exit: sinkhorn_exit()?,
             }),
         })
     }
 }
 
-/// A block's Sinkhorn streams: S streams of `hidden` and their mixing,
-/// whose sites' weights are F32 (`is_fixed_dense_role`), so their entries
-/// bind no element.
+/// A block's Sinkhorn streams: S streams of `hidden` and their mixing by
+/// the `pre` `input` names, whose sites' weights are F32
+/// (`is_fixed_dense_role`), so their entries bind no element.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SinkhornBinding {
     pub hidden: u64,
     pub streams: u64,
+    pub input: SinkhornInput,
     pub mixing: SinkhornMixing,
+    /// The collapse the decoder's exit ends the streams with.
+    pub exit: SinkhornExit,
+}
+
+impl SinkhornBinding {
+    /// Its sites' `P` (`carried`).
+    pub fn carried(&self) -> u64 {
+        carried(self.input)
+    }
 }
 
 /// The low-rank streams a block's graph reads and writes, and the elements
@@ -515,4 +599,32 @@ pub(crate) fn binding(
         exit: exit.map(site).transpose()?,
         activation,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::error::PlanError;
+    use crate::operators::admit;
+    use crate::planning::fixtures::{
+        qwen4exp_fixture_definition, sinkhorn_fixture_definition_of,
+        sinkhorn_fixture_definition_over,
+    };
+    use magnitude_family_contracts::{ExitSite, SinkhornInput};
+
+    /// A mean exit is admitted over Sinkhorn streams of any count, a power
+    /// of two or not (its collapse sums then divides by S, exact at either),
+    /// and refused by name over low-rank streams, which have no collapse.
+    #[test]
+    fn a_mean_exit_is_admitted_over_sinkhorn_streams_of_any_count() {
+        let mean = sinkhorn_fixture_definition_of(2, SinkhornInput::OwnSite, ExitSite::Mean);
+        assert_eq!(admit(&mean, false), Ok(()));
+        let three = sinkhorn_fixture_definition_over(3, 2, SinkhornInput::OwnSite, ExitSite::Mean);
+        assert_eq!(admit(&three, false), Ok(()));
+        let mut low_rank = qwen4exp_fixture_definition();
+        low_rank.decoder.exit.norm = mean.decoder.exit.norm.clone();
+        assert_eq!(
+            admit(&low_rank, false),
+            Err(PlanError::Unsupported("a mean exit over low-rank hyper-connection streams"))
+        );
+    }
 }

@@ -183,14 +183,17 @@ pub fn describe_projector(
         projection_norm: Some(r.norm("mm.input_norm", joined)?),
         stages: vec![
             MergerStage {
+                norm: None,
                 linear: r.linear("mm.up", joined, joined)?,
                 activation: Some(VisionActivation::GeluErf),
             },
             MergerStage {
+                norm: None,
                 linear: r.linear("mm.down", output_hidden, joined)?,
                 activation: None,
             },
         ],
+        feed_forward: None,
         output_norm: None,
     };
     // The released graph reads the four boundary tokens from the target's

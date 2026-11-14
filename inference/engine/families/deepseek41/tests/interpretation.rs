@@ -112,6 +112,7 @@ fn slice_a_binds_every_layer_zero_form_from_its_header() {
                 iterations: integer(&directory, "hyper_connection.sinkhorn_iterations"),
                 epsilon: number(&directory, "hyper_connection.epsilon"),
                 norm_epsilon: epsilon,
+                input: magnitude_family_contracts::SinkhornInput::PreviousSite,
             },
         })
     );

@@ -8,7 +8,8 @@ use magnitude_kernels::{
     attention_append_dense, attention_append_k8v4, attention_decode, attention_decode_k8v4,
     attention_output, attention_prefill, attention_prefill_k8v4, attention_project, dense_expand,
     dense_output, embedding_rows, gated_delta_chunk, gated_delta_project,
-    gated_delta_project_convolved, gated_delta_step, gated_delta_step_convolved, indexer_select,
+    gated_delta_project_convolved, gated_delta_step, gated_delta_step_convolved, kimi_delta_chunk,
+    kimi_delta_step,
     post_norm_residual, project_rows, readout_exact_rows, readout_features_rows, readout_head_rows,
     readout_planes_rows, readout_refine_rows, readout_selected_rows, readout_top_rows,
     routed_combine, routed_expand, routed_experts, routed_group, routed_output, routed_route,
@@ -21,7 +22,7 @@ use magnitude_kernels::{
 };
 use magnitude_kernels::{short_conv_project, short_conv_rows};
 use magnitude_kernels::{
-    candidate_blocks, candidate_rows, indexer_keys, indexer_score, pool_rows, rows_topk,
+    candidate_blocks, candidate_rows, indexer_keys, indexer_score, pool_rows, rows_topk, unit_reads,
 };
 use seismic::NativeKernel;
 use std::collections::HashMap;
@@ -487,6 +488,8 @@ pub struct AttentionKernels {
     pub output: SublayerOutput<NativeKernel<attention_output::Entry>>,
     /// A grouped output's first product (`AttentionBinding::grouped`).
     pub grouped: Option<NativeKernel<project_rows::Entry>>,
+    /// An absorbed query's per-head products (`AttentionBinding::absorbed`).
+    pub absorbed: Option<NativeKernel<project_rows::Entry>>,
     /// A selected read's indexer and selected prefill
     /// (`AttentionBinding::selection`).
     pub selection: Option<SelectionKernels>,
@@ -557,15 +560,28 @@ pub struct LowRankQueryKernels {
     pub project: NativeKernel<attention_project::Entry>,
 }
 
-/// A selected read's entries: the indexer's normed query and raw-key
-/// projection (`attention_project`: query rows `heads · width`, key rows
-/// `width`), `indexer_select`, and the codec's prefill in its WorkList form
-/// (`B` words) for the classes that score.
+/// A selected read's entries over token rows (`graph::select`): its keys'
+/// projection, widening and pooling, its indexer, its reads (`unit_reads`
+/// and `candidate_rows` listing a row's units), and the codec's prefill in
+/// its WorkList form (`B` words) for the classes that score.
 #[derive(Clone, Debug)]
 pub struct SelectionKernels {
-    pub project: NativeKernel<attention_project::Entry>,
-    pub select: NativeKernel<indexer_select::Entry>,
+    pub keys: SelectionKeyKernels,
+    pub indexer: IndexerKernels,
+    pub reads: NativeKernel<unit_reads::Entry>,
+    pub rows: NativeKernel<candidate_rows::Entry>,
     pub prefill: SelectedPrefillKernel,
+}
+
+/// A selected read's keys' entries: the tokens' `u` (and gated, `g`)
+/// projection over `x` (`attention_project`), the widening of an ungated
+/// `u` published in A to F32 (`widen_rows`), and the pooling into F32 keys
+/// (`pool_rows`).
+#[derive(Clone, Debug)]
+pub struct SelectionKeyKernels {
+    pub project: NativeKernel<attention_project::Entry>,
+    pub widen: NativeKernel<widen_rows::Entry>,
+    pub pool: NativeKernel<pool_rows::Entry>,
 }
 
 /// The WorkList prefill of a selected read's history codec.
@@ -643,13 +659,36 @@ pub struct DenseKernels {
 /// rest), and the plain residual output projection.
 #[derive(Clone, Debug)]
 pub struct RecurrentKernels {
-    /// The chunked row classes' projection, and every row class's in the
-    /// step form.
-    pub project: NativeKernel<gated_delta_project::Entry>,
-    /// The step row classes, by the backend's `StepForm`.
-    pub step: RecurrentStepKernels,
-    pub chunk: NativeKernel<gated_delta_chunk::Entry>,
+    pub form: RecurrentFormKernels,
     pub output: NativeKernel<attention_output::Entry>,
+}
+
+/// The projection and state entries of a layer's `RecurrentForm`.
+#[derive(Clone, Debug)]
+pub enum RecurrentFormKernels {
+    /// Gated DeltaNet.
+    Gated {
+        /// The chunked row classes' projection, and every row class's in
+        /// the step form.
+        project: NativeKernel<gated_delta_project::Entry>,
+        /// The step row classes, by the backend's `StepForm`.
+        step: RecurrentStepKernels,
+        chunk: NativeKernel<gated_delta_chunk::Entry>,
+    },
+    /// Kimi Delta Attention.
+    Kimi(KimiKernels),
+}
+
+/// A Kimi Delta Attention layer's entries: the projection of q | k | v, the
+/// gate's and decay's down products and beta (`attention_project`), their up
+/// projections (`project_rows`) and the state entries.
+#[derive(Clone, Debug)]
+pub struct KimiKernels {
+    pub project: NativeKernel<attention_project::Entry>,
+    pub gate_up: NativeKernel<project_rows::Entry>,
+    pub alpha_up: NativeKernel<project_rows::Entry>,
+    pub step: NativeKernel<kimi_delta_step::Entry>,
+    pub chunk: NativeKernel<kimi_delta_chunk::Entry>,
 }
 
 /// The step row classes' entries, by the backend's `StepForm`.

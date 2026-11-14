@@ -1,17 +1,18 @@
 //! The streams' graph fragments: the widening of the embedded rows into the
 //! streams (block 0), a mix site over the streams (each sublayer's, and a
 //! low-rank decoder's exit), and under Sinkhorn mixing the exit's collapse
-//! and the join of a sublayer whose output joins nothing itself.
+//! (by the last site's pre, or into the streams' mean) and the join of a
+//! sublayer whose output joins nothing itself.
 
 use super::{
-    BlockStreams, LowRankGeometry, MixDownBinding, MixUpBinding, ResidualCarry, SinkhornTopology,
-    Sites, StreamsGeometry,
+    BlockStreams, LowRankGeometry, MixDownBinding, MixUpBinding, ResidualCarry, SinkhornExit,
+    SinkhornTopology, Sites, StreamsGeometry, StreamsMixing, carried,
 };
 use crate::native::{MixingKernels, StreamsKernels};
 use crate::programs::graph::{GraphError, draft::GraphDraft};
 use crate::programs::native_constants::GraphConstant;
 use crate::programs::native_target_graph::{PlannedWeights, WeightPort, weight};
-use magnitude_family_contracts::{WeightKind, WeightScope};
+use magnitude_family_contracts::{SinkhornInput, WeightKind, WeightScope};
 use magnitude_kernels::{
     repeat_rows, stream_collapse, stream_join, stream_mix_down, stream_mix_sinkhorn, stream_mix_up,
 };
@@ -239,12 +240,12 @@ where
             },
         )?
         .value;
-    // Under Sinkhorn mixing the first site reads the one-hot pre
-    // `[1, 0, .., 0]` (`HyperConnectionMixing::Sinkhorn`).
+    // Under Sinkhorn mixing by the previous site's pre the first site reads
+    // the one-hot pre `[1, 0, .., 0]` (`SinkhornInput::PreviousSite`).
     let pre = geometry
-        .sinkhorn()
-        .map(|_| {
-            let one_hot = GraphConstant::row_one_hot(graph, rows.clone(), geometry.streams, Some("M"))?;
+        .carried_pre()
+        .map(|streams| {
+            let one_hot = GraphConstant::row_one_hot(graph, rows.clone(), streams, Some("M"))?;
             let pre = one_hot.port().tensor().clone();
             constants.push(one_hot);
             Ok::<_, GraphError>(pre)
@@ -338,15 +339,17 @@ where
 
 /// A Sinkhorn site's results: its sublayer's input `[rows, H]` (which the
 /// sublayer's input norm normalizes), its `pre` `[rows, S]` (the next
-/// site's previous) and its join row post | comb `[rows, S + S * S]`.
+/// site's previous, when sites mix by the previous site's) and its join row
+/// post | comb `[rows, S + S * S]`.
 pub(crate) struct SinkhornSite {
     pub input: WorkflowTensor,
-    pub pre: WorkflowTensor,
+    pub pre: Option<WorkflowTensor>,
     pub join: WorkflowTensor,
 }
 
-/// The Sinkhorn site of `scope` over `carry`'s `[rows, S * H]` streams and
-/// the previous site's pre: its function, base and scale weights are the
+/// The Sinkhorn site of `scope` over `carry`'s `[rows, S * H]` streams,
+/// mixing by the previous site's pre `carry` holds or by its own (the
+/// streams' `SinkhornInput`): its function, base and scale weights are the
 /// scope's hyper-connection roles.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sinkhorn_site<'a, G: GraphDraft + 'a, D: Clone>(
@@ -359,6 +362,7 @@ pub(crate) fn sinkhorn_site<'a, G: GraphDraft + 'a, D: Clone>(
     carry: &ResidualCarry<WorkflowTensor>,
     rows: impl Into<Dim>,
     weights: &mut Vec<(WeightPort, NativePort)>,
+    constants: &mut Vec<GraphConstant>,
 ) -> Result<SinkhornSite, GraphError>
 where
     D: Into<Dim>,
@@ -366,15 +370,16 @@ where
     let geometry = geometry.dims();
     let rows = rows.into();
     let (h, s) = (&geometry.hidden, Dim::from(geometry.streams));
-    let iterations = geometry
-        .sinkhorn()
-        .ok_or("a Sinkhorn site over low-rank streams")?
-        .word::<u32>()
-        .ok_or("Sinkhorn iterations exceed u32")?;
-    let previous = carry
-        .pre
-        .as_ref()
-        .ok_or("Sinkhorn streams without the previous site's pre")?;
+    let StreamsMixing::Sinkhorn { input, numerics: iterations } = &geometry.mixing else {
+        return Err("a Sinkhorn site over low-rank streams".into());
+    };
+    let (input, iterations) = (*input, iterations.word::<u32>().ok_or("Sinkhorn iterations exceed u32")?);
+    // A site mixing by its own pre reads none: `[rows, 0]`.
+    let previous = match (input, &carry.pre) {
+        (SinkhornInput::PreviousSite, Some(pre)) => pre.clone(),
+        (SinkhornInput::OwnSite, None) => GraphConstant::absent_rows(graph, rows.clone(), Some("M"), constants)?,
+        _ => return Err("a Sinkhorn site's carried pre disagrees with its mixing".into()),
+    };
     let streams = carry.rows.reshape(&[&rows, &s, h]);
     let mut weight = |kind| weight(graph, load, scope, kind, weights);
     let (function, base, scale) = (
@@ -384,10 +389,10 @@ where
     );
     let site = graph.enqueue(
         entry,
-        &[("M", &rows), ("H", h), ("S", &s)],
+        &[("M", &rows), ("H", h), ("S", &s), ("P", &Dim::from(carried(input)))],
         stream_mix_sinkhorn::WorkflowArgs {
             hidden: (&streams).into(),
-            previous: previous.into(),
+            previous: (&previous).into(),
             function: (&function).into(),
             base: (&base).into(),
             scale: (&scale).into(),
@@ -398,19 +403,21 @@ where
     )?;
     Ok(SinkhornSite {
         input: site.r0,
-        pre: site.r1,
+        pre: (input == SinkhornInput::PreviousSite).then_some(site.r1),
         join: site.r2,
     })
 }
 
-/// The decoder's exit over `carry`'s Sinkhorn streams: their collapse by the
-/// last site's pre `[rows, H]`, which the readout normalizes.
+/// The decoder's exit over `carry`'s Sinkhorn streams: their collapse
+/// `[rows, H]` as `exit` names it, which the readout normalizes.
 pub(crate) fn collapse<'a, G: GraphDraft + 'a, D: Clone>(
     graph: &mut G,
     entry: G::Binding<'a, stream_collapse::Entry>,
     geometry: StreamsGeometry<D, D>,
     carry: &ResidualCarry<WorkflowTensor>,
+    exit: SinkhornExit,
     rows: impl Into<Dim>,
+    constants: &mut Vec<GraphConstant>,
 ) -> Result<WorkflowTensor, GraphError>
 where
     D: Into<Dim>,
@@ -418,14 +425,18 @@ where
     let geometry = geometry.dims();
     let rows = rows.into();
     let (h, s) = (&geometry.hidden, Dim::from(geometry.streams));
-    let pre = carry.pre.as_ref().ok_or("the exit of Sinkhorn streams without the last site's pre")?;
+    // The mean reads no pre: `[rows, 0]`.
+    let pre = match exit {
+        SinkhornExit::LastPre => carry.pre.clone().ok_or("the exit of Sinkhorn streams without the last site's pre")?,
+        SinkhornExit::Mean => GraphConstant::absent_rows(graph, rows.clone(), Some("M"), constants)?,
+    };
     Ok(graph
         .enqueue(
             entry,
-            &[("M", &rows), ("H", h), ("S", &s)],
+            &[("M", &rows), ("H", h), ("S", &s), ("P", &Dim::from(exit.previous()))],
             stream_collapse::WorkflowArgs {
                 hidden: (&carry.rows.reshape(&[&rows, &s, h])).into(),
-                pre: pre.into(),
+                pre: (&pre).into(),
             },
         )?
         .value)

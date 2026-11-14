@@ -98,6 +98,13 @@ fn write_gguf(
                     }
                 }
             }
+            // E4M3 codes of a sign, an exponent of one to eight and a mantissa: finite, none of the NaN codes.
+            Encoding::F8E4M3 => {
+                for _ in 0..values {
+                    let code = next();
+                    payload.push((((code >> 7) & 1) << 7 | (1 + (code >> 3) % 8) << 3 | (code & 7)) as u8);
+                }
+            }
             other => panic!("the fixture stores no {other:?} tensor"),
         }
     }
@@ -1056,7 +1063,7 @@ fn drafter_steps_record_no_graph_beyond_their_charge() {
     let limits = limits(DrafterSteps::ROWS, true, 1, 0);
     let (mut domain, mut bindings, _, _) = load_with(&catalog, &definition, &package, cuda, limits, Banked::Resident, method);
     let row_bytes = definition.decoder.hidden as usize * definition.decoder.activation_dtype.bytes();
-    let mut steps = DrafterSteps { row_bytes, recorded: Vec::new() };
+    let mut steps = DrafterSteps { backend: cuda, row_bytes, recorded: Vec::new(), drafted: Vec::new() };
     for pass in [1, 2] {
         let first = steps.recorded.len();
         let requests = [RequestId(2 * pass - 1), RequestId(2 * pass)];
@@ -1083,16 +1090,152 @@ fn drafter_steps_record_no_graph_beyond_their_charge() {
     std::fs::remove_dir_all(&directory).expect("the fixture's directory is removed");
 }
 
+/// A head that does not select reads each entry row's accepted history
+/// alone, whatever the entry pass's rows: its launch's earlier rows are fresh
+/// to the launch, not stored history. A draft from a two-row entry pass runs
+/// (the lane's validation of each row's visible spans agrees with the
+/// producer's) on a head of the plain fixture, on the CPU backend.
+#[test]
+fn a_head_without_selection_drafts_from_a_multi_row_entry_pass() {
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+    let backend = seismic::BackendName::Cpu;
+    assert!(available(&catalog, backend), "the CPU backend is always available");
+    let mtp = crate::planning::fixtures::with_mtp_head(crate::planning::fixtures::fixture_definition());
+    let (directory, definition, package) = fixture_with("head-multi-row-entry", mtp, crate::planning::fixtures::fixture_manifest);
+    let method = PlannedMethod::Mtp {
+        greedy_proposals: DrafterSteps::PROPOSALS as u8,
+        sampled_proposals: DrafterSteps::PROPOSALS as u8,
+        widths: crate::DraftWidths::Adaptive,
+    };
+    let (mut domain, bindings, _, _) =
+        load_with(&catalog, &definition, &package, backend, limits(DrafterSteps::ROWS, true, 1, 0), Banked::Resident, method);
+    let row_bytes = definition.decoder.hidden as usize * definition.decoder.activation_dtype.bytes();
+    let mut steps = DrafterSteps { backend, row_bytes, recorded: Vec::new(), drafted: Vec::new() };
+    let request = RequestId(1);
+    let (mut position, mut bindings) = steps.prime(&mut domain, bindings, request);
+    for _ in 0..2 {
+        bindings = steps.draft_from(&mut domain, bindings, std::iter::once((request, &mut position)), 2, DrafterSteps::PROPOSALS);
+    }
+    assert_eq!(steps.drafted.len(), 2);
+    domain.close(request).unwrap_or_else(|error| panic!("{error}"));
+    drop(bindings);
+    drop(domain);
+    std::fs::remove_dir_all(&directory).expect("the fixture's directory is removed");
+}
+
+/// The limits the harness's drafting load resolves from its step allowances
+/// (`StepAllowances`, which `resource_limits` and the harness read too).
+fn harness_drafting_limits() -> ResourceLimits {
+    let steps = crate::StepAllowances::EVALUATION_DRAFTING;
+    ResourceLimits {
+        max_launch_slots: steps.launch_slots(),
+        max_selected_rows: steps.selection_bound(),
+        max_drafting_slots: steps.selection_bound(),
+        ..limits(steps.launch_rows(), true, 1, 0)
+    }
+}
+
+/// A load of the GLM MTP head (a general routed feed-forward over one residual) binds its graphs on every backend
+/// this host has, at a launch bound past the routed decode form's rows: its head classes certify, seal and bind the constants and
+/// weights its prepared layouts hold. The load runs no step.
+#[test]
+fn glm_mtp_head_loads_and_binds_its_graphs_on_every_available_backend() {
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+    let method = PlannedMethod::Mtp {
+        greedy_proposals: DrafterSteps::PROPOSALS as u8,
+        sampled_proposals: DrafterSteps::PROPOSALS as u8,
+        widths: crate::DraftWidths::Adaptive,
+    };
+    for backend in [seismic::BackendName::Metal, seismic::BackendName::Cuda, seismic::BackendName::Vulkan] {
+        if !available(&catalog, backend) {
+            continue;
+        }
+        let (definition, manifest) = crate::planning::fixtures::glm_slice_b_mtp_fixture();
+        let (directory, definition, package) = fixture_stored("glm-mtp-head", definition, &manifest, &|_| None);
+        // The harness's drafting load: the head's grouped and many-slot classes certify and bind too.
+        let limits = harness_drafting_limits();
+        let (domain, bindings, _, _) = load_with(&catalog, &definition, &package, backend, limits, Banked::Resident, method);
+        drop(bindings);
+        drop(domain);
+        std::fs::remove_dir_all(&directory).expect("the fixture's directory is removed");
+    }
+}
+
+/// The GLM MTP head reads the rows its own pooled indexer picks, on every
+/// backend this host has. Its prompt rows enter its state, then drafts of two
+/// proposals each accept their entry row alone, so every round rolls the
+/// chained row's pooled keys back. The same drafts run over two loads that
+/// differ only in the head's indexer weights, its own and the body's tied
+/// ones: until a row of the head sees more complete units than the indexer
+/// picks, the head reads its whole history and the loads draft bit for bit
+/// alike; from the first round that scores, the picks decide what the head
+/// reads, so the drafts differ. They would not were the head to read the
+/// body's picks or never to score.
+#[test]
+fn glm_mtp_head_drafts_from_the_rows_its_own_indexer_picks_on_every_available_backend() {
+    use crate::planning::fixtures::{GLM_SLICE_B_RATE, GLM_SLICE_B_TOP};
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+    let method = PlannedMethod::Mtp {
+        greedy_proposals: DrafterSteps::PROPOSALS as u8,
+        sampled_proposals: DrafterSteps::PROPOSALS as u8,
+        widths: crate::DraftWidths::Adaptive,
+    };
+    // A round's last row sits at position `PRIMED + round + PROPOSALS - 1`
+    // and sees the units complete through it, `(position + 1) / RATE`.
+    let scoring = ((GLM_SLICE_B_TOP + 1) * GLM_SLICE_B_RATE) as usize - DrafterSteps::PRIMED - DrafterSteps::PROPOSALS;
+    let rounds = scoring + 4;
+    for backend in [seismic::BackendName::Cpu, seismic::BackendName::Metal, seismic::BackendName::Cuda, seismic::BackendName::Vulkan] {
+        if !available(&catalog, backend) {
+            continue;
+        }
+        let drafts = |own_indexer: bool| {
+            let (definition, manifest) = crate::planning::fixtures::glm_slice_b_mtp_fixture_of(own_indexer);
+            let (directory, definition, package) = fixture_stored("glm-mtp-head-drafts", definition, &manifest, &|_| None);
+            let (mut domain, bindings, _, _) =
+                load_with(&catalog, &definition, &package, backend, limits(DrafterSteps::ROWS, true, 1, 0), Banked::Resident, method);
+            let row_bytes = definition.decoder.hidden as usize * definition.decoder.activation_dtype.bytes();
+            let mut steps = DrafterSteps { backend, row_bytes, recorded: Vec::new(), drafted: Vec::new() };
+            let request = RequestId(1);
+            let (mut position, mut bindings) = steps.prime(&mut domain, bindings, request);
+            assert_eq!(position, DrafterSteps::PRIMED);
+            for _ in 0..rounds {
+                bindings = steps.draft(&mut domain, bindings, std::iter::once((request, &mut position)), DrafterSteps::PROPOSALS);
+            }
+            domain.close(request).unwrap_or_else(|error| panic!("{error}"));
+            drop(bindings);
+            drop(domain);
+            std::fs::remove_dir_all(&directory).expect("the fixture's directory is removed");
+            steps.drafted
+        };
+        let own = drafts(true);
+        let tied = drafts(false);
+        assert_eq!(own.len(), rounds);
+        assert_eq!(own[..scoring], tied[..scoring], "{backend:?}: drafts before any row scores read the whole history");
+        assert!(
+            own[scoring..] != tied[scoring..],
+            "{backend:?}: drafts from the first scoring round do not depend on the head's indexer"
+        );
+    }
+}
+
 /// Drafter steps on CUDA, each step's recordings kept by family.
 struct DrafterSteps {
+    backend: seismic::BackendName,
     /// Bytes of a drafter entry row's conditioning feature.
     row_bytes: usize,
     recorded: Vec<(String, Vec<(&'static str, u64)>)>,
+    /// What each draft proposed, in order.
+    drafted: Vec<Outcome>,
 }
 
 impl DrafterSteps {
     /// Rows of a prompt chunk, the launch row bound.
     const ROWS: usize = 4;
+    /// The head rows a primed prompt leaves (`prime`).
+    const PRIMED: usize = 2 * Self::ROWS - 1;
     /// The most proposals a draft makes.
     const PROPOSALS: usize = 2;
     /// The families a drafter step runs graphs of.
@@ -1108,19 +1251,19 @@ impl DrafterSteps {
     /// successor, so both entries are in flight at once. Returns the head's
     /// position after them.
     fn prime(&mut self, domain: &mut ExecutorDomain, mut bindings: crate::StateBindings, request: RequestId) -> (usize, crate::StateBindings) {
-        let cuda = seismic::BackendName::Cuda;
+        let backend = self.backend;
         domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
         domain.open_state(&mut bindings, request, None).unwrap();
         let before = domain.family_graph_replays();
         domain.plan_successors(vec![Self::primed_chunk(request, 1)]);
         for chunk in 0..2 {
-            let (_, returned) = run(domain, bindings, Self::primed_chunk(request, chunk), chunk > 0, cuda);
+            let (_, returned) = run(domain, bindings, Self::primed_chunk(request, chunk), chunk > 0, backend);
             bindings = returned;
         }
         self.keep(domain, before, format!("{request:?}'s two primed chunks"));
         // An embedded head's entry pairs each token with the feature of the
         // row before it, so it trails the target by a row.
-        (2 * Self::ROWS - 1, bindings)
+        (Self::PRIMED, bindings)
     }
 
     /// Prompt chunk `chunk` of two of `request`'s prompt, its features
@@ -1169,8 +1312,21 @@ impl DrafterSteps {
     fn draft<'p>(
         &mut self,
         domain: &mut ExecutorDomain,
+        bindings: crate::StateBindings,
+        drafting: impl Iterator<Item = (RequestId, &'p mut usize)>,
+        proposals: usize,
+    ) -> crate::StateBindings {
+        self.draft_from(domain, bindings, drafting, 1, proposals)
+    }
+
+    /// [`Self::draft`] from `entry_rows` entry rows, all of which the round
+    /// accepts.
+    fn draft_from<'p>(
+        &mut self,
+        domain: &mut ExecutorDomain,
         mut bindings: crate::StateBindings,
         drafting: impl Iterator<Item = (RequestId, &'p mut usize)>,
+        entry_rows: usize,
         proposals: usize,
     ) -> crate::StateBindings {
         assert!(proposals <= Self::PROPOSALS, "a draft makes at most the method's proposals");
@@ -1178,13 +1334,13 @@ impl DrafterSteps {
         let operations = drafting
             .map(|(request, position)| {
                 let at = *position;
-                *position += 1;
+                *position += entry_rows;
                 drafted.push(request);
                 Operation::Head {
                     request,
                     phase: crate::HeadPhase::Generation,
-                    tokens: vec![TokenId((at * 13 % 256) as u32)],
-                    conditioning: crate::FeatureRows::new(vec![0; self.row_bytes].into(), 1).unwrap(),
+                    tokens: (0..entry_rows).map(|row| TokenId(((at + row) * 13 % 256) as u32)).collect(),
+                    conditioning: crate::FeatureRows::new(vec![0; self.row_bytes * entry_rows].into(), entry_rows).unwrap(),
                     position: at,
                     proposals: (1..=proposals).map(|step| Self::greedy(at + step)).collect(),
                     form: crate::DraftForm::Chained,
@@ -1201,7 +1357,8 @@ impl DrafterSteps {
             .unwrap_or_else(|failure| panic!("{}", failure.error()));
         let (pendings, bindings) = domain.finish_head(flight).unwrap_or_else(|error| panic!("{error}"));
         for pending in pendings {
-            domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }).unwrap_or_else(|error| panic!("{error}"));
+            self.drafted.push(pending.outcome().clone());
+            domain.reconcile(pending, PhysicalDecision { accepted_rows: entry_rows }).unwrap_or_else(|error| panic!("{error}"));
         }
         self.keep(domain, before, format!("a draft of {proposals} proposals by {drafted:?}"));
         bindings
@@ -2582,15 +2739,34 @@ const BOUND: f32 = 2.0 + TIPS;
 /// [`STAGES`]' tips at row scale, in [`BOUND`]'s units.
 const TIPS: f32 = 2.0 * STAGES as f32;
 
+/// The forms of a Sinkhorn fixture: whether each site mixes by its own pre
+/// (GLM-5.3) or by the previous site's (V4.1), and whether the exit takes
+/// the streams' mean or collapses them by the last site's pre.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct SinkhornForm {
+    own: bool,
+    mean: bool,
+}
+
 /// The host reference of the Sinkhorn fixture as written, and the faults it
 /// tells apart from it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum SinkhornHost {
     Faithful,
-    /// Every site reads the one-hot pre, not its predecessor's.
+    /// Every site mixes by the one-hot pre.
     FirstPre,
     /// The routed branch joins without the site's post.
     UnscaledJoin,
+    /// Every site mixes by the other site's pre (its own for the previous
+    /// site's, and the reverse).
+    OtherInput,
+    /// The exit takes the other weights (the last pre for the mean, and the
+    /// reverse).
+    OtherExit,
+}
+
+impl SinkhornHost {
+    const FAULTS: [Self; 4] = [Self::FirstPre, Self::UnscaledJoin, Self::OtherInput, Self::OtherExit];
 }
 
 fn sigmoid(value: f32) -> f32 {
@@ -2623,11 +2799,11 @@ fn rms_normalized(values: &[f32], epsilon: f32) -> Vec<f32> {
     values.iter().map(|value| value * inverse).collect()
 }
 
-/// A Sinkhorn site over streams `x` `[S·H]` after the pre `previous`, in
-/// F32 by its formulas (pre `sigmoid + ε`, post `2·sigmoid`, the comb a row
-/// softmax plus ε, then alternating column and row normalization): the
-/// sublayer's input, the site's pre, post and comb `[S, S]` (source major).
-fn sinkhorn_site(x: &[f32], previous: &[f32], weights: [&[f32]; 3]) -> [Vec<f32>; 4] {
+/// A Sinkhorn site over streams `x` `[S·H]`, in F32 by its formulas (pre
+/// `sigmoid + ε`, post `2·sigmoid`, the comb a row softmax plus ε, then
+/// alternating column and row normalization): the site's pre, post and comb
+/// `[S, S]` (source major).
+fn sinkhorn_site(x: &[f32], weights: [&[f32]; 3]) -> [Vec<f32>; 3] {
     let (s, h, epsilon, iterations) = SINKHORN;
     let [function, base, scale] = weights;
     let inverse = 1.0 / (dot(x, x) / (s * h) as f32 + epsilon).sqrt();
@@ -2656,18 +2832,33 @@ fn sinkhorn_site(x: &[f32], previous: &[f32], weights: [&[f32]; 3]) -> [Vec<f32>
         }
         columns(&mut comb);
     }
-    let input = (0..h).map(|column| (0..s).map(|stream| previous[stream] * x[stream * h + column]).sum()).collect();
-    [input, pre, post, comb]
+    [pre, post, comb]
 }
 
-/// The Sinkhorn fixture's readout features of `token`'s row, from the
-/// resident weights `tensor` reads, rounded where the device rounds
-/// ([`BOUND`]): per block its attention (whose zero output projection adds
-/// nothing, so its join is the comb's mix) and its routed branch over every
-/// expert, joined by post and comb in F32; then the streams collapsed by
-/// the last pre under the unit output norm, published in BF16.
-fn sinkhorn_reference(tensor: &dyn Fn(&str) -> Rc<Vec<f32>>, blocks: usize, token: usize, host: SinkhornHost) -> Vec<f32> {
+/// Streams `x` `[S·H]` collapsed by `weights` `[S]` in F32, in stream order.
+fn collapse_streams(x: &[f32], weights: &[f32]) -> Vec<f32> {
+    let (s, h, ..) = SINKHORN;
+    (0..h).map(|column| (0..s).map(|stream| weights[stream] * x[stream * h + column]).sum()).collect()
+}
+
+/// The Sinkhorn fixture's readout features of `token`'s row under `form`,
+/// from the resident weights `tensor` reads, rounded where the device
+/// rounds ([`BOUND`]): per block its attention (whose zero output
+/// projection adds nothing, so its join is the comb's mix) and its routed
+/// branch over every expert, each reading its site's input (the streams
+/// mixed by the site's own pre or the previous site's), joined by post and
+/// comb in F32; then the streams collapsed by the last pre or into their
+/// mean under the unit output norm, published in BF16.
+fn sinkhorn_reference(
+    tensor: &dyn Fn(&str) -> Rc<Vec<f32>>,
+    blocks: usize,
+    token: usize,
+    form: SinkhornForm,
+    host: SinkhornHost,
+) -> Vec<f32> {
     let (s, h, epsilon, _) = SINKHORN;
+    let own = form.own != (host == SinkhornHost::OtherInput);
+    let mean = form.mean != (host == SinkhornHost::OtherExit);
     let embedding = tensor("embedding");
     let mut x = embedding[token * h..(token + 1) * h].repeat(s);
     let first = (0..s).map(|stream| f32::from(u8::from(stream == 0))).collect::<Vec<_>>();
@@ -2676,8 +2867,14 @@ fn sinkhorn_reference(tensor: &dyn Fn(&str) -> Rc<Vec<f32>>, blocks: usize, toke
         for sublayer in ["attn", "ffn"] {
             let name = |part: &str| format!("blk.{block}.{sublayer}_{part}");
             let [function, base, scale] = ["hc_fn", "hc_base", "hc_scale"].map(|part| tensor(&name(part)));
-            let [input, pre, post, comb] = sinkhorn_site(&x, &previous, [&function, &base, &scale]);
-            previous = if host == SinkhornHost::FirstPre { first.clone() } else { pre };
+            let [pre, post, comb] = sinkhorn_site(&x, [&function, &base, &scale]);
+            let mixing = match host {
+                SinkhornHost::FirstPre => &first,
+                _ if own => &pre,
+                _ => &previous,
+            };
+            let input = collapse_streams(&x, mixing);
+            previous = pre;
             let y = match sublayer {
                 "attn" => vec![0.0; h],
                 _ => routed_reference(tensor, block, &input),
@@ -2691,8 +2888,8 @@ fn sinkhorn_reference(tensor: &dyn Fn(&str) -> Rc<Vec<f32>>, blocks: usize, toke
                 .collect();
         }
     }
-    let collapsed = (0..h).map(|column| (0..s).map(|stream| previous[stream] * x[stream * h + column]).sum()).collect::<Vec<f32>>();
-    rms_normalized(&collapsed, epsilon).into_iter().map(bf16).collect()
+    let weights = if mean { vec![1.0 / s as f32; s] } else { previous };
+    rms_normalized(&collapse_streams(&x, &weights), epsilon).into_iter().map(bf16).collect()
 }
 
 /// Block `block`'s routed branch over its sublayer input `input`, as the
@@ -2739,30 +2936,79 @@ fn routed_reference(tensor: &dyn Fn(&str) -> Rc<Vec<f32>>, block: usize, input: 
 }
 
 /// On CUDA, Metal and the CPU, the Sinkhorn fixture (two blocks of attention
-/// and a general routed feed-forward over four Sinkhorn streams) equals
-/// its host reference (`sinkhorn_reference`, rounding where the device
-/// rounds) at every row of a prompt
+/// and a general routed feed-forward over four Sinkhorn streams, V4.1's
+/// form: each site mixing by the previous site's pre, the exit by the last)
+/// equals its host reference (`sinkhorn_reference`, rounding where the
+/// device rounds) at every row of a prompt
 /// group, whose routed layers split into fronts and backs around the
-/// group's pass, and at a decode step; and a chain of its prompt chunks
-/// equals its chunks one step at a time. The output projections are zero
-/// (rows stay apart), the norms one and the site scales 4 (so each comb is
-/// far from uniform). Every row is within [`BOUND`] of the reference, and
-/// each fault the reference can play (`SinkhornHost`) lies past twice it
-/// at some row.
+/// group's pass, and at decode steps of the same tokens; and a chain of its
+/// prompt chunks equals its chunks one step at a time. The output
+/// projections are zero
+/// (rows stay apart), the norms one and the site scales 16. The streams
+/// enter as copies and differ only by their joins' `post · y`, so a fault in
+/// whose pre mixes them or in the exit's weights shows only as far as the
+/// sites' pre and post differ across streams: at scale 16 a site's mixes
+/// (about ±0.8 each) put its pre and post near 0 or 1 (2 for post) and its
+/// comb near a permutation, so the streams differ by up to `2·y` and two
+/// sites' pre select different streams. Every row is within [`BOUND`] of the
+/// reference, and each fault the reference can play (`SinkhornHost`) lies
+/// past twice it at some prompt row and at some decode row.
 #[test]
 fn a_sinkhorn_decoder_matches_its_host_reference() {
+    assert_sinkhorn_decoder_matches_its_host_reference(SinkhornForm { own: false, mean: false });
+}
+
+/// [`a_sinkhorn_decoder_matches_its_host_reference`] in GLM-5.3's form: each
+/// site mixing by its own pre, carrying none, and the exit the streams'
+/// mean.
+#[test]
+fn an_own_site_mean_exit_sinkhorn_decoder_matches_its_host_reference() {
+    assert_sinkhorn_decoder_matches_its_host_reference(SinkhornForm { own: true, mean: true });
+}
+
+/// A Kimi Delta Attention layer (GLM-5.3-Flash slice A's block) prepares
+/// and qualifies on every backend this host has: qualification reads the
+/// layer's gate and decay ranks from its binding, whichever statics the
+/// backend's `attention_project` keeps (the CPU keeps neither).
+#[test]
+fn a_kimi_delta_layer_qualifies_on_every_backend() {
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+    let (_directory, definition, package) = fixture_valued(
+        "kimi-delta-qualifies",
+        crate::planning::fixtures::glm_slice_fixture_definition(),
+        crate::planning::fixtures::fixture_manifest,
+        &|_| None,
+    );
+    let backends = [
+        seismic::BackendName::Cuda,
+        seismic::BackendName::Metal,
+        seismic::BackendName::Vulkan,
+        seismic::BackendName::Cpu,
+    ];
+    for backend in backends.into_iter().filter(|&backend| available(&catalog, backend)) {
+        load(&catalog, &definition, &package, backend, limits(2, false, 1, 0), Banked::Resident);
+    }
+}
+
+fn assert_sinkhorn_decoder_matches_its_host_reference(form: SinkhornForm) {
+    use magnitude_family_contracts::{ExitSite, SinkhornInput};
     let _placement = crate::test_support::process_placement();
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let constant = |name: &str| match name {
         "o" => Some(0.0),
-        _ if name.ends_with("_hc_scale") => Some(4.0),
+        _ if name.ends_with("_hc_scale") => Some(16.0),
         _ if name.ends_with("norm") => Some(1.0),
         _ => None,
     };
     let blocks = 2;
     let (directory, definition, package) = fixture_valued(
-        "sinkhorn-steps",
-        crate::planning::fixtures::sinkhorn_fixture_definition(blocks as u64),
+        &format!("sinkhorn-steps-own-{}-mean-{}", form.own, form.mean),
+        crate::planning::fixtures::sinkhorn_fixture_definition_of(
+            blocks as u64,
+            if form.own { SinkhornInput::OwnSite } else { SinkhornInput::PreviousSite },
+            if form.mean { ExitSite::Mean } else { ExitSite::PreviousSite },
+        ),
         crate::planning::fixtures::fixture_manifest,
         &constant,
     );
@@ -2793,7 +3039,7 @@ fn a_sinkhorn_decoder_matches_its_host_reference() {
             .collect::<Vec<_>>();
         assert_eq!(device.len(), h, "{label}: the step's BF16 features hold the row's");
         let reference = |host| {
-            references.borrow_mut().entry((token, host)).or_insert_with(|| sinkhorn_reference(&tensor, blocks, token, host)).clone()
+            references.borrow_mut().entry((token, host)).or_insert_with(|| sinkhorn_reference(&tensor, blocks, token, form, host)).clone()
         };
         // In units of 2^-8 of the faithful row's RMS.
         let faithful = reference(SinkhornHost::Faithful);
@@ -2805,7 +3051,11 @@ fn a_sinkhorn_decoder_matches_its_host_reference() {
             let units = (device - host).abs() / unit;
             assert!(units <= allowed, "{label}: {device} is {units} units from {host}, past {allowed}");
         }
-        [error(faithful.clone()), error(reference(SinkhornHost::FirstPre)), error(reference(SinkhornHost::UnscaledJoin))]
+        let mut errors = [error(faithful.clone()); 5];
+        for (at, fault) in SinkhornHost::FAULTS.into_iter().enumerate() {
+            errors[at + 1] = error(reference(fault));
+        }
+        errors
     };
     let backends = [seismic::BackendName::Cuda, seismic::BackendName::Metal, seismic::BackendName::Cpu];
     for backend in backends.into_iter().filter(|&backend| available(&catalog, backend)) {
@@ -2815,31 +3065,46 @@ fn a_sinkhorn_decoder_matches_its_host_reference() {
         assert_steps_equal(&alone, &chained, prompts, &format!("{backend:?} chain of 2"));
         // The most units any prompt row (the chain's rows, being equal) is
         // from the reference, and from each fault.
-        let worse = |worst: [f32; 3], units: [f32; 3]| std::array::from_fn(|at| worst[at].max(units[at]));
-        let mut prompt = [0.0f32; 3];
+        let worse = |worst: [f32; 5], units: [f32; 5]| std::array::from_fn(|at| worst[at].max(units[at]));
+        // The prompt's token at `position` (`prompt_chunk`, request 1).
+        let token = |position: usize| (position * 37 + 11 + 5) % 256;
+        let mut prompt = [0.0f32; 5];
         for (chunk, (bits, _)) in alone[..prompts.chunks].iter().enumerate() {
             for (row, (features, ..)) in bits.iter().enumerate() {
                 let position = chunk * CHUNK_ROWS + row;
-                let token = (position * 37 + 11 + 5) % 256;
-                prompt = worse(prompt, check(features, row, token, &format!("{backend:?} prompt row {position}")));
+                prompt = worse(prompt, check(features, row, token(position), &format!("{backend:?} prompt row {position}")));
             }
         }
+        // The same tokens decoded one step at a time, which carries every
+        // site's pre across the decode graphs: each fault is judged over all
+        // of them, as over the prompt's rows (a row's divergence, and so a
+        // fault's reach, follows its token; the zero output projections
+        // keep rows apart).
         let (mut domain, mut bindings, _, _) = load(&catalog, &definition, &package, backend, limits(2, false, 1, 0), Banked::Resident);
         let request = RequestId(1);
         domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
         domain.open_state(&mut bindings, request, None).unwrap();
-        let mut decode = forward(request, WorkKind::Decode, &[5], 0, false);
-        if let Operation::Forward { demand, .. } = &mut decode {
-            *demand |= crate::batching::Demand::FEATURES;
+        let mut decoded = [0.0f32; 5];
+        for position in 0..prompts.chunks * CHUNK_ROWS {
+            let mut decode = forward(request, WorkKind::Decode, &[token(position) as u32], position, false);
+            if let Operation::Forward { demand, .. } = &mut decode {
+                *demand |= crate::batching::Demand::FEATURES;
+            }
+            let (outcome, returned) = run(&mut domain, bindings, decode, false, backend);
+            bindings = returned;
+            let label = format!("{backend:?} decode row {position}");
+            decoded = worse(decoded, check(&step_bits(&outcome)[0].0, 0, token(position), &label));
         }
-        let (outcome, returned) = run(&mut domain, bindings, decode, false, backend);
-        drop(returned);
-        let decoded = check(&step_bits(&outcome)[0].0, 0, 5, &format!("{backend:?} decode"));
-        for (mode, [within, first, unscaled]) in [("prompt", prompt), ("decode", decoded)] {
-            eprintln!("{backend:?} {mode}: within {within} units (bound {BOUND}); faults at {first} (first pre), {unscaled} (unscaled join)");
+        drop(bindings);
+        for (mode, [within, faults @ ..]) in [("prompt", prompt), ("decode", decoded)] {
+            eprintln!("{backend:?} {form:?} {mode}: within {within} units (bound {BOUND}); faults {:?} at {faults:?}", SinkhornHost::FAULTS);
         }
-        let [_, first, unscaled] = worse(prompt, decoded);
-        assert!(first > 2.0 * BOUND && unscaled > 2.0 * BOUND, "{backend:?}: a fault within twice the bound");
+        for (mode, [_, faults @ ..]) in [("prompt", prompt), ("decode", decoded)] {
+            assert!(
+                faults.iter().all(|units| *units > 2.0 * BOUND),
+                "{backend:?} {form:?} {mode}: a fault within twice the bound: {faults:?}"
+            );
+        }
     }
     std::fs::remove_dir_all(&directory).ok();
 }

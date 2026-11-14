@@ -21,3 +21,6 @@ serde_json.workspace = true
 sha2 = "=0.11.0"
 magnitude-family-dflash = { path = "../dflash" }
 magnitude-family-registry = { path = "../registry" }
+# The worker wire's encoding, which every built definition crosses (`tests/catalog_definitions.rs`).
+postcard.workspace = true
+flate2.workspace = true

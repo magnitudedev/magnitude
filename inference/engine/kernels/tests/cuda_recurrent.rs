@@ -4,6 +4,10 @@
 
 include!("recurrent_stages.rs");
 
+/// CUDA's step and chunk entries, for their bounds.
+const STEP: Native = Native::Step(BackendName::Cuda);
+const CHUNK: Native = Native::Chunk(BackendName::Cuda);
+
 fn cuda() -> Option<Device> {
     seismic_native_tests::devices(&[BackendName::Cuda]).into_iter().next()
 }
@@ -15,9 +19,9 @@ fn cuda_slab_bank_crossing_matches_host_model() {
     let host = case.host();
     for reused in [false, true] {
         let step = case.cuda_with_reused_slab(&device, Element::f32(), Mapping::Step(4, 8), reused);
-        check("cuda slab tape step", &case, &step, &host, (5e-4, 2e-5));
+        check("cuda slab tape step", &case, &step, &host, against_host(STEP));
         let chunk = case.cuda_with_reused_slab(&device, Element::f32(), Mapping::Chunk(32), reused);
-        check("cuda slab tape chunk", &case, &chunk, &host, (5e-4, 2e-5));
+        check("cuda slab tape chunk", &case, &chunk, &host, against_host(CHUNK));
     }
 }
 
@@ -29,51 +33,6 @@ enum Mapping {
 }
 
 impl Case {
-    fn cuda_step(
-        &self,
-        device: &Device,
-        activation: Element,
-        (rows, warps): (u64, u64),
-    ) -> seismic::NativeKernel<gated_delta_step::Entry> {
-        gated_delta_step::native_for_device_with(
-            device,
-            gated_delta_step::Elements {
-                RN: Element::f32(),
-                A: activation,
-            },
-            &NativeSpecialization::new()
-                .with_static("NK", self.geometry.key_heads as u64)
-                .with_static("NV", self.geometry.value_heads as u64)
-                .with_static("W", self.geometry.width as u64)
-                .with_static("C", self.geometry.convolution as u64)
-                .with_launch_param(0, "ROWS", rows)
-                .with_launch_param(0, "WARPS", warps),
-        )
-        .unwrap()
-    }
-
-    fn cuda_chunk(
-        &self,
-        device: &Device,
-        activation: Element,
-        rows: u64,
-    ) -> seismic::NativeKernel<gated_delta_chunk::Entry> {
-        gated_delta_chunk::native_for_device_with(
-            device,
-            gated_delta_chunk::Elements {
-                RN: Element::f32(),
-                A: activation,
-            },
-            &NativeSpecialization::new()
-                .with_static("NK", self.geometry.key_heads as u64)
-                .with_static("NV", self.geometry.value_heads as u64)
-                .with_static("W", self.geometry.width as u64)
-                .with_static("C", self.geometry.convolution as u64)
-                .with_launch_param(1, "ROWS", rows),
-        )
-        .unwrap()
-    }
-
     fn cuda(&self, device: &Device, activation: Element, mapping: Mapping) -> Outcome {
         self.cuda_with_reused_slab(device, activation, mapping, false)
     }
@@ -86,20 +45,21 @@ impl Case {
         reused: bool,
     ) -> Outcome {
         let mut t = self.tensors_with_reused_slab(device, activation, reused);
-        let gated = match mapping {
-            Mapping::Step(rows, warps) => {
-                self.cuda_step(device, activation, (rows, warps))
-                    .call(t.step_args(self))
-                    .unwrap()
-                    .value
-            }
-            Mapping::Chunk(rows) => {
-                self.cuda_chunk(device, activation, rows)
-                    .call(t.chunk_args(self))
-                    .unwrap()
-                    .value
-            }
+        let statics = NativeSpecialization::new()
+            .with_static("NK", self.geometry.key_heads as u64)
+            .with_static("NV", self.geometry.value_heads as u64)
+            .with_static("W", self.geometry.width as u64)
+            .with_static("C", self.geometry.convolution as u64);
+        let (chunk, specialization) = match mapping {
+            Mapping::Step(rows, warps) => (
+                false,
+                statics
+                    .with_launch_param(0, "ROWS", rows)
+                    .with_launch_param(0, "WARPS", warps),
+            ),
+            Mapping::Chunk(rows) => (true, statics.with_launch_param(1, "ROWS", rows)),
         };
+        let gated = t.run(device, self, activation, chunk, &specialization);
         Outcome {
             gated: read(&gated),
             window: read(&t.window),
@@ -122,15 +82,17 @@ fn cuda_step_and_chunk_match_the_portable_body() {
                 &case,
                 &step,
                 &oracle,
-                (2e-5, 2e-6),
+                between(STEP, ORACLE),
             );
         }
         // The chunked form runs its state products on f16 tensor-core
-        // operands (2^-11 relative rounding) with F32 accumulation, so it is
-        // held to f16-operand tolerances.
+        // operands with F32 accumulation: its bound carries their roundings
+        // (`recurrent_bound`).
+        // One mapping per distinct kernel path: ROWS never changes result bits.
         for rows in CHUNK_ROWS
             .into_iter()
             .filter(|rows| *rows <= case.geometry.width as u64)
+            .take(1)
         {
             let chunked = case.cuda(&device, Element::f32(), Mapping::Chunk(rows));
             check(
@@ -138,7 +100,7 @@ fn cuda_step_and_chunk_match_the_portable_body() {
                 &case,
                 &chunked,
                 &oracle,
-                (1e-2, 1e-3),
+                between(CHUNK, ORACLE),
             );
         }
     }
@@ -171,6 +133,7 @@ fn cuda_mapping_never_changes_bits_and_stop_equals_a_shorter_run() {
         key_heads: 2,
         value_heads: 4,
         width: 128,
+        decay_width: 1,
         convolution: 4,
         banks: 3,
         tape: 4,
@@ -228,7 +191,7 @@ fn cuda_chunk_short_slots_get_the_step_bits() {
     };
     let slots = vec![
         slot(4, 1, 1, 6),
-        slot(16, 9, 2, 7),
+        slot(SEQUENTIAL_ROWS, 9, 2, 7),
         slot(40, 40, 3, 8),
         slot(1, 1, 4, 9),
         slot(7, 0, 5, 10),
@@ -244,7 +207,7 @@ fn cuda_chunk_short_slots_get_the_step_bits() {
         for s in &case.slots {
             let range = first * row_elements..(first + s.rows) * row_elements;
             first += s.rows;
-            if s.rows > 16 {
+            if s.rows > SEQUENTIAL_ROWS {
                 continue;
             }
             let bank = s.following * g.delta_bank()..(s.following + 1) * g.delta_bank();
@@ -266,7 +229,7 @@ fn cuda_chunk_short_slots_get_the_step_bits() {
             &case,
             &chunk,
             &host,
-            (1.5e-2, 3e-3),
+            against_host(CHUNK),
         );
     }
 }
@@ -361,12 +324,14 @@ fn cuda_tape_cases_match_the_portable_body() {
                 &case,
                 &step,
                 &oracle,
-                (2e-5, 2e-6),
+                between(STEP, ORACLE),
             );
         }
+        // One mapping per distinct kernel path: ROWS never changes result bits.
         for rows in CHUNK_ROWS
             .into_iter()
             .filter(|rows| *rows <= case.geometry.width as u64)
+            .take(1)
         {
             let chunked = case.cuda(&device, Element::f32(), Mapping::Chunk(rows));
             check(
@@ -374,7 +339,7 @@ fn cuda_tape_cases_match_the_portable_body() {
                 &case,
                 &chunked,
                 &oracle,
-                (1e-2, 1e-3),
+                between(CHUNK, ORACLE),
             );
         }
     }
@@ -383,11 +348,12 @@ fn cuda_tape_cases_match_the_portable_body() {
 #[test]
 fn cuda_tape_versions_equal_runs_that_stopped_there() {
     let Some(device) = cuda() else { return };
+    let per_head = |case: Case| case.with_bf16_activations();
     for geometry in [SMALL, QWEN_4B] {
-        tape_versions_equal_stopped_runs("cuda step", geometry, &|case| {
+        tape_versions_equal_stopped_runs("cuda step", geometry, &per_head, STEP, &|case| {
             case.cuda(&device, Element::bf16(), Mapping::Step(2, 4))
         });
-        tape_versions_equal_stopped_runs("cuda chunk", geometry, &|case| {
+        tape_versions_equal_stopped_runs("cuda chunk", geometry, &per_head, CHUNK, &|case| {
             case.cuda(&device, Element::bf16(), Mapping::Chunk(32))
         });
     }
@@ -397,6 +363,7 @@ const QWEN_4B: Geometry = Geometry {
     key_heads: 16,
     value_heads: 32,
     width: 128,
+    decay_width: 1,
     convolution: 4,
     banks: 5,
     tape: 0,
@@ -427,7 +394,7 @@ fn cuda_real_4b_geometry_step_and_chunk_agree_with_the_host_model() {
             &case,
             &step,
             &host,
-            (1.5e-2, 3e-3),
+            against_host(STEP),
         );
         if rows >= 16 {
             for rows in CHUNK_ROWS {
@@ -437,7 +404,7 @@ fn cuda_real_4b_geometry_step_and_chunk_agree_with_the_host_model() {
                     &case,
                     &chunked,
                     &host,
-                    (1.5e-2, 3e-3),
+                    against_host(CHUNK),
                 );
             }
         }
@@ -468,7 +435,7 @@ fn cuda_chunk_every_value_head_group_matches_the_portable_body() {
             &case,
             &chunked,
             &oracle,
-            (1e-2, 1e-3),
+            between(CHUNK, ORACLE),
         );
     }
 }
@@ -486,15 +453,59 @@ fn cuda_chunk_every_catalog_value_head_count_matches_the_host_model() {
         let case =
             Case::new(geometry, 128, vec![slot(128, 100, 1, 3)], false, 23).with_bf16_activations();
         let host = case.host();
-        for rows in CHUNK_ROWS {
+        for rows in CHUNK_ROWS.into_iter().take(1) {
             let chunked = case.cuda(&device, Element::bf16(), Mapping::Chunk(rows));
             check(
                 &format!("NK 16 NV {value_heads} prefill 128: cuda chunk ROWS {rows}"),
                 &case,
                 &chunked,
                 &host,
-                (1.5e-2, 3e-3),
+                against_host(CHUNK),
             );
         }
     }
+}
+
+/// The CUDA entries for the per-channel checks. The step is the sequential F32
+/// form. The chunk runs its state products on f16 operands (keys and state
+/// as high + low pairs), with the decays inside the operands (Q o exp G,
+/// K o exp G, K o exp(G_last - G)) instead of F32 row factors after them;
+/// `recurrent_bound` derives its bounds from those roundings.
+fn cuda_per_channel_entries(device: &Device) -> PerChannelEntries<'_> {
+    PerChannelEntries {
+        backend: "cuda",
+        kind: BackendName::Cuda,
+        step: Box::new(move |case: &Case, activation| {
+            case.cuda(device, activation, Mapping::Step(STEPS[0].0, STEPS[0].1))
+        }),
+        chunks: CHUNK_ROWS
+            .into_iter()
+            .take(1)
+            .map(|rows| {
+                let run: Box<dyn Fn(&Case, Element) -> Outcome + '_> =
+                    Box::new(move |case: &Case, activation| {
+                        case.cuda(device, activation, Mapping::Chunk(rows.min(case.geometry.width as u64)))
+                    });
+                (format!("cuda chunk ROWS {rows}"), run)
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn cuda_per_channel_decay_matches_the_portable_body() {
+    let Some(device) = cuda() else { return };
+    per_channel_decay_matches_the_portable_body_on(&cuda_per_channel_entries(&device));
+}
+
+#[test]
+fn cuda_kda_geometry_step_and_chunk_agree_with_the_host_model() {
+    let Some(device) = cuda() else { return };
+    kda_geometry_step_and_chunk_agree_with_the_host_model_on(&cuda_per_channel_entries(&device));
+}
+
+#[test]
+fn cuda_kda_prefill_then_decode_equals_decode_alone() {
+    let Some(device) = cuda() else { return };
+    kda_prefill_then_decode_equals_decode_alone_on(&cuda_per_channel_entries(&device));
 }

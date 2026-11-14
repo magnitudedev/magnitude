@@ -812,9 +812,6 @@ impl CheckedDraftEntries {
     }
 }
 
-/// The class scope of a draft graph's injection pass, whose rows are the
-/// class's entry rows.
-const INJECTION: &str = "draft-injection";
 /// The class dimension of the injection pass's rows, for the ports it
 /// declares with them.
 const ENTRY_ROWS: &str = "draft_entry_rows";
@@ -1399,9 +1396,7 @@ fn certify_draft_family<L: Certified>(
         let slices = group
             .iter()
             .map(|class| {
-                NativeGraphClassSlice::new()
-                    .dimension(ENTRY_ROWS, [class.entry_rows])
-                    .scoped(INJECTION, "M", [class.entry_rows])
+                NativeGraphClassSlice::new().dimension(ENTRY_ROWS, [class.entry_rows])
             })
             .collect::<Vec<_>>();
         let (layout, constants) = L::traced(
@@ -1693,9 +1688,6 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
         .ok_or("a draft has no injected layers")?;
     let first_pass = passes.injection(first).expect("an injected layer has its injection");
     let entry_rows = &draft_class.entry_rows;
-    // Only the injection pass follows the entry rows: its rows are a
-    // topology's class dimension (`certify_draft_family`).
-    graph.set_class_scope(Some(INJECTION));
     let (conditioning, conditioning_rows) = if class.device {
         let features = graph.port_with_class_extent(activation, &[entry_rows, hidden], 0, ENTRY_ROWS)?;
         let widened = graph
@@ -1746,7 +1738,6 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
         injected = Some(mixed);
     }
     let injected = injected.ok_or("a draft has no layers")?;
-    graph.set_class_scope(None);
     let ClassPasses::Drafting(drafting) = passes else {
         graph.export(&injected)?;
         return Ok(DraftGraphParts {
@@ -1862,6 +1853,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
             input_norm: Some(input_norm),
             query: injection_weights.query.clone(),
             low_rank_query: injection_weights.low_rank_query.clone(),
+            absorbed: injection_weights.absorbed.clone(),
             gate: injection_weights.gate.clone(),
             key: injection_weights.key.clone(),
             value: injection_weights.value.clone(),
@@ -1872,7 +1864,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
             grouped: injection_weights.grouped.clone(),
             post_norm: None,
             operands: injection_weights.operands.clone(),
-            indexer: None,
+            selection: None,
             picked: None,
         };
         let (mixed, state, controls) = attention_graph::attention(
@@ -1896,6 +1888,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
             draft_sublayer(index, 1)?,
             &mut weights,
             &mut constants,
+            &mixed,
             &mixed,
             &Dim::from(rows),
             None,
@@ -2416,7 +2409,7 @@ fn convolved_layer<'a, G: GraphDraft + 'a>(
     let (Some(key_weight), Some(value_weight)) = (&attention.key, &attention.value) else {
         return Err("a convolved draft layer projects its keys and values".into());
     };
-    if attention.low_rank_query.is_some() {
+    if attention.low_rank_query.is_some() || attention.absorbed.is_some() {
         return Err("a convolved draft layer projects its query whole".into());
     }
     let query = project_attention(

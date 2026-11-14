@@ -1016,14 +1016,6 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
     ) -> Result<WorkflowTensor, GraphError> {
         let entries = self.entries;
         let numbers = self.numbers;
-        // The layer's group's records, its expert stacks, which the device's
-        // seed copy writes.
-        let records = {
-            let (planned, scope) = (self.planned, self.scope);
-            self.topology.record.try_map(|kind, _| {
-                weight_port(graph, planned, WeightRole { scope, kind: kind.kind() }, WeightPart::Values, weights)
-            })?
-        };
         let experts = &numbers.experts;
         let (scratch_slots, scratch_lanes) = (&numbers.scratch_slots, &numbers.scratch_lanes);
         let [features, hidden] = &numbers.matrix.up;
@@ -1065,7 +1057,6 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
             )),
         };
         let (mut seed_grid, mut seed_staged) = (self.part(graph, BankPart::SeedGrid)?, self.part(graph, BankPart::SeedStaged)?);
-        let commits = self.part(graph, BankPart::Commits)?;
         // Round 0 always launches (hit against cold is final only as the
         // request is served); its answer carries the count of records the
         // rounds convert, from which `routed_scratch_grids` writes every
@@ -1199,12 +1190,23 @@ impl<'p, 'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'p, '
         // scratch fill, so the copy's destination is disjoint from its
         // source by construction. A lender with no record past them seeds
         // nothing: its last write the scratch's up records, which every
-        // round converts into.
+        // round converts into. Its records and commits, which only the seed
+        // copy and commit read, are not made: a graph port no launch reads is
+        // unbound.
         let first = &numbers.seeded_from;
         let seeded = numbers.records.checked_sub(first).ok_or("a bank group's lent records exceed its records")?;
         if seeded.is_zero() {
             return Ok(scratch.up.tensor().clone());
         }
+        // The layer's group's records, its expert stacks, which the device's
+        // seed copy writes.
+        let records = {
+            let (planned, scope) = (self.planned, self.scope);
+            self.topology.record.try_map(|kind, _| {
+                weight_port(graph, planned, WeightRole { scope, kind: kind.kind() }, WeightPart::Values, weights)
+            })?
+        };
+        let commits = self.part(graph, BankPart::Commits)?;
         let tensors = numbers.matrix.as_ref().zip(seeding.seed).zip(scratch.as_ref()).zip(records.as_ref());
         for ((([n, k], seed), scratch), records) in tensors {
             let mut destination = records.tensor().slice_leading(first, &numbers.records);

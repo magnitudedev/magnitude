@@ -701,6 +701,44 @@ fn chat_accepts_empty_assistant_content_when_tool_calls_are_present() {
     assert_eq!(turn.tool_calls.len(), 1);
 }
 
+// Results sent out of call order pair with their calls by id and render in
+// call order, the order GLM's template restores by id.
+#[test]
+fn chat_renders_tool_results_in_call_order() {
+    let request = chat_request(json!({
+        "model": "test-model",
+        "messages": [
+            { "role": "user", "content": "weather and search" },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    { "id": "call_b", "type": "function",
+                      "function": { "name": "get_weather", "arguments": "{\"city\":\"Paris\"}" } },
+                    { "id": "call_A", "type": "function",
+                      "function": { "name": "search", "arguments": "{\"query\":\"x\"}" } }
+                ]
+            },
+            { "role": "tool", "tool_call_id": "call_A", "content": "found" },
+            { "role": "tool", "tool_call_id": "call_b", "content": "sunny" }
+        ]
+    }))
+    .unwrap();
+    let rendered = request.input.render(0, None).unwrap().request.messages;
+    let results = rendered
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .map(|message| (message["tool_call_id"].clone(), message["content"].clone()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results,
+        [
+            (json!("call_b"), json!("sunny")),
+            (json!("call_A"), json!("found")),
+        ]
+    );
+}
+
 #[test]
 fn chat_normalizes_permitted_empty_content_without_placeholder_text() {
     let request = chat_request(json!({

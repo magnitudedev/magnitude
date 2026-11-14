@@ -1,39 +1,50 @@
 """Reference tokenization and chat-template renders for the chat layer.
 
-For each tokenizer profile the release catalog uses, this writes under
-``results/tokenizers/``:
+For each model this writes under ``--output`` (default ``results/tokenizers/``):
 
-- ``<name>.gguf``: a vocabulary-only GGUF, the locked file's metadata with no
-  tensors (split keys dropped), read from the header bytes by range request;
+- ``<name>.gguf.gz``: a vocabulary-only GGUF, the tokenizer metadata (and
+  architecture) of the model's GGUF with no tensors;
 - ``<name>.json``: the model's own reference tokenizer ids for a fixed corpus
   (HF ``tokenizers`` from the original repository's ``tokenizer.json``), and
   the reference Jinja renders (``transformers`` ``apply_chat_template``) of the
-  GGUF's chat template for representative conversations.
+  GGUF's chat template for representative conversations, and, for the models
+  in ``REPLYING``, assistant replies as the template writes them after the
+  generation prompt.
 
-The reference is independent of the engine. Consume it with::
+A published model's vocabulary is its locked GGUF's header, read by range
+request. A converted model's is what llama.cpp's converter writes from the
+checkpoint's tokenizer files (its ``set_vocab``), read from the source tree
+``--llama-cpp`` names (v0.9.0, ``cd959bae``, the revision our converter builds
+on); no weights are read.
 
-    MAGNITUDE_TEST_GGUF=results/tokenizers/<name>.gguf \
+The reference is independent of the engine. Run it in the evaluation workspace
+(``uv run --project inference/evaluation --package magnitude-references
+--extra check python -I tokenizer_reference.py``). Consume it with::
+
+    MAGNITUDE_TEST_GGUF=results/tokenizers/<name>.gguf.gz \
     MAGNITUDE_TEST_REFERENCE=results/tokenizers/<name>.json \
     cargo test -p magnitude-chat --test real_tokenizer -- --ignored
+
+GLM-5.3-Flash's (``glm53``) is committed in ``tests/assets/`` and always runs.
 """
 
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
-import struct
-import urllib.request
+import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 from huggingface_hub import hf_hub_download
-
-import audit_catalog_tensor_types as audit
+from magnitude_references.gguf import DEFAULT_ALIGNMENT, LocalSource, RemoteSource, Value, encode_header
 
 RESULTS = Path(__file__).resolve().parent / "results" / "tokenizers"
 
 # name: (GGUF repository, locked revision, file, reference repository, revision)
-MODELS = {
+PUBLISHED = {
     "qwen3.5-4b": (
         "unsloth/Qwen3.5-4B-MTP-GGUF", "86835bf9949e4d14d6860f7910b1340ad4f271a9",
         "Qwen3.5-4B-Q4_0.gguf", "Qwen/Qwen3.5-4B", "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
@@ -85,6 +96,16 @@ MODELS = {
     ),
 }
 
+# name: (checkpoint repository, revision, the converter's model class as `module.Class`)
+CONVERTED = {
+    "glm53": (
+        "zai-org/GLM-5.3-Flash", "46a050bec13002ad29ee795c16e61cf4fa3c4a9c", "glm.Glm5NextModel",
+    ),
+}
+
+# The checkpoint files a converter's `set_vocab` reads.
+TOKENIZER_FILES = ("config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja")
+
 CORPUS = [
     "Hello, world!",
     "The quick brown fox jumps over the lazy dog. It's a test; they'll see, we've done, "
@@ -101,7 +122,7 @@ CORPUS = [
     "<div class=\"x\">&amp; &lt;tag&gt;</div> // comment /* block */ #!/usr/bin/env bash",
     "日本語のテキストと中文文本，还有한국어 텍스트。",
     "Emoji: 😀👍🏽👨‍👩‍👧‍👦 🇳🇴 ❤️ ✅",
-    "Combining: é ä ñ — café naïve résumé Ångström",
+    "Combining: é ä ñ — café naïve résumé Ångström",
     "Arabic: مرحبا بالعالم. Hebrew: שלום עולם. Hindi: नमस्ते दुनिया। Thai: สวัสดีชาวโลก",
     "Cyrillic: Привет, мир! Greek: Γειά σου Κόσμε. Math: ∑ᵢ xᵢ² ≤ ∞ ∫₀¹ f(x) dx ≠ π",
     "CamelCaseIdentifier snake_case_name SCREAMING_CASE kebab-case iPhone McDonald's",
@@ -113,14 +134,19 @@ CORPUS = [
     "a",
     "tab\tseparated\tvalues\n1\t2\t3\n",
     "Quotes: “smart” ‘single’ «guillemets» „German“",
-    "Zero​width and non breaking and ideographic　space",
+    "Zero​width and non breaking and ideographic　space",
     "Repeated punctuation!!! ??? ... --- === *** ### @@@ $$$ %%% ^^^ &&& ((( )))",
     "ALLCAPS WORDS AND lowercase words And Title Case Words",
     "   indented\n      more indented\n\t\ttabbed\n",
     "\u0000\u0001\u007f bytes ÿĀ \U0001f600\U000e0001 end",
+    # Contractions whose letters case-fold beyond ASCII (long s, Kelvin sign).
+    "it'ſ, it'S, we'LL, K'd, 'Ve, 'ﬅ",
     # Special-token text of several vocabularies; each tokenizer recognizes its own.
     "<|im_start|>user\nhi<|im_end|>\n<s> </s> <bos> <eos> <|endoftext|> <think>x</think> "
     "<|turn>model\n<turn|> 〈|EOS|〉 <|start|>assistant<|message|>ok<|eot|>",
+    "[gMASK]<sop><|system|>s<|user|>u<|assistant|><think>r</think>a<tool_call>f<arg_key>k</arg_key>"
+    "<arg_value>v</arg_value></tool_call><|observation|><tool_response>x</tool_response>/nothink"
+    "<|begin_of_image|><|image|><|end_of_image|>",
 ]
 
 WEATHER = {
@@ -139,14 +165,54 @@ WEATHER = {
     },
 }
 
-CALL = {
+SEARCH = {
     "type": "function",
-    "function": {"name": "get_weather", "arguments": {"city": "Paris", "days": 2}},
+    "function": {
+        "name": "search",
+        "description": "Search the web «verbatim»",
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}},
+            "required": ["query"],
+        },
+    },
 }
 
-# (name, messages, tools); every render adds the generation prompt.
+
+def call(identity: str, name: str, arguments: dict) -> dict:
+    return {"id": identity, "type": "function", "function": {"name": name, "arguments": arguments}}
+
+
+def result(identity: str, name: str, content: str) -> dict:
+    return {"role": "tool", "tool_call_id": identity, "name": name, "content": content}
+
+
+ASK = {"role": "user", "content": "What is the weather in Paris?"}
+CALLED = {"role": "assistant", "content": "", "reasoning_content": "One call for Paris.",
+          "tool_calls": [call("call_1", "get_weather", {"city": "Paris", "days": 2})]}
+ANSWERED = result("call_1", "get_weather", "{\"temperature\": 21, \"sky\": \"clear\"}")
+REASONED = [
+    {"role": "system", "content": "You are a concise assistant."},
+    {"role": "user", "content": "Name a colour."},
+    {"role": "assistant", "content": "Blue.", "reasoning_content": "Any colour will do."},
+    {"role": "user", "content": "Another one."},
+    {"role": "assistant", "content": "Red."},
+    {"role": "user", "content": "And one more, with some 日本語."},
+]
+# Two calls answered out of call order.
+PARALLEL = [
+    {"role": "user", "content": "Weather in Paris, and search for llama.cpp."},
+    {"role": "assistant", "content": "Both at once.",
+     "tool_calls": [call("call_b", "get_weather", {"city": "Paris"}),
+                    call("call_A", "search", {"query": "llama.cpp \"chat\"\nparser", "limit": 3})]},
+    result("call_A", "search", "[{\"title\": \"llama.cpp\"}]"),
+    result("call_b", "get_weather", "sunny"),
+]
+
+# (name, messages, tools, the request's template arguments); every render adds the generation prompt.
+# A template reads the arguments it names and ignores the others.
 CONVERSATIONS = [
-    ("single", [{"role": "user", "content": "Hi there! What's 2+2?"}], None),
+    ("single", [{"role": "user", "content": "Hi there! What's 2+2?"}], None, {}),
     (
         "multi_turn",
         [
@@ -156,87 +222,138 @@ CONVERSATIONS = [
             {"role": "user", "content": "Another one, with some 日本語."},
         ],
         None,
+        {},
     ),
-    ("tools", [{"role": "user", "content": "What is the weather in Paris?"}], [WEATHER]),
+    ("tools", [ASK], [WEATHER], {}),
+    ("tool_round_trip", [ASK, CALLED, ANSWERED], [WEATHER], {}),
+    ("tool_round_trip_cleared", [ASK, CALLED, ANSWERED], [WEATHER], {"clear_thinking": True}),
+    ("parallel_results", PARALLEL, [WEATHER, SEARCH], {}),
+    ("reasoning_kept", REASONED, None, {}),
+    ("reasoning_kept_explicitly", REASONED, None, {"clear_thinking": False}),
+    ("reasoning_cleared", REASONED, None, {"clear_thinking": True}),
     (
-        "tool_round_trip",
+        "reasoning_in_content",
         [
-            {"role": "user", "content": "What is the weather in Paris?"},
-            {"role": "assistant", "content": "", "tool_calls": [dict(CALL, id="call_1")]},
-            {"role": "tool", "tool_call_id": "call_1", "name": "get_weather",
-             "content": "{\"temperature\": 21, \"sky\": \"clear\"}"},
+            {"role": "user", "content": "Name a colour."},
+            {"role": "assistant", "content": "<think>Any will do.</think>\n\nBlue.  "},
+            {"role": "user", "content": "Another."},
         ],
-        [WEATHER],
+        None,
+        {},
     ),
+    ("effort_low", [ASK], [WEATHER], {"reasoning_effort": "low"}),
+    ("effort_high", [ASK], None, {"reasoning_effort": "high"}),
+    ("effort_unnamed", [ASK], None, {"reasoning_effort": "medium"}),
 ]
+
+FORECAST = {
+    "type": "function",
+    "function": {
+        "name": "forecast",
+        "description": "Forecast",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "city": {"type": "string"},
+                "options": {
+                    "type": "object",
+                    "properties": {
+                        "units": {"type": "string"},
+                        "hours": {"type": "array", "items": {"type": "integer"}},
+                    },
+                    "required": ["units", "hours"],
+                },
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "verbose": {"type": "boolean"},
+                "limit": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+            },
+            "required": ["city", "options"],
+        },
+    },
+}
+
+NOW = {
+    "type": "function",
+    "function": {
+        "name": "now",
+        "description": "The current time",
+        "parameters": {"type": "object", "properties": {"zone": {"type": "string"}}},
+    },
+}
+
+
+def assistant(reasoning: str, content: str, calls: list[dict]) -> dict:
+    message = {"role": "assistant", "content": content, "reasoning_content": reasoning}
+    if calls:
+        message["tool_calls"] = calls
+    return message
+
+
+# (name, messages, tools, template arguments, the assistant reply). The reply's text is what the
+# template writes for it after the generation prompt; the engine must read it back as the reply.
+REPLIES = [
+    ("single_call", [ASK], [WEATHER], {},
+     assistant("One call for Paris.", "", [call("call_1", "get_weather", {"city": "Paris", "days": 2})])),
+    ("content_and_calls", PARALLEL[:1], [WEATHER, SEARCH], {},
+     assistant("Two tools.", "Both at once.", [
+         call("call_b", "get_weather", {"city": "Paris"}),
+         call("call_A", "search", {"query": "llama.cpp \"chat\"\nparser </arg_val <line> & more",
+                                   "limit": 3}),
+     ])),
+    ("json_values", [ASK], [FORECAST], {},
+     assistant("", "", [call("call_1", "forecast", {
+         "city": "Oslo",
+         "options": {"units": "metric", "hours": [6, 12]},
+         "tags": ["日本", "a\"b"],
+         "verbose": True,
+         "limit": None,
+     })])),
+    ("call_without_arguments", [{"role": "user", "content": "What time is it?"}], [NOW], {},
+     assistant("Ask the clock.", "", [call("call_1", "now", {})])),
+    ("content_without_calls", [ASK], [WEATHER], {"reasoning_effort": "low"},
+     assistant("No tool needed.", "It is sunny in Paris.", [])),
+]
+
+# Models whose references hold replies.
+REPLYING = {"glm53"}
 
 FIXED_NOW = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
 
 
-def header_bytes(repository: str, revision: str, path: str) -> bytes:
-    url = audit.header_url(repository, revision, path)
-    size = 1 << 20
-    while size <= 256 << 20:
-        request = urllib.request.Request(url, headers={"Range": f"bytes=0-{size - 1}"})
-        with urllib.request.urlopen(request, timeout=300) as response:
-            if response.headers.get("x-repo-commit") not in (None, revision):
-                raise ValueError(f"{repository} resolved to another commit than {revision}")
-            data = response.read(size + 1)
-        try:
-            audit.parse_header(data)
-            return data
-        except audit.NeedMore:
-            size *= 2
-    raise ValueError("GGUF header exceeds 256 MiB")
+def vocabulary(metadata: dict[str, Value]) -> bytes:
+    """The tokenizer metadata (and architecture) of a GGUF's metadata, as a GGUF without tensors."""
+    kept = {key: value for key, value in metadata.items()
+            if key.startswith("tokenizer.") or key == "general.architecture"}
+    return encode_header(kept, [], DEFAULT_ALIGNMENT)
 
 
-SCALAR_SIZES = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+def converted_metadata(files: Path, model_class: str, llama_cpp: Path) -> dict[str, Value]:
+    """The metadata llama.cpp's converter writes for the checkpoint's vocabulary: its model class's
+    `set_vocab` over the checkpoint's hyperparameters as the converter merges them, no tensors."""
+    sys.path.insert(0, str(llama_cpp))
+    import importlib
+
+    import gguf
+    from conversion.base import ModelBase
+
+    module, name = model_class.rsplit(".", 1)
+    cls = getattr(importlib.import_module(f"conversion.{module}"), name)
+    model = cls.__new__(cls)  # only the vocabulary: no tensors are indexed
+    model.dir_model = files
+    hparams = ModelBase.load_hparams(files, False)
+    model.hparams = {**hparams, **hparams.get("text_config", {})}  # as TextModel.__init__ merges them
+    with tempfile.TemporaryDirectory() as scratch:
+        path = Path(scratch) / "vocabulary.gguf"
+        model.gguf_writer = gguf.GGUFWriter(path, gguf.MODEL_ARCH_NAMES[cls.model_arch])
+        model.set_vocab()
+        model.gguf_writer.write_header_to_file()
+        model.gguf_writer.write_kv_data_to_file()
+        model.gguf_writer.write_tensors_to_file()
+        model.gguf_writer.close()
+        return LocalSource(path).header.metadata
 
 
-def vocabulary_only(data: bytes) -> bytes:
-    """The container's metadata, without split keys, and no tensors."""
-
-    def skip(kind: int, offset: int) -> int:
-        if kind in SCALAR_SIZES:
-            return offset + SCALAR_SIZES[kind]
-        if kind == 8:
-            return offset + 8 + struct.unpack_from("<Q", data, offset)[0]
-        if kind == 9:
-            element, count = struct.unpack_from("<IQ", data, offset)
-            offset += 12
-            if element in SCALAR_SIZES:
-                return offset + SCALAR_SIZES[element] * count
-            for _ in range(count):
-                offset = skip(element, offset)
-            return offset
-        raise ValueError(f"unsupported GGUF metadata type {kind}")
-
-    if data[:4] != b"GGUF":
-        raise ValueError("not a little-endian GGUF container")
-    _, metadata_count = struct.unpack_from("<QQ", data, 8)
-    offset = 24
-    kept = []
-    for _ in range(metadata_count):
-        start = offset
-        length = struct.unpack_from("<Q", data, offset)[0]
-        name = data[offset + 8 : offset + 8 + length].decode()
-        offset = skip(struct.unpack_from("<I", data, offset + 8 + length)[0], offset + 12 + length)
-        if not name.startswith("split."):
-            kept.append(data[start:offset])
-    out = data[:8] + struct.pack("<QQ", 0, len(kept)) + b"".join(kept)
-    return out + b"\0" * (-len(out) % 32)
-
-
-def chat_template(data: bytes) -> str:
-    marker = b"tokenizer.chat_template"
-    index = data.index(struct.pack("<Q", len(marker)) + marker)
-    offset = index + 8 + len(marker)
-    assert struct.unpack_from("<I", data, offset)[0] == 8
-    length = struct.unpack_from("<Q", data, offset + 4)[0]
-    return data[offset + 12 : offset + 12 + length].decode()
-
-
-def generate(name: str) -> None:
+def generate(name: str, output: Path, llama_cpp: Path | None) -> None:
     from tokenizers import Tokenizer
     from transformers import AutoTokenizer
     from transformers.utils import chat_template_utils
@@ -250,61 +367,94 @@ def generate(name: str) -> None:
 
     chat_template_utils.datetime = FixedClock
 
-    repository, revision, path, reference, reference_revision = MODELS[name]
-    data = header_bytes(repository, revision, path)
-    RESULTS.mkdir(parents=True, exist_ok=True)
-    (RESULTS / f"{name}.gguf").write_bytes(vocabulary_only(data))
-    tokenizer = Tokenizer.from_file(
-        hf_hub_download(reference, "tokenizer.json", revision=reference_revision)
-    )
-    corpus = []
-    for text in CORPUS:
-        ids = tokenizer.encode(text, add_special_tokens=False).ids
-        corpus.append(
-            {"text": text, "ids": ids, "decoded": tokenizer.decode(ids, skip_special_tokens=False)}
+    output.mkdir(parents=True, exist_ok=True)
+    if name in PUBLISHED:
+        repository, revision, path, reference, reference_revision = PUBLISHED[name]
+        metadata = RemoteSource(repository, revision, path).header.metadata
+        source = {"gguf": {"repository": repository, "revision": revision, "path": path}}
+        tokenizer_json = hf_hub_download(reference, "tokenizer.json", revision=reference_revision)
+        renderer = AutoTokenizer.from_pretrained(
+            reference, revision=reference_revision, trust_remote_code=False
         )
-    template = chat_template(data)
-    renderer = AutoTokenizer.from_pretrained(
-        reference, revision=reference_revision, trust_remote_code=False
-    )
+    else:
+        if llama_cpp is None:
+            raise SystemExit(f"{name} is converted: --llama-cpp names llama.cpp's source tree")
+        reference, reference_revision, model_class = CONVERTED[name]
+        files = output / name
+        for file in TOKENIZER_FILES:
+            hf_hub_download(reference, file, revision=reference_revision, local_dir=files)
+        metadata = converted_metadata(files, model_class, llama_cpp)
+        source = {"converter": model_class}
+        tokenizer_json = str(files / "tokenizer.json")
+        renderer = AutoTokenizer.from_pretrained(files, trust_remote_code=False)
+    (output / f"{name}.gguf.gz").write_bytes(gzip.compress(vocabulary(metadata), 9, mtime=0))
+    tokenizer = Tokenizer.from_file(tokenizer_json)
+
+    def ids(text: str) -> list[int]:
+        return tokenizer.encode(text, add_special_tokens=False).ids
+
+    corpus = [{"text": text, "ids": ids(text), "decoded": tokenizer.decode(ids(text), skip_special_tokens=False)}
+              for text in CORPUS]
+    template = metadata["tokenizer.chat_template"].value
     renders = []
-    for conversation, messages, tools in CONVERSATIONS:
+    for conversation, messages, tools, template_arguments in CONVERSATIONS:
         text = renderer.apply_chat_template(
             messages,
             tools=tools,
             chat_template=template,
             add_generation_prompt=True,
             tokenize=False,
+            **template_arguments,
         )
-        renders.append(
-            {
-                "name": conversation,
-                "messages": messages,
-                "tools": tools or [],
-                "text": text,
-                "ids": tokenizer.encode(text, add_special_tokens=False).ids,
-            }
-        )
-    reference_record = {
-        "gguf": {"repository": repository, "revision": revision, "path": path},
+        renders.append({"name": conversation, "messages": messages, "tools": tools or [],
+                        "template_arguments": template_arguments, "text": text, "ids": ids(text)})
+    replies = []
+    for reply, messages, tools, template_arguments, message in REPLIES if name in REPLYING else []:
+        def render(conversation: list[dict], generation_prompt: bool) -> str:
+            return renderer.apply_chat_template(
+                conversation,
+                tools=tools,
+                chat_template=template,
+                add_generation_prompt=generation_prompt,
+                tokenize=False,
+                **template_arguments,
+            )
+
+        prompt = render(messages, True)
+        written = render([*messages, message], False)
+        if not written.startswith(prompt):
+            raise SystemExit(f"{name} {reply}: the reply's render does not extend the prompt")
+        replies.append({
+            "name": reply, "messages": messages, "tools": tools, "template_arguments": template_arguments,
+            "text": written[len(prompt):], "content": message["content"],
+            "reasoning": message["reasoning_content"],
+            "calls": [{"name": tool_call["function"]["name"], "arguments": tool_call["function"]["arguments"]}
+                      for tool_call in message.get("tool_calls", [])],
+        })
+    record = {
+        **source,
         "reference": {"repository": reference, "revision": reference_revision},
         "now": int(FIXED_NOW.timestamp()),
         "corpus": corpus,
         "renders": renders,
+        **({"replies": replies} if replies else {}),
     }
-    (RESULTS / f"{name}.json").write_text(json.dumps(reference_record, ensure_ascii=False, indent=1))
-    print(name, len(corpus), "texts,", len(renders), "renders")
+    (output / f"{name}.json").write_text(json.dumps(record, ensure_ascii=False, indent=1) + "\n")
+    print(name, len(corpus), "texts,", len(renders), "renders,", len(replies), "replies")
 
 
 def main() -> int:
+    models = [*PUBLISHED, *CONVERTED]
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("names", nargs="*", help=f"any of {', '.join(MODELS)}; default all")
+    parser.add_argument("names", nargs="*", help=f"any of {', '.join(models)}; default all")
+    parser.add_argument("--output", type=Path, default=RESULTS)
+    parser.add_argument("--llama-cpp", type=Path, help="llama.cpp v0.9.0's source tree, for converted models")
     arguments = parser.parse_args()
-    unknown = sorted(set(arguments.names) - set(MODELS))
+    unknown = sorted(set(arguments.names) - set(models))
     if unknown:
         parser.error(f"unknown names: {', '.join(unknown)}")
-    for name in arguments.names or MODELS:
-        generate(name)
+    for name in arguments.names or models:
+        generate(name, arguments.output, arguments.llama_cpp)
     return 0
 
 

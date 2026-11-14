@@ -5,25 +5,17 @@
 //! precision declarations.
 use seismic::{BoundEntry, Entry, Limit, NumericalRequirement};
 
+/// A load's profile. It crosses the worker wire in the load's manifest, so
+/// it serializes every field; a profile file states only what differs from
+/// the standard ([`Self::read`]).
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NumericalProfile {
-    /// The standard α ([`STANDARD_ALPHA`]) unless the profile states one.
-    #[serde(default = "standard_alpha")]
     pub alpha: Limit,
     /// Whether a streamed layer's CPU site may compute its misses: its
     /// arithmetic is admitted against α by its own qualification. Without,
     /// no site verdict is requested or used and every miss is the device's.
-    #[serde(default = "approved")]
     pub cpu_sites: bool,
-}
-
-fn standard_alpha() -> Limit {
-    STANDARD_ALPHA
-}
-
-fn approved() -> bool {
-    true
 }
 
 /// A checked profile.
@@ -94,6 +86,31 @@ impl NumericalProfile {
         }
     }
 
+    /// The profile file at `path` (`--numerical-profile`).
+    pub fn read(path: &std::path::Path) -> Result<Self, String> {
+        std::fs::read(path)
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| Self::from_json(&bytes))
+            .map_err(|error| format!("numerical profile {}: {error}", path.display()))
+    }
+
+    /// A profile file's: the standard profile with the fields the file's
+    /// object states in place of its own, so `{"cpu_sites": false}` is the
+    /// standard α with no CPU sites. A field the profile does not have is
+    /// refused.
+    fn from_json(bytes: &[u8]) -> Result<Self, String> {
+        let serde_json::Value::Object(stated) = serde_json::from_slice(bytes).map_err(|error| error.to_string())? else {
+            return Err("a numerical profile is a JSON object".into());
+        };
+        let serde_json::Value::Object(mut profile) =
+            serde_json::to_value(Self::standard()).expect("a profile serializes")
+        else {
+            unreachable!("a profile serializes as an object")
+        };
+        profile.extend(stated);
+        serde_json::from_value(serde_json::Value::Object(profile)).map_err(|error| error.to_string())
+    }
+
     pub fn resolve(&self) -> Result<ResolvedNumericalProfile, String> {
         if self.alpha.get() <= 0.0 {
             return Err("numerical profile α must be positive".into());
@@ -117,12 +134,14 @@ mod tests {
         };
         assert_eq!(looser.resolve().unwrap().alpha(), 16.5);
         assert!(NumericalProfile { alpha: Limit::ZERO, cpu_sites: true }.resolve().is_err());
-        let parsed: NumericalProfile = serde_json::from_str(r#"{"alpha":0.5}"#).unwrap();
+        let parsed = NumericalProfile::from_json(br#"{"alpha":0.5}"#).unwrap();
         assert_eq!(parsed.resolve().unwrap().alpha(), 0.5);
         assert!(parsed.resolve().unwrap().site_requirement(None).is_some(), "a profile approves CPU sites unless it says otherwise");
-        let unsited: NumericalProfile = serde_json::from_str(r#"{"cpu_sites":false}"#).unwrap();
+        let unsited = NumericalProfile::from_json(br#"{"cpu_sites":false}"#).unwrap();
         assert_eq!(unsited, NumericalProfile { cpu_sites: false, ..NumericalProfile::standard() });
         assert_eq!(unsited.resolve().unwrap().site_requirement(None), None);
+        assert!(NumericalProfile::from_json(br#"{"cpu_site":false}"#).is_err(), "an unknown field is refused");
+        assert!(NumericalProfile::from_json(b"[]").is_err());
         assert_eq!(
             ResolvedNumericalProfile::standard(),
             &NumericalProfile::standard().resolve().unwrap()

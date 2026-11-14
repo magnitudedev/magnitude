@@ -16,11 +16,13 @@
 //! prints the variants and the default selection.
 //!
 //! A provenance record `<output>.json` (the output's extension replaced) lists the source files,
-//! kept layers, renaming and output sha256.
+//! kept layers, renaming and output sha256 (`record`, the one writer of the format; a reader tells
+//! a slice by it). `slice-record` writes it for a slice another tool wrote: a converter's slice of
+//! a checkpoint's layers (`magnitude-conversion convert --layers`).
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use futures_util::{StreamExt, stream};
@@ -49,6 +51,14 @@ pub struct Options {
     pub no_mtp: bool,
     pub list: bool,
     pub parallel: usize,
+}
+
+/// `slice-record`'s inputs: the slice, its sources as provenance names them, and the source main
+/// layers it keeps, in order.
+pub struct RecordOptions {
+    pub output: PathBuf,
+    pub source: Vec<String>,
+    pub layers: Vec<usize>,
 }
 
 /// A layer tensor's layer and the name after `blk.<layer>.`.
@@ -427,32 +437,114 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
     }
     file.flush()?;
     drop(file);
-    let sha256 = digest
-        .finalize()
+    let sha256 = hex(digest);
+    let record = record(
+        gguf.describe(),
+        &slicer.architecture,
+        &main_layers,
+        &mtp,
+        tensor_bytes,
+        &output,
+        &sha256,
+    );
+    write_record(&output, &record)?;
+    println!("{}", serde_json::to_string_pretty(&summary(record))?);
+    Ok(())
+}
+
+/// The provenance record of `output`, a slice of `source` keeping main layers `main_layers` and MTP
+/// layers `mtp` (source indices, renumbered in that order): its sources, architecture, kept layers,
+/// tensor bytes, output, SHA-256 and each kept layer's new index (`renaming`).
+fn record(
+    source: Vec<String>,
+    architecture: &str,
+    main_layers: &[usize],
+    mtp: &[usize],
+    tensor_bytes: u64,
+    output: &Path,
+    sha256: &str,
+) -> serde_json::Value {
+    let renaming = main_layers
         .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    let mut record = json!({
-        "source": gguf.describe(),
-        "architecture": slicer.architecture,
+        .chain(mtp)
+        .enumerate()
+        .map(|(new, old)| (old.to_string(), json!(new)))
+        .collect::<serde_json::Map<_, _>>();
+    json!({
+        "source": source,
+        "architecture": architecture,
         "main_layers": main_layers,
         "mtp_layers": mtp,
         "tensor_bytes": tensor_bytes,
         "output": output.display().to_string(),
         "sha256": sha256,
-    });
-    let summary = serde_json::to_string_pretty(&record)?;
-    record["renaming"] = kept
-        .iter()
-        .enumerate()
-        .map(|(new, old)| (old.to_string(), json!(new)))
-        .collect::<serde_json::Map<_, _>>()
-        .into();
+        "renaming": renaming,
+    })
+}
+
+/// The record as printed: without its renaming.
+fn summary(mut record: serde_json::Value) -> serde_json::Value {
+    record
+        .as_object_mut()
+        .expect("a record is an object")
+        .remove("renaming");
+    record
+}
+
+fn write_record(output: &Path, record: &serde_json::Value) -> anyhow::Result<()> {
     std::fs::write(
         output.with_extension("json"),
-        serde_json::to_string_pretty(&record)? + "\n",
+        serde_json::to_string_pretty(record)? + "\n",
     )?;
-    println!("{summary}");
+    Ok(())
+}
+
+fn hex(digest: Sha256) -> String {
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Writes the provenance record of a local slice another tool wrote, keeping `layers` of its
+/// sources' main layers and no MTP layer.
+pub async fn record_existing(options: RecordOptions) -> anyhow::Result<()> {
+    let output = options.output;
+    let gguf = Gguf::open(&GgufSource::Local {
+        path: output.clone(),
+    })
+    .await?;
+    anyhow::ensure!(
+        gguf.shards.len() == 1,
+        "{} is split; a slice is one file",
+        output.display()
+    );
+    let slicer = Slicer::new(&gguf)?;
+    anyhow::ensure!(
+        slicer.mtp == 0,
+        "{} holds MTP layers, whose source indices only `slice` knows",
+        output.display()
+    );
+    anyhow::ensure!(
+        options.layers.len() == slicer.main
+            && options.layers.windows(2).all(|pair| pair[0] < pair[1]),
+        "--layers must name the slice's {} main layers' source indices, ascending",
+        slicer.main
+    );
+    let mut digest = Sha256::new();
+    std::io::copy(&mut std::fs::File::open(&output)?, &mut digest)?;
+    let record = record(
+        options.source,
+        &slicer.architecture,
+        &options.layers,
+        &[],
+        gguf.tensors().map(|tensor| tensor.nbytes).sum(),
+        &output,
+        &hex(digest),
+    );
+    write_record(&output, &record)?;
+    println!("{}", serde_json::to_string_pretty(&summary(record))?);
     Ok(())
 }
 
@@ -473,5 +565,32 @@ mod tests {
         assert_eq!(layer_of("token_embd.weight"), None);
         assert_eq!(layer_of("blk.x.attn_q.weight"), None);
         assert_eq!(layer_of("blk.3."), None);
+    }
+
+    #[test]
+    fn a_record_names_each_kept_layers_new_index() {
+        let record = record(
+            vec!["zai-org/GLM-5.3-Flash@abc/model-00001-of-00002.safetensors".into()],
+            "glm5-next",
+            &[0, 3],
+            &[47],
+            1024,
+            Path::new("/m/slice.gguf"),
+            "ff",
+        );
+        assert_eq!(
+            record,
+            json!({
+                "source": ["zai-org/GLM-5.3-Flash@abc/model-00001-of-00002.safetensors"],
+                "architecture": "glm5-next",
+                "main_layers": [0, 3],
+                "mtp_layers": [47],
+                "tensor_bytes": 1024,
+                "output": "/m/slice.gguf",
+                "sha256": "ff",
+                "renaming": {"0": 0, "3": 1, "47": 2},
+            })
+        );
+        assert!(summary(record).get("renaming").is_none());
     }
 }

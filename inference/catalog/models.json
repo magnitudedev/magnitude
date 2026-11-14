@@ -23,7 +23,8 @@
     { "name": "LFM 2.5 and 3", "lab": "liquid", "architectures": ["lfm2", "lfm2moe", "lfm3"], "status": "supported" },
     { "name": "Nemotron 3 and 3.5", "lab": "nvidia", "architectures": ["nemotron_h_moe"], "status": "supported" },
     { "name": "Muse Glimmer", "lab": "meta", "architectures": ["muse-glimmer"], "status": "supported" },
-    { "name": "DeepSeek V4.1", "lab": "deepseek", "architectures": ["deepseek41"], "status": "comingSoon" }
+    { "name": "DeepSeek V4.1", "lab": "deepseek", "architectures": ["deepseek41"], "status": "comingSoon" },
+    { "name": "GLM-5.3 Flash", "lab": "zai", "architectures": ["glm5-next"], "status": "comingSoon" }
   ],
   "models": [
     {
@@ -619,6 +620,23 @@
         }
       ],
       "speculativeDecoding": { "method": "dspark", "draft": { "type": "file", "repository": "magnitudedev/DeepSeek-V4.1-Flash-1017-GGUF", "path": "DeepSeek-V4.1-Flash-1017-DSpark.gguf" } }
+    },
+    {
+      "id": "glm-5.3-flash",
+      "displayName": "GLM-5.3 Flash 321B-A18B",
+      "lab": "zai",
+      "description": "Multimodal MoE model with hybrid linear and latent attention, hyper-connections and low active compute.",
+      "releaseDate": "2026-08-25",
+      "parameterization": { "architecture": "mixtureOfExperts", "totalParameters": 321300000000, "activeParameters": 18000000000 },
+      "support": { "level": "disabled", "reason": "GLM-5.3 Flash is withheld until the whole model meets its bar: D11 on the full checkpoint, measured MTP acceptance and served throughput. It has no Artificial Analysis score yet." },
+      "sources": [
+        {
+          "repository": "magnitudedev/GLM-5.3-Flash-GGUF",
+          "variants": [{"variantId": "gguf:fp8", "format": "FP8", "variantLabel": "FP8", "quantizationAware": true}],
+          "projector": { "path": "mmproj-BF16.gguf" },
+          "license": "mit"
+        }
+      ]
     },
     {
       "id": "nemotron-3-ultra-550b-a55b",

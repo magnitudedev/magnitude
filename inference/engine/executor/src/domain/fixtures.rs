@@ -243,7 +243,7 @@ fn spare_head_store(device: Rc<seismic::Device>) -> StoreBindings {
             layout: HistoryDomainLayout::Token {
                 components: vec![
                     ComponentDescriptor::new(
-                        LayerRef::Target(0),
+                        LayerRef::Head(0),
                         CodecSpec::dense(seismic::DType::F32, 4096, 4096),
                         1,
                     )

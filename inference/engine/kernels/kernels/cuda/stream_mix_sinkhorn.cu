@@ -2,11 +2,12 @@
 // Every row count takes one form: block (slice, tile) reduces the squares
 // and every mix of a tile of rows over one contiguous slice of their columns
 // [slice * width / SINKHORN_SPLIT rounded up, the next slice's first) into
-// the scratch, in fixed order, and mixes its share of the tile's input
-// columns by the previous site's pre (`streams::collapse`); a second launch
-// sums each row's SINKHORN_SPLIT partials in slice order and forms pre, post
-// and the Sinkhorn comb (`stream_mix_sinkhorn_finish`). The launch boundary
-// orders every partial before its sum.
+// the scratch, in fixed order, and under P = 1 mixes its share of the tile's
+// input columns by the previous site's pre (`streams::collapse`); a second
+// launch sums each row's SINKHORN_SPLIT partials in slice order and forms
+// pre, post and the Sinkhorn comb (`stream_mix_sinkhorn_finish`), and under
+// P = 0 mixes the row's input by that pre, which nothing carries. The launch
+// boundary orders every partial before its sum.
 // Decode rows (M <= DECODE_ROWS, `stream_mix_sinkhorn_split`) take a tile of
 // one row, all eight warps over its columns, reading the function matrix
 // straight from device memory: a row's function matrix streams through many
@@ -19,6 +20,8 @@
 
 constexpr unsigned STREAMS = SEISMIC_DIM_S;
 constexpr unsigned MIXES = (2u + STREAMS) * STREAMS;
+// Whether the input mixes by the previous site's pre (P = 1) or this site's.
+constexpr bool CARRIED = SEISMIC_DIM_P != 0;
 constexpr unsigned THREADS = 256u;
 // A slice's reduced values: its squares, then every mix.
 constexpr unsigned SUMS = 1u + MIXES;
@@ -220,12 +223,15 @@ __device__ __forceinline__ void reduce_slice(const float *__restrict__ hidden, c
         }
     }
     // The sublayer's input: the streams mixed by the previous site's pre.
-    for (unsigned r = 0; r < TILE && row0 + r < rows; ++r) {
-        const u64 row = row0 + r;
-        streams::collapse<STREAMS>(hidden + row * SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1,
-                                   SEISMIC_HIDDEN_STRIDE_2, previous + row * SEISMIC_PREVIOUS_STRIDE_0,
-                                   SEISMIC_PREVIOUS_STRIDE_1, input + row * SEISMIC_RESULT_0_STRIDE_0,
-                                   SEISMIC_RESULT_0_STRIDE_1, h, blockIdx.x * THREADS + threadIdx.x, split * THREADS);
+    if constexpr (CARRIED) {
+        for (unsigned r = 0; r < TILE && row0 + r < rows; ++r) {
+            const u64 row = row0 + r;
+            streams::collapse<STREAMS>(hidden + row * SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1,
+                                       SEISMIC_HIDDEN_STRIDE_2, previous + row * SEISMIC_PREVIOUS_STRIDE_0,
+                                       SEISMIC_PREVIOUS_STRIDE_1, input + row * SEISMIC_RESULT_0_STRIDE_0,
+                                       SEISMIC_RESULT_0_STRIDE_1, h, blockIdx.x * THREADS + threadIdx.x,
+                                       split * THREADS);
+        }
     }
 }
 
@@ -246,7 +252,8 @@ STREAM_MIX_SLICE_KERNEL(stream_mix_sinkhorn_split, 1u, 1u)
 STREAM_MIX_SLICE_KERNEL(stream_mix_sinkhorn_tiles, PREFILL_TILE, MIXES * CHUNK)
 
 // Block row: its SINKHORN_SPLIT partials summed in slice order, then its
-// coefficients (`publish_coefficients`).
+// coefficients (`publish_coefficients`); under P = 0 its pre stays in shared
+// memory and the block mixes the row's input by it.
 extern "C" __global__ void stream_mix_sinkhorn_finish(SEISMIC_KERNEL_PARAMS) {
     typedef unsigned long long u64;
     __shared__ float reduced[SUMS];
@@ -254,7 +261,6 @@ extern "C" __global__ void stream_mix_sinkhorn_finish(SEISMIC_KERNEL_PARAMS) {
     const float *base = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_BASE));
     const float *scale = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCALE));
     const float *partials = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS));
-    float *pre = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER));
     float *join = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_2_BUFFER));
     const unsigned row = blockIdx.x;
     const unsigned width = STREAMS * SEISMIC_DIM_H, split = (unsigned)SEISMIC_CONST_SINKHORN_SPLIT;
@@ -273,7 +279,23 @@ extern "C" __global__ void stream_mix_sinkhorn_finish(SEISMIC_KERNEL_PARAMS) {
 #pragma unroll
     for (unsigned j = 0; j < MIXES; ++j)
         mixes[j] = reduced[1u + j] * inverse;
-    publish_coefficients(mixes, comb, base, SEISMIC_BASE_STRIDE_0, scale, SEISMIC_SCALE_STRIDE_0,
-                         pre + (u64)row * SEISMIC_RESULT_1_STRIDE_0, SEISMIC_RESULT_1_STRIDE_1,
-                         join + (u64)row * SEISMIC_RESULT_2_STRIDE_0, SEISMIC_RESULT_2_STRIDE_1, epsilon, iterations);
+    if constexpr (CARRIED) {
+        float *pre = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER));
+        publish_coefficients(mixes, comb, base, SEISMIC_BASE_STRIDE_0, scale, SEISMIC_SCALE_STRIDE_0,
+                             pre + (u64)row * SEISMIC_RESULT_1_STRIDE_0, SEISMIC_RESULT_1_STRIDE_1,
+                             join + (u64)row * SEISMIC_RESULT_2_STRIDE_0, SEISMIC_RESULT_2_STRIDE_1, epsilon,
+                             iterations);
+    } else {
+        // Every thread holds its mixes, so `reduced` takes the pre.
+        publish_coefficients(mixes, comb, base, SEISMIC_BASE_STRIDE_0, scale, SEISMIC_SCALE_STRIDE_0, reduced, 1u,
+                             join + (u64)row * SEISMIC_RESULT_2_STRIDE_0, SEISMIC_RESULT_2_STRIDE_1, epsilon,
+                             iterations);
+        __syncthreads();
+        // The sublayer's input: the streams mixed by this site's pre.
+        const float *hidden = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN));
+        float *input = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER));
+        streams::collapse<STREAMS>(hidden + (u64)row * SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1,
+                                   SEISMIC_HIDDEN_STRIDE_2, reduced, 1u, input + (u64)row * SEISMIC_RESULT_0_STRIDE_0,
+                                   SEISMIC_RESULT_0_STRIDE_1, SEISMIC_DIM_H, threadIdx.x, THREADS);
+    }
 }

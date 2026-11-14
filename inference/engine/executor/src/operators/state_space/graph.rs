@@ -346,7 +346,7 @@ mod tests {
         EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection, FamilyId, FeedForwardUp,
         HeadNorm, HistoryRows, HistorySource, ImportTransform, InputNorm, InputSemantics,
         LatentExperts, MediaRowAttention, ModelDefinition, Operator, OutputForm,
-        OutputProjection, ProjectedRows, QueryProjection, ResidualForm, RmsNorm, Rotary,
+        OutputProjection, ProjectedRows, QueryKeys, QueryProjection, ResidualForm, RmsNorm, Rotary,
         RouteNormalization, RoutedFfn, Router, RouterInput, RowProducer, RowRounding,
         TokenDomain,
         ScaledActivations,
@@ -496,6 +496,7 @@ mod tests {
                     kv_heads: 2,
                     width: 128,
                     query: QueryProjection::Full(tensor(name("attn_q"), vec![512, HIDDEN])),
+                    query_keys: QueryKeys::Direct,
                     gate: AttentionGate::None,
                     query_norm: HeadNorm::None,
                     history: vec![HistorySource::visible(HistoryRows::Own(

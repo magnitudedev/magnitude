@@ -48,7 +48,7 @@ constexpr int INPUT_WIDTH = 2 * G * N + 2 * NH;
 
 // Slots of at most this many rows advance row-sequentially in either entry,
 // so a request's state bits never depend on its row class or its peers.
-constexpr int SEQUENTIAL_ROWS = 16;
+constexpr int SEQUENTIAL_ROWS = SEISMIC_CONST_SEQUENTIAL_ROWS;
 // The chunk's pieces: a slot of more than SEQUENTIAL_ROWS rows splits its
 // rows before the stop row into pieces of at most PIECE rows from its first
 // row; other slots have none. Pieces are numbered over the slots in order.

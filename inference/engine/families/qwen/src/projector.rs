@@ -213,6 +213,7 @@ pub fn describe_projector(
     let merger_hidden = product(&[hidden, merge, merge])?;
     let stages = vec![
         MergerStage {
+            norm: None,
             linear: VisionLinear {
                 weight: tensor("mm.0.weight", &[merger_hidden, merger_hidden])?,
                 bias: Some(tensor("mm.0.bias", &[merger_hidden])?),
@@ -221,6 +222,7 @@ pub fn describe_projector(
             activation: Some(VisionActivation::GeluErf),
         },
         MergerStage {
+            norm: None,
             linear: VisionLinear {
                 weight: tensor("mm.2.weight", &[output_hidden, merger_hidden])?,
                 bias: Some(tensor("mm.2.bias", &[output_hidden])?),
@@ -267,6 +269,7 @@ pub fn describe_projector(
             standardize: None,
             projection_norm: None,
             stages,
+            feed_forward: None,
             output_norm: None,
         },
     };

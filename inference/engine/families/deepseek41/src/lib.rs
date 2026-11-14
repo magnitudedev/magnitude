@@ -65,20 +65,19 @@ use magnitude_artifacts::{
     PackageIdentity, UnsupportedReason,
 };
 use magnitude_family_common::{
+    binders,
     rotary::{self, Yarn, YarnAmplitude},
     HeaderError, Metadata, Tensors,
 };
 use magnitude_family_contracts::{
-    checked_product, grouped_output_columns, ActivationDType, ActivationFunction, Attention, AttentionGate, Block,
+    checked_product, grouped_output_columns, ActivationDType, Attention, AttentionGate, Block,
     BlockElement, BlockRounding, BlockScale, Candidates, Decoder, EmbeddingScale, HeadWeights, HistoryReads,
-    Indexer, IndexerInput, IndexerKeys, IndexerQuery, Pool, PooledRows, Selection, SublayerIndex, EntryForm, ExitForm, ExitNorm, ExitSite, ExpertSelection,
-    FamilyError, FamilyId, FeedForwardUp, GluLimit, HeadNorm, HistoryRows, HistorySource,
-    HyperConnectionExit, HyperConnectionInput, HyperConnectionMixing, HyperConnectionWeights,
+    Indexer, IndexerInput, IndexerKeys, IndexerQuery, Pool, PoolNorm, PooledRows, Selection, SublayerIndex, EntryForm, ExitForm, ExitNorm, ExitSite, FamilyError, FamilyId, GluLimit, HeadNorm, HistoryRows, HistorySource,
+    HyperConnectionExit, HyperConnectionMixing, SinkhornInput,
     HyperConnections, ImportTransform, InputNorm, InputSemantics, MediaRowAttention,
     ProjectedRows, RowProducer, RowRounding, TokenDomain,
-    ModelDefinition, NGramGate, NGramHash, NGramInput, NGramMedia, Operator, OutputForm, OutputProjection, OutputRotary, QueryProjection, ResidualForm, RmsNorm,
-    Rotary, RotaryLayout, RotaryPairing, RotaryPlacement, RouteNormalization, RoutedFfn, Router,
-    RouterInput, RowRange, ScoreFunction, SharedExpert, SharedExpertGate, SinkhornSite, Sublayer,
+    ModelDefinition, NGramGate, NGramHash, NGramInput, NGramMedia, Operator, OutputForm, OutputProjection, OutputRotary, QueryKeys, QueryProjection, ResidualForm, RmsNorm,
+    Rotary, RotaryLayout, RotaryPairing, RotaryPlacement, RouteNormalization, RoutedFfn, RowRange, ScoreFunction, Sublayer,
     ValueNorm,
     ValueSource, WeightDescriptor,
 };
@@ -184,9 +183,6 @@ const ENGRAM_KEYS: &[&str] = &[
 /// (`LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS`), the one V4.1 routes by.
 const SQRT_SOFTPLUS: u64 = 4;
 
-/// The combine weights' normalizer, `sum + 1e-20`: the released router's
-/// own constant, as trained, not the model's RMS epsilon.
-const ROUTE_EPSILON: f64 = 1e-20;
 
 /// Where V4.1's rotary pairs sit: adjacent pairs `(2p, 2p + 1)` over a
 /// head's trailing dimensions, from `head_dim - rope_dim` on.
@@ -533,9 +529,7 @@ impl Geometry {
                 // A limit of 0 is no clamp, as the released definition reads it.
                 .map(|limit| match limit == 0.0 {
                     true => Ok(None),
-                    false => GluLimit::new(limit)
-                        .map(Some)
-                        .map_err(|error| FamilyError::metadata(m.key(key), error.to_string())),
+                    false => binders::glu_limit(&m, key, limit).map(Some),
                 })
                 .collect()
         };
@@ -563,7 +557,7 @@ impl Geometry {
             // A lone selected expert keeps its raw score: the released router
             // normalizes only a selection of more than one.
             normalization: match m.flag("expert_weights_norm")? && selected > 1 {
-                true => RouteNormalization::SumPlusEpsilon(ROUTE_EPSILON),
+                true => RouteNormalization::SumPlusEpsilon(binders::ROUTE_EPSILON),
                 false => RouteNormalization::None,
             },
             scale: m.positive_number("expert_weights_scale")?,
@@ -591,20 +585,7 @@ impl Geometry {
         norm: &str,
         op: Operator,
     ) -> Result<Sublayer, FamilyError> {
-        let mixes = product(&[2 + self.streams, self.streams])?;
-        let wide = product(&[self.streams, self.hidden])?;
-        Ok(Sublayer {
-            input: InputNorm::HyperConnectionMix(HyperConnectionInput {
-                site: HyperConnectionWeights::Sinkhorn(SinkhornSite {
-                    function: weight(&format!("hc_{site}_fn.weight"), &[mixes, wide])?,
-                    base: weight(&format!("hc_{site}_base.weight"), &[mixes])?,
-                    scale: weight(&format!("hc_{site}_scale.weight"), &[3])?,
-                }),
-                norm: Some(self.rms(weight(&format!("{norm}.weight"), &[self.hidden])?)),
-            }),
-            op,
-            output: OutputForm::Scatter,
-        })
+        binders::sinkhorn_sited(weight, self.streams, self.hidden, self.epsilon, site, norm, op)
     }
 
     /// A compressed layer's second history source (part 1): its own pooled
@@ -643,13 +624,14 @@ impl Geometry {
                     1 => Pool::Identity,
                     _ => Pool::SoftmaxGated {
                         gate: weight("attn_compressor_gate.weight", &[width, hidden])?,
+                        position: None,
                     },
                 };
                 let rows = PooledRows {
                     rate: ratio,
                     projection: weight("attn_compressor_kv.weight", &[width, hidden])?,
                     pool,
-                    norm: self.rms(weight("attn_compressor_norm.weight", &[width])?),
+                    norm: PoolNorm::Pooled(self.rms(weight("attn_compressor_norm.weight", &[width])?)),
                     rounding: COMPRESSED_ROUNDING,
                 };
                 let candidates = match candidate_pool {
@@ -725,6 +707,7 @@ impl Geometry {
                 norm: self.rms(weight("attn_q_a_norm.weight", &[self.query_rank])?),
                 up: weight("attn_q_b.weight", &[rows, self.query_rank])?,
             },
+            query_keys: QueryKeys::Direct,
             gate: AttentionGate::None,
             query_norm: HeadNorm::None,
             history: vec![HistorySource::visible(HistoryRows::Own(RowProducer::Projected(
@@ -759,54 +742,23 @@ impl Geometry {
     }
 
     fn routed(&self, weight: &mut Weight, layer: u64) -> Result<RoutedFfn, FamilyError> {
-        let (experts, intermediate, hidden) = (self.experts, self.intermediate, self.hidden);
         let (routed_limit, shared_limit) = self.clamps[layer as usize];
-        let silu = |limit, gate, up| FeedForwardUp::Gated {
-            activation: ActivationFunction::Silu,
-            limit,
-            gate,
-            up,
-        };
-        let stacked = [experts, intermediate, hidden];
-        Ok(RoutedFfn {
-            experts,
-            selected: self.selected,
-            intermediate,
-            router: Router {
-                weight: weight("ffn_gate_inp.weight", &[experts, hidden])?,
-                input: RouterInput::Operator,
+        binders::routed(
+            weight,
+            binders::RoutedForm {
+                experts: self.experts,
+                selected: self.selected,
+                intermediate: self.intermediate,
+                hidden: self.hidden,
+                shared: self.shared,
                 score: ScoreFunction::SqrtSoftplus,
-                selection: ExpertSelection::TopK {
-                    bias: Some(weight("exp_probs_b.bias", &[experts])?),
-                },
-                media_bias: Some(weight("exp_probs_b_vl.bias", &[experts])?),
+                media_bias: true,
                 normalization: self.normalization,
                 scale: self.scale,
-            },
-            expert_up: silu(
                 routed_limit,
-                weight("ffn_gate_exps.weight", &stacked)?,
-                weight("ffn_up_exps.weight", &stacked)?,
-            ),
-            expert_down: weight("ffn_down_exps.weight", &[experts, hidden, intermediate])?,
-            expert_scale: None,
-            latent: None,
-            shared: self
-                .shared
-                .map(|shared| -> Result<SharedExpert, FamilyError> {
-                    Ok(SharedExpert {
-                        intermediate: shared,
-                        up: silu(
-                            shared_limit,
-                            weight("ffn_gate_shexp.weight", &[shared, hidden])?,
-                            weight("ffn_up_shexp.weight", &[shared, hidden])?,
-                        ),
-                        down: weight("ffn_down_shexp.weight", &[hidden, shared])?,
-                        gate: SharedExpertGate::None,
-                    })
-                })
-                .transpose()?,
-        })
+                shared_limit,
+            },
+        )
     }
 }
 
@@ -1014,6 +966,7 @@ pub fn inspect_components(
                     iterations: m.integer("hyper_connection.sinkhorn_iterations")?,
                     epsilon: m.positive_number("hyper_connection.epsilon")?,
                     norm_epsilon: geometry.epsilon,
+                    input: SinkhornInput::PreviousSite,
                 },
             }),
             entry: EntryForm {

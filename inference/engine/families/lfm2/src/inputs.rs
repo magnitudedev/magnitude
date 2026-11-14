@@ -5,10 +5,7 @@
 
 use crate::Architecture;
 use magnitude_artifacts::BoundaryRule;
-use magnitude_family_contracts::{
-    ImageMarkers, InputPreparationError, ModelDefinition, SequentialImageInput,
-    VisionSpatialControls,
-};
+use magnitude_family_contracts::{cell_raster_controls, ImageMarkers, SequentialImageInput};
 
 /// Declares an image's start, row and end markers once, and the text one
 /// image renders as from them.
@@ -31,42 +28,6 @@ pub fn input_adapter(markers: ImageMarkers) -> SequentialImageInput {
         Architecture::Lfm3.family_id(),
         Some(markers),
         BoundaryRule::Causal,
-        spatial_controls,
+        cell_raster_controls,
     )
-}
-
-/// Patch rows cell by cell (the `merge`² cells in raster order), each cell's
-/// patches in raster order, as the processor flattens them; the tower holds
-/// them in that order. A row's rotary coordinates are its patch's grid row
-/// and column. The tower has no position table.
-pub fn spatial_controls(
-    definition: &ModelDefinition,
-    grid: [usize; 3],
-) -> Result<VisionSpatialControls, InputPreparationError> {
-    let vision = definition
-        .vision
-        .as_ref()
-        .ok_or(InputPreparationError::UnsupportedMedia)?;
-    let merge = usize::try_from(vision.preprocessing.merge)
-        .map_err(|_| InputPreparationError::VisionGeometry)?;
-    let [t, h, w] = grid;
-    if t != 1 || merge == 0 || h == 0 || w == 0 || h % merge != 0 || w % merge != 0 {
-        return Err(InputPreparationError::VisionGeometry);
-    }
-    let coordinate =
-        |value: usize| i32::try_from(value).map_err(|_| InputPreparationError::VisionGeometry);
-    let mut coordinates = Vec::with_capacity(h * w);
-    for cell_row in 0..h / merge {
-        for cell_col in 0..w / merge {
-            for inner_row in 0..merge {
-                for inner_col in 0..merge {
-                    coordinates.push([
-                        coordinate(cell_row * merge + inner_row)?,
-                        coordinate(cell_col * merge + inner_col)?,
-                    ]);
-                }
-            }
-        }
-    }
-    VisionSpatialControls::new((0..h * w).collect(), coordinates, None, Vec::new())
 }

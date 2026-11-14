@@ -26,7 +26,7 @@ use magnitude_family_contracts::{
     FeedForwardUp, GateFunction, GateGranularity, HeadNorm, HistoryRows, HistorySource,
     ImportTransform, InputNorm, InputSemantics, MediaRowAttention, ModelDefinition,
     ProjectedRows, RowProducer, RowRounding, TokenDomain,
-    Operator, OutputForm, OutputProjection, QueryProjection, ResidualForm, RmsNorm,
+    Operator, OutputForm, OutputProjection, QueryKeys, QueryProjection, ResidualForm, RmsNorm,
     Rotary, RouteNormalization, RoutedFfn, Router,
     RouterInput, RowRange, ScoreFunction, ShortConv, Sublayer, ValueNorm, ValueSource,
     WeightDescriptor,
@@ -378,6 +378,7 @@ pub fn inspect_components(
                     kv_heads,
                     width,
                     query: QueryProjection::Full(weight("attn_q.weight", &[head_rows, hidden])?),
+                    query_keys: QueryKeys::Direct,
                     gate: match architecture {
                         Architecture::Dense | Architecture::Routed => AttentionGate::None,
                         Architecture::Lfm3 => AttentionGate::Separate {

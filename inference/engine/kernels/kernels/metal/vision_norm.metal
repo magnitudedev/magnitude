@@ -28,6 +28,6 @@ kernel void vision_norm(device const float *source [[buffer(SEISMIC_BUFFER_SOURC
     const ulong first = ulong(cell) * SEISMIC_RESULT_0_STRIDE_0 + (interleave ? member : ulong(member) * h);
     vision::norm<NORM_THREADS, output_element, weight_element, bias_element, SEISMIC_DIM_NW == 1,
         SEISMIC_DIM_NB == 1>(source + ulong(from) * h, result + first * output_element::bytes, interleave ? g : 1,
-        weight, bias, h, int(SEISMIC_PARAM_CENTERED) != 0, as_type<float>(uint(SEISMIC_PARAM_EPSILON)), partials,
-        thread_index, sg, lane);
+        weight, bias, h, int(SEISMIC_PARAM_CENTERED) != 0, as_type<float>(uint(SEISMIC_PARAM_EPSILON)),
+        int(SEISMIC_PARAM_ACTIVATION), partials, thread_index, sg, lane);
 }

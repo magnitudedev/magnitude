@@ -3,6 +3,7 @@
 //! engine's pairing, and text-only input. A family crate keeps only what
 //! varies between families: which keys and tensors mean what.
 
+pub mod binders;
 mod error;
 #[cfg(feature = "catalog-headers")]
 pub mod headers;

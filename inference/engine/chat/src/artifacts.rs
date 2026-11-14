@@ -140,6 +140,10 @@ impl Profile {
             // llama.cpp's Llama 3 pre-tokenizer: its pieces, merges ignored for
             // a piece in the vocabulary, the BOS by default.
             ("gpt2", Some("lfm2" | "llama-bpe")) => byte_level(&[(LLAMA3, Isolated)], true, true),
+            // GLM-4 and GLM-5 read Llama 3's pieces with merges ignored for a
+            // piece in the vocabulary and no BOS by default (cd959bae,
+            // `llama-vocab.cpp:414-417`, `:2609-2614`).
+            ("gpt2", Some("glm4" | "glm5")) => byte_level(&[(LLAMA3, Isolated)], true, false),
             // Digit groups of one to three first, then Llama 3 pieces over
             // whole digit runs.
             ("gpt2", Some("minicpm5")) => byte_level(

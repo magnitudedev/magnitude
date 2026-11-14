@@ -1,9 +1,9 @@
 //! CUDA K1 projections over real Qwen3.5-4B GGUF weights, against an f64
 //! reference of the exact operands and a host emulation of each operand
-//! path. Every mapping must agree with its own emulation to within output
-//! roundings (a decode, scale or fragment-order defect shows up as a
-//! departure that dwarfs them); the report also gives each path's error
-//! against the exact product, relative to the output RMS. Run with
+//! path. Every output must lie within its derived bound
+//! (`cuda_common::expansion_bound`) of its operand path's exact expansion; the
+//! report also gives each path's error against the exact product, relative
+//! to the output RMS. Run with
 //! `MAGNITUDE_GGUF_4B` naming the pinned unsloth Q4_K_M file; returns early
 //! without it or without CUDA.
 
@@ -267,18 +267,24 @@ fn real_4b_projections_match_their_operand_emulation() {
         for outliers in [false, true] {
             for o in [1usize, 3, 12, 64, 128] {
                 let values = residual(&gguf, o, outliers);
-                let exact = normalized(&values, &norm_values, o, h);
+                let (exact, flips) = normalized(&values, &norm_values, o, h);
                 let residual_tensor = f32_tensor(&device, &[o as u64, h as u64], &values);
                 let norm = f32_tensor(&device, &[h as u64], &norm_values);
                 let out_rows = i32_tensor(&device, &[o as u64], &(0..o as i32).collect::<Vec<_>>());
-                let (g_exact, _) = project(&exact, &gate.values, o, f, h);
-                let (u_exact, _) = project(&exact, &up.values, o, f, h);
+                let reference_mapping = GEMV_MAPPINGS[0];
+                let (gate_element, up_element) = (gate.tensor.element(), up.tensor.element());
+                let (g_exact, _) =
+                    project(&exact, &gate.values, gate_element, o, f, h, reference_mapping);
+                let (u_exact, _) =
+                    project(&exact, &up.values, up_element, o, f, h, reference_mapping);
                 let reference: Vec<f64> =
                     (0..o * f).map(|i| silu(g_exact[i]) * u_exact[i]).collect();
                 for mapping in mappings(o, |mapping| expand.admits(&device, mapping)) {
-                    let (x, _) = operand_rows(&exact, h, mapping, Some(gate_format));
-                    let (g, _) = project(&x, &gate.values, o, f, h);
-                    let (u, _) = project(&x, &up.values, o, f, h);
+                    let (x, operand) = operand_rows(&exact, h, mapping, Some(gate_format));
+                    let (g, _) = project(&x, &gate.values, gate_element, o, f, h, mapping);
+                    let (u, _) = project(&x, &up.values, up_element, o, f, h, mapping);
+                    let (expected, tolerance) =
+                        expansion_bound(&x, &flips, &operand, &gate, &up, o, f, h, mapping);
                     // The operand path and the epilogue's bf16 roundings.
                     let round = |v: f64| f64::from(bf16_round(v as f32));
                     let emulated: Vec<f64> = (0..o * f)
@@ -325,19 +331,14 @@ fn real_4b_projections_match_their_operand_emulation() {
                         departure.rms,
                         departure.max
                     );
-                    // Accumulation order across bf16 rounding boundaries, the
-                    // rare activation-rounding tie that moves a q8_1 group, and
-                    // on the 16-bit GEMM the weights' dequantization to bf16
-                    // (2^-9 of each weight, not emulated; 1.9-5.0e-3 of the
-                    // output RMS on these rows).
-                    let limit = if o > GEMV_ROWS && !mapping.quantizes(o) {
-                        8e-3
-                    } else {
-                        1e-3
-                    };
-                    if departure.rms > limit {
+                    // Every output within its derived bound of the operand
+                    // path's exact expansion.
+                    let outside = (0..o * f)
+                        .filter(|&i| !((actual[i] - expected[i]).abs() <= tolerance[i]))
+                        .count();
+                    if outside > 0 {
                         failures.push(format!(
-                            "{gate_name} outliers={outliers} O={o} {}",
+                            "{gate_name} outliers={outliers} O={o} {}: {outside} outside",
                             mapping_label(mapping, o)
                         ));
                     }
@@ -347,7 +348,7 @@ fn real_4b_projections_match_their_operand_emulation() {
     }
     assert!(
         failures.is_empty(),
-        "paths departing from their emulation: {failures:?}"
+        "paths outside their bound: {failures:?}"
     );
 }
 
@@ -638,7 +639,7 @@ fn real_26b_grouped_physical_f16_operands() {
         .into_iter()
         .map(bf16_round)
         .collect::<Vec<_>>();
-    let input = normalized(&residual(&gguf, m, false), &norm, m, h);
+    let (input, _) = normalized(&residual(&gguf, m, false), &norm, m, h);
     let input = bf16_tensor(&device, &[m as u64, h as u64], &input);
     let order = (0..e * t).map(|i| (i % m) as i32).collect::<Vec<_>>();
     let order = i32_tensor(&device, &[e as u64, t as u64], &order);

@@ -36,6 +36,24 @@ pub enum LayerRef {
     /// The keys of the indexer selecting source `part` of target block
     /// `block`, which no attention reads as history.
     IndexKeys { block: u32, part: u32 },
+    /// [`LayerRef::Pooled`] of draft head block `block`, in the head's store.
+    HeadPooled { block: u32, part: u32 },
+    /// [`LayerRef::IndexKeys`] of draft head block `block`, in the head's
+    /// store.
+    HeadIndexKeys { block: u32, part: u32 },
+}
+
+impl LayerRef {
+    /// A pooled source's rows or incomplete group, of a target block or a
+    /// head block.
+    pub fn is_pooled(self) -> bool {
+        matches!(self, Self::Pooled { .. } | Self::HeadPooled { .. })
+    }
+
+    /// An indexer's keys, of a target block or a head block.
+    pub fn is_index_keys(self) -> bool {
+        matches!(self, Self::IndexKeys { .. } | Self::HeadIndexKeys { .. })
+    }
 }
 
 /// What reads a component's rows, and whose codec they take.
@@ -388,7 +406,7 @@ impl ComponentDescriptor {
         heads: usize,
         role: ComponentRole,
     ) -> Result<Self, LayoutError> {
-        if matches!(layer, LayerRef::IndexKeys { .. }) {
+        if layer.is_index_keys() {
             return Err(LayoutError::WrongRepresentation("indexer keys as attention history"));
         }
         if heads == 0 {
@@ -429,7 +447,7 @@ impl ComponentDescriptor {
         width: usize,
         coordinates: bool,
     ) -> Result<Self, LayoutError> {
-        if !matches!(layer, LayerRef::IndexKeys { .. } | LayerRef::Pooled { .. }) {
+        if !(layer.is_index_keys() || layer.is_pooled()) {
             return Err(LayoutError::WrongRepresentation(
                 "produced rows of an attention layer",
             ));

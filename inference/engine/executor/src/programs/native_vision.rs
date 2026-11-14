@@ -20,7 +20,7 @@ use super::{ReadySubmission, VisionProgram};
 use crate::error::PlanError;
 use crate::native::{AttestedVision, VisionKernels};
 use crate::operators::vision::{
-    VisionEntry, VisionKernel, VisionOperands, VisionProgram as VisionOps, VisionRows,
+    LinearBounds, VisionEntry, VisionKernel, VisionOperands, VisionProgram as VisionOps, VisionRows,
     VisionValue, vision_program,
 };
 use crate::{
@@ -379,6 +379,8 @@ enum Constant {
     Unit(Dim),
     /// The row identity of the post-norms' output rows.
     Identity,
+    /// One F32 value (a feed-forward limit's bound), as its bits.
+    Bound(u32),
 }
 
 impl Constant {
@@ -390,6 +392,7 @@ impl Constant {
             | (Self::EmptyI32, Self::EmptyI32)
             | (Self::Identity, Self::Identity) => true,
             (Self::Unit(width), Self::Unit(other)) => width.equals(other),
+            (Self::Bound(bits), Self::Bound(other)) => bits == other,
             _ => false,
         }
     }
@@ -399,15 +402,21 @@ impl Constant {
     fn of(topology: &VisionTopology, numbers: &VisionNumbers<Dim>) -> Result<Vec<Self>, GraphError> {
         let mut constants = vec![Self::EmptyF32, Self::EmptyI32];
         for (index, op) in topology.ops.iter().enumerate() {
-            let constant = match op.operands {
+            let needed = match op.operands {
                 VisionOperands::Attention { value_norm: true, .. } => {
-                    Self::Unit(static_value(topology, numbers, index, "P")? * 4u64)
+                    vec![Self::Unit(static_value(topology, numbers, index, "P")? * 4u64)]
                 }
-                VisionOperands::PostNormResidual { .. } => Self::Identity,
+                VisionOperands::PostNormResidual { .. } => vec![Self::Identity],
+                VisionOperands::Linear {
+                    bounds: Some(LinearBounds::Fixed { minimum, maximum }),
+                    ..
+                } => vec![Self::Bound(minimum), Self::Bound(maximum)],
                 _ => continue,
             };
-            if !constants.iter().any(|known| known.is(&constant)) {
-                constants.push(constant);
+            for constant in needed {
+                if !constants.iter().any(|known| known.is(&constant)) {
+                    constants.push(constant);
+                }
             }
         }
         Ok(constants)
@@ -420,6 +429,7 @@ impl Constant {
             Self::EmptyI32 => GraphConstant::i32(graph, &[0]),
             Self::Unit(width) => GraphConstant::f32_filled(graph, &[Dim::from(1u64), width.clone()], 1.0),
             Self::Identity => GraphConstant::row_identity(graph, rows.clone(), Some("O")),
+            Self::Bound(bits) => GraphConstant::f32_shaped(graph, &[1], &[f32::from_bits(*bits)]),
         }
     }
 }
@@ -691,6 +701,7 @@ impl<G: GraphDraft, B: VisionBindings<G>, W: PlannedWeights + ?Sized> Draft<'_, 
                 epsilon,
                 centered,
                 interleave,
+                activation,
             } => {
                 let (g, h) = (statics("G")?, statics("H")?);
                 // A norm of G > 1 member rows per cell reads patch rows and
@@ -734,6 +745,7 @@ impl<G: GraphDraft, B: VisionBindings<G>, W: PlannedWeights + ?Sized> Draft<'_, 
                             epsilon: epsilon.f32(),
                             centered: i32::from(*centered).into(),
                             interleave: i32::from(*interleave).into(),
+                            activation: (*activation).into(),
                         },
                     )?
                     .value
@@ -773,10 +785,15 @@ impl<G: GraphDraft, B: VisionBindings<G>, W: PlannedWeights + ?Sized> Draft<'_, 
                     Some(value) => self.value(*value, &rows_by_width)?,
                     None => x.slice_leading(0u64, 0u64).reshape(&[Dim::from(0u64), m, n]),
                 };
+                let unit = [Dim::from(1u64)];
                 let (minimum, maximum) = match bounds {
-                    Some((minimum, maximum)) => (
-                        self.weight(*minimum, &[Dim::from(1u64)])?,
-                        self.weight(*maximum, &[Dim::from(1u64)])?,
+                    Some(LinearBounds::Stored { minimum, maximum }) => (
+                        self.weight(*minimum, &unit)?,
+                        self.weight(*maximum, &unit)?,
+                    ),
+                    Some(LinearBounds::Fixed { minimum, maximum }) => (
+                        self.constant(&Constant::Bound(*minimum))?.reshape(&unit),
+                        self.constant(&Constant::Bound(*maximum))?.reshape(&unit),
                     ),
                     None => (
                         self.empty(Constant::EmptyF32, &[])?,
@@ -1228,12 +1245,7 @@ impl VisionFamily {
             .iter()
             .map(|&patches| {
                 let (rows, cells) = class_rows(self.numbers.registers, self.numbers.cell_rows, patches)?;
-                Ok(vec![NativeGraphClassSlice::new()
-                    .dimension("M", [rows])
-                    .dimension("O", [rows])
-                    .scoped(<vision_norm::Entry as seismic::Entry>::NAME, "C", [rows])
-                    .scoped(CELLS, "M", [cells])
-                    .scoped(CELLS, "C", [cells])])
+                Ok(vec![NativeGraphClassSlice::new().dimension("M", [rows]).scoped(CELLS, "M", [cells])])
             })
             .collect::<Result<Vec<_>, GraphError>>()?;
         let classes = [

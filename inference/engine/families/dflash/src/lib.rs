@@ -36,7 +36,7 @@ use magnitude_family_contracts::{
     HistorySource, ImportTransform, InputNorm, LayerConvolutions, MarkovHead, ProjectedRows,
     RowProducer, RowRounding, TokenDomain,
     MediaRowAttention, ModelDefinition, Operator, OutputForm, OutputProjection, OutputRotary,
-    QueryProjection, RmsNorm, Rotary, RotaryLayout, Sublayer, TapPoint,
+    QueryKeys, QueryProjection, RmsNorm, Rotary, RotaryLayout, Sublayer, TapPoint,
     ValueNorm, ValueSource, WeightDescriptor, CORRECTOR_FEATURES,
 };
 use std::{error, fmt};
@@ -579,6 +579,7 @@ pub fn inspect(
                 kv_heads,
                 width,
                 query: QueryProjection::Full(weight("attn_q", &[query_rows, hidden])?),
+                query_keys: QueryKeys::Direct,
                 gate: AttentionGate::None,
                 query_norm: HeadNorm::Rms(rms(weight("attn_q_norm", &[width])?)),
                 history: vec![HistorySource::visible(HistoryRows::Own(

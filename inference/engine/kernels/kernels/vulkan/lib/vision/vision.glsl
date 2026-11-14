@@ -20,6 +20,7 @@
 // This file is independent of any entry ABI.
 #include "../projection/projection.glsl"
 #include "../core/rotary.glsl"
+#include "../core/norm.glsl"
 #include "../attention/flash.glsl"
 #include "../core/precise.glsl"
 
@@ -68,8 +69,8 @@ float vision_gelu_quick(float value) {
 // output (m, n).
 //   Linear  the projection is acc, plus bias[n] when `biased`, clamped to
 //           [minimum, maximum] when `clamped`; with `activation` nonzero
-//           y = Y(act(round_A(projection))); with a gate (A rows, 0: none)
-//           y = Y(round_A(projection) · gate[m, n]); otherwise
+//           y = Y(act(projection)); with a gate (A rows, 0: none)
+//           y = Y(projection · gate[m, n]), rounded once; otherwise
 //           y = Y(projection), plus residual[m, n] (F32) when bound
 //   Stem    y = ((partial[m, n] when bound) + acc [+ bias[n]]) + blended,
 //           F32, with blended the four table corners times their
@@ -142,9 +143,9 @@ void vision_put(vision_epilogue out_, uint m, uint n, float value) {
             projected = min(max(projected, out_.minimum), out_.maximum);
         float published = projected;
         if (out_.activation != 0)
-            published = vision_activate(out_.activation, element_round(out_.act, projected));
+            published = vision_activate(out_.activation, projected);
         else if (out_.gate != 0ul)
-            published = element_round(out_.act, projected)
+            published = projected
                 * element_at(out_.act, out_.gate, uint64_t(m) * out_.gate0 + n);
         else if (out_.residual != 0ul)
             published = element_f32_at(out_.residual + (uint64_t(m) * out_.residual0 + n) * 4ul) + projected;
@@ -193,39 +194,30 @@ projection_weights vision_weights(uint64_t base, packets_rows16 rows, uint k) {
 }
 
 // ---------------------------------------------------------------------------
-// Norm of one F32 row of `width` values by the whole workgroup: two-pass F32
-// statistics, centered (a layer norm) or not (the mean taken as 0, a
+// Norm of one F32 row of `width` values by the whole workgroup: `norm_*`'s
+// two-pass statistics, centered (a layer norm) or not (the mean taken as 0, a
 // root-mean-square norm), out[i * stride] = Y(centered * inverse [* weight]
 // [+ bias]). Shared: one float per subgroup at float 0.
 void vision_row_norm(const int y_kind, uint64_t x, uint64_t out_, uint64_t stride, const bool weighted, uint64_t weight,
     const int weight_kind, const bool biased, uint64_t bias, const int bias_kind, uint width, bool centered,
-    float epsilon) {
+    float epsilon, int activation) {
     float mean = 0.0;
     if (centered) {
         float sum = 0.0;
         for (uint i = gl_LocalInvocationIndex; i < width; i += gl_WorkGroupSize.x)
             sum += element_f32_at(x + uint64_t(i) * 4ul);
-        mean = seismic_div_rn(reduce_group_sum(sum, 0u), float(width));
+        mean = norm_mean(reduce_group_sum(sum, 0u), width);
     }
     float squares = 0.0;
-    for (uint i = gl_LocalInvocationIndex; i < width; i += gl_WorkGroupSize.x) {
-        const float value = element_f32_at(x + uint64_t(i) * 4ul) - mean;
-        squares = seismic_fma_rn(value, value, squares);
-    }
-    const float inverse = inversesqrt(seismic_div_rn(reduce_group_sum(squares, 0u), float(width)) + epsilon);
-    // One expression per form, as the layer norm has always been written.
+    for (uint i = gl_LocalInvocationIndex; i < width; i += gl_WorkGroupSize.x)
+        squares = norm_square(element_f32_at(x + uint64_t(i) * 4ul) - mean, squares);
+    const float inverse = norm_inverse(reduce_group_sum(squares, 0u), width, epsilon);
     for (uint i = gl_LocalInvocationIndex; i < width; i += gl_WorkGroupSize.x) {
         const float centered = element_f32_at(x + uint64_t(i) * 4ul) - mean;
-        float value;
-        if (weighted && biased)
-            value = centered * inverse * element_at(weight_kind, weight, i) + element_at(bias_kind, bias, i);
-        else if (weighted)
-            value = centered * inverse * element_at(weight_kind, weight, i);
-        else if (biased)
-            value = centered * inverse + element_at(bias_kind, bias, i);
-        else
-            value = centered * inverse;
-        element_put(y_kind, out_, uint64_t(i) * stride, value);
+        const float w = weighted ? element_at(weight_kind, weight, i) : 0.0;
+        const float b = biased ? element_at(bias_kind, bias, i) : 0.0;
+        const float normalized = norm_apply(centered, inverse, weighted, w, biased, b);
+        element_put(y_kind, out_, uint64_t(i) * stride, activation != 0 ? vision_activate(activation, normalized) : normalized);
     }
 }
 

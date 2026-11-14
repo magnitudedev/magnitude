@@ -135,6 +135,18 @@ pub struct RowHistory {
     pub destination: i32,
 }
 
+/// Ascending visible spans with adjacent spans merged.
+pub fn coalesce_spans(spans: &[[i32; 2]]) -> Vec<[i32; 2]> {
+    let mut merged: Vec<[i32; 2]> = Vec::with_capacity(spans.len());
+    for &span in spans {
+        match merged.last_mut() {
+            Some(previous) if previous[1] == span[0] => previous[1] = span[1],
+            _ => merged.push(span),
+        }
+    }
+    merged
+}
+
 /// One history domain's row tables: per row its visible ranges, its fresh
 /// batch rows `[start, end)` and its destination.
 #[derive(Clone, Debug, PartialEq)]

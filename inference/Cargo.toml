@@ -27,6 +27,7 @@ members = [
   "engine/families/nemotron_h",
   "engine/families/dflash",
   "engine/families/deepseek41",
+  "engine/families/glm5next",
   "engine/families/registry",
   "engine/templates",
   "engine/serving",

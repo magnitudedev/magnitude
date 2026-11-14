@@ -1,6 +1,7 @@
 //! Shared host models and fixtures of the CUDA K1 entry tests: random GGUF
 //! blocks repacked into mma16 by the registry's host conversion, tensors,
-//! RMS/projection host models, mappings and tolerance checks.
+//! RMS/projection host models and their bounds (`common::bound`), and
+//! mappings.
 #![allow(dead_code)]
 
 use magnitude_kernels::dense_expand;
@@ -20,6 +21,11 @@ mod gguf_formats;
 pub mod int8_rule;
 #[path = "../mapped/mod.rs"]
 mod mapped;
+#[path = "../common/bound.rs"]
+pub mod bound;
+// Not every suite reads every item.
+#[allow(unused_imports)]
+pub use bound::{Float, Form, Library, Products, assert_within, silu_product_from_exact};
 pub use gguf_formats::{Format, Rng};
 pub use mapped::Mapped;
 // The suites with a module of tests a format generate them.
@@ -129,47 +135,137 @@ pub fn read_i32(tensor: &Tensor) -> Vec<i32> {
 
 pub const EPSILON: f32 = 1e-6;
 
-/// RMS rows rounded to bf16, as the prologue forms them.
-pub fn normalized(residual: &[f32], norm: &[f32], m: usize, k: usize) -> Vec<f32> {
+/// RMS rows rounded to bf16, as the prologue forms them, with each value's
+/// rounding flip: CUDA's prologue and this F32 host each land within
+/// [`Library::rms`] of the exact normalized value (zero away from a rounding
+/// boundary).
+pub fn normalized(residual: &[f32], norm: &[f32], m: usize, k: usize) -> (Vec<f32>, Vec<f64>) {
+    let native = Library::of(BackendName::Cuda).rms(k);
+    let host = Library::of(BackendName::Cpu).rms(k);
+    let window = (native + host) / (1.0 - host);
     let mut out = vec![0.0; m * k];
+    let mut slack = vec![0.0; m * k];
     for row in 0..m {
         let line = &residual[row * k..(row + 1) * k];
         let squares: f32 = line.iter().map(|v| v * v).sum();
         let inverse = 1.0 / (squares / k as f32 + EPSILON).sqrt();
         for c in 0..k {
-            out[row * k + c] = bf16_round(line[c] * inverse * norm[c]);
+            let value = line[c] * inverse * norm[c];
+            out[row * k + c] = bf16_round(value);
+            slack[row * k + c] = Float::Bf16.flip(f64::from(value), window);
         }
     }
-    out
+    (out, slack)
 }
 
-/// sum_k x[m, k] * w[n, k] and sum_k |x[m, k] * w[n, k]| in f64.
-pub fn project(x: &[f32], w: &[f64], m: usize, n: usize, k: usize) -> (Vec<f64>, Vec<f64>) {
-    let mut out = vec![0.0; m * n];
-    let mut magnitude = vec![0.0; m * n];
-    for row in 0..m {
-        for col in 0..n {
-            let mut sum = 0.0;
-            let mut abs = 0.0;
-            for c in 0..k {
-                let p = f64::from(x[row * k + c]) * w[col * k + c];
-                sum += p;
-                abs += p.abs();
-            }
-            out[row * n + col] = sum;
-            magnitude[row * n + col] = abs;
-        }
+/// `Σ_k x[m, k] w[n, k]` in F64 for weight values `w` [n, k] of resident
+/// `element`, and how far CUDA's F32 sum of each on `mapping` may be from it
+/// ([`form`], [`Form::exact`]).
+pub fn project(
+    x: &[f32],
+    w: &[f64],
+    element: Element,
+    m: usize,
+    n: usize,
+    k: usize,
+    mapping: Mapping,
+) -> (Vec<f64>, Vec<f64>) {
+    let form = form(element, m, mapping);
+    (0..m * n)
+        .map(|i| {
+            let (x, w) = (&x[i / n * k..][..k], &w[i % n * k..][..k]);
+            let sum = x.iter().zip(w).map(|(a, b)| f64::from(*a) * b).sum::<f64>();
+            (sum, form.exact(&Products::of(x, w)))
+        })
+        .unzip()
+}
+
+/// [`project`] of operand rows `x` [m, k] through `weight` [n, k], each
+/// value's tolerance widened by its input `slack` through the weight
+/// ([`slack_bound`]).
+pub fn project_with_slack(
+    x: &[f32],
+    slack: &[f64],
+    weight: &Weight,
+    m: usize,
+    n: usize,
+    k: usize,
+    mapping: Mapping,
+) -> (Vec<f64>, Vec<f64>) {
+    let (values, sums) = project(x, &weight.values, weight.tensor.element(), m, n, k, mapping);
+    let carried = slack_bound(slack, &weight.values, m, n, k);
+    (values, sum_slack(&sums, &carried))
+}
+
+/// The arithmetic of CUDA's projection of `rows` rows over a weight resident
+/// as `element` on `mapping`: the INT8 path's past the GEMV band
+/// ([`Mapping::quantizes`], [`Form::cuda_int8`]), else the 16-bit path's
+/// ([`Form::projection`]).
+pub fn form(element: Element, rows: usize, mapping: Mapping) -> Form {
+    if mapping.quantizes(rows) {
+        Form::cuda_int8()
+    } else {
+        Form::projection(BackendName::Cuda, rows, Float::Bf16, element)
     }
-    (out, magnitude)
 }
 
 pub fn silu(x: f64) -> f64 {
     x / (1.0 + (-x).exp())
 }
 
+/// Each value's slack from two independent sources, summed.
+pub fn sum_slack(first: &[f64], second: &[f64]) -> Vec<f64> {
+    first.iter().zip(second).map(|(a, b)| a + b).collect()
+}
+
+/// How far a published residual output `residual + round_A(ŝ)` (F32) may be
+/// from the exact `residual + sum`, the native sum `ŝ` within `sums` of
+/// `sum`.
+pub fn residual_bound(residual: f64, sum: f64, sums: f64) -> f64 {
+    Float::F32.rounded_from_exact(Float::Bf16.rounded_from_exact(sums, sum), residual + sum)
+}
+
+/// How far an A-published projection may be from the exact `sum`, its native
+/// sum within `sums` of it.
+pub fn published_bound(sum: f64, sums: f64) -> f64 {
+    Float::Bf16.rounded_from_exact(sums, sum)
+}
+
+/// The largest slope of SiLU, `sup x σ(x)' + σ(x)` ≈ 1.0998 (at x ≈ 2.4).
+/// `SiLU(gate) · up` of operand rows `x` [o, h] through `gate` and `up`
+/// [f, h] in F64, and each output's tolerance on `mapping`: each sum within
+/// its form's bound plus the rows' prologue `flips` and `operand` slack
+/// through its weight; through SiLU's slope and the other factor; and the
+/// epilogue's own model, its three bf16 roundings and SiLU's evaluation
+/// (`4 / 256` of the result, 1e-6 absolute).
+pub fn expansion_bound(
+    x: &[f32],
+    flips: &[f64],
+    operand: &[f64],
+    gate: &Weight,
+    up: &Weight,
+    o: usize,
+    f: usize,
+    h: usize,
+    mapping: Mapping,
+) -> (Vec<f64>, Vec<f64>) {
+    let (g, g_sums) = project(x, &gate.values, gate.tensor.element(), o, f, h, mapping);
+    let (u, u_sums) = project(x, &up.values, up.tensor.element(), o, f, h, mapping);
+    let slack = sum_slack(flips, operand);
+    let g_slack = slack_bound(&slack, &gate.values, o, f, h);
+    let u_slack = slack_bound(&slack, &up.values, o, f, h);
+    (0..o * f)
+        .map(|i| {
+            let expected = silu(g[i]) * u[i];
+            let (dg, du) = (g_sums[i] + g_slack[i], u_sums[i] + u_slack[i]);
+            (expected, silu_product_from_exact(Float::Bf16, &Library::of(BackendName::Cuda), (g[i], dg), (u[i], du)))
+        })
+        .unzip()
+}
+
 /// The largest row count the CUDA K1 GEMV serves (`projection::GEMV_ROWS`);
 /// larger counts run the GEMM.
-pub const GEMV_ROWS: usize = 16;
+pub const GEMV_ROWS: usize = bound::gemv_rows(BackendName::Cuda);
 
 /// The largest row count the small-band GEMM serves
 /// (`projection::SMALL_GEMM_ROWS`); larger counts run the large-band GEMM.
@@ -340,7 +436,7 @@ pub fn admitted(mappings: &[Mapping], admits: impl Fn(Mapping) -> bool) -> Vec<M
 /// INT8 quantization of rows of `k` as the INT8 path forms them, per 32
 /// values by the rule every backend shares (`int8_rule`). Returns the
 /// dequantized rows and each value's half quantization step (d / 2).
-pub fn quantize(x: &[f32], k: usize) -> (Vec<f32>, Vec<f32>) {
+pub fn quantize(x: &[f32], k: usize) -> (Vec<f32>, Vec<f64>) {
     let mut values = vec![0.0; x.len()];
     let mut half_steps = vec![0.0; x.len()];
     for group in (0..x.len()).step_by(int8_rule::GROUP) {
@@ -348,7 +444,7 @@ pub fn quantize(x: &[f32], k: usize) -> (Vec<f32>, Vec<f32>) {
         let (d, codes) = int8_rule::cpu(x[group..group + int8_rule::GROUP].try_into().unwrap());
         for (i, code) in codes.iter().enumerate() {
             values[group + i] = d * f32::from(*code);
-            half_steps[group + i] = d / 2.0;
+            half_steps[group + i] = f64::from(d) / 2.0;
         }
     }
     (values, half_steps)
@@ -356,48 +452,13 @@ pub fn quantize(x: &[f32], k: usize) -> (Vec<f32>, Vec<f32>) {
 
 /// sum_k |w[n, k]| * slack[m, k]: the bound of a projection whose inputs may
 /// each differ by `slack`.
-pub fn slack_bound(slack: &[f32], w: &[f64], m: usize, n: usize, k: usize) -> Vec<f64> {
+pub fn slack_bound(slack: &[f64], w: &[f64], m: usize, n: usize, k: usize) -> Vec<f64> {
     let mut out = vec![0.0; m * n];
     for row in 0..m {
         for col in 0..n {
             out[row * n + col] = (0..k)
-                .map(|c| f64::from(slack[row * k + c]) * w[col * k + c].abs())
+                .map(|c| slack[row * k + c] * w[col * k + c].abs())
                 .sum::<f64>();
-        }
-    }
-    out
-}
-
-/// The bound of the 16-bit GEMM's weight dequantization (rows > GEMV_ROWS,
-/// not on the INT8 path): each weight becomes round_A(code * round_A(scale)
-/// - round_A(bias)), off by at most 2^-9 (|code * scale| + |bias| + |value|)
-/// <= 2^-7 max_row |w| in bf16; zero on every other path.
-pub fn dequant_bound(
-    x: &[f32],
-    w: &[f64],
-    m: usize,
-    n: usize,
-    k: usize,
-    mapping: Mapping,
-) -> Vec<f64> {
-    if m <= GEMV_ROWS || mapping.quantizes(m) {
-        return vec![0.0; m * n];
-    }
-    let maximum: Vec<f64> = (0..n)
-        .map(|col| {
-            w[col * k..(col + 1) * k]
-                .iter()
-                .fold(0.0f64, |a, v| a.max(v.abs()))
-        })
-        .collect();
-    let mut out = vec![0.0; m * n];
-    for row in 0..m {
-        let magnitude: f64 = x[row * k..(row + 1) * k]
-            .iter()
-            .map(|v| f64::from(v.abs()))
-            .sum();
-        for col in 0..n {
-            out[row * n + col] = magnitude * maximum[col] / 128.0;
         }
     }
     out
@@ -414,7 +475,7 @@ pub fn operand_rows(
     k: usize,
     mapping: Mapping,
     format: Option<Format>,
-) -> (Vec<f32>, Vec<f32>) {
+) -> (Vec<f32>, Vec<f64>) {
     if format.is_some_and(|format| format.operands == OperandRecipe::Nvfp4Rows) {
         (nvfp4_rows(x, k), vec![0.0; x.len()])
     } else if mapping.quantizes(x.len() / k) {
@@ -428,28 +489,3 @@ pub fn operand_rows(
 mod operands;
 pub use operands::nvfp4_rows;
 
-pub fn check(label: &str, actual: &[f32], expected: &[f64], tolerance: &[f64]) {
-    assert_eq!(actual.len(), expected.len(), "{label}: length");
-    let mut worst = (0.0f64, 0usize);
-    for i in 0..actual.len() {
-        let ratio = (f64::from(actual[i]) - expected[i]).abs() / tolerance[i];
-        assert!(
-            ratio.is_finite(),
-            "{label}[{i}]: {} vs {}",
-            actual[i],
-            expected[i]
-        );
-        if ratio > worst.0 {
-            worst = (ratio, i);
-        }
-    }
-    assert!(
-        worst.0 <= 1.0,
-        "{label}[{}]: {} vs {} (tolerance {}, ratio {:.3})",
-        worst.1,
-        actual[worst.1],
-        expected[worst.1],
-        tolerance[worst.1],
-        worst.0
-    );
-}

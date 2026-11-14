@@ -19,7 +19,7 @@ use super::{
 use crate::{
     ModelLoadPlan, PassLaunches, ResourceLimits, StateResourcePlan, TargetProgramPlan,
     operators::{
-        block, paired_block,
+        paired_block,
         per_layer::graph::{
             CheckedPerLayerEntryEntries, per_layer_entry, per_layer_entry_class_slice, split_entry,
         },
@@ -318,16 +318,10 @@ impl<L: Certified> FamilyLayouts<L> {
         // no rows.
         let once = |index: usize, stage: OnceStage, rows: u64| {
             let slot = plan.blocks()[index];
-            let paired = paired_block(&geometry.blocks[index]).map_err(|error| error.to_string())?;
             // A fill reads no rows.
             let (slice, classes) = match stage {
                 OnceStage::Pass => (
-                    block::feed_forward_class_slice(
-                        &paired,
-                        rows,
-                        rows,
-                        NativeGraphClassSlice::new().dimension("M", [rows]),
-                    )?,
+                    NativeGraphClassSlice::new().dimension("M", [rows]),
                     &[(None, "M", ClassNumber::Rows)][..],
                 ),
                 OnceStage::Fill => (NativeGraphClassSlice::new(), &[][..]),
@@ -353,10 +347,6 @@ impl<L: Certified> FamilyLayouts<L> {
             let mut graphs = ShapeLayouts::new();
             let slot = plan.blocks()[index];
             let paired = paired_block(&geometry.blocks[index]).map_err(|error| error.to_string())?;
-            let picked = match slot.mixer() {
-                crate::MixerProgramSlot::Attention(binding) => binding.picked,
-                _ => None,
-            };
             let split = block_split(load, geometry, index, limits)?.is_some();
             let resident = streamed::resident_form(load, block_scopes(index)?[1]);
             let mut regimes: BTreeMap<RowForm, Vec<u64>> = BTreeMap::new();
@@ -401,11 +391,8 @@ impl<L: Certified> FamilyLayouts<L> {
                         );
                         let slices = rows
                             .iter()
-                            .map(|&rows| {
-                                let grouped = if stage == RunStage::Combine { passes.rows() } else { rows };
-                                block_class_slice(&paired, rows, grouped, max_slots, max_segments, &listings, scored, picked)
-                            })
-                            .collect::<Result<Vec<_>, _>>()?;
+                            .map(|&rows| block_class_slice(&paired, rows, max_slots, max_segments, &listings))
+                            .collect::<Vec<_>>();
                         let certified = certify_block::<L>(
                             backend,
                             slot,

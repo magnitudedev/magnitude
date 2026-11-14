@@ -1,7 +1,7 @@
 // vision_patch_stem: the patch projection as one GEMM per frame (K = C * P * P
-// each). A first launch converts the F32 pixels [M, C, 1 + S, P, P] to the
-// staged element (the weights' 16-bit element, or f16 for F32 weights; a
-// relative rounding of 2^-11 for f16) in frame-major rows [M, 1 + S, Kp]
+// each). A first launch converts the F32 pixels [M, C, 1 + S, P, P] to f16
+// (a relative rounding of 2^-11, whatever the weights' element: BF16 pixels
+// would round at 2^-9 ahead of every block) in frame-major rows [M, 1 + S, Kp]
 // (Kp = K rounded up to whole 16-byte chunks, the pad zero); with two frames
 // the first GEMM stores its F32 product; the last adds it, the bias and the
 // bilinear position-table blend, publishing the F32 residual stream. Bodies in
@@ -14,7 +14,7 @@ using vision::u8;
 typedef ELEMENT_OF(SEISMIC_FRAME_WEIGHT) Weight;
 typedef ELEMENT_OF(SEISMIC_BIAS) BiasElement;
 typedef ELEMENT_OF(SEISMIC_TABLE) TableElement;
-typedef typename vision::Staged<element::F16, Weight>::type Pixel;
+typedef element::F16 Pixel;
 static_assert(SEISMIC_DIM_S == 0 || vision::Same<Weight, ELEMENT_OF(SEISMIC_NEXT_FRAME_WEIGHT)>::value,
               "every frame weight shares one element");
 

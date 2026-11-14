@@ -188,6 +188,7 @@ impl<'a> QualificationView<'a> {
                             epsilon: 1.0e-6,
                             centered: 1,
                             interleave: 0,
+                            activation: 0,
                         })
                         .map_err(|error| qualification_dynamic(entry, label, error))?
                         .value;

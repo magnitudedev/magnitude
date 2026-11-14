@@ -1218,6 +1218,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 advance,
                 &appends,
                 index,
+                0,
                 span_end(index),
                 &bidirectional,
             )?;
@@ -1283,11 +1284,17 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 /// `bidirectional`, through its media span's end `span_end`), and the row's
 /// destination. A Shared source domain's (`shared_read_history`) follow.
 /// `appends` is the advance's (`SlotAppends::of`), formed once for its rows.
+///
+/// `pass_start` is the advance row that starts the launch the row belongs to
+/// (0 for a target launch, whose rows are its advance's; a draft head's
+/// chained row is a launch of its own): the advance's rows before it are
+/// stored history, not the launch's fresh rows.
 pub(super) fn row_histories(
     store: &StateStore,
     advance: &TentativeAdvance,
     appends: &SlotAppends,
     index: usize,
+    pass_start: usize,
     span_end: Option<usize>,
     bidirectional: &[bool],
 ) -> Result<Vec<RowHistory>, String> {
@@ -1298,18 +1305,29 @@ pub(super) fn row_histories(
             let appended = appends.causal[domain.0]
                 .as_ref()
                 .ok_or("an indexer domain has no appended rows")?;
-            return indexer_history(store, advance, appended, domain, index);
+            return indexer_history(store, advance, appended, domain, index, pass_start);
         }
         let (mut visible, mut fresh_start) = accepted_history(store, advance, domain, index)?;
         // Policy comes from this target row's declared causal/media behavior,
-        // never a window size or the shape of a drafter's block.
+        // never a window size or the shape of a drafter's block. A cached
+        // causal domain reads the launch's earlier rows as stored history, any
+        // domain the earlier launches' of its advance.
         if let Some(appended) = appends.causal[domain.0]
             .as_ref()
             .filter(|_| end(domain.0).is_none())
         {
-            visible.extend(appended.causal_prior(fresh_start, index)?);
-            fresh_start = index;
+            let stored = match cached_causal_domain(store, domain) {
+                true => index,
+                false => pass_start,
+            };
+            if stored > fresh_start {
+                visible.extend(appended.causal_prior(fresh_start, stored)?);
+                fresh_start = stored;
+            }
         }
+        let fresh_start = fresh_start
+            .checked_sub(pass_start)
+            .ok_or("a row's fresh span starts before its launch")?;
         let destination = binding.destinations[domain.0]
             .get(index)
             .map_or(Ok(-1), |value| {
@@ -1343,7 +1361,7 @@ pub(super) fn row_histories(
 }
 
 /// What row `index` of `advance` reads of an indexer's `domain`
-/// (`indexer_select`), every row as stored history, this launch's earlier
+/// (`graph::select`), every row as stored history, this launch's earlier
 /// rows at their destinations: in its raw keys' Window domain the rows of
 /// the `rows` positions before it, and its own destination; in its block
 /// keys' Block domain every block complete through it (`advance_blocks`:
@@ -1357,6 +1375,7 @@ pub(crate) fn indexer_history(
     appended: &AppendedRuns,
     domain: magnitude_state::HistoryDomainId,
     index: usize,
+    pass_start: usize,
 ) -> Result<RowHistory, String> {
     let start = advance.position();
     let position = start
@@ -1392,7 +1411,7 @@ pub(crate) fn indexer_history(
     visible.extend(appended.causal_prior(prior.start, prior.end)?);
     Ok(RowHistory {
         visible,
-        fresh_start: i32::try_from(index).map_err(|_| "fresh start exceeds i32")?,
+        fresh_start: i32::try_from(index - pass_start).map_err(|_| "fresh start exceeds i32")?,
         bidirectional_end: None,
         destination: destination.map_or(Ok(-1), |value| {
             i32::try_from(*value).map_err(|_| "indexer destination exceeds i32")
@@ -1419,10 +1438,14 @@ pub(crate) fn cached_causal_domain(
     store: &StateStore,
     domain: magnitude_state::HistoryDomainId,
 ) -> bool {
+    use magnitude_state::LayerRef;
     store.history_components(domain).iter().any(|component| {
-        component.causal_rows_use_cache()
-            || matches!(component.layer, magnitude_state::LayerRef::Target(block)
-                if store.index_key_domains(block, 0).is_some())
+        let keys = match component.layer {
+            LayerRef::Target(block) => LayerRef::IndexKeys { block, part: 0 },
+            LayerRef::Head(block) => LayerRef::HeadIndexKeys { block, part: 0 },
+            _ => return component.causal_rows_use_cache(),
+        };
+        component.causal_rows_use_cache() || store.produced_domains(keys).is_some()
     })
 }
 
@@ -1615,15 +1638,28 @@ pub(super) struct SlotAppends {
 
 impl SlotAppends {
     pub(super) fn of(store: &StateStore, advance: &TentativeAdvance) -> Self {
+        Self::reading(store, advance, |domain| {
+            cached_causal_domain(store, domain) || store.is_produced_domain(domain)
+        })
+    }
+
+    /// The appended runs of every stored domain: a draft head's chained
+    /// rows read all of their advance's earlier rows as stored history.
+    pub(super) fn every_domain(store: &StateStore, advance: &TentativeAdvance) -> Self {
+        Self::reading(store, advance, |_| true)
+    }
+
+    fn reading(
+        store: &StateStore,
+        advance: &TentativeAdvance,
+        read: impl Fn(magnitude_state::HistoryDomainId) -> bool,
+    ) -> Self {
         Self {
             // An indexer reads its launch's earlier rows as stored history
             // too (`indexer_history`).
             causal: store
                 .history_domains()
-                .map(|domain| {
-                    (cached_causal_domain(store, domain) || store.is_produced_domain(domain))
-                        .then(|| AppendedRuns::of(store, advance, domain))
-                })
+                .map(|domain| read(domain).then(|| AppendedRuns::of(store, advance, domain)))
                 .collect(),
             shared: store
                 .history_reads()
@@ -1851,8 +1887,8 @@ mod causal_cache_tests {
                     .unwrap(),
             );
             let appends = SlotAppends::of(&store, &advance);
-            let causal = row_histories(&store, &advance, &appends, 1, None, &[true]).unwrap();
-            let media = row_histories(&store, &advance, &appends, 1, Some(3), &[true]).unwrap();
+            let causal = row_histories(&store, &advance, &appends, 1, 0, None, &[true]).unwrap();
+            let media = row_histories(&store, &advance, &appends, 1, 0, Some(3), &[true]).unwrap();
             assert_eq!(media[0].fresh_start, 0);
             assert_eq!(media[0].bidirectional_end, Some(3));
             assert!(media[0].visible.is_empty());
@@ -1865,7 +1901,7 @@ mod causal_cache_tests {
                 assert_eq!(causal[0].fresh_start, 0);
             }
             assert_eq!(causal[0].bidirectional_end, None);
-            let first = row_histories(&store, &advance, &appends, 0, None, &[false]).unwrap();
+            let first = row_histories(&store, &advance, &appends, 0, 0, None, &[false]).unwrap();
             assert!(first[0].visible.is_empty());
             assert_eq!(first[0].fresh_start, 0);
         }

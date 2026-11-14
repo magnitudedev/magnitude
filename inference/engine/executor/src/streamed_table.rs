@@ -187,7 +187,7 @@ mod tests {
         let mut bytes = vec![0xee; 16];
         bytes.extend((0..ROWS).flat_map(row));
         std::fs::write(&path, &bytes).unwrap();
-        let stored = Stored::Dense(StoredTensor {
+        let stored = Stored::dense(StoredTensor {
             source: Arc::new(FileSource::open(&path).unwrap()),
             offset: 16,
             nbytes: u64::from(ROWS) * 12,

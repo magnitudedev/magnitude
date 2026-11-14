@@ -31,7 +31,6 @@
 
 use super::launches::{operand_recipe, Declarations, Kernel, Launches, Words};
 use super::AssessmentError;
-use crate::operators::attention::graph::selected_segments;
 use crate::operators::attention::pooled::Pooling;
 use crate::operators::gated_delta::graph::StepForm;
 use crate::operators::routed::{fused_graph::DecodeForm, streamed};
@@ -40,7 +39,7 @@ use crate::operators::{parallel::DenseBesideRouted, InputForm};
 use crate::{
     CandidatesBinding, FeedForwardProgramSlot, GeneralRoutedBinding, MixerProgramSlot,
     ModelLoadPlan, NGramGateForm, PerLayerEntryBinding, PickedBinding, ReadoutHead,
-    SublayerTail, WeightPlan,
+    RecurrentForm, SublayerTail, WeightPlan,
 };
 use magnitude_family_contracts::{
     InputNorm, ModelDefinition, SublayerIndex, WeightKind, WeightScope,
@@ -627,7 +626,8 @@ fn f32_bytes(elements: u64) -> Result<u64, AssessmentError> {
 /// `stream_mix_sinkhorn` reads each row's `[S, H]` streams and projects
 /// them through the site's F32 function weights (`(2+S)·S × S·H`, with its
 /// base and scale), and writes the sublayer's input `[H]`, the site's pre
-/// `[S]` and its join values (post | comb, `[S+S²]`). Beside the
+/// `[S]` when its mixing carries it, and its join values (post | comb,
+/// `[S+S²]`). Beside the
 /// projection, the first of its `iterations` Sinkhorn passes normalizes the
 /// comb's columns and each later one its rows and then its columns
 /// (`2·iterations − 1` normalizations, none at zero), a sum and a division
@@ -642,6 +642,7 @@ fn sinkhorn_site(
         hidden,
         streams,
         mixing,
+        ..
     } = binding;
     let weight = |kind| planned(load, scope, kind, Element::f32());
     let mut work = projection(&[
@@ -649,7 +650,8 @@ fn sinkhorn_site(
         weight(WeightKind::HyperConnectionBase)?,
         weight(WeightKind::HyperConnectionScale)?,
     ])?;
-    work.row_bytes = f32_bytes(streams * hidden + hidden + streams + streams + streams * streams)?;
+    let pre = binding.carried() * streams;
+    work.row_bytes = f32_bytes(streams * hidden + hidden + pre + streams + streams * streams)?;
     add(
         &mut work.row_flops,
         Flops {
@@ -658,6 +660,20 @@ fn sinkhorn_site(
         },
     )?;
     step.call(Kernel::of::<kernels::stream_mix_sinkhorn::Entry>(), work)
+}
+
+/// A feed-forward branch's join over Sinkhorn streams
+/// (`BlockSublayers::sinkhorn_branch`): `stream_join` reads the streams
+/// `[S·H]` and the branch row `[H]` and writes the streams. Over any other
+/// residual the branch's output entry joins it.
+fn sinkhorn_join(step: &mut Step<'_>, streams: Option<BlockStreams>) -> Result<(), AssessmentError> {
+    match streams {
+        Some(BlockStreams::Sinkhorn(SinkhornBinding { hidden, streams, .. })) => step.call(
+            Kernel::of::<kernels::stream_join::Entry>(),
+            rows(f32_bytes(2 * streams * hidden + hidden)?),
+        ),
+        _ => Ok(()),
+    }
 }
 
 /// The input of the sublayer at `scope` as it runs: the residual under its
@@ -992,65 +1008,46 @@ fn component_row_bytes(
         .transpose()
 }
 
-/// One decode row's `indexer_select` call for target block `layer`'s
-/// selected read of `shape`: it reads the raw keys of the positions before
-/// it in its block and writes its own and the block it completes, then
-/// scores every complete block (reading its key, writing and reading its F32
-/// score) and selects. Per token of context that is one block's key and
-/// score traffic over the block's rows; its scoring arithmetic is priced by
-/// those bytes. Its launch clauses read its bitmap words (`B`) and, at
-/// decode rows, its selected segments (`C`, `operators::attention::graph::
-/// select`).
-fn indexer_select(
+/// A selected read over token rows (`operators::attention::graph::select`):
+/// its keys' `u | g` projection (widened from A for a mean), their pooling
+/// (each completing row reads its group's pending tokens and writes its
+/// own and the unit it completes), its indexer over the units
+/// ([`indexer`]), and its reads (`unit_reads`, then at decode rows
+/// `candidate_rows`), whose launch clauses read its bitmap words (`B`).
+fn selection<'a>(
     step: &mut Step<'_>,
     domains: &[HistoryDomainLayout],
     layer: u32,
-    shape: crate::SelectionShape,
+    selection: crate::SelectionBinding,
+    weight: impl Fn(WeightKind, Element) -> Result<&'a WeightPlan, AssessmentError>,
 ) -> Result<(), AssessmentError> {
-    let indexer = LayerRef::IndexKeys {
-        block: layer,
-        part: 0,
-    };
-    let mut raw = None;
-    let mut finished = None;
-    for domain in domains {
-        match domain {
-            HistoryDomainLayout::Window { .. } if raw.is_none() => {
-                raw = component_row_bytes(domain, indexer)?;
-            }
-            HistoryDomainLayout::Block { .. } if finished.is_none() => {
-                finished = component_row_bytes(domain, indexer)?;
-            }
-            _ => {}
-        }
+    let keys = LayerRef::IndexKeys { block: layer, part: 0 };
+    let mut projected = vec![weight(WeightKind::IndexerKey, selection.keys.projection)?];
+    if let Some(gate) = selection.keys.gate {
+        projected.push(weight(WeightKind::IndexerKeyGate, gate)?);
     }
-    let (Some(raw), Some(finished)) = (raw, finished) else {
-        return Err(demand_error(format!(
-            "selected attention layer {layer} has no indexer history"
-        )));
-    };
-    let block = shape.block;
-    let local = raw
-        .checked_mul(block)
-        .and_then(|bytes| bytes.checked_add(finished))
-        .ok_or_else(|| demand_error("indexer row bytes overflow"))?;
-    let scored = finished
-        .checked_add(2 * 4)
-        .ok_or_else(|| demand_error("indexer block bytes overflow"))?;
+    step.call(Kernel::of::<kernels::attention_project::Entry>(), projection(&projected)?)?;
+    if selection.keys.gate.is_none() {
+        step.call(Kernel::of::<kernels::widen_rows::Entry>(), Work::default())?;
+    }
+    let pending = domains
+        .iter()
+        .filter(|domain| matches!(domain, HistoryDomainLayout::Window { .. }))
+        .find_map(|domain| component_row_bytes(domain, keys).transpose())
+        .transpose()?
+        .ok_or_else(|| demand_error(format!("selected attention layer {layer} has no pending keys")))?;
+    let (key_row, _) = block_component(domains, keys)?;
+    let local = product(pending, selection.shape.block, "pending key bytes")?
+        .checked_add(key_row)
+        .ok_or_else(|| demand_error("pending key bytes overflow"))?;
+    step.call(Kernel::of::<kernels::pool_rows::Entry>(), rows(local))?;
+    indexer(step, domains, selection.indexer, keys, &weight)?;
     step.call_with(
-        Kernel::of::<kernels::indexer_select::Entry>(),
-        &[("B", shape.words), ("C", selected_segments(shape.blocks))],
-        Work {
-            row_bytes: local,
-            history: Some(HistoryRead {
-                layout: None,
-                bytes_per_token: scored.div_ceil(block),
-                flops_per_token: 0,
-                window: None,
-            }),
-            ..Work::default()
-        },
-    )
+        Kernel::of::<kernels::unit_reads::Entry>(),
+        &[("B", selection.shape.words)],
+        Work::default(),
+    )?;
+    step.call(Kernel::of::<kernels::candidate_rows::Entry>(), Work::default())
 }
 
 /// `left · right`, its overflow named by `what`.
@@ -1134,7 +1131,7 @@ fn picked<'a>(
     let project = Kernel::of::<kernels::attention_project::Entry>();
     let plane_rows = picked_rows(domains, layer, picked.part())?;
     let (plane_row, _) = block_component(domains, plane_rows)?;
-    let indexer = match picked {
+    let indexed = match picked {
         PickedBinding::Reused => None,
         PickedBinding::Own(pooled) => {
             let mut projected = vec![weight(WeightKind::PooledProjection, pooled.projection)?];
@@ -1183,52 +1180,8 @@ fn picked<'a>(
             indexer,
         } => Some((indexer, LayerRef::IndexKeys { block: source, part })),
     };
-    if let Some((indexer, keys)) = indexer {
-        let (key_row, rate) = block_component(domains, keys)?;
-        step.call(
-            project,
-            projection(&[weight(WeightKind::IndexerQuery, indexer.query)?])?,
-        )?;
-        if let Some(head_weights) = indexer.head_weights {
-            step.call(
-                project,
-                projection(&[weight(WeightKind::IndexerHeadWeights, head_weights)?])?,
-            )?;
-        }
-        let window = match indexer.candidates {
-            CandidatesBinding::All | CandidatesBinding::Produce(_) => None,
-            CandidatesBinding::Restrict(pool) => {
-                Some(product(pool.units(), rate, "candidate pool tokens")?)
-            }
-        };
-        // Traffic and arithmetic over each `tokens` tokens of context.
-        let read = |window, bytes: u64, flops: u64, tokens: u64| Work {
-            history: Some(HistoryRead {
-                layout: None,
-                bytes_per_token: bytes.div_ceil(tokens),
-                flops_per_token: flops.div_ceil(tokens),
-                window,
-            }),
-            ..Work::default()
-        };
-        let score = product(2 * indexer.heads, indexer.width, "indexer score FLOPs")?;
-        step.call(
-            Kernel::of::<kernels::indexer_score::Entry>(),
-            read(window, key_row + 4, score, rate),
-        )?;
-        let topk = Kernel::of::<kernels::rows_topk::Entry>();
-        step.call(topk, read(window, 4, 0, rate))?;
-        if let CandidatesBinding::Produce(pool) = indexer.candidates {
-            // A block's scores, then its score and its span (two i32).
-            let block = product(pool.block_units, rate, "candidate block tokens")?;
-            let block_units = product(4, pool.block_units, "candidate block bytes")?;
-            step.call(
-                Kernel::of::<kernels::candidate_blocks::Entry>(),
-                read(None, block_units + 4 + 8, 0, block),
-            )?;
-            step.call(topk, read(None, 4 + 8, 0, block))?;
-            step.call(Kernel::of::<kernels::candidate_rows::Entry>(), Work::default())?;
-        }
+    if let Some((index, keys)) = indexed {
+        indexer(step, domains, index, keys, &weight)?;
     }
     Ok(Work {
         row_bytes: product(picks, plane_row, "picked row bytes")?,
@@ -1238,6 +1191,66 @@ fn picked<'a>(
         }],
         ..Work::default()
     })
+}
+
+/// An indexer over the unit keys `keys` (`selection.rs`): its query and
+/// (projected) head-weight projections, its scores over a row's list
+/// (reading a key and writing an F32 score per unit) and its picks, and a
+/// producing indexer's candidate pool. Its traffic is per unit of context.
+fn indexer<'a>(
+    step: &mut Step<'_>,
+    domains: &[HistoryDomainLayout],
+    indexer: crate::IndexerBinding,
+    keys: LayerRef,
+    weight: &impl Fn(WeightKind, Element) -> Result<&'a WeightPlan, AssessmentError>,
+) -> Result<(), AssessmentError> {
+    let project = Kernel::of::<kernels::attention_project::Entry>();
+    let (key_row, rate) = block_component(domains, keys)?;
+    step.call(
+        project,
+        projection(&[weight(WeightKind::IndexerQuery, indexer.query)?])?,
+    )?;
+    if let Some(head_weights) = indexer.head_weights {
+        step.call(
+            project,
+            projection(&[weight(WeightKind::IndexerHeadWeights, head_weights)?])?,
+        )?;
+    }
+    let window = match indexer.candidates {
+        CandidatesBinding::All | CandidatesBinding::Produce(_) => None,
+        CandidatesBinding::Restrict(pool) => {
+            Some(product(pool.units(), rate, "candidate pool tokens")?)
+        }
+    };
+    // Traffic and arithmetic over each `tokens` tokens of context.
+    let read = |window, bytes: u64, flops: u64, tokens: u64| Work {
+        history: Some(HistoryRead {
+            layout: None,
+            bytes_per_token: bytes.div_ceil(tokens),
+            flops_per_token: flops.div_ceil(tokens),
+            window,
+        }),
+        ..Work::default()
+    };
+    let score = product(2 * indexer.heads, indexer.width, "indexer score FLOPs")?;
+    step.call(
+        Kernel::of::<kernels::indexer_score::Entry>(),
+        read(window, key_row + 4, score, rate),
+    )?;
+    let topk = Kernel::of::<kernels::rows_topk::Entry>();
+    step.call(topk, read(window, 4, 0, rate))?;
+    if let CandidatesBinding::Produce(pool) = indexer.candidates {
+        // A block's scores, then its score and its span (two i32).
+        let block = product(pool.block_units, rate, "candidate block tokens")?;
+        let block_units = product(4, pool.block_units, "candidate block bytes")?;
+        step.call(
+            Kernel::of::<kernels::candidate_blocks::Entry>(),
+            read(None, block_units + 4 + 8, 0, block),
+        )?;
+        step.call(topk, read(None, 4 + 8, 0, block))?;
+        step.call(Kernel::of::<kernels::candidate_rows::Entry>(), Work::default())?;
+    }
+    Ok(())
 }
 
 /// The bytes of `count` recurrent bank components from `first`.
@@ -1359,6 +1372,14 @@ impl DecodeDemand {
                         step.call(Kernel::of::<kernels::widen_rows::Entry>(), Work::default())?;
                         step.call(project, projection(&[weight(query, binding.query)?])?)?;
                     }
+                    // An absorbed query's per-head products (`project_rows`),
+                    // the queries attention reads.
+                    if let Some(absorbed) = binding.absorbed {
+                        step.call(
+                            Kernel::of::<kernels::project_rows::Entry>(),
+                            projection(&[weight(WeightKind::QueryKeys, absorbed.element)?])?,
+                        )?;
+                    }
                     // The entry attending the layer's history, and the
                     // layout it reads: the layer's own (`history_codec`; the
                     // model's own store is dense whatever the policy).
@@ -1429,26 +1450,23 @@ impl DecodeDemand {
                         // The indexer projects its query and key, selects,
                         // and attention reads the selected blocks and the
                         // row's tail: at most one block past them.
-                        Some(selection) => {
-                            step.call(
-                                project,
-                                projection(&[
-                                    weight(WeightKind::IndexerQuery, selection.query)?,
-                                    weight(WeightKind::IndexerKey, selection.key)?,
-                                ])?,
-                            )?;
-                            indexer_select(
-                                &mut step,
-                                &layout.target_history,
-                                layer,
-                                selection.shape,
-                            )?;
-                            let selected = (selection.shape.blocks + 1)
-                                .checked_mul(selection.shape.block)
+                        Some(binding) => {
+                            selection(&mut step, &layout.target_history, layer, binding, &weight)?;
+                            let selected = (binding.indexer.top + 1)
+                                .checked_mul(binding.shape.block)
                                 .ok_or_else(|| demand_error("selected tokens overflow"))?;
+                            // The scoring class's call: a prefill entry reads
+                            // its selection through a bitmap of `B` words,
+                            // where a class that does not score yet (`B` 0)
+                            // reads every visible row, fewer than it selects.
+                            let scoring = statics
+                                .iter()
+                                .copied()
+                                .chain([("B", binding.shape.words)])
+                                .collect::<Vec<_>>();
                             step.call_specialized(
                                 attend,
-                                &statics,
+                                &scoring,
                                 &[],
                                 Work {
                                     history: Some(read(Some(
@@ -1535,25 +1553,55 @@ impl DecodeDemand {
                 // output projection.
                 MixerProgramSlot::Recurrent(binding) => {
                     input(&mut step, scope, binding.norm)?;
-                    let (project, advance) = match StepForm::of(backend).map_err(demand_error)? {
-                        StepForm::Step => (
-                            Kernel::of::<kernels::gated_delta_project::Entry>(),
-                            Kernel::of::<kernels::gated_delta_step::Entry>(),
-                        ),
-                        StepForm::Convolved => (
-                            Kernel::of::<kernels::gated_delta_project_convolved::Entry>(),
-                            Kernel::of::<kernels::gated_delta_step_convolved::Entry>(),
-                        ),
+                    let advance = match binding.form {
+                        RecurrentForm::PerHead => {
+                            let (project, advance) =
+                                match StepForm::of(backend).map_err(demand_error)? {
+                                    StepForm::Step => (
+                                        Kernel::of::<kernels::gated_delta_project::Entry>(),
+                                        Kernel::of::<kernels::gated_delta_step::Entry>(),
+                                    ),
+                                    StepForm::Convolved => (
+                                        Kernel::of::<kernels::gated_delta_project_convolved::Entry>(),
+                                        Kernel::of::<kernels::gated_delta_step_convolved::Entry>(),
+                                    ),
+                                };
+                            step.call(
+                                project,
+                                projection(&[
+                                    weight(WeightKind::RecurrentQueryKeyValue, binding.qkv)?,
+                                    weight(WeightKind::RecurrentGate, binding.gate)?,
+                                    weight(WeightKind::RecurrentAlpha, binding.alpha)?,
+                                    weight(WeightKind::RecurrentBeta, binding.beta)?,
+                                ])?,
+                            )?;
+                            advance
+                        }
+                        // The projection (`attention_project`), the up
+                        // projections (`project_rows`) of its gate and decay
+                        // down products, and `kimi_delta_step`.
+                        RecurrentForm::PerChannel { gate_up, alpha_up, .. } => {
+                            step.call(
+                                Kernel::of::<kernels::attention_project::Entry>(),
+                                projection(&[
+                                    weight(WeightKind::RecurrentQueryKeyValue, binding.qkv)?,
+                                    weight(WeightKind::RecurrentGate, binding.gate)?,
+                                    weight(WeightKind::RecurrentAlpha, binding.alpha)?,
+                                    weight(WeightKind::RecurrentBeta, binding.beta)?,
+                                ])?,
+                            )?;
+                            for (kind, element) in [
+                                (WeightKind::RecurrentGateUp, gate_up),
+                                (WeightKind::RecurrentAlphaUp, alpha_up),
+                            ] {
+                                step.call(
+                                    Kernel::of::<kernels::project_rows::Entry>(),
+                                    projection(&[weight(kind, element)?])?,
+                                )?;
+                            }
+                            Kernel::of::<kernels::kimi_delta_step::Entry>()
+                        }
                     };
-                    step.call(
-                        project,
-                        projection(&[
-                            weight(WeightKind::RecurrentQueryKeyValue, binding.qkv)?,
-                            weight(WeightKind::RecurrentGate, binding.gate)?,
-                            weight(WeightKind::RecurrentAlpha, binding.alpha)?,
-                            weight(WeightKind::RecurrentBeta, binding.beta)?,
-                        ])?,
-                    )?;
                     step.call(
                         advance,
                         sequences(bank_bytes(&layout, recurrent_component, 3, index)?),
@@ -1589,6 +1637,7 @@ impl DecodeDemand {
                         down,
                         weight,
                     )?;
+                    sinkhorn_join(&mut step, streams)?;
                 }
                 // `operators::routed::fused_graph` at decode rows, in the
                 // backend's decode form: routing (`routed_route`), then the
@@ -1708,15 +1757,7 @@ impl DecodeDemand {
                 FeedForwardProgramSlot::GeneralRouted(binding) => {
                     input(&mut step, scope, binding.norm)?;
                     general_routed(&mut step, load, scope, &binding)?;
-                    // Over Sinkhorn streams the routed branch joins the
-                    // streams `[S·H]` through `stream_join`, from its
-                    // branch row `[H]`.
-                    if let Some(BlockStreams::Sinkhorn(SinkhornBinding { hidden, streams, .. })) = streams {
-                        step.call(
-                            Kernel::of::<kernels::stream_join::Entry>(),
-                            rows(f32_bytes(2 * streams * hidden + hidden)?),
-                        )?;
-                    }
+                    sinkhorn_join(&mut step, streams)?;
                 }
             }
             // `programs::graph::per_layer`: the gate over the layer's slice
@@ -2116,6 +2157,53 @@ pub(crate) mod tests {
         assert_eq!(call("stream_collapse").work.row_bytes, 4 * (s * h + h));
     }
 
+    /// GLM-5.3-Flash's slice A over Sinkhorn streams: its dense branch, like
+    /// the general routed one, joins the streams through `stream_join`
+    /// after its down projection, and its gated delta joins them in its own
+    /// output projection.
+    #[test]
+    fn a_sinkhorn_dense_branch_bills_its_join() {
+        let definition = crate::planning::fixtures::glm_slice_fixture_definition();
+        let manifest = crate::planning::fixtures::fixture_manifest(&definition);
+        let selection = crate::ComponentSelection { head: false, vision: false };
+        let limits = crate::planning::fixtures::LIMITS;
+        let load =
+            ModelLoadPlan::derive(&manifest, &definition, selection, Layout::Rows8, crate::PlannedMethod::Plain, limits)
+                .unwrap();
+        let demand = demand(&definition, &load, KvCodec::Dense).unwrap();
+        let names = demand.calls.iter().map(|call| call.launches.kernel().name()).collect::<Vec<_>>();
+        let after = |name| names.iter().position(|call| *call == name).map(|at| names[at + 1]);
+        assert_eq!(after("dense_output"), Some("stream_join"), "{names:?}");
+        assert_eq!(names.iter().filter(|name| **name == "stream_join").count(), 1, "{names:?}");
+        assert_eq!(names.iter().filter(|name| **name == "stream_mix_sinkhorn").count(), 2, "{names:?}");
+        let (s, h) = (4, definition.decoder.hidden);
+        let join = demand.calls.iter().find(|call| call.launches.kernel().name() == "stream_join").unwrap();
+        assert_eq!(join.work.row_bytes, 4 * (2 * s * h + h));
+    }
+
+    /// GLM-5.3-Flash's slice B decode step prices on every backend at one,
+    /// five and 32 rows. The GPU backends attend the latent attention's decode
+    /// rows with their prefill entries, which the load prepares both for the classes
+    /// that score (a WorkList bitmap of `B` words) and for those that do not
+    /// yet (`B` 0, one launch fewer): the step's call is the scoring class's.
+    #[test]
+    fn a_selected_latent_decode_step_prices_its_scoring_attention() {
+        let (definition, manifest) = crate::planning::fixtures::glm_slice_b_fixture();
+        let selection = crate::ComponentSelection { head: false, vision: false };
+        let limits = crate::planning::fixtures::LIMITS;
+        for backend in [BackendName::Cpu, BackendName::Metal, BackendName::Cuda, BackendName::Vulkan] {
+            let layout = crate::resident_layout(crate::ExecutionPath::Native, backend);
+            let load =
+                ModelLoadPlan::derive(&manifest, &definition, selection, layout, crate::PlannedMethod::Plain, limits)
+                    .unwrap();
+            let demand = demand_on(&definition, &load, KvCodec::Dense, backend).unwrap();
+            for (call, rows) in demand.calls.iter().flat_map(|call| [1, 5, 32].map(|rows| (call, rows))) {
+                let name = call.launches.kernel().name();
+                call.launches.at(rows).unwrap_or_else(|error| panic!("{backend:?} `{name}` at {rows} rows: {error}"));
+            }
+        }
+    }
+
     /// An n-gram input charges its row rule over its token window, its
     /// heads' stored rows, its key and value projections, its gate's norms,
     /// and its row op's norm, taps and window; the recurrent mixers after it
@@ -2231,16 +2319,16 @@ pub(crate) mod tests {
         ));
     }
 
-    /// A selected read charges its indexer: the projection of its query and
-    /// key, a select call writing its raw key and block and reading its
-    /// block's raw keys, and per token one block's F32 key and score traffic
-    /// over the block's rows; attention reads the selected blocks and the
-    /// tail alone.
+    /// A selected read charges its indexer: its keys' projection and
+    /// pooling (reading a block's pending keys and writing its key), its
+    /// query's projection, and per token one block's F32 key and score
+    /// traffic over the block's rows; attention reads the selected blocks
+    /// and the tail alone.
     #[test]
     fn a_selected_read_charges_its_indexer_and_reads_its_blocks() {
         use magnitude_family_contracts::{
             HeadNorm, HeadWeights, HistoryReads, Indexer, IndexerInput, IndexerKeys,
-            IndexerQuery, Operator, Pool, PooledRows, RmsNorm, RowRounding, Selection,
+            IndexerQuery, Operator, Pool, PoolNorm, PooledRows, RmsNorm, RowRounding, Selection,
             WeightDescriptor,
         };
         let (mut definition, _) = fixture();
@@ -2266,7 +2354,7 @@ pub(crate) mod tests {
                 rate: 4,
                 projection: WeightDescriptor::stored("indexer_k", vec![64, hidden]),
                 pool: Pool::Mean,
-                norm: norm("indexer_k_norm"),
+                norm: PoolNorm::Pooled(norm("indexer_k_norm")),
                 rounding: RowRounding::None,
             }),
             head_weights: HeadWeights::Uniform,
@@ -2290,9 +2378,11 @@ pub(crate) mod tests {
         let (plain_definition, plain_load) = fixture();
         let plain = demand(&plain_definition, &plain_load, KvCodec::Dense).unwrap();
         let selected = demand(&definition, &load, KvCodec::Dense).unwrap();
-        // The indexer's projection and select calls.
-        assert_eq!(selected.calls.len(), plain.calls.len() + 2);
-        // Its projection weights; the select call's raw keys (four F32 rows
+        // The keys' projection, widening and pooling; the indexer's query
+        // projection, scores and picks; the selection's unit reads and
+        // candidate rows.
+        assert_eq!(selected.calls.len(), plain.calls.len() + 8);
+        // Its projection weights; the pooling's pending keys (four F32 rows
         // of 64 plus their coordinates) and finished block key.
         let projection = resident(&load, WeightKind::IndexerQuery).resident_bytes
             + resident(&load, WeightKind::IndexerKey).resident_bytes;
@@ -2301,13 +2391,16 @@ pub(crate) mod tests {
             streamed(&selected),
             streamed(&plain) + projection + 4 * raw + 64 * 4
         );
-        // The indexer reads one block key and two scores per four tokens;
-        // attention at most the eight selected blocks and its tail.
+        // Per four tokens, the scores read one block key and write its F32
+        // score, and the picks read the score; attention reads at most the
+        // eight selected blocks and its tail.
         let history = histories(&selected);
-        assert_eq!(history[0].bytes_per_token, (64 * 4 + 8) / 4);
+        assert_eq!(history[0].bytes_per_token, (64 * 4 + 4) / 4);
         assert_eq!(history[0].window, None);
-        assert_eq!(history[1].bytes_per_token, 256);
-        assert_eq!(history[1].window, Some(9 * 4));
+        assert_eq!(history[1].bytes_per_token, 4 / 4);
+        assert_eq!(history[1].window, None);
+        assert_eq!(history[2].bytes_per_token, 256);
+        assert_eq!(history[2].window, Some(9 * 4));
     }
 
     #[test]

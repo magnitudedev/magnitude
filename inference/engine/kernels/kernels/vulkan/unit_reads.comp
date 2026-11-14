@@ -1,0 +1,57 @@
+// unit_reads on Vulkan (contract and portable body in indexer.seismic), as
+// CUDA's (`cuda/unit_reads.cu`): a workgroup of 256 invocations per row, an
+// invocation per bitmap word finding its word's picks by a binary search of
+// the ascending valid picks (their count found by a binary search for the
+// first -1); invocation 0 writes the units, the picks then the tail unit,
+// then -1.
+#include <seismic/element.glsl>
+
+void unit_reads() {
+    const uint64_t row = uint64_t(gl_WorkGroupID.x);
+    const uint k = uint(SEISMIC_DIM_K);
+    const uint b = uint(SEISMIC_DIM_B);
+    const uint64_t picks = SEISMIC_PTR(SEISMIC_BUFFER_PICKS) + row * SEISMIC_PICKS_STRIDE_0 * 4ul;
+    const uint64_t pick_stride = SEISMIC_PICKS_STRIDE_1 * 4ul;
+    const int tail = element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_COMPLETE) + row * SEISMIC_COMPLETE_STRIDE_0 * 4ul);
+    const uint64_t bitmap = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + row * SEISMIC_RESULT_0_STRIDE_0 * 4ul;
+    const uint64_t units = SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER) + row * SEISMIC_RESULT_1_STRIDE_0 * 4ul;
+    // The valid picks: the first `count`.
+    uint lo = 0u, hi = k;
+    while (lo < hi) {
+        const uint mid = (lo + hi) / 2u;
+        if (element_i32_at(picks + uint64_t(mid) * pick_stride) >= 0)
+            lo = mid + 1u;
+        else
+            hi = mid;
+    }
+    const uint count = lo;
+    if (gl_LocalInvocationIndex == 0u)
+        for (uint slot = 0u; slot <= k; ++slot)
+            element_i32_put(units + uint64_t(slot) * SEISMIC_RESULT_1_STRIDE_1 * 4ul,
+                slot < count ? element_i32_at(picks + uint64_t(slot) * pick_stride) : (slot == count ? tail : -1));
+    for (uint word = gl_LocalInvocationIndex; word < b; word += 256u) {
+        const int first = int(word * 32u);
+        // The first pick at or past the word's first unit.
+        uint at = 0u, end = count;
+        while (at < end) {
+            const uint mid = (at + end) / 2u;
+            if (element_i32_at(picks + uint64_t(mid) * pick_stride) < first)
+                at = mid + 1u;
+            else
+                end = mid;
+        }
+        uint bits = 0u;
+        for (; at < count; ++at) {
+            const int unit = element_i32_at(picks + uint64_t(at) * pick_stride);
+            if (unit >= first + 32)
+                break;
+            bits |= 1u << uint(unit - first);
+        }
+        // Every unit from the tail's on.
+        if (tail <= first)
+            bits = 0xffffffffu;
+        else if (tail < first + 32)
+            bits |= 0xffffffffu << uint(tail - first);
+        element_u32_put(bitmap + uint64_t(word) * SEISMIC_RESULT_0_STRIDE_1 * 4ul, bits);
+    }
+}

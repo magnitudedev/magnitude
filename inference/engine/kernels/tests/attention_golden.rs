@@ -345,10 +345,13 @@ fn configurations(backend: BackendName, kind: Kind) -> Vec<Vec<(&'static str, u6
             vec![("SPAN", 64), ("PARTS", 8), ("SIMDS", 8), ("SLICES", 2)],
             vec![("SPAN", 128), ("PARTS", 32), ("SIMDS", 4), ("SLICES", 1)],
         ],
+        // The matrix form, whose walks the goldens record (the vector form
+        // is checked against the host model in `attention.rs`); the other
+        // parameters at their declared defaults.
         (BackendName::Vulkan, false) => vec![
-            vec![("ROWS", 64), ("SPLIT_GROUPS", 256)],
-            vec![("ROWS", 64), ("SPLIT_GROUPS", 1)],
-            vec![("ROWS", 128), ("SPLIT_GROUPS", 512)],
+            vec![("MATRIX", 1), ("ROWS", 64), ("SPLIT_GROUPS", 256)],
+            vec![("MATRIX", 1), ("ROWS", 64), ("SPLIT_GROUPS", 1)],
+            vec![("MATRIX", 1), ("ROWS", 128), ("SPLIT_GROUPS", 512)],
         ],
         (other, _) => panic!("no attention configurations for {other:?}"),
     }

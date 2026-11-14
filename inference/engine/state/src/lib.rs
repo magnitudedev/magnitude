@@ -2052,30 +2052,13 @@ impl StateStore {
                     .map(|(_, source)| *source)
             })
     }
-    /// The stored domains of target block `block`'s source `part`'s indexer
-    /// keys (`LayerRef::IndexKeys`): the Window of its pooled keys' raw
-    /// projections (none for keys of a pooled source's rows), and the Block
-    /// of its keys, each one history read of a launch row
-    /// (`history_reads`). `None` for a source without an own indexer.
-    pub fn index_key_domains(
-        &self,
-        block: u32,
-        part: u32,
-    ) -> Option<(Option<HistoryDomainId>, HistoryDomainId)> {
-        self.produced_domains(LayerRef::IndexKeys { block, part })
-    }
-    /// The stored domains of target block `block`'s pooled source `part`
-    /// (`LayerRef::Pooled`): the Window of its incomplete group (none at
-    /// rate 1), and the Block of its rows. `None` for a source the block
-    /// does not own.
-    pub fn pooled_domains(
-        &self,
-        block: u32,
-        part: u32,
-    ) -> Option<(Option<HistoryDomainId>, HistoryDomainId)> {
-        self.produced_domains(LayerRef::Pooled { block, part })
-    }
-    fn produced_domains(
+    /// The stored domains of the produced rows of `layer`
+    /// (`LayerRef::IndexKeys`, `Pooled` or their head forms): the Window of
+    /// its raw projections or incomplete group (none for keys of a pooled
+    /// source's rows, nor at rate 1), and the Block of its rows or keys, each
+    /// one history read of a launch row (`history_reads`). `None` for a layer
+    /// the store keeps none of.
+    pub fn produced_domains(
         &self,
         layer: LayerRef,
     ) -> Option<(Option<HistoryDomainId>, HistoryDomainId)> {

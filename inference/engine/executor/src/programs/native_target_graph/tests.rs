@@ -103,6 +103,7 @@ mod upload_region_tests {
         let layout = LaunchControlLayout {
             padded: vec![false, true],
             picked: vec![None, None],
+            units: vec![false, false],
             max_segments: 4,
             region_bytes: 0,
         };
@@ -135,7 +136,7 @@ mod upload_region_tests {
         }
         // Without history reads: coordinates and the slot controls, each
         // at a 256-byte boundary; the last, one slot's word.
-        let plain = LaunchControlLayout::of(&reads, &[], &[], 16, 4, 1).unwrap();
+        let plain = LaunchControlLayout::of(&reads, &[], &[], &[], 16, 4, 1).unwrap();
         assert_eq!(plain.region_bytes(), 5 * 256 + 4);
     }
 
@@ -147,11 +148,13 @@ mod upload_region_tests {
         use crate::programs::native_target_graph::classes::PickedRead;
         use super::{LaunchControl, LaunchControlLayout};
         let layout = LaunchControlLayout {
-            padded: vec![false, false],
+            padded: vec![false, false, false],
             picked: vec![
                 Some(PickedRead { top: 2, pool_blocks: Some(8) }),
                 Some(PickedRead { top: 3, pool_blocks: None }),
+                None,
             ],
+            units: vec![false, false, true],
             max_segments: 4,
             region_bytes: 0,
         };
@@ -167,6 +170,11 @@ mod upload_region_tests {
         assert_eq!(at(LaunchControl::Pool { read: 0 }), Some(vec![16, 8 + 2, 2]));
         assert_eq!(at(LaunchControl::Picks { read: 1 }), Some(vec![16, 3]));
         assert_eq!(at(LaunchControl::Pool { read: 1 }), None);
+        // A selected read's keys' Block read takes its rows' complete units
+        // and unit lists, and no picks.
+        assert_eq!(at(LaunchControl::Complete { read: 2 }), Some(vec![16]));
+        assert_eq!(at(LaunchControl::Units { read: 2 }), Some(vec![16, 1, 2]));
+        assert_eq!(at(LaunchControl::Picks { read: 2 }), None);
         assert!(LaunchControl::Pool { read: 0 }.per_row());
     }
 }
@@ -1168,7 +1176,9 @@ mod sinkhorn_graph_tests {
     use super::*;
     use magnitude_family_contracts::ModelDefinition;
     use crate::operators::streams::ResidualCarry;
-    use crate::planning::fixtures::{fixture_manifest, qwen4exp_fixture_definition, sinkhorn_fixture_definition};
+    use crate::planning::fixtures::{
+        fixture_manifest, glm_slice_b_fixture, qwen4exp_fixture_definition, sinkhorn_fixture_definition,
+    };
     use crate::{ComponentSelection, ExecutionPath, PlannedMethod, ResourceCapacity, ResourcePlanner, resident_layout};
     use magnitude_state::KvCodec;
 
@@ -1228,6 +1238,88 @@ mod sinkhorn_graph_tests {
                 let label = format!("{backend:?} block {index} {rows} rows {stage:?}");
                 drop(checked.unwrap_or_else(|error| panic!("{label}: {error}")));
             }
+        }
+    }
+    /// GLM-5.3-Flash's slice B blocks check on the CPU and Metal at decode,
+    /// verify and chunked prompt rows, each sublayer reading its Sinkhorn
+    /// site's input row and joining the streams through it: slice A's (KDA,
+    /// then a clamped dense feed-forward), and the latent attention with
+    /// absorbed queries over the rows its pooled indexer picks, then the
+    /// biased sigmoid route over clamped FP8 experts and shared expert; and
+    /// every class of the ladder a load prepares certifies.
+    #[test]
+    fn glm_slice_block_graphs_check_on_every_backend() {
+        let (definition, manifest) = glm_slice_b_fixture();
+        let codec = KvCodec::Dense;
+        let selection = ComponentSelection { head: false, vision: false };
+        let limits = crate::planning::fixtures::LIMITS;
+        for backend in [BackendName::Cpu, BackendName::Metal, BackendName::Cuda, BackendName::Vulkan] {
+            let layout = resident_layout(ExecutionPath::Native, backend);
+            let load = ModelLoadPlan::derive(&manifest, &definition, selection, layout, PlannedMethod::Plain, limits).unwrap();
+            let capacity = ResourceCapacity { domain_bytes: 1 << 30, tensor_operations: crate::TensorOperations::Absent };
+            let state = ResourcePlanner::state_plan(&definition, &load, PlannedMethod::Plain, codec, limits, capacity).unwrap();
+            let plan = load.program_plan(&definition, codec).unwrap();
+            for (index, rows) in (0..2).flat_map(|index| [1, 5, 64, 512].map(|rows| (index, rows))) {
+                let inputs = BlockGraphInputs::of_class(
+                    &load,
+                    &definition.decoder,
+                    &state,
+                    index,
+                    ((rows, 1, 1, 0, 0), Stage::Run(RunStage::Whole)),
+                    rows,
+                );
+                let checked = checked_block_graph_draft(NativeGraphMetadata::new(backend), plan.target().blocks()[index], None, inputs);
+                drop(checked.unwrap_or_else(|error| panic!("{backend:?} block {index} {rows} rows: {error}")));
+            }
+            let certified = crate::programs::native_target_graph::checked_target_family_storage(
+                backend,
+                &load,
+                &definition.decoder,
+                &state,
+                plan.target(),
+                limits,
+            );
+            drop(certified.unwrap_or_else(|error| panic!("{backend:?}: {error}")));
+        }
+    }
+
+    /// Slice B with its experts streamed at the bank's floor (the plan a load
+    /// under a weight cap makes) certifies every class of its ladder,
+    /// including each routed block's scratch fill: beside unified memory
+    /// (Metal, GB10) and beside a discrete device's linked host tier (the
+    /// RTX 3090's), whose device seeds the bank, where its one layer has no
+    /// record past those it lends and so seeds nothing.
+    #[test]
+    fn glm_slice_block_graphs_with_streamed_experts_certify_on_every_backend() {
+        use crate::planning::{HostTier, Parking};
+        let (definition, manifest) = glm_slice_b_fixture();
+        let codec = KvCodec::Dense;
+        let selection = ComponentSelection { head: false, vision: false };
+        let limits = crate::planning::fixtures::LIMITS;
+        let reservation = |host_addressed| seismic::Reservation { granule: 2 << 20, host_addressed, chunks: None };
+        for (backend, tier) in [
+            (BackendName::Metal, HostTier::Unified(Parking::InKernels)),
+            (BackendName::Cuda, HostTier::Unified(Parking::InKernels)),
+            (BackendName::Cuda, HostTier::Linked(reservation(true))),
+            (BackendName::Vulkan, HostTier::Linked(reservation(true))),
+        ] {
+            let layout = resident_layout(ExecutionPath::Native, backend);
+            let load = ModelLoadPlan::derive(&manifest, &definition, selection, layout, PlannedMethod::Plain, limits)
+                .unwrap()
+                .with_expert_bank_at_floor(&definition, crate::planning::BankSubstrate { backend, reservation: reservation(true), host: tier })
+                .unwrap();
+            let capacity = ResourceCapacity { domain_bytes: 1 << 30, tensor_operations: crate::TensorOperations::Absent };
+            let state = ResourcePlanner::state_plan(&definition, &load, PlannedMethod::Plain, codec, limits, capacity).unwrap();
+            let plan = load.program_plan(&definition, codec).unwrap();
+            let certified = crate::programs::native_target_graph::checked_target_family_storage(
+                backend,
+                &load,
+                &definition.decoder,
+                &state,
+                plan.target(),
+                limits,
+            );
+            drop(certified.unwrap_or_else(|error| panic!("{backend:?} beside {tier:?}: {error}")));
         }
     }
 }

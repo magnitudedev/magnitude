@@ -1,0 +1,3060 @@
+{
+ "converter": "glm.Glm5NextModel",
+ "reference": {
+  "repository": "zai-org/GLM-5.3-Flash",
+  "revision": "46a050bec13002ad29ee795c16e61cf4fa3c4a9c"
+ },
+ "now": 1790510400,
+ "corpus": [
+  {
+   "text": "Hello, world!",
+   "ids": [
+    9703,
+    11,
+    1879,
+    0
+   ],
+   "decoded": "Hello, world!"
+  },
+  {
+   "text": "The quick brown fox jumps over the lazy dog. It's a test; they'll see, we've done, I'd go, you're right, I'M LOUD, DON'T.",
+   "ids": [
+    785,
+    3974,
+    13867,
+    38627,
+    34041,
+    916,
+    279,
+    15666,
+    5562,
+    13,
+    1084,
+    594,
+    264,
+    1273,
+    26,
+    807,
+    3278,
+    1490,
+    11,
+    582,
+    3003,
+    2814,
+    11,
+    358,
+    4172,
+    728,
+    11,
+    498,
+    2299,
+    1290,
+    11,
+    358,
+    27511,
+    5017,
+    4656,
+    11,
+    44017,
+    17302,
+    13
+   ],
+   "decoded": "The quick brown fox jumps over the lazy dog. It's a test; they'll see, we've done, I'd go, you're right, I'M LOUD, DON'T."
+  },
+  {
+   "text": "  leading spaces and trailing   ",
+   "ids": [
+    220,
+    6388,
+    12615,
+    323,
+    27654,
+    262
+   ],
+   "decoded": "  leading spaces and trailing   "
+  },
+  {
+   "text": "multiple    internal     spaces\tand\ttabs\t\t\tend",
+   "ids": [
+    35495,
+    262,
+    5306,
+    257,
+    12615,
+    52133,
+    3244,
+    3435,
+    298,
+    6246
+   ],
+   "decoded": "multiple    internal     spaces\tand\ttabs\t\t\tend"
+  },
+  {
+   "text": "line one\nline two\n\nline four\n\n\n\nafter blank lines\n",
+   "ids": [
+    1056,
+    825,
+    198,
+    1056,
+    1378,
+    271,
+    1056,
+    3040,
+    1022,
+    10689,
+    10108,
+    5128,
+    198
+   ],
+   "decoded": "line one\nline two\n\nline four\n\n\n\nafter blank lines\n"
+  },
+  {
+   "text": "windows\r\nline\r\nendings\r\n\r\ndouble crlf and lone \r carriage",
+   "ids": [
+    26989,
+    319,
+    1056,
+    319,
+    408,
+    819,
+    871,
+    4331,
+    1560,
+    11003,
+    323,
+    46379,
+    220,
+    201,
+    51109
+   ],
+   "decoded": "windows\r\nline\r\nendings\r\n\r\ndouble crlf and lone \r carriage"
+  },
+  {
+   "text": "Numbers: 1 12 123 1234 12345 123456 3.14159 -42 1,000,000 0x1F 2026-09-27 v1.2.3",
+   "ids": [
+    27148,
+    25,
+    220,
+    16,
+    220,
+    98886,
+    220,
+    108714,
+    220,
+    108714,
+    19,
+    220,
+    108714,
+    100461,
+    220,
+    108714,
+    100461,
+    21,
+    220,
+    18,
+    13,
+    122804,
+    102573,
+    481,
+    101961,
+    220,
+    16,
+    11,
+    99752,
+    11,
+    99752,
+    220,
+    15,
+    87,
+    16,
+    37,
+    220,
+    115937,
+    21,
+    12,
+    100614,
+    12,
+    99951,
+    348,
+    16,
+    13,
+    17,
+    13,
+    18
+   ],
+   "decoded": "Numbers: 1 12 123 1234 12345 123456 3.14159 -42 1,000,000 0x1F 2026-09-27 v1.2.3"
+  },
+  {
+   "text": "def fib(n):\n    if n < 2:\n        return n\n    return fib(n - 1) + fib(n - 2)\n\nprint([fib(i) for i in range(10)])\n",
+   "ids": [
+    750,
+    15789,
+    1445,
+    982,
+    262,
+    421,
+    308,
+    366,
+    220,
+    17,
+    510,
+    286,
+    470,
+    308,
+    198,
+    262,
+    470,
+    15789,
+    1445,
+    481,
+    220,
+    16,
+    8,
+    488,
+    15789,
+    1445,
+    481,
+    220,
+    17,
+    692,
+    1350,
+    2561,
+    74731,
+    1956,
+    8,
+    369,
+    600,
+    304,
+    2088,
+    7,
+    98668,
+    27055
+   ],
+   "decoded": "def fib(n):\n    if n < 2:\n        return n\n    return fib(n - 1) + fib(n - 2)\n\nprint([fib(i) for i in range(10)])\n"
+  },
+  {
+   "text": "fn main() {\n\tlet x: Vec<u32> = (0..10).map(|i| i * i).collect();\n\tprintln!(\"{:?}\", x);\n}\n",
+   "ids": [
+    8821,
+    1887,
+    368,
+    341,
+    10212,
+    856,
+    25,
+    11307,
+    34664,
+    101175,
+    29,
+    284,
+    320,
+    15,
+    496,
+    98668,
+    568,
+    2186,
+    22369,
+    72,
+    91,
+    600,
+    353,
+    600,
+    568,
+    17362,
+    543,
+    80510,
+    88193,
+    25,
+    52306,
+    856,
+    317,
+    532
+   ],
+   "decoded": "fn main() {\n\tlet x: Vec<u32> = (0..10).map(|i| i * i).collect();\n\tprintln!(\"{:?}\", x);\n}\n"
+  },
+  {
+   "text": "{\"key\": \"value\", \"list\": [1, 2, 3], \"nested\": {\"a\": null, \"b\": true}}",
+   "ids": [
+    4913,
+    792,
+    788,
+    330,
+    957,
+    497,
+    330,
+    1607,
+    788,
+    508,
+    16,
+    11,
+    220,
+    17,
+    11,
+    220,
+    18,
+    1125,
+    330,
+    58860,
+    788,
+    5212,
+    64,
+    788,
+    845,
+    11,
+    330,
+    65,
+    788,
+    830,
+    3417
+   ],
+   "decoded": "{\"key\": \"value\", \"list\": [1, 2, 3], \"nested\": {\"a\": null, \"b\": true}}"
+  },
+  {
+   "text": "<div class=\"x\">&amp; &lt;tag&gt;</div> // comment /* block */ #!/usr/bin/env bash",
+   "ids": [
+    2626,
+    536,
+    428,
+    87,
+    13357,
+    1121,
+    26,
+    609,
+    4832,
+    26,
+    4578,
+    15349,
+    11342,
+    611,
+    29,
+    442,
+    3980,
+    1391,
+    2504,
+    639,
+    671,
+    87251,
+    7063,
+    8748,
+    14348,
+    26935
+   ],
+   "decoded": "<div class=\"x\">&amp; &lt;tag&gt;</div> // comment /* block */ #!/usr/bin/env bash"
+  },
+  {
+   "text": "日本語のテキストと中文文本，还有한국어 텍스트。",
+   "ids": [
+    99799,
+    131513,
+    15755,
+    56451,
+    61369,
+    70008,
+    19146,
+    102169,
+    103231,
+    3837,
+    99252,
+    23508,
+    130419,
+    30953,
+    10759,
+    43849,
+    52836,
+    1773
+   ],
+   "decoded": "日本語のテキストと中文文本，还有한국어 텍스트。"
+  },
+  {
+   "text": "Emoji: 😀👍🏽👨‍👩‍👧‍👦 🇳🇴 ❤️ ✅",
+   "ids": [
+    91952,
+    25,
+    89570,
+    151901,
+    151821,
+    151928,
+    124564,
+    151929,
+    124564,
+    151927,
+    124564,
+    151926,
+    11157,
+    229,
+    111,
+    9281,
+    229,
+    112,
+    69945,
+    30423,
+    25442,
+    227
+   ],
+   "decoded": "Emoji: 😀👍🏽👨‍👩‍👧‍👦 🇳🇴 ❤️ ✅"
+  },
+  {
+   "text": "Combining: é ä ñ — café naïve résumé Ångström",
+   "ids": [
+    36009,
+    5740,
+    25,
+    3958,
+    12703,
+    1683,
+    109,
+    1959,
+    51609,
+    94083,
+    586,
+    9330,
+    1242,
+    963,
+    78615,
+    968,
+    495,
+    84879
+   ],
+   "decoded": "Combining: é ä ñ — café naïve résumé Ångström"
+  },
+  {
+   "text": "Arabic: مرحبا بالعالم. Hebrew: שלום עולם. Hindi: नमस्ते दुनिया। Thai: สวัสดีชาวโลก",
+   "ids": [
+    6953,
+    67794,
+    25,
+    147686,
+    132131,
+    127893,
+    23161,
+    129360,
+    13,
+    36083,
+    25,
+    87071,
+    48974,
+    36478,
+    251,
+    17263,
+    95,
+    36478,
+    250,
+    147,
+    251,
+    13,
+    43727,
+    25,
+    14913,
+    101,
+    86522,
+    77740,
+    30366,
+    97,
+    34200,
+    14913,
+    99,
+    72094,
+    59678,
+    42069,
+    107,
+    23801,
+    151430,
+    26307,
+    25,
+    220,
+    35470,
+    37019,
+    23208,
+    35470,
+    36839,
+    28221,
+    47818,
+    20728,
+    37019,
+    153233,
+    31649,
+    25122
+   ],
+   "decoded": "Arabic: مرحبا بالعالم. Hebrew: שלום עולם. Hindi: नमस्ते दुनिया। Thai: สวัสดีชาวโลก"
+  },
+  {
+   "text": "Cyrillic: Привет, мир! Greek: Γειά σου Κόσμε. Math: ∑ᵢ xᵢ² ≤ ∞ ∫₀¹ f(x) dx ≠ π",
+   "ids": [
+    34,
+    10915,
+    321,
+    415,
+    25,
+    141521,
+    8177,
+    11,
+    130422,
+    0,
+    17834,
+    25,
+    83521,
+    127513,
+    73558,
+    143537,
+    128461,
+    136807,
+    127797,
+    13,
+    4149,
+    25,
+    11989,
+    239,
+    157,
+    113,
+    95,
+    856,
+    157,
+    113,
+    95,
+    29346,
+    37100,
+    11989,
+    252,
+    11989,
+    104,
+    88927,
+    59085,
+    282,
+    2075,
+    8,
+    13813,
+    93511,
+    51405
+   ],
+   "decoded": "Cyrillic: Привет, мир! Greek: Γειά σου Κόσμε. Math: ∑ᵢ xᵢ² ≤ ∞ ∫₀¹ f(x) dx ≠ π"
+  },
+  {
+   "text": "CamelCaseIdentifier snake_case_name SCREAMING_CASE kebab-case iPhone McDonald's",
+   "ids": [
+    25328,
+    301,
+    4207,
+    8713,
+    25187,
+    19061,
+    1269,
+    7531,
+    15903,
+    1718,
+    28440,
+    1962,
+    47427,
+    38278,
+    12161,
+    30789,
+    594
+   ],
+   "decoded": "CamelCaseIdentifier snake_case_name SCREAMING_CASE kebab-case iPhone McDonald's"
+  },
+  {
+   "text": "URL: https://example.com/path/to/page?query=1&other=two#frag and email a.b@c.io",
+   "ids": [
+    3144,
+    25,
+    3703,
+    1110,
+    8686,
+    905,
+    50642,
+    32283,
+    32036,
+    30,
+    1631,
+    28,
+    16,
+    5,
+    1575,
+    28,
+    19752,
+    2,
+    33038,
+    323,
+    2551,
+    264,
+    948,
+    89174,
+    4245
+   ],
+   "decoded": "URL: https://example.com/path/to/page?query=1&other=two#frag and email a.b@c.io"
+  },
+  {
+   "text": "Mixed123Numbers456 and a1b2c3 and 99bottles",
+   "ids": [
+    85715,
+    108714,
+    27148,
+    100461,
+    21,
+    323,
+    264,
+    16,
+    65,
+    17,
+    66,
+    18,
+    323,
+    220,
+    100809,
+    65,
+    1716,
+    642
+   ],
+   "decoded": "Mixed123Numbers456 and a1b2c3 and 99bottles"
+  },
+  {
+   "text": "\n\n\n",
+   "ids": [
+    1406
+   ],
+   "decoded": "\n\n\n"
+  },
+  {
+   "text": "   ",
+   "ids": [
+    262
+   ],
+   "decoded": "   "
+  },
+  {
+   "text": " ",
+   "ids": [
+    220
+   ],
+   "decoded": " "
+  },
+  {
+   "text": "a",
+   "ids": [
+    64
+   ],
+   "decoded": "a"
+  },
+  {
+   "text": "tab\tseparated\tvalues\n1\t2\t3\n",
+   "ids": [
+    6192,
+    83990,
+    49282,
+    45663,
+    198,
+    16,
+    197,
+    17,
+    197,
+    18,
+    198
+   ],
+   "decoded": "tab\tseparated\tvalues\n1\t2\t3\n"
+  },
+  {
+   "text": "Quotes: “smart” ‘single’ «guillemets» „German“",
+   "ids": [
+    43530,
+    25,
+    1036,
+    39587,
+    854,
+    3369,
+    15326,
+    527,
+    12480,
+    8716,
+    321,
+    3433,
+    1415,
+    12985,
+    14824,
+    31937,
+    2073
+   ],
+   "decoded": "Quotes: “smart” ‘single’ «guillemets» „German“"
+  },
+  {
+   "text": "Zero​width and non breaking and ideographic　space",
+   "ids": [
+    17971,
+    15680,
+    3098,
+    323,
+    2477,
+    14709,
+    323,
+    2614,
+    12673,
+    22382,
+    8745
+   ],
+   "decoded": "Zero​width and non breaking and ideographic　space"
+  },
+  {
+   "text": "Repeated punctuation!!! ??? ... --- === *** ### @@@ $$$ %%% ^^^ &&& ((( )))",
+   "ids": [
+    90231,
+    61071,
+    12063,
+    50979,
+    2503,
+    12442,
+    2049,
+    17141,
+    16584,
+    569,
+    19155,
+    96877,
+    1018,
+    2769,
+    6306,
+    21824,
+    1009,
+    5,
+    11595,
+    98113
+   ],
+   "decoded": "Repeated punctuation!!! ??? ... --- === *** ### @@@ $$$ %%% ^^^ &&& ((( )))"
+  },
+  {
+   "text": "ALLCAPS WORDS AND lowercase words And Title Case Words",
+   "ids": [
+    3919,
+    31269,
+    50,
+    36699,
+    50,
+    3567,
+    41810,
+    4244,
+    1597,
+    10864,
+    11533,
+    27538
+   ],
+   "decoded": "ALLCAPS WORDS AND lowercase words And Title Case Words"
+  },
+  {
+   "text": "   indented\n      more indented\n\t\ttabbed\n",
+   "ids": [
+    256,
+    1257,
+    15852,
+    198,
+    414,
+    803,
+    1257,
+    15852,
+    198,
+    197,
+    57752,
+    2721,
+    198
+   ],
+   "decoded": "   indented\n      more indented\n\t\ttabbed\n"
+  },
+  {
+   "text": "\u0000\u0001 bytes ÿĀ 😀󠀁 end",
+   "ids": [
+    188,
+    189,
+    221,
+    5820,
+    1683,
+    123,
+    152916,
+    89570,
+    175,
+    62770,
+    223,
+    835
+   ],
+   "decoded": "\u0000\u0001 bytes ÿĀ 😀󠀁 end"
+  },
+  {
+   "text": "it'ſ, it'S, we'LL, K'd, 'Ve, 'ﬅ",
+   "ids": [
+    275,
+    6,
+    153000,
+    11,
+    432,
+    13264,
+    11,
+    582,
+    6,
+    4086,
+    11,
+    730,
+    4172,
+    11,
+    364,
+    42368,
+    11,
+    364,
+    171,
+    105,
+    227
+   ],
+   "decoded": "it'ſ, it'S, we'LL, K'd, 'Ve, 'ﬅ"
+  },
+  {
+   "text": "<|im_start|>user\nhi<|im_end|>\n<s> </s> <bos> <eos> <|endoftext|> <think>x</think> <|turn>model\n<turn|> 〈|EOS|〉 <|start|>assistant<|message|>ok<|eot|>",
+   "ids": [
+    27,
+    91,
+    318,
+    4906,
+    91,
+    29,
+    872,
+    198,
+    6023,
+    27,
+    91,
+    318,
+    6213,
+    91,
+    397,
+    43794,
+    29,
+    690,
+    82,
+    29,
+    366,
+    77820,
+    29,
+    366,
+    83704,
+    29,
+    220,
+    154820,
+    220,
+    154841,
+    87,
+    154842,
+    81959,
+    412,
+    29,
+    2528,
+    198,
+    27,
+    412,
+    91,
+    29,
+    220,
+    107778,
+    91,
+    55564,
+    91,
+    107498,
+    81959,
+    2468,
+    91,
+    29,
+    76478,
+    27,
+    91,
+    1994,
+    91,
+    29,
+    562,
+    27,
+    91,
+    68,
+    354,
+    91,
+    29
+   ],
+   "decoded": "<|im_start|>user\nhi<|im_end|>\n<s> </s> <bos> <eos> <|endoftext|> <think>x</think> <|turn>model\n<turn|> 〈|EOS|〉 <|start|>assistant<|message|>ok<|eot|>"
+  },
+  {
+   "text": "[gMASK]<sop><|system|>s<|user|>u<|assistant|><think>r</think>a<tool_call>f<arg_key>k</arg_key><arg_value>v</arg_value></tool_call><|observation|><tool_response>x</tool_response>/nothink<|begin_of_image|><|image|><|end_of_image|>",
+   "ids": [
+    154822,
+    154824,
+    154826,
+    82,
+    154827,
+    84,
+    154828,
+    154841,
+    81,
+    154842,
+    64,
+    154843,
+    69,
+    154847,
+    74,
+    154848,
+    154849,
+    85,
+    154850,
+    154844,
+    154829,
+    154845,
+    87,
+    154846,
+    154851,
+    154830,
+    154854,
+    154831
+   ],
+   "decoded": "[gMASK]<sop><|system|>s<|user|>u<|assistant|><think>r</think>a<tool_call>f<arg_key>k</arg_key><arg_value>v</arg_value></tool_call><|observation|><tool_response>x</tool_response>/nothink<|begin_of_image|><|image|><|end_of_image|>"
+  }
+ ],
+ "renders": [
+  {
+   "name": "single",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi there! What's 2+2?"
+    }
+   ],
+   "tools": [],
+   "template_arguments": {},
+   "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hi there! What's 2+2?<|assistant|><think>",
+   "ids": [
+    154822,
+    154824,
+    154826,
+    25062,
+    287,
+    29905,
+    371,
+    25,
+    7487,
+    154827,
+    13041,
+    1052,
+    0,
+    3555,
+    594,
+    220,
+    17,
+    10,
+    17,
+    30,
+    154828,
+    154841
+   ]
+  },
+  {
+   "name": "multi_turn",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a concise assistant."
+    },
+    {
+     "role": "user",
+     "content": "Name a colour."
+    },
+    {
+     "role": "assistant",
+     "content": "Blue."
+    },
+    {
+     "role": "user",
+     "content": "Another one, with some 日本語."
+    }
+   ],
+   "tools": [],
+   "template_arguments": {},
+   "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>You are a concise assistant.<|user|>Name a colour.<|assistant|><think></think>Blue.<|user|>Another one, with some 日本語.<|assistant|><think>",
+   "ids": [
+    154822,
+    154824,
+    154826,
+    25062,
+    287,
+    29905,
+    371,
+    25,
+    7487,
+    154826,
+    2610,
+    525,
+    264,
+    63141,
+    17821,
+    13,
+    154827,
+    675,
+    264,
+    12457,
+    13,
+    154828,
+    154841,
+    154842,
+    10326,
+    13,
+    154827,
+    14028,
+    825,
+    11,
+    448,
+    1045,
+    108478,
+    131513,
+    13,
+    154828,
+    154841
+   ]
+  },
+  {
+   "name": "tools",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the weather in Paris?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "template_arguments": {},
+   "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>What is the weather in Paris?<|assistant|><think>",
+   "ids": [
+    154822,
+    154824,
+    154826,
+    25062,
+    287,
+    29905,
+    371,
+    25,
+    7487,
+    154826,
+    198,
+    2,
+    13843,
+    271,
+    2610,
+    1231,
+    1618,
+    825,
+    476,
+    803,
+    5746,
+    311,
+    7789,
+    448,
+    279,
+    1196,
+    3239,
+    382,
+    2610,
+    525,
+    3897,
+    448,
+    729,
+    32479,
+    2878,
+    366,
+    15906,
+    1472,
+    15906,
+    29,
+    11868,
+    9488,
+    510,
+    27,
+    15906,
+    397,
+    4913,
+    606,
+    788,
+    330,
+    455,
+    68852,
+    497,
+    330,
+    4684,
+    788,
+    330,
+    1949,
+    279,
+    1482,
+    9101,
+    369,
+    264,
+    3283,
+    497,
+    330,
+    13777,
+    788,
+    5212,
+    1313,
+    788,
+    330,
+    1700,
+    497,
+    330,
+    13185,
+    788,
+    5212,
+    8923,
+    788,
+    5212,
+    1313,
+    788,
+    330,
+    917,
+    497,
+    330,
+    4684,
+    788,
+    330,
+    12724,
+    829,
+    14335,
+    330,
+    13769,
+    788,
+    5212,
+    1313,
+    788,
+    330,
+    11656,
+    9204,
+    2137,
+    330,
+    6279,
+    788,
+    4383,
+    8923,
+    1341,
+    11243,
+    522,
+    15906,
+    1339,
+    2461,
+    1817,
+    729,
+    1618,
+    11,
+    2550,
+    279,
+    729,
+    829,
+    323,
+    5977,
+    2878,
+    279,
+    2701,
+    11868,
+    3561,
+    510,
+    154843,
+    90,
+    1688,
+    11489,
+    92,
+    154847,
+    90,
+    858,
+    16159,
+    12,
+    16,
+    92,
+    154848,
+    154849,
+    90,
+    858,
+    19048,
+    12,
+    16,
+    92,
+    154850,
+    154847,
+    90,
+    858,
+    16159,
+    12,
+    17,
+    92,
+    154848,
+    154849,
+    90,
+    858,
+    19048,
+    12,
+    17,
+    92,
+    154850,
+    1112,
+    154844,
+    154827,
+    3838,
+    374,
+    279,
+    9101,
+    304,
+    12089,
+    30,
+    154828,
+    154841
+   ]
+  },
+  {
+   "name": "tool_round_trip",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": "One call for Paris.",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 2
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_1",
+     "name": "get_weather",
+     "content": "{\"temperature\": 21, \"sky\": \"clear\"}"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "template_arguments": {},
+   "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>What is the weather in Paris?<|assistant|><think>One call for Paris.</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>2</arg_value></tool_call><|observation|><tool_response>{\"temperature\": 21, \"sky\": \"clear\"}</tool_response><|assistant|><think>",
+   "ids": [
+    154822,
+    154824,
+    154826,
+    25062,
+    287,
+    29905,
+    371,
+    25,
+    7487,
+    154826,
+    198,
+    2,
+    13843,
+    271,
+    2610,
+    1231,
+    1618,
+    825,
+    476,
+    803,
+    5746,
+    311,
+    7789,
+    448,
+    279,
+    1196,
+    3239,
+    382,
+    2610,
+    525,
+    3897,
+    448,
+    729,
+    32479,
+    2878,
+    366,
+    15906,
+    1472,
+    15906,
+    29,
+    11868,
+    9488,
+    510,
+    27,
+    15906,
+    397,
+    4913,
+    606,
+    788,
+    330,
+    455,
+    68852,
+    497,
+    330,
+    4684,
+    788,
+    330,
+    1949,
+    279,
+    1482,
+    9101,
+    369,
+    264,
+    3283,
+    497,
+    330,
+    13777,
+    788,
+    5212,
+    1313,
+    788,
+    330,
+    1700,
+    497,
+    330,
+    13185,
+    788,
+    5212,
+    8923,
+    788,
+    5212,
+    1313,
+    788,
+    330,
+    917,
+    497,
+    330,
+    4684,
+    788,
+    330,
+    12724,
+    829,
+    14335,
+    330,
+    13769,
+    788,
+    5212,
+    1313,
+    788,
+    330,
+    11656,
+    9204,
+    2137,
+    330,
+    6279,
+    788,
+    4383,
+    8923,
+    1341,
+    11243,
+    522,
+    15906,
+    1339,
+    2461,
+    1817,
+    729,
+    1618,
+    11,
+    2550,
+    279,
+    729,
+    829,
+    323,
+    5977,
+    2878,
+    279,
+    2701,
+    11868,
+    3561,
+    510,
+    154843,
+    90,
+    1688,
+    11489,
+    92,
+    154847,
+    90,
+    858,
+    16159,
+    12,
+    16,
+    92,
+    154848,
+    154849,
+    90,
+    858,
+    19048,
+    12,
+    16,
+    92,
+    154850,
+    154847,
+    90,
+    858,
+    16159,
+    12,
+    17,
+    92,
+    154848,
+    154849,
+    90,
+    858,
+    19048,
+    12,
+    17,
+    92,
+    154850,
+    1112,
+    154844,
+    154827,
+    3838,
+    374,
+    279,
+    9101,
+    304,
+    12089,
+    30,
+    154828,
+    154841,
+    3966,
+    1618,
+    369,
+    12089,
+    13,
+    154842,
+    154843,
+    455,
+    68852,
+    154847,
+    8923,
+    154848,
+    154849,
+    59190,
+    154850,
+    154847,
+    13769,
+    154848,
+    154849,
+    17,
+    154850,
+    154844,
+    154829,
+    154845,
+    4913,
+    34388,
+    788,
+    220,
+    99146,
+    11,
+    330,
+    26598,
+    788,
+    330,
+    7422,
+    9204,
+    154846,
+    154828,
+    154841
+   ]
+  },
+  {
+   "name": "tool_round_trip_cleared",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": "One call for Paris.",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 2
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_1",
+     "name": "get_weather",
+     "content": "{\"temperature\": 21, \"sky\": \"clear\"}"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "template_arguments": {
+    "clear_thinking": true
+   },
+   "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>What is the weather in Paris?<|assistant|><think>One call for Paris.</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>2</arg_value></tool_call><|observation|><tool_response>{\"temperature\": 21, \"sky\": \"clear\"}</tool_response><|assistant|><think>",
+   "ids": [
+    154822,
+    154824,
+    154826,
+    25062,
+    287,
+    29905,
+    371,
+    25,
+    7487,
+    154826,
+    198,
+    2,
+    13843,
+    271,
+    2610,
+    1231,
+    1618,
+    825,
+    476,
+    803,
+    5746,
+    311,
+    7789,
+    448,
+    279,
+    1196,
+    3239,
+    382,
+    2610,
+    525,
+    3897,
+    448,
+    729,
+    32479,
+    2878,
+    366,
+    15906,
+    1472,
+    15906,
+    29,
+    11868,
+    9488,
+    510,
+    27,
+    15906,
+    397,
+    4913,
+    606,
+    788,
+    330,
+    455,
+    68852,
+    497,
+    330,
+    4684,
+    788,
+    330,
+    1949,
+    279,
+    1482,
+    9101,
+    369,
+    264,
+    3283,
+    497,
+    330,
+    13777,
+    788,
+    5212,
+    1313,
+    788,
+    330,
+    1700,
+    497,
+    330,
+    13185,
+    788,
+    5212,
+    8923,
+    788,
+    5212,
+    1313,
+    788,
+    330,
+    917,
+    497,
+    330,
+    4684,
+    788,
+    330,
+    12724,
+    829,
+    14335,
+    330,
+    13769,
+    788,
+    5212,
+    1313,
+    788,
+    330,
+    11656,
+    9204,
+    2137,
+    330,
+    6279,
+    788,
+    4383,
+    8923,
+    1341,
+    11243,
+    522,
+    15906,
+    1339,
+    2461,
+    1817,
+    729,
+    1618,
+    11,
+    2550,
+    279,
+    729,
+    829,
+    323,
+    5977,
+    2878,
+    279,
+    2701,
+    11868,
+    3561,
+    510,
+    154843,
+    90,
+    1688,
+    11489,
+    92,
+    154847,
+    90,
+    858,
+    16159,
+    12,
+    16,
+    92,
+    154848,
+    154849,
+    90,
+    858,
+    19048,
+    12,
+    16,
+    92,
+    154850,
+    154847,
+    90,
+    858,
+    16159,
+    12,
+    17,
+    92,
+    154848,
+    154849,
+    90,
+    858,
+    19048,
+    12,
+    17,
+    92,
+    154850,
+    1112,
+    154844,
+    154827,
+    3838,
+    374,
+    279,
+    9101,
+    304,
+    12089,
+    30,
+    154828,
+    154841,
+    3966,
+    1618,
+    369,
+    12089,
+    13,
+    154842,
+    154843,
+    455,
+    68852,
+    154847,
+    8923,
+    154848,
+    154849,
+    59190,
+    154850,
+    154847,
+    13769,
+    154848,
+    154849,
+    17,
+    154850,
+    154844,
+    154829,
+    154845,
+    4913,
+    34388,
+    788,
+    220,
+    99146,
+    11,
+    330,
+    26598,
+    788,
+    330,
+    7422,
+    9204,
+    154846,
+    154828,
+    154841
+   ]
+  },
+  {
+   "name": "parallel_results",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris, and search for llama.cpp."
+    },
+    {
+     "role": "assistant",
+     "content": "Both at once.",
+     "tool_calls": [
+      {
+       "id": "call_b",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris"
+        }
+       }
+      },
+      {
+       "id": "call_A",
+       "type": "function",
+       "function": {
+        "name": "search",
+        "arguments": {
+         "query": "llama.cpp \"chat\"\nparser",
+         "limit": 3
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_A",
+     "name": "search",
+     "content": "[{\"title\": \"llama.cpp\"}]"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_b",
+     "name": "get_weather",
+     "content": "sunny"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "search",
+      "description": "Search the web «verbatim»",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "query": {
+         "type": "string"
+        },
+        "limit": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "query"
+       ]
+      }
+     }
+    }
+   ],
+   "template_arguments": {},
+   "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n{\"name\": \"search\", \"description\": \"Search the web «verbatim»\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"limit\": {\"type\": \"integer\"}}, \"required\": [\"query\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>Weather in Paris, and search for llama.cpp.<|assistant|><think></think>Both at once.<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call><tool_call>search<arg_key>query</arg_key><arg_value>llama.cpp \"chat\"\nparser</arg_value><arg_key>limit</arg_key><arg_value>3</arg_value></tool_call><|observation|><tool_response>sunny</tool_response><tool_response>[{\"title\": \"llama.cpp\"}]</tool_response><|assistant|><think>",
+   "ids": [
+    154822,
+    154824,
+    154826,
+    25062,
+    287,
+    29905,
+    371,
+    25,
+    7487,
+    154826,
+    198,
+    2,
+    13843,
+    271,
+    2610,
+    1231,
+    1618,
+    825,
+    476,
+    803,
+    5746,
+    311,
+    7789,
+    448,
+    279,
+    1196,
+    3239,
+    382,
+    2610,
+    525,
+    3897,
+    448,
+    729,
+    32479,
+    2878,
+    366,
+    15906,
+    1472,
+    15906,
+    29,
+    11868,
+    9488,
+    510,
+    27,
+    15906,
+    397,
+    4913,
+    606,
+    788,
+    330,
+    455,
+    68852,
+    497,
+    330,
+    4684,
+    788,
+    330,
+    1949,
+    279,
+    1482,
+    9101,
+    369,
+    264,
+    3283,
+    497,
+    330,
+    13777,
+    788,
+    5212,
+    1313,
+    788,
+    330,
+    1700,
+    497,
+    330,
+    13185,
+    788,
+    5212,
+    8923,
+    788,
+    5212,
+    1313,
+    788,
+    330,
+    917,
+    497,
+    330,
+    4684,
+    788,
+    330,
+    12724,
+    829,
+    14335,
+    330,
+    13769,
+    788,
+    5212,
+    1313,
+    788,
+    330,
+    11656,
+    9204,
+    2137,
+    330,
+    6279,
+    788,
+    4383,
+    8923,
+    1341,
+    11243,
+    4913,
+    606,
+    788,
+    330,
+    1836,
+    497,
+    330,
+    4684,
+    788,
+    330,
+    5890,
+    279,
+    3482,
+    12480,
+    83313,
+    12985,
+    497,
+    330,
+    13777,
+    788,
+    5212,
+    1313,
+    788,
+    330,
+    1700,
+    497,
+    330,
+    13185,
+    788,
+    5212,
+    1631,
+    788,
+    5212,
+    1313,
+    788,
+    330,
+    917,
+    14335,
+    330,
+    9502,
+    788,
+    5212,
+    1313,
+    788,
+    330,
+    11656,
+    9204,
+    2137,
+    330,
+    6279,
+    788,
+    4383,
+    1631,
+    1341,
+    11243,
+    522,
+    15906,
+    1339,
+    2461,
+    1817,
+    729,
+    1618,
+    11,
+    2550,
+    279,
+    729,
+    829,
+    323,
+    5977,
+    2878,
+    279,
+    2701,
+    11868,
+    3561,
+    510,
+    154843,
+    90,
+    1688,
+    11489,
+    92,
+    154847,
+    90,
+    858,
+    16159,
+    12,
+    16,
+    92,
+    154848,
+    154849,
+    90,
+    858,
+    19048,
+    12,
+    16,
+    92,
+    154850,
+    154847,
+    90,
+    858,
+    16159,
+    12,
+    17,
+    92,
+    154848,
+    154849,
+    90,
+    858,
+    19048,
+    12,
+    17,
+    92,
+    154850,
+    1112,
+    154844,
+    154827,
+    28876,
+    304,
+    12089,
+    11,
+    323,
+    2711,
+    369,
+    92890,
+    7208,
+    13,
+    154828,
+    154841,
+    154842,
+    20586,
+    518,
+    3055,
+    13,
+    154843,
+    455,
+    68852,
+    154847,
+    8923,
+    154848,
+    154849,
+    59190,
+    154850,
+    154844,
+    154843,
+    1836,
+    154847,
+    1631,
+    154848,
+    154849,
+    654,
+    3029,
+    7208,
+    330,
+    9682,
+    698,
+    9653,
+    154850,
+    154847,
+    9502,
+    154848,
+    154849,
+    18,
+    154850,
+    154844,
+    154829,
+    154845,
+    82,
+    27208,
+    154846,
+    154845,
+    58,
+    4913,
+    2102,
+    788,
+    330,
+    654,
+    3029,
+    7208,
+    9204,
+    60,
+    154846,
+    154828,
+    154841
+   ]
+  },
+  {
+   "name": "reasoning_kept",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a concise assistant."
+    },
+    {
+     "role": "user",
+     "content": "Name a colour."
+    },
+    {
+     "role": "assistant",
+     "content": "Blue.",
+     "reasoning_content": "Any colour will do."
+    },
+    {
+     "role": "user",
+     "content": "Another one."
+    },
+    {
+     "role": "assistant",
+     "content": "Red."
+    },
+    {
+     "role": "user",
+     "content": "And one more, with some 日本語."
+    }
+   ],
+   "tools": [],
+   "template_arguments": {},
+   "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>You are a concise assistant.<|user|>Name a colour.<|assistant|><think>Any colour will do.</think>Blue.<|user|>Another one.<|assistant|><think></think>Red.<|user|>And one more, with some 日本語.<|assistant|><think>",
+   "ids": [
+    154822,
+    154824,
+    154826,
+    25062,
+    287,
+    29905,
+    371,
+    25,
+    7487,
+    154826,
+    2610,
+    525,
+    264,
+    63141,
+    17821,
+    13,
+    154827,
+    675,
+    264,
+    12457,
+    13,
+    154828,
+    154841,
+    8609,
+    12457,
+    686,
+    653,
+    13,
+    154842,
+    10326,
+    13,
+    154827,
+    14028,
+    825,
+    13,
+    154828,
+    154841,
+    154842,
+    6033,
+    13,
+    154827,
+    3036,
+    825,
+    803,
+    11,
+    448,
+    1045,
+    108478,
+    131513,
+    13,
+    154828,
+    154841
+   ]
+  },
+  {
+   "name": "reasoning_kept_explicitly",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a concise assistant."
+    },
+    {
+     "role": "user",
+     "content": "Name a colour."
+    },
+    {
+     "role": "assistant",
+     "content": "Blue.",
+     "reasoning_content": "Any colour will do."
+    },
+    {
+     "role": "user",
+     "content": "Another one."
+    },
+    {
+     "role": "assistant",
+     "content": "Red."
+    },
+    {
+     "role": "user",
+     "content": "And one more, with some 日本語."
+    }
+   ],
+   "tools": [],
+   "template_arguments": {
+    "clear_thinking": false
+   },
+   "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>You are a concise assistant.<|user|>Name a colour.<|assistant|><think>Any colour will do.</think>Blue.<|user|>Another one.<|assistant|><think></think>Red.<|user|>And one more, with some 日本語.<|assistant|><think>",
+   "ids": [
+    154822,
+    154824,
+    154826,
+    25062,
+    287,
+    29905,
+    371,
+    25,
+    7487,
+    154826,
+    2610,
+    525,
+    264,
+    63141,
+    17821,
+    13,
+    154827,
+    675,
+    264,
+    12457,
+    13,
+    154828,
+    154841,
+    8609,
+    12457,
+    686,
+    653,
+    13,
+    154842,
+    10326,
+    13,
+    154827,
+    14028,
+    825,
+    13,
+    154828,
+    154841,
+    154842,
+    6033,
+    13,
+    154827,
+    3036,
+    825,
+    803,
+    11,
+    448,
+    1045,
+    108478,
+    131513,
+    13,
+    154828,
+    154841
+   ]
+  },
+  {
+   "name": "reasoning_cleared",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a concise assistant."
+    },
+    {
+     "role": "user",
+     "content": "Name a colour."
+    },
+    {
+     "role": "assistant",
+     "content": "Blue.",
+     "reasoning_content": "Any colour will do."
+    },
+    {
+     "role": "user",
+     "content": "Another one."
+    },
+    {
+     "role": "assistant",
+     "content": "Red."
+    },
+    {
+     "role": "user",
+     "content": "And one more, with some 日本語."
+    }
+   ],
+   "tools": [],
+   "template_arguments": {
+    "clear_thinking": true
+   },
+   "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>You are a concise assistant.<|user|>Name a colour.<|assistant|><think></think>Blue.<|user|>Another one.<|assistant|><think></think>Red.<|user|>And one more, with some 日本語.<|assistant|><think>",
+   "ids": [
+    154822,
+    154824,
+    154826,
+    25062,
+    287,
+    29905,
+    371,
+    25,
+    7487,
+    154826,
+    2610,
+    525,
+    264,
+    63141,
+    17821,
+    13,
+    154827,
+    675,
+    264,
+    12457,
+    13,
+    154828,
+    154841,
+    154842,
+    10326,
+    13,
+    154827,
+    14028,
+    825,
+    13,
+    154828,
+    154841,
+    154842,
+    6033,
+    13,
+    154827,
+    3036,
+    825,
+    803,
+    11,
+    448,
+    1045,
+    108478,
+    131513,
+    13,
+    154828,
+    154841
+   ]
+  },
+  {
+   "name": "reasoning_in_content",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Name a colour."
+    },
+    {
+     "role": "assistant",
+     "content": "<think>Any will do.</think>\n\nBlue.  "
+    },
+    {
+     "role": "user",
+     "content": "Another."
+    }
+   ],
+   "tools": [],
+   "template_arguments": {},
+   "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Name a colour.<|assistant|><think>Any will do.</think>Blue.<|user|>Another.<|assistant|><think>",
+   "ids": [
+    154822,
+    154824,
+    154826,
+    25062,
+    287,
+    29905,
+    371,
+    25,
+    7487,
+    154827,
+    675,
+    264,
+    12457,
+    13,
+    154828,
+    154841,
+    8609,
+    686,
+    653,
+    13,
+    154842,
+    10326,
+    13,
+    154827,
+    14028,
+    13,
+    154828,
+    154841
+   ]
+  },
+  {
+   "name": "effort_low",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the weather in Paris?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "template_arguments": {
+    "reasoning_effort": "low"
+   },
+   "text": "[gMASK]<sop><|system|>Reasoning Effort: Low<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>What is the weather in Paris?<|assistant|><think>",
+   "ids": [
+    154822,
+    154824,
+    154826,
+    25062,
+    287,
+    29905,
+    371,
+    25,
+    12035,
+    154826,
+    198,
+    2,
+    13843,
+    271,
+    2610,
+    1231,
+    1618,
+    825,
+    476,
+    803,
+    5746,
+    311,
+    7789,
+    448,
+    279,
+    1196,
+    3239,
+    382,
+    2610,
+    525,
+    3897,
+    448,
+    729,
+    32479,
+    2878,
+    366,
+    15906,
+    1472,
+    15906,
+    29,
+    11868,
+    9488,
+    510,
+    27,
+    15906,
+    397,
+    4913,
+    606,
+    788,
+    330,
+    455,
+    68852,
+    497,
+    330,
+    4684,
+    788,
+    330,
+    1949,
+    279,
+    1482,
+    9101,
+    369,
+    264,
+    3283,
+    497,
+    330,
+    13777,
+    788,
+    5212,
+    1313,
+    788,
+    330,
+    1700,
+    497,
+    330,
+    13185,
+    788,
+    5212,
+    8923,
+    788,
+    5212,
+    1313,
+    788,
+    330,
+    917,
+    497,
+    330,
+    4684,
+    788,
+    330,
+    12724,
+    829,
+    14335,
+    330,
+    13769,
+    788,
+    5212,
+    1313,
+    788,
+    330,
+    11656,
+    9204,
+    2137,
+    330,
+    6279,
+    788,
+    4383,
+    8923,
+    1341,
+    11243,
+    522,
+    15906,
+    1339,
+    2461,
+    1817,
+    729,
+    1618,
+    11,
+    2550,
+    279,
+    729,
+    829,
+    323,
+    5977,
+    2878,
+    279,
+    2701,
+    11868,
+    3561,
+    510,
+    154843,
+    90,
+    1688,
+    11489,
+    92,
+    154847,
+    90,
+    858,
+    16159,
+    12,
+    16,
+    92,
+    154848,
+    154849,
+    90,
+    858,
+    19048,
+    12,
+    16,
+    92,
+    154850,
+    154847,
+    90,
+    858,
+    16159,
+    12,
+    17,
+    92,
+    154848,
+    154849,
+    90,
+    858,
+    19048,
+    12,
+    17,
+    92,
+    154850,
+    1112,
+    154844,
+    154827,
+    3838,
+    374,
+    279,
+    9101,
+    304,
+    12089,
+    30,
+    154828,
+    154841
+   ]
+  },
+  {
+   "name": "effort_high",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the weather in Paris?"
+    }
+   ],
+   "tools": [],
+   "template_arguments": {
+    "reasoning_effort": "high"
+   },
+   "text": "[gMASK]<sop><|system|>Reasoning Effort: High<|user|>What is the weather in Paris?<|assistant|><think>",
+   "ids": [
+    154822,
+    154824,
+    154826,
+    25062,
+    287,
+    29905,
+    371,
+    25,
+    5124,
+    154827,
+    3838,
+    374,
+    279,
+    9101,
+    304,
+    12089,
+    30,
+    154828,
+    154841
+   ]
+  },
+  {
+   "name": "effort_unnamed",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the weather in Paris?"
+    }
+   ],
+   "tools": [],
+   "template_arguments": {
+    "reasoning_effort": "medium"
+   },
+   "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>What is the weather in Paris?<|assistant|><think>",
+   "ids": [
+    154822,
+    154824,
+    154826,
+    25062,
+    287,
+    29905,
+    371,
+    25,
+    7487,
+    154827,
+    3838,
+    374,
+    279,
+    9101,
+    304,
+    12089,
+    30,
+    154828,
+    154841
+   ]
+  }
+ ],
+ "replies": [
+  {
+   "name": "single_call",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the weather in Paris?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "template_arguments": {},
+   "text": "One call for Paris.</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>2</arg_value></tool_call>",
+   "content": "",
+   "reasoning": "One call for Paris.",
+   "calls": [
+    {
+     "name": "get_weather",
+     "arguments": {
+      "city": "Paris",
+      "days": 2
+     }
+    }
+   ]
+  },
+  {
+   "name": "content_and_calls",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris, and search for llama.cpp."
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "search",
+      "description": "Search the web «verbatim»",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "query": {
+         "type": "string"
+        },
+        "limit": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "query"
+       ]
+      }
+     }
+    }
+   ],
+   "template_arguments": {},
+   "text": "Two tools.</think>Both at once.<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call><tool_call>search<arg_key>query</arg_key><arg_value>llama.cpp \"chat\"\nparser </arg_val <line> & more</arg_value><arg_key>limit</arg_key><arg_value>3</arg_value></tool_call>",
+   "content": "Both at once.",
+   "reasoning": "Two tools.",
+   "calls": [
+    {
+     "name": "get_weather",
+     "arguments": {
+      "city": "Paris"
+     }
+    },
+    {
+     "name": "search",
+     "arguments": {
+      "query": "llama.cpp \"chat\"\nparser </arg_val <line> & more",
+      "limit": 3
+     }
+    }
+   ]
+  },
+  {
+   "name": "json_values",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the weather in Paris?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "forecast",
+      "description": "Forecast",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        },
+        "options": {
+         "type": "object",
+         "properties": {
+          "units": {
+           "type": "string"
+          },
+          "hours": {
+           "type": "array",
+           "items": {
+            "type": "integer"
+           }
+          }
+         },
+         "required": [
+          "units",
+          "hours"
+         ]
+        },
+        "tags": {
+         "type": "array",
+         "items": {
+          "type": "string"
+         }
+        },
+        "verbose": {
+         "type": "boolean"
+        },
+        "limit": {
+         "anyOf": [
+          {
+           "type": "integer"
+          },
+          {
+           "type": "null"
+          }
+         ]
+        }
+       },
+       "required": [
+        "city",
+        "options"
+       ]
+      }
+     }
+    }
+   ],
+   "template_arguments": {},
+   "text": "</think><tool_call>forecast<arg_key>city</arg_key><arg_value>Oslo</arg_value><arg_key>options</arg_key><arg_value>{\"units\": \"metric\", \"hours\": [6, 12]}</arg_value><arg_key>tags</arg_key><arg_value>[\"日本\", \"a\\\"b\"]</arg_value><arg_key>verbose</arg_key><arg_value>true</arg_value><arg_key>limit</arg_key><arg_value>null</arg_value></tool_call>",
+   "content": "",
+   "reasoning": "",
+   "calls": [
+    {
+     "name": "forecast",
+     "arguments": {
+      "city": "Oslo",
+      "options": {
+       "units": "metric",
+       "hours": [
+        6,
+        12
+       ]
+      },
+      "tags": [
+       "日本",
+       "a\"b"
+      ],
+      "verbose": true,
+      "limit": null
+     }
+    }
+   ]
+  },
+  {
+   "name": "call_without_arguments",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What time is it?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "now",
+      "description": "The current time",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "zone": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   ],
+   "template_arguments": {},
+   "text": "Ask the clock.</think><tool_call>now</tool_call>",
+   "content": "",
+   "reasoning": "Ask the clock.",
+   "calls": [
+    {
+     "name": "now",
+     "arguments": {}
+    }
+   ]
+  },
+  {
+   "name": "content_without_calls",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the weather in Paris?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "template_arguments": {
+    "reasoning_effort": "low"
+   },
+   "text": "No tool needed.</think>It is sunny in Paris.",
+   "content": "It is sunny in Paris.",
+   "reasoning": "No tool needed.",
+   "calls": []
+  }
+ ]
+}

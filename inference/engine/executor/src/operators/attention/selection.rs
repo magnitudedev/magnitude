@@ -31,7 +31,74 @@ use crate::planning::RoundingArguments;
 use magnitude_kernels::{
     attention_project, candidate_blocks, candidate_rows, indexer_keys, indexer_score, rows_topk,
 };
-use seismic::{Argument, Dim, NativePort, WorkflowTensor, WorkflowTensorView};
+use magnitude_family_contracts::IndexerInput;
+use seismic::{Argument, Dim, Element, NativePort, WorkflowTensor, WorkflowTensorView};
+
+/// The elements an indexer's projections are specialized at, the one
+/// assignment preparation and the checked graphs share: its query over its
+/// input (`x` under the input norm, or the low-rank query's `qr` under that
+/// query's norm, of `query_rank` rows) and its head weights over `x`. Each
+/// reads its input in A and is published in A, from which the indexer
+/// entries compute in F32.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct IndexerElements {
+    pub indexer: crate::IndexerBinding,
+    /// The `qr` rows' width for a query over them; none over `x`.
+    pub query_rank: Option<u64>,
+    pub query_project: [(&'static str, Element); 7],
+    pub weights_project: Option<[(&'static str, Element); 7]>,
+}
+
+impl IndexerElements {
+    /// `indexer`'s elements in `binding`. A query over `qr` reads the
+    /// low-rank query's rows, which `Decoder::validate` holds such an
+    /// indexer to.
+    pub(crate) fn of(binding: crate::AttentionBinding, indexer: crate::IndexerBinding) -> Self {
+        let activation = binding.activation;
+        let (query_rank, query_norm) = match indexer.input {
+            IndexerInput::Hidden => (None, binding.norm),
+            IndexerInput::QueryRank => {
+                let low_rank = binding
+                    .low_rank_query
+                    .expect("a validated indexer over the query rank has a low-rank query");
+                (Some(low_rank.rank), low_rank.norm)
+            }
+        };
+        Self {
+            indexer,
+            query_rank,
+            query_project: segment(activation, query_norm, indexer.query, activation),
+            weights_project: indexer
+                .head_weights
+                .map(|weights| segment(activation, binding.norm, weights, activation)),
+        }
+    }
+
+    /// Whether the indexer produces a candidate pool.
+    pub(crate) fn produces(&self) -> bool {
+        matches!(self.indexer.candidates, crate::CandidatesBinding::Produce(_))
+    }
+}
+
+/// `attention_project`'s elements for one projection through `weight` under
+/// the input norm `norm`, every absent segment a zero-row view of `weight`
+/// at its element: its input in `activation`, published in `published`.
+pub(crate) fn segment(
+    activation: Element,
+    norm: Element,
+    weight: Element,
+    published: Element,
+) -> [(&'static str, Element); 7] {
+    [
+        ("NW", norm),
+        ("QW", weight),
+        ("GW", weight),
+        ("KW", weight),
+        ("VW", weight),
+        ("A", activation),
+        ("Y", published),
+    ]
+}
 
 /// The indexer's entries at one graph class.
 pub(crate) struct IndexerEntries<'a, G: GraphDraft + 'a> {
@@ -129,6 +196,19 @@ pub(crate) struct IndexerInputs<'v, 'a, G: GraphDraft + 'a> {
     /// (`[rows]`).
     pub spans: &'v WorkflowTensorView,
     pub complete: &'v WorkflowTensorView,
+    /// What its picks name.
+    pub picks: Picks<'v>,
+}
+
+/// What an indexer's picks name: the key-plane rows of its list (a pooled
+/// source's, which attention reads through `selected_rows`), or the
+/// ordinals of a row's units, `rows_topk` over each row's unit list
+/// (`[rows, 1, 2]`, `[0, c)`), which a token source's reads take
+/// (`unit_reads`).
+#[derive(Clone, Copy)]
+pub(crate) enum Picks<'v> {
+    Rows,
+    Units(&'v WorkflowTensorView),
 }
 
 /// The extents of one class of the indexer `source`.
@@ -143,6 +223,33 @@ pub(crate) struct IndexerClass<'s> {
     pub scores: Dim,
     /// The rotary pairs of the attention's head width.
     pub rotary_pairs: Dim,
+}
+
+impl IndexerClass<'_> {
+    /// `indexer_score`'s dimensions for this class: with a query norm
+    /// (`NQ`), projected head weights (`HW`) and the rotary layout.
+    pub(crate) fn score_dimensions(
+        &self,
+        query_norm: bool,
+        head_weights: bool,
+        rotary_adjacent: bool,
+        rotary_trailing: bool,
+    ) -> [(&'static str, Dim); 11] {
+        let (heads, width, pairs) = (&self.source.heads, &self.source.width, &self.rotary_pairs);
+        [
+            ("M", self.rows.clone()),
+            ("H", heads.clone()),
+            ("NQ", axis(query_norm)),
+            ("HW", if head_weights { heads.clone() } else { Dim::from(0) }),
+            ("TB", self.source.plane.rows.clone()),
+            ("R", self.spans.clone()),
+            ("N", self.scores.clone()),
+            ("P", pairs.clone()),
+            ("S", width - pairs * 2),
+            ("RA", axis(rotary_adjacent)),
+            ("RT", axis(rotary_trailing)),
+        ]
+    }
 }
 
 /// What the indexer of one class computes: each row's scores over its list
@@ -300,23 +407,12 @@ pub(crate) fn indexer<'a, G: GraphDraft + 'a>(
     let score = graph
         .enqueue(
             entries.score,
-            &[
-                [
-                    ("M", rows.clone()),
-                    ("H", heads.clone()),
-                    ("NQ", axis(reals.query_norm.is_some())),
-                    (
-                        "HW",
-                        if inputs.head_weights.is_some() { heads.clone() } else { Dim::from(0) },
-                    ),
-                    ("TB", class.source.plane.rows.clone()),
-                    ("R", class.spans.clone()),
-                    ("N", scores.clone()),
-                ]
-                .as_slice(),
-                &rotary,
-            ]
-            .concat(),
+            &class.score_dimensions(
+                reals.query_norm.is_some(),
+                inputs.head_weights.is_some(),
+                inputs.rotary_adjacent,
+                inputs.rotary_trailing,
+            ),
             indexer_score::WorkflowArgs {
                 query: (&query).into(),
                 query_norm: (&query_norm).into(),
@@ -340,19 +436,23 @@ pub(crate) fn indexer<'a, G: GraphDraft + 'a>(
         )?
         .value;
     let top_slots = none.reshape(&[Dim::from(0), class.source.top.clone()]);
+    let (list, list_spans) = match inputs.picks {
+        Picks::Rows => (inputs.spans, class.spans.clone()),
+        Picks::Units(units) => (units, Dim::from(1)),
+    };
     let picks = graph
         .enqueue(
             entries.topk,
             &[
                 ("M", rows.clone()),
                 ("N", scores.clone()),
-                ("R", class.spans.clone()),
+                ("R", list_spans),
                 ("K", class.source.top.clone()),
             ],
             rows_topk::WorkflowArgs {
                 scores: (&score).into(),
                 complete: inputs.complete.into(),
-                spans: inputs.spans.into(),
+                spans: list.into(),
                 top_slots: (&top_slots).into(),
             },
         )?

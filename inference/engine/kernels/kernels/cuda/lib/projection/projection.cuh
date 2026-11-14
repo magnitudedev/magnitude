@@ -1586,6 +1586,10 @@ struct ActivationRows {
     const u8 *act;
     u64 stride;
     __device__ __forceinline__ const u8 *row(u64 m) const { return act + m * stride * 2; }
+    // Whether every row starts 16-byte aligned: a view's base and stride are
+    // only element-aligned, so a GEMM stages its rows whole only where this
+    // holds (`gemm_segment`).
+    __device__ __forceinline__ bool wide() const { return stride % 8 == 0 && ((u64)act & 15) == 0; }
 };
 
 // The weight side of a GEMM block's shared memory: STAGES stages (BM
@@ -1883,6 +1887,9 @@ __device__ __forceinline__ void gemm_segment(u8 *shared, const Rows &source, u32
         piece[i] = source.row(present[i] ? row : 0) + (c % 3 < 2 ? 16 * (c % 3) : PackedRows::scales(K));
         place[i] = (c / 3) * PITCH + 16 * (c % 3);
     }
+    // Packed NVFP4 operand rows are owned staging, aligned as `form_row` lays
+    // them out; the activation rows are a view, whose alignment is read once.
+    const bool wide = Operands::FP4 || source.wide();
     // Stage k-block `kb`'s activation rows into stage `base`.
     auto load_rows = [&](u8 *base, u64 kb) {
         if constexpr (Operands::FP4) {
@@ -1896,12 +1903,27 @@ __device__ __forceinline__ void gemm_segment(u8 *shared, const Rows &source, u32
                 else
                     cp_async_4_zfill(base + place[i], piece[i] + kb * 4, present[i] ? 4u : 0u);
             }
-        } else {
+        } else if (wide) {
 #pragma unroll
             for (int i = 0; i < CHUNKS; ++i) {
                 const int c = (int)loader + i * LOADERS;
                 seismic_cp_async_16_zfill(base + (c / 8) * PITCH + (c % 8) * 16, chunk[i] + kb * 128,
                                           valid[i] ? 16u : 0u);
+            }
+        } else {
+            // Rows off 16-byte alignment (a view's base or stride): each
+            // chunk's eight 16-bit values, loaded singly.
+#pragma unroll
+            for (int i = 0; i < CHUNKS; ++i) {
+                const int c = (int)loader + i * LOADERS;
+                u32 w[4] = {0u, 0u, 0u, 0u};
+                if (valid[i]) {
+                    const u16 *values = reinterpret_cast<const u16 *>(chunk[i] + kb * 128);
+#pragma unroll
+                    for (int j = 0; j < 4; ++j)
+                        w[j] = (u32)values[2 * j] | (u32)values[2 * j + 1] << 16;
+                }
+                *reinterpret_cast<uint4 *>(base + (c / 8) * PITCH + (c % 8) * 16) = make_uint4(w[0], w[1], w[2], w[3]);
             }
         }
     };

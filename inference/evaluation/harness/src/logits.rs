@@ -141,7 +141,7 @@ pub fn run(
         artifacts,
         options,
         &Load {
-            drafter: false,
+            method: magnitude_engine::options::ModelMethod::Plain,
             proposals: None,
             context_tokens: longest + logits.verify_width,
             // Every fixture of a batch holds its sequence until it is scored.
@@ -178,6 +178,7 @@ pub fn run(
         scored.push((base, runs));
     }
     let indices = (0..rendered.len()).collect::<Vec<_>>();
+    let scoring = std::time::Instant::now();
     // Each pass over the fixtures runs on the one load, in the state the last left its bank.
     for pass in 0..logits.passes {
         let data = match pass {
@@ -222,6 +223,9 @@ pub fn run(
         file.flush()
             .map_err(|error| format!("{}: {error}", data.display()))?;
     }
+    // What the rig's estimate reads: scored rows per second of the whole walk (its prefill between windows included).
+    let throughput = scoring_record(rows.len() * logits.passes, scoring.elapsed().as_secs_f64());
+    eprintln!("magnitude-harness: scored {throughput}");
     // A streamed load's decode misses: the fewest any streamed layer took
     // (none means some layer never read past its bank), all of them, and
     // those its CPU site served.
@@ -261,6 +265,7 @@ pub fn run(
         // The sample that chose `rows`; none scores every predicting position.
         "sample": logits.sample.map(|Sample { windows, steps }| json!({ "windows": windows, "steps": steps })),
         "experts": experts,
+        "scoring": throughput,
         "stored_tables": tables,
     });
     let path = stem.with_extension("json");
@@ -270,6 +275,11 @@ pub fn run(
     )
     .map_err(|error| format!("writing {}: {error}", path.display()))?;
     Ok(engine.device().info().name().to_owned())
+}
+
+/// The scoring walk's throughput: the rows it scored (every pass's), its seconds and their quotient.
+fn scoring_record(rows: usize, seconds: f64) -> serde_json::Value {
+    json!({ "rows": rows, "seconds": seconds, "rows_per_second": rows as f64 / seconds })
 }
 
 /// Advance every walk through its predicting positions: a packed prefill
@@ -408,5 +418,12 @@ mod tests {
         assert_eq!(sample(3, 8), [9..17, 22..29, 45..53]);
         // No more positions than the windows would take: all of them.
         assert_eq!(sample(5, 8), [9..29, 39..59]);
+    }
+
+    #[test]
+    fn a_scoring_walk_reports_its_rows_per_second() {
+        let record = scoring_record(128, 64.0);
+        assert_eq!(record["rows"], 128);
+        assert_eq!(record["rows_per_second"], 2.0);
     }
 }

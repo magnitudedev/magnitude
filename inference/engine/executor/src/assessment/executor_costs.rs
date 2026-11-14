@@ -3033,7 +3033,7 @@ impl AttendCase {
         let norms = zeros(Element::f32(), &[0, HEAD_WIDTH])?;
         let sinks = zeros(Element::f32(), &[0, heads])?;
         let form = zeros(Element::i32(), &[0, 0, 0, 0, 0])?;
-        let dense_form = zeros(Element::i32(), &[0, 0, 0, 0, 0, 0])?;
+        let dense_form = zeros(Element::i32(), &[0, 0, 0, 0, 0, 0, 0])?;
         let selected_rows = zeros(Element::i32(), &[1, 0])?;
         let selected = zeros(Element::bf16(), &[0, KV_HEADS, HEAD_WIDTH])?;
         let rotary_components = host(Element::i32(), &[ROTARY_PAIRS], words(&components))?;
@@ -3204,6 +3204,7 @@ fn attention_values(layout: KvCodec) -> Result<Vec<(&'static str, u64)>, Executo
         ("RT", 0),
         ("RO", 0),
         ("VK", 0),
+        ("AB", 0),
     ];
     // An affine layout's statics are its planes' widths; the dense entry's
     // also its key rounding and picks (none).

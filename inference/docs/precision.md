@@ -313,6 +313,56 @@ least 2^−117 · 2^−9 = 2^−126, an F32 normal, which a device that flushes 
 A kernel that applies a group's scale after summing its products reorders the arithmetic,
 and admission judges it against α like any other reordering.
 
+## Absorbed latent attention
+
+Multi-head latent attention without positions (GLM-5.3-Flash) stores one latent row c per token,
+which every head reads as key k_h = W_UK_h c and value v_h = W_UV_h c. The engine never forms
+k_h or v_h, and never composes a weight from two stored ones: each head's query is absorbed at
+run time, q'_h = W_UK_hᵀ q_h, so q_h · k_h = q'_h · c, and its attended latent row goes through
+W_UV_h after the softmax (`QueryKeys::Absorbed`, `OutputProjection::GroupedLowRank`). The
+chain, with A the activation element, which is BF16 for this form (the planner refuses an F16
+activation):
+
+- q_h: the low-rank query's up projection, F32 sums published in A.
+- q'_h: `project_rows` over the heads stages q_h in A (an exact copy), sums each head's
+  products in F32 and publishes them in A. A rounds q'_h once, as it rounds any query; it has
+  F32's exponent range, so a query absorbed far past F16's largest value stays finite. NoPE
+  latent attention broke under llama.cpp's F16 attention cast for this reason.
+- c: the key projection's F32 sums published in A, its RMS norm in F32, the normalized row
+  stored in A (`history_codec`: a stored-key history is the model's own dense store under every
+  KV policy).
+- Scores q'_h · c and the softmax are F32. The CPU entries read q'_h, c and the values in A and
+  keep everything else in F32. Metal's and CUDA's prefill entries stage queries, history rows
+  and probabilities as A operands of F32-accumulated products (CUDA's dense MMA operands are
+  the activation element, `cuda/lib/attention/prefill.cuh`'s `Operands`).
+- The attended latent row is published in A, goes through W_UV_h (`project_rows`, F32 sums
+  published in A), and the output projection sums into the F32 residual.
+
+Nothing in an absorbed read is staged in F16. A BF16 value is exact in F16 when
+2^−17 <= |x| <= 65280 or x = 0 (BF16's 8-bit significand fits F16's subnormal grid down to
+2^−17), so a smaller latent value would lose bits that A holds, and no bound on the stored norm
+weight keeps every value above it. Every decode and prefill form that rounds an operand to F16
+(Metal's decode matrix forms, `attention.h`'s `dense_history::KeyOperand`, and its shared-tile
+prefill with picks (KS > 0); Vulkan's decode and prefill matrix forms) is refused for an absorbed read by the declarations themselves: the dense
+entries' form table carries an axis `AB`, 1 for `QueryKeys::Absorbed`, and their `where` clauses
+exclude `MATRIX` (and, on Metal's prefill, KS > 0) for it (`attention.seismic`). The catalog decides which entry attends: Metal's
+vector decode holds no group of 64 queries of 512 and CUDA's holds no stored key (VK = 1), so
+their decode rows attend with their prefill entries (`graph::dense_decodes`), a selected read's
+rows (the indexer's WorkList bitmap) included: every prefill entry reads the bitmap, which only
+chooses the keys, so no operand is staged differently. Vulkan's vector decode form holds it, in
+A with F32 products.
+
+Vulkan's prefill entry has two forms. Where a stored key is read as the value (VK = 1) its
+canonical default is the vector form (MATRIX = 0, `vulkan/lib/attention/vector.glsl`), which
+reads q'_h, c and the values in A and keeps every product in F32, as the CPU does: staging that
+operand in F16 is a precision choice, so it is a tuned alternative, never the untuned default.
+Where VK = 0 the matrix form alone is declared, as before. Its cooperative-matrix form
+(MATRIX = 1) stages queries, history rows and probabilities as F16 operands, so it is a
+candidate the tuner admits only where its measured r ≤ α against the default at the point;
+nothing about it is declared admissible. It is no candidate for an absorbed read (AB = 1),
+which the layer's own latent range could not keep exact; a latent-norm bound on its weights would
+keep every value finite in F16 but not exact, and no such admission has been measured.
+
 ## Evidence and boundaries
 
 Development evaluation measures the four relations together: scaling at fixed structure;

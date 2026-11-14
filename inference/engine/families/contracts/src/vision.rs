@@ -52,6 +52,9 @@ pub enum VisionResize {
     /// aspect kept and each side a whole number of cells (Nemotron Omni's
     /// dynamic resolution).
     PatchBounds { min_patches: u64, max_patches: u64 },
+    /// The aspect-kept content in a canvas of whole cells within the pixel
+    /// bounds, black elsewhere (GLM-5).
+    PaddedCanvas { min_pixels: u64, max_pixels: u64 },
 }
 
 impl VisionResize {
@@ -71,7 +74,9 @@ impl VisionResize {
                 // covers that added area, including very thin overviews.
                 checked_product(&[resolution / patch + 16, resolution / patch + 16])? / cell_rows
             }
-            Self::PixelBounds { max_pixels, .. } => max_pixels / cell_pixels,
+            Self::PixelBounds { max_pixels, .. } | Self::PaddedCanvas { max_pixels, .. } => {
+                max_pixels / cell_pixels
+            }
             Self::PatchBudget { max_patches } => max_patches / cell_rows,
             Self::CellBudget { max_cells } => max_cells,
             Self::PatchBounds { max_patches, .. } => max_patches / cell_rows,
@@ -108,6 +113,16 @@ impl VisionResize {
             } => {
                 let max_pixels = max_pixels.min(checked_product(&[patches, patch, patch])?);
                 Self::PixelBounds {
+                    min_pixels: min_pixels.min(max_pixels),
+                    max_pixels,
+                }
+            }
+            Self::PaddedCanvas {
+                min_pixels,
+                max_pixels,
+            } => {
+                let max_pixels = max_pixels.min(checked_product(&[patches, patch, patch])?);
+                Self::PaddedCanvas {
                     min_pixels: min_pixels.min(max_pixels),
                     max_pixels,
                 }
@@ -435,10 +450,12 @@ pub struct VisionAttention {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum VisionUp {
     Plain(VisionLinear),
-    /// `activation(gate(x)) ⊙ up(x)`.
+    /// `activation(gate(x)) ⊙ up(x)`; under a `limit` L the gate is clamped
+    /// to at most L and the up to `[−L, L]` before they combine.
     Gated {
         gate: VisionLinear,
         up: VisionLinear,
+        limit: Option<f64>,
     },
 }
 
@@ -454,6 +471,17 @@ impl VisionFeedForward {
         match &self.up {
             VisionUp::Plain(up) | VisionUp::Gated { up, .. } => up.outputs(),
         }
+    }
+
+    fn weights<'a>(&'a self, scope: WeightScope, out: &mut Roles<'a>) {
+        match &self.up {
+            VisionUp::Plain(up) => up.weights(scope, VisionLinearSite::Up, out),
+            VisionUp::Gated { gate, up, .. } => {
+                gate.weights(scope, VisionLinearSite::Gate, out);
+                up.weights(scope, VisionLinearSite::Up, out);
+            }
+        }
+        self.down.weights(scope, VisionLinearSite::Down, out);
     }
 }
 
@@ -524,17 +552,19 @@ pub struct Standardize {
     pub scale: WeightDescriptor,
 }
 
+/// `activation(norm(linear(x)))`, each step optional after the linear.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MergerStage {
     pub linear: VisionLinear,
+    pub norm: Option<VisionNorm>,
     pub activation: Option<VisionActivation>,
 }
 
 /// Tower rows to image features: an optional norm of each tower row, the
 /// cell reduction, an optional standardization, an optional norm, the linear
-/// stages, then an optional norm of the feature row. Features enter the
-/// decoder as they are: the decoder's entry transform applies to text rows
-/// only.
+/// stages, an optional feed-forward of the last stage's rows, then an
+/// optional norm of the feature row. Features enter the decoder as they are:
+/// the decoder's entry transform applies to text rows only.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VisionMerger {
     pub norm: Option<VisionNorm>,
@@ -542,6 +572,8 @@ pub struct VisionMerger {
     pub standardize: Option<Standardize>,
     pub projection_norm: Option<VisionNorm>,
     pub stages: Vec<MergerStage>,
+    /// Applied to the last stage's rows; its width is the stage's.
+    pub feed_forward: Option<VisionFeedForward>,
     pub output_norm: Option<VisionNorm>,
 }
 
@@ -576,6 +608,8 @@ pub enum VisionNormSite {
     FeedForwardOutput,
     Merger,
     MergerProjection,
+    /// A merger stage's norm (scope `VisionMerger(stage)`).
+    MergerStage,
     Output,
 }
 
@@ -715,6 +749,13 @@ impl VisionDescription {
                 min_patches: size(min_patches, "minimum patches")?,
                 max_patches: size(max_patches, "maximum patches")?,
             },
+            VisionResize::PaddedCanvas {
+                min_pixels,
+                max_pixels,
+            } => ImageResize::PaddedCanvas {
+                min_pixels: size(min_pixels, "minimum pixels")?,
+                max_pixels: size(max_pixels, "maximum pixels")?,
+            },
         };
         let config = ImageProcessorConfig {
             resize,
@@ -749,6 +790,10 @@ impl VisionDescription {
                     max_slices,
                 } => resolution < 4 * p.patch || max_slices == 0 || max_slices > 9,
                 VisionResize::PixelBounds {
+                    min_pixels,
+                    max_pixels,
+                }
+                | VisionResize::PaddedCanvas {
                     min_pixels,
                     max_pixels,
                 } => min_pixels == 0 || min_pixels > max_pixels,
@@ -841,19 +886,25 @@ impl VisionDescription {
         if let Some(norm) = &merger.projection_norm {
             norm.validate(width, "vision merger projection norm")?;
         }
-        let Some(last) = merger.stages.last() else {
+        if merger.stages.is_empty() {
             return Err(DefinitionError::new("a vision merger needs a linear stage"));
-        };
-        if last.linear.outputs() != self.output_hidden {
-            return Err(DefinitionError::new(
-                "the last vision merger stage must produce the decoder width",
-            ));
         }
         for stage in &merger.stages {
             stage
                 .linear
                 .validate(stage.linear.outputs(), width, "vision merger stage")?;
             width = stage.linear.outputs();
+            if let Some(norm) = &stage.norm {
+                norm.validate(width, "vision merger stage norm")?;
+            }
+        }
+        if let Some(feed_forward) = &merger.feed_forward {
+            Self::validate_feed_forward(feed_forward, width)?;
+        }
+        if width != self.output_hidden {
+            return Err(DefinitionError::new(
+                "the last vision merger stage must produce the decoder width",
+            ));
         }
         if let Some(norm) = &merger.output_norm {
             norm.validate(width, "vision feature norm")?;
@@ -898,6 +949,30 @@ impl VisionDescription {
         Ok(())
     }
 
+    /// A feed-forward of rows of `width`, back to `width`.
+    fn validate_feed_forward(
+        feedforward: &VisionFeedForward,
+        width: u64,
+    ) -> Result<(), DefinitionError> {
+        let intermediate = feedforward.intermediate();
+        if intermediate == 0 {
+            return Err(DefinitionError::new("invalid vision feed-forward width"));
+        }
+        match &feedforward.up {
+            VisionUp::Plain(up) => up.validate(intermediate, width, "vision up projection")?,
+            VisionUp::Gated { gate, up, limit } => {
+                if limit.is_some_and(|limit| !limit.is_finite() || limit <= 0.0) {
+                    return Err(DefinitionError::new("invalid vision feed-forward limit"));
+                }
+                gate.validate(intermediate, width, "vision gate projection")?;
+                up.validate(intermediate, width, "vision up projection")?;
+            }
+        }
+        feedforward
+            .down
+            .validate(width, intermediate, "vision down projection")
+    }
+
     fn validate_block(&self, block: &VisionBlock) -> Result<(), DefinitionError> {
         let hidden = self.hidden;
         block
@@ -935,21 +1010,7 @@ impl VisionDescription {
         block
             .feedforward_norm
             .validate(hidden, "vision feed-forward norm")?;
-        let feedforward = &block.feedforward;
-        let intermediate = feedforward.intermediate();
-        if intermediate == 0 {
-            return Err(DefinitionError::new("invalid vision feed-forward width"));
-        }
-        match &feedforward.up {
-            VisionUp::Plain(up) => up.validate(intermediate, hidden, "vision up projection")?,
-            VisionUp::Gated { gate, up } => {
-                gate.validate(intermediate, hidden, "vision gate projection")?;
-                up.validate(intermediate, hidden, "vision up projection")?;
-            }
-        }
-        feedforward
-            .down
-            .validate(hidden, intermediate, "vision down projection")?;
+        Self::validate_feed_forward(&block.feedforward, hidden)?;
         if let Some(norm) = &block.feedforward_post_norm {
             norm.validate(hidden, "vision feed-forward post-norm")?;
         }
@@ -1060,17 +1121,7 @@ impl VisionDescription {
             block
                 .feedforward_norm
                 .weights(scope, VisionNormSite::FeedForwardInput, &mut out);
-            match &block.feedforward.up {
-                VisionUp::Plain(up) => up.weights(scope, VisionLinearSite::Up, &mut out),
-                VisionUp::Gated { gate, up } => {
-                    gate.weights(scope, VisionLinearSite::Gate, &mut out);
-                    up.weights(scope, VisionLinearSite::Up, &mut out);
-                }
-            }
-            block
-                .feedforward
-                .down
-                .weights(scope, VisionLinearSite::Down, &mut out);
+            block.feedforward.weights(scope, &mut out);
             if let Some(norm) = &block.feedforward_post_norm {
                 norm.weights(scope, VisionNormSite::FeedForwardOutput, &mut out);
             }
@@ -1093,11 +1144,17 @@ impl VisionDescription {
             norm.weights(vision, VisionNormSite::MergerProjection, &mut out);
         }
         for (index, stage) in merger.stages.iter().enumerate() {
-            stage.linear.weights(
-                WeightScope::VisionMerger(u32_index(index)),
-                VisionLinearSite::Merger,
-                &mut out,
-            );
+            let scope = WeightScope::VisionMerger(u32_index(index));
+            stage
+                .linear
+                .weights(scope, VisionLinearSite::Merger, &mut out);
+            if let Some(norm) = &stage.norm {
+                norm.weights(scope, VisionNormSite::MergerStage, &mut out);
+            }
+        }
+        if let Some(feed_forward) = &merger.feed_forward {
+            let scope = WeightScope::VisionMerger(u32_index(merger.stages.len()));
+            feed_forward.weights(scope, &mut out);
         }
         if let Some(norm) = &merger.output_norm {
             norm.weights(vision, VisionNormSite::Output, &mut out);

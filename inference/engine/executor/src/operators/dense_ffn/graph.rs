@@ -1,9 +1,11 @@
 //! Dense feed-forward block graph: the RMS-normed paired gate/up projection
-//! with SiLU·mul, then the down projection plus the residual (or, for a
-//! post-norm sublayer, the down projection into F32 rows normalized into the
-//! residual). Every entry gathers its rows through `out_rows`; a block that
-//! advances every row binds the identity table as a graph constant, so no run
-//! uploads it.
+//! of the input rows with SiLU·mul, then the down projection summed onto the
+//! sum rows (or, for a post-norm sublayer, the down projection into F32 rows
+//! normalized onto them). A single stream's input and sum rows are the
+//! residual; a Sinkhorn site's branch reads the site's input row and sums
+//! onto zeros, which the site's join scatters into the streams. Every entry
+//! gathers its rows through `out_rows`; a block that advances every row binds
+//! the identity table as a graph constant, so no run uploads it.
 
 use crate::operators::output::{CheckedPostNormEntries, PostNorm, PostNormShape, TailEntries, post_norm};
 use crate::operators::routed::{Expansion, ExpansionForm};
@@ -122,9 +124,10 @@ pub(crate) fn split(
     ))
 }
 
-/// `tail` is the sublayer's post-norm tail's reals, none for a
-/// residual tail. Its row identity follows the class dimension `rows_class`
-/// (`GraphConstant::row_identity`), or is fixed without one.
+/// `input` is the rows the expansion normalizes, `sum` the rows the down
+/// projection sums onto. `tail` is the sublayer's post-norm tail's reals,
+/// none for a residual tail. Its row identity follows the class dimension
+/// `rows_class` (`GraphConstant::row_identity`), or is fixed without one.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dense<'a, G: GraphDraft + 'a>(
     graph: &mut G,
@@ -135,7 +138,8 @@ pub(crate) fn dense<'a, G: GraphDraft + 'a>(
     scope: WeightScope,
     weights: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
-    residual: &WorkflowTensor,
+    input: &WorkflowTensor,
+    sum: &WorkflowTensor,
     rows: &Dim,
     rows_class: Option<&'static str>,
     epsilon: Argument<f32>,
@@ -170,7 +174,7 @@ pub(crate) fn dense<'a, G: GraphDraft + 'a>(
             kernels.expand,
             &expand_dimensions,
             dense_expand::WorkflowArgs {
-                residual: residual.into(),
+                residual: input.into(),
                 norm: (&norm).into(),
                 gate_weight: (&gate.weight).into(),
                 up_weight: (&up.weight).into(),
@@ -192,7 +196,7 @@ pub(crate) fn dense<'a, G: GraphDraft + 'a>(
                     output,
                     &output_dimensions,
                     dense_output::WorkflowArgs {
-                        residual: residual.into(),
+                        residual: sum.into(),
                         product: (&product).into(),
                         down_weight: (&down.weight).into(),
                         out_rows: out_rows.port().tensor().into(),
@@ -207,7 +211,7 @@ pub(crate) fn dense<'a, G: GraphDraft + 'a>(
             post_norm(
                 graph,
                 entries,
-                residual,
+                sum,
                 (&product).into(),
                 &down,
                 &post_norm_weight,

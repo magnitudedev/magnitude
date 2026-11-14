@@ -12,6 +12,43 @@ use magnitude_state::{
 use seismic::{BackendName, Device, Element, SlabLayout, SlabRegion};
 use std::{num::NonZeroUsize, rc::Rc};
 
+/// Rows of one prefill forward in the evaluation harness's loads, as the
+/// service bounds them.
+pub const EVALUATION_PREFILL_ROWS: usize = 512;
+
+/// The token allowances of a service's steps, from which a load's launch
+/// bounds follow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StepAllowances {
+    pub prefill_tokens: usize,
+    pub decode_tokens: usize,
+}
+
+impl StepAllowances {
+    /// The evaluation harness's drafting load: prefill forwards of
+    /// [`EVALUATION_PREFILL_ROWS`] rows, decode rounds of sixteen.
+    pub const EVALUATION_DRAFTING: Self =
+        Self { prefill_tokens: EVALUATION_PREFILL_ROWS, decode_tokens: 16 };
+
+    /// The most rows one launch carries: the larger step allowance.
+    pub const fn launch_rows(self) -> usize {
+        if self.prefill_tokens > self.decode_tokens { self.prefill_tokens } else { self.decode_tokens }
+    }
+
+    /// The most requests one launch serves. Every request consumes at least
+    /// one token in either phase, so a prefill round can have as many
+    /// request slots as its larger allowance admits.
+    pub const fn launch_slots(self) -> usize {
+        self.launch_rows()
+    }
+
+    /// The most rows one launch selects a token for, and the most requests
+    /// one drafter launch drafts for: the decode allowance.
+    pub const fn selection_bound(self) -> usize {
+        self.decode_tokens
+    }
+}
+
 /// The service's bounds a load plans for. None is a request-count batch
 /// width: a launch is bounded by its token budget (rows and request slots
 /// are compiled shape classes), its vocabulary work by the selection bound,
@@ -721,6 +758,27 @@ pub struct HistoryStorePlan {
     pub span_limit: usize,
 }
 
+/// A stored history domain as a draft head's graphs bind it: its read (the
+/// index of its tables among a launch row's histories), its reserved rows and
+/// its slab rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct DomainRows {
+    pub read: usize,
+    pub rows: u64,
+    pub slab_rows: u32,
+}
+
+/// The state a causal draft head's graphs bind ([`StateStorePlan::head_geometry`]):
+/// the rows of its block's attention, its indexer's pending keys (Window) and
+/// unit keys (Block) if it selects, and the most spans any of them presents
+/// to a launch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct HeadHistoryGeometry {
+    pub tokens: DomainRows,
+    pub indexer: Option<[DomainRows; 2]>,
+    pub span_limit: usize,
+}
+
 /// The history an attention layer binds: its stored domain, and the
 /// component whose regions it reads (its own, or a Shared domain's source).
 #[derive(Clone, Copy, Debug)]
@@ -846,7 +904,7 @@ impl StateStorePlan {
     }
 
     /// The domains of target block `block`'s pooled source `part`
-    /// (`LayerRef::Pooled`), as `StateStore::pooled_domains` binds them: the
+    /// (`LayerRef::Pooled`), as `StateStore::produced_domains` binds them: the
     /// Window of its incomplete group (none at rate 1) and the Block of its
     /// rows, whose index keys (`LayerRef::IndexKeys`) share it. `None` for a
     /// source the block does not own.
@@ -867,6 +925,12 @@ impl StateStorePlan {
         self.produced_domain(LayerRef::Pooled { block, part }, true).map(|(read, _)| read)
     }
 
+    /// The history read of target block `block`'s selected read's unit keys
+    /// (`LayerRef::IndexKeys`, its first source's): their Block domain's.
+    pub fn index_keys_read(&self, block: u32) -> Option<usize> {
+        self.produced_domain(LayerRef::IndexKeys { block, part: 0 }, true).map(|(read, _)| read)
+    }
+
     /// The Block (`blocks`) or Window domain holding `layer`'s produced rows,
     /// with its read index.
     fn produced_domain(&self, layer: LayerRef, blocks: bool) -> Option<(usize, &HistoryStorePlan)> {
@@ -880,7 +944,7 @@ impl StateStorePlan {
     }
 
     /// The store's one history domain, for a store whose history the
-    /// caller addresses as one domain (the draft head's).
+    /// caller addresses as one domain.
     pub fn sole_history(&self) -> Result<&HistoryStorePlan, String> {
         match self.domains.as_slice() {
             [domain] => Ok(domain),
@@ -889,6 +953,44 @@ impl StateStorePlan {
                 domains.len()
             )),
         }
+    }
+
+    /// The history a causal draft head's graphs bind: its own token rows and,
+    /// when its attention selects, its indexer's two domains. The store
+    /// holds nothing else.
+    pub(crate) fn head_geometry(&self) -> Result<HeadHistoryGeometry, String> {
+        let rows = |read: usize, store: &HistoryStorePlan| -> Result<DomainRows, String> {
+            Ok(DomainRows {
+                read,
+                rows: u64::try_from(store.rows).map_err(|_| "head history rows exceed u64")?,
+                slab_rows: store.slab_rows,
+            })
+        };
+        let tokens = self
+            .layer_history(LayerRef::Head(0))
+            .ok_or("a head's store keeps no history of its block")?;
+        let indexer = match (
+            self.produced_domain(LayerRef::HeadIndexKeys { block: 0, part: 0 }, false),
+            self.produced_domain(LayerRef::HeadIndexKeys { block: 0, part: 0 }, true),
+        ) {
+            (Some((window, pending)), Some((blocks, units))) => {
+                Some([rows(window, pending)?, rows(blocks, units)?])
+            }
+            (None, None) => None,
+            _ => return Err("a head's indexer keeps one of its two domains".into()),
+        };
+        let kept = 1 + 2 * usize::from(indexer.is_some());
+        if self.domains.len() != kept {
+            return Err(format!(
+                "a head's store has {} history domains where its block's attention keeps {kept}",
+                self.domains.len()
+            ));
+        }
+        Ok(HeadHistoryGeometry {
+            tokens: rows(tokens.domain.0, tokens.store)?,
+            indexer,
+            span_limit: self.span_limit(),
+        })
     }
 
     pub fn bank_slab_banks(&self) -> Result<u32, String> {

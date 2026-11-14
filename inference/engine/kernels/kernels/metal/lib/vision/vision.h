@@ -15,6 +15,7 @@
 
 #include "../core/activation.h"
 #include "../projection/projection.h"
+#include "../core/norm.h"
 #include "../core/reduce.h"
 
 namespace vision {
@@ -86,8 +87,8 @@ inline float activate(int code, float value) {
 // The `vision_linear` epilogue. `store(m, n, acc)` receives the F32 product
 // of output (m, n); the projection is acc, plus bias[n] when BIAS, clamped to
 // [minimum, maximum] when CLAMP. With `activation` nonzero
-// y = Y(act(round_A(projection))); with GATE y = Y(round_A(projection) ·
-// gate[m, n]); otherwise y = Y(projection), plus the F32 residual row when
+// y = Y(act(projection)), rounded once, as published; with GATE
+// y = Y(projection · gate[m, n]), rounded once; otherwise y = Y(projection), plus the F32 residual row when
 // RESIDUAL.
 template <typename A, typename B, typename Y, bool BIAS, bool RESIDUAL, bool GATE, bool CLAMP>
 struct output_linear {
@@ -109,9 +110,9 @@ struct output_linear {
             projected = metal::min(metal::max(projected, minimum), maximum);
         float published = projected;
         if (activation != 0)
-            published = activate(activation, A::round(projected));
+            published = activate(activation, projected);
         else if (GATE)
-            published = A::round(projected) * element::at<A>(gate, ulong(m) * gate_stride + n);
+            published = projected * element::at<A>(gate, ulong(m) * gate_stride + n);
         else if (RESIDUAL)
             published = residual[ulong(m) * residual_stride + n] + projected;
         element::put<Y>(y, ulong(m) * stride + n, published);
@@ -123,41 +124,31 @@ struct output_linear {
 };
 
 // ---------------------------------------------------------------------------
-// Norm of one F32 row of `width` values (THREADS threads): two-pass F32
-// statistics, centered (a layer norm) or not (the mean taken as 0, a
-// root-mean-square norm), out = Y(centered * inverse [* weight] [+ bias]).
+// Norm of one F32 row of `width` values (THREADS threads): `norm`'s
+// two-pass statistics, centered (a layer norm) or not (the mean taken as 0, a
+// root-mean-square norm), out = Y(act(centered * inverse [* weight] [+ bias])), `act` the
+// activation of `vision_linear`'s codes when `activation` is nonzero.
 // `partials` holds THREADS / 32 floats.
 template <uint THREADS, typename Y, typename WN, typename BN, bool WEIGHT, bool BIAS>
 inline void norm(device const float *row, device uchar *out, ulong stride, device const uchar *weight,
-    device const uchar *bias, uint width, bool centered, float epsilon, threadgroup float *partials,
-    uint thread_index, uint sg, uint lane) {
+    device const uchar *bias, uint width, bool centered, float epsilon, int activation,
+    threadgroup float *partials, uint thread_index, uint sg, uint lane) {
     float mean = 0.0f;
     if (centered) {
         float sum = 0.0f;
         for (uint i = thread_index; i < width; i += THREADS)
             sum += row[i];
-        mean = reduce::group_sum<THREADS / 32>(sum, partials, sg, lane) / float(width);
+        mean = row_norm::mean(reduce::group_sum<THREADS / 32>(sum, partials, sg, lane), width);
     }
     float squares = 0.0f;
+    for (uint i = thread_index; i < width; i += THREADS)
+        squares = row_norm::square(row[i] - mean, squares);
+    const float inverse = row_norm::inverse(reduce::group_sum<THREADS / 32>(squares, partials, sg, lane), width, epsilon);
     for (uint i = thread_index; i < width; i += THREADS) {
-        const float value = row[i] - mean;
-        squares = metal::fma(value, value, squares);
-    }
-    const float inverse =
-        metal::rsqrt(reduce::group_sum<THREADS / 32>(squares, partials, sg, lane) / float(width) + epsilon);
-    // One expression per form: the compiler contracts a product and a sum
-    // only within an expression.
-    for (uint i = thread_index; i < width; i += THREADS) {
-        float value;
-        if (WEIGHT && BIAS)
-            value = (row[i] - mean) * inverse * element::at<WN>(weight, i) + element::at<BN>(bias, i);
-        else if (WEIGHT)
-            value = (row[i] - mean) * inverse * element::at<WN>(weight, i);
-        else if (BIAS)
-            value = (row[i] - mean) * inverse + element::at<BN>(bias, i);
-        else
-            value = (row[i] - mean) * inverse;
-        element::put<Y>(out, ulong(i) * stride, value);
+        const float w = WEIGHT ? element::at<WN>(weight, i) : 0.0f;
+        const float b = BIAS ? element::at<BN>(bias, i) : 0.0f;
+        const float normalized = row_norm::apply<WEIGHT, BIAS>(row[i] - mean, inverse, w, b);
+        element::put<Y>(out, ulong(i) * stride, activation != 0 ? activate(activation, normalized) : normalized);
     }
 }
 

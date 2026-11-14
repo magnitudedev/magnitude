@@ -1,0 +1,99 @@
+Each iteration of a loop body has its own scope, as in Jinja2: an assignment in the body lasts until its
+iteration ends. Upstream ran every iteration in one scope, so a name set in one iteration was still set in the
+next (GLM-5.3-Flash's template sets `reasoning_content` for one assistant message and tests `is defined` for
+the next). The context records the iteration's assignments with the values they replaced and undoes them,
+latest first, when the iteration ends, so an iteration costs its own assignments and never the scope's size.
+--- a/common/jinja/runtime.cpp
++++ b/common/jinja/runtime.cpp
+@@ -601,6 +601,7 @@ value for_statement::execute_impl(context & ctx) {
+ 
+     auto result = mk_val<value_array>();
+ 
++    std::vector<std::pair<value, value>> iteration_assignments;
+     bool noIteration = true;
+     for (size_t i = 0; i < filtered_items.size(); i++) {
+         JJ_DEBUG("For loop iteration %zu/%zu", i + 1, filtered_items.size());
+@@ -617,17 +618,23 @@ value for_statement::execute_impl(context & ctx) {
+         loop_obj->insert("nextitem", i < filtered_items.size() - 1 ? filtered_items[i + 1] : mk_val<value_undefined>("nextitem"));
+         scope.set_val("loop", loop_obj);
+         scope_update_fns[i](scope);
++        scope.iteration_assignments = &iteration_assignments;
++        noIteration = false;
++        bool broken = false;
+         try {
+             for (auto & stmt : body) {
+                 value val = stmt->execute(scope);
+                 result->push_back(val);
+             }
+         } catch (const continue_statement::signal &) {
+-            continue;
+         } catch (const break_statement::signal &) {
++            broken = true;
++        }
++        scope.end_iteration();
++        scope.iteration_assignments = nullptr;
++        if (broken) {
+             break;
+         }
+-        noIteration = false;
+     }
+ 
+     JJ_DEBUG("For loop complete, total iterations: %zu", filtered_items.size());
+--- a/common/jinja/runtime.h
++++ b/common/jinja/runtime.h
+@@ -91,13 +91,33 @@ struct context {
+     }
+ 
+     void set_val(const std::string & name, const value & val) {
+-        env->insert(name, val);
++        set_val(mk_val<value_string>(name), val);
+     }
+ 
+     void set_val(const value & name, const value & val) {
++        if (iteration_assignments) {
++            iteration_assignments->push_back({name, env->has_key(name) ? env->at(name) : nullptr});
++        }
+         env->insert(name, val);
+     }
+ 
++    // Each assignment made while a loop iteration runs, with the value its name had (null when it
++    // had none), so the iteration's scope ends with it: Jinja gives every iteration of a loop body
++    // its own scope. Null outside a loop body; a copied context starts outside one.
++    std::vector<std::pair<value, value>> * iteration_assignments = nullptr;
++
++    // Undo the iteration's assignments, latest first.
++    void end_iteration() {
++        for (auto it = iteration_assignments->rbegin(); it != iteration_assignments->rend(); ++it) {
++            if (it->second) {
++                env->insert(it->first, it->second);
++            } else {
++                env->erase(it->first);
++            }
++        }
++        iteration_assignments->clear();
++    }
++
+     void print_vars() const {
+         printf("Context Variables:\n%s\n", value_to_json(env, 2).c_str());
+     }
+--- a/common/jinja/value.h
++++ b/common/jinja/value.h
+@@ -546,6 +546,18 @@ struct value_object_t : public value_t {
+             val_obj.push_back({key, val});
+         }
+     }
++    void erase(const value & key) {
++        if (unordered.erase(key) == 0) {
++            return;
++        }
++        // a key added last is erased first, so search from the end
++        for (auto it = val_obj.rbegin(); it != val_obj.rend(); ++it) {
++            if (*(it->first) == *key) {
++                val_obj.erase(std::next(it).base());
++                break;
++            }
++        }
++    }
+     virtual value & at(const value & key, value & default_val) override {
+         if (!has_key(key)) {
+             return default_val;

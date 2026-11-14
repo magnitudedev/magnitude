@@ -2676,7 +2676,9 @@ enum TemplatePort<N> {
     Direct {
         element: Element,
         extents: Vec<N>,
-        class_extent: Option<(usize, &'static str)>,
+        /// The axis that follows a class dimension, the dimension's name and
+        /// the class scope the port was recorded in.
+        class_extent: Option<(usize, &'static str, Option<&'static str>)>,
     },
     Checked {
         port: Arc<CheckedPortSource>,
@@ -2791,6 +2793,17 @@ impl NativeGraphClassSlice {
     ) -> Self {
         self.scoped.push((scope, name, distinct(values)));
         self
+    }
+
+    /// The slice without the dimensions of `fixed`.
+    fn without(&self, fixed: &[ClassFact]) -> Self {
+        let fixes = |scope: Option<&str>, name: &str| {
+            fixed.iter().any(|class| class.scope == scope && class.dimension == name)
+        };
+        Self {
+            dimensions: self.dimensions.iter().filter(|(name, _)| !fixes(None, name)).cloned().collect(),
+            scoped: self.scoped.iter().filter(|(scope, name, _)| !fixes(Some(scope), name)).cloned().collect(),
+        }
     }
 
     fn names(&self) -> Vec<(Option<&'static str>, &'static str)> {
@@ -2980,10 +2993,36 @@ impl NativeGraphOutline {
 }
 
 /// Every buffer of a template at its capacity over a regime's classes.
-struct Capacities {
+pub(crate) struct Capacities {
     ports: Vec<u64>,
     results: Vec<Vec<u64>>,
     scratch: Vec<Vec<seismic_runtime::native::ScratchNeed>>,
+}
+
+impl Capacities {
+    /// Each buffer at the larger of its capacity here and in `other`, the
+    /// same template's at other classes.
+    pub(crate) fn cover(self, other: Self) -> Self {
+        let widest = |left: Vec<u64>, right: Vec<u64>| left.cover(right);
+        Self {
+            ports: widest(self.ports, other.ports),
+            results: self.results.into_iter().zip(other.results).map(|(left, right)| widest(left, right)).collect(),
+            scratch: self
+                .scratch
+                .into_iter()
+                .zip(other.scratch)
+                .map(|(left, right)| {
+                    left.into_iter()
+                        .zip(right)
+                        .map(|(left, right)| {
+                            assert_eq!(left.sync, right.sync, "one template's scratch syncs alike at every class");
+                            seismic_runtime::native::ScratchNeed { bytes: left.bytes.max(right.bytes), sync: left.sync }
+                        })
+                        .collect()
+                })
+                .collect(),
+        }
+    }
 }
 
 impl NativeGraphResourceTemplate {
@@ -3007,7 +3046,7 @@ impl NativeGraphResourceTemplate {
         let Some(first) = slices.first() else {
             return Err(NativeGraphMetadataError::Unsupported("graph regime has no admitted classes".into()));
         };
-        self.certify_with(&self.capacity_program(points, first)?, slices)
+        self.certify_with(&self.capacity_program(points, first, &[])?, slices)
     }
 
     /// [`Self::certify`] with its buffers compiled into `program`
@@ -3017,7 +3056,15 @@ impl NativeGraphResourceTemplate {
         program: &CapacityProgram,
         slices: &[NativeGraphClassSlice],
     ) -> Result<NativeGraphLayout, NativeGraphMetadataError> {
-        let Capacities { ports, results, scratch } = program.at(slices)?;
+        self.certify_capacities(program.at(slices)?)
+    }
+
+    /// The layout that holds every buffer at `capacities`.
+    pub(crate) fn certify_capacities(
+        &self,
+        capacities: Capacities,
+    ) -> Result<NativeGraphLayout, NativeGraphMetadataError> {
+        let Capacities { ports, results, scratch } = capacities;
         self.inner
             .capacity_layout(&ports, &results, scratch)
             .map(|inner| NativeGraphLayout {
@@ -3045,7 +3092,7 @@ impl NativeGraphResourceTemplate {
 
     /// Every port's and node's dimensions at `facts`, `None` where one does
     /// not evaluate there.
-    fn points(&self, facts: &[u64]) -> Option<TemplatePoints> {
+    pub(crate) fn points(&self, facts: &[u64]) -> Option<TemplatePoints> {
         let ports = self.recorder.ports.iter().map(|source| source.at(facts)).collect::<Option<_>>()?;
         let nodes = self
             .recorder
@@ -3054,6 +3101,25 @@ impl NativeGraphResourceTemplate {
             .map(|source| evaluated(&source.dimensions, facts))
             .collect::<Option<_>>()?;
         Some(TemplatePoints { ports, nodes })
+    }
+
+    /// A node static dimension `a` and `b`, two class points' dimensions,
+    /// give different values, as the node's entry and the dimension: every
+    /// class calls a node's entry at the statics it was enqueued and
+    /// domain-checked at, so classes vary only dynamic dimensions.
+    pub(crate) fn varied_static(&self, a: &TemplatePoints, b: &TemplatePoints) -> Option<(&'static str, String)> {
+        self.recorder.nodes.iter().zip(a.nodes.iter().zip(&b.nodes)).find_map(|(source, (a, b))| {
+            let value = |dimensions: &[(String, u64)], name: &str| {
+                dimensions.iter().find(|(candidate, _)| candidate == name).map(|&(_, value)| value)
+            };
+            source
+                .checked
+                .implementation()
+                .statics
+                .iter()
+                .find(|name| value(a, name) != value(b, name))
+                .map(|name| (source.entry_name, name.clone()))
+        })
     }
 
     /// Whether every check the recording made of a shape holds at `points`:
@@ -3106,7 +3172,7 @@ impl NativeGraphResourceTemplate {
         let Some(first) = slices.first() else {
             return Err(NativeGraphMetadataError::Unsupported("graph regime has no admitted classes".into()));
         };
-        self.outline_with(&self.capacity_program(points, first)?, slices)
+        self.outline_with(&self.capacity_program(points, first, &[])?, slices)
     }
 
     /// What the template holds over `slices` with its buffers compiled into
@@ -3116,7 +3182,15 @@ impl NativeGraphResourceTemplate {
         program: &CapacityProgram,
         slices: &[NativeGraphClassSlice],
     ) -> Result<NativeGraphOutline, NativeGraphMetadataError> {
-        let Capacities { ports, results, scratch } = program.at(slices)?;
+        self.outline_capacities(program.at(slices)?)
+    }
+
+    /// What a layout holding every buffer at `capacities` holds.
+    pub(crate) fn outline_capacities(
+        &self,
+        capacities: Capacities,
+    ) -> Result<NativeGraphOutline, NativeGraphMetadataError> {
+        let Capacities { ports, results, scratch } = capacities;
         let storage = self
             .inner
             .capacity_storage(&ports, &results, scratch)
@@ -3134,19 +3208,31 @@ impl NativeGraphResourceTemplate {
     /// compiled shape (or its scratch bound) over the class dimensions it
     /// reads alone, so a regime's slices evaluate it at their class points
     /// with no lookup by name and no contract walk ([`CapacityProgram::at`]).
-    fn capacity_program(
+    /// A dimension varies where the slices name it and `points` do not fix
+    /// it: `fixed` are the class facts `points` are evaluated at (one class
+    /// point's, every dimension that follows them evaluated there), and a
+    /// name the slices give such a fact says nothing of a node's own
+    /// dimension of that name (a routed feed-forward's `R` against an
+    /// attention block's segments). A family naming no class facts fixes
+    /// none, at the model's own points. A port's class extent varies where
+    /// the slices name it.
+    pub(crate) fn capacity_program(
         &self,
         points: &TemplatePoints,
         namer: &NativeGraphClassSlice,
+        fixed: &[ClassFact],
     ) -> Result<CapacityProgram, NativeGraphMetadataError> {
         let unsupported = NativeGraphMetadataError::Unsupported;
+        let unfixed = namer.without(fixed);
+        let named = &unfixed;
         let ports = points
             .ports
             .iter()
             .map(|point| match point {
                 TemplatePort::Direct { element, extents, class_extent } => {
                     let element = *element;
-                    let Some((axis, name)) = *class_extent else {
+                    let named = class_extent.filter(|&(_, name, scope)| ClassRead::Port { scope, name }.values(namer).is_some());
+                    let Some((axis, name, scope)) = named else {
                         return element
                             .canonical_byte_len(extents)
                             .map(Capacity::Fixed)
@@ -3154,7 +3240,7 @@ impl NativeGraphResourceTemplate {
                     };
                     let extents = extents.clone();
                     Ok(Capacity::Varying {
-                        reads: vec![ClassRead::Global(name)],
+                        reads: vec![ClassRead::Port { scope, name }],
                         size: Box::new(move |values: &[u64]| {
                             let mut extents = extents.clone();
                             extents[axis] = values[0];
@@ -3168,7 +3254,7 @@ impl NativeGraphResourceTemplate {
                     bound_capacity(
                         checked,
                         seismic_lang::entry::TensorSlot::Parameter(parameter),
-                        namer,
+                        named,
                         entry_name,
                         *class_scope,
                         dimensions,
@@ -3207,7 +3293,7 @@ impl NativeGraphResourceTemplate {
             if let Some(name) = implementation
                 .statics
                 .iter()
-                .find(|name| namer.values(entry, source.class_scope, name).is_some())
+                .find(|name| named.values(entry, source.class_scope, name).is_some())
             {
                 return Err(unsupported(format!(
                     "graph regime classes vary `{entry}`'s static dimension `{name}`"
@@ -3219,7 +3305,7 @@ impl NativeGraphResourceTemplate {
                     bound_capacity(
                         &source.checked,
                         seismic_lang::entry::TensorSlot::Result(ordinal),
-                        namer,
+                        named,
                         entry,
                         source.class_scope,
                         dimensions,
@@ -3236,7 +3322,7 @@ impl NativeGraphResourceTemplate {
                 .scratch
                 .iter()
                 .flat_map(|buffer| buffer.dimensions())
-                .filter(|name| namer.values(entry, source.class_scope, name).is_some())
+                .filter(|name| named.values(entry, source.class_scope, name).is_some())
                 .fold(Vec::<String>::new(), |mut reads, name| {
                     if !reads.contains(&name) {
                         reads.push(name);
@@ -3277,18 +3363,22 @@ impl NativeGraphResourceTemplate {
     }
 }
 
-/// Where a class dimension's values are read in a slice: unscoped (a
-/// port's class extent), or as a node of an entry and class scope reads it
-/// ([`NativeGraphClassSlice::values`]).
+/// Where a class dimension's values are read in a slice: a port's class
+/// extent, in the class scope it was recorded in where the slice scopes the
+/// dimension there and unscoped otherwise, or as a node of an entry and class
+/// scope reads it ([`NativeGraphClassSlice::values`]).
+#[derive(Debug)]
 enum ClassRead {
-    Global(&'static str),
+    Port { scope: Option<&'static str>, name: &'static str },
     Node { entry: &'static str, scope: Option<&'static str>, name: String },
 }
 
 impl ClassRead {
     fn values<'s>(&self, slice: &'s NativeGraphClassSlice) -> Option<&'s [u64]> {
         match self {
-            Self::Global(name) => slice.global(name),
+            Self::Port { scope, name } => {
+                scope.and_then(|scope| slice.class_values(Some(scope), name)).or_else(|| slice.global(name))
+            }
             Self::Node { entry, scope, name } => slice.values(entry, *scope, name),
         }
     }
@@ -3338,7 +3428,7 @@ impl<T: Covers> Capacity<T> {
         for slice in slices {
             let lists = reads
                 .iter()
-                .map(|read| read.values(slice).ok_or("class slice omits a dimension its buffer reads"))
+                .map(|read| read.values(slice).ok_or_else(|| format!("class slice omits {read:?}, which its buffer reads")))
                 .collect::<Result<Vec<_>, _>>()?;
             let mut digits = vec![0; reads.len()];
             'combinations: loop {
@@ -3393,7 +3483,7 @@ impl CapacityProgram {
 
     /// Every buffer at its capacity over the classes of `slices`, which
     /// name its dimensions.
-    fn at(&self, slices: &[NativeGraphClassSlice]) -> Result<Capacities, NativeGraphMetadataError> {
+    pub(crate) fn at(&self, slices: &[NativeGraphClassSlice]) -> Result<Capacities, NativeGraphMetadataError> {
         let unsupported = NativeGraphMetadataError::Unsupported;
         let valid = !slices.is_empty()
             && self.names.windows(2).all(|pair| pair[0] != pair[1])
@@ -3781,7 +3871,7 @@ impl NativeGraphMetadata {
                     "graph port extent axis {extent_axis} is absent"
                 )));
             }
-            *class_extent = Some((extent_axis, class_dimension));
+            *class_extent = Some((extent_axis, class_dimension, self.class_scope));
         }
         Ok(port)
     }
@@ -3944,10 +4034,10 @@ impl NativeGraphMetadata {
         let pending = match condition {
             Some(condition) => self
                 .inner
-                .enqueue_under(encoded, parameters, results, scratch, sealed, condition),
+                .enqueue_under(E::NAME, encoded, parameters, results, scratch, sealed, condition),
             None => self
                 .inner
-                .enqueue(encoded, parameters, results, scratch, sealed),
+                .enqueue(E::NAME, encoded, parameters, results, scratch, sealed),
         }
         .map_err(NativeGraphMetadataError::Call)?;
         if let Some(template) = &mut self.template {

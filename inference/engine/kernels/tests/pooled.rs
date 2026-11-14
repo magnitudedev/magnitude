@@ -1,12 +1,15 @@
 // `pool_rows` (pooled.seismic) against an independent host model of pooled
-// history rows: each row's u (and gate scores) appended to the window, each
-// complete group of RATE tokens pooled (softmax-gated or mean), RMS-normed,
+// rows: each row's u (LayerNorm-ed per token under a token norm, and gate
+// scores) appended to the window, each complete group of RATE tokens pooled
+// (softmax-gated, with a per-place gate term or none, or mean), RMS-normed
+// unless its tokens were,
 // rotated at its first token's coordinates, rounded by the independent
 // rounding model (a rounded row from its pooled row, norm and rotation each
-// held in the activation element) and stored in the activation element. The portable body
+// held in the activation element) and stored in the row element. The portable body
 // equals the host model, and every backend this host opens equals the
-// portable body: the window planes, block rows written and origin
-// coordinates exactly, the latents within F32 arithmetic order, the rounded
+// portable body: the window planes (but a token-normed u, within F32
+// arithmetic order), block rows written and origin coordinates exactly, the
+// latents within F32 arithmetic order, the rounded
 // block rows identical but where an F32 input sits on a rounding boundary.
 
 mod common;
@@ -15,7 +18,8 @@ mod versions_common;
 
 use magnitude_kernels::pool_rows;
 use rounding_model::{COMPRESSED, NONE, Rounding};
-use seismic::{Device, Element, NativeSpecialization};
+use common::bound::{self, Library};
+use seismic::{BackendName, Device, Element, NativeSpecialization};
 use versions_common::*;
 
 const EPSILON: f32 = 1e-6;
@@ -31,13 +35,19 @@ const BLOCK_SLAB_ROWS: usize = 32;
 /// window.
 #[derive(Clone)]
 struct Case {
-    /// The activation element `A` of the block plane.
+    /// The activation element `A`, which a rounded row is held in.
     element: Element,
+    /// The block plane's row element `Y`.
+    row: Element,
     p: usize,
     s: usize,
     adjacent: bool,
     trailing: bool,
     gated: bool,
+    /// The per-place gate term `[rate, W]` (`position`), if any.
+    places: Vec<Vec<f32>>,
+    /// `PoolNorm::Token`'s bias: the tokens are LayerNorm-ed before pooling.
+    bias: Option<Vec<f32>>,
     rate: usize,
     rounding: Rounding,
     first: usize,
@@ -85,6 +95,9 @@ impl Case {
         let norm = draw(0.5).iter().map(|x| 1.0 + x).collect();
         Self {
             element,
+            row: element,
+            places: Vec::new(),
+            bias: None,
             p,
             s,
             adjacent,
@@ -122,8 +135,41 @@ impl Case {
         self
     }
 
+    /// GLM-5.3-Flash's indexer keys: each token LayerNorm-ed with a bias,
+    /// gated with a per-place term, stored in an F32 key plane.
+    fn with_token_keys(mut self, seed: u64) -> Self {
+        let mut random = Random(seed);
+        let w = self.w();
+        self.row = Element::f32();
+        self.places = (0..self.rate).map(|_| (0..w).map(|_| random.next() * 2.0).collect()).collect();
+        self.bias = Some((0..w).map(|_| random.next() * 0.25).collect());
+        self
+    }
+
     fn w(&self) -> usize {
         2 * self.p + self.s
+    }
+    /// The launch of this case's first `rows` rows alone, over the same
+    /// tokens: the accepted prefix of a verify.
+    fn prefix(&self, rows: usize) -> Self {
+        let kept = self.first - self.start() + rows;
+        let mut prefix = self.clone();
+        prefix.rows = rows;
+        prefix.u.truncate(kept);
+        prefix.g.truncate(kept);
+        prefix
+    }
+    fn tn(&self) -> usize {
+        usize::from(self.bias.is_some())
+    }
+    /// A token's u as the window holds it: LayerNorm-ed under a token norm.
+    fn token(&self, u: &[f32]) -> Vec<f32> {
+        let Some(bias) = &self.bias else { return u.to_vec() };
+        let w = u.len() as f32;
+        let mean = u.iter().sum::<f32>() / w;
+        let variance = u.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / w;
+        let inverse = 1.0 / (variance + EPSILON).sqrt();
+        u.iter().zip(&self.norm).zip(bias).map(|((x, n), b)| (x - mean) * inverse * n + b).collect()
     }
     /// Whether a value is held in BF16: a rounded row's model holds its
     /// pooled row, norm and rotation in the activation element (DeepSeek
@@ -189,7 +235,7 @@ impl Case {
 
     fn write_window(&self, rows: &mut [f32], coordinate_rows: &mut [i32], position: usize) {
         let (width, at, index) = (self.window_width(), window_of(position), position - self.start());
-        rows[at * width..][..self.w()].copy_from_slice(&self.u[index]);
+        rows[at * width..][..self.w()].copy_from_slice(&self.token(&self.u[index]));
         rows[at * width + self.w()..][..self.gt() * self.w()].copy_from_slice(&self.g[index]);
         coordinate_rows[at * 4..][..4].copy_from_slice(&coordinates(position));
     }
@@ -232,21 +278,28 @@ fn model(case: &Case) -> Outcome {
         }
         let group = position - position % case.rate;
         let members = (group..=position).map(|member| member - case.start()).collect::<Vec<_>>();
+        let u = members.iter().map(|&m| case.token(&case.u[m])).collect::<Vec<_>>();
+        // Member i's gate scores plus its place's term.
+        let gate = |i: usize, c: usize| case.g[members[i]][c] + case.places.get(i).map_or(0.0, |place| place[c]);
         let pooled = (0..w)
             .map(|c| {
                 if case.gated {
-                    let top = members.iter().fold(f32::NEG_INFINITY, |top, &m| top.max(case.g[m][c]));
-                    let total = members.iter().fold(0.0f32, |total, &m| total + (case.g[m][c] - top).exp());
-                    members.iter().fold(0.0f32, |sum, &m| sum + (case.g[m][c] - top).exp() / total * case.u[m][c])
+                    let top = (0..case.rate).fold(f32::NEG_INFINITY, |top, i| top.max(gate(i, c)));
+                    let total = (0..case.rate).fold(0.0f32, |total, i| total + (gate(i, c) - top).exp());
+                    (0..case.rate).fold(0.0f32, |sum, i| sum + (gate(i, c) - top).exp() / total * u[i][c])
                 } else {
-                    members.iter().fold(0.0f32, |sum, &m| sum + case.u[m][c]) / case.rate as f32
+                    u.iter().fold(0.0f32, |sum, u| sum + u[c]) / case.rate as f32
                 }
             })
             .map(|x| case.hold(x))
             .collect::<Vec<_>>();
-        let squares = pooled.iter().fold(0.0f32, |sum, x| sum + x * x);
-        let inverse = 1.0 / (squares / w as f32 + EPSILON).sqrt();
-        let normed = pooled.iter().zip(&case.norm).map(|(x, n)| case.hold(x * inverse * n)).collect::<Vec<_>>();
+        let normed = if case.bias.is_some() {
+            pooled
+        } else {
+            let squares = pooled.iter().fold(0.0f32, |sum, x| sum + x * x);
+            let inverse = 1.0 / (squares / w as f32 + EPSILON).sqrt();
+            pooled.iter().zip(&case.norm).map(|(x, n)| case.hold(x * inverse * n)).collect::<Vec<_>>()
+        };
         let origin = coordinates(group);
         let mut rotated = normed.clone();
         for pair in 0..case.p {
@@ -259,7 +312,7 @@ fn model(case: &Case) -> Outcome {
         let rotated = rotated.into_iter().map(|x| case.hold(x)).collect::<Vec<_>>();
         let destination = block_of(position / case.rate);
         for (target, value) in blocks[destination * w..][..w].iter_mut().zip(rounding_model::round(case.rounding, &rotated)) {
-            *target = if case.element == Element::bf16() { bf16_round(value) } else { value };
+            *target = if case.row == Element::bf16() { bf16_round(value) } else { value };
         }
         latent[row * w..][..w].copy_from_slice(&normed);
         latent_rows[row] = destination as i32;
@@ -278,7 +331,8 @@ fn portable(case: &Case) -> Outcome {
         registry,
         types::DType,
     };
-    let element = if case.element == Element::bf16() { DType::BF16 } else { DType::F32 };
+    let dtype = |element: Element| if element == Element::bf16() { DType::BF16 } else { DType::F32 };
+    let (element, row) = (dtype(case.element), dtype(case.row));
     let mut sources = seismic_std::sources();
     for (path, text) in [
         ("pooled.seismic", include_str!("../kernels/pooled.seismic")),
@@ -290,7 +344,10 @@ fn portable(case: &Case) -> Outcome {
     }
     let module = crate::common::check(sources);
     let logical = module
-        .entry(module.entry_named("pool_rows").unwrap(), &ElementBindings::new().bind("A", registry::dense(element)))
+        .entry(
+            module.entry_named("pool_rows").unwrap(),
+            &ElementBindings::new().bind("A", registry::dense(element)).bind("Y", registry::dense(row)),
+        )
         .unwrap();
     let mut interpreter = Interpreter::new(&logical);
     let (m, w, gt) = (case.rows, case.w(), case.gt());
@@ -307,7 +364,9 @@ fn portable(case: &Case) -> Outcome {
     let args = vec![
         tensor(DType::F32, vec![m, w], launch(&case.u)),
         tensor(DType::F32, vec![m, gt * w], launch(&case.g)),
+        tensor(DType::F32, vec![case.places.len(), w], floats(&case.places.concat())),
         tensor(DType::F32, vec![1, w], floats(&case.norm)),
+        tensor(DType::F32, vec![case.tn(), w], floats(case.bias.as_deref().unwrap_or(&[]))),
         tensor(DType::I32, vec![case.p], ints(&case.components)),
         tensor(DType::F32, vec![case.p], floats(&case.frequencies)),
         tensor(DType::F32, vec![case.p], floats(&case.amplitudes)),
@@ -317,7 +376,7 @@ fn portable(case: &Case) -> Outcome {
         tensor(DType::I32, vec![m], ints(&block_destinations)),
         tensor(DType::F32, vec![WINDOW_ROWS, case.window_width()], floats(&window)),
         tensor(DType::I32, vec![WINDOW_ROWS, 4], ints(&window_coordinates)),
-        tensor(element, vec![BLOCK_ROWS, w], vec![f64::from(SENTINEL); BLOCK_ROWS * w]),
+        tensor(row, vec![BLOCK_ROWS, w], vec![f64::from(SENTINEL); BLOCK_ROWS * w]),
         tensor(DType::I32, vec![0, usize::from(case.adjacent), usize::from(case.trailing), case.rate, gt], Vec::new()),
         Arg::Scalar(ReferenceScalar::F32(EPSILON.to_bits())),
         Arg::Scalar(ReferenceScalar::U32(WINDOW_SLAB_ROWS as u32)),
@@ -348,26 +407,32 @@ fn portable(case: &Case) -> Outcome {
         latent,
         latent_rows,
         latent_coordinates,
-        window: plane(10).into_iter().map(|v| v as f32).collect(),
-        window_coordinates: plane(11).into_iter().map(|v| v as i32).collect(),
-        blocks: plane(12).into_iter().map(|v| v as f32).collect(),
+        window: plane(12).into_iter().map(|v| v as f32).collect(),
+        window_coordinates: plane(13).into_iter().map(|v| v as i32).collect(),
+        blocks: plane(14).into_iter().map(|v| v as f32).collect(),
     }
+}
+
+/// `case`'s `pool_rows` static values.
+fn statics(case: &Case) -> NativeSpecialization {
+    [
+        ("P", case.p as u64),
+        ("S", case.s as u64),
+        ("GT", case.gt() as u64),
+        ("PR", case.places.len() as u64),
+        ("TN", case.tn() as u64),
+        ("RA", u64::from(case.adjacent)),
+        ("RT", u64::from(case.trailing)),
+        ("RATE", case.rate as u64),
+    ]
+    .iter()
+    .fold(NativeSpecialization::new(), |spec, (name, value)| spec.with_static(*name, *value))
 }
 
 fn native(device: &Device, case: &Case) -> Outcome {
     let (m, w, gt) = (case.rows as u64, case.w() as u64, case.gt() as u64);
-    let statics = [
-        ("P", case.p as u64),
-        ("S", case.s as u64),
-        ("GT", gt),
-        ("RA", u64::from(case.adjacent)),
-        ("RT", u64::from(case.trailing)),
-        ("RATE", case.rate as u64),
-    ];
-    let specialization =
-        statics.iter().fold(NativeSpecialization::new(), |spec, (name, value)| spec.with_static(*name, *value));
-    let entry = pool_rows::native_entry_with(pool_rows::Elements { A: case.element });
-    let specialization = entry.offered(device).unwrap().unwrap().default_specialization(&specialization).unwrap();
+    let entry = pool_rows::native_entry_with(pool_rows::Elements { A: case.element, Y: case.row });
+    let specialization = entry.offered(device).unwrap().unwrap().default_specialization(&statics(case)).unwrap();
     let kernel = entry.prepare(device, &specialization).unwrap();
     let (window_destinations, window_visible, block_destinations, row_coordinates) = case.controls();
     let (window, window_coordinates) = case.window_planes();
@@ -388,13 +453,15 @@ fn native(device: &Device, case: &Case) -> Outcome {
     let (_coordinate_slabs, mut coordinate_plane) =
         plane(WINDOW_ROWS, WINDOW_SLAB_ROWS, Element::i32(), 4, &coordinate_words);
     let (_block_slabs, mut block_plane) =
-        plane(BLOCK_ROWS, BLOCK_SLAB_ROWS, case.element, w, &vec![SENTINEL; BLOCK_ROWS * case.w()]);
+        plane(BLOCK_ROWS, BLOCK_SLAB_ROWS, case.row, w, &vec![SENTINEL; BLOCK_ROWS * case.w()]);
     let launch = |values: &[Vec<f32>]| values[case.first - case.start()..].concat();
     let results = kernel
         .call(pool_rows::Args {
             u: &tensor(device, Element::f32(), &[m, w], &launch(&case.u)),
             g: &tensor(device, Element::f32(), &[m, gt * w], &launch(&case.g)),
+            position: &tensor(device, Element::f32(), &[case.places.len() as u64, w], &case.places.concat()),
             norm: &tensor(device, Element::f32(), &[1, w], &case.norm),
+            bias: &tensor(device, Element::f32(), &[case.tn() as u64, w], case.bias.as_deref().unwrap_or(&[])),
             rotary_components: &ints(device, &[case.p as u64], &case.components),
             rotary_frequencies: &tensor(device, Element::f32(), &[case.p as u64], &case.frequencies),
             rotary_amplitudes: &tensor(device, Element::f32(), &[case.p as u64], &case.amplitudes),
@@ -433,8 +500,27 @@ fn native(device: &Device, case: &Case) -> Outcome {
 /// rounding boundary). An unrounded one is the rotated latent in its
 /// element, so it agrees as the latents do (the backends' rotary sines
 /// differ in their last bits), within one code in BF16.
-fn agree(label: &str, case: &Case, actual: &Outcome, expected: &Outcome) {
-    assert!(same_bits(&actual.window, &expected.window), "{label}: window plane");
+fn agree(label: &str, case: &Case, backend: BackendName, actual: &Outcome, expected: &Outcome) {
+    if let Some(bias) = &case.bias {
+        // Under a token norm the window holds each token's computed
+        // LayerNorm, within the LayerNorm bound of `backend`'s library and
+        // the host's; its gate scores and unwritten rows are copies, held
+        // exactly.
+        assert_eq!(actual.window.len(), expected.window.len(), "{label}: window plane");
+        let libraries = (&Library::of(backend), &Library::of(BackendName::Cpu));
+        let mut bounds = vec![0.0; expected.window.len()];
+        for (index, u) in case.u.iter().enumerate() {
+            let at = window_of(case.start() + index) * case.window_width();
+            bounds[at..][..case.w()]
+                .copy_from_slice(&bound::layer_norm_between(libraries, u, &case.norm, bias, EPSILON));
+        }
+        for (index, ((a, e), bound)) in actual.window.iter().zip(&expected.window).zip(&bounds).enumerate() {
+            let held = a.to_bits() == e.to_bits() || (f64::from(*a) - f64::from(*e)).abs() <= *bound;
+            assert!(held, "{label}: window[{index}] {a} vs {e}, bound {bound}");
+        }
+    } else {
+        assert!(same_bits(&actual.window, &expected.window), "{label}: window plane");
+    }
     assert_eq!(actual.window_coordinates, expected.window_coordinates, "{label}: window coordinates");
     assert_eq!(actual.latent_rows, expected.latent_rows, "{label}: latent rows");
     assert_eq!(actual.latent_coordinates, expected.latent_coordinates, "{label}: latent coordinates");
@@ -453,7 +539,7 @@ fn agree(label: &str, case: &Case, actual: &Outcome, expected: &Outcome) {
         // 2 b(m) + 2^-12 m of the oracle's, m the row's largest |value|; a BF16
         // plane adds one code (2^-7 |x|) of its publication.
         let w = case.w();
-        let publication = if case.element == Element::f32() { 0.0 } else { 2f32.powi(-7) };
+        let publication = if case.row == Element::f32() { 0.0 } else { 2f32.powi(-7) };
         for (row, (a, e)) in actual.blocks.chunks(w).zip(expected.blocks.chunks(w)).enumerate() {
             let m = e.iter().fold(0f32, |m, x| m.max(x.abs()));
             let bound = 2.0 * (1e-6 + 1e-5 * m) + 2f32.powi(-12) * m;
@@ -477,10 +563,10 @@ fn agree(label: &str, case: &Case, actual: &Outcome, expected: &Outcome) {
 fn check(case: &Case, label: &str) {
     let expected = model(case);
     let oracle = portable(case);
-    agree(&format!("{label} portable"), case, &oracle, &expected);
-    for device in offering(&pool_rows::native_entry_with(pool_rows::Elements { A: case.element })) {
-        let backend = device.backend().as_str();
-        agree(&format!("{label} {backend}"), case, &native(&device, case), &oracle);
+    agree(&format!("{label} portable"), case, BackendName::Cpu, &oracle, &expected);
+    for device in offering(&pool_rows::native_entry_with(pool_rows::Elements { A: case.element, Y: case.row })) {
+        let backend = device.backend();
+        agree(&format!("{label} {}", backend.as_str()), case, backend, &native(&device, case), &oracle);
     }
 }
 
@@ -515,4 +601,61 @@ fn groups_straddle_launches() {
     // then one row completes the group from three pending tokens.
     check(&Case::new(Element::f32(), QWEN4, false, 4, NONE, 45, 2, 6), "qwen4 pending rows");
     check(&Case::new(Element::f32(), QWEN4, false, 4, NONE, 47, 1, 7), "qwen4 one completing row");
+}
+
+/// GLM-5.3-Flash's indexer keys: W = 128 without a rotary, groups of four
+/// tokens, each LayerNorm-ed with a bias, softmax-gated with a per-place
+/// term, unrounded, in an F32 key plane beside a BF16 activation.
+const GLM: (usize, usize, bool, bool) = (0, 128, false, false);
+
+#[test]
+fn token_normed_keys_gated_by_place_at_glm_shape() {
+    check(&Case::new(Element::bf16(), GLM, true, 4, NONE, 42, 16, 8).with_token_keys(9), "glm keys");
+    // A decode step completing its group from three pending tokens.
+    check(&Case::new(Element::bf16(), GLM, true, 4, NONE, 47, 1, 10).with_token_keys(11), "glm keys one row");
+}
+
+/// A verify that accepts a prefix of its rows leaves, bit for bit on every
+/// backend this host opens, the state a launch of that prefix alone leaves:
+/// each accepted row's latent and origin, each group it completes' block
+/// row, and each pending token's window row and coordinates. The rows after
+/// it write only the window rows of their own tokens and the block rows of
+/// the groups they complete, which the state releases with them; so the
+/// next advance from the accepted prefix reads what a run that stopped
+/// there would have, and rolling back a rejected verify is exact. Each key
+/// form: V4.1's rounded gated rows, Qwen4exp's mean keys and GLM-5.3's
+/// token-normed keys gated by place, each over launches whose prefixes end
+/// inside a group and on its last token.
+#[test]
+fn an_accepted_prefix_leaves_the_state_its_own_launch_does() {
+    let cases = [
+        (Case::new(Element::bf16(), V41, true, 2, COMPRESSED, 101, 9, 1).with_yarn(), "v41 gated"),
+        (Case::new(Element::f32(), QWEN4, false, 4, NONE, 42, 16, 4), "qwen4 mean"),
+        (Case::new(Element::bf16(), GLM, true, 4, NONE, 42, 16, 8).with_token_keys(9), "glm keys"),
+    ];
+    let bits = |values: &[f32]| values.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
+    for (case, label) in &cases {
+        let (w, width) = (case.w(), case.window_width());
+        for device in offering(&pool_rows::native_entry_with(pool_rows::Elements { A: case.element, Y: case.row })) {
+            let whole = native(&device, case);
+            for rows in 1..case.rows {
+                let prefix = native(&device, &case.prefix(rows));
+                for row in 0..rows {
+                    let position = case.position(row);
+                    let label = format!("{label} {} prefix of {rows} at {position}", device.backend().as_str());
+                    assert_eq!(bits(&prefix.latent[row * w..][..w]), bits(&whole.latent[row * w..][..w]), "{label}: latent");
+                    assert_eq!(prefix.latent_rows[row], whole.latent_rows[row], "{label}: latent row");
+                    assert_eq!(prefix.latent_coordinates[row * 4..][..4], whole.latent_coordinates[row * 4..][..4], "{label}: origin");
+                    if case.completes(position) {
+                        let at = block_of(position / case.rate) * w;
+                        assert_eq!(bits(&prefix.blocks[at..][..w]), bits(&whole.blocks[at..][..w]), "{label}: block row");
+                    } else {
+                        let at = window_of(position);
+                        assert_eq!(bits(&prefix.window[at * width..][..width]), bits(&whole.window[at * width..][..width]), "{label}: window row");
+                        assert_eq!(prefix.window_coordinates[at * 4..][..4], whole.window_coordinates[at * 4..][..4], "{label}: window coordinates");
+                    }
+                }
+            }
+        }
+    }
 }

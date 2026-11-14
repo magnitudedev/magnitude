@@ -3,6 +3,9 @@
 
 mod common;
 
+use common::bound::{self, Float, Form, Library, Products};
+use seismic::BackendName;
+
 use magnitude_kernels::{
     SlotTable, constants, landing_extent, list_extent, routed_combine, routed_copy, routed_down, routed_expand,
     routed_experts, routed_gate_up, routed_group, routed_land, routed_list_grid, routed_move, routed_output,
@@ -1656,29 +1659,128 @@ impl Routed {
         .concat()
     }
 
-    /// The publication slack of [`Routed::output`] at bf16: each published
-    /// down projection (every choice's, the shared expert's) may round to
-    /// either bf16 neighbour of a value the native computes along another
-    /// path, so each contributes one bf16 ulp at its weight.
-    fn publication_slack(&self, routing: &Routing, expert: &[f32], shared: &[f32]) -> Vec<f32> {
+    /// The bounds of [`Routed::expand`]'s published products (expert,
+    /// shared), each publication rounded to `output`, against a native that
+    /// multiplies each weight in its form of `forms` over the same rows. Each
+    /// gate and up sum is held to its form's bound, scaled in F32 and
+    /// published; the SiLU product carries both errors through SiLU's slope,
+    /// each side's evaluation, the F32 product and one more publication
+    /// ([`bound::silu_product_between`]), `backend` the native's.
+    fn expand_bounds(
+        &self,
+        routing: &Routing,
+        forms: &RoutedForms,
+        output: Float,
+        backend: BackendName,
+    ) -> (Vec<f64>, Vec<f64>) {
         let (h, k, f, s) = (self.hidden, self.choices, self.features, self.shared);
+        let side = |form: Form, x: &[f32], row: &[f32], scale: Option<f32>| {
+            let (acc, sums) = (dot(x, row), form.sums(&Products::of(x, row)));
+            let (value, difference) = match scale {
+                Some(scale) => (acc * scale, Float::F32.rounded(f64::from(scale.abs()) * sums, acc * scale)),
+                None => (acc, sums),
+            };
+            let published = publish(output, value);
+            (published, output.rounded(difference, published))
+        };
+        let (native, host) = (Library::of(backend), Library::of(BackendName::Cpu));
+        let glu = |(g, gate): (f32, f64), (u, up): (f32, f64)| {
+            let a = publish(output, silu(g));
+            let value = publish(output, a * u);
+            bound::silu_product_between(output, (&native, &host), (g, gate), (u, up), (a, value))
+        };
+        let rows = parallel(routing.rows, |m| {
+            let normalized = &routing.normalized[m * h..(m + 1) * h];
+            let x = operands::operand_rows(normalized, h, self.nvfp4.expert_gate_up);
+            let expert = (0..k)
+                .flat_map(|choice| {
+                    let e = routing.routes[m * k + choice] as usize;
+                    (0..f).map(move |feature| (e, feature))
+                })
+                .map(|(e, feature)| {
+                    let row = (e * f + feature) * h;
+                    glu(
+                        side(forms.expert_gate, &x, &self.expert_gate[row..row + h], self.gate_scale.get(e).copied()),
+                        side(forms.expert_up, &x, &self.expert_up[row..row + h], self.up_scale.get(e).copied()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let x = operands::operand_rows(normalized, h, self.nvfp4.shared_gate_up);
+            let shared = (0..s)
+                .map(|feature| {
+                    let row = feature * h..(feature + 1) * h;
+                    glu(
+                        side(forms.shared_gate, &x, &self.shared_gate[row.clone()], None),
+                        side(forms.shared_up, &x, &self.shared_up[row], None),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (expert, shared)
+        });
+        let (expert, shared): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
+        (expert.concat(), shared.concat())
+    }
+
+    /// The bounds of [`Routed::output`], each down projection published in
+    /// `output`, against a native that multiplies each weight in its form of
+    /// `forms` over products within `expert_bound` and `shared_bound` of
+    /// `expert` and `shared` (zero where it reads these products). Each
+    /// published down projection is held to its form's bound plus its
+    /// inputs' carried through the weight row; the combination
+    /// `residual + Σ score·down + coefficient·shared` of K + 2 terms is an
+    /// F32 sum on both sides, each within `γ_{K+2}` of the exact one.
+    fn output_bounds(
+        &self,
+        routing: &Routing,
+        (expert, shared): (&[f32], &[f32]),
+        (expert_bound, shared_bound): (&[f64], &[f64]),
+        forms: &RoutedForms,
+        output: Float,
+    ) -> Vec<f64> {
+        let (h, k, f, s) = (self.hidden, self.choices, self.features, self.shared);
+        // An NVFP4 down operand re-quantizes its products, which a
+        // perturbation can move by a whole step: outside this model.
+        assert!(
+            !(self.nvfp4.expert_down && expert_bound.iter().any(|b| *b != 0.0)
+                || self.nvfp4.shared_down && shared_bound.iter().any(|b| *b != 0.0)),
+            "a carried product bound through an NVFP4 down operand"
+        );
         let (expert, shared) = &self.down_rows(expert, shared);
+        let gamma = bound::gamma(k + 2);
+        let published = |form: Form, x: &[f32], row: &[f32], carried: &[f64]| {
+            let value = publish(output, dot(x, row));
+            let carried = row.iter().zip(carried).map(|(w, b)| f64::from(w.abs()) * b).sum::<f64>();
+            (value, output.rounded(form.sums(&Products::of(x, row)) + carried, value))
+        };
         parallel(routing.rows, |m| {
             (0..h)
                 .map(|column| {
-                    let mut total = 0.0f32;
+                    let mut magnitude = f64::from(routing.residual[m * h + column].abs());
+                    let mut moved = 0.0;
                     for choice in 0..k {
                         let e = routing.routes[m * k + choice] as usize;
                         let row = (e * h + column) * f;
-                        let product = &expert[(m * k + choice) * f..(m * k + choice + 1) * f];
-                        total += routing.scores[m * k + choice].abs()
-                            * bf16_ulp(dot(product, &self.expert_down[row..row + f]));
+                        let at = (m * k + choice) * f..(m * k + choice + 1) * f;
+                        let (value, difference) = published(
+                            forms.expert_down,
+                            &expert[at.clone()],
+                            &self.expert_down[row..row + f],
+                            &expert_bound[at],
+                        );
+                        let score = f64::from(routing.scores[m * k + choice].abs());
+                        magnitude += score * f64::from(value.abs());
+                        moved += score * difference;
                     }
-                    let down = dot(
+                    let (value, difference) = published(
+                        forms.shared_down,
                         &shared[m * s..(m + 1) * s],
                         &self.shared_down[column * s..(column + 1) * s],
+                        &shared_bound[m * s..(m + 1) * s],
                     );
-                    total + routing.coefficient[m].abs() * bf16_ulp(down)
+                    let coefficient = f64::from(routing.coefficient[m].abs());
+                    magnitude += coefficient * f64::from(value.abs());
+                    moved += coefficient * difference;
+                    (1.0 + gamma) * moved + 2.0 * gamma * magnitude
                 })
                 .collect::<Vec<_>>()
         })
@@ -1686,12 +1788,66 @@ impl Routed {
     }
 }
 
-/// The spacing of bf16 values at `value`'s binade (8 significant bits).
-fn bf16_ulp(value: f32) -> f32 {
-    f32::from_bits(value.abs().to_bits() & 0x7F80_0000) * 2f32.powi(-7)
+/// `value` published in `output`: rounded to BF16, or held in F32.
+fn publish(output: Float, value: f32) -> f32 {
+    match output {
+        Float::Bf16 => bf16_round(value),
+        Float::F32 => value,
+        Float::F16 => panic!("the routed host model publishes BF16 or F32"),
+    }
 }
 
-/// Floating results agree within `relative * |reference| + absolute`, with
+/// The forms a device's routed natives multiply each weight in.
+#[derive(Clone, Copy)]
+struct RoutedForms {
+    expert_gate: Form,
+    expert_up: Form,
+    expert_down: Form,
+    shared_gate: Form,
+    shared_up: Form,
+    shared_down: Form,
+}
+
+impl RoutedForms {
+    /// Every weight in `form`.
+    fn uniform(form: Form) -> Self {
+        Self {
+            expert_gate: form,
+            expert_up: form,
+            expert_down: form,
+            shared_gate: form,
+            shared_up: form,
+            shared_down: form,
+        }
+    }
+
+    /// Each of the weights (expert gate, up, down; shared gate, up, down)
+    /// in `form` of its resident element.
+    fn of(weights: [&seismic::Tensor; 6], form: impl Fn(seismic::Element) -> Form) -> Self {
+        let [expert_gate, expert_up, expert_down, shared_gate, shared_up, shared_down] =
+            weights.map(|weight| form(weight.element()));
+        Self { expert_gate, expert_up, expert_down, shared_gate, shared_up, shared_down }
+    }
+
+    /// The decode entries (`routed_expand`, `routed_output`) on `device` at
+    /// `rows`: the projection family's GEMVs (`Form::projection`).
+    fn decode(device: &seismic::Device, weights: [&seismic::Tensor; 6], rows: usize) -> Self {
+        Self::of(weights, |weight| Form::projection(device.backend(), rows, Float::Bf16, weight))
+    }
+
+    /// The grouped entries (`routed_experts`, `routed_combine`) on `device`:
+    /// the family's GEMM at every block (`Form::matrix`), or CUDA's
+    /// F16-operand GEMM at `OPERAND` 1.
+    fn grouped(device: &seismic::Device, weights: [&seismic::Tensor; 6], operand: u64) -> Self {
+        Self::of(weights, |weight| match (device.backend(), operand) {
+            (seismic::BackendName::Cuda, 1) => Form::cuda_f16_operands(Float::Bf16, weight),
+            (backend, _) => Form::matrix(backend, Float::Bf16, weight),
+        })
+    }
+}
+
+/// Route results (scores after the softmax, the shared expert's sigmoid
+/// coefficient) agree within `relative * |reference| + absolute`, with
 /// `absolute` a fraction of the reference's largest magnitude.
 fn assert_near(
     name: &str,
@@ -1700,52 +1856,24 @@ fn assert_near(
     relative: f32,
     absolute_fraction: f32,
 ) {
-    assert_within(name, actual, expected, relative, absolute_fraction, |_| 0.0);
-}
-
-/// [`assert_near`] with each element's `slack` added to its bound.
-fn assert_within(
-    name: &str,
-    actual: &[f32],
-    expected: &[f32],
-    relative: f32,
-    absolute_fraction: f32,
-    slack: impl Fn(usize) -> f32,
-) {
     assert_eq!(actual.len(), expected.len(), "{name} length");
     let scale = expected
         .iter()
         .fold(0.0f32, |max, value| max.max(value.abs()));
-    let mut worst = (0usize, 0.0f32);
     for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
-        assert!(actual.is_finite(), "{name}[{index}] is {actual}");
-        let excess = (actual - expected).abs()
-            - (relative * expected.abs() + absolute_fraction * scale + slack(index));
-        if excess > worst.1 {
-            worst = (index, excess);
-        }
+        assert!(
+            (actual - expected).abs() <= relative * expected.abs() + absolute_fraction * scale,
+            "{name}[{index}]: native {actual}, reference {expected} (scale {scale})"
+        );
     }
-    assert!(
-        worst.1 <= 0.0,
-        "{name}[{}]: native {}, reference {} (scale {scale})",
-        worst.0,
-        actual[worst.0],
-        expected[worst.0]
-    );
 }
 
-/// Arithmetic variants use the tuner's relative output-norm defect guard.
-fn assert_arithmetic(
-    name: &str,
-    actual: &[f32],
-    expected: &[f32],
-    int8: bool,
-    relative: f32,
-    absolute_fraction: f32,
-    slack: impl Fn(usize) -> f32,
-) {
+/// `actual` within `bound` of the host model `expected`; the INT8 form,
+/// which quantizes its activations (a tuned alternative, not the same
+/// arithmetic), to the tuner's relative output-norm defect guard instead.
+fn assert_arithmetic(name: &str, actual: &[f32], expected: &[f32], int8: bool, bound: &[f64]) {
     if !int8 {
-        return assert_within(name, actual, expected, relative, absolute_fraction, slack);
+        return bound::assert_within(name, actual, expected, bound);
     }
     assert_eq!(actual.len(), expected.len(), "{name} length");
     let error = actual
@@ -1793,7 +1921,12 @@ fn host_reference_matches_portable_decode_body() {
     };
     let (expert, shared) = routed.expand(&routing, |v| v);
     let reference = routed.output(&routing, &expert, &shared, |v| v);
-    assert_near("decode", &block.decode(&module), &reference, 1e-6, 1e-6);
+    // Both sum in F32 and publish in F32, in their own orders.
+    let forms = RoutedForms::uniform(Form::F32);
+    let (expert_bound, shared_bound) = routed.expand_bounds(&routing, &forms, Float::F32, BackendName::Cpu);
+    let bounds =
+        routed.output_bounds(&routing, (&expert, &shared), (&expert_bound, &shared_bound), &forms, Float::F32);
+    bound::assert_within("decode", &block.decode(&module), &reference, &bounds);
 }
 
 // ---------------------------------------------------------------------------
@@ -2150,6 +2283,11 @@ struct PackedBlock {
 
 impl PackedBlock {
     const HIDDEN: usize = 512;
+
+    /// The resident weights, as [`RoutedForms::of`] takes them.
+    fn weights(&self) -> [&seismic::Tensor; 6] {
+        [&self.expert_gate, &self.expert_up, &self.expert_down, &self.shared_gate, &self.shared_up, &self.shared_down]
+    }
     const EXPERTS: usize = 16;
     const CHOICES: usize = 4;
     const SHARED: usize = 256;
@@ -2583,7 +2721,16 @@ fn native_decode_expand_and_output_match_reference_rows(
         let m = rows as u64;
         let (expert, shared) = block.routed.expand(&routing, bf16_round);
         let reference = block.routed.output(&routing, &expert, &shared, bf16_round);
-        let slack = block.routed.publication_slack(&routing, &expert, &shared);
+        // The output reads the host's products: nothing carried into it.
+        let forms = RoutedForms::decode(device, block.weights(), rows);
+        let (expert_bound, shared_bound) = block.routed.expand_bounds(&routing, &forms, Float::Bf16, device.backend());
+        let output_bound = block.routed.output_bounds(
+            &routing,
+            (&expert, &shared),
+            (&vec![0.0; expert.len()], &vec![0.0; shared.len()]),
+            &forms,
+            Float::Bf16,
+        );
         let normalized = bf16_tensor(&device, &[m, h], &routing.normalized);
         let routes = i32_tensor(&device, &[m, k], &routing.routes);
         let scores = f32_tensor(&device, &[m, k], &routing.scores);
@@ -2649,18 +2796,14 @@ fn native_decode_expand_and_output_match_reference_rows(
                 &read_bf16(&expanded.r0),
                 &expert,
                 int8,
-                2e-2,
-                2e-3,
-                |_| 0.0,
+                &expert_bound,
             );
             assert_arithmetic(
                 &format!("{label} shared product"),
                 &read_bf16(&expanded.r1),
                 &shared,
                 int8,
-                2e-2,
-                2e-3,
-                |_| 0.0,
+                &shared_bound,
             );
             let output_native =
                 routed_output::native_for_device_with(&device, output_elements(), &output_specialization).unwrap();
@@ -2689,9 +2832,7 @@ fn native_decode_expand_and_output_match_reference_rows(
                 &resident,
                 &reference,
                 int8,
-                1e-2,
-                2e-3,
-                |index| slack[index],
+                &output_bound,
             );
             // Read where its sources name from a bank holding the experts
             // in reverse, the output keeps its bits, but for the choices of
@@ -3271,7 +3412,17 @@ fn native_grouped_prefill_matches_reference_on(
         let m = rows as u64;
         let (expert, shared) = block.routed.expand(&routing, bf16_round);
         let reference = block.routed.output(&routing, &expert, &shared, bf16_round);
-        let slack = block.routed.publication_slack(&routing, &expert, &shared);
+        // The combination reads the natives' own products: their bounds
+        // carry into it.
+        let forms = RoutedForms::grouped(device, block.weights(), operand);
+        let products = block.routed.expand_bounds(&routing, &forms, Float::Bf16, device.backend());
+        let output_bound = block.routed.output_bounds(
+            &routing,
+            (&expert, &shared),
+            (&products.0, &products.1),
+            &forms,
+            Float::Bf16,
+        );
         let blocks = group_blocks(m * k, e, tile);
         let routes = i32_tensor(&device, &[m, k], &routing.routes);
         let fill = |shape: &[u64]| {
@@ -3425,9 +3576,7 @@ fn native_grouped_prefill_matches_reference_on(
                 &combined_values,
                 &reference,
                 int8,
-                2e-2,
-                4e-3,
-                |index| slack[index],
+                &output_bound,
             );
         }
     }
@@ -3467,6 +3616,11 @@ struct Qwen35b {
 
 impl Qwen35b {
     const HIDDEN: usize = 2048;
+
+    /// The resident weights, as [`RoutedForms::of`] takes them.
+    fn weights(&self) -> [&seismic::Tensor; 6] {
+        [&self.expert_gate, &self.expert_up, &self.expert_down, &self.shared_gate, &self.shared_up, &self.shared_down]
+    }
     const EXPERTS: usize = 256;
     const CHOICES: usize = 8;
     const FEATURES: usize = 512;
@@ -3875,9 +4029,17 @@ fn native_35b_geometry_chain_matches_reference_on(device: &seismic::Device) {
         let reference = block
             .routed
             .output(&reference_routing, &expert, &shared, bf16_round);
-        let slack = block
-            .routed
-            .publication_slack(&reference_routing, &expert, &shared);
+        // The output reads the native's own products: their bounds carry
+        // into it.
+        let forms = RoutedForms::decode(device, block.weights(), rows);
+        let (expert_bound, shared_bound) = block.routed.expand_bounds(&reference_routing, &forms, Float::Bf16, device.backend());
+        let output_bound = block.routed.output_bounds(
+            &reference_routing,
+            (&expert, &shared),
+            (&expert_bound, &shared_bound),
+            &forms,
+            Float::Bf16,
+        );
         let residual_tensor = f32_tensor(&device, &[rows as u64, h], &residual);
         let [gate_scale, up_scale] = block.routed.expansion_scales(device);
         for (index, mapping) in decode_mappings(&device).into_iter().enumerate() {
@@ -3919,19 +4081,17 @@ fn native_35b_geometry_chain_matches_reference_on(device: &seismic::Device) {
                 up_scale: &up_scale,
             })
             .unwrap();
-            assert_near(
+            bound::assert_within(
                 &format!("{label} expert product"),
                 &read_bf16(&expanded.r0),
                 &expert,
-                2e-2,
-                2e-3,
+                &expert_bound,
             );
-            assert_near(
+            bound::assert_within(
                 &format!("{label} shared product"),
                 &read_bf16(&expanded.r1),
                 &shared,
-                2e-2,
-                2e-3,
+                &shared_bound,
             );
             let output = routed_output::native_for_device_with(
                 &device,
@@ -3958,14 +4118,7 @@ fn native_35b_geometry_chain_matches_reference_on(device: &seismic::Device) {
             })
             .unwrap()
             .value;
-            assert_within(
-                &format!("{label} output"),
-                &read_f32(&output),
-                &reference,
-                2e-2,
-                4e-3,
-                |index| slack[index],
-            );
+            bound::assert_within(&format!("{label} output"), &read_f32(&output), &reference, &output_bound);
         }
     }
 
@@ -3982,9 +4135,17 @@ fn native_35b_geometry_chain_matches_reference_on(device: &seismic::Device) {
         let reference = block
             .routed
             .output(&reference_routing, &expert, &shared, bf16_round);
-        let slack = block
-            .routed
-            .publication_slack(&reference_routing, &expert, &shared);
+        // The combination reads the natives' own products (CUDA's at
+        // `OPERAND` 0): their bounds carry into it.
+        let forms = RoutedForms::grouped(device, block.weights(), 0);
+        let products = block.routed.expand_bounds(&reference_routing, &forms, Float::Bf16, device.backend());
+        let output_bound = block.routed.output_bounds(
+            &reference_routing,
+            (&expert, &shared),
+            (&products.0, &products.1),
+            &forms,
+            Float::Bf16,
+        );
         let blocks = group_blocks(m * k, e, t);
         let fill = |shape: &[u64]| {
             i32_tensor(
@@ -4109,14 +4270,7 @@ fn native_35b_geometry_chain_matches_reference_on(device: &seismic::Device) {
                         .copied()
                 })
                 .collect::<Vec<_>>();
-            assert_within(
-                &format!("{label} output"),
-                &sampled,
-                &reference,
-                2e-2,
-                4e-3,
-                |index| slack[index],
-            );
+            bound::assert_within(&format!("{label} output"), &sampled, &reference, &output_bound);
         }
     }
 }

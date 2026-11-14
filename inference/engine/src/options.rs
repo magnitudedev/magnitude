@@ -86,7 +86,7 @@ pub enum ModelMethod {
 
 impl ModelMethod {
     /// The separate-draft variant this method requests, if it requests one.
-    fn draft_variant(self) -> Option<DraftVariant> {
+    pub fn draft_variant(self) -> Option<DraftVariant> {
         match self {
             Self::DFlash => Some(DraftVariant::DFlash),
             Self::DSpark => Some(DraftVariant::DSpark),
@@ -96,7 +96,8 @@ impl ModelMethod {
         }
     }
 
-    const ALL: [Self; 7] = [
+    /// Every method, in the order a host lists them.
+    pub const ALL: [Self; 7] = [
         Self::Auto,
         Self::Plain,
         Self::Mtp,
@@ -678,7 +679,7 @@ pub(crate) mod tests {
         EmbeddingScale, EntryForm, ExitForm, ExitNorm, FeedForwardUp, GateFunction, Head,
         HeadBlock, HeadChain, HeadComponent, HeadHistory, HeadInput, HeadNorm, HeadReadout,
         HistoryRows, HistorySource, InputNorm, MediaRowAttention, Operator, OutputForm,
-        OutputProjection, ProjectedRows, QueryProjection, ResidualForm, RmsNorm, Rotary,
+        OutputProjection, ProjectedRows, QueryKeys, QueryProjection, ResidualForm, RmsNorm, Rotary,
         RowProducer, RowRounding, Sublayer, TokenDomain, ValueNorm, ValueSource,
         VocabularyProjection, WeightDescriptor,
     };
@@ -701,6 +702,7 @@ pub(crate) mod tests {
             kv_heads: 1,
             width: 2,
             query: QueryProjection::Full(weight(&format!("{p}qg"), &[4, 2])),
+            query_keys: QueryKeys::Direct,
             gate: AttentionGate::Interleaved {
                 function: GateFunction::Sigmoid,
             },

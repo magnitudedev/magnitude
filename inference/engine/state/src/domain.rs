@@ -419,7 +419,7 @@ pub(crate) fn validate_domains(
                     // A Block domain's attended rows are pooled sources'.
                     HistoryDomainKind::Block { .. } => attended
                         .clone()
-                        .any(|component| !matches!(component.layer, LayerRef::Pooled { .. })),
+                        .any(|component| !component.layer.is_pooled()),
                     _ => produced && attended.clone().next().is_some(),
                 };
                 if mixed

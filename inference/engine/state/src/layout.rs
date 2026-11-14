@@ -161,6 +161,7 @@ impl ModelStateLayout {
                         attention,
                         target_codec,
                         activation,
+                        Owner::Target,
                     )?,
                     Stateful::GatedDelta(delta) => {
                         target_banks.extend(delta_bank(delta, activation)?)
@@ -185,28 +186,26 @@ impl ModelStateLayout {
         for (index, block) in drafter.iter().enumerate() {
             match block_state(block)?.as_slice() {
                 // Drafter history stays dense whatever the target codec: the
-                // drafters' attention reads dense planes only.
-                [Stateful::Attention(attention)] => match attention.history.as_slice() {
-                    [source] => match &source.rows {
-                        HistoryRows::Own(RowProducer::Projected(rows)) => head_history.own(
-                            rows.domain,
-                            history_component(
-                                attention,
-                                LayerRef::Head(layer(index)?),
-                                KvCodec::Dense,
-                                activation,
-                            )?,
-                        )?,
-                        _ => {
-                            return Err("a drafter block must own its attention history".into());
-                        }
-                    },
-                    _ => return Err("a drafter attention over more than one source".into()),
-                },
+                // drafters' attention reads dense planes only. A drafter
+                // keeps every source's own state, its indexer's too.
+                [Stateful::Attention(attention)] => {
+                    if attention
+                        .history
+                        .iter()
+                        .any(|source| matches!(source.rows, HistoryRows::Shared { .. }))
+                    {
+                        return Err("a drafter block must own its attention history".into());
+                    }
+                    head_history.attention(
+                        layer(index)?,
+                        attention,
+                        KvCodec::Dense,
+                        activation,
+                        Owner::Head,
+                    )?
+                }
                 _ => {
-                    return Err(
-                        "a drafter block must hold exactly one owned attention history".into(),
-                    );
+                    return Err("a drafter block must hold exactly one owned attention history".into());
                 }
             }
         }
@@ -244,19 +243,20 @@ impl HistoryDomains {
     /// order. Part 0 is projected (validation keeps a pooled source out of
     /// the first place): its rows are `Target(block)`'s, under `codec`
     /// unless the model rounds them. A later part is pooled: its rows are
-    /// `Pooled { block, part }`'s. A Shared source's rows, and an indexer's
+    /// `Pooled { block, part }`'s (`HeadPooled` in a head's). A Shared source's rows, and an indexer's
     /// Shared keys, are their owner's. A source's own indexer keeping its
-    /// own keys keeps them as `IndexKeys { block, part }`.
+    /// own keys keeps them as `IndexKeys { block, part }` (`HeadIndexKeys`).
     fn attention(
         &mut self,
         block: u32,
         attention: &Attention,
         codec: KvCodec,
         activation: DType,
+        owner: Owner,
     ) -> Result<(), String> {
         for (part, source) in attention.history.iter().enumerate() {
             let part = u32::try_from(part).map_err(|_| "history source index".to_string())?;
-            let layer = source_layer(block, part);
+            let layer = owner.source(block, part);
             match &source.rows {
                 HistoryRows::Own(RowProducer::Projected(rows)) => {
                     self.own(rows.domain, history_component(attention, layer, codec, activation)?)?
@@ -270,14 +270,14 @@ impl HistoryDomains {
                 } => {
                     let source_part = u32::try_from(*source_part)
                         .map_err(|_| "history source index".to_string())?;
-                    self.share(source_layer(source.block, source_part), layer);
+                    self.share(owner.source(source.block, source_part), layer);
                 }
             }
             match &source.reads {
                 HistoryReads::Selected(Selection::Own(indexer))
                     if !matches!(indexer.keys, IndexerKeys::Shared { .. }) =>
                 {
-                    self.index(LayerRef::IndexKeys { block, part }, indexer, &source.rows)?
+                    self.index(owner.keys(block, part), indexer, &source.rows)?
                 }
                 HistoryReads::Visible | HistoryReads::Selected(_) => {}
             }
@@ -300,21 +300,7 @@ impl HistoryDomains {
     ) -> Result<(), String> {
         let rate = host(rows.rate, "pooled source rate")?;
         let width = host(width, "pooled source width")?;
-        let pending = match rows.pool {
-            Pool::Identity => None,
-            Pool::Mean => Some(width),
-            Pool::SoftmaxGated { .. } => Some(
-                width
-                    .checked_mul(2)
-                    .ok_or("pooled source width arithmetic overflow")?,
-            ),
-        };
-        let window = pending
-            .map(|pending| {
-                ComponentDescriptor::produced(layer, DType::F32, pending, true)
-                    .map_err(|error| error.to_string())
-            })
-            .transpose()?;
+        let window = pending(layer, &rows.pool, width)?;
         let dtype = match rows.rounding {
             RowRounding::None => activation,
             RowRounding::Block(_) => DType::BF16,
@@ -329,10 +315,11 @@ impl HistoryDomains {
     }
 
     /// The keys of an indexer selecting `rows`:
-    /// - pooled keys over a token source (Qwen4's): one key row of `width`
-    ///   F32 values per token with its coordinates in the rate's Window, and
-    ///   per group in the rate's Block (the indexer scores in F32, as the
-    ///   reference does);
+    /// - pooled keys over a token source (Qwen4's, GLM's): each pending
+    ///   token's F32 key row (gated, with its gate scores beside it) with
+    ///   its coordinates in the rate's Window, as a pooled source's
+    ///   ([`pending`]), and each group's key of `width` F32 values in the
+    ///   rate's Block (the indexer scores in F32, as the reference does);
     /// - keys of the layer's pooled source's rows: one row per source row,
     ///   in the source's Block, so its rows are the source's, in F32.
     fn index(
@@ -347,12 +334,10 @@ impl HistoryDomains {
                 .map_err(|error| error.to_string())
         };
         match (&indexer.keys, rows) {
-            // The raw keys are the projections a mean pools; a gate's
-            // scores or a rounding would be state no indexer form keeps.
+            // A rounding would be state no indexer form keeps.
             (
                 IndexerKeys::Pooled(
                     pooled @ PooledRows {
-                        pool: Pool::Mean,
                         rounding: RowRounding::None,
                         ..
                     },
@@ -363,10 +348,12 @@ impl HistoryDomains {
                 if rate < 2 {
                     return Err("a selection block holds at least two rows".into());
                 }
-                self.produce(rate, Some(component(DType::F32, true)?), component(DType::F32, false)?)
+                let window = pending(keys, &pooled.pool, width)?
+                    .ok_or("pooled indexer keys of a pool without pending tokens")?;
+                self.produce(rate, Some(window), component(DType::F32, false)?)
             }
             (IndexerKeys::Pooled(_), _) => {
-                Err("pooled indexer keys other than an unrounded mean have no state layout".into())
+                Err("rounded pooled indexer keys have no state layout".into())
             }
             // F32 holds a rounded key's values exactly, and the scoring
             // entry reads one key element (`indexer_score`).
@@ -492,7 +479,7 @@ fn block_state(block: &Block) -> Result<Vec<Stateful<'_>>, String> {
             {
                 continue;
             }
-            op @ (Operator::LatentAttention(_) | Operator::Parallel(_)) => {
+            op @ Operator::Parallel(_) => {
                 return Err(format!("{} state has no layout yet", op.name()));
             }
         };
@@ -592,12 +579,48 @@ pub fn kv_codec_policy(decoder: &Decoder, requested: Option<KvCodec>) -> Result<
     }
 }
 
-/// The state layer of target block `block`'s history source `part`: its
-/// token rows (part 0) or its pooled rows.
-fn source_layer(block: u32, part: u32) -> LayerRef {
-    match part {
-        0 => LayerRef::Target(block),
-        part => LayerRef::Pooled { block, part },
+/// The Window component of `layer`'s pending tokens under `pool` over rows
+/// of `width` (`pool_rows`' `window_rows`): each token's F32 row, gated with
+/// its F32 gate scores beside it, and its coordinates; none at rate 1.
+fn pending(layer: LayerRef, pool: &Pool, width: usize) -> Result<Option<ComponentDescriptor>, String> {
+    let pending = match pool {
+        Pool::Identity => return Ok(None),
+        Pool::Mean => width,
+        Pool::SoftmaxGated { .. } => width
+            .checked_mul(2)
+            .ok_or("pooled source width arithmetic overflow")?,
+    };
+    ComponentDescriptor::produced(layer, DType::F32, pending, true)
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
+/// Whose store an attention block's state is kept in: a target block's, or
+/// a draft head block's (whose `block` is its index among the head's blocks).
+#[derive(Clone, Copy)]
+enum Owner {
+    Target,
+    Head,
+}
+
+impl Owner {
+    /// The state layer of the block's history source `part`: its token rows
+    /// (part 0) or its pooled rows.
+    fn source(self, block: u32, part: u32) -> LayerRef {
+        match (self, part) {
+            (Self::Target, 0) => LayerRef::Target(block),
+            (Self::Head, 0) => LayerRef::Head(block),
+            (Self::Target, part) => LayerRef::Pooled { block, part },
+            (Self::Head, part) => LayerRef::HeadPooled { block, part },
+        }
+    }
+
+    /// The state layer of the keys of the indexer selecting source `part`.
+    fn keys(self, block: u32, part: u32) -> LayerRef {
+        match self {
+            Self::Target => LayerRef::IndexKeys { block, part },
+            Self::Head => LayerRef::HeadIndexKeys { block, part },
+        }
     }
 }
 
@@ -643,6 +666,7 @@ fn delta_bank(recurrent: &GatedDelta, activation: DType) -> Result<[BankComponen
             value_heads,
             key_heads: host(recurrent.key_heads, "recurrent key heads")?,
             width,
+            decay_width: host(recurrent.decay_width(), "recurrent decay width")?,
         },
     ])
 }
@@ -748,9 +772,9 @@ mod tests {
     use crate::ComponentRole;
     use magnitude_family_contracts::{
         AttentionGate, BlockElement, BlockRounding, BlockScale, EmbeddingScale, EntryForm,
-        ExitForm, ExitNorm, GateFunction, HeadNorm, HeadWeights, IndexerInput, IndexerQuery,
-        SublayerIndex, HistorySource, InputNorm, MediaRowAttention, OutputForm, OutputProjection, QueryProjection,
-        RecurrentHeadMapping, ResidualForm, RmsNorm, Rotary, Sublayer, ValueNorm, ValueSource,
+        ExitForm, ExitNorm, GateFunction, GateProjection, RecurrentDecay, RecurrentGate, HeadNorm, HeadWeights, IndexerInput, IndexerQuery,
+        SublayerIndex, HistorySource, InputNorm, MediaRowAttention, OutputForm, OutputProjection, QueryKeys, QueryProjection,
+        PoolNorm, RecurrentHeadMapping, ResidualForm, RmsNorm, Rotary, Sublayer, ValueNorm, ValueSource,
         WeightDescriptor,
     };
 
@@ -855,6 +879,7 @@ mod tests {
             kv_heads: 2,
             width: 32,
             query: QueryProjection::Full(weight(&[128, 32])),
+            query_keys: QueryKeys::Direct,
             gate: AttentionGate::None,
             query_norm: HeadNorm::None,
             history: vec![HistorySource::visible(owned(
@@ -905,14 +930,19 @@ mod tests {
             width: 8,
             head_mapping: RecurrentHeadMapping::Grouped,
             query_key_value: weight(&[64, 32]),
-            gate: weight(&[32, 32]),
-            alpha: weight(&[4, 32]),
             beta: weight(&[4, 32]),
             convolution: weight(&[64, 4]),
-            decay: weight(&[4]),
-            time_bias: weight(&[4]),
+            decay: RecurrentDecay::PerHead {
+                alpha: weight(&[4, 32]),
+                time_bias: weight(&[4]),
+                decay: weight(&[4]),
+            },
+            key_norm_epsilon: 8e-6,
             norm: norm(8),
-            output_gate: GateFunction::Silu,
+            output_gate: RecurrentGate {
+                projection: GateProjection::Full(weight(&[32, 32])),
+                function: GateFunction::Silu,
+            },
             output: weight(&[32, 32]),
         };
         let decoder = decoder(
@@ -1289,8 +1319,9 @@ mod tests {
                     projection: weight(&[V41_WIDTH, 32]),
                     pool: Pool::SoftmaxGated {
                         gate: weight(&[V41_WIDTH, 32]),
+                        position: None,
                     },
-                    norm: norm(V41_WIDTH),
+                    norm: PoolNorm::Pooled(norm(V41_WIDTH)),
                     rounding: block_rounding(BlockElement::E2M1, 16, BlockScale::E4M3, 6.0 * 2f64.powi(-9)),
                 })),
                 reads: HistoryReads::Selected(Selection::Own(Box::new(Indexer {
@@ -1419,12 +1450,9 @@ mod tests {
         assert_eq!(kv_codec_policy(&plain, None), Ok(KvCodec::AffineK8V4));
     }
 
-    /// Qwen4's selected read: raw F32 keys with coordinates in a Window of
-    /// the block less one, F32 block keys in a Block of the block, after
-    /// the attended domain: the layout before history sources, its keys now
-    /// named by part.
-    #[test]
-    fn a_pooled_key_indexer_keeps_its_raw_and_block_keys() {
+    /// An attention whose selected read's indexer pools its keys by `pool`
+    /// under `norm` at rate 4 over keys of 64.
+    fn selected_attention(pool: Pool, norm: PoolNorm) -> Operator {
         let Operator::Attention(mut attention) = attention() else {
             unreachable!("an attention operator")
         };
@@ -1434,14 +1462,14 @@ mod tests {
             query: IndexerQuery {
                 input: IndexerInput::Hidden,
                 projection: weight(&[128, 32]),
-                norm: HeadNorm::Rms(norm(64)),
+                norm: HeadNorm::Rms(self::norm(64)),
                 rounding: RowRounding::None,
             },
             keys: IndexerKeys::Pooled(PooledRows {
                 rate: 4,
                 projection: weight(&[64, 32]),
-                pool: Pool::Mean,
-                norm: norm(64),
+                pool,
+                norm,
                 rounding: RowRounding::None,
             }),
             head_weights: HeadWeights::Uniform,
@@ -1449,11 +1477,26 @@ mod tests {
             top: 8,
             candidates: magnitude_family_contracts::Candidates::All,
         })));
-        let decoder = decoder(ActivationDType::BF16, vec![block(Operator::Attention(attention))]);
+        Operator::Attention(attention)
+    }
+
+    /// GLM's token-normed keys gated by place.
+    fn gated_selected_attention() -> Operator {
+        selected_attention(
+            Pool::SoftmaxGated { gate: weight(&[64, 32]), position: Some(weight(&[4, 64])) },
+            PoolNorm::Token {
+                norm: magnitude_family_contracts::LayerNorm { weight: weight(&[64]), epsilon: 1e-6 },
+                bias: weight(&[64]),
+            },
+        )
+    }
+
+    /// The Window and Block components of a selected read whose indexer
+    /// pools its keys by `pool` under `norm` at rate 4 over keys of 64.
+    fn pooled_key_layout(pool: Pool, norm: PoolNorm) -> (Vec<ComponentDescriptor>, Vec<ComponentDescriptor>) {
+        let attention = selected_attention(pool, norm);
+        let decoder = decoder(ActivationDType::BF16, vec![block(attention)]);
         let layout = ModelStateLayout::derive(&decoder, &[], KvCodec::AffineK8V4, 0).unwrap();
-        let keys = LayerRef::IndexKeys { block: 0, part: 0 };
-        let produced =
-            |coordinates| ComponentDescriptor::produced(keys, DType::F32, 64, coordinates).unwrap();
         let [
             HistoryDomainLayout::Token { components: token },
             HistoryDomainLayout::Window { rows: 3, components: raw },
@@ -1463,6 +1506,111 @@ mod tests {
             panic!("token, raw and block domains: {:?}", layout.target_history);
         };
         assert_eq!(token[0].role, ComponentRole::History);
-        assert_eq!((raw.as_slice(), finished.as_slice()), (&[produced(true)][..], &[produced(false)][..]));
+        (raw.clone(), finished.clone())
+    }
+
+    fn index_keys(width: usize, coordinates: bool) -> ComponentDescriptor {
+        keys_of(LayerRef::IndexKeys { block: 0, part: 0 }, width, coordinates)
+    }
+
+    fn keys_of(layer: LayerRef, width: usize, coordinates: bool) -> ComponentDescriptor {
+        ComponentDescriptor::produced(layer, DType::F32, width, coordinates).unwrap()
+    }
+
+    /// Qwen4's selected read: raw F32 keys with coordinates in a Window of
+    /// the block less one, F32 block keys in a Block of the block, after
+    /// the attended domain: the layout before history sources, its keys now
+    /// named by part.
+    #[test]
+    fn a_pooled_key_indexer_keeps_its_raw_and_block_keys() {
+        let layout = pooled_key_layout(Pool::Mean, PoolNorm::Pooled(norm(64)));
+        assert_eq!(layout, (vec![index_keys(64, true)], vec![index_keys(64, false)]));
+    }
+
+    /// GLM's: each pending token's normed key and its gate scores beside
+    /// it (2W, as a gated pooled source's Window), the group keys in F32.
+    #[test]
+    fn a_gated_pooled_key_indexer_keeps_its_keys_and_gate_scores() {
+        let layout = pooled_key_layout(
+            Pool::SoftmaxGated { gate: weight(&[64, 32]), position: Some(weight(&[4, 64])) },
+            PoolNorm::Token {
+                norm: magnitude_family_contracts::LayerNorm { weight: weight(&[64]), epsilon: 1e-6 },
+                bias: weight(&[64]),
+            },
+        );
+        assert_eq!(layout, (vec![index_keys(128, true)], vec![index_keys(64, false)]));
+    }
+
+    /// A draft head's block selecting through its own indexer keeps the keys
+    /// beside its rows, named by the head's block: the pending tokens' Window
+    /// and the units' Block, after its Token domain.
+    #[test]
+    fn a_head_keeps_its_indexers_keys_beside_its_rows() {
+        let decoder = decoder(ActivationDType::BF16, vec![block(attention())]);
+        let head = [block(gated_selected_attention())];
+        let layout = ModelStateLayout::derive(&decoder, &head.iter().collect::<Vec<_>>(), KvCodec::AffineK8V4, 0).unwrap();
+        let [
+            HistoryDomainLayout::Token { components: rows },
+            HistoryDomainLayout::Window { rows: 3, components: pending },
+            HistoryDomainLayout::Block { rate: 4, components: units },
+        ] = &layout.head_history[..]
+        else {
+            panic!("token, pending and unit domains: {:?}", layout.head_history);
+        };
+        assert_eq!((rows[0].layer, rows[0].role), (LayerRef::Head(0), ComponentRole::History));
+        assert!(matches!(rows[0].codec.key, crate::Codec::Dense { .. }), "a head's rows stay dense");
+        let keys = LayerRef::HeadIndexKeys { block: 0, part: 0 };
+        assert_eq!(pending, &vec![keys_of(keys, 128, true)]);
+        assert_eq!(units, &vec![keys_of(keys, 64, false)]);
+        // The target keeps none of them.
+        assert_eq!(layout.target_history.len(), 1);
+    }
+
+    /// A drafting round's speculative rows complete units of the head's
+    /// indexer keys beside its rows; accepting only the entry rows leaves the
+    /// state a launch of them alone leaves, the unit and the pending keys the
+    /// rejected rows wrote released, so the next round reads exactly what a
+    /// run that stopped there would.
+    #[test]
+    fn a_rejected_draft_leaves_the_heads_pooled_rows_as_its_entry_rows_alone_do() {
+        use crate::{BankCapacity, HistoryDomainPlan, OwnedAdvanceResolution, OwnedStateAdvance, StateStore};
+        let decoder = decoder(ActivationDType::BF16, vec![block(attention())]);
+        let head = [block(gated_selected_attention())];
+        let layout = ModelStateLayout::derive(&decoder, &head.iter().collect::<Vec<_>>(), KvCodec::AffineK8V4, 0).unwrap();
+        let (context, max_advance) = (64, 16);
+        let plans = layout
+            .head_history
+            .iter()
+            .map(|layout| HistoryDomainPlan { logical_rows: layout.kind().row_limit(context, max_advance).unwrap(), layout: layout.clone() })
+            .collect::<Vec<_>>();
+        let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+        let device = std::rc::Rc::new(catalog.open_backend(seismic::BackendName::Cpu).expect("the CPU backend opens"));
+        let banks = BankCapacity { active: 4, in_flight: 4, retained: 4 };
+        let build = || StateStore::new(device.clone(), context, max_advance, plans.clone(), vec![], banks.clone()).unwrap().1;
+        let store = build();
+        let (pending, units) = store.produced_domains(LayerRef::HeadIndexKeys { block: 0, part: 0 }).map(|(pending, units)| (pending.unwrap(), units)).unwrap();
+        let rows = |ranges: Vec<(usize, usize)>| ranges.into_iter().flat_map(|(start, count)| start..start + count).collect::<Vec<_>>();
+        // Two entry rows and four speculative ones: the chained row at
+        // position 3 completes the first unit.
+        let advance = OwnedStateAdvance::begin(store.create().unwrap(), 6).ok().unwrap();
+        assert_eq!(advance.bindings().destinations[units.0].len(), 1);
+        let OwnedAdvanceResolution::Committed(accepted) = advance.commit(2).ok().unwrap() else {
+            panic!("a prefix commits");
+        };
+        let reference = build();
+        let alone = OwnedStateAdvance::begin(reference.create().unwrap(), 2).ok().unwrap();
+        let OwnedAdvanceResolution::Committed(alone) = alone.commit_all().ok().unwrap() else {
+            panic!("an advance commits");
+        };
+        for domain in [pending, units] {
+            assert_eq!(rows(accepted.history_ranges(domain)).len(), rows(alone.history_ranges(domain)).len());
+            assert_eq!(accepted.history_start(domain), alone.history_start(domain));
+            assert_eq!(store.occupied_rows(domain), reference.occupied_rows(domain));
+        }
+        assert_eq!(accepted.position(), 2);
+        assert_eq!(store.occupied_rows(units), 0);
+        // The next round completes the unit again, from the entry rows alone.
+        let next = OwnedStateAdvance::begin(accepted, 2).ok().unwrap();
+        assert_eq!(next.bindings().destinations[units.0].len(), 1);
     }
 }

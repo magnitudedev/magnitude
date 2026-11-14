@@ -74,7 +74,7 @@ use magnitude_family_contracts::{
 };
 use magnitude_state::LayerRef;
 use seismic::{
-    BackendName, Dim, Element, NativeGraph, NativeGraphClassSlice, NativeGraphMetadata, NativePort,
+    BackendName, Dim, Element, NativeGraph, NativeGraphMetadata, NativePort,
     WorkflowTensor,
 };
 
@@ -566,7 +566,8 @@ struct SublayerRead {
     input: WorkflowTensor,
     form: InputForm,
     join: Join,
-    /// A Sinkhorn site's pre, which the next site reads.
+    /// The pre the next site reads: a Sinkhorn site's own when sites mix
+    /// by the previous site's, or the one the residual carried here.
     pre: Option<WorkflowTensor>,
 }
 
@@ -840,7 +841,9 @@ impl BlockSublayers<'_> {
             Some(sublayer) => {
                 let (topology, numbers) = match sublayer.op {
                     FeedForward::Dense(operator) => {
-                        single(sublayer.input, "dense")?;
+                        if let Some(SublayerSource::Mix(_)) = sublayer.input {
+                            return Err("a dense feed-forward over low-rank streams".into());
+                        }
                         let (expansion, numbers) = dense_ffn::graph::split(load, scope, &operator.up)?;
                         let post_norm = post_norm(sublayer.output, output_scales.feed_forward);
                         (FeedForwardTopology::Dense { expansion, post_norm }, FeedForwardNumbers::Dense(numbers))
@@ -969,7 +972,9 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
     /// norm, joined as one stream; a low-rank mix site's partials over the
     /// streams, joined by the scatter with the site's inject values; or a
     /// Sinkhorn site's input row under the sublayer's norm, joined by the
-    /// scatter with the site's post | comb, the site's pre carried on.
+    /// scatter with the site's post | comb, the site's pre carried on when
+    /// sites mix by the previous site's.
+    #[allow(clippy::too_many_arguments)]
     fn read<'e, G: GraphDraft + 'e>(
         &self,
         graph: &mut G,
@@ -978,6 +983,7 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
         sublayer: u32,
         hidden: &ResidualCarry<WorkflowTensor>,
         weights: &mut Vec<(WeightPort, NativePort)>,
+        constants: &mut Vec<GraphConstant>,
     ) -> Result<SublayerRead, GraphError> {
         let site = streams.and_then(|entries| entries.site(sublayer));
         let rows = &self.numbers.rows;
@@ -1028,12 +1034,13 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
                     hidden,
                     rows.clone(),
                     weights,
+                    constants,
                 )?;
                 Ok(SublayerRead {
                     input: site.input,
                     form: read.form(geometry.streams),
                     join: Join::streams(geometry, site.join, Some("M")),
-                    pre: Some(site.pre),
+                    pre: site.pre,
                 })
             }
         }
@@ -1041,6 +1048,8 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
 
     /// The block's mixer over `carry`: the new residual, and the block's
     /// state and control ports.
+    /// `mixer`'s class scope where it keeps a bank: its request slots
+    /// (`B`), which no other entry of the block reads by that name.
     pub(crate) fn mixer<'e, G: GraphDraft + 'e>(
         &self,
         graph: &mut G,
@@ -1053,7 +1062,7 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
         let scope = self.scope(0);
         let planned = self.weights;
         let (read, ref mixer) = self.topology.mixer;
-        let SublayerRead { input: input_rows, form, join, pre } = self.read(graph, read, streams, 0, carry, weights)?;
+        let SublayerRead { input: input_rows, form, join, pre } = self.read(graph, read, streams, 0, carry, weights, constants)?;
         let hidden = &carry.rows;
         let input = SublayerInput { rows: &input_rows, form };
         let (mixed, block_state) = match (mixer, &self.numbers.mixer, entries) {
@@ -1088,9 +1097,11 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
                 )
             }
             (MixerTopology::Recurrent(topology), MixerNumbers::Recurrent(numbers), MixerEntries::Recurrent(entries)) => {
+                graph.set_class_scope(Some(RECURRENT_SLOTS));
                 let (mixed, ports, controls) = recurrent(
                     graph, entries, topology, numbers, planned, scope, weights, constants, input, hidden, &join,
                 )?;
+                graph.set_class_scope(None);
                 (mixed, (ports, controls).into())
             }
             (
@@ -1098,13 +1109,17 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
                 MixerNumbers::StateSpace(numbers),
                 MixerEntries::StateSpace(entries),
             ) => {
+                graph.set_class_scope(Some(RECURRENT_SLOTS));
                 let (mixed, ports, controls) =
                     state_space(graph, entries, topology, numbers, planned, scope, weights, constants, hidden, &join)?;
+                graph.set_class_scope(None);
                 (mixed, (ports, controls).into())
             }
             (MixerTopology::ShortConv(topology), MixerNumbers::ShortConv(numbers), MixerEntries::ShortConv(entries)) => {
+                graph.set_class_scope(Some(RECURRENT_SLOTS));
                 let (mixed, window, controls) =
                     short_conv(graph, entries, topology, numbers, planned, scope, weights, constants, hidden, &join)?;
+                graph.set_class_scope(None);
                 (mixed, BlockState::bank(vec![window], controls))
             }
             _ => return Err("target block mixer and its kernel entries disagree".into()),
@@ -1235,21 +1250,47 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
                 FeedForwardTopology::Dense { expansion, post_norm },
                 Some(FeedForwardNumbers::Dense(numbers)),
                 FeedForwardEntries::Dense(entries),
-            ) => dense(
-                graph,
-                entries,
-                *expansion,
-                numbers,
-                planned,
-                scope,
-                weights,
-                constants,
-                mixed,
-                rows,
-                None,
-                epsilon,
-                post_norm.as_ref(),
-            )?,
+            ) => {
+                let dense = |graph: &mut G,
+                             weights: &mut Vec<(WeightPort, NativePort)>,
+                             constants: &mut Vec<GraphConstant>,
+                             input: &WorkflowTensor,
+                             sum: &WorkflowTensor| {
+                    dense(
+                        graph, entries, *expansion, numbers, planned, scope, weights, constants, input, sum, rows, None,
+                        epsilon, post_norm.as_ref(),
+                    )
+                };
+                match read {
+                    None | Some(ReadTopology::Norm) => dense(graph, weights, constants, mixed, mixed)?,
+                    // Over Sinkhorn streams the dense branch sums onto zeros.
+                    Some(read @ ReadTopology::Sinkhorn(_)) => {
+                        let (joined, ()) = self.sinkhorn_branch(
+                            graph,
+                            read,
+                            streams,
+                            &carry,
+                            weights,
+                            constants,
+                            false,
+                            |graph, weights, constants, input| {
+                                let zeros = GraphConstant::row_zeros(
+                                    graph,
+                                    Element::f32(),
+                                    rows.clone(),
+                                    &numbers.hidden,
+                                    Some("M"),
+                                )?;
+                                let branch = dense(graph, weights, constants, input, zeros.port().tensor())?;
+                                constants.push(zeros);
+                                Ok((branch, ()))
+                            },
+                        )?;
+                        return Ok((joined, None));
+                    }
+                    Some(ReadTopology::Mix { .. }) => return Err("a dense feed-forward over low-rank streams".into()),
+                }
+            }
             (
                 FeedForwardTopology::Routed(topology),
                 Some(FeedForwardNumbers::Routed(numbers)),
@@ -1257,7 +1298,7 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
             ) => {
                 let read = read.ok_or("a routed feed-forward without its input source")?;
                 let SublayerRead { input: input_rows, form, join, pre } =
-                    self.read(graph, read, streams, 1, &carry, weights)?;
+                    self.read(graph, read, streams, 1, &carry, weights, constants)?;
                 let (output, sequence) = routed_graph::routed(
                     graph,
                     entries,
@@ -1298,28 +1339,17 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
                         Ok((carried(output, carry.pre.clone()), sequence))
                     }
                     // Over Sinkhorn streams the routed branch sums onto
-                    // zeros, and `stream_join` joins it into the streams.
-                    Some(read @ ReadTopology::Sinkhorn(_)) => {
-                        let read = self.read(graph, read, streams, 1, &carry, weights)?;
-                        let (branch, sequence) = routed(graph, weights, constants, &read.input, RoutedSum::Branch)?;
-                        if front {
-                            return Ok((carry.clone(), sequence));
-                        }
-                        let entry = streams
-                            .and_then(|streams| streams.sinkhorn())
-                            .ok_or("a Sinkhorn join without its entry")?
-                            .join;
-                        let joined = stream_join(
-                            graph,
-                            entry,
-                            self.streams_geometry()?.clone(),
-                            mixed,
-                            &branch,
-                            read.join.values.as_ref().ok_or("a Sinkhorn site without its join values")?,
-                            rows.clone(),
-                        )?;
-                        Ok((ResidualCarry { rows: joined, pre: read.pre }, sequence))
-                    }
+                    // zeros (`RoutedSum::Branch`).
+                    Some(read @ ReadTopology::Sinkhorn(_)) => self.sinkhorn_branch(
+                        graph,
+                        read,
+                        streams,
+                        &carry,
+                        weights,
+                        constants,
+                        front,
+                        |graph, weights, constants, input| routed(graph, weights, constants, input, RoutedSum::Branch),
+                    ),
                     Some(ReadTopology::Mix { .. }) => Err("a general routed feed-forward over low-rank streams".into()),
                 };
             }
@@ -1348,6 +1378,49 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
             _ => return Err("target block feed-forward and its kernel entries disagree".into()),
         };
         Ok((ResidualCarry { rows: output, pre: carry.pre.clone() }, None))
+    }
+
+    /// A feed-forward branch behind its Sinkhorn site: `branch` runs over
+    /// the site's input row and returns its F32 output `[rows, H]`, summed
+    /// onto zeros, which `stream_join` joins into the streams `carry` holds
+    /// by the site's post | comb. A split layer's front returns the carry it
+    /// read, its back joining the branch.
+    #[allow(clippy::too_many_arguments)]
+    fn sinkhorn_branch<'e, G: GraphDraft + 'e, T>(
+        &self,
+        graph: &mut G,
+        read: ReadTopology,
+        streams: Option<StreamsEntries<'e, G>>,
+        carry: &ResidualCarry<WorkflowTensor>,
+        weights: &mut Vec<(WeightPort, NativePort)>,
+        constants: &mut Vec<GraphConstant>,
+        front: bool,
+        branch: impl FnOnce(
+            &mut G,
+            &mut Vec<(WeightPort, NativePort)>,
+            &mut Vec<GraphConstant>,
+            &WorkflowTensor,
+        ) -> Result<(WorkflowTensor, T), GraphError>,
+    ) -> Result<(ResidualCarry<WorkflowTensor>, T), GraphError> {
+        let read = self.read(graph, read, streams, 1, carry, weights, constants)?;
+        let (output, value) = branch(graph, weights, constants, &read.input)?;
+        if front {
+            return Ok((carry.clone(), value));
+        }
+        let entry = streams
+            .and_then(|streams| streams.sinkhorn())
+            .ok_or("a Sinkhorn join without its entry")?
+            .join;
+        let joined = stream_join(
+            graph,
+            entry,
+            self.streams_geometry()?.clone(),
+            &carry.rows,
+            &output,
+            read.join.values.as_ref().ok_or("a Sinkhorn site without its join values")?,
+            self.numbers.rows.clone(),
+        )?;
+        Ok((ResidualCarry { rows: joined, pre: read.pre }, value))
     }
 
     /// The block's per-layer input sublayer over `residual`: the new
@@ -1428,35 +1501,7 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
     }
 }
 
-/// A feed-forward's class dimensions for a `rows`-row launch: a routed
-/// feed-forward's grouped entries size their tile table from the row count
-/// alone, its combine (the fused combine, the general scatter) from the
-/// rows its experts were grouped over, `grouped` (the launch's, or the
-/// chain's after its group's pass).
-pub(crate) fn feed_forward_class_slice(
-    paired: &PairedBlock,
-    rows: u64,
-    grouped_rows: u64,
-    mut slice: NativeGraphClassSlice,
-) -> Result<NativeGraphClassSlice, String> {
-    let grouped = match paired.feed_forward.map(|sublayer| sublayer.op) {
-        Some(FeedForward::Routed(shape)) => Some((shape, &["routed_group", "routed_experts"][..], "routed_combine")),
-        Some(
-            FeedForward::GeneralRouted(shape)
-            | FeedForward::Parallel(DenseBesideRouted { routed: shape, .. }),
-        ) => Some((shape, &["routed_group", "routed_experts", "routed_experts_up"][..], "routed_scatter")),
-        Some(FeedForward::Dense(_)) | None => None,
-    };
-    if let Some((shape, entries, combine)) = grouped {
-        if !routed_graph::decodes(rows) {
-            let blocks = routed_graph::grouped_blocks(rows, shape.experts, shape.selected)?.fixed();
-            for entry in entries {
-                slice = slice.scoped(entry, "B", [blocks]);
-            }
-            let blocks = routed_graph::grouped_blocks(grouped_rows, shape.experts, shape.selected)?.fixed();
-            slice = slice.scoped(combine, "B", [blocks]);
-        }
-    }
-    Ok(slice)
-}
-
+/// The class scope of a recurrent mixer's nodes and ports, whose `B` is the
+/// block's request slots: a block's other entries call other dimensions `B`
+/// (a routed feed-forward's expert tiles).
+pub(crate) const RECURRENT_SLOTS: &str = "recurrent_slots";

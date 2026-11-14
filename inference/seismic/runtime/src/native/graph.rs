@@ -767,6 +767,8 @@ pub struct NativeGraphMetadataDraft {
     identity: u64,
     ports: Vec<PortSpec>,
     nodes: Vec<PlannedNode>,
+    /// Per node, the name of its checked entry, which a mismatch names.
+    entries: Vec<&'static str>,
     /// Per node, the lengths of its sealed form's vectors.
     shapes: Vec<SealedNodeShape>,
     results: Vec<Vec<Option<NativeTensorSpec>>>,
@@ -1061,6 +1063,7 @@ impl NativeGraphMetadataDraft {
             identity: NEXT_NATIVE_GRAPH.fetch_add(1, Ordering::Relaxed),
             ports: Vec::new(),
             nodes: Vec::new(),
+            entries: Vec::new(),
             shapes: Vec::new(),
             results: Vec::new(),
             exports: Vec::new(),
@@ -1168,8 +1171,10 @@ impl NativeGraphMetadataDraft {
         prewrite_port(self.identity, &mut self.ports, port)
     }
 
+    /// Node `entry` (its checked entry's name) over `args`.
     pub fn enqueue(
         &mut self,
+        entry: &'static str,
         args: EncodedWorkflowArgs,
         parameter_shapes: Vec<Option<(RepresentationId, Vec<u64>)>>,
         result_shapes: Vec<Option<(RepresentationId, Vec<u64>)>>,
@@ -1179,7 +1184,7 @@ impl NativeGraphMetadataDraft {
         let node = u32::try_from(self.nodes.len()).expect("native graph node ordinal exhausted");
         validate_node_references(self.identity, self.ports.len(), node, &args)
             .map_err(CallError::Workflow)?;
-        validate_metadata_arguments(&args, &parameter_shapes, &self.ports, &self.results, None)?;
+        validate_metadata_arguments(entry, &args, &parameter_shapes, &self.ports, &self.results, None)?;
         validate_park(&self.timelines, self.nodes.len(), shape.parks).map_err(CallError::Workflow)?;
         let results = result_shapes
             .into_iter()
@@ -1199,6 +1204,7 @@ impl NativeGraphMetadataDraft {
             .collect::<Result<Vec<_>, CallError>>()?;
         let count = u32::try_from(results.len()).expect("native result ordinal exhausted");
         self.nodes.push(PlannedNode { args: Arc::new(args), scratch, condition: None, share: None });
+        self.entries.push(entry);
         self.shapes.push(shape);
         self.results.push(results);
         Ok(PendingWorkflowResults::new(self.identity, node, count))
@@ -1213,6 +1219,7 @@ impl NativeGraphMetadataDraft {
     /// proof that results may share storage (`Self::share`).
     pub fn enqueue_under(
         &mut self,
+        entry: &'static str,
         args: EncodedWorkflowArgs,
         parameter_shapes: Vec<Option<(RepresentationId, Vec<u64>)>>,
         result_shapes: Vec<Option<(RepresentationId, Vec<u64>)>>,
@@ -1221,7 +1228,7 @@ impl NativeGraphMetadataDraft {
         condition: NodeCondition,
     ) -> Result<PendingWorkflowResults, CallError> {
         let port = condition_port(self.identity, &self.ports, self.nodes.len(), condition).map_err(CallError::Workflow)?;
-        let pending = self.enqueue(args, parameter_shapes, result_shapes, scratch, shape)?;
+        let pending = self.enqueue(entry, args, parameter_shapes, result_shapes, scratch, shape)?;
         self.nodes.last_mut().expect("the node just enqueued").condition = Some((port, condition.index, condition.encoded));
         Ok(pending)
     }
@@ -1401,8 +1408,8 @@ impl ValidatedMetadataDraft {
                     .collect::<Result<Vec<_>, _>>()
             })
             .collect::<Result<Vec<_>, _>>()?;
-        for (node, parameters) in self.draft.nodes.iter().zip(parameters) {
-            validate_metadata_arguments(&node.args, parameters, &ports, &results, Some(facts))?;
+        for ((node, entry), parameters) in self.draft.nodes.iter().zip(&self.draft.entries).zip(parameters) {
+            validate_metadata_arguments(entry, &node.args, parameters, &ports, &results, Some(facts))?;
         }
         validate_stores(&self.draft.stores, &ports, &results, &self.draft.exports).map_err(CallError::Workflow)?;
         validate_shares(&self.draft.nodes, &results, &self.draft.exports, &self.draft.stores).map_err(CallError::Workflow)
@@ -1564,33 +1571,45 @@ fn make_layout(
 /// recording, or, with `facts`, each view's operations at a graph trace's
 /// facts (`NativeGraphMetadataDraft::validate_at`).
 fn validate_metadata_arguments(
+    entry: &'static str,
     args: &EncodedWorkflowArgs,
     parameter_shapes: &[Option<(RepresentationId, Vec<u64>)>],
     ports: &[PortSpec],
     results: &[Vec<Option<NativeTensorSpec>>],
     facts: Option<&[u64]>,
 ) -> Result<(), CallError> {
+    let mismatch = |parameter: usize, expected: String, bound: String| {
+        CallError::Workflow(WorkflowError::NativeGraphArgumentMismatch { entry, parameter, expected, bound })
+    };
+    let shape = |shape: &Option<(RepresentationId, Vec<u64>)>| match shape {
+        Some((representation, extents)) => format!("a {representation:?} tensor {extents:?}"),
+        None => "a scalar".to_owned(),
+    };
     if parameter_shapes.len() != args.arguments().len() {
-        return Err(CallError::Workflow(
-            WorkflowError::NativeGraphArgumentMismatch { parameter: 0 },
+        return Err(mismatch(
+            0,
+            format!("{} arguments", parameter_shapes.len()),
+            format!("{} arguments", args.arguments().len()),
         ));
     }
     for (ordinal, (argument, expected)) in args.arguments().iter().zip(parameter_shapes).enumerate()
     {
         match (argument, expected) {
             (EncodedWorkflowArgument::Tensor(argument), Some((representation, extents))) => {
-                let actual = metadata_argument_shape(argument, ordinal, ports, results, facts)?;
+                let actual = metadata_argument_shape(entry, argument, ordinal, ports, results, facts)?;
                 if actual.0 != *representation || actual.1 != *extents {
-                    return Err(CallError::Workflow(
-                        WorkflowError::NativeGraphArgumentMismatch { parameter: ordinal },
-                    ));
+                    return Err(mismatch(ordinal, shape(expected), shape(&Some(actual))));
                 }
             }
             (EncodedWorkflowArgument::Scalar(_), None) => {}
-            _ => {
-                return Err(CallError::Workflow(
-                    WorkflowError::NativeGraphArgumentMismatch { parameter: ordinal },
-                ));
+            (EncodedWorkflowArgument::Tensor(_), None) => {
+                return Err(mismatch(ordinal, shape(expected), "a tensor".to_owned()));
+            }
+            (EncodedWorkflowArgument::Scalar(_) | EncodedWorkflowArgument::ScalarResult(_), Some(_)) => {
+                return Err(mismatch(ordinal, shape(expected), "a scalar".to_owned()));
+            }
+            (EncodedWorkflowArgument::ScalarResult(_), None) => {
+                return Err(mismatch(ordinal, "a host scalar".to_owned(), "a node's scalar result".to_owned()));
             }
         }
     }
@@ -1598,6 +1617,7 @@ fn validate_metadata_arguments(
 }
 
 fn metadata_argument_shape(
+    entry: &'static str,
     argument: &WorkflowTensorArgument,
     ordinal: usize,
     ports: &[PortSpec],
@@ -1614,7 +1634,14 @@ fn metadata_argument_shape(
                         .iter()
                         .map(|expression| expression.at(facts))
                         .collect::<Option<Vec<_>>>()
-                        .ok_or(CallError::Workflow(WorkflowError::NativeGraphArgumentMismatch { parameter: ordinal }))?,
+                        .ok_or_else(|| {
+                            CallError::Workflow(WorkflowError::NativeGraphArgumentMismatch {
+                                entry,
+                                parameter: ordinal,
+                                expected: "a view defined at the trace's facts".to_owned(),
+                                bound: "a view with an undefined extent there".to_owned(),
+                            })
+                        })?,
                 ),
             ),
             _ => (*result, std::borrow::Cow::Borrowed(operations.as_slice())),

@@ -1349,6 +1349,7 @@ fn vision_definition() -> ModelDefinition {
             standardize: None,
             projection_norm: None,
             stages: Vec::new(),
+            feed_forward: None,
             output_norm: None,
         },
     });
@@ -2448,11 +2449,14 @@ fn an_expert_read_failure_fails_only_its_steps_sequences() {
 
 /// The planning fixture with its attention selecting one block of four rows
 /// past the dense limit, by an indexer of two 64-wide heads, over a 64-token
-/// context.
-fn selected_definition() -> ModelDefinition {
+/// context: its keys each block's mean under an RMS norm (Qwen4exp's), or
+/// where `gated` each token's key LayerNorm-ed with a bias and the block's
+/// softmax-gated with a per-place term (GLM-5.3's).
+fn selected_definition(gated: bool) -> ModelDefinition {
     use magnitude_family_contracts::{
         HeadNorm, HeadWeights, HistoryReads, Indexer, IndexerInput, IndexerKeys, IndexerQuery,
-        Operator, Pool, PooledRows, RmsNorm, RowRounding, Selection, WeightDescriptor,
+        LayerNorm, Operator, Pool, PoolNorm, PooledRows, RmsNorm, RowRounding, Selection,
+        WeightDescriptor,
     };
     let mut definition = tiny_definition();
     definition.decoder.context_limit = 64;
@@ -2476,8 +2480,23 @@ fn selected_definition() -> ModelDefinition {
         keys: IndexerKeys::Pooled(PooledRows {
             rate: 4,
             projection: WeightDescriptor::stored("indexer_k", vec![64, hidden]),
-            pool: Pool::Mean,
-            norm: norm("indexer_k_norm"),
+            pool: match gated {
+                false => Pool::Mean,
+                true => Pool::SoftmaxGated {
+                    gate: WeightDescriptor::stored("indexer_k_gate", vec![64, hidden]),
+                    position: Some(WeightDescriptor::stored("indexer_k_place", vec![4, 64])),
+                },
+            },
+            norm: match gated {
+                false => PoolNorm::Pooled(norm("indexer_k_norm")),
+                true => PoolNorm::Token {
+                    norm: LayerNorm {
+                        weight: WeightDescriptor::stored("indexer_k_norm", vec![64]),
+                        epsilon: 1e-6,
+                    },
+                    bias: WeightDescriptor::stored("indexer_k_bias", vec![64]),
+                },
+            },
             rounding: RowRounding::None,
         }),
         head_weights: HeadWeights::Uniform,
@@ -2494,80 +2513,84 @@ fn selected_definition() -> ModelDefinition {
 /// it completes; a commit of an accepted prefix keeps the blocks that prefix
 /// completes, so a rollback across a block boundary continues as a straight
 /// run does. The graphs of every class (the indexer, the Segments decode,
-/// the WorkList prefill) prepare and seal on the device.
+/// the WorkList prefill) prepare and seal on the device. Each key form:
+/// a mean's raw keys and a gated pool's normed keys beside their gate
+/// scores keep one Window row per pending token alike.
 #[test]
 fn selected_histories_follow_blocks_across_rollback() {
     use magnitude_state::HistoryDomainId;
     const RAW: HistoryDomainId = HistoryDomainId(1);
     const BLOCKS: HistoryDomainId = HistoryDomainId(2);
-    let (mut domain, mut bindings) = fixture_of(
-        selected_definition(),
-        limits(16, 1, false),
-        None,
-        false,
-        platform::DeviceRequest::Automatic,
-    );
-    let blocks = |domain: &ExecutorDomain<TestFamily>, request| {
+    for gated in [false, true] {
+        let (mut domain, mut bindings) = fixture_of(
+            selected_definition(gated),
+            limits(16, 1, false),
+            None,
+            false,
+            platform::DeviceRequest::Automatic,
+        );
+        let blocks = |domain: &ExecutorDomain<TestFamily>, request| {
+            domain
+                .resume_state(request)
+                .unwrap()
+                .target
+                .history_ranges(BLOCKS)
+                .iter()
+                .map(|(_, rows)| rows)
+                .sum::<usize>()
+        };
+        let source = RequestId(91);
+        open(&mut domain, &mut bindings, source);
+        // Ten prompt rows complete blocks 0 and 1.
+        let tokens = (0..10).collect::<Vec<u32>>();
+        let flight = submit_reserved_target(&mut domain, bindings, vec![feed(source, 0, &tokens)]);
+        let (pending, bindings) = finish_one(&mut domain, flight);
         domain
-            .resume_state(request)
-            .unwrap()
-            .target
-            .history_ranges(BLOCKS)
-            .iter()
-            .map(|(_, rows)| rows)
-            .sum::<usize>()
-    };
-    let source = RequestId(91);
-    open(&mut domain, &mut bindings, source);
-    // Ten prompt rows complete blocks 0 and 1.
-    let tokens = (0..10).collect::<Vec<u32>>();
-    let flight = submit_reserved_target(&mut domain, bindings, vec![feed(source, 0, &tokens)]);
-    let (pending, bindings) = finish_one(&mut domain, flight);
-    domain
-        .reconcile(pending, PhysicalDecision { accepted_rows: 10 })
-        .unwrap();
-    assert_eq!(blocks(&domain, source), 2);
-    // Six rows from 10 complete blocks 2 and 3, then roll back whole: the
-    // history keeps blocks 0 and 1.
-    let flight = submit_reserved_target(
-        &mut domain,
-        bindings,
-        vec![feed(source, 10, &[20, 21, 22, 23, 24, 25])],
-    );
-    let (pending, bindings) = finish_one(&mut domain, flight);
-    domain.abort(pending).unwrap();
-    assert_eq!(domain.resume_state(source).unwrap().position(), 10);
-    assert_eq!(blocks(&domain, source), 2);
-    // Two other rows from 10 (positions 10, 11) complete block 2 alone.
-    let flight = submit_reserved_target(&mut domain, bindings, vec![feed(source, 10, &[40, 41])]);
-    let (pending, bindings) = finish_one(&mut domain, flight);
-    domain
-        .reconcile(pending, PhysicalDecision { accepted_rows: 2 })
-        .unwrap();
-    assert_eq!(domain.resume_state(source).unwrap().position(), 12);
-    assert_eq!(blocks(&domain, source), 3);
-    // The raw keys of positions 9..12 remain for the next block.
-    let checkpoint = domain.resume_state(source).unwrap();
-    assert_eq!(
-        checkpoint
-            .target
-            .history_ranges(RAW)
-            .iter()
-            .map(|(_, rows)| rows)
-            .sum::<usize>(),
-        3
-    );
-    // Single decode rows continue past the dense limit, completing block 3.
-    let mut bindings = bindings;
-    for (position, token) in (12..16).zip(30..) {
-        let flight = submit_reserved_target(&mut domain, bindings, vec![feed(source, position, &[token])]);
-        let (pending, returned) = finish_one(&mut domain, flight);
-        domain
-            .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+            .reconcile(pending, PhysicalDecision { accepted_rows: 10 })
             .unwrap();
-        bindings = returned;
+        assert_eq!(blocks(&domain, source), 2);
+        // Six rows from 10 complete blocks 2 and 3, then roll back whole: the
+        // history keeps blocks 0 and 1.
+        let flight = submit_reserved_target(
+            &mut domain,
+            bindings,
+            vec![feed(source, 10, &[20, 21, 22, 23, 24, 25])],
+        );
+        let (pending, bindings) = finish_one(&mut domain, flight);
+        domain.abort(pending).unwrap();
+        assert_eq!(domain.resume_state(source).unwrap().position(), 10);
+        assert_eq!(blocks(&domain, source), 2);
+        // Two other rows from 10 (positions 10, 11) complete block 2 alone.
+        let flight = submit_reserved_target(&mut domain, bindings, vec![feed(source, 10, &[40, 41])]);
+        let (pending, bindings) = finish_one(&mut domain, flight);
+        domain
+            .reconcile(pending, PhysicalDecision { accepted_rows: 2 })
+            .unwrap();
+        assert_eq!(domain.resume_state(source).unwrap().position(), 12);
+        assert_eq!(blocks(&domain, source), 3);
+        // The raw keys of positions 9..12 remain for the next block.
+        let checkpoint = domain.resume_state(source).unwrap();
+        assert_eq!(
+            checkpoint
+                .target
+                .history_ranges(RAW)
+                .iter()
+                .map(|(_, rows)| rows)
+                .sum::<usize>(),
+            3
+        );
+        // Single decode rows continue past the dense limit, completing block 3.
+        let mut bindings = bindings;
+        for (position, token) in (12..16).zip(30..) {
+            let flight = submit_reserved_target(&mut domain, bindings, vec![feed(source, position, &[token])]);
+            let (pending, returned) = finish_one(&mut domain, flight);
+            domain
+                .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+                .unwrap();
+            bindings = returned;
+        }
+        assert_eq!(blocks(&domain, source), 4);
     }
-    assert_eq!(blocks(&domain, source), 4);
 }
 
 /// A causal head (entry rows, no proposals) has no selection to pad a

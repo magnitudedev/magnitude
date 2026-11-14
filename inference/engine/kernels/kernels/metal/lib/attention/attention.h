@@ -1644,7 +1644,7 @@ inline void prefill_prepare(History history, device const Scalar *query,
 // and the F32 output from activation-dtype probabilities. `scores` forms a
 // key tile's probabilities and rescales the output (K staged); `accumulate`
 // adds their product with the staged V; `store` publishes the window.
-// A launch's WorkList selection (`indexer_select`'s per-row block bitmap,
+// A launch's WorkList selection (`unit_reads`' per-row block bitmap,
 // `words` words a row, `block_rows` keys a block; none when `words` is 0),
 // with what its list launch (`prefill_list`) leaves: each row's key ordinal
 // at the start of each of its spans (`bases`, [M][R + 1]) and each query

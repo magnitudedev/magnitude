@@ -191,7 +191,7 @@ mod tests {
             }
         }
         std::fs::write(&path, &bytes).unwrap();
-        let stored = Stored::Dense(StoredTensor {
+        let stored = Stored::dense(StoredTensor {
             source: Arc::new(FileSource::open(&path).unwrap()),
             offset: 16,
             nbytes: 5 * 3 * 4,

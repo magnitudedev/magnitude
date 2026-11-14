@@ -9,6 +9,7 @@
 use magnitude_family_contracts::ModelFamily;
 use magnitude_family_deepseek41::DeepSeek41Family;
 use magnitude_family_gemma4::Gemma4Family;
+use magnitude_family_glm5next::Glm5NextFamily;
 use magnitude_family_lfm2::Lfm2Family;
 use magnitude_family_llama::LlamaFamily;
 use magnitude_family_muse_glimmer::MuseGlimmerFamily;
@@ -27,4 +28,5 @@ pub static FAMILIES: &[&dyn ModelFamily] = &[
     &Gemma4Family,
     &MuseGlimmerFamily,
     &DeepSeek41Family,
+    &Glm5NextFamily,
 ];

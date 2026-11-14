@@ -1,12 +1,14 @@
 // pool_rows on Vulkan (contract and portable body in pooled.seismic), the
 // CUDA launches (`cuda/pool_rows.cu`):
 //
-// append:   a logical subgroup per row; its u (then g) and coordinates to the
+// append:   a logical subgroup per row, lane l holding columns l + 32 k; its
+//           u (LayerNorm-ed when TN = 1, then g) and coordinates to the
 //           window planes.
 // complete: a logical subgroup per row, lane l holding columns
 //           [l E, (l + 1) E); a completing row gathers its group (the last
-//           RATE - 1 rows of its window spans, then its own inputs), pools
-//           it, RMS-norms it with `norm` (the latent, published), rotates it
+//           RATE - 1 rows of its window spans, then its own inputs, normed as
+//           append's; its gates plus their place terms), pools it, RMS-norms
+//           it with `norm` when TN = 0 (the latent, published), rotates it
 //           at the coordinates stored with the group's first token
 //           (`rotary_lane_rotate`), rounds it (`rounding_lanes`; a rounded
 //           row held in A after its pooling, norm and rotation) and stores it
@@ -16,16 +18,29 @@
 #include <seismic/element.glsl>
 #include <seismic/slab.glsl>
 #include "lib/core/activation.glsl"
+// The row element Y: A for a history source's rows, F32 for indexer keys.
+#if defined(SEISMIC_ELEMENT_Y_REPRESENTATION_F32)
+#define POOL_ROW ELEMENT_F32
+#elif defined(SEISMIC_ELEMENT_Y_REPRESENTATION_BF16)
+#define POOL_ROW ELEMENT_BF16
+#elif defined(SEISMIC_ELEMENT_Y_REPRESENTATION_F16)
+#define POOL_ROW ELEMENT_F16
+#else
+#error "pool_rows requires a dense row element"
+#endif
 #include "lib/core/precise.glsl"
 
 #define POOL_W uint(2ul * SEISMIC_DIM_P + SEISMIC_DIM_S)
 #define LANE_E (POOL_W / 32u)
 #define POOL_RATE uint(SEISMIC_DIM_RATE)
 #define POOL_GATED (SEISMIC_DIM_GT != 0)
+#define POOL_TOKEN_NORM (SEISMIC_DIM_TN != 0)
+#define POOL_PLACES uint(SEISMIC_DIM_PR)
 // A window row: u, then (gated) g.
 #define POOL_WIDTH ((POOL_GATED ? 2u : 1u) * POOL_W)
 
 #include "lib/core/head.glsl"
+#include "lib/core/norm.glsl"
 #include "lib/core/rotary.glsl"
 #include "lib/core/rounding.glsl"
 #include "lib/indexer/indexer.glsl"
@@ -34,6 +49,37 @@
 // (RT = 1, from S); half-split, or adjacent (RA = 1).
 #define POOL_ROTARY \
     rotary_layout(uint(SEISMIC_DIM_P), SEISMIC_DIM_RT != 0 ? uint(SEISMIC_DIM_S) : 0u, SEISMIC_DIM_RA != 0)
+
+// Row `row`'s own u, the lane holding column l + 32 k (`strided`, append's)
+// or l E + k (complete's) in x[k], LayerNorm-ed per token with `norm` and
+// `bias` when TN = 1 (`token_norm`): `norm_*`'s arithmetic over the logical
+// subgroup's partials.
+void pool_own_row(inout float x[LANE_E], uint64_t row, uint lane, bool strided) {
+    const uint64_t u = SEISMIC_PTR(SEISMIC_BUFFER_U) + row * SEISMIC_U_STRIDE_0 * 4ul;
+    [[unroll]] for (uint k = 0u; k < LANE_E; ++k) {
+        const uint column = strided ? lane + 32u * k : lane * LANE_E + k;
+        x[k] = element_f32_at(u + uint64_t(column) * SEISMIC_U_STRIDE_1 * 4ul);
+    }
+    if (POOL_TOKEN_NORM) {
+        float sum = 0.0;
+        [[unroll]] for (uint k = 0u; k < LANE_E; ++k)
+            sum += x[k];
+        const float mean = norm_mean(seismic_subgroup_sum_f32(sum), POOL_W);
+        float squares = 0.0;
+        [[unroll]] for (uint k = 0u; k < LANE_E; ++k) {
+            x[k] -= mean;
+            squares = norm_square(x[k], squares);
+        }
+        const float inverse = norm_inverse(seismic_subgroup_sum_f32(squares), POOL_W,
+            element_word_f32(SEISMIC_PARAM_EPSILON));
+        [[unroll]] for (uint k = 0u; k < LANE_E; ++k) {
+            const uint64_t column = uint64_t(strided ? lane + 32u * k : lane * LANE_E + k);
+            x[k] = norm_apply(x[k], inverse,
+                true, element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_NORM) + column * SEISMIC_NORM_STRIDE_1 * 4ul),
+                true, element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_BIAS) + column * SEISMIC_BIAS_STRIDE_1 * 4ul));
+        }
+    }
+}
 
 void pool_rows_append() {
     const uint64_t row = gl_WorkGroupID.x;
@@ -45,10 +91,10 @@ void pool_rows_append() {
     const uint slab_rows = uint(SEISMIC_PARAM_WINDOW_SLAB_ROWS);
     const uint64_t target = slab_row(SEISMIC_PTR(SEISMIC_BUFFER_WINDOW_ROWS), uint(destination), slab_rows,
         uint64_t(POOL_WIDTH) * 4ul);
-    const uint64_t u = SEISMIC_PTR(SEISMIC_BUFFER_U);
-    for (uint column = lane; column < POOL_W; column += 32u)
-        element_f32_put(target + uint64_t(column) * 4ul,
-            element_f32_at(u + (row * SEISMIC_U_STRIDE_0 + uint64_t(column) * SEISMIC_U_STRIDE_1) * 4ul));
+    float x[LANE_E];
+    pool_own_row(x, row, lane, true);
+    [[unroll]] for (uint k = 0u; k < LANE_E; ++k)
+        element_f32_put(target + uint64_t(lane + 32u * k) * 4ul, x[k]);
     if (POOL_GATED) {
         const uint64_t g = SEISMIC_PTR(SEISMIC_BUFFER_G);
         for (uint column = lane; column < POOL_W; column += 32u)
@@ -62,17 +108,21 @@ void pool_rows_append() {
     }
 }
 
-// Member `member` of the group's column `column`: a window row's u (gate:
-// its g after it), or the row's own for the last member.
-float pool_value(uint64_t members[16], uint64_t row, uint member, uint column) {
-    return member + 1u < POOL_RATE
-        ? element_f32_at(members[member] + uint64_t(column) * 4ul)
-        : element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_U) + (row * SEISMIC_U_STRIDE_0 + uint64_t(column) * SEISMIC_U_STRIDE_1) * 4ul);
+// Member `member` of the group's column `column`: a window row's u (normed
+// when TN = 1), or the row's own (`own`, normed here) for the last member.
+float pool_value(uint64_t members[16], float own, uint member, uint column) {
+    return member + 1u < POOL_RATE ? element_f32_at(members[member] + uint64_t(column) * 4ul) : own;
 }
+// Its gate logit: a window row's g after its u, or the row's own g; plus its
+// place's term (PR = RATE; none at PR = 0).
 float pool_gate(uint64_t members[16], uint64_t row, uint member, uint column) {
-    return member + 1u < POOL_RATE
+    const float logit = member + 1u < POOL_RATE
         ? element_f32_at(members[member] + uint64_t(POOL_W + column) * 4ul)
         : element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_G) + (row * SEISMIC_G_STRIDE_0 + uint64_t(column) * SEISMIC_G_STRIDE_1) * 4ul);
+    return member < POOL_PLACES
+        ? logit + element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_POSITION)
+            + (uint64_t(member) * SEISMIC_POSITION_STRIDE_0 + uint64_t(column) * SEISMIC_POSITION_STRIDE_1) * 4ul)
+        : logit;
 }
 
 void pool_rows_complete() {
@@ -105,6 +155,8 @@ void pool_rows_complete() {
             uint(indexer_span_row(spans, SEISMIC_DIM_R, SEISMIC_WINDOW_VISIBLE_STRIDE_1,
                 SEISMIC_WINDOW_VISIBLE_STRIDE_2, first_member + member)),
             window_slab_rows, uint64_t(POOL_WIDTH) * 4ul);
+    float own[LANE_E];
+    pool_own_row(own, row, lane, false);
     float x[LANE_E];
     if (POOL_GATED) {
         float top[LANE_E], total[LANE_E];
@@ -122,13 +174,13 @@ void pool_rows_complete() {
         for (uint member = 0u; member < POOL_RATE; ++member)
             [[unroll]] for (uint i = 0u; i < LANE_E; ++i)
                 x[i] += seismic_div_rn(precise_exp(pool_gate(members, row, member, lane * LANE_E + i) - top[i]), total[i])
-                    * pool_value(members, row, member, lane * LANE_E + i);
+                    * pool_value(members, own[i], member, lane * LANE_E + i);
     } else {
         [[unroll]] for (uint i = 0u; i < LANE_E; ++i)
             x[i] = 0.0;
         for (uint member = 0u; member < POOL_RATE; ++member)
             [[unroll]] for (uint i = 0u; i < LANE_E; ++i)
-                x[i] += pool_value(members, row, member, lane * LANE_E + i);
+                x[i] += pool_value(members, own[i], member, lane * LANE_E + i);
         [[unroll]] for (uint i = 0u; i < LANE_E; ++i)
             x[i] = seismic_div_rn(x[i], float(POOL_RATE));
     }
@@ -137,9 +189,13 @@ void pool_rows_complete() {
     const rounding_t trained =
         rounding_of(SEISMIC_PARAM_BLOCK, SEISMIC_PARAM_ELEMENT, SEISMIC_PARAM_SCALE, SEISMIC_PARAM_AMAX_FLOOR);
     rounding_hold_lanes(x, trained);
-    // The latent: RMS-normed with `norm`.
-    head_rms_norm(x, SEISMIC_PTR(SEISMIC_BUFFER_NORM), SEISMIC_NORM_STRIDE_1, element_word_f32(SEISMIC_PARAM_EPSILON), lane);
-    rounding_hold_lanes(x, trained);
+    // The latent: RMS-normed with `norm` (TN = 0); a token-normed row's is the
+    // pooled row.
+    if (!POOL_TOKEN_NORM) {
+        head_rms_norm(x, SEISMIC_PTR(SEISMIC_BUFFER_NORM), SEISMIC_NORM_STRIDE_1,
+            element_word_f32(SEISMIC_PARAM_EPSILON), lane);
+        rounding_hold_lanes(x, trained);
+    }
     [[unroll]] for (uint i = 0u; i < LANE_E; ++i)
         element_f32_put(published + uint64_t(lane * LANE_E + i) * SEISMIC_RESULT_0_STRIDE_1 * 4ul, x[i]);
     if (lane == 0u)
@@ -159,9 +215,9 @@ void pool_rows_complete() {
     rotary_lane_rotate(x, turns, POOL_ROTARY, lane);
     rounding_hold_lanes(x, trained);
     rounding_lanes(x, trained);
-    // Published in the activation element, which holds every rounded value.
+    // Stored in the row element Y (A holds every rounded value; F32 keys hold every value).
     const uint64_t target = slab_row(SEISMIC_PTR(SEISMIC_BUFFER_BLOCK_ROWS), uint(destination),
-        uint(SEISMIC_PARAM_BLOCK_SLAB_ROWS), uint64_t(POOL_W) * uint64_t(ELEMENT_BYTES(ELEMENT_ACT)));
+        uint(SEISMIC_PARAM_BLOCK_SLAB_ROWS), uint64_t(POOL_W) * uint64_t(ELEMENT_BYTES(POOL_ROW)));
     [[unroll]] for (uint i = 0u; i < LANE_E; ++i)
-        element_put(ELEMENT_ACT, target, lane * LANE_E + i, x[i]);
+        element_put(POOL_ROW, target, lane * LANE_E + i, x[i]);
 }

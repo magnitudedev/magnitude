@@ -7,7 +7,7 @@
 // one query row of one head over the keys of its span (every row, or its
 // window), query head h reading key and value head h / G.
 
-use lib::core::activation;
+use lib::core::{activation, norm};
 use lib::vision::vision;
 
 #[inline(always)]
@@ -30,7 +30,7 @@ fn vision_attention_prepare<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, gro
         for (head, target) in targets.chunks_exact_mut(w).enumerate() {
             seismic::cpu::tensor::widen_row::<E::A>(operand.row([row, head, 0]), source);
             if cx.dim_nq() == 1 {
-                vision::norm(source, false, Some(norm.row([0, 0])), None, epsilon, target);
+                norm::row(source, false, Some(norm.row([0, 0])), None, epsilon, target);
             } else {
                 target.copy_from_slice(source);
             }
@@ -46,7 +46,7 @@ fn vision_attention_prepare<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, gro
     for (head, value) in values.chunks_exact_mut(w).enumerate() {
         seismic::cpu::tensor::widen_row::<E::A>(cx.arg_value().row([row, head, 0]), source);
         if cx.dim_nv() == 1 {
-            vision::norm(source, false, Some(cx.arg_value_norm().row([0, 0])), None, epsilon, value);
+            norm::row(source, false, Some(cx.arg_value_norm().row([0, 0])), None, epsilon, value);
             for element in value.iter_mut() {
                 *element = activation::publish::<E::A>(*element);
             }

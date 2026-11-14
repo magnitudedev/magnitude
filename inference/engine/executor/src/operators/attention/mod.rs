@@ -10,17 +10,18 @@ pub(crate) mod split;
 use super::{PlanError, WeightPush, tail};
 use crate::planning::{AttentionForm, AttentionWidths, GateForm, SeparateGate};
 use crate::{
-    AttentionBinding, AttentionShape, AttentionValues, CandidatePool, CandidatesBinding,
+    AbsorbedQueryBinding, AbsorbedQueryShape, AttentionBinding, AttentionShape, AttentionValues,
+    CandidatePool, CandidatesBinding,
     GroupedOutputBinding, GroupedOutputShape, IndexerBinding, LowRankQueryBinding, PickedBinding,
-    PooledBinding, ScalableWeight, SelectionBinding, SelectionShape,
+    PooledBinding, ScalableWeight, SelectionBinding, SelectionKeysBinding, SelectionShape,
 };
 use magnitude_family_contracts::{
     Attention, AttentionGate, Candidates, Decoder, GateFunction, GateGranularity, HeadNorm, HeadWeights,
     HistoryReads, HistoryRows, Indexer, IndexerInput, IndexerKeys, MediaRowAttention,
-    Operator, OutputForm, OutputProjection, OutputRotary, Pool, PooledRows, ProjectedRows,
-    QueryProjection, RmsNorm, Rotary, RotaryLayout, RotaryPair, RotaryPairing, RotaryPlacement,
-    RowProducer, RowRounding, Selection, SublayerIndex, TokenDomain, ValueNorm, ValueSource,
-    WeightKind,
+    Operator, OutputForm, OutputProjection, OutputRotary, Pool, PoolNorm, PooledRows, ProjectedRows,
+    QueryKeys, QueryProjection, RmsNorm, Rotary, RotaryPair, RotaryPairing,
+    RotaryPlacement, RowProducer, RowRounding, Selection, SublayerIndex, TokenDomain, ValueNorm,
+    ValueSource, WeightKind,
 };
 use magnitude_state::{CodecSpec, HistoryEncoding, KvCodec};
 use seismic::{DType, Element};
@@ -45,68 +46,68 @@ pub(crate) fn fresh_rows(attention: &Attention) -> FreshRows<'_> {
     }
 }
 
-/// The selected read the indexer entries implement (`indexer_select`): an
-/// indexer over the layer's own token rows whose query is projected from
-/// the hidden row with a weighted RMS norm, whose keys are the mean of
-/// `block` raw keys under a weighted RMS norm, whose heads weigh alike at
-/// `1/√width`, with nothing rounded, selecting `blocks` blocks.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct SelectedRead<'a> {
-    pub block: u64,
-    pub blocks: u64,
-    pub heads: u64,
-    pub width: u64,
-    pub query_norm: &'a RmsNorm,
-    pub key_norm: &'a RmsNorm,
+/// The norm of a pooled source's rows the entries run: an RMS norm of the
+/// pooled row; a per-token norm of a pooled source's rows (no family's)
+/// refused by name.
+pub(crate) fn pooled_norm(rows: &PooledRows) -> Result<&RmsNorm, PlanError> {
+    match &rows.norm {
+        PoolNorm::Pooled(norm) => Ok(norm),
+        PoolNorm::Token { .. } => Err(PlanError::Unsupported(
+            "a pooled source's rows normed per token",
+        )),
+    }
 }
 
-/// The `indexer_select` read of `reads`: none for a read of every visible
-/// row, and every other selection refused by name.
+/// [`pooled_norm`] of pooled rows of an admitted attention, which
+/// [`admit`] holds to that form.
+pub(crate) fn admitted_pooled_norm(rows: &PooledRows) -> &RmsNorm {
+    pooled_norm(rows).expect("admission refuses every other pooled norm")
+}
+
+/// The rows of `attention`'s pooled sources (an indexer's pooled keys,
+/// which `selected_read` admits, are not among them).
+fn pooled_sources(attention: &Attention) -> impl Iterator<Item = &PooledRows> {
+    attention.history.iter().filter_map(|source| match &source.rows {
+        HistoryRows::Own(RowProducer::Pooled(rows)) => Some(rows),
+        HistoryRows::Own(RowProducer::Projected(_)) | HistoryRows::Shared { .. } => None,
+    })
+}
+
+/// A selected read over the layer's token rows (its first source's
+/// `HistoryReads::Selected`): its indexer, scoring units of `keys.rate`
+/// rows, and those pooled keys, which `pool_rows` makes into the keys'
+/// Window and Block (`graph::select`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SelectedRead<'a> {
+    pub indexer: &'a Indexer,
+    pub keys: &'a PooledRows,
+}
+
+/// The selected read of `reads` over token rows: none for a read of every
+/// visible row, and every form the entries don't implement refused by
+/// name.
 pub(crate) fn selected_read(reads: &HistoryReads) -> Result<Option<SelectedRead<'_>>, PlanError> {
     let indexer = match reads {
         HistoryReads::Visible => return Ok(None),
         HistoryReads::Selected(Selection::Reuse { .. }) => {
-            return Err(PlanError::Unsupported("a reused selection"));
+            return Err(PlanError::Unsupported("a reused selection over token rows"));
         }
         HistoryReads::Selected(Selection::Own(indexer)) => indexer,
     };
-    if indexer.query.input != IndexerInput::Hidden {
-        return Err(PlanError::Unsupported("an indexer over the query rank"));
-    }
-    let HeadNorm::Rms(query_norm) = &indexer.query.norm else {
-        return Err(PlanError::Unsupported("an indexer query without a norm"));
-    };
-    let IndexerKeys::Pooled(PooledRows {
-        rate,
-        projection: _,
-        pool: Pool::Mean,
-        norm: key_norm,
-        rounding: RowRounding::None,
-    }) = &indexer.keys
-    else {
+    let IndexerKeys::Pooled(keys) = &indexer.keys else {
         return Err(PlanError::Unsupported(
-            "indexer keys other than a mean of raw keys",
+            "indexer keys over token rows other than pooled keys",
         ));
     };
-    if !matches!(indexer.query.rounding, RowRounding::None) {
-        return Err(PlanError::Unsupported("a rounded indexer query"));
+    if !matches!(keys.rounding, RowRounding::None) {
+        return Err(PlanError::Unsupported("rounded pooled indexer keys"));
     }
-    if !matches!(indexer.head_weights, HeadWeights::Uniform) {
-        return Err(PlanError::Unsupported("projected indexer head weights"));
+    // Validation admits no pooled indexer keys of one row.
+    assert!(!matches!(keys.pool, Pool::Identity), "validated pooled indexer keys pool at least two rows");
+    if !matches!(indexer.candidates, Candidates::All) {
+        return Err(PlanError::Unsupported("a candidate pool over token rows"));
     }
-    if indexer.scale != 1.0 / (indexer.width as f64).sqrt() {
-        return Err(PlanError::Unsupported(
-            "an indexer score scale other than 1/sqrt(width)",
-        ));
-    }
-    Ok(Some(SelectedRead {
-        block: *rate,
-        blocks: indexer.top,
-        heads: indexer.heads,
-        width: indexer.width,
-        query_norm,
-        key_norm,
-    }))
+    Ok(Some(SelectedRead { indexer, keys }))
 }
 
 /// [`selected_read`] of an admitted attention's first source, whose
@@ -399,9 +400,8 @@ pub(crate) fn indexer_roundings(indexer: &Indexer) -> (crate::planning::Rounding
     let keys = match &indexer.keys {
         IndexerKeys::Latent { rounding, .. } => crate::planning::rounding_args(*rounding),
         IndexerKeys::Shared { .. } => crate::planning::RoundingArgs::NONE,
-        IndexerKeys::Pooled(_) => {
-            unreachable!("picked_source refuses pooled indexer keys over a pooled source")
-        }
+        // A selected read's pooled keys, which it admits unrounded.
+        IndexerKeys::Pooled(keys) => crate::planning::rounding_args(keys.rounding),
     };
     (crate::planning::rounding_args(indexer.query.rounding), keys)
 }
@@ -417,7 +417,8 @@ fn key_rounding(attention: &Attention) -> RowRounding {
 }
 
 /// The attention forms the attention entries implement: a full query, or a
-/// low-rank one composed of two projections (`graph::attention`), a full or
+/// low-rank one composed of two projections (`graph::attention`), either
+/// meeting the keys directly or absorbed per head by `project_rows`, a full or
 /// grouped low-rank output projection (its groups' products by
 /// `project_rows`, then the output projection over them), any output gate, a
 /// query norm and a key norm each present or absent (`NQ`, `N`), values
@@ -439,6 +440,13 @@ pub(crate) fn admit(attention: &Attention, input_epsilon: f64) -> Result<(), Pla
     // source is its source's, admitted with the source. A rounded first
     // source holds stored keys (contract validation), which the dense
     // entries round as they prepare them (`KR`).
+    for rows in pooled_sources(attention) {
+        pooled_norm(rows)?;
+        // `pool_rows` gates a pooled source's rows by their scores alone.
+        if matches!(rows.pool, Pool::SoftmaxGated { position: Some(_), .. }) {
+            return Err(PlanError::Unsupported("a pooled source's rows gated by place"));
+        }
+    }
     let picked = picked_source(attention)?;
     if picked.is_some() && !matches!(attention.fresh().reads, HistoryReads::Visible) {
         return Err(PlanError::Unsupported(
@@ -474,29 +482,14 @@ pub(crate) fn admit(attention: &Attention, input_epsilon: f64) -> Result<(), Pla
             ));
         }
     }
-    // A selected read's indexer orders keys by position (`indexer_select`):
-    // its rows attend causally, and its norms share one epsilon.
-    if let Some(indexer) = selected_read(&attention.fresh().reads)? {
-        if attention.media_rows != MediaRowAttention::Causal {
-            return Err(PlanError::Unsupported(
-                "selected attention attending media rows bidirectionally",
-            ));
-        }
-        if indexer.query_norm.epsilon != indexer.key_norm.epsilon {
-            return Err(PlanError::Unsupported(
-                "indexer norms with differing epsilons",
-            ));
-        }
-        // The indexer rotates its heads by the attention's table in
-        // half-split leading pairs (`indexer_select`).
-        if matches!(
-            &attention.rotary,
-            Rotary::Table { layout, .. } if *layout != RotaryLayout::HALF_SPLIT_LEADING
-        ) {
-            return Err(PlanError::Unsupported(
-                "selected attention with rotary pairs other than half-split leading",
-            ));
-        }
+    // A selected read's indexer orders keys by position: its rows attend
+    // causally.
+    if selected_read(&attention.fresh().reads)?.is_some()
+        && attention.media_rows != MediaRowAttention::Causal
+    {
+        return Err(PlanError::Unsupported(
+            "selected attention attending media rows bidirectionally",
+        ));
     }
     let shape = geometry(0, attention)?;
     if shape.widths.width < 2 * shape.widths.rotary_pairs {
@@ -670,6 +663,7 @@ fn geometry(hidden: u64, attention: &Attention) -> Result<AttentionShape, PlanEr
             rotary_adjacent,
             rotary_trailing,
             output_rotary,
+            absorbed_query: matches!(attention.query_keys, QueryKeys::Absorbed { .. }),
         },
         widths: AttentionWidths {
             hidden,
@@ -771,6 +765,9 @@ pub(super) fn weights<'a>(attention: &'a Attention, push: &mut WeightPush<'_, 'a
             push(query_kind(attention), up);
         }
     }
+    if let QueryKeys::Absorbed { weight, .. } = &attention.query_keys {
+        push(WeightKind::QueryKeys, weight);
+    }
     if let AttentionGate::Separate { weight, .. } = &attention.gate {
         push(WeightKind::AttentionGate, weight);
     }
@@ -805,10 +802,19 @@ pub(super) fn weights<'a>(attention: &'a Attention, push: &mut WeightPush<'_, 'a
     for source in &attention.history {
         if let HistoryRows::Own(RowProducer::Pooled(rows)) = &source.rows {
             push(WeightKind::PooledProjection, &rows.projection);
-            if let Pool::SoftmaxGated { gate } = &rows.pool {
+            if let Pool::SoftmaxGated { gate, position } = &rows.pool {
                 push(WeightKind::PooledGate, gate);
+                if let Some(position) = position {
+                    push(WeightKind::PooledGatePosition, position);
+                }
             }
-            push(WeightKind::PooledNorm, &rows.norm.weight);
+            match &rows.norm {
+                PoolNorm::Pooled(norm) => push(WeightKind::PooledNorm, &norm.weight),
+                PoolNorm::Token { norm, bias } => {
+                    push(WeightKind::PooledNorm, &norm.weight);
+                    push(WeightKind::PooledNormBias, bias);
+                }
+            }
         }
     }
     for source in &attention.history {
@@ -817,27 +823,37 @@ pub(super) fn weights<'a>(attention: &'a Attention, push: &mut WeightPush<'_, 'a
         };
         push(WeightKind::IndexerQuery, &indexer.query.projection);
         // Shared keys are their owner's, as are their weights.
+        // The key norm's weight, and its bias when it has one.
         let key_norm = match &indexer.keys {
             IndexerKeys::Pooled(keys) => {
                 push(WeightKind::IndexerKey, &keys.projection);
-                if let Pool::SoftmaxGated { gate } = &keys.pool {
+                if let Pool::SoftmaxGated { gate, position } = &keys.pool {
                     push(WeightKind::IndexerKeyGate, gate);
+                    if let Some(position) = position {
+                        push(WeightKind::IndexerKeyGatePosition, position);
+                    }
                 }
-                Some(&keys.norm)
+                Some(match &keys.norm {
+                    PoolNorm::Pooled(norm) => (&norm.weight, None),
+                    PoolNorm::Token { norm, bias } => (&norm.weight, Some(bias)),
+                })
             }
             IndexerKeys::Latent {
                 projection, norm, ..
             } => {
                 push(WeightKind::IndexerKey, projection);
-                Some(norm)
+                Some((&norm.weight, None))
             }
             IndexerKeys::Shared { .. } => None,
         };
         if let HeadNorm::Rms(norm) = &indexer.query.norm {
             push(WeightKind::IndexerQueryNorm, &norm.weight);
         }
-        if let Some(key_norm) = key_norm {
-            push(WeightKind::IndexerKeyNorm, &key_norm.weight);
+        if let Some((weight, bias)) = key_norm {
+            push(WeightKind::IndexerKeyNorm, weight);
+            if let Some(bias) = bias {
+                push(WeightKind::IndexerKeyNormBias, bias);
+            }
         }
         if let HeadWeights::Projected(weight) = &indexer.head_weights {
             push(WeightKind::IndexerHeadWeights, weight);
@@ -874,6 +890,20 @@ pub(crate) fn grouped_output(attention: &Attention) -> Option<GroupedOutputShape
     }
 }
 
+/// `project_rows`' axes of an absorbed query (`QueryKeys::Absorbed`): each
+/// head's projected row through its own block of the weight into the
+/// `W`-wide query the entries attend with; none for direct queries.
+pub(crate) fn absorbed_query(attention: &Attention) -> Option<AbsorbedQueryShape> {
+    match &attention.query_keys {
+        QueryKeys::Direct => None,
+        QueryKeys::Absorbed { width, .. } => Some(AbsorbedQueryShape {
+            heads: attention.heads,
+            width: *width,
+            keys: attention.width,
+        }),
+    }
+}
+
 /// The static axes of a selected read in a decoder serving `context`
 /// tokens; none for a read of every visible row.
 pub(crate) fn selection_shape(attention: &Attention, context: u64) -> Option<SelectionShape> {
@@ -882,30 +912,39 @@ pub(crate) fn selection_shape(attention: &Attention, context: u64) -> Option<Sel
 
 fn read_shape(read: SelectedRead<'_>, context: u64) -> SelectionShape {
     SelectionShape {
-        heads: read.heads,
-        width: read.width,
-        block: read.block,
-        blocks: read.blocks,
-        // A row at position t < context reads blocks up to its tail's,
+        block: read.keys.rate,
+        // A row at position t < context reads units up to its tail's,
         // t / block: the bitmap covers them all.
-        words: context / read.block / 32 + 1,
+        words: context / read.keys.rate / 32 + 1,
     }
 }
 
-/// A selected read's numerical parameters apart from its weights: block,
-/// blocks, indexer heads, width and norm epsilon.
-fn selection_key(
-    attention: &Attention,
-) -> Result<Option<(u64, u64, u64, u64, f64)>, PlanError> {
-    Ok(selected_read(&attention.fresh().reads)?.map(|read| {
-        (
-            read.block,
-            read.blocks,
-            read.heads,
-            read.width,
-            read.query_norm.epsilon,
-        )
-    }))
+/// A selected read's numerical parameters apart from its weights: its
+/// keys' pooling and norm, and its indexer's.
+fn selection_key(attention: &Attention) -> Result<Option<String>, PlanError> {
+    selected_read(&attention.fresh().reads)?
+        .map(|read| {
+            let norm = match &read.keys.norm {
+                PoolNorm::Pooled(norm) => format!("pooled {:?}", norm.epsilon),
+                PoolNorm::Token { norm, .. } => format!("token {:?}", norm.epsilon),
+            };
+            let pool = match &read.keys.pool {
+                Pool::Mean => "mean".to_string(),
+                Pool::SoftmaxGated { position, .. } => format!("gated {}", position.is_some()),
+                Pool::Identity => unreachable!("selected_read admits pooling of two rows or more"),
+            };
+            let query_norm = match &read.indexer.query.norm {
+                HeadNorm::Rms(norm) => Some(norm.epsilon),
+                HeadNorm::None => None,
+            };
+            Ok(format!(
+                "selected {} {pool} {norm} {:?} {query_norm:?} {}",
+                read.keys.rate,
+                read.indexer.query.input,
+                indexer_key(None, 0, read.indexer)?,
+            ))
+        })
+        .transpose()
 }
 
 /// An own indexer's numerical parameters apart from its weights and keys:
@@ -941,7 +980,7 @@ fn picked_key(attention: &Attention, site: Option<DecoderSite<'_>>) -> Result<Op
                     "own {} {} {:?} {:?} {:?} {}",
                     rows.rate,
                     pooled::gated(rows),
-                    rows.norm.epsilon,
+                    pooled_norm(rows)?.epsilon,
                     rows.rounding,
                     // [`picked_source`] admits latent keys alone.
                     match &indexer.keys {
@@ -969,16 +1008,19 @@ pub(super) fn shape_key(
     epsilon: f64,
     site: Option<DecoderSite<'_>>,
 ) -> Result<String, PlanError> {
-    // A full query or output adds nothing, so every other form's key is
-    // unchanged.
+    // A full query or output and a direct query add nothing, so every other
+    // form's key is unchanged.
     let low_rank = low_rank_query(attention)
         .map(|(rank, epsilon)| format!(" low-rank query {rank} {epsilon:?}"))
         .unwrap_or_default();
     let grouped = grouped_output(attention)
         .map(|grouped| format!(" grouped output {grouped:?}"))
         .unwrap_or_default();
+    let absorbed = absorbed_query(attention)
+        .map(|absorbed| format!(" absorbed query {absorbed:?}"))
+        .unwrap_or_default();
     Ok(format!(
-        "attention {:?} {:?} {:?} {:?} {} {:?} {:?}{low_rank}{grouped}",
+        "attention {:?} {:?} {:?} {:?} {} {:?} {:?}{low_rank}{grouped}{absorbed}",
         geometry(0, attention)?,
         gate_function(attention),
         head_norm_epsilon(attention, epsilon)?,
@@ -1017,10 +1059,20 @@ pub(super) fn binding(
             "rounded or pooled history rows under an activation other than BF16",
         ));
     }
+    // An absorbed query and the latent rows it reads are held in the
+    // activation element (precision.md, "Absorbed latent attention"): F16
+    // would bound them by its range.
+    let absorbed = absorbed_query(attention);
+    if absorbed.is_some() && activation == Element::dense(DType::F16) {
+        return Err(PlanError::Unsupported(
+            "absorbed query keys under an F16 activation",
+        ));
+    }
     // An own indexer's binding: its query, head weights and candidates.
     let indexer_binding = |part: u32, indexer: &Indexer| {
         let (query_rounding, key_rounding) = indexer_roundings(indexer);
         Ok::<_, PlanError>(IndexerBinding {
+            input: indexer.query.input,
             heads: indexer.heads,
             width: indexer.width,
             top: indexer.top,
@@ -1063,12 +1115,21 @@ pub(super) fn binding(
     let query = projection(query_kind(attention))?;
     let segment = |present: bool, kind| if present { projection(kind) } else { Ok(query) };
     let selection = selected_read(&attention.fresh().reads)?
-        .map(|read| read_shape(read, context))
-        .map(|shape| {
+        .map(|read| {
+            let gate = match read.keys.pool {
+                Pool::SoftmaxGated { .. } => Some(projection(WeightKind::IndexerKeyGate)?),
+                Pool::Mean | Pool::Identity => None,
+            };
             Ok::<_, PlanError>(SelectionBinding {
-                shape,
-                query: projection(WeightKind::IndexerQuery)?,
-                key: projection(WeightKind::IndexerKey)?,
+                shape: read_shape(read, context),
+                keys: SelectionKeysBinding {
+                    projection: projection(WeightKind::IndexerKey)?,
+                    gate,
+                    place: matches!(read.keys.pool, Pool::SoftmaxGated { position: Some(_), .. }),
+                    norm: lookup(WeightKind::IndexerKeyNorm)?,
+                    token_norm: matches!(read.keys.norm, PoolNorm::Token { .. }),
+                },
+                indexer: indexer_binding(0, read.indexer)?,
             })
         })
         .transpose()?;
@@ -1108,6 +1169,14 @@ pub(super) fn binding(
                 Ok::<_, PlanError>(GroupedOutputBinding {
                     shape,
                     element: projection(WeightKind::AttentionOutputGrouped)?,
+                })
+            })
+            .transpose()?,
+        absorbed: absorbed
+            .map(|shape| {
+                Ok::<_, PlanError>(AbsorbedQueryBinding {
+                    shape,
+                    element: projection(WeightKind::QueryKeys)?,
                 })
             })
             .transpose()?,
@@ -1190,13 +1259,13 @@ pub(crate) mod tests {
         };
         use magnitude_family_contracts::{
             ActivationDType, ActivationFunction, Attention, AttentionGate, Block, BlockElement,
-            BlockRounding, BlockScale, SublayerIndex, Decoder,
+            BlockRounding, BlockScale, ImportTransform, SublayerIndex, Decoder,
             DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm, FamilyId, FeedForwardUp,
             HeadNorm, HeadWeights, HistoryReads, HistoryRows, HistorySource, Indexer,
             IndexerInput, IndexerKeys, IndexerQuery, InputNorm, InputSemantics, MediaRowAttention,
-            ModelDefinition, Operator, OutputForm, OutputProjection, Pool, PooledRows,
+            ModelDefinition, Operator, OutputForm, OutputProjection, Pool, PoolNorm, PooledRows,
             ProjectedRows, ResidualForm, RmsNorm, RowProducer, RowRounding, Selection,
-            TokenDomain, OutputRotary, QueryProjection, Rotary, RotaryLayout, RotaryPair,
+            TokenDomain, OutputRotary, QueryKeys, QueryProjection, Rotary, RotaryLayout, RotaryPair,
             Sublayer, ValueNorm, ValueSource, WeightDescriptor,
         };
         use magnitude_state::{HistoryDomainKind, KvCodec, LayerRef};
@@ -1260,6 +1329,7 @@ pub(crate) mod tests {
                         kv_heads: 2,
                         width: 64,
                         query,
+                        query_keys: QueryKeys::Direct,
                         gate: AttentionGate::None,
                         query_norm: HeadNorm::Rms(rms(tensor(name("attn_q_norm"), vec![64]))),
                         history: vec![HistorySource {
@@ -1293,7 +1363,7 @@ pub(crate) mod tests {
                                     rate: 4,
                                     projection: tensor(name("indexer.k_proj"), vec![64, HIDDEN]),
                                     pool: Pool::Mean,
-                                    norm: rms(tensor(name("indexer.k_norm"), vec![64])),
+                                    norm: PoolNorm::Pooled(rms(tensor(name("indexer.k_norm"), vec![64]))),
                                     rounding: RowRounding::None,
                                 }),
                                 head_weights: HeadWeights::Uniform,
@@ -1451,6 +1521,161 @@ pub(crate) mod tests {
                     })
                 );
                 assert_eq!(binding.output_input(), (2, 32));
+                let state = ResourcePlanner::state_plan(
+                    &definition,
+                    &load,
+                    PlannedMethod::Plain,
+                    codec,
+                    limits,
+                    ResourceCapacity {
+                        domain_bytes: 16 * 1024 * 1024 * 1024,
+                        tensor_operations: crate::TensorOperations::Absent,
+                    },
+                )
+                .unwrap();
+                let certified = checked_target_family_storage(
+                    backend,
+                    &load,
+                    &definition.decoder,
+                    &state,
+                    plan.target(),
+                    limits,
+                );
+                certified.unwrap_or_else(|error| panic!("{backend:?}: {error}"));
+            }
+        }
+
+        /// `selected(true, false)` with GLM's absorbed latent attention in
+        /// each block: 4 query heads 32 wide off its low-rank `qr`, each
+        /// absorbed into the 64-wide latent row the layer stores once as key
+        /// and value, read whole without positions, and a grouped output
+        /// whose blocks are the heads' value projections. The per-head
+        /// projections are stored as GLM stores them, `attn_k_b` `[4, 64,
+        /// 32]` and `attn_v_b` `[4, 32, 64]`, and read with their leading
+        /// axes merged.
+        fn absorbed() -> (ModelDefinition, PackageManifest) {
+            let (mut definition, mut manifest) = selected(true, false);
+            let mut offset = manifest.target.files[0].size;
+            let tensors = &mut manifest.target.tensors;
+            let mut tensor = |name: String, shape: Vec<u64>| {
+                let encoding = if shape.len() > 1 { Encoding::BF16 } else { Encoding::F32 };
+                let nbytes = source_element(encoding, *shape.last().unwrap())
+                    .unwrap()
+                    .canonical_byte_len(&shape)
+                    .unwrap();
+                tensors.push(TensorDescriptor { name: name.clone(), shape: shape.clone(), encoding, offset, nbytes });
+                offset += nbytes;
+                WeightDescriptor::stored(name, shape)
+            };
+            fn merged(stack: WeightDescriptor) -> WeightDescriptor {
+                WeightDescriptor {
+                    shape: vec![stack.shape[0] * stack.shape[1], stack.shape[2]],
+                    transforms: vec![ImportTransform::MergeLeadingAxes],
+                    ..stack
+                }
+            }
+            for (layer, block) in definition.decoder.blocks.iter_mut().enumerate() {
+                let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+                let Operator::Attention(attention) = &mut block.sublayers[0].op else {
+                    unreachable!("each block opens with attention")
+                };
+                let QueryProjection::LowRank { down, norm, .. } = attention.query.clone() else {
+                    unreachable!("a low-rank query")
+                };
+                **attention = Attention {
+                    heads: 4,
+                    kv_heads: 1,
+                    width: 128,
+                    query: QueryProjection::LowRank {
+                        down,
+                        norm,
+                        up: tensor(name("attn_q_b.heads"), vec![4 * 64, LOW_RANK]),
+                    },
+                    query_keys: QueryKeys::Absorbed {
+                        weight: merged(tensor(name("attn_k_b"), vec![4, 128, 64])),
+                        width: 64,
+                    },
+                    gate: AttentionGate::None,
+                    query_norm: HeadNorm::None,
+                    history: vec![HistorySource::visible(HistoryRows::Own(RowProducer::Projected(
+                        ProjectedRows {
+                            key: tensor(name("attn_kv_a_mqa"), vec![128, HIDDEN]),
+                            value: ValueSource::StoredKey,
+                            key_norm: HeadNorm::Rms(RmsNorm {
+                                weight: tensor(name("attn_kv_a_norm"), vec![128]),
+                                epsilon: 1e-6,
+                            }),
+                            value_norm: ValueNorm::None,
+                            domain: TokenDomain::Token,
+                            rounding: RowRounding::None,
+                        },
+                    )))],
+                    rotary: Rotary::None,
+                    scale: 1.0 / 8.0,
+                    media_rows: MediaRowAttention::Causal,
+                    sinks: None,
+                    output: OutputProjection::GroupedLowRank {
+                        groups: 4,
+                        rank: 64,
+                        a: merged(tensor(name("attn_v_b"), vec![4, 64, 128])),
+                        b: tensor(name("attn_output.heads"), vec![HIDDEN, 4 * 64]),
+                    },
+                };
+            }
+            manifest.target.files[0].size = offset;
+            definition.validate().unwrap();
+            (definition, manifest)
+        }
+
+        /// Absorbed latent attention plans as its query heads at their own
+        /// width (`Q` = 4·64 off the rank-64 `qr`), absorbed per head by
+        /// `project_rows` into the 128-wide queries its history entries
+        /// attend with over one stored-key latent plane, and the grouped
+        /// value products. Its graphs certify on every backend at every row
+        /// class; on the GPUs its decode classes attend with the prefill
+        /// entries. Head width 64 and latent width 128 lie
+        /// inside every backend's projection domain (CUDA's projections
+        /// reduce over multiples of 64), and the latent is wider than the
+        /// head so a transposition of the two shows.
+        #[test]
+        fn absorbed_latent_attention_plans_and_certifies() {
+            let (definition, manifest) = absorbed();
+            let limits = limits();
+            for backend in BackendName::ALL {
+                let codec = KvCodec::Dense;
+                let load = ModelLoadPlan::derive(
+                    &manifest,
+                    &definition,
+                    ComponentSelection {
+                        head: false,
+                        vision: false,
+                    },
+                    resident_layout(ExecutionPath::Native, backend),
+                    crate::PlannedMethod::Plain,
+                    crate::planning::fixtures::LIMITS,
+                )
+                .unwrap();
+                let plan = load.program_plan(&definition, codec).unwrap();
+                let MixerProgramSlot::Attention(binding) = plan.target().blocks()[0].mixer() else {
+                    panic!("an attention block");
+                };
+                assert_eq!(
+                    binding.absorbed.map(|absorbed| absorbed.shape),
+                    Some(crate::AbsorbedQueryShape { heads: 4, width: 64, keys: 128 })
+                );
+                assert_eq!((binding.query_rows(), binding.query_segment_rows()), (4 * 64, LOW_RANK));
+                assert_eq!(
+                    binding.grouped.map(|grouped| grouped.shape),
+                    Some(crate::GroupedOutputShape { groups: 4, inputs: 128, rank: 64 })
+                );
+                assert_eq!((binding.shape.widths.width, binding.shape.stored_key()), (128, 1));
+                assert_eq!(
+                    crate::operators::attention::graph::dense_decodes(backend, binding).unwrap(),
+                    // CUDA's decode holds no stored key; the others' vector
+                    // forms (F32 products) hold this narrow a group.
+                    backend != BackendName::Cuda,
+                    "{backend:?}"
+                );
                 let state = ResourcePlanner::state_plan(
                     &definition,
                     &load,
@@ -1684,9 +1909,10 @@ pub(crate) mod tests {
                                 CompressedForm::TwoFull { second_gated: false } if index == 1 => Pool::Mean,
                                 CompressedForm::FullAndReuse | CompressedForm::TwoFull { .. } => Pool::SoftmaxGated {
                                     gate: tensor(name("compressor.gate"), vec![64, HIDDEN]),
+                                    position: None,
                                 },
                             },
-                            norm: rms(tensor(name("compressor.norm"), vec![64])),
+                            norm: PoolNorm::Pooled(rms(tensor(name("compressor.norm"), vec![64]))),
                             rounding: RowRounding::None,
                         })),
                         reads: HistoryReads::Selected(Selection::Own(Box::new(Indexer {
@@ -1759,6 +1985,31 @@ pub(crate) mod tests {
             manifest.target.files[0].size = offset;
             definition.validate().unwrap();
             (definition, manifest)
+        }
+
+        /// A pooled source's rows gated by place are refused by name: the
+        /// entries pool a source's rows by their gate scores alone, a place
+        /// term only an indexer's pooled keys (GLM-5.3's).
+        #[test]
+        fn a_pooled_source_gated_by_place_is_refused() {
+            use crate::{PlanError, operators::attention::admit};
+            let (definition, _) = compressed(CompressedForm::FullAndReuse);
+            let Operator::Attention(attention) = &definition.decoder.blocks[0].sublayers[0].op else {
+                unreachable!("each block opens with attention")
+            };
+            let mut placed = (**attention).clone();
+            let HistoryRows::Own(RowProducer::Pooled(rows)) = &mut placed.history[1].rows else {
+                unreachable!("the Full layer pools its own rows")
+            };
+            let Pool::SoftmaxGated { position, .. } = &mut rows.pool else {
+                unreachable!("the Full layer's pool is gated")
+            };
+            *position = Some(WeightDescriptor::stored("blk.0.compressor.ape", vec![rows.rate, 64]));
+            admit(attention, 1e-6).unwrap();
+            match admit(&placed, 1e-6) {
+                Err(PlanError::Unsupported(reason)) => assert_eq!(reason, "a pooled source's rows gated by place"),
+                other => panic!("admitted as {other:?}"),
+            }
         }
 
         /// Slice C's Full and Reuse layers plan their rounded keys (`KR`)
@@ -2142,11 +2393,8 @@ pub(crate) mod tests {
                     assert_eq!(
                         binding.selection.map(|selection| selection.shape),
                         Some(SelectionShape {
-                            heads: 2,
-                            width: 64,
                             block: 4,
-                            blocks: 2,
-                            // Blocks [0, 1024] of a 4096-token context.
+                            // Units [0, 1024] of a 4096-token context.
                             words: 33,
                         })
                     );
@@ -2213,7 +2461,7 @@ pub(crate) mod tests {
     #[test]
     fn forms_without_an_entry_axis_are_refused_by_name() {
         use magnitude_family_contracts::{
-            HistorySource, OutputProjection, OutputRotary, QueryProjection, RmsNorm, RotaryLayout,
+            HistorySource, OutputProjection, OutputRotary, QueryKeys, QueryProjection, RmsNorm, RotaryLayout,
             RotaryPairing, RotaryPlacement, WeightDescriptor,
         };
         let weight = |name: &str, shape: &[u64]| WeightDescriptor::stored(name, shape);
@@ -2222,6 +2470,7 @@ pub(crate) mod tests {
             kv_heads: 1,
             width: 64,
             query: QueryProjection::Full(weight("q", &[128, 32])),
+            query_keys: QueryKeys::Direct,
             gate: AttentionGate::None,
             query_norm: HeadNorm::None,
             history: vec![HistorySource::visible(HistoryRows::Own(RowProducer::Projected(
@@ -2330,10 +2579,10 @@ pub(crate) mod tests {
                     rate: 4,
                     projection: weight("indexer.k", &[64, 32]),
                     pool: Pool::Mean,
-                    norm: RmsNorm {
+                    norm: PoolNorm::Pooled(RmsNorm {
                         weight: weight("indexer.k_norm", &[64]),
                         epsilon: 1e-6,
-                    },
+                    }),
                     rounding: RowRounding::None,
                 }),
                 head_weights: HeadWeights::Uniform,
@@ -2342,12 +2591,57 @@ pub(crate) mod tests {
                 candidates: magnitude_family_contracts::Candidates::All,
             },
         )));
-        match admit(&selected, 1e-6) {
-            Err(PlanError::Unsupported(reason)) => assert_eq!(
-                reason,
-                "selected attention with rotary pairs other than half-split leading"
-            ),
-            other => panic!("admitted as {other:?}"),
+        // The indexer rotates by the attention's table in its layout
+        // (`pool_rows`, `indexer_score`).
+        admit(&selected, 1e-6).unwrap();
+        // GLM-5.3-Flash's keys, normed per token with a bias and gated by
+        // place, are admitted; a candidate pool over token rows and
+        // rounded keys are refused by name.
+        fn indexer(selected: &mut Attention) -> &mut Indexer {
+            let HistoryReads::Selected(Selection::Own(indexer)) = &mut selected.history[0].reads else {
+                unreachable!()
+            };
+            indexer
+        }
+        fn keys(selected: &mut Attention) -> &mut PooledRows {
+            let IndexerKeys::Pooled(keys) = &mut indexer(selected).keys else { unreachable!() };
+            keys
+        }
+        let mut glm = selected.clone();
+        keys(&mut glm).norm = PoolNorm::Token {
+            norm: magnitude_family_contracts::LayerNorm {
+                weight: weight("indexer.k_norm", &[64]),
+                epsilon: 1e-6,
+            },
+            bias: weight("indexer.k_norm_bias", &[64]),
+        };
+        keys(&mut glm).pool = Pool::SoftmaxGated {
+            gate: weight("indexer.gate", &[64, 32]),
+            position: Some(weight("indexer.ape", &[4, 64])),
+        };
+        admit(&glm, 1e-6).unwrap();
+        let mut pooled = selected.clone();
+        indexer(&mut pooled).candidates = magnitude_family_contracts::Candidates::Produce {
+            blocks: 2,
+            block_units: 2,
+        };
+        let mut rounded = selected.clone();
+        keys(&mut rounded).rounding = magnitude_family_contracts::RowRounding::Block(
+            magnitude_family_contracts::BlockRounding {
+                element: magnitude_family_contracts::BlockElement::E2M1,
+                block: 16,
+                scale: magnitude_family_contracts::BlockScale::E4M3,
+                amax_floor: 6.0 * 2f64.powi(-9),
+            },
+        );
+        for (refused, expected) in [
+            (pooled, "a candidate pool over token rows"),
+            (rounded, "rounded pooled indexer keys"),
+        ] {
+            match admit(&refused, 1e-6) {
+                Err(PlanError::Unsupported(reason)) => assert_eq!(reason, expected),
+                other => panic!("admitted as {other:?}"),
+            }
         }
     }
 

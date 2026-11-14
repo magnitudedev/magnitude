@@ -627,7 +627,7 @@ struct Picked {
     }
 };
 
-// A prefill launch's WorkList selection (`indexer_select`'s per-row block
+// A prefill launch's WorkList selection (`unit_reads`' per-row block
 // bitmap, `words` words a row, `block_rows` keys a block; none when `words`
 // is 0), with what its list launch (`list`) leaves: each row's key ordinal at
 // the start of each of its spans (`bases`, [M][R + 1]) and each query tile's

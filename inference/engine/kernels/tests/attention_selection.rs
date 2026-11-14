@@ -2,9 +2,11 @@
 // the keys whose block (`block_rows` keys, in the row's key order) its bitmap
 // sets. The portable body against the host model, and every backend this
 // host opens against both, over rows of two sequences sharing query tiles,
-// with split and unsplit key partitions.
+// with split and unsplit key partitions; over a stored-key history, Vulkan's
+// vector form too, which reads the bitmap per key.
 
 mod common;
+mod declared;
 
 use magnitude_kernels::attention_prefill;
 use seismic::{BackendName, Device, Element, NativeSpecialization, SlabRegion, SlabTensor, Tensor};
@@ -87,7 +89,7 @@ fn portable(case: &Case, bits: &[u32], words: usize) -> Vec<f32> {
         tensor(DType::BF16, vec![t, kv, w], floats(&case.history_value)),
         // Half-split leading rotary pairs, no output rotary, own values, no
         // key rounding.
-        tensor(DType::I32, vec![0, 0, 0, 0, 0, 0], Vec::new()),
+        tensor(DType::I32, vec![0, 0, 0, 0, 0, 0, 0], Vec::new()),
         Arg::Scalar(ReferenceScalar::F32(case.epsilon.to_bits())),
         Arg::Scalar(ReferenceScalar::F32(case.scale.to_bits())),
         Arg::Scalar(ReferenceScalar::I32(0)),
@@ -107,15 +109,34 @@ fn portable(case: &Case, bits: &[u32], words: usize) -> Vec<f32> {
     (0..gated.element_count()).map(|index| gated.read(index).unwrap() as f32).collect()
 }
 
-fn native(device: &Device, specialization: &NativeSpecialization, case: &Case, bits: &[u32], words: usize) -> Vec<f32> {
+/// `case` as a stored-key history (VK = 1): its values are its keys, a fresh
+/// row's the prepared key.
+fn stored_key(case: &Case) -> Case {
+    let Geometry { kv, .. } = case.geometry;
+    let w = case.geometry.w();
+    let mut value = Vec::new();
+    for row in 0..case.rows {
+        for head in 0..kv {
+            value.extend(case.prepare(&case.key[(row * kv + head) * w..][..w], &case.key_norm, row));
+        }
+    }
+    Case { value, history_value: case.history_key.clone(), ..case.clone() }
+}
+
+fn native(
+    device: &Device,
+    specialization: &NativeSpecialization,
+    case: &Case,
+    bits: &[u32],
+    words: usize,
+    stored: bool,
+) -> Vec<f32> {
     let Geometry { kv, g, p, .. } = case.geometry;
     let (m, w, t) = (case.rows, case.geometry.w(), case.history_rows);
-    let kernel = attention_prefill::native_for_device_with(
-        device,
-        attention_prefill::Elements { A: Element::bf16() },
-        &dense_statics(specialization.clone().with_static("SK", 0)),
-    )
-    .unwrap();
+    let entry = attention_prefill::native_entry_with(attention_prefill::Elements { A: Element::bf16() });
+    let specialization =
+        declared::declared_at(device, &entry, &dense_statics(specialization.clone().with_static("SK", 0))).unwrap();
+    let kernel = entry.prepare(device, &specialization).unwrap();
     let (selected_rows, selected) = no_picks(device, m, kv, w);
     let plane = |values: &[f32]| {
         let mut slabs = SlabTensor::new(
@@ -135,7 +156,13 @@ fn native(device: &Device, specialization: &NativeSpecialization, case: &Case, b
         (slabs, logical)
     };
     let (_key_slabs, mut history_key) = plane(&case.history_key);
-    let (_value_slabs, mut history_value) = plane(&case.history_value);
+    // A stored-key history holds the key plane alone.
+    let (_value_slabs, mut history_value) = if stored {
+        (None, bf16_tensor(device, &[0, kv, w], &[]))
+    } else {
+        let (slabs, plane) = plane(&case.history_value);
+        (Some(slabs), plane)
+    };
     let selection = Tensor::from_host(
         device,
         Element::u32(),
@@ -148,7 +175,7 @@ fn native(device: &Device, specialization: &NativeSpecialization, case: &Case, b
             query: &bf16_tensor(device, &[m, kv * g, 2 * w], &case.query_gate),
             gate: &bf16_tensor(device, &[m, kv * g, 0], &[]),
             key: &bf16_tensor(device, &[1, m, kv * w], &case.key),
-            value: &bf16_tensor(device, &[1, m, kv * w], &case.value),
+            value: &bf16_tensor(device, &[usize::from(!stored), m, kv * w], if stored { &[] } else { case.value.as_slice() }),
             query_norm: &f32_tensor(device, &[1, w], &case.query_norm),
             key_norm: &f32_tensor(device, &[1, w], &case.key_norm),
             value_norm: &f32_tensor(device, &[0, w], &[]),
@@ -166,7 +193,13 @@ fn native(device: &Device, specialization: &NativeSpecialization, case: &Case, b
             selected: &selected,
             history_key: &mut history_key,
             history_value: &mut history_value,
-            form: &dense_layout(device),
+            form: &Tensor::from_host(
+                device,
+                Element::i32(),
+                &[0, 0, 0, 0, u64::from(stored), 0, 0],
+                &[],
+            )
+            .unwrap(),
             epsilon: case.epsilon,
             scale: case.scale,
             gate_function: 0,
@@ -204,14 +237,40 @@ fn specializations(device: &Device, geometry: Geometry, words: usize) -> Vec<(St
                     .with_param("QT", query_tile)
                     .with_param("HEADS", (geometry.g.next_power_of_two() as u64).min(16))
                     .with_param("DIRECT", 0)
-                    .with_param("KEYS", 8),
-                BackendName::Vulkan => base.with_param("ROWS", 64),
-                _ => base.with_param("QT", query_tile),
-            }
-            .with_param("SPLIT_GROUPS", split);
+                    .with_param("KEYS", 8)
+                    .with_param("SPLIT_GROUPS", split),
+                // A WorkList prefill over a history with values of its own
+                // runs in Vulkan's matrix form alone (its vector form is
+                // declared for stored keys).
+                BackendName::Vulkan => vulkan_prefill_matrix(64, split)
+                    .into_iter()
+                    .fold(base, |s, (name, value)| s.with_param(name, value)),
+                _ => base.with_param("QT", query_tile).with_param("SPLIT_GROUPS", split),
+            };
             (format!("{backend:?} QT={query_tile} SPLIT_GROUPS={split}"), specialization)
         })
         .collect()
+}
+
+/// Vulkan's configurations over a stored-key history (VK = 1), where its
+/// vector form is declared: two of the vector form, which reads the bitmap
+/// per key, and the matrix form beside them.
+fn stored_key_specializations(device: &Device, geometry: Geometry, words: usize) -> Vec<(String, NativeSpecialization)> {
+    if device.backend() != BackendName::Vulkan {
+        return Vec::new();
+    }
+    let base = qwen_form(statics(geometry), geometry).with_static("B", words as u64).with_static("VK", 1);
+    [
+        ("vector SPAN=32 PARTS=16 SIMDS=4", vulkan_prefill_vector(32, 16, 4)),
+        ("vector SPAN=64 PARTS=8 SIMDS=8", vulkan_prefill_vector(64, 8, 8)),
+        ("matrix", vulkan_prefill_matrix(64, 256)),
+    ]
+    .into_iter()
+    .map(|(name, params)| {
+        let specialization = params.into_iter().fold(base.clone(), |s, (name, value)| s.with_param(name, value));
+        (format!("Vulkan stored-key {name}"), specialization)
+    })
+    .collect()
 }
 
 fn check(label: &str, actual: &[f32], expected: &[f32]) {
@@ -247,7 +306,15 @@ fn native_worklist_prefill_reads_only_selected_blocks() {
         let expected = case.expected_reading(&reads(&bits, words)).0;
         for device in devices() {
             for (config, specialization) in specializations(&device, geometry, words) {
-                let actual = native(&device, &specialization, &case, &bits, words);
+                let actual = native(&device, &specialization, &case, &bits, words, false);
+                check(&format!("{config} words={words}"), &actual, &expected);
+            }
+        }
+        let stored = stored_key(&case);
+        let expected = stored.expected_reading(&reads(&bits, words)).0;
+        for device in devices() {
+            for (config, specialization) in stored_key_specializations(&device, geometry, words) {
+                let actual = native(&device, &specialization, &stored, &bits, words, true);
                 check(&format!("{config} words={words}"), &actual, &expected);
             }
         }

@@ -811,9 +811,6 @@ impl AssessmentGraphResourceBounds {
                             .ok_or("head graph requires a draft head block")?,
                     )
                     .map_err(|error| error.to_string())?;
-                    let history = head_state.sole_history()?;
-                    let history_rows =
-                        u64::try_from(history.rows).map_err(|_| "head history rows exceed u64")?;
                     let head_graph = crate::programs::native_head::checked_head_family_storage(
                         backend,
                         load,
@@ -822,9 +819,7 @@ impl AssessmentGraphResourceBounds {
                         binding,
                         crate::programs::native_head::head_graph_classes(
                             limits,
-                            history_rows,
-                            history.slab_rows,
-                            head_state.span_limit(),
+                            head_state.head_geometry()?,
                             method.draft_rows(),
                         )?,
                     )?;

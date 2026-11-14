@@ -601,6 +601,7 @@ value for_statement::execute_impl(context & ctx) {
 
     auto result = mk_val<value_array>();
 
+    std::vector<std::pair<value, value>> iteration_assignments;
     bool noIteration = true;
     for (size_t i = 0; i < filtered_items.size(); i++) {
         JJ_DEBUG("For loop iteration %zu/%zu", i + 1, filtered_items.size());
@@ -617,17 +618,23 @@ value for_statement::execute_impl(context & ctx) {
         loop_obj->insert("nextitem", i < filtered_items.size() - 1 ? filtered_items[i + 1] : mk_val<value_undefined>("nextitem"));
         scope.set_val("loop", loop_obj);
         scope_update_fns[i](scope);
+        scope.iteration_assignments = &iteration_assignments;
+        noIteration = false;
+        bool broken = false;
         try {
             for (auto & stmt : body) {
                 value val = stmt->execute(scope);
                 result->push_back(val);
             }
         } catch (const continue_statement::signal &) {
-            continue;
         } catch (const break_statement::signal &) {
+            broken = true;
+        }
+        scope.end_iteration();
+        scope.iteration_assignments = nullptr;
+        if (broken) {
             break;
         }
-        noIteration = false;
     }
 
     JJ_DEBUG("For loop complete, total iterations: %zu", filtered_items.size());

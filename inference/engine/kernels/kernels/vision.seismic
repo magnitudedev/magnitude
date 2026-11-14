@@ -12,8 +12,9 @@
 # intermediates (normalized rows, projections that feed a projection or the
 # attention, rotated queries and keys, the attention output, activations) are
 # rounded to the activation element A. Projections accumulate in F32 and add
-# their bias before that rounding; a projection that feeds the residual
-# stream is added in F32. (A precision study on the Qwen3.5 4B projector: bf16
+# their bias before that rounding; an activation or a GLU's gate multiply
+# reads the F32 projection and rounds once, as published; a projection that
+# feeds the residual stream is added in F32. (A precision study on the Qwen3.5 4B projector: bf16
 # for both the intermediates and the residual stream puts the features 19%
 # relative RMS from an F64 forward; an F32 residual stream with f16
 # intermediates 1.9%, llama.cpp's policy 1.6%. Qwen35 binds A = f16.)
@@ -125,16 +126,48 @@ native vision_patch_stem for cpu from "cpu/vision_patch_stem.rs":
         shared_bytes ((H + 8 * (1 + S) * C * P * P) * 4)
 
 
+# The vision activations by code (`vision_linear`'s and `vision_norm`'s
+# `activation`), of each F32 value a of `values`:
+#   0  none
+#   1  GELU-tanh   0.5 a (1 + tanh u), u = √(2/π) (a + 0.044715 a³), with
+#                  tanh u = 2 / (1 + exp(-2u)) - 1
+#   2  GELU-erf    0.5 a (1 + erf(a / √2))
+#   3  quick GELU  a / (1 + exp(-1.702 a))
+#   4  ReLU²       max(a, 0)²
+#   5  SiLU        a / (1 + exp(-a))
+fn vision_activate[N](values: &tensor[N] f32, code: i32) -> tensor[N] f32:
+    let probability = erf_values(values * 0.7071067811865476)
+    let mut result = tensor[N] f32
+    parallel for column in 0..N:
+        let a = values[column]
+        let mut value = a
+        if code == 1:
+            let argument = 0.7978845608028654 * (a + 0.044715 * a * a * a)
+            value = 0.5 * a * (1.0 + (2.0 / (1.0 + exp(-2.0 * argument)) - 1.0))
+        if code == 2:
+            value = 0.5 * a * (1.0 + probability[column])
+        if code == 3:
+            value = a / (1.0 + exp(-1.702 * a))
+        if code == 4:
+            let positive = max(a, 0.0)
+            value = positive * positive
+        if code == 5:
+            value = a / (1.0 + exp(-a))
+        result[column] = value
+    return result
+
 # One norm of each of the C · G F32 rows (C cells of G rows): centered
 # statistics (a layer norm, `centered` nonzero) or root-mean-square ones,
 # times NW weight rows and plus NB bias rows (each 0 or 1), published to Y as
 # one row of G · H per cell. With NO = 1 row r of the result normalizes source
 # row order[r] (cell-major row numbers of `source`). The G normalized rows of
 # a cell are laid side by side (value c of member s at s · H + c), or, with
-# `interleave` nonzero, channel by channel (at c · G + s).
+# `interleave` nonzero, channel by channel (at c · G + s). A nonzero
+# `activation` (`vision_activate`'s codes) applies to each normalized value
+# in F32 before it is published.
 fn vision_norm[C, G, H, NW, NB, NO](source: &tensor[C, G, H] f32,
     weight: &tensor[NW, H] NWE, bias: &tensor[NB, H] NBE, order: &tensor[NO, C * G] i32,
-    epsilon: f32, centered: i32, interleave: i32) -> tensor[C, G * H] Y
+    epsilon: f32, centered: i32, interleave: i32, activation: i32) -> tensor[C, G * H] Y
     where NW >= 0 and NB >= 0 and NO >= 0:
     let mut normalized = tensor[C, G, H] f32
     parallel for cell in 0..C:
@@ -153,7 +186,7 @@ fn vision_norm[C, G, H, NW, NB, NO](source: &tensor[C, G, H] f32,
                 row = row * f32(weight[weight_row])
             for bias_row in 0..NB:
                 row = row + f32(bias[bias_row])
-            normalized[cell, member] = row
+            normalized[cell, member] = vision_activate(row, activation)
     let mut result = tensor[C, G * H] Y
     parallel for cell in 0..C:
         for member in 0..G:
@@ -197,10 +230,10 @@ native vision_norm for cpu from "cpu/vision_norm.rs":
 # clamped to [minimum, maximum] when NC = 1, then:
 #   activation 0, NG = 0: plus the NR residual rows (NR <= 1, F32), published
 #   to Y;
-#   activation 1 (tanh GELU), 2 (erf GELU), 3 (quick GELU), 4 (squared
-#   ReLU), 5 (SiLU): Y(act(A(value)));
-#   NG = 1 (activation 0): Y(A(value) * gate), the up half of a GLU whose
-#   gate projection published A(act(A(gate))).
+#   activation 1 to 5 (`vision_activate`'s codes): Y(act(value));
+#   NG = 1 (activation 0): Y(value * gate), the up half of a GLU whose
+#   gate projection published Y(act(gate)). An activation and the gate
+#   multiply read the F32 value and round once, as `vision_norm`'s does.
 fn vision_linear[M, N, K, NB, NR, NG, NC](x: &tensor[M, K] A, weight: &tensor[N, K] W,
     bias: &tensor[NB, N] B, residual: &tensor[NR, M, N] f32, gate: &tensor[NG, M, N] A,
     minimum: &tensor[NC] f32, maximum: &tensor[NC] f32, activation: i32) -> tensor[M, N] Y
@@ -216,31 +249,13 @@ fn vision_linear[M, N, K, NB, NR, NG, NC](x: &tensor[M, K] A, weight: &tensor[N,
             for bound in 0..NC:
                 sum = min(max(sum, minimum[bound]), maximum[bound])
             value[row, output] = sum
-    let mut projected = tensor[M, N] A
-    parallel for row in 0..M:
-        parallel for output in 0..N:
-            projected[row, output] = value[row, output]
     let mut result = tensor[M, N] Y
     parallel for row in 0..M:
-        let rounded = f32(projected[row])
-        let probability = erf_values(rounded * 0.7071067811865476)
+        let activated = vision_activate(value[row], activation)
         parallel for output in 0..N:
-            let a = rounded[output]
-            let mut sum = value[row, output]
-            if activation == 1:
-                let argument = 0.7978845608028654 * (a + 0.044715 * a * a * a)
-                sum = 0.5 * a * (1.0 + (2.0 / (1.0 + exp(-2.0 * argument)) - 1.0))
-            if activation == 2:
-                sum = 0.5 * a * (1.0 + probability[output])
-            if activation == 3:
-                sum = a / (1.0 + exp(-1.702 * a))
-            if activation == 4:
-                let positive = max(a, 0.0)
-                sum = positive * positive
-            if activation == 5:
-                sum = a / (1.0 + exp(-a))
+            let mut sum = activated[output]
             for gated in 0..NG:
-                sum = a * f32(gate[gated, row, output])
+                sum = value[row, output] * f32(gate[gated, row, output])
             for residual_row in 0..NR:
                 sum = residual[residual_row, row, output] + sum
             result[row, output] = sum

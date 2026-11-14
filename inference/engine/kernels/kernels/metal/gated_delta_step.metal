@@ -1,4 +1,4 @@
-// Row-sequential gated delta step (`recurrent::advance_rows`). A threadgroup
+// Row-sequential gated delta step (`recurrent::step`). A threadgroup
 // of four simdgroups owns (value head, block of ROWS state rows, slot); each
 // simdgroup keeps ROWS / 4 state rows in registers, W / 32 contiguous key
 // columns per lane. State is read from version (previous_bank,
@@ -48,26 +48,14 @@ kernel void gated_delta_step(
     threadgroup float beta_block[RST_BLOCK];
     threadgroup float decay_block[RST_BLOCK];
     threadgroup uint last;
-    const uint threads = threadgroup_shape.x;
-    const ulong head = group.x;
-    const ulong block_row0 = ulong(group.y) * SEISMIC_TUNE_ROWS;
-    const ulong row0 = block_row0 + ulong(simdgroup) * RST_LANE_ROWS;
     const recurrent::Slot slot = recurrent::slot_of(segments, stop, previous_bank, previous_tape, following_bank,
         group.z, seismic_words);
     // The successor bank's window is no slot's source, so it is written first.
     if (group.y == 0)
-        recurrent::publish_window(projection, window, slot, head, thread_index, threads, seismic_words);
-    recurrent::advance_rows<RST_LANE_ROWS, SEISMIC_TUNE_ROWS, RST_BLOCK, SEISMIC_DIM_W, SEISMIC_TUNE_ROWS>(
-        projection, recurrent::Convolving{projection, window, convolution, slot}, rate, time_bias, delta, tape,
-        mixed, slot, slot.lo, head, block_row0, row0, query_block, key_block, value_block, beta_block,
-        decay_block, thread_index, threads, simdgroup, lane, seismic_words);
-    // Rows after the last slot belong to no sequence; their raw output is zero.
-    if (group.z + 1 == SEISMIC_DIM_B && lane < RST_LANE_ROWS) {
-        for (ulong row = ulong(slot.hi); row < SEISMIC_DIM_M; ++row)
-            mixed[recurrent::raw_index(row, head, row0 + lane, seismic_words)] = element::Act::store(0.0f);
-    }
-    const uint expected = uint(SEISMIC_DIM_W / SEISMIC_TUNE_ROWS * SEISMIC_DIM_B);
-    if (!arrive::last(arrivals + head, expected, &last, thread_index))
-        return;
-    recurrent::gate_head(mixed, projection, recurrent_norm, gated, head, thread_index, threads, seismic_words);
+        recurrent::publish_window(projection, window, slot, group.x, thread_index, threadgroup_shape.x,
+            seismic_words);
+    recurrent::step<RST_LANE_ROWS, RST_BLOCK>(recurrent::Convolving{projection, window, convolution, slot},
+        recurrent::HeadRule{projection, rate, time_bias}, recurrent::projected_gate(projection, seismic_words),
+        recurrent_norm, gated, mixed, arrivals, delta, tape, slot, group, query_block, key_block, value_block,
+        beta_block, decay_block, &last, thread_index, threadgroup_shape.x, simdgroup, lane, seismic_words);
 }

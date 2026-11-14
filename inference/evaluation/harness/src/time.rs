@@ -116,7 +116,7 @@ pub fn run(
         artifacts,
         options,
         &Load {
-            drafter: false,
+            method: magnitude_engine::options::ModelMethod::Plain,
             proposals: None,
             context_tokens: longest + decode_context_rows(time.warm, time.steps, time.attribution_steps),
             // A cell's sequences are held together.

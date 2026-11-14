@@ -163,8 +163,13 @@ pub enum WorkflowError {
         expected: String,
         bound: String,
     },
+    /// Argument `parameter` of a node of checked entry `entry` is not what
+    /// the entry declares: `expected` against the `bound` argument.
     NativeGraphArgumentMismatch {
+        entry: &'static str,
         parameter: usize,
+        expected: String,
+        bound: String,
     },
     NativePortAlreadyBound {
         port: usize,
@@ -316,10 +321,10 @@ impl fmt::Display for CallError {
             Self::Workflow(WorkflowError::NativePortBinding { port, expected, bound }) => {
                 write!(f, "native graph port {port} takes {expected}, bound {bound}")
             }
-            Self::Workflow(WorkflowError::NativeGraphArgumentMismatch { parameter }) => {
+            Self::Workflow(WorkflowError::NativeGraphArgumentMismatch { entry, parameter, expected, bound }) => {
                 write!(
                     f,
-                    "native graph argument {parameter} differs from its checked entry"
+                    "native graph argument {parameter} of {entry} takes {expected}, bound {bound}"
                 )
             }
             Self::Workflow(WorkflowError::NativePortAlreadyBound { port }) => {

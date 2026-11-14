@@ -6,11 +6,12 @@
 //
 // L1 (prepare): one subgroup per (row, query or kv head), rows padded to whole
 // QT tiles, prepares the query, or the key (rounded to A) and the value, and
-// stores them to scratch as f16, the attention operand type. K/V are stored
-// as history holds them (`history_hold`): dense, as prepared; affine, their
-// encoding decoded, the one encoding also appended at the row's destination.
-// Queries sit at [KV][rows][G][W], so the QT x G matrix rows of one (tile, kv
-// head) are consecutive rows of stride W.
+// stores them to scratch as f16, the attention operand type, a query row
+// scaled by its factor (`prefill_query_exponent`), which follows in a plane of
+// its own. K/V are stored as history holds them (`history_hold`): dense, as
+// prepared; affine, their encoding decoded, the one encoding also appended at
+// the row's destination. Queries sit at [KV][rows][G][W], so the QT x G matrix
+// rows of one (tile, kv head) are consecutive rows of stride W.
 //
 // L2 (attend): workgroup (QT-row tile, kv head, key partition); its QT * G
 // matrix rows (token-major, head-minor) split into 16-row blocks, one per
@@ -54,7 +55,7 @@
 #endif
 
 #define PREFILL_KEYS FLASH_KEYS
-// A WorkList prefill (the entry's PREFILL_SELECTED: `indexer_select`'s
+// A WorkList prefill (the entry's PREFILL_SELECTED: `unit_reads`'
 // per-row block bitmap, PREFILL_SELECTION_WORDS words a row, the
 // PREFILL_BLOCK_ROWS keys of a block) walks the key tiles its list launch
 // (`prefill_list`) listed for its query tile and masks every key per row.
@@ -98,15 +99,32 @@
 // PREFILL_DECODE, PREFILL_PARTS its partitions).
 
 // The prefill entries' scratch planes ([KV][rows][G][W], [M][KV][W],
-// [M][KV][W] f16 and the tile partition counts), named by the entry: the
-// entry ABI is not this file's. Decode rows use the first three where L1
-// runs (PREFILL_PREPARED), and no counts.
+// [M][KV][W] f16, the tile partition counts and the query rows' factors),
+// named by the entry: the entry ABI is not this file's. Decode rows use the
+// queries, keys, values and factors where L1 runs (PREFILL_PREPARED), and no
+// counts.
 struct prefill_scratch {
     uint64_t queries;
     uint64_t keys;
     uint64_t values;
     uint64_t counts;
+    // Each query row's factor 2^e (F32, [KV][rows][G], and the queries'
+    // slack rows).
+    uint64_t query_factors;
 };
+
+// The exponent e >= 0 a query row (its lanes' E columns, rounded to A) is
+// staged scaled down by, 2^-e, so its largest magnitude stays below 2^15 and
+// F16 holds it: e = 0 unless the row reaches 2^15, which nothing bounds a
+// query row below. Scaling by a power of two keeps every value within F16's
+// range exact, and its scores take the factor 2^e back exactly, as
+// `projection.glsl` stages bf16 activation rows. The whole subgroup calls it.
+int prefill_query_exponent(float x[ATTENTION_E]) {
+    float largest = 0.0;
+    [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
+        largest = max(largest, abs(x[i]));
+    return staging_f16_exponent(seismic_subgroup_max_f32(largest));
+}
 
 // The index-list source's state (PREFILL_PICKS), named by the entry:
 // [M][KV * G][W] and [M][KV * G][2] F32 after the key partitions' partials
@@ -142,7 +160,8 @@ void prefill_prepare(attention_history h, prefill_scratch scratch_planes) {
     const uint64_t queries = scratch_planes.queries;
     if (head < KV * G) {
         const uint kv_head = head / G, g = head % G;
-        const uint64_t at = ((uint64_t(kv_head) * padded + row) * G + g) * W + lane * E;
+        const uint64_t query_row = (uint64_t(kv_head) * padded + row) * G + g;
+        const uint64_t at = query_row * W + lane * E;
         float x[ATTENTION_E];
         if (row < rows) {
             attention_prepare(ATTENTION_QUERY_BUFFER + ((row * KV * G + head) * ATTENTION_QUERY_STRIDE) * 2ul,
@@ -155,7 +174,12 @@ void prefill_prepare(attention_history h, prefill_scratch scratch_planes) {
                 x[i] = 0.0;
         }
         [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
-            element_put(ELEMENT_F16, queries, at + i, element_round(ELEMENT_ACT, x[i]));
+            x[i] = element_round(ELEMENT_ACT, x[i]);
+        const int exponent = prefill_query_exponent(x);
+        [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
+            element_put(ELEMENT_F16, queries, at + i, ldexp(x[i], -exponent));
+        if (lane == 0u)
+            element_f32_put(scratch_planes.query_factors + query_row * 4ul, ldexp(1.0, exponent));
         return;
     }
     if (row >= rows || !ATTENTION_FRESH)
@@ -405,6 +429,25 @@ bool prefill_reads(uint64_t row, int base, int key, int lo) {
     return ((word >> (block % 32u)) & 1u) != 0u;
 }
 
+// The least key ordinal at or past `ordinal`, and before `end`, that row `row`
+// reads under the WorkList (the next set bit of its bitmap, the blocks past
+// the bitmap unread), or `end` when it reads none there. It reads the
+// bitmap's words, not its keys, so a walk of the selected keys costs its
+// selection and the bitmap's words, not the context.
+uint prefill_next_read(uint64_t row, uint ordinal, uint end) {
+    if (!PREFILL_SELECTED || ordinal >= end)
+        return ordinal;
+    const uint block = ordinal / uint(PREFILL_BLOCK_ROWS);
+    for (uint w = block / 32u; w < uint(PREFILL_SELECTION_WORDS); ++w) {
+        uint word = element_u32_at(PREFILL_SELECTION_BUFFER + (row * uint64_t(PREFILL_SELECTION_WORDS) + uint64_t(w)) * 4ul);
+        if (w == block / 32u)
+            word &= ~0u << (block % 32u);
+        if (word != 0u)
+            return min(max((w * 32u + uint(findLSB(word))) * uint(PREFILL_BLOCK_ROWS), ordinal), end);
+    }
+    return end;
+}
+
 // The list launch (PREFILL_SELECTED): workgroup per QT-row query tile, 256
 // invocations. It writes each tile row's span ordinals, then lists, in L2's
 // tile order (each span's union interval in PREFILL_KEYS-key tiles, spans
@@ -536,13 +579,13 @@ void prefill_stage_from(attention_history h, prefill_scratch scratch_planes, con
 // tile: from pick `first` of row `pick_row`): the block's scores, each row's
 // keys outside [row_lo, row_hi) masked unless the tile lies in every row's
 // interval (`inside`), and a pick tile's keys masked for every row but its
-// own (the lane's row is `token`) and where a pick is -1; the online
-// softmax; O += P V over the pass's output window. The whole workgroup calls
-// it.
+// own (the lane's row is `token`) and where a pick is -1, the lane's row's
+// scores scaled by `row_scale`; the online softmax; O += P V over the pass's
+// output window. The whole workgroup calls it.
 void prefill_absorb(attention_history h, prefill_scratch scratch_planes, uint source, int first, int end, bool inside,
     int row_lo, int row_hi, uint64_t pick_row, uint64_t token, uint kv_head, const uint chunk, uint column0,
     const uint width,
-    bool computes, uint64_t block_queries, uint shared_queries, uint scratch, float scale,
+    bool computes, uint64_t block_queries, uint shared_queries, uint scratch, float row_scale,
     inout flash_softmax softmax, inout flash_output o) {
     flash_scores_state scores;
     flash_scores_clear(scores);
@@ -555,7 +598,7 @@ void prefill_absorb(attention_history h, prefill_scratch scratch_planes, uint so
     }
     flash_scores_publish(scores, scratch);
     float s[16];
-    prefill_lane_scores(scratch, scale, first, inside, row_lo, row_hi, s);
+    prefill_lane_scores(scratch, row_scale, first, inside, row_lo, row_hi, s);
 #ifdef PREFILL_DECODE
     if (source == PREFILL_FROM_PICKS) {
         const uint lane_half = SEISMIC_LANE / 16u;
@@ -604,8 +647,10 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
     const uint width = flash_window(W, PREFILL_WINDOW);
     const uint scratch = (FLASH_KEYS * flash_pitch(chunk)) / 2u + SEISMIC_SUBGROUP * FLASH_SCRATCH_FLOATS;
 #if !PREFILL_PREPARED
-    // The query tile [ROWS][W + 8] f16, after every subgroup's scratch.
+    // The query tile [ROWS][W + 8] f16, after every subgroup's scratch, then
+    // its rows' factors [ROWS] (F32).
     const uint queries = FLASH_KEYS * flash_pitch(chunk) + 2u * SEISMIC_SUBGROUPS * FLASH_SCRATCH_FLOATS;
+    const uint query_factors = (queries + PREFILL_ROWS * (W + 8u)) / 2u;
     for (uint i = SEISMIC_SUBGROUP; i < PREFILL_ROWS; i += SEISMIC_SUBGROUPS) {
         const uint64_t token = tile_first + i / G;
         float x[ATTENTION_E];
@@ -621,7 +666,12 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
             [[unroll]] for (uint j = 0u; j < ATTENTION_E; ++j)
                 x[j] = 0.0;
         }
+        const int exponent = prefill_query_exponent(x);
+        [[unroll]] for (uint j = 0u; j < ATTENTION_E; ++j)
+            x[j] = ldexp(x[j], -exponent);
         prefill_put_row(queries, W + 8u, i, 0u, W, lane, x);
+        if (lane == 0u)
+            seismic_shared_f32[query_factors + i] = ldexp(1.0, exponent);
     }
     if (ATTENTION_FRESH && part == 0u) {
         for (uint64_t token = tile_first + SEISMIC_SUBGROUP; token < min(tile_first + PREFILL_QT, rows);
@@ -712,10 +762,16 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
     const uint64_t block_queries = scratch_planes.queries
         + ((uint64_t(kv_head) * padded + tile_first) * G + block_row) * W * 2ul;
     const uint shared_queries = 0u;
+    const float factor = valid
+        ? element_f32_at(scratch_planes.query_factors + ((uint64_t(kv_head) * padded + tile_first) * G + lane_row) * 4ul)
+        : 1.0;
 #else
     const uint64_t block_queries = 0ul;
     const uint shared_queries = queries + block_row * (W + 8u);
+    const float factor = valid ? seismic_shared_f32[query_factors + lane_row] : 1.0;
 #endif
+    // The lane's row's scores: its staged query times its factor.
+    const float row_scale = scale * factor;
 
     const uint64_t heads = uint64_t(KV * G);
     const uint64_t query = ATTENTION_QUERY_BUFFER;
@@ -754,7 +810,7 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
             }
             flash_scores_publish(scores, scratch);
             float s[16];
-            prefill_lane_scores(scratch, scale, first, false, row_lo, row_hi, s);
+            prefill_lane_scores(scratch, row_scale, first, false, row_lo, row_hi, s);
             const uint lane_half = SEISMIC_LANE / 16u;
             [[unroll]] for (uint j = 0u; j < 16u; ++j) {
                 const int t = first + int(16u * lane_half + j);
@@ -775,7 +831,7 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
             const int first = int(t * PREFILL_KEYS);
             prefill_absorb(h, scratch_planes, PREFILL_FROM_POSITIONS, first, int(sequence),
                 first + int(PREFILL_KEYS) <= int(sequence), 0, int(sequence), tile_first, token, kv_head, chunk,
-                column0, width, computes, block_queries, shared_queries, scratch, scale, softmax, o);
+                column0, width, computes, block_queries, shared_queries, scratch, row_scale, softmax, o);
         }
         uint tiles_before = located.y;
         for (uint64_t index = located.x;
@@ -797,7 +853,7 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
                 const bool inside = first >= interval.z && first + int(PREFILL_KEYS) <= interval.w;
                 prefill_absorb(h, scratch_planes, historical ? PREFILL_FROM_HISTORY : PREFILL_FROM_FRESH, first,
                     interval.y, inside, row_lo, row_hi, 0ul, token, kv_head, chunk, column0, width, computes,
-                    block_queries, shared_queries, scratch, scale, softmax, o);
+                    block_queries, shared_queries, scratch, row_scale, softmax, o);
             }
         }
 #ifdef PREFILL_DECODE
@@ -810,7 +866,7 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
                 break;
             prefill_absorb(h, scratch_planes, PREFILL_FROM_PICKS, int((ordinal % pick_tiles) * PREFILL_KEYS), 0, true,
                 0, 0, pick_row, token, kv_head, chunk, column0, width, computes, block_queries, shared_queries,
-                scratch, scale, softmax, o);
+                scratch, row_scale, softmax, o);
         }
 #endif
         const float maximum = softmax.maximum;
@@ -873,10 +929,12 @@ void prefill_picks(prefill_scratch scratch_planes, prefill_picked picked, uint64
     const uint kv_head = head / G;
     const uint lane = SEISMIC_LANE;
     const float scale = element_word_f32(SEISMIC_PARAM_SCALE) * ATTENTION_LOG2E;
-    const uint64_t query = ((uint64_t(kv_head) * padded + row) * G + head % G) * W + lane * E;
+    const uint64_t query_row = (uint64_t(kv_head) * padded + row) * G + head % G;
+    const uint64_t query = query_row * W + lane * E;
     float q[ATTENTION_E], accumulated[ATTENTION_E];
     [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i) {
-        q[i] = element_at(ELEMENT_F16, scratch_planes.queries, query + i);
+        q[i] = element_at(ELEMENT_F16, scratch_planes.queries, query + i)
+            * element_f32_at(scratch_planes.query_factors + query_row * 4ul);
         accumulated[i] = 0.0;
     }
     const uint64_t head_bytes = uint64_t(W) * ELEMENT_BYTES(ELEMENT_ACT);

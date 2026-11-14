@@ -587,49 +587,48 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let i32_of = |value: usize, what: &str| {
             i32::try_from(value).map_err(|_| format!("head {what} exceeds i32"))
         };
-        // The draft head's store has one Token domain.
-        let domain = self
+        let store = self
             .head_store
             .as_ref()
-            .ok_or("a head operation without a head store")?
-            .sole_history_domain()
-            .map_err(|error| error.to_string())?;
-        let history = advance
-            .history_ranges(domain)
-            .into_iter()
-            .map(|(start, count)| {
-                Ok([
-                    i32_of(start, "history start")?,
-                    i32_of(
-                        start
-                            .checked_add(count)
-                            .ok_or("head history end overflow")?,
-                        "history end",
-                    )?,
-                ])
-            })
-            .collect::<Result<Vec<[i32; 2]>, String>>()?;
-        let destination = |row: usize| -> Result<i32, String> {
-            binding.destinations[domain.0]
-                .get(row)
-                .map_or(Ok(-1), |value| i32_of(*value, "destination"))
-        };
-        // A head row at head position p pairs the token after target row p
-        // with that row's feature, so it takes target row p's coordinates.
+            .ok_or("a head operation without a head store")?;
+        // The entry rows are one launch; each chained row is a launch of its
+        // own, reading every earlier row of the advance as stored history.
+        let appends = super::target::SlotAppends::every_domain(store, advance);
+        let reads = vec![false; store.history_reads().len()];
+        let written = advance.rows();
+        let last_written = written
+            .checked_sub(1)
+            .expect("a head advance carries its entry rows");
         let chained = steps.saturating_sub(1);
         let coordinates = self.input_coordinates(request, position, tokens.len() + chained)?;
-        let row = |index: usize, token: i32, visible: Vec<[i32; 2]>| -> Result<Row, String> {
+        let row = |index: usize, token: i32, pass_start: usize| -> Result<Row, String> {
+            // A chained row past the request's own proposals appends nowhere
+            // and its selection is discarded: it reads as the last written
+            // row does, appending nothing.
+            let unwritten = index >= written;
+            let at = index.min(last_written);
+            let mut histories = super::target::row_histories(
+                store,
+                advance,
+                &appends,
+                at,
+                pass_start.min(at),
+                None,
+                &reads,
+            )?;
+            for history in &mut histories {
+                // Adjacent spans read as one, as the accepted rows' are.
+                history.visible = crate::batching::coalesce_spans(&history.visible);
+                if unwritten {
+                    history.destination = -1;
+                }
+            }
             Ok(Row {
                 token,
                 coordinates: *coordinates
                     .get(index)
                     .ok_or("prepared input coordinate count differs from head rows")?,
-                histories: vec![RowHistory {
-                    visible,
-                    fresh_start: 0,
-                    bidirectional_end: None,
-                    destination: destination(index)?,
-                }],
+                histories,
                 demand: crate::batching::Demand::NONE,
                 select: None,
             })
@@ -638,29 +637,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .iter()
             .enumerate()
             .map(|(index, token)| {
-                row(
-                    index,
-                    i32::try_from(token.0).map_err(|_| "head token exceeds i32")?,
-                    history.clone(),
-                )
+                row(index, i32::try_from(token.0).map_err(|_| "head token exceeds i32")?, 0)
             })
             .collect::<Result<Vec<_>, String>>()?;
-        // Chained row j sees the history, the entry rows, and the chained
-        // rows before it; the entry rows were appended by the entry pass.
-        let mut visible = history.clone();
-        for index in 0..tokens.len() {
-            let appended = destination(index)?;
-            visible.push([appended, appended + 1]);
-        }
-        let mut chain = Vec::with_capacity(chained);
-        for step in 1..steps {
-            let index = tokens.len() + step - 1;
-            chain.push(row(index, 0, coalesce(&visible))?);
-            let appended = destination(index)?;
-            if appended >= 0 {
-                visible.push([appended, appended + 1]);
-            }
-        }
+        let chain = (1..steps)
+            .map(|step| {
+                let index = tokens.len() + step - 1;
+                row(index, 0, index)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         let last = proposals.last();
         let selections = (0..steps)
             .map(|step| {
@@ -924,16 +909,4 @@ fn advance_rows(passes: HeadPasses, entry: usize, proposals: usize) -> usize {
         HeadPasses::Chained => entry + proposals.saturating_sub(1),
         HeadPasses::Block => entry,
     }
-}
-
-/// Ascending visible spans with adjacent spans merged.
-fn coalesce(spans: &[[i32; 2]]) -> Vec<[i32; 2]> {
-    let mut merged: Vec<[i32; 2]> = Vec::with_capacity(spans.len());
-    for &span in spans {
-        match merged.last_mut() {
-            Some(previous) if previous[1] == span[0] => previous[1] = span[1],
-            _ => merged.push(span),
-        }
-    }
-    merged
 }

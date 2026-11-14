@@ -125,6 +125,7 @@ fn module() -> seismic_lang::checked::CheckedModule {
     let mut sources = seismic_std::sources();
     for (path, text) in [
         ("indexer.seismic", include_str!("../../kernels/indexer.seismic")),
+        ("pooled.seismic", include_str!("../../kernels/pooled.seismic")),
         ("attention.seismic", include_str!("../../kernels/attention.seismic")),
         ("functions.seismic", include_str!("../../kernels/functions.seismic")),
         ("rounding.seismic", include_str!("../../kernels/rounding.seismic")),
@@ -142,17 +143,27 @@ pub enum Input {
     ScalarF32(f32),
     ScalarI32(i32),
     ScalarU32(u32),
+    U32(Vec<usize>, Vec<u32>),
 }
 
 /// Entry `entry`'s portable body over `inputs` with element `A` BF16 when
 /// `activation`: its results, and its inputs after the call.
 pub fn interpret(entry: &str, activation: bool, inputs: Vec<Input>) -> (Vec<Vec<f64>>, Vec<(usize, Vec<f64>)>) {
-    let module = module();
     let bindings = match activation {
         true => ElementBindings::new().bind("A", registry::dense(DType::BF16)),
         false => ElementBindings::new(),
     };
-    let logical = module.entry(module.entry_named(entry).unwrap(), &bindings).unwrap();
+    interpret_with(entry, &bindings, inputs)
+}
+
+/// [`interpret`] with the element bindings given.
+pub fn interpret_with(
+    entry: &str,
+    bindings: &ElementBindings,
+    inputs: Vec<Input>,
+) -> (Vec<Vec<f64>>, Vec<(usize, Vec<f64>)>) {
+    let module = module();
+    let logical = module.entry(module.entry_named(entry).unwrap(), bindings).unwrap();
     let mut interpreter = Interpreter::new(&logical);
     let args = inputs
         .into_iter()
@@ -160,6 +171,7 @@ pub fn interpret(entry: &str, activation: bool, inputs: Vec<Input>) -> (Vec<Vec<
             Input::F32(shape, v) => Arg::Tensor(interpreter.add_tensor(TensorData::dense(DType::F32, shape, v.iter().map(|x| f64::from(*x)).collect()))),
             Input::Bf16(shape, v) => Arg::Tensor(interpreter.add_tensor(TensorData::dense(DType::BF16, shape, v.iter().map(|x| f64::from(*x)).collect()))),
             Input::I32(shape, v) => Arg::Tensor(interpreter.add_tensor(TensorData::dense(DType::I32, shape, v.iter().map(|x| f64::from(*x)).collect()))),
+            Input::U32(shape, v) => Arg::Tensor(interpreter.add_tensor(TensorData::dense(DType::U32, shape, v.iter().map(|x| f64::from(*x)).collect()))),
             Input::ScalarF32(x) => Arg::Scalar(ReferenceScalar::F32(x.to_bits())),
             Input::ScalarI32(x) => Arg::Scalar(ReferenceScalar::I32(x)),
             Input::ScalarU32(x) => Arg::Scalar(ReferenceScalar::U32(x)),

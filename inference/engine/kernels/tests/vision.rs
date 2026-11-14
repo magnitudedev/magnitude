@@ -52,8 +52,8 @@ impl Rng {
     }
 }
 
-/// A host tensor: its element, shape and logical values (exact in the
-/// element).
+/// A host tensor: its element (F32, F16, BF16 or I32), shape and logical
+/// values (exact in the element).
 struct Host {
     dtype: DType,
     shape: Vec<usize>,
@@ -66,10 +66,10 @@ impl Host {
         let values = values
             .into_iter()
             .map(|value| {
-                if dtype == DType::F16 {
-                    f16_to_f32(registry::f16_bits(value))
-                } else {
-                    value
+                match dtype {
+                    DType::F16 => f16_to_f32(registry::f16_bits(value)),
+                    DType::BF16 => registry::bf16_round(value),
+                    _ => value,
                 }
             })
             .collect();
@@ -118,6 +118,8 @@ impl Host {
             .iter()
             .flat_map(|value| match self.dtype {
                 DType::F16 => registry::f16_bits(*value).to_le_bytes().to_vec(),
+                // Exact: the value is already BF16's (`Host::new`).
+                DType::BF16 => ((value.to_bits() >> 16) as u16).to_le_bytes().to_vec(),
                 DType::F32 => value.to_le_bytes().to_vec(),
                 DType::I32 => (*value as i32).to_le_bytes().to_vec(),
                 other => panic!("unsupported host dtype {other:?}"),
@@ -279,18 +281,22 @@ const EPSILON: f32 = 1e-6;
 
 /// The two-frame biased stem (the Qwen form), single-frame unbiased ones
 /// with F32 weights (Gemma 4's 16-pixel patches, Muse Glimmer's 14-pixel
-/// ones, whose depth 588 is no whole GEMM step), and the two-frame unbiased
-/// stem without a position table (LFM3-VL).
+/// ones, whose depth 588 is no whole GEMM step), the two-frame unbiased
+/// stem without a position table (LFM3-VL), and the two-frame biased
+/// 14-pixel stem with BF16 weights (GLM-5.3 Flash), whose 16-bit rows of
+/// 588 leave 16-byte alignment past the first, at a width of two of CUDA's
+/// 128-column tiles.
 #[test]
 fn patch_stem_matches_its_portable_body() {
     let module = module();
-    let (rows, channels, hidden, table_rows) = (5usize, 3usize, 64usize, 49usize);
+    let (rows, channels, table_rows) = (5usize, 3usize, 49usize);
     for device in devices() {
-        for (frames, biased, patch, weights, positioned) in [
-            (2usize, true, 16usize, DType::F16, true),
-            (1, false, 16, DType::F32, true),
-            (1, false, 14, DType::F32, true),
-            (2, false, 16, DType::F16, false),
+        for (frames, biased, patch, weights, positioned, hidden) in [
+            (2usize, true, 16usize, DType::F16, true, 64usize),
+            (1, false, 16, DType::F32, true, 64),
+            (1, false, 14, DType::F32, true, 64),
+            (2, false, 16, DType::F16, false, 64),
+            (2, true, 14, DType::BF16, true, 256),
         ] {
             let (s, nb, nt) = (frames - 1, usize::from(biased), usize::from(positioned));
             let table_rows = table_rows * nt;
@@ -389,21 +395,27 @@ fn patch_stem_matches_its_portable_body() {
 }
 
 /// Layer norms and RMS norms, weighted or not, of single rows and of cells
-/// of four rows laid side by side or interleaved, gathered or in order.
+/// of four rows laid side by side or interleaved, gathered or in order; the
+/// interleaved RMS cell also at GLM-5.3 Flash's tower width (1024), whose
+/// rows span many threads' strides.
 #[test]
 fn norm_matches_its_portable_body() {
     let module = module();
-    let (cells, h) = (3usize, 96usize);
-    // (members, centered, weighted, biased, gathered, interleave, output)
+    let cells = 3usize;
+    // (members, centered, weighted, biased, gathered, interleave, activation, output, width)
     let forms = [
-        (1usize, true, true, true, false, false, DType::F16),
-        (1, false, true, false, false, false, DType::F32),
-        (1, false, false, false, false, false, DType::F32),
-        (4, true, true, true, false, false, DType::F16),
-        (4, false, true, false, true, true, DType::F16),
+        (1usize, true, true, true, false, false, 0, DType::F16, 96usize),
+        (1, false, true, false, false, false, 0, DType::F32, 96),
+        (1, false, false, false, false, false, 0, DType::F32, 96),
+        (4, true, true, true, false, false, 0, DType::F16, 96),
+        (4, false, true, false, true, true, 0, DType::F16, 96),
+        (4, false, true, false, false, true, 0, DType::F16, 1024),
+        // A layer norm followed by the erf GELU (a merger stage's), and by SiLU.
+        (1, true, true, true, false, false, 2, DType::F16, 96),
+        (1, true, true, true, false, false, 5, DType::F32, 96),
     ];
     for device in devices() {
-        for (g, centered, weighted, biased, gathered, interleave, output) in forms {
+        for (g, centered, weighted, biased, gathered, interleave, activation, output, h) in forms {
             let (nw, nb, no) = (
                 usize::from(weighted),
                 usize::from(biased),
@@ -427,6 +439,7 @@ fn norm_matches_its_portable_body() {
                     Input::F32(EPSILON),
                     Input::I32(i32::from(centered)),
                     Input::I32(i32::from(interleave)),
+                    Input::I32(activation),
                 ],
             );
             let kernel = vision_norm::native_for_device_with(
@@ -452,12 +465,13 @@ fn norm_matches_its_portable_body() {
                     epsilon: EPSILON,
                     centered: i32::from(centered),
                     interleave: i32::from(interleave),
+                    activation,
                 })
                 .unwrap()
                 .value;
             relative_error(
                 &format!(
-                    "vision_norm {:?} G{g} centered {centered} NW{nw} NB{nb} NO{no}",
+                    "vision_norm {:?} G{g} centered {centered} NW{nw} NB{nb} NO{no} activation {activation}",
                     device.backend()
                 ),
                 &read_values(&result),
@@ -469,14 +483,123 @@ fn norm_matches_its_portable_body() {
     }
 }
 
-/// Projections with their epilogues: the residual form (F32), the four
-/// activations (A), the gated and the clamped forms, and F32 weights over a
-/// depth that is no whole GEMM step.
+/// Per-element rounding bound of `vision_linear` on `backend` (`x` of A = F16)
+/// against its portable body's `expected`: [`common::bound::Form::matrix`]
+/// bounds the native and portable F32 dot products (`vision_linear` runs the
+/// matrix-unit GEMM at every row count), followed by the F32 bias, clamp,
+/// epilogue (`activation` 1..=5, `gate`, or `residual`) and publication to
+/// `output`.
+#[allow(clippy::too_many_arguments)]
+fn linear_bounds(
+    backend: seismic::BackendName,
+    x: &Host,
+    weight: &Host,
+    bias: &Host,
+    residuals: &Host,
+    gate: &Host,
+    minimum: &Host,
+    maximum: &Host,
+    activation: i32,
+    output: DType,
+    expected: &[f32],
+) -> Vec<f64> {
+    use common::bound::{
+        Float, Form, Library, Products, SILU_SLOPE, gamma, silu_evaluation, silu_f64,
+    };
+    let (m, k, n) = (x.shape[0], x.shape[1], weight.shape[0]);
+    let form = Form::matrix(backend, Float::F16, weight.element());
+    let out = Float::dense(Element::dense(output)).unwrap();
+    let u = Float::F32.unit();
+    let (native, host) = (Library::of(backend), Library::of(seismic::BackendName::Cpu));
+    let mut bounds = Vec::with_capacity(m * n);
+    for row in 0..m {
+        let x_row = &x.values[row * k..(row + 1) * k];
+        for col in 0..n {
+            let at = row * n + col;
+            let w_row = &weight.values[col * k..(col + 1) * k];
+            let products = Products::of(x_row, w_row);
+            let mut projected: f64 = x_row
+                .iter()
+                .zip(w_row)
+                .map(|(&a, &b)| f64::from(a) * f64::from(b))
+                .sum();
+            let mut delta = form.sums(&products);
+            if bias.shape[0] == 1 {
+                let b = f64::from(bias.values[col]);
+                delta = (1.0 + u) * delta + 2.0 * u * (projected.abs() + delta + b.abs());
+                projected += b;
+            }
+            if minimum.shape[0] == 1 {
+                projected = projected
+                    .clamp(f64::from(minimum.values[0]), f64::from(maximum.values[0]));
+            }
+            let reach = projected.abs() + delta;
+            let published_delta = match activation {
+                0 if gate.shape[0] == 1 => {
+                    let g = f64::from(gate.values[at]).abs();
+                    delta * g + 2.0 * u * reach * g
+                }
+                0 if residuals.shape[0] == 1 => {
+                    let r = f64::from(residuals.values[at]).abs();
+                    (1.0 + u) * delta + 2.0 * u * (r + reach)
+                }
+                0 => delta,
+                // 0.5 a (1 + (2 / (1 + exp(-2u)) - 1)), u = c0 (a + c1 a³);
+                // |d/da| <= 1.13, |d/dt 2 / (1 + e^-t)| <= 0.5.
+                1 => {
+                    let arg = 0.7978845608028654 * (reach + 0.044715 * reach.powi(3));
+                    let hyp = 0.5 * (2.0 * gamma(5) * arg + native.exp + host.exp)
+                        + 2.0 * (native.divide + host.divide + gamma(4));
+                    1.13 * delta + reach * (hyp + 2.0 * gamma(3))
+                }
+                // 0.5 a (1 + erf(a / √2)); |d/da| <= 1.13, Numerical Recipes
+                // `erfcc` on Metal/Vulkan within 1.2e-7 plus Horner steps and
+                // `exp` on [0, 1].
+                2 => {
+                    let erf_eval = 1.2e-7
+                        + native.exp
+                        + host.exp
+                        + native.divide
+                        + host.divide
+                        + 2.0 * gamma(12);
+                    1.13 * delta + 0.5 * reach * (erf_eval + 2.0 * gamma(3))
+                }
+                // a / (1 + exp(-1.702 a)): slope <= SILU_SLOPE, plus the F32
+                // product `-1.702 * a` before `exp`.
+                3 => {
+                    let eval = silu_evaluation(&native)
+                        + silu_evaluation(&host)
+                        + 2.0 * u * (1.0 + 1.702 * reach);
+                    SILU_SLOPE * delta
+                        + eval * (silu_f64(1.702 * projected).abs() / 1.702 + SILU_SLOPE * delta)
+                }
+                // max(a, 0)².
+                4 => {
+                    let pos = projected.max(0.0);
+                    delta * (2.0 * pos + delta) + 2.0 * u * (pos + delta).powi(2)
+                }
+                // SiLU: a / (1 + exp(-a)).
+                5 => {
+                    let eval = silu_evaluation(&native) + silu_evaluation(&host);
+                    SILU_SLOPE * delta + eval * (silu_f64(projected).abs() + SILU_SLOPE * delta)
+                }
+                other => panic!("unexpected vision activation code {other}"),
+            };
+            bounds.push(out.rounded(published_delta, expected[at]));
+        }
+    }
+    bounds
+}
+
+/// Projections with their epilogues: the residual form (F32), the five
+/// activations (A), the gated and the clamped forms, and F32 and BF16 weights
+/// over depths and tiles past one GEMM step, held element by element to the
+/// rounding bound of each backend's matrix-unit form ([`linear_bounds`]).
 #[test]
 fn linear_matches_its_portable_body() {
     let module = module();
-    let (m, n) = (70usize, 96usize);
-    // (biased, residual, gated, clamped, activation, output, weights, depth)
+    let (tiny_m, tiny_n, tiny_k) = (2usize, 2usize, 8usize);
+    // (biased, residual, gated, clamped, activation, output, weights, m, n, depth)
     let forms = [
         (
             true,
@@ -486,20 +609,31 @@ fn linear_matches_its_portable_body() {
             0,
             DType::F32,
             DType::F16,
-            128usize,
+            tiny_m,
+            tiny_n,
+            tiny_k,
         ),
-        (true, false, false, false, 0, DType::F16, DType::F16, 128),
-        (true, false, false, false, 1, DType::F16, DType::F16, 128),
-        (true, false, false, false, 2, DType::F16, DType::F16, 128),
-        (false, false, false, false, 3, DType::F32, DType::F16, 128),
-        (false, false, false, false, 4, DType::F16, DType::F16, 128),
-        (false, false, false, false, 5, DType::F16, DType::F16, 128),
-        (false, false, true, false, 0, DType::F16, DType::F16, 128),
-        (true, true, false, true, 0, DType::F32, DType::F16, 128),
-        (true, false, false, false, 0, DType::F16, DType::F32, 136),
+        (true, false, false, false, 0, DType::F16, DType::F16, tiny_m, tiny_n, tiny_k),
+        (true, false, false, false, 1, DType::F16, DType::F16, tiny_m, tiny_n, tiny_k),
+        (true, false, false, false, 2, DType::F16, DType::F16, tiny_m, tiny_n, tiny_k),
+        (false, false, false, false, 3, DType::F32, DType::F16, tiny_m, tiny_n, tiny_k),
+        (false, false, false, false, 4, DType::F16, DType::F16, tiny_m, tiny_n, tiny_k),
+        (false, false, false, false, 5, DType::F16, DType::F16, tiny_m, tiny_n, tiny_k),
+        (false, false, true, false, 0, DType::F16, DType::F16, tiny_m, 65, 33),
+        (true, true, false, true, 0, DType::F32, DType::F16, tiny_m, 65, 33),
+        // One past a whole M and N tile and a whole K step (64, 64 and 32).
+        (true, false, false, false, 0, DType::F16, DType::F32, 65, 65, 33),
+        // Past CUDA's 128 x 128 tiles in M and N, two K steps, BF16 weights
+        // (GLM-5.3 Flash's projector) under a residual.
+        (true, true, false, false, 0, DType::F32, DType::BF16, 200, 300, 64),
     ];
     for device in devices() {
-        for (biased, residual, gated, clamped, activation, output, weights, k) in forms {
+        for (biased, residual, gated, clamped, activation, output, weights, m, n, k) in forms {
+            // CUDA's form stages its activation rows in whole 16-byte chunks
+            // and stores output pairs (its `K % 8 == 0` and `N % 2 == 0`): a
+            // ragged depth or width is there the next whole one.
+            let cuda = device.backend() == seismic::BackendName::Cuda;
+            let (n, k) = if cuda { (n.next_multiple_of(2), k.next_multiple_of(8)) } else { (n, k) };
             let (nb, nr, ng, nc) = (
                 usize::from(biased),
                 usize::from(residual),
@@ -569,18 +703,27 @@ fn linear_matches_its_portable_body() {
                 })
                 .unwrap()
                 .value;
-            // The squared ReLU doubles the relative size of a flip of its
-            // rounded input (d(a²)/a² = 2 da/a).
-            let flips = if activation == 4 { 2.0 } else { 1.0 };
-            relative_error(
+            let bounds = linear_bounds(
+                device.backend(),
+                &x,
+                &weight,
+                &bias,
+                &residuals,
+                &gate,
+                &minimum,
+                &maximum,
+                activation,
+                output,
+                &expected,
+            );
+            common::bound::assert_within(
                 &format!(
                     "vision_linear {:?} NB{nb} NR{nr} NG{ng} NC{nc} activation {activation} {weights:?} K{k}",
                     device.backend()
                 ),
                 &read_values(&result),
                 &expected,
-                3e-3 * flips,
-                3e-4 * flips,
+                &bounds,
             );
         }
     }
@@ -629,37 +772,46 @@ fn clamp_matches_its_portable_body() {
     }
 }
 
-/// The rotary attention of 100 rows (a partial query tile, a partial key
-/// tile): the Qwen form; head norms, a weightless value norm and the unit
-/// scale at a head width of 72 (Gemma 4's large towers); windows of 48 rows,
-/// so a query tile spans two windows and starts its walk past row 0, at head
-/// widths 64 and 96 (Muse Glimmer).
+/// The rotary attention (the Qwen form, small: the oracle's per-element
+/// cost does not need a boundary shape for a path that isn't about a tile
+/// boundary); head norms, a weightless value norm and the unit scale at a
+/// head width of 72 (Gemma 4's large towers), also small; windows of 48
+/// rows at head widths 64 and 96 (Muse Glimmer), with just enough rows (49)
+/// for a query tile to span two windows, the last one partial, since the
+/// window size is this test's own 48 (below), not a kernel constant.
 #[test]
 fn attention_matches_its_portable_body() {
     check_attention_forms(&[
-        (2usize, 1usize, 16usize, false, false, false, false, true),
-        (2, 1, 18, true, true, false, true, true),
-        (1, 1, 16, false, false, true, false, true),
-        (1, 1, 24, false, false, true, false, true),
+        (2usize, 1usize, 16usize, false, false, false, false, true, 5),
+        (2, 1, 18, true, true, false, true, true, 5),
+        (1, 1, 16, false, false, true, false, true, 49),
+        (1, 1, 24, false, false, true, false, true, 49),
         // LFM3-VL: two query heads per key and value head.
-        (2, 2, 16, true, false, false, false, true),
+        (2, 2, 16, true, false, false, false, true, 5),
+        // GLM-5.3 Flash: head norms and rotary at width 64, full attention
+        // over rows past several 64-row query blocks and key tiles.
+        (2, 1, 16, true, false, false, false, true, 200),
     ]);
 }
 
 #[test]
 fn learned_position_attention_matches_its_portable_body() {
     // SigLIP: 72-column heads, learned positions, no rotary or head norm.
-    check_attention_forms(&[(2, 1, 18, false, false, false, false, false)]);
+    check_attention_forms(&[(2, 1, 18, false, false, false, false, false, 5)]);
 }
 
 /// Forms (key/value heads, query heads per key/value head, P, head norms,
-/// value norm, windows, unit scale, rotary).
+/// value norm, windows, unit scale, rotary, rows). `rows` is the smallest
+/// that still exercises the form's path: just above one 48-row window
+/// (this test's own window size, not a kernel constant) where `windows`,
+/// otherwise small, since the oracle's cost is per element and the path
+/// through it is chosen by the flags, not by which row is read.
 #[allow(clippy::type_complexity)]
-fn check_attention_forms(forms: &[(usize, usize, usize, bool, bool, bool, bool, bool)]) {
+fn check_attention_forms(forms: &[(usize, usize, usize, bool, bool, bool, bool, bool, usize)]) {
     let module = module();
-    let rows = 100usize;
     for device in devices() {
-        for &(kv_heads, group, quarter, head_norms, value_norm, windows, unit_scale, rotary) in forms
+        for &(kv_heads, group, quarter, head_norms, value_norm, windows, unit_scale, rotary, rows) in
+            forms
         {
             let heads = kv_heads * group;
             let width = 4 * quarter;

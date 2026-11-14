@@ -41,9 +41,10 @@ pub(crate) use target::{
     DenseExpansionKernel, DenseKernels, ExpertBankKernels, ExpertKernels, LEADS,
     GeneralRoutedKernels, NGramKernels, NGramOutputKernel, ParallelKernels, PerLayerEntryKernels, PerLayerKernels,
     PostNormKernels, ProgressiveReadoutKernels, ReadoutHeadKernels, ReadoutKernels,
-    RecurrentKernels, RecurrentStepKernels, RoutedDecodeKernels, RoutedKernels,
+    KimiKernels, RecurrentFormKernels, RecurrentKernels, RecurrentStepKernels, RoutedDecodeKernels,
+    RoutedKernels,
     CandidateKernels, IndexerKernels, LowRankQueryKernels, PickedKernels, PoolKernel, PooledKernels,
-    SelectedPrefillKernel, SelectionKernels,
+    SelectedPrefillKernel, SelectionKernels, SelectionKeyKernels,
     MixingKernels, ShortConvKernels, SinkhornKernels, StateSpaceKernels, StreamsEntryKernels,
     StreamsKernels,
     SublayerOutput, TableConversion,
@@ -72,7 +73,8 @@ use magnitude_kernels::{
     attention_prefill, attention_prefill_k8v4, attention_project, conditioning_overlay, copy_rows,
     dense_expand, dense_output, dense_up, draft_rows, embedding_rows, feature_copy,
     gated_delta_chunk, gated_delta_project, gated_delta_project_convolved, gated_delta_step,
-    gated_delta_step_convolved, import_dense, indexer_select, moe_tail, per_layer_gate,
+    gated_delta_step_convolved, import_dense, kimi_delta_chunk, kimi_delta_step, moe_tail,
+    per_layer_gate,
     per_layer_inputs,
     post_norm_residual, project_rows, readout_exact_rows, readout_features_rows, readout_head_rows,
     readout_planes_rows, readout_project_rows, readout_refine_rows, readout_selected_rows,
@@ -228,7 +230,7 @@ fn element_binding_name(source: Element, resident: Element) -> String {
 #[cfg(test)]
 mod qualification_tests {
     use super::*;
-    use crate::RecurrentBinding;
+    use crate::{RecurrentBinding, RecurrentForm};
 
     #[test]
     fn packed_recurrent_prepares_with_the_qwen_4b_binding() {
@@ -249,6 +251,9 @@ mod qualification_tests {
             value_heads: 32,
             width: 128,
             convolution_width: 4,
+            decay_width: 1,
+            key_norm_epsilon: 1.0e-6_f32.to_bits(),
+            gate_function: 0,
             norm: Element::bf16(),
             qkv: q5k,
             gate: q4k,
@@ -257,6 +262,7 @@ mod qualification_tests {
             recurrent_norm: Element::bf16(),
             output: q5k,
             activation: Element::bf16(),
+            form: RecurrentForm::PerHead,
         };
         let heads = seismic::NativeSpecialization::new()
             .with_static("NK", binding.key_heads)

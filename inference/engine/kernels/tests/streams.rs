@@ -4,10 +4,15 @@
 //! launches, at a small geometry and at Qwen3.8 Flash Next's (H 2560, four
 //! streams, rank 320). The Sinkhorn site and its comb join are checked
 //! against the formulas of DeepSeek V4.1 Flash's single pass, written here,
-//! at its geometry (H 5120, four streams, 20 iterations).
+//! at its geometry (H 5120, four streams, 20 iterations); the site mixing by
+//! its own pre and the streams' mean exit against GLM-5.3-Flash's
+//! (transformers `Glm5NextTextHyperConnection`, `Glm5NextTextHyperHead`) at
+//! its geometry (H 4096, four streams, 20 iterations).
 
 mod common;
 mod declared;
+
+use common::bound::gamma;
 
 use magnitude_kernels::{
     attention_output, repeat_rows, stream_mix_down, stream_mix_sinkhorn, stream_mix_up,
@@ -560,38 +565,53 @@ const V41: (usize, usize, usize) = (5120, 4, 20);
 const V41_EPSILON: f32 = 1e-6;
 const V41_NORM_EPSILON: f32 = 1e-20;
 
+/// GLM-5.3-Flash's mix sites: H, S and Sinkhorn iterations (`hc_mult`,
+/// `hc_sinkhorn_iters`), and the mixing's epsilon and its RMS statistic's
+/// (`hc_eps`, `rms_norm_eps`).
+const GLM: (usize, usize, usize) = (4096, 4, 20);
+const GLM_EPSILONS: (f32, f32) = (1e-6, 1e-5);
+
 /// One Sinkhorn site's weights: `function [(2 + S) S, S H]`, `base`,
-/// `scale [3]`, at magnitudes that put every mix at O(1).
+/// `scale [3]`, at magnitudes that put every mix at O(1), and its mixing's
+/// epsilon and RMS statistic's epsilon.
 struct Sinkhorn {
     function: Vec<f32>,
     base: Vec<f32>,
     scale: Vec<f32>,
+    epsilons: (f32, f32),
 }
 
 impl Sinkhorn {
     fn new(h: usize, s: usize, seed: u32) -> Self {
+        Self::with_epsilons(h, s, seed, (V41_EPSILON, V41_NORM_EPSILON))
+    }
+
+    fn with_epsilons(h: usize, s: usize, seed: u32, epsilons: (f32, f32)) -> Self {
         let mixes = (2 + s) * s;
         Self {
             function: pattern(mixes * s * h, seed, 4.0 / ((s * h) as f32).sqrt()),
             base: pattern(mixes, seed + 1, 1.0),
             scale: vec![0.6, 0.9, 1.7],
+            epsilons,
         }
     }
 
-    /// The site of the streams `x [rows, S H]` with the previous site's
-    /// `previous [rows, S]`, by the map's formulas (engine-map §6) in F64:
-    /// the sublayer input `[rows, H]`, pre `[rows, S]` and the join row
-    /// post | comb `[rows, S + S²]`.
+    /// The site of the streams `x [rows, S H]` mixing its input by the
+    /// previous site's `previous [rows, S]` (V4.1), or by its own pre
+    /// (none: GLM's `collapsed = Σ pre·X` with this site's pre), by the
+    /// map's formulas (engine-map §6) in F64: the sublayer input
+    /// `[rows, H]`, pre `[rows, S]` and the join row post | comb
+    /// `[rows, S + S²]`.
     fn reference(
         &self,
         x: &[f64],
-        previous: &[f64],
+        previous: Option<&[f64]>,
         h: usize,
         s: usize,
         iterations: usize,
     ) -> [Vec<f64>; 3] {
         let (width, mixes) = (s * h, (2 + s) * s);
-        let (epsilon, norm_epsilon) = (f64::from(V41_EPSILON), f64::from(V41_NORM_EPSILON));
+        let (epsilon, norm_epsilon) = (f64::from(self.epsilons.0), f64::from(self.epsilons.1));
         let sigmoid = |v: f64| 1.0 / (1.0 + (-v).exp());
         let (mut input, mut pre, mut join) = (Vec::new(), Vec::new(), Vec::new());
         for (row, x) in x.chunks_exact(width).enumerate() {
@@ -646,7 +666,10 @@ impl Sinkhorn {
                 columns(&mut comb);
             }
             join.extend(comb.iter().flatten());
-            let carried = &previous[row * s..(row + 1) * s];
+            let carried = match previous {
+                Some(previous) => &previous[row * s..(row + 1) * s],
+                None => &pre[row * s..(row + 1) * s],
+            };
             input.extend((0..h).map(|column| {
                 (0..s)
                     .map(|stream| carried[stream] * x[stream * h + column])
@@ -656,46 +679,36 @@ impl Sinkhorn {
         [input, pre, join]
     }
 
-    /// `stream_mix_sinkhorn` on `device`: input, pre and the join row.
+    /// `stream_mix_sinkhorn` on `device`, mixing by `previous` (P = 1) or
+    /// by the site's own pre (none, P = 0): input, pre (empty under P = 0)
+    /// and the join row.
     fn native(
         &self,
         device: &seismic::Device,
         x: &[f32],
-        previous: &[f32],
+        previous: Option<&[f32]>,
         rows: usize,
         (h, s, n): (usize, usize, usize),
     ) -> [Vec<f32>; 3] {
         let mixes = (2 + s) * s;
-        let specialization =
-            seismic::generated::native_implementation::<stream_mix_sinkhorn::Entry>(device)
-                .unwrap()
-                .unwrap()
-                .default_specialization(
-                    &[("H", h), ("S", s)]
-                        .into_iter()
-                        // The CPU's one static is S.
-                        .filter(|(name, _)| {
-                            device.backend() != seismic::BackendName::Cpu || *name != "H"
-                        })
-                        .fold(
-                            seismic::NativeSpecialization::new(),
-                            |spec, (name, value)| spec.with_static(name, value as u64),
-                        ),
-                )
-                .unwrap();
-        let site = stream_mix_sinkhorn::native_for_device(device, &specialization)
-            .unwrap()
-            .call(stream_mix_sinkhorn::Args {
-                hidden: &tensor(device, DType::F32, &[rows, s, h], x),
-                previous: &tensor(device, DType::F32, &[rows, s], previous),
-                function: &tensor(device, DType::F32, &[mixes, s * h], &self.function),
-                base: &tensor(device, DType::F32, &[mixes], &self.base),
-                scale: &tensor(device, DType::F32, &[3], &self.scale),
-                epsilon: V41_EPSILON,
-                norm_epsilon: V41_NORM_EPSILON,
-                iterations: u32::try_from(n).unwrap(),
-            })
-            .unwrap();
+        let carried = usize::from(previous.is_some());
+        let site = at_defaults(
+            device,
+            stream_mix_sinkhorn::native_entry(),
+            &[("H", h as u64), ("S", s as u64), ("P", carried as u64)],
+        )
+        .unwrap()
+        .call(stream_mix_sinkhorn::Args {
+            hidden: &tensor(device, DType::F32, &[rows, s, h], x),
+            previous: &tensor(device, DType::F32, &[rows, carried * s], previous.unwrap_or(&[])),
+            function: &tensor(device, DType::F32, &[mixes, s * h], &self.function),
+            base: &tensor(device, DType::F32, &[mixes], &self.base),
+            scale: &tensor(device, DType::F32, &[3], &self.scale),
+            epsilon: self.epsilons.0,
+            norm_epsilon: self.epsilons.1,
+            iterations: u32::try_from(n).unwrap(),
+        })
+        .unwrap();
         [
             read(&site.r0, DType::F32),
             read(&site.r1, DType::F32),
@@ -834,79 +847,87 @@ fn entry_pre(rows: usize, s: usize) -> Vec<f64> {
 }
 
 /// The portable `stream_mix_sinkhorn` gives the formulas' site at a small
-/// geometry over two consecutive sites, the second reading the first's pre.
+/// geometry over two consecutive sites: mixing by the previous site's pre,
+/// the second reading the first's (P = 1), and each mixing by its own,
+/// carrying none (P = 0).
 #[test]
 fn portable_sinkhorn_site_matches_the_single_pass_formulas() {
     let module = module();
     let (h, s, n, rows) = (64, 4, V41.2, 3);
     let width = s * h;
     let x = pattern(rows * width, 21, 3.0);
-    let previous = entry_pre(rows, s);
-    let mut carried = narrow(&previous);
-    for seed in [31, 41] {
-        let site = Sinkhorn::new(h, s, seed);
-        let mixes = (2 + s) * s;
-        let elements = ElementBindings::new();
-        let logical = module
-            .entry(
-                module.entry_named("stream_mix_sinkhorn").unwrap(),
-                &elements,
-            )
-            .unwrap();
-        let mut interpreter = Interpreter::new(&logical);
-        let tensors = [
-            (vec![rows, s, h], x.clone()),
-            (vec![rows, s], carried.clone()),
-            (vec![mixes, width], site.function.clone()),
-            (vec![mixes], site.base.clone()),
-            (vec![3], site.scale.clone()),
-        ];
-        let mut arguments = tensors
-            .into_iter()
-            .map(|(shape, values)| {
-                Arg::Tensor(interpreter.add_tensor(TensorData::dense(
-                    DType::F32,
-                    shape,
-                    values.iter().map(|v| f64::from(*v)).collect(),
-                )))
-            })
-            .collect::<Vec<_>>();
-        arguments.push(Arg::Scalar(ReferenceScalar::F32(V41_EPSILON.to_bits())));
-        arguments.push(Arg::Scalar(ReferenceScalar::F32(
-            V41_NORM_EPSILON.to_bits(),
-        )));
-        arguments.push(Arg::Scalar(ReferenceScalar::U32(u32::try_from(n).unwrap())));
-        let outcome = interpreter.run(&arguments).unwrap();
-        if let SourceTermination::Failed(failure) = outcome.termination() {
-            panic!("stream_mix_sinkhorn failed: {failure}");
+    for carries in [true, false] {
+        let mut carried = carries.then(|| narrow(&entry_pre(rows, s)));
+        for seed in [31, 41] {
+            let site = Sinkhorn::new(h, s, seed);
+            let mixes = (2 + s) * s;
+            let previous = carried.clone().unwrap_or_default();
+            let elements = ElementBindings::new();
+            let logical = module
+                .entry(
+                    module.entry_named("stream_mix_sinkhorn").unwrap(),
+                    &elements,
+                )
+                .unwrap();
+            let mut interpreter = Interpreter::new(&logical);
+            let tensors = [
+                (vec![rows, s, h], x.clone()),
+                (vec![rows, previous.len() / rows], previous),
+                (vec![mixes, width], site.function.clone()),
+                (vec![mixes], site.base.clone()),
+                (vec![3], site.scale.clone()),
+            ];
+            let mut arguments = tensors
+                .into_iter()
+                .map(|(shape, values)| {
+                    Arg::Tensor(interpreter.add_tensor(TensorData::dense(
+                        DType::F32,
+                        shape,
+                        values.iter().map(|v| f64::from(*v)).collect(),
+                    )))
+                })
+                .collect::<Vec<_>>();
+            arguments.push(Arg::Scalar(ReferenceScalar::F32(V41_EPSILON.to_bits())));
+            arguments.push(Arg::Scalar(ReferenceScalar::F32(
+                V41_NORM_EPSILON.to_bits(),
+            )));
+            arguments.push(Arg::Scalar(ReferenceScalar::U32(u32::try_from(n).unwrap())));
+            let outcome = interpreter.run(&arguments).unwrap();
+            if let SourceTermination::Failed(failure) = outcome.termination() {
+                panic!("stream_mix_sinkhorn failed: {failure}");
+            }
+            let portable = outcome
+                .results()
+                .map(|result| {
+                    let OutcomeValue::Tensor(tensor) = result.value() else {
+                        panic!("tensor result")
+                    };
+                    (0..tensor.element_count())
+                        .map(|i| tensor.read(i).unwrap() as f32)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let x64 = x.iter().map(|v| f64::from(*v)).collect::<Vec<_>>();
+            let carried64 = carried
+                .as_ref()
+                .map(|carried| carried.iter().map(|v| f64::from(*v)).collect::<Vec<_>>());
+            let [input, pre, join] = site.reference(&x64, carried64.as_deref(), h, s, n);
+            // The site publishes its pre only for a next site to read.
+            let pre = if carries { pre } else { Vec::new() };
+            for (name, (actual, expected)) in ["input", "pre", "join"]
+                .into_iter()
+                .zip(portable.iter().zip([&input, &pre, &join]))
+            {
+                assert_close(
+                    &format!("portable carries {carries} seed {seed} {name}"),
+                    actual,
+                    expected,
+                    1e-6,
+                    1e-5,
+                );
+            }
+            carried = carries.then(|| portable[1].clone());
         }
-        let portable = outcome
-            .results()
-            .map(|result| {
-                let OutcomeValue::Tensor(tensor) = result.value() else {
-                    panic!("tensor result")
-                };
-                (0..tensor.element_count())
-                    .map(|i| tensor.read(i).unwrap() as f32)
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let x64 = x.iter().map(|v| f64::from(*v)).collect::<Vec<_>>();
-        let carried64 = carried.iter().map(|v| f64::from(*v)).collect::<Vec<_>>();
-        let expected = site.reference(&x64, &carried64, h, s, n);
-        for (name, (actual, expected)) in ["input", "pre", "join"]
-            .into_iter()
-            .zip(portable.iter().zip(&expected))
-        {
-            assert_close(
-                &format!("portable seed {seed} {name}"),
-                actual,
-                expected,
-                1e-6,
-                1e-5,
-            );
-        }
-        carried = portable[1].clone();
     }
 }
 
@@ -914,10 +935,11 @@ fn portable_sinkhorn_site_matches_the_single_pass_formulas() {
 /// threadgroups, to the last decode row) and prefill rows, over two
 /// consecutive sites joined by the comb scatter, the second site reading
 /// the streams and pre the first left: each site's input, pre and join row,
-/// and the joined streams, against the formulas over the natives' inputs.
+/// the joined streams, and the exit's collapse by the last pre, against the
+/// formulas over the natives' inputs.
 #[test]
 fn native_sinkhorn_sites_and_comb_join_match_the_single_pass_formulas() {
-    check_sinkhorn_sites(&[1, 2, 7, 8, 20]);
+    check_sinkhorn_sites(V41, (V41_EPSILON, V41_NORM_EPSILON), true, &[1, 2, 7, 8, 20]);
 }
 
 /// Prefill rows in the GPU natives' row tiles (16 rows, two a simdgroup): 9
@@ -925,15 +947,50 @@ fn native_sinkhorn_sites_and_comb_join_match_the_single_pass_formulas() {
 /// only its first simdgroup holds; 17, a whole tile and a tile of one row.
 #[test]
 fn native_sinkhorn_prefill_tiles_match_the_single_pass_formulas() {
-    check_sinkhorn_sites(&[9, 17]);
+    check_sinkhorn_sites(V41, (V41_EPSILON, V41_NORM_EPSILON), true, &[9, 17]);
 }
 
-/// [`native_sinkhorn_sites_and_comb_join_match_the_single_pass_formulas`] at
-/// each of `row_counts`.
-fn check_sinkhorn_sites(row_counts: &[usize]) {
-    let (h, s, n) = V41;
+/// The natives at GLM-5.3-Flash's geometry, each site mixing by its own pre
+/// and carrying none (`SinkhornInput::OwnSite`), and the exit the streams'
+/// mean (`ExitSite::Mean`), as
+/// [`native_sinkhorn_sites_and_comb_join_match_the_single_pass_formulas`]:
+/// one decode row, the last decode row, and the two prefill tilings.
+#[test]
+fn native_own_site_sinkhorn_sites_and_mean_exit_match_the_formulas() {
+    check_sinkhorn_sites(GLM, GLM_EPSILONS, false, &[1, 8, 9, 17]);
+}
+
+/// The mean exit at a stream count that is not a power of two, where
+/// `1 / S` is no F32 value and a scale by it would round twice: only the
+/// summed-then-divided form (`stream_collapse` at P = 0) collapses bit
+/// for bit, which this asserts at three streams, over one decode row and
+/// both prefill tilings. Its sites also exercise the Sinkhorn comb at an
+/// odd S, whose `[S, S]` sweeps no native can tile by powers of two.
+#[test]
+fn native_mean_exit_collapses_three_streams_exactly() {
+    let (h, _, iterations) = GLM;
+    check_sinkhorn_sites((h, 3, iterations), GLM_EPSILONS, false, &[1, 9, 17]);
+}
+
+/// Two consecutive Sinkhorn sites at `geometry` (H, S, iterations) under
+/// `epsilons`, at each of `row_counts`, each joined by the comb scatter and
+/// the second reading the streams the first left: with `carries`, each
+/// mixing by the previous site's pre (the first by the one-hot entry pre)
+/// and the exit collapsing by the last site's; else each mixing by its own,
+/// publishing none, and the exit the streams' mean (`stream_collapse` at
+/// P = 0, reading no pre). Each site's input, pre and join row and the joined streams
+/// are checked against the formulas in F64 over the natives' inputs; the
+/// last pre's collapse within the F32 sum's bound, and the mean exactly
+/// as F32 sums the streams in order and divides by S.
+fn check_sinkhorn_sites(
+    geometry: (usize, usize, usize),
+    epsilons: (f32, f32),
+    carries: bool,
+    row_counts: &[usize],
+) {
+    let (h, s, n) = geometry;
     let width = s * h;
-    let sites = [Sinkhorn::new(h, s, 51), Sinkhorn::new(h, s, 61)];
+    let sites = [51, 61].map(|seed| Sinkhorn::with_epsilons(h, s, seed, epsilons));
     for &rows in row_counts {
         let mut x = pattern(rows * width, 71 + rows as u32, 2.0);
         for (index, value) in x.iter_mut().enumerate() {
@@ -942,12 +999,17 @@ fn check_sinkhorn_sites(row_counts: &[usize]) {
         let projections = [Projection::new(h, rows, 81), Projection::new(h, rows, 91)];
         for device in devices() {
             let label = |stage: &str| format!("{:?} M {rows} {stage}", device.backend());
-            let (mut streams, mut pre) = (x.clone(), narrow(&entry_pre(rows, s)));
+            let (mut streams, mut pre) = (x.clone(), carries.then(|| narrow(&entry_pre(rows, s))));
             for (index, (site, projection)) in sites.iter().zip(&projections).enumerate() {
                 let wide =
                     |values: &[f32]| values.iter().map(|v| f64::from(*v)).collect::<Vec<_>>();
-                let expected = site.reference(&wide(&streams), &wide(&pre), h, s, n);
-                let actual = site.native(&device, &streams, &pre, rows, V41);
+                let mut expected =
+                    site.reference(&wide(&streams), pre.as_deref().map(wide).as_deref(), h, s, n);
+                let actual = site.native(&device, &streams, pre.as_deref(), rows, geometry);
+                if !carries {
+                    // The site publishes no pre for a next site.
+                    expected[1].clear();
+                }
                 for (name, (actual, expected)) in ["input", "pre", "join"]
                     .into_iter()
                     .zip(actual.iter().zip(&expected))
@@ -980,10 +1042,57 @@ fn check_sinkhorn_sites(row_counts: &[usize]) {
                         label(&format!("site {index} joined"))
                     );
                 }
-                (streams, pre) = (actual_joined, actual[1].clone());
+                streams = actual_joined;
+                pre = carries.then(|| actual[1].clone());
+            }
+            let collapsed = collapse_native(&device, &streams, pre.as_deref(), rows, h, s);
+            let stream = |row: usize, stream: usize, column: usize| streams[row * width + stream * h + column];
+            for (at, actual) in collapsed.iter().enumerate() {
+                let (row, column) = (at / h, at % h);
+                if let Some(weights) = &pre {
+                    let terms = (0..s)
+                        .map(|from| f64::from(weights[row * s + from]) * f64::from(stream(row, from, column)))
+                        .collect::<Vec<_>>();
+                    let (expected, bound) =
+                        (terms.iter().sum::<f64>(), gamma(s) * terms.iter().map(|term| term.abs()).sum::<f64>());
+                    assert!(
+                        (f64::from(*actual) - expected).abs() <= bound,
+                        "{}[{at}]: native {actual}, expected {expected}, bound {bound}",
+                        label("exit by the last pre")
+                    );
+                } else {
+                    let mean = (0..s).fold(0.0f32, |sum, from| sum + stream(row, from, column)) / s as f32;
+                    assert_eq!(actual.to_bits(), mean.to_bits(), "{}[{at}]", label("mean exit"));
+                }
             }
         }
     }
+}
+
+/// `stream_collapse` on `device`: the streams `[rows, S, H]` collapsed by
+/// the last site's `pre [rows, S]` (P = 1), or into their mean without one
+/// (P = 0).
+fn collapse_native(
+    device: &seismic::Device,
+    streams: &[f32],
+    pre: Option<&[f32]>,
+    rows: usize,
+    h: usize,
+    s: usize,
+) -> Vec<f32> {
+    let previous = usize::from(pre.is_some());
+    let collapsed = at_defaults(
+        device,
+        magnitude_kernels::stream_collapse::native_entry(),
+        &[("H", h as u64), ("S", s as u64), ("P", previous as u64)],
+    )
+    .unwrap()
+    .call(magnitude_kernels::stream_collapse::Args {
+        hidden: &tensor(device, DType::F32, &[rows, s, h], streams),
+        pre: &tensor(device, DType::F32, &[rows, previous * s], pre.unwrap_or(&[])),
+    })
+    .unwrap();
+    read(&collapsed.value, DType::F32)
 }
 
 /// Each value of `actual` against the F64 `expected`: a NaN where it is a
@@ -1001,14 +1110,6 @@ fn assert_ieee_close(name: &str, actual: &[f32], expected: &[f64], bound: &[f64]
         };
         assert!(agrees, "{name}[{index}]: native {actual}, expected {expected}, bound {bound}");
     }
-}
-
-/// The relative error bound of an F32 sum of `n` products in any order
-/// (with or without fused multiply-adds), `γ_n = n u / (1 - n u)` with
-/// `u = 2^-24`, of the sum of the terms' magnitudes.
-fn gamma(n: usize) -> f64 {
-    let nu = n as f64 * 2f64.powi(-24);
-    nu / (1.0 - nu)
 }
 
 /// `stream_join`'s formula in F64 (`scatter`): for each stream d of each
@@ -1137,23 +1238,39 @@ fn native_stream_collapse_matches_its_formula() {
             }
         }
         for device in devices() {
-            let collapsed = at_defaults(
-                &device,
-                magnitude_kernels::stream_collapse::native_entry(),
-                &[("H", h as u64), ("S", s as u64)],
-            )
-            .unwrap()
-            .call(magnitude_kernels::stream_collapse::Args {
-                hidden: &tensor(&device, DType::F32, &[rows, s, h], &x),
-                pre: &tensor(&device, DType::F32, &[rows, s], &pre),
-            })
-            .unwrap();
             assert_ieee_close(
                 &format!("{:?} stream_collapse M {rows}", device.backend()),
-                &read(&collapsed.value, DType::F32),
+                &collapse_native(&device, &x, Some(&pre), rows, h, s),
                 &expected,
                 &bound,
             );
+        }
+    }
+}
+
+/// The exit's mean (`stream_collapse` at P = 0) is exactly `Σ_s X[s] / S`
+/// as F32 sums the streams in order and divides by S, bit for bit, for
+/// stream counts that are powers of two and those that are not (where 1/S
+/// is inexact, so a collapse weighted by 1/S would differ).
+#[test]
+fn native_stream_mean_is_exact_for_any_stream_count() {
+    let h = 257;
+    for s in [1usize, 2, 3, 4, 5, 6, 7, 8, 12] {
+        for rows in [1usize, 3] {
+            let x = pattern(rows * s * h, 211 + (rows * s) as u32, 4.0);
+            for device in devices() {
+                let mean = collapse_native(&device, &x, None, rows, h, s);
+                for (at, actual) in mean.iter().enumerate() {
+                    let (row, column) = (at / h, at % h);
+                    let expected = (0..s).fold(0.0f32, |sum, from| sum + x[row * s * h + from * h + column]) / s as f32;
+                    assert_eq!(
+                        actual.to_bits(),
+                        expected.to_bits(),
+                        "{:?} mean S {s} M {rows}[{at}]",
+                        device.backend()
+                    );
+                }
+            }
         }
     }
 }
@@ -1182,7 +1299,12 @@ fn native_sinkhorn_split_timing() {
     let specialization = seismic::generated::native_implementation::<stream_mix_sinkhorn::Entry>(&device)
         .unwrap()
         .unwrap()
-        .default_specialization(&seismic::NativeSpecialization::new().with_static("H", h as u64).with_static("S", s as u64))
+        .default_specialization(
+            &seismic::NativeSpecialization::new()
+                .with_static("H", h as u64)
+                .with_static("S", s as u64)
+                .with_static("P", 1),
+        )
         .unwrap();
     let kernel = stream_mix_sinkhorn::native_for_device(&device, &specialization).unwrap();
     // (rows, iterations)

@@ -1,12 +1,16 @@
-// Shared device code of the CUDA gated-delta entries (`gated_delta_step`,
-// `gated_delta_chunk`; contracts in recurrent.seismic): slot and
-// bank lookup, tensor addressing, the per-head gates, piece splitting, the
-// state-arena window publication, the row-sequential advance both entries
-// run for slots of at most SEQUENTIAL_ROWS rows, and the gating of the raw
-// outputs into the entries' result.
+// Shared device code of the CUDA delta-rule entries (`gated_delta_step`,
+// `gated_delta_chunk`, and through `kimi.cuh` `kimi_delta_step` and
+// `kimi_delta_chunk`; contracts in recurrent.seismic): slot and bank lookup,
+// tensor addressing, Gated DeltaNet's per-head gates, piece splitting, the
+// state-arena window publication, the row-sequential advance every entry
+// runs for slots of at most SEQUENTIAL_ROWS rows, the gating of the raw
+// outputs into the entries' result, and the step entries' body (`step`).
+// They take the rule's gates (`HeadGates`, Kimi's `kimi::ChannelGates`) and
+// the output gate's input (`GateInput`) as arguments.
 // Activation tensors are canonical in their last axis.
 
 #include "../core/activation.cuh"
+#include "../core/arrive.cuh"
 #include "../core/functions.cuh"
 #include <seismic/slab.cuh>
 
@@ -27,7 +31,7 @@ constexpr int CH = (2 * NK + NV) * W;
 constexpr int ALPHA = CH + NV * W;
 constexpr int BETA = ALPHA + NV;
 // A tape row: the innovations u [NV, W], the normalized keys k [NK, W], the
-// decays d [NV].
+// decay factors d [NV, DECAYS] (`HeadGates`).
 constexpr int TAPE_U = 0;
 constexpr int TAPE_K = NV * W;
 constexpr int TAPE_D = NV * W + NK * W;
@@ -158,6 +162,56 @@ __device__ __forceinline__ Gates gates(const Inputs &in, int row, int head) {
     return Gates{1.0f / (1.0f + expf(-beta_input)), log_decay, expf(log_decay)};
 }
 
+// A lane's W / 32 state columns in the sequential layout.
+constexpr int CPL = W / 32;
+
+// The output gate's input z: column `column` of row `row` is element
+// row * stride + first + column of `rows`, a value-head-major [NV, W] row.
+struct GateInput {
+    const u8 *rows;
+    u64 stride;
+    u64 first;
+    __device__ __forceinline__ float at(u64 row, u64 column) const {
+        return element::at<Act>(rows, row * stride + first + column);
+    }
+};
+
+// A rule's gates, which the entry bodies (`step`, `chunk::prepare`,
+// `chunk::scan`), `load_version` and `advance_rows` take: the rule's `Inputs`
+// and their gated-delta operands (`base`); `at(row, head, lane, factor)`,
+// value head `head`'s beta at `row`, setting `factor` to the decay factors of
+// lane `lane`'s CPL key columns; and `gate_input()`, z. DECAYS is 1 (the
+// head's one decay scales every key column) or W (one per key column); a tape
+// row records DECAYS factors per value head. Gated DeltaNet's are columns of
+// the projection row (`gates`), computed once per row, and z its columns from
+// CH.
+struct HeadGates {
+    static constexpr int DECAYS = 1;
+    using Inputs = recurrent::Inputs;
+    const Inputs &in;
+    __device__ static const Inputs &base(const Inputs &in) { return in; }
+    // Row `row`'s gates of value head `head`, its one decay for every column.
+    __device__ static Gates row_gates(const Inputs &in, int row, int head) { return gates(in, row, head); }
+    __device__ __forceinline__ GateInput gate_input() const {
+        [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
+        return GateInput{in.projection, SEISMIC_PROJECTION_STRIDE_0, CH};
+    }
+    __device__ __forceinline__ float at(int row, int head, int, float (&factor)[CPL]) const {
+        const Gates g = row_gates(in, row, head);
+#pragma unroll
+        for (int c = 0; c < CPL; ++c) factor[c] = g.decay;
+        return g.beta;
+    }
+};
+
+// The offset in a tape row of value head `head`'s decay factor of key
+// column `column`, DECAYS factors per value head.
+template <int DECAYS>
+__device__ __forceinline__ int tape_decay(int head, int column) {
+    static_assert(DECAYS == 1 || DECAYS == W, "one decay per value head or per key column");
+    return TAPE_D + head * DECAYS + (DECAYS == 1 ? 0 : column);
+}
+
 // The chunked rows of a slot, the ones before its publication row lo + stop,
 // split into pieces of at most `CHUNK` rows:
 template <int CHUNK>
@@ -205,22 +259,10 @@ __device__ __forceinline__ bool records_key(const Inputs &in, int head) {
     return in.grouped ? head % (NV / NK) == 0 : head < NK;
 }
 
-// Tape row `entry` of the slot's source bank and its decay of value head
-// `head`: S <- decay S + u k^T replays it.
-struct TapeEntry {
-    const float *row;
-    float decay;
-};
-__device__ __forceinline__ TapeEntry tape_entry(const Inputs &in, const Slot &slot, int head, int entry) {
-    const float *row = tape_row(in, slot.source, entry);
-    return TapeEntry{row, row[TAPE_D + head]};
-}
-static_assert((NV * W + NK * W + NV) % 4 == 0, "16-byte tape rows");
-
 // Slots of at most this many rows advance row-sequentially in either entry,
 // so a request's recurrent bits never depend on its row class or its peers
 // (an MTP verify slot gets the bits of one-row decode).
-constexpr int SEQUENTIAL_ROWS = 16;
+constexpr int SEQUENTIAL_ROWS = SEISMIC_CONST_SEQUENTIAL_ROWS;
 
 // Shared memory of the sequential advance of a block owning BLOCK_ROWS state
 // rows of one value head: a row's convolved q | k of the key head and the
@@ -246,7 +288,7 @@ __device__ __forceinline__ float convolved(const Inputs &in, const Slot &slot, i
 // A warp's ROWS state rows in the sequential layout: lane l holds columns
 // [l W / 32, (l + 1) W / 32) of each.
 template <int ROWS>
-using WarpRows = float[ROWS][W / 32];
+using WarpRows = float[ROWS][CPL];
 
 template <int ROWS>
 __device__ __forceinline__ void load_rows(const Inputs &in, int bank, int head, int first_row,
@@ -267,30 +309,36 @@ __device__ __forceinline__ void store_rows(const Inputs &in, int bank, int head,
 }
 
 // A warp's ROWS rows of the slot's source version: the bank's state advanced
-// by its first `taped` tape rows with the step's update, so the bits equal a
-// run that published after those rows.
-template <int ROWS>
-__device__ __forceinline__ void load_version(const Inputs &in, const Slot &slot, int head, int first_row,
-                                             WarpRows<ROWS> &state) {
-    constexpr int CPL = W / 32;
+// by its first `taped` tape rows with the step's update (S <- S diag(d) +
+// u k^T, the tape's DECAYS factors per value head of `gates`' rule), so the
+// bits equal a run that published after those rows.
+template <int ROWS, class RowGates>
+__device__ __forceinline__ void load_version(const Inputs &in, const RowGates &, const Slot &slot, int head,
+                                             int first_row, WarpRows<ROWS> &state) {
+    constexpr int DECAYS = RowGates::DECAYS;
+    static_assert((NV * W + NK * W + NV * DECAYS) % 4 == 0, "16-byte tape rows");
     load_rows<ROWS>(in, slot.source, head, first_row, state);
     const int lane = threadIdx.x % 32;
     const int key = key_head(in, head);
     for (int entry = 0; entry < slot.taped; ++entry) {
-        const TapeEntry tape = tape_entry(in, slot, head, entry);
-        float k[CPL];
-        element::f32_span(tape.row + TAPE_K + key * W + lane * CPL, k);
+        const float *row = tape_row(in, slot.source, entry);
+        float k[CPL], factor[CPL];
+        element::f32_span(row + TAPE_K + key * W + lane * CPL, k);
+#pragma unroll
+        for (int c = 0; c < CPL; ++c)
+            factor[c] = DECAYS == 1 && c > 0 ? factor[0] : row[tape_decay<DECAYS>(head, lane * CPL + c)];
 #pragma unroll
         for (int s = 0; s < ROWS; ++s) {
-            const float u = tape.row[TAPE_U + head * W + first_row + s];
+            const float u = row[TAPE_U + head * W + first_row + s];
 #pragma unroll
-            for (int c = 0; c < CPL; ++c) state[s][c] = __fmaf_rn(u, k[c], state[s][c] * tape.decay);
+            for (int c = 0; c < CPL; ++c) state[s][c] = __fmaf_rn(u, k[c], state[s][c] * factor[c]);
         }
     }
 }
 
-// The row-sequential gated delta rule over the slot's rows [begin, hi), the
-// arithmetic of `gated_delta_step` (a block's shape never changes bits).
+// The row-sequential delta rule over the slot's rows [begin, hi) with the
+// rule's gates `gates` (`HeadGates`), the arithmetic of the step entries (a
+// block's shape never changes bits).
 // Every thread of the block calls it. The block owns state rows [block_row,
 // block_row + BLOCK_ROWS) of value head `head`; a warp with `owns` holds its
 // ROWS rows from `first_row` in `state` (the state before row `begin`),
@@ -301,21 +349,24 @@ __device__ __forceinline__ void load_version(const Inputs &in, const Slot &slot,
 // block convolves (causal depthwise conv + SiLU) the key head's q and k
 // channels and the block's v channels into a buffer double-buffered by row
 // parity; each warp then L2-normalizes q (scaled by W^-1/2) and k and
-// advances its rows: S <- decay S + beta (v - decay S k) k^T, output S q.
-template <int ROWS, int BLOCK_ROWS>
-__device__ __forceinline__ void advance_rows(const Inputs &in, const Slot &slot, int begin, int head,
-                                             int block_row, bool owns, int first_row,
+// advances its rows: S <- S diag(d) + beta (v - S diag(d) k) k^T, output
+// S q, with d the row's decay factors of each lane's columns.
+template <int ROWS, int BLOCK_ROWS, class RowGates>
+__device__ __forceinline__ void advance_rows(const Inputs &in, const RowGates &gates, const Slot &slot, int begin,
+                                             int head, int block_row, bool owns, int first_row,
                                              WarpRows<ROWS> &state, u8 *mixed,
                                              SequentialShared<BLOCK_ROWS> &shared) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
-    constexpr int CPL = W / 32;
+    constexpr int DECAYS = RowGates::DECAYS;
+    // A lane's distinct decay factors.
+    constexpr int LANE_DECAYS = DECAYS == 1 ? 1 : CPL;
     constexpr int PREPARED = 2 * W + BLOCK_ROWS;
     const int lane = threadIdx.x % 32;
     const int key_row = key_head(in, head);
     const int publish = slot.lo + slot.stop;
     const int taped = tape_rows(in, slot);
-    // The warp that owns state row 0 records the head's decay, and the key
-    // when the head records its key head's key.
+    // The warp that owns state row 0 records the head's decay factors, and
+    // the key when the head records its key head's key.
     const bool records = first_row == 0;
     const bool records_keys = records && records_key(in, head);
     if (owns && begin == slot.lo && slot.stop == 0) store_rows<ROWS>(in, slot.target, head, first_row, state);
@@ -348,14 +399,15 @@ __device__ __forceinline__ void advance_rows(const Inputs &in, const Slot &slot,
             q[c] *= q_inverse;
             k[c] *= k_inverse;
         }
-        const Gates row_gates = gates(in, row, head);
+        float factor[CPL];
+        const float beta = gates.at(row, head, lane, factor);
 
         float remembered[ROWS];
 #pragma unroll
         for (int s = 0; s < ROWS; ++s) {
             float sum = 0.0f;
 #pragma unroll
-            for (int c = 0; c < CPL; ++c) sum = __fmaf_rn(state[s][c] * row_gates.decay, k[c], sum);
+            for (int c = 0; c < CPL; ++c) sum = __fmaf_rn(state[s][c] * factor[c], k[c], sum);
             remembered[s] = sum;
         }
 #pragma unroll
@@ -367,17 +419,20 @@ __device__ __forceinline__ void advance_rows(const Inputs &in, const Slot &slot,
 #pragma unroll
             for (int c = 0; c < CPL; ++c) entry[TAPE_K + key_row * W + lane * CPL + c] = k[c];
         }
-        if (entry != nullptr && records && lane == 0) entry[TAPE_D + head] = row_gates.decay;
+        if (entry != nullptr && records && (DECAYS != 1 || lane == 0)) {
+#pragma unroll
+            for (int c = 0; c < LANE_DECAYS; ++c) entry[tape_decay<DECAYS>(head, lane * CPL + c)] = factor[c];
+        }
         float output[ROWS];
 #pragma unroll
         for (int s = 0; s < ROWS; ++s) {
             const float v = buffer[2 * W + first_row - block_row + s];
-            const float residual = (v - remembered[s]) * row_gates.beta;
+            const float residual = (v - remembered[s]) * beta;
             if (entry != nullptr && lane == s) entry[TAPE_U + head * W + first_row + s] = residual;
             float sum = 0.0f;
 #pragma unroll
             for (int c = 0; c < CPL; ++c) {
-                state[s][c] = __fmaf_rn(residual, k[c], state[s][c] * row_gates.decay);
+                state[s][c] = __fmaf_rn(residual, k[c], state[s][c] * factor[c]);
                 sum = __fmaf_rn(state[s][c], q[c], sum);
             }
             output[s] = sum;
@@ -395,16 +450,16 @@ __device__ __forceinline__ void advance_rows(const Inputs &in, const Slot &slot,
     }
 }
 
-// The `gate` launch of both entries: block `row` forms the row's gated result
+// The `gate` launch of every entry: block `row` forms the row's gated result
 // from its raw outputs `mixed`. Per value head (one warp each, lanes striding
 // the head's columns, then a warp sum),
 //   gated = round_A(round_A(raw * rsqrt(sum_head raw^2 / W + eps) * norm[i])
 //                   * round_A(gate(z)))
 // with gate the output gate of `gate_function` (`functions::output_gate`)
-// with z column CH + head * W + i of the projection row.
+// with z column head * W + i of the row's `input`.
 template <class NORM>
-__device__ __forceinline__ void gate_row(const Inputs &in, const u8 *mixed, const u8 *norm, float eps,
-                                         u8 *gated, int row) {
+__device__ __forceinline__ void gate_row(const Inputs &in, const GateInput &input, const u8 *mixed, const u8 *norm,
+                                         float eps, u8 *gated, int row) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
     __shared__ float inverses[NV];
     const int warps = blockDim.x / 32;
@@ -423,7 +478,7 @@ __device__ __forceinline__ void gate_row(const Inputs &in, const u8 *mixed, cons
         const int head = k / W, i = k % W;
         const float v = element::at<Act>(mixed, raw_index(row, head, i));
         const float normalized = Act::round(v * inverses[head] * element::at<NORM>(norm, i));
-        const float z = projection(in, row, CH + k);
+        const float z = input.at(row, k);
         const float activated = Act::round(functions::output_gate((int)SEISMIC_PARAM_GATE_FUNCTION, z));
         element::put<Act>(gated,
                           static_cast<u64>(row) * SEISMIC_RESULT_0_STRIDE_0 +
@@ -437,8 +492,8 @@ __device__ __forceinline__ void gate_row(const Inputs &in, const u8 *mixed, cons
 // row, by the last of the head's step blocks to arrive: the raw outputs the
 // other blocks published are read from L2.
 template <class NORM>
-__device__ __forceinline__ void gate_head(const Inputs &in, const u8 *mixed, const u8 *norm, float eps, u8 *gated,
-                                          int head) {
+__device__ __forceinline__ void gate_head(const Inputs &in, const GateInput &input, const u8 *mixed, const u8 *norm,
+                                          float eps, u8 *gated, int head) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
     const typename Act::storage *raw = reinterpret_cast<const typename Act::storage *>(mixed);
     const int lane = threadIdx.x % 32;
@@ -454,7 +509,7 @@ __device__ __forceinline__ void gate_head(const Inputs &in, const u8 *mixed, con
         for (int i = lane; i < W; i += 32) {
             const float v = Act::load(__ldcg(raw + raw_index(row, head, i)));
             const float normalized = Act::round(v * inverse * element::at<NORM>(norm, i));
-            const float z = projection(in, row, CH + head * W + i);
+            const float z = input.at(row, head * W + i);
             const float activated = Act::round(functions::output_gate((int)SEISMIC_PARAM_GATE_FUNCTION, z));
             element::put<Act>(gated,
                               static_cast<u64>(row) * SEISMIC_RESULT_0_STRIDE_0 +
@@ -464,5 +519,54 @@ __device__ __forceinline__ void gate_head(const Inputs &in, const u8 *mixed, con
         }
     }
 }
+
+// The row-sequential step entries' body (`gated_delta_step`,
+// `kimi_delta_step`) over the rule's gates: one block per (value head,
+// state-row block, slot); slots are a grid axis. Each warp owns ROWS state
+// rows (value coordinates), a lane W / 32 columns (key coordinates) of each,
+// held in registers for the whole slot. The state is read from version
+// (previous_bank, previous_tape)[slot] and published to following_bank[slot]
+// after the slot's first stop[slot] rows, with the window and the tape of the
+// rows after it. The raw outputs go to the `mixed` scratch; grid z = B zeroes
+// the raw rows no slot covers. The last of a value head's blocks to arrive
+// (`arrivals`, one counter per head) gates the head's rows (`gate_head`:
+// `gate_row`'s arithmetic). ROWS and WARPS never change result bits, and the
+// chunked entries give their short slots the same bits.
+template <unsigned ROWS, unsigned WARPS, class NORM, class RowGates>
+__device__ __forceinline__ void step(const typename RowGates::Inputs &rule, u8 *mixed, unsigned *arrivals,
+                                     const u8 *norm, float eps, u8 *gated) {
+    constexpr int BLOCK_ROWS = ROWS * WARPS;
+    static_assert(W % 32 == 0 && W % BLOCK_ROWS == 0, "state rows split evenly");
+    const Inputs &in = RowGates::base(rule);
+    [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
+    const int head = blockIdx.x;
+    const int block_row = blockIdx.y * BLOCK_ROWS;
+    const u64 slot_index = blockIdx.z;
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int first_row = block_row + warp * ROWS;  // this warp's state rows
+    // Let a programmatic dependent start (its first weight loads overlap this
+    // launch; it still waits for this launch's completion).
+    seismic_dependents_launch();
+
+    if (slot_index == SEISMIC_DIM_B) {
+        const int covered = covered_end(in);
+        for (u64 row = covered; row < SEISMIC_DIM_M; ++row)
+            if (lane < ROWS) element::put<Act>(mixed, raw_index(row, head, first_row + lane), 0.0f);
+    } else {
+        const Slot slot = slot_of(in, slot_index);
+        WarpRows<ROWS> state;
+        load_version<ROWS>(in, RowGates{rule}, slot, head, first_row, state);
+        publish_window(in, slot, head * gridDim.y + blockIdx.y, NV * gridDim.y);
+        __shared__ __align__(16) SequentialShared<BLOCK_ROWS> shared;
+        advance_rows<ROWS, BLOCK_ROWS>(in, RowGates{rule}, slot, slot.lo, head, block_row, true, first_row, state,
+                                       mixed, shared);
+    }
+
+    __shared__ unsigned last;
+    if (!arrive::last(arrivals + head, gridDim.y * gridDim.z, &last)) return;
+    gate_head<NORM>(in, RowGates{rule}.gate_input(), mixed, norm, eps, gated, head);
+}
+
 
 }  // namespace recurrent

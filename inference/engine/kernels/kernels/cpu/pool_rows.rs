@@ -1,15 +1,16 @@
 // pool_rows on CPU (contract and portable body in pooled.seismic).
-// `append`: one work item per row stores its u (then g) and coordinates in
-// the window planes. `complete`: one work item per row publishes its latent,
-// block row and origin coordinates (zero, -1 and zeros for a row that
-// completes no group); a
-// completing row pools its group (the last RATE - 1 rows of its window
-// spans, then its own inputs), norms it, rotates it at the coordinates stored
-// with the group's first token, rounds it and stores it in the block plane
-// (a rounded row held in A after its pooling, its norm and its rotation).
+// `append`: one work item per row stores its u (normed per token when TN =
+// 1; then g) and coordinates in the window planes. `complete`: one work item
+// per row publishes its latent, block row and origin coordinates (zero, -1
+// and zeros for a row that completes no group); a completing row pools its
+// group (the last RATE - 1 rows of its window spans, then its own inputs,
+// its gates plus their place terms), norms the pooled row (TN = 0), rotates
+// it at the coordinates stored with the group's first token, rounds it and
+// stores it in the block plane in the row element Y (a rounded row held in A
+// after its pooling, its norm and its rotation).
 
 use lib::attention::attention::{self, Layout};
-use lib::core::{reduce, rounding::Rounding, spans};
+use lib::core::{norm, reduce, rounding::Rounding, spans};
 use seismic::cpu::{math, slab::SlabTensor};
 
 #[inline(always)]
@@ -26,6 +27,7 @@ fn pool_rows_append<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64
     // work item of this launch reads.
     let target = unsafe { window.row_mut([destination as usize, 0]) };
     target[..w].copy_from_slice(cx.arg_u().row([row, 0]));
+    token_norm(cx, &mut target[..w]);
     if gated {
         target[w..].copy_from_slice(cx.arg_g().row([row, 0]));
     }
@@ -48,6 +50,17 @@ unsafe fn coordinate_row<'a>(plane: seismic::cpu::Scalars<'a, i32, 2>, slab_rows
         let region = seismic::cpu::slab::region::<i32>(plane.pointer().cast(), at / slab_rows);
         std::slice::from_raw_parts_mut(region.add((at % slab_rows) * 4), 4)
     }
+}
+
+/// `PoolNorm::Token` (TN = 1): `u` in place, `norm::row`'s layer norm with
+/// `norm` and `bias` (the variance biased); TN = 0 leaves it.
+#[inline(always)]
+fn token_norm<E: Elements>(cx: &Context<'_, E>, u: &mut [f32]) {
+    if cx.dim_tn() == 0 {
+        return;
+    }
+    let x = u.to_vec();
+    norm::row(&x, true, Some(cx.arg_norm().row([0, 0])), Some(cx.arg_bias().row([0, 0])), cx.arg_epsilon(), u);
 }
 
 #[inline(always)]
@@ -78,11 +91,20 @@ fn pool_rows_complete<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u
     let window = SlabTensor::from_bound(cx.arg_window_rows(), slab_rows);
     // Each member's (u, g): the window's rows, then the row's own inputs.
     let (u, g) = (cx.arg_u(), cx.arg_g());
+    let mut own = u.row([row, 0]).to_vec();
+    token_norm(cx, &mut own);
     let rows = members
         .iter()
         .map(|&at| window.row([at as usize, 0]).split_at(w))
-        .chain(std::iter::once((u.row([row, 0]), if gated { g.row([row, 0]) } else { &[][..] })))
+        .chain(std::iter::once((&own[..], if gated { g.row([row, 0]) } else { &[][..] })))
         .collect::<Vec<_>>();
+    // Each member's gate scores plus its place's term (PR = RATE; none at 0).
+    let places = cx.dim_pr() as usize;
+    let position = cx.arg_position();
+    let gate = |member: usize, column: usize| {
+        let term = if member < places { position.row([member, 0])[column] } else { 0.0 };
+        rows[member].1[column] + term
+    };
     // The group's first token's (RATE >= 2: a window member). SAFETY: only
     // read.
     let origin = &*unsafe { coordinate_row(cx.arg_window_coordinates(), slab_rows, members[0] as usize) };
@@ -100,19 +122,24 @@ fn pool_rows_complete<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u
     let hold = rounding.map(|_| lib::core::activation::publish::<E::A>);
     for (column, pooled) in latent.iter_mut().enumerate() {
         *pooled = if gated {
-            let top = rows.iter().fold(f32::NEG_INFINITY, |top, (_, g)| top.max(g[column]));
-            let total = rows.iter().fold(0.0, |total, (_, g)| total + math::exp(g[column] - top));
-            rows.iter().fold(0.0, |sum, (u, g)| sum + math::exp(g[column] - top) / total * u[column])
+            let top = (0..rate).fold(f32::NEG_INFINITY, |top, member| top.max(gate(member, column)));
+            let total = (0..rate).fold(0.0, |total, member| total + math::exp(gate(member, column) - top));
+            (0..rate).fold(0.0, |sum, member| {
+                sum + math::exp(gate(member, column) - top) / total * rows[member].0[column]
+            })
         } else {
             rows.iter().fold(0.0, |sum, (u, _)| sum + u[column]) / rate as f32
         };
     }
     attention::held(hold, latent);
-    let inverse = reduce::rms_inverse(latent, cx.arg_epsilon());
-    for (value, weight) in latent.iter_mut().zip(cx.arg_norm().row([0, 0])) {
-        *value = *value * inverse * weight;
+    // The pooled row's norm (TN = 0); a token-normed row is its latent.
+    if cx.dim_tn() == 0 {
+        let inverse = reduce::rms_inverse(latent, cx.arg_epsilon());
+        for (value, weight) in latent.iter_mut().zip(cx.arg_norm().row([0, 0])) {
+            *value = *value * inverse * weight;
+        }
+        attention::held(hold, latent);
     }
-    attention::held(hold, latent);
     attention::prepare_rounded_head::<seismic::cpu::F32>(
         latent,
         None,
@@ -127,7 +154,7 @@ fn pool_rows_complete<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u
     let blocks = SlabTensor::from_bound(cx.arg_block_rows(), cx.arg_block_slab_rows() as usize);
     // SAFETY: block destinations are distinct freshly reserved rows no work
     // item of this launch reads.
-    lib::core::activation::store::<E::A>(finished, unsafe { blocks.row_mut([destination as usize, 0]) });
+    lib::core::activation::store::<E::Y>(finished, unsafe { blocks.row_mut([destination as usize, 0]) });
     // SAFETY: each work item writes its own row.
     unsafe { cx.result_1().set([row], destination) };
 }
