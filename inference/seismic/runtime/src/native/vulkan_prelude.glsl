@@ -345,10 +345,34 @@ void seismic_walk_next(inout seismic_walk walk) {
 }
 
 // Correctly rounded fp32 division and square root (CUDA's `/` and `sqrtf`
-// under --prec-div/--prec-sqrt). Integer long division and square root handle
-// every operand; division of operands and quotient well inside the normal
-// range takes a fused exact-residual fast path.
+// under --prec-div/--prec-sqrt). Division of operands and quotient well
+// inside the normal range takes a fused exact-residual path; any other
+// division takes the same path on the significands. Integer square root
+// handles every operand.
 
+// The correctly rounded a / b for operands and quotient within 2^+-100, where
+// every residual is exact: one correction from the exact residual, then the
+// neighbor whose exact residual is smallest (division has no ties).
+float seismic_div_core(float a, float b, float q0) {
+    const float q1 = q0 + fma(-q0, b, a) / b;
+    const uint bits = floatBitsToUint(q1);
+    float best = q1;
+    float residual = abs(fma(-q1, b, a));
+    for (int step = -1; step <= 1; step += 2) {
+        const float candidate = uintBitsToFloat(uint(int(bits) + step));
+        const float candidate_residual = abs(fma(-candidate, b, a));
+        if (candidate_residual < residual) {
+            best = candidate;
+            residual = candidate_residual;
+        }
+    }
+    return best;
+}
+
+// a / b for any operands, on the core: the significands in [1, 2) divide in
+// range, then the quotient takes back the exponents. Every division site
+// inlines this path, often inside unrolled epilogues with live accumulators,
+// so it holds no integer division: only the core again and bit arithmetic.
 float seismic_div_exact(float a, float b) {
     const uint ua = floatBitsToUint(a), ub = floatBitsToUint(b);
     const uint sign = (ua ^ ub) & 0x80000000u;
@@ -364,17 +388,23 @@ float seismic_div_exact(float a, float b) {
         return uintBitsToFloat(sign);
     int ea, eb;
     const uint ma = seismic_normalize(ua, ea), mb = seismic_normalize(ub, eb);
-    // ma / mb lies in (1/2, 2): 27 or 28 quotient bits.
-    const uint64_t numerator = uint64_t(ma) << 27;
-    uint64_t q = numerator / uint64_t(mb);
-    bool sticky = numerator % uint64_t(mb) != 0ul;
-    int exponent = ea - eb + 127 - 1;
-    if (q >= (1ul << 27)) {
-        sticky = sticky || (q & 1ul) != 0ul;
-        q >>= 1;
-        exponent += 1;
-    }
-    return seismic_round_pack(sign, exponent, uint(q), sticky);
+    const float x = uintBitsToFloat(0x3f800000u | (ma & 0x7fffffu));
+    const float y = uintBitsToFloat(0x3f800000u | (mb & 0x7fffffu));
+    // q = RN(x / y) in (1/2, 2), and the sign of the exact residual.
+    const float q = seismic_div_core(x, y, x / y);
+    const float residual = fma(-q, y, x);
+    const uint bits = floatBitsToUint(q);
+    const int exponent = int(bits >> 23) + ea - eb;
+    // A normal result is q scaled exactly.
+    if (exponent >= 255)
+        return uintBitsToFloat(sign | 0x7f800000u);
+    if (exponent >= 1)
+        return uintBitsToFloat(sign | (uint(exponent) << 23) | (bits & 0x7fffffu));
+    // A subnormal one rounds at bit 1 or above of the truncated quotient t,
+    // the rest below t only sticky: t is q, or its predecessor when q is
+    // above the quotient.
+    const uint t = residual < 0.0 ? bits - 1u : bits;
+    return seismic_round_pack(sign, int(t >> 23) + ea - eb, ((t & 0x7fffffu) | 0x800000u) << 3, residual != 0.0);
 }
 
 float seismic_div_rn(float a, float b) {
@@ -385,21 +415,7 @@ float seismic_div_rn(float a, float b) {
         && abs(q0) >= low && abs(q0) <= high;
     if (!fast)
         return seismic_div_exact(a, b);
-    // One correction from the exact residual, then the neighbor whose exact
-    // residual is smallest (division has no ties).
-    const float q1 = q0 + fma(-q0, b, a) / b;
-    const uint bits = floatBitsToUint(q1);
-    float best = q1;
-    float residual = abs(fma(-q1, b, a));
-    for (int step = -1; step <= 1; step += 2) {
-        const float candidate = uintBitsToFloat(uint(int(bits) + step));
-        const float candidate_residual = abs(fma(-candidate, b, a));
-        if (candidate_residual < residual) {
-            best = candidate;
-            residual = candidate_residual;
-        }
-    }
-    return best;
+    return seismic_div_core(a, b, q0);
 }
 
 float seismic_sqrt_rn(float x) {

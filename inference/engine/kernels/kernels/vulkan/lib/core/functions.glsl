@@ -20,16 +20,22 @@
 #define FUNCTIONS_GELU_TANH 1
 #define FUNCTIONS_RELU_SQUARED 2
 
+// The function is a launch word, so every form is compiled wherever this is
+// inlined: SiLU and GELU share one division, whose correctly rounded form is
+// long.
 float functions_activate(const int function, float x) {
-    if (function == FUNCTIONS_GELU_TANH) {
-        const float u = 0.7978845608028654 * (x + 0.044715 * (x * x * x));
-        return seismic_div_rn(x, 1.0 + precise_exp(-2.0 * u));
-    }
     if (function == FUNCTIONS_RELU_SQUARED) {
         const float r = max(x, 0.0);
         return r * r;
     }
-    return seismic_div_rn(x, 1.0 + exp(-x));
+    float e;
+    if (function == FUNCTIONS_GELU_TANH) {
+        const float u = 0.7978845608028654 * (x + 0.044715 * (x * x * x));
+        e = precise_exp(-2.0 * u);
+    } else {
+        e = exp(-x);
+    }
+    return seismic_div_rn(x, 1.0 + e);
 }
 
 // A gated delta net's output gate on z, by the code the entries take
@@ -37,9 +43,7 @@ float functions_activate(const int function, float x) {
 #define FUNCTIONS_GATE_SIGMOID 1
 
 float functions_output_gate(const int function, float z) {
-    if (function == FUNCTIONS_GATE_SIGMOID)
-        return seismic_div_rn(1.0, 1.0 + exp(-z));
-    return seismic_div_rn(z, 1.0 + exp(-z));
+    return seismic_div_rn(function == FUNCTIONS_GATE_SIGMOID ? 1.0 : z, 1.0 + exp(-z));
 }
 
 float functions_softcap(float cap, float z) {
