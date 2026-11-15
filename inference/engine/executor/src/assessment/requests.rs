@@ -612,14 +612,14 @@ mod tests {
 
     /// A job measures assessment's points in their order within
     /// `MEASUREMENT_SECONDS` of its start, whatever time it is given, and
-    /// prices those its time cannot hold rather than leaving them to the
-    /// next job, except a required figure's, which nothing prices: on the
-    /// host's CPU, two host memory lines (standing requests) are measured in
-    /// the order requested by a job given more than the budget; a job of no
-    /// time records every point priced but leaves the probe unrecorded; and
-    /// a later job loads every point stored, measuring none again.
+    /// leaves a figure nothing prices to the next job when its time cannot
+    /// hold it: on the host's CPU, two host memory lines (standing requests,
+    /// which nothing else prices) are measured in the order requested by a
+    /// job given more than the budget; a job of no time records none of
+    /// them, nor the probe, and the next job measures them; and a later job
+    /// loads every point stored, measuring none again.
     #[test]
-    fn a_job_measures_assessment_within_its_budget_and_prices_what_it_cannot_hold() {
+    fn a_job_measures_assessment_within_its_budget_and_leaves_what_nothing_prices_to_the_next() {
         let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::BackendName::Cpu).unwrap();
         let requests = Outstanding {
             standing: vec![PointRequest::HostMemory { readers: 2 }, PointRequest::HostMemory { readers: 1 }],
@@ -641,21 +641,21 @@ mod tests {
         use seismic::measure::Outcome;
         let topology = device.topology();
         let root = std::env::temp_dir().join(format!("point-requests-job-{}", std::process::id()));
-        // No time: every point is priced, recorded so, and never measured.
-        let priced = JsonFileStore::new(&root.join("priced"));
-        let none = job(&priced, 0.);
-        assert!(none.iter().all(|(_, outcome)| matches!(outcome, Outcome::Skipped(reason) if reason.as_str().contains("priced"))), "{none:?}");
-        assert!(matches!(MemoryCosts::stored(topology, device.info(), 2, &priced), Err(MemoryError::Unobtainable { .. })));
-        let again = job(&priced, 30.);
-        assert!(again.iter().all(|(_, outcome)| matches!(outcome, Outcome::Loaded(_))), "{again:?}");
-        // A required figure the time cannot hold is never priced: no
-        // record holds the probe, and the next job measures it.
+        // No time: no line is recorded, so the next job measures them.
+        let unheld = JsonFileStore::new(&root.join("unheld"));
+        let none = job(&unheld, 0.);
+        assert!(none.iter().all(|(_, outcome)| matches!(outcome, Outcome::Expired)), "{none:?}");
+        assert!(matches!(MemoryCosts::stored(topology, device.info(), 2, &unheld), Err(MemoryError::Unrecorded { .. })));
+        let again = job(&unheld, 30.);
+        assert!(again.iter().all(|(_, outcome)| matches!(outcome, Outcome::Measured(_))), "{again:?}");
+        // Nor the probe, a required figure: no record holds it, and the
+        // next job measures it.
         let mut measurer = Measurer::new(crate::SEARCH_SETTINGS.error_rate, crate::MIN_SAMPLE_SECONDS);
         let deadlines = JobDeadlines::new(std::time::Instant::now(), std::time::Duration::ZERO);
         let costs = Outstanding { standing: vec![PointRequest::Costs(CostWalk::Required)], loads: Vec::new() };
-        measure(&mut measurer, &device, &priced, &costs, deadlines, &mut |_| Attempt::Proceed, &mut |_, _| {}).unwrap();
+        measure(&mut measurer, &device, &unheld, &costs, deadlines, &mut |_| Attempt::Proceed, &mut |_, _| {}).unwrap();
         assert!(matches!(
-            super::super::ExecutorCosts::stored(topology, device.info(), &priced),
+            super::super::ExecutorCosts::stored(topology, device.info(), &unheld),
             Ok(super::super::StoredCosts::Missing(_))
         ));
         // Given more than the budget: measured in order within it.

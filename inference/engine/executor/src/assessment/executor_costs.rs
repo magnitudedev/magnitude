@@ -456,6 +456,11 @@ impl Placement {
             rest: Vec::new(),
         }
     }
+
+    /// Whether `route` is one of its paths' routes.
+    fn holds(&self, route: NativeKind) -> bool {
+        self.first == route || self.rest.contains(&route)
+    }
 }
 
 /// The storage kinds operands are allocated in, whose routes the costs
@@ -1668,9 +1673,9 @@ struct Share {
     /// memory, so a compile running beside it would be timed too: it is
     /// timed only while no program forms ([`Programs::quiet`]).
     host: bool,
-    /// Whether it reads a figure the costs require (the probe, or one of
-    /// [`Required`]): one the job's time ends is measured by the next job,
-    /// never priced ([`Measured::kept`]).
+    /// Whether it reads a figure nothing prices (the probe, or a step's
+    /// [`Step::unpriced`]): one the job's time ends is measured by the next
+    /// job, never priced ([`Measured::kept`]).
     required: bool,
 }
 
@@ -1914,13 +1919,14 @@ pub(super) enum Whose {
 /// its request no point to measure
 /// ([`super::requests::PointRequest::outstanding`]); so a point the budget
 /// cannot hold is priced by construction, and nothing schedules a job for
-/// it. A figure outside the walk (the model store's read line, the
-/// reference convert, the host memory's line), which nothing else prices,
-/// is unavailable with this reason. A required figure (the probe, or one of
-/// [`Required`]) is never recorded so, since nothing prices it: the job's
-/// time ending leaves it unrecorded, and the next job measures it
-/// ([`Measured::kept`]). Its record is of the machine as a timing's is,
-/// standing while the point's key does.
+/// it. A required figure (the probe, one of [`Required`], the activation
+/// dtype's rate along host storage's routes, or a figure outside the walk:
+/// the model store's read line, the reference convert, the host memory's
+/// line) is never recorded so, since nothing prices it:
+/// the job's time ending leaves it unrecorded, and the next job measures it
+/// ([`Measured::kept`]). Recorded, it would stand while its key does, and
+/// every plan that reads it would have no price. An unobtainable record is
+/// of the machine as a timing's is, standing while the point's key does.
 fn unreached() -> Reason {
     Reason::new(format!(
         "assessment's {MEASUREMENT_SECONDS} s measurement of this machine could not hold it: its figure is priced from those read"
@@ -3702,6 +3708,20 @@ impl Step {
         matches!(self, Self::Launch(_) | Self::Chain)
     }
 
+    /// Whether nothing prices its figure, so a job whose time ends before it
+    /// leaves it unrecorded for the next ([`Measured::kept`]): a required
+    /// one, or the activation dtype's rate along a route of `routes` that
+    /// host storage's placement `host` lies along, which a host tier's link
+    /// line reads and no other figure stands in for (`ExpertLines::priced`).
+    /// The route may be walked as another storage's: a discrete GPU's
+    /// pinned host memory is upload storage's route as well as host
+    /// storage's, and is walked once, as the first storage placing it.
+    fn unpriced(self, routes: &[&Route], host: &Placement) -> bool {
+        self.required()
+            || matches!(self, Self::WeightRate(route, format, Pass::Rate)
+                if format == Element::bf16() && host.holds(routes[route].route))
+    }
+
     /// Whether it reads a format's rate streaming from memory, which its
     /// pilot prices until then.
     fn streams(self) -> bool {
@@ -3867,6 +3887,7 @@ fn walk<T: Times>(
         // (`Measured::left`).
         point_seconds: MEASUREMENT_SECONDS / points as f64,
         routes,
+        host: placements.host.clone(),
     };
     let probe = walk.probe(Share::UNFORECAST.required(), times)?;
     let mut read = Read::new(walk.routes.len(), probe);
@@ -3891,7 +3912,7 @@ fn walk<T: Times>(
             true => Share::UNFORECAST.before(walk.ahead(&steps[index + 1..], &read)),
             false => Share::UNFORECAST,
         };
-        let share = match step.required() {
+        let share = match step.unpriced(&walk.routes, &walk.host) {
             true => share.required(),
             false => share,
         };
@@ -3979,6 +4000,9 @@ struct Walk<'r> {
     programs: ProgramSet,
     copy: KernelIdentity,
     routes: Vec<&'r Route>,
+    /// Host storage's placement, whose routes' activation rates nothing
+    /// else prices ([`Step::unpriced`]).
+    host: Placement,
     cache: u64,
     largest: u64,
     room: u64,
@@ -4181,7 +4205,7 @@ impl Walk<'_> {
         later.iter().fold(Ahead::NONE, |ahead, &step| match self.forecast(step, read) {
             Some(forecast) => Ahead {
                 all: ahead.all.then(forecast),
-                required: match step.required() {
+                required: match step.unpriced(&self.routes, &self.host) {
                     true => ahead.required.then(forecast),
                     false => ahead.required,
                 },
@@ -4899,7 +4923,7 @@ impl<'a, 'd> Walks<'a, 'd> {
         let measured = &mut self.measured;
         let store = measured.records.store;
         if std::time::Instant::now() >= deadline {
-            let kept = measured.kept(&key, Outcome::<String, String>::Expired, store, false);
+            let kept = measured.kept(&key, Outcome::<String, String>::Expired, store, true);
             return measured.tell(key, kept, began);
         }
         let made = match (measured.attempting)(&key) {
@@ -4960,7 +4984,7 @@ impl<'a, 'd> Walks<'a, 'd> {
         );
         drop(quiet);
         let (key, outcome) = outcomes.pop().expect("one point is measured");
-        let kept = self.measured.kept(&key, outcome, store, false);
+        let kept = self.measured.kept(&key, outcome, store, true);
         self.measured.tell(key, kept, began);
     }
 
@@ -5002,7 +5026,7 @@ impl<'a, 'd> Walks<'a, 'd> {
         );
         drop(quiet);
         let (key, outcome) = outcomes.pop().expect("one point is measured");
-        let kept = self.measured.kept(&key, outcome, store, false);
+        let kept = self.measured.kept(&key, outcome, store, true);
         self.measured.tell(key, kept, began);
     }
 
@@ -5327,6 +5351,41 @@ mod tests {
         expected.extend(deeper(KvCodec::Dense).chain(deeper(KvCodec::AffineK8V4)));
         expected.push(Step::Matrix(f32));
         assert_eq!(steps, expected);
+    }
+
+    /// What nothing prices is never left priced by a job's time ending: the
+    /// required figures and the activation dtype's rate along host storage's
+    /// routes, which a host tier's link line reads, one walked as upload
+    /// storage's included (a discrete GPU's pinned host memory, kind 1
+    /// here); an upload route of no host path's and the formats' rates are
+    /// priced from the others.
+    #[test]
+    fn host_storages_activation_rate_is_left_unrecorded_like_a_required_figure() {
+        let route = |kind, storage| Route {
+            route: crate::assessment::fixtures::kind(kind),
+            storage,
+            passed: Vec::new(),
+            along: Vec::new(),
+        };
+        let (device, pinned, upload) =
+            (route(0, OperandStorage::Device), route(1, OperandStorage::Upload), route(2, OperandStorage::Upload));
+        let routes = [&device, &pinned, &upload];
+        let host = Placement { first: crate::assessment::fixtures::kind(1), rest: Vec::new() };
+        let (bf16, f32) = (Element::bf16(), Element::f32());
+        let unpriced = plan(&routes, &[bf16, f32])
+            .into_iter()
+            .filter(|step| step.unpriced(&routes, &host))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            unpriced,
+            [
+                Step::Launch(GraphTiming::Device),
+                Step::Chain,
+                Step::Launch(GraphTiming::Waited),
+                Step::Launch(GraphTiming::Queued),
+                Step::WeightRate(1, bf16, Pass::Rate),
+            ]
+        );
     }
 
     /// The composition ratio is the chain's time over its layers' calls as
