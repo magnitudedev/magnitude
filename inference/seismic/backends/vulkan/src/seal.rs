@@ -9,10 +9,15 @@
 //! the device's default.
 //!
 //! glslang has no global switch for this, and `precise` is per object.
+//!
+//! [`contract`] reports the constructs a formed module may not contain.
 
-/// Version of these passes; part of the formation identity and SPIR-V cache
-/// key.
-pub const SEAL_VERSION: u32 = 4;
+use std::collections::{BTreeMap, HashMap};
+
+/// Version of these passes and of the emitted contract; part of the
+/// formation identity and SPIR-V cache key, so a kept module was formed
+/// under the current contract.
+pub const SEAL_VERSION: u32 = 5;
 
 /// The execution modes a sealed module declares beyond the fixed ones.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -268,6 +273,114 @@ pub fn fma_khr(module: &[u32]) -> Result<Vec<u32>, MalformedModule> {
         }
     }
     Ok(rewritten)
+}
+
+const OP_NAME: u32 = 5;
+const OP_TYPE_INT: u32 = 21;
+const OP_TYPE_VECTOR: u32 = 23;
+const OP_FUNCTION: u32 = 54;
+const OP_FUNCTION_END: u32 = 56;
+
+/// `OpUDiv`, `OpSDiv`, `OpUMod`, `OpSRem`, `OpSMod`.
+const INTEGER_DIVISION: [(u32, &str); 5] = [
+    (134, "OpUDiv"),
+    (135, "OpSDiv"),
+    (137, "OpUMod"),
+    (138, "OpSRem"),
+    (139, "OpSMod"),
+];
+
+/// A construct the emitted contract forbids, with how often and where it
+/// occurs.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Violation(pub String);
+
+/// What [`contract`] reads of a module's declarations.
+struct Declarations {
+    names: HashMap<u32, String>,
+    int_widths: HashMap<u32, u32>,
+    /// Vector type → component type.
+    vectors: HashMap<u32, u32>,
+}
+
+impl Declarations {
+    fn of(module: &[u32], instructions: &[Instruction]) -> Self {
+        let mut declarations = Self {
+            names: HashMap::new(),
+            int_widths: HashMap::new(),
+            vectors: HashMap::new(),
+        };
+        for instruction in instructions {
+            let words = &module[instruction.start..instruction.start + instruction.words];
+            match instruction.opcode {
+                OP_NAME => {
+                    declarations
+                        .names
+                        .insert(words[1], literal_string(&words[2..]));
+                }
+                OP_TYPE_INT => {
+                    declarations.int_widths.insert(words[1], words[2]);
+                }
+                OP_TYPE_VECTOR => {
+                    declarations.vectors.insert(words[1], words[2]);
+                }
+                _ => {}
+            }
+        }
+        declarations
+    }
+
+    /// The integer width of a scalar or vector type.
+    fn int_width(&self, ty: u32) -> Option<u32> {
+        let component = self.vectors.get(&ty).copied().unwrap_or(ty);
+        self.int_widths.get(&component).copied()
+    }
+}
+
+/// The constructs of a formed, cleaned `module` the emitted contract
+/// forbids: a 64-bit integer division or remainder, scalar or vector.
+/// Drivers expand each into a long sequence (Mesa's Intel compiler about
+/// 2,300 instructions), copied by every unrolled loop around it.
+/// Arithmetic on specialization constants is folded at pipeline creation
+/// and is exempt.
+pub fn contract(module: &[u32]) -> Result<Vec<Violation>, MalformedModule> {
+    let instructions = instructions(module)?;
+    let declarations = Declarations::of(module, &instructions);
+    let mut found = BTreeMap::<(String, String), usize>::new();
+    let mut function = None;
+    for instruction in &instructions {
+        let words = &module[instruction.start..instruction.start + instruction.words];
+        match instruction.opcode {
+            OP_FUNCTION => function = Some(words[2]),
+            OP_FUNCTION_END => function = None,
+            opcode => {
+                let Some((_, name)) = INTEGER_DIVISION
+                    .iter()
+                    .find(|(division, _)| *division == opcode)
+                    .filter(|_| declarations.int_width(words[1]) == Some(64))
+                else {
+                    continue;
+                };
+                let holder = function.map_or_else(
+                    || "module scope".to_owned(),
+                    |function| {
+                        declarations
+                            .names
+                            .get(&function)
+                            .cloned()
+                            .unwrap_or_else(|| format!("%{function}"))
+                    },
+                );
+                *found.entry((holder, format!("64-bit {name}"))).or_default() += 1;
+            }
+        }
+    }
+    Ok(found
+        .into_iter()
+        .map(|((holder, construct), count)| {
+            Violation(format!("{count} × {construct} in `{holder}`"))
+        })
+        .collect())
 }
 
 /// Result ids of float arithmetic lacking `NoContraction`, and whether the

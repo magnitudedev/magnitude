@@ -119,9 +119,15 @@ fn vulkan_priming_abi_forms() {
         &requests,
         &Progress::default(),
     );
-    for (request, result) in requests.iter().zip(results) {
-        eprintln!("{request}: {result:?}");
-        assert!(result.is_ok(), "{request}: {result:?}");
-    }
+    let failed = requests
+        .iter()
+        .zip(results)
+        .filter(|(request, result)| {
+            eprintln!("{request}: {result:?}");
+            result.is_err()
+        })
+        .map(|(request, _)| request.to_string())
+        .collect::<Vec<_>>();
+    assert!(failed.is_empty(), "{} of {} requests fail to form: {failed:#?}", failed.len(), requests.len());
     eprintln!("FORMED {} exact native Vulkan requests", requests.len());
 }

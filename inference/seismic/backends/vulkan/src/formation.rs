@@ -55,7 +55,9 @@ fn toolchain(error: impl std::fmt::Display) -> NativeCompilationError {
 }
 
 /// Compile the launch `kernel` of `source` to SPIR-V sealed for
-/// `environment`, validated and cleaned.
+/// `environment`, validated and cleaned. A module holding a construct the
+/// emitted contract forbids ([`seal::contract`]) is refused, as glslang
+/// refuses invalid source.
 pub fn compile(
     source: &str,
     kernel: &str,
@@ -79,7 +81,22 @@ pub fn compile(
     let sealed = seal::seal(&compiled, environment)
         .map_err(|error| NativeCompilationError::MalformedToolchainOutput(error.0))?;
     validate(&sealed).map_err(NativeCompilationError::MalformedToolchainOutput)?;
-    clean(&sealed)
+    let cleaned = clean(&sealed)?;
+    let violations = seal::contract(&cleaned)
+        .map_err(|error| NativeCompilationError::MalformedToolchainOutput(error.0))?;
+    if !violations.is_empty() {
+        // Written as glslang writes a diagnostic, so readers that keep a
+        // toolchain failure's error lines keep it.
+        return Err(toolchain(format!(
+            "ERROR: `{kernel}` violates the Vulkan kernel contract: {}",
+            violations
+                .iter()
+                .map(|violation| violation.0.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        )));
+    }
+    Ok(cleaned)
 }
 
 /// The glslang options of every formation.
@@ -439,5 +456,83 @@ impl Drop for DirectModule {
         for pipeline in &self.pipelines {
             unsafe { self.device.inner.device.destroy_pipeline(*pipeline, None) };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `body` as the launch `probe` of a module with one u64 buffer.
+    fn form(globals: &str, body: &str) -> Result<Vec<u32>, NativeCompilationError> {
+        let source = format!(
+            "#version 460\n\
+             #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require\n\
+             layout(local_size_x = 32) in;\n\
+             layout(set = 0, binding = 0, std430) buffer Output {{ uint64_t x[]; }} data;\n\
+             {globals}\n\
+             void probe() {{ {body} }}\n\
+             void main() {{ SEISMIC_KERNEL(); }}\n"
+        );
+        let environment = seal::Environment {
+            float16: false,
+            rounding_rte_32: true,
+            denorm_preserve_32: false,
+        };
+        compile(&source, "probe", environment)
+    }
+
+    fn refused(globals: &str, body: &str, construct: &str) {
+        match form(globals, body) {
+            Err(NativeCompilationError::ToolchainFailure(message)) => assert!(
+                message.starts_with("ERROR: `probe` violates") && message.contains(construct),
+                "{body}: {message}"
+            ),
+            other => panic!("{body}: expected a contract violation, got {other:?}"),
+        }
+    }
+
+    fn formed(globals: &str, body: &str) {
+        if let Err(error) = form(globals, body) {
+            panic!("{body}: {error}");
+        }
+    }
+
+    const OUT: &str = "data.x[gl_GlobalInvocationID.x]";
+
+    #[test]
+    fn a_64_bit_division_is_refused_wherever_it_runs() {
+        refused(
+            "",
+            &format!("{OUT} = data.x[0] / data.x[1];"),
+            "64-bit OpUDiv",
+        );
+        // A literal divisor still divides at run time.
+        refused(
+            "",
+            &format!("{OUT} = data.x[0] / uint64_t(3);"),
+            "64-bit OpUDiv",
+        );
+        refused(
+            "",
+            &format!("{OUT} = uint64_t(int64_t(data.x[0]) % int64_t(data.x[1]));"),
+            "64-bit OpSMod",
+        );
+        refused(
+            "",
+            &format!(
+                "u64vec2 a = u64vec2(data.x[0], data.x[1]), b = u64vec2(data.x[2], data.x[3]); {OUT} = (a / b).x;"
+            ),
+            "64-bit OpUDiv",
+        );
+    }
+
+    #[test]
+    fn folded_and_32_bit_division_form() {
+        formed("", &format!("{OUT} = uint64_t(123) / uint64_t(3);"));
+        formed(
+            "",
+            &format!("{OUT} = uint64_t(uint(data.x[0]) / uint(data.x[1]) + uint(data.x[2]) % 7u);"),
+        );
     }
 }

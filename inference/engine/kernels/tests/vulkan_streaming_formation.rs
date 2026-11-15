@@ -143,7 +143,10 @@ fn vulkan_streaming_forms() {
         &requests,
         &Progress::default(),
     );
-    for (request, result) in requests.iter().zip(results) {
-        result.unwrap_or_else(|error| panic!("{request}: {error:?}"));
-    }
+    let failed = requests
+        .iter()
+        .zip(results)
+        .filter_map(|(request, result)| result.err().map(|error| format!("{request}: {error:?}")))
+        .collect::<Vec<_>>();
+    assert!(failed.is_empty(), "{} of {} requests fail to form: {failed:#?}", failed.len(), requests.len());
 }
