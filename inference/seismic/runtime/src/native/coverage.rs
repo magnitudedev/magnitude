@@ -2413,8 +2413,9 @@ fn in_parallel<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> 
         .map_or(1, usize::from)
         .min(items.len());
     std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
         for _ in 0..workers {
-            scope.spawn(|| {
+            handles.push(scope.spawn(|| {
                 loop {
                     let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(item) = items.get(index) else {
@@ -2426,7 +2427,12 @@ fn in_parallel<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> 
                         .expect("no worker panics holding the lock")
                         .push((index, result));
                 }
-            });
+            }));
+        }
+        for handle in handles {
+            if let Err(payload) = handle.join() {
+                std::panic::resume_unwind(payload);
+            }
         }
     });
     let mut results = results.into_inner().expect("the lock is not poisoned");

@@ -20,13 +20,13 @@ use super::timeline::{
     TimelineRole, ValuedRole,
 };
 use super::{
-    merge_access, submit, CallLaunches, Dispatch, DispatchList, LaunchGeometry, NativeQueue,
-    NativePrepared, NativeRoute, NativeSubmission, NativeTensorSpec, ScratchNeed, BUFFER_ALIGNMENT,
-    SYNC_SCRATCH_BYTES,
+    charge_emissions, merge_access, submit, CallLaunches, Dispatch, DispatchList, FormedAt, LaunchGeometry,
+    NativeOperandNorm, NativePrepared, NativeQueue, NativeRoute, NativeSubmission, NativeTensorSpec, ScratchNeed,
+    ScratchOperand, BUFFER_ALIGNMENT, SYNC_SCRATCH_BYTES,
 };
 use crate::api::device::DeviceInner;
 use crate::api::kernel::{
-    EncodedWorkflowArgs, EncodedWorkflowArgument, NativePreparedAny, PendingWorkflowResults,
+    EncodedScalar, EncodedWorkflowArgs, EncodedWorkflowArgument, NativePreparedAny, PendingWorkflowResults,
     ViewOperation, WorkflowResultRef, WorkflowTensorArgument,
 };
 use crate::api::tensor::{Records, TensorInner};
@@ -375,6 +375,190 @@ fn validate_stores(
     Ok(())
 }
 
+/// The forms of an operand a carry holds ([`OperandCarry`]): its formed
+/// F32 rows always, under the NVFP4 operand transform where `nvfp4`, and its
+/// Q8 blocks where `quantized`. They are the forms its readers' kernels
+/// take, so only a graph of kernels names them
+/// (`NativeGraphDraft::carry_out`, `carry_in`): its seal writes them into
+/// its producers' emission words and holds its readers to them. A carry's
+/// ports, and every byte a graph reserves for it, are the same in each
+/// ([`operand_carry_ports`]), so a graph built to be sized names none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct OperandForms {
+    pub quantized: bool,
+    pub nvfp4: bool,
+}
+
+impl OperandForms {
+    /// The emission word (`abi::emitted_word`) of a producer's buffer of
+    /// these forms: its rows (`rows`) or its Q8 blocks.
+    fn word(self, rows: bool) -> u64 {
+        emission_word(rows, rows || self.quantized, self.nvfp4)
+    }
+
+    /// Whether a reader's buffer of a carry in these forms, its rows
+    /// (`rows`) or its Q8 blocks, standing as `at` at its call, reads what
+    /// the carry holds: its rows formed under the same transform, by a
+    /// reader that also reads the carry's Q8 blocks where it holds them
+    /// (`blocks`: whether the reader reads any); its Q8 blocks formed
+    /// exactly where the carry holds them.
+    fn read_by(self, rows: bool, at: FormedAt, blocks: bool) -> bool {
+        match rows {
+            true => at.formed && at.nvfp4 == self.nvfp4 && (blocks || !self.quantized),
+            false => at.formed == self.quantized,
+        }
+    }
+}
+
+/// The emission word of a producer's operand buffer, its rows (`rows`) or
+/// its Q8 blocks, which a consumer reads: 0 where the consumer does not
+/// form it (`formed`); Q8 blocks 1; rows bit 0 to emit, bit 1 where they
+/// take the NVFP4 operand transform (`nvfp4`).
+fn emission_word(rows: bool, formed: bool, nvfp4: bool) -> u64 {
+    match (formed, rows) {
+        (false, _) => 0,
+        (true, false) => 1,
+        (true, true) => 1 | (u64::from(nvfp4) << 1),
+    }
+}
+
+/// An operand carried across graphs: one graph's producer of a tensor
+/// writes the tensor's normed operand into the tensors a run binds to these
+/// ports (`carry_out`), and another graph's consumers of that tensor read it
+/// from them in place of forming it (`carry_in`). Each graph declares its
+/// own carry's ports; a run binds a producer's tensors to the next graph's
+/// consumer ports ([`operand_carry_ports`] describes them).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OperandCarry {
+    /// F32 `[ROWS, WIDTH]`: the formed rows.
+    pub rows: NativePort,
+    /// U32 words `[ROWS, ceil(WIDTH / Q8_VALUES) * OPERAND_CARRY_BLOCK_WORDS]`:
+    /// the rows' Q8 blocks.
+    pub quantized: NativePort,
+    /// The activation element both sides bind
+    /// ([`super::OPERAND_ACTIVATION`]), which the rows are rounded to.
+    pub activation: RepresentationId,
+}
+
+/// The u32 words of one Q8 block (`forms::CPU_Q8_BYTES`) in a carry's
+/// `quantized` port: its blocks are opaque words, as a call's scratch is
+/// bytes.
+pub const OPERAND_CARRY_BLOCK_WORDS: u64 = seismic_lang::forms::CPU_Q8_BYTES / 4;
+const _: () = assert!(seismic_lang::forms::CPU_Q8_BYTES % 4 == 0, "a Q8 block is whole u32 words");
+
+/// The representation and extents of each port of a carry of `rows` rows of
+/// `width` values: its rows, then its Q8 blocks ([`OperandCarry`]).
+pub fn operand_carry_ports(rows: u64, width: u64) -> [(RepresentationId, [u64; 2]); 2] {
+    let representation =
+        |name| seismic_lang::registry::representation(name).expect("the registry holds every dense dtype");
+    [
+        (representation("f32"), [rows, width]),
+        (
+            representation("u32"),
+            [rows, width.div_ceil(seismic_lang::forms::CPU_Q8_VALUES) * OPERAND_CARRY_BLOCK_WORDS],
+        ),
+    ]
+}
+
+/// A carry a graph declares ([`OperandCarry`]), by port ordinal, in the
+/// forms `F` its graph names: a graph of kernels its [`OperandForms`], a
+/// graph built to be sized none. What a graph reserves for a carry
+/// (`operand_links`, `plan_storage`) is decided over any `F`, so by no form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Carry<F = ()> {
+    rows: u32,
+    quantized: u32,
+    forms: F,
+    activation: RepresentationId,
+    side: CarrySide,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CarrySide {
+    /// The node producing `result` emits its normed operand into the ports.
+    Out { result: WorkflowResultRef },
+    /// Each consumer of port `hidden`'s whole tensor whose operand is
+    /// normed by port `norm`'s under the epsilon of bits `epsilon` reads
+    /// the operand from the ports.
+    In { hidden: u32, norm: u32, epsilon: u32 },
+}
+
+/// One end of a carry as a graph declares it (`carry_out`, `carry_in`).
+enum CarryEnd {
+    Out(WorkflowResultRef),
+    In { hidden: NativePort, norm: NativePort, epsilon: f32 },
+}
+
+/// Record that graph `identity`, of `ports` and the `nodes` enqueued so
+/// far, carries `carry` in `forms` at `end`. Its ports are two external
+/// ports of the graph, of the shapes a carry takes, that no other carry
+/// names; a carried out result is one of its nodes', carried out once; a
+/// carried in tensor and norm are its ports.
+fn add_carry<F>(
+    identity: u64,
+    ports: &[PortSpec],
+    nodes: usize,
+    carries: &mut Vec<Carry<F>>,
+    carry: &OperandCarry,
+    forms: F,
+    end: CarryEnd,
+) -> Result<(), WorkflowError> {
+    let own = |port: NativePort| {
+        port.reference.workflow == identity
+            && port.reference.node == INPUT_NODE
+            && (port.reference.result as usize) < ports.len()
+    };
+    let mismatch = |port: NativePort| WorkflowError::NativePortMismatch { port: port.reference.result as usize };
+    if !own(carry.rows) || !own(carry.quantized) {
+        return Err(WorkflowError::CrossWorkflowResult);
+    }
+    let side = match end {
+        CarryEnd::Out(result) => {
+            if result.workflow != identity || result.node == INPUT_NODE || result.node as usize >= nodes {
+                return Err(WorkflowError::CrossWorkflowResult);
+            }
+            if carries.iter().any(|other| other.side == CarrySide::Out { result }) {
+                return Err(WorkflowError::OperandEmitter { node: result.node as usize });
+            }
+            CarrySide::Out { result }
+        }
+        CarryEnd::In { hidden, norm, epsilon } => {
+            if !own(hidden) || !own(norm) {
+                return Err(WorkflowError::CrossWorkflowResult);
+            }
+            if [hidden, norm].iter().any(|port| *port == carry.rows || *port == carry.quantized) {
+                return Err(mismatch(hidden));
+            }
+            CarrySide::In { hidden: hidden.reference.result, norm: norm.reference.result, epsilon: epsilon.to_bits() }
+        }
+    };
+    let rows = &ports[carry.rows.reference.result as usize];
+    let [rows_port, quantized_port] = match rows.extents[..] {
+        [count, width] => operand_carry_ports(count, width),
+        _ => return Err(mismatch(carry.rows)),
+    };
+    for (port, (representation, extents)) in [(carry.rows, rows_port), (carry.quantized, quantized_port)] {
+        let spec = &ports[port.reference.result as usize];
+        let named = carries
+            .iter()
+            .any(|other| [other.rows, other.quantized].contains(&port.reference.result));
+        if spec.local || spec.representation != representation || spec.extents != extents || named {
+            return Err(mismatch(port));
+        }
+    }
+    if carry.rows == carry.quantized {
+        return Err(mismatch(carry.quantized));
+    }
+    carries.push(Carry {
+        rows: carry.rows.reference.result,
+        quantized: carry.quantized.reference.result,
+        forms,
+        activation: carry.activation,
+        side,
+    });
+    Ok(())
+}
+
 /// That the timeline nodes before node `node` (or the graph's end, `node`
 /// the node count) end with one park exactly when the node parks
 /// (`TimelineNode::Park`): a park answers the call right after it, and
@@ -401,6 +585,9 @@ pub struct NativeGraphDraft {
     nodes: Vec<NodeDraft>,
     exports: Vec<WorkflowResultRef>,
     stores: Vec<Store>,
+    /// Operands carried out to and in from other graphs, in the forms
+    /// its seal writes and checks.
+    carries: Vec<Carry<OperandForms>>,
     layout: Option<Arc<NativeGraphLayout>>,
     /// Timeline nodes, each before the kernel node of its position.
     timelines: Vec<(usize, TimelineNode)>,
@@ -451,6 +638,7 @@ impl NativeGraphDraft {
             nodes: Vec::new(),
             exports: Vec::new(),
             stores: Vec::new(),
+            carries: Vec::new(),
             layout: None,
             timelines: Vec::new(),
             marks: Vec::new(),
@@ -637,6 +825,52 @@ impl NativeGraphDraft {
         )
     }
 
+    /// Declare a carry of `rows` rows of `width` values, its rows rounded
+    /// to `activation`: two external ports of the shapes
+    /// [`operand_carry_ports`] gives, which each run binds.
+    pub fn operand_carry(
+        &mut self,
+        rows: u64,
+        width: u64,
+        activation: RepresentationId,
+    ) -> Result<OperandCarry, TensorError> {
+        let [(rows_element, rows_extents), (quantized_element, quantized_extents)] = operand_carry_ports(rows, width);
+        Ok(OperandCarry {
+            rows: self.port(rows_element, &rows_extents)?,
+            quantized: self.port(quantized_element, &quantized_extents)?,
+            activation,
+        })
+    }
+
+    /// The node producing `result` emits its normed operand into `carry`'s
+    /// ports in `forms`, those the carry's readers in the next graph take
+    /// (sealing refuses a node that emits none, `OperandEmitter`).
+    pub fn carry_out(
+        &mut self,
+        result: WorkflowResultRef,
+        carry: &OperandCarry,
+        forms: OperandForms,
+    ) -> Result<(), WorkflowError> {
+        add_carry(self.identity, &self.ports, self.nodes.len(), &mut self.carries, carry, forms, CarryEnd::Out(result))
+    }
+
+    /// Each consumer of `hidden`'s whole tensor whose operand is normed by
+    /// `norm`'s tensor under `epsilon` reads it from `carry`'s ports, which
+    /// hold it in `forms`, its formation left out (sealing refuses a carry
+    /// no consumer reads, `UnreadOperandCarry`, and one whose forms differ
+    /// from a reader's kernel's, `OperandForms`).
+    pub fn carry_in(
+        &mut self,
+        hidden: NativePort,
+        carry: &OperandCarry,
+        forms: OperandForms,
+        norm: NativePort,
+        epsilon: f32,
+    ) -> Result<(), WorkflowError> {
+        let end = CarryEnd::In { hidden, norm, epsilon };
+        add_carry(self.identity, &self.ports, self.nodes.len(), &mut self.carries, carry, forms, end)
+    }
+
     /// Seal the graph as a plan whose runs replay graphs: on CUDA graphs
     /// recorded as a run first needs one, once the device's queued work has
     /// drained.
@@ -665,6 +899,7 @@ impl NativeGraphDraft {
             self.nodes.iter().map(|node| &node.args),
             &self.exports,
             &self.stores,
+            &self.carries,
         )
         .map_err(CallError::Workflow)?;
         // A sealed plan's vectors hold exactly their lengths, so its host
@@ -690,6 +925,7 @@ impl NativeGraphDraft {
             planned.push(PlannedNode {
                 args: Arc::new(node.args),
                 scratch: shape.scratch.clone(),
+                activation: node.kernel.inner.activation(),
                 condition: node
                     .condition
                     .map(|condition| (condition.port.reference.result, condition.index, condition.encoded)),
@@ -705,6 +941,54 @@ impl NativeGraphDraft {
         validate_stores(&self.stores, &self.ports, &results, &self.exports)
             .map_err(CallError::Workflow)?;
         validate_shares(&planned, &results, &self.exports, &self.stores).map_err(CallError::Workflow)?;
+        let links = operand_links(&planned, &self.carries).map_err(CallError::Workflow)?;
+        charge_node_emissions(&mut planned, &links);
+        // A consumer whose operands its producers emit (in the graph or
+        // through a carry), where each stands for the one it would form,
+        // leaves out the launch that forms them, and each of those producers
+        // emits: its word for the operand (`abi::emitted_word`) is set from
+        // the forms its consumer reads. Every other call emits nothing.
+        let mut emitting: Vec<(usize, usize, u64)> = Vec::new();
+        for (node, (_, _, shape)) in shaped.iter_mut().enumerate() {
+            let scratch = &planned[node].scratch;
+            let left_out = formations_left_out(node, scratch, &shape.forms, &links);
+            for carried in links.carried.iter().filter(|carried| carried.node == node) {
+                let carry = &self.carries[carried.carry];
+                match (scratch[carried.scratch].operand, shape.forms[carried.scratch]) {
+                    // A carried consumer reads the carry alone: its forms are
+                    // the carry's and the launch forming them is left out.
+                    (Some(ScratchOperand::Formed { formation, rows, .. }), Some(at)) => {
+                        let blocks = links.carried.iter().any(|other| {
+                            (other.node, other.carry, other.port) == (node, carried.carry, carry.quantized)
+                        });
+                        if !carry.forms.read_by(rows, at, blocks) || !left_out.contains(&(formation as usize)) {
+                            return Err(CallError::Workflow(WorkflowError::OperandForms { node }));
+                        }
+                    }
+                    (Some(ScratchOperand::Emitted { rows, .. }), None) => {
+                        emitting.push((node, carried.scratch, carry.forms.word(rows)));
+                    }
+                    _ => unreachable!("a carried buffer is an operand buffer"),
+                }
+            }
+            for pair in links.pairs.iter().filter(|pair| pair.consumer == node) {
+                let (Some(ScratchOperand::Formed { formation, rows, .. }), Some(at)) =
+                    (scratch[pair.formed].operand, shape.forms[pair.formed])
+                else {
+                    unreachable!("a paired consumer's buffer is a formed operand");
+                };
+                if left_out.contains(&(formation as usize)) {
+                    emitting.push((pair.producer, pair.emitted, emission_word(rows, at.formed, at.nvfp4)));
+                }
+            }
+            for &launch in &left_out {
+                shape.launches.geometry[launch] = None;
+            }
+        }
+        for (producer, emitted, word) in emitting {
+            let (kernel, _, shape) = &mut shaped[producer];
+            shape.words[super::abi::emitted_word(kernel.schema(), kernel.implementation(), emitted)] = word;
+        }
         let recorded = recorded_census(
             shaped
                 .iter()
@@ -714,10 +998,10 @@ impl NativeGraphDraft {
         );
         let storage = if let Some(layout) = &self.layout {
             layout
-                .storage_for(&self.ports, &planned, &results, &self.exports, &self.stores)
+                .storage_for(&self.ports, &planned, &links, &results, &self.exports, &self.stores)
                 .map_err(CallError::Workflow)?
         } else {
-            plan_storage(&self.ports, &planned, &results, &self.exports, &self.stores)
+            plan_storage(&self.ports, &planned, &links, &results, &self.exports, &self.stores)
         };
         let mut executable = Executable {
             nodes: Vec::with_capacity(planned.len()),
@@ -774,6 +1058,9 @@ pub struct NativeGraphMetadataDraft {
     results: Vec<Vec<Option<NativeTensorSpec>>>,
     exports: Vec<WorkflowResultRef>,
     stores: Vec<Store>,
+    /// Operands carried out to and in from other graphs
+    /// (`NativeGraphDraft::carry_out`, `carry_in`).
+    carries: Vec<Carry>,
     timelines: Vec<(usize, TimelineNode)>,
     marks: Vec<usize>,
 }
@@ -826,10 +1113,15 @@ impl NativeGraphLayout {
         }
     }
 
+    /// The storage of an exact graph sealed into this layout: refused
+    /// unless its topology (its edges and carries among them, so each
+    /// carried buffer lies on the same port) is the layout's and every
+    /// buffer fits its capacity.
     fn storage_for(
         &self,
         ports: &[PortSpec],
         nodes: &[PlannedNode],
+        links: &OperandLinks,
         results: &[Vec<Option<NativeTensorSpec>>],
         exports: &[WorkflowResultRef],
         stores: &[Store],
@@ -842,7 +1134,7 @@ impl NativeGraphLayout {
                 capacity,
             })
         };
-        if storage_signature(ports, nodes, results, exports, stores) != self.signature
+        if storage_signature(ports, nodes, links, results, exports, stores) != self.signature
             || ports.len() != self.port_capacity.len()
             || results.len() != self.result_capacity.len()
             || nodes.len() != self.scratch_capacity.len()
@@ -882,7 +1174,7 @@ impl NativeGraphLayout {
                 return Err(topology());
             }
             for (scratch, (need, capacity)) in node.scratch.iter().zip(capacities).enumerate() {
-                if need.sync != capacity.sync {
+                if need.sync != capacity.sync || need.operand != capacity.operand || need.emission != capacity.emission {
                     return Err(topology());
                 }
                 if need.bytes > capacity.bytes {
@@ -906,11 +1198,14 @@ struct StorageSignature {
     /// Per node, its condition and its shared result (ordinal, the result it
     /// shares).
     conditions: Vec<(Option<Condition>, Option<(u32, u32, u32)>)>,
+    /// Each carried buffer's (node, buffer, port).
+    carried: Vec<(usize, usize, u32)>,
 }
 
 fn storage_signature(
     ports: &[PortSpec],
     nodes: &[PlannedNode],
+    links: &OperandLinks,
     results: &[Vec<Option<NativeTensorSpec>>],
     exports: &[WorkflowResultRef],
     stores: &[Store],
@@ -960,6 +1255,7 @@ fn storage_signature(
             .iter()
             .map(|node| (node.condition, node.share.map(|(ordinal, primary)| (ordinal, primary.node, primary.result))))
             .collect(),
+        carried: links.carried.iter().map(|carried| (carried.node, carried.scratch, carried.port)).collect(),
     }
 }
 
@@ -1068,6 +1364,7 @@ impl NativeGraphMetadataDraft {
             results: Vec::new(),
             exports: Vec::new(),
             stores: Vec::new(),
+            carries: Vec::new(),
             timelines: Vec::new(),
             marks: Vec::new(),
         }
@@ -1171,7 +1468,11 @@ impl NativeGraphMetadataDraft {
         prewrite_port(self.identity, &mut self.ports, port)
     }
 
-    /// Node `entry` (its checked entry's name) over `args`.
+    /// Enqueue node `entry` (its checked entry's name) over `args`, its
+    /// parameters and results of these shapes, with `scratch`, its entry's
+    /// activation element bound to `activation` ([`super::OPERAND_ACTIVATION`])
+    /// where it has one.
+    #[allow(clippy::too_many_arguments)]
     pub fn enqueue(
         &mut self,
         entry: &'static str,
@@ -1179,6 +1480,7 @@ impl NativeGraphMetadataDraft {
         parameter_shapes: Vec<Option<(RepresentationId, Vec<u64>)>>,
         result_shapes: Vec<Option<(RepresentationId, Vec<u64>)>>,
         scratch: Vec<ScratchNeed>,
+        activation: Option<RepresentationId>,
         shape: SealedNodeShape,
     ) -> Result<PendingWorkflowResults, CallError> {
         let node = u32::try_from(self.nodes.len()).expect("native graph node ordinal exhausted");
@@ -1203,7 +1505,7 @@ impl NativeGraphMetadataDraft {
             })
             .collect::<Result<Vec<_>, CallError>>()?;
         let count = u32::try_from(results.len()).expect("native result ordinal exhausted");
-        self.nodes.push(PlannedNode { args: Arc::new(args), scratch, condition: None, share: None });
+        self.nodes.push(PlannedNode { args: Arc::new(args), scratch, activation, condition: None, share: None });
         self.entries.push(entry);
         self.shapes.push(shape);
         self.results.push(results);
@@ -1217,6 +1519,7 @@ impl NativeGraphMetadataDraft {
     /// [`Self::enqueue`] under `condition` (`NativeGraphDraft::enqueue_under`):
     /// planning holds the node as any other, its condition kept for the
     /// proof that results may share storage (`Self::share`).
+    #[allow(clippy::too_many_arguments)]
     pub fn enqueue_under(
         &mut self,
         entry: &'static str,
@@ -1224,11 +1527,12 @@ impl NativeGraphMetadataDraft {
         parameter_shapes: Vec<Option<(RepresentationId, Vec<u64>)>>,
         result_shapes: Vec<Option<(RepresentationId, Vec<u64>)>>,
         scratch: Vec<ScratchNeed>,
+        activation: Option<RepresentationId>,
         shape: SealedNodeShape,
         condition: NodeCondition,
     ) -> Result<PendingWorkflowResults, CallError> {
         let port = condition_port(self.identity, &self.ports, self.nodes.len(), condition).map_err(CallError::Workflow)?;
-        let pending = self.enqueue(entry, args, parameter_shapes, result_shapes, scratch, shape)?;
+        let pending = self.enqueue(entry, args, parameter_shapes, result_shapes, scratch, activation, shape)?;
         self.nodes.last_mut().expect("the node just enqueued").condition = Some((port, condition.index, condition.encoded));
         Ok(pending)
     }
@@ -1256,11 +1560,33 @@ impl NativeGraphMetadataDraft {
         )
     }
 
-    pub fn seal(self) -> Result<NativeGraphStorageBytes, WorkflowError> {
-        self.validate_topology()?;
+    /// `NativeGraphDraft::carry_out`, in no form: `carry`'s ports are two
+    /// of this graph's ports, of [`operand_carry_ports`]' shapes, and what
+    /// the graph reserves for them is the same in every form
+    /// ([`OperandForms`]).
+    pub fn carry_out(&mut self, result: WorkflowResultRef, carry: &OperandCarry) -> Result<(), WorkflowError> {
+        add_carry(self.identity, &self.ports, self.nodes.len(), &mut self.carries, carry, (), CarryEnd::Out(result))
+    }
+
+    /// `NativeGraphDraft::carry_in`, in no form.
+    pub fn carry_in(
+        &mut self,
+        hidden: NativePort,
+        carry: &OperandCarry,
+        norm: NativePort,
+        epsilon: f32,
+    ) -> Result<(), WorkflowError> {
+        let end = CarryEnd::In { hidden, norm, epsilon };
+        add_carry(self.identity, &self.ports, self.nodes.len(), &mut self.carries, carry, (), end)
+    }
+
+    pub fn seal(mut self) -> Result<NativeGraphStorageBytes, WorkflowError> {
+        let links = self.validate_topology()?;
+        charge_node_emissions(&mut self.nodes, &links);
         let storage = plan_storage(
             &self.ports,
             &self.nodes,
+            &links,
             &self.results,
             &self.exports,
             &self.stores,
@@ -1281,13 +1607,15 @@ impl NativeGraphMetadataDraft {
     /// Verify an exact checked metadata graph against the storage certificate
     /// used by executable preparation, without placing it again.
     pub fn seal_with_layout(
-        self,
+        mut self,
         layout: &NativeGraphLayout,
     ) -> Result<NativeGraphStorageBytes, WorkflowError> {
-        self.validate_topology()?;
+        let links = self.validate_topology()?;
+        charge_node_emissions(&mut self.nodes, &links);
         let storage = layout.storage_for(
             &self.ports,
             &self.nodes,
+            &links,
             &self.results,
             &self.exports,
             &self.stores,
@@ -1303,8 +1631,9 @@ impl NativeGraphMetadataDraft {
     /// It as a resource template for other exact shape classes, once its
     /// ordered edges and exports are validated.
     pub fn validated(self) -> Result<ValidatedMetadataDraft, WorkflowError> {
-        self.validate_topology()?;
+        let links = self.validate_topology()?;
         Ok(ValidatedMetadataDraft {
+            links,
             plan_heap: self.plan_heap(),
             bound_heap: bindings_heap(self.ports.len(), self.timelines.len()),
             census: self.recorded(),
@@ -1312,8 +1641,9 @@ impl NativeGraphMetadataDraft {
         })
     }
 
-    /// Validate a graph's ordered edges and exports.
-    fn validate_topology(&self) -> Result<(), WorkflowError> {
+    /// Validate a graph's ordered edges, exports and carries: its operand
+    /// links, where it has them.
+    fn validate_topology(&self) -> Result<OperandLinks, WorkflowError> {
         if self.nodes.is_empty() {
             return Err(WorkflowError::Empty);
         }
@@ -1322,6 +1652,7 @@ impl NativeGraphMetadataDraft {
             self.nodes.iter().map(|node| &*node.args),
             &self.exports,
             &self.stores,
+            &self.carries,
         )?;
         validate_park(&self.timelines, self.nodes.len(), false)?;
         for reference in &self.exports {
@@ -1330,7 +1661,8 @@ impl NativeGraphMetadataDraft {
             }
         }
         validate_stores(&self.stores, &self.ports, &self.results, &self.exports)?;
-        validate_shares(&self.nodes, &self.results, &self.exports, &self.stores)
+        validate_shares(&self.nodes, &self.results, &self.exports, &self.stores)?;
+        operand_links(&self.nodes, &self.carries)
     }
 }
 
@@ -1340,6 +1672,8 @@ impl NativeGraphMetadataDraft {
 /// validation. What its topology alone decides is derived once with it.
 pub struct ValidatedMetadataDraft {
     draft: NativeGraphMetadataDraft,
+    /// Its operand links, which its topology decides.
+    links: OperandLinks,
     plan_heap: HostHeap,
     bound_heap: HostHeap,
     /// What recording one run of it takes.
@@ -1430,6 +1764,7 @@ impl ValidatedMetadataDraft {
         Ok(make_layout(
             &ports,
             &nodes,
+            &self.links,
             &results,
             &self.draft.exports,
             &self.draft.stores,
@@ -1449,7 +1784,7 @@ impl ValidatedMetadataDraft {
         scratch: Vec<Vec<ScratchNeed>>,
     ) -> Result<NativeGraphStorageBytes, WorkflowError> {
         let (ports, nodes, results) = self.at_capacities(ports, results, scratch)?;
-        let storage = plan_storage(&ports, &nodes, &results, &self.draft.exports, &self.draft.stores);
+        let storage = plan_storage(&ports, &nodes, &self.links, &results, &self.draft.exports, &self.draft.stores);
         Ok(NativeGraphStorageBytes {
             workspace: storage.scratch_bytes,
             output: storage.output_bytes,
@@ -1471,7 +1806,8 @@ impl ValidatedMetadataDraft {
     }
 
     /// This validated topology with every buffer at its supplied byte
-    /// capacity.
+    /// capacity, each that serves an emission no consumer reads charged the
+    /// minimum.
     #[allow(clippy::type_complexity)]
     fn at_capacities(
         &self,
@@ -1520,7 +1856,7 @@ impl ValidatedMetadataDraft {
                     .collect()
             })
             .collect::<Vec<_>>();
-        let nodes = self
+        let mut nodes = self
             .draft
             .nodes
             .iter()
@@ -1528,10 +1864,12 @@ impl ValidatedMetadataDraft {
             .map(|(node, scratch)| PlannedNode {
                 args: Arc::clone(&node.args),
                 scratch,
+                activation: node.activation,
                 condition: node.condition,
                 share: node.share,
             })
             .collect::<Vec<_>>();
+        charge_node_emissions(&mut nodes, &self.links);
         Ok((ports, nodes, results))
     }
 }
@@ -1540,6 +1878,7 @@ impl ValidatedMetadataDraft {
 fn make_layout(
     ports: &[PortSpec],
     nodes: &[PlannedNode],
+    links: &OperandLinks,
     results: &[Vec<Option<NativeTensorSpec>>],
     exports: &[WorkflowResultRef],
     stores: &[Store],
@@ -1552,8 +1891,8 @@ fn make_layout(
         plan_heap,
         timelines,
         recorded,
-        storage: plan_storage(ports, nodes, results, exports, stores),
-        signature: storage_signature(ports, nodes, results, exports, stores),
+        storage: plan_storage(ports, nodes, links, results, exports, stores),
+        signature: storage_signature(ports, nodes, links, results, exports, stores),
         port_capacity: ports.iter().map(|port| port.byte_len).collect(),
         result_capacity: results
             .iter()
@@ -1739,11 +2078,14 @@ fn validate_export_reference(
     Ok(())
 }
 
-fn validate_used_ports<'a>(
+/// Every port is used: by a node's argument, an export, a store or a carry.
+/// A carry's ports are its alone: no node, export or store names them.
+fn validate_used_ports<'a, F>(
     port_count: usize,
     nodes: impl Iterator<Item = &'a EncodedWorkflowArgs>,
     exports: &[WorkflowResultRef],
     stores: &[Store],
+    carries: &[Carry<F>],
 ) -> Result<(), WorkflowError> {
     let mut used = vec![false; port_count];
     for node in nodes {
@@ -1762,6 +2104,14 @@ fn validate_used_ports<'a>(
     }
     for store in stores {
         used[store.port as usize] = true;
+    }
+    for carry in carries {
+        for port in [carry.rows, carry.quantized] {
+            if used[port as usize] {
+                return Err(WorkflowError::NativePortMismatch { port: port as usize });
+            }
+            used[port as usize] = true;
+        }
     }
     if let Some(port) = used.iter().position(|used| !used) {
         return Err(WorkflowError::NativePortUnbound { port });
@@ -1909,12 +2259,298 @@ struct PlannedNode {
     args: Arc<EncodedWorkflowArgs>,
     /// Each of the node's call-private scratch buffers.
     scratch: Vec<ScratchNeed>,
+    /// The element its entry binds its activation to
+    /// ([`super::OPERAND_ACTIVATION`]), where it has one: a pair's or a
+    /// carry's ends bind one.
+    activation: Option<RepresentationId>,
     /// Its condition (`NodeCondition`): the external port, the word and what
     /// the node is encoded under.
     condition: Option<Condition>,
     /// Its result that shares an earlier or later node's result storage
     /// (`NativeGraphDraft::share`): its ordinal and that result.
     share: Option<(u32, WorkflowResultRef)>,
+}
+
+/// One operand pairing (`ScratchOperand`): node `consumer`'s buffer
+/// `formed` holds one form of the operand of a tensor node `producer` writes
+/// whole, whose buffer `emitted` holds that form of that tensor's operand,
+/// under the same norm. The two are one storage, live from the producer to
+/// the consumer: the producer's launches write the operand, and the consumer
+/// reads it, or forms it over the producer's where the producer's does not
+/// stand for its own (`formations_left_out`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OperandPair {
+    consumer: usize,
+    formed: usize,
+    producer: usize,
+    emitted: usize,
+}
+
+/// Every operand pairing of `nodes`: each consumer's formed operand whose
+/// tensor parameter is bound to a whole result of an earlier node that emits
+/// that form of that result's operand, under one norm: none on either, or
+/// each bound to the same norm weight and epsilon. An emitted operand pairs
+/// with its first consumer alone: another consumer's own layout may differ,
+/// so it forms its own.
+fn operand_pairs(nodes: &[PlannedNode]) -> Vec<OperandPair> {
+    let mut pairs: Vec<OperandPair> = Vec::new();
+    for (consumer, node) in nodes.iter().enumerate() {
+        for (formed, need) in node.scratch.iter().enumerate() {
+            let Some(ScratchOperand::Formed { parameter, rows, norm, .. }) = need.operand else { continue };
+            // A view of a result is not its whole tensor, whose operand the
+            // producer emits.
+            let source = match node.args.arguments().get(parameter as usize) {
+                Some(EncodedWorkflowArgument::Tensor(WorkflowTensorArgument::Result(source)))
+                    if source.node != INPUT_NODE =>
+                {
+                    *source
+                }
+                _ => continue,
+            };
+            let producer = source.node as usize;
+            let emitted = nodes[producer].scratch.iter().position(|need| match need.operand {
+                Some(ScratchOperand::Emitted { result, rows: emitted_rows, norm: emitted_norm }) => {
+                    result == source.result
+                        && emitted_rows == rows
+                        && same_norm(&node.args, norm, &nodes[producer].args, emitted_norm)
+                }
+                _ => false,
+            });
+            let Some(emitted) = emitted else { continue };
+            if pairs.iter().any(|pair| pair.producer == producer && pair.emitted == emitted) {
+                continue;
+            }
+            pairs.push(OperandPair { consumer, formed, producer, emitted });
+        }
+    }
+    pairs
+}
+
+/// Whether a consumer's operand norm (`consumer`, of its arguments
+/// `formed`) and a producer's (`producer`, of `emitting`) are one: both
+/// absent, or both bound to the same norm weight tensor and the same
+/// epsilon.
+fn same_norm(
+    formed: &EncodedWorkflowArgs,
+    consumer: Option<NativeOperandNorm>,
+    emitting: &EncodedWorkflowArgs,
+    producer: Option<NativeOperandNorm>,
+) -> bool {
+    let argument = |args: &EncodedWorkflowArgs, ordinal: u32| args.arguments().get(ordinal as usize).cloned();
+    match (consumer, producer) {
+        (None, None) => true,
+        (Some(consumer), Some(producer)) => {
+            let weights = match (argument(formed, consumer.weight), argument(emitting, producer.weight)) {
+                (Some(EncodedWorkflowArgument::Tensor(a)), Some(EncodedWorkflowArgument::Tensor(b))) => match (a, b) {
+                    (WorkflowTensorArgument::External(a), WorkflowTensorArgument::External(b)) => Arc::ptr_eq(&a, &b),
+                    (WorkflowTensorArgument::Result(a), WorkflowTensorArgument::Result(b)) => a == b,
+                    (
+                        WorkflowTensorArgument::ResultView { result: a, operations: x, .. },
+                        WorkflowTensorArgument::ResultView { result: b, operations: y, .. },
+                    ) => a == b && x == y,
+                    _ => false,
+                },
+                _ => false,
+            };
+            let epsilons = match (argument(formed, consumer.epsilon), argument(emitting, producer.epsilon)) {
+                (Some(EncodedWorkflowArgument::Scalar(a)), Some(EncodedWorkflowArgument::Scalar(b))) => a == b,
+                _ => false,
+            };
+            weights && epsilons
+        }
+        _ => false,
+    }
+}
+
+/// Where a graph's operand buffers lie beyond their own node: its in-graph
+/// pairs (`operand_pairs`) and its carried buffers. Its topology decides it
+/// (`operand_links`), every class of a layout alike.
+#[derive(Clone, Debug)]
+struct OperandLinks {
+    pairs: Vec<OperandPair>,
+    carried: Vec<CarriedBuffer>,
+}
+
+/// Node `node`'s operand buffer `scratch`, which lies on port `port` of
+/// carry `carry` (its ordinal among the graph's carries): an emitted
+/// buffer of a carry out, which the node writes, or a formed one of a carry
+/// in, which it reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CarriedBuffer {
+    node: usize,
+    scratch: usize,
+    port: u32,
+    carry: usize,
+}
+
+impl OperandLinks {
+    /// Whether node `node`'s buffer `scratch` is a consumer's operand its
+    /// producer emits: in the graph or through a carry.
+    fn linked(&self, node: usize, scratch: usize) -> bool {
+        self.pairs.iter().any(|pair| pair.consumer == node && pair.formed == scratch)
+            || self.carried.iter().any(|carried| carried.node == node && carried.scratch == scratch)
+    }
+
+    /// The carry node `node`'s buffer `scratch` lies on, if any.
+    fn carried(&self, node: usize, scratch: usize) -> Option<&CarriedBuffer> {
+        self.carried.iter().find(|carried| carried.node == node && carried.scratch == scratch)
+    }
+
+    /// The buffers node `node` emits an operand into for a consumer: its
+    /// paired and carried out ones.
+    fn emitted(&self, node: usize) -> impl Iterator<Item = usize> + '_ {
+        let paired = self.pairs.iter().filter(move |pair| pair.producer == node).map(|pair| pair.emitted);
+        let carried = self.carried.iter().filter(move |carried| carried.node == node).map(|carried| carried.scratch);
+        paired.chain(carried)
+    }
+}
+
+/// The operand links of `nodes` and `carries`: its in-graph pairs, and each
+/// carry's buffers. A carry's forms `F` decide none of it: a graph links,
+/// and so reserves (`charge_node_emissions`, `plan_storage`), alike in
+/// each.
+///
+/// - A carry out's producer emits both forms of its result's operand under
+///   a norm, neither paired in the graph (`OperandEmitter` otherwise).
+/// - A carry in's readers are the consumers whose formed operand is of the
+///   carried port's whole tensor, under the carried norm port's tensor and
+///   epsilon: each forms the rows once and the Q8 blocks at most once
+///   (`OperandForms` otherwise); at least one reads it
+///   (`UnreadOperandCarry` otherwise).
+/// - Every pair's ends bind one activation element, and every carry's ends
+///   the carry's (`OperandElement` otherwise).
+fn operand_links<F>(nodes: &[PlannedNode], carries: &[Carry<F>]) -> Result<OperandLinks, WorkflowError> {
+    let pairs = operand_pairs(nodes);
+    if let Some(pair) = pairs.iter().find(|pair| nodes[pair.producer].activation != nodes[pair.consumer].activation) {
+        return Err(WorkflowError::OperandElement { node: pair.consumer });
+    }
+    let mut carried = Vec::new();
+    for (index, carry) in carries.iter().enumerate() {
+        let port = |rows: bool| if rows { carry.rows } else { carry.quantized };
+        let buffer = |node: usize, (scratch, rows): (usize, bool)| CarriedBuffer { node, scratch, port: port(rows), carry: index };
+        match carry.side {
+            CarrySide::Out { result } => {
+                let producer = result.node as usize;
+                let emitted = |rows: bool| {
+                    nodes[producer].scratch.iter().position(|need| {
+                        matches!(
+                            need.operand,
+                            Some(ScratchOperand::Emitted { result: of, rows: form, norm: Some(_) })
+                                if of == result.result && form == rows
+                        )
+                    })
+                };
+                let (Some(emitted_rows), Some(emitted_blocks)) = (emitted(true), emitted(false)) else {
+                    return Err(WorkflowError::OperandEmitter { node: producer });
+                };
+                if pairs
+                    .iter()
+                    .any(|pair| pair.producer == producer && [emitted_rows, emitted_blocks].contains(&pair.emitted))
+                {
+                    return Err(WorkflowError::OperandEmitter { node: producer });
+                }
+                if nodes[producer].activation != Some(carry.activation) {
+                    return Err(WorkflowError::OperandElement { node: producer });
+                }
+                carried.extend([(emitted_rows, true), (emitted_blocks, false)].map(|form| buffer(producer, form)));
+            }
+            CarrySide::In { hidden, norm, epsilon } => {
+                let mut read = false;
+                for (consumer, node) in nodes.iter().enumerate() {
+                    let arguments = node.args.arguments();
+                    let whole_port = |ordinal: u32, port: u32| {
+                        matches!(
+                            arguments.get(ordinal as usize),
+                            Some(EncodedWorkflowArgument::Tensor(WorkflowTensorArgument::Result(reference)))
+                                if reference.node == INPUT_NODE && reference.result == port
+                        )
+                    };
+                    let reading = node
+                        .scratch
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(ordinal, need)| match need.operand {
+                            Some(ScratchOperand::Formed { parameter, rows, norm: Some(formed), .. })
+                                if whole_port(parameter, hidden)
+                                    && whole_port(formed.weight, norm)
+                                    && matches!(
+                                        arguments.get(formed.epsilon as usize),
+                                        Some(EncodedWorkflowArgument::Scalar(value))
+                                            if *value == EncodedScalar::F32Bits(epsilon)
+                                    ) =>
+                            {
+                                Some((ordinal, rows))
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    if reading.is_empty() {
+                        continue;
+                    }
+                    let forms = |rows: bool| reading.iter().filter(|&&(_, form)| form == rows).count();
+                    if forms(true) != 1 || forms(false) > 1 {
+                        return Err(WorkflowError::OperandForms { node: consumer });
+                    }
+                    if node.activation != Some(carry.activation) {
+                        return Err(WorkflowError::OperandElement { node: consumer });
+                    }
+                    read = true;
+                    carried.extend(reading.into_iter().map(|form| buffer(consumer, form)));
+                }
+                if !read {
+                    return Err(WorkflowError::UnreadOperandCarry { port: carry.rows as usize });
+                }
+            }
+        }
+    }
+    Ok(OperandLinks { pairs, carried })
+}
+
+/// Charge each node of `nodes` the minimum for every buffer serving the
+/// emission of a result it emits no operand of for a consumer (`links`):
+/// unpaired and uncarried producers reserve what a call alone does
+/// (`charge_emissions`). Every class of a topology is charged alike, so a
+/// layout's capacities bound its classes'.
+fn charge_node_emissions(nodes: &mut [PlannedNode], links: &OperandLinks) {
+    for (node, planned) in nodes.iter_mut().enumerate() {
+        let emitted = links
+            .emitted(node)
+            .filter_map(|scratch| match planned.scratch[scratch].operand {
+                Some(ScratchOperand::Emitted { result, .. }) => Some(result),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        charge_emissions(&mut planned.scratch, |result| emitted.contains(&result));
+    }
+}
+
+/// The formation launches node `node` leaves out at its call (`forms`):
+/// each launch of whose formed operand buffers (`scratch`) some are formed
+/// at it, and every one formed is linked to an emitting producer, in the
+/// graph or through a carry (`links`), whose operand stands for it
+/// (`FormedAt::pairs`). A launch forming nothing linked (a staging
+/// buffer's alone) stays.
+fn formations_left_out(
+    node: usize,
+    scratch: &[ScratchNeed],
+    forms: &[Option<FormedAt>],
+    links: &OperandLinks,
+) -> Vec<usize> {
+    let formation = |ordinal: usize| match scratch[ordinal].operand {
+        Some(ScratchOperand::Formed { formation, .. }) => Some(formation as usize),
+        _ => None,
+    };
+    let mut launches = (0..scratch.len()).filter_map(formation).collect::<Vec<_>>();
+    launches.sort_unstable();
+    launches.dedup();
+    launches.retain(|&launch| {
+        let mut formed = (0..scratch.len())
+            .filter(|&ordinal| formation(ordinal) == Some(launch))
+            .filter_map(|ordinal| forms[ordinal].filter(|at| at.formed).map(|at| (ordinal, at)))
+            .peekable();
+        formed.peek().is_some() && formed.all(|(ordinal, at)| at.pairs && links.linked(node, ordinal))
+    });
+    launches
 }
 
 /// The port of graph `identity`'s `ports` a condition of node `node` names,
@@ -2266,10 +2902,23 @@ impl Executable {
             representations
                 .push(seismic_lang::registry::representation_info(spec.representation).name);
         }
-        for (offset, need) in storage.node_scratch[node].iter().zip(&shape.scratch) {
+        // Scratch at the graph's charges (`charge_node_emissions`): in the
+        // workspace, or a carried operand buffer in its port's tensor, which
+        // covers it, written by the producer and read by the consumer.
+        for (placement, need) in storage.node_scratch[node].iter().zip(&planned.scratch) {
+            let (region, offset) = placement.site();
+            if let Region::External(port) = region {
+                if need.bytes > ports[port as usize].byte_len {
+                    return Err(WorkflowError::NativePortMismatch { port: port as usize });
+                }
+                self.port_uses[port as usize].direct = true;
+                if let Some(ScratchOperand::Emitted { .. }) = need.operand {
+                    self.external_writes[port as usize] = true;
+                }
+            }
             sites.push(Site {
-                region: Region::Workspace,
-                offset: *offset,
+                region,
+                offset,
                 bytes: need.bytes,
                 records: SiteRecords::None,
             });
@@ -2392,13 +3041,14 @@ impl Executable {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Placement {
     Scratch(u64),
     Export(u64),
     /// A host-written input in the per-submission upload region.
     Upload(u64),
-    /// A stored result: the tensor bound to this external port.
+    /// A stored result or a carried operand buffer: the tensor bound to
+    /// this external port.
     Port(u32),
     Scalar,
 }
@@ -2426,7 +3076,9 @@ enum StorageKey {
 struct StoragePlan {
     port_placements: Vec<Option<Placement>>,
     placements: Vec<Vec<Placement>>,
-    node_scratch: Vec<Vec<u64>>,
+    /// Per node, each scratch buffer's: in the workspace, or a carried
+    /// operand buffer's port.
+    node_scratch: Vec<Vec<Placement>>,
     scratch_bytes: u64,
     /// The most workspace bytes live at one step: no placement fits in less.
     scratch_floor_bytes: u64,
@@ -2461,8 +3113,9 @@ impl Interval {
         self.overlaps(other) && !self.contains(other) && !other.contains(self)
     }
 
-    /// Whether it is a node's call-private scratch, which lives at its node
-    /// alone.
+    /// Whether it is a node's scratch: call-private, which lives at its node
+    /// alone, or a paired operand, which lives from its producer to its
+    /// consumer (`operand_pairs`). Either lies between the ends.
     fn scratch(&self) -> bool {
         matches!(self.key, StorageKey::NodeScratch(..))
     }
@@ -2785,6 +3438,7 @@ fn aligned_floor_end(intervals: &[&Interval], steps: &[usize]) -> u64 {
 fn plan_storage(
     ports: &[PortSpec],
     nodes: &[PlannedNode],
+    links: &OperandLinks,
     results: &[Vec<Option<NativeTensorSpec>>],
     exports: &[WorkflowResultRef],
     stores: &[Store],
@@ -2887,10 +3541,31 @@ fn plan_storage(
     let mut sync_cursor = 0u64;
     let mut node_scratch = nodes
         .iter()
-        .map(|node| vec![0u64; node.scratch.len()])
+        .map(|node| vec![None; node.scratch.len()])
         .collect::<Vec<_>>();
+    // A paired operand (`operand_pairs`) is one buffer, the producer's, live
+    // from the producer to its consumer and as large as either needs. A
+    // carried one lies in the tensor each run binds to its carry's port.
+    let pairs = &links.pairs;
     for (node, planned) in nodes.iter().enumerate() {
         for (ordinal, need) in planned.scratch.iter().enumerate() {
+            if let Some(carried) = links.carried(node, ordinal) {
+                node_scratch[node][ordinal] = Some(Placement::Port(carried.port));
+                continue;
+            }
+            if pairs.iter().any(|pair| pair.consumer == node && pair.formed == ordinal) {
+                continue;
+            }
+            if let Some(pair) = pairs.iter().find(|pair| pair.producer == node && pair.emitted == ordinal) {
+                intervals.push(Interval {
+                    key: StorageKey::NodeScratch(node, ordinal),
+                    start: node * 2,
+                    end: pair.consumer * 2 + 1,
+                    bytes: need.bytes.max(nodes[pair.consumer].scratch[pair.formed].bytes),
+                    exported: false,
+                });
+                continue;
+            }
             if need.sync {
                 let offset = sync_cursor.next_multiple_of(BUFFER_ALIGNMENT);
                 sync_cursor = offset + need.bytes;
@@ -2898,7 +3573,7 @@ fn plan_storage(
                     sync_cursor <= SYNC_SCRATCH_BYTES,
                     "sync scratch of one graph exceeds the reserved {SYNC_SCRATCH_BYTES} bytes"
                 );
-                node_scratch[node][ordinal] = offset;
+                node_scratch[node][ordinal] = Some(Placement::Scratch(offset));
                 continue;
             }
             intervals.push(Interval {
@@ -2948,12 +3623,19 @@ fn plan_storage(
         match (interval.key, placement) {
             (StorageKey::Port(ordinal), _) => port_placements[ordinal] = Some(placement),
             (StorageKey::Result(node, ordinal), _) => placements[node][ordinal] = placement,
-            (StorageKey::NodeScratch(node, ordinal), Placement::Scratch(offset)) => {
-                node_scratch[node][ordinal] = offset;
+            (StorageKey::NodeScratch(node, ordinal), placement @ Placement::Scratch(_)) => {
+                node_scratch[node][ordinal] = Some(placement);
             }
             (StorageKey::NodeScratch(..), _) => unreachable!("node scratch is never exported"),
         }
     }
+    for pair in pairs {
+        node_scratch[pair.consumer][pair.formed] = node_scratch[pair.producer][pair.emitted];
+    }
+    let node_scratch = node_scratch
+        .into_iter()
+        .map(|row| row.into_iter().map(|placement| placement.expect("every scratch buffer is placed")).collect())
+        .collect();
     for store in stores {
         placements[store.result.node as usize][store.result.result as usize] =
             Placement::Port(store.port);
@@ -5258,7 +5940,10 @@ mod layout_certificate_tests {
             scratch: vec![ScratchNeed {
                 bytes: rows * 4,
                 sync: false,
+                operand: None,
+                emission: None,
             }],
+            activation: None,
             condition: None,
             share: None,
         };
@@ -5274,17 +5959,18 @@ mod layout_certificate_tests {
     #[test]
     fn dominating_layout_accepts_smaller_exact_graph_and_rejects_larger_one() {
         let (ports, nodes, results) = class(16);
+        let links = operand_links::<()>(&nodes, &[]).unwrap();
         let certified =
-            make_layout(&ports, &nodes, &results, &[], &[], HostHeap::default(), 0, GraphCensus::default());
+            make_layout(&ports, &nodes, &links, &results, &[], &[], HostHeap::default(), 0, GraphCensus::default());
         let charge = certified.storage_bytes();
         let (ports, nodes, results) = class(8);
         let exact = certified
-            .storage_for(&ports, &nodes, &results, &[], &[])
+            .storage_for(&ports, &nodes, &links, &results, &[], &[])
             .unwrap();
         assert_eq!(exact.scratch_bytes, charge.workspace);
         let (ports, nodes, results) = class(32);
         assert_eq!(
-            certified.storage_for(&ports, &nodes, &results, &[], &[]).err(),
+            certified.storage_for(&ports, &nodes, &links, &results, &[], &[]).err(),
             Some(WorkflowError::NativeGraphLayoutMismatch(LayoutMismatch::Exceeds {
                 buffer: GraphBuffer::Port {
                     port: 0,
@@ -5294,6 +5980,336 @@ mod layout_certificate_tests {
                 capacity: 64,
             }))
         );
+    }
+}
+
+#[cfg(test)]
+mod operand_pairing_tests {
+    use super::*;
+
+    const WORKFLOW: u64 = 1;
+
+    fn spec(bytes: u64) -> NativeTensorSpec {
+        let representation = seismic_lang::registry::representation("f32").unwrap();
+        let canonical = layout::canonical(representation, &[bytes / 4]).unwrap();
+        NativeTensorSpec {
+            representation,
+            extents: vec![bytes / 4],
+            strides: canonical.strides,
+            byte_len: canonical.byte_len,
+        }
+    }
+
+    fn port(representation: &str, extents: &[u64], local: bool) -> PortSpec {
+        let representation = seismic_lang::registry::representation(representation).unwrap();
+        let canonical = layout::canonical(representation, extents).unwrap();
+        PortSpec {
+            representation,
+            extents: extents.to_vec(),
+            strides: canonical.strides,
+            byte_len: canonical.byte_len,
+            local,
+            owned_input: false,
+            prewritten: false,
+        }
+    }
+
+    fn bf16() -> Option<RepresentationId> {
+        seismic_lang::registry::representation("bf16")
+    }
+
+    /// A node reading `source` (a port's or a node result's tensor) with
+    /// `scratch`, its activation bf16.
+    fn node(source: (u32, u32), scratch: Vec<ScratchNeed>) -> PlannedNode {
+        let mut args = EncodedWorkflowArgs::new();
+        args.push_result_tensor(WorkflowResultRef { workflow: WORKFLOW, node: source.0, result: source.1 });
+        PlannedNode { args: Arc::new(args), scratch, activation: bf16(), condition: None, share: None }
+    }
+
+    /// A node reading `source`, normed by port `norm`'s tensor under
+    /// `epsilon` (its arguments 1 and 2), with `scratch`.
+    fn normed(source: (u32, u32), norm: u32, epsilon: f32, scratch: Vec<ScratchNeed>) -> PlannedNode {
+        let mut args = EncodedWorkflowArgs::new();
+        args.push_result_tensor(WorkflowResultRef { workflow: WORKFLOW, node: source.0, result: source.1 });
+        args.push_result_tensor(WorkflowResultRef { workflow: WORKFLOW, node: INPUT_NODE, result: norm });
+        args.push_scalar(EncodedScalar::F32Bits(epsilon.to_bits()));
+        PlannedNode { args: Arc::new(args), scratch, activation: bf16(), condition: None, share: None }
+    }
+
+    const NORM: Option<NativeOperandNorm> = Some(NativeOperandNorm { weight: 1, epsilon: 2 });
+
+    fn need(bytes: u64, operand: Option<ScratchOperand>) -> ScratchNeed {
+        ScratchNeed { bytes, sync: false, operand, emission: None }
+    }
+
+    /// A buffer serving the emission of result 0.
+    fn emitting(bytes: u64, operand: Option<ScratchOperand>, sync: bool) -> ScratchNeed {
+        ScratchNeed { bytes, sync, operand, emission: Some(0) }
+    }
+
+    fn formed(rows: bool, formation: u32) -> Option<ScratchOperand> {
+        Some(ScratchOperand::Formed { parameter: 0, formation, rows, norm: NORM })
+    }
+
+    fn emitted(rows: bool) -> Option<ScratchOperand> {
+        Some(ScratchOperand::Emitted { result: 0, rows, norm: NORM })
+    }
+
+    fn at(pairs: bool, formed: bool) -> Option<FormedAt> {
+        Some(FormedAt { pairs, formed, nvfp4: false })
+    }
+
+    /// A producer of node 0 emitting both forms of its result's operand
+    /// under port 1's norm, with its arrivals.
+    fn producer() -> PlannedNode {
+        normed(
+            (INPUT_NODE, 0),
+            1,
+            1e-6,
+            vec![
+                emitting(4096, emitted(true), false),
+                emitting(320, emitted(false), false),
+                emitting(16, None, true),
+            ],
+        )
+    }
+
+    /// A consumer of `source` forming both forms in launch 0 under port 1's
+    /// norm, beside a staging buffer of its own.
+    fn consumer(source: (u32, u32)) -> PlannedNode {
+        normed(source, 1, 1e-6, vec![need(4096, formed(true, 0)), need(320, formed(false, 0)), need(64, None)])
+    }
+
+    fn carry(side: CarrySide, rows: u32) -> Carry {
+        Carry { rows, quantized: rows + 1, forms: (), activation: bf16().unwrap(), side }
+    }
+
+    fn carry_in(rows: u32) -> Carry {
+        carry(CarrySide::In { hidden: 0, norm: 1, epsilon: 1e-6f32.to_bits() }, rows)
+    }
+
+    fn carry_out(rows: u32) -> Carry {
+        carry(CarrySide::Out { result: WorkflowResultRef { workflow: WORKFLOW, node: 0, result: 0 } }, rows)
+    }
+
+    /// A producer that emits its result's operand, a node between, and two
+    /// consumers of that result's operand: the first consumer's buffer is
+    /// the producer's, live across the node between, and its formation is
+    /// left out where its operand stands for its own; the second forms its
+    /// own.
+    #[test]
+    fn a_consumers_operand_lies_where_its_producer_emits_it() {
+        let input = (INPUT_NODE, 0);
+        let emitted = Some(ScratchOperand::Emitted { result: 0, rows: false, norm: None });
+        let formed = Some(ScratchOperand::Formed { parameter: 0, formation: 0, rows: false, norm: None });
+        let nodes = vec![
+            node(input, vec![need(272, emitted), ScratchNeed { bytes: 4, sync: true, operand: None, emission: None }]),
+            node(input, vec![need(4096, None)]),
+            node((0, 0), vec![need(2176, formed), need(512, None)]),
+            node((0, 0), vec![need(8192, formed)]),
+        ];
+        let links = operand_links::<()>(&nodes, &[]).unwrap();
+        assert_eq!(links.pairs, [OperandPair { consumer: 2, formed: 0, producer: 0, emitted: 0 }]);
+        assert!(!links.linked(3, 0), "a second consumer forms its own");
+        assert_eq!(formations_left_out(2, &nodes[2].scratch, &[at(true, true), None], &links), [0]);
+        assert!(formations_left_out(2, &nodes[2].scratch, &[at(false, true), None], &links).is_empty());
+        assert!(formations_left_out(3, &nodes[3].scratch, &[at(true, true)], &links).is_empty());
+
+        let ports = [port("f32", &[64], true)];
+        let results = vec![vec![Some(spec(1024))], vec![Some(spec(1024))], vec![Some(spec(1024))], vec![Some(spec(1024))]];
+        let storage = plan_storage(&ports, &nodes, &links, &results, &[], &[]);
+        let scratch = |node: usize, ordinal: usize| match storage.node_scratch[node][ordinal] {
+            Placement::Scratch(offset) => offset,
+            other => panic!("node {node}'s buffer {ordinal} lies at {other:?}"),
+        };
+        let at = scratch(0, 0);
+        assert_eq!(scratch(2, 0), at, "the consumer reads the producer's operand");
+        // The second consumer's larger buffer is placed only across its own
+        // step, never widening the paired buffer live across node 1.
+        assert!(
+            storage.scratch_bytes - SYNC_SCRATCH_BYTES < 8192 + 4096 + 1024,
+            "the paired buffer is sized to its paired consumer alone: {}",
+            storage.scratch_bytes - SYNC_SCRATCH_BYTES,
+        );
+        // The paired operand, as large as the consumer's, lives across the
+        // node between: nothing else live then aliases it.
+        let between = scratch(1, 0);
+        assert!(between + 4096 <= at || at + 2176 <= between, "the node between aliases the operand");
+        let Placement::Scratch(result) = storage.placements[0][0] else { panic!("the producer's result is placed") };
+        assert!(result + 1024 <= at || at + 2176 <= result, "the producer's result aliases its operand");
+    }
+
+    /// A formation is left out where every buffer it forms at the call is
+    /// linked and stands for its own, whatever it does not form: its Q8
+    /// blocks where it takes no INT8 dot need no producer. Where nothing it
+    /// forms is linked, or nothing is formed, it stays.
+    #[test]
+    fn a_formation_is_left_out_on_the_forms_it_writes() {
+        let nodes = vec![producer(), consumer((0, 0))];
+        let links = operand_links::<()>(&nodes, &[]).unwrap();
+        assert_eq!(links.pairs.len(), 2, "both forms pair");
+        let scratch = &nodes[1].scratch;
+        let left_out = |forms: [Option<FormedAt>; 2]| formations_left_out(1, scratch, &[forms[0], forms[1], None], &links);
+        assert_eq!(left_out([at(true, true), at(true, true)]), [0]);
+        assert_eq!(left_out([at(true, true), at(false, false)]), [0], "Q8 blocks it does not form");
+        assert!(left_out([at(true, true), at(false, true)]).is_empty(), "Q8 blocks it forms that do not pair");
+        assert!(left_out([at(true, false), at(true, false)]).is_empty(), "nothing formed");
+
+        // Rows alone pair: a formation that also forms Q8 blocks stays.
+        let mut unpaired = consumer((0, 0));
+        unpaired.scratch[1].operand = Some(ScratchOperand::Formed { parameter: 0, formation: 0, rows: false, norm: None });
+        let nodes = vec![producer(), unpaired];
+        let links = operand_links::<()>(&nodes, &[]).unwrap();
+        let scratch = &nodes[1].scratch;
+        assert!(formations_left_out(1, scratch, &[at(true, true), at(true, true), None], &links).is_empty());
+        assert_eq!(formations_left_out(1, scratch, &[at(true, true), at(true, false), None], &links), [0]);
+    }
+
+    /// Every buffer serving an emission no consumer reads, its operand
+    /// buffers and its arrivals alike, is charged the minimum, as a call
+    /// alone charges it; a paired or carried emission keeps its bytes.
+    #[test]
+    fn unread_emissions_reserve_the_minimum() {
+        let minimum = |nodes: &[PlannedNode]| nodes[0].scratch.iter().map(|need| need.bytes).collect::<Vec<_>>();
+        let mut alone = vec![producer(), node((0, 0), vec![need(64, None)])];
+        let links = operand_links::<()>(&alone, &[]).unwrap();
+        charge_node_emissions(&mut alone, &links);
+        assert_eq!(minimum(&alone), [1, 1, 1]);
+
+        let mut paired = vec![producer(), consumer((0, 0))];
+        let links = operand_links::<()>(&paired, &[]).unwrap();
+        charge_node_emissions(&mut paired, &links);
+        assert_eq!(minimum(&paired), [4096, 320, 16]);
+
+        let mut carried = vec![producer()];
+        let links = operand_links(&carried, &[carry_out(2)]).unwrap();
+        charge_node_emissions(&mut carried, &links);
+        assert_eq!(minimum(&carried), [4096, 320, 16]);
+
+        let mut standalone = producer().scratch;
+        charge_emissions(&mut standalone, |_| false);
+        assert_eq!(standalone.iter().map(|need| need.bytes).collect::<Vec<_>>(), [1, 1, 1]);
+    }
+
+    /// A carried operand buffer lies on its carry's port, on either side,
+    /// in no workspace; a layout certifies the carry with its topology.
+    #[test]
+    fn carried_operands_lie_on_their_ports() {
+        let [(rows, rows_extents), (blocks, blocks_extents)] = operand_carry_ports(1, 256);
+        let name = |id| seismic_lang::registry::representation_info(id).name;
+        let ports = [
+            port("f32", &[1, 256], false),
+            port("f32", &[256], false),
+            port(name(rows), &rows_extents, false),
+            port(name(blocks), &blocks_extents, false),
+        ];
+        let results = vec![vec![Some(spec(1024))]];
+
+        let producing = vec![producer()];
+        let links = operand_links(&producing, &[carry_out(2)]).unwrap();
+        let storage = plan_storage(&ports, &producing, &links, &results, &[], &[]);
+        assert_eq!(storage.node_scratch[0][0], Placement::Port(2));
+        assert_eq!(storage.node_scratch[0][1], Placement::Port(3));
+        assert!(matches!(storage.node_scratch[0][2], Placement::Scratch(_)), "its arrivals stay in the workspace");
+
+        let consuming = vec![consumer((INPUT_NODE, 0))];
+        let links = operand_links(&consuming, &[carry_in(2)]).unwrap();
+        let storage = plan_storage(&ports, &consuming, &links, &results, &[], &[]);
+        assert_eq!(storage.node_scratch[0][0], Placement::Port(2));
+        assert_eq!(storage.node_scratch[0][1], Placement::Port(3));
+        assert!(matches!(storage.node_scratch[0][2], Placement::Scratch(_)), "its staging stays in the workspace");
+        let uncarried = operand_links::<()>(&consuming, &[]).unwrap();
+        let formed = plan_storage(&ports, &consuming, &uncarried, &results, &[], &[]);
+        assert!(storage.scratch_bytes < formed.scratch_bytes, "carried buffers take no workspace");
+
+        let certified = make_layout(&ports, &consuming, &links, &results, &[], &[], HostHeap::default(), 0, GraphCensus::default());
+        assert!(certified.storage_for(&ports, &consuming, &links, &results, &[], &[]).is_ok());
+        assert_eq!(
+            certified.storage_for(&ports, &consuming, &uncarried, &results, &[], &[]).err(),
+            Some(WorkflowError::NativeGraphLayoutMismatch(LayoutMismatch::Topology)),
+            "a layout of a carry certifies no graph without it"
+        );
+    }
+
+    /// What a carry or pair does not hold is refused: a carry nothing
+    /// reads, a carry out of a producer emitting no normed operand, and
+    /// ends of another activation element.
+    #[test]
+    fn carries_and_pairs_refuse_what_they_cannot_hold() {
+        // Another norm or epsilon reads no carry.
+        let other_epsilon = vec![normed((INPUT_NODE, 0), 1, 1e-5, consumer((INPUT_NODE, 0)).scratch)];
+        assert_eq!(
+            operand_links(&other_epsilon, &[carry_in(2)]).err(),
+            Some(WorkflowError::UnreadOperandCarry { port: 2 })
+        );
+        let raw = vec![node((INPUT_NODE, 0), vec![need(64, None)])];
+        assert_eq!(operand_links(&raw, &[carry_out(2)]).err(), Some(WorkflowError::OperandEmitter { node: 0 }));
+        // A producer emitting rows alone lacks a form a carry holds.
+        let mut rows_alone = producer();
+        rows_alone.scratch.remove(1);
+        assert_eq!(
+            operand_links(&[rows_alone], &[carry_out(2)]).err(),
+            Some(WorkflowError::OperandEmitter { node: 0 })
+        );
+        // A consumer forming rows alone reads a carry's rows.
+        let mut rows_reader = consumer((INPUT_NODE, 0));
+        rows_reader.scratch.remove(1);
+        assert_eq!(operand_links(&[rows_reader], &[carry_in(2)]).unwrap().carried.len(), 1);
+
+        let f32 = seismic_lang::registry::representation("f32");
+        let mut other = consumer((INPUT_NODE, 0));
+        other.activation = f32;
+        assert_eq!(
+            operand_links(&[other], &[carry_in(2)]).err(),
+            Some(WorkflowError::OperandElement { node: 0 })
+        );
+        let mut other = consumer((0, 0));
+        other.activation = f32;
+        assert_eq!(operand_links::<()>(&[producer(), other], &[]).err(), Some(WorkflowError::OperandElement { node: 1 }));
+    }
+
+    /// A reader's kernel reads a carry only in the forms the carry holds:
+    /// its rows formed under the carry's transform, its Q8 blocks formed
+    /// exactly where the carry holds them, and never rows alone of a carry
+    /// of Q8 blocks.
+    #[test]
+    fn a_carry_is_read_in_the_forms_it_holds() {
+        let at = |formed, nvfp4| FormedAt { pairs: true, formed, nvfp4 };
+        let rows_only = OperandForms { quantized: false, nvfp4: false };
+        let quantized = OperandForms { quantized: true, nvfp4: false };
+        let transformed = OperandForms { quantized: false, nvfp4: true };
+        for blocks in [false, true] {
+            assert!(rows_only.read_by(true, at(true, false), blocks));
+            assert!(!rows_only.read_by(true, at(false, false), blocks), "its rows are always formed");
+            assert!(!rows_only.read_by(true, at(true, true), blocks));
+            assert!(transformed.read_by(true, at(true, true), blocks));
+            assert!(!transformed.read_by(true, at(true, false), blocks));
+        }
+        assert!(quantized.read_by(true, at(true, false), true));
+        assert!(!quantized.read_by(true, at(true, false), false), "a reader of rows alone leaves its blocks unread");
+        assert!(quantized.read_by(false, at(true, false), true));
+        assert!(!quantized.read_by(false, at(false, false), true));
+        assert!(rows_only.read_by(false, at(false, false), true));
+        assert!(!rows_only.read_by(false, at(true, false), true));
+    }
+
+    /// A producer's operand formed under a norm stands for a consumer's only
+    /// under the same one: both absent, or both bound to the same norm
+    /// weight and the same epsilon.
+    #[test]
+    fn operands_pair_only_under_one_norm() {
+        let args = |norm_port: u32, epsilon: f32| {
+            let mut args = EncodedWorkflowArgs::new();
+            args.push_result_tensor(WorkflowResultRef { workflow: WORKFLOW, node: INPUT_NODE, result: norm_port });
+            args.push_scalar(crate::api::kernel::EncodedScalar::F32Bits(epsilon.to_bits()));
+            args
+        };
+        let norm = Some(NativeOperandNorm { weight: 0, epsilon: 1 });
+        assert!(same_norm(&args(0, 1e-6), norm, &args(0, 1e-6), norm));
+        assert!(!same_norm(&args(0, 1e-6), norm, &args(1, 1e-6), norm), "another norm weight");
+        assert!(!same_norm(&args(0, 1e-6), norm, &args(0, 1e-5), norm), "another epsilon");
+        assert!(!same_norm(&args(0, 1e-6), norm, &args(0, 1e-6), None), "a raw operand");
+        assert!(same_norm(&args(0, 1e-6), None, &args(1, 1e-5), None));
     }
 }
 

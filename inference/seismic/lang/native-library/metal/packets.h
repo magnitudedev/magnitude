@@ -33,6 +33,7 @@
 
 #include <seismic/element.h>
 #include <seismic/slab.h>
+#include <seismic/producers.h>
 #include <seismic/tables.h>
 
 namespace packets {

@@ -3040,10 +3040,7 @@ impl Capacities {
                 .map(|(left, right)| {
                     left.into_iter()
                         .zip(right)
-                        .map(|(left, right)| {
-                            assert_eq!(left.sync, right.sync, "one template's scratch syncs alike at every class");
-                            seismic_runtime::native::ScratchNeed { bytes: left.bytes.max(right.bytes), sync: left.sync }
-                        })
+                        .map(|(left, right)| left.cover(right))
                         .collect()
                 })
                 .collect(),
@@ -3382,7 +3379,7 @@ impl NativeGraphResourceTemplate {
                 entry,
                 results,
                 scratch,
-                sync: implementation.scratch.iter().map(|buffer| buffer.sync).collect(),
+                buffers: &implementation.scratch,
             });
         }
         Ok(CapacityProgram { names: namer.names(), ports, programs, nodes })
@@ -3487,7 +3484,8 @@ struct NodeProgram {
     entry: &'static str,
     results: Vec<Capacity<u64>>,
     scratch: Capacity<Vec<u64>>,
-    sync: Vec<bool>,
+    /// Its declared buffers, which `scratch` sizes.
+    buffers: &'static [seismic_lang::checked::NativeScratch],
 }
 
 /// A template's buffers at a model's points, compiled for the slices of a
@@ -3541,8 +3539,8 @@ impl CapacityProgram {
                 let bytes = program.scratch.over(slices).map_err(|error| unsupported(format!("`{entry}`: {error}")))?;
                 let scratch = bytes
                     .into_iter()
-                    .zip(&program.sync)
-                    .map(|(bytes, &sync)| seismic_runtime::native::ScratchNeed { bytes, sync })
+                    .zip(program.buffers)
+                    .map(|(bytes, buffer)| seismic_runtime::native::ScratchNeed::of(buffer, bytes))
                     .collect::<Vec<_>>();
                 Ok((results, scratch))
             })
@@ -4057,13 +4055,17 @@ impl NativeGraphMetadata {
             node.scratch.clone(),
             node.checked.sealed_node().clone(),
         );
+        let activation = elements
+            .iter()
+            .find(|(name, _)| *name == seismic_runtime::native::OPERAND_ACTIVATION)
+            .map(|(_, element)| element.id());
         let pending = match condition {
             Some(condition) => self
                 .inner
-                .enqueue_under(E::NAME, encoded, parameters, results, scratch, sealed, condition),
+                .enqueue_under(E::NAME, encoded, parameters, results, scratch, activation, sealed, condition),
             None => self
                 .inner
-                .enqueue(E::NAME, encoded, parameters, results, scratch, sealed),
+                .enqueue(E::NAME, encoded, parameters, results, scratch, activation, sealed),
         }
         .map_err(NativeGraphMetadataError::Call)?;
         if let Some(template) = &mut self.template {
@@ -4102,6 +4104,60 @@ impl NativeGraphMetadata {
     ) -> Result<(), NativeGraphMetadataError> {
         self.inner
             .store(result.inner, port.inner)
+            .map_err(NativeGraphMetadataError::Workflow)
+    }
+
+    /// `NativeGraph::operand_carry`: its ports are this graph's, of extents
+    /// over the recording's facts where `rows` or `width` are.
+    pub fn operand_carry<D: Clone>(
+        &mut self,
+        rows: D,
+        width: D,
+        activation: Element,
+    ) -> Result<OperandCarry, NativeGraphMetadataError>
+    where
+        Dim: From<D>,
+    {
+        self.operand_carry_over(Dim::from(rows), Dim::from(width), activation)
+    }
+
+    /// [`Self::operand_carry`] over `Dim`s: outside the generic body, whose
+    /// `Dim: From<D>` would bind every other conversion here to `D`.
+    fn operand_carry_over(
+        &mut self,
+        rows: Dim,
+        width: Dim,
+        activation: Element,
+    ) -> Result<OperandCarry, NativeGraphMetadataError> {
+        let blocks = width.ceil_div(seismic_lang::forms::CPU_Q8_VALUES)
+            * seismic_runtime::native::graph::OPERAND_CARRY_BLOCK_WORDS;
+        let shape = [rows.recorded(), width.recorded()];
+        Ok(OperandCarry {
+            rows: self.port(Element::f32(), &[rows.clone(), width])?,
+            quantized: self.port(Element::u32(), &[rows, blocks])?,
+            activation,
+            shape,
+        })
+    }
+
+    /// `NativeGraph::carry_out`, in no form: what the graph reserves for a
+    /// carry is the same in each ([`OperandForms`]).
+    pub fn carry_out(&mut self, result: &WorkflowTensor, carry: &OperandCarry) -> Result<(), NativeGraphMetadataError> {
+        self.inner
+            .carry_out(result.inner, &carry.inner())
+            .map_err(NativeGraphMetadataError::Workflow)
+    }
+
+    /// `NativeGraph::carry_in`, in no form.
+    pub fn carry_in(
+        &mut self,
+        hidden: &NativePort,
+        carry: &OperandCarry,
+        norm: &NativePort,
+        epsilon: f32,
+    ) -> Result<(), NativeGraphMetadataError> {
+        self.inner
+            .carry_in(hidden.inner, &carry.inner(), norm.inner, epsilon)
             .map_err(NativeGraphMetadataError::Workflow)
     }
 
@@ -4250,10 +4306,7 @@ fn check_node(
         })?
         .into_iter()
         .zip(&implementation.scratch)
-        .map(|(bytes, buffer)| seismic_runtime::native::ScratchNeed {
-            bytes,
-            sync: buffer.sync,
-        })
+        .map(|(bytes, buffer)| seismic_runtime::native::ScratchNeed::of(buffer, bytes))
         .collect();
     Ok(CheckedNode {
         parameters: parameters
@@ -4283,6 +4336,58 @@ impl NativePort {
     }
     pub fn tensor_mut(&mut self) -> &mut WorkflowTensor {
         &mut self.tensor
+    }
+}
+
+pub use seismic_runtime::native::graph::OperandForms;
+
+/// An operand carried from one graph to the next
+/// ([`NativeGraph::operand_carry`]): a graph's producer of a tensor writes
+/// its operand, normed for the next graph's consumers, into the tensors a run
+/// binds to these ports ([`NativeGraph::carry_out`]), and the next graph's
+/// consumers read it from the tensors bound to its own carry's ports in
+/// place of forming it ([`NativeGraph::carry_in`]). A run binds the same
+/// tensors ([`Self::allocate`]) to the producer's ports and then to the
+/// consumer's. Its ports are the same in every form the operand takes
+/// ([`OperandForms`]), which only a graph of kernels names, at each end.
+#[derive(Clone, Debug)]
+pub struct OperandCarry {
+    /// F32 `[ROWS, WIDTH]`: the formed rows.
+    pub rows: NativePort,
+    /// U32 words `[ROWS, ceil(WIDTH / 256) * Q8_BYTES / 4]`: the rows' Q8
+    /// blocks.
+    pub quantized: NativePort,
+    /// The activation element both ends bind, which the rows are rounded to.
+    pub activation: Element,
+    /// Its rows and width, which its tensors take.
+    shape: [u64; 2],
+}
+
+impl std::fmt::Debug for NativePort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
+impl OperandCarry {
+    /// Tensors to bind to its ports, one run's carry: its rows, then its Q8
+    /// blocks.
+    pub fn allocate(&self, device: &Device) -> Result<[Tensor; 2], TensorError> {
+        let [(rows, rows_extents), (quantized, quantized_extents)] =
+            seismic_runtime::native::graph::operand_carry_ports(self.shape[0], self.shape[1]);
+        Ok([
+            Tensor::zeros(device, Element(rows), &rows_extents)?,
+            Tensor::zeros(device, Element(quantized), &quantized_extents)?,
+        ])
+    }
+
+    /// It as the graph records it.
+    fn inner(&self) -> seismic_runtime::native::graph::OperandCarry {
+        seismic_runtime::native::graph::OperandCarry {
+            rows: self.rows.inner,
+            quantized: self.quantized.inner,
+            activation: self.activation.id(),
+        }
     }
 }
 
@@ -4437,6 +4542,57 @@ impl NativeGraph {
         port: &NativePort,
     ) -> Result<(), WorkflowError> {
         self.inner.store(result.inner, port.inner)
+    }
+
+    /// Declare an operand carry of `rows` rows of `width` values, rounded
+    /// to `activation`: two external ports each run binds
+    /// ([`OperandCarry`]).
+    pub fn operand_carry(
+        &mut self,
+        rows: u64,
+        width: u64,
+        activation: Element,
+    ) -> Result<OperandCarry, TensorError> {
+        let inner = self.inner.operand_carry(rows, width, activation.id())?;
+        let port = |inner: seismic_runtime::native::graph::NativePort| NativePort {
+            tensor: WorkflowTensor { inner: inner.reference() },
+            inner,
+        };
+        Ok(OperandCarry {
+            rows: port(inner.rows),
+            quantized: port(inner.quantized),
+            activation,
+            shape: [rows, width],
+        })
+    }
+
+    /// The producer of `result` emits its normed operand into `carry`'s
+    /// ports in `forms`, those the carry's readers in the next graph take.
+    /// Sealing refuses a producer that emits no normed operand of it in
+    /// both forms, or one of another activation element.
+    pub fn carry_out(
+        &mut self,
+        result: &WorkflowTensor,
+        carry: &OperandCarry,
+        forms: OperandForms,
+    ) -> Result<(), WorkflowError> {
+        self.inner.carry_out(result.inner, &carry.inner(), forms)
+    }
+
+    /// Consumers of the tensor bound to `hidden` whose operand is normed by
+    /// the tensor bound to `norm` under `epsilon` read it from `carry`,
+    /// which holds it in `forms`, the launch forming it left out. Sealing
+    /// refuses a carry no consumer reads, and a consumer whose forms at its
+    /// call are not `forms` or whose activation element is not the carry's.
+    pub fn carry_in(
+        &mut self,
+        hidden: &NativePort,
+        carry: &OperandCarry,
+        forms: OperandForms,
+        norm: &NativePort,
+        epsilon: f32,
+    ) -> Result<(), WorkflowError> {
+        self.inner.carry_in(hidden.inner, &carry.inner(), forms, norm.inner, epsilon)
     }
 
     pub fn seal(self) -> Result<NativeGraphPlan, CallError> {

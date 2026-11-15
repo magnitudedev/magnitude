@@ -89,6 +89,17 @@ impl BackendName {
         }
     }
 
+    /// Whether preparing a specialization of a native implementation forms
+    /// a program on the device: the backend's toolchain compiles the source
+    /// rendered at the specialization ([`Self::source_dialect`]) into a
+    /// pipeline or module, which the load waits for and the device holds.
+    /// The CPU's implementations are Rust compiled into the embedding crate,
+    /// so preparing a further specialization of one compiles nothing: a
+    /// load waits for nothing more and the device holds nothing more.
+    pub const fn specializations_form_programs(self) -> bool {
+        self.source_dialect().is_some()
+    }
+
     /// Whether the backend is a compiler target for planned code (portable
     /// bodies and `lower … for` bodies). A native-only backend runs only
     /// authored `native` implementations.

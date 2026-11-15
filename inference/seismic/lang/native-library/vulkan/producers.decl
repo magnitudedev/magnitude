@@ -1,0 +1,51 @@
+# The decoders Vulkan's producers read (`seismic_lang::producers`): the one
+# statement of reach. Admission reads it (`forms`: a Vulkan native takes a
+# packed-rows weight only where `DECODED` holds, `dense.seismic`), and the
+# build (seismic/lang/build.rs) renders `<seismic/producers.glsl>`'s
+# preprocessor predicates from it, which `packets.glsl` holds every bound
+# weight slot to. A pattern lists the axis values it takes: `codes` (kind),
+# `planes` (low.high bits, a grid entry's whole bytes as its low bits and
+# the rest as its high, as the registry's decode axes give them); `*` is
+# any. A requirement limits the weights of every pattern by the slot's
+# other axes (`SEISMIC_AXIS_<NAME>`), which admission evaluates as the
+# library does.
+
+# The packet decoder (`packets_codes`, grid entries `packets_grid_codes`):
+# code planes of 1, 2 or 4 low bits with up to two high bits, or of 8 low
+# bits, split on nibble (or 2- or 1-bit) boundaries into exact small
+# integers; grid entries of 8, 16 or 24 whole bits with none, two or four
+# more. Offset codes are of
+# at most 7 bits (so that a code less its offset is a signed byte), two's
+# complement and E4M3 codes bytes, codebook codes nibbles.
+producer decode
+codes=unsigned|odd planes=1.0|1.1|1.2|2.0|2.1|2.2|4.0|4.1|4.2|8.0
+codes=offset planes=1.0|1.1|1.2|2.0|2.1|2.2|4.0|4.1|4.2
+codes=twos|e4m3 planes=8.0
+codes=table planes=4.0|2.2
+codes=grid planes=8.0|8.2|8.4|16.0|16.2|16.4|24.0|24.2|24.4
+# A product operand takes an offset code's offset off as the exact bias
+# -(offset scale) (`packets_values`): the offset is a power of two of at
+# most 128 without a coefficient bias, and a code less it a signed byte.
+require CODES != CODES:OFFSET || (CODES_OFFSET <= 128 && (CODES_OFFSET & (CODES_OFFSET - 1)) == 0 && COEFF_BIAS == 0)
+# The coefficients `packets_coefficients` reads: direct ones per 16 values or
+# a multiple of 32 (with a bias, each group's scale then its bias), and
+# hierarchical ones per 16 or 32 values whose local codes are unsigned, two's
+# complement, offset or odd, either carried by at most a group's grid
+# entries (less their sign bit where they sign a signed bias) or in the
+# scales plane: a packet's field (its groups' scale codes, and minimum
+# codes, of a coefficient group of 16 or 32: two groups or one) below a word
+# and within the reader's four bytes (a field of F bits starts at a multiple
+# of F's lowest set bit, at most 8, within a byte, so it reaches F + 8 - that
+# bit), and a factor group's fields filling whole bytes, so that storage
+# groups' fields abut.
+let FIELD = COEFF_LOCAL_BITS * (1 + (COEFF_BIAS == BIAS_KIND:MINIMUM)) * (1 + (COEFF_GROUP == 16))
+let SPANS = FIELD <= 25 || (FIELD % 2 == 0 && FIELD <= 26) || (FIELD % 4 == 0 && FIELD <= 28) || FIELD % 8 == 0
+let IN_PLANE = COEFF_CARRIED == 0 && FIELD < 32 && SPANS && COEFF_FACTOR_GROUP * FIELD % 256 == 0
+let CARRIED = COEFF_CARRIED != 0 && CODES == CODES:GRID && 8 * COEFF_LOCAL_BITS <= COEFF_GROUP
+let LOCAL = COEFF_LOCAL == CODES:UNSIGNED || COEFF_LOCAL == CODES:TWOS || COEFF_LOCAL == CODES:OFFSET || COEFF_LOCAL == CODES:ODD
+let DIRECT = COEFF == COEFF:DIRECT && (COEFF_GROUP == 16 || COEFF_GROUP % 32 == 0) && (COEFF_BIAS == 0 || LOGICAL_GROUP == COEFF_GROUP)
+let HIERARCHICAL = COEFF == COEFF:HIER && (COEFF_GROUP == 16 || COEFF_GROUP == 32) && LOCAL && (IN_PLANE || CARRIED)
+require DIRECT || HIERARCHICAL
+
+# The weights a native's packet decoder reads.
+form DECODED uses decode

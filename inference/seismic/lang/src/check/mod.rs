@@ -1133,6 +1133,19 @@ pub(crate) fn check_closed<E>(
             ) {
                 Ok(mut implementation) => {
                     let source = read(&entry.name, &implementation).map_err(CheckFailure::Read)?;
+                    if let (Some(kind), Some(text), crate::registry::BackendName::Cuda) =
+                        (native.projected_rows, source.as_deref(), backend)
+                    {
+                        if let Err(message) = crate::native_source::check_rows_kind(kind, text) {
+                            native_diagnostics.push(SourceDiagnostic::new(
+                                &sources.files()[*file],
+                                native.span,
+                                DiagnosticRule::NativeDeclaration,
+                                format!("native source `{}`: {message}", implementation.source_path),
+                            ));
+                            continue;
+                        }
+                    }
                     match crate::native_source::derive_codes(&mut implementation, source.as_deref()) {
                         Ok(()) => {
                             if let Some(source) = source {
@@ -1240,6 +1253,166 @@ fn native_records(
         }
     }
     records
+}
+
+/// The operand an expanded buffer holds (`ast::ScratchOperandDecl`), and the
+/// result whose emitted operand it serves (`emission`): `Some((None, None))`
+/// for a buffer that serves none, `None` where it fails to check (its errors
+/// recorded). A consumer's operand is of one of the entry's tensor
+/// parameters, formed by one of the declaration's launches; a producer's, of
+/// one of its tensor results; a declared operand is a projection's text,
+/// which only its expansion places. `condition` checks a clause.
+#[allow(clippy::type_complexity)]
+fn native_operand(
+    backend: crate::registry::BackendName,
+    native: &crate::syntax::ast::NativeDecl,
+    entry: &crate::checked::EntryInfo,
+    buffer: &ast::NativeScratchDecl,
+    errors: &mut Vec<(Span, String)>,
+    condition: &mut dyn FnMut(&str, &ast::Expr, &mut Vec<(Span, String)>) -> Option<crate::checked::NativeCondition>,
+) -> Option<(Option<crate::checked::NativeOperand>, Option<u32>)> {
+    use crate::checked::{NativeOperand, ParameterSummaryKind, ResultSummaryKind};
+    fn refuse<T>(errors: &mut Vec<(Span, String)>, span: Span, message: String) -> Option<T> {
+        errors.push((span, message));
+        None
+    }
+    let emission = match buffer.emission {
+        None => None,
+        Some(result) => match entry.results.get(result as usize).map(|summary| &summary.kind) {
+            Some(ResultSummaryKind::Tensor { .. }) => Some(result as u32),
+            _ => {
+                return refuse(
+                    errors,
+                    buffer.span,
+                    format!("`{}` has no tensor result {result} to emit the operand of", entry.name),
+                );
+            }
+        },
+    };
+    let operand = match &buffer.operand {
+        None => None,
+        Some(ast::ScratchOperandDecl::Declared { .. }) => {
+            return refuse(
+                errors,
+                buffer.span,
+                "only a projection's buffer is declared an operand; an entry takes it with `project .. operand (..)`".to_owned(),
+            );
+        }
+        Some(ast::ScratchOperandDecl::Formed { parameter, formation, pairs, rows, norm, formed, nvfp4 }) => {
+            let ordinal = entry.parameters.iter().position(|candidate| {
+                candidate.name == parameter.name
+                    && matches!(candidate.kind, ParameterSummaryKind::Tensor { .. })
+            });
+            let Some(ordinal) = ordinal else {
+                return refuse(
+                    errors,
+                    parameter.span,
+                    format!("`{}` is not a tensor parameter of `{}`", parameter.name, entry.name),
+                );
+            };
+            if backend == crate::registry::BackendName::Cpu {
+                if let ParameterSummaryKind::Tensor {
+                    element: crate::checked::ElementSummary::Parameter(element),
+                    ..
+                } = &entry.parameters[ordinal].kind
+                {
+                    let uses = entry
+                        .element_domain
+                        .parameters()
+                        .iter()
+                        .find(|candidate| candidate.name == *element)
+                        .map(|candidate| candidate.uses);
+                    if matches!(
+                        entry.element_domain.cpu_binding(element),
+                        Some(crate::checked::CpuBinding::Packed | crate::checked::CpuBinding::External)
+                    ) || uses.is_some_and(|uses| uses.component_read || uses.integer_code_read)
+                    {
+                        return refuse(
+                            errors,
+                            parameter.span,
+                            format!("`{}` is not dense rows in `{}`", parameter.name, entry.name),
+                        );
+                    }
+                }
+            }
+            let Some(launch) = native.launches.iter().position(|launch| launch.kernel.name == formation.name) else {
+                return refuse(errors, formation.span, format!("`{}` is not a launch of the declaration", formation.name));
+            };
+            let norm = operand_norm(backend, entry, norm.as_ref(), errors);
+            let pairs = condition("operand when", pairs, errors);
+            let formed = condition("formed", formed, errors);
+            let nvfp4 = condition("nvfp4", nvfp4, errors);
+            Some(NativeOperand::Formed {
+                parameter: ordinal as u32,
+                formation: launch as u32,
+                pairs: pairs?,
+                rows: *rows,
+                norm: norm?,
+                formed: formed?,
+                nvfp4: nvfp4?,
+            })
+        }
+        Some(ast::ScratchOperandDecl::Emitted { rows, norm }) => {
+            let norm = operand_norm(backend, entry, norm.as_ref(), errors)?;
+            let Some(result) = emission else {
+                return refuse(
+                    errors,
+                    buffer.span,
+                    "an emitted operand is one of a producer's `for emits` buffers, which serve its result".to_owned(),
+                );
+            };
+            Some(NativeOperand::Emitted { result, rows: *rows, norm })
+        }
+    };
+    Some((operand, emission))
+}
+
+/// The norm an operand is formed under (`normed (WEIGHT, EPSILON)`): a
+/// tensor parameter and an `f32` scalar of the entry. `Some(None)` for an
+/// operand without one, `None` where it fails to check.
+fn operand_norm(
+    backend: crate::registry::BackendName,
+    entry: &crate::checked::EntryInfo,
+    norm: Option<&ast::OperandNormDecl>,
+    errors: &mut Vec<(Span, String)>,
+) -> Option<Option<crate::checked::NativeOperandNorm>> {
+    use crate::checked::{CpuBinding, ElementSummary, ParameterSummaryKind};
+    let Some(norm) = norm else { return Some(None) };
+    let find = |name: &ast::Ident, scalar: bool| {
+        entry.parameters.iter().position(|candidate| {
+            candidate.name == name.name
+                && match &candidate.kind {
+                    ParameterSummaryKind::Tensor { .. } => !scalar,
+                    ParameterSummaryKind::Scalar(dtype) => scalar && *dtype == crate::types::DType::F32,
+                    _ => false,
+                }
+        })
+    };
+    let mut weight = find(&norm.weight, false);
+    let epsilon = find(&norm.epsilon, true);
+    match weight {
+        None => errors.push((norm.weight.span, format!("`{}` is not a tensor parameter of `{}`", norm.weight.name, entry.name))),
+        Some(ordinal) if backend == crate::registry::BackendName::Cpu => {
+            if let ParameterSummaryKind::Tensor {
+                element: ElementSummary::Parameter(element),
+                ..
+            } = &entry.parameters[ordinal].kind
+            {
+                if !matches!(entry.element_domain.cpu_binding(element), None | Some(CpuBinding::Weights)) {
+                    errors.push((
+                        norm.weight.span,
+                        format!("`{}` is not read as a weight in `{}`", norm.weight.name, entry.name),
+                    ));
+                    weight = None;
+                }
+            }
+        }
+        Some(_) => {}
+    }
+    if epsilon.is_none() {
+        errors.push((norm.epsilon.span, format!("`{}` is not an `f32` parameter of `{}`", norm.epsilon.name, entry.name)));
+    }
+    Some(Some(crate::checked::NativeOperandNorm { weight: weight? as u32, epsilon: epsilon? as u32 }))
 }
 
 /// Check one native declaration against its entry. Every problem is reported.
@@ -1577,21 +1750,6 @@ fn check_native(
         });
     }
 
-    // A CPU form binds every element parameter by how the entry uses it.
-    if backend == crate::registry::BackendName::Cpu {
-        for parameter in entry.element_domain.parameters() {
-            if entry.element_domain.cpu_binding(&parameter.name).is_none() {
-                errors.push((
-                    native.function.span,
-                    format!(
-                        "`{}` has no CPU binding in `{}`: the entry neither reads, stores nor converts it",
-                        parameter.name, entry.name
-                    ),
-                ));
-            }
-        }
-    }
-
     let expression = |expr: &crate::syntax::ast::Expr, errors: &mut Vec<(Span, String)>| {
         native_nat_expr(expr, &entry.dimensions, &parameter_names, element_reads)
             .map_err(|message| errors.push((expr.span, message)))
@@ -1691,6 +1849,7 @@ fn check_native(
     }
 
     let mut scratch: Vec<NativeScratch> = Vec::new();
+    let mut operands_checked = true;
     for buffer in &native.scratch {
         if scratch
             .iter()
@@ -1700,17 +1859,63 @@ fn check_native(
                 buffer.name.span,
                 format!("scratch buffer `{}` is declared twice", buffer.name.name),
             ));
+            operands_checked = false;
             continue;
         }
         let bytes = expression(&buffer.bytes, &mut errors);
         let when = condition("when", &buffer.when, &mut errors);
-        if let (Some(bytes), Some(when)) = (bytes, when) {
-            scratch.push(NativeScratch {
-                name: buffer.name.name.clone(),
-                bytes,
-                sync: buffer.sync,
-                when,
-            });
+        let operand = native_operand(backend, native, entry, buffer, &mut errors, &mut |clause, expr, errors| {
+            condition(clause, &Some(expr.clone()), errors).flatten()
+        });
+        if let (Some(bytes), Some(when), Some((operand, emission))) = (bytes, when, operand) {
+            let mut device_reads = Vec::new();
+            bytes.device_reads(&mut device_reads);
+            if let Some(condition) = &when {
+                condition.device_reads(&mut device_reads);
+            }
+            if let Some(read) = device_reads.first() {
+                errors.push((
+                    buffer.name.span,
+                    format!(
+                        "scratch buffer `{}` reads `device.{read}`, which has no value before a device is opened",
+                        buffer.name.name
+                    ),
+                ));
+                operands_checked = false;
+            } else {
+                scratch.push(NativeScratch {
+                    name: buffer.name.name.clone(),
+                    bytes,
+                    sync: buffer.sync,
+                    when,
+                    operand,
+                    emission,
+                });
+            }
+        } else {
+            operands_checked = false;
+        }
+    }
+
+    // A CPU form binds every element parameter by how the entry and its
+    // operand clauses use it.
+    if backend == crate::registry::BackendName::Cpu && operands_checked {
+        for parameter in entry.element_domain.parameters() {
+            if crate::checked::NativeImplementation::cpu_binding_with_scratch(
+                entry,
+                &scratch,
+                &parameter.name,
+            )
+            .is_none()
+            {
+                errors.push((
+                    native.function.span,
+                    format!(
+                        "`{}` has no CPU binding in `{}`: neither the entry nor its CPU declaration reads, stores or converts it",
+                        parameter.name, entry.name
+                    ),
+                ));
+            }
         }
     }
 
@@ -2096,6 +2301,12 @@ fn check_native(
         }
     };
 
+    let formation = native.formation.as_ref().and_then(|formation| {
+        native_formation(native, entry, formation, &scratch, &mut errors, &mut |expr, errors| expression(expr, errors), &mut |clause, expr, errors| {
+            condition(clause, &Some(expr.clone()), errors).flatten()
+        })
+    });
+
     if !errors.is_empty() {
         return Err(errors);
     }
@@ -2114,7 +2325,85 @@ fn check_native(
         scratch,
         launches,
         repeat,
+        formation,
+        segments: native.projected_segments.clone(),
+        ordered_segments: native.projected_ordered.clone(),
     })
+}
+
+/// The CPU operator's formation of a consumer's operands
+/// (`ast::NativeFormationDecl`, set by the expansion), by ordinal: its
+/// launch, each operand's buffers, row index and weights. `None` where it
+/// fails to check (its errors recorded).
+fn native_formation(
+    native: &crate::syntax::ast::NativeDecl,
+    entry: &crate::checked::EntryInfo,
+    formation: &ast::NativeFormationDecl,
+    scratch: &[crate::checked::NativeScratch],
+    errors: &mut Vec<(Span, String)>,
+    expression: &mut dyn FnMut(&ast::Expr, &mut Vec<(Span, String)>) -> Option<crate::checked::NativeNatExpr>,
+    condition: &mut dyn FnMut(&str, &ast::Expr, &mut Vec<(Span, String)>) -> Option<crate::checked::NativeCondition>,
+) -> Option<crate::checked::NativeFormation> {
+    use crate::checked::{NativeFormedOperand, NativeFormedValues, ParameterSummaryKind};
+    let tensor = |name: &ast::Ident, errors: &mut Vec<(Span, String)>| {
+        let found = entry.parameters.iter().position(|candidate| {
+            candidate.name == name.name && matches!(candidate.kind, ParameterSummaryKind::Tensor { .. })
+        });
+        if found.is_none() {
+            errors.push((name.span, format!("`{}` is not a tensor parameter of `{}`", name.name, entry.name)));
+        }
+        found.map(|ordinal| ordinal as u32)
+    };
+    let buffer = |name: &ast::Ident, errors: &mut Vec<(Span, String)>| {
+        let found = scratch.iter().position(|buffer| buffer.name == name.name);
+        if found.is_none() {
+            errors.push((name.span, format!("`{}` is not a scratch buffer of the declaration", name.name)));
+        }
+        found.map(|ordinal| ordinal as u32)
+    };
+    let launch = native.launches.iter().position(|launch| launch.kernel.name == formation.launch.name);
+    if launch.is_none() {
+        errors.push((formation.launch.span, format!("`{}` is not a launch of the declaration", formation.launch.name)));
+    }
+    let mut operands = Vec::new();
+    for operand in &formation.operands {
+        let values = match &operand.values {
+            ast::FormedValuesDecl::Parameter { at, within, .. } => {
+                // `None` where a named port fails to check.
+                let at = match at.as_ref().map(|at| tensor(at, errors)) {
+                    None => Some(None),
+                    Some(found) => found.map(Some),
+                };
+                let within = match within.as_ref().map(|[first, count]| (tensor(first, errors), tensor(count, errors))) {
+                    None => Some(None),
+                    Some((first, count)) => first.zip(count).map(|(first, count)| Some([first, count])),
+                };
+                at.zip(within).map(|(at, within)| NativeFormedValues::Parameter { at, within })
+            }
+            ast::FormedValuesDecl::Function(function) => Some(NativeFormedValues::Function(function.name.clone())),
+        };
+        let rows = expression(&operand.rows, errors);
+        let width = expression(&operand.width, errors);
+        let groups = expression(&operand.groups, errors);
+        let formed = condition("formed", &operand.formed, errors);
+        let tiles = condition("tiles", &operand.tiles, errors);
+        let staged = buffer(&operand.staged, errors);
+        let quantized = buffer(&operand.quantized, errors);
+        let weights = operand.weights.iter().map(|weight| tensor(weight, errors)).collect::<Vec<_>>();
+        let weights = weights.into_iter().collect::<Option<Vec<_>>>();
+        operands.push(NativeFormedOperand {
+            values: values?,
+            rows: rows?,
+            width: width?,
+            groups: groups?,
+            staged: staged?,
+            quantized: quantized?,
+            formed: formed?,
+            weights: weights?,
+            tiles: tiles?,
+        });
+    }
+    Some(crate::checked::NativeFormation { launch: launch? as u32, operands })
 }
 
 /// `expression` with every name of `terms` replaced by that term's
@@ -2176,7 +2465,7 @@ fn native_condition(
         (
             expression.span,
             format!(
-                "a native `{clause}` condition is a comparison (`<`, `<=`, `>`, `>=`, `==`, `!=`) of natural-number expressions, or conditions joined by `and` and `or`"
+                "a native `{clause}` condition is a comparison (`<`, `<=`, `>`, `>=`, `==`, `!=`) of natural-number expressions, `true` or `false`, or conditions joined by `and` and `or`"
             ),
         )
     };
@@ -2192,6 +2481,14 @@ fn native_condition(
                 right: crate::checked::NativeNatExpr::Constant(0),
             });
         }
+    }
+    // `true` and `false` stand as the comparisons of zero that hold and fail.
+    if let ExprKind::Bool(holds) = expression.kind {
+        return Ok(NativeCondition::Compare {
+            comparison: if holds { NativeComparison::Eq } else { NativeComparison::Ne },
+            left: crate::checked::NativeNatExpr::Constant(0),
+            right: crate::checked::NativeNatExpr::Constant(0),
+        });
     }
     let ExprKind::Binary { op, lhs, rhs } = &expression.kind else {
         return Err(not_a_condition());
@@ -2321,6 +2618,18 @@ fn native_nat_expr(
             callee,
             bindings,
             args,
+        } if matches!(&callee.kind, ExprKind::Name(name) if name.name == "dense_bytes") => {
+            match (bindings.is_empty(), args.as_slice()) {
+                (true, [arg]) => {
+                    Ok(N::Element(elements.parameter("dense_bytes", arg)?, ElementQuery::DenseBytes))
+                }
+                _ => Err("`dense_bytes` takes one element parameter".to_owned()),
+            }
+        }
+        ExprKind::Call {
+            callee,
+            bindings,
+            args,
         } if matches!(&callee.kind, ExprKind::Name(name) if name.name == "unit_columns") => {
             match (bindings.is_empty(), args.as_slice()) {
                 (true, [arg]) => {
@@ -2376,7 +2685,7 @@ fn native_nat_expr(
                 ExprKind::Name(name) if name.name == "max" => N::Max,
                 _ => {
                     return Err(
-                        "native expressions call only `ceil_div`, `min`, `max`, `operands`, `form`, `packed` and `unit_columns`"
+                        "native expressions call only `ceil_div`, `min`, `max`, `operands`, `form`, `packed`, `dense_bytes` and `unit_columns`"
                             .to_owned()
                     );
                 }

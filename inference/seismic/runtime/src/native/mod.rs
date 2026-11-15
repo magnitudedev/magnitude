@@ -523,12 +523,93 @@ const MINIMUM_SCRATCH_BYTES: u64 = 1;
 /// starts, whichever call or graph used it last.
 pub(crate) const SYNC_SCRATCH_BYTES: u64 = 64 * 1024;
 
-/// One call-private scratch buffer: its bytes, and whether it holds arrival
-/// counters (`sync`), which live in the reserved range of their arena.
+/// One call-private scratch buffer: its bytes, whether it holds arrival
+/// counters (`sync`), which live in the reserved range of their arena, the
+/// operand it holds, if any (`ScratchOperand`), and the result whose
+/// emission it serves, if any (`NativeScratch::emission`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScratchNeed {
     pub bytes: u64,
     pub sync: bool,
+    pub operand: Option<ScratchOperand>,
+    pub emission: Option<u32>,
+}
+
+impl ScratchNeed {
+    /// Declared buffer `buffer` at `bytes`.
+    pub fn of(buffer: &seismic_lang::checked::NativeScratch, bytes: u64) -> Self {
+        Self {
+            bytes,
+            sync: buffer.sync,
+            operand: buffer.operand.as_ref().map(ScratchOperand::of),
+            emission: buffer.emission,
+        }
+    }
+
+    /// Declared buffer `self` at the larger of `self.bytes` and
+    /// `other.bytes`, where `other` is the same buffer at other classes.
+    pub fn cover(self, other: Self) -> Self {
+        assert_eq!(
+            (self.sync, self.operand, self.emission),
+            (other.sync, other.operand, other.emission),
+            "one template's scratch buffer has the same declaration at every class",
+        );
+        Self { bytes: self.bytes.max(other.bytes), ..self }
+    }
+}
+
+/// Charge the minimum to each of a call's buffers `needs` that serves the
+/// emission of a result (`ScratchNeed::emission`) the call does not emit
+/// (`emits`): its launches never reach it, so it keeps only its ABI slot. A
+/// standalone call emits nothing; a sealed graph's node emits each result
+/// whose operand a consumer reads, in the graph or through a carry.
+pub(crate) fn charge_emissions(needs: &mut [ScratchNeed], emits: impl Fn(u32) -> bool) {
+    for need in needs {
+        if need.emission.is_some_and(|result| !emits(result)) {
+            need.bytes = MINIMUM_SCRATCH_BYTES;
+        }
+    }
+}
+
+/// The element parameter every operand entry binds its activation rows to:
+/// a pair's producer and consumer, and a carry's, bind it alike.
+pub const OPERAND_ACTIVATION: &str = "A";
+
+/// How a formed operand buffer (`NativeOperand::Formed`) stands at one
+/// call: whether a producer's operand stands for it (`pairs`), whether its
+/// formation writes it (`formed`), and whether its rows take the NVFP4
+/// operand transform (`nvfp4`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FormedAt {
+    pub(crate) pairs: bool,
+    pub(crate) formed: bool,
+    pub(crate) nvfp4: bool,
+}
+
+/// The operand form a buffer holds (`checked::NativeOperand`), as storage
+/// planning pairs them: a graph places a consumer's buffer of a tensor's
+/// operand where the node that produces the tensor emits that form, under
+/// the same norm (`graph::operand_pairs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScratchOperand {
+    /// The operand of the call's tensor parameter `parameter` (its ordinal
+    /// among the entry's parameters), which launch `formation` forms.
+    Formed { parameter: u32, formation: u32, rows: bool, norm: Option<NativeOperandNorm> },
+    /// The operand of the call's tensor result `result`.
+    Emitted { result: u32, rows: bool, norm: Option<NativeOperandNorm> },
+}
+
+pub use seismic_lang::checked::NativeOperandNorm;
+
+impl ScratchOperand {
+    pub fn of(operand: &seismic_lang::checked::NativeOperand) -> Self {
+        match *operand {
+            seismic_lang::checked::NativeOperand::Formed { parameter, formation, rows, norm, .. } => {
+                Self::Formed { parameter, formation, rows, norm }
+            }
+            seismic_lang::checked::NativeOperand::Emitted { result, rows, norm } => Self::Emitted { result, rows, norm },
+        }
+    }
 }
 
 /// Place one standalone call's scratch buffers: `sync` buffers in the
@@ -721,6 +802,10 @@ pub struct NativePrepared {
     /// Tensor parameters (by schema ordinal) whose static extents render
     /// constant canonical strides (S10), with those strides.
     canonical_parameters: Vec<(usize, Vec<u64>)>,
+    /// The element bound to the entry's activation parameter
+    /// ([`OPERAND_ACTIVATION`]), where it has one: what its operands' rows
+    /// are rounded to.
+    activation: Option<RepresentationId>,
     /// Whether a launch writes each buffer and whether its host rewrites it
     /// once it sees the launch, in ABI order ([`abi::buffer_writes`],
     /// [`abi::host_writes`]), which Metal's encoding orders by ([`hazard`]).
@@ -1214,7 +1299,7 @@ fn cpu_route(
     implementation: &NativeImplementation,
     specialization: &NativeSpecialization,
     bindings: &ElementBindings,
-    domain: &seismic_lang::checked::ElementDomain,
+    entry: &seismic_lang::checked::EntryInfo,
 ) -> Result<cpu::CpuRoute, PrepareError> {
     use seismic_lang::checked::NativeParameterRole;
     use seismic_native_cpu::Tier;
@@ -1243,7 +1328,7 @@ fn cpu_route(
     // Every weight is bound in a form the tier's components read where it
     // lies (a CPU row layout, or a device's).
     for (element, representation) in bindings.iter() {
-        if domain.cpu_binding(element) != Some(seismic_lang::checked::CpuBinding::Weights) {
+        if implementation.cpu_binding(entry, element) != Some(seismic_lang::checked::CpuBinding::Weights) {
             continue;
         }
         if seismic_native_cpu::WeightOperand::of(tier, representation).is_none() {
@@ -1981,7 +2066,7 @@ impl NativePrepared {
                         &implementation,
                         &specialization,
                         &bindings,
-                        &entry_info(module, entry).element_domain,
+                        entry_info(module, entry),
                     )?;
                     digest.update(kernels.digest.as_bytes());
                     let toolchain = format!(
@@ -2128,6 +2213,7 @@ impl NativePrepared {
             specialization,
             statics,
             canonical_parameters,
+            activation: bindings.get(OPERAND_ACTIVATION),
             buffer_writes,
             host_writes,
             bound,
@@ -2142,6 +2228,12 @@ impl NativePrepared {
 
     pub(crate) fn implementation(&self) -> &NativeImplementation {
         &self.implementation
+    }
+
+    /// The element bound to its activation parameter
+    /// ([`OPERAND_ACTIVATION`]), where the entry has one.
+    pub(crate) fn activation(&self) -> Option<RepresentationId> {
+        self.activation
     }
 
     /// Whether a launch reads its grid from tensor parameter `ordinal`
@@ -2558,10 +2650,7 @@ impl NativePrepared {
                 } else {
                     MINIMUM_SCRATCH_BYTES
                 };
-                Ok(ScratchNeed {
-                    bytes,
-                    sync: scratch.sync,
-                })
+                Ok(ScratchNeed::of(scratch, bytes))
             })
             .collect()
     }
@@ -2620,8 +2709,21 @@ impl NativePrepared {
             &results,
             &values,
         )?;
+        let forms = self
+            .implementation
+            .scratch
+            .iter()
+            .map(|scratch| match &scratch.operand {
+                Some(seismic_lang::checked::NativeOperand::Formed { pairs, formed, nvfp4, .. }) => {
+                    let holds = |condition: &NativeCondition| self.active(&Some(condition.clone()), &values, None);
+                    Ok(Some(FormedAt { pairs: holds(pairs)?, formed: holds(formed)?, nvfp4: holds(nvfp4)? }))
+                }
+                _ => Ok(None),
+            })
+            .collect::<Result<Vec<_>, CallError>>()?;
         Ok(CallShape {
             scratch: self.scratch_needs(&values)?,
+            forms,
             results,
             words,
             launches,
@@ -2728,7 +2830,9 @@ impl NativePrepared {
                 }
             }
         }
-        let shape = self.shape(&args.values())?;
+        let mut shape = self.shape(&args.values())?;
+        // A call alone emits no operand: no consumer of it reads one.
+        charge_emissions(&mut shape.scratch, |_| false);
         let specs = shape.results.iter().flatten().collect::<Vec<_>>();
         let supplied = outputs.map(EncodedOutputs::into_tensors);
         if let Some(outputs) = &supplied {
@@ -3005,6 +3109,9 @@ pub(crate) struct CallShape {
     pub(crate) results: Vec<Option<NativeTensorSpec>>,
     /// Each scratch buffer, in declaration order.
     pub(crate) scratch: Vec<ScratchNeed>,
+    /// Per scratch buffer, how it stands at this call where it is a formed
+    /// operand (`FormedAt`); `None` for every other buffer.
+    pub(crate) forms: Vec<Option<FormedAt>>,
     pub(crate) words: Vec<u64>,
     pub(crate) launches: CallLaunches,
 }
@@ -3881,7 +3988,7 @@ fn native_words(
     values: &InvocationValues,
 ) -> Result<Vec<u64>, CallError> {
     let runtime = abi::runtime_parameters(implementation);
-    let mut words = Vec::with_capacity(abi::word_count(schema) + runtime.len());
+    let mut words = Vec::with_capacity(abi::native_word_count(schema, implementation));
     for dimension in schema.dimensions() {
         match values.get(dimension.symbol) {
             Some(SymbolValue::Nat(value)) => words.push(word(SymbolValue::Nat(value))?),
@@ -3918,6 +4025,9 @@ fn native_words(
         words.extend_from_slice(&spec.extents);
         words.extend_from_slice(&spec.strides);
     }
+    // A call emits no operand until a sealed graph pairs it
+    // (`abi::emitted_words`).
+    words.extend(std::iter::repeat_n(0, abi::emitted_words(implementation)));
     for address in runtime {
         words.push(address.value(specialization));
     }

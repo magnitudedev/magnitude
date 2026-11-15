@@ -7,6 +7,7 @@
 use crate::checked::{NativeImplementation, NativeLaunch};
 use crate::native_name::native_macro;
 use crate::registry::{BackendName, SourceDialect};
+use crate::syntax::ast::RowsKind;
 
 /// Every identifier outside comments and literals, with its offset.
 pub fn identifiers(source: &str) -> Vec<(&str, usize)> {
@@ -160,6 +161,40 @@ pub fn launch_template<'s>(
         })
         .collect::<Result<Vec<_>, _>>()
         .map(Some)
+}
+
+/// The kind of rows a CUDA kernel's prologue forms: `projection::Strided`
+/// stages them (`staged`), `Rms`, `GroupRms` (normalizing each part of a
+/// row, `parts`) and `Input` (normalizing, or summing partials) form them in
+/// the kernel (`rms`), and every other prologue passes them as given
+/// (`plain`).
+fn prologue_rows(source: &str) -> RowsKind {
+    let names = identifiers(source);
+    let named = |wanted: &[&str]| {
+        names.windows(2).any(|pair| pair[0].0 == "projection" && wanted.contains(&pair[1].0))
+    };
+    if named(&["Strided"]) {
+        RowsKind::Staged
+    } else if named(&["Rms", "GroupRms", "Input", "OrderedRms", "OrderedInput"]) {
+        RowsKind::Rms
+    } else {
+        RowsKind::Plain
+    }
+}
+
+/// A projecting CUDA entry's declared kind of rows (`rows KIND`) against its
+/// kernel's prologue.
+pub fn check_rows_kind(kind: RowsKind, source: &str) -> Result<(), String> {
+    let formed = prologue_rows(source);
+    if formed == kind {
+        Ok(())
+    } else {
+        Err(format!(
+            "it declares `rows {}`, but its prologue forms `{}` rows (`projection::Strided`: staged; `Rms`, `GroupRms` or `Input`: rms; any other: plain)",
+            kind.name(),
+            formed.name()
+        ))
+    }
 }
 
 /// What a native source fails to read of its declaration.
@@ -543,6 +578,37 @@ pub fn check_fixture(
 mod tests {
     use super::*;
     use crate::checked::{check_source_with, CheckFailure, CheckedModule, SourceFile, SourceSet};
+
+    /// A projecting CUDA kernel's prologue is exactly the kind its declaration names.
+    #[test]
+    fn a_declared_kind_of_rows_must_be_its_prologues() {
+        let rms = "using Raw = projection::Rms<float, projection::SelectedRows>;";
+        let input = "using Raw = projection::Input<float, projection::AllRows, NM, PT>;";
+        let staged = "using Raw = projection::Strided<element::F32, projection::AllRows>;";
+        let plain = "using Raw = projection::Plain<float, projection::AllRows>;";
+        for (kind, source) in [
+            (RowsKind::Rms, rms),
+            (RowsKind::Rms, input),
+            (RowsKind::Staged, staged),
+            (RowsKind::Plain, plain),
+        ] {
+            assert_eq!(check_rows_kind(kind, source), Ok(()), "{kind:?} over {source}");
+        }
+        // Each kind refuses each other kind's prologue, `staged` and `rms` included.
+        for (kind, source) in [
+            (RowsKind::Staged, rms),
+            (RowsKind::Staged, input),
+            (RowsKind::Rms, staged),
+            (RowsKind::Plain, rms),
+            (RowsKind::Plain, staged),
+            (RowsKind::Rms, plain),
+            (RowsKind::Staged, plain),
+        ] {
+            assert!(check_rows_kind(kind, source).is_err(), "{kind:?} over {source}");
+        }
+        // A comment does not name a prologue.
+        assert_eq!(check_rows_kind(RowsKind::Plain, "// projection::Rms rows\n"), Ok(()));
+    }
 
     fn sources(native: &str) -> SourceSet {
         let mut sources = SourceSet::default();

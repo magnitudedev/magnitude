@@ -21,7 +21,8 @@
 //!
 //! The GPUs' forms are of packed rows, a dense weight having one path; the
 //! CPU's are of every weight, whose dense rows take its quantized
-//! activations too.
+//! activations too, and so is Vulkan's one form (`DECODED`), which admits a
+//! weight to its natives at all.
 //!
 //! A form whose producer reads every weight admits every weight and has no
 //! row here: Metal's tall GEMM (`TALL`), whose staging simdgroups decode
@@ -31,6 +32,7 @@
 
 use crate::ids::RepresentationId;
 use crate::registry::{self, BackendName, OperandRecipe, RepresentationInfo};
+use crate::producers::{self, Weight};
 use crate::registry::profile::{Bias, Domain, LocalScale, Profile, ValueMap};
 use crate::types::DType;
 
@@ -39,6 +41,10 @@ use crate::types::DType;
 /// GEMM's local scale codes multiplied into the codes (`INT8_LOCAL`), negated
 /// (`INT8_LOCAL_NEGATED`). [`cuda_forms`] values them in this order.
 const CUDA_FORMS: [&str; 5] = ["GEMM_FOLD", "INT8", "GEMV_RECORDS", "INT8_LOCAL", "INT8_LOCAL_NEGATED"];
+
+/// Vulkan's forms: whether its packet decoder reads the weight (`DECODED`).
+/// [`vulkan_decoded`] values it.
+const VULKAN_FORMS: [&str; 1] = ["DECODED"];
 
 /// Metal's forms, in emission order (`packets::Forms` reads those its
 /// library selects on). [`metal_forms`] values them in this order.
@@ -56,8 +62,10 @@ const METAL_FORMS: [&str; 11] = [
     "MATRIX",
 ];
 
-/// The CPU's forms: the quantized dot (`INT8`). [`cpu_int8`] values it.
-const CPU_FORMS: [&str; 1] = ["INT8"];
+/// The CPU's forms, in emission order: the quantized dot (`INT8`) and its
+/// tile products on AMX tiles (`INT8_AMX`). [`cpu_forms`] values them in this
+/// order.
+const CPU_FORMS: [&str; 2] = ["INT8", "INT8_AMX"];
 
 /// Values of one CPU INT8 activation block (`quant::Q8Block`, the k-quant
 /// super block): its `i8` codes, then the `i16` sums of each 16, then its
@@ -78,23 +86,32 @@ pub const CPU_Q8_BYTES: u64 =
 /// Q8_ROWS) * Q8_ROWS` blocks a row hold either form.
 pub const CPU_Q8_ROWS: u64 = 8;
 
+/// Most participants a CPU worker pool holds (`seismic_cpu::workers::Workers`),
+/// which bounds every `device.units` partition of a scratch buffer.
+pub const CPU_MAX_UNITS: u64 = 256;
+
 /// The named constants `backend`'s native declarations may use in their
 /// expressions (`scratch quantized bytes (M * ceil_div(H, Q8_VALUES) *
 /// Q8_BYTES)`), the facts of its forms they size buffers by.
 pub fn constants(backend: BackendName) -> &'static [(&'static str, u64)] {
     match backend {
-        BackendName::Cpu => &[("Q8_VALUES", CPU_Q8_VALUES), ("Q8_BYTES", CPU_Q8_BYTES), ("Q8_ROWS", CPU_Q8_ROWS)],
+        BackendName::Cpu => &[
+            ("Q8_VALUES", CPU_Q8_VALUES),
+            ("Q8_BYTES", CPU_Q8_BYTES),
+            ("Q8_ROWS", CPU_Q8_ROWS),
+            ("MAX_UNITS", CPU_MAX_UNITS),
+        ],
         BackendName::Cuda | BackendName::Metal | BackendName::Vulkan => &[],
     }
 }
 
 /// The names of `backend`'s forms, in emission order.
-pub fn names(backend: BackendName) -> &'static [&'static str] {
+pub const fn names(backend: BackendName) -> &'static [&'static str] {
     match backend {
         BackendName::Cuda => &CUDA_FORMS,
         BackendName::Metal => &METAL_FORMS,
         BackendName::Cpu => &CPU_FORMS,
-        BackendName::Vulkan => &[],
+        BackendName::Vulkan => &VULKAN_FORMS,
     }
 }
 
@@ -127,21 +144,22 @@ fn values(backend: BackendName, id: RepresentationId) -> Option<&'static [u32]> 
 }
 
 /// The values of `backend`'s forms for representation `id`, in the order of
-/// [`names`]; `None` where the backend chooses no form of it: on a GPU,
-/// storage other than packed rows.
+/// [`names`]; `None` where the backend chooses no form of it: on Metal and
+/// CUDA, storage other than packed rows.
 fn admitted(backend: BackendName, id: RepresentationId) -> Option<Vec<u32>> {
     let info = registry::representation_info(id);
-    if backend == BackendName::Cpu {
-        return Some(vec![u32::from(cpu_int8(info))]);
+    if backend == BackendName::Vulkan {
+        return Some(vec![u32::from(vulkan_decoded(info))]);
     }
-    let (registry::RepresentationKind::PackedRows(rows), Some(axes)) =
-        (&info.kind, registry::decode_axes(id))
-    else {
+    if backend == BackendName::Cpu {
+        return Some(cpu_forms(info).to_vec());
+    }
+    let (registry::RepresentationKind::PackedRows(rows), Some(weight)) = (&info.kind, Weight::of(info)) else {
         return None;
     };
     Some(match backend {
-        BackendName::Cuda => cuda_forms(rows, &axes, info.operands).to_vec(),
-        BackendName::Metal => metal_forms(&axes).to_vec(),
+        BackendName::Cuda => cuda_forms(rows, &weight, info.operands).to_vec(),
+        BackendName::Metal => metal_forms(&weight).to_vec(),
         BackendName::Cpu | BackendName::Vulkan => Vec::new(),
     })
 }
@@ -165,6 +183,35 @@ pub struct Form {
 }
 
 impl Form {
+    /// Form `name` of `backend`, where the name is written here: the value
+    /// of a constant (`const METAL_PACK: Form = ..`), so a backend without a
+    /// form of that name fails the build.
+    const fn constant(backend: BackendName, name: &str) -> Self {
+        const fn same(a: &str, b: &str) -> bool {
+            let (a, b) = (a.as_bytes(), b.as_bytes());
+            if a.len() != b.len() {
+                return false;
+            }
+            let mut at = 0;
+            while at < a.len() {
+                if a[at] != b[at] {
+                    return false;
+                }
+                at += 1;
+            }
+            true
+        }
+        let names = names(backend);
+        let mut index = 0;
+        while index < names.len() {
+            if same(names[index], name) {
+                return Self { backend, index };
+            }
+            index += 1;
+        }
+        panic!("a backend has no form of this name")
+    }
+
     /// Form `name` of `backend`, or `None` when the backend has no form of
     /// that name.
     pub fn named(backend: BackendName, name: &str) -> Option<Self> {
@@ -174,6 +221,10 @@ impl Form {
 
     pub fn name(self) -> &'static str {
         names(self.backend)[self.index]
+    }
+
+    pub fn backend(self) -> BackendName {
+        self.backend
     }
 
     /// The form's admitted value for representation `id` (`forms`): 0 where
@@ -193,6 +244,16 @@ impl Form {
     }
 }
 
+/// The forms whose reach their producers bound (`producers.decl`), as
+/// admission asks of them.
+const VULKAN_DECODED: Form = Form::constant(BackendName::Vulkan, "DECODED");
+const CUDA_INT8_LOCAL: Form = Form::constant(BackendName::Cuda, "INT8_LOCAL");
+pub(crate) const METAL_PACK: Form = Form::constant(BackendName::Metal, "PACK");
+const METAL_INT8: Form = Form::constant(BackendName::Metal, "INT8");
+const METAL_MATRIX_CODES: Form = Form::constant(BackendName::Metal, "MATRIX_CODES");
+const METAL_MATRIX_RUNS: Form = Form::constant(BackendName::Metal, "MATRIX_RUNS");
+const METAL_MATRIX_SYMMETRIC: Form = Form::constant(BackendName::Metal, "MATRIX_SYMMETRIC");
+
 impl TryFrom<(BackendName, String)> for Form {
     type Error = String;
 
@@ -207,16 +268,23 @@ impl From<Form> for (BackendName, String) {
     }
 }
 
+/// Whether Vulkan's packet decoder reads weight `info` (`DECODED`): dense
+/// rows, and packed rows whose decode axes its producers decode, within
+/// their requirements (`vulkan/producers.decl`). It reads neither packet
+/// nor external storage, which a Vulkan native never binds.
+fn vulkan_decoded(info: &RepresentationInfo) -> bool {
+    match &info.kind {
+        registry::RepresentationKind::Dense(_) => true,
+        _ => Weight::of(info).is_some_and(|weight| producers::covers(VULKAN_DECODED, &weight)),
+    }
+}
+
 /// CUDA's forms of a packed-rows weight, in the order of [`CUDA_FORMS`].
-fn cuda_forms(
-    rows: &registry::PackedRowLayout,
-    axes: &registry::DecodeAxes,
-    operands: OperandRecipe,
-) -> [u32; CUDA_FORMS.len()] {
-    let local = cuda_int8_local(axes, operands);
+fn cuda_forms(rows: &registry::PackedRowLayout, weight: &Weight, operands: OperandRecipe) -> [u32; CUDA_FORMS.len()] {
+    let local = cuda_int8_local(weight, operands);
     [
-        u32::from(cuda_gemm_fold(axes)),
-        u32::from(cuda_int8(axes, operands)),
+        u32::from(cuda_gemm_fold(&weight.axes)),
+        u32::from(cuda_int8(&weight.axes, operands)),
         // The GEMV reads a records layout as records (`gemv_records_group`,
         // `packets::Records`). Its launch keeps the blocks per SM that hold
         // its grid in one wave (`projection::GemvResidency`), so it takes no
@@ -288,24 +356,18 @@ fn cuda_int8(axes: &registry::DecodeAxes, operands: OperandRecipe) -> bool {
 ///
 /// Its producer multiplies the s8 codes of any code planes by a local code
 /// (`packets::s8_times`) it reads from the scales plane
-/// (`packets::Hier::staged_local`).
-fn cuda_int8_local(axes: &registry::DecodeAxes, operands: OperandRecipe) -> Option<bool> {
+/// (`packets::Hier::staged_local`): the weights its declaration covers.
+fn cuda_int8_local(weight: &Weight, operands: OperandRecipe) -> Option<bool> {
+    let axes = &weight.axes;
     let profile = axes.profile();
     let LocalScale::Code(locals) = profile.local.scale else {
         return None;
     };
-    let plane = matches!(
-        &axes.coding,
-        registry::CodingAxes::Hierarchical {
-            locals: registry::LocalCodes::Plane { .. },
-            ..
-        }
-    );
     let admitted = cuda_int8(axes, operands)
         && profile.integer_through_upper()
         && profile.local.bias == Bias::None
         && profile.local.group % 16 == 0
-        && plane;
+        && producers::covers(CUDA_INT8_LOCAL, weight);
     if !admitted {
         return None;
     }
@@ -338,10 +400,10 @@ fn cuda_int8_local(axes: &registry::DecodeAxes, operands: OperandRecipe) -> Opti
 /// operations) is the library's condition. One operand serves several weights of a declaration only
 /// where their operand layout (`PACK_FOLDS`, `PACK_RESIDUE`) or order
 /// (`INT8_INTERLEAVED`) agree.
-fn metal_forms(axes: &registry::DecodeAxes) -> [u32; METAL_FORMS.len()] {
-    let packing = metal_packing(axes);
-    let int8 = metal_int8(axes);
-    let matrix = metal_matrix(axes);
+fn metal_forms(weight: &Weight) -> [u32; METAL_FORMS.len()] {
+    let packing = metal_packing(weight);
+    let int8 = metal_int8(weight);
+    let matrix = metal_matrix(weight);
     [
         u32::from(packing.is_some()),
         packing.map_or(0, |packing| packing.centre),
@@ -361,88 +423,14 @@ fn metal_forms(axes: &registry::DecodeAxes) -> [u32; METAL_FORMS.len()] {
 }
 
 /// Columns of a Metal packet, whose coefficient groups a decoder holds
-/// (`packets::Direct::groups`, `packets::Hier::groups`).
-const METAL_PACKET: u32 = 32;
+/// (`packets::Direct::groups`, `packets::Hier::groups`): a `rows32` code
+/// chunk.
+const METAL_PACKET: u32 = registry::ROWS32_CHUNK as u32;
 
 /// The coefficient groups of a Metal packet: two of 16 columns, else one.
 fn metal_packet_groups(profile: &Profile) -> u32 {
     let group = profile.local.group;
     if group < METAL_PACKET { METAL_PACKET / group } else { 1 }
-}
-
-/// How Metal's lane producers (`projection::lane_codes`) deliver a weight's
-/// integer codes to its matrix GEMV and token-packing GEMM: a packet's
-/// chunks of eight codes, which a lane takes two at a time as unsigned
-/// integers entering at a zero code. `None` for any other codes (odd codes).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MetalLanes {
-    /// Linear codes of code planes, of every split `registry::code_planes`
-    /// makes up to 8 bits (two's complement bytes with their sign bits
-    /// flipped), entering as their stored codes, whose value zero is `zero`,
-    /// or, but as `bytes` (codes of a plane of bytes), at any zero above.
-    Stored { zero: u32, bytes: bool },
-    /// A codebook's 4-bit codes of values of `i8`, entering as those values
-    /// + 128 (`codebooks::pairs`), as bytes.
-    Table,
-    /// A grid's entries of values of `i8`, entering as those values (signed,
-    /// moved by their delta) + any zero.
-    Grid,
-}
-
-impl MetalLanes {
-    /// Whether the codes enter as their values + `offset`, in a layout of
-    /// bytes (`bytes`) or of pairs.
-    fn enter_at(self, offset: u32, bytes: bool) -> bool {
-        match self {
-            MetalLanes::Stored { zero, bytes: true } => offset == zero,
-            MetalLanes::Stored { zero, bytes: false } => !bytes && offset >= zero,
-            MetalLanes::Table => offset == 128,
-            MetalLanes::Grid => !bytes,
-        }
-    }
-}
-
-fn metal_lanes(axes: &registry::DecodeAxes) -> Option<MetalLanes> {
-    use registry::CodeInterpretation as Code;
-    let code = match axes.coding.codes() {
-        registry::ValueCodes::Fields(code) => code,
-        registry::ValueCodes::Grid(_) => {
-            return axes.profile().codes.fits_i8().then_some(MetalLanes::Grid);
-        }
-        // Floating codes enter no lane as integers.
-        registry::ValueCodes::E4m3 => return None,
-    };
-    // Every split `code_planes` makes of up to 8 bits; a plane of bytes is
-    // the one without a high plane at 8.
-    let width = axes.low + axes.high;
-    let planes = width <= 8 && registry::code_planes(width) == Some((axes.low, axes.high));
-    let bytes = (axes.low, axes.high) == (8, 0);
-    match code {
-        Code::Unsigned => planes.then_some(MetalLanes::Stored { zero: 0, bytes }),
-        Code::Offset(zero) => planes.then_some(MetalLanes::Stored {
-            zero: u32::try_from(zero).ok()?,
-            bytes,
-        }),
-        Code::TwosComplement => bytes.then_some(MetalLanes::Stored { zero: 128, bytes }),
-        Code::Table(_) => ((axes.low, axes.high) == (4, 0) && axes.profile().codes.fits_i8())
-            .then_some(MetalLanes::Table),
-        Code::Odd(_) => None,
-    }
-}
-
-/// Whether a Metal producer reads the weight's local codes from its scales
-/// plane, of plain unsigned codes (`packets::LocalUnsigned`), rather than
-/// from its grid entries.
-fn metal_plane_locals(axes: &registry::DecodeAxes, unsigned: bool) -> bool {
-    match &axes.coding {
-        registry::CodingAxes::Direct { .. } => true,
-        registry::CodingAxes::Hierarchical { interpretation, locals, .. } => match locals {
-            registry::LocalCodes::Plane { .. } => {
-                !unsigned || *interpretation == registry::CodeInterpretation::Unsigned
-            }
-            registry::LocalCodes::Carried { .. } => false,
-        },
-    }
 }
 
 /// A weight's admission to Metal's token-packing GEMM (`PACK`,
@@ -494,17 +482,17 @@ pub fn metal_packing_of(id: RepresentationId) -> Option<MetalPacking> {
 /// columns; and a block of two runs only without a bias term,
 /// (centre - offset) scale + bias.
 ///
-/// Its producer packs a weight's lane codes (`metal_lanes`) as entries,
+/// Its producer packs a weight's lane codes (`producers::lanes`) as entries,
 /// the values + `offset`, of the fewest bits that hold them centred as the
 /// packing bound centres them (`packing_bound`): unsigned codes as
 /// themselves, centred at half their range, and signed values at the
 /// centre, a power of two holding their magnitudes. Entries below 8 bits pack
 /// in runs of 32 or 16 columns (`packing_layout`), entries of 8 bits only as
 /// bytes in runs of 32 (the residue bits' layout); local codes come from the
-/// scales plane.
-fn metal_packing(axes: &registry::DecodeAxes) -> Option<MetalPacking> {
-    let profile = axes.profile();
-    let lanes = metal_lanes(axes)?;
+/// scales plane, which its declaration covers.
+fn metal_packing(weight: &Weight) -> Option<MetalPacking> {
+    let profile = weight.axes.profile();
+    let lanes = producers::lanes(METAL_PACK, weight)?;
     let (bits, offset) = if profile.codes.least >= 0 {
         (
             u32::BITS - u32::try_from(profile.codes.greatest).ok()?.leading_zeros(),
@@ -516,9 +504,7 @@ fn metal_packing(axes: &registry::DecodeAxes) -> Option<MetalPacking> {
         (centre.trailing_zeros() + 1, centre)
     };
     let folds = metal_packet_groups(&profile);
-    let entries = (bits < 8 || folds == 1)
-        && lanes.enter_at(offset, bits == 8)
-        && metal_plane_locals(axes, false);
+    let entries = (bits < 8 || folds == 1) && lanes.enter_at(offset, bits == 8);
     let centre = 1u32 << (bits - 1);
     let biased = profile.local.bias != Bias::None || centre != offset;
     let factors = match profile.upper {
@@ -558,8 +544,8 @@ enum MetalInt8 {
 /// Its producer reads unsigned 4-bit codes of one plane with plain unsigned
 /// local codes of the scales plane (`Nibbles`), or 8-bit two's complement
 /// codes (`Bytes`).
-fn metal_int8(axes: &registry::DecodeAxes) -> Option<MetalInt8> {
-    let profile = axes.profile();
+fn metal_int8(weight: &Weight) -> Option<MetalInt8> {
+    let profile = weight.axes.profile();
     let codes = profile.codes.fits_i8() && profile.code_exponent == 0 && profile.local.group == 32;
     let coefficients = match (profile.upper, profile.local.scale, profile.local.bias) {
         (Some(upper), LocalScale::Code(locals), _) => {
@@ -569,14 +555,12 @@ fn metal_int8(axes: &registry::DecodeAxes) -> Option<MetalInt8> {
         (None, LocalScale::Stored(_), Bias::None) => true,
         _ => false,
     };
-    let produced = match profile.upper {
-        Some(_) => (axes.coding.codes() == registry::ValueCodes::Fields(registry::CodeInterpretation::Unsigned)
-            && (axes.low, axes.high) == (4, 0)
-            && metal_plane_locals(axes, true))
-        .then_some(MetalInt8::Nibbles),
-        None => (axes.coding.codes() == registry::ValueCodes::Fields(registry::CodeInterpretation::TwosComplement)
-            && (axes.low, axes.high) == (8, 0))
-            .then_some(MetalInt8::Bytes),
+    let produced = if !producers::covers(METAL_INT8, weight) {
+        None
+    } else if profile.upper.is_some() {
+        Some(MetalInt8::Nibbles)
+    } else {
+        Some(MetalInt8::Bytes)
     };
     produced.filter(|_| codes && coefficients)
 }
@@ -603,6 +587,56 @@ fn metal_int8(axes: &registry::DecodeAxes) -> Option<MetalInt8> {
 /// (`weights::DenseRows`).
 pub fn cpu_int8_of(id: RepresentationId) -> bool {
     values(BackendName::Cpu, id).is_some_and(|values| values[0] == 1)
+}
+
+/// The CPU's form values of a representation, in [`CPU_FORMS`] order.
+fn cpu_forms(info: &RepresentationInfo) -> [u32; CPU_FORMS.len()] {
+    let int8 = cpu_int8(info);
+    [u32::from(int8), u32::from(int8 && cpu_int8_amx(info))]
+}
+
+/// Whether the CPU's tile products over the weight (`Weights::tile_q8`, the
+/// quantized dot of several activation rows) take AMX tiles where the host
+/// has them (`INT8_AMX`): sixteen weight rows a tile pair, each a byte tile
+/// product of a strip's signed activation codes by unsigned weight bytes,
+/// each code times its unit's scale code split as `8 high + low` so that
+/// every product stays a byte, giving the same integers as the VNNI tiers.
+/// A row range below sixteen rows, or the tail of one, runs the VNNI tier
+/// inside the same call, so a declaration offers its sixteen-row block
+/// (`ROWS = 16`) only where a weight it multiplies takes this form.
+///
+/// Its arithmetic requires, of the quantized dot's packed rows, linear
+/// integer codes of at most five bits, none negative (`0 ..= 31`, unscaled
+/// by a power of two of their own), under integer local scale codes of at
+/// most six bits, none negative (`0 ..= 63`, three bits a part), and a
+/// minimum code, where the group has one, of the same range; and units of
+/// 16 or 32 values (a coefficient group of 16, else a 32-value packet).
+/// Q4_K and Q5_K take it; Q3_K's signed scales and Q8_0's byte codes do
+/// not.
+pub fn cpu_int8_amx_of(id: RepresentationId) -> bool {
+    values(BackendName::Cpu, id).is_some_and(|values| values[1] == 1)
+}
+
+/// [`cpu_int8_amx_of`]'s rule over the representation's registry record.
+fn cpu_int8_amx(info: &RepresentationInfo) -> bool {
+    let (registry::RepresentationKind::PackedRows(_), Some(axes)) = (&info.kind, registry::decode_axes(info.id)) else {
+        return false;
+    };
+    let profile = axes.profile();
+    let within = |domain: Domain, greatest: i32| 0 <= domain.least && domain.greatest <= greatest;
+    let scales = matches!(profile.local.scale, LocalScale::Code(scales) if within(scales, 63));
+    let minimums = match profile.local.bias {
+        Bias::None => true,
+        Bias::Minimum { codes, .. } => within(codes, 63),
+        Bias::Stored | Bias::Signed { .. } => false,
+    };
+    let group = profile.local.group;
+    profile.map == ValueMap::Linear
+        && profile.code_exponent == 0
+        && within(profile.codes, 31)
+        && scales
+        && minimums
+        && (group == 16 || group % 32 == 0)
 }
 
 /// [`cpu_int8_of`]'s rule over the representation's registry record.
@@ -643,27 +677,24 @@ enum MetalMatrix {
 ///
 /// Each product's arithmetic requires integer codes not scaled by a power
 /// of two of their own, under its levels (`MetalMatrix`). Its producer takes
-/// the weight's lane codes (`metal_lanes`): codes entering as themselves
-/// with plain unsigned local codes of the scales plane (`Codes`), any lane
-/// codes with local codes of the scales plane (`Runs`), or any lane codes
-/// (`Symmetric`).
-fn metal_matrix(axes: &registry::DecodeAxes) -> Option<MetalMatrix> {
-    let profile = axes.profile();
-    let lanes = metal_lanes(axes)?;
+/// the weight's lane codes (`producers::lanes`): unsigned codes with plain
+/// unsigned local codes of the scales plane (`Codes`), any lane codes with
+/// local codes of the scales plane (`Runs`), or any lane codes
+/// (`Symmetric`), as its declaration states.
+fn metal_matrix(weight: &Weight) -> Option<MetalMatrix> {
+    let profile = weight.axes.profile();
     if profile.code_exponent != 0 {
         return None;
     }
     let factors = profile.upper.is_some_and(|upper| upper.group == 256);
     match (profile.local.group, profile.local.scale, profile.local.bias) {
         (32, LocalScale::Code(locals), Bias::Minimum { .. })
-            if factors
-                && matches!(lanes, MetalLanes::Stored { zero: 0, .. })
-                && metal_plane_locals(axes, true) =>
+            if factors && producers::lanes(METAL_MATRIX_CODES, weight).is_some() =>
         {
             (profile.codes.greatest * locals.greatest < 2048).then_some(MetalMatrix::Codes)
         }
         (16 | 32, LocalScale::Code(locals), Bias::None)
-            if factors && metal_plane_locals(axes, false) =>
+            if factors && producers::lanes(METAL_MATRIX_RUNS, weight).is_some() =>
         {
             let magnitude = |least: i32, greatest: i32| least.abs().max(greatest.abs());
             let product = magnitude(profile.codes.least, profile.codes.greatest)
@@ -673,7 +704,9 @@ fn metal_matrix(axes: &registry::DecodeAxes) -> Option<MetalMatrix> {
             })
         }
         (group, LocalScale::Stored(_), Bias::None)
-            if group % 32 == 0 && profile.codes.fits_i8() =>
+            if group % 32 == 0
+                && profile.codes.fits_i8()
+                && producers::lanes(METAL_MATRIX_SYMMETRIC, weight).is_some() =>
         {
             Some(MetalMatrix::Symmetric)
         }
@@ -684,6 +717,10 @@ fn metal_matrix(axes: &registry::DecodeAxes) -> Option<MetalMatrix> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checked::{
+        ElementQuery, ElementSummary, NativeComparison, NativeCondition, NativeNatExpr, ParameterSummaryKind,
+    };
+    use crate::native_name::native_macro;
 
     /// CUDA's GEMM recipe of every representation it imports, as main's
     /// library derived it (`ScaledGemm`), and for q4g32, q2k, q2g256,
@@ -830,6 +867,30 @@ mod tests {
         }
     }
 
+    /// The AMX tile products take the K-quants of unsigned codes under
+    /// unsigned six-bit scales, and nothing the quantized dot does not.
+    #[test]
+    fn cpu_int8_amx_takes_unsigned_k_quants() {
+        let amx = Form::named(BackendName::Cpu, "INT8_AMX").unwrap();
+        for (name, value) in [
+            ("q4k@rows16", 1),
+            ("q5k@rows16", 1),
+            ("q4k@rows8", 1),
+            ("q3k@rows16", 0),
+            ("q6k@rows16", 0),
+            ("q8g32s@rows16", 0),
+            ("q4g32s@rows16", 0),
+            ("f16", 0),
+        ] {
+            let id = registry::representation(name).unwrap_or_else(|| panic!("{name}"));
+            assert_eq!(amx.of(id), value, "{name}");
+        }
+        let int8 = Form::named(BackendName::Cpu, "INT8").unwrap();
+        for info in registry::representations() {
+            assert!(amx.of(info.id) <= int8.of(info.id), "{}", info.name);
+        }
+    }
+
     /// The host's queries of a form read the table the forms are decided in
     /// once (`values`), and take what its rule decides of every
     /// representation of the registry.
@@ -838,7 +899,7 @@ mod tests {
         for info in registry::representations() {
             let packed = matches!(info.kind, registry::RepresentationKind::PackedRows(_));
             let axes = registry::decode_axes(info.id);
-            assert_eq!(metal_packing_of(info.id), axes.as_ref().and_then(metal_packing), "{}", info.name);
+            assert_eq!(metal_packing_of(info.id), Weight::of(info).as_ref().and_then(metal_packing), "{}", info.name);
             assert_eq!(
                 cuda_gemm_fold_of(info.id),
                 packed && axes.as_ref().is_some_and(cuda_gemm_fold),
@@ -846,17 +907,18 @@ mod tests {
                 info.name
             );
             assert_eq!(cpu_int8_of(info.id), cpu_int8(info), "{}", info.name);
+            assert_eq!(cpu_int8_amx_of(info.id), cpu_int8(info) && cpu_int8_amx(info), "{}", info.name);
         }
     }
 
-    /// Every backend's forms are its names, valued on a GPU for packed rows
-    /// only and on the CPU for every representation.
+    /// Every backend's forms are its names, valued on Metal and CUDA for
+    /// packed rows only and on the CPU and Vulkan for every representation.
     #[test]
     fn forms_are_named_by_their_backend() {
         for backend in BackendName::ALL {
             for info in registry::representations() {
                 let forms = forms(backend, info.id);
-                let valued = backend == BackendName::Cpu
+                let valued = matches!(backend, BackendName::Cpu | BackendName::Vulkan)
                     || matches!(info.kind, registry::RepresentationKind::PackedRows(_));
                 let named = forms.iter().map(|(name, _)| *name).collect::<Vec<_>>();
                 assert_eq!(named, if valued { names(backend).to_vec() } else { Vec::new() }, "{}", info.name);
@@ -899,7 +961,7 @@ mod tests {
     /// Metal's admissions of every representation it imports: PACK (folds,
     /// centre, offset, residue), INT8 and the matrix GEMV product, as
     /// `metal_packing`, `metal_int8` and `metal_matrix` admit each over the
-    /// lane codes `metal_lanes` delivers (every code-plane split up to 8
+    /// lane codes `producers::lanes` delivers (every code-plane split up to 8
     /// bits, codebook and grid of `i8` values; no odd codes).
     #[test]
     fn metal_admissions_are_pinned() {
@@ -1010,12 +1072,153 @@ mod tests {
         ];
         for (storage, packing, int8, matrix) in expected {
             let id = registry::storage(storage, registry::Layout::Rows32).unwrap();
-            let axes = registry::decode_axes(id).unwrap();
+            let weight = Weight::of(registry::representation_info(id)).unwrap();
             assert_eq!(
-                (metal_packing(&axes), metal_int8(&axes), metal_matrix(&axes)),
+                (metal_packing(&weight), metal_int8(&weight), metal_matrix(&weight)),
                 (packing, int8, matrix),
                 "{storage}"
             );
         }
+    }
+
+    /// A grid weight's code planes are its entries' whole bytes (the low
+    /// plane) and the rest (the high plane), in the bits the native ABI
+    /// renders (`CODE_LOW_BITS`, `CODE_HIGH_BITS`, the decode axes' own) and
+    /// the producers read (`AxisKey`): the units of Vulkan's grid patterns.
+    #[test]
+    fn grid_planes_are_an_entrys_whole_bytes_and_the_rest() {
+        let mut grids = 0;
+        for info in registry::representations() {
+            let Some(axes) = registry::decode_axes(info.id) else { continue };
+            let registry::ValueCodes::Grid(grid) = axes.coding.codes() else { continue };
+            grids += 1;
+            let bits = grid.entry_bits();
+            assert_eq!((axes.low, axes.high), (bits / 8 * 8, bits % 8), "{}", info.name);
+            let key = axes.axis_key();
+            assert_eq!((key.low, key.high), (axes.low, axes.high), "{}", info.name);
+        }
+        assert!(grids > 0, "the registry has grid weights");
+    }
+
+    /// Vulkan's decoder reads every packed-rows weight of its resident layout
+    /// (`rows16`), within its producers' requirements (`DECODED`, which every
+    /// Vulkan native that binds a packed weight declares, `dense.seismic`).
+    #[test]
+    fn vulkan_decodes_every_rows16_weight() {
+        let undecoded: Vec<&str> = registry::representations()
+            .iter()
+            .filter(|info| {
+                matches!(&info.kind, registry::RepresentationKind::PackedRows(rows) if rows.layout == registry::Layout::Rows16)
+            })
+            .filter(|info| !vulkan_decoded(info))
+            .map(|info| info.name)
+            .collect();
+        assert!(undecoded.is_empty(), "rows16 weights Vulkan's producers do not decode (`vulkan/producers.decl`): {undecoded:?}");
+    }
+
+    /// The parameter prefix a native source line binds a packet decoder
+    /// slot to (`#define KERNEL_W<n> SEISMIC_<PARAMETER>`, `packets.glsl`).
+    fn slot_binding(line: &str) -> Option<&str> {
+        let slot = line.trim_start().strip_prefix("#define KERNEL_W")?;
+        let bound = slot.strip_prefix(|digit: char| digit.is_ascii_digit())?;
+        bound.strip_prefix(char::is_whitespace)?.split_whitespace().next()
+    }
+
+    /// Whether `conjuncts` (a native's `where`, its projections' included)
+    /// hold only where `form(element, DECODED) == 1`: one of them is that
+    /// comparison, or some are it under guards (`GUARD or form(..) == 1`, a
+    /// gated projection's) that never all hold. The guards are decided over
+    /// the one dimension they read, at every value up to past their greatest
+    /// constant, which is exact for comparisons of it with constants; guards
+    /// of any other shape prove nothing.
+    fn admits_only_decoded(conjuncts: &[&NativeCondition], element: &str) -> bool {
+        let admission = |condition: &NativeCondition| {
+            let NativeCondition::Compare { comparison: NativeComparison::Eq, left, right } = condition else {
+                return false;
+            };
+            matches!(
+                (left, right),
+                (NativeNatExpr::Element(read, ElementQuery::Form(form)), NativeNatExpr::Constant(1))
+                    | (NativeNatExpr::Constant(1), NativeNatExpr::Element(read, ElementQuery::Form(form)))
+                    if read == element && *form == VULKAN_DECODED
+            )
+        };
+        let mut guards: Vec<&NativeCondition> = Vec::new();
+        for &conjunct in conjuncts {
+            if admission(conjunct) {
+                return true;
+            }
+            if let NativeCondition::Or(left, right) = conjunct {
+                if admission(&**right) {
+                    guards.push(&**left);
+                } else if admission(&**left) {
+                    guards.push(&**right);
+                }
+            }
+        }
+        let mut names = Vec::new();
+        let mut constants = std::collections::BTreeSet::new();
+        for guard in &guards {
+            guard.dimensions(&mut names);
+            guard.constants(&mut constants);
+        }
+        names.sort();
+        names.dedup();
+        let [name] = names.as_slice() else {
+            return false;
+        };
+        let past = constants.last().map_or(0, |greatest| greatest + 1);
+        (0..=past).all(|value| {
+            guards.iter().any(|guard| {
+                guard.decided(&|dimension: &str| (dimension == name.as_str()).then_some(value), &|_: &str| None)
+                    == Some(false)
+            })
+        })
+    }
+
+    /// Every weight a Vulkan native binds to a packet decoder slot is one
+    /// its declaration admits only where `DECODED` holds, through its own
+    /// `where` or its projection's, so `packets.glsl`'s `#error`s (a slot
+    /// its producers do not decode, or of neither dense nor packed rows) are
+    /// invariant violations no admitted configuration reaches.
+    #[test]
+    fn vulkan_natives_bind_only_decoded_weights() {
+        let module = crate::analysis::tests::kernels();
+        let mut bound = 0;
+        let mut unadmitted = Vec::new();
+        for entry in module.entries() {
+            let Some(native) = module.native_implementation(entry.id, BackendName::Vulkan) else { continue };
+            let asset = module.native_asset(entry.id, BackendName::Vulkan).expect("a Vulkan native has a source");
+            let mut conjuncts = Vec::new();
+            if let Some(constraint) = &native.constraint {
+                constraint.conjuncts(&mut conjuncts);
+            }
+            let slots: std::collections::BTreeSet<&str> = asset.text.lines().filter_map(slot_binding).collect();
+            for slot in slots {
+                let parameter = entry
+                    .parameters
+                    .iter()
+                    .find(|parameter| format!("SEISMIC_{}", native_macro(&parameter.name)) == slot)
+                    .unwrap_or_else(|| panic!("`{}` binds a weight slot to `{slot}`, no parameter of its entry", entry.name));
+                let ParameterSummaryKind::Tensor { element, .. } = &parameter.kind else {
+                    panic!("`{}` binds a weight slot to `{}`, which is no tensor", entry.name, parameter.name);
+                };
+                bound += 1;
+                let admitted = match element {
+                    ElementSummary::Fixed(name) => {
+                        registry::representation(name).is_some_and(|id| VULKAN_DECODED.of(id) == 1)
+                    }
+                    ElementSummary::Parameter(element) => admits_only_decoded(&conjuncts, element),
+                };
+                if !admitted {
+                    unadmitted.push(format!("{} ({}): {}", entry.name, native.declared_in, parameter.name));
+                }
+            }
+        }
+        assert!(bound > 0, "some Vulkan native binds a weight");
+        assert!(
+            unadmitted.is_empty(),
+            "Vulkan natives bind weights they do not admit by `form(W, DECODED) == 1`: {unadmitted:#?}"
+        );
     }
 }

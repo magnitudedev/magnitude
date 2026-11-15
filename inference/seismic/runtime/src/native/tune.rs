@@ -7399,6 +7399,9 @@ fn update_declaration_digest(
         scratch,
         launches,
         repeat,
+        formation,
+        segments,
+        ordered_segments,
     } = implementation;
     digest.update(b"native-declaration-v3");
     digest.update(format!("{entry_name:?}").as_bytes());
@@ -7416,6 +7419,17 @@ fn update_declaration_digest(
     // nothing: a declaration's identity changes only with what it forms.
     if !launch_records.is_empty() {
         digest.update(format!("{launch_records:?}").as_bytes());
+    }
+    // Likewise a formation: only a declaration that forms operands names one.
+    if let Some(formation) = formation {
+        digest.update(format!("{formation:?}").as_bytes());
+    }
+    // And a grouping: only a segmented projection's declaration names one.
+    if let Some(segments) = segments {
+        digest.update(format!("segments {segments:?}").as_bytes());
+    }
+    if ordered_segments.iter().any(|ordered| *ordered) {
+        digest.update(format!("ordered_segments {ordered_segments:?}").as_bytes());
     }
     // A stable entry identity names the whole module, with the paths its
     // sources were built from; the content names the entry's closure alone.

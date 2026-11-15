@@ -128,6 +128,10 @@ template <typename E> class Cell {
 
 template <typename E> struct Out {
     explicit Out(device Cell<E> *cells) : cells(cells) {}
+    // The tensor from element `index` on, read-only, for vector and staged loads of owner-written elements.
+    device const uchar *stored(ulong index = 0) const {
+        return reinterpret_cast<device const uchar *>(&cells[index].stored);
+    }
 
     // Element `index`, as F32.
     float at(ulong index) const { return E::load(cells[index].stored); }

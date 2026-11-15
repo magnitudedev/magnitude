@@ -236,24 +236,244 @@ pub struct NativeDecl {
     /// The projection whose forms the declaration takes; checking reads the
     /// declaration only once it is expanded, which leaves this `None`.
     pub project: Option<NativeProjectDecl>,
+    /// The kind of rows (`rows KIND`) the declaration was expanded over: set
+    /// by the expansion, which the checker compares with its kernel's
+    /// prologue.
+    pub projected_rows: Option<RowsKind>,
+    /// The weights each segment serves, set by the expansion of a `segmented`
+    /// projection: the implementation's `segments`.
+    pub projected_segments: Option<Vec<usize>>,
+    /// Whether each segment of a `segmented` projection accumulates in the
+    /// reference order (`ordered`), parallel to `projected_segments`.
+    pub projected_ordered: Vec<bool>,
+    /// The CPU operator's formation of the operands the `project` line
+    /// names, set by the expansion.
+    pub formation: Option<NativeFormationDecl>,
     /// Every launch in dispatch order, those of the `repeat` block included.
     pub launches: Vec<NativeLaunchDecl>,
     pub repeat: Option<NativeRepeatDecl>,
     pub span: Span,
 }
 
-/// `project PROJECTION VARIANT (WEIGHT, ..)`: the entry's projection of its
-/// weight ports, by the named projection's `VARIANT` (`paired`: two weights
-/// one activation row serves, `single`: one).
+/// The kind of rows a projecting entry projects (`rows KIND`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowsKind {
+    /// The prologue passes the rows as given.
+    Plain,
+    /// The prologue forms the rows, normalizing them: a stage launch
+    /// materializes them for more than one row.
+    Rms,
+    /// A stage launch always forms the rows, whatever the row count.
+    Staged,
+}
+
+impl RowsKind {
+    pub const ALL: [RowsKind; 3] = [RowsKind::Plain, RowsKind::Rms, RowsKind::Staged];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            RowsKind::Plain => "plain",
+            RowsKind::Rms => "rms",
+            RowsKind::Staged => "staged",
+        }
+    }
+
+    pub fn named(name: &str) -> Option<RowsKind> {
+        Self::ALL.into_iter().find(|kind| kind.name() == name)
+    }
+}
+
+/// `project PROJECTION VARIANT (WEIGHT, ..) [shared (WEIGHT, ..)] [down (WEIGHT)] [groups G] [parts P] [gathered PORT] [rows KIND [publishes (result N)]] [ordered (WEIGHT, ..)]`:
+/// the entry's projection of its weight ports, by the named projection's
+/// `VARIANT` (`paired`: two weights one activation row serves, `single`:
+/// one), over `G` groups of each weight's rows where it names them, over `P`
+/// parts of its columns where it names them (each weight then `[N, P * X]`,
+/// each part's rows of their own, `rms` rows normalized per part), over the
+/// weight rows a `tensor[N]` port selects where it is `gathered` (its extent
+/// is the projection's `N`; a `tensor[M, I, N]` port selects them per
+/// activation row), over rows of the kind `KIND` (`plain` by default), whose
+/// formed rows the entry's result `N` is (`publishes`), and the products of
+/// the weights it `ordered` sum in the reference order. Lines of `if (WORD)`
+/// or `unless (WORD)` after it hold every launch the line expands to.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NativeProjectDecl {
     pub projection: Ident,
     pub variant: Ident,
     pub weights: Vec<Ident>,
+    /// `over (ROWS, WIDTH)` after a weight, parallel to `weights`: the rows
+    /// and width the weight multiplies where it has its own
+    /// (`NativeProjectOver`).
+    pub weight_overs: Vec<Option<NativeProjectOver>>,
+    /// `planes (PLANE, ..) over (ROWS, WIDTH)` in place of a weight,
+    /// parallel to `weights`: the ports of a plane set (one weight stored as
+    /// planes, its rows and width those of its `over`), empty for a weight
+    /// that is one port.
+    pub weight_planes: Vec<Vec<Ident>>,
+    /// `over (ROWS, WIDTH)` after the list: the activation rows and width
+    /// the entry's weights multiply, for an entry whose weights share no
+    /// `[N, K]` shape (the CPU's): `weights` then name element parameters.
+    pub over: Option<NativeProjectOver>,
+    /// `segmented` only: the weights each segment serves, in order, where
+    /// the line groups them (`((b, x), c)`: a segment of two weights one
+    /// activation row serves, then one of a single weight); empty where it
+    /// does not (a weight a segment).
+    pub served: Vec<usize>,
+    /// A routed projection's (`choice`, `summed`): the shared expert's
+    /// weights (`shared (..)`), projected beside the chosen experts'.
+    pub shared: Vec<Ident>,
+    /// A routed `grouped` projection's: the weight its expansion's products
+    /// project by (`down (..)`).
+    pub down: Option<Ident>,
+    pub groups: Option<Ident>,
+    pub parts: Option<Ident>,
+    /// `restate NAME` lines after it: the projection's named `mapping`s, taken as
+    /// if their `restate` lines were the entry's own.
+    pub mappings: Vec<Ident>,
+    pub gathered: Option<Ident>,
+    pub rows: Option<Ident>,
+    /// `publishes (result N)`: the rows the operator forms (`rows rms` or
+    /// `staged`) are the entry's result `N`, stored by the launch that forms
+    /// them in place of the projection's `staged` scratch (`PUBLISHED`).
+    pub publishes: Option<NativePublishDecl>,
+    /// `ordered (WEIGHT, ..)`: the weights whose output sums accumulate in
+    /// the reference order (`ORDERED`), because they feed a discrete choice.
+    pub ordered: Vec<Ident>,
+    /// `if (WORD)` and `unless (WORD)` lines after the `project` line: held
+    /// by every launch it expands to, as a launch's own are (a launch of the
+    /// entry's keeps only its own).
+    pub guard: Vec<NativeConditionDecl>,
+    /// `restate [LAUNCH] PARAM ..` lines after it: a projection's or one of its
+    /// launches' parameter taking the entry's range and default.
+    pub restated: Vec<NativeRestateDecl>,
+    /// `operand (PARAMETER [normed (WEIGHT, EPSILON)], ..)`: the tensor
+    /// parameters whose operands the projection's operand buffers (their Q8
+    /// blocks) and the entry's own `operand rows` buffers (their formed rows)
+    /// hold, each one for one in the order the expansion places them (a CPU
+    /// consumer whose input a producer may form), each with the norm its
+    /// rows are formed under, where they are.
+    pub operands: Vec<NativeOperandDecl>,
+    /// `emits (RESULT over (ROWS, WIDTH), ..)`: the results whose operands the
+    /// entry's launches write, each `ROWS` rows of `WIDTH` values (a CPU
+    /// producer); a line of these alone (`project NAME emits (..)`) takes
+    /// nothing else of the projection.
+    pub emits: Vec<NativeEmitDecl>,
     /// The declaration's scratch buffers before the line: the projection's
     /// follow them, and its later ones follow the projection's.
     pub scratch_before: usize,
     pub span: Span,
+}
+
+/// The result whose rows the operator forms (`publishes (result N)`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativePublishDecl {
+    pub result: u64,
+    pub span: Span,
+}
+
+/// One result a producer emits the operand of (`emits (result N over
+/// (ROWS, WIDTH) [normed (WEIGHT, EPSILON)])`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeEmitDecl {
+    pub result: u64,
+    pub over: NativeProjectOver,
+    pub norm: Option<OperandNormDecl>,
+    pub span: Span,
+}
+
+/// One operand a consumer's buffers hold (`operand (SOURCE [tiles
+/// (COND)], ..)`): the rows its source gives, their Q8 blocks tiles of a
+/// `tiled` projection only where `COND` holds (absent: always).
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeOperandDecl {
+    pub source: OperandSourceDecl,
+    pub tiles: Option<Expr>,
+}
+
+/// Where an operand's rows come from.
+#[derive(Clone, Debug, PartialEq)]
+pub enum OperandSourceDecl {
+    /// A tensor parameter's rows (`PARAMETER [at (INDEX)] [within (FIRST,
+    /// COUNT)] [normed (WEIGHT, EPSILON)]`): each the row of the parameter
+    /// that `INDEX` (a `tensor[ROWS] i32` port) names where it names one,
+    /// only rows `FIRST[0]` to `FIRST[0] + COUNT[0]` (`tensor[1] i32`
+    /// ports) where it has a window, formed under the norm where it has one.
+    Parameter {
+        parameter: Ident,
+        at: Option<Ident>,
+        within: Option<[Ident; 2]>,
+        norm: Option<OperandNormDecl>,
+    },
+    /// Rows whose values the entry's function computes (`values
+    /// (FUNCTION)`), a row at a time.
+    Values(Ident),
+    /// Rows of a weight's own (`W over (ROWS, WIDTH)`) that one of the
+    /// entry's launches stores and forms itself (`emitted`, through the
+    /// operator's `projection::emit`).
+    Emitted(Span),
+}
+
+/// The CPU operator's formation of a consumer's operands, set by the
+/// expansion (`project .. operand (..)`): its `form` launch, whose body the
+/// build generates, and each operand it forms, in the order the line names
+/// them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeFormationDecl {
+    pub launch: Ident,
+    pub operands: Vec<FormedOperandDecl>,
+}
+
+/// One operand a formation forms: `rows` rows of `width` values from
+/// `values` (in `groups` runs of `width` columns of each row, group-major);
+/// its formed rows in buffer `staged` and, where `formed` holds, its Q8
+/// blocks in `quantized`, as tiles where the condition `tiles` holds and the weights take them, for
+/// the products over `weights` (ports).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FormedOperandDecl {
+    pub values: FormedValuesDecl,
+    pub rows: Expr,
+    pub width: Expr,
+    pub groups: Expr,
+    pub staged: Ident,
+    pub quantized: Ident,
+    pub formed: Expr,
+    pub weights: Vec<Ident>,
+    pub tiles: Expr,
+}
+
+/// The values a formation forms an operand from: a parameter's rows (each
+/// the row `at` names where it names one, only the window `within` where it
+/// has one), or the entry's function's.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FormedValuesDecl {
+    Parameter { parameter: Ident, at: Option<Ident>, within: Option<[Ident; 2]> },
+    Function(Ident),
+}
+
+/// The norm an operand's rows are formed under (`normed (WEIGHT,
+/// EPSILON)`): the entry's norm weight port and its epsilon scalar, by
+/// name. A consumer's operand and its producer's emitted one pair only
+/// under one norm, bound to the same weight and epsilon.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OperandNormDecl {
+    pub weight: Ident,
+    pub epsilon: Ident,
+    pub span: Span,
+}
+
+/// The activation rows (`M`) and their width (`K`) a `project` line gives.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeProjectOver {
+    pub rows: Expr,
+    pub width: Expr,
+}
+
+/// `restate [LAUNCH] NAME in [..] default ..`: the entry's range and default for
+/// a parameter of its projection (entry-wide) or of one of the projection's
+/// launches (`LAUNCH`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeRestateDecl {
+    pub launch: Option<Ident>,
+    pub param: NativeParamDecl,
 }
 
 /// One consumer projection for a backend: the forms of projecting
@@ -283,6 +503,18 @@ pub struct ProjectionDecl {
     pub constraints: Vec<Gated<Expr>>,
     pub scratch: Vec<ProjectionScratchDecl>,
     pub launches: Vec<ProjectionLaunchDecl>,
+    /// The `mapping NAME:` blocks: restates an entry takes by name.
+    pub mappings: Vec<ProjectionMapping>,
+    pub span: Span,
+}
+
+/// `mapping NAME:` and its `restate` lines: parameter ranges and defaults several
+/// entries share, owned once by the projection and taken by an entry's
+/// `restate NAME`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProjectionMapping {
+    pub name: Ident,
+    pub restated: Vec<NativeRestateDecl>,
     pub span: Span,
 }
 
@@ -291,7 +523,8 @@ pub struct ProjectionDecl {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Gated<T> {
     pub item: T,
-    pub variant: Option<Ident>,
+    /// `for VARIANT | ..`: the variants it belongs to; empty, every one.
+    pub variants: Vec<Ident>,
 }
 
 /// A projection's scratch: one buffer, or (`each W:`) buffers per weight,
@@ -307,8 +540,8 @@ pub enum ProjectionScratchDecl {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProjectionLaunchDecl {
     pub launch: NativeLaunchDecl,
-    pub variant: Option<Ident>,
-    pub param_variants: Vec<Option<Ident>>,
+    pub variants: Vec<Ident>,
+    pub param_variants: Vec<Vec<Ident>>,
 }
 
 /// `let NAME = EXPR`: a name for a natural-number expression over entry
@@ -388,7 +621,49 @@ pub struct NativeScratchDecl {
     pub sync: bool,
     /// The buffer is sized only when this condition holds.
     pub when: Option<Expr>,
+    /// The buffer is a projection's operand (`ScratchOperandDecl`).
+    pub operand: Option<ScratchOperandDecl>,
+    /// Expanded on a producer (`project .. emits (result N ..)`): the result
+    /// `N` whose emitted operand the buffer serves, one of the projection's
+    /// `for emits` buffers (its forms and their arrival counters alike).
+    pub emission: Option<u64>,
     pub span: Span,
+}
+
+/// A buffer that holds one form of an operand of the entry: the activation
+/// rows' INT8 form (`projection quantized for cpu`'s Q8 blocks) or its F32
+/// rows (`rows`: the formed rows exact products read, under the operand's
+/// norm where it has one), which either the entry forms from one of its
+/// tensor parameters or the producer of that tensor writes in its epilogue.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ScratchOperandDecl {
+    /// `operand [rows] [when PAIRS] [formed (COND)] [nvfp4 (COND)]`, as a
+    /// projection or a consumer writes it on a buffer. On a consumer's
+    /// buffer: `when`, the condition under which a producer's operand stands
+    /// for the one the entry forms (absent: always); `formed`, when the
+    /// entry's formation writes this form (absent: always); `nvfp4`, on a
+    /// rows form, when the formation applies the NVFP4 operand transform to
+    /// the rows (absent: never). On an `emits` buffer, none: the form a
+    /// producer writes.
+    Declared { rows: bool, when: Option<Expr>, formed: Option<Expr>, nvfp4: Option<Expr> },
+    /// Expanded on a consumer (`project .. operand (PARAMETER, ..)`): the
+    /// operand of tensor parameter `parameter`, which the entry's launch
+    /// `formation` forms unless a producer emits it and `pairs` holds; the
+    /// launch writes this form where `formed` holds, its rows as NVFP4
+    /// operands where `nvfp4` holds (a Q8 form's is `false`).
+    Formed {
+        parameter: Ident,
+        formation: Ident,
+        pairs: Expr,
+        rows: bool,
+        norm: Option<OperandNormDecl>,
+        formed: Expr,
+        nvfp4: Expr,
+    },
+    /// Expanded on a producer (`project .. emits (RESULT over (..), ..)`): the
+    /// operand of its result (the buffer's `emission`), which its launches
+    /// write.
+    Emitted { rows: bool, norm: Option<OperandNormDecl> },
 }
 
 /// One ordered dispatch of a kernel function from the native source.

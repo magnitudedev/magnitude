@@ -38,12 +38,14 @@
 // projection GEMM pipeline staging every kind instead of 0.5 s and 213 MB
 // (seismic/hardware/rdna3-vulkan.md), and an RTX 3090's NVIDIA compiler
 // 4.4 s instead of 2.4 s for one staging two. The axes reach `#if` through
-// the prefix's expansion alone: glslang pastes no tokens there. A component
-// that dispatches on an axis states the values it implements, and a bound
-// slot outside them is an `#error`.
+// the prefix's expansion alone: glslang pastes no tokens there. The weights
+// the decoder reads, its code kinds and planes and the limits of its
+// components, are its producer's (`producers.decl`, rendered as
+// <seismic/producers.glsl>), which admission reads too (`DECODED`).
 //
 // This file is independent of any entry ABI.
 #include <seismic/element.glsl>
+#include <seismic/producers.glsl>
 
 #define PACKETS_CAT_(a, b) a##b
 #define PACKETS_CAT(a, b) PACKETS_CAT_(a, b)
@@ -51,6 +53,10 @@
 // dense one (its rows its axis AXIS, each of its elements' bytes).
 #define PACKETS_ROWS_PACKED(T) packets_rows16(PACKETS_CAT(T, _ROW_STRIDE_BYTES), PACKETS_CAT(T, _ROW_CODES), \
     PACKETS_CAT(T, _ROW_HIGH), PACKETS_CAT(T, _ROW_SCALES), PACKETS_CAT(T, _ROW_SUPERS))
+#define PACKETS_ROWS_DENSE_UNSTACKED(T) \
+    packets_rows16(((PACKETS_CAT(T, _RANK) == 1) \
+        ? (PACKETS_CAT(T, _EXTENT_0) * PACKETS_CAT(T, _STRIDE_0)) \
+        : PACKETS_CAT(T, _STRIDE_0)) * uint64_t(PACKETS_CAT(T, _PACKET_SIZE)), 0ul, 0ul, 0ul, 0ul)
 #define PACKETS_ROWS_DENSE(T, AXIS) \
     packets_rows16(PACKETS_CAT(T, _STRIDE_##AXIS) * uint64_t(PACKETS_CAT(T, _PACKET_SIZE)), 0ul, 0ul, 0ul, 0ul)
 
@@ -62,7 +68,7 @@
 #endif
 #define PACKETS_W0 PACKETS_W0_AXES(SEISMIC_AXIS_ID)
 #if defined(KERNEL_W0) && PACKETS_W0_AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_DENSE
-#define PACKETS_W0_ROWS PACKETS_ROWS_DENSE(KERNEL_W0, 0)
+#define PACKETS_W0_ROWS PACKETS_ROWS_DENSE_UNSTACKED(KERNEL_W0)
 #define PACKETS_W0_STACKED_ROWS PACKETS_ROWS_DENSE(KERNEL_W0, 1)
 #elif defined(KERNEL_W0) && PACKETS_W0_AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_ROWS
 #define PACKETS_W0_ROWS PACKETS_ROWS_PACKED(KERNEL_W0)
@@ -77,7 +83,7 @@
 #endif
 #define PACKETS_W1 PACKETS_W1_AXES(SEISMIC_AXIS_ID)
 #if defined(KERNEL_W1) && PACKETS_W1_AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_DENSE
-#define PACKETS_W1_ROWS PACKETS_ROWS_DENSE(KERNEL_W1, 0)
+#define PACKETS_W1_ROWS PACKETS_ROWS_DENSE_UNSTACKED(KERNEL_W1)
 #define PACKETS_W1_STACKED_ROWS PACKETS_ROWS_DENSE(KERNEL_W1, 1)
 #elif defined(KERNEL_W1) && PACKETS_W1_AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_ROWS
 #define PACKETS_W1_ROWS PACKETS_ROWS_PACKED(KERNEL_W1)
@@ -92,7 +98,7 @@
 #endif
 #define PACKETS_W2 PACKETS_W2_AXES(SEISMIC_AXIS_ID)
 #if defined(KERNEL_W2) && PACKETS_W2_AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_DENSE
-#define PACKETS_W2_ROWS PACKETS_ROWS_DENSE(KERNEL_W2, 0)
+#define PACKETS_W2_ROWS PACKETS_ROWS_DENSE_UNSTACKED(KERNEL_W2)
 #define PACKETS_W2_STACKED_ROWS PACKETS_ROWS_DENSE(KERNEL_W2, 1)
 #elif defined(KERNEL_W2) && PACKETS_W2_AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_ROWS
 #define PACKETS_W2_ROWS PACKETS_ROWS_PACKED(KERNEL_W2)
@@ -107,7 +113,7 @@
 #endif
 #define PACKETS_W3 PACKETS_W3_AXES(SEISMIC_AXIS_ID)
 #if defined(KERNEL_W3) && PACKETS_W3_AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_DENSE
-#define PACKETS_W3_ROWS PACKETS_ROWS_DENSE(KERNEL_W3, 0)
+#define PACKETS_W3_ROWS PACKETS_ROWS_DENSE_UNSTACKED(KERNEL_W3)
 #define PACKETS_W3_STACKED_ROWS PACKETS_ROWS_DENSE(KERNEL_W3, 1)
 #elif defined(KERNEL_W3) && PACKETS_W3_AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_ROWS
 #define PACKETS_W3_ROWS PACKETS_ROWS_PACKED(KERNEL_W3)
@@ -242,22 +248,15 @@ void packets_set_group(inout packets_packet packet, uint g, float scale, const b
 // grid code's entries: four a packet, their whole bytes (LOW bits) in the
 // grids plane and the rest (HIGH bits) in the grid high plane.
 
-// The code planes this file reads: 1-, 2- and 4-bit low planes with up to
-// two high bits, 8-bit low planes; grid entries of 8, 16 or 24 whole bits
-// with none, two or four more.
-#define PACKETS_READS_PLANES(AXES) (AXES(SEISMIC_AXIS_FORM) != SEISMIC_FORM_ROWS \
-    || (AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_GRID \
-        && (AXES(SEISMIC_AXIS_CODE_LOW_BITS) == 8 || AXES(SEISMIC_AXIS_CODE_LOW_BITS) == 16 \
-            || AXES(SEISMIC_AXIS_CODE_LOW_BITS) == 24) \
-        && (AXES(SEISMIC_AXIS_CODE_HIGH_BITS) == 0 || AXES(SEISMIC_AXIS_CODE_HIGH_BITS) == 2 \
-            || AXES(SEISMIC_AXIS_CODE_HIGH_BITS) == 4)) \
-    || (AXES(SEISMIC_AXIS_CODES) != SEISMIC_CODES_GRID \
-        && (((AXES(SEISMIC_AXIS_CODE_LOW_BITS) == 1 || AXES(SEISMIC_AXIS_CODE_LOW_BITS) == 2 \
-                    || AXES(SEISMIC_AXIS_CODE_LOW_BITS) == 4) \
-                && AXES(SEISMIC_AXIS_CODE_HIGH_BITS) <= 2) \
-            || (AXES(SEISMIC_AXIS_CODE_LOW_BITS) == 8 && AXES(SEISMIC_AXIS_CODE_HIGH_BITS) == 0))))
-#if !PACKETS_ALL(PACKETS_READS_PLANES)
-#error "packets: a weight slot's code planes are of a width this file does not read"
+// The weights the decoder reads are its producer's (`producers.decl`,
+// `PRODUCERS_DECODE`): their code planes and interpretations, offset codes'
+// exact bias (`packets_values`) and the coefficient structures
+// `packets_coefficients` reads. Admission takes a native only weights its
+// `DECODED` form admits, the same declaration, so a bound slot outside it is
+// an invariant violation.
+#define PACKETS_DECODED(AXES) (AXES(SEISMIC_AXIS_FORM) != SEISMIC_FORM_ROWS || PRODUCERS_DECODE(AXES))
+#if !PACKETS_ALL(PACKETS_DECODED)
+#error "packets: a bound weight slot is one DECODED does not admit (producers.decl)"
 #endif
 
 // Bytes 0,2,4,6 / 1,3,5,7 of a 16-bit field of 2-bit high codes, moved to
@@ -307,27 +306,8 @@ vec4 packets_unsigned_bytes(uint word) { return vec4(unpack8(word)); }
 // (`CODEBOOKS_TABLE_<ID>`, `PACKETS_CODEBOOK`), and E4M3 bytes
 // (`registry::ValueCodes::E4m3`) their values. A product
 // operand takes an offset off as the exact bias -(offset scale)
-// (`packets_values`): the offset is a power of two, without a stored bias.
-
-#define PACKETS_READS_CODES(AXES) (AXES(SEISMIC_AXIS_FORM) != SEISMIC_FORM_ROWS \
-    || AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_UNSIGNED \
-    || (AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_OFFSET \
-        && AXES(SEISMIC_AXIS_CODE_LOW_BITS) + AXES(SEISMIC_AXIS_CODE_HIGH_BITS) <= 7 \
-        && AXES(SEISMIC_AXIS_CODES_OFFSET) <= 128 \
-        && (AXES(SEISMIC_AXIS_CODES_OFFSET) & (AXES(SEISMIC_AXIS_CODES_OFFSET) - 1)) == 0 \
-        && AXES(SEISMIC_AXIS_COEFF_BIAS) == 0) \
-    || (AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_TWOS \
-        && AXES(SEISMIC_AXIS_CODE_LOW_BITS) + AXES(SEISMIC_AXIS_CODE_HIGH_BITS) == 8) \
-    || (AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_TABLE \
-        && AXES(SEISMIC_AXIS_CODE_LOW_BITS) + AXES(SEISMIC_AXIS_CODE_HIGH_BITS) == 4) \
-    || (AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_ODD \
-        && AXES(SEISMIC_AXIS_CODE_LOW_BITS) + AXES(SEISMIC_AXIS_CODE_HIGH_BITS) <= 8) \
-    || (AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_E4M3 \
-        && AXES(SEISMIC_AXIS_CODE_LOW_BITS) == 8 && AXES(SEISMIC_AXIS_CODE_HIGH_BITS) == 0) \
-    || AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_GRID)
-#if !PACKETS_ALL(PACKETS_READS_CODES)
-#error "packets: a weight slot's codes are of an interpretation this file does not read"
-#endif
+// (`packets_values`): the offset is a power of two, without a stored bias
+// (`producers.decl`).
 
 // The codebook value of `code` of slot axes `AXES` (`CODEBOOKS_TABLE_<id>`).
 #define PACKETS_CODEBOOK(AXES) PACKETS_CAT(CODEBOOKS_TABLE_, AXES(SEISMIC_AXIS_CODES_TABLE))
@@ -615,43 +595,6 @@ vec2 packets_scale_pair_at(const int scale, uint64_t at) {
 // code, signed by the local code's top bit.
 #define PACKETS_SIGNED_BIAS(AXES) (AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_ROWS \
     && AXES(SEISMIC_AXIS_COEFF_BIAS) == SEISMIC_BIAS_KIND_SIGNED)
-// A packet's local field bits (its groups' scale codes, and minimum codes,
-// of a coefficient group of 16 or 32: two groups or one), so that no `#if`
-// divides.
-#define PACKETS_FIELD_BITS(AXES) (AXES(SEISMIC_AXIS_COEFF_LOCAL_BITS) \
-    * (1 + (AXES(SEISMIC_AXIS_COEFF_BIAS) == SEISMIC_BIAS_KIND_MINIMUM)) \
-    * (1 + (AXES(SEISMIC_AXIS_COEFF_GROUP) == 16)))
-// Whether a field of F bits read from the plane fits the reader's four
-// bytes: it starts at a multiple of F's lowest set bit (at most 8) within a
-// byte, so it reaches F + 8 - that bit (`packets_coefficients`), at most 32.
-#define PACKETS_FIELD_SPANS(F) ((F) <= 25 || ((F) % 2 == 0 && (F) <= 26) || ((F) % 4 == 0 && (F) <= 28) \
-    || (F) % 8 == 0)
-// The coefficient structures this file reads: direct ones per 16 values or a
-// multiple of 32 (with a bias, each group's scale then its bias), and
-// hierarchical ones per 16 or 32 values whose local codes are unsigned, two's
-// complement, offset or odd, either carried by at most a group's grid
-// entries (less their sign bit where they sign a signed bias) or
-// in the scales plane, a packet's field below a word and within the reader's
-// four bytes, and a factor group's fields filling whole bytes (so that
-// storage groups' fields abut).
-#define PACKETS_READS_COEFFICIENTS(AXES) (AXES(SEISMIC_AXIS_FORM) != SEISMIC_FORM_ROWS \
-    || (AXES(SEISMIC_AXIS_COEFF) == SEISMIC_COEFF_DIRECT \
-        && (AXES(SEISMIC_AXIS_COEFF_GROUP) == 16 || AXES(SEISMIC_AXIS_COEFF_GROUP) % 32 == 0) \
-        && (AXES(SEISMIC_AXIS_COEFF_BIAS) == 0 || AXES(SEISMIC_AXIS_LOGICAL_GROUP) == AXES(SEISMIC_AXIS_COEFF_GROUP))) \
-    || (AXES(SEISMIC_AXIS_COEFF) == SEISMIC_COEFF_HIER \
-        && (AXES(SEISMIC_AXIS_COEFF_GROUP) == 16 || AXES(SEISMIC_AXIS_COEFF_GROUP) == 32) \
-        && (AXES(SEISMIC_AXIS_COEFF_LOCAL) == SEISMIC_CODES_UNSIGNED \
-            || AXES(SEISMIC_AXIS_COEFF_LOCAL) == SEISMIC_CODES_TWOS \
-            || AXES(SEISMIC_AXIS_COEFF_LOCAL) == SEISMIC_CODES_OFFSET \
-            || AXES(SEISMIC_AXIS_COEFF_LOCAL) == SEISMIC_CODES_ODD) \
-        && ((AXES(SEISMIC_AXIS_COEFF_CARRIED) == 0 \
-                && PACKETS_FIELD_BITS(AXES) < 32 && PACKETS_FIELD_SPANS(PACKETS_FIELD_BITS(AXES)) \
-                && AXES(SEISMIC_AXIS_COEFF_FACTOR_GROUP) * PACKETS_FIELD_BITS(AXES) % 256 == 0) \
-            || (AXES(SEISMIC_AXIS_COEFF_CARRIED) != 0 && AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_GRID \
-                && 8 * AXES(SEISMIC_AXIS_COEFF_LOCAL_BITS) <= AXES(SEISMIC_AXIS_COEFF_GROUP)))))
-#if !PACKETS_ALL(PACKETS_READS_COEFFICIENTS)
-#error "packets: a weight slot's coefficients are of a structure this file does not read"
-#endif
 
 // A `bits`-bit local coefficient code's value: unsigned, two's complement,
 // offset, or odd (2 (c - K) + 1, K the offset). A scale code is

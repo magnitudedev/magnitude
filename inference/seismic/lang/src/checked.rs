@@ -986,6 +986,10 @@ pub enum SignatureType {
     Range,
 }
 
+/// The most segments a `segmented` projection has
+/// ([`NativeImplementation::segments`]).
+pub const PROJECTION_SEGMENTS: usize = 4;
+
 /// One direct top-level native implementation attached to a checked entry.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeImplementation {
@@ -1012,7 +1016,7 @@ pub struct NativeImplementation {
     pub launch_records: Vec<(usize, Vec<RecordPort>)>,
     /// The `where` condition restricting admissible parameter
     /// configurations. It reads only static dimensions, parameters and the
-    /// elements (`operands(W)`, `form(W, NAME)`, `packed(W)`, `unit_columns(W)`), whose reads make the
+    /// elements (`operands(W)`, `form(W, NAME)`, `packed(W)`, `dense_bytes(W)`, `unit_columns(W)`), whose reads make the
     /// configurations the implementation's at its bindings
     /// ([`Self::at_elements`]).
     pub constraint: Option<NativeCondition>,
@@ -1022,6 +1026,66 @@ pub struct NativeImplementation {
     pub launches: Vec<NativeLaunch>,
     /// The launches a call dispatches more than once.
     pub repeat: Option<NativeRepeat>,
+    /// The CPU operator's formation of the operands its `project` line
+    /// names: a launch whose body the build generates.
+    pub formation: Option<NativeFormation>,
+    /// A `segmented` projection's grouping of its weights: the weights each
+    /// segment serves (one, or a pair), segment by segment. Its kernel never
+    /// states it: the ABI prefix renders it (`SEISMIC_PROJECTION_SEGMENTS`,
+    /// `SEISMIC_SEGMENT_WEIGHTS_<s>`), and the projection library reads it
+    /// from there alone.
+    pub segments: Option<Vec<usize>>,
+    /// For a `segmented` projection, whether each segment's weights accumulate
+    /// in the reference order (`SEISMIC_SEGMENT_ORDERED_<s>`), parallel to
+    /// `segments`; empty otherwise.
+    pub ordered_segments: Vec<bool>,
+}
+
+/// The CPU operator's formation launch (`<entry>_form`, ordinal `launch`)
+/// and the operands it forms, in order. Its grid is the operator's: one
+/// work item a part of a row of every operand's rows in turn, a row's parts
+/// whole Q8 blocks (`ceil_div(width, Q8_VALUES * rows)` a row, `rows`
+/// every operand's together), a row taken as NVFP4 operands formed whole
+/// by its first part.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeFormation {
+    pub launch: u32,
+    pub operands: Vec<NativeFormedOperand>,
+}
+
+/// One operand a formation forms: `rows` rows of `width` values from
+/// `values`, in `groups` runs of `width` columns of each row (group-major).
+/// The formed rows go to scratch buffer `staged` and, where `formed` holds,
+/// their Q8 blocks to `quantized` (both by ordinal), as
+/// tiles where the condition `tiles` holds and every one of `weights` (its
+/// products' weight parameters, by ordinal) takes them; the rows are NVFP4
+/// operands where every weight takes them, and where only some do, the
+/// buffer holds the NVFP4 copy after the rows.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeFormedOperand {
+    pub values: NativeFormedValues,
+    pub rows: NativeNatExpr,
+    pub width: NativeNatExpr,
+    pub groups: NativeNatExpr,
+    pub staged: u32,
+    pub quantized: u32,
+    pub formed: NativeCondition,
+    pub weights: Vec<u32>,
+    pub tiles: NativeCondition,
+}
+
+/// The values a formation forms an operand from.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NativeFormedValues {
+    /// The rows of the tensor parameter the buffer `staged`'s operand names
+    /// (`NativeOperand::Formed`, with its norm), each the row `at` (a
+    /// `tensor[ROWS] i32` parameter, by ordinal) names where it names one,
+    /// only rows `first[0]` to `first[0] + count[0]` where `within` names
+    /// the `[first, count]` (`tensor[1] i32` parameters, by ordinal).
+    Parameter { at: Option<u32>, within: Option<[u32; 2]> },
+    /// The rows the entry's function computes, one whole row a call
+    /// (`fn FUNCTION(cx, row, out, shared)`).
+    Function(String),
 }
 
 /// Consecutive launches a call dispatches in order `count` times, each round
@@ -1166,7 +1230,7 @@ impl OnDevice {
 
 impl NativeImplementation {
     /// The implementation as formed at `bindings`: every element read
-    /// (`operands(W)`, `form(W, NAME)`, `packed(W)`, `unit_columns(W)`) is its value for the representation
+    /// (`operands(W)`, `form(W, NAME)`, `packed(W)`, `dense_bytes(W)`, `unit_columns(W)`) is its value for the representation
     /// `W` is bound to. The checker admits element reads only over the
     /// entry's element parameters, and a formation binds every one of them.
     /// `None` when a read has no value at its binding (`unit_columns(U)`
@@ -1209,6 +1273,93 @@ impl NativeImplementation {
         (!self.reads_device()).then_some(DeviceBound(self))
     }
 
+    /// The default configuration at the given static values, when neither
+    /// the parameters' defaults nor the domain's constraints read a device
+    /// property (`device.NAME`); `None` when either does, so a default is
+    /// only computed where it does not depend on a device.
+    pub fn default_specialization_without_device(
+        &self,
+        statics: &NativeSpecialization,
+    ) -> Option<Result<NativeSpecialization, NativeSpecializationError>> {
+        (!self.specialization_reads_device())
+            .then(|| DeviceBound(self).default_specialization(statics))
+    }
+
+    /// Whether any parameter default or domain constraint reads `device.NAME`.
+    fn specialization_reads_device(&self) -> bool {
+        let mut reads = Vec::new();
+        for parameter in self
+            .params
+            .iter()
+            .chain(self.launches.iter().flat_map(|launch| &launch.params))
+        {
+            match &parameter.default {
+                NativeDefault::Value(value) => value.device_reads(&mut reads),
+                NativeDefault::Least(bound) | NativeDefault::Greatest(bound) => {
+                    bound.device_reads(&mut reads);
+                }
+            }
+        }
+        if let Some(constraint) = &self.constraint {
+            constraint.device_reads(&mut reads);
+        }
+        !reads.is_empty()
+    }
+
+    /// How this CPU native binds element parameter `name`: [`CpuBinding::Dense`]
+    /// where the declaration forms operands (for `A` and the formed source
+    /// parameter), [`CpuBinding::Weights`] where an operand is formed or
+    /// emitted under a norm of `name`, and otherwise the entry's binding
+    /// ([`ElementDomain::cpu_binding`]).
+    pub fn cpu_binding(&self, entry: &EntryInfo, name: &str) -> Option<CpuBinding> {
+        Self::cpu_binding_with_scratch(entry, &self.scratch, name)
+    }
+
+    pub(crate) fn cpu_binding_with_scratch(
+        entry: &EntryInfo,
+        scratch: &[NativeScratch],
+        name: &str,
+    ) -> Option<CpuBinding> {
+        let declared = entry
+            .element_domain
+            .parameters()
+            .iter()
+            .find(|parameter| parameter.name == name)?;
+        let parameter_has = |ordinal: u32| {
+            entry.parameters.get(ordinal as usize).is_some_and(|parameter| {
+                matches!(
+                    &parameter.kind,
+                    ParameterSummaryKind::Tensor {
+                        element: ElementSummary::Parameter(element),
+                        ..
+                    } if element == name
+                )
+            })
+        };
+        let operand_dense = scratch.iter().any(|scratch| match &scratch.operand {
+            Some(NativeOperand::Formed { parameter, .. }) => name == "A" || parameter_has(*parameter),
+            _ => false,
+        });
+        let operand_norm = scratch.iter().any(|scratch| match &scratch.operand {
+            Some(NativeOperand::Formed { norm: Some(norm), .. })
+            | Some(NativeOperand::Emitted { norm: Some(norm), .. }) => parameter_has(norm.weight),
+            _ => false,
+        });
+        let base = entry.element_domain.cpu_binding(name);
+        if operand_dense && operand_norm {
+            None
+        } else if operand_dense {
+            let dense_ok = matches!(base, None | Some(CpuBinding::Dense | CpuBinding::Weights))
+                && !declared.uses.component_read
+                && !declared.uses.integer_code_read;
+            dense_ok.then_some(CpuBinding::Dense)
+        } else if operand_norm {
+            matches!(base, None | Some(CpuBinding::Weights)).then_some(CpuBinding::Weights)
+        } else {
+            base
+        }
+    }
+
     /// Whether any expression or condition of the implementation reads
     /// `device.NAME`.
     fn reads_device(&self) -> bool {
@@ -1245,6 +1396,11 @@ impl NativeImplementation {
         for scratch in &self.scratch {
             expression(&scratch.bytes);
             scratch.when.iter().for_each(&mut *condition);
+            if let Some(NativeOperand::Formed { pairs, formed, nvfp4, .. }) = &scratch.operand {
+                condition(pairs);
+                condition(formed);
+                condition(nvfp4);
+            }
         }
         for launch in &self.launches {
             for declared in &launch.params {
@@ -1257,6 +1413,11 @@ impl NativeImplementation {
         }
         if let Some(repeat) = &self.repeat {
             expression(&repeat.count);
+        }
+        for operand in self.formation.iter().flat_map(|formation| &formation.operands) {
+            expression(&operand.rows);
+            expression(&operand.width);
+            expression(&operand.groups);
         }
     }
 
@@ -1280,6 +1441,22 @@ impl NativeImplementation {
                 .map(|scratch| NativeScratch {
                     bytes: expression(&scratch.bytes),
                     when: scratch.when.as_ref().map(condition),
+                    operand: scratch.operand.as_ref().map(|operand| match operand {
+                        NativeOperand::Formed { parameter, formation, pairs, rows, norm, formed, nvfp4 } => {
+                            NativeOperand::Formed {
+                                parameter: *parameter,
+                                formation: *formation,
+                                pairs: condition(pairs),
+                                rows: *rows,
+                                norm: *norm,
+                                formed: condition(formed),
+                                nvfp4: condition(nvfp4),
+                            }
+                        }
+                        NativeOperand::Emitted { result, rows, norm } => {
+                            NativeOperand::Emitted { result: *result, rows: *rows, norm: *norm }
+                        }
+                    }),
                     ..scratch.clone()
                 })
                 .collect(),
@@ -1298,6 +1475,19 @@ impl NativeImplementation {
             repeat: self.repeat.as_ref().map(|repeat| NativeRepeat {
                 count: expression(&repeat.count),
                 ..repeat.clone()
+            }),
+            formation: self.formation.as_ref().map(|formation| NativeFormation {
+                operands: formation
+                    .operands
+                    .iter()
+                    .map(|operand| NativeFormedOperand {
+                        rows: expression(&operand.rows),
+                        width: expression(&operand.width),
+                        groups: expression(&operand.groups),
+                        ..operand.clone()
+                    })
+                    .collect(),
+                ..formation.clone()
             }),
             ..self.clone()
         }
@@ -1674,6 +1864,68 @@ pub struct NativeScratch {
     /// keeps its ABI slot at the minimum charge and `bytes` is not
     /// evaluated. `None` is always active.
     pub when: Option<NativeCondition>,
+    /// The buffer holds one form of an operand of the call
+    /// (`NativeOperand`): the Q8 blocks of activation rows a CPU projection
+    /// multiplies, or their formed F32 rows, which the producer of those
+    /// rows may write in its epilogue. `None` for every other buffer.
+    pub operand: Option<NativeOperand>,
+    /// The result whose emitted operand the buffer serves (a producer's
+    /// `for emits` buffers: its `Emitted` forms and their arrival counters
+    /// alike). A call that emits no operand of it, which no graph pairs,
+    /// reads only its word and leaves these buffers unread. `None` for every
+    /// other buffer.
+    pub emission: Option<u32>,
+}
+
+/// An operand buffer (`projection quantized for cpu`'s `operand` buffers, a
+/// consumer's `operand rows`): one form of the activation operand of a
+/// tensor, formed once: its Q8 blocks, or (`rows`) its formed F32 rows, which
+/// exact products and NVFP4-free weights read. A graph places a consumer's
+/// buffer where the producer of its tensor emits that form, so the
+/// producer's epilogue writes it and the consumer reads it; the consumer
+/// forms it itself in a standalone call, where its tensor has no producer
+/// that emits it, and where `pairs` does not hold.
+///
+/// A consumer's operand is every form its formation writes: the Q8 blocks
+/// where `formed` holds (`INT8 == 1`), and its rows, always, which take the
+/// NVFP4 operand transform where `nvfp4` holds. A producer writes the forms
+/// a graph pairs it with, each as the consumer's formation would: the rows
+/// (`form_input` under the norm, else the stored values staged), the Q8
+/// blocks quantized from them, then the NVFP4 transform of the rows.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NativeOperand {
+    /// The operand of tensor parameter `parameter` (its ordinal in the
+    /// entry's parameters), which launch `formation` (its ordinal) forms,
+    /// with the rows of every other buffer it reads, under `norm` where its
+    /// rows are normalized. The launch is left out where the graph pairs
+    /// every operand form it writes with an emitting producer under the same
+    /// norm and `pairs` holds of each: the call then reads only the operands,
+    /// in the producer's layout. The launch writes this form only where
+    /// `formed` holds; a rows form's rows are NVFP4 operands where `nvfp4`
+    /// holds (a Q8 form's `nvfp4` never holds).
+    Formed {
+        parameter: u32,
+        formation: u32,
+        pairs: NativeCondition,
+        rows: bool,
+        norm: Option<NativeOperandNorm>,
+        formed: NativeCondition,
+        nvfp4: NativeCondition,
+    },
+    /// The operand of result `result` (the buffer's `emission`), which the
+    /// call's launches write: its Q8 blocks, or its rows, formed under `norm`
+    /// where it has one, else the result's stored values.
+    Emitted { result: u32, rows: bool, norm: Option<NativeOperandNorm> },
+}
+
+/// The norm an operand's rows are formed under: the entry's norm weight
+/// port (`weight`) and epsilon scalar (`epsilon`), by parameter ordinal. A
+/// producer's operand stands for a consumer's only where both are bound to
+/// the same weight and epsilon.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeOperandNorm {
+    pub weight: u32,
+    pub epsilon: u32,
 }
 
 /// One ordered dispatch of a native call.
@@ -1790,7 +2042,7 @@ pub enum NativeNatExpr {
     Dimension(String),
     Parameter(String),
     /// `query` of the representation element parameter `W` is bound to
-    /// (`operands(W)`, `form(W, NAME)`, `packed(W)`, `unit_columns(W)`). It has a value only in an
+    /// (`operands(W)`, `form(W, NAME)`, `packed(W)`, `dense_bytes(W)`, `unit_columns(W)`). It has a value only in an
     /// implementation instantiated at its bindings
     /// ([`NativeImplementation::at_elements`]).
     Element(String, ElementQuery),
@@ -1830,6 +2082,9 @@ pub enum ElementQuery {
     /// `packed(W)`: 1 where `W` is a packed representation (a packet or row
     /// layout), else 0 (dense or external).
     Packed,
+    /// `dense_bytes(W)`: the bytes of one element where `W` is a dense
+    /// dtype, else 0 (packed or external).
+    DenseBytes,
 }
 
 impl ElementQuery {
@@ -1846,6 +2101,10 @@ impl ElementQuery {
                 info.kind,
                 registry::RepresentationKind::Packed(_) | registry::RepresentationKind::PackedRows(_)
             ))),
+            Self::DenseBytes => Some(match info.kind {
+                registry::RepresentationKind::Dense(dtype) => u64::from(dtype.bytes()),
+                _ => 0,
+            }),
         }
     }
 
@@ -1869,6 +2128,13 @@ impl ElementQuery {
                 columns
             }
             Self::Packed => vec![0, 1],
+            Self::DenseBytes => {
+                let mut bytes: Vec<u64> =
+                    std::iter::once(0).chain(crate::types::DType::ALL.map(|dtype| u64::from(dtype.bytes()))).collect();
+                bytes.sort_unstable();
+                bytes.dedup();
+                bytes
+            }
         }
     }
 
@@ -1879,6 +2145,7 @@ impl ElementQuery {
             Self::Form(form) => format!("form({element}, {})", form.name()),
             Self::UnitColumns => format!("unit_columns({element})"),
             Self::Packed => format!("packed({element})"),
+            Self::DenseBytes => format!("dense_bytes({element})"),
         }
     }
 }
@@ -4131,6 +4398,8 @@ mod native_tests {
                     right: NativeNatExpr::Constant(64),
                 }),
             )),
+            operand: None,
+            emission: None,
         };
         let at = |value: u64| {
             scratch
@@ -4147,6 +4416,8 @@ mod native_tests {
             ),
             sync: false,
             when: None,
+            operand: None,
+            emission: None,
         };
         assert_eq!(
             overflow.charge(&|_| Some(2), &|_| None),
@@ -5452,6 +5723,37 @@ mod native_tests {
             &format!("native run for metal from \"run.metal\":\n{launch}"),
         )
         .expect("other backends bind each representation when prepared");
+        let emitted_norm = "fn run[N](a: &tensor[N] f32, w: &tensor[N] W, eps: f32) -> tensor[N] f32:\n    let mut out = tensor[N] f32\n    for i in 0..N:\n        out[i] = a[i]\n    return out";
+        let operator = "projection quantized for cpu:\n    scratch quantized bytes (N * 4) operand for emits\n    scratch rows bytes (N * 4) operand rows for emits\n";
+        let module = check(
+            emitted_norm,
+            &format!("{operator}\nnative run for cpu from \"run.rs\":\n    project quantized emits (result 0 over (1, N) normed (w, eps))\n{launch}"),
+        )
+        .expect("an emitted operand norm binds its weight element on CPU");
+        let info = module.entries().iter().find(|entry| entry.name == "run").expect("the entry");
+        let cpu_impl = module.native_implementation(info.id, crate::registry::BackendName::Cpu).expect("CPU native");
+        assert_eq!(info.element_domain.cpu_binding("W"), None);
+        assert_eq!(cpu_impl.cpu_binding(info, "W"), Some(CpuBinding::Weights));
+        let stored_norm = "fn run[N](w: &mut tensor[N] W, eps: f32) -> tensor[N] f32:\n    w[0] = 0.0\n    let mut out = tensor[N] f32\n    for i in 0..N:\n        out[i] = 0.0\n    return out";
+        let error = check(
+            stored_norm,
+            &format!("{operator}\nnative run for cpu from \"run.rs\":\n    project quantized emits (result 0 over (1, N) normed (w, eps))\n{launch}"),
+        )
+        .expect_err("a stored tensor is not a CPU weight norm")
+        .to_string();
+        assert!(error.contains("`w` is not read as a weight in `run`"), "{error}");
+        let read_only_activation = "fn run[N](x: &tensor[N] A, w: &tensor[N] W) -> tensor[N] f32:\n    let mut out = tensor[N] f32\n    for i in 0..N:\n        out[i] = f32(x[i]) + f32(w[i])\n    return out";
+        let consumer = "projection quantized for cpu:\n    scratch quantized bytes (M * K * 4) operand for rows\n    scratch rows bytes (M * K * 4) operand rows for rows\n    launch form for rows:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n";
+        let module = check(
+            read_only_activation,
+            &format!("{consumer}\nnative run for cpu from \"run.rs\":\n    project quantized rows (W) over (1, N) operand (x)\n{launch}"),
+        )
+        .expect("a formed operand binds A and its source parameter as dense on CPU");
+        let info = module.entries().iter().find(|entry| entry.name == "run").expect("the entry");
+        let cpu_impl = module.native_implementation(info.id, crate::registry::BackendName::Cpu).expect("CPU native");
+        assert_eq!(info.element_domain.cpu_binding("A"), Some(CpuBinding::Weights));
+        assert_eq!(cpu_impl.cpu_binding(info, "A"), Some(CpuBinding::Dense));
+        assert_eq!(cpu_impl.cpu_binding(info, "W"), Some(CpuBinding::Weights));
     }
 
     #[test]
@@ -5517,6 +5819,14 @@ mod native_tests {
             (
                 format!("native scale for metal from \"scale.metal\":\n    scratch partials bytes (N * 4) when Q >= 2\n{launch}"),
                 "references `Q`, which is neither a dimension, a native parameter nor a constant",
+            ),
+            (
+                format!("native scale for metal from \"scale.metal\":\n    scratch partials bytes (device.units * 4)\n{launch}"),
+                "scratch buffer `partials` reads `device.units`, which has no value before a device is opened",
+            ),
+            (
+                format!("native scale for metal from \"scale.metal\":\n    scratch partials bytes (N * 4) when device.units > 1\n{launch}"),
+                "scratch buffer `partials` reads `device.units`, which has no value before a device is opened",
             ),
             (
                 "native scale for metal from \"scale.metal\":\n    static (N)\n".to_owned(),

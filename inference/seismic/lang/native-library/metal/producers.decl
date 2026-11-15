@@ -1,0 +1,41 @@
+# The decoders Metal's producers read (`seismic_lang::producers`): the one
+# statement of reach. The build renders `<seismic/producers.h>`'s predicates
+# from it, which the library's decode functions are dispatched by
+# (`producers::lane`, `producers::PACK`, ..); form admission reads it too.
+# A pattern lists the axis values it takes: `codes` (kind), `planes`
+# (low.high bits), `locals` (direct, plane[:unsigned], carried); `*` is any.
+# A lane producer's pattern also states how its codes `enter` the lanes:
+# as `pairs`, at any zero from the code's own, or as `bytes`, at the code's
+# own zero or at `bytes:ZERO`; form admission and the decode functions both
+# read it (`producers::lane_bytes`, `producers::lane_zero`). `values=i8`
+# takes only weights whose values are signed bytes, which admission reads.
+# A declared pattern without a decode function fails the library's build
+# (`declared_lane`); a decode function is dispatched only where declared.
+
+# The lane producers (`lane_codes`): a packet's chunks of eight codes, which a
+# lane takes two at a time as unsigned integers entering at a zero code.
+# Linear codes of every split of up to 8 bits (`unsigned`, `offset` and
+# `twos`, whose own zero is the sign bit the 8-bit plane flips), 4-bit
+# codebook codes (each byte's two values + their zero, `codebooks::pairs`)
+# and the entries of grids of signed bytes. Floating (E4M3) and odd codes
+# enter no lane as integers.
+producer lane
+codes=unsigned|offset planes=1.0|2.0|2.1|4.0|4.1|4.2 enter=pairs
+codes=unsigned|offset|twos planes=8.0 enter=bytes
+codes=table planes=4.0 enter=bytes:128
+codes=grid values=i8 enter=pairs
+
+# The forms that take lane codes with the local codes of the scales plane.
+form PACK uses lane locals=direct|plane
+form MATRIX_RUNS uses lane locals=direct|plane
+form MATRIX_SYMMETRIC uses lane locals=direct|plane
+# Unsigned codes (`packets::Unsigned`) under plain unsigned local codes
+# (`packets::LocalUnsigned`) only.
+form MATRIX_CODES uses lane codes=unsigned locals=direct|plane:unsigned
+
+# The int8 product's own producers: unsigned 4-bit codes of one plane with
+# plain unsigned local codes (`Nibbles`), or 8-bit two's complement codes
+# under a stored scale (`Bytes`).
+form INT8
+codes=unsigned planes=4.0 locals=plane:unsigned
+codes=twos planes=8.0 locals=direct

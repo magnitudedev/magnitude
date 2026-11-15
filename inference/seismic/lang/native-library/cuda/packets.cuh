@@ -26,6 +26,7 @@
 #pragma once
 
 #include <seismic/element.cuh>
+#include <seismic/producers.cuh>
 #include <seismic/tables.cuh>
 
 namespace packets {
@@ -211,6 +212,10 @@ template <> struct NativeOperand<OpF16, element::F16> {
 //          `codes`)
 //   rows:  Raw fetch(tile, kb, lane), code(raw, step, slot), apply(code,
 //          scale, bias), coefficient(row, kb, group, scale, bias)
+//   gathered rows (a GEMV over rows a table selects, `projection::Gathered`):
+//          Raw fetch_rows(a, b, kb, t) and Block block_rows(a, b,
+//          superblock), lane (g, t)'s fragment and coefficients with any
+//          two rows a and b as its rows g and g + 8
 // with value = scale * code - bias per group of GROUP codes (GROUPS per
 // 64-code k-block; a coefficient group spanning k-blocks is GROUP = 64 here,
 // each k-block's share of it).
@@ -261,6 +266,29 @@ __device__ __forceinline__ float f16_at(const u8 *address) {
 // as 16-bit operand pairs, s8 bytes or one slot), their interpretation C
 // (operands, s8 values and the code term of `apply`) and coefficients K
 // (scales and biases, with their staging). SCALED selects the scaled GEMM.
+
+// Gathered rows: in every code plane a lane chunk's B-bit slots alternate
+// between its rows g (even slots) and g + 8 (odd), so a lane chunk holding
+// row a as its g and row b as its g + 8 is a word of row a's lane chunk
+// (lane 4 (a % 8) + t of a's tile, its slots of parity `ua`, a's half of
+// the tile) and the same word of row b's (parity `ub`), each moved to its
+// parity: a shift and a mask a word (2B divides 32).
+template <int B> __device__ __forceinline__ u32 rows_word(u32 a, u32 ua, u32 b, u32 ub) {
+    static_assert(B == 1 || B == 2 || B == 4 || B == 8, "slots of 1, 2, 4 or 8 bits");
+    constexpr u32 EVEN = B == 1 ? 0x55555555u : B == 2 ? 0x33333333u : B == 4 ? 0x0F0F0F0Fu : 0x00FF00FFu;
+    return ((ua != 0 ? a >> B : a) & EVEN) | ((ub != 0 ? b : b << B) & ~EVEN);
+}
+template <int B> __device__ __forceinline__ uint2 rows_word(uint2 a, u32 ua, uint2 b, u32 ub) {
+    return make_uint2(rows_word<B>(a.x, ua, b.x, ub), rows_word<B>(a.y, ua, b.y, ub));
+}
+template <int B> __device__ __forceinline__ uint4 rows_word(uint4 a, u32 ua, uint4 b, u32 ub) {
+    return make_uint4(rows_word<B>(a.x, ua, b.x, ub), rows_word<B>(a.y, ua, b.y, ub), rows_word<B>(a.z, ua, b.z, ub),
+                      rows_word<B>(a.w, ua, b.w, ub));
+}
+// The lane holding row `row` (lane 4 (row % 8) + t of its tile) and its half
+// of the lane's slots (0: the even ones, row g's; 1: the odd ones, g + 8's).
+__device__ __forceinline__ u32 row_lane(u64 row, u32 t) { return 4 * (u32)(row % 8) + t; }
+__device__ __forceinline__ u32 row_half(u64 row) { return (u32)(row % 16) / 8; }
 
 // Code planes `Planes<LOW, HIGH, WHOLE>` (`registry::code_planes`): a lane
 // chunk's codes as a LOW-bit and a HIGH-bit plane; WHOLE when rows hold whole
@@ -340,6 +368,13 @@ template <int LOW, int HIGH, bool WHOLE> struct Planes {
             raw.high = seismic_ld_nc_u32(w.high.chunk(w.base, w.stride, tile, kblock * 128 + lane * 4));
         else
             raw.high = 0;
+        return raw;
+    }
+    template <class W> __device__ static __forceinline__ Raw fetch_rows(const W &w, u64 a, u64 b, u64 kblock, u32 t) {
+        const Raw x = fetch(w, a / 16, kblock, row_lane(a, t)), y = fetch(w, b / 16, kblock, row_lane(b, t));
+        Raw raw;
+        raw.low = rows_word<LOW>(x.low, row_half(a), y.low, row_half(b));
+        raw.high = HIGH == 1 ? rows_word<1>(x.high, row_half(a), y.high, row_half(b)) : 0u;
         return raw;
     }
     // The lane chunks of one superblock (4 k-blocks). With WHOLE the warp's
@@ -463,6 +498,13 @@ template <> struct Planes<4, 2, true> {
         raw.high = seismic_ld_nc_v2(w.high.chunk(w.base, w.stride, tile, kblock * 256 + lane * 8));
         return raw;
     }
+    template <class W> __device__ static __forceinline__ Raw fetch_rows(const W &w, u64 a, u64 b, u64 kblock, u32 t) {
+        const Raw x = fetch(w, a / 16, kblock, row_lane(a, t)), y = fetch(w, b / 16, kblock, row_lane(b, t));
+        Raw raw;
+        raw.low = rows_word<4>(x.low, row_half(a), y.low, row_half(b));
+        raw.high = rows_word<2>(x.high, row_half(a), y.high, row_half(b));
+        return raw;
+    }
     struct Super {
         uint4 low[4];
         uint4 high[2];
@@ -546,6 +588,13 @@ template <> struct Planes<8, 0, false> {
         Raw raw;
         raw.first = seismic_ld_nc_na_v4(chunk);
         raw.second = seismic_ld_nc_na_v4(chunk + 16);
+        return raw;
+    }
+    template <class W> __device__ static __forceinline__ Raw fetch_rows(const W &w, u64 a, u64 b, u64 kblock, u32 t) {
+        const Raw x = fetch(w, a / 16, kblock, row_lane(a, t)), y = fetch(w, b / 16, kblock, row_lane(b, t));
+        Raw raw;
+        raw.first = rows_word<8>(x.first, row_half(a), y.first, row_half(b));
+        raw.second = rows_word<8>(x.second, row_half(a), y.second, row_half(b));
         return raw;
     }
     struct Super {
@@ -1043,11 +1092,11 @@ template <class S, int GROUP_, bool BIAS_, int STORAGE, int CODE_EXPONENT> struc
                         : make_uint4(0, 0, 0, 0));
         }
     }
-    template <class W> __device__ static __forceinline__ Block block(const W &w, u64 tile, u64 superblock, u32 lane) {
+    template <class W> __device__ static __forceinline__ Block block_rows(const W &w, u64 a, u64 b, u64 superblock) {
         Block block;
 #pragma unroll
         for (int r = 0; r < 2; ++r)
-            load(w.base + (tile * 16 + lane / 4 + 8 * r) * w.stride + w.supers + superblock * BLOCK_BYTES, superblock,
+            load(w.base + (r == 0 ? a : b) * w.stride + w.supers + superblock * BLOCK_BYTES, superblock,
                  w.supers_bytes, block.words[r]);
         return block;
     }
@@ -1305,11 +1354,11 @@ struct Hier : HierFactors<FS, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP_, FA
         u32 fields[2][WORDS];
         Held factors[2];
     };
-    template <class W> __device__ static __forceinline__ Block block(const W &w, u64 tile, u64 superblock, u32 lane) {
+    template <class W> __device__ static __forceinline__ Block block_rows(const W &w, u64 a, u64 b, u64 superblock) {
         Block block;
 #pragma unroll
         for (int r = 0; r < 2; ++r) {
-            const u8 *line = w.base + (tile * 16 + lane / 4 + 8 * r) * w.stride;
+            const u8 *line = w.base + (r == 0 ? a : b) * w.stride;
             const u8 *fields = line + w.scales + superblock * field_bytes();
             if constexpr (!whole_words()) {
                 // Half words, the superblock's first at bit 0.
@@ -1456,7 +1505,13 @@ struct Packed : Rows, Select<K::BIAS, None, typename OrderOf<P, K::GROUP>::type>
         K::coefficient(*this, row, kblock, group, scale, bias);
     }
     __device__ __forceinline__ Block block(u64 tile, u64 superblock, u32 lane) const {
-        return K::block(*this, tile, superblock, lane);
+        return K::block_rows(*this, tile * 16 + lane / 4, tile * 16 + lane / 4 + 8, superblock);
+    }
+    __device__ __forceinline__ Raw fetch_rows(u64 a, u64 b, u64 kblock, u32 t) const {
+        return P::fetch_rows(*this, a, b, kblock, t);
+    }
+    __device__ __forceinline__ Block block_rows(u64 a, u64 b, u64 superblock) const {
+        return K::block_rows(*this, a, b, superblock);
     }
     __host__ __device__ static constexpr u64 staged_bytes(u64 kblocks) { return K::staged_bytes(kblocks); }
     __device__ __forceinline__ void stage(u64 tile, u64 kblocks, u8 *shared, u32 thread, u32 threads) const {
@@ -1481,6 +1536,11 @@ struct Packed : Rows, Select<K::BIAS, None, typename OrderOf<P, K::GROUP>::type>
     // local code into its codes (`_FORM_INT8_LOCAL`), 0 where it does not,
     // and a staged group's multiplier and factor (`Hier::staged_local`).
     __host__ __device__ static constexpr int int8_local() { return LOCAL; }
+    // Its producer reads local codes of the scales plane only, as its
+    // declaration states (`producers::INT8_LOCAL`, `producers.decl`).
+    static_assert(LOCAL == 0 ||
+                      producers::INT8_LOCAL(0u, 0u, 0u, IsCarried<K>::value ? producers::CARRIED : producers::PLANE),
+                  "the int8 GEMM's local scale codes are read where a producer is declared");
     __device__ static __forceinline__ void staged_local(const u32 *words, u64 kblock, int group, float &factor,
                                                         u32 &multiplier) {
         K::template staged_local<LOCAL>(words, kblock, group, factor, multiplier);
@@ -1803,14 +1863,24 @@ template <class G> struct GridPlanes {
             code |= ((high >> (G::high_bits() * ((u32)e0 + j) + AT)) & 1u) << j;
         return code;
     }
-    template <class W> __device__ static __forceinline__ Raw fetch(const W &w, u64 tile, u64 kblock, u32 lane) {
+    // Row `row`'s k-block entries (row row % 16 of its tile's grids plane).
+    template <class W>
+    __device__ static __forceinline__ void load_row(const W &w, u64 row, u64 kblock, u32 (&entries)[G::WORDS]) {
+        const u64 tile = row / 16;
+        const u32 r = (u32)(row % 16);
+        G::load(w.low.chunk(w.base, w.stride, tile, (kblock * 16 + r) * KBLOCK_BYTES), high_word(w, tile, kblock, r),
+                entries);
+    }
+    // Rows a and b as the lane's rows g and g + 8: each row's own entries.
+    template <class W> __device__ static __forceinline__ Raw fetch_rows(const W &w, u64 a, u64 b, u64 kblock, u32 t) {
         Raw raw;
-        const u64 row = (kblock * 16 + lane / 4) * KBLOCK_BYTES;
-        G::load(w.low.chunk(w.base, w.stride, tile, row), high_word(w, tile, kblock, lane / 4), raw.g);
-        G::load(w.low.chunk(w.base, w.stride, tile, row + 8 * KBLOCK_BYTES), high_word(w, tile, kblock, lane / 4 + 8),
-                raw.g8);
-        raw.t = lane % 4;
+        load_row(w, a, kblock, raw.g);
+        load_row(w, b, kblock, raw.g8);
+        raw.t = t;
         return raw;
+    }
+    template <class W> __device__ static __forceinline__ Raw fetch(const W &w, u64 tile, u64 kblock, u32 lane) {
+        return fetch_rows(w, tile * 16 + lane / 4, tile * 16 + lane / 4 + 8, kblock, lane % 4);
     }
     // Rows hold whole 256-value groups, so a superblock's four k-blocks exist.
     struct Super {
@@ -1910,14 +1980,20 @@ template <class G> struct GridPlanes {
         // The k-block's entries lane `lane` reads in entry order.
         template <class W>
         __device__ static __forceinline__ EntryRaw fetch_entries(const W &w, u64 tile, u64 kblock, u32 lane) {
+            return fetch_entries_rows(w, tile * 16 + lane / 4, tile * 16 + lane / 4 + 8, kblock, lane % 4);
+        }
+        // The same with rows a and b as the lane's rows g and g + 8.
+        template <class W>
+        __device__ static __forceinline__ EntryRaw fetch_entries_rows(const W &w, u64 a, u64 b, u64 kblock, u32 t) {
             if constexpr (word_entries()) {
-                return GridPlanes::fetch(w, tile, kblock, lane);
+                return GridPlanes::fetch_rows(w, a, b, kblock, t);
             } else {
                 constexpr u32 BYTES = (u32)G::entries::BYTES;
                 LaneEntries raw;
 #pragma unroll
                 for (int r = 0; r < 2; ++r) {
-                    const u32 row = lane / 4 + 8 * (u32)r;
+                    const u64 tile = (r == 0 ? a : b) / 16;
+                    const u32 row = (u32)((r == 0 ? a : b) % 16);
                     // The row's k-block entries start at a word (`KBLOCK_BYTES`
                     // is whole words): an entry is the bytes from its first
                     // to its last word, funnel-shifted.
@@ -1925,7 +2001,7 @@ template <class G> struct GridPlanes {
                     const u32 high = high_word(w, tile, kblock, row);
 #pragma unroll
                     for (int group = 0; group < 64 / GROUP; ++group) {
-                        const u32 e = (u32)gemv_entry(group, lane % 4);
+                        const u32 e = (u32)gemv_entry(group, t);
                         const u32 first = BYTES * e, last = first + BYTES - 1;
                         const u32 lo = seismic_ld_nc_u32(entries + 4 * (first / 4));
                         const u32 hi = seismic_ld_nc_u32(entries + 4 * (last / 4));
@@ -1984,16 +2060,15 @@ template <class K, class P> struct CarriedPlanes : K {
         u32 high[2][K::KBLOCKS];
         float2 factor[2];
     };
-    template <class W> __device__ static __forceinline__ Block block(const W &w, u64 tile, u64 superblock, u32 lane) {
+    template <class W> __device__ static __forceinline__ Block block_rows(const W &w, u64 a, u64 b, u64 superblock) {
         Block block;
 #pragma unroll
         for (int r = 0; r < 2; ++r) {
-            const u32 row = lane / 4 + 8 * (u32)r;
-            block.factor[r] =
-                K::factors(K::factor_word(w.base + (tile * 16 + row) * w.stride + w.supers, superblock));
+            const u64 row = r == 0 ? a : b;
+            block.factor[r] = K::factors(K::factor_word(w.base + row * w.stride + w.supers, superblock));
 #pragma unroll
             for (int q = 0; q < K::KBLOCKS; ++q)
-                block.high[r][q] = P::high_word(w, tile, K::KBLOCKS * superblock + q, row);
+                block.high[r][q] = P::high_word(w, row / 16, K::KBLOCKS * superblock + q, (u32)(row % 16));
         }
         return block;
     }
@@ -2086,6 +2161,21 @@ template <class G, class K> struct Records {
         record.w[4] = high.x, record.w[5] = high.y, record.w[6] = high.z, record.w[7] = high.w;
         record.factors = seismic_ld_nc_u32(factors_at(tile, superblock) + 4 * (lane / 4));
         return record;
+    }
+    // Rows a and b as the lane's rows g and g + 8: each row's words of its
+    // own lane's record (`row_lane`), and its half of that lane's factor word.
+    __device__ __forceinline__ Record record_rows(u64 a, u64 b, u64 superblock, u32 t) const {
+        const Record x = record(a / 16, superblock, row_lane(a, t)), y = record(b / 16, superblock, row_lane(b, t));
+        const u32 ua = row_half(a), ub = row_half(b);
+        Record rows;
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            rows.w[2 * q] = ua != 0 ? x.w[2 * q + 1] : x.w[2 * q];
+            rows.w[2 * q + 1] = ub != 0 ? y.w[2 * q + 1] : y.w[2 * q];
+        }
+        rows.factors = ((ua != 0 ? x.factors >> 16 : x.factors) & 0xFFFFu) |
+                       (ub != 0 ? y.factors & 0xFFFF0000u : y.factors << 16);
+        return rows;
     }
     // The scales of the record's groups of the lane's rows, held as the
     // groups' codes and the rows' factors and formed where used: `(r, n)` is
@@ -2336,6 +2426,11 @@ template <class E> struct Dense {
     const u8 *base;
     u64 stride;
     u64 rows;
+    u64 col_stride = 1;
+
+    __device__ __forceinline__ float ordered_at(u64 row, u64 col, u64 cols) const {
+        return (row < rows && col < cols) ? element::at<E>(base, row * stride + col * col_stride) : 0.0f;
+    }
 
     static constexpr int GROUP = 32;
     static constexpr int GROUPS = 2;
@@ -2349,11 +2444,14 @@ template <class E> struct Dense {
         u32 w[4][4][WORDS];
     };
     __device__ __forceinline__ Raw fetch(u64 tile, u64 kblock, u32 lane) const {
-        const u32 g = lane / 4, t = lane % 4;
+        return fetch_rows(tile * 16 + lane / 4, tile * 16 + lane / 4 + 8, kblock, lane % 4);
+    }
+    // Rows a and b as the lane's rows g and g + 8.
+    __device__ __forceinline__ Raw fetch_rows(u64 a, u64 b, u64 kblock, u32 t) const {
         Raw raw;
 #pragma unroll
         for (int half = 0; half < 2; ++half) {
-            const u64 row = tile * 16 + g + 8 * half;
+            const u64 row = half == 0 ? a : b;
             const bool valid = row < rows;
             const u8 *line = base + (valid ? row : 0) * stride * E::bytes;
 #pragma unroll
@@ -2392,36 +2490,38 @@ template <class E> struct Dense {
     static constexpr bool GEMV_PERMUTED = true;
     __device__ __forceinline__ Super fetch_superblock_permuted(u64 tile, u64 superblock, u64 kblocks,
                                                                u32 lane) const {
-        constexpr int VECTORS = E::bytes; // 16-byte vectors of a lane's 16 columns
-        const u32 g = lane / 4, t = lane % 4;
         Super super;
 #pragma unroll
-        for (int q = 0; q < 4; ++q) {
-            const u64 kblock = 4 * superblock + q;
-            if (kblock >= kblocks)
-                continue;
-#pragma unroll
-            for (int half = 0; half < 2; ++half) {
-                const u64 row = tile * 16 + g + 8 * half;
-                const bool valid = row < rows;
-                const u8 *at = base + ((valid ? row : 0) * stride + kblock * 64 + 16 * t) * E::bytes;
-                u32 words[4 * VECTORS];
-#pragma unroll
-                for (int v = 0; v < VECTORS; ++v) {
-                    const uint4 x = valid ? seismic_ld_nc_v4(at + 16 * v) : make_uint4(0u, 0u, 0u, 0u);
-                    words[4 * v] = x.x, words[4 * v + 1] = x.y, words[4 * v + 2] = x.z, words[4 * v + 3] = x.w;
-                }
-#pragma unroll
-                for (int s = 0; s < 4; ++s)
-#pragma unroll
-                    for (int upper = 0; upper < 2; ++upper)
-#pragma unroll
-                        for (int word = 0; word < WORDS; ++word)
-                            super.raw[q].w[s][half + 2 * upper][word] =
-                                words[(4 * s + 2 * upper) * E::bytes / 4 + word];
-            }
-        }
+        for (int q = 0; q < 4; ++q)
+            if (4 * superblock + q < kblocks)
+                super.raw[q] = fetch_rows_permuted(tile * 16 + lane / 4, tile * 16 + lane / 4 + 8, 4 * superblock + q,
+                                                   lane % 4);
         return super;
+    }
+    // Rows a and b as the lane's rows g and g + 8, in the permuted order.
+    __device__ __forceinline__ Raw fetch_rows_permuted(u64 a, u64 b, u64 kblock, u32 t) const {
+        constexpr int VECTORS = E::bytes; // 16-byte vectors of a lane's 16 columns
+        Raw raw;
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const u64 row = half == 0 ? a : b;
+            const bool valid = row < rows;
+            const u8 *at = base + ((valid ? row : 0) * stride + kblock * 64 + 16 * t) * E::bytes;
+            u32 words[4 * VECTORS];
+#pragma unroll
+            for (int v = 0; v < VECTORS; ++v) {
+                const uint4 x = valid ? seismic_ld_nc_v4(at + 16 * v) : make_uint4(0u, 0u, 0u, 0u);
+                words[4 * v] = x.x, words[4 * v + 1] = x.y, words[4 * v + 2] = x.z, words[4 * v + 3] = x.w;
+            }
+#pragma unroll
+            for (int s = 0; s < 4; ++s)
+#pragma unroll
+                for (int upper = 0; upper < 2; ++upper)
+#pragma unroll
+                    for (int word = 0; word < WORDS; ++word)
+                        raw.w[s][half + 2 * upper][word] = words[(4 * s + 2 * upper) * E::bytes / 4 + word];
+        }
+        return raw;
     }
     // The two elements of register i, as F32.
     __device__ static __forceinline__ float2 pair(const Raw &raw, int step, int i) {
@@ -2443,6 +2543,7 @@ template <class E> struct Dense {
     }
     struct Block {};
     __device__ __forceinline__ Block block(u64, u64, u32) const { return Block{}; }
+    __device__ __forceinline__ Block block_rows(u64, u64, u64) const { return Block{}; }
     __device__ __forceinline__ void coefficients(const Block &, int, Coefficients<GROUPS> &c) const {
 #pragma unroll
         for (int r = 0; r < 2; ++r)
@@ -2613,6 +2714,44 @@ template <class W> __device__ __forceinline__ void row_values16(const W &w, u64 
     }
 }
 
+// One 32-value packet's four lane values at k = 32*packet + 8*s + u (s = 0..3)
+// for lane u in 0..7 (`u = lane & 7`), in ascending column order.
+template <class W>
+__device__ __forceinline__ void row_packet8(const W &w, u64 row, u64 rows, u64 packet, u64 cols, u32 u,
+                                            float (&out)[4]) {
+    if constexpr (W::DENSE) {
+        const u64 base_col = 32 * packet + u;
+#pragma unroll
+        for (int s = 0; s < 4; ++s)
+            out[s] = row < rows ? w.ordered_at(row, base_col + 8 * (u64)s, cols) : 0.0f;
+    } else {
+        if (row >= rows || 32 * packet >= cols) {
+            out[0] = out[1] = out[2] = out[3] = 0.0f;
+            return;
+        }
+        const u64 kb = packet / 2;
+        const int half = (int)(packet & 1u);
+        const u32 t = u >> 1;
+        const u32 par = u & 1u;
+        const u32 local = (u32)(row % 16);
+        const u32 upper = local / 8;
+        const typename W::Raw raw = w.fetch(row / 16, kb, 4 * (local % 8) + t);
+        const u32 slot0 = upper + 4 * par;
+        const u32 slot8 = upper + 2 + 4 * par;
+        const u32 off0 = 2 * t + par;
+        const u32 off8 = 2 * t + 8 + par;
+#pragma unroll
+        for (int step = 0; step < 2; ++step) {
+            const int s = 2 * half + step;
+            float sc0, b0, sc8, b8;
+            w.coefficient(row, kb, (int)((16 * s + off0) / W::GROUP), sc0, b0);
+            w.coefficient(row, kb, (int)((16 * s + off8) / W::GROUP), sc8, b8);
+            out[2 * step] = W::apply(w.code(raw, s, slot0), sc0, b0);
+            out[2 * step + 1] = W::apply(w.code(raw, s, slot8), sc8, b8);
+        }
+    }
+}
+
 } // namespace packets
 
 // A packed element's coefficients component (`packets::Direct`,
@@ -2655,12 +2794,20 @@ template <class W> __device__ __forceinline__ void row_values16(const W &w, u64 
         (const packets::u8 *)(pointer), ELEMENT_CAT(P, _ROW_STRIDE_BYTES), ELEMENT_CAT(P, _PLANE_RECORDS_FACTORS_OFFSET) \
     }
 // Dense weights: the tensor's rows (extent 0) at its row stride (stride 0,
-// elements). A rank-2 [rows, K] tensor is required.
-#define PACKETS_MAKE_DENSE(P, pointer)                                                                   \
+// elements), or the single row of a rank-1 [K] vector.
+#define PACKETS_MAKE_DENSE_1(P, pointer)                                                                 \
+    packets::Dense<ELEMENT_OF(P)> {                                                                      \
+        (const packets::u8 *)(pointer),                                                                  \
+            (packets::u64)ELEMENT_CAT(P, _EXTENT_0) * ELEMENT_CAT(P, _STRIDE_0), 1ull,                   \
+            (packets::u64)ELEMENT_CAT(P, _STRIDE_0)                                                      \
+    }
+#define PACKETS_MAKE_DENSE_2(P, pointer)                                                                 \
     packets::Dense<ELEMENT_OF(P)> {                                                                      \
         (const packets::u8 *)(pointer), (packets::u64)ELEMENT_CAT(P, _STRIDE_0),                         \
-            (packets::u64)ELEMENT_CAT(P, _EXTENT_0)                                                      \
+            (packets::u64)ELEMENT_CAT(P, _EXTENT_0), (packets::u64)ELEMENT_CAT(P, _STRIDE_1)             \
     }
+#define PACKETS_MAKE_DENSE_RANK_(rank, P, pointer) ELEMENT_CAT(PACKETS_MAKE_DENSE_, rank)(P, pointer)
+#define PACKETS_MAKE_DENSE(P, pointer) PACKETS_MAKE_DENSE_RANK_(ELEMENT_CAT(P, _RANK), P, pointer)
 
 // Matrix `index` of a stacked rank-3 [B, N, K] tensor (such as expert
 // weights [E, N, K]), at `index` matrices' bytes from the tensor's base, the
@@ -2675,7 +2822,8 @@ template <class W> __device__ __forceinline__ void row_values16(const W &w, u64 
 #define PACKETS_DENSE_MATRIX(P, pointer, index)                                                          \
     packets::Dense<ELEMENT_OF(P)> {                                                                      \
         (const packets::u8 *)(pointer) + (packets::u64)(index) * PACKETS_DENSE_MATRIX_BYTES(P),          \
-            (packets::u64)ELEMENT_CAT(P, _STRIDE_1), (packets::u64)ELEMENT_CAT(P, _EXTENT_1)             \
+            (packets::u64)ELEMENT_CAT(P, _STRIDE_1), (packets::u64)ELEMENT_CAT(P, _EXTENT_1),            \
+            (packets::u64)ELEMENT_CAT(P, _STRIDE_2)                                                      \
     }
 #define PACKETS_PACKED_MATRIX(P, pointer, index)                                                         \
     ((const packets::u8 *)(pointer) + (packets::u64)(index) * PACKETS_PACKED_MATRIX_BYTES(P))

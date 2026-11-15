@@ -49,6 +49,29 @@ inline typename S::template pointer<T> region(device const ulong *table, ulong s
     return reinterpret_cast<typename S::template pointer<T>>(table[slab_index]);
 }
 
+// Where an expert-stacked weight's matrix is read for one use (a routed
+// choice's, a grouped block's): `code` >= 0 is record `code` of the primary
+// table, <= -2 record -2 - code of the secondary, and -1 none (the use reads
+// no record and contributes nothing). The routed entries' `decode_source`.
+struct Source {
+    int code;
+    bool none() const { return code == -1; }
+};
+
+// An expert-stacked weight bound as record tables, each entry an expert's
+// matrix in space S: `primary` (a bank's records, a held layer's slots, a
+// resident layer's experts) and `secondary` (the host tier's records, read
+// in place, or the experts' homes by index).
+template <typename S = space<false>>
+struct Experts {
+    device const ulong *primary;
+    device const ulong *secondary;
+    typename S::template pointer<const uchar> matrix(Source source) const {
+        return source.code >= 0 ? region<const uchar, S>(primary, ulong(source.code))
+                                : region<const uchar, S>(secondary, ulong(-2 - source.code));
+    }
+};
+
 template <typename T>
 inline device T *row(device const ulong *table, ulong index, ulong rows_per_slab,
     ulong row_elements) {

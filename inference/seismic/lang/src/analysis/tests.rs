@@ -17,7 +17,7 @@ pub(super) fn entry(source: &str) -> LogicalEntry {
 }
 
 /// The engine's kernel sources, checked once.
-pub(super) fn kernels() -> &'static CheckedModule {
+pub(crate) fn kernels() -> &'static CheckedModule {
     static KERNELS: std::sync::OnceLock<CheckedModule> = std::sync::OnceLock::new();
     KERNELS.get_or_init(|| {
         let manifest = std::path::PathBuf::from(

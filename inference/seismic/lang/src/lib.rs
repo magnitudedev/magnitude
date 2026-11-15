@@ -29,6 +29,8 @@ pub mod intrinsics;
 pub mod lattice;
 pub mod native_name;
 pub mod native_parameter;
+pub mod producers;
+mod producer_decl;
 pub mod native_source;
 pub mod precision;
 mod projection;

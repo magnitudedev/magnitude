@@ -872,6 +872,16 @@ mod internals {
         let mut symbols = HashSet::new();
         symbols.insert("SEISMIC_BUFFER_SCALAR_RESULTS".to_owned());
         symbols.insert("SEISMIC_PARKS_IN_KERNELS".to_owned());
+        // A `segmented` projection's grouping, stated in every source (no
+        // segments where the entry projects none); a library pastes a
+        // segment's number onto the stem.
+        symbols.insert("SEISMIC_PROJECTION_SEGMENTS".to_owned());
+        symbols.insert("SEISMIC_SEGMENT_WEIGHTS_".to_owned());
+        symbols.insert("SEISMIC_SEGMENT_ORDERED_".to_owned());
+        for segment in 0..seismic_lang::checked::PROJECTION_SEGMENTS {
+            symbols.insert(format!("SEISMIC_SEGMENT_WEIGHTS_{segment}"));
+            symbols.insert(format!("SEISMIC_SEGMENT_ORDERED_{segment}"));
+        }
         match dialect {
             SourceDialect::Cuda => {
                 symbols.insert("SEISMIC_BUFFER_WORDS".to_owned());
@@ -1028,6 +1038,7 @@ mod internals {
                         }
                     }
                     for prefix in names.tensor_prefixes() {
+                        symbols.insert(format!("{prefix}_RANK"));
                         for axis in 0..*rank {
                             symbols.insert(format!("{prefix}_EXTENT_{axis}"));
                             symbols.insert(format!("{prefix}_STRIDE_{axis}"));
@@ -1073,6 +1084,7 @@ mod internals {
                             symbols.extend(owner_result_symbols(dialect, ordinal));
                         }
                     }
+                    symbols.insert(format!("{prefix}_RANK"));
                     for axis in 0..*rank {
                         symbols.insert(format!("{prefix}_EXTENT_{axis}"));
                         symbols.insert(format!("{prefix}_STRIDE_{axis}"));
@@ -1907,19 +1919,18 @@ mod internals {
     }
 
     /// Every element parameter's binding is the checker's
-    /// ([`ElementDomain::cpu_binding`]); a CPU native declaration is admitted
-    /// only when every parameter has one.
+    /// ([`NativeImplementation::cpu_binding`]); a CPU native declaration is
+    /// admitted only when every parameter has one.
     fn cpu_elements(entry: &EntryInfo, definition: &NativeImplementation) -> CpuElements {
-        let domain = &entry.element_domain;
         let mut elements = CpuElements {
             dense: Vec::new(),
             weights: Vec::new(),
             external: Vec::new(),
             packed: Vec::new(),
         };
-        for parameter in domain.parameters() {
+        for parameter in entry.element_domain.parameters() {
             let name = parameter.name.clone();
-            match domain.cpu_binding(&name) {
+            match definition.cpu_binding(entry, &name) {
                 Some(CpuBinding::Dense) => {
                     let dtypes = definition
                         .elements
@@ -1938,6 +1949,180 @@ mod internals {
             }
         }
         elements
+    }
+
+    /// The accessor of entry parameter `ordinal` on a CPU `Context`:
+    /// `arg_<name>`, or `arg_<ordinal>` where another parameter shares the
+    /// name.
+    fn cpu_argument(entry: &EntryInfo, ordinal: usize) -> String {
+        let name = &entry.parameters[ordinal].name;
+        if entry.parameters.iter().filter(|candidate| candidate.name == *name).count() == 1 {
+            format!("arg_{}", ident(name).to_lowercase())
+        } else {
+            format!("arg_{ordinal}")
+        }
+    }
+
+    /// `expression` as a CPU kernel's `u64`, its dimensions and parameters
+    /// read from `cx`; `None` for one that reads an element or the device,
+    /// which a formation's shape never does.
+    fn cpu_nat(expression: &seismic_lang::checked::NativeNatExpr) -> Option<String> {
+        use seismic_lang::checked::NativeNatExpr as E;
+        let pair = |left: &E, right: &E| Some((cpu_nat(left)?, cpu_nat(right)?));
+        Some(match expression {
+            E::Constant(value) => format!("{value}u64"),
+            E::Dimension(name) => format!("cx.dim_{}()", ident(name).to_lowercase()),
+            E::Parameter(name) => format!("cx.param_{}()", ident(name).to_lowercase()),
+            E::Element(..) | E::Device(_) => return None,
+            E::Add(left, right) => pair(left, right).map(|(l, r)| format!("({l} + {r})"))?,
+            E::Sub(left, right) => pair(left, right).map(|(l, r)| format!("({l} - {r})"))?,
+            E::Mul(left, right) => pair(left, right).map(|(l, r)| format!("({l} * {r})"))?,
+            E::Div(left, right) => pair(left, right).map(|(l, r)| format!("({l} / {r})"))?,
+            E::Rem(left, right) => pair(left, right).map(|(l, r)| format!("({l} % {r})"))?,
+            E::CeilDiv(left, right) => pair(left, right).map(|(l, r)| format!("{l}.div_ceil({r})"))?,
+            E::Min(left, right) => pair(left, right).map(|(l, r)| format!("{l}.min({r})"))?,
+            E::Max(left, right) => pair(left, right).map(|(l, r)| format!("{l}.max({r})"))?,
+        })
+    }
+
+    /// `condition` as a CPU kernel's `bool` ([`cpu_nat`]).
+    fn cpu_condition(condition: &seismic_lang::checked::NativeCondition) -> Option<String> {
+        use seismic_lang::checked::{NativeComparison as C, NativeCondition};
+        Some(match condition {
+            NativeCondition::Compare { comparison, left, right } => {
+                let op = match comparison {
+                    C::Lt => "<",
+                    C::Le => "<=",
+                    C::Gt => ">",
+                    C::Ge => ">=",
+                    C::Eq => "==",
+                    C::Ne => "!=",
+                };
+                format!("({} {op} {})", cpu_nat(left)?, cpu_nat(right)?)
+            }
+            NativeCondition::And(left, right) => format!("({} && {})", cpu_condition(left)?, cpu_condition(right)?),
+            NativeCondition::Or(left, right) => format!("({} || {})", cpu_condition(left)?, cpu_condition(right)?),
+        })
+    }
+
+    /// The CPU operator's formation launch of `definition`
+    /// (`NativeFormation`): `<entry>_form`, one work item a part of a row of
+    /// every operand's rows in turn (a window's rows alone), each operand's
+    /// values its prologue (its parameter's rows staged, rounded to the
+    /// activation element `A`, or formed under its norm: `form_input`; or
+    /// the entry's function's whole row), its forms written by
+    /// `projection::form`. The entry's source writes no stage launch.
+    fn render_cpu_formation(
+        out: &mut String,
+        entry: &EntryInfo,
+        cpu: &CpuAsset<'_>,
+        definition: &NativeImplementation,
+        formation: &seismic_lang::checked::NativeFormation,
+        elements: &CpuElements,
+    ) -> Result<(), BuildError> {
+        use seismic_lang::checked::{NativeFormedValues, NativeOperand};
+        let refuse = |reason: String| BuildError::CpuNative { path: cpu.path.clone(), reason };
+        let nat = |expression: &seismic_lang::checked::NativeNatExpr| cpu_nat(expression).ok_or_else(|| refuse(format!("a formation of `{}` reads an element or the device in its shape", entry.name)));
+        let kernel = &definition.launches[formation.launch as usize].kernel;
+        let mut rows = Vec::new();
+        for operand in &formation.operands {
+            rows.push(format!("({} as usize)", nat(&operand.rows)?));
+        }
+        out.push_str(&format!(
+            "    #[inline(always)]\n    fn {kernel}<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {{\n      use lib::projection::projection as operator;\n      let total = {};\n      let mut first = 0usize;\n",
+            rows.join(" + ")
+        ));
+        for (operand, rows) in formation.operands.iter().zip(&rows) {
+            let formed = cpu_condition(&operand.formed).ok_or_else(|| refuse(format!("a formation of `{}` reads an element or the device in `formed`", entry.name)))?;
+            let tiles = cpu_condition(&operand.tiles).ok_or_else(|| refuse(format!("a formation of `{}` reads an element or the device in `tiles`", entry.name)))?;
+            let weights = operand
+                .weights
+                .iter()
+                .map(|weight| format!("cx.{}()", cpu_argument(entry, *weight as usize)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let scratch = |ordinal: u32| ident(&definition.scratch[ordinal as usize].name).to_lowercase();
+            out.push_str(&format!(
+                "      {{\n        let (rows, width, groups) = ({rows}, {} as usize, {} as usize);\n        let weights = [{weights}];\n        let weights = weights.each_ref();\n",
+                nat(&operand.width)?,
+                nat(&operand.groups)?,
+            ));
+            // The rows formed (all, or the window's), whether each is formed
+            // whole by its first part, the item's private bytes as the
+            // values read them, and the values of columns `columns` of row
+            // `row` into `out`.
+            let (window, whole, shared, values) = match &operand.values {
+                // The entry's function computes a whole row.
+                NativeFormedValues::Function(function) => {
+                    ("0..rows", true, "shared", format!("{function}(cx, row, out, shared)"))
+                }
+                NativeFormedValues::Parameter { at, within } => {
+                    let Some(NativeOperand::Formed { parameter, norm, .. }) = &definition.scratch[operand.staged as usize].operand else {
+                        return Err(refuse(format!("the formed rows of a `{}` operand are not a formed operand buffer", entry.name)));
+                    };
+                    if !elements.dense.iter().any(|(name, _)| name == "A") {
+                        return Err(refuse(format!("`{}` forms operands but has no activation element `A`", entry.name)));
+                    }
+                    let ParameterSummaryKind::Tensor { rank, element, .. } = &entry.parameters[*parameter as usize].kind else {
+                        return Err(refuse(format!("a `{}` operand is of no tensor parameter", entry.name)));
+                    };
+                    let CpuView::Dense(source_element) = cpu_view(element, elements) else {
+                        return Err(refuse(format!("a `{}` operand's parameter is not dense rows", entry.name)));
+                    };
+                    out.push_str(&format!("        let source = cx.{}();\n", cpu_argument(entry, *parameter as usize)));
+                    let row = match at {
+                        Some(at) => {
+                            out.push_str(&format!("        let at = cx.{}();\n", cpu_argument(entry, *at as usize)));
+                            "at.get([row]) as usize".to_owned()
+                        }
+                        // Group-major operand rows of the source's rows.
+                        None => "row % (rows / groups) * groups + row / (rows / groups)".to_owned(),
+                    };
+                    let window = match within {
+                        Some([first, count]) => {
+                            out.push_str(&format!(
+                                "        let window = {{\n          let first = usize::try_from(cx.{}().get([0])).expect(\"a window's first row is not negative\");\n          first..first + usize::try_from(cx.{}().get([0])).expect(\"a window's row count is not negative\")\n        }};\n",
+                                cpu_argument(entry, *first as usize),
+                                cpu_argument(entry, *count as usize),
+                            ));
+                            "window"
+                        }
+                        None => "0..rows",
+                    };
+                    let values = match norm {
+                        Some(norm) => {
+                            if source_element != "seismic::cpu::F32" || *rank != 2 {
+                                return Err(refuse(format!("a `{}` operand formed under a norm is not of `[ROWS, WIDTH] f32` rows", entry.name)));
+                            }
+                            out.push_str(&format!(
+                                "        let (norm, epsilon) = (cx.{}(), cx.{}());\n",
+                                cpu_argument(entry, norm.weight as usize),
+                                cpu_argument(entry, norm.epsilon as usize)
+                            ));
+                            format!(
+                                "operator::form_input_columns::<E::A>(source.row([{row}, 0]), (norm.k() > 0).then_some(&norm), epsilon, shared, width, columns, out)"
+                            )
+                        }
+                        None if source_element == "E::A" => {
+                            format!("operator::flat_values::<{source_element}, {rank}>(&source, {row}, width, columns, out)")
+                        }
+                        None => format!(
+                            "{{ operator::flat_values::<{source_element}, {rank}>(&source, {row}, width, columns, out); operator::publish_row::<E::A>(out) }}"
+                        ),
+                    };
+                    // Only a normed prologue decodes into the item's private bytes.
+                    (window, false, if norm.is_some() { "shared" } else { "_shared" }, values)
+                }
+            };
+            let columns = if whole { "_columns" } else { "columns" };
+            out.push_str(&format!(
+                "        let formed = operator::Formed {{ rows, width, groups, window: {window}, whole: {whole}, staged: cx.scratch_{}(), quantized: {formed}.then(|| cx.scratch_{}()), tiles: {tiles} && operator::tiled(rows / groups, &weights), weights: &weights }};\n        // SAFETY: the declaration's buffers; every item of the launch forms the same operands, each column of a row once.\n        unsafe {{ operator::form(formed, first, total, group, shared, |row, {columns}, out, {shared}| {values}) }};\n        first += rows;\n      }}\n",
+                scratch(operand.staged),
+                scratch(operand.quantized),
+            ));
+        }
+        out.push_str("      let _ = first;\n    }\n");
+        Ok(())
     }
 
     /// How a CPU kernel views a tensor of one element.
@@ -2284,6 +2469,24 @@ mod internals {
                 }
             }
         }
+        // One word per emitted operand buffer, after the schema's words, in
+        // buffer order (`abi::emitted_words`), set when a graph is sealed
+        // from the forms of the consumer it pairs the buffer with: bit 0,
+        // the call emits it; on the rows, bit 1, as NVFP4 operand rows.
+        for scratch in &definition.scratch {
+            if let Some(seismic_lang::checked::NativeOperand::Emitted { result, rows, .. }) = &scratch.operand {
+                let name = ident(&scratch.name).to_lowercase();
+                out.push_str(&format!(
+                    "      /// Whether the call emits result {result}'s operand into `scratch_{name}`: a sealed graph pairs it.\n      pub fn emits_{name}(&self) -> bool {{ self.invocation.word({word}) & 1 != 0 }}\n"
+                ));
+                if *rows {
+                    out.push_str(&format!(
+                        "      /// Whether the emitted rows in `scratch_{name}` are NVFP4 operand rows: its consumer's are.\n      pub fn nvfp4_{name}(&self) -> bool {{ self.invocation.word({word}) & 2 != 0 }}\n"
+                    ));
+                }
+                word += 1;
+            }
+        }
         for scratch in &definition.scratch {
             out.push_str(&format!(
                 "      pub fn scratch_{}(&self) -> seismic::cpu::Scratch<'a> {{ // SAFETY: the runtime places every scratch buffer for the call, 256-byte aligned.\n        unsafe {{ seismic::cpu::Scratch::from_raw(self.invocation.buffer({buffer})) }} }}\n",
@@ -2299,6 +2502,9 @@ mod internals {
             ));
         }
         out.push_str("    }\n");
+        if let Some(formation) = &definition.formation {
+            render_cpu_formation(out, entry, cpu, definition, formation, &elements)?;
+        }
         out.push_str(&format!(
             "    include!({:?});\n",
             cpu.path.to_string_lossy()
@@ -2365,6 +2571,8 @@ mod internals {
 
         let mut digest = Sha256::new();
         digest.update(cpu.text.as_bytes());
+        // The generated formation is code of the form as its source is.
+        digest.update(format!("{:?}", definition.formation).as_bytes());
         digest.update(library.digest);
         digest.update(seismic_cpu_tiers::VERSION.as_bytes());
         let digest = hex(&digest.finalize().into());

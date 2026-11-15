@@ -10,7 +10,7 @@
 
 use super::plan::ParameterAddress;
 use seismic_lang::checked::{
-    LaunchGrid, NativeAsset, NativeImplementation, NativeSpecialization, RecordPort,
+    LaunchGrid, NativeAsset, NativeImplementation, NativeSpecialization, PROJECTION_SEGMENTS, RecordPort,
 };
 use seismic_lang::entry::{
     CallSchema, ElementBindings, LogicalEntry, ParameterKind, ResultKind, TensorAccess,
@@ -21,6 +21,7 @@ use seismic_lang::ids::RepresentationId;
 use seismic_lang::native_parameter::{
     OwnerReach, native_parameter_names, parameter_reach, representation_reach, result_handle,
 };
+use seismic_lang::producers;
 use seismic_lang::registry;
 use seismic_lang::repack::WordTable;
 
@@ -195,7 +196,26 @@ pub(crate) fn native_word_count(
     schema: &CallSchema,
     implementation: &NativeImplementation,
 ) -> usize {
-    word_count(schema) + runtime_parameters(implementation).len()
+    word_count(schema) + emitted_words(implementation) + runtime_parameters(implementation).len()
+}
+
+/// The words that tell a call whether it emits each operand its launches
+/// can write (`NativeOperand::Emitted`): one per such buffer, in buffer
+/// order, after the schema's words. Nonzero only where a sealed graph pairs
+/// the operand with a consumer that reads it (`graph::operand_pairs`), so a
+/// standalone call, and a node nothing reads the operand of, emits none.
+pub(crate) fn emitted_words(implementation: &NativeImplementation) -> usize {
+    implementation.scratch.iter().filter(|scratch| emits(scratch)).count()
+}
+
+/// The word of buffer `scratch`'s emitted operand ([`emitted_words`]).
+pub(crate) fn emitted_word(schema: &CallSchema, implementation: &NativeImplementation, scratch: usize) -> usize {
+    assert!(emits(&implementation.scratch[scratch]), "buffer {scratch} holds no emitted operand");
+    word_count(schema) + implementation.scratch[..scratch].iter().filter(|scratch| emits(scratch)).count()
+}
+
+fn emits(scratch: &seismic_lang::checked::NativeScratch) -> bool {
+    matches!(scratch.operand, Some(seismic_lang::checked::NativeOperand::Emitted { .. }))
 }
 
 /// Argument slots an implementation binds: its bound buffers ([`bound`]),
@@ -618,6 +638,30 @@ fn render_source_with(
         ));
         prefix.push_str(include_str!("metal_resident.h"));
     }
+    // A `segmented` projection's grouping of its weights, the declaration's
+    // alone: its segments (none where the entry projects no segments), and the
+    // weights each serves (one, a pair, or none past the last), which the
+    // projection libraries read. Plain integers, which an `#if` and a pasted
+    // name read; every source has them, so a library shared with entries of
+    // no segments tests the count, never whether it is defined.
+    let segments = implementation.segments.as_deref().unwrap_or(&[]);
+    assert!(
+        (implementation.segments.is_none() || !segments.is_empty())
+            && segments.len() <= PROJECTION_SEGMENTS
+            && segments.iter().all(|weights| (1..=2).contains(weights)),
+        "the checker admits one to {PROJECTION_SEGMENTS} segments of one weight or a pair, not {segments:?}"
+    );
+    prefix.push_str(&format!("#define SEISMIC_PROJECTION_SEGMENTS {}\n", segments.len()));
+    for segment in 0..PROJECTION_SEGMENTS {
+        prefix.push_str(&format!(
+            "#define SEISMIC_SEGMENT_WEIGHTS_{segment} {}\n",
+            segments.get(segment).copied().unwrap_or(0)
+        ));
+        prefix.push_str(&format!(
+            "#define SEISMIC_SEGMENT_ORDERED_{segment} {}\n",
+            usize::from(implementation.ordered_segments.get(segment).copied().unwrap_or(false))
+        ));
+    }
     if let Some(kernel) = forming {
         prefix.push_str(&format!(
             "#define SEISMIC_FORMING_{} 1\n",
@@ -813,6 +857,7 @@ fn render_source_with(
             scalar_word += result.kind.class().scalar_words();
         }
     }
+    word += emitted_words(implementation);
     let runtime_parameters = if forming.is_some() {
         runtime_parameters(implementation)
     } else {
@@ -865,7 +910,7 @@ fn render_source_with(
     #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
     if let Dialect::Vulkan(_) = dialect {
         prefix.push_str(&vulkan::tail(read_only, &absent));
-        debug_assert_eq!(word, word_count(schema) + runtime_parameters.len());
+        debug_assert_eq!(word, word_count(schema) + emitted_words(implementation) + runtime_parameters.len());
         constant_macros(&mut prefix, asset);
         prefix.push_str(asset.text);
         prefix.push_str(vulkan::SUFFIX);
@@ -910,7 +955,7 @@ fn render_source_with(
     if let (Dialect::Cuda(_), Some(_)) = (dialect, written) {
         prefix.push_str(WRITTEN_GRID_BLOCK);
     }
-    debug_assert_eq!(word, word_count(schema) + runtime_parameters.len());
+    debug_assert_eq!(word, word_count(schema) + emitted_words(implementation) + runtime_parameters.len());
     constant_macros(&mut prefix, asset);
     if matches!(dialect, Dialect::Cuda(_)) {
         let tensors = schema.parameters().iter().filter_map(|parameter| match &parameter.kind {
@@ -1065,6 +1110,7 @@ struct TensorAbi<'a> {
 impl TensorAbi<'_> {
     fn render(&self, out: &mut String, prefix: &str) {
         render_representation(out, prefix, self.representation, self.dialect);
+        out.push_str(&format!("#define {prefix}_RANK {}\n", self.rank));
         let constant = |value| literal(self.dialect, value);
         for axis in 0..self.rank {
             match self.fixed.extents[axis] {
@@ -1532,8 +1578,9 @@ trait Axis: Copy + PartialEq + 'static {
 }
 
 fn render_axis_values<A: Axis>(out: &mut String) {
-    for (index, value) in A::ALL.iter().enumerate() {
-        out.push_str(&format!("#define {} {}\n", value.constant(), index + 1));
+    for value in A::ALL {
+        let number = producers::number(A::ALL, Some(*value));
+        out.push_str(&format!("#define {} {number}\n", value.constant()));
     }
 }
 
@@ -1553,14 +1600,13 @@ impl Axis for registry::CodeKind {
     }
 }
 
-/// A code interpretation's axis values: the interpretation, its offset, its
-/// codebook (`SEISMIC_CODEBOOK_<NAME>`), and its grid (`grid`,
-/// `SEISMIC_GRID_<NAME>`) with the grid's index bits, values a point, signs
-/// (`SEISMIC_GRID_SIGNS_<NAME>`, their first bit and their count) and delta
-/// (`delta`, its exponent, and its bit); 0 where it has none (and every
-/// value 0 for no interpretation).
+/// A code interpretation's axis values beside its kind (`producers::Axis`):
+/// its offset, its codebook (`SEISMIC_CODEBOOK_<NAME>`), and its grid
+/// (`grid`, `SEISMIC_GRID_<NAME>`) with the grid's index bits, values a
+/// point, signs (`SEISMIC_GRID_SIGNS_<NAME>`, their first bit and their
+/// count) and delta (`delta`, its exponent, and its bit); 0 where it has
+/// none (and every value 0 for no interpretation).
 struct Interpretation {
-    codes: Option<registry::CodeKind>,
     offset: i32,
     table: String,
     grid: Option<&'static registry::GridCodes>,
@@ -1569,7 +1615,6 @@ struct Interpretation {
 impl Interpretation {
     fn none() -> Self {
         Self {
-            codes: None,
             offset: 0,
             table: "0".to_owned(),
             grid: None,
@@ -1577,45 +1622,32 @@ impl Interpretation {
     }
 
     fn of(code: &registry::CodeInterpretation) -> Self {
-        let id = |kind: &str, name: &str| format!("SEISMIC_{kind}_{}", native_macro(name));
-        let kind = Self {
-            codes: Some(code.kind()),
-            ..Self::none()
-        };
         match code {
             registry::CodeInterpretation::Unsigned
-            | registry::CodeInterpretation::TwosComplement => kind,
+            | registry::CodeInterpretation::TwosComplement => Self::none(),
             registry::CodeInterpretation::Offset(offset)
             | registry::CodeInterpretation::Odd(offset) => Self {
                 offset: *offset,
-                ..kind
+                ..Self::none()
             },
             registry::CodeInterpretation::Table(codebook) => Self {
-                table: id("CODEBOOK", codebook.name),
-                ..kind
+                table: format!("SEISMIC_CODEBOOK_{}", native_macro(codebook.name)),
+                ..Self::none()
             },
         }
     }
 
     /// The axis values of a decoder's value codes: their interpretation's,
-    /// a grid's, or E4M3 bytes' (their kind alone).
+    /// a grid's, or none (E4M3 bytes).
     fn of_values(codes: &registry::ValueCodes) -> Self {
         match codes {
             registry::ValueCodes::Fields(code) => Self::of(code),
             registry::ValueCodes::Grid(grid) => Self {
-                codes: Some(registry::CodeKind::Grid),
                 grid: Some(grid),
                 ..Self::none()
             },
-            registry::ValueCodes::E4m3 => Self {
-                codes: Some(registry::CodeKind::E4m3),
-                ..Self::none()
-            },
+            registry::ValueCodes::E4m3 => Self::none(),
         }
-    }
-
-    fn codes(&self) -> String {
-        self.codes.map_or_else(|| "0".to_owned(), Axis::constant)
     }
 
     /// A fact of its grid, 0 where it has none.
@@ -1661,33 +1693,24 @@ impl Axis for registry::ScaleEncoding {
     }
 }
 
-/// A row-layout packed element's decode axes (`registry::decode_axes`) as
-/// the ABI's flat values, 0 where its coefficients have none: a direct
-/// coefficient's scale is `scale`; a hierarchical one's factor is `scale`,
-/// its local codes are `local_bits`-bit `local`, its bias term is of kind
-/// `bias` (`SEISMIC_BIAS_KIND_*`), a minimum's sign `bias_sign` (1 without
-/// one) and a signed bias's exponent `signed_exponent`, and carried local
-/// codes sit at entry bit `carried_bit`, which is past the entry's indices,
-/// signs and delta (0: none carried).
+/// A row-layout packed element's decode axes as the ABI's flat values, 0
+/// where its coefficients have none. The axes its producers are declared by
+/// are the weight's (`producers::Weight::value`, the one computation of
+/// them); beside them, a direct coefficient's scale is `scale`; a
+/// hierarchical one's factor is `scale`, a minimum's sign `bias_sign` (1
+/// without one) and a signed bias's exponent `signed_exponent`.
 struct Coded {
-    low: u32,
-    high: u32,
+    weight: producers::Weight,
     code: Interpretation,
     code_exponent: i32,
-    coeff: registry::CoefficientKind,
     scale: registry::ScaleEncoding,
-    bias: Option<registry::BiasKind>,
     bias_sign: i32,
-    group: u32,
-    factor_group: u32,
     exponent: i32,
-    local_bits: u32,
     /// The bits of a local code read as its scale code
     /// (`registry::LocalCodes::scale_bits`).
     local_scale_bits: u32,
     local: Interpretation,
     signed_exponent: i32,
-    carried_bit: u32,
     /// The code domain and the local coefficient code domain, where its
     /// local scales are codes (`registry::profile::Profile`).
     codes: registry::profile::Domain,
@@ -1696,51 +1719,37 @@ struct Coded {
 
 impl Coded {
     fn of(id: RepresentationId) -> Self {
-        let axes = registry::decode_axes(id).expect("packed storage has decode axes");
+        let weight = producers::Weight::of(registry::representation_info(id))
+            .expect("packed rows have decode axes");
+        let axes = weight.axes.clone();
         let profile = axes.profile();
         let codes = profile.codes;
         let locals = match profile.local.scale {
             registry::profile::LocalScale::Code(locals) => Some(locals),
             registry::profile::LocalScale::Stored(_) => None,
         };
-        let values = axes.coding.codes();
-        let flat = |coeff, scale, bias, group| Self {
-            low: axes.low,
-            high: axes.high,
-            code: Interpretation::of_values(&values),
+        let flat = |scale| Self {
+            weight,
+            code: Interpretation::of_values(&axes.coding.codes()),
             code_exponent: axes.code_exponent,
-            coeff,
             scale,
-            bias,
             bias_sign: 1,
-            group,
-            factor_group: 0,
             exponent: 0,
-            local_bits: 0,
             local_scale_bits: 0,
             local: Interpretation::none(),
             signed_exponent: 0,
-            carried_bit: 0,
             codes,
             locals,
         };
         match &axes.coding {
-            registry::CodingAxes::Direct {
-                scale, bias, group, ..
-            } => flat(
-                axes.coding.kind(),
-                *scale,
-                bias.then_some(registry::BiasKind::Minimum),
-                *group,
-            ),
+            registry::CodingAxes::Direct { scale, .. } => flat(*scale),
             registry::CodingAxes::Hierarchical {
                 factor,
-                factor_group,
                 exponent,
-                group,
                 bits,
                 interpretation,
                 locals,
+                ..
             } => {
                 let (bias_sign, signed_exponent) = match locals.bias() {
                     None => (1, 0),
@@ -1748,21 +1757,25 @@ impl Coded {
                     Some(registry::LocalBias::Signed { exponent }) => (1, exponent),
                 };
                 Self {
-                    factor_group: *factor_group,
                     exponent: *exponent,
-                    bias: locals.bias().map(registry::LocalBias::kind),
                     bias_sign,
                     signed_exponent,
-                    local_bits: *bits,
                     local_scale_bits: locals.scale_bits(*bits),
                     local: Interpretation::of(interpretation),
-                    carried_bit: match locals {
-                        registry::LocalCodes::Plane { .. } => 0,
-                        registry::LocalCodes::Carried { grid, .. } => grid.carried_bit(),
-                    },
-                    ..flat(axes.coding.kind(), *factor, None, *group)
+                    ..flat(*factor)
                 }
             }
+        }
+    }
+
+    /// The weight's value of `axis` as the ABI writes it: a number, or an
+    /// enumerated value's name (`SEISMIC_<AXIS>_<NAME>`), 0 for none.
+    fn axis(&self, axis: producers::Axis) -> String {
+        match self.weight.value(axis) {
+            producers::AxisValue::Number(value) => value.to_string(),
+            producers::AxisValue::Codes(kind) => kind.map_or_else(|| "0".to_owned(), Axis::constant),
+            producers::AxisValue::Coeff(kind) => kind.constant(),
+            producers::AxisValue::Bias(kind) => kind.map_or_else(|| "0".to_owned(), Axis::constant),
         }
     }
 }
@@ -1771,10 +1784,10 @@ impl Coded {
 /// `<prefix>_<AXIS>` (`render_representation`), in the order of the axes
 /// tuple (`render_axes_tuple`).
 const CODING_AXES: [(&str, fn(&Coded) -> String); 32] = [
-    ("CODE_LOW_BITS", |c| c.low.to_string()),
-    ("CODE_HIGH_BITS", |c| c.high.to_string()),
-    ("CODES", |c| c.code.codes()),
-    ("CODES_OFFSET", |c| c.code.offset.to_string()),
+    (producers::Axis::CodeLowBits.name(), |c| c.axis(producers::Axis::CodeLowBits)),
+    (producers::Axis::CodeHighBits.name(), |c| c.axis(producers::Axis::CodeHighBits)),
+    (producers::Axis::Codes.name(), |c| c.axis(producers::Axis::Codes)),
+    (producers::Axis::CodesOffset.name(), |c| c.axis(producers::Axis::CodesOffset)),
     ("CODES_TABLE", |c| c.code.table.clone()),
     ("CODES_GRID", |c| {
         c.code.grid.map_or_else(|| "0".to_owned(), grid_id)
@@ -1786,18 +1799,18 @@ const CODING_AXES: [(&str, fn(&Coded) -> String); 32] = [
         c.code.grid_value(registry::GridCodes::lanes)
     }),
     ("CODES_EXPONENT", |c| c.code_exponent.to_string()),
-    ("COEFF", |c| c.coeff.constant()),
+    (producers::Axis::Coeff.name(), |c| c.axis(producers::Axis::Coeff)),
     ("COEFF_SCALE", |c| c.scale.constant()),
-    ("COEFF_BIAS", |c| c.bias.map_or_else(|| "0".to_owned(), Axis::constant)),
+    (producers::Axis::CoeffBias.name(), |c| c.axis(producers::Axis::CoeffBias)),
     ("COEFF_BIAS_SIGN", |c| c.bias_sign.to_string()),
-    ("COEFF_GROUP", |c| c.group.to_string()),
-    ("COEFF_FACTOR_GROUP", |c| c.factor_group.to_string()),
+    (producers::Axis::CoeffGroup.name(), |c| c.axis(producers::Axis::CoeffGroup)),
+    (producers::Axis::CoeffFactorGroup.name(), |c| c.axis(producers::Axis::CoeffFactorGroup)),
     ("COEFF_EXPONENT", |c| c.exponent.to_string()),
-    ("COEFF_LOCAL_BITS", |c| c.local_bits.to_string()),
+    (producers::Axis::CoeffLocalBits.name(), |c| c.axis(producers::Axis::CoeffLocalBits)),
     ("COEFF_LOCAL_SCALE_BITS", |c| c.local_scale_bits.to_string()),
-    ("COEFF_LOCAL", |c| c.local.codes()),
+    (producers::Axis::CoeffLocal.name(), |c| c.axis(producers::Axis::CoeffLocal)),
     ("COEFF_LOCAL_OFFSET", |c| c.local.offset.to_string()),
-    ("COEFF_CARRIED", |c| c.carried_bit.to_string()),
+    (producers::Axis::CoeffCarried.name(), |c| c.axis(producers::Axis::CoeffCarried)),
     ("CODES_LEAST", |c| c.codes.least.to_string()),
     ("CODES_GREATEST", |c| c.codes.greatest.to_string()),
     ("COEFF_LOCAL_LEAST", |c| {

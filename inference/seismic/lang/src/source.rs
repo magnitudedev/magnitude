@@ -46,6 +46,7 @@ pub const NATIVE_LIBRARY: &[(&str, &str)] = &[
         include_str!("../native-library/metal/packets.h"),
     ),
     ("slab.h", include_str!("../native-library/metal/slab.h")),
+    ("producers.h", include_str!(concat!(env!("OUT_DIR"), "/producers.h"))),
     ("tables.h", include_str!(concat!(env!("OUT_DIR"), "/tables.h"))),
     (
         "element.cuh",
@@ -56,6 +57,10 @@ pub const NATIVE_LIBRARY: &[(&str, &str)] = &[
         include_str!("../native-library/cuda/packets.cuh"),
     ),
     ("slab.cuh", include_str!("../native-library/cuda/slab.cuh")),
+    (
+        "producers.cuh",
+        include_str!(concat!(env!("OUT_DIR"), "/producers.cuh")),
+    ),
     (
         "tables.cuh",
         include_str!(concat!(env!("OUT_DIR"), "/tables.cuh")),
@@ -75,6 +80,10 @@ pub const NATIVE_LIBRARY: &[(&str, &str)] = &[
     (
         "slab.glsl",
         include_str!("../native-library/vulkan/slab.glsl"),
+    ),
+    (
+        "producers.glsl",
+        include_str!(concat!(env!("OUT_DIR"), "/producers.glsl")),
     ),
     (
         "tables.glsl",
@@ -767,7 +776,7 @@ mod tests {
             "#include <seismic/element.h>\nLIB\n",
         )
         .unwrap();
-        // packets.h includes element.h, slab.h and tables.h itself; each
+        // packets.h includes element.h, slab.h, producers.h and tables.h itself; each
         // library file is inlined once.
         let asset = asset(
             &root,
@@ -778,7 +787,7 @@ mod tests {
             includes,
             library,
         } = expand_includes(&asset, "h", &[root.clone()]).unwrap();
-        assert_eq!(library, ["packets.h", "element.h", "slab.h", "tables.h"]);
+        assert_eq!(library, ["packets.h", "element.h", "slab.h", "producers.h", "tables.h"]);
         assert_eq!(
             includes.len(),
             1,

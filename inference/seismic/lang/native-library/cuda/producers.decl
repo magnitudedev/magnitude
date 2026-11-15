@@ -1,0 +1,10 @@
+# The decoders CUDA's producers read, per form that bounds them
+# (`seismic_lang::producers`): the one statement of reach, from which the
+# build renders `<seismic/producers.cuh>`. The folded and int8 GEMMs read
+# every packed-rows weight's codes as exact operand integers
+# (`packets::Packed::s8`, `packets::Records::s8`) and declare no bound; the
+# int8 GEMM's local-scale form multiplies local codes it reads from the
+# scales plane (`packets::Hier::staged_local`), as `Packed` asserts.
+
+form INT8_LOCAL
+locals=plane

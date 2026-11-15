@@ -145,7 +145,7 @@ impl Printer {
                         self.out.push_str("):\n");
                         self.level += 1;
                     }
-                    self.launch(launch, None, &[]);
+                    self.launch(launch, &[], &[]);
                     if repeat.is_some_and(|repeat| repeat.first + repeat.launches == ordinal + 1) {
                         self.level -= 1;
                     }
@@ -155,12 +155,10 @@ impl Printer {
         }
     }
 
-    fn launch(&mut self, launch: &NativeLaunchDecl, variant: Option<&Ident>, variants: &[Option<Ident>]) {
+    fn launch(&mut self, launch: &NativeLaunchDecl, gate: &[Ident], variants: &[Vec<Ident>]) {
         self.indent();
         let _ = write!(self.out, "launch {}", launch.kernel.name);
-        if let Some(variant) = variant {
-            let _ = write!(self.out, " for {}", variant.name);
-        }
+        self.variants(gate);
         if let Some(before) = &launch.before {
             let _ = write!(self.out, " before {}", before.name);
         }
@@ -212,18 +210,7 @@ impl Printer {
             self.out.push_str(&grid.name);
             self.out.push_str(")\n");
         }
-        for condition in &launch.conditions {
-            self.indent();
-            self.out.push_str(condition.encoded.keyword());
-            self.out.push_str(" (");
-            self.out.push_str(&condition.word.name);
-            if let Some(index) = &condition.index {
-                self.out.push('[');
-                self.expr(index, 0);
-                self.out.push(']');
-            }
-            self.out.push_str(")\n");
-        }
+        self.conditions(&launch.conditions);
         self.indent();
         self.out.push_str("threads_per_threadgroup (");
         self.list(&launch.threads_per_threadgroup, |p, expr| p.expr(expr, 0));
@@ -248,19 +235,198 @@ impl Printer {
             self.out.push_str(" when ");
             self.expr(when, 0);
         }
+        // An expanded operand (`Formed`, `Emitted`) has no text of its own:
+        // its `project` line and its projection's buffer write it.
+        if let Some(ScratchOperandDecl::Declared { rows, when, formed, nvfp4 }) = &scratch.operand {
+            self.out.push_str(if *rows { " operand rows" } else { " operand" });
+            if let Some(when) = when {
+                self.out.push_str(" when ");
+                self.expr(when, 0);
+            }
+            for (word, clause) in [("formed", formed), ("nvfp4", nvfp4)] {
+                if let Some(clause) = clause {
+                    let _ = write!(self.out, " {word} (");
+                    self.expr(clause, 0);
+                    self.out.push(')');
+                }
+            }
+        }
     }
 
-    fn variant(&mut self, variant: &Option<Ident>) {
-        if let Some(variant) = variant {
-            let _ = write!(self.out, " for {}", variant.name);
+    fn emits(&mut self, emits: &[NativeEmitDecl]) {
+        self.out.push_str("emits (");
+        for (ordinal, emit) in emits.iter().enumerate() {
+            if ordinal > 0 {
+                self.out.push_str(", ");
+            }
+            let _ = write!(self.out, "result {}", emit.result);
+            self.over(Some(&emit.over));
+            self.norm(emit.norm.as_ref());
         }
+        self.out.push(')');
+    }
+
+    fn conditions(&mut self, conditions: &[NativeConditionDecl]) {
+        for condition in conditions {
+            self.indent();
+            self.out.push_str(condition.encoded.keyword());
+            self.out.push_str(" (");
+            self.out.push_str(&condition.word.name);
+            if let Some(index) = &condition.index {
+                self.out.push('[');
+                self.expr(index, 0);
+                self.out.push(']');
+            }
+            self.out.push_str(")\n");
+        }
+    }
+
+    fn norm(&mut self, norm: Option<&OperandNormDecl>) {
+        if let Some(norm) = norm {
+            let _ = write!(self.out, " normed ({}, {})", norm.weight.name, norm.epsilon.name);
+        }
+    }
+
+    fn variants(&mut self, variants: &[Ident]) {
+        let names = variants.iter().map(|variant| variant.name.as_str()).collect::<Vec<_>>();
+        if !names.is_empty() {
+            let _ = write!(self.out, " for {}", names.join(" | "));
+        }
+    }
+
+    fn over(&mut self, over: Option<&NativeProjectOver>) {
+        let Some(over) = over else { return };
+        self.out.push_str(" over (");
+        self.expr(&over.rows, 0);
+        self.out.push_str(", ");
+        self.expr(&over.width, 0);
+        self.out.push(')');
     }
 
     fn project(&mut self, project: &NativeProjectDecl) {
         self.indent();
+        if project.weights.is_empty() && !project.emits.is_empty() {
+            let _ = write!(self.out, "project {} ", project.projection.name);
+            self.emits(&project.emits);
+            self.out.push('\n');
+            return;
+        }
         let _ = write!(self.out, "project {} {} (", project.projection.name, project.variant.name);
-        self.names(&project.weights);
-        self.out.push_str(")\n");
+        let mut at = 0;
+        let weight = |printer: &mut Self, at: &mut usize| {
+            match project.weight_planes[*at].as_slice() {
+                [] => printer.out.push_str(&project.weights[*at].name),
+                planes => {
+                    let planes: Vec<&str> = planes.iter().map(|plane| plane.name.as_str()).collect();
+                    let _ = write!(printer.out, "planes ({})", planes.join(", "));
+                }
+            }
+            printer.over(project.weight_overs[*at].as_ref());
+            *at += 1;
+        };
+        if project.served.is_empty() {
+            for ordinal in 0..project.weights.len() {
+                if ordinal > 0 {
+                    self.out.push_str(", ");
+                }
+                weight(self, &mut at);
+            }
+        } else {
+            for (segment, count) in project.served.iter().enumerate() {
+                if segment > 0 {
+                    self.out.push_str(", ");
+                }
+                if *count == 1 {
+                    weight(self, &mut at);
+                } else {
+                    self.out.push('(');
+                    for ordinal in 0..*count {
+                        if ordinal > 0 {
+                            self.out.push_str(", ");
+                        }
+                        weight(self, &mut at);
+                    }
+                    self.out.push(')');
+                }
+            }
+        }
+        self.out.push(')');
+        self.over(project.over.as_ref());
+        if !project.shared.is_empty() {
+            let shared: Vec<&str> = project.shared.iter().map(|weight| weight.name.as_str()).collect();
+            let _ = write!(self.out, " shared ({})", shared.join(", "));
+        }
+        if let Some(down) = &project.down {
+            let _ = write!(self.out, " down ({})", down.name);
+        }
+        if let Some(groups) = &project.groups {
+            let _ = write!(self.out, " groups {}", groups.name);
+        }
+        if let Some(parts) = &project.parts {
+            let _ = write!(self.out, " parts {}", parts.name);
+        }
+        if let Some(gathered) = &project.gathered {
+            let _ = write!(self.out, " gathered {}", gathered.name);
+        }
+        if let Some(rows) = &project.rows {
+            let _ = write!(self.out, " rows {}", rows.name);
+        }
+        if let Some(publishes) = &project.publishes {
+            let _ = write!(self.out, " publishes (result {})", publishes.result);
+        }
+        if !project.ordered.is_empty() {
+            let ordered: Vec<&str> = project.ordered.iter().map(|weight| weight.name.as_str()).collect();
+            let _ = write!(self.out, " ordered ({})", ordered.join(", "));
+        }
+        if !project.operands.is_empty() {
+            self.out.push_str(" operand (");
+            for (ordinal, operand) in project.operands.iter().enumerate() {
+                if ordinal > 0 {
+                    self.out.push_str(", ");
+                }
+                match &operand.source {
+                    OperandSourceDecl::Parameter { parameter, at, within, norm } => {
+                        self.out.push_str(&parameter.name);
+                        if let Some(at) = at {
+                            let _ = write!(self.out, " at ({})", at.name);
+                        }
+                        if let Some([first, count]) = within {
+                            let _ = write!(self.out, " within ({}, {})", first.name, count.name);
+                        }
+                        self.norm(norm.as_ref());
+                    }
+                    OperandSourceDecl::Values(function) => {
+                        let _ = write!(self.out, "values ({})", function.name);
+                    }
+                    OperandSourceDecl::Emitted(_) => self.out.push_str("emitted"),
+                }
+                if let Some(tiles) = &operand.tiles {
+                    self.out.push_str(" tiles (");
+                    self.expr(tiles, 0);
+                    self.out.push(')');
+                }
+            }
+            self.out.push(')');
+        }
+        if !project.emits.is_empty() {
+            self.out.push(' ');
+            self.emits(&project.emits);
+        }
+        self.out.push('\n');
+        self.conditions(&project.guard);
+        for mapping in &project.mappings {
+            self.indent();
+            let _ = writeln!(self.out, "restate {}", mapping.name);
+        }
+        for restated in &project.restated {
+            self.indent();
+            self.out.push_str("restate ");
+            if let Some(launch) = &restated.launch {
+                let _ = write!(self.out, "{} ", launch.name);
+            }
+            self.native_param(&restated.param);
+            self.out.push('\n');
+        }
     }
 
     fn projection(&mut self, p: &ProjectionDecl) {
@@ -270,20 +436,20 @@ impl Printer {
             self.indent();
             let _ = write!(self.out, "let {} = ", term.item.name.name);
             self.expr(&term.item.value, 0);
-            self.variant(&term.variant);
+            self.variants(&term.variants);
             self.out.push('\n');
         }
         if !p.params.is_empty() {
             self.indent();
             let params = p.params.iter().map(|param| param.item.clone()).collect::<Vec<_>>();
-            let variants = p.params.iter().map(|param| param.variant.clone()).collect::<Vec<_>>();
+            let variants = p.params.iter().map(|param| param.variants.clone()).collect::<Vec<_>>();
             self.native_params(&params, &variants);
         }
         for constraint in &p.constraints {
             self.indent();
             self.out.push_str("where ");
             self.expr(&constraint.item, 0);
-            self.variant(&constraint.variant);
+            self.variants(&constraint.variants);
             self.out.push('\n');
         }
         for scratch in &p.scratch {
@@ -291,7 +457,7 @@ impl Printer {
                 ProjectionScratchDecl::One(one) => {
                     self.indent();
                     self.native_scratch(&one.item);
-                    self.variant(&one.variant);
+                    self.variants(&one.variants);
                     self.out.push('\n');
                 }
                 ProjectionScratchDecl::Each(each) => {
@@ -301,7 +467,7 @@ impl Printer {
                     for one in each {
                         self.indent();
                         self.native_scratch(&one.item);
-                        self.variant(&one.variant);
+                        self.variants(&one.variants);
                         self.out.push('\n');
                     }
                     self.level -= 1;
@@ -309,41 +475,55 @@ impl Printer {
             }
         }
         for launch in &p.launches {
-            self.launch(&launch.launch, launch.variant.as_ref(), &launch.param_variants);
+            self.launch(&launch.launch, &launch.variants, &launch.param_variants);
+        }
+        for mapping in &p.mappings {
+            self.indent();
+            let _ = writeln!(self.out, "mapping {}:", mapping.name.name);
+            self.level += 1;
+            for restated in &mapping.restated {
+                self.indent();
+                self.out.push_str("restate ");
+                if let Some(launch) = &restated.launch {
+                    let _ = write!(self.out, "{} ", launch.name);
+                }
+                self.native_param(&restated.param);
+                self.out.push('\n');
+            }
+            self.level -= 1;
         }
         self.level -= 1;
     }
 
-    fn native_params(&mut self, params: &[NativeParamDecl], variants: &[Option<Ident>]) {
+    fn native_param(&mut self, param: &NativeParamDecl) {
+        if param.arithmetic {
+            self.out.push_str("arithmetic ");
+        }
+        if param.form {
+            self.out.push_str("form ");
+        }
+        let values = param.values.iter().map(u64::to_string).collect::<Vec<_>>().join(", ");
+        let _ = write!(self.out, "{} in [{values}] default ", param.name.name);
+        match &param.default {
+            NativeDefaultDecl::Value(value) => self.expr(value, 0),
+            NativeDefaultDecl::Least(condition) => {
+                self.out.push_str("least where ");
+                self.expr(condition, 0);
+            }
+            NativeDefaultDecl::Greatest(condition) => {
+                self.out.push_str("greatest where ");
+                self.expr(condition, 0);
+            }
+        }
+    }
+
+    fn native_params(&mut self, params: &[NativeParamDecl], variants: &[Vec<Ident>]) {
         self.out.push_str("params (");
         let gated = params.iter().enumerate().collect::<Vec<_>>();
         self.list(&gated, |p, &(ordinal, param)| {
-            if param.arithmetic {
-                p.out.push_str("arithmetic ");
-            }
-            if param.form {
-                p.out.push_str("form ");
-            }
-            let values = param
-                .values
-                .iter()
-                .map(u64::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            let _ = write!(p.out, "{} in [{values}] default ", param.name.name);
-            match &param.default {
-                NativeDefaultDecl::Value(value) => p.expr(value, 0),
-                NativeDefaultDecl::Least(condition) => {
-                    p.out.push_str("least where ");
-                    p.expr(condition, 0);
-                }
-                NativeDefaultDecl::Greatest(condition) => {
-                    p.out.push_str("greatest where ");
-                    p.expr(condition, 0);
-                }
-            }
-            if let Some(variant) = variants.get(ordinal) {
-                p.variant(variant);
+            p.native_param(param);
+            if let Some(variants) = variants.get(ordinal) {
+                p.variants(variants);
             }
         });
         self.out.push_str(")\n");

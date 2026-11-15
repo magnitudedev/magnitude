@@ -279,6 +279,31 @@ pub enum WorkflowError {
     PlannedRouteUnavailable {
         backend: seismic_lang::registry::BackendName,
     },
+    /// An operand carry declared in (`carry_in`) that no consumer of the
+    /// graph reads: none forms the operand of its tensor under its norm and
+    /// epsilon. `port` is the carry's rows port.
+    UnreadOperandCarry {
+        port: usize,
+    },
+    /// Node `node`, whose result an operand carry is declared out of
+    /// (`carry_out`), emits no normed operand of it in both forms a carry
+    /// holds, or emits it to a consumer in its own graph, or a carry of it
+    /// was declared twice.
+    OperandEmitter {
+        node: usize,
+    },
+    /// Node `node` reads a carried operand in forms other than the carry's:
+    /// its rows not formed, its Q8 blocks formed where the carry holds none
+    /// or not formed where it holds them, its NVFP4 transform not the
+    /// carry's, or a formation that cannot be left out.
+    OperandForms {
+        node: usize,
+    },
+    /// Node `node` binds an activation element other than its operand's
+    /// other end: a pair's producer, or the carry it reads or writes.
+    OperandElement {
+        node: usize,
+    },
 }
 impl fmt::Display for WorkflowError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -415,6 +440,19 @@ impl fmt::Display for CallError {
                 "`{}` is a native-only backend: planned workflows are unavailable",
                 backend.as_str()
             ),
+            Self::Workflow(WorkflowError::UnreadOperandCarry { port }) => {
+                write!(f, "the operand carried in at native graph port {port} has no consumer that reads it")
+            }
+            Self::Workflow(WorkflowError::OperandEmitter { node }) => write!(
+                f,
+                "native graph node {node} emits no normed operand in both carried forms, or emits it within its graph"
+            ),
+            Self::Workflow(WorkflowError::OperandForms { node }) => {
+                write!(f, "native graph node {node} forms its operand other than the carry it reads holds it")
+            }
+            Self::Workflow(WorkflowError::OperandElement { node }) => {
+                write!(f, "native graph node {node} binds another activation element than its operand's other end")
+            }
         }
     }
 }

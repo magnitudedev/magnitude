@@ -17,6 +17,33 @@ uint64_t slab_row(uint64_t table, uint64_t row_index, uint64_t rows_per_slab,
         + (row_index % rows_per_slab) * row_bytes;
 }
 
+// Where an expert-stacked weight's matrix is read for one use (a routed
+// choice's, a grouped block's): `code` >= 0 is record `code` of the primary
+// table, <= -2 record -2 - code of the secondary, and -1 none (the use reads
+// no record and contributes nothing). The routed entries' `decode_source`.
+struct slab_source {
+    int code;
+};
+
+bool slab_source_none(slab_source source) {
+    return source.code == -1;
+}
+
+// An expert-stacked weight bound as record tables, each entry an expert's
+// matrix: `primary` (a bank's records, a held layer's slots, a resident
+// layer's experts) and `secondary` (the host tier's records, read in place,
+// or the experts' homes by index). `slab_experts_matrix` is the address of
+// the matrix a source names.
+struct slab_experts {
+    uint64_t primary;
+    uint64_t secondary;
+};
+
+uint64_t slab_experts_matrix(slab_experts experts, slab_source source) {
+    return source.code >= 0 ? slab_region(experts.primary, uint64_t(source.code))
+                            : slab_region(experts.secondary, uint64_t(-2 - source.code));
+}
+
 // Row maps use i32 indices and slab counts use u32. Keep their quotient and
 // remainder in that domain before widening the byte address.
 uint64_t slab_row(uint64_t table, uint row_index, uint rows_per_slab,

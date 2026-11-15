@@ -8,7 +8,8 @@
 //! `CODEBOOKS_TABLE_<ID>`). A
 //! `u32` grid point is one word and a `u64` point its (low, high) words;
 //! codebook values are exact floats. A 16-value codebook also has a dialect's own forms of its values:
-//! on Metal each code byte's two values + 128 (`codebooks::pairs<ID>`: the
+//! on Metal each code byte's two values + the zero its lane producer enters
+//! codebook values at (`metal/producers.decl`; `codebooks::pairs<ID>`: the
 //! low nibble's in the low byte), on CUDA its values as little-endian s8
 //! words (`codebooks::words<ID>`: `W0`..`W3`, values 4w..4w + 3 in word w)
 //! and whether they are E2M1 doubled (`codebooks::e2m1<ID>`). On CUDA a grid
@@ -22,6 +23,8 @@ use std::fmt::Write as _;
 
 #[path = "src/native_name.rs"]
 mod native_name;
+#[path = "src/producer_decl.rs"]
+mod producer_decl;
 use native_name::native_macro;
 
 /// A table space: its namespace and the accessor of a table's elements.
@@ -93,8 +96,9 @@ struct Dialect {
     /// The binding of table `id` of `space` to array `space::name` of type
     /// `ty`.
     bind: fn(space: Space, id: usize, name: &str, ty: &str) -> String,
-    /// A 16-value codebook's dialect forms.
-    sixteen: fn(id: usize, name: &str, values: [i8; 16]) -> String,
+    /// A 16-value codebook's dialect forms, where `zero` is the code its
+    /// values enter Metal's lanes at (`metal/producers.decl`).
+    sixteen: fn(id: usize, name: &str, values: [i8; 16], zero: i32) -> String,
     /// A grid's dialect forms.
     grid: fn(id: usize, points: GridPoints) -> String,
     /// Whether the dialect reads codebooks' values themselves (CUDA reads
@@ -142,10 +146,10 @@ const DIALECTS: [Dialect; 3] = [
         grid: |_, _| String::new(),
         values: true,
         guarded: &[],
-        sixteen: |id, name, values| {
+        sixteen: |id, name, values, zero| {
             let pairs: Vec<String> = (0..256)
                 .map(|byte| {
-                    let value = |code: usize| (i32::from(values[code]) + 128) as u16;
+                    let value = |code: usize| (i32::from(values[code]) + zero) as u16;
                     format!("0x{:04x}", value(byte & 15) | (value(byte >> 4) << 8))
                 })
                 .collect();
@@ -179,7 +183,7 @@ const DIALECTS: [Dialect; 3] = [
                 space.accessor()
             )
         },
-        sixteen: |id, _, values| {
+        sixteen: |id, _, values, _| {
             let word = |w: usize| u32::from_le_bytes(std::array::from_fn(|b| values[4 * w + b] as u8));
             format!(
                 "namespace codebooks {{ template <> struct words<{id}> {{ static constexpr unsigned W0 = 0x{:08x}u, W1 = 0x{:08x}u, W2 = 0x{:08x}u, W3 = 0x{:08x}u; }}; template <> struct e2m1<{id}> {{ static constexpr bool value = {}; }}; }}\n",
@@ -211,7 +215,7 @@ const DIALECTS: [Dialect; 3] = [
             let space = space.name();
             format!("#define {}_TABLE_{id} {space}_{name}\n", native_macro(space))
         },
-        sixteen: |_, _, _| String::new(),
+        sixteen: |_, _, _, _| String::new(),
         grid: |_, _| String::new(),
         values: true,
         // glslang emits every declared constant array, read or not: a
@@ -324,11 +328,211 @@ fn body(text: &mut String, words: &[String]) {
     writeln!(text, "    {}", lines.join(",\n    ")).unwrap();
 }
 
+/// A backend's producer predicates (`<seismic/producers.*>`), rendered from
+/// its `native-library/<backend>/producers.decl`: one constexpr predicate per
+/// producer over `(code, low, high)` and per form over `(code, low, high,
+/// locals)`, true exactly where the declaration has a pattern for the axis
+/// values. `code` is one of `producers::UNSIGNED`, `TWOS`, `OFFSET`, `ODD`,
+/// `TABLE`, `GRID`, `E4M3` (the kinds of `CodeKind`), `locals` one
+/// of `producers::DIRECT`, `PLANE_UNSIGNED` (a scales plane of plain
+/// unsigned local codes), `PLANE` (any other plane's local codes) or
+/// `CARRIED` (in the grid entries). The library's decode functions are
+/// dispatched by these predicates, so the declaration is the one statement
+/// of reach. Each producer's concrete (code, low, high) values are also
+/// listed as `PRODUCERS_<NAME>(X)`, which the library checks
+/// against its decode functions: a declared pattern without one fails the
+/// build. A producer whose patterns state how its codes enter its lanes
+/// also has `<name>_bytes(code, low, high)`, whether they enter as bytes,
+/// and `<name>_zero(code, low, high, stored)`, the zero they enter at (the
+/// declared one, else the code's own `stored`), which its decode functions
+/// are held to.
+fn producers_header(backend: &str, decl: &producer_decl::Declaration, device: &str, constant: &str) -> String {
+    use producer_decl::Pattern;
+    assert!(
+        decl.producers.iter().all(|producer| producer.requires.is_empty())
+            && decl.forms.iter().all(|form| form.requires.is_empty()),
+        "the {backend} library's producers state no requirements"
+    );
+    let kind = |name: &str| name.to_uppercase();
+    let uint = if backend == "CUDA" { "unsigned" } else { "uint" };
+    let locals = |pattern: &Pattern| -> String {
+        if pattern.locals.is_empty() {
+            return "true".to_owned();
+        }
+        let terms: Vec<String> = pattern
+            .locals
+            .iter()
+            .map(|(placement, kind)| match (placement.as_str(), kind.as_deref()) {
+                ("direct", None) => "locals == DIRECT".to_owned(),
+                ("carried", None) => "locals == CARRIED".to_owned(),
+                ("plane", None) => "(locals == PLANE_UNSIGNED || locals == PLANE)".to_owned(),
+                ("plane", Some("unsigned")) => "locals == PLANE_UNSIGNED".to_owned(),
+                other => panic!("the {backend} library distinguishes no local placement {other:?}"),
+            })
+            .collect();
+        format!("({})", terms.join(" || "))
+    };
+    let codes = |pattern: &Pattern| -> String {
+        let mut terms = Vec::new();
+        if !pattern.kinds.is_empty() {
+            let kinds: Vec<String> = pattern.kinds.iter().map(|name| format!("code == {}", kind(name))).collect();
+            terms.push(format!("({})", kinds.join(" || ")));
+        }
+        if !pattern.planes.is_empty() {
+            let planes: Vec<String> =
+                pattern.planes.iter().map(|(low, high)| format!("(low == {low}u && high == {high}u)")).collect();
+            terms.push(format!("({})", planes.join(" || ")));
+        }
+        if terms.is_empty() { "true".to_owned() } else { terms.join(" && ") }
+    };
+    let any = |expressions: Vec<String>| if expressions.is_empty() { "false".to_owned() } else { expressions.join("\n        || ") };
+    let mut text = format!(
+        "// Seismic native library ({backend}): the producer predicates, rendered from\n\
+         // `{backend}/producers.decl` by seismic/lang/build.rs.\n\nnamespace producers {{\n\
+         {constant} {uint} DIRECT = 0u, PLANE_UNSIGNED = 1u, PLANE = 2u, CARRIED = 3u;\n\
+         {constant} {uint} UNSIGNED = 0u, TWOS = 1u, OFFSET = 2u, ODD = 3u, TABLE = 4u, GRID = 5u, E4M3 = 6u;\n\n"
+    );
+    for producer in &decl.producers {
+        let body = any(producer.patterns.iter().map(&codes).collect());
+        writeln!(text, "{device}constexpr bool {}({uint} code, {uint} low, {uint} high) {{\n    return {body};\n}}\n", producer.name).unwrap();
+        let entries: Vec<(&Pattern, producer_decl::Entry)> =
+            producer.patterns.iter().filter_map(|pattern| pattern.entry.map(|entry| (pattern, entry))).collect();
+        if entries.is_empty() {
+            continue;
+        }
+        let bytes = any(entries.iter().filter(|(_, entry)| entry.bytes).map(|&(pattern, _)| codes(pattern)).collect());
+        writeln!(text, "{device}constexpr bool {}_bytes({uint} code, {uint} low, {uint} high) {{\n    return {bytes};\n}}\n", producer.name).unwrap();
+        let zero = entries.iter().filter_map(|&(pattern, entry)| entry.zero.map(|zero| (codes(pattern), zero))).fold(
+            "stored".to_owned(),
+            |rest, (held, zero)| format!("({held}) ? {zero} : {rest}"),
+        );
+        writeln!(
+            text,
+            "{device}constexpr int {}_zero({uint} code, {uint} low, {uint} high, int stored) {{\n    return {zero};\n}}\n",
+            producer.name
+        )
+        .unwrap();
+    }
+    for form in &decl.forms {
+        let body = any(
+            form.patterns.iter().map(|pattern| format!("({} && {})", codes(pattern), locals(pattern))).collect(),
+        );
+        writeln!(
+            text,
+            "{device}constexpr bool {}({uint} code, {uint} low, {uint} high, {uint} locals) {{\n    return {body};\n}}\n",
+            form.name
+        )
+        .unwrap();
+    }
+    text += "}\n\n";
+    for producer in &decl.producers {
+        let mut entries = Vec::new();
+        for pattern in &producer.patterns {
+            if pattern.kinds.is_empty() || pattern.planes.is_empty() {
+                continue;
+            }
+            for name in &pattern.kinds {
+                for (low, high) in &pattern.planes {
+                    entries.push(format!("X(producers::{}, {low}u, {high}u)", kind(name)));
+                }
+            }
+        }
+        writeln!(text, "#define PRODUCERS_{}(X) \\", producer.name.to_uppercase()).unwrap();
+        text += &entries.join(" \\\n");
+        text += "\n";
+    }
+    text
+}
+
+/// Vulkan's producer predicates (`<seismic/producers.glsl>`), rendered from
+/// `native-library/vulkan/producers.decl`: one preprocessor predicate per
+/// producer over a bound slot's axes tuple (`PRODUCERS_<NAME>(AXES)`, read
+/// with its selectors `SEISMIC_AXIS_*`), true exactly where the declaration
+/// has a pattern for the slot's code kind and planes and its requirements
+/// hold. GLSL has no templates: the library reaches a bound slot's axes in
+/// `#if` alone, so the predicates are macros, not functions. Its forms
+/// (`DECODED`) are admission's (`forms`), which no library reads.
+fn producers_glsl(decl: &producer_decl::Declaration) -> String {
+    const KINDS: [&str; 7] = ["UNSIGNED", "TWOS", "OFFSET", "ODD", "TABLE", "GRID", "E4M3"];
+    let axis = |name: producer_decl::Axis| format!("AXES(SEISMIC_AXIS_{})", name.name());
+    let constant = |domain: producer_decl::Domain, name: &str| format!("SEISMIC_{}_{name}", domain.name());
+    let mut text = "// Seismic native library (Vulkan): the producer predicates, rendered from\n\
+                    // `vulkan/producers.decl` by seismic/lang/build.rs.\n\n"
+        .to_owned();
+    for producer in &decl.producers {
+        let patterns: Vec<String> = producer
+            .patterns
+            .iter()
+            .map(|pattern| {
+                assert!(
+                    pattern.locals.is_empty() && pattern.entry.is_none() && !pattern.signed_bytes,
+                    "a Vulkan producer's pattern names no locals, lane entry or values"
+                );
+                let mut terms = Vec::new();
+                if !pattern.kinds.is_empty() {
+                    let kinds: Vec<String> = pattern
+                        .kinds
+                        .iter()
+                        .map(|name| {
+                            let kind = name.to_uppercase();
+                            assert!(KINDS.contains(&kind.as_str()), "no code kind `{name}`");
+                            format!("AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_{kind}")
+                        })
+                        .collect();
+                    terms.push(format!("({})", kinds.join(" || ")));
+                }
+                if !pattern.planes.is_empty() {
+                    let planes: Vec<String> = pattern
+                        .planes
+                        .iter()
+                        .map(|(low, high)| {
+                            format!("(AXES(SEISMIC_AXIS_CODE_LOW_BITS) == {low} && AXES(SEISMIC_AXIS_CODE_HIGH_BITS) == {high})")
+                        })
+                        .collect();
+                    terms.push(format!("({})", planes.join(" || ")));
+                }
+                if terms.is_empty() { "1".to_owned() } else { format!("({})", terms.join(" && ")) }
+            })
+            .collect();
+        let patterns = if patterns.is_empty() { "0".to_owned() } else { patterns.join(" \\\n    || ") };
+        let requires: Vec<String> =
+            producer.requires.iter().map(|requirement| requirement.render(&axis, &constant)).collect();
+        let body = std::iter::once(format!("({patterns})")).chain(requires).collect::<Vec<_>>().join(" \\\n    && ");
+        writeln!(text, "#define PRODUCERS_{}(AXES) ({body})", producer.name.to_uppercase()).unwrap();
+    }
+    text
+}
+
 fn main() {
     // The tables come from the build dependency `magnitude_ggml`, whose
-    // changes Cargo tracks itself; the script reads no file.
+    // changes Cargo tracks itself; the script reads no other file than the
+    // producer declarations.
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/producer_decl.rs");
     let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
+    let declaration = |directory: &str| {
+        let path = format!("native-library/{directory}/producers.decl");
+        println!("cargo:rerun-if-changed={path}");
+        producer_decl::parse(&std::fs::read_to_string(&path).expect("producer declaration"))
+    };
+    let metal = declaration("metal");
+    for (backend, decl, file, device, constant) in [
+        ("Metal", &metal, "producers.h", "", "constant constexpr"),
+        ("CUDA", &declaration("cuda"), "producers.cuh", "__host__ __device__ ", "constexpr"),
+    ] {
+        std::fs::write(out.join(file), producers_header(backend, decl, device, constant)).expect("producers header");
+    }
+    std::fs::write(out.join("producers.glsl"), producers_glsl(&declaration("vulkan"))).expect("producers header");
+    // The zero Metal's lane producer enters a codebook's values at
+    // (`codebooks::pairs`).
+    let table_zero = metal
+        .producers
+        .iter()
+        .flat_map(|producer| &producer.patterns)
+        .find(|pattern| pattern.kinds.iter().any(|kind| kind == "table"))
+        .and_then(|pattern| pattern.entry?.zero)
+        .expect("Metal's lane producer states the zero codebook values enter at");
+    let table_zero = i32::try_from(table_zero).expect("a lane zero of i32");
     for dialect in DIALECTS {
         let mut text = format!(
             "// Seismic native library: ggml's grids and codebooks (`ggml-common.h`),\n\
@@ -377,7 +581,7 @@ fn main() {
                 text += &dialect.declare(Table::Codebook, index + 1, values);
             }
             if let Ok(values) = <[i8; 16]>::try_from(codebook.values) {
-                text += &(dialect.sixteen)(index + 1, codebook.name, values);
+                text += &(dialect.sixteen)(index + 1, codebook.name, values, table_zero);
             }
             text += "\n";
         }

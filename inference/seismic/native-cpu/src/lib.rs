@@ -232,6 +232,34 @@ impl<'a> Weights<'a> {
         view
     }
 
+    /// Every `count` adjacent rows as one row of `count` times the values:
+    /// a tensor's trailing axes taken as one (a convolution kernel's `[H,
+    /// C, P, P]` as `[H, C * P * P]`).
+    ///
+    /// # Panics
+    /// Unless the rows are dense and contiguous and `count` divides them: a
+    /// packed row's storage groups end with it, so packed rows join only
+    /// where no other group would, and none is joined.
+    pub fn joined(&self, count: usize) -> Weights<'a> {
+        let registry::RepresentationKind::Dense(dtype) = &self.storage.kind else {
+            panic!("`{}` rows are joined only dense", self.storage.name);
+        };
+        assert!(
+            count > 0 && self.rows % count == 0 && self.geometry.stride == self.k * dtype.bytes() as usize,
+            "{count} contiguous rows of {} rows of {} values",
+            self.rows,
+            self.k
+        );
+        let operand = WeightOperand {
+            kernels: self.kernels,
+            storage: self.storage,
+            nvfp4_operands: self.nvfp4_operands,
+            quantized: self.quantized,
+        };
+        // SAFETY: the joined rows are the same bytes (`from_raw`).
+        unsafe { Self::from_raw(self.base, self.rows / count, self.k * count, self.geometry.stride * count, operand) }
+    }
+
     pub fn rows(&self) -> usize {
         self.rows
     }

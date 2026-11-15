@@ -690,7 +690,8 @@ impl Workers {
     /// A pool of `count` participants (at least one): the submitting thread
     /// and `count - 1` pool threads.
     pub fn new(count: usize) -> Result<Self, std::io::Error> {
-        let count = count.clamp(1, (1 << PARTICIPANT_BITS) - 1);
+        const _: () = assert!(seismic_lang::forms::CPU_MAX_UNITS < 1 << PARTICIPANT_BITS);
+        let count = count.clamp(1, seismic_lang::forms::CPU_MAX_UNITS as usize);
         let shared = Arc::new(Shared {
             participants: count,
             published: AtomicU64::new(0),
@@ -1238,7 +1239,7 @@ mod tests {
     fn the_host_pool_is_its_performance_cores_under_the_quota() {
         let quota = std::thread::available_parallelism().expect("host parallelism");
         let workers = Workers::host(quota.saturating_add(1)).expect("pool");
-        assert_eq!(workers.count(), quota.get());
+        assert_eq!(workers.count(), quota.get().min(seismic_lang::forms::CPU_MAX_UNITS as usize));
         assert_eq!(Workers::host(std::num::NonZeroUsize::MIN).expect("pool").count(), 1);
     }
 }

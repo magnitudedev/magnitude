@@ -19,7 +19,7 @@ mod domain;
 mod probe;
 mod term;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 mod trace;
 
 pub use term::{CodeLevels, Neighbours, Term, TermError, Variable};
