@@ -4,19 +4,19 @@
 //! row op that normalizes each row first (`post_norm_residual`), since the
 //! norm spans a whole output row that a column-tiled epilogue cannot form.
 
-use crate::native::{PostNormKernels, SublayerOutput};
+use crate::native::{PostNormKernels, RangedKernels, SublayerOutput};
 use crate::programs::graph::facts::Numbers;
 use crate::programs::graph::{GraphError, draft::GraphDraft};
 use crate::programs::native_target_graph::{PackedWeight, WeightOperands};
 use magnitude_kernels::{post_norm_residual, project_rows};
 use seismic::{
-    Argument, Dim, Element, Entry, NativeGraph, NativeGraphMetadata, NativeKernel, WorkflowTensor,
-    WorkflowTensorRef,
+    Argument, Dim, Element, Entry, NativeGraph, NativeGraphMetadata, WorkflowTensor, WorkflowTensorRef,
 };
 
-/// A sublayer's output entries, with `E` the operator's own output entry.
+/// A sublayer's output entries, with `E` the operator's own output entry;
+/// each projection's by row range.
 pub(crate) enum TailEntries<'a, G: GraphDraft + 'a, E: Entry + 'a> {
-    Residual(G::Binding<'a, E>),
+    Residual(G::Ranged<'a, E>),
     PostNorm(PostNormEntries<'a, G>),
 }
 
@@ -28,7 +28,7 @@ impl<'a, G: GraphDraft + 'a, E: Entry + 'a> Clone for TailEntries<'a, G, E> {
 }
 
 pub(crate) struct PostNormEntries<'a, G: GraphDraft + 'a> {
-    pub project: G::Binding<'a, project_rows::Entry>,
+    pub project: G::Ranged<'a, project_rows::Entry>,
     pub residual: G::Binding<'a, post_norm_residual::Entry>,
 }
 
@@ -39,10 +39,10 @@ impl<'a, G: GraphDraft + 'a> Clone for PostNormEntries<'a, G> {
     }
 }
 
-impl<'a, E: Entry + 'a> From<&'a SublayerOutput<NativeKernel<E>>>
+impl<'a, E: Entry + 'a> From<&'a SublayerOutput<RangedKernels<E>>>
     for TailEntries<'a, NativeGraph, E>
 {
-    fn from(output: &'a SublayerOutput<NativeKernel<E>>) -> Self {
+    fn from(output: &'a SublayerOutput<RangedKernels<E>>) -> Self {
         match output {
             SublayerOutput::Residual(kernel) => Self::Residual(kernel),
             SublayerOutput::PostNorm(PostNormKernels { project, residual }) => {
@@ -111,7 +111,7 @@ pub(crate) fn post_norm<'a, G: GraphDraft + 'a, D: Into<Dim>>(
     } = weight;
     let projected = graph
         .enqueue(
-            entries.project,
+            G::pick(entries.project, &out),
             &[
                 ("M", &out),
                 ("G", &Dim::from(1)),

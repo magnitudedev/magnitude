@@ -54,10 +54,10 @@ use seismic::{Argument, Dim, Element, NativePort, WorkflowTensor, WorkflowTensor
 /// rows the pooling reads where they are published in A (an ungated pool),
 /// the pooling, and its index keys' projection and write.
 pub(crate) struct PooledEntries<'a, G: GraphDraft + 'a> {
-    pub project: G::Binding<'a, attention_project::Entry>,
+    pub project: G::Ranged<'a, attention_project::Entry>,
     pub widen: G::Binding<'a, widen_rows::Entry>,
     pub pool: PoolEntry<'a, G>,
-    pub key_project: G::Binding<'a, attention_project::Entry>,
+    pub key_project: G::Ranged<'a, attention_project::Entry>,
     pub keys: G::Binding<'a, indexer_keys::Entry>,
 }
 
@@ -433,7 +433,7 @@ fn own_rows<'a, G: GraphDraft + 'a>(
     );
     let operand = |extent: Option<&Dim>| extent.cloned().unwrap_or(Dim::from(0));
     let projected = graph.enqueue(
-        entries.project,
+        G::pick(entries.project, rows),
         &[
             [
                 ("M", rows.clone()),

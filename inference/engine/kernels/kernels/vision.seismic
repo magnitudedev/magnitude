@@ -95,7 +95,7 @@ native vision_patch_stem for cuda from "cuda/vision_patch_stem.cu":
 # floor), L2/L3 the frame GEMMs.
 native vision_patch_stem for vulkan from "vulkan/vision_patch_stem.comp":
     static (C, S, P, H, NB, NT)
-    where S <= 1 and NB <= 1 and NT <= 1
+    where S <= 1 and NB <= 1 and NT <= 1 and form(W0, DECODED) == 1 and form(W1, DECODED) == 1
     scratch converted bytes (M * (1 + S) * ceil_div(C * P * P, 8) * 8 * 2)
     scratch partial bytes (M * H * 4)
     launch vision_patch_stem_convert:
@@ -110,21 +110,21 @@ native vision_patch_stem for vulkan from "vulkan/vision_patch_stem.comp":
         threads_per_threadgroup (128, 1, 1)
         shared_bytes (10240)
 
-# CPU: L1 stages each patch row's frames as F32 and blends its position table
-# rows; L2 gives each work item eight outputs, their frame weights decoded
-# once, projected against every staged row.
+# CPU: each frame's rows are its weight's own operand (frame 0's against W0,
+# the S others' against W1), their values the entry's gathers of the patch
+# rows' frames as F32 rows of C * P * P values and their forms (with the Q8
+# blocks under the INT8 form) the operator's `form` launch's; the row launch
+# gives each work item ROWS outputs, each frame's weight rows projected
+# against that frame's rows, then blends its outputs' position-table values
+# (bias and table columns in `shared_bytes`). The weights are dense (their
+# rows of P values are shorter than any packed group), which the tile kernel
+# does not take, so their rows are quantized each alone.
 native vision_patch_stem for cpu from "cpu/vision_patch_stem.rs":
-    scratch pixels bytes (M * (1 + S) * C * P * P * 4)
-    scratch blended bytes (M * H * 4)
-    launch vision_patch_stem_stage:
-        staging
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (1, 1, 1)
-        shared_bytes (H * 4)
+    project quantized rows (W0 over (M, C * P * P), W1 over (S * M, C * P * P)) operand (values (vision_patch_stem_first), values (vision_patch_stem_next))
     launch vision_patch_stem_rows:
-        threadgroups (ceil_div(H, 8), 1, 1)
+        threadgroups (ceil_div(H, ROWS), 1, 1)
         threads_per_threadgroup (1, 1, 1)
-        shared_bytes ((H + 8 * (1 + S) * C * P * P) * 4)
+        shared_bytes (H * 8)
 
 
 # The vision activations by code (`vision_linear`'s and `vision_norm`'s
@@ -281,23 +281,20 @@ native vision_linear for cuda from "cuda/vision_linear.cu":
 
 native vision_linear for vulkan from "vulkan/vision_linear.comp":
     static (N, K, NB, NR, NG, NC)
-    where NB <= 1 and NR <= 1 and NG <= 1 and NC <= 1
+    where NB <= 1 and NR <= 1 and NG <= 1 and NC <= 1 and form(W, DECODED) == 1
     launch vision_linear:
         threadgroups (ceil_div(N, 64), ceil_div(M, 64), 1)
         threads_per_threadgroup (128, 1, 1)
         shared_bytes (10240)
 
-# CPU: the stage launch converts each input row to F32; the row launch gives
-# each work item eight weight rows, projected against every staged row.
+# CPU: the input rows are the projection's operand, formed by the operator's
+# `form` launch (F32, and their Q8 blocks under the INT8 form); the row
+# launch gives each work item ROWS weight rows, projected against every
+# operand row.
 native vision_linear for cpu from "cpu/vision_linear.rs":
-    scratch staged bytes (M * K * 4)
-    scratch gates bytes (NG * M * N * 4)
-    launch vision_linear_stage:
-        staging
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (1, 1, 1)
+    project quantized tiled (W) over (M, K) operand (x)
     launch vision_linear_rows:
-        threadgroups (ceil_div(N, 8), 1, 1)
+        threadgroups (ceil_div(N, ROWS), 1, 1)
         threads_per_threadgroup (1, 1, 1)
         shared_bytes (N * 4)
 

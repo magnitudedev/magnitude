@@ -18,7 +18,7 @@ use super::target::{ExpertReads, qualify_general_routed, qualify_routed};
 use super::*;
 use crate::experts::{PooledRecords, pooled_records};
 use crate::planning::{
-    BankBinding, BankedFeedForward, RecordTensor, RecordTensors,
+    BankBinding, BankedFeedForward, HINT_LEADS, RecordTensor, RecordTensors,
 };
 use magnitude_kernels::constants::{
     FILE_CHOICE, FILE_COUNT, FILE_RECORD, LANDING_DONE, LANDING_ENTRIES, LANDING_FROM, LANDING_HEAD, LANDING_TO, LIST_COUNT,
@@ -27,9 +27,9 @@ use magnitude_kernels::constants::{
     SLOT_ANSWER, SLOT_REQUEST, SOURCE_RECORD, SOURCE_ROWS, SOURCE_SITE, STEP_HIGH, STEP_LOW, STEP_WORDS,
 };
 use magnitude_kernels::{
-    SlotTable, landing_extent, list_extent, routed_copy, routed_land, routed_list_grid, routed_pass_map,
-    routed_round, routed_route_streamed, routed_scratch_grids, routed_scratch_request, routed_seed_commit,
-    routed_select_streamed, routed_step,
+    SlotTable, landing_extent, list_extent, routed_copy, routed_hint_route, routed_hint_select, routed_land,
+    routed_list_grid, routed_pass_map, routed_round, routed_route_streamed, routed_scratch_grids,
+    routed_scratch_request, routed_seed_commit, routed_select_streamed, routed_step,
 };
 
 /// The fixture step's sequence.
@@ -374,30 +374,19 @@ pub(super) fn qualify_bank(
 }
 
 /// A streamed layer's routed form: its binding, its resident entries and its
-/// bank's decode routes, one by `AHEAD`.
+/// bank's decode route and ahead-of-step hint launches.
 pub(super) enum Served<'a> {
     Fused {
         binding: RoutedBinding,
         kernels: &'a RoutedKernels,
-        routes: &'a [Option<NativeKernel<routed_route_streamed::Entry>>; LEADS],
+        route: &'a RangedKernels<routed_route_streamed::Entry>,
+        hints: &'a [Option<NativeKernel<routed_hint_route::Entry>>; HINT_LEADS as usize],
     },
     General {
         binding: crate::GeneralRoutedBinding,
         kernels: &'a GeneralRoutedKernels,
-        selects: &'a [Option<NativeKernel<routed_select_streamed::Entry>>; LEADS],
-    },
-}
-
-/// A streamed binding's route at one lead, in its routed form.
-#[derive(Clone, Copy)]
-enum Lead<'a> {
-    Fused {
-        binding: RoutedBinding,
-        kernel: &'a NativeKernel<routed_route_streamed::Entry>,
-    },
-    General {
-        binding: crate::GeneralRoutedBinding,
-        kernel: &'a NativeKernel<routed_select_streamed::Entry>,
+        select: &'a NativeKernel<routed_select_streamed::Entry>,
+        hints: &'a [Option<NativeKernel<routed_hint_select::Entry>>; HINT_LEADS as usize],
     },
 }
 
@@ -409,22 +398,27 @@ impl<'a> Served<'a> {
         label: &str,
     ) -> Result<Self, CatalogFailure> {
         match (banked, route, feed_forward) {
-            (BankedFeedForward::Routed(binding), BankRouteKernels::Fused(routes), AttestedFeedForward::Routed(kernels)) => {
-                Ok(Self::Fused { binding, kernels, routes })
-            }
+            (
+                BankedFeedForward::Routed(binding),
+                BankRouteKernels::Fused { route, hints, .. },
+                AttestedFeedForward::Routed(kernels),
+            ) => Ok(Self::Fused { binding, kernels, route, hints }),
             (
                 BankedFeedForward::GeneralRouted(binding),
-                BankRouteKernels::General(selects),
+                BankRouteKernels::General { select, hints, .. },
                 AttestedFeedForward::GeneralRouted(kernels),
-            ) => Ok(Self::General { binding, kernels, selects }),
+            ) => Ok(Self::General { binding, kernels, select, hints }),
             // A parallel block's routed branch is general.
-            (BankedFeedForward::Parallel(parallel), BankRouteKernels::General(selects), AttestedFeedForward::Parallel(kernels)) => {
-                Ok(Self::General {
-                    binding: parallel.routed,
-                    kernels: &kernels.routed,
-                    selects,
-                })
-            }
+            (
+                BankedFeedForward::Parallel(parallel),
+                BankRouteKernels::General { select, hints, .. },
+                AttestedFeedForward::Parallel(kernels),
+            ) => Ok(Self::General {
+                binding: parallel.routed,
+                kernels: &kernels.routed,
+                select,
+                hints,
+            }),
             _ => Err(qualification_dynamic(
                 "routed_bank",
                 label,
@@ -433,25 +427,8 @@ impl<'a> Served<'a> {
         }
     }
 
-    /// Its route at `ahead`, where a layer of the binding launches one.
-    fn lead(&self, ahead: usize) -> Option<Lead<'a>> {
-        match *self {
-            Self::Fused { binding, routes, .. } => Some(Lead::Fused { binding, kernel: routes[ahead].as_ref()? }),
-            Self::General { binding, selects, .. } => Some(Lead::General { binding, kernel: selects[ahead].as_ref()? }),
-        }
-    }
-
-    /// One decode row's route by each lead the binding launches and each
-    /// pair of this layer's whole word and the next layer's resolved word, every expert absent from the layer's map
-    /// and its tier map (where the bank has a host tier), its policy lines
-    /// zero and its hint ring of no step, over zero weights. A layer not
-    /// whole writes its sources and routing record, every choice's source
-    /// none for the GPU (across a link every miss the CPU's, pending its
-    /// landing: SOURCE_SITE -2), and its grid, and publishes its request of
-    /// every choice; a whole layer sources each choice from its home record,
-    /// the expert past `WHOLE_HOME`, reading no map;
-    /// and a hinting route whose next layer is not resolved publishes every
-    /// lead's hints.
+    /// One decode row's route at each whole word, then each prepared hint
+    /// launch at each resolved word of the next layer.
     fn qualify_routes(
         &self,
         device: &Device,
@@ -464,18 +441,13 @@ impl<'a> Served<'a> {
             Self::Fused { .. } => "routed_route_streamed",
             Self::General { .. } => "routed_select_streamed",
         };
-        let words = |extents: &[u64], set: &[(u64, i32)]| shared_words(device, extents, set, entry, label);
-        let zeros = |element, extents: &[u64]| semantic_zeros(device, element, extents, entry, label);
-        let failed = |error: seismic::CallError| qualification_dynamic(entry, label, error);
+        let words = |extents: &[u64], set: &[(u64, i32)], entry| shared_words(device, extents, set, entry, label);
+        let zeros = |element, extents: &[u64], entry| semantic_zeros(device, element, extents, entry, label);
         let (experts, next, selected) = (binding.experts, binding.next_experts, binding.selected);
         let (ring, flight) = (binding.words.ring_words(), binding.words.flight);
         let choices = word(selected, entry, label)?;
         let routing_words = binding.words.routing_words();
         let record = u64::from(SEQUENCE.unsigned_abs()) % flight * routing_words;
-        // Every choice's source none for the GPU, in the sources and the
-        // routing record's sources; across a link a layer not whole, sited
-        // (its answer slots bound), priced, gives the CPU every miss (zero
-        // lines: no link time is ever less).
         let tier_experts = crate::native::tuning::routed::tier_experts(binding);
         let sited = i32::from(tier_experts > 0);
         let site = if tier_experts > 0 { -2 } else { -1 };
@@ -485,113 +457,162 @@ impl<'a> Served<'a> {
         let unrouted = (0..selected)
             .map(|choice| (record + binding.words.routing_source(choice), -1))
             .collect::<Vec<_>>();
-        for (ahead, lead) in (0..LEADS).filter_map(|ahead| Some((ahead as u64, self.lead(ahead)?))) {
-            for (whole, next_resolved) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
-                let map = words(&[experts, MAP_WORDS], &unmapped(experts))?;
-                let tier = words(&[tier_experts], &(0..tier_experts).map(|expert| (expert, -1)).collect::<Vec<_>>())?;
-                let policy = words(&[POLICY_WORDS], &[(POLICY_WHOLE, whole), (POLICY_HOME, whole * WHOLE_HOME), (POLICY_PRICED, 1)])?;
-                let next_policy = words(&[POLICY_WORDS], &[(POLICY_RESOLVED, next_resolved)])?;
-                let mut file = words(&binding.words.file().extents(), &[])?;
-                let mut sources = zeros(Element::i32(), &[SOURCE_ROWS, 1, selected])?;
-                let mut rings = words(&[ahead, ring], &[])?;
-                let mut routing = words(&[flight, routing_words], &[])?;
-                let mut routes = zeros(Element::i32(), &[1, selected])?;
-                match lead {
-                    Lead::Fused { binding: b, kernel } => {
-                        let (h, e) = (b.hidden, b.experts);
-                        let norm = rows.norm(device, b.norm, h, entry, label)?;
-                        kernel
-                            .call(routed_route_streamed::Args {
-                                residual: &rows.input(device, 1, h, entry, label)?,
-                                norm: &norm,
-                                router: &zeros(b.router, &[e, h])?,
-                                shared_router: &zeros(Element::f32(), &[h])?,
-                                shared_gate: &zeros(b.shared_gate, &[b.shared, h])?,
-                                shared_up: &zeros(b.shared_up, &[b.shared, h])?,
-                                routes: &mut routes,
-                                scores: &mut zeros(Element::f32(), &[1, selected])?,
-                                eps: 1.0e-5,
-                                normalize: 1,
-                                expert_scale: &unit_scale(device, kernel, "ES", entry, label)?,
-                                map: &map,
-                                tier: &tier,
-                                policy: &policy,
-                                sited,
-                                step,
-                                file: &mut file,
-                                sources: &mut sources,
-                                next_norm: &norm,
-                                next_router: &zeros(b.router, &[next, h])?,
-                                after_norm: &norm,
-                                after_router: &zeros(b.router, &[next, h])?,
-                                next_policy: &next_policy,
-                                rings: &mut rings,
-                                routing: &mut routing,
-                            })
-                            .map_err(failed)?;
-                    }
-                    Lead::General { binding: b, kernel } => {
-                        let shape = b.shape;
-                        let (h, e) = (shape.hidden, shape.experts);
-                        let router_norm = zeros(b.router_norm, &[h])?;
-                        kernel
-                            .call(routed_select_streamed::Args {
-                                residual: &semantic_ones(device, Element::f32(), &[1, h], entry, label)?,
-                                norm: &zeros(b.norm, &[h])?,
-                                router_norm: &router_norm,
-                                router: &zeros(b.router, &[e, h])?,
-                                bias: &zeros(Element::f32(), &[e])?,
-                                expert_scale: &unit_scale(device, kernel, "ES", entry, label)?,
-                                routes: &mut routes,
-                                weights: &mut zeros(Element::f32(), &[1, selected])?,
-                                epsilon: 1.0e-5,
-                                score: shape.score,
-                                normalization: shape.normalization,
-                                normalization_epsilon: f32::from_bits(shape.normalization_epsilon),
-                                scale: f32::from_bits(shape.scale),
-                                map: &map,
-                                tier: &tier,
-                                policy: &policy,
-                                sited,
-                                step,
-                                file: &mut file,
-                                sources: &mut sources,
-                                next_router_norm: &router_norm,
-                                next_router: &zeros(b.router, &[next, h])?,
-                                next_bias: &zeros(Element::f32(), &[next])?,
-                                after_router_norm: &router_norm,
-                                after_router: &zeros(b.router, &[next, h])?,
-                                after_bias: &zeros(Element::f32(), &[next])?,
-                                next_policy: &next_policy,
-                                rings: &mut rings,
-                                routing: &mut routing,
-                            })
-                            .map_err(failed)?;
-                    }
-                }
-                if whole == 0 {
-                    require_words(&routing, &[(record + RING_SEQUENCE, SEQUENCE), (record + RING_COUNT, choices)], entry, label)?;
-                    require_words(&routing, &unrouted, entry, label)?;
-                    require_words(&sources, &unsourced, entry, label)?;
-                    let slot = binding.words.file().lane(SEQUENCE as u64, 0);
-                    require_words(&file, &[(slot + SLOT_REQUEST, SEQUENCE), (slot + FILE_COUNT, choices)], entry, label)?;
-                }
-                if whole == 1 {
-                    let routed = routes.read_to_host().map_err(|error| qualification_dynamic(entry, label, error))?;
-                    let sourced = routed
-                        .chunks_exact(4)
-                        .zip(0..)
-                        .flat_map(|(route, choice)| {
-                            let expert = i32::from_ne_bytes(route.try_into().expect("a word"));
-                            [(SOURCE_RECORD * selected + choice, WHOLE_HOME + expert), (SOURCE_SITE * selected + choice, -1)]
+        for whole in [0, 1] {
+            let map = words(&[experts, MAP_WORDS], &unmapped(experts), entry)?;
+            let tier = words(&[tier_experts], &(0..tier_experts).map(|expert| (expert, -1)).collect::<Vec<_>>(), entry)?;
+            let policy = words(&[POLICY_WORDS], &[(POLICY_WHOLE, whole), (POLICY_HOME, whole * WHOLE_HOME), (POLICY_PRICED, 1)], entry)?;
+            let mut file = words(&binding.words.file().extents(), &[], entry)?;
+            let mut sources = zeros(Element::i32(), &[SOURCE_ROWS, 1, selected], entry)?;
+            let mut routing = words(&[flight, routing_words], &[], entry)?;
+            let mut routes = zeros(Element::i32(), &[1, selected], entry)?;
+            match *self {
+                Self::Fused { binding: b, route, .. } => {
+                    let kernel = route.first();
+                    let (h, e) = (b.hidden, b.experts);
+                    let norm = rows.norm(device, b.norm, h, entry, label)?;
+                    kernel
+                        .call(routed_route_streamed::Args {
+                            residual: &rows.input(device, 1, h, entry, label)?,
+                            norm: &norm,
+                            router: &zeros(b.router, &[e, h], entry)?,
+                            shared_router: &zeros(Element::f32(), &[h], entry)?,
+                            shared_gate: &zeros(b.shared_gate, &[b.shared, h], entry)?,
+                            shared_up: &zeros(b.shared_up, &[b.shared, h], entry)?,
+                            routes: &mut routes,
+                            scores: &mut zeros(Element::f32(), &[1, selected], entry)?,
+                            eps: 1.0e-5,
+                            normalize: 1,
+                            expert_scale: &unit_scale(device, kernel, "ES", entry, label)?,
+                            map: &map,
+                            tier: &tier,
+                            policy: &policy,
+                            sited,
+                            step,
+                            file: &mut file,
+                            sources: &mut sources,
+                            routing: &mut routing,
                         })
-                        .collect::<Vec<_>>();
-                    require_words(&sources, &sourced, entry, label)?;
+                        .map_err(|error| qualification_dynamic(entry, label, error))?;
                 }
-                // Every lead publishes its ring row.
-                if next_resolved == 0 {
-                    for lead in 0..ahead {
-                        require_words(&rings, &[(lead * ring + RING_SEQUENCE, SEQUENCE)], entry, label)?;
+                Self::General { binding: b, select: kernel, .. } => {
+                    let shape = b.shape;
+                    let (h, e) = (shape.hidden, shape.experts);
+                    let router_norm = zeros(b.router_norm, &[h], entry)?;
+                    kernel
+                        .call(routed_select_streamed::Args {
+                            residual: &semantic_ones(device, Element::f32(), &[1, h], entry, label)?,
+                            norm: &zeros(b.norm, &[h], entry)?,
+                            router_norm: &router_norm,
+                            router: &zeros(b.router, &[e, h], entry)?,
+                            bias: &zeros(Element::f32(), &[e], entry)?,
+                            expert_scale: &unit_scale(device, kernel, "ES", entry, label)?,
+                            routes: &mut routes,
+                            weights: &mut zeros(Element::f32(), &[1, selected], entry)?,
+                            epsilon: 1.0e-5,
+                            score: shape.score,
+                            normalization: shape.normalization,
+                            normalization_epsilon: f32::from_bits(shape.normalization_epsilon),
+                            scale: f32::from_bits(shape.scale),
+                            map: &map,
+                            tier: &tier,
+                            policy: &policy,
+                            sited,
+                            step,
+                            file: &mut file,
+                            sources: &mut sources,
+                            routing: &mut routing,
+                        })
+                        .map_err(|error| qualification_dynamic(entry, label, error))?;
+                }
+            }
+            if whole == 0 {
+                require_words(&routing, &[(record + RING_SEQUENCE, SEQUENCE), (record + RING_COUNT, choices)], entry, label)?;
+                require_words(&routing, &unrouted, entry, label)?;
+                require_words(&sources, &unsourced, entry, label)?;
+                let slot = binding.words.file().lane(SEQUENCE as u64, 0);
+                require_words(&file, &[(slot + SLOT_REQUEST, SEQUENCE), (slot + FILE_COUNT, choices)], entry, label)?;
+            }
+            if whole == 1 {
+                let routed = routes.read_to_host().map_err(|error| qualification_dynamic(entry, label, error))?;
+                let sourced = routed
+                    .chunks_exact(4)
+                    .zip(0..)
+                    .flat_map(|(route, choice)| {
+                        let expert = i32::from_ne_bytes(route.try_into().expect("a word"));
+                        [(SOURCE_RECORD * selected + choice, WHOLE_HOME + expert), (SOURCE_SITE * selected + choice, -1)]
+                    })
+                    .collect::<Vec<_>>();
+                require_words(&sources, &sourced, entry, label)?;
+            }
+        }
+        match *self {
+            Self::Fused { binding: b, hints, .. } => {
+                let hint_entry = "routed_hint_route";
+                let h = b.hidden;
+                let norm = rows.norm(device, b.norm, h, hint_entry, label)?;
+                let activation = zeros(b.activation, &[0, b.selected], hint_entry)?;
+                for (index, kernel) in hints.iter().enumerate() {
+                    let Some(kernel) = kernel.as_ref() else { continue };
+                    let ahead = index as u64 + 1;
+                    for next_resolved in [0, 1] {
+                        let next_policy = words(&[POLICY_WORDS], &[(POLICY_RESOLVED, next_resolved)], hint_entry)?;
+                        let mut rings = words(&[ahead, ring], &[], hint_entry)?;
+                        kernel
+                            .call(routed_hint_route::Args {
+                                residual: &rows.input(device, 1, h, hint_entry, label)?,
+                                activation: &activation,
+                                next_norm: &norm,
+                                next_router: &zeros(b.router, &[next, h], hint_entry)?,
+                                after_norm: &norm,
+                                after_router: &zeros(b.router, &[next, h], hint_entry)?,
+                                eps: 1.0e-5,
+                                step,
+                                next_policy: &next_policy,
+                                rings: &mut rings,
+                            })
+                            .map_err(|error| qualification_dynamic(hint_entry, label, error))?;
+                        if next_resolved == 0 {
+                            for lead in 0..ahead {
+                                require_words(&rings, &[(lead * ring + RING_SEQUENCE, SEQUENCE)], hint_entry, label)?;
+                            }
+                        }
+                    }
+                }
+            }
+            Self::General { binding: b, hints, .. } => {
+                let hint_entry = "routed_hint_select";
+                let shape = b.shape;
+                let h = shape.hidden;
+                let router_norm = zeros(b.router_norm, &[h], hint_entry)?;
+                let activation = zeros(b.activation, &[0, shape.selected], hint_entry)?;
+                for (index, kernel) in hints.iter().enumerate() {
+                    let Some(kernel) = kernel.as_ref() else { continue };
+                    let ahead = index as u64 + 1;
+                    for next_resolved in [0, 1] {
+                        let next_policy = words(&[POLICY_WORDS], &[(POLICY_RESOLVED, next_resolved)], hint_entry)?;
+                        let mut rings = words(&[ahead, ring], &[], hint_entry)?;
+                        kernel
+                            .call(routed_hint_select::Args {
+                                residual: &semantic_ones(device, Element::f32(), &[1, h], hint_entry, label)?,
+                                activation: &activation,
+                                next_router_norm: &router_norm,
+                                next_router: &zeros(b.router, &[next, h], hint_entry)?,
+                                next_bias: &zeros(Element::f32(), &[next], hint_entry)?,
+                                after_router_norm: &router_norm,
+                                after_router: &zeros(b.router, &[next, h], hint_entry)?,
+                                after_bias: &zeros(Element::f32(), &[next], hint_entry)?,
+                                score: shape.score,
+                                epsilon: 1.0e-5,
+                                step,
+                                next_policy: &next_policy,
+                                rings: &mut rings,
+                            })
+                            .map_err(|error| qualification_dynamic(hint_entry, label, error))?;
+                        if next_resolved == 0 {
+                            for lead in 0..ahead {
+                                require_words(&rings, &[(lead * ring + RING_SEQUENCE, SEQUENCE)], hint_entry, label)?;
+                            }
+                        }
                     }
                 }
             }
@@ -634,7 +655,8 @@ impl RecordFixture {
             .resident
             .repack_host(tensor.source, &record, &vec![0; stored])
             .ok_or_else(|| failed(&"the stored record has no conversion into its resident form"))?;
-        let marker = converted.iter().map(|byte| !byte).collect::<Vec<_>>();
+        // Distinct at every byte from `converted` while keeping dense floats finite (`0x0000` -> `0x5555`).
+        let marker = converted.iter().map(|byte| byte ^ 0x55).collect::<Vec<_>>();
         let shared = |extents: &[u64]| Tensor::shared(device, tensor.source, extents).map_err(|error| failed(&error));
         let mut scratch = Tensor::zeros(device, tensor.resident, &record).map_err(|error| failed(&error))?;
         scratch.write_from_host(&marker).map_err(|error| failed(&error))?;
@@ -780,6 +802,7 @@ fn require_bytes(tensor: &Tensor, wanted: &[u8], entry: &'static str, label: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operators::routed::fused_graph::TILE_ROWS;
     use magnitude_kernels::constants::VERIFY_ROWS;
     use crate::planning::RegionWords;
     use crate::{Expansion, ExecutionPath, GeneralRoutedShape};
@@ -789,16 +812,26 @@ mod tests {
     };
     use crate::planning::Placer;
 
+    /// `kernel` as the one range of its entry's rows.
+    fn every_row<E: seismic::Entry>(kernel: seismic::NativeKernel<E>) -> RangedKernels<E> {
+        RangedKernels::new(vec![(crate::native::tuning::ranged::EVERY_ROW, kernel)])
+    }
+
     const HIDDEN: u64 = 256;
     const FEATURES: u64 = 128;
     const EXPERTS: u64 = 16;
     const SELECTED: u64 = 4;
 
-    /// `E`'s specialization on `device` at the statics its implementation
+    /// Prepares `entry` on `device` at the statics its implementation
     /// declares, each the first of `values` of its name (as preparation
-    /// fixes them), its parameters the declared defaults.
-    fn specialization<E: seismic::Entry>(device: &Device, values: &[(&str, u64)]) -> seismic::NativeSpecialization {
-        let implementation = seismic::generated::native_implementation::<E>(device).unwrap().unwrap();
+    /// fixes them), its parameters at the declared defaults for `entry`'s
+    /// bound elements.
+    fn prepare<E: seismic::Entry>(
+        device: &Device,
+        entry: seismic::BoundEntry<E>,
+        values: &[(&str, u64)],
+    ) -> seismic::NativeKernel<E> {
+        let implementation = entry.offered(device).unwrap().unwrap();
         let statics = implementation.statics.iter().fold(seismic::NativeSpecialization::new(), |statics, name| {
             let (_, value) = values
                 .iter()
@@ -806,7 +839,9 @@ mod tests {
                 .unwrap_or_else(|| panic!("{} declares {name}", E::NAME));
             statics.with_static(name.clone(), *value)
         });
-        implementation.default_specialization(&statics).unwrap()
+        entry
+            .prepare(device, &implementation.default_specialization(&statics).unwrap())
+            .unwrap()
     }
 
     /// How the test bank's down records are stored and held.
@@ -864,17 +899,18 @@ mod tests {
         }
     }
 
-    /// The statics of `bank`'s decode route at `ahead` leads, beside
-    /// `resident`'s.
-    fn route_statics<'v>(bank: BankBinding, ahead: usize, resident: &[(&'v str, u64)]) -> Vec<(&'v str, u64)> {
-        [
-            ("AHEAD", ahead as u64),
-            ("EN", bank.next_experts),
-            ("TM", crate::native::tuning::routed::tier_experts(bank)),
-        ]
-        .into_iter()
-        .chain(resident.iter().copied())
-        .collect()
+    fn route_statics<'v>(bank: BankBinding, resident: &[(&'v str, u64)]) -> Vec<(&'v str, u64)> {
+        [("TM", crate::native::tuning::routed::tier_experts(bank))]
+            .into_iter()
+            .chain(resident.iter().copied())
+            .collect()
+    }
+
+    fn hint_statics<'v>(bank: BankBinding, ahead: u64, resident: &[(&'v str, u64)]) -> Vec<(&'v str, u64)> {
+        [("AHEAD", ahead), ("EN", bank.next_experts)]
+            .into_iter()
+            .chain(resident.iter().copied())
+            .collect()
     }
 
     /// `bank`'s entries on `device` beside its `route`, each at the statics
@@ -884,19 +920,14 @@ mod tests {
         let gate = gate.unwrap_or(up);
         let table = bank.words.scratch();
         let scratch = [("FLIGHT", table.slots()), ("LANES", table.lanes())];
-        let land = routed_land::native_for_device_with(
-            device,
-            routed_land::Elements {
+        let land = prepare(device, routed_land::native_entry_with(routed_land::Elements {
                 SG: gate.source,
                 SU: up.source,
                 SD: down.source,
                 UG: gate.resident,
                 UU: up.resident,
                 UD: down.resident,
-            },
-            &specialization::<routed_land::Entry>(device, &[("K", bank.selected)]),
-        )
-        .unwrap();
+            }), &[("K", bank.selected)]);
         let record_statics = |tensor: RecordTensor, list: u64| {
             let [n, k] = tensor.matrix;
             [
@@ -912,53 +943,24 @@ mod tests {
         ExpertBankKernels {
             route,
             land,
-            step: routed_step::native_for_device(device, &specialization::<routed_step::Entry>(device, &[])).unwrap(),
-            scratch_request: routed_scratch_request::native_for_device(
-                device,
-                &specialization::<routed_scratch_request::Entry>(
-                    device,
-                    &[&[("K", bank.selected), ("E", bank.widest)], scratch.as_slice()].concat(),
-                ),
-            )
-            .unwrap(),
-            round: routed_round::native_for_device_with(
-                device,
-                routed_round::Elements {
+            step: prepare(device, routed_step::native_entry(), &[]),
+            scratch_request: prepare(device, routed_scratch_request::native_entry(), &[&[("K", bank.selected), ("E", bank.widest)], scratch.as_slice()].concat()),
+            round: prepare(device, routed_round::native_entry_with(routed_round::Elements {
                     SG: gate.source,
                     SU: up.source,
                     SD: down.source,
                     UG: gate.resident,
                     UU: up.resident,
                     UD: down.resident,
-                },
-                &specialization::<routed_round::Entry>(device, &scratch),
-            )
-            .unwrap(),
-            scratch_grids: routed_scratch_grids::native_for_device(
-                device,
-                &specialization::<routed_scratch_grids::Entry>(device, &[scratch.as_slice(), &[("RW", bank.window_rounds)]].concat()),
-            )
-            .unwrap(),
-            pass_map: routed_pass_map::native_for_device(device, &specialization::<routed_pass_map::Entry>(device, &[])).unwrap(),
+                }), &scratch),
+            scratch_grids: prepare(device, routed_scratch_grids::native_entry(), &[scratch.as_slice(), &[("RW", bank.window_rounds)]].concat()),
+            pass_map: prepare(device, routed_pass_map::native_entry(), &[]),
             placement: DevicePlacement {
                 seed: bank.record.map(|_, tensor| {
-                    routed_copy::native_for_device_with(
-                        device,
-                        routed_copy::Elements { U: tensor.resident },
-                        &specialization::<routed_copy::Entry>(device, &record_statics(tensor, bank.window_slots)),
-                    )
-                    .unwrap()
+                    prepare(device, routed_copy::native_entry_with(routed_copy::Elements { U: tensor.resident }), &record_statics(tensor, bank.window_slots))
                 }),
-                seed_commit: routed_seed_commit::native_for_device(
-                    device,
-                    &specialization::<routed_seed_commit::Entry>(
-                        device,
-                        &[&[("X", bank.window_slots), ("BANK", bank.records)], scratch.as_slice()].concat(),
-                    ),
-                )
-                .unwrap(),
-                list_grid: routed_list_grid::native_for_device(device, &specialization::<routed_list_grid::Entry>(device, &[]))
-                    .unwrap(),
+                seed_commit: prepare(device, routed_seed_commit::native_entry(), &[&[("X", bank.window_slots), ("BANK", bank.records)], scratch.as_slice()].concat()),
+                list_grid: prepare(device, routed_list_grid::native_entry(), &[]),
             },
             site: None,
         }
@@ -1028,70 +1030,51 @@ mod tests {
             ("S", FEATURES),
             ("ES", 0),
             ("F", FEATURES),
+            ("T", TILE_ROWS),
             ("GS", 0),
             ("US", 0),
             ("LB", 0),
             ("SN", 1),
             ("IN", 0),
         ];
+        let f32 = Element::f32();
         let resident = RoutedKernels {
-            route: routed_route::native_for_device_with(
-                &device,
-                routed_route::Elements { NW: bf16, RW: bf16, A: bf16 },
-                &specialization::<routed_route::Entry>(&device, &statics),
-            )
-            .unwrap(),
+            route: prepare(&device, routed_route::native_entry_with(routed_route::Elements { NW: bf16, RW: bf16, SRW: f32, A: bf16 }), &statics),
             decode: RoutedDecodeKernels::SharedRoute {
-                route: routed_route_shared::native_for_device_with(
-                    &device,
-                    routed_route_shared::Elements { NW: bf16, RW: bf16, SGW: bf16, SUW: bf16, A: bf16 },
-                    &specialization::<routed_route_shared::Entry>(&device, &statics),
-                )
-                .unwrap(),
-                choices: routed_gate_up::native_for_device_with(
-                    &device,
-                    routed_gate_up::Elements { EGW: q8, EUW: q8, A: bf16 },
-                    &specialization::<routed_gate_up::Entry>(&device, &statics),
-                )
-                .unwrap(),
+                route: every_row(
+                    prepare(&device, routed_route_shared::native_entry_with(routed_route_shared::Elements { NW: bf16, RW: bf16, SRW: f32, SGW: bf16, SUW: bf16, A: bf16 }), &statics),
+                ),
+                choices: every_row(
+                    prepare(&device, routed_gate_up::native_entry_with(routed_gate_up::Elements { EGW: q8, EUW: q8, A: bf16 }), &statics),
+                ),
             },
-            output: routed_output::native_for_device_with(
-                &device,
-                routed_output::Elements { EDW: down, SDW: bf16, A: bf16 },
-                &specialization::<routed_output::Entry>(&device, &statics),
-            )
-            .unwrap(),
-            group: routed_group::native_for_device(&device, &specialization::<routed_group::Entry>(&device, &statics))
-                .unwrap(),
-            experts: routed_experts::native_for_device_with(
-                &device,
-                routed_experts::Elements { A: bf16, EGW: q8, EUW: q8, EDW: down },
-                &specialization::<routed_experts::Entry>(&device, &statics),
-            )
-            .unwrap(),
-            combine: routed_combine::native_for_device_with(
-                &device,
-                routed_combine::Elements { A: bf16, SGW: bf16, SUW: bf16, SDW: bf16 },
-                &specialization::<routed_combine::Entry>(&device, &statics),
-            )
-            .unwrap(),
+            output: every_row(
+                prepare(&device, routed_output::native_entry_with(routed_output::Elements { EDW: down, SDW: bf16, A: bf16, NW: binding.norm }), &statics),
+            ),
+            operand_norm: binding.norm,
+            group: prepare(&device, routed_group::native_entry(), &statics),
+            experts: every_row(
+                prepare(&device, routed_experts::native_entry_with(routed_experts::Elements { A: bf16, EGW: q8, EUW: q8, EDW: down }), &statics),
+            ),
+            combine: every_row(
+                prepare(&device, routed_combine::native_entry_with(routed_combine::Elements { A: bf16, SGW: bf16, SUW: bf16, SDW: bf16 }), &statics),
+            ),
         };
-        let routes = std::array::from_fn(|ahead| {
-            routed_route_streamed::native_for_device_with(
-                &device,
-                routed_route_streamed::Elements {
+        let route = every_row(
+            prepare(&device, routed_route_streamed::native_entry_with(routed_route_streamed::Elements {
                     NW: bf16,
                     RW: bf16,
+                    SRW: f32,
                     SGW: bf16,
                     SUW: bf16,
                     A: bf16,
-                },
-                &specialization::<routed_route_streamed::Entry>(&device, &route_statics(bank, ahead, &statics)),
-            )
-            .map(Some)
-            .unwrap()
+                }), &route_statics(bank, &statics)),
+        );
+        let hints = std::array::from_fn(|index| {
+            let ahead = index as u64 + 1;
+            Some(prepare(&device, routed_hint_route::native_entry_with(routed_hint_route::Elements { NW: bf16, RW: bf16, A: bf16 }), &hint_statics(bank, ahead, &statics)))
         });
-        let kernels = bank_kernels(&device, bank, BankRouteKernels::Fused(routes));
+        let kernels = bank_kernels(&device, bank, BankRouteKernels::Fused { activation: bf16, route, hints });
         qualify_bank(
             &device,
             BankedFeedForward::Routed(binding),
@@ -1173,61 +1156,38 @@ mod tests {
             ("K", SELECTED),
             ("ES", 0),
             ("F", FEATURES),
+            ("T", TILE_ROWS),
             ("US", 0),
         ];
         let resident = GeneralRoutedKernels {
-            select: routed_select::native_for_device_with(
-                &device,
-                routed_select::Elements { NW: bf16, RNW: bf16, RW: bf16, A: bf16 },
-                &specialization::<routed_select::Entry>(&device, &statics),
-            )
-            .unwrap(),
+            select: prepare(&device, routed_select::native_entry_with(routed_select::Elements { NW: bf16, RNW: bf16, RW: bf16, A: bf16 }), &statics),
             experts: ExpertKernels::Plain {
-                decode: routed_up::native_for_device_with(
-                    &device,
-                    routed_up::Elements { EUW: q8, A: bf16 },
-                    &specialization::<routed_up::Entry>(&device, &statics),
-                )
-                .unwrap(),
-                grouped: routed_experts_up::native_for_device_with(
-                    &device,
-                    routed_experts_up::Elements { A: bf16, EUW: q8, EDW: q8 },
-                    &specialization::<routed_experts_up::Entry>(&device, &statics),
-                )
-                .unwrap(),
+                decode: every_row(
+                    prepare(&device, routed_up::native_entry_with(routed_up::Elements { EUW: q8, A: bf16 }), &statics),
+                ),
+                grouped: every_row(
+                    prepare(&device, routed_experts_up::native_entry_with(routed_experts_up::Elements { A: bf16, EUW: q8, EDW: q8 }), &statics),
+                ),
             },
-            down: routed_down::native_for_device_with(
-                &device,
-                routed_down::Elements { EDW: q8, A: bf16, R: f32 },
-                &specialization::<routed_down::Entry>(&device, &statics),
-            )
-            .unwrap(),
-            group: routed_group::native_for_device(&device, &specialization::<routed_group::Entry>(&device, &statics))
-                .unwrap(),
-            scatter: routed_scatter::native_for_device_with(
-                &device,
-                routed_scatter::Elements { A: bf16, R: f32 },
-                &specialization::<routed_scatter::Entry>(&device, &statics),
-            )
-            .unwrap(),
+            down: every_row(
+                prepare(&device, routed_down::native_entry_with(routed_down::Elements { EDW: q8, A: bf16, R: f32 }), &statics),
+            ),
+            group: prepare(&device, routed_group::native_entry(), &statics),
+            scatter: prepare(&device, routed_scatter::native_entry_with(routed_scatter::Elements { A: bf16, R: f32 }), &statics),
             shared: None,
             latent: None,
         };
-        let selects = std::array::from_fn(|ahead| {
-            routed_select_streamed::native_for_device_with(
-                &device,
-                routed_select_streamed::Elements {
-                    NW: bf16,
-                    RNW: bf16,
-                    RW: bf16,
-                    A: bf16,
-                },
-                &specialization::<routed_select_streamed::Entry>(&device, &route_statics(bank, ahead, &statics)),
-            )
-            .map(Some)
-            .unwrap()
+        let select = prepare(&device, routed_select_streamed::native_entry_with(routed_select_streamed::Elements {
+                NW: bf16,
+                RNW: bf16,
+                RW: bf16,
+                A: bf16,
+            }), &route_statics(bank, &statics));
+        let hints = std::array::from_fn(|index| {
+            let ahead = index as u64 + 1;
+            Some(prepare(&device, routed_hint_select::native_entry_with(routed_hint_select::Elements { RNW: bf16, RW: bf16, A: bf16 }), &hint_statics(bank, ahead, &statics)))
         });
-        let mut kernels = bank_kernels(&device, bank, BankRouteKernels::General(selects));
+        let mut kernels = bank_kernels(&device, bank, BankRouteKernels::General { activation: bf16, select, hints });
         if sited {
             let form = SiteForm {
                 activation: bf16,
@@ -1235,25 +1195,12 @@ mod tests {
                 limit: binding.shape.experts_expansion.limit,
             };
             kernels.site = Some(BankSite {
-                request: routed_site_request::native_for_device_with(
-                    &device,
-                    routed_site_request::Elements { A: bf16 },
-                    &specialization::<routed_site_request::Entry>(&device, &statics),
-                )
-                .unwrap(),
+                request: prepare(&device, routed_site_request::native_entry_with(routed_site_request::Elements { A: bf16 }), &statics),
                 combine: BankCombine::General {
-                    project: routed_down_project::native_for_device_with(
-                        &device,
-                        routed_down_project::Elements { EDW: q8, A: bf16 },
-                        &specialization::<routed_down_project::Entry>(&device, &statics),
-                    )
-                    .unwrap(),
-                    sited: routed_down_sited::native_for_device_with(
-                        &device,
-                        routed_down_sited::Elements { A: bf16, R: f32 },
-                        &specialization::<routed_down_sited::Entry>(&device, &statics),
-                    )
-                    .unwrap(),
+                    project: every_row(
+                        prepare(&device, routed_down_project::native_entry_with(routed_down_project::Elements { EDW: q8, A: bf16 }), &statics),
+                    ),
+                    sited: prepare(&device, routed_down_sited::native_entry_with(routed_down_sited::Elements { A: bf16, R: f32 }), &statics),
                 },
                 form,
                 admitted: None,

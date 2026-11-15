@@ -1619,9 +1619,17 @@ fn router(attribution: &Value, entries: &[&str]) -> Result<Value, String> {
 /// every layer of a step. Absent, with why, where either cell's trace has
 /// no per-entry times.
 fn routers(cell: &Value, resident: &Value) -> Value {
-    use magnitude_kernels::{routed_route, routed_route_shared, routed_route_streamed, routed_select, routed_select_streamed};
+    use magnitude_kernels::{
+        routed_hint_route, routed_hint_select, routed_route, routed_route_shared,
+        routed_route_streamed, routed_select, routed_select_streamed,
+    };
     use seismic::Entry;
-    const STREAMED: [&str; 2] = [routed_route_streamed::Entry::NAME, routed_select_streamed::Entry::NAME];
+    const STREAMED: [&str; 4] = [
+        routed_route_streamed::Entry::NAME,
+        routed_hint_route::Entry::NAME,
+        routed_select_streamed::Entry::NAME,
+        routed_hint_select::Entry::NAME,
+    ];
     const RESIDENT: [&str; 3] = [routed_route::Entry::NAME, routed_route_shared::Entry::NAME, routed_select::Entry::NAME];
     let of = |cell: &Value, entries: &[&str], whose: &str| match &cell["detail"]["attribution"] {
         Value::Null => Err(format!("the {whose} cell's trace has no per-entry times (--attribution-steps 0)")),

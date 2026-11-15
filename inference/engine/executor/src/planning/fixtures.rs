@@ -376,9 +376,15 @@ const RANK: u64 = 64;
 /// domain, so no fixture built at it names a shape a backend has no
 /// configuration for.
 pub(crate) fn mix_site_hidden() -> u64 {
-    use seismic::{BackendName, NativeSpecialization, NativeSpecializationError};
+    use seismic::{BackendName, Element, NativeSpecialization, NativeSpecializationError};
+    let elements = [
+        ("A", Element::bf16()),
+        ("NW", Element::f16()),
+        ("DW", Element::f16()),
+        ("IW", Element::f16()),
+    ];
     let implementations = BackendName::ALL.map(|backend| {
-        seismic::generated::native_implementation_for_backend::<magnitude_kernels::stream_mix_down::Entry>(backend)
+        seismic::generated::native_implementation_at::<magnitude_kernels::stream_mix_down::Entry>(backend, &elements)
             .expect("the kernels bundle resolves `stream_mix_down`")
             .unwrap_or_else(|| panic!("{backend:?} implements `stream_mix_down`"))
     });

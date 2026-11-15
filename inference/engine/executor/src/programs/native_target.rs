@@ -12,8 +12,8 @@ use super::{
         BoundTargetReadoutGraphs, ReadoutClass, ReadoutKind, certifies, shapes, write_selection,
     },
     native_target_graph::{
-        BankRun, BoundTargetGraphs, EntryTokens, GroupBuffers, LaunchControl, LaunchControlLayout, TokenRow,
-        complete, packed_selection_scores,
+        BankRun, BoundTargetGraphs, CarryPorts, EntryTokens, GroupBuffers, LaunchControl, LaunchControlLayout,
+        TokenRow, complete, packed_selection_scores,
     },
 };
 use crate::device_table::{SelectedRead, SubmittedRead};
@@ -601,6 +601,10 @@ struct TargetRun<'l> {
     residual: Option<Tensor>,
     /// The carry the next block reads (`ResidualCarry`).
     hidden: ResidualCarry<Tensor>,
+    /// Which of its place's operand carries (`GroupBuffers::operands`) the
+    /// run's latest graph formed the next block's operand into, beside
+    /// `hidden`; none where it formed none.
+    carried: Option<usize>,
     per_layer_rows: Option<Tensor>,
     region: ChainRegion,
     controls: GraphControls,
@@ -1688,6 +1692,7 @@ impl NativeTargetProgram {
             unfilled: None,
             residual: None,
             hidden: ResidualCarry::rows(hidden),
+            carried: None,
             per_layer_rows: None,
             region,
             controls,
@@ -1737,6 +1742,10 @@ impl NativeTargetProgram {
                         bank.window(*sequence, index, run.window.first + tail.first).map_err(invalid)?;
                     }
                     run.hidden = run.hidden.as_ref().try_map(|carried| tail.slice(carried))?;
+                    // An operand is carried at one row: none survives a
+                    // narrower window (no block of the tail reads one,
+                    // `block_carries`).
+                    run.carried = None;
                     run.per_layer_rows = run
                         .per_layer_rows
                         .as_ref()
@@ -2072,6 +2081,38 @@ impl NativeTargetProgram {
                 (None, None) => {}
                 _ => return Err(invalid("a block graph's pre port disagrees with the carry it reads")),
             }
+            // The operand the block before formed for this graph's
+            // projection, and the one this graph forms for the next
+            // block's: its place's two carries in turn.
+            let carried = match (&graph.operand_in, &graph.operand) {
+                (None, None) => None,
+                (operand_in, operand) => {
+                    let carries = run.region.group.operands(run.region.place).map_err(invalid)?;
+                    let mut bind = |ports: &CarryPorts, at: usize| {
+                        let [rows, quantized] = &carries[at];
+                        bindings.set(&ports.carry.rows, rows).map_err(device)?;
+                        bindings.set(&ports.carry.quantized, quantized).map_err(device)
+                    };
+                    let read = match (operand_in, run.carried) {
+                        (None, _) => None,
+                        (Some(ports), Some(at)) => {
+                            bind(ports, at)?;
+                            Some(at)
+                        }
+                        (Some(_), None) => {
+                            return Err(invalid("a block graph reads an operand the block before did not carry"));
+                        }
+                    };
+                    match operand {
+                        None => None,
+                        Some(ports) => {
+                            let at = read.map_or(0, |read| 1 - read);
+                            bind(ports, at)?;
+                            Some(at)
+                        }
+                    }
+                }
+            };
             // A split block binds its chain place's words of the bank's
             // placed parts and its rows of the crossing buffers; a back after
             // the group's pass the chain's experts' rows and its rows'
@@ -2351,6 +2392,7 @@ impl NativeTargetProgram {
                 .output
                 .as_ref()
                 .try_map(|output| outputs.exported(output).ok_or_else(|| invalid("target block output was not exported")))?;
+            run.carried = carried;
             rotation.recycle(std::mem::replace(&mut run.output, (next, outputs)))?;
             if let Some(started) = block_started {
                 let kind = graph.state.kind();

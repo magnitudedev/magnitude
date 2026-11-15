@@ -275,10 +275,11 @@ struct HeadGraphEntries<'a, G: GraphDraft + 'a> {
     landing: Option<LandingEntries<'a, G>>,
     streams: Option<StreamsEntries<'a, G>>,
     gather: G::Binding<'a, feature_rows::Entry>,
-    input: G::Binding<'a, draft_rows::Entry>,
+    /// The head's input rows and its priming projection, by row range.
+    input: G::Ranged<'a, draft_rows::Entry>,
     copy: G::Binding<'a, feature_copy::Entry>,
     attention: AttentionGraphEntries<'a, G>,
-    priming_project: G::Binding<'a, attention_project::Entry>,
+    priming_project: G::Ranged<'a, attention_project::Entry>,
     feed_forward: HeadFeedForwardEntries<'a, G>,
     features: G::Binding<'a, readout_features_rows::Entry>,
     logits: readout::ProjectionEntries<'a, G>,
@@ -924,7 +925,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
         ("R", Dim::from(0)),
         ("F", Dim::from(1)),
     ];
-    let tokens = graph.input_for(entries.input, "tokens", &entry_dims)?;
+    let tokens = graph.input_for(G::first(entries.input), "tokens", &entry_dims)?;
     // The host writes the entry rows' conditioning, or a device-conditioned
     // class binds the leading rows of its chunk's target features.
     let conditioning = if prefix && entry_rows.equals(1u64) {
@@ -937,7 +938,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
             "head_entry_rows",
         )?)
     } else {
-        Some(graph.input_for(entries.input, "conditioning", &entry_dims)?)
+        Some(graph.input_for(G::first(entries.input), "conditioning", &entry_dims)?)
     };
     let prefix_conditioning = if prefix {
         Some(graph.port(conditioning_element, &[Dim::from(1), conditioning_width.clone()])?)
@@ -1034,7 +1035,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                 let directory = table.by_rows(&mut graph, &mut constants)?;
                 let input = graph
                     .enqueue(
-                        entries.input,
+                        G::pick(entries.input, &rows),
                         &[
                             ("M", rows.clone()),
                             ("V", table.rows.clone()),
@@ -1081,7 +1082,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                     |graph, directory| {
                         Ok(graph
                             .enqueue(
-                                entries.input,
+                                G::pick(entries.input, &rows),
                                 &[
                                     ("M", rows.clone()),
                                     ("V", table_rows),
@@ -1244,6 +1245,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                         route: entries.route,
                         decode: entries.decode,
                         output: entries.output,
+                        operand_norm: entries.operand_norm,
                         group: entries.group,
                         experts: entries.experts,
                         combine: entries.combine,
@@ -1265,6 +1267,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                     &join,
                     &rows,
                     epsilon,
+                    None,
                     None,
                 )?;
                 output

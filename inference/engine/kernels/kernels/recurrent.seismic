@@ -94,84 +94,24 @@ fn gated_delta_project[M, H, PT, NM, NK, NV, W, QB, ZB](hidden: &tensor[M, PT * 
 # Both backends: one segmented K1 projection qkv | z | alpha | beta (see
 # `dense.seismic` for the projection library's launches on each backend;
 # segments enumerate their tile groups or block columns in segment order).
-# Metal: GEMV up to VERIFY_ROWS rows, batched GEMV to 16, each normalizing
-# in-threadgroup; larger classes stage the normalized rows, then the GEMM
-# (17..64 rows at the fixed small-row geometry `_gemm_small`, 32 x 64 tiles;
-# beyond over tuned TILE_M x TILE_N tiles, or under TALL the tall GEMM over
-# rows staged in its order).
+# Metal: the `dense` projection (`dense.seismic`), segmented, over the
+# normalized rows: the GEMVs and the batched rows normalize while staging;
+# `stage` normalizes once for the matrix GEMV and past 16 rows, and
+# `stage_tall` in the tall GEMM's order.
 # (CUDA: GEMV to 16 rows, no batched class, GEMM row bands; see below.)
-# PACK selects the token-packing form of `dense.seismic` past 64 rows for
-# the qkv and z segments, over the staged normalized rows: one operand for
-# both segments (coded under the tighter of the two weights' packing limits),
-# each weight's own factor tables (the z weights' after the qkv weights' in
-# every table), and the packed tiles in segment order (four a threadgroup). A
-# segment whose weights the operand does not serve, and the alpha and beta
-# segments, run the staged 64 x 64 tiles in the `unpacked` launch, with their
-# results. PACK is admitted where the qkv or z weights are (`form(W, PACK)`),
-# and RESIDUE 2 where a bounded one's codes take the residue
-# (`form(W, PACK_RESIDUE)`). The scratch is transient, per call, with
-# `dense_output`'s sizes per padded row and per qkv and z weight row.
 native gated_delta_project for metal from "metal/gated_delta_project.metal":
     static (H, PT, NM, NK, NV, W, QB, ZB)
-    params (form TALL in [1, 0] default 1, arithmetic form PACK in [0, 1] default 0,
-        arithmetic form RESIDUE in [1, 2] default 1)
-    where (TALL == 0 or H % 128 == 0) and (PACK == 0 or (TALL == 1 and H % 256 == 0 and H < 1048576 and (2 * NK + NV) * W % 32 == 0 and NV * W % 32 == 0 and (form(QW, PACK) == 1 or form(GW, PACK) == 1))) and (PACK == 1 or (PACK_TOKENS == 4 and WEIGHTS_AHEAD == 0)) and (PACK == 0 or (TILE_M == 64 and TILE_N == 64)) and (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2)) and (RESIDUE == 1 or (PACK == 1 and ((QB > 0 and form(QW, PACK_RESIDUE) == 1) or (ZB > 0 and form(GW, PACK_RESIDUE) == 1))))
-    scratch normalized bytes ((M + TALL * (ceil_div(M, 64) * 64 - M)) * H * 2) when M > 16
-    scratch packed bytes (ceil_div(M, 128) * 128 * H * 2 + 1024) when M > 64 and PACK == 1
-    scratch token_factors bytes (ceil_div(M, 128) * 128 * (H / 32) * 4 * RESIDUE) when M > 64 and PACK == 1
-    scratch weight_factors bytes ((2 * NK + 2 * NV) * W * (H / 32) * 4) when M > 64 and PACK == 1
-    scratch token_scales bytes (ceil_div(M, 128) * 128 * 4) when M > 64 and PACK == 1
-    scratch weight_scales bytes ((2 * NK + 2 * NV) * W * 4) when M > 64 and PACK == 1
-    launch gated_delta_project_stage when M > 16 and (M <= 64 or TALL == 0 or PACK == 1):
+    project dense segmented (qkv_weight, gate_weight, alpha_weight, beta_weight)
+    restate single_gemv
+    scratch normalized bytes ((M + TALL * (ceil_div(M, 64) * 64 - M)) * H * 2) when M > VERIFY_ROWS and (M > 16 or MATRIX == 1)
+    launch gated_delta_project_stage before batch when M > VERIFY_ROWS and (M > 16 or MATRIX == 1) and (M <= 64 or TALL == 0 or PACK == 1):
         staging
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch gated_delta_project_gemv when M <= VERIFY_ROWS:
-        params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default 16)
-        threadgroups (ceil_div((2 * NK + NV) * W, SIMDGROUPS * ROWS * 32 / LANES)
-            + ceil_div(NV * W, SIMDGROUPS * ROWS * 32 / LANES)
-            + 2 * ceil_div(NV, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
-        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (min(ceil_div(H, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
-    launch gated_delta_project_batch when M > VERIFY_ROWS and M <= 16:
-        params (BATCH_SIMDGROUPS in [8, 4, 16, 32] default 8, BATCH_ROWS in [2, 1, 4] default 2)
-        threadgroups (ceil_div((2 * NK + NV) * W, BATCH_SIMDGROUPS * BATCH_ROWS * 8)
-            + ceil_div(NV * W, BATCH_SIMDGROUPS * BATCH_ROWS * 8) + 2 * ceil_div(NV, BATCH_SIMDGROUPS * BATCH_ROWS * 8), 1, 1)
-        threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
-        shared_bytes (16640)
-    launch gated_delta_project_gemm_small when M > 16 and M <= 64:
-        threadgroups (ceil_div((2 * NK + NV) * W, 64)
-            + ceil_div(NV * W, 64) + 2 * ceil_div(NV, 64), ceil_div(M, 32), 1)
-        threads_per_threadgroup (128, 1, 1)
-    launch gated_delta_project_gemm when M > 64 and TALL == 0:
-        params (TILE_M in [64, 128, 32] default 64, TILE_N in [64, 128] default 64)
-        threadgroups (ceil_div((2 * NK + NV) * W, TILE_N)
-            + ceil_div(NV * W, TILE_N) + 2 * ceil_div(NV, TILE_N), ceil_div(M, TILE_M), 1)
-        threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
-    launch gated_delta_project_stage_tall when M > 64 and TALL == 1 and PACK == 0:
+    launch gated_delta_project_stage_tall before tall when M > 64 and TALL == 1 and PACK == 0:
+        staging
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch gated_delta_project_tall when M > 64 and TALL == 1 and PACK == 0:
-        params (TALL_M in [128, 256, 512] default 128, TALL_K in [64, 128] default 64, STAGERS in [2, 1] default 2)
-        threadgroups (ceil_div((2 * NK + NV) * W, 32)
-            + ceil_div(NV * W, 32) + 2 * ceil_div(NV, 32), ceil_div(M, TALL_M), 1)
-        threads_per_threadgroup ((TALL_M / 32 + STAGERS) * 32, 1, 1)
-    launch gated_delta_project_pack when M > 64 and PACK == 1:
-        reads (RESIDUE)
-        threadgroups (ceil_div(M, 128) * 32, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch gated_delta_project_pack_coefficients when M > 64 and PACK == 1:
-        threadgroups ((2 * NK + 2 * NV) * W, 1, 1)
-        threads_per_threadgroup (32, 1, 1)
-    launch gated_delta_project_packed when M > 64 and PACK == 1:
-        params (PACK_TOKENS in [4, 2] default 4, WEIGHTS_AHEAD in [0, 1] default 0)
-        reads (RESIDUE)
-        threadgroups (ceil_div(M, 128) * ((2 * NK + NV) * W / 32) + ceil_div(M, 128) * (NV * W / 32), 1, 1)
-        threads_per_threadgroup (128, 1, 1)
-    launch gated_delta_project_unpacked when M > 64 and PACK == 1:
-        threadgroups (ceil_div((2 * NK + NV) * W, 64) + ceil_div(NV * W, 64) + 2 * ceil_div(NV, 64),
-            ceil_div(M, 64), 1)
-        threads_per_threadgroup (128, 1, 1)
 
 # CUDA: GEMV to 16 rows (`gemv` to 8, `gemv16` beyond; at M = 1 the block
 # forms its A row in shared memory), GEMM beyond in the K1 row bands
@@ -179,100 +119,23 @@ native gated_delta_project for metal from "metal/gated_delta_project.metal":
 # `dense.seismic`); one shared stage forms semantic rows or selected S8/F16 matrix operands. (Metal: batched GEMV class, no INT8 path.)
 native gated_delta_project for cuda from "cuda/gated_delta_project.cu":
     static (H, PT, NM, NK, NV, W)
-    params (arithmetic INT8 in [0, 1] default 0, arithmetic OPERAND in [0, 1] default 0, arithmetic KSPLIT in [4, 2, 8] default 4)
-    where H % 64 == 0 and (OPERAND == 0 or INT8 == 0) and (INT8 == 0 or (form(QW, INT8) == 1 and form(GW, INT8) == 1 and form(AW, INT8) == 1 and form(BW, INT8) == 1))
-    scratch staged bytes (M * H * 2) when M > 1
-    scratch groups bytes (M * H / 4) when INT8 == 1 and M > 16
-    launch gated_delta_project_stage when M > 1:
-        reads (INT8, OPERAND)
-        staging
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch gated_delta_project_gemv when M <= 8:
-        threadgroups (ceil_div(ceil_div((2 * NK + NV) * W, 16), 8 / KSPLIT)
-            + ceil_div(ceil_div(NV * W, 16), 8 / KSPLIT) + 2 * ceil_div(ceil_div(NV, 16), 8 / KSPLIT), 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes ((1 - min(1, M - 1)) * H * 2)
-    launch gated_delta_project_gemv16 when M > 8 and M <= 16:
-        alike (gated_delta_project_gemv)
-        threadgroups (ceil_div(ceil_div((2 * NK + NV) * W, 16), 8 / KSPLIT)
-            + ceil_div(ceil_div(NV * W, 16), 8 / KSPLIT) + 2 * ceil_div(ceil_div(NV, 16), 8 / KSPLIT), 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch gated_delta_project_gemm_small when M > 16 and M <= 64:
-        reads (INT8, OPERAND)
-        threadgroups (ceil_div(ceil_div((2 * NK + NV) * W, 16), 8)
-            + ceil_div(ceil_div(NV * W, 16), 8) + 2 * ceil_div(ceil_div(NV, 16), 8), 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes (3 * (64 * 144 + 10240) + 2048)
-    launch gated_delta_project_gemm when M > 64:
-        params (ROTATE in [2, 1, 4] default 2)
-        reads (INT8, OPERAND)
-        threadgroups (ceil_div(ceil_div((2 * NK + NV) * W, 16), 8)
-            + ceil_div(ceil_div(NV * W, 16), 8) + 2 * ceil_div(ceil_div(NV, 16), 8), ceil_div(M, 128), 1)
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes (2 * (128 * 144 + 10240) + 2048)
+    project dense segmented (qkv_weight, gate_weight, alpha_weight, beta_weight) rows rms
 
-# Vulkan: the K1 projection library (`vulkan/common/projection.glsl`). Rows
-# M <= VERIFY_ROWS run the GEMV (SIMDGROUPS x ROWS lane groups of LANES lanes per
-# workgroup, each owning weight rows; LANES sets the reduction order, so it
-# is arithmetic) with the norm prologue in-workgroup, one launch per
-# activation-row bound (see `dense_expand`); larger classes a
-# stage launch writing the normalized rows to scratch, then the GEMM over
-# TILE_M x TILE_N tiles (cooperative-matrix f16 multiplies under
-# SEISMIC_HAS_MATRIX, F32 FMAs otherwise).
+# Vulkan: the `dense` projection (segmented) over the normalized rows.
 native gated_delta_project for vulkan from "vulkan/gated_delta_project.comp":
     static (H, PT, NM, NK, NV, W)
-    params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default 16,
-            TILE_M in [128, 64, 32] default 64, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32)
-    let GEMV_GROUPS = ceil_div((2 * NK + NV) * W, SIMDGROUPS * ROWS * 32 / LANES) + ceil_div(NV * W, SIMDGROUPS * ROWS * 32 / LANES) + 2 * ceil_div(NV, SIMDGROUPS * ROWS * 32 / LANES)
-    let GEMV_THREADS = SIMDGROUPS * 32
-    let GEMV_SHARED = 256 + 32 * operands(QW) + min(8 * ceil_div(H, 32), 288) * 72
-    where SUB_M <= TILE_M and SUB_N <= TILE_N
-    scratch normalized bytes (M * H * 2) when M > VERIFY_ROWS
-    launch gated_delta_project_stage when M > VERIFY_ROWS:
-        staging
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes (128)
-    launch gated_delta_project_gemv1 when M <= 1:
-        threadgroups (GEMV_GROUPS, 1, 1)
-        threads_per_threadgroup (GEMV_THREADS, 1, 1)
-        shared_bytes (GEMV_SHARED)
-    launch gated_delta_project_gemv2 when M == 2:
-        alike (gated_delta_project_gemv1)
-        threadgroups (GEMV_GROUPS, 1, 1)
-        threads_per_threadgroup (GEMV_THREADS, 1, 1)
-        shared_bytes (GEMV_SHARED)
-    launch gated_delta_project_gemv4 when M >= 3 and M <= 4:
-        alike (gated_delta_project_gemv1)
-        threadgroups (GEMV_GROUPS, 1, 1)
-        threads_per_threadgroup (GEMV_THREADS, 1, 1)
-        shared_bytes (GEMV_SHARED)
-    launch gated_delta_project_gemv8 when M >= 5 and M <= VERIFY_ROWS:
-        alike (gated_delta_project_gemv1)
-        threadgroups (GEMV_GROUPS, 1, 1)
-        threads_per_threadgroup (GEMV_THREADS, 1, 1)
-        shared_bytes (GEMV_SHARED)
-    launch gated_delta_project_gemm when M > VERIFY_ROWS:
-        threadgroups (ceil_div((2 * NK + NV) * W, TILE_N) + ceil_div(NV * W, TILE_N) + 2 * ceil_div(NV, TILE_N),
-            ceil_div(M, TILE_M), 1)
-        threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
-        shared_bytes ((TILE_M + TILE_N) * 80)
+    project dense segmented (qkv_weight, gate_weight, alpha_weight, beta_weight) rows rms
 
-# CPU: the CPU projection library (`cpu/lib/projection/projection.rs`). A
-# normalize launch writes each normalized row as F32 to scratch; the row
-# launch enumerates the segments qkv | z | alpha | beta, ROWS weight rows per
-# work item, projected against every normalized row.
+# CPU: the CPU projection library (`cpu/lib/projection/projection.rs`). The
+# hidden rows under the input norm are the projection's operand: the
+# operator's `form` launch forms each normalized row as F32 (NVFP4 operands
+# where the weights take them) and its Q8 blocks, left out where the hidden
+# rows' producer emits them under the same norm (`routed_output`'s
+# `operand_norm`). The row launch enumerates the segments qkv | z | alpha |
+# beta, ROWS weight rows per work item, projected against every operand row;
+# only qkv and z read the Q8 blocks.
 native gated_delta_project for cpu from "cpu/gated_delta_project.rs":
-    params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
-    where (INT8 == 0 or form(QW, INT8) == 1 or form(GW, INT8) == 1)
-    scratch quantized bytes (ceil_div(M, Q8_ROWS) * Q8_ROWS * ceil_div(H, Q8_VALUES) * Q8_BYTES)
-    scratch normalized bytes (M * H * 4)
-    launch gated_delta_project_normalize:
-        staging
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (1, 1, 1)
-        shared_bytes (H * 4)
+    project quantized tiled (QW, GW) over (M, H) operand (hidden normed (input_norm, epsilon))
     launch gated_delta_project_rows:
         threadgroups (ceil_div((2 * NK + NV) * W, ROWS) + ceil_div(NV * W, ROWS) + 2 * ceil_div(NV, ROWS), 1, 1)
         threads_per_threadgroup (1, 1, 1)
@@ -575,6 +438,7 @@ native gated_delta_step for vulkan from "vulkan/gated_delta_step.comp":
 native gated_delta_step for cpu from "cpu/gated_delta_step.rs":
     params (ROWS in [32, 16, 64, 128] default 32)
     scratch mixed bytes (M * NV * W * 4)
+    project quantized emits (result 0 over (M, NV * W))
     launch gated_delta_step:
         threadgroups (NV, ceil_div(W, ROWS), B + 1)
         threads_per_threadgroup (1, 1, 1)
@@ -604,7 +468,7 @@ fn gated_delta_project_convolved[M, B, S, H, PT, NM, NK, NV, W, C, T](hidden: &t
     previous_bank: &tensor[B] i32, previous_tape: &tensor[B] i32, following_bank: &tensor[B] i32,
     window: &slab mut tensor[S, C - 1 + T, (2 * NK + NV) * W] A, epsilon: f32, slab_banks: u32)
     -> (tensor[M, (2 * NK + NV) * W + NV * W + 2 * NV] A, tensor[M, (2 * NK + NV) * W] f32)
-    where T >= 0 and NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)):
+    where M <= 16 and T >= 0 and NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)):
     # Decode classes: no packed form, so no packing bounds.
     let qkv_bound = tensor[0] f32
     let gate_bound = tensor[0] f32
@@ -614,56 +478,28 @@ fn gated_delta_project_convolved[M, B, S, H, PT, NM, NK, NV, W, C, T](hidden: &t
         previous_tape, following_bank, window)
     return (projection, convolved)
 
-# Metal: GEMV for one row, `gemv_pair` for two and `gemv_rows` up to
-# VERIFY_ROWS (see `dense.seismic`). Batched rows stage the normalized
-# operand with the same small-row RMS reduction, then use compressed-code
-# matrix products for supported weights and batched GEMV for other formats.
-# The qkv segment's epilogue receives every row's sum of its
-# channel (a GEMV lane group holds them all; the batched class gathers them
-# from the matrix fragment's lanes). For each row it publishes, it convolves
-# the channel over the slot's earlier rows (rounded to A, as published) and
-# the source window's rows with `gated_delta_step`'s F32 tap chain and SiLU,
-# and writes the row's raw value to the successor window when the window keeps
-# it; the owner of a slot's first row also copies the source window rows the
-# successor keeps.
+# Metal: the `dense` projection (`dense.seismic`), segmented, in its
+# launches of up to 16 rows (the contract's row bound): the GEMVs and the
+# batched rows normalize while staging, and `normalize` stages the rows once
+# for the matrix GEMV. The qkv segment's epilogue receives every row's sum
+# of its channel (a GEMV threadgroup reads back the values it published; the
+# batched launch gathers them from the matrix fragment's lanes). For each row
+# it publishes, it convolves the channel over the slot's earlier rows
+# (rounded to A, as published) and the source window's rows with
+# `gated_delta_step`'s F32 tap chain and SiLU, and writes the row's raw value
+# to the successor window when the window keeps it; the owner of a slot's
+# first row also copies the source window rows the successor keeps.
 native gated_delta_project_convolved for metal from "metal/gated_delta_project_convolved.metal":
     static (H, PT, NM, NK, NV, W, C)
-    params (arithmetic LANES in [16, 32, 8] default 16)
-    where MATRIX == 0 or (H % 256 == 0 and (form(QW, MATRIX) == 1 or form(GW, MATRIX) == 1 or form(AW, MATRIX) == 1 or form(BW, MATRIX) == 1))
-    scratch normalized bytes (M * H * 2) when M > VERIFY_ROWS and M <= 16
-    launch gated_delta_project_convolved_normalize when M > VERIFY_ROWS and M <= 16:
+    project dense segmented (qkv_weight, gate_weight, alpha_weight, beta_weight)
+    restate batch BATCH_ROWS in [1, 2, 4] default 1
+    restate gemv_rows ROWS in [2, 1, 4] default 2
+    restate gemv_pair ROWS in [2, 1, 4] default 2
+    scratch normalized bytes (M * H * 2) when M > VERIFY_ROWS and MATRIX == 1
+    launch gated_delta_project_convolved_normalize before batch when M > VERIFY_ROWS and MATRIX == 1:
         staging
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch gated_delta_project_convolved_gemv when M < 2:
-        params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1)
-        threadgroups (ceil_div((2 * NK + NV) * W, SIMDGROUPS * ROWS * 32 / LANES)
-            + ceil_div(NV * W, SIMDGROUPS * ROWS * 32 / LANES)
-            + 2 * ceil_div(NV, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
-        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (min(ceil_div(H, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
-    launch gated_delta_project_convolved_batch when M > VERIFY_ROWS and M <= 16:
-        params (BATCH_SIMDGROUPS in [8, 4, 16, 32] default 8, BATCH_ROWS in [2, 1, 4] default 1, arithmetic BATCH_PARTS in [2, 4, 1] default 2, arithmetic form MATRIX in [1, 0] default 1)
-        threadgroups (ceil_div(ceil_div((2 * NK + NV) * W, 8) * BATCH_PARTS, BATCH_SIMDGROUPS)
-            + ceil_div(ceil_div(NV * W, 8) * BATCH_PARTS, BATCH_SIMDGROUPS) + 2 * ceil_div(ceil_div(NV, 8) * BATCH_PARTS, BATCH_SIMDGROUPS), 1, 1)
-        threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
-        shared_bytes (max(16640, min((BATCH_SIMDGROUPS * 256 + ceil_div(H, 32) * 32) * ceil_div(M, 8), 28672)))
-    launch gated_delta_project_convolved_gemv_rows when M >= 3 and M <= VERIFY_ROWS:
-        params (SIMDGROUPS in [8, 16, 4, 2, 32] default 8, ROWS in [2, 1, 4] default 2)
-        alike (gated_delta_project_convolved_gemv)
-        threadgroups (ceil_div((2 * NK + NV) * W, SIMDGROUPS * ROWS * 32 / LANES)
-            + ceil_div(NV * W, SIMDGROUPS * ROWS * 32 / LANES)
-            + 2 * ceil_div(NV, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
-        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (min(ceil_div(H, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
-    launch gated_delta_project_convolved_gemv_pair when M == 2:
-        params (SIMDGROUPS in [8, 16, 4, 2, 32] default 8, ROWS in [2, 1, 4] default 2)
-        alike (gated_delta_project_convolved_gemv)
-        threadgroups (ceil_div((2 * NK + NV) * W, SIMDGROUPS * ROWS * 32 / LANES)
-            + ceil_div(NV * W, SIMDGROUPS * ROWS * 32 / LANES)
-            + 2 * ceil_div(NV, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
-        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (min(ceil_div(H, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
 
 fn gated_delta_step_convolved[M, B, S, NK, NV, W, T](
     projection: &tensor[M, (2 * NK + NV) * W + NV * W + 2 * NV] A,
@@ -949,6 +785,7 @@ native kimi_delta_step for vulkan from "vulkan/kimi_delta_step.comp":
 native kimi_delta_step for cpu from "cpu/kimi_delta_step.rs":
     params (ROWS in [32, 16, 64, 128] default 32)
     scratch mixed bytes (M * NV * W * 4)
+    project quantized emits (result 0 over (M, NV * W))
     launch kimi_delta_step:
         threadgroups (NV, ceil_div(W, ROWS), B + 1)
         threads_per_threadgroup (1, 1, 1)

@@ -47,6 +47,7 @@ use std::ops::Range;
 /// remains searchable.
 fn decode_starts(
     mix: &AttentionMix,
+    _rows: &Range<u64>,
     backend: seismic::BackendName,
     implementation: &seismic::OnDevice,
     statics: &seismic::NativeSpecialization,
@@ -1888,12 +1889,13 @@ macro_rules! mix_entry {
 
             $(fn search_starts(
                 &self,
+                rows: &Range<u64>,
                 device: &Device,
                 implementation: &seismic::OnDevice,
                 statics: &seismic::NativeSpecialization,
                 limits: TuningLimits,
             ) -> Vec<seismic::ParameterValues> {
-                $starts(&self.0, device.backend(), implementation, statics, limits)
+                $starts(&self.0, rows, device.backend(), implementation, statics, limits)
             })?
 
             fn workload(&self, _cases: usize) -> seismic::WorkloadRotation {
@@ -2057,6 +2059,7 @@ mod tests {
             rows,
             sequences,
             history,
+            projected: rows,
         };
         for launch in [
             launch(512, 1, 0),
@@ -2150,6 +2153,7 @@ mod tests {
                 let defaults = implementation.default_specialization(&statics).unwrap();
                 let starts = decode_starts(
                     &mix,
+                    &(1..VERIFY_ROWS + 1),
                     seismic::BackendName::Metal,
                     &implementation,
                     &statics,
@@ -2180,6 +2184,7 @@ mod tests {
                 assert!(
                     decode_starts(
                         &mix,
+                        &(1..2),
                         seismic::BackendName::Metal,
                         &implementation,
                         &statics,
@@ -2264,6 +2269,7 @@ mod tests {
                 };
                 let starts = decode_starts(
                     &mix,
+                    &(1..VERIFY_ROWS + 1),
                     seismic::BackendName::Metal,
                     &implementation,
                     &statics,
@@ -2361,8 +2367,15 @@ mod tests {
                     .fold(NativeSpecialization::new(), |spec, (name, value)| {
                         spec.with_static(name, value)
                     });
-                let start =
-                    decode_starts(&mix, BackendName::Cuda, &implementation, &statics, limits);
+                let decode = 1..VERIFY_ROWS + 1;
+                let start = decode_starts(
+                    &mix,
+                    &decode,
+                    BackendName::Cuda,
+                    &implementation,
+                    &statics,
+                    limits,
+                );
                 assert_eq!(start.len(), 1);
                 let mut choice = statics.clone();
                 for (name, value) in &start[0] {
@@ -2388,7 +2401,7 @@ mod tests {
                     ..limits
                 };
                 assert!(
-                    decode_starts(&mix, BackendName::Cuda, &implementation, &statics, single)
+                    decode_starts(&mix, &decode, BackendName::Cuda, &implementation, &statics, single)
                         .is_empty()
                 );
                 mix.shape.widths.width = 512;
@@ -2400,6 +2413,7 @@ mod tests {
                 assert!(
                     decode_starts(
                         &mix,
+                        &decode,
                         BackendName::Cuda,
                         &implementation,
                         &wide_statics,
@@ -2471,6 +2485,7 @@ mod tests {
                 rows,
                 sequences: 1,
                 history: 0,
+                projected: rows,
             },
             &representatives,
         )

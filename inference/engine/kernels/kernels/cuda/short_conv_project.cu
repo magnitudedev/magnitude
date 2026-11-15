@@ -1,21 +1,33 @@
-// short_conv_project: RMS prologue over every residual row, then
-// `dense_expand`'s bands over two segments along x: the u segment pairs the
-// B and X streams into u = B * X (F32, columns 0..CH), the C segment stores C
-// (F32, columns CH..2CH).
+// short_conv_project: RMS prologue over every residual row, then the forms of
+// the `dense` projection (`lib/projection/operator.cuh`) over two segments
+// along x: the u segment pairs the B and X streams into u = B * X (F32,
+// columns 0..CH), the C segment stores C (F32, columns CH..2CH).
 #define KERNEL_W0 SEISMIC_B_WEIGHT
 #define KERNEL_W1 SEISMIC_X_WEIGHT
 #define KERNEL_W2 SEISMIC_C_WEIGHT
-#include "lib/projection/projection.cuh"
+#include "lib/projection/operator.cuh"
+
 
 using Raw = projection::Rms<ELEMENT_OF(SEISMIC_NORM), projection::AllRows>;
 using Pro = projection::Operands<projection::OperandRecipe<packets::W0_OPERANDS_NVFP4, packets::W1_OPERANDS_NVFP4,
                                                            packets::W2_OPERANDS_NVFP4>::NVFP4,
                                  Raw>;
-using Source = projection::GemvSource<Pro>;
 using Product = projection::Mul;
 using Gate = projection::Store<element::F32>;
 
-#define PROLOGUE                                                                                              \
+// The two segments: rows, weights and epilogues (formed in the kernel body,
+// where the ABI macros are defined).
+#define SEGMENT_ROWS SEISMIC_DIM_CH, SEISMIC_DIM_CH
+using Segments = projection::op::SegmentSet<0, projection::op::Types<packets::W0, packets::W1, packets::W2>,
+                                            projection::op::Types<Product, Gate>,
+                                            projection::op::empty_mask(SEGMENT_ROWS)>;
+
+#define PROJECTION_M SEISMIC_DIM_M
+#define PROJECTION_K SEISMIC_DIM_H
+#define PROJECTION_ZERO 0
+#define PROJECTION_INT8 PACKETS_FORM_INT8(KERNEL_W0), PACKETS_FORM_INT8(KERNEL_W1), PACKETS_FORM_INT8(KERNEL_W2)
+#define PROJECTION_WEIGHT_TYPES Segments::Weights
+#define PROJECTION_ROWS(g)                                                                                    \
     Pro {                                                                                                     \
         Raw {                                                                                                 \
             reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL)), SEISMIC_RESIDUAL_STRIDE_0,  \
@@ -23,99 +35,49 @@ using Gate = projection::Store<element::F32>;
                 projection::AllRows{}                                                                         \
         }                                                                                                     \
     }
-#define STAGING SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)
-#define GROUPS SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GROUPS)
-#define B_ROWS KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_B_WEIGHT))
-#define X_ROWS KERNEL_W1_AT(SEISMIC_PTR(SEISMIC_BUFFER_X_WEIGHT))
-#define C_ROWS KERNEL_W2_AT(SEISMIC_PTR(SEISMIC_BUFFER_C_WEIGHT))
-#define PRODUCT Product{SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0}
-#define GATE Gate{SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_DIM_CH}
-
-// The weights and epilogues of both segments (formed in the kernel body,
-// where the ABI macros are defined).
-struct Segments {
-    packets::W0 b;
-    packets::W1 x;
-    packets::W2 c;
-    Product product;
-    Gate gate;
-};
-#define SEGMENTS Segments{B_ROWS, X_ROWS, C_ROWS, PRODUCT, GATE}
-
-// The GEMV over NB column blocks of 8 rows: tile groups [0, S) are the u
-// segment's, the rest the C segment's.
-template <int NB, int KSPLIT>
-__device__ __forceinline__ void project_gemv(const Pro &pro, projection::u8 *row, const projection::u8 *staged,
-                                             unsigned M, unsigned long long H, unsigned long long CH,
-                                             const Segments &segments) {
-    using Shape = projection::GemvShape<8, 1, KSPLIT, NB>;
-    __shared__ projection::GemvShared<Shape, Source::type> shared;
-    const Source::type x = Source::make(pro, row, M, H, staged);
-    const unsigned long long group = Shape::tile_group(), segment = projection::gemv_groups<Shape>(CH);
-    if (group < segment)
-        projection::gemv_segment<Shape>(shared, x, M, H / 64, group, CH, segments.b, segments.x, segments.product);
-    else
-        projection::gemv_segment<Shape>(shared, x, M, H / 64, group - segment, CH, segments.c, projection::NoWeight{},
-                                        segments.gate);
-}
-
-// The GEMM of one row band over the staged rows (A rows, or q8_1 rows with Q).
-template <class Shape, bool Q, class Operands = projection::SemanticGemmOperands>
-__device__ __forceinline__ void project_gemm(const projection::u8 *staged, const void *groups, unsigned M,
-                                             unsigned long long H, unsigned long long CH, const Segments &segments) {
-    extern __shared__ uint4 dynamic_shared[];
-    projection::u8 *shared = reinterpret_cast<projection::u8 *>(dynamic_shared);
-    const unsigned long long segment = projection::gemm_columns(CH);
-    const unsigned long long column = projection::gemm_column<Shape>();
-    if (column < segment)
-        projection::gemm_run<Shape, Q, Operands>(shared, staged, H, groups, M, H, column, CH, segments.b, segments.x,
-                                       segments.product);
-    else if (column < 2 * segment)
-        projection::gemm_run<Shape, Q, Operands>(shared, staged, H, groups, M, H, column - segment, CH, segments.c,
-                                       projection::NoWeight{}, segments.gate);
-}
+#define PROJECTION_STAGING SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)
+#define PROJECTION_GROUPS SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GROUPS)
+#define PROJECTION_SEGMENTS                                                                                   \
+    Segments {                                                                                                \
+        {SEGMENT_ROWS},                                                                                       \
+            {KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_B_WEIGHT)), KERNEL_W1_AT(SEISMIC_PTR(SEISMIC_BUFFER_X_WEIGHT)), \
+             KERNEL_W2_AT(SEISMIC_PTR(SEISMIC_BUFFER_C_WEIGHT))},                                              \
+            {Product{SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0}, \
+             Gate{SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_DIM_CH}}            \
+    }
 
 #ifdef SEISMIC_FORMING_SHORT_CONV_PROJECT_STAGE
 template <unsigned INT8, unsigned OPERAND>
 __global__ void short_conv_project_stage(SEISMIC_KERNEL_PARAMS) {
-    constexpr bool S8 = projection::int8_path<INT8, PACKETS_FORM_INT8(KERNEL_W0), PACKETS_FORM_INT8(KERNEL_W1), PACKETS_FORM_INT8(KERNEL_W2)>();
-    using Operands = projection::GemmOperandsOf<OPERAND, packets::W0, packets::W1, packets::W2>;
-    projection::stage_projection_row<S8, Operands>(PROLOGUE, blockIdx.x, SEISMIC_DIM_M, SEISMIC_DIM_H, STAGING, GROUPS);
+    PROJECTION_STAGE;
 }
 #endif
 
-
 #ifdef SEISMIC_FORMING_SHORT_CONV_PROJECT_GEMV
-template <unsigned KSPLIT>
+template <unsigned STAGING, unsigned KSPLIT>
 __global__ void short_conv_project_gemv(SEISMIC_KERNEL_PARAMS) {
     extern __shared__ uint4 dynamic_shared[];
-    project_gemv<1, KSPLIT>(PROLOGUE, reinterpret_cast<projection::u8 *>(dynamic_shared), STAGING,
-                            (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H, SEISMIC_DIM_CH, SEGMENTS);
+    PROJECTION_SEGMENTED_GEMV(1, KSPLIT, STAGING, reinterpret_cast<projection::u8 *>(dynamic_shared));
 }
 #endif
 
 #ifdef SEISMIC_FORMING_SHORT_CONV_PROJECT_GEMV16
-template <unsigned KSPLIT>
+template <unsigned STAGING, unsigned KSPLIT>
 __global__ void short_conv_project_gemv16(SEISMIC_KERNEL_PARAMS) {
-    project_gemv<2, KSPLIT>(PROLOGUE, nullptr, STAGING, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H, SEISMIC_DIM_CH,
-                            SEGMENTS);
+    PROJECTION_SEGMENTED_GEMV(2, KSPLIT, STAGING, nullptr);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_SHORT_CONV_PROJECT_GEMM_SMALL
 template <unsigned INT8, unsigned OPERAND>
 __global__ void short_conv_project_gemm_small(SEISMIC_KERNEL_PARAMS) {
-    constexpr bool S8 = projection::int8_path<INT8, PACKETS_FORM_INT8(KERNEL_W0), PACKETS_FORM_INT8(KERNEL_W1), PACKETS_FORM_INT8(KERNEL_W2)>();
-    project_gemm<projection::SmallGemm, S8, projection::GemmOperandsOf<OPERAND, packets::W0, packets::W1, packets::W2>>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H, SEISMIC_DIM_CH,
-                                            SEGMENTS);
+    PROJECTION_SEGMENTED_GEMM(projection::SmallGemm, PROJECTION_OPERANDS);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_SHORT_CONV_PROJECT_GEMM
 template <unsigned INT8, unsigned OPERAND, unsigned ROTATE>
 __global__ void short_conv_project_gemm(SEISMIC_KERNEL_PARAMS) {
-    constexpr bool S8 = projection::int8_path<INT8, PACKETS_FORM_INT8(KERNEL_W0), PACKETS_FORM_INT8(KERNEL_W1), PACKETS_FORM_INT8(KERNEL_W2)>();
-    project_gemm<projection::LargeGemm<ROTATE>, S8, projection::GemmOperandsOf<OPERAND, packets::W0, packets::W1, packets::W2>>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H,
-                                                       SEISMIC_DIM_CH, SEGMENTS);
+    PROJECTION_SEGMENTED_GEMM(projection::LargeGemm<ROTATE>, PROJECTION_OPERANDS);
 }
 #endif

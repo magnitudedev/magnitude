@@ -1,72 +1,29 @@
 // routed_output on CPU (contract and portable body in routed.seismic).
-// `routed_output_stage` stages each row's expert and shared products as F32
-// in scratch, one work item per row. `routed_output_rows`: work item (x, m)
-// owns ROWS output channels of row m. It projects each choice's expert down
-// rows, weighting each published (A-rounded) projection by its score in slot
-// order, then the shared expert's down rows, and publishes
+// The operator's form launch forms each row's expert and shared products as
+// F32 (`edw_rows`, `sdw_rows`), their Q8 blocks where INT8 = 1, and NVFP4
+// operands where the down weights take them; `routed_expand` emits the same
+// operands. `routed_output_rows`: work item
+// (x, m) owns ROWS output channels of row m. It projects each choice's
+// expert down rows, weighting each published (A-rounded) projection by its
+// score in slot order, then the shared expert's down rows, and publishes
 //     residual + selected + A(shared) * coefficient.
+// The row's last item then forms the next projection's operand from the
+// whole row under `operand_norm` (`projection::emit`), in the forms its
+// graph pairs (`emits_result_0_rows()`, `emits_result_0_quantized()`,
+// `nvfp4_result_0_rows()`): the normalized rows, their Q8 blocks and their
+// NVFP4 operand rows, which that projection's form launch would otherwise
+// form.
 
 use lib::core::activation;
 use lib::projection::projection;
 use lib::routed::routed;
 
 #[inline(always)]
-fn routed_output_stage<L: Isa, E: Elements>(
-    _l: L,
-    cx: &Context<'_, E>,
-    group: [u64; 3],
-    _shared: &mut [u8],
-) {
-    let row = group[0] as usize;
-    let (k, f, s) = (
-        cx.dim_k() as usize,
-        cx.dim_f() as usize,
-        cx.dim_s() as usize,
-    );
-    let expert_product = cx.arg_expert_product();
-    for slot in 0..k {
-        let choice = row * k + slot;
-        // SAFETY: each work item writes its own row's choices of the scratch.
-        let staged = unsafe { cx.scratch_expert().slice_mut::<f32>(4 * choice * f, f) };
-        projection::stage::<E::A>(expert_product.row([row, slot, 0]), staged);
-        if cx.param_int8() == 1 {
-            let blocks = seismic::cpu::quant::blocks(f);
-            // SAFETY: this work item owns the corresponding choice row.
-            let q8 = unsafe {
-                cx.scratch_expert_q8()
-                    .slice_mut::<seismic::cpu::quant::Q8Block>(
-                        choice * blocks * seismic::cpu::quant::Q8_BYTES,
-                        blocks,
-                    )
-            };
-            projection::quantize(staged, q8);
-        }
-        projection::operand_row(&[&cx.arg_expert_down()], staged);
-    }
-    // SAFETY: each work item writes its own row of the scratch.
-    let staged = unsafe { cx.scratch_shared().slice_mut::<f32>(4 * row * s, s) };
-    projection::stage::<E::A>(cx.arg_shared_product().row([row, 0]), staged);
-    if cx.param_int8() == 1 {
-        let blocks = seismic::cpu::quant::blocks(s);
-        // SAFETY: this work item owns the corresponding shared row.
-        let q8 = unsafe {
-            cx.scratch_shared_q8()
-                .slice_mut::<seismic::cpu::quant::Q8Block>(
-                    row * blocks * seismic::cpu::quant::Q8_BYTES,
-                    blocks,
-                )
-        };
-        projection::quantize(staged, q8);
-    }
-    projection::operand_row(&[&cx.arg_shared_down()], staged);
-}
-
-#[inline(always)]
 fn routed_output_rows<L: Isa, E: Elements>(
     _l: L,
     cx: &Context<'_, E>,
     group: [u64; 3],
-    _shared: &mut [u8],
+    shared_bytes: &mut [u8],
 ) {
     let (m, h, k) = (
         cx.dim_m() as usize,
@@ -76,11 +33,11 @@ fn routed_output_rows<L: Isa, E: Elements>(
     let (f, s) = (cx.dim_f() as usize, cx.dim_s() as usize);
     let row = group[1] as usize;
     let columns = projection::item_rows(group[0], cx.param_rows(), h);
-    // SAFETY: the stage launch wrote every row before this launch.
+    // SAFETY: the form launch (or the products' producer) wrote every row before this launch.
     let (expert, shared) = unsafe {
         (
-            cx.scratch_expert().slice::<f32>(0, m * k * f),
-            cx.scratch_shared().slice::<f32>(0, m * s),
+            cx.scratch_edw_rows().slice::<f32>(0, m * k * f),
+            cx.scratch_sdw_rows().slice::<f32>(0, m * s),
         )
     };
     let (expert_blocks, shared_blocks) = (
@@ -88,11 +45,11 @@ fn routed_output_rows<L: Isa, E: Elements>(
         seismic::cpu::quant::blocks(s),
     );
     let expert_q8 = (cx.param_int8() == 1).then(|| unsafe {
-        cx.scratch_expert_q8()
+        cx.scratch_edw_quantized()
             .slice::<seismic::cpu::quant::Q8Block>(0, m * k * expert_blocks)
     });
     let shared_q8 = (cx.param_int8() == 1).then(|| unsafe {
-        cx.scratch_shared_q8()
+        cx.scratch_sdw_quantized()
             .slice::<seismic::cpu::quant::Q8Block>(0, m * shared_blocks)
     });
     let (routes, scores, down) = (cx.arg_routes(), cx.arg_scores(), cx.arg_expert_down());
@@ -149,6 +106,33 @@ fn routed_output_rows<L: Isa, E: Elements>(
                 None => residual + selected + shared,
                 Some(factor) => residual + (selected + shared) * factor,
             });
+        }
+    }
+    if cx.emits_result_0_rows() {
+        let norm = cx.arg_operand_norm();
+        // SAFETY: the emitted operand's buffers over rows of H values (one
+        // stream: the contract's `NO == H and SN == 1`); this item stored
+        // its channels of the row, and the row's last arrival reads it whole
+        // once every item has.
+        unsafe {
+            projection::emit(
+                cx.scratch_result_0_rows(),
+                cx.emits_result_0_quantized().then(|| cx.scratch_result_0_quantized()),
+                cx.nvfp4_result_0_rows(),
+                cx.scratch_result_0_arrivals(),
+                h,
+                row,
+                columns.len(),
+                |out| {
+                    projection::form_input::<E::A>(
+                        cx.result_0().span([row, 0], h),
+                        (cx.dim_no() != 0).then_some(&norm),
+                        cx.arg_operand_epsilon(),
+                        shared_bytes,
+                        out,
+                    )
+                },
+            );
         }
     }
 }

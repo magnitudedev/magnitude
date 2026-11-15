@@ -2,7 +2,7 @@ use super::specialization::{Specializer, Tuning};
 use super::readout::{ReadoutRecipe, RecipePreparation};
 use super::tuning::streams::{StreamMixDownTuning, StreamMixUpTuning};
 use super::tuning::{
-    ModelInputs, TunedEntry, Tuner, TuningLimits, TuningWeights, decode_experts,
+    EntryTuning, ModelInputs, TunedEntry, Tuner, TuningLimits, TuningWeights, decode_experts,
     attention::{
         AttentionDecodeK8V4Tuning, AttentionDecodeTuning, AttentionMix, AttentionOutputTuning,
         AttentionPrefillK8V4Tuning, AttentionPrefillTuning, AttentionProjectTuning, PrefillRows,
@@ -10,9 +10,10 @@ use super::tuning::{
         PooledProjectTuning, PrefillListing, history_window, picked_rows,
     },
     cases::{DenseExpandTuning, DenseOutputTuning, DenseUpTuning},
+    ranged::EVERY_ROW,
     general_routed::{
         RoutedDownProjectTuning, RoutedDownTuning, RoutedExpandDecodeTuning, RoutedExpertTilesTuning, RoutedGateUpTuning,
-        RoutedGatedTilesTuning, RoutedScatterTuning, RoutedSelectStreamedTuning,
+        RoutedGatedTilesTuning, RoutedHintSelectTuning, RoutedScatterTuning, RoutedSelectStreamedTuning,
         RoutedSelectTuning, RoutedUpTilesTuning, RoutedUpTuning, routing_shape,
     },
     post_norm::ProjectRowsTuning,
@@ -27,9 +28,9 @@ use super::tuning::{
     },
     routed::{
         RoutedChoicesTuning, RoutedCombineTuning, RoutedExpandTuning, RoutedExpertsTuning,
-        RoutedGroupTuning, RoutedOutputProjectTuning, RoutedOutputTuning, RoutedRouteSharedTuning,
-        RoutedRouteStreamedTuning,
-        RoutedRouteTuning, RoutedShape,
+        RoutedGroupTuning, RoutedHintRouteTuning, RoutedOutputProjectTuning, RoutedOutputTuning,
+        RoutedRouteSharedTuning, RoutedRouteStreamedTuning,
+        RoutedRouteTuning, RoutedShape, DECODE_SERVED, GROUPED_SERVED,
     },
     short_conv::{ShortConvOutputTuning, ShortConvProjectTuning},
     state_space::{
@@ -64,7 +65,9 @@ use magnitude_kernels::{
     token_confidence, widen_rows,
 };
 use seismic::KernelRequest;
+use super::RangedKernels;
 use std::collections::HashSet;
+use std::ops::Range;
 use std::{cell::RefCell, rc::Rc};
 /// Each recipe's formed levels, by the programs they are.
 type ReadoutRecipeStates = Rc<RefCell<HashMap<String, RecipePreparation>>>;
@@ -156,14 +159,13 @@ fn ordered_layers<K: Eq>(
 /// `AHEAD` none does; or the first `AHEAD`'s failure; none where a launched
 /// one formed none (a count or a listing, which forms nothing at every
 /// `AHEAD`).
-fn each_lead<K>(
-    leads: [Option<Result<Option<K>, CatalogFailure>>; super::LEADS],
-) -> Result<Option<[Option<K>; super::LEADS]>, CatalogFailure> {
-    let leads = leads.into_iter().map(Option::transpose).collect::<Result<Vec<_>, _>>()?;
-    // An `AHEAD` no layer launches is whole without a kernel.
-    let formed = leads
+fn each_hint<K>(
+    hints: [Option<Result<Option<K>, CatalogFailure>>; crate::planning::HINT_LEADS as usize],
+) -> Result<Option<[Option<K>; crate::planning::HINT_LEADS as usize]>, CatalogFailure> {
+    let hints = hints.into_iter().map(Option::transpose).collect::<Result<Vec<_>, _>>()?;
+    let formed = hints
         .into_iter()
-        .map(|lead| match lead {
+        .map(|hint| match hint {
             None => Some(None),
             Some(kernel) => kernel.map(Some),
         })
@@ -605,17 +607,18 @@ struct Preparation<'a> {
     /// The target's vocabulary: the static dimension of token selection.
     vocabulary: u64,
     target: TargetKernels,
-    /// The tuning case of each fused binding's resident decode route: the
-    /// unit a streamed layer's route follows (`Self::bank_route`).
+    /// The tuning case of each fused binding's resident decode route over
+    /// every row it serves, whose ranges a streamed layer's route follows
+    /// (`Self::bank_route`).
     resident_routes: HashMap<RoutedBinding, RoutedRouteSharedTuning>,
     /// The tuning case of each general binding's resident selection: the
     /// unit a streamed layer's selection follows.
     resident_selects: HashMap<GeneralRoutedBinding, RoutedSelectTuning>,
-    /// Each fused binding's resident output, which a streamed layer's
-    /// combine with the CPU site follows.
+    /// Each fused binding's resident output over every row it serves, whose
+    /// ranges a streamed layer's combine with the CPU site follows.
     resident_outputs: HashMap<RoutedBinding, RoutedOutputTuning>,
-    /// Each general binding's resident down, which a streamed layer's
-    /// combine with the CPU site follows.
+    /// Each general binding's resident down over every row it serves, whose
+    /// ranges a streamed layer's combine with the CPU site follows.
     resident_downs: HashMap<GeneralRoutedBinding, RoutedDownTuning>,
     head: Option<HeadKernels>,
     shared_head: Option<SharedHeadKernels>,
@@ -1178,27 +1181,21 @@ impl<'a> Preparation<'a> {
         let features = self.target_features(&bindings, b.norm, b.activation)?;
         let head = match b.head {
             ReadoutHead::Packed { weight, .. } | ReadoutHead::Qualified { weight, .. } => {
-                let head = self.spec.tuned(
-                    &mut self.tuning,
-                    &HeadRowsTuning {
-                        projection_scope: WeightScope::Target,
-                        norm_scope: WeightScope::Target,
-                        norm: b.norm,
-                        weight,
-                        activation: b.activation,
-                        epsilon: self.epsilon,
-                        rows: None,
-                    },
-                )?;
-                let selected = self.spec.tuned(
-                    &mut self.tuning,
-                    &SelectedRowsTuning {
-                        norm: b.norm,
-                        weight,
-                        activation: b.activation,
-                        epsilon: self.epsilon,
-                    },
-                )?;
+                let head = self.projection(HeadRowsTuning {
+                    projection_scope: WeightScope::Target,
+                    norm_scope: WeightScope::Target,
+                    norm: b.norm,
+                    weight,
+                    activation: b.activation,
+                    epsilon: self.epsilon,
+                    rows: None,
+                })?;
+                let selected = self.projection(SelectedRowsTuning {
+                    norm: b.norm,
+                    weight,
+                    activation: b.activation,
+                    epsilon: self.epsilon,
+                })?;
                 head.zip(selected)
                     .map(|(head, selected)| ReadoutHeadKernels::Packed { head, selected })
             }
@@ -1257,17 +1254,14 @@ impl<'a> Preparation<'a> {
             bindings,
             tap_rows::Elements { A: activation }
         );
-        let fusion = self.spec.tuned(
-            &mut self.tuning,
-            &ProjectRowsTuning {
-                weight: taps.fusion,
-                activation,
-                kind: WeightKind::DraftFusion,
-                groups: 1,
-                output: Element::f32(),
-                scopes: vec![WeightScope::Draft],
-            },
-        )?;
+        let fusion = self.projection(ProjectRowsTuning {
+            weight: taps.fusion,
+            activation,
+            kind: WeightKind::DraftFusion,
+            groups: 1,
+            output: Element::f32(),
+            scopes: vec![WeightScope::Draft],
+        })?;
         let features = fixed!(
             self.spec,
             feature_rows,
@@ -1335,14 +1329,11 @@ impl<'a> Preparation<'a> {
             output,
             ..
         } = binding;
-        let project = self.spec.tuned(
-            &mut self.tuning,
-            &AttentionProjectTuning {
-                binding,
-                scopes: scopes.clone(),
-                epsilon: self.epsilon,
-            },
-        )?;
+        let project = self.projection(AttentionProjectTuning {
+            binding,
+            scopes: scopes.clone(),
+            epsilon: self.epsilon,
+        })?;
         // A low-rank query's widening and up projection, tuned over the
         // layers' `up` weights.
         let low_rank_query = match binding.low_rank_query {
@@ -1354,14 +1345,11 @@ impl<'a> Preparation<'a> {
                     format!("A={}", activation.name()),
                     widen_rows::Elements { A: activation }
                 );
-                let project = self.spec.tuned(
-                    &mut self.tuning,
-                    &LowRankQueryProjectTuning {
-                        binding,
-                        low_rank,
-                        scopes: scopes.clone(),
-                    },
-                )?;
+                let project = self.projection(LowRankQueryProjectTuning {
+                    binding,
+                    low_rank,
+                    scopes: scopes.clone(),
+                })?;
                 widen
                     .zip(project)
                     .map(|(widen, project)| Some(LowRankQueryKernels { widen, project }))
@@ -1543,18 +1531,14 @@ impl<'a> Preparation<'a> {
         let grouped = match binding.grouped {
             None => Some(None),
             Some(grouped) => self
-                .spec
-                .tuned(
-                    &mut self.tuning,
-                    &ProjectRowsTuning {
-                        weight: grouped.element,
-                        activation,
-                        kind: WeightKind::AttentionOutputGrouped,
-                        groups: grouped.shape.groups,
-                        output: activation,
-                        scopes: scopes.clone(),
-                    },
-                )?
+                .projection(ProjectRowsTuning {
+                    weight: grouped.element,
+                    activation,
+                    kind: WeightKind::AttentionOutputGrouped,
+                    groups: grouped.shape.groups,
+                    output: activation,
+                    scopes: scopes.clone(),
+                })?
                 .map(Some),
         };
         // An absorbed query's per-head products publish the activation
@@ -1562,33 +1546,25 @@ impl<'a> Preparation<'a> {
         let absorbed = match binding.absorbed {
             None => Some(None),
             Some(absorbed) => self
-                .spec
-                .tuned(
-                    &mut self.tuning,
-                    &ProjectRowsTuning {
-                        weight: absorbed.element,
-                        activation,
-                        kind: WeightKind::QueryKeys,
-                        groups: absorbed.shape.heads,
-                        output: activation,
-                        scopes: scopes.clone(),
-                    },
-                )?
+                .projection(ProjectRowsTuning {
+                    weight: absorbed.element,
+                    activation,
+                    kind: WeightKind::QueryKeys,
+                    groups: absorbed.shape.heads,
+                    output: activation,
+                    scopes: scopes.clone(),
+                })?
                 .map(Some),
         };
         let output = match binding.tail {
             SublayerTail::Residual => self
-                .spec
-                .tuned(
-                    &mut self.tuning,
-                    &AttentionOutputTuning {
-                        output,
-                        activation,
-                        shape,
-                        input: binding.output_input(),
-                        scopes,
-                    },
-                )?
+                .projection(AttentionOutputTuning {
+                    output,
+                    activation,
+                    shape,
+                    input: binding.output_input(),
+                    scopes,
+                })?
                 .map(SublayerOutput::Residual),
             SublayerTail::PostNorm { norm, .. } => self
                 .post_norm(
@@ -1645,16 +1621,13 @@ impl<'a> Preparation<'a> {
         let shape = binding.shape;
         let activation = binding.activation;
         let project = |this: &mut Self, elements, segments, input| {
-            this.spec.tuned(
-                &mut this.tuning,
-                &PooledProjectTuning {
-                    elements,
-                    segments,
-                    input,
-                    scopes: scopes.to_vec(),
-                    epsilon: this.epsilon,
-                },
-            )
+            this.projection(PooledProjectTuning {
+                elements,
+                segments,
+                input,
+                scopes: scopes.to_vec(),
+                epsilon: this.epsilon,
+            })
         };
         let hidden = PooledProjectInput::Hidden { hidden: shape.widths.hidden };
         let pairs = shape.widths.rotary_pairs;
@@ -1759,16 +1732,13 @@ impl<'a> Preparation<'a> {
         let activation = binding.activation;
         let pairs = shape.widths.rotary_pairs;
         let project = |this: &mut Self, elements, kind, input| {
-            this.spec.tuned(
-                &mut this.tuning,
-                &PooledProjectTuning {
-                    elements,
-                    segments: [Some(kind), None],
-                    input,
-                    scopes: scopes.to_vec(),
-                    epsilon: this.epsilon,
-                },
-            )
+            this.projection(PooledProjectTuning {
+                elements,
+                segments: [Some(kind), None],
+                input,
+                scopes: scopes.to_vec(),
+                epsilon: this.epsilon,
+            })
         };
         let hidden = PooledProjectInput::Hidden { hidden: shape.widths.hidden };
         let query_project = project(
@@ -1837,21 +1807,18 @@ impl<'a> Preparation<'a> {
         let activation = binding.activation;
         let (keys, index) = (selection.keys, selection.indexer);
         let pairs = shape.widths.rotary_pairs;
-        let project = self.spec.tuned(
-            &mut self.tuning,
-            &PooledProjectTuning {
-                elements: crate::operators::attention::pooled::tokens_project(
-                    activation,
-                    binding.norm,
-                    keys.projection,
-                    keys.gate,
-                ),
-                segments: [Some(WeightKind::IndexerKey), keys.gate.map(|_| WeightKind::IndexerKeyGate)],
-                input: PooledProjectInput::Hidden { hidden: shape.widths.hidden },
-                scopes: scopes.to_vec(),
-                epsilon: self.epsilon,
-            },
-        )?;
+        let project = self.projection(PooledProjectTuning {
+            elements: crate::operators::attention::pooled::tokens_project(
+                activation,
+                binding.norm,
+                keys.projection,
+                keys.gate,
+            ),
+            segments: [Some(WeightKind::IndexerKey), keys.gate.map(|_| WeightKind::IndexerKeyGate)],
+            input: PooledProjectInput::Hidden { hidden: shape.widths.hidden },
+            scopes: scopes.to_vec(),
+            epsilon: self.epsilon,
+        })?;
         let widen = fixed!(
             self.spec,
             widen_rows,
@@ -1903,14 +1870,11 @@ impl<'a> Preparation<'a> {
         binding: StateSpaceBinding,
         scopes: Vec<WeightScope>,
     ) -> Result<Option<StateSpaceKernels>, CatalogFailure> {
-        let project = self.spec.tuned(
-            &mut self.tuning,
-            &StateSpaceProjectTuning {
-                binding,
-                scopes: scopes.clone(),
-                epsilon: self.epsilon,
-            },
-        )?;
+        let project = self.projection(StateSpaceProjectTuning {
+            binding,
+            scopes: scopes.clone(),
+            epsilon: self.epsilon,
+        })?;
         let state = || StateSpaceState {
             activation: binding.activation,
             shape: binding.shape,
@@ -1937,10 +1901,7 @@ impl<'a> Preparation<'a> {
                     ("P", shape.head_width)
                 ]
         );
-        let output = self.spec.tuned(
-            &mut self.tuning,
-            &StateSpaceOutputTuning { binding, scopes },
-        )?;
+        let output = self.projection(StateSpaceOutputTuning { binding, scopes })?;
         Ok(match (project, step, chunk, gate, output) {
             (Some(project), Some(step), Some(chunk), Some(gate), Some(output)) => {
                 Some(StateSpaceKernels {
@@ -1962,14 +1923,11 @@ impl<'a> Preparation<'a> {
         binding: ShortConvBinding,
         scopes: Vec<WeightScope>,
     ) -> Result<Option<ShortConvKernels>, CatalogFailure> {
-        let project = self.spec.tuned(
-            &mut self.tuning,
-            &ShortConvProjectTuning {
-                binding,
-                scopes: scopes.clone(),
-                epsilon: self.epsilon,
-            },
-        )?;
+        let project = self.projection(ShortConvProjectTuning {
+            binding,
+            scopes: scopes.clone(),
+            epsilon: self.epsilon,
+        })?;
         let rows = fixed!(
             self.spec,
             short_conv_rows,
@@ -1980,14 +1938,10 @@ impl<'a> Preparation<'a> {
         );
         let output = match binding.tail {
             SublayerTail::Residual => self
-                .spec
-                .tuned(
-                    &mut self.tuning,
-                    &ShortConvOutputTuning {
-                        binding,
-                        scopes,
-                    },
-                )?
+                .projection(ShortConvOutputTuning {
+                    binding,
+                    scopes,
+                })?
                 .map(SublayerOutput::Residual),
             SublayerTail::PostNorm { norm, .. } => self
                 .post_norm(
@@ -2022,11 +1976,12 @@ impl<'a> Preparation<'a> {
             decay_width: b.decay_width,
             scopes,
         };
+        let epsilon = self.epsilon;
         let state = || RecurrentState {
             recurrent_norm: b.recurrent_norm,
             activation: b.activation,
             shape: shape.clone(),
-            epsilon: self.epsilon,
+            epsilon,
         };
         let form = match b.form {
             RecurrentForm::PerHead => self.gated_delta(b, &shape, state())?,
@@ -2034,14 +1989,11 @@ impl<'a> Preparation<'a> {
                 self.kimi_delta(b, [gate_up, alpha_up], [gate_rank, alpha_rank], &shape, state())?
             }
         };
-        let output = self.spec.tuned(
-            &mut self.tuning,
-            &RecurrentOutputTuning {
-                output: b.output,
-                activation: b.activation,
-                shape,
-            },
-        )?;
+        let output = self.projection(RecurrentOutputTuning {
+            output: b.output,
+            activation: b.activation,
+            shape,
+        })?;
         Ok(form.zip(output).map(|(form, output)| RecurrentKernels { form, output }))
     }
 
@@ -2058,6 +2010,7 @@ impl<'a> Preparation<'a> {
                 bindings: format!("{b:?}"),
                 outcome,
             })?;
+        let epsilon = self.epsilon;
         let project_tuning = || RecurrentProjectTuning {
             norm: b.norm,
             qkv: b.qkv,
@@ -2066,7 +2019,7 @@ impl<'a> Preparation<'a> {
             beta: b.beta,
             activation: b.activation,
             shape: shape.clone(),
-            epsilon: self.epsilon,
+            epsilon,
         };
         let step = match form {
             StepForm::Step => self
@@ -2074,10 +2027,7 @@ impl<'a> Preparation<'a> {
                 .tuned(&mut self.tuning, &RecurrentStepTuning(state.clone()))?
                 .map(RecurrentStepKernels::Step),
             StepForm::Convolved => {
-                let project = self.spec.tuned(
-                    &mut self.tuning,
-                    &RecurrentProjectConvolvedTuning(project_tuning()),
-                )?;
+                let project = self.projection(RecurrentProjectConvolvedTuning(project_tuning()))?;
                 let step = self
                     .spec
                     .tuned(&mut self.tuning, &RecurrentStepConvolvedTuning(state.clone()))?;
@@ -2089,7 +2039,7 @@ impl<'a> Preparation<'a> {
         let chunk = self
             .spec
             .tuned(&mut self.tuning, &RecurrentChunkTuning(state))?;
-        let project = self.spec.tuned(&mut self.tuning, &project_tuning())?;
+        let project = self.projection(project_tuning())?;
         Ok(match (project, step, chunk) {
             (Some(project), Some(step), Some(chunk)) => Some(RecurrentFormKernels::Gated {
                 project,
@@ -2115,32 +2065,26 @@ impl<'a> Preparation<'a> {
             .spec
             .tuned(&mut self.tuning, &KimiStepTuning(state.clone()))?;
         let chunk = self.spec.tuned(&mut self.tuning, &KimiChunkTuning(state))?;
-        let project = self.spec.tuned(
-            &mut self.tuning,
-            &KimiProjectTuning {
-                norm: b.norm,
-                qkv: b.qkv,
-                gate: b.gate,
-                alpha: b.alpha,
-                beta: b.beta,
-                activation: b.activation,
-                ranks,
-                shape: shape.clone(),
-                epsilon: self.epsilon,
-            },
-        )?;
+        let project = self.projection(KimiProjectTuning {
+            norm: b.norm,
+            qkv: b.qkv,
+            gate: b.gate,
+            alpha: b.alpha,
+            beta: b.beta,
+            activation: b.activation,
+            ranks,
+            shape: shape.clone(),
+            epsilon: self.epsilon,
+        })?;
         let mut up = |weight, kind| {
-            self.spec.tuned(
-                &mut self.tuning,
-                &ProjectRowsTuning {
-                    weight,
-                    activation: b.activation,
-                    kind,
-                    groups: 1,
-                    output: b.activation,
-                    scopes: shape.scopes.clone(),
-                },
-            )
+            self.projection(ProjectRowsTuning {
+                weight,
+                activation: b.activation,
+                kind,
+                groups: 1,
+                output: b.activation,
+                scopes: shape.scopes.clone(),
+            })
         };
         let gate_up = up(gate_up, WeightKind::RecurrentGateUp)?;
         let alpha_up = up(alpha_up, WeightKind::RecurrentAlphaUp)?;
@@ -2176,33 +2120,26 @@ impl<'a> Preparation<'a> {
             // The tunings read their scale ports' extents from the plan.
             scales: _,
         } = binding;
-        let expand = self.spec.tuned(
-            &mut self.tuning,
-            &DenseExpandTuning {
-                norm,
-                gate,
-                up,
-                activation,
-                gate_kind: WeightKind::DenseGate,
-                up_kind: WeightKind::DenseUp,
-                function,
-                limit,
-                scopes: scopes.clone(),
-                epsilon: self.epsilon,
-            },
-        )?;
+        let expand = self.projection(DenseExpandTuning {
+            norm,
+            gate,
+            up,
+            activation,
+            gate_kind: WeightKind::DenseGate,
+            up_kind: WeightKind::DenseUp,
+            function,
+            limit,
+            scopes: scopes.clone(),
+            epsilon: self.epsilon,
+        })?;
         let output = match tail {
             SublayerTail::Residual => self
-                .spec
-                .tuned(
-                    &mut self.tuning,
-                    &DenseOutputTuning {
-                        down,
-                        activation,
-                        down_kind: WeightKind::DenseDown,
-                        scopes,
-                    },
-                )?
+                .projection(DenseOutputTuning {
+                    down,
+                    activation,
+                    down_kind: WeightKind::DenseDown,
+                    scopes,
+                })?
                 .map(SublayerOutput::Residual),
             SublayerTail::PostNorm { norm, .. } => self
                 .post_norm(WeightKind::DenseDown, down, activation, norm, scopes)?
@@ -2228,13 +2165,10 @@ impl<'a> Preparation<'a> {
                 outcome: "a per-layer input sublayer ends in a post-norm tail".into(),
             });
         };
-        let gate = self.spec.tuned(
-            &mut self.tuning,
-            &super::tuning::per_layer::PerLayerGateTuning {
-                binding,
-                scopes: scopes.clone(),
-            },
-        )?;
+        let gate = self.projection(super::tuning::per_layer::PerLayerGateTuning {
+            binding,
+            scopes: scopes.clone(),
+        })?;
         let output = self.post_norm(
             WeightKind::PerLayerProjection,
             binding.projection,
@@ -2264,12 +2198,8 @@ impl<'a> Preparation<'a> {
             output: Element::f32(),
             scopes: scopes.clone(),
         };
-        let key = self
-            .spec
-            .tuned(&mut self.tuning, &projection(WeightKind::NGramKey))?;
-        let value = self
-            .spec
-            .tuned(&mut self.tuning, &projection(WeightKind::NGramValue))?;
+        let key = self.projection(projection(WeightKind::NGramKey))?;
+        let value = self.projection(projection(WeightKind::NGramValue))?;
         let rows = self.spec.fixed(
             "fixed",
             &binding.rule.statics(),
@@ -2381,14 +2311,11 @@ impl<'a> Preparation<'a> {
             if prepared.down.contains_key(&binding) {
                 continue;
             }
-            let kernel = self.spec.tuned(
-                &mut self.tuning,
-                &StreamMixDownTuning {
-                    binding,
-                    scopes,
-                    epsilon: self.epsilon,
-                },
-            )?;
+            let kernel = self.projection(StreamMixDownTuning {
+                binding,
+                scopes,
+                epsilon: self.epsilon,
+            })?;
             if let Some(kernel) = kernel {
                 prepared.down.insert(binding, kernel);
             }
@@ -2398,9 +2325,7 @@ impl<'a> Preparation<'a> {
             if prepared.up.contains_key(&binding) {
                 continue;
             }
-            let kernel = self
-                .spec
-                .tuned(&mut self.tuning, &StreamMixUpTuning { binding, scopes })?;
+            let kernel = self.projection(StreamMixUpTuning { binding, scopes })?;
             if let Some(kernel) = kernel {
                 prepared.up.insert(binding, kernel);
             }
@@ -2418,17 +2343,14 @@ impl<'a> Preparation<'a> {
         &mut self,
         binding: crate::PerLayerEntryBinding,
     ) -> Result<Option<PerLayerEntryKernels>, CatalogFailure> {
-        let project = self.spec.tuned(
-            &mut self.tuning,
-            &ProjectRowsTuning {
-                weight: binding.projection,
-                activation: binding.activation,
-                kind: WeightKind::PerLayerModelProjection,
-                groups: 1,
-                output: Element::f32(),
-                scopes: vec![WeightScope::Target],
-            },
-        )?;
+        let project = self.projection(ProjectRowsTuning {
+            weight: binding.projection,
+            activation: binding.activation,
+            kind: WeightKind::PerLayerModelProjection,
+            groups: 1,
+            output: Element::f32(),
+            scopes: vec![WeightScope::Target],
+        })?;
         let spec = &mut self.spec;
         let activation = binding
             .activation
@@ -2516,32 +2438,26 @@ impl<'a> Preparation<'a> {
         };
         let (dense_scopes, routed_scopes) = (branch_scopes(0)?, branch_scopes(1)?);
         let dense = binding.dense;
-        let expand = self.spec.tuned(
-            &mut self.tuning,
-            &DenseExpandTuning {
-                norm: dense.norm,
-                gate: dense.gate,
-                up: dense.up,
-                activation: dense.activation,
-                gate_kind: WeightKind::DenseGate,
-                up_kind: WeightKind::DenseUp,
-                function: dense.function,
-                limit: dense.limit,
-                scopes: dense_scopes.clone(),
-                epsilon: self.epsilon,
-            },
-        )?;
-        let down = self.spec.tuned(
-            &mut self.tuning,
-            &ProjectRowsTuning {
-                weight: dense.down,
-                activation: dense.activation,
-                kind: WeightKind::DenseDown,
-                groups: 1,
-                output: Element::f32(),
-                scopes: dense_scopes,
-            },
-        )?;
+        let expand = self.projection(DenseExpandTuning {
+            norm: dense.norm,
+            gate: dense.gate,
+            up: dense.up,
+            activation: dense.activation,
+            gate_kind: WeightKind::DenseGate,
+            up_kind: WeightKind::DenseUp,
+            function: dense.function,
+            limit: dense.limit,
+            scopes: dense_scopes.clone(),
+            epsilon: self.epsilon,
+        })?;
+        let down = self.projection(ProjectRowsTuning {
+            weight: dense.down,
+            activation: dense.activation,
+            kind: WeightKind::DenseDown,
+            groups: 1,
+            output: Element::f32(),
+            scopes: dense_scopes,
+        })?;
         let routed = self.general_routed(binding.routed, routed_scopes)?;
         let tail = fixed!(
             self.spec,
@@ -2560,6 +2476,40 @@ impl<'a> Preparation<'a> {
         })
     }
 
+    /// A projecting entry's kernels: `case` tuned at each range of its rows
+    /// ([`Specializer::tuned_ranges`]), each range its own unit, which a
+    /// graph node binds by its rows.
+    fn projection<T: EntryTuning>(
+        &mut self,
+        case: T,
+    ) -> Result<Option<RangedKernels<T::Entry>>, CatalogFailure> {
+        self.served_projection(EVERY_ROW, case)
+    }
+
+    /// [`Self::projection`] of an entry whose launches take the rows of
+    /// `served` alone (a routed form's decode or grouped rows): its
+    /// partition's ranges of them.
+    fn served_projection<T: EntryTuning>(
+        &mut self,
+        served: Range<u64>,
+        case: T,
+    ) -> Result<Option<RangedKernels<T::Entry>>, CatalogFailure> {
+        self.spec.tuned_ranges(&mut self.tuning, served, case)
+    }
+
+    /// [`Self::served_projection`] of a dependant of `prerequisite`'s
+    /// ranges over the same rows ([`Specializer::tuned_ranges_following`]):
+    /// each range keeps the bits of the prerequisite's kernel of its rows.
+    fn served_projection_following<T: EntryTuning, P: EntryTuning>(
+        &mut self,
+        served: Range<u64>,
+        case: T,
+        prerequisite: P,
+    ) -> Result<Option<RangedKernels<T::Entry>>, CatalogFailure> {
+        self.spec
+            .tuned_ranges_following(&mut self.tuning, served, case, prerequisite)
+    }
+
     /// A post-norm tail: the output projection `kind` into F32 rows, then the
     /// row op that normalizes them into the residual.
     fn post_norm(
@@ -2570,17 +2520,14 @@ impl<'a> Preparation<'a> {
         norm: Element,
         scopes: Vec<WeightScope>,
     ) -> Result<Option<PostNormKernels>, CatalogFailure> {
-        let project = self.spec.tuned(
-            &mut self.tuning,
-            &ProjectRowsTuning {
-                weight,
-                activation,
-                kind,
-                groups: 1,
-                output: Element::f32(),
-                scopes,
-            },
-        )?;
+        let project = self.projection(ProjectRowsTuning {
+            weight,
+            activation,
+            kind,
+            groups: 1,
+            output: Element::f32(),
+            scopes,
+        })?;
         let residual = fixed!(
             self.spec,
             post_norm_residual,
@@ -2632,22 +2579,14 @@ impl<'a> Preparation<'a> {
             scopes: scopes.clone(),
         };
         let experts = if shape.experts_expansion.gated {
-            let decode = self
-                .spec
-                .tuned(&mut self.tuning, &RoutedGateUpTuning(decode()))?;
-            let grouped = self
-                .spec
-                .tuned(&mut self.tuning, &RoutedGatedTilesTuning(tiles()))?;
+            let decode = self.served_projection(DECODE_SERVED, RoutedGateUpTuning(decode()))?;
+            let grouped = self.served_projection(GROUPED_SERVED, RoutedGatedTilesTuning(tiles()))?;
             decode
                 .zip(grouped)
                 .map(|(decode, grouped)| ExpertKernels::Gated { decode, grouped })
         } else {
-            let decode = self
-                .spec
-                .tuned(&mut self.tuning, &RoutedUpTuning(decode()))?;
-            let grouped = self
-                .spec
-                .tuned(&mut self.tuning, &RoutedUpTilesTuning(tiles()))?;
+            let decode = self.served_projection(DECODE_SERVED, RoutedUpTuning(decode()))?;
+            let grouped = self.served_projection(GROUPED_SERVED, RoutedUpTilesTuning(tiles()))?;
             decode
                 .zip(grouped)
                 .map(|(decode, grouped)| ExpertKernels::Plain { decode, grouped })
@@ -2657,7 +2596,7 @@ impl<'a> Preparation<'a> {
             scopes: scopes.clone(),
             experts: down_experts,
         };
-        let down = self.spec.tuned(&mut self.tuning, &resident_down)?;
+        let down = self.served_projection(DECODE_SERVED, resident_down.clone())?;
         self.resident_downs.insert(binding, resident_down);
         let group = self.spec.tuned(
             &mut self.tuning,
@@ -2677,48 +2616,37 @@ impl<'a> Preparation<'a> {
             (Some((_, expansion)), Some((gate, up, down))) => {
                 let expansion = match gate {
                     Some(gate) => self
-                        .spec
-                        .tuned(
-                            &mut self.tuning,
-                            &DenseExpandTuning {
-                                norm: binding.norm,
-                                gate,
-                                up,
-                                activation,
-                                gate_kind: WeightKind::SharedGate,
-                                up_kind: WeightKind::SharedUp,
-                                function: expansion.activation,
-                                limit: expansion.limit,
-                                scopes: scopes.clone(),
-                                epsilon,
-                            },
-                        )?
+                        .projection(DenseExpandTuning {
+                            norm: binding.norm,
+                            gate,
+                            up,
+                            activation,
+                            gate_kind: WeightKind::SharedGate,
+                            up_kind: WeightKind::SharedUp,
+                            function: expansion.activation,
+                            limit: expansion.limit,
+                            scopes: scopes.clone(),
+                            epsilon,
+                        })?
                         .map(DenseExpansionKernel::Gated),
                     None => self
-                        .spec
-                        .tuned(
-                            &mut self.tuning,
-                            &DenseUpTuning {
-                                norm: binding.norm,
-                                up,
-                                activation,
-                                up_kind: WeightKind::SharedUp,
-                                function: expansion.activation,
-                                scopes: scopes.clone(),
-                                epsilon,
-                            },
-                        )?
+                        .projection(DenseUpTuning {
+                            norm: binding.norm,
+                            up,
+                            activation,
+                            up_kind: WeightKind::SharedUp,
+                            function: expansion.activation,
+                            scopes: scopes.clone(),
+                            epsilon,
+                        })?
                         .map(DenseExpansionKernel::Plain),
                 };
-                let output = self.spec.tuned(
-                    &mut self.tuning,
-                    &DenseOutputTuning {
-                        down,
-                        activation,
-                        down_kind: WeightKind::SharedDown,
-                        scopes: scopes.clone(),
-                    },
-                )?;
+                let output = self.projection(DenseOutputTuning {
+                    down,
+                    activation,
+                    down_kind: WeightKind::SharedDown,
+                    scopes: scopes.clone(),
+                })?;
                 Some(expansion.zip(output))
             }
             (None, None) => None,
@@ -2732,26 +2660,20 @@ impl<'a> Preparation<'a> {
         };
         let latent = match binding.latent {
             Some((down, up)) => {
-                let project = self.spec.tuned(
-                    &mut self.tuning,
-                    &ProjectRowsTuning {
-                        weight: down,
-                        activation,
-                        kind: WeightKind::LatentDown,
-                        groups: 1,
-                        output: activation,
-                        scopes: scopes.clone(),
-                    },
-                )?;
-                let output = self.spec.tuned(
-                    &mut self.tuning,
-                    &DenseOutputTuning {
-                        down: up,
-                        activation,
-                        down_kind: WeightKind::LatentUp,
-                        scopes,
-                    },
-                )?;
+                let project = self.projection(ProjectRowsTuning {
+                    weight: down,
+                    activation,
+                    kind: WeightKind::LatentDown,
+                    groups: 1,
+                    output: activation,
+                    scopes: scopes.clone(),
+                })?;
+                let output = self.projection(DenseOutputTuning {
+                    down: up,
+                    activation,
+                    down_kind: WeightKind::LatentUp,
+                    scopes,
+                })?;
                 Some(project.zip(output))
             }
             None => None,
@@ -2903,9 +2825,9 @@ impl<'a> Preparation<'a> {
     /// no host tier or the backend serves none of the site's entries
     /// (`routed_site_request` and the combine of the layer's form);
     /// `Some(None)` where one is a count or a listing. The combine's
-    /// projections follow the binding's resident combine
-    /// (`Specializer::tuned_following`), so they keep that combine's bits; its
-    /// sum has no parameter.
+    /// projections follow the binding's resident combine range by range
+    /// (`Specializer::tuned_ranges_following`), so they keep that combine's
+    /// bits at every row; its sum has no parameter.
     fn bank_site(
         &mut self,
         slot: crate::planning::BankedFeedForward,
@@ -2930,7 +2852,7 @@ impl<'a> Preparation<'a> {
                     failure("routed_output_project", "a streamed layer's output was not prepared before it".into())
                 })?;
                 let case = RoutedOutputProjectTuning { resident: resident.clone(), layers: layers.to_vec() };
-                let project = self.spec.tuned_following(&mut self.tuning, &case, &resident)?;
+                let project = self.served_projection_following(DECODE_SERVED, case, resident)?;
                 let (streams, inject) =
                     self.tuning.model().join(layers).map_err(|outcome| failure("routed_output_sited", outcome))?;
                 let sited = self.spec.fixed(
@@ -2946,7 +2868,7 @@ impl<'a> Preparation<'a> {
                     failure("routed_down_project", "a streamed layer's down was not prepared before it".into())
                 })?;
                 let case = RoutedDownProjectTuning { resident: resident.clone(), layers: layers.to_vec() };
-                let project = self.spec.tuned_following(&mut self.tuning, &case, &resident)?;
+                let project = self.served_projection_following(DECODE_SERVED, case, resident)?;
                 let sited = self.spec.fixed(
                     bindings,
                     &[("H", b.shape.expert_hidden), ("K", bank.selected)],
@@ -2973,10 +2895,11 @@ impl<'a> Preparation<'a> {
     /// at each count of leads, `ExpertBankPlan::ahead`) in that form, over
     /// its streamed `layers`.
     /// Each is a unit of its own that follows its resident decode entry of
-    /// this binding (`Specializer::tuned_following`): at that entry's
-    /// arithmetic choice, so its bits, and tuned in its launch shape over
-    /// the layers that launch it at its `AHEAD`; none at an `AHEAD` none of
-    /// `layers` launches.
+    /// this binding (`Specializer::tuned_following`; the fused form's route,
+    /// a projection, range by range, `Specializer::tuned_ranges_following`):
+    /// at that entry's arithmetic choice, so its bits, and tuned in its
+    /// launch shape over the layers that launch it at its `AHEAD`; none at an
+    /// `AHEAD` none of `layers` launches.
     fn bank_route(
         &mut self,
         slot: crate::planning::BankedFeedForward,
@@ -2996,63 +2919,84 @@ impl<'a> Preparation<'a> {
         // weights' forms): an `AHEAD` none of its layers launches has no
         // kernel.
         let model = self.tuning.model();
-        let mut leads: [Vec<WeightScope>; super::LEADS] = Default::default();
+        let mut hint_layers: [Vec<WeightScope>; crate::planning::HINT_LEADS as usize] = Default::default();
         let plan = model.load.expert_bank().ok_or_else(|| failure("routed_bank", "a streamed layer's load holds no bank".into()))?;
         for &scope in layers {
             let (index, _) = plan
                 .layer(scope)
                 .ok_or_else(|| failure("routed_bank", format!("{scope:?} is not a streamed layer")))?;
-            leads[plan.ahead(index) as usize].push(scope);
+            let ahead = plan.ahead(index);
+            if ahead > 0 {
+                hint_layers[ahead as usize - 1].push(scope);
+            }
         }
         match slot {
             BankedFeedForward::Routed(b) => {
+                if layers.is_empty() {
+                    return Ok(([b.experts, b.selected], None));
+                }
                 let entry = "routed_route_streamed";
                 let resident = self.resident_routes.get(&b).cloned().ok_or_else(|| {
                     failure(entry, "a streamed layer's decode needs the shared-route form".into())
                 })?;
-                let mut ahead = 0;
-                let routes = leads.map(|layers| {
+                let route_case = RoutedRouteStreamedTuning {
+                    resident: resident.clone(),
+                    layers: layers.to_vec(),
+                    bank,
+                };
+                let route = self.served_projection_following(DECODE_SERVED, route_case, resident.clone())?;
+                let mut ahead = 1;
+                let hints = each_hint(hint_layers.map(|layers| {
                     let lead = ahead;
                     ahead += 1;
                     (!layers.is_empty()).then(|| {
-                        let case = RoutedRouteStreamedTuning {
-                            resident: resident.clone(),
+                        let case = RoutedHintRouteTuning {
+                            resident: resident.route.clone(),
                             layers,
                             bank,
                             ahead: lead,
                         };
-                        self.spec.tuned_following(&mut self.tuning, &case, &resident)
+                        self.spec.tuned(&mut self.tuning, &case)
                     })
-                });
+                }))?;
                 Ok((
                     [b.experts, b.selected],
-                    each_lead(routes)?.map(super::BankRouteKernels::Fused),
+                    route.zip(hints).map(|(route, hints)| super::BankRouteKernels::Fused { activation: b.activation, route, hints }),
                 ))
             }
             // A parallel block's routed branch is general: its selection is
             // the branch's.
             BankedFeedForward::GeneralRouted(b) | BankedFeedForward::Parallel(crate::ParallelBinding { routed: b, .. }) => {
+                if layers.is_empty() {
+                    return Ok(([b.shape.experts, b.shape.selected], None));
+                }
                 let entry = "routed_select_streamed";
                 let resident = self.resident_selects.get(&b).cloned().ok_or_else(|| {
                     failure(entry, "a streamed layer's selection was not prepared before it".into())
                 })?;
-                let mut ahead = 0;
-                let selects = leads.map(|layers| {
+                let select_case = RoutedSelectStreamedTuning {
+                    resident: resident.clone(),
+                    layers: layers.to_vec(),
+                    bank,
+                };
+                let select = self.spec.tuned_following(&mut self.tuning, &select_case, &resident)?;
+                let mut ahead = 1;
+                let hints = each_hint(hint_layers.map(|layers| {
                     let lead = ahead;
                     ahead += 1;
                     (!layers.is_empty()).then(|| {
-                        let case = RoutedSelectStreamedTuning {
+                        let case = RoutedHintSelectTuning {
                             resident: resident.clone(),
                             layers,
                             bank,
                             ahead: lead,
                         };
-                        self.spec.tuned_following(&mut self.tuning, &case, &resident)
+                        self.spec.tuned(&mut self.tuning, &case)
                     })
-                });
+                }))?;
                 Ok((
                     [b.shape.experts, b.shape.selected],
-                    each_lead(selects)?.map(super::BankRouteKernels::General),
+                    select.zip(hints).map(|(select, hints)| super::BankRouteKernels::General { activation: b.activation, select, hints }),
                 ))
             }
         }
@@ -3090,10 +3034,9 @@ impl<'a> Preparation<'a> {
         )?;
         let decode = match form {
             DecodeForm::Expand => self
-                .spec
-                .tuned(
-                    &mut self.tuning,
-                    &RoutedExpandTuning {
+                .served_projection(
+                    DECODE_SERVED,
+                    RoutedExpandTuning {
                         expert_gate: b.expert_gate,
                         expert_up: b.expert_up,
                         shared_gate: b.shared_gate,
@@ -3111,11 +3054,11 @@ impl<'a> Preparation<'a> {
                     shared_gate: b.shared_gate,
                     shared_up: b.shared_up,
                 };
-                let route = self.spec.tuned(&mut self.tuning, &shared_route)?;
+                let route = self.served_projection(DECODE_SERVED, shared_route.clone())?;
                 self.resident_routes.insert(b, shared_route);
-                let choices = self.spec.tuned(
-                    &mut self.tuning,
-                    &RoutedChoicesTuning {
+                let choices = self.served_projection(
+                    DECODE_SERVED,
+                    RoutedChoicesTuning {
                         expert_gate: b.expert_gate,
                         expert_up: b.expert_up,
                         activation: b.activation,
@@ -3132,16 +3075,17 @@ impl<'a> Preparation<'a> {
         let resident_output = RoutedOutputTuning {
             expert_down: b.expert_down,
             shared_down: b.shared_down,
+            norm: b.norm,
             activation: b.activation,
             shape,
             scopes: scopes.clone(),
             experts: down_experts,
         };
-        let output = self.spec.tuned(&mut self.tuning, &resident_output)?;
+        let output = self.served_projection(DECODE_SERVED, resident_output.clone())?;
         self.resident_outputs.insert(b, resident_output);
-        let experts = self.spec.tuned(
-            &mut self.tuning,
-            &RoutedExpertsTuning {
+        let experts = self.served_projection(
+            GROUPED_SERVED,
+            RoutedExpertsTuning {
                 expert_gate: b.expert_gate,
                 expert_up: b.expert_up,
                 expert_down: b.expert_down,
@@ -3150,9 +3094,9 @@ impl<'a> Preparation<'a> {
                 scopes: scopes.clone(),
             },
         )?;
-        let combine = self.spec.tuned(
-            &mut self.tuning,
-            &RoutedCombineTuning {
+        let combine = self.served_projection(
+            GROUPED_SERVED,
+            RoutedCombineTuning {
                 shared_gate: b.shared_gate,
                 shared_up: b.shared_up,
                 shared_down: b.shared_down,
@@ -3173,6 +3117,7 @@ impl<'a> Preparation<'a> {
                 route,
                 decode,
                 output,
+                operand_norm: b.norm,
                 group,
                 experts,
                 combine,
@@ -3246,20 +3191,17 @@ impl<'a> Preparation<'a> {
                 &bindings,
                 feature_rows::Elements { A: b.conditioning }
             );
-            let input = self.spec.tuned(
-                &mut self.tuning,
-                &DraftRowsTuning {
-                    conditioning: b.conditioning,
-                    streams: b.streams.map_or(1, |s| s.geometry.streams),
-                    embedding: b.embedding_table,
-                    embedding_norm: b.embedding_norm,
-                    hidden_norm: b.hidden_norm,
-                    combine: b.combine,
-                    activation: b.activation,
-                    scopes: layers.scopes(b),
-                    epsilon: self.epsilon,
-                },
-            )?;
+            let input = self.projection(DraftRowsTuning {
+                conditioning: b.conditioning,
+                streams: b.streams.map_or(1, |s| s.geometry.streams),
+                embedding: b.embedding_table,
+                embedding_norm: b.embedding_norm,
+                hidden_norm: b.hidden_norm,
+                combine: b.combine,
+                activation: b.activation,
+                scopes: layers.scopes(b),
+                epsilon: self.epsilon,
+            })?;
             // Priming injects K/V only: it does not run attention or FFN.
             if let Some(demand) = &self.graph_demand {
                 self.tuning.set_invocations(demand.head.clone(), true);
@@ -3270,17 +3212,14 @@ impl<'a> Preparation<'a> {
                 self.tuning
                     .set_invocations(demand.head_prefix.clone(), true);
             }
-            let priming_project = self.spec.tuned(
-                &mut self.tuning,
-                &AttentionProjectTuning {
-                    binding: AttentionBinding {
-                        key_value_only: true,
-                        ..b.attention
-                    },
-                    scopes: attention_layers.scopes(b),
-                    epsilon: self.epsilon,
+            let priming_project = self.projection(AttentionProjectTuning {
+                binding: AttentionBinding {
+                    key_value_only: true,
+                    ..b.attention
                 },
-            )?;
+                scopes: attention_layers.scopes(b),
+                epsilon: self.epsilon,
+            })?;
             if let Some(demand) = &self.graph_demand {
                 self.tuning.set_invocations(demand.head.clone(), true);
             }
@@ -3317,19 +3256,15 @@ impl<'a> Preparation<'a> {
                 self.features_at(&bindings, b.output_norm, b.activation, self.hidden, form)?;
             let logits = match b.projection {
                 ReadoutHead::Packed { weight, .. } | ReadoutHead::Qualified { weight, .. } => self
-                    .spec
-                    .tuned(
-                        &mut self.tuning,
-                        &PreparedProjectionTuning {
-                            scope: WeightScope::Target,
-                            kind: WeightKind::Output,
-                            weight,
-                            activation: b.activation,
-                            columns: None,
-                            indexed: false,
-                            softcap: 0.0,
-                        },
-                    )?
+                    .projection(PreparedProjectionTuning {
+                        scope: WeightScope::Target,
+                        kind: WeightKind::Output,
+                        weight,
+                        activation: b.activation,
+                        columns: None,
+                        indexed: false,
+                        softcap: 0.0,
+                    })?
                     .map(ProjectionKernels::PreparedPacked),
             };
             let qualified = self.qualified_readout(
@@ -3437,17 +3372,14 @@ impl<'a> Preparation<'a> {
         // Both projections publish F32 rows: the residual the blocks read,
         // and the hidden row the next step joins.
         let project = |this: &mut Self, weight: Element, kind: WeightKind| {
-            this.spec.tuned(
-                &mut this.tuning,
-                &ProjectRowsTuning {
-                    weight,
-                    activation,
-                    kind,
-                    groups: 1,
-                    output: Element::f32(),
-                    scopes: scopes.clone(),
-                },
-            )
+            this.projection(ProjectRowsTuning {
+                weight,
+                activation,
+                kind,
+                groups: 1,
+                output: Element::f32(),
+                scopes: scopes.clone(),
+            })
         };
         let input = project(self, head.input.element, WeightKind::HeadInputProjection)?;
         let chain = project(self, head.chain.element, WeightKind::HeadChainProjection)?;
@@ -3463,19 +3395,15 @@ impl<'a> Preparation<'a> {
         });
         let projection = match head.projection {
             ReadoutHead::Packed { weight, .. } | ReadoutHead::Qualified { weight, .. } => self
-                .spec
-                .tuned(
-                    &mut self.tuning,
-                    &PreparedProjectionTuning {
-                        scope: head_scope(0),
-                        kind: WeightKind::Output,
-                        weight,
-                        activation,
-                        columns: compact_columns,
-                        indexed: head.clustered.is_some(),
-                        softcap: 0.0,
-                    },
-                )?
+                .projection(PreparedProjectionTuning {
+                    scope: head_scope(0),
+                    kind: WeightKind::Output,
+                    weight,
+                    activation,
+                    columns: compact_columns,
+                    indexed: head.clustered.is_some(),
+                    softcap: 0.0,
+                })?
                 .map(ProjectionKernels::PreparedPacked),
         };
         let qualified = if head.clustered.is_none() {
@@ -3501,18 +3429,15 @@ impl<'a> Preparation<'a> {
             .clustered
             .as_ref()
             .map(|cluster| {
-                self.spec.tuned(
-                    &mut self.tuning,
-                    &PreparedProjectionTuning {
-                        scope: head_scope(0),
-                        kind: WeightKind::OutputCentroids,
-                        weight: cluster.centroids.element,
-                        activation,
-                        columns: None,
-                        indexed: false,
-                        softcap: 0.0,
-                    },
-                )
+                self.projection(PreparedProjectionTuning {
+                    scope: head_scope(0),
+                    kind: WeightKind::OutputCentroids,
+                    weight: cluster.centroids.element,
+                    activation,
+                    columns: None,
+                    indexed: false,
+                    softcap: 0.0,
+                })
             })
             .transpose()?
             .flatten();
@@ -3608,19 +3533,15 @@ impl<'a> Preparation<'a> {
         )?;
         let head = match draft_plan.projection() {
             ReadoutHead::Packed { weight, .. } | ReadoutHead::Qualified { weight, .. } => self
-                .spec
-                .tuned(
-                    &mut self.tuning,
-                    &HeadRowsTuning {
-                        projection_scope: draft_plan.projection_scope(),
-                        norm_scope: WeightScope::Draft,
-                        norm: draft_plan.output_norm(),
-                        weight,
-                        activation: draft_plan.activation(),
-                        epsilon: self.epsilon,
-                        rows: Some(self.vocabulary),
-                    },
-                )?
+                .projection(HeadRowsTuning {
+                    projection_scope: draft_plan.projection_scope(),
+                    norm_scope: WeightScope::Draft,
+                    norm: draft_plan.output_norm(),
+                    weight,
+                    activation: draft_plan.activation(),
+                    epsilon: self.epsilon,
+                    rows: Some(self.vocabulary),
+                })?
                 .map(ProjectionKernels::RawPacked),
         };
         // A draft through the target's projection reads it as it is stored:
@@ -3675,15 +3596,12 @@ impl<'a> Preparation<'a> {
                         A: activation,
                     }),
                 )?;
-                let projection = self.spec.tuned(
-                    &mut self.tuning,
-                    &DenseOutputTuning {
-                        down: markov.projection,
-                        activation,
-                        down_kind: WeightKind::MarkovProjection,
-                        scopes: vec![WeightScope::Draft],
-                    },
-                )?;
+                let projection = self.projection(DenseOutputTuning {
+                    down: markov.projection,
+                    activation,
+                    down_kind: WeightKind::MarkovProjection,
+                    scopes: vec![WeightScope::Draft],
+                })?;
                 match (embedding, projection) {
                     (Some(embedding), Some(projection)) => Some(MarkovKernels {
                         embedding,
@@ -3714,17 +3632,14 @@ impl<'a> Preparation<'a> {
         let activation = plan.activation();
         let (projections, norm_keys) = super::draft::stage_entries(plan);
         for ((kind, weight, output), scopes) in projections {
-            if let Some(kernel) = self.spec.tuned(
-                &mut self.tuning,
-                &ProjectRowsTuning {
-                    weight,
-                    activation,
-                    kind,
-                    groups: 1,
-                    output,
-                    scopes,
-                },
-            )? {
+            if let Some(kernel) = self.projection(ProjectRowsTuning {
+                weight,
+                activation,
+                kind,
+                groups: 1,
+                output,
+                scopes,
+            })? {
                 self.draft_kernels()
                     .projections
                     .insert((kind, weight, output), kernel);

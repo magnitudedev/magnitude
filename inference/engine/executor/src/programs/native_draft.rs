@@ -323,7 +323,7 @@ pub(crate) struct ConvolvedEntries<'a, G: GraphDraft + 'a> {
 /// DFlash2's candidate path.
 pub(crate) struct SelectorEntries<'a, G: GraphDraft + 'a> {
     pub features: G::Binding<'a, readout_features_rows::Entry>,
-    pub hidden: G::Binding<'a, project_rows::Entry>,
+    pub hidden: G::Ranged<'a, project_rows::Entry>,
     pub top_k: G::Binding<'a, draft_top_k::Entry>,
     pub predecessor: G::Binding<'a, embedding_rows::Entry>,
     pub successor: G::Binding<'a, embedding_rows::Entry>,
@@ -336,50 +336,50 @@ pub(crate) struct CorrectorEntries<'a, G: GraphDraft + 'a> {
     pub anchor_rows: G::Binding<'a, readout_features_rows::Entry>,
     pub top_k: G::Binding<'a, draft_top_k::Entry>,
     pub features: G::Binding<'a, corrector_features::Entry>,
-    pub feature_down: G::Binding<'a, project_rows::Entry>,
-    pub token: Option<G::Binding<'a, project_rows::Entry>>,
-    pub pass: G::Binding<'a, project_rows::Entry>,
+    pub feature_down: G::Ranged<'a, project_rows::Entry>,
+    pub token: Option<G::Ranged<'a, project_rows::Entry>>,
+    pub pass: G::Ranged<'a, project_rows::Entry>,
     pub nodes: G::Binding<'a, corrector_nodes::Entry>,
-    pub context: G::Binding<'a, project_rows::Entry>,
+    pub context: G::Ranged<'a, project_rows::Entry>,
     pub context_bias: G::Binding<'a, corrector_rows::Entry>,
     pub anchor_norm: G::Binding<'a, readout_features_rows::Entry>,
     pub attention: G::Binding<'a, corrector_attention::Entry>,
     pub layers: Vec<CorrectorLayerEntries<'a, G>>,
     pub output_norm: G::Binding<'a, readout_features_rows::Entry>,
     pub factors: G::Binding<'a, corrector_factors::Entry>,
-    pub factor_input: G::Binding<'a, project_rows::Entry>,
+    pub factor_input: G::Ranged<'a, project_rows::Entry>,
     pub factor_activated: G::Binding<'a, corrector_rows::Entry>,
-    pub outgoing: G::Binding<'a, project_rows::Entry>,
-    pub incoming: G::Binding<'a, project_rows::Entry>,
-    pub anchor: G::Binding<'a, project_rows::Entry>,
+    pub outgoing: G::Ranged<'a, project_rows::Entry>,
+    pub incoming: G::Ranged<'a, project_rows::Entry>,
+    pub anchor: G::Ranged<'a, project_rows::Entry>,
     pub unit: G::Binding<'a, corrector_rows::Entry>,
     pub path: G::Binding<'a, corrector_path::Entry>,
 }
 
 pub(crate) struct CorrectorLayerEntries<'a, G: GraphDraft + 'a> {
     pub attention_norm: G::Binding<'a, readout_features_rows::Entry>,
-    pub attention_input: G::Binding<'a, project_rows::Entry>,
-    pub attention_output: G::Binding<'a, project_rows::Entry>,
+    pub attention_input: G::Ranged<'a, project_rows::Entry>,
+    pub attention_output: G::Ranged<'a, project_rows::Entry>,
     pub attention_residual: G::Binding<'a, corrector_rows::Entry>,
     pub mlp_norm: G::Binding<'a, readout_features_rows::Entry>,
-    pub up: G::Binding<'a, project_rows::Entry>,
+    pub up: G::Ranged<'a, project_rows::Entry>,
     pub activated: G::Binding<'a, corrector_rows::Entry>,
-    pub down: G::Binding<'a, project_rows::Entry>,
+    pub down: G::Ranged<'a, project_rows::Entry>,
     pub down_residual: G::Binding<'a, corrector_rows::Entry>,
 }
 
 pub(crate) struct ConvolvedLayerEntries<'a, G: GraphDraft + 'a> {
     pub attention_norm: G::Binding<'a, readout_features_rows::Entry>,
-    pub attention_coefficients: G::Binding<'a, project_rows::Entry>,
-    pub query: G::Binding<'a, project_rows::Entry>,
-    pub key: G::Binding<'a, project_rows::Entry>,
-    pub value: G::Binding<'a, project_rows::Entry>,
-    pub output: G::Binding<'a, project_rows::Entry>,
+    pub attention_coefficients: G::Ranged<'a, project_rows::Entry>,
+    pub query: G::Ranged<'a, project_rows::Entry>,
+    pub key: G::Ranged<'a, project_rows::Entry>,
+    pub value: G::Ranged<'a, project_rows::Entry>,
+    pub output: G::Ranged<'a, project_rows::Entry>,
     pub feed_forward_norm: G::Binding<'a, readout_features_rows::Entry>,
-    pub feed_forward_coefficients: G::Binding<'a, project_rows::Entry>,
-    pub gate: G::Binding<'a, project_rows::Entry>,
-    pub up: G::Binding<'a, project_rows::Entry>,
-    pub down: G::Binding<'a, project_rows::Entry>,
+    pub feed_forward_coefficients: G::Ranged<'a, project_rows::Entry>,
+    pub gate: G::Ranged<'a, project_rows::Entry>,
+    pub up: G::Ranged<'a, project_rows::Entry>,
+    pub down: G::Ranged<'a, project_rows::Entry>,
 }
 
 pub(crate) struct DraftLayerEntries<'a, G: GraphDraft + 'a> {
@@ -390,7 +390,7 @@ pub(crate) struct DraftLayerEntries<'a, G: GraphDraft + 'a> {
 
 pub(crate) struct MarkovEntries<'a, G: GraphDraft + 'a> {
     pub embedding: G::Binding<'a, embedding_rows::Entry>,
-    pub projection: G::Binding<'a, dense_output::Entry>,
+    pub projection: G::Ranged<'a, dense_output::Entry>,
 }
 
 impl<'a> DraftGraphEntries<'a, NativeGraph> {
@@ -1700,7 +1700,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
         (DraftConditioning::Features(features), widened)
     } else {
         let rows = graph.input_for(
-            entries.layers[first].injection.project,
+            G::first(entries.layers[first].injection.project),
             "hidden",
             &[
                 first_pass
@@ -2058,7 +2058,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                     .r0;
                 let mut biased = graph
                     .enqueue(
-                        chain.projection,
+                        G::pick(chain.projection, &Dim::from(outputs)),
                         &[
                             ("M", Dim::from(outputs)),
                             ("O", Dim::from(slots)),
@@ -2199,17 +2199,18 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
 }
 
 /// One `project_rows` of `rows` rows through `weight`, binding its planned
-/// scale and packing bound (`operands`).
+/// scale and packing bound (`operands`), by the kernel of the range `rows`
+/// lie in.
 fn project_planned<'a, G: GraphDraft + 'a>(
     graph: &mut G,
-    entry: G::Binding<'a, project_rows::Entry>,
+    entry: G::Ranged<'a, project_rows::Entry>,
     (weight, operands): (&WorkflowTensor, &WeightOperands),
     source: seismic::WorkflowTensorRef<'_>,
     (rows, inputs, outputs): (Dim, Dim, Dim),
 ) -> Result<WorkflowTensor, GraphError> {
     graph
         .enqueue(
-            entry,
+            G::pick(entry, &rows),
             &[
                 ("M", rows),
                 ("G", Dim::from(1)),
@@ -2233,7 +2234,7 @@ fn project_planned<'a, G: GraphDraft + 'a>(
 #[allow(clippy::too_many_arguments)]
 fn project_role<'a, G: GraphDraft + 'a>(
     graph: &mut G,
-    entry: G::Binding<'a, project_rows::Entry>,
+    entry: G::Ranged<'a, project_rows::Entry>,
     planned: &GraphWeights,
     weights: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
@@ -2302,7 +2303,7 @@ fn convolved_layer<'a, G: GraphDraft + 'a>(
     // packing bound: the attention's through its loaded weights and
     // operands, the rest loading theirs.
     let project_attention = |graph: &mut G,
-                             entry: G::Binding<'a, project_rows::Entry>,
+                             entry: G::Ranged<'a, project_rows::Entry>,
                              operand: (&WorkflowTensor, &WeightOperands),
                              source: seismic::WorkflowTensorRef<'_>,
                              (inputs, outputs): (Dim, Dim)| {
@@ -2311,7 +2312,7 @@ fn convolved_layer<'a, G: GraphDraft + 'a>(
     let project = |graph: &mut G,
                    weights: &mut Vec<(WeightPort, NativePort)>,
                    constants: &mut Vec<GraphConstant>,
-                   entry: G::Binding<'a, project_rows::Entry>,
+                   entry: G::Ranged<'a, project_rows::Entry>,
                    role: (WeightScope, WeightKind),
                    source: seismic::WorkflowTensorRef<'_>,
                    (inputs, outputs): (Dim, Dim)| {
@@ -2325,7 +2326,7 @@ fn convolved_layer<'a, G: GraphDraft + 'a>(
                     residual: &WorkflowTensor,
                     sublayer: u32,
                     norm_entry: G::Binding<'a, readout_features_rows::Entry>,
-                    coefficient_entry: G::Binding<'a, project_rows::Entry>| {
+                    coefficient_entry: G::Ranged<'a, project_rows::Entry>| {
         let scope = draft_sublayer(layer.index, sublayer)?;
         let norm = weight(graph, planned, scope, WeightKind::InputNorm, weights)?;
         let base = weight(graph, planned, scope, WeightKind::ConvolutionBase, weights)?;
@@ -2779,7 +2780,7 @@ fn correct_candidates<'a, G: GraphDraft + 'a>(
     let project = |graph: &mut G,
                    weights: &mut Vec<(WeightPort, NativePort)>,
                    constants: &mut Vec<GraphConstant>,
-                   entry: G::Binding<'a, project_rows::Entry>,
+                   entry: G::Ranged<'a, project_rows::Entry>,
                    (scope, site): (WeightScope, CorrectorSite),
                    source: seismic::WorkflowTensorRef<'_>,
                    dims: (Dim, Dim, Dim)| {
@@ -3227,7 +3228,7 @@ fn correct_candidates<'a, G: GraphDraft + 'a>(
     let head = |graph: &mut G,
                 weights: &mut Vec<(WeightPort, NativePort)>,
                 constants: &mut Vec<GraphConstant>,
-                entry: G::Binding<'a, project_rows::Entry>,
+                entry: G::Ranged<'a, project_rows::Entry>,
                 site: CorrectorSite,
                 source: &WorkflowTensor,
                 count: &Dim| {

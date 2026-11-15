@@ -1,10 +1,11 @@
 // routed_select on CPU (contract and portable body in routed.seismic).
 // `routed_select_normalize` publishes each row's RMS normalization with
 // `norm` (rounded to A) as the `normalized` result, and with `router_norm` as
-// F32 into scratch, one work item per row. `routed_select_logits` gives each
-// work item ROWS router rows, which it projects against every router input
-// row into the `logits` scratch [M, E]. `routed_select_select` selects one
-// row per work item: scores, biased top-K, normalization, scales.
+// F32 into scratch, one work item per row. `routed_select_logits` splits the
+// router rows evenly over its grid (the pool's participants, at most E), each
+// work item projecting its rows against every router input row into the
+// `logits` scratch [M, E]. `routed_select_select` selects one row per work
+// item: scores, biased top-K, normalization, scales.
 
 use lib::core::{activation, reduce};
 use lib::projection::projection;
@@ -40,7 +41,7 @@ fn routed_select_normalize<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, grou
 #[inline(always)]
 fn routed_select_logits<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let (m, h, e) = (cx.dim_m() as usize, cx.dim_h() as usize, cx.dim_e() as usize);
-    let rows = projection::item_rows(group[0], cx.param_rows(), e);
+    let rows = projection::part_rows(group[0], cx.groups()[0], e);
     let router = cx.arg_router();
     // SAFETY: the normalize launch wrote every row before this launch.
     let router_rows = unsafe { cx.scratch_router_rows().slice::<f32>(0, m * h) };

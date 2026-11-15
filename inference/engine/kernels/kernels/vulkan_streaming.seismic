@@ -9,116 +9,39 @@
 # Group words are each call's group memory (`shared_bytes`), viewed as
 # `seismic_shared_i32`.
 
-# Reuse the resident router's numerical launches and the shared expert's
-# paired projection. Streaming adds selection resolution and next-layer hints.
-# Each row class (2, 4, 8 rows) computes a row as the one-row launch does, and
-# a whole layer's (`routed_route_whole`, chosen by a policy word) as the
-# streamed one-row launch does: all are `alike` it, as on CUDA and Metal.
-native routed_route_shared for vulkan from "vulkan/routed_route_shared.comp":
-    static (H, PT, NM, E, K, S, ES)
-    params (SIMDGROUPS in [8, 4, 2] default 8, ROWS in [1, 2, 4] default 1)
-    where H % 32 == 0 and E <= 1024
-    scratch logits bytes (M * (E + 1) * 4)
-    launch routed_route_gemv:
-        threadgroups (ceil_div(E + 1, SIMDGROUPS), 1, 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (4 * VERIFY_ROWS * 9)
-    launch routed_route_shared1 when M <= 1:
-        threadgroups (1 + ceil_div(S, SIMDGROUPS * ROWS), 1, 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (min(S, 1) * (256 + 32 * operands(SGW) + min(8 * ceil_div(H, 32), 288) * 72))
-    launch routed_route_shared2 when M == 2:
-        alike (routed_route_shared1)
-        threadgroups (1 + ceil_div(S, SIMDGROUPS * ROWS), 1, 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (min(S, 1) * (256 + 32 * operands(SGW) + min(8 * ceil_div(H, 32), 288) * 72))
-    launch routed_route_shared4 when M >= 3 and M <= 4:
-        alike (routed_route_shared1)
-        threadgroups (1 + ceil_div(S, SIMDGROUPS * ROWS), 1, 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (min(S, 1) * (256 + 32 * operands(SGW) + min(8 * ceil_div(H, 32), 288) * 72))
-    launch routed_route_shared8 when M >= 5 and M <= VERIFY_ROWS:
-        alike (routed_route_shared1)
-        threadgroups (1 + ceil_div(S, SIMDGROUPS * ROWS), 1, 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (min(S, 1) * (256 + 32 * operands(SGW) + min(8 * ceil_div(H, 32), 288) * 72))
-
 native routed_route_streamed for vulkan from "vulkan/routed_route_streamed.comp":
-    static (H, PT, NM, E, K, S, ES, AHEAD, EN, TM)
-    params (SIMDGROUPS in [8, 4, 2] default 8, ROWS in [1, 2, 4] default 1)
-    where H % 32 == 0 and E <= 1024 and EN <= 1024 and K <= E and (AHEAD == 0 or K <= EN)
-    scratch logits bytes ((M * (E + 1) + AHEAD * M * (EN + 1)) * 4)
-    launch routed_route_gemv:
-        threadgroups (ceil_div(E + 1, SIMDGROUPS), 1, 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (4 * VERIFY_ROWS * 9)
-    launch hint_routed_route_gemv when AHEAD >= 1:
-        threadgroups (ceil_div(EN, SIMDGROUPS), AHEAD, 1)
-        unless (next_policy[POLICY_RESOLVED])
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (4 * VERIFY_ROWS * 9)
-    launch routed_route_hint when AHEAD >= 1:
+    static (H, PT, NM, E, K, S, ES, TM)
+    where H % 32 == 0 and E <= 1024 and K <= E
+    project dense segmented (router, shared_router, (shared_gate, shared_up)) rows rms publishes (result 0) ordered (router, shared_router)
+    scratch logits bytes (M * (E + 1) * 4)
+    launch routed_route_streamed_select:
+        threadgroups (1, 1, 1)
+        unless (policy[POLICY_WHOLE])
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (4 * (1 + 4 * VERIFY_ROWS * K + POLICY_WORDS))
+    launch routed_route_whole_select:
+        threadgroups (1, 1, 1)
+        if (policy[POLICY_WHOLE])
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (4 * (1 + 4 * VERIFY_ROWS * K + POLICY_WORDS))
+
+native routed_hint_route for vulkan from "vulkan/routed_hint_route.comp":
+    static (H, PT, NM, K, AHEAD, EN)
+    where H % 32 == 0 and EN <= 1024 and K <= EN
+    project dense segmented (next_router, after_router) rows rms ordered (next_router, after_router)
+    unless (next_policy[POLICY_RESOLVED])
+    scratch logits bytes (2 * M * EN * 4)
+    launch routed_hint_route_publish:
         threadgroups (1, AHEAD, 1)
         unless (next_policy[POLICY_RESOLVED])
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (8 * VERIFY_ROWS * K)
-    launch routed_route_streamed1 when M <= 1:
-        threadgroups (1 + ceil_div(S, SIMDGROUPS * ROWS), 1, 1)
-        unless (policy[POLICY_WHOLE])
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (max(4 * (1 + 4 * VERIFY_ROWS * K + POLICY_WORDS), min(S, 1) * (256 + 32 * operands(SGW) + min(8 * ceil_div(H, 32), 288) * 72)))
-    launch routed_route_streamed2 when M == 2:
-        alike (routed_route_streamed1)
-        threadgroups (1 + ceil_div(S, SIMDGROUPS * ROWS), 1, 1)
-        unless (policy[POLICY_WHOLE])
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (max(4 * (1 + 4 * VERIFY_ROWS * K + POLICY_WORDS), min(S, 1) * (256 + 32 * operands(SGW) + min(8 * ceil_div(H, 32), 288) * 72)))
-    launch routed_route_streamed4 when M >= 3 and M <= 4:
-        alike (routed_route_streamed1)
-        threadgroups (1 + ceil_div(S, SIMDGROUPS * ROWS), 1, 1)
-        unless (policy[POLICY_WHOLE])
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (max(4 * (1 + 4 * VERIFY_ROWS * K + POLICY_WORDS), min(S, 1) * (256 + 32 * operands(SGW) + min(8 * ceil_div(H, 32), 288) * 72)))
-    launch routed_route_streamed8 when M >= 5 and M <= VERIFY_ROWS:
-        alike (routed_route_streamed1)
-        threadgroups (1 + ceil_div(S, SIMDGROUPS * ROWS), 1, 1)
-        unless (policy[POLICY_WHOLE])
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (max(4 * (1 + 4 * VERIFY_ROWS * K + POLICY_WORDS), min(S, 1) * (256 + 32 * operands(SGW) + min(8 * ceil_div(H, 32), 288) * 72)))
-    launch routed_route_whole1 when M <= 1:
-        alike (routed_route_streamed1)
-        threadgroups (1 + ceil_div(S, SIMDGROUPS * ROWS), 1, 1)
-        if (policy[POLICY_WHOLE])
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (max(4 * (1 + 4 * VERIFY_ROWS * K + POLICY_WORDS), min(S, 1) * (256 + 32 * operands(SGW) + min(8 * ceil_div(H, 32), 288) * 72)))
-    launch routed_route_whole2 when M == 2:
-        alike (routed_route_streamed1)
-        threadgroups (1 + ceil_div(S, SIMDGROUPS * ROWS), 1, 1)
-        if (policy[POLICY_WHOLE])
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (max(4 * (1 + 4 * VERIFY_ROWS * K + POLICY_WORDS), min(S, 1) * (256 + 32 * operands(SGW) + min(8 * ceil_div(H, 32), 288) * 72)))
-    launch routed_route_whole4 when M >= 3 and M <= 4:
-        alike (routed_route_streamed1)
-        threadgroups (1 + ceil_div(S, SIMDGROUPS * ROWS), 1, 1)
-        if (policy[POLICY_WHOLE])
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (max(4 * (1 + 4 * VERIFY_ROWS * K + POLICY_WORDS), min(S, 1) * (256 + 32 * operands(SGW) + min(8 * ceil_div(H, 32), 288) * 72)))
-    launch routed_route_whole8 when M >= 5 and M <= VERIFY_ROWS:
-        alike (routed_route_streamed1)
-        threadgroups (1 + ceil_div(S, SIMDGROUPS * ROWS), 1, 1)
-        if (policy[POLICY_WHOLE])
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (max(4 * (1 + 4 * VERIFY_ROWS * K + POLICY_WORDS), min(S, 1) * (256 + 32 * operands(SGW) + min(8 * ceil_div(H, 32), 288) * 72)))
 
 native routed_select_streamed for vulkan from "vulkan/routed_select_streamed.comp":
-    static (H, E, K, ES, AHEAD, EN, TM)
-    params (SIMDGROUPS in [8, 4, 2] default 8)
-    where H % 32 == 0 and E <= 1024 and EN <= 1024 and K <= E and (AHEAD == 0 or K <= EN)
-    scratch logits bytes ((M * E + AHEAD * M * EN) * 4)
-    launch routed_select_gemv:
-        threadgroups (ceil_div(E, SIMDGROUPS), 1, 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (4 * VERIFY_ROWS * 9)
+    static (H, E, K, ES, TM)
+    where H % 32 == 0 and E <= 1024 and K <= E
+    project dense single (router) rows rms ordered (router)
+    scratch logits bytes (M * E * 4)
     launch routed_select_streamed_select:
         threadgroups (1, 1, 1)
         unless (policy[POLICY_WHOLE])
@@ -129,12 +52,14 @@ native routed_select_streamed for vulkan from "vulkan/routed_select_streamed.com
         if (policy[POLICY_WHOLE])
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (4 * (1 + 4 * VERIFY_ROWS * K + POLICY_WORDS))
-    launch hint_routed_select_gemv when AHEAD >= 1:
-        threadgroups (ceil_div(EN, SIMDGROUPS), AHEAD, 1)
-        unless (next_policy[POLICY_RESOLVED])
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (4 * VERIFY_ROWS * 9)
-    launch routed_select_hint when AHEAD >= 1:
+
+native routed_hint_select for vulkan from "vulkan/routed_hint_select.comp":
+    static (H, K, AHEAD, EN)
+    where H % 32 == 0 and EN <= 1024 and K <= EN
+    project dense segmented (next_router, after_router) rows rms ordered (next_router, after_router)
+    unless (next_policy[POLICY_RESOLVED])
+    scratch logits bytes (2 * M * EN * 4)
+    launch routed_hint_select_publish:
         threadgroups (1, AHEAD, 1)
         unless (next_policy[POLICY_RESOLVED])
         threads_per_threadgroup (256, 1, 1)
@@ -235,16 +160,12 @@ native routed_site_request for vulkan from "vulkan/routed_site_request.comp":
         threadgroups (1, 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
-# Vulkan: `routed_down`'s workgroups over its projection
-# (`lib/routed/down.glsl`), publishing each choice's projection.
+# Vulkan: `routed_down`'s projection (`summed`, `lib/routed/down.glsl`),
+# its epilogue publishing each choice's projection in place of their sum.
 native routed_down_project for vulkan from "vulkan/routed_down_project.comp":
     static (H, K, F)
-    params (SIMDGROUPS in [2, 4, 8] default 2, ROWS in [1, 2, 4] default 1, arithmetic LANES in [32, 16, 8] default 32)
     records (expert_down, tier_down)
-    launch routed_down_project:
-        threadgroups (ceil_div(H, SIMDGROUPS * ROWS * 32 / LANES), M, 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (256 + 32 * operands(EDW) + min(ceil_div(F, 32), 288) * 72)
+    project routed summed (expert_down)
 
 # Vulkan: an invocation a channel of a row (`lib/routed/down_sum.glsl`), its
 # workgroup's invocation 0 reading the CPU's answer after its park
@@ -255,16 +176,12 @@ native routed_down_sited for vulkan from "vulkan/routed_down_sited.comp":
         threadgroups (ceil_div(H, 256), M, 1)
         threads_per_threadgroup (256, 1, 1)
 
-# Vulkan: `routed_output`'s projection launch (`lib/routed/output.glsl`),
-# publishing into the result.
+# Vulkan: `routed_output`'s projection (`summed` with the shared expert,
+# `lib/routed/output.glsl`), its epilogue publishing into the result.
 native routed_output_project for vulkan from "vulkan/routed_output_project.comp":
     static (H, K, F, S)
-    params (SIMDGROUPS in [2, 4, 8] default 2, ROWS in [1, 2, 4] default 1, arithmetic LANES in [32, 16, 8] default 32)
     records (expert_down, tier_down)
-    launch routed_output_project:
-        threadgroups (ceil_div(H, SIMDGROUPS * ROWS * 32 / LANES), M * (K + 1), 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (256 + 32 * max(operands(EDW), operands(SDW)) + min(ceil_div(max(F, S), 32), 288) * 72)
+    project routed summed (expert_down) shared (shared_down)
 
 # Vulkan: `routed_output`'s combine launch (`lib/routed/output_sum.glsl`),
 # its workgroup's invocation 0 reading the CPU's answer after its park.

@@ -279,7 +279,7 @@ fn real_4b_projections_match_their_operand_emulation() {
                     project(&exact, &up.values, up_element, o, f, h, reference_mapping);
                 let reference: Vec<f64> =
                     (0..o * f).map(|i| silu(g_exact[i]) * u_exact[i]).collect();
-                for mapping in mappings(o, |mapping| expand.admits(&device, mapping)) {
+                for mapping in mappings("dense_expand", o, |mapping| expand.admits(&device, mapping)) {
                     let (x, operand) = operand_rows(&exact, h, mapping, Some(gate_format));
                     let (g, _) = project(&x, &gate.values, gate_element, o, f, h, mapping);
                     let (u, _) = project(&x, &up.values, up_element, o, f, h, mapping);
@@ -402,6 +402,8 @@ fn real_12b_physical_f16_projection_operands() {
                 ksplit: 4,
                 rotate: 1,
                 residency: 1,
+                split: 2,
+                staging: 0,
             }
             .projection_params(
                 NativeSpecialization::new()

@@ -1,7 +1,10 @@
 // Decode output (M <= VERIFY_ROWS): the fused projections (`lib/routed/output.h`)
-// and their join (`lib/routed/output_sum.h`), without a CPU site.
+// and their join (`lib/routed/output_sum.h`), without a CPU site. Gathered
+// (GATHERED), each slot's projection is published in A (`published`) and the
+// last threadgroup of a channel tile to arrive (`arrivals`) joins the tile's
+// channels of every row.
 
-#ifdef SEISMIC_FORMING_ROUTED_OUTPUT_RESIDENT
+#if defined(SEISMIC_FORMING_ROUTED_OUTPUT_RESIDENT) || defined(SEISMIC_FORMING_ROUTED_OUTPUT_GATHERED_RESIDENT)
 // A resident layer's: nothing lands in its records while it runs, so plain
 // loads read them.
 #define PACKETS_PLAIN_RECORDS
@@ -9,6 +12,7 @@
 #define ROUTED_SOURCE_ROWS SEISMIC_DIM_XS
 #include "lib/routed/output.h"
 #include "lib/routed/output_sum.h"
+#include "lib/core/arrive.h"
 
 // The ports, the expert stack's: its records' address table.
 #define ROUTED_OUTPUT_PORTS                                                \
@@ -47,9 +51,46 @@
     routed::output_publish(residual, inject, scores, coefficient, value, m, n,                                   \
         routed::TileProjections{&projected[0][0], REGION, tid}, routed::Answer{false, 0.0f}, seismic_words);
 
-#ifdef SEISMIC_FORMING_ROUTED_OUTPUT
+// The gathered ports: the side-by-side form's, the published projections and
+// the channel tiles' arrival counters.
+#define ROUTED_OUTPUT_GATHERED_PORTS                                                   \
+    ROUTED_OUTPUT_PORTS,                                                               \
+    routed::PublishedSlots published [[buffer(SEISMIC_BUFFER_SCRATCH_PUBLISHED)]],    \
+    device atomic_uint *arrivals [[buffer(SEISMIC_BUFFER_SCRATCH_ARRIVALS)]]
+
+// The gathered body (`routed::project_gathered` over `routed::output_project`):
+// threadgroup (x, m)'s simdgroups publish their projections of tile x; the last
+// of the tile's M threadgroups to arrive joins the tile's channels of every
+// row.
+#define ROUTED_OUTPUT_GATHERED_BODY                                                                              \
+    constexpr uint TILE = routed::output_tile<ROWS, LANES>();                                                    \
+    constexpr uint REGION = routed::output_region<ROWS, LANES>();                                                \
+    constexpr uint SLOTS = uint(SEISMIC_DIM_K) + 1;                                                              \
+    constexpr uint H = uint(SEISMIC_DIM_H);                                                                      \
+    threadgroup float projected[SLOTS][REGION];                                                                  \
+    threadgroup uint last;                                                                                       \
+    const uint first = group.x * TILE;                                                                           \
+    const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> value(value_cells);                                         \
+    routed::project_gathered<TILE, uint(SEISMIC_DIM_K), SLOTS, H>(routes, SEISMIC_ROUTES_STRIDE_0,               \
+        SEISMIC_ROUTES_STRIDE_1, uint(SEISMIC_DIM_M), group.y, sg, first, lane, projected[sg], published,        \
+        [&](ulong m, uint slot, threadgroup float *region) {                                                     \
+            routed::output_project<ROWS, LANES>(expert_product, shared_product, routes, sources, expert_down,    \
+                tier_down, shared_down, m, first, slot, lane, region, seismic_words);                            \
+        });                                                                                                      \
+    if (!arrive::last(arrivals + group.x, uint(SEISMIC_DIM_M), &last, tid))                                      \
+        return;                                                                                                  \
+    for (uint item = tid; item < uint(SEISMIC_DIM_M) * TILE; item += 32 * SLOTS) {                               \
+        const ulong m = item / TILE;                                                                             \
+        const uint n = first + item % TILE;                                                                      \
+        if (n < H)                                                                                               \
+            routed::output_publish(residual, inject, scores, coefficient, value, m, n,                           \
+                routed::ArrivedProjections<SLOTS, H>{published, m, n}, routed::Answer{false, 0.0f},              \
+                seismic_words);                                                                                  \
+    }
+
+#ifdef SEISMIC_FORMING_ROUTED_OUTPUT_SUMMED
 template <uint ROWS, uint LANES>
-kernel void routed_output(ROUTED_OUTPUT_PORTS) {
+kernel void routed_output_summed(ROUTED_OUTPUT_PORTS) {
     ROUTED_OUTPUT_BODY
 }
 #endif
@@ -58,5 +99,18 @@ kernel void routed_output(ROUTED_OUTPUT_PORTS) {
 template <uint ROWS, uint LANES>
 kernel void routed_output_resident(ROUTED_OUTPUT_PORTS) {
     ROUTED_OUTPUT_BODY
+}
+#endif
+#ifdef SEISMIC_FORMING_ROUTED_OUTPUT_GATHERED
+template <uint ROWS, uint LANES>
+kernel void routed_output_gathered(ROUTED_OUTPUT_GATHERED_PORTS) {
+    ROUTED_OUTPUT_GATHERED_BODY
+}
+#endif
+#ifdef SEISMIC_FORMING_ROUTED_OUTPUT_GATHERED_RESIDENT
+// A resident layer's (XS 0), its records read with plain loads.
+template <uint ROWS, uint LANES>
+kernel void routed_output_gathered_resident(ROUTED_OUTPUT_GATHERED_PORTS) {
+    ROUTED_OUTPUT_GATHERED_BODY
 }
 #endif

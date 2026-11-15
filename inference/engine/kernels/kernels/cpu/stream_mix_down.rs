@@ -1,9 +1,11 @@
 // stream_mix_down on CPU (contract and portable body in streams.seismic).
 // `stream_mix_down_normalize` normalizes each stream of a row (rounded to A)
 // into F32 scratch and publishes the streams' inverses, one work item per
-// row. `stream_mix_down_rows` enumerates the segments down | inject, ROWS
-// weight rows per work item, each projected against every normalized row:
-// the down rows publish `silu(v / S)` in A, the inject rows `2 sigmoid(v / S)`.
+// row. `stream_mix_down_rows` splits the combined weight rows of the
+// segments down | inject evenly over its grid (the pool's participants, at
+// most LR + C S), each projected against every normalized row, a block of at
+// most `MAX_ROWS` at a time: the down rows publish `silu(v / S)` in A, the
+// inject rows `2 sigmoid(v / S)`.
 
 use lib::core::{activation, reduce};
 use lib::projection::projection;
@@ -51,39 +53,30 @@ fn stream_mix_down_rows<L: Isa, E: Elements>(
     let m = cx.dim_m() as usize;
     let (width, streams) = ((cx.dim_s() * cx.dim_h()) as usize, cx.dim_s() as f32);
     let segments = [cx.dim_lr() as usize, (cx.dim_c() * cx.dim_s()) as usize];
-    let (segment, rows) = projection::segment_rows(group[0], cx.param_rows(), &segments);
     // SAFETY: the normalize launch wrote every row before this launch.
     let normalized = unsafe { cx.scratch_normalized().slice::<f32>(0, m * width) };
-    if segment == 0 {
-        let result = cx.result_0();
-        projection::project_staged(
-            &cx.arg_down_weight(),
-            rows.clone(),
-            normalized,
-            |row, projected| {
-                let mut low = [0.0f32; projection::MAX_ROWS];
-                for (target, v) in low.iter_mut().zip(projected) {
-                    *target = activation::silu(v / streams);
-                }
-                // SAFETY: each work item writes its own columns of every row.
-                activation::store::<E::A>(&low[..rows.len()], unsafe {
-                    result.span_mut([row, rows.start], rows.len())
+    for (segment, share) in projection::segment_parts(group[0], cx.groups()[0], &segments) {
+        for rows in projection::row_blocks(share) {
+            if segment == 0 {
+                let result = cx.result_0();
+                projection::project_staged(&cx.arg_down_weight(), rows.clone(), normalized, |row, projected| {
+                    let mut low = [0.0f32; projection::MAX_ROWS];
+                    for (target, v) in low.iter_mut().zip(projected) {
+                        *target = activation::silu(v / streams);
+                    }
+                    // SAFETY: each work item writes its own columns of every row.
+                    activation::store::<E::A>(&low[..rows.len()], unsafe { result.span_mut([row, rows.start], rows.len()) });
                 });
-            },
-        );
-    } else {
-        let result = cx.result_1();
-        projection::project_staged(
-            &cx.arg_inject_weight(),
-            rows.clone(),
-            normalized,
-            |row, projected| {
-                // SAFETY: each work item writes its own columns of every row.
-                let mut out = unsafe { result.span_mut([row, rows.start], rows.len()) };
-                for (target, v) in out.iter_mut().zip(projected) {
-                    target.set(2.0 * activation::sigmoid(v / streams));
-                }
-            },
-        );
+            } else {
+                let result = cx.result_1();
+                projection::project_staged(&cx.arg_inject_weight(), rows.clone(), normalized, |row, projected| {
+                    // SAFETY: each work item writes its own columns of every row.
+                    let mut out = unsafe { result.span_mut([row, rows.start], rows.len()) };
+                    for (target, v) in out.iter_mut().zip(projected) {
+                        target.set(2.0 * activation::sigmoid(v / streams));
+                    }
+                });
+            }
+        }
     }
 }

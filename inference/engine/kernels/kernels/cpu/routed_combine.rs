@@ -1,8 +1,11 @@
 // routed_combine on CPU (contract and portable body in routed.seismic).
-// `routed_combine_stage` stages each normalized row as F32 in scratch, one
-// work item per row. `routed_combine_shared` gives each work item ROWS shared
-// features, which it expands against every row into the `shared_product`
-// scratch [M, S] (the SiLU `glu` of gate and up, as F32). `routed_combine` gives each
+// The operator's form launch forms the normalized rows as F32 and their Q8
+// blocks. `routed_combine_shared` gives each work item ROWS shared features,
+// which it expands against every row (from a row of its own, so the items
+// finish rows apart) into the shared down weight's rows `sdw_rows` [M, S]
+// (the SiLU `glu` of gate and up, as F32); a row's last stored feature
+// forms the down projection's operand of it (`routed::product_arrival`,
+// on the sync counters `product_arrivals`). `routed_combine` gives each
 // work item ROWS output channels: per row it projects the shared expert's
 // down rows, gathers the row's grouped expert outputs (`inverse`) weighted by
 // their scores in slot order, and publishes
@@ -11,32 +14,6 @@
 use lib::core::{activation, functions};
 use lib::projection::projection;
 use lib::routed::routed;
-
-#[inline(always)]
-fn routed_combine_stage<L: Isa, E: Elements>(
-    _l: L,
-    cx: &Context<'_, E>,
-    group: [u64; 3],
-    _shared: &mut [u8],
-) {
-    let row = group[0] as usize;
-    let h = cx.dim_h() as usize;
-    // SAFETY: each work item writes its own row of the scratch.
-    let staged = unsafe { cx.scratch_staged().slice_mut::<f32>(4 * row * h, h) };
-    projection::stage::<E::A>(cx.arg_normalized().row([row, 0]), staged);
-    if cx.param_int8() == 1 {
-        let blocks = seismic::cpu::quant::blocks(h);
-        // SAFETY: this work item owns the corresponding quantized row.
-        let q8 = unsafe {
-            cx.scratch_quantized()
-                .slice_mut::<seismic::cpu::quant::Q8Block>(
-                    row * blocks * seismic::cpu::quant::Q8_BYTES,
-                    blocks,
-                )
-        };
-        projection::quantize(staged, q8);
-    }
-}
 
 #[inline(always)]
 fn routed_combine_shared<L: Isa, E: Elements>(
@@ -52,19 +29,23 @@ fn routed_combine_shared<L: Isa, E: Elements>(
     );
     let rows = projection::item_rows(group[0], cx.param_rows(), s);
     let (gate, up) = (cx.arg_shared_gate(), cx.arg_shared_up());
-    // SAFETY: the stage launch wrote every row before this launch.
-    let staged = unsafe { cx.scratch_staged().slice::<f32>(0, m * h) };
+    // SAFETY: the form launch (or the rows' producer) wrote every row before
+    // this launch.
+    let staged = unsafe { cx.scratch_rows().slice::<f32>(0, m * h) };
     let blocks = seismic::cpu::quant::blocks(h);
     let quantized = (cx.param_int8() == 1).then(|| unsafe {
         cx.scratch_quantized()
             .slice::<seismic::cpu::quant::Q8Block>(0, m * blocks)
     });
-    for row in 0..m {
+    let (products, down_q8, nvfp4) = (
+        cx.scratch_sdw_rows(),
+        (cx.param_int8() == 1).then(|| cx.scratch_sdw_quantized()),
+        cx.arg_shared_down().nvfp4_operands(),
+    );
+    for step in 0..m {
+        let row = (group[0] as usize + step) % m;
         // SAFETY: each work item writes its own features of every row.
-        let out = unsafe {
-            cx.scratch_shared_product()
-                .slice_mut::<f32>(4 * (row * s + rows.start), rows.len())
-        };
+        let out = unsafe { products.slice_mut::<f32>(4 * (row * s + rows.start), rows.len()) };
         let q8 = quantized.map(|q8| &q8[row * blocks..(row + 1) * blocks]);
         routed::expand::<E::A>(
             &gate,
@@ -78,30 +59,10 @@ fn routed_combine_shared<L: Isa, E: Elements>(
             (1.0, 1.0),
             out,
         );
+        // SAFETY: the counters are sync scratch, zero between calls; these
+        // features are this item's, stored above.
+        unsafe { routed::product_arrival(products, down_q8, nvfp4, cx.scratch_product_arrivals(), s, row, rows.len()) };
     }
-}
-
-#[inline(always)]
-fn routed_combine_quantize<L: Isa, E: Elements>(
-    _l: L,
-    cx: &Context<'_, E>,
-    group: [u64; 3],
-    _shared: &mut [u8],
-) {
-    let row = group[0] as usize;
-    let s = cx.dim_s() as usize;
-    let blocks = seismic::cpu::quant::blocks(s);
-    // SAFETY: the shared launch wrote this product row; this work item owns
-    // its quantized row.
-    let product = unsafe { cx.scratch_shared_product().slice::<f32>(4 * row * s, s) };
-    let q8 = unsafe {
-        cx.scratch_shared_q8()
-            .slice_mut::<seismic::cpu::quant::Q8Block>(
-                row * blocks * seismic::cpu::quant::Q8_BYTES,
-                blocks,
-            )
-    };
-    projection::quantize(product, q8);
 }
 
 #[inline(always)]
@@ -130,11 +91,11 @@ fn routed_combine<L: Isa, E: Elements>(
         cx.arg_coefficient(),
         cx.result_0(),
     );
-    // SAFETY: the shared launch wrote every row before this launch.
-    let shared = unsafe { cx.scratch_shared_product().slice::<f32>(0, m * s) };
+    // SAFETY: the shared launch wrote and formed every row before this launch.
+    let shared = unsafe { cx.scratch_sdw_rows().slice::<f32>(0, m * s) };
     let blocks = seismic::cpu::quant::blocks(s);
     let quantized = (cx.param_int8() == 1).then(|| unsafe {
-        cx.scratch_shared_q8()
+        cx.scratch_sdw_quantized()
             .slice::<seismic::cpu::quant::Q8Block>(0, m * blocks)
     });
     let mut projected = [0.0f32; projection::MAX_ROWS];

@@ -1,6 +1,6 @@
 // readout_head_rows: final RMS prologue over the `out_rows` rows, then the
 // vocabulary projection into F32 logits. The Vulkan form of
-// `metal/readout_head_rows.metal` over `lib/projection/projection.glsl`.
+// `metal/readout_head_rows.metal` on the `dense` projection (`lib/projection/operator.glsl`).
 #define KERNEL_W0 SEISMIC_WEIGHT
 #include "lib/core/activation.glsl"
 #if SEISMIC_STATIC_WS != 0
@@ -33,44 +33,45 @@
 
 #define HEAD_K uint(SEISMIC_DIM_D)
 
-projection_prologue head_rows_input() {
+#define PROJECTION_SINGLE
+#define PROJECTION_M uint(SEISMIC_DIM_O)
+#define PROJECTION_N uint(SEISMIC_DIM_V)
+#define PROJECTION_K HEAD_K
+#define PROJECTION_G 1
+#define PROJECTION_NORM PROJECTION_NORM_SHARED
+#define PROJECTION_STAGED SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)
+#define PROJECTION_SPLIT SEISMIC_TUNE_SPLIT
+#define PROJECTION_PARTIALS SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS)
+
+projection_prologue projected_input(uint g) {
     return projection_operands(projection_input(HEAD_ACT, SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN),
         SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_NORM), SEISMIC_NORM_STRIDE_0,
         HEAD_NORM, element_word_f32(SEISMIC_PARAM_EPSILON), HEAD_K, SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS),
         uint(SEISMIC_DIM_NM), uint(SEISMIC_DIM_PT)), HEAD_OPERANDS);
 }
 
-projection_epilogue head_rows_output() {
+// The normalized rows the stage launch formed.
+projection_prologue projected_rows(uint g) {
+    return projection_plain(HEAD_ACT, PROJECTION_STAGED, uint64_t(HEAD_K), 1ul, HEAD_K, 0ul);
+}
+
+projection_epilogue projected_output(uint g) {
     return projection_scaled(projection_logits(SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0,
         SEISMIC_RESULT_0_STRIDE_1, element_word_f32(SEISMIC_PARAM_SOFTCAP)),
         projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT_SCALE), SEISMIC_DIM_WS, 0ul, 0ul), 1.0);
 }
 
-projection_weights head_rows_weight() {
+projection_weights projected_weight(uint g) {
     return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT), PACKETS_W0_ROWS, HEAD_K, 0ul, 1ul, 0u);
 }
 
-// The GEMV with the activation-row bound `maxm` (`projection_gemv`: one bound
-// per pipeline, so one entry per bound).
-void readout_head_rows_gemv_bounded(const uint maxm) {
-    const projection_weights w = head_rows_weight();
-    projection_gemv(PACKETS_W0, PACKETS_W0, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, maxm, PROJECTION_NORM_SHARED,
-        head_rows_input(), head_rows_output(), w, w, uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_V), HEAD_K,
-        gl_WorkGroupID.x);
-}
+#include "lib/projection/operator.glsl"
 
-void readout_head_rows_gemv1() { readout_head_rows_gemv_bounded(1u); }
-void readout_head_rows_gemv2() { readout_head_rows_gemv_bounded(2u); }
-void readout_head_rows_gemv4() { readout_head_rows_gemv_bounded(4u); }
-void readout_head_rows_gemv8() { readout_head_rows_gemv_bounded(8u); }
-
-void readout_head_rows_stage() {
-    projection_stage(head_rows_input(), gl_WorkGroupID.x, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_NORMALIZED), HEAD_K);
-}
-
-void readout_head_rows_gemm() {
-    const projection_prologue x = projection_plain(HEAD_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_NORMALIZED),
-        uint64_t(HEAD_K), 1ul, HEAD_K, 0ul);
-    projection_gemm(PACKETS_W0, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N, x, head_rows_output(), head_rows_weight(),
-        uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_V), HEAD_K, gl_WorkGroupID.y, gl_WorkGroupID.x, 0xffffffffu);
-}
+// The `dense` projection's launches (`lib/projection/operator.glsl`).
+void readout_head_rows_stage() { projection_dense_stage(); }
+void readout_head_rows_gemv1() { projection_single_gemv(1u); }
+void readout_head_rows_gemv2() { projection_single_gemv(2u); }
+void readout_head_rows_gemv4() { projection_single_gemv(4u); }
+void readout_head_rows_gemv8() { projection_single_gemv(8u); }
+void readout_head_rows_gemm() { projection_single_gemm(); }
+void readout_head_rows_finalize() { projection_single_finalize(); }

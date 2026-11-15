@@ -319,10 +319,8 @@ fn cases(kind: Kind, geometry: Geometry) -> Vec<Named> {
 /// variations, each admissible at both geometries.
 fn configurations(backend: BackendName, kind: Kind) -> Vec<Vec<(&'static str, u64)>> {
     match (backend, kind.decode()) {
-        (BackendName::Cpu, true) => {
-            vec![vec![("PARTS", 8)], vec![("PARTS", 1)], vec![("PARTS", 16)]]
-        }
-        (BackendName::Cpu, false) => vec![vec![]],
+        // The CPU's decode partitions are the pool's (`device.units`).
+        (BackendName::Cpu, _) => vec![vec![]],
         (BackendName::Metal, true) => vec![
             vec![("SPAN", 32), ("PARTS", 16), ("SIMDS", 4)],
             vec![("SPAN", 64), ("PARTS", 8), ("SIMDS", 8)],

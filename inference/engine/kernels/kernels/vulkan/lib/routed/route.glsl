@@ -1,64 +1,40 @@
-// Routing for M rows in four launches. The Vulkan form of
-// `metal/routed_route.metal`.
-//   routed_route_stage (M > VERIFY_ROWS, one workgroup per row): the row's RMS and
-//     its normalized values (rounded to the activation dtype), published once.
-//   routed_route_gemv (M <= VERIFY_ROWS): one subgroup per logit column reads the
-//     column's weights once and dots them with every row, normalizing on the
-//     fly from RMS partials shared across the workgroup (in the stage
-//     launch's sum order); workgroup 0 publishes the normalized rows.
-//   routed_route_gemm (M > VERIFY_ROWS): 32 rows x 32 columns per workgroup over
-//     staged F32 tiles, each invocation 8 outputs in ascending-K FMAs.
-//   Logits are [M, E + 1]: column E is the shared-expert gate.
-//   routed_route_select (one subgroup per row): the softmax over every
-//     expert (ceil(E / 32) experts per lane), K rounds of subgroup argmax
-//     (ties to the higher expert index), the optional renormalization, each
-//     score times its expert's `expert_scale` entry where that port is
-//     present (static ES), and the shared-expert coefficient from column E.
-// Every logit accumulates over the hidden axis in the same order for every
-// expert, so experts with equal router rows tie exactly.
-#define KERNEL_W0 SEISMIC_ROUTER
-#include "../core/activation.glsl"
-#include "../core/reduce.glsl"
-#include <seismic/packets.glsl>
-#ifdef ROUTE_PROJECTION
-#include "routed.glsl"
-#endif
+// Output selection of the `routed_route` contract, shared by `routed_route`,
+// `routed_route_shared` and `routed_route_streamed`. Projection of the router
+// and shared-expert gate rows is the `dense` projection operator's
+// (`lib/projection/ordered.glsl`). Before including, the entry defines ROUTE_E
+// (expert count) and ROUTE_STRIDE (logits row stride: E + 1).
 #include "ranked.glsl"
 
-#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16) \
-    || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F32)
-#define ROUTE_ACT ELEMENT_ACT
-#else
-#error "routed activation must be dense"
-#endif
-#if defined(SEISMIC_NORM_REPRESENTATION_F32)
-#define ROUTE_NORM ELEMENT_F32
-#elif defined(SEISMIC_NORM_REPRESENTATION_F16)
-#define ROUTE_NORM ELEMENT_F16
-#elif defined(SEISMIC_NORM_REPRESENTATION_BF16)
-#define ROUTE_NORM ELEMENT_BF16
-#else
-#error "routed norm must be dense"
-#endif
-#if defined(SEISMIC_ROUTER_KIND_PACKED) && !defined(SEISMIC_ROUTER_LAYOUT_ROWS16)
-#error "packed routed router requires rows16"
-#endif
-
-#define ROUTE_THREADS 256u
-#define ROUTE_SUBGROUPS 8u
 #define ROUTE_K uint(SEISMIC_DIM_K)
+#define ROUTE_PER_LANE ((ROUTE_E + 31u) / 32u)
+ROUTE_DEFINE_RANK_AT
 
-#define ROUTE_FN(name) name
-#define ROUTE_E uint(SEISMIC_DIM_E)
-#define ROUTE_NORM_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_NORM)
-#define ROUTE_NORM_STRIDE SEISMIC_NORM_STRIDE_0
-#define ROUTE_ROUTER_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_ROUTER)
-#define ROUTE_ROUTER_STRIDE_0 SEISMIC_ROUTER_STRIDE_0
-#define ROUTE_ROUTER_STRIDE_1 SEISMIC_ROUTER_STRIDE_1
-#define ROUTE_ROUTER_ROWS PACKETS_W0_ROWS
-#define ROUTE_LOGITS SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS)
-#define ROUTE_PUBLISH true
-#include "route_body.glsl"
-
-ROUTE_NUMERICAL
-ROUTE_OUTPUT
+void route_select_row(uint64_t logits_base, uint64_t row) {
+    const uint lane = SEISMIC_LANE;
+    const uint64_t routes = SEISMIC_PTR(SEISMIC_BUFFER_ROUTES);
+    const Out scores = SEISMIC_OUT_SCORES;
+    float chosen[ROUTE_K];
+    int winners[ROUTE_K];
+    route_rank_at(logits_base, row, chosen, winners);
+    if (lane == 0u)
+        for (uint slot = 0u; slot < ROUTE_K; ++slot)
+            element_i32_put(routes + (row * SEISMIC_ROUTES_STRIDE_0 + uint64_t(slot) * SEISMIC_ROUTES_STRIDE_1) * 4ul,
+                winners[ROUTE_K - 1u - slot]);
+    float denominator = 0.0;
+    if (SEISMIC_PARAM_NORMALIZE != 0ul)
+        for (uint slot = 0u; slot < ROUTE_K; ++slot)
+            denominator += chosen[ROUTE_K - 1u - slot];
+    if (lane == 0u) {
+        for (uint slot = 0u; slot < ROUTE_K; ++slot) {
+            const uint rank = ROUTE_K - 1u - slot;
+            float score = SEISMIC_PARAM_NORMALIZE != 0ul ? seismic_div_rn(chosen[rank], denominator) : chosen[rank];
+            if (SEISMIC_DIM_ES != 0ul)
+                score = seismic_mul_rn(score, element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_SCALE)
+                    + uint64_t(winners[rank]) * SEISMIC_EXPERT_SCALE_STRIDE_0 * 4ul));
+            out_put(scores, row * SEISMIC_SCORES_STRIDE_0 + uint64_t(slot) * SEISMIC_SCORES_STRIDE_1, score);
+        }
+        const float gate_logit = element_f32_at(logits_base + (row * uint64_t(ROUTE_STRIDE) + uint64_t(ROUTE_E)) * 4ul);
+        out_put(SEISMIC_RESULT_1_OUT, row * SEISMIC_RESULT_1_STRIDE_0,
+            seismic_div_rn(1.0, 1.0 + exp(-gate_logit)));
+    }
+}

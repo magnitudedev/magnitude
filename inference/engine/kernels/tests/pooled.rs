@@ -337,6 +337,7 @@ fn portable(case: &Case) -> Outcome {
     for (path, text) in [
         ("pooled.seismic", include_str!("../kernels/pooled.seismic")),
         ("attention.seismic", include_str!("../kernels/attention.seismic")),
+        ("dense.seismic", include_str!("../kernels/dense.seismic")),
         ("functions.seismic", include_str!("../kernels/functions.seismic")),
         ("rounding.seismic", include_str!("../kernels/rounding.seismic")),
     ] {

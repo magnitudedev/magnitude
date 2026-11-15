@@ -242,10 +242,12 @@ impl GraphWeights<u64> {
     }
 
     /// What a graph of target block `block` may read: its sublayers'
-    /// weights, with the target's own of the exit block (`exit`), and every
-    /// part of its streamed layers' banks, with the weights and policy of
-    /// each layer they lead to (`ExpertBankPlan::lead_layer`).
-    pub(crate) fn of_block(load: &ModelLoadPlan, block: u32, exit: bool) -> Result<Self, GraphError> {
+    /// weights, with the target's own of the exit block (`exit`), the next
+    /// block's input norm of a block whose output forms that block's
+    /// operand (`carries`, `block::carried_norm`), and every part of its
+    /// streamed layers' banks, with the weights and policy of each layer
+    /// they lead to (`ExpertBankPlan::lead_layer`).
+    pub(crate) fn of_block(load: &ModelLoadPlan, block: u32, exit: bool, carries: bool) -> Result<Self, GraphError> {
         let own = |scope: WeightScope| match scope {
             WeightScope::TargetSublayer(index) | WeightScope::TargetBranch { sublayer: index, .. } => {
                 index.block == block
@@ -279,7 +281,12 @@ impl GraphWeights<u64> {
                 }
             }
         }
-        Ok(Self { banks, ..Self::of(load, |role| own(role.scope) || leads.contains(&role.scope)) })
+        let carried = |role: WeightRole| {
+            carries
+                && role.kind == WeightKind::InputNorm
+                && role.scope == WeightScope::TargetSublayer(SublayerIndex { block: block + 1, sublayer: 0 })
+        };
+        Ok(Self { banks, ..Self::of(load, |role| own(role.scope) || leads.contains(&role.scope) || carried(role)) })
     }
 }
 

@@ -1,175 +1,81 @@
-// Expert streaming's decode routing (`routed_route_streamed` in
-// routed.seismic); the CUDA form of `metal/routed_route_streamed.metal`:
-// `routed_route_shared`'s launch, whose last router block to arrive
-// selects, and the next two layers' hints (AHEAD 2).
-//   [0, route::BLOCKS)               the router blocks
-//                                    (`lib/routed/route.cuh`).
-//   [.., + AHEAD * PREDICT_BLOCKS)   the router GEMV of the next layer (EN
-//                                    experts) over this layer's residual
-//                                    normed by that layer's norm, into the
-//                                    logits after this layer's [M, E + 1];
-//                                    the last of them to
-//                                    arrive ranks its rows and publishes the
-//                                    hints (`streaming/hint.hpp`).
-//   [.., + shared blocks)            the shared expert's gate/up blocks
-//                                    (`lib/routed/shared.cuh`).
-// The hints dispatch before the shared expert, so their serial tail (the
-// arrival, ranking and publication) runs beside the shared product rather
-// than after it. While the next layer's group is whole the launch encoded is
-// the `_alone` kernel, the same body compiled without the hint blocks or
-// their code.
-// Every block forms the RMS inverses and stages its rows as
-// `routed_route_shared` does, so the routing and the shared product carry
-// its bits. The three groups count their arrivals apart and none waits for
-// another.
-//
-// The selecting block then resolves and assigns (`streaming/resolve.hpp`):
-// a layer of a group that is not whole (`routed_route_streamed`) its
-// sources, routing record, the tier wait's grid and, on a miss, the
-// request; a layer of a whole group (`routed_route_whole`) its hits and
-// routing record alone.
-
+// Expert streaming's decode routing (`routed_route_streamed`) on the `dense`
+// projection operator, segmented over `(router, shared_router, (shared_gate, shared_up))`,
+// followed by resolve and assignment in the selecting block.
 #define KERNEL_W0 SEISMIC_ROUTER
-#define KERNEL_W1 SEISMIC_SHARED_GATE
-#define KERNEL_W2 SEISMIC_SHARED_UP
-#include <seismic/packets.cuh>
+#define KERNEL_W1 SEISMIC_SHARED_ROUTER
+#define KERNEL_W2 SEISMIC_SHARED_GATE
+#define KERNEL_W3 SEISMIC_SHARED_UP
+#include "lib/projection/operator.cuh"
 #include "lib/routed/route.cuh"
-#include "lib/routed/shared.cuh"
 #include "lib/streaming/control.cuh"
-#include "../streaming/hint.hpp"
 #include "../streaming/resolve.hpp"
 #include "lib/routed/resolve.cuh"
 
 SEISMIC_PROGRAMMATIC_DEPENDENCY
 
-// The next streamed layer's experts (EN, static) and its router blocks: its
-// EN logit columns.
-constexpr unsigned NEXT_EXPERTS = static_cast<unsigned>(SEISMIC_DIM_EN);
-constexpr unsigned PREDICT_BLOCKS = (NEXT_EXPERTS + SEISMIC_TUNE_SIMDGROUPS - 1) / SEISMIC_TUNE_SIMDGROUPS;
+using Raw = projection::OrderedInput<ELEMENT_OF(SEISMIC_NORM), projection::AllRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>;
+constexpr bool NVFP4_SHARED =
+    projection::OperandRecipe<packets::W2_OPERANDS_NVFP4, packets::W3_OPERANDS_NVFP4>::NVFP4;
+using UnordPro = projection::Operands<NVFP4_SHARED, Raw>;
+using LogitStore = projection::Store<element::F32>;
+using SharedEpi = projection::SiluMul<element::Act>;
+using Segments = projection::op::SegmentSet<0, projection::op::Types<packets::W0, packets::W1, packets::W2, packets::W3>,
+                                            projection::op::Types<LogitStore, LogitStore, SharedEpi>,
+                                            projection::op::empty_mask(SEISMIC_DIM_E, 1, SEISMIC_DIM_S)>;
 
-// The ports the launch's kernels bind.
-struct Ports {
-    route::Input in;
-    route::Columns columns;
-    route::Selection selection;
-    element::Out<element::Act> normalized;
-    const unsigned char *shared_gate, *shared_up;
-    element::Out<element::Act> shared_product;
-    const int *routes;
-    const int *step;
-    ResolvePorts bank;
-    // Each lead's prediction (one layer ahead, then two): that layer's
-    // router input and columns.
-    route::Input ahead[2];
-    route::Columns ahead_columns[2];
-    int *rings;
-    float *logits;
-    unsigned *arrivals;
-};
-
-#define ROUTED_ROUTE_PORTS                                                                                 \
-    Ports {                                                                                                \
-        ROUTE_INPUT, ROUTE_COLUMNS, ROUTE_SELECTION, SEISMIC_RESULT_0_OUT,                                 \
-            SEISMIC_PTR(SEISMIC_BUFFER_SHARED_GATE), SEISMIC_PTR(SEISMIC_BUFFER_SHARED_UP),               \
-            SEISMIC_RESULT_2_OUT, reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES)),       \
-            reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_STEP)), ROUTED_RESOLVE_PORTS,        \
-            {route::Input{reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL)),          \
-                          SEISMIC_PTR(SEISMIC_BUFFER_NEXT_NORM), SEISMIC_NEXT_NORM_STRIDE_0},             \
-             route::Input{reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL)),          \
-                          SEISMIC_PTR(SEISMIC_BUFFER_AFTER_NORM), SEISMIC_AFTER_NORM_STRIDE_0}},          \
-            {route::Columns{SEISMIC_PTR(SEISMIC_BUFFER_NEXT_ROUTER), SEISMIC_NEXT_ROUTER_STRIDE_0,        \
-                            SEISMIC_NEXT_ROUTER_STRIDE_1,                                                 \
-                            reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_ROUTER)),   \
-                            SEISMIC_SHARED_ROUTER_STRIDE_0},                                              \
-             route::Columns{SEISMIC_PTR(SEISMIC_BUFFER_AFTER_ROUTER), SEISMIC_AFTER_ROUTER_STRIDE_0,      \
-                            SEISMIC_AFTER_ROUTER_STRIDE_1,                                                \
-                            reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_ROUTER)),   \
-                            SEISMIC_SHARED_ROUTER_STRIDE_0}},                                             \
-            reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_BUFFER_RINGS)),                                   \
-            reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS)),                        \
-            reinterpret_cast<unsigned *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_ARRIVALS))                    \
+#define MAKE_RAW                                                                                              \
+    Raw {                                                                                                     \
+        reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL)), SEISMIC_RESIDUAL_STRIDE_0,      \
+            SEISMIC_PTR(SEISMIC_BUFFER_NORM), __uint_as_float(static_cast<unsigned>(SEISMIC_PARAM_EPS)),      \
+            SEISMIC_DIM_H, projection::AllRows{}, SEISMIC_RESIDUAL_STRIDE_1, SEISMIC_NORM_STRIDE_0            \
     }
 
-// Hint block `group` (of PREDICT_BLOCKS) of lead `lead` (0: one layer
-// ahead, 1: two): that layer's router GEMV over this residual's inverses
-// into the lead's [M, EN + 1] logits plane after this layer's [M, E + 1],
-// then, in the last of the lead's blocks to arrive (arrival counter 1 +
-// lead), its rows ranked (`route::rank_row`) and the hints published into
-// the lead's ring row. The rows are staged in `memory` (the launch's dynamic
-// shared memory). Every thread calls it.
-__device__ __forceinline__ void hint_block(const Ports &ports, unsigned lead, unsigned group,
-                                           float (*parts)[route::WARPS], float *inverses, unsigned *last,
-                                           projection::u8 *memory, const seismic_words_t &seismic_words_value) {
-    constexpr unsigned K = SEISMIC_DIM_K;
-    __shared__ int words[STREAMING_HINT_WORDS(SEISMIC_CONST_VERIFY_ROWS)];
-    // The lead's ports, selected rather than indexed: an index the compiler
-    // cannot resolve would place the whole `Ports` in local memory.
-    const route::Input next = lead == 0 ? ports.ahead[0] : ports.ahead[1];
-    const route::Columns next_columns = lead == 0 ? ports.ahead_columns[0] : ports.ahead_columns[1];
-    float *predicted = ports.logits + SEISMIC_DIM_M * (SEISMIC_DIM_E + 1) + lead * SEISMIC_DIM_M * (SEISMIC_DIM_EN + 1);
-    const unsigned lane = threadIdx.x % 32;
-    const unsigned long long expert = static_cast<unsigned long long>(group) * (blockDim.x / 32) + threadIdx.x / 32;
-    if (expert < NEXT_EXPERTS)
-        route::prefetch<NEXT_EXPERTS>(next_columns, expert, lane, seismic_words_value);
+#define MAKE_SEGMENTS(logits_out)                                                                             \
+    Segments {                                                                                                \
+        {SEISMIC_DIM_E, 1, SEISMIC_DIM_S},                                                                    \
+            {KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_ROUTER)),                                                \
+             KERNEL_W1_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_ROUTER)),                                        \
+             KERNEL_W2_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_GATE)),                                          \
+             KERNEL_W3_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_UP))},                                            \
+        {LogitStore{logits_out, SEISMIC_DIM_E + 1, 0},                                                        \
+         LogitStore{logits_out, SEISMIC_DIM_E + 1, SEISMIC_DIM_E},                                            \
+         SharedEpi{SEISMIC_RESULT_2_OUT, SEISMIC_RESULT_2_STRIDE_0}}                                          \
+    }
+
+extern "C" __global__ void routed_route_streamed_ordered_stage(SEISMIC_KERNEL_PARAMS) {
     seismic_dependency_start();
-    route::decode_inverses(next.residual, parts, inverses, seismic_words_value);
-    const route::Staged input = route::stage_rows(next, inverses, memory, seismic_words_value);
-    if (expert < NEXT_EXPERTS)
-        route::column<NEXT_EXPERTS>(input, next_columns, expert, predicted, lane, seismic_words_value);
-    if (!arrive::last(ports.arrivals + 1 + lead, PREDICT_BLOCKS, last))
-        return;
-    const unsigned rows = static_cast<unsigned>(SEISMIC_DIM_M);
-    for (unsigned row = threadIdx.x / 32; row < rows; row += blockDim.x / 32) {
-        const float *values = predicted + route::logit_index<NEXT_EXPERTS>(row, 0, seismic_words_value);
-        const route::Ranked ranked = route::rank_row<NEXT_EXPERTS>(
-            [&](unsigned long long column) { return __ldcg(values + column); }, lane);
-        if (lane == 0)
-            for (unsigned r = 0; r < K; ++r)
-                words[STREAMING_HINT_CHOSEN(row) + r] = ranked.winners[r];
-    }
-    streaming_hint(rows, ports.rings + lead * SEISMIC_RINGS_STRIDE_0, SEISMIC_RINGS_STRIDE_1,
-        ports.step[0], words, threadIdx.x, blockDim.x);
+    const UnordPro unord_pro{MAKE_RAW};
+    projection::form_row(unord_pro, blockIdx.x, SEISMIC_DIM_H, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED));
 }
 
-// The launch's body: with the next layer's hint blocks (HINTS) or without
-// them; resolving a layer of a group that is not whole, or of a whole one
-// its sources and routing record alone (WHOLE). `memory` is the launch's dynamic shared
-// memory.
-template <bool HINTS, bool WHOLE>
-__device__ __forceinline__ void route_streamed(const Ports &ports, projection::u8 *memory,
-                                               const seismic_words_t &seismic_words_value) {
-    __shared__ float parts[SEISMIC_CONST_VERIFY_ROWS][route::WARPS];
-    __shared__ float inverses[SEISMIC_CONST_VERIFY_ROWS];
+extern "C" __global__ void routed_route_streamed_ordered_gemv(SEISMIC_KERNEL_PARAMS) {
+    extern __shared__ uint4 dynamic_shared[];
+    const Raw raw = MAKE_RAW;
+    const UnordPro unord_pro{raw};
+    const element::Out<element::F32> logits_out = element::out_over_scratch<element::F32>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS));
+    const Segments segs = MAKE_SEGMENTS(logits_out);
+    const unsigned ordered_tiles = static_cast<unsigned>(
+        projection::op::ordered_gemv_segmented<true, SEISMIC_DIM_H, SEISMIC_TUNE_TPW, SEISMIC_TUNE_KSPLIT>(
+            reinterpret_cast<projection::u8 *>(dynamic_shared), raw, unord_pro,
+            SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED), SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0,
+            SEISMIC_RESULT_0_STRIDE_1, static_cast<unsigned>(SEISMIC_DIM_M), segs, 0u));
+    if (blockIdx.x >= ordered_tiles)
+        return;
     __shared__ unsigned last;
-    const unsigned predicting = HINTS ? static_cast<unsigned>(SEISMIC_DIM_AHEAD) * PREDICT_BLOCKS : 0u;
-    const unsigned group = blockIdx.x;
-    if (HINTS && group >= route::BLOCKS && group < route::BLOCKS + predicting) {
-        hint_block(ports, (group - route::BLOCKS) / PREDICT_BLOCKS, (group - route::BLOCKS) % PREDICT_BLOCKS, parts,
-            inverses, &last, memory, seismic_words_value);
+    unsigned *arrivals = reinterpret_cast<unsigned *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_ARRIVALS));
+    if (!arrive::last(arrivals, ordered_tiles, &last))
         return;
+    const float *logits = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS));
+    const route::Selection sel = ROUTE_SELECTION;
+    const unsigned lane = threadIdx.x % 32, warp = threadIdx.x / 32, warps = blockDim.x / 32;
+    for (unsigned row = warp; row < static_cast<unsigned>(SEISMIC_DIM_M); row += warps) {
+        const float *row_logits = logits + static_cast<unsigned long long>(row) * (SEISMIC_DIM_E + 1);
+        route::select_row([&](unsigned long long e) { return __ldcg(row_logits + e); }, sel, row, lane,
+                          seismic_words_value);
     }
-    if (group >= route::BLOCKS) {
-        shared_expert::block(ports.in, ports.shared_gate, ports.shared_up, ports.shared_product, parts, inverses,
-            memory, group - route::BLOCKS - predicting, seismic_words_value);
-        return;
-    }
-    __shared__ int resolved[STREAMING_RESOLVE_WORDS(SEISMIC_CONST_VERIFY_ROWS * SEISMIC_DIM_K)];
-    if (!route::route_block(ports.in, route::StageRows{memory}, ports.columns, ports.selection, ports.normalized,
-            SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, ports.logits, ports.arrivals, group, parts,
-            inverses, &last, seismic_words_value))
-        return;
-    // Resolve: the selection's routes are this block's own stores.
-    routed_resolve(ports.bank, WHOLE, resolved, seismic_words_value);
+    int *words = reinterpret_cast<int *>(dynamic_shared);
+    const ResolvePorts bank = ROUTED_RESOLVE_PORTS;
+    const bool whole =
+        streaming_load(STREAMING_AT(bank.policy, SEISMIC_CONST_POLICY_WHOLE * SEISMIC_POLICY_STRIDE_0)) != 0;
+    routed_resolve(bank, whole, words, seismic_words_value);
 }
-
-#define ROUTED_ROUTE_STREAMED(NAME, HINTS, WHOLE)                                                          \
-    extern "C" __global__ void NAME(SEISMIC_KERNEL_PARAMS) {                                               \
-        extern __shared__ uint4 memory[];                                                                  \
-        route_streamed<HINTS, WHOLE>(ROUTED_ROUTE_PORTS, reinterpret_cast<projection::u8 *>(memory),       \
-            seismic_words_value);                                                                          \
-    }
-
-ROUTED_ROUTE_STREAMED(routed_route_streamed, true, false)
-ROUTED_ROUTE_STREAMED(routed_route_streamed_alone, false, false)
-ROUTED_ROUTE_STREAMED(routed_route_whole, true, true)
-ROUTED_ROUTE_STREAMED(routed_route_whole_alone, false, true)

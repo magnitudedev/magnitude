@@ -54,6 +54,7 @@ impl<'a> QualificationView<'a> {
             )?;
             let features = block
                 .input
+                .first()
                 .call(draft_rows::Args {
                     tokens: &tokens,
                     directory: &direct,
@@ -108,6 +109,7 @@ impl<'a> QualificationView<'a> {
                     )?;
                     let product = kernels
                         .expand
+                        .first()
                         .call(dense_expand::Args {
                             residual: &attended,
                             norm: &norm,
@@ -118,28 +120,28 @@ impl<'a> QualificationView<'a> {
                             activation: 0,
                             gate_scale: &unit_scale(
                                 device,
-                                &kernels.expand,
+                                kernels.expand.first(),
                                 "GS",
                                 "dense_expand",
                                 &label,
                             )?,
                             up_scale: &unit_scale(
                                 device,
-                                &kernels.expand,
+                                kernels.expand.first(),
                                 "US",
                                 "dense_expand",
                                 &label,
                             )?,
                             gate_bound: &any_row_bound(
                                 device,
-                                &kernels.expand,
+                                kernels.expand.first(),
                                 "GB",
                                 "dense_expand",
                                 &label,
                             )?,
                             up_bound: &any_row_bound(
                                 device,
-                                &kernels.expand,
+                                kernels.expand.first(),
                                 "UB",
                                 "dense_expand",
                                 &label,
@@ -155,6 +157,7 @@ impl<'a> QualificationView<'a> {
                             "draft head feed-forward has a post-norm tail",
                         ));
                     };
+                    let output = output.first();
                     output
                         .call(dense_output::Args {
                             residual: &attended,
@@ -262,6 +265,7 @@ impl<'a> QualificationView<'a> {
                         &label,
                     )?;
                     let logits = kernel
+                        .first()
                         .call(readout_project_rows::Args {
                             features: &projected_features,
                             weight: &projection,

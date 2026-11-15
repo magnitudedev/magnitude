@@ -77,9 +77,10 @@ pub(crate) fn split<G: GraphDraft>(
     ))
 }
 
+/// A parallel block's entries; the dense branch's projections by row range.
 pub(crate) struct ParallelGraphEntries<'a, G: GraphDraft + 'a> {
-    pub expand: G::Binding<'a, dense_expand::Entry>,
-    pub down: G::Binding<'a, project_rows::Entry>,
+    pub expand: G::Ranged<'a, dense_expand::Entry>,
+    pub down: G::Ranged<'a, project_rows::Entry>,
     pub routed: GeneralRoutedGraphEntries<'a, G>,
     pub tail: G::Binding<'a, moe_tail::Entry>,
 }
@@ -196,7 +197,7 @@ pub(crate) fn parallel<'a, G: GraphDraft + 'a>(
     let down = packed(graph, WeightKind::DenseDown)?;
     let product = graph
         .enqueue(
-            entries.expand,
+            G::pick(entries.expand, rows),
             &[
                 dimensions.as_slice(),
                 &[
@@ -226,7 +227,7 @@ pub(crate) fn parallel<'a, G: GraphDraft + 'a>(
         .value;
     let dense = graph
         .enqueue(
-            entries.down,
+            G::pick(entries.down, rows),
             &[
                 ("M", rows.clone()),
                 ("G", Dim::from(1)),

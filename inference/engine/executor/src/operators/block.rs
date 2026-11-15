@@ -1217,7 +1217,9 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
     /// experts as `FeedForwardGraph::bank` says, and returns the sequence
     /// input a run writes when it reads its sequence; a split one is built
     /// as its front, which exports the carry it read, or its back, which
-    /// reads its site again from that carry (`split`).
+    /// reads its site again from that carry (`split`). A fused routed
+    /// feed-forward forms the next block's operand where `operand` names
+    /// it (`routed_graph::OperandOut`); no other feed-forward forms one.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn feed_forward<'e, G: GraphDraft + 'e>(
         &self,
@@ -1228,6 +1230,7 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
         weights: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
         split: Option<Split<'_>>,
+        operand: Option<routed_graph::OperandOut<'_, G::Forms>>,
     ) -> Result<(ResidualCarry<WorkflowTensor>, Option<NativePort>), GraphError> {
         let FeedForwardGraph { entries, bank } = feed_forward;
         let (planned, rows, scope) = (self.weights, &self.numbers.rows, self.scope(1));
@@ -1240,6 +1243,9 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
             true => carry.clone(),
             false => ResidualCarry { rows: output, pre },
         };
+        if operand.is_some() && !matches!(&self.topology.feed_forward, Some((_, FeedForwardTopology::Routed(_)))) {
+            return Err("only a fused routed feed-forward forms the next block's operand".into());
+        }
         let (read, topology, entries) = match (&self.topology.feed_forward, entries) {
             (None, None) => return Ok((carry.clone(), None)),
             (Some((read, topology)), Some(entries)) => (*read, topology, entries),
@@ -1315,6 +1321,7 @@ impl<W: PlannedWeights + ?Sized> SublayerGraph<'_, W> {
                     rows,
                     epsilon,
                     split,
+                    operand,
                 )?;
                 return Ok((carried(output, pre), sequence));
             }

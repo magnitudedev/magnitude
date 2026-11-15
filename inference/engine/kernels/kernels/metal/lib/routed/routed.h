@@ -3,13 +3,17 @@
 // activation prologue they share, the grouped-row prologue of the expert
 // GEMMs, the live-row count of a grouped block and the choice of a block's
 // GEMM form. Every form gives the GEMM's bits, so a row's output depends on
-// its own row alone, never on how many rows share its block. Weights are
+// its own row alone, never on how many rows share its block. The grouped
+// projection's other forms (TALL, INT8, PACK) take whole blocks, each row's
+// result its own but under PACK, which packs a block's adjacent rows in
+// pairs (as dense's, `int8_token_packing`): their grids, the grouped rows'
+// positions and the forms' scratch are here. Weights are
 // bound through the `packets.h` slots (`KERNEL_W0..3`); an expert-stacked
 // weight a launch reads per step's source is a record port, bound as its
 // records' address table, and an expert's weights are rows 0.. of its
-// record's base (`slab::region<const uchar, packets::space>(table, record)`,
-// in the bound weights' space); a resident layer's expert is its own record
-// (`decode_source`).
+// record's base (`slab::Experts::matrix`, in the bound weights' space), the
+// record a `slab::Source` names; a resident layer's expert is its own
+// record (`decode_source`).
 
 #include <seismic/slab.h>
 #include "../projection/projection.h"
@@ -19,35 +23,23 @@ namespace routed {
 typedef element::Act Act;
 static_assert(Act::bytes == 2, "the Metal routed family requires a bf16 or f16 activation element");
 
-// An expert's weights of an expert-stacked weight at resolved `slot` (not -1):
-// record `slot` of `records` (`slot` >= 0), or record -2 - `slot` of `experts`
-// (`slot` <= -2: the stack, or a scratch slot).
-inline packets::weight_bytes expert_weights(device const ulong *records, device const ulong *experts, int slot) {
-    return slot >= 0 ? slab::region<const uchar, packets::space>(records, ulong(slot))
-                     : slab::region<const uchar, packets::space>(experts, ulong(-2 - slot));
-}
+// An expert-stacked weight's record tables, in the bound weights' space.
+typedef slab::Experts<packets::space> Experts;
 
-// The record a decode expert entry reads choice (m, k)'s weights from, of
+// The source a decode expert entry reads choice (m, k)'s weights from, of
 // expert `expert` (`decode_source`, routed.seismic): the expert itself
-// without sources (`rows` 0, a resident layer), else the step's source
-// (`sources`' SOURCE_RECORD row at strides `row_stride`, `choice_stride`);
-// -1 where that names none (a choice that reads no record and contributes
-// nothing; when is stated there).
-inline int decode_source(device const int *sources, ulong rows, ulong row_stride, ulong choice_stride, ulong m,
-                         ulong k, int expert) {
-    return rows == 0 ? expert : sources[m * row_stride + k * choice_stride];
+// without sources (`rows` 0, a resident layer: record `expert` of its
+// experts' table), else the step's source (`sources`' SOURCE_RECORD row at
+// strides `row_stride`, `choice_stride`): a bank record, a host tier record
+// (the secondary table, which on unified memory the entries read in place as
+// they read the bank's), or none (a choice that reads no record and
+// contributes nothing; when is stated there).
+inline slab::Source decode_source(device const int *sources, ulong rows, ulong row_stride, ulong choice_stride,
+                                  ulong m, ulong k, int expert) {
+    return slab::Source{rows == 0 ? expert : sources[m * row_stride + k * choice_stride]};
 }
 
-// The weights a decode source names (`decode_source`, not -1): a record of
-// the bank's records `bank` (>= 0), or record t of the host tier's `tier` as
-// -2 - t, which on unified memory the entries read in place as they read the
-// bank's (both record tables).
-inline packets::weight_bytes source_weights(device const ulong *bank, device const ulong *tier, int source) {
-    return source >= 0 ? slab::region<const uchar, packets::space>(bank, ulong(source))
-                       : slab::region<const uchar, packets::space>(tier, ulong(-2 - source));
-}
-
-// A choice with no record's product row (`decode_source` -1): `count` zero A
+// A choice with no record's product row (`decode_source` none): `count` zero A
 // elements at `out`, element stride `stride`, by `threads` threads from
 // `first`.
 inline void zero_row(element::Out<Act> out, ulong stride, uint count, uint first, uint threads) {
@@ -79,13 +71,6 @@ inline projection::Weights<W> weights(packets::weight_bytes base, packets::Rows1
     return projection::Weights<W>{base, layout, k, nullptr, first};
 }
 
-// Choice (m, k)'s record (`decode_source`, `rows` source rows at strides
-// `row_stride`, `choice_stride`) of expert `expert`.
-inline int choice_record(device const ulong *, device const int *sources, ulong rows, ulong row_stride,
-    ulong choice_stride, ulong m, ulong k, int expert) {
-    return decode_source(sources, rows, row_stride, choice_stride, m, k, expert);
-}
-
 // The weights of record `record` of an expert-stacked weight's record table
 // `records`: rows 0.. of the record's base.
 template <typename W>
@@ -94,13 +79,140 @@ inline projection::Weights<W> record_weights(device const ulong *records, int re
     return weights<W>(slab::region<const uchar, packets::space>(records, ulong(record)), layout, 0, k);
 }
 
-// The weights of `record` (`choice_record`, not -1): a bank or tier record
-// through their tables (`source_weights`).
+// The weights of an expert's matrix where `source` (not none) names it.
 template <typename W>
-inline projection::Weights<W> choice_weights(device const ulong *bank, device const ulong *tier, int record,
-    packets::Rows16 layout, ulong, uint k) {
-    return weights<W>(source_weights(bank, tier, record), layout, 0, k);
+inline projection::Weights<W> expert_matrix(Experts experts, slab::Source source, packets::Rows16 layout, uint k) {
+    return weights<W>(experts.matrix(source), layout, 0, k);
 }
+
+// The gathered decode form (`choice`, GATHERED): the threadgroups of choice
+// `at` (flat m * K + k) run only where it is its expert's first choice, and
+// then project that expert's weights once over the activation row of every
+// choice of it, so a step reads each chosen expert's records once. A row
+// chooses an expert at most once, so an expert has at most M (at most
+// VERIFY_ROWS) choices. A GEMV row's sums never depend on the other rows
+// (`gemv.h`), so every choice keeps its one-row bits.
+struct Gathered {
+    // The expert, and its choices' count: 0 where `at` is not its first.
+    int expert;
+    uint count;
+    // Choice r's activation row, and its product row's element offset
+    // (m * stride0 + k * stride1).
+    uint rows[SEISMIC_CONST_VERIFY_ROWS];
+    uint products[SEISMIC_CONST_VERIFY_ROWS];
+};
+
+// The choices of choice `at`'s expert over `m_rows` rows of `slots` choices
+// (`routes` at strides `s0`, `s1`), in flat order, their product rows at
+// strides `p0`, `p1`; none where an earlier choice names the expert. Every
+// thread computes the same. The form is admitted at M <= VERIFY_ROWS, and a
+// row names an expert once, so the bound on `count` never binds; it keeps
+// the tables in bounds.
+inline Gathered gather(device const int *routes, ulong s0, ulong s1, uint m_rows, uint slots, uint at, ulong p0,
+    ulong p1) {
+    Gathered chosen;
+    chosen.expert = routes[ulong(at / slots) * s0 + ulong(at % slots) * s1];
+    chosen.count = 0;
+    for (uint c = 0; c < at; ++c)
+        if (routes[ulong(c / slots) * s0 + ulong(c % slots) * s1] == chosen.expert)
+            return chosen;
+    for (uint c = at; c < m_rows * slots && chosen.count < uint(SEISMIC_CONST_VERIFY_ROWS); ++c) {
+        const uint m = c / slots, k = c % slots;
+        if (routes[ulong(m) * s0 + ulong(k) * s1] == chosen.expert) {
+            chosen.rows[chosen.count] = m;
+            chosen.products[chosen.count] = uint(ulong(m) * p0 + ulong(k) * p1);
+            ++chosen.count;
+        }
+    }
+    return chosen;
+}
+
+// The activation rows a gathered GEMV reads: row r is `rows[r]`.
+struct Listed {
+    thread const uint *rows;
+    uint at(uint m) const { return rows[m]; }
+};
+
+// A gathered GEMV's epilogue: its row r is stored where product row
+// `products[r]` (an element offset) lies, by an epilogue whose row stride is
+// one element.
+template <typename Out>
+struct ChoiceRows {
+    Out out;
+    thread const uint *products;
+    void store(uint m, uint n, float value) const { out.store(products[m], n, value); }
+    void store2(uint m, uint n, float first, float second) const { out.store2(products[m], n, first, second); }
+    void store_pair(uint m, uint n, float gate, float up) const { out.store_pair(products[m], n, gate, up); }
+};
+
+// The gathered decode down projections (`summed`, GATHERED) publish each
+// slot's projection in A ([M, SLOTS, H], SLOTS the K choices then the shared
+// expert's where it has one): stored by the launch's threadgroups, loaded by
+// the last to arrive, so through memory declared coherent
+// (`arrive::coherent_device`).
+typedef coherent(device) device Act::storage *PublishedSlots;
+
+// Channel `first` + c (c < TILE, below H) of a projection in `region`
+// (`project_channels`' layout, every lane group's sums stored) published in A
+// at row `row` of `published`, by the simdgroup that projected it. Its reads
+// follow the stores of the sums, and precede the simdgroup's next
+// projection's stores.
+template <uint SLOTS>
+struct OutPublishedSlots {
+    element::Out<Act> out;
+    ulong s0, s1, s2;
+};
+
+template <uint TILE, uint H>
+inline void publish_slot(PublishedSlots published, uint row, uint first, threadgroup const float *region, uint lane) {
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint channel = lane; channel < TILE; channel += 32)
+        if (first + channel < H)
+            published[ulong(row) * H + first + channel] = Act::store(region[channel]);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+template <uint TILE, uint H, uint SLOTS>
+inline void publish_slot(OutPublishedSlots<SLOTS> published, uint row, uint first, threadgroup const float *region,
+    uint lane) {
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    const ulong base = ulong(row / SLOTS) * published.s0 + ulong(row % SLOTS) * published.s1;
+    for (uint channel = lane; channel < TILE; channel += 32)
+        if (first + channel < H)
+            published.out.put(base + ulong(first + channel) * published.s2, region[channel]);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+template <uint TILE, uint K, uint SLOTS, uint H, typename Published, typename Project>
+inline void project_gathered(device const int *routes, ulong s0, ulong s1, uint m_rows, uint m, uint sg,
+    uint first, uint lane, threadgroup float *region, Published published, Project project) {
+    if (sg < K) {
+        // Each choice's place is its published row, m * SLOTS + k.
+        const Gathered chosen = gather(routes, s0, s1, m_rows, K, m * K + sg, SLOTS, 1);
+        for (uint r = 0; r < chosen.count; ++r) {
+            project(ulong(chosen.rows[r]), chosen.products[r] - chosen.rows[r] * SLOTS, region);
+            publish_slot<TILE, H>(published, chosen.products[r], first, region, lane);
+        }
+    } else if (m == 0) {
+        for (uint row = 0; row < m_rows; ++row) {
+            project(ulong(row), K, region);
+            publish_slot<TILE, H>(published, row * SLOTS + K, first, region, lane);
+        }
+    }
+}
+
+// Channel n of row m's projections where a gathered decode down launch
+// published them (`project_gathered`), A-rounded, read by its last
+// threadgroup to arrive.
+template <uint SLOTS, uint H>
+struct ArrivedProjections {
+    PublishedSlots published;
+    ulong m;
+    uint n;
+    float at(uint k) const thread {
+        return Act::load(published[(m * SLOTS + k) * H + n]);
+    }
+};
 
 // A plain activation prologue over rows of a [rows, columns] A tensor.
 inline projection::Plain<Act, projection::AllRows> activation(device const uchar *x, ulong stride0, ulong stride1,
@@ -123,8 +235,12 @@ inline uint block_rows(device const int *order, ulong stride, uint rows) {
     return low;
 }
 
-// The grouped prologue of the expert GEMMs: tile row m of a block reads
-// activation row `order[m]`; padding rows (-1) read zeros.
+// The grouped prologue of the expert GEMMs: row m is tile row m % T of block
+// m / T (T `tile_rows`, blocks `block_stride` entries of `order` apart), and
+// reads activation row `order[m / T, m % T]`; padding rows (-1) read zeros.
+// A block's GEMM takes its own rows (`order` at the block, m below T); the
+// forms whose operand covers every block take the grouped rows' positions,
+// block b's from b * T.
 struct Grouped {
     typedef Act activation;
     device const uchar *x;
@@ -132,19 +248,24 @@ struct Grouped {
     uint columns;
     device const int *order;
     ulong order_stride;
+    ulong block_stride;
+    uint tile_rows;
     uint groups() const { return 0; }
     uint width() const { return 1; }
     float norm_input(uint, uint, uint) const { return 0.0f; }
     float epsilon() const { return 0.0f; }
     uint inverse_index(uint, uint) const { return 0; }
+    int source(uint m) const {
+        return order[ulong(m / tile_rows) * block_stride + ulong(m % tile_rows) * order_stride];
+    }
     float value(uint m, uint k, float) const {
-        int row = order[ulong(m) * order_stride];
+        int row = source(m);
         return row < 0 ? 0.0f
             : Act::load(reinterpret_cast<device const typename Act::storage *>(x)
                 [ulong(row) * stride0 + ulong(k) * stride1]);
     }
     uint4 words8(uint m, uint k) const {
-        int row = order[ulong(m) * order_stride];
+        int row = source(m);
         if (row < 0)
             return uint4(0);
         device const typename Act::storage *base =
@@ -152,7 +273,7 @@ struct Grouped {
         return projection::words8_storage<Act>(base, stride1, k, columns, stride1 == 1 && (stride0 & 7u) == 0);
     }
     void load8(uint m, uint k, float, thread float4 &even, thread float4 &odd) const {
-        int row = order[ulong(m) * order_stride];
+        int row = source(m);
         if (row < 0) {
             even = odd = float4(0.0f);
             return;
@@ -161,7 +282,155 @@ struct Grouped {
             reinterpret_cast<device const typename Act::storage *>(x) + ulong(row) * stride0;
         projection::load8_storage<Act>(base, stride1, k, columns, stride1 == 1 && (stride0 & 7u) == 0, even, odd);
     }
+    // x[m, k] and x[m, k + 1] as one storage word, zero for a padding row or
+    // a row at or past `m_rows` (`projection::tall_relayout`).
+    uint words2(uint m, uint k, uint m_rows) const {
+        int row = m < m_rows ? source(m) : -1;
+        if (row < 0)
+            return 0u;
+        device const typename Act::storage *base =
+            reinterpret_cast<device const typename Act::storage *>(x) + ulong(row) * stride0;
+        if (stride1 == 1)
+            return as_type<uint>(ushort2(*reinterpret_cast<device const packed_ushort2 *>(base + k)));
+        return uint(as_type<ushort>(base[ulong(k) * stride1])) | uint(as_type<ushort>(base[ulong(k + 1u) * stride1])) << 16u;
+    }
 };
+
+// The products of the grouped rows (`product`, a row a position) as the down
+// GEMM's forms over every block read them: padding positions (`order` -1)
+// read zeros, as dense pads its rows, whatever the expansion left there.
+struct GroupedProducts {
+    typedef Act activation;
+    projection::Plain<Act, projection::AllRows> rows;
+    Grouped grouped;
+    void load8(uint m, uint k, float inverse, thread float4 &even, thread float4 &odd) const {
+        if (grouped.source(m) < 0) {
+            even = odd = float4(0.0f);
+            return;
+        }
+        rows.load8(m, k, inverse, even, odd);
+    }
+};
+
+// Block `block`'s rows in the tall GEMM's order (`projection::tall_relayout`):
+// whole 64-row tiles of `columns` storage elements, ceil(tile_rows / 64) a
+// block.
+inline device uchar *block_fragments(device uchar *fragments, uint block, uint tile_rows, uint columns) {
+    return fragments + ulong(block) * ((tile_rows + 63u) / 64u) * 64u * columns * Act::bytes;
+}
+
+// The forms' scratch (`projection routed for metal`), each GEMM's in turn.
+// `operand`: the GEMM's rows in its form, TALL's in the tall GEMM's order
+// (`block_fragments`), INT8's quantized and PACK's coded over `rows` rows of
+// `columns` columns (the capacity of every launch of the form). `tables`:
+// over stacked experts, each used block's expert's ordinal among the used
+// experts first (`ordinals`, `blocks` words in 16-byte units), then each used
+// expert's tables of the GEMM's `weights` weights, ordinal o's weight j at
+// o * weights + j (`weight_table`); one set over dense weights (blocks 0,
+// ordinal 0). A weight of `rows` rows by `columns` columns takes the INT8
+// form's block coefficients and biases, or the PACK form's block factors and
+// weight scales (`*_table_bytes`).
+inline device int *ordinals(device uchar *tables) {
+    return reinterpret_cast<device int *>(tables);
+}
+inline ulong int8_table_bytes(uint rows, uint columns) {
+    return ulong(rows) * (columns / 32u) * 4u + ulong((rows + 31u) / 32u * 32u) * ((columns + 1023u) / 1024u) * 64u;
+}
+inline ulong packing_table_bytes(uint rows, uint columns) {
+    return ulong(rows) * (columns / 32u) * 4u + ulong(rows) * 4u;
+}
+inline device uchar *weight_table(device uchar *tables, uint blocks, int ordinal, uint weights, uint weight,
+    ulong bytes) {
+    return tables + ulong((blocks + 3u) / 4u) * 16u + (ulong(ordinal) * weights + weight) * bytes;
+}
+// The INT8 and PACK forms' scratch of a weight whose table is `table` (the
+// operand's own passes take no table: `rows` 0); PACK's a
+// `projection::packing_scratch`, of `packing.h`, which its entries include.
+inline projection::int8_scratch int8_forms(device uchar *operand, ulong operand_rows, device uchar *table,
+    uint rows, uint columns) {
+    device uchar *row_scales = operand + operand_rows * columns;
+    device uchar *block_sums = row_scales + operand_rows * (columns / 32u) * 2u;
+    return projection::int8_scratch{operand, reinterpret_cast<device half *>(row_scales),
+        reinterpret_cast<device half *>(block_sums), reinterpret_cast<device float *>(table),
+        reinterpret_cast<device half *>(table + ulong(rows) * (columns / 32u) * 4u)};
+}
+template <typename Packing>
+inline Packing packing_forms(device uchar *operand, ulong operand_rows, device uchar *table, uint rows,
+    uint columns) {
+    device uchar *token_factors = operand + operand_rows * columns * 2u + 1024u;
+    device uchar *token_scales = token_factors + operand_rows * (columns / 32u) * 4u;
+    return Packing{reinterpret_cast<device float *>(operand), reinterpret_cast<device half *>(token_factors),
+        reinterpret_cast<device float *>(token_scales), reinterpret_cast<device half *>(table),
+        reinterpret_cast<device float *>(table + ulong(rows) * (columns / 32u) * 4u)};
+}
+
+// An epilogue of one block's rows reached at the grouped rows' positions:
+// position m is the block's row m - first.
+template <typename Out>
+struct Positioned {
+    Out out;
+    uint first;
+    void store(uint m, uint n, float value) const { out.store(m - first, n, value); }
+    void store2(uint m, uint n, float a, float b) const { out.store2(m - first, n, a, b); }
+    void store_pair(uint m, uint n, float gate, float up) const { out.store_pair(m - first, n, gate, up); }
+    auto row(uint m) const { return projection::row_of(out, m - first); }
+};
+template <typename Out>
+inline Positioned<Out> positioned(thread const Out &out, uint first) {
+    return Positioned<Out>{out, first};
+}
+
+// Whether used block `b` is its expert's first: an expert's blocks are
+// consecutive (`routed_group`), and its first forms what they share (the
+// weights' tables of the INT8 and PACK forms, one an expert).
+inline bool first_block(device const int *blocks, ulong stride, uint b) {
+    return b == 0u || blocks[ulong(b - 1u) * stride] != blocks[ulong(b) * stride];
+}
+
+// Each of the `used` blocks' expert ordinals among the used experts.
+inline void write_ordinals(device const int *blocks, ulong stride, uint used, device int *ordinals) {
+    int ordinal = -1;
+    for (uint b = 0; b < used; ++b) {
+        if (first_block(blocks, stride, b))
+            ++ordinal;
+        ordinals[b] = ordinal;
+    }
+}
+
+// A grouped GEMM's form past its default tiles: TALL, INT8 or PACK (the
+// forms' `INT8` and `PACK` parameters, each 0 or 1).
+enum class gemm_form : uint { tall, int8, pack };
+inline gemm_form form_of(int int8, int pack) {
+    return int8 != 0 ? gemm_form::int8 : pack != 0 ? gemm_form::pack : gemm_form::tall;
+}
+
+// The grids of a grouped GEMM's form over `used` blocks of `tile_rows` rows
+// (`routed_experts`): the GEMM's `n` weight rows of `width` columns, which
+// `served` weights expand (its features `n` each). The form's row pass into
+// `own`, the GEMM's own grid, whose default tiles the form replaces (TALL's
+// relayout, a block a row; INT8's quantization and PACK's codes, over the
+// blocks' positions); its tables pass into `tables` (a used block a row);
+// its tiles into `tiles`: TALL's 64-row tiles, INT8's and PACK's 32-row tiles
+// of 128 weight rows (64 features where paired; on a device with tensor
+// operations PACK's the default form's two 32 x 64 there).
+inline void form_grids(gemm_form form, uint used, uint tile_rows, uint n, uint width, uint served, device int *own,
+    device int *tables, device int *tiles) {
+    switch (form) {
+    case gemm_form::tall:
+        write_grid(own, ((tile_rows + 63u) / 64u * width + 255u) / 256u, used);
+        write_grid(tiles, (n * served + 31u) / 32u, used * ((tile_rows + 63u) / 64u));
+        return;
+    case gemm_form::int8:
+        write_grid(own, used * tile_rows, 1);
+        write_grid(tables, (n * (width / 256u) + 1023u) / 1024u, used);
+        break;
+    case gemm_form::pack:
+        write_grid(own, used * tile_rows / 4u, 1);
+        write_grid(tables, n / 32u, used);
+        break;
+    }
+    write_grid(tiles, (n * served + 127u) / 128u, used * (tile_rows / 32u));
+}
 
 // The expert projections of one grouped block tile: the TM x TN GEMM over
 // the block's `live` rows, or, on simdgroup matrices, its one-row form

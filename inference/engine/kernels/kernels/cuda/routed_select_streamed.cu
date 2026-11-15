@@ -1,139 +1,64 @@
-// Expert streaming's decode selection of the general routed form
-// (`routed_select_streamed` in routed.seismic); the CUDA form of
-// `metal/routed_select_streamed.metal`: `routed_select`'s decode launches
-// (`lib/routed/selection.cuh`), so its bits, then resolve and the next two
-// layers' hints (AHEAD 2).
-//   routed_select_streamed_gemv: `routed_select_gemv`'s blocks, then per
-//     lead (one layer ahead, then two) ceil(EN / SIMDGROUPS) forming that
-//     layer's logits over this residual through its router norm and router,
-//     into the lead's [SPLIT, M, EN] partial planes after this layer's
-//     [SPLIT, M, E].
-//   routed_select_streamed_select: block 0 selects every row, one warp per
-//     row (M <= VERIFY_ROWS), then resolves and assigns
-//     (`streaming/resolve.hpp`); block 1 + lead ranks the lead's layer's
-//     rows as its selection ranks them (`select::rank_row` with that layer's
-//     bias) and publishes the hints into the lead's ring row
-//     (`streaming/hint.hpp`).
-//   routed_select_whole: a whole group's layer's, as the select launch but
-//     block 0 resolves its hits and routing record alone.
-// While the next layer holds every expert, each launch is encoded without
-// the next layer's blocks, which follow this layer's.
-
+// Expert streaming's decode general selection (`routed_select_streamed`) on the
+// `dense` projection operator, single over `router`, followed by resolve and
+// assignment in the selecting block.
+#define KERNEL_W0 SEISMIC_ROUTER
+#include "lib/projection/operator.cuh"
 #include "lib/routed/selection.cuh"
 #include "lib/streaming/control.cuh"
-#include "../streaming/hint.hpp"
 #include "../streaming/resolve.hpp"
 #include "lib/routed/resolve.cuh"
 
-// Block 0's group words: the resolve's, or a hint block's the hints'.
-constexpr unsigned SELECT_WORDS =
-    STREAMING_RESOLVE_WORDS(SEISMIC_CONST_VERIFY_ROWS * SEISMIC_DIM_K) > STREAMING_HINT_WORDS(SEISMIC_CONST_VERIFY_ROWS)
-        ? STREAMING_RESOLVE_WORDS(SEISMIC_CONST_VERIFY_ROWS * SEISMIC_DIM_K)
-        : STREAMING_HINT_WORDS(SEISMIC_CONST_VERIFY_ROWS);
+SEISMIC_PROGRAMMATIC_DEPENDENCY
 
-// E and EN (the next streamed layer's experts) are static.
-constexpr unsigned COLUMN_GROUPS =
-    (static_cast<unsigned>(SEISMIC_DIM_E) + SEISMIC_TUNE_SIMDGROUPS - 1) / SEISMIC_TUNE_SIMDGROUPS;
-constexpr unsigned NEXT_EXPERTS = static_cast<unsigned>(SEISMIC_DIM_EN);
-constexpr unsigned NEXT_GROUPS = (NEXT_EXPERTS + SEISMIC_TUNE_SIMDGROUPS - 1) / SEISMIC_TUNE_SIMDGROUPS;
-// Where lead `lead`'s partial planes begin: after this layer's [SPLIT, M,
-// E] and each earlier lead's [SPLIT, M, EN].
-__device__ __forceinline__ unsigned long long predicted_at(unsigned lead, const seismic_words_t &seismic_words_value) {
-    return static_cast<unsigned long long>(SEISMIC_TUNE_SPLIT) * SEISMIC_DIM_M * (SEISMIC_DIM_E + lead * NEXT_EXPERTS);
-}
+using RouterRaw = projection::OrderedRms<ELEMENT_OF(SEISMIC_ROUTER_NORM), projection::AllRows>;
+using NormRaw = projection::OrderedRms<ELEMENT_OF(SEISMIC_NORM), projection::AllRows>;
+using LogitStore = projection::Store<element::F32>;
 
-extern "C" __global__ void routed_select_streamed_gemv(SEISMIC_KERNEL_PARAMS) {
-    const float *residual = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL));
-    const unsigned char *norm = SEISMIC_PTR(SEISMIC_BUFFER_NORM);
-    const unsigned char *router_norm = SEISMIC_PTR(SEISMIC_BUFFER_ROUTER_NORM);
-    const unsigned char *router = SEISMIC_PTR(SEISMIC_BUFFER_ROUTER);
-    const unsigned char *next_router_norm = SEISMIC_PTR(SEISMIC_BUFFER_NEXT_ROUTER_NORM);
-    const unsigned char *next_router = SEISMIC_PTR(SEISMIC_BUFFER_NEXT_ROUTER);
-    const unsigned char *after_router_norm = SEISMIC_PTR(SEISMIC_BUFFER_AFTER_ROUTER_NORM);
-    const unsigned char *after_router = SEISMIC_PTR(SEISMIC_BUFFER_AFTER_ROUTER);
-    const element::Out<Act> normalized = SEISMIC_RESULT_0_OUT;
-    float *logits = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS));
-    __shared__ float parts[SEISMIC_CONST_VERIFY_ROWS][SELECT_WARPS];
-    __shared__ float inverses[SEISMIC_CONST_VERIFY_ROWS];
-    __shared__ alignas(16) Act::storage staged[SEISMIC_CONST_VERIFY_ROWS][GEMV_SHARE];
-    decode_inverses(residual, parts, inverses, seismic_words_value);
-    if (blockIdx.x < COLUMN_GROUPS) {
-        select_columns(residual, inverses, router_norm, SEISMIC_ROUTER_NORM_STRIDE_0, router, SEISMIC_ROUTER_STRIDE_0,
-                       norm, blockIdx.x == 0 ? &normalized : nullptr, logits, blockIdx.x, staged, seismic_words_value);
+extern "C" __global__ void routed_select_streamed_ordered_gemv(SEISMIC_KERNEL_PARAMS) {
+    seismic_dependency_start();
+    extern __shared__ uint4 dynamic_shared[];
+    projection::u8 *shared_raw = reinterpret_cast<projection::u8 *>(dynamic_shared);
+    const unsigned m = static_cast<unsigned>(SEISMIC_DIM_M);
+    const unsigned long long k = SEISMIC_DIM_H;
+    const float eps = __uint_as_float(static_cast<unsigned>(SEISMIC_PARAM_EPSILON));
+    const RouterRaw router_raw{reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL)),
+                               SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_PTR(SEISMIC_BUFFER_ROUTER_NORM), eps, k,
+                               projection::AllRows{}, SEISMIC_RESIDUAL_STRIDE_1, SEISMIC_ROUTER_NORM_STRIDE_0};
+    const NormRaw norm_raw{reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL)),
+                           SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_PTR(SEISMIC_BUFFER_NORM), eps, k,
+                           projection::AllRows{}, SEISMIC_RESIDUAL_STRIDE_1, SEISMIC_NORM_STRIDE_0};
+    const element::Out<element::F32> logits_out = element::out_over_scratch<element::F32>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS));
+    projection::op::ordered_gemv_block<false>(
+        shared_raw, router_raw, SEISMIC_RESULT_0_OUT, 0, 1, false, m, k, SEISMIC_DIM_E, blockIdx.x,
+        KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_ROUTER)), LogitStore{logits_out, SEISMIC_DIM_E, 0});
+    if (blockIdx.x == 0) {
+        const float *smem_inv = reinterpret_cast<const float *>(shared_raw);
+        const auto pub_out = SEISMIC_RESULT_0_OUT;
+        for (unsigned long long idx = threadIdx.x; idx < m * k; idx += blockDim.x) {
+            const unsigned r = static_cast<unsigned>(idx / k);
+            const unsigned long long c = idx % k;
+            pub_out.put(static_cast<unsigned long long>(r) * SEISMIC_RESULT_0_STRIDE_0 + c * SEISMIC_RESULT_0_STRIDE_1,
+                        norm_raw.ordered_at(r, c, smem_inv[r]));
+        }
+    }
+    const unsigned ordered_tiles = static_cast<unsigned>((SEISMIC_DIM_E + 31ull) / 32ull);
+    __shared__ unsigned last;
+    unsigned *arrivals = reinterpret_cast<unsigned *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_ARRIVALS));
+    if (!arrive::last(arrivals, ordered_tiles, &last))
         return;
+    const float *logits = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS));
+    const float *bias = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_BIAS));
+    const float *expert_scale = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_SCALE));
+    int *routes = reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));
+    const auto weights = SEISMIC_OUT_WEIGHTS;
+    for (unsigned row = threadIdx.x / 32; row < m; row += blockDim.x / 32) {
+        const float *row_logits = logits + static_cast<unsigned long long>(row) * SEISMIC_DIM_E;
+        select_row(row, [&](unsigned e) { return __ldcg(row_logits + e); }, bias, expert_scale, routes, weights,
+                   seismic_words_value);
     }
-    const unsigned lead = (blockIdx.x - COLUMN_GROUPS) / NEXT_GROUPS;
-    const unsigned group = (blockIdx.x - COLUMN_GROUPS) % NEXT_GROUPS;
-    if (lead == 0)
-        select_columns<NEXT_EXPERTS>(residual, inverses, next_router_norm, SEISMIC_NEXT_ROUTER_NORM_STRIDE_0,
-                                     next_router, SEISMIC_NEXT_ROUTER_STRIDE_0, norm, nullptr,
-                                     logits + predicted_at(0, seismic_words_value), group, staged, seismic_words_value);
-    else
-        select_columns<NEXT_EXPERTS>(residual, inverses, after_router_norm, SEISMIC_AFTER_ROUTER_NORM_STRIDE_0,
-                                     after_router, SEISMIC_AFTER_ROUTER_STRIDE_0, norm, nullptr,
-                                     logits + predicted_at(1, seismic_words_value), group, staged, seismic_words_value);
-}
-
-// Block 1 + `lead` of a select launch: the hints of the layer `lead` + 1
-// ahead, by its selection bias (`bias`, of stride `bias_stride`), through
-// its group words (`STREAMING_HINT_WORDS`) into the lead's ring row.
-__device__ __forceinline__ void hint_block(const float *logits, unsigned lead, const float *bias,
-                                           unsigned long long bias_stride, int *rings, int sequence, int *words,
-                                           const seismic_words_t &seismic_words_value) {
-    constexpr unsigned K = SEISMIC_DIM_K;
-    const unsigned lane = threadIdx.x % 32;
-    const float *predicted = logits + predicted_at(lead, seismic_words_value);
-    const unsigned rows = static_cast<unsigned>(SEISMIC_DIM_M);
-    for (unsigned row = threadIdx.x / 32; row < rows; row += blockDim.x / 32) {
-        const select::Selected<K> selected = select::rank_row<NEXT_EXPERTS, K>(
-            static_cast<int>(SEISMIC_PARAM_SCORE),
-            [&](unsigned expert) { return select_logit<NEXT_EXPERTS>(predicted, row, expert, seismic_words_value); },
-            [&](int expert) { return bias[static_cast<unsigned long long>(expert) * bias_stride]; },
-            lane);
-        if (lane == 0)
-            for (unsigned r = 0; r < K; ++r)
-                words[STREAMING_HINT_CHOSEN(row) + r] = selected.winners[K - 1 - r];
-    }
-    streaming_hint(rows, rings + lead * SEISMIC_RINGS_STRIDE_0, SEISMIC_RINGS_STRIDE_1, sequence, words,
-                   threadIdx.x, blockDim.x);
-}
-
-// The ports both select launches read.
-#define ROUTED_SELECT_PORTS                                                                                        \
-    const float *bias = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_BIAS));                         \
-    const float *expert_scale = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_SCALE));         \
-    int *routes = reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));                                     \
-    const element::Out<element::F32> weights = SEISMIC_OUT_WEIGHTS;                                                \
-    const int *step = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_STEP));                             \
-    const float *next_bias = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_NEXT_BIAS));               \
-    const float *after_bias = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_AFTER_BIAS));             \
-    int *rings = reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_BUFFER_RINGS));                                       \
-    const float *logits = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS));             \
-    const unsigned warp = threadIdx.x / 32;                                                                        \
-    const unsigned rows = static_cast<unsigned>(SEISMIC_DIM_M)
-
-// Block 0 selects every row, then resolves and assigns (WHOLE: its hits and
-// routing record alone); block 1 + lead publishes the lead's hints. In each kernel's
-// own scope, where its ports are.
-#define ROUTED_SELECT_STREAMED(WHOLE)                                                                              \
-    ROUTED_SELECT_PORTS;                                                                                           \
-    __shared__ int words[SELECT_WORDS];                                                                            \
-    if (blockIdx.x >= 1) {                                                                                         \
-        const unsigned lead = blockIdx.x - 1;                                                                      \
-        hint_block(logits, lead, lead == 0 ? next_bias : after_bias,                                               \
-            lead == 0 ? SEISMIC_NEXT_BIAS_STRIDE_0 : SEISMIC_AFTER_BIAS_STRIDE_0, rings, step[0], words,           \
-            seismic_words_value);                                                                                  \
-        return;                                                                                                    \
-    }                                                                                                              \
-    if (warp < rows)                                                                                               \
-        select_row(warp, logits, bias, expert_scale, routes, weights, seismic_words_value);             \
-    /* Resolve: the selection's routes are this block's own stores. */                                             \
-    routed_resolve(ROUTED_RESOLVE_PORTS, (WHOLE), words, seismic_words_value)
-
-extern "C" __global__ void routed_select_streamed_select(SEISMIC_KERNEL_PARAMS) {
-    ROUTED_SELECT_STREAMED(false);
-}
-
-extern "C" __global__ void routed_select_whole(SEISMIC_KERNEL_PARAMS) {
-    ROUTED_SELECT_STREAMED(true);
+    int *words = reinterpret_cast<int *>(dynamic_shared);
+    const ResolvePorts bank = ROUTED_RESOLVE_PORTS;
+    const bool whole =
+        streaming_load(STREAMING_AT(bank.policy, SEISMIC_CONST_POLICY_WHOLE * SEISMIC_POLICY_STRIDE_0)) != 0;
+    routed_resolve(bank, whole, words, seismic_words_value);
 }

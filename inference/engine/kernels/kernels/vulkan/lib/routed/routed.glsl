@@ -4,7 +4,7 @@
 // `metal/lib/routed/routed.h` (the grouped-row prologue is
 // `projection_grouped`). An expert-stacked weight is a record port, bound as
 // its records' address table, and an expert's weights are rows 0.. of its
-// record's base (`slab_region(table, record)`).
+// record's base (`slab_experts_matrix`, the record a `slab_source` names).
 #include <seismic/slab.glsl>
 #include "../projection/projection.glsl"
 
@@ -19,37 +19,24 @@ projection_weights routed_record_weights(uint64_t table, uint64_t record, packet
     return routed_weights(slab_region(table, record), geometry, 0ul, k);
 }
 
-// An expert's weights of an expert-stacked weight at resolved `slot`
-// (`EXPERTS_SLOT`, not -1): record `slot` of the table at `records`
-// (`slot` >= 0), or record -2 - `slot` of the table at `experts` (`slot` <= -2).
-projection_weights routed_expert_weights(uint64_t records, uint64_t experts, int slot,
-    packets_rows16 geometry, uint k) {
-    if (slot >= 0)
-        return routed_record_weights(records, uint64_t(slot), geometry, k);
-    return routed_record_weights(experts, uint64_t(-2 - slot), geometry, k);
-}
-
-// The record choice (m, k), of expert `expert`, of a decode expert entry
+// The source choice (m, k), of expert `expert`, of a decode expert entry
 // reads its weights from (`decode_source`, routed.seismic): the expert
 // itself without sources (`rows` 0, a resident layer), else the step's
 // snapshot (`sources`, SOURCE_RECORD of its [SOURCE_ROWS, M, K] at strides
-// `stride0`..`stride2`): a bank record >= 0, a host tier record t as
-// -2 - t, or -1 for none (a choice the CPU computes, or a failed one), of
-// which the device computes nothing.
-int routed_decode_source(uint64_t sources, uint64_t rows, uint64_t stride0, uint64_t stride1, uint64_t stride2,
-    uint64_t m, uint64_t k, int expert) {
+// `stride0`..`stride2`): a bank record, a host tier record (the secondary
+// table, read in place over the link), or none (a choice the CPU computes,
+// or a failed one), of which the device computes nothing.
+slab_source routed_decode_source(uint64_t sources, uint64_t rows, uint64_t stride0, uint64_t stride1,
+    uint64_t stride2, uint64_t m, uint64_t k, int expert) {
     if (rows == 0ul)
-        return expert;
-    return element_i32_at(sources + (SEISMIC_CONST_SOURCE_RECORD * stride0 + m * stride1 + k * stride2) * 4ul);
+        return slab_source(expert);
+    return slab_source(
+        element_i32_at(sources + (SEISMIC_CONST_SOURCE_RECORD * stride0 + m * stride1 + k * stride2) * 4ul));
 }
 
-// The weights a decode choice of source record `source` (`routed_decode_source`,
-// not -1) reads of an expert-stacked weight: its bank record of the record
-// table at `bank`, or its host tier record -2 - source of the record table at
-// `tier`, read in place over the link.
-projection_weights routed_source_weights(uint64_t bank, uint64_t tier, int source, packets_rows16 geometry, uint k) {
-    return source >= 0 ? routed_record_weights(bank, uint64_t(source), geometry, k)
-                       : routed_record_weights(tier, uint64_t(-2 - source), geometry, k);
+// The weights of an expert's matrix where `source` (not none) names it.
+projection_weights routed_expert_matrix(slab_experts experts, slab_source source, packets_rows16 geometry, uint k) {
+    return routed_weights(slab_experts_matrix(experts, source), geometry, 0ul, k);
 }
 
 // The gathered decode form's tables (`routed_gather`): ROUTED_GATHER_WORDS
@@ -87,6 +74,22 @@ void routed_gather(uint64_t routes, uint64_t routes0, uint64_t routes1, uint row
         }
         element_i32_put(at, int(count));
     }
+}
+
+// The GEMV rows of choice `choice` in the tables at `table`
+// (`routed_gather`): their count (0 where it is not its expert's first
+// choice), the table of their activation rows and that of their products'
+// element offsets.
+struct routed_gathered_rows {
+    uint count;
+    uint64_t rows;
+    uint64_t outputs;
+};
+
+routed_gathered_rows routed_gathered(uint64_t table, uint choice) {
+    const uint64_t at = table + uint64_t(choice) * ROUTED_GATHER_WORDS * 4ul;
+    return routed_gathered_rows(uint(element_i32_at(at)), at + 4ul,
+        at + (1ul + uint64_t(SEISMIC_CONST_VERIFY_ROWS)) * 4ul);
 }
 
 // Zeroes features [first, first + count) of `features` of each of the epilogue's

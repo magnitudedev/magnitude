@@ -94,94 +94,35 @@ native routed_land for cuda from "cuda/routed_land.cu":
         threads_per_threadgroup (WINDOW_THREADS, 1, 1)
         shared_bytes (min(V, 1) * max(packed(UG), max(packed(UU), packed(UD))) * MIRROR_BYTES)
 
-# Metal's launches over `routed_select`'s CUDA decode launches and
-# parameters (so its bits, `cuda/lib/routed/selection.cuh`): the GEMV adds
-# AHEAD times ceil(EN / SIMDGROUPS) blocks, per lead (one layer ahead,
-# then two), for that layer's [SPLIT, M, EN] partial logits;
-# block 0 of the select launch selects, resolves and assigns
-# (`streaming/resolve.hpp`), or of a whole layer
-# (`routed_select_whole`) resolves its hits and writes the routing record; block 1 + lead ranks the lead's layer's rows
-# (`select::rank_row`) and publishes the hints into the lead's ring row
-# (`streaming/hint.hpp`).
 native routed_select_streamed for cuda from "cuda/routed_select_streamed.cu":
-    static (H, E, K, ES, AHEAD, EN, TM)
-    params (SIMDGROUPS in [8, 4, 2] default 8, arithmetic SPLIT in [8, 4, 16] default 8)
-    where H % 32 == 0 and E <= 1024 and K <= E and EN <= 1024 and K <= EN
-    scratch logits bytes ((M * E + AHEAD * M * EN) * SPLIT * 4)
-    launch routed_select_streamed_gemv:
-        threadgroups (ceil_div(E, SIMDGROUPS) + AHEAD * ceil_div(EN, SIMDGROUPS), 1, SPLIT)
-        unless (next_policy[POLICY_RESOLVED])
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-    launch routed_select_streamed_gemv:
-        threadgroups (ceil_div(E, SIMDGROUPS), 1, SPLIT)
-        if (next_policy[POLICY_RESOLVED])
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-    launch routed_select_streamed_select:
-        threadgroups (1 + AHEAD, 1, 1)
-        unless (policy[POLICY_WHOLE])
-        unless (next_policy[POLICY_RESOLVED])
-        threads_per_threadgroup (256, 1, 1)
-    launch routed_select_streamed_select:
-        threadgroups (1, 1, 1)
-        unless (policy[POLICY_WHOLE])
-        if (next_policy[POLICY_RESOLVED])
-        threads_per_threadgroup (256, 1, 1)
-    launch routed_select_whole:
-        threadgroups (1 + AHEAD, 1, 1)
-        if (policy[POLICY_WHOLE])
-        unless (next_policy[POLICY_RESOLVED])
-        threads_per_threadgroup (256, 1, 1)
-    launch routed_select_whole:
-        threadgroups (1, 1, 1)
-        if (policy[POLICY_WHOLE])
-        if (next_policy[POLICY_RESOLVED])
-        threads_per_threadgroup (256, 1, 1)
+    static (H, E, K, ES, TM)
+    where H % 32 == 0 and E <= 1024 and K <= E and K <= 32
+    project dense single (router) rows rms ordered (router)
+    scratch logits bytes (M * E * 4)
+    scratch arrivals bytes (4) sync
 
-# `routed_route_shared`'s launch and parameters (so its bits): its router
-# blocks, then with layers ahead (AHEAD 2), while the next layer may lack
-# an expert (its POLICY_RESOLVED clear), the router GEMV blocks of the next layer and of the one after it over EN experts each
-# (`cuda/lib/routed/route.cuh`),
-# dispatched before the shared expert's blocks, each lead's last to arrive ranks
-# its rows (`route::rank_row`) and publishes the hints into the lead's ring row
-# (`streaming/hint.hpp`); the groups count their arrivals
-# apart and none waits for another. Metal's four launches, by this layer's
-# POLICY_WHOLE and the next layer's POLICY_RESOLVED words, each compiled with only its own work:
-# `routed_route_streamed` (`_alone` without the hints) resolves and assigns
-# in its selecting block (`streaming/resolve.hpp`); `routed_route_whole`
-# (`_alone`) writes the routing record from its selecting lanes.
+native routed_hint_select for cuda from "cuda/routed_hint_select.cu":
+    static (H, K, AHEAD, EN)
+    where H % 32 == 0 and EN <= 1024 and K <= EN and K <= 32
+    project dense segmented (next_router, after_router) rows rms ordered (next_router, after_router)
+    unless (next_policy[POLICY_RESOLVED])
+    scratch logits bytes (2 * M * EN * 4)
+    scratch arrivals bytes (4) sync
+
 native routed_route_streamed for cuda from "cuda/routed_route_streamed.cu":
-    static (H, PT, NM, E, K, S, ES, AHEAD, EN, TM)
-    params (SIMDGROUPS in [8, 4, 2] default 8, TPW in [1, 2] default 1, arithmetic KSPLIT in [1, 2, 4] default 1)
-    where H % 64 == 0 and E <= 1024 and EN <= 1024 and K <= 32 and SIMDGROUPS % KSPLIT == 0
-    scratch logits bytes ((M * (E + 1) + AHEAD * M * (EN + 1)) * 4)
-    scratch arrivals bytes (4 * (1 + AHEAD)) sync
-    launch routed_route_streamed:
-        threadgroups (ceil_div(E + 1, SIMDGROUPS) + AHEAD * ceil_div(EN, SIMDGROUPS) + ceil_div(ceil_div(S, 16), TPW), 1, 1)
-        unless (policy[POLICY_WHOLE])
-        unless (next_policy[POLICY_RESOLVED])
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (M * H * 2)
-    launch routed_route_streamed_alone:
-        alike (routed_route_streamed)
-        threadgroups (ceil_div(E + 1, SIMDGROUPS) + ceil_div(ceil_div(S, 16), TPW), 1, 1)
-        unless (policy[POLICY_WHOLE])
-        if (next_policy[POLICY_RESOLVED])
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (M * H * 2)
-    launch routed_route_whole:
-        alike (routed_route_streamed)
-        threadgroups (ceil_div(E + 1, SIMDGROUPS) + AHEAD * ceil_div(EN, SIMDGROUPS) + ceil_div(ceil_div(S, 16), TPW), 1, 1)
-        if (policy[POLICY_WHOLE])
-        unless (next_policy[POLICY_RESOLVED])
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (M * H * 2)
-    launch routed_route_whole_alone:
-        alike (routed_route_streamed)
-        threadgroups (ceil_div(E + 1, SIMDGROUPS) + ceil_div(ceil_div(S, 16), TPW), 1, 1)
-        if (policy[POLICY_WHOLE])
-        if (next_policy[POLICY_RESOLVED])
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (M * H * 2)
+    static (H, PT, NM, E, K, S, ES, TM)
+    where H % 64 == 0 and E <= 1024 and K <= 32
+    project dense segmented (router, shared_router, (shared_gate, shared_up)) rows rms publishes (result 0) ordered (router, shared_router)
+    scratch logits bytes (M * (E + 1) * 4)
+    scratch arrivals bytes (4) sync
+
+native routed_hint_route for cuda from "cuda/routed_hint_route.cu":
+    static (H, PT, NM, K, AHEAD, EN)
+    where H % 32 == 0 and EN <= 1024 and K <= 32
+    project dense segmented (next_router, after_router) rows rms ordered (next_router, after_router)
+    unless (next_policy[POLICY_RESOLVED])
+    scratch logits bytes (2 * M * EN * 4)
+    scratch arrivals bytes (4) sync
 
 # One block reads the list's count, then commits after a system-scope fence.
 native routed_seed_commit for cuda from "cuda/routed_seed_commit.cu":
@@ -201,24 +142,8 @@ native routed_site_request for cuda from "cuda/routed_site_request.cu":
 # publishing into the result.
 native routed_down_project for cuda from "cuda/routed_down_project.cu":
     static (H, K, F)
-    params (TPW in [1, 2] default 1, arithmetic KSPLIT in [1, 2, 4] default 1)
     records (expert_down, tier_down)
-    where F % 64 == 0
-    scratch operands bytes (M * K * F * 2) when M > 1 and operands(EDW) == 1
-    launch routed_down when M == 1:
-        reads (TPW, KSPLIT)
-        threadgroups (ceil_div(ceil_div(ceil_div(H, 16), TPW), 4 / KSPLIT), M * K, 1)
-        threads_per_threadgroup (128, 1, 1)
-        shared_bytes (operands(EDW) * F * 2)
-    launch routed_down_stage when M > 1 and operands(EDW) == 1:
-        staging
-        threadgroups (M * K, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch routed_down_gathered when M > 1:
-        reads (TPW, KSPLIT)
-        alike (routed_down)
-        threadgroups (ceil_div(ceil_div(ceil_div(H, 16), TPW), 4 / KSPLIT), M * K, 1)
-        threads_per_threadgroup (128, 1, 1)
+    project routed summed (expert_down)
 
 # CUDA: `routed_down`'s combine launch (`lib/routed/down_sum.cuh`), its
 # block's thread 0 spinning on the CPU's answer before the slot-order sum.
@@ -232,24 +157,8 @@ native routed_down_sited for cuda from "cuda/routed_down_sited.cu":
 # publishing into the result, no block combining.
 native routed_output_project for cuda from "cuda/routed_output_project.cu":
     static (H, K, F, S)
-    params (TPW in [1, 2] default 1, arithmetic KSPLIT in [1, 2, 4] default 1)
     records (expert_down, tier_down)
-    where F % 64 == 0 and S % 64 == 0
-    scratch expert_operands bytes (M * K * F * 2) when operands(EDW) == 1
-    scratch shared_operands bytes (M * S * 2) when operands(SDW) == 1
-    launch routed_output_stage when operands(EDW) + operands(SDW) > 0:
-        staging
-        threadgroups (M * (K + 1), 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch routed_output when M == 1:
-        reads (TPW, KSPLIT)
-        threadgroups (ceil_div(ceil_div(ceil_div(H, 16), TPW), 4 / KSPLIT), M * (K + 1), 1)
-        threads_per_threadgroup (128, 1, 1)
-    launch routed_output_gathered when M > 1:
-        reads (TPW, KSPLIT)
-        alike (routed_output)
-        threadgroups (ceil_div(ceil_div(ceil_div(H, 16), TPW), 4 / KSPLIT), M * (K + 1), 1)
-        threads_per_threadgroup (128, 1, 1)
+    project routed summed (expert_down) shared (shared_down)
 
 # CUDA: a thread a channel of a row (`lib/routed/output_sum.cuh`), its
 # block's thread 0 spinning on the CPU's answer before it joins.

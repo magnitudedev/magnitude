@@ -6,6 +6,7 @@
 //! Super).
 
 mod common;
+mod mapped;
 
 use magnitude_kernels::{
     constants, routed_down, routed_experts, routed_experts_up, routed_gate_up, routed_group,
@@ -20,6 +21,7 @@ use seismic_lang::{
     registry,
     types::DType,
 };
+use mapped::Mapped;
 
 mod streaming_words;
 
@@ -28,6 +30,7 @@ use streaming_words::{map_words, step_words};
 fn module() -> CheckedModule {
     let mut sources = seismic_std::sources();
     for (path, text) in [
+        ("dense.seismic", include_str!("../kernels/dense.seismic")),
         ("routed.seismic", include_str!("../kernels/routed.seismic")),
         (
             "streaming_words.seismic",
@@ -240,14 +243,11 @@ fn specialization(
     })
 }
 
-/// The route's tuning parameters on `device`.
+/// The route's tuning parameters on `device` (the CPU's router rows split
+/// over the pool, `device.units`, so it has none).
 fn select_mappings(device: &seismic::Device) -> Vec<Vec<(&'static str, u64)>> {
     match device.backend() {
-        seismic::BackendName::Cuda => vec![
-            vec![("SIMDGROUPS", 8), ("SPLIT", 8)],
-            vec![("SIMDGROUPS", 2), ("SPLIT", 4)],
-        ],
-        seismic::BackendName::Cpu => vec![vec![("ROWS", 8)], vec![("ROWS", 1)]],
+        seismic::BackendName::Cuda | seismic::BackendName::Cpu => vec![vec![]],
         _ => vec![vec![("SIMDGROUPS", 8)], vec![("SIMDGROUPS", 2)]],
     }
 }
@@ -1605,8 +1605,9 @@ fn decode_mappings(device: &seismic::Device) -> Vec<Vec<(&'static str, u64)>> {
 
 /// The mapping of `routed_down` beside decode mapping `index` at `statics`:
 /// Metal tiles its channels itself (ROWS channels per lane group of LANES
-/// lanes), from the configurations its declaration admits there; elsewhere
-/// the expansion's mapping.
+/// lanes), from the configurations its declaration admits there in the
+/// form `decode_specialization` gives it at `index`; elsewhere the
+/// expansion's mapping.
 fn down_mapping(
     device: &seismic::Device,
     index: usize,
@@ -1624,7 +1625,8 @@ fn down_mapping(
             let admissible = [(2u64, 16u64), (4, 32), (1, 16), (8, 16), (1, 32)]
                 .into_iter()
                 .filter(|&(rows, lanes)| {
-                    let candidate = specialization(device, statics, &[("ROWS", rows), ("LANES", lanes)]);
+                    let candidate =
+                        decode_specialization(device, &entry, index, statics, &[("ROWS", rows), ("LANES", lanes)], false);
                     entry.specialization_valid(device, &candidate).unwrap()
                 })
                 .collect::<Vec<_>>();
@@ -1709,11 +1711,11 @@ fn expert_specialization<E: seismic::Entry>(
     }
 }
 
-/// `expert_specialization` of decode expansion `entry` (`routed_gate_up`,
-/// `routed_up`) at mapping `index`: where its native declares a gathered
+/// `expert_specialization` of decode `entry` (`routed_gate_up`, `routed_up`,
+/// `routed_down`) at mapping `index`: where its native declares a gathered
 /// form, the form alternates, per-choice (`GATHERED` 0) then gathered, so
 /// the mappings cover both forms; a native of one form is as it is.
-fn expansion_specialization<E: seismic::Entry>(
+fn decode_specialization<E: seismic::Entry>(
     device: &seismic::Device,
     entry: &seismic::BoundEntry<E>,
     index: usize,
@@ -1729,21 +1731,83 @@ fn expansion_specialization<E: seismic::Entry>(
     }
 }
 
-/// `expert_specialization` of grouped `entry` (`routed_experts`,
-/// `routed_experts_up`); CUDA's also takes its activation operand.
-fn grouped_specialization<E: seismic::Entry>(
-    device: &seismic::Device,
-    entry: &seismic::BoundEntry<E>,
-    statics: &[(&str, usize)],
-    mapping: &[(&'static str, u64)],
-    int8: bool,
-) -> seismic::NativeSpecialization {
-    let specialization = expert_specialization(device, entry, statics, mapping, int8);
-    if device.backend() == seismic::BackendName::Cuda {
-        specialization.with_param("OPERAND", 0)
-    } else {
-        specialization
+/// A form of the grouped expert entries: the parameters that select it over
+/// the declaration's defaults (none: the default form), and whether it
+/// quantizes a GEMM's operand rows, which holds its results to the tuner's
+/// output-norm guard (as the CPU's INT8 arithmetic, [`assert_outcome`]).
+#[derive(Clone, Debug, Default)]
+struct GroupedForm {
+    params: Vec<(&'static str, u64)>,
+    quantized: bool,
+}
+
+/// The grouped expert entries' forms on `device`, the default first, then
+/// each of one GEMM with the other's at its default: Metal's (dense's) tall
+/// tiles, INT8 and PACK of the expansion, then of the down GEMM (`DOWN_`),
+/// INT8 and PACK on the tall tiles; CUDA's and the CPU's INT8, which takes
+/// both GEMMs. The GPUs' INT8 and PACK take packed weights alone, so these
+/// BF16 experts take none of them.
+fn grouped_forms(device: &seismic::Device) -> Vec<GroupedForm> {
+    fn form(params: &[(&'static str, u64)], quantized: bool) -> GroupedForm {
+        GroupedForm {
+            params: params.to_vec(),
+            quantized,
+        }
     }
+    let forms: Vec<GroupedForm> = match device.backend() {
+        seismic::BackendName::Metal => [("TALL", "INT8", "PACK"), ("DOWN_TALL", "DOWN_INT8", "DOWN_PACK")]
+            .into_iter()
+            .flat_map(|(tall, int8, pack)| {
+                [
+                    form(&[(tall, 1)], false),
+                    form(&[(tall, 1), (int8, 1)], true),
+                    form(&[(tall, 1), (pack, 1)], true),
+                ]
+            })
+            .collect(),
+        seismic::BackendName::Cuda | seismic::BackendName::Cpu => vec![form(&[("INT8", 1)], true)],
+        seismic::BackendName::Vulkan => Vec::new(),
+    };
+    std::iter::once(GroupedForm::default()).chain(forms).collect()
+}
+
+/// A grouped expert entry's configuration: a mapping and a form.
+#[derive(Clone, Copy)]
+struct Grouped<'a> {
+    mapping: &'a [(&'static str, u64)],
+    form: &'a GroupedForm,
+}
+
+/// Grouped expert entry `entry` (`routed_experts`, `routed_experts_up`)
+/// under the specialization each configuration gives it on a device
+/// ([`Mapped`]): `statics` with the block rows `T` ([`TILE`]) where its
+/// native declares them, the configuration's mapping and form, CUDA's
+/// activation operand off (`OPERAND` 0), the rest at their declared
+/// defaults.
+fn grouped_entry<E: seismic::Entry>(
+    entry: seismic::BoundEntry<E>,
+    statics: Vec<(&'static str, usize)>,
+) -> Mapped<E, impl for<'a, 'b> Fn(&'a seismic::Device, Grouped<'b>) -> seismic::NativeSpecialization> {
+    Mapped::new(entry, move |device: &seismic::Device, configuration: Grouped<'_>| {
+        let implementation = seismic::generated::native_implementation::<E>(device)
+            .unwrap()
+            .unwrap();
+        let rows = implementation
+            .statics
+            .iter()
+            .any(|name| name == "T")
+            .then_some(("T", TILE));
+        let statics = statics.iter().copied().chain(rows).collect::<Vec<_>>();
+        let operand = (device.backend() == seismic::BackendName::Cuda).then_some(("OPERAND", 0));
+        let params = configuration
+            .mapping
+            .iter()
+            .copied()
+            .chain(operand)
+            .chain(configuration.form.params.iter().copied())
+            .collect::<Vec<_>>();
+        specialization(device, &statics, &params)
+    })
 }
 
 /// The device tensors of an `ExpertBlock` (`gate`: the gate rows of gated
@@ -2043,13 +2107,13 @@ fn native_decode_experts_match_host_reference_at_catalog_shapes() {
                                 let gated_statics =
                                     [expansion_statics.as_slice(), &[("LB", shape.limit_word())]].concat();
                                 let specialization =
-                                    expansion_specialization(device, &entry, index, &gated_statics, &mapping, int8);
+                                    decode_specialization(device, &entry, index, &gated_statics, &mapping, int8);
                                 DecodeExpansion::Gated(entry.prepare(device, &specialization).unwrap())
                             }
                             None => {
                                 let entry = routed_up::native_entry_with(routed_up::Elements { A: bf16, EUW: bf16 });
                                 let specialization =
-                                    expansion_specialization(device, &entry, index, &expansion_statics, &mapping, int8);
+                                    decode_specialization(device, &entry, index, &expansion_statics, &mapping, int8);
                                 DecodeExpansion::Up(entry.prepare(device, &specialization).unwrap())
                             }
                         };
@@ -2082,7 +2146,7 @@ fn native_decode_experts_match_host_reference_at_catalog_shapes() {
                                 R: element(published),
                             });
                             entry
-                                .prepare(device, &expert_specialization(device, &entry, &statics, &down, int8))
+                                .prepare(device, &decode_specialization(device, &entry, index, &statics, &down, int8))
                                 .unwrap()
                         };
                         let project = |native: &seismic::NativeKernel<routed_down::Entry>,
@@ -2260,150 +2324,174 @@ fn native_grouped_experts_match_host_reference_at_catalog_shapes() {
             assert_eq!(read_i32(&native_inverse), inverse, "{label} inverse");
             assert_eq!(read_i32(&native_table)[..live], table[..live], "{label} blocks");
             let normalized = tensor(device, DType::BF16, &[m, h], &case.normalized);
-            for mapping in grouped_mappings(device) {
-                for int8 in arithmetic_variants(device) {
-                    let label = format!("{label} {mapping:?} INT8 {int8}");
-                    let grouped_statics = [[("H", h), ("F", f)].as_slice(), &block.scale_statics()].concat();
-                    let gated_statics = [grouped_statics.as_slice(), &[("LB", shape.limit_word())]].concat();
-                    let glu_limit = i32_tensor(device, &[0, shape.limit_word()], &[]);
-                    // The grouped pass writing into `output`, with its experts
-                    // placed by `map` at `step` in `records` (slot >= 0) or
-                    // `scratch` (slot <= -2, else `experts` when unmapped), and
-                    // skipped when `held` returns -1.
-                    let pass_into = |map: &seismic::Tensor,
-                                     step: &seismic::Tensor,
-                                     scratch: [Option<&seismic::Tensor>; 3],
-                                     records: [Option<&seismic::Tensor>; 3],
-                                     output: &mut seismic::Tensor| match &experts.gate {
-                        Some(gate) => {
-                            let entry = routed_experts::native_entry_with(routed_experts::Elements {
-                                A: bf16,
-                                EGW: bf16,
-                                EUW: bf16,
-                                EDW: bf16,
-                            });
-                            entry
-                                .prepare(device, &grouped_specialization(device, &entry, &gated_statics, &mapping, int8))
-                                .unwrap()
-                                .call_into(
-                                    routed_experts::Args {
-                                        first: &first,
-                                        rows: &grouped_rows,
-                                        normalized: &normalized,
-                                        order: &native_order,
-                                        blocks: &native_table,
-                                        used: &used,
-                                        expert_gate: scratch[0].unwrap_or(gate),
-                                        expert_up: scratch[1].unwrap_or(&experts.up),
-                                        expert_down: scratch[2].unwrap_or(&experts.down),
-                                        map,
-                                        step,
-                                        records_gate: records[0].unwrap_or(gate),
-                                        records_up: records[1].unwrap_or(&experts.up),
-                                        records_down: records[2].unwrap_or(&experts.down),
-                                        activation: shape.activation,
-                                        gate_scale: &experts.gate_scale,
-                                        up_scale: &experts.up_scale,
-                                        glu_limit: &glu_limit,
-                                    },
-                                    routed_experts::OutputArgs { value: output },
-                                )
-                                .unwrap();
-                        }
-                        None => {
-                            let entry = routed_experts_up::native_entry_with(routed_experts_up::Elements {
-                                A: bf16,
-                                EUW: bf16,
-                                EDW: bf16,
-                            });
-                            entry
-                                .prepare(device, &grouped_specialization(device, &entry, &grouped_statics, &mapping, int8))
-                                .unwrap()
-                                .call_into(
-                                    routed_experts_up::Args {
-                                        first: &first,
-                                        rows: &grouped_rows,
-                                        normalized: &normalized,
-                                        order: &native_order,
-                                        blocks: &native_table,
-                                        used: &used,
-                                        expert_up: scratch[1].unwrap_or(&experts.up),
-                                        expert_down: scratch[2].unwrap_or(&experts.down),
-                                        map,
-                                        step,
-                                        records_up: records[1].unwrap_or(&experts.up),
-                                        records_down: records[2].unwrap_or(&experts.down),
-                                        up_scale: &experts.up_scale,
-                                        activation: shape.activation,
-                                    },
-                                    routed_experts_up::OutputArgs { value: output },
-                                )
-                                .unwrap();
-                        }
-                    };
-                    let mut grouped = tensor(device, DType::BF16, &[b, TILE, h], &vec![0.0; b * TILE * h]);
-                    pass_into(&no_map, &no_step, [None; 3], [None; 3], &mut grouped);
-                    // Two windows into one persistent output: window 0 serves
-                    // bank records and skips the rest; window 1 skips the bank
-                    // half (preserving window 0's rows) and serves scratch
-                    // slots `-2 - s` from a narrower `[E - mapped, ...]` stack.
-                    let mut mapped = tensor(device, DType::BF16, &[b, TILE, h], &vec![-9.0; b * TILE * h]);
-                    for window_map in &placed.maps {
-                        pass_into(
-                            window_map,
-                            &placed.step,
-                            [placed.scratch_gate.as_ref(), Some(&placed.scratch_up), Some(&placed.scratch_down)],
-                            [placed.gate.as_ref(), Some(&placed.up), Some(&placed.down)],
-                            &mut mapped,
-                        );
-                    }
-                    assert_eq!(
-                        gather_rows(&read_activation(&mapped, DType::BF16), &inverse, h)
-                            .iter()
-                            .map(|value| value.to_bits())
-                            .collect::<Vec<_>>(),
-                        gather_rows(&read_activation(&grouped, DType::BF16), &inverse, h)
-                            .iter()
-                            .map(|value| value.to_bits())
-                            .collect::<Vec<_>>(),
-                        "{label} through a slot map"
-                    );
-                    let rows = gather_rows(&read_activation(&grouped, DType::BF16), &inverse, h);
-                    // `routed_experts` forms A(act(gate) * up) unrounded on the
-                    // CPU (as its portable body and Qwen's CPU bits), while the
-                    // reference rounds gate and up (the GPU forms): each of the
-                    // F down terms differs by up to a BF16 ulp of its product.
-                    let absolute = if shape.gated { 1e-2 } else { 2e-3 };
-                    assert_outcome(
-                        &format!("{label} grouped"),
-                        &rows,
-                        &case.published,
-                        int8,
-                        2e-2,
-                        absolute,
-                    );
-                    for (published, base, expected) in published_forms(&shape, &case) {
-                        let output = routed_scatter::native_for_device_with(
-                            device,
-                            routed_scatter::Elements {
-                                A: bf16,
-                                R: element(published),
+            let grouped_statics = [[("H", h), ("F", f)].as_slice(), &block.scale_statics()].concat();
+            let gated_statics = [grouped_statics.as_slice(), &[("LB", shape.limit_word())]].concat();
+            let gated_entry = grouped_entry(
+                routed_experts::native_entry_with(routed_experts::Elements {
+                    A: bf16,
+                    EGW: bf16,
+                    EUW: bf16,
+                    EDW: bf16,
+                }),
+                gated_statics,
+            );
+            let up_entry = grouped_entry(
+                routed_experts_up::native_entry_with(routed_experts_up::Elements {
+                    A: bf16,
+                    EUW: bf16,
+                    EDW: bf16,
+                }),
+                grouped_statics,
+            );
+            let glu_limit = i32_tensor(device, &[0, shape.limit_word()], &[]);
+            // Every mapping in the default form, then each other form at the
+            // first mapping: a form's launches are its own, and its other
+            // GEMM's the default's, which every mapping runs.
+            let (mappings, forms) = (grouped_mappings(device), grouped_forms(device));
+            let candidates = mappings
+                .iter()
+                .map(|mapping| Grouped {
+                    mapping: mapping.as_slice(),
+                    form: &forms[0],
+                })
+                .chain(forms[1..].iter().map(|form| Grouped {
+                    mapping: mappings[0].as_slice(),
+                    form,
+                }));
+            let name = match &experts.gate {
+                Some(_) => "routed_experts",
+                None => "routed_experts_up",
+            };
+            for configuration in mapped::admitted(name, candidates, |configuration| match &experts.gate {
+                Some(_) => gated_entry.admits(device, *configuration),
+                None => up_entry.admits(device, *configuration),
+            }) {
+                let label = format!("{label} {:?} {:?}", configuration.mapping, configuration.form.params);
+                // The grouped pass writing into `output`, with its experts
+                // placed by `map` at `step` in `records` (slot >= 0) or
+                // `scratch` (slot <= -2, else `experts` when unmapped), and
+                // skipped when `held` returns -1.
+                let pass_into = |map: &seismic::Tensor,
+                                 step: &seismic::Tensor,
+                                 scratch: [Option<&seismic::Tensor>; 3],
+                                 records: [Option<&seismic::Tensor>; 3],
+                                 output: &mut seismic::Tensor| match &experts.gate {
+                    Some(gate) => {
+                        gated_entry
+                        .kernel(device, configuration)
+                        .call_into(
+                            routed_experts::Args {
+                                first: &first,
+                                rows: &grouped_rows,
+                                normalized: &normalized,
+                                order: &native_order,
+                                blocks: &native_table,
+                                used: &used,
+                                expert_gate: scratch[0].unwrap_or(gate),
+                                expert_up: scratch[1].unwrap_or(&experts.up),
+                                expert_down: scratch[2].unwrap_or(&experts.down),
+                                map,
+                                step,
+                                records_gate: records[0].unwrap_or(gate),
+                                records_up: records[1].unwrap_or(&experts.up),
+                                records_down: records[2].unwrap_or(&experts.down),
+                                activation: shape.activation,
+                                gate_scale: &experts.gate_scale,
+                                up_scale: &experts.up_scale,
+                                glu_limit: &glu_limit,
                             },
-                            &seismic::NativeSpecialization::new(),
+                            routed_experts::OutputArgs { value: output },
                         )
-                        .unwrap()
-                        .call(routed_scatter::Args {
-                            base: &tensor(device, DType::F32, &[m, h], &base),
-                            expert_output: &grouped,
-                            inverse: &native_inverse,
-                            weights: &tensor(device, DType::F32, &[m, k], &case.weights),
-                        })
-                        .unwrap()
-                        .value;
-                        let actual = read_activation(&output, published);
-                        let label = format!("{label} output {published:?}");
-                        assert_outcome(&label, &actual, &expected, int8, 1e-2, absolute);
+                        .unwrap();
                     }
+                    None => {
+                        up_entry
+                        .kernel(device, configuration)
+                        .call_into(
+                            routed_experts_up::Args {
+                                first: &first,
+                                rows: &grouped_rows,
+                                normalized: &normalized,
+                                order: &native_order,
+                                blocks: &native_table,
+                                used: &used,
+                                expert_up: scratch[1].unwrap_or(&experts.up),
+                                expert_down: scratch[2].unwrap_or(&experts.down),
+                                map,
+                                step,
+                                records_up: records[1].unwrap_or(&experts.up),
+                                records_down: records[2].unwrap_or(&experts.down),
+                                up_scale: &experts.up_scale,
+                                activation: shape.activation,
+                            },
+                            routed_experts_up::OutputArgs { value: output },
+                        )
+                        .unwrap();
+                    }
+                };
+                let mut grouped = tensor(device, DType::BF16, &[b, TILE, h], &vec![0.0; b * TILE * h]);
+                pass_into(&no_map, &no_step, [None; 3], [None; 3], &mut grouped);
+                // Two windows into one persistent output: window 0 serves
+                // bank records and skips the rest; window 1 skips the bank
+                // half (preserving window 0's rows) and serves scratch
+                // slots `-2 - s` from a narrower `[E - mapped, ...]` stack.
+                let mut mapped = tensor(device, DType::BF16, &[b, TILE, h], &vec![-9.0; b * TILE * h]);
+                for window_map in &placed.maps {
+                    pass_into(
+                        window_map,
+                        &placed.step,
+                        [placed.scratch_gate.as_ref(), Some(&placed.scratch_up), Some(&placed.scratch_down)],
+                        [placed.gate.as_ref(), Some(&placed.up), Some(&placed.down)],
+                        &mut mapped,
+                    );
+                }
+                assert_eq!(
+                    gather_rows(&read_activation(&mapped, DType::BF16), &inverse, h)
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    gather_rows(&read_activation(&grouped, DType::BF16), &inverse, h)
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    "{label} through a slot map"
+                );
+                let rows = gather_rows(&read_activation(&grouped, DType::BF16), &inverse, h);
+                // `routed_experts` forms A(act(gate) * up) unrounded on the
+                // CPU (as its portable body and Qwen's CPU bits), while the
+                // reference rounds gate and up (the GPU forms): each of the
+                // F down terms differs by up to a BF16 ulp of its product.
+                let absolute = if shape.gated { 1e-2 } else { 2e-3 };
+                let quantized = configuration.form.quantized;
+                assert_outcome(
+                    &format!("{label} grouped"),
+                    &rows,
+                    &case.published,
+                    quantized,
+                    2e-2,
+                    absolute,
+                );
+                for (published, base, expected) in published_forms(&shape, &case) {
+                    let output = routed_scatter::native_for_device_with(
+                        device,
+                        routed_scatter::Elements {
+                            A: bf16,
+                            R: element(published),
+                        },
+                        &seismic::NativeSpecialization::new(),
+                    )
+                    .unwrap()
+                    .call(routed_scatter::Args {
+                        base: &tensor(device, DType::F32, &[m, h], &base),
+                        expert_output: &grouped,
+                        inverse: &native_inverse,
+                        weights: &tensor(device, DType::F32, &[m, k], &case.weights),
+                    })
+                    .unwrap()
+                    .value;
+                    let actual = read_activation(&output, published);
+                    let label = format!("{label} output {published:?}");
+                    assert_outcome(&label, &actual, &expected, quantized, 1e-2, absolute);
                 }
             }
             eprintln!("{label} grouped: {:.1}s", started.elapsed().as_secs_f64());
@@ -2531,7 +2619,7 @@ fn glu_clamps_adversarial_sums_as_the_reference() {
             let statics = [("H", H), ("K", 1), ("F", f), ("GS", 0), ("US", 0), ("LB", word)];
             for (index, mapping) in decode_mappings(device).into_iter().enumerate() {
                 let native = entry
-                    .prepare(device, &expansion_specialization(device, &entry, index, &statics, &mapping, false))
+                    .prepare(device, &decode_specialization(device, &entry, index, &statics, &mapping, false))
                     .unwrap();
                 let (gate_stack, up_stack) =
                     (tensor(device, DType::BF16, &[1, f, H], &gate), tensor(device, DType::BF16, &[1, f, H], &up));

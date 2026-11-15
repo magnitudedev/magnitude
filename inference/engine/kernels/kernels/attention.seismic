@@ -101,93 +101,18 @@ fn attention_output[M, D, SN, IN, Q, W, OS, OB](hidden: &tensor[M, SN * D] f32, 
     scatter(hidden, projected, inject, result)
     return result
 
-# Metal: GEMV up to VERIFY_ROWS rows (`gemv` for one row, `gemv_pair` for two,
-# `gemv_rows` for more, see `dense.seismic`), batched GEMV to 16, GEMM beyond with
-# SPLIT-way split-K summed by `finalize`. The input needs no prologue, so
-# there is no `stage`. (CUDA: GEMV to 16 rows, INT8 candidate on the GEMM.)
-# TALL selects the tall GEMM past 64 rows (see `dense.seismic`): on
-# simdgroup matrices `relayout` first reorders the gated rows into
-# `fragments`, a second copy of them in whole 64-row tiles.
-# PACK selects `dense_output`'s token-packing form past 64 rows (see
-# `dense.seismic`), with its launches, complete paired computation and transient
-# scratch, over the gated rows (the weights' factors a simdgroup per weight
-# row), for weights admitted to it (`form(OW, PACK)`); devices without the
-# packed path run the staged tile, with its results.
+# Metal: the `dense` projection (`dense.seismic`), single, over the
+# gated rows; the NVFP4 operands of an output weight that takes them are the
+# entry's own prologue (`stage`, into `staged`).
 native attention_output for metal from "metal/attention_output.metal":
     static (D, SN, IN, Q, W, OS, OB)
-    params (arithmetic SPLIT in [1, 2, 4] default 1, form TALL in [1, 0] default 1,
-        arithmetic form PACK in [0, 1] default 0, arithmetic form RESIDUE in [1, 2] default 1, arithmetic LANES in [16, 32, 8] default 16)
-    where Q * W > 0 and (TALL == 0 or (SPLIT == 1 and Q * W % 128 == 0)) and (PACK == 0 or (TALL == 1 and Q * W % 256 == 0 and Q * W < 1048576 and D % 64 == 0 and form(OW, PACK) == 1)) and (PACK == 1 or (PACK_TOKENS == 4 and WEIGHTS_AHEAD == 0)) and (PACK == 0 or (TILE_M == 64 and TILE_N == 64)) and (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2)) and (RESIDUE == 1 or (PACK == 1 and OB > 0 and form(OW, PACK_RESIDUE) == 1)) and (MATRIX == 0 or (Q * W % 256 == 0 and form(OW, MATRIX) == 1))
-    scratch partials bytes (SPLIT * M * D * 4) when M > 64 and SPLIT > 1
-    scratch small_partials bytes (4 * M * D * 4) when M > 16 and M <= 64
-    scratch fragments bytes (ceil_div(M, 64) * 64 * Q * W * 2) when M > 64 and TALL == 1 and PACK == 0
-    scratch packed bytes (ceil_div(M, 128) * 128 * Q * W * 2 + 1024) when M > 64 and PACK == 1
-    scratch token_factors bytes (ceil_div(M, 128) * 128 * (Q * W / 32) * 4 * RESIDUE) when M > 64 and PACK == 1
-    scratch weight_factors bytes (D * (Q * W / 32) * 4) when M > 64 and PACK == 1
-    scratch token_scales bytes (ceil_div(M, 128) * 128 * 4) when M > 64 and PACK == 1
-    scratch weight_scales bytes (D * 4) when M > 64 and PACK == 1
+    where Q * W > 0
+    project dense single (output_weight)
     scratch staged bytes (M * Q * W * 2) when M > VERIFY_ROWS and operands(OW) == 1
-    launch attention_output_gemv when M < 2:
-        params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1)
-        threadgroups (ceil_div(D, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
-        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (min(ceil_div(Q * W, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
-    launch attention_output_stage when M > VERIFY_ROWS and operands(OW) == 1:
+    launch attention_output_stage before batch when M > VERIFY_ROWS and operands(OW) == 1:
         staging
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch attention_output_batch when M > VERIFY_ROWS and M <= 16:
-        params (BATCH_SIMDGROUPS in [8, 4, 16, 32] default 8, BATCH_ROWS in [2, 1, 4] default 2, arithmetic BATCH_PARTS in [2, 4, 1] default 2, arithmetic form MATRIX in [1, 0] default 1)
-        threadgroups (ceil_div(ceil_div(D, 8) * BATCH_PARTS, BATCH_SIMDGROUPS), 1, 1)
-        threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
-        shared_bytes (max(16640, min((BATCH_SIMDGROUPS * 256 + ceil_div(Q * W, 32) * 32) * ceil_div(M, 8), 28672)))
-    launch attention_output_gemm_small when M > 16 and M <= 64:
-        threadgroups (ceil_div(D, 64), ceil_div(M, 32), 4)
-        threads_per_threadgroup (128, 1, 1)
-    launch attention_output_finalize_small when M > 16 and M <= 64:
-        threadgroups (ceil_div(M * D, 256), 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch attention_output_gemm when M > 64 and TALL == 0:
-        params (TILE_M in [64, 128, 32] default 64, TILE_N in [64, 128] default 64)
-        threadgroups (ceil_div(D, TILE_N), ceil_div(M, TILE_M), SPLIT)
-        threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
-    launch attention_output_finalize when M > 64 and SPLIT > 1:
-        threadgroups (ceil_div(M * D, 256), 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch attention_output_relayout when M > 64 and TALL == 1 and PACK == 0:
-        threadgroups (ceil_div(ceil_div(M, 64) * Q * W, 256), 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch attention_output_tall when M > 64 and TALL == 1 and PACK == 0:
-        params (TALL_M in [128, 256, 512] default 128, TALL_K in [64, 128] default 64, STAGERS in [2, 1] default 2)
-        threadgroups (ceil_div(D, 32), ceil_div(M, TALL_M), 1)
-        threads_per_threadgroup ((TALL_M / 32 + STAGERS) * 32, 1, 1)
-    launch attention_output_gemv_rows when M >= 3 and M <= VERIFY_ROWS:
-        params (SIMDGROUPS in [8, 16, 4, 2, 32] default 8, ROWS in [2, 1, 4] default 2)
-        alike (attention_output_gemv)
-        threadgroups (ceil_div(D, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
-        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (min(ceil_div(Q * W, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
-    launch attention_output_gemv_pair when M == 2:
-        params (SIMDGROUPS in [8, 16, 4, 2, 32] default 8, ROWS in [2, 1, 4] default 2)
-        alike (attention_output_gemv)
-        threadgroups (ceil_div(D, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
-        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (min(ceil_div(Q * W, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
-    launch attention_output_pack when M > 64 and PACK == 1:
-        reads (RESIDUE)
-        threadgroups (ceil_div(M, 128) * 32, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch attention_output_pack_coefficients when M > 64 and PACK == 1:
-        threadgroups (D, 1, 1)
-        threads_per_threadgroup (32, 1, 1)
-    launch attention_output_packed when M > 64 and PACK == 1:
-        params (PACK_TOKENS in [4, 2] default 4, WEIGHTS_AHEAD in [0, 1] default 0)
-        reads (RESIDUE)
-        threadgroups (ceil_div(M, 128) * D / 32, 1, 1)
-        threads_per_threadgroup (128, 1, 1)
-    launch attention_output_unpacked when M > 64 and PACK == 1:
-        threadgroups (ceil_div(D, 64), ceil_div(M, 64), 1)
-        threads_per_threadgroup (128, 1, 1)
 
 # CUDA: GEMV to 8 rows, `gemv16` to 16, GEMM beyond in the K1 row bands
 # (`gemm_small` to 64 rows, `gemm` beyond; either supports selected operands), both split
@@ -196,100 +121,27 @@ native attention_output for metal from "metal/attention_output.metal":
 # (Metal: batched GEMV class, no INT8 path.)
 native attention_output for cuda from "cuda/attention_output.cu":
     static (D, SN, IN, Q, W, OS)
-    params (arithmetic INT8 in [0, 1] default 0, arithmetic OPERAND in [0, 1] default 0, arithmetic KSPLIT in [4, 2, 8] default 4)
-    where Q * W > 0 and Q * W % 64 == 0 and (OPERAND == 0 or INT8 == 0) and (INT8 == 0 or form(OW, INT8) == 1)
-    scratch staged bytes (M * Q * W * max(1 + OPERAND, 2 * operands(OW))) when (M > 1 and operands(OW) == 1) or (M > 16 and (INT8 == 1 or OPERAND == 1))
-    scratch groups bytes (M * Q * W / 4) when INT8 == 1 and M > 16
-    scratch partials bytes (2 * M * D * 4) when M > 16 and M <= 128
-    launch attention_output_stage when (M > 1 and operands(OW) == 1) or (M > 16 and (INT8 == 1 or OPERAND == 1)):
-        reads (INT8, OPERAND)
-        staging
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch attention_output_gemv when M <= 8:
-        threadgroups (ceil_div(ceil_div(D, 16), 8 / KSPLIT), 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes (operands(OW) * (1 - min(1, M - 1)) * Q * W * 2)
-    launch attention_output_gemv16 when M > 8 and M <= 16:
-        alike (attention_output_gemv)
-        threadgroups (ceil_div(ceil_div(D, 16), 8 / KSPLIT), 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch attention_output_gemm_small when M > 16 and M <= 64:
-        reads (INT8, OPERAND)
-        threadgroups (ceil_div(ceil_div(D, 16), 8), 1, 1 + min(1, 128 / M))
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes (3 * (64 * 144 + 10240) + 2048)
-    launch attention_output_gemm when M > 64:
-        params (ROTATE in [2, 1, 4] default 2)
-        reads (INT8, OPERAND)
-        threadgroups (ceil_div(ceil_div(D, 16), 8), ceil_div(M, 128), 1 + min(1, 128 / M))
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes (2 * (128 * 144 + 10240) + 2048)
-    launch attention_output_finalize when M > 16 and M <= 128:
-        threadgroups (ceil_div(M * D, 256), 1, 1)
-        threads_per_threadgroup (256, 1, 1)
+    where Q * W > 0
+    project dense single (output_weight)
 
-# Vulkan: the K1 projection (see `attention_project`): GEMV to 8 rows,
-# GEMM beyond with SPLIT-way split-K summed in order by `finalize`. Over
-# NVFP4 output weights the stage launch forms the gated rows' operands into
-# `staged`, which the GEMM reads.
+# Vulkan: the `dense` projection (single) over the gated rows read in place,
+# its GEMM splitting K SPLIT ways.
 native attention_output for vulkan from "vulkan/attention_output.comp":
     static (D, SN, IN, Q, W, OS)
-    params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default 16,
-            TILE_M in [128, 64, 32] default 64, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32,
-            arithmetic SPLIT in [1, 2, 4] default 1)
-    let GEMV_GROUPS = ceil_div(D, SIMDGROUPS * ROWS * 32 / LANES)
-    let GEMV_THREADS = SIMDGROUPS * 32
-    let GEMV_SHARED = 256 + 32 * operands(OW) + min(8 * ceil_div(Q * W, 32), 288) * 72
-    where Q * W > 0 and SUB_M <= TILE_M and SUB_N <= TILE_N
-    scratch partials bytes (SPLIT * M * D * 4) when M > VERIFY_ROWS and SPLIT > 1
-    scratch staged bytes (M * Q * W * 2) when M > VERIFY_ROWS and operands(OW) == 1
-    launch attention_output_stage when M > VERIFY_ROWS and operands(OW) == 1:
-        staging
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes (128)
-    launch attention_output_gemv1 when M <= 1:
-        threadgroups (GEMV_GROUPS, 1, 1)
-        threads_per_threadgroup (GEMV_THREADS, 1, 1)
-        shared_bytes (GEMV_SHARED)
-    launch attention_output_gemv2 when M == 2:
-        alike (attention_output_gemv1)
-        threadgroups (GEMV_GROUPS, 1, 1)
-        threads_per_threadgroup (GEMV_THREADS, 1, 1)
-        shared_bytes (GEMV_SHARED)
-    launch attention_output_gemv4 when M >= 3 and M <= 4:
-        alike (attention_output_gemv1)
-        threadgroups (GEMV_GROUPS, 1, 1)
-        threads_per_threadgroup (GEMV_THREADS, 1, 1)
-        shared_bytes (GEMV_SHARED)
-    launch attention_output_gemv8 when M >= 5 and M <= VERIFY_ROWS:
-        alike (attention_output_gemv1)
-        threadgroups (GEMV_GROUPS, 1, 1)
-        threads_per_threadgroup (GEMV_THREADS, 1, 1)
-        shared_bytes (GEMV_SHARED)
-    launch attention_output_gemm when M > VERIFY_ROWS:
-        threadgroups (ceil_div(D, TILE_N), ceil_div(M, TILE_M), SPLIT)
-        threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
-        shared_bytes ((TILE_M + TILE_N) * 80)
-    launch attention_output_finalize when M > VERIFY_ROWS and SPLIT > 1:
-        threadgroups (ceil_div(M * D, 256), 1, 1)
-        threads_per_threadgroup (256, 1, 1)
+    where Q * W > 0
+    project dense single (output_weight)
 
-# CPU: the CPU projection library (`cpu/lib/projection/projection.rs`). A
-# stage launch writes each row's gated heads as one F32 row to scratch; the
-# row launch gives each work item ROWS output weight rows, projected against
-# every staged row and added to the hidden row.
+# CPU: the CPU projection library (`cpu/lib/projection/projection.rs`). The
+# gated rows are the projection's operand: the operator's `form` launch
+# forms each row's gated heads as one F32 row (NVFP4 operands where the
+# weight takes them) and its Q8 blocks, left out where the gated rows'
+# producer emits them (`attention_decode`, `gated_delta_step`); the row
+# launch gives each work item ROWS output weight rows, projected against
+# every operand row and added to the hidden row.
 native attention_output for cpu from "cpu/attention_output.rs":
     static (Q, W, OS)
-    params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
-    where Q * W > 0 and (INT8 == 0 or form(OW, INT8) == 1)
-    scratch quantized bytes (ceil_div(M, Q8_ROWS) * Q8_ROWS * ceil_div(Q * W, Q8_VALUES) * Q8_BYTES)
-    scratch staged bytes (M * Q * W * 4)
-    launch attention_output_stage:
-        staging
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (1, 1, 1)
+    where Q * W > 0
+    project quantized tiled (OW) over (M, Q * W) operand (gated)
     launch attention_output_rows:
         threadgroups (ceil_div(D, ROWS), 1, 1)
         threads_per_threadgroup (1, 1, 1)
@@ -424,98 +276,24 @@ fn attention_project[M, D, PT, NM, Q, GR, K, V, QS, GS, KS, VS, QB, GB, KB, VB](
         scale_rows(value_sum, value_scale, value)
     return query, gate, key, value
 
-# Metal: TALL selects the tall GEMM past 64 rows (see `dense.seismic`)
-# over rows staged in its order.
-# PACK selects the token-packing form of `dense.seismic` past 64 rows for
-# the four segments, over the staged normalized rows, as in
-# `gated_delta_project` (`recurrent.seismic`): one operand for every segment,
-# each weight's own factor tables in segment order, the packed tiles in
-# segment order, and the staged 64 x 64 tiles (`unpacked`) for a segment whose
-# weights the operand does not serve and for the zero tiles of mode 1. PACK
-# is admitted where a segment's weights are (`form(W, PACK)`), and RESIDUE 2
-# where a bounded segment's codes take the residue (`form(W, PACK_RESIDUE)`).
+# Metal: the `dense` projection (`dense.seismic`), segmented, over the
+# normalized rows: the GEMVs and the batched rows normalize while staging;
+# `stage` normalizes once for the matrix GEMV and past 16 rows, and
+# `stage_tall` in the tall GEMM's order. Mode 1's query and gate segments
+# are zeros in every form.
 native attention_project for metal from "metal/attention_project.metal":
     static (D, PT, NM, Q, GR, K, V, QS, GS, KS, VS, QB, GB, KB, VB)
-    params (form TALL in [1, 0] default 1, arithmetic form PACK in [0, 1] default 0,
-        arithmetic form RESIDUE in [1, 2] default 1, arithmetic LANES in [16, 32, 8] default 16)
-    where D > 0 and (TALL == 0 or D % 128 == 0) and (PACK == 0 or (TALL == 1 and D % 256 == 0 and D < 1048576 and Q % 32 == 0 and GR % 32 == 0 and K % 32 == 0 and V % 32 == 0 and ((Q > 0 and form(QW, PACK) == 1) or (GR > 0 and form(GW, PACK) == 1) or (K > 0 and form(KW, PACK) == 1) or (V > 0 and form(VW, PACK) == 1)))) and (PACK == 1 or (PACK_TOKENS == 4 and WEIGHTS_AHEAD == 0)) and (PACK == 0 or (TILE_M == 64 and TILE_N == 64)) and (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2)) and (RESIDUE == 1 or (PACK == 1 and ((QB > 0 and form(QW, PACK_RESIDUE) == 1) or (GB > 0 and form(GW, PACK_RESIDUE) == 1) or (KB > 0 and form(KW, PACK_RESIDUE) == 1) or (VB > 0 and form(VW, PACK_RESIDUE) == 1))))
-    scratch normalized bytes ((M + TALL * (ceil_div(M, 64) * 64 - M)) * D * 2) when M > 16
-    scratch packed bytes (ceil_div(M, 128) * 128 * D * 2 + 1024) when M > 64 and PACK == 1
-    scratch token_factors bytes (ceil_div(M, 128) * 128 * (D / 32) * 4 * RESIDUE) when M > 64 and PACK == 1
-    scratch weight_factors bytes ((Q + GR + K + V) * (D / 32) * 4) when M > 64 and PACK == 1
-    scratch token_scales bytes (ceil_div(M, 128) * 128 * 4) when M > 64 and PACK == 1
-    scratch weight_scales bytes ((Q + GR + K + V) * 4) when M > 64 and PACK == 1
-    launch attention_project_stage when M > 16 and (M <= 64 or TALL == 0 or PACK == 1):
+    where D > 0
+    project dense segmented (query_weight, gate_weight, key_weight, value_weight)
+    scratch normalized bytes ((M + TALL * (ceil_div(M, 64) * 64 - M)) * D * 2) when M > VERIFY_ROWS and (M > 16 or MATRIX == 1)
+    launch attention_project_stage before batch when M > VERIFY_ROWS and (M > 16 or MATRIX == 1) and (M <= 64 or TALL == 0 or PACK == 1):
         staging
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch attention_project_gemv when M < 2:
-        params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1)
-        threadgroups (ceil_div(Q, SIMDGROUPS * ROWS * 32 / LANES)
-            + ceil_div(GR, SIMDGROUPS * ROWS * 32 / LANES)
-            + ceil_div(K, SIMDGROUPS * ROWS * 32 / LANES)
-            + ceil_div(V, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
-        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (min(ceil_div(D, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
-    launch attention_project_batch when M > VERIFY_ROWS and M <= 16:
-        params (BATCH_SIMDGROUPS in [8, 4, 16, 32] default 8, BATCH_ROWS in [2, 1, 4] default 2)
-        threadgroups (ceil_div(Q, BATCH_SIMDGROUPS * BATCH_ROWS * 8)
-            + ceil_div(GR, BATCH_SIMDGROUPS * BATCH_ROWS * 8)
-            + ceil_div(K, BATCH_SIMDGROUPS * BATCH_ROWS * 8)
-            + ceil_div(V, BATCH_SIMDGROUPS * BATCH_ROWS * 8), 1, 1)
-        threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
-        shared_bytes (16640)
-    launch attention_project_gemm_small when M > 16 and M <= 64:
-        threadgroups (ceil_div(Q, 64) + ceil_div(GR, 64) + ceil_div(K, 64) + ceil_div(V, 64),
-            ceil_div(M, 32), 1)
-        threads_per_threadgroup (128, 1, 1)
-    launch attention_project_gemm when M > 64 and TALL == 0:
-        params (TILE_M in [64, 128, 32] default 64, TILE_N in [64, 128] default 64)
-        threadgroups (ceil_div(Q, TILE_N) + ceil_div(GR, TILE_N) + ceil_div(K, TILE_N)
-            + ceil_div(V, TILE_N), ceil_div(M, TILE_M), 1)
-        threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
-    launch attention_project_stage_tall when M > 64 and TALL == 1 and PACK == 0:
+    launch attention_project_stage_tall before tall when M > 64 and TALL == 1 and PACK == 0:
+        staging
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch attention_project_tall when M > 64 and TALL == 1 and PACK == 0:
-        params (TALL_M in [128, 256, 512] default 128, TALL_K in [64, 128] default 64, STAGERS in [2, 1] default 2)
-        threadgroups (ceil_div(Q, 32) + ceil_div(GR, 32) + ceil_div(K, 32) + ceil_div(V, 32),
-            ceil_div(M, TALL_M), 1)
-        threads_per_threadgroup ((TALL_M / 32 + STAGERS) * 32, 1, 1)
-    launch attention_project_gemv_rows when M >= 3 and M <= VERIFY_ROWS:
-        params (SIMDGROUPS in [8, 16, 4, 2, 32] default 8, ROWS in [1, 2, 4] default 1)
-        alike (attention_project_gemv)
-        threadgroups (ceil_div(Q, SIMDGROUPS * ROWS * 32 / LANES)
-            + ceil_div(GR, SIMDGROUPS * ROWS * 32 / LANES)
-            + ceil_div(K, SIMDGROUPS * ROWS * 32 / LANES)
-            + ceil_div(V, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
-        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (min(ceil_div(D, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
-    launch attention_project_gemv_pair when M == 2:
-        params (SIMDGROUPS in [8, 16, 4, 2, 32] default 8, ROWS in [1, 2, 4] default 1)
-        alike (attention_project_gemv)
-        threadgroups (ceil_div(Q, SIMDGROUPS * ROWS * 32 / LANES)
-            + ceil_div(GR, SIMDGROUPS * ROWS * 32 / LANES)
-            + ceil_div(K, SIMDGROUPS * ROWS * 32 / LANES)
-            + ceil_div(V, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
-        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (min(ceil_div(D, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
-    launch attention_project_pack when M > 64 and PACK == 1:
-        reads (RESIDUE)
-        threadgroups (ceil_div(M, 128) * 32, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch attention_project_pack_coefficients when M > 64 and PACK == 1:
-        threadgroups (Q + GR + K + V, 1, 1)
-        threads_per_threadgroup (32, 1, 1)
-    launch attention_project_packed when M > 64 and PACK == 1:
-        params (PACK_TOKENS in [4, 2] default 4, WEIGHTS_AHEAD in [0, 1] default 0)
-        reads (RESIDUE)
-        threadgroups (ceil_div(M, 128) * (Q / 32) + ceil_div(M, 128) * (GR / 32) + ceil_div(M, 128) * (K / 32)
-            + ceil_div(M, 128) * (V / 32), 1, 1)
-        threads_per_threadgroup (128, 1, 1)
-    launch attention_project_unpacked when M > 64 and PACK == 1:
-        threadgroups (ceil_div(Q, 64) + ceil_div(GR, 64) + ceil_div(K, 64) + ceil_div(V, 64), ceil_div(M, 64), 1)
-        threads_per_threadgroup (128, 1, 1)
 
 # CUDA: the K1 projection (`attention_output`'s row bands). The GEMV splits
 # K KSPLIT ways, one setting its 1..8-row and 9..16-row launches both read,
@@ -533,89 +311,24 @@ native attention_project for metal from "metal/attention_project.metal":
 # slower on the 3090 (51.5 against 48.5), which no order requires.
 native attention_project for cuda from "cuda/attention_project.cu":
     static (D, PT, NM, Q, GR, K, V, QS, GS, KS, VS)
-    params (arithmetic INT8 in [0, 1] default 0, arithmetic OPERAND in [0, 1] default 0, arithmetic KSPLIT in [4, 2, 8] default 4)
-    where D > 0 and D % 64 == 0 and (OPERAND == 0 or INT8 == 0) and (INT8 == 0 or ((Q == 0 or form(QW, INT8) == 1) and (GR == 0 or form(GW, INT8) == 1) and (K == 0 or form(KW, INT8) == 1) and (V == 0 or form(VW, INT8) == 1)))
-    scratch staged bytes (M * D * 2) when M > 1
-    scratch groups bytes (M * D / 4) when INT8 == 1 and M > 16
-    launch attention_project_stage when M > 1:
-        reads (INT8, OPERAND)
-        staging
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch attention_project_gemv when M <= 8:
-        threadgroups (ceil_div(ceil_div(Q, 16), 8 / KSPLIT) + ceil_div(ceil_div(GR, 16), 8 / KSPLIT)
-            + ceil_div(ceil_div(K, 16), 8 / KSPLIT) + ceil_div(ceil_div(V, 16), 8 / KSPLIT), 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes ((1 - min(1, M - 1)) * D * 2)
-    launch attention_project_gemv16 when M > 8 and M <= 16:
-        alike (attention_project_gemv)
-        threadgroups (ceil_div(ceil_div(Q, 16), 8 / KSPLIT) + ceil_div(ceil_div(GR, 16), 8 / KSPLIT)
-            + ceil_div(ceil_div(K, 16), 8 / KSPLIT) + ceil_div(ceil_div(V, 16), 8 / KSPLIT), 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch attention_project_gemm_small when M > 16 and M <= 64:
-        reads (INT8, OPERAND)
-        threadgroups (ceil_div(ceil_div(Q, 16), 8) + ceil_div(ceil_div(GR, 16), 8) + ceil_div(ceil_div(K, 16), 8)
-            + ceil_div(ceil_div(V, 16), 8), 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes (3 * (64 * 144 + 10240) + 2048)
-    launch attention_project_gemm when M > 64:
-        params (ROTATE in [2, 1, 4] default 2)
-        reads (INT8, OPERAND)
-        threadgroups (ceil_div(ceil_div(Q, 16), 8) + ceil_div(ceil_div(GR, 16), 8) + ceil_div(ceil_div(K, 16), 8)
-            + ceil_div(ceil_div(V, 16), 8), ceil_div(M, 128), 1)
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes (2 * (128 * 144 + 10240) + 2048)
+    where D > 0
+    project dense segmented (query_weight, gate_weight, key_weight, value_weight) rows rms
 
+# Vulkan: the `dense` projection (segmented) over the normalized rows.
 native attention_project for vulkan from "vulkan/attention_project.comp":
     static (D, PT, NM, Q, GR, K, V, QS, GS, KS, VS)
-    params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default 16,
-            TILE_M in [128, 64, 32] default 64, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32)
-    let GEMV_GROUPS = ceil_div(Q, SIMDGROUPS * ROWS * 32 / LANES) + ceil_div(GR, SIMDGROUPS * ROWS * 32 / LANES) + ceil_div(K, SIMDGROUPS * ROWS * 32 / LANES) + ceil_div(V, SIMDGROUPS * ROWS * 32 / LANES)
-    let GEMV_THREADS = SIMDGROUPS * 32
-    let GEMV_SHARED = 256 + 32 * operands(QW) + min(8 * ceil_div(D, 32), 288) * 72
-    where D > 0 and SUB_M <= TILE_M and SUB_N <= TILE_N
-    scratch normalized bytes (M * D * 2) when M > VERIFY_ROWS
-    launch attention_project_stage when M > VERIFY_ROWS:
-        staging
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes (128)
-    launch attention_project_gemv1 when M <= 1:
-        threadgroups (GEMV_GROUPS, 1, 1)
-        threads_per_threadgroup (GEMV_THREADS, 1, 1)
-        shared_bytes (GEMV_SHARED)
-    launch attention_project_gemv2 when M == 2:
-        alike (attention_project_gemv1)
-        threadgroups (GEMV_GROUPS, 1, 1)
-        threads_per_threadgroup (GEMV_THREADS, 1, 1)
-        shared_bytes (GEMV_SHARED)
-    launch attention_project_gemv4 when M >= 3 and M <= 4:
-        alike (attention_project_gemv1)
-        threadgroups (GEMV_GROUPS, 1, 1)
-        threads_per_threadgroup (GEMV_THREADS, 1, 1)
-        shared_bytes (GEMV_SHARED)
-    launch attention_project_gemv8 when M >= 5 and M <= VERIFY_ROWS:
-        alike (attention_project_gemv1)
-        threadgroups (GEMV_GROUPS, 1, 1)
-        threads_per_threadgroup (GEMV_THREADS, 1, 1)
-        shared_bytes (GEMV_SHARED)
-    launch attention_project_gemm when M > VERIFY_ROWS:
-        threadgroups (ceil_div(Q, TILE_N) + ceil_div(GR, TILE_N) + ceil_div(K, TILE_N) + ceil_div(V, TILE_N),
-            ceil_div(M, TILE_M), 1)
-        threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
-        shared_bytes ((TILE_M + TILE_N) * 80)
+    where D > 0
+    project dense segmented (query_weight, gate_weight, key_weight, value_weight) rows rms
 
+# CPU: the hidden rows under the input norm are the projection's operand:
+# the operator's `form` launch forms each normalized row as F32 (NVFP4
+# operands where the weights take them) and its Q8 blocks, left out where
+# the hidden rows' producer emits them under the same norm (`routed_output`'s
+# `operand_norm`); the rows launch projects every segment against them.
 native attention_project for cpu from "cpu/attention_project.rs":
     static (D, QS, GS, KS, VS)
-    params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
-    where D > 0 and (INT8 == 0 or form(QW, INT8) == 1 or form(GW, INT8) == 1 or form(KW, INT8) == 1 or form(VW, INT8) == 1)
-    scratch quantized bytes (ceil_div(M, Q8_ROWS) * Q8_ROWS * ceil_div(D, Q8_VALUES) * Q8_BYTES)
-    scratch normalized bytes (M * D * 4)
-    launch attention_project_normalize:
-        staging
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (1, 1, 1)
-        shared_bytes (D * 4)
+    where D > 0
+    project quantized tiled (QW, GW, KW, VW) over (M, D) operand (hidden normed (input_norm, epsilon))
     launch attention_project_rows:
         threadgroups (ceil_div(Q, ROWS) + ceil_div(GR, ROWS) + ceil_div(K, ROWS) + ceil_div(V, ROWS), 1, 1)
         threads_per_threadgroup (1, 1, 1)
@@ -1115,21 +828,32 @@ native attention_decode for vulkan from "vulkan/attention_decode.comp":
 # CPU (`cpu/lib/attention/attention.rs`): one launch, `attend` per (kv head,
 # partition, row): the item prepares its queries and the keys and values of the
 # rows it reads into its own shared bytes (part 0 appends the row's K/V), absorbs
-# its partition of max(128, ceil(keys / PARTS)) keys, and the last item of its
+# its partition of max(128, ceil(keys / parts)) keys, and the last item of its
 # (kv head, row) to arrive (`arrivals`) runs the fixed-order partition merge and
 # the output gates of its G query heads. A row's keys absorb in blocks at fixed
 # positions of its key sequence, history and fresh keys alike, so its result is
 # bit for bit the same whatever rows share its launch, as Metal's one-row forms.
+# Each (kv head, row) takes one partition per pool participant
+# (`device.units`): a row's KV * units items are KV whole rounds of the pool,
+# every participant absorbing KV / units of a kv head's keys, the least any
+# split gives, for every KV and units (ceil(units / KV) partitions leave a
+# round part idle where KV does not divide units). A partition's fixed work,
+# preparing its G queries and its row's fresh keys, is O(G W) against its
+# keys' O(keys G W / units), and the merge reads units partial states a
+# head. The count follows the pool, never the rows beside it, which keeps
+# that bit identity; the partition merge's order is the count's, so a result
+# is bit for bit one pool's (the pool size is in the CPU device's tuning
+# identity).
 #
 native attention_decode for cpu from "cpu/attention_decode.rs":
     static (P, S, I, U, F, NQ, N, NV, SK, RA, RT, RO, VK, KR, AB, KS)
-    params (arithmetic PARTS in [8, 4, 16, 1] default 8)
     where KR <= 1 and NQ <= 1 and RA <= 1 and RT <= 1 and RO <= 1 and (RO == 0 or (P > 0 and I == 0 and U == 0)) and VK <= 1 and SK <= 1 and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1
-    scratch partials bytes (M * KV * PARTS * G * (2 * P + S) * 4)
-    scratch statistics bytes (M * KV * PARTS * G * 8)
+    scratch partials bytes (M * KV * MAX_UNITS * G * (2 * P + S) * 4)
+    scratch statistics bytes (M * KV * MAX_UNITS * G * 8)
     scratch arrivals bytes (M * KV * 4) sync
+    project quantized emits (result 0 over (M, KV * G * (2 * P + S)))
     launch attention_decode_attend:
-        threadgroups (KV, PARTS, M)
+        threadgroups (KV, device.units, M)
         threads_per_threadgroup (1, 1, 1)
         shared_bytes ((G * 32 + 2 * (2 * P + S) + 2 * P + G * (2 * P + S) + 2 * M * (2 * P + S) + 2 * P * RO) * 4)
 
@@ -1910,20 +1634,21 @@ native attention_decode_k8v4 for vulkan from "vulkan/attention_decode_k8v4.comp"
         threadgroups (KV * G, M, 1)
         threads_per_threadgroup (2 * P + S, 1, 1)
 
-# CPU: the dense CPU decode's launch: `attend` prepares its own queries, keys
-# and values, part 0 appends the encoded row, and it decodes history keys and
-# values (F32) as it absorbs them, its fresh keys and values as history will
-# hold them (encoded and decoded back); the last item of a (kv head, row) to
-# arrive merges. W is whole affine groups.
+# CPU: the dense CPU decode's launch and partitions (units a kv head and
+# row): `attend` prepares its own queries, keys and values, part 0
+# appends the encoded row, and it decodes history keys and values (F32) as it
+# absorbs them, its fresh keys and values as history will hold them (encoded
+# and decoded back); the last item of a (kv head, row) to arrive merges. W is
+# whole affine groups.
 native attention_decode_k8v4 for cpu from "cpu/attention_decode_k8v4.rs":
     static (P, S, I, U, F, NQ, N, NV, KC, KP, VC, VP, SK, RA, RT, RO, VK)
-    params (arithmetic PARTS in [8, 4, 16, 1] default 8)
     where NQ <= 1 and RA <= 1 and RT <= 1 and RO <= 1 and (RO == 0 or (P > 0 and I == 0 and U == 0)) and VK == 0 and SK <= 1 and 32 * KC == 8 * (2 * P + S) and 32 * VC == 4 * (2 * P + S) and 16 * KP == 2 * P + S and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0
-    scratch partials bytes (M * KV * PARTS * G * (2 * P + S) * 4)
-    scratch statistics bytes (M * KV * PARTS * G * 8)
+    scratch partials bytes (M * KV * MAX_UNITS * G * (2 * P + S) * 4)
+    scratch statistics bytes (M * KV * MAX_UNITS * G * 8)
     scratch arrivals bytes (M * KV * 4) sync
+    project quantized emits (result 0 over (M, KV * G * (2 * P + S)))
     launch attention_decode_k8v4_attend:
-        threadgroups (KV, PARTS, M)
+        threadgroups (KV, device.units, M)
         threads_per_threadgroup (1, 1, 1)
         shared_bytes ((G * 32 + 4 * (2 * P + S) + 2 * P + G * (2 * P + S) + 2 * M * (2 * P + S) + 2 * P * RO) * 4)
 

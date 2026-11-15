@@ -2,7 +2,8 @@ use super::{
     GroupRows,
     block::{BlockGraphInputs, ClassNumber, certify_block},
     classes::{
-        BlockGraphEnumeration, BlockOutputScales, BlockServed, FamilyOutline, Holder, Passes, StagedClass, Topology, UnreadScales,
+        BlockGraphEnumeration, BlockOutputScales, BlockServed, FamilyOutline, Holder, Passes, StagedClass,
+        Topology, UnreadScales,
         block_class_numbers, block_class_slice, block_listings, block_routed, block_served, block_split, block_stages,
         block_upload_regions, chained_once_runs, class_topology, decode_launch, enumerate_block_graphs, LaunchRuns, once_class, once_graphs,
         slot_scores,
@@ -52,8 +53,16 @@ pub(crate) fn checked_target_family_storage(
     plan: &TargetProgramPlan,
     limits: ResourceLimits,
 ) -> Result<CheckedGraphResources, GraphError> {
-    certify_target_family::<NativeGraphLayout>(backend, load, geometry, state, plan, limits, PassLaunches::whole_chain(limits))
-        .map(|certificate| certificate.resources)
+    certify_target_family::<NativeGraphLayout>(
+        backend,
+        load,
+        geometry,
+        state,
+        plan,
+        limits,
+        PassLaunches::whole_chain(limits),
+    )
+    .map(|certificate| certificate.resources)
 }
 
 /// The target family a load of `plan` prepares, as its assessment charges
@@ -68,7 +77,8 @@ pub(crate) fn checked_target_family(
     limits: ResourceLimits,
     pass: PassLaunches,
 ) -> Result<CheckedTargetFamily, GraphError> {
-    certify_target_family::<NativeGraphOutline>(backend, load, geometry, state, plan, limits, pass)?.checked()
+    certify_target_family::<NativeGraphOutline>(backend, load, geometry, state, plan, limits, pass)?
+        .checked()
 }
 
 /// [`checked_target_family`] of `plan`'s family and of the same target's
@@ -82,7 +92,15 @@ pub(crate) fn checked_target_and_undrafted(
     limits: ResourceLimits,
     pass: PassLaunches,
 ) -> Result<[CheckedTargetFamily; 2], GraphError> {
-    let [target, undrafted] = certify_target_and_undrafted::<NativeGraphOutline>(backend, load, geometry, state, plan, limits, pass)?;
+    let [target, undrafted] = certify_target_and_undrafted::<NativeGraphOutline>(
+        backend,
+        load,
+        geometry,
+        state,
+        plan,
+        limits,
+        pass,
+    )?;
     Ok([target.checked()?, undrafted.checked()?])
 }
 
@@ -330,7 +348,7 @@ impl<L: Certified> FamilyLayouts<L> {
                 backend,
                 slot,
                 None,
-                BlockGraphInputs::of_class(load, geometry, state, index, once_class(rows, stage), rows),
+                BlockGraphInputs::of_class(load, geometry, state, index, once_class(rows, stage), rows, outline.carries[index]),
                 classes,
                 &[vec![slice]],
             )
@@ -401,7 +419,15 @@ impl<L: Certified> FamilyLayouts<L> {
                                 .filter(|(_, positions)| !untapped && positions.any()),
                             BlockGraphInputs {
                                 residual: !untapped && outline.exports_residual(index),
-                                ..BlockGraphInputs::of_class(load, geometry, state, index, drafted, passes.rows())
+                                ..BlockGraphInputs::of_class(
+                                    load,
+                                    geometry,
+                                    state,
+                                    index,
+                                    drafted,
+                                    passes.rows(),
+                                    outline.carries[index],
+                                )
                             },
                             &classes,
                             &[slices],

@@ -1,6 +1,6 @@
 use super::{
     GroupExtents,
-    block::{BlockGraphInputs, checked_block_graph_draft, checked_block_graph_resources},
+    block::{BlockCarries, BlockGraphInputs, checked_block_graph_draft, checked_block_graph_resources},
     bound::{TokenRow, TokenRows},
     certify::certify_target_family,
     classes::{
@@ -28,6 +28,11 @@ use magnitude_state::LayerRef;
 use seismic::{
     BackendName, HostHeap, NativeGraphLayout, NativeGraphMetadata, NativeGraphStorageBytes,
 };
+
+/// No block carries an operand into the next: one empty carry per block.
+fn no_carries(geometry: &magnitude_family_contracts::Decoder) -> Vec<BlockCarries<crate::MixerProgramSlot>> {
+    vec![BlockCarries::default(); geometry.blocks.len()]
+}
 
 #[cfg(test)]
 mod token_rows_tests {
@@ -235,7 +240,7 @@ mod shared_graph_tests {
         .unwrap();
         let plan = load.program_plan(&definition, codec).unwrap();
         let (_, tapped) = block_taps(plan.target(), &definition.decoder).unwrap();
-        let shapes = block_graph_shapes(&load, &definition.decoder, &state, &tapped, None).unwrap();
+        let shapes = block_graph_shapes(&load, &definition.decoder, &state, &tapped, &no_carries(&definition.decoder), None).unwrap();
         let bank = load.expert_bank().unwrap();
         let home = |index: usize| block_layer(bank, index).ok().map(|layer| bank.home(layer));
         assert_eq!(shapes[1], shapes[2], "the first two attention blocks share a graph");
@@ -282,7 +287,7 @@ mod shared_graph_tests {
             .unwrap();
             let plan = load.program_plan(&definition, codec).unwrap();
             let (_, tapped) = block_taps(plan.target(), &definition.decoder).unwrap();
-            let shapes = block_graph_shapes(&load, &definition.decoder, &state, &tapped, None).unwrap();
+            let shapes = block_graph_shapes(&load, &definition.decoder, &state, &tapped, &no_carries(&definition.decoder), None).unwrap();
             assert_eq!(shapes[0] == shapes[1], shared, "second pool gated {second_gated}: the blocks share a plan");
         }
     }
@@ -514,7 +519,7 @@ mod resource_template_tests {
         let geometry = &definition.decoder;
         let plan = load.program_plan(&definition, codec).unwrap();
         let (_, tapped) = block_taps(plan.target(), geometry).unwrap();
-        let shapes = block_graph_shapes(&load, geometry, &state, &tapped, None).unwrap();
+        let shapes = block_graph_shapes(&load, geometry, &state, &tapped, &no_carries(geometry), None).unwrap();
         assert_ne!(shapes[0], shapes[1], "stream widening cannot be shared");
         assert_eq!(shapes[1], shapes[2], "interior graphs still share");
         assert_ne!(shapes[2], shapes[3], "the exit mix cannot be omitted");
@@ -668,6 +673,7 @@ mod resource_template_tests {
                     index,
                     (class, Stage::Run(RunStage::Whole)),
                     class.0,
+                    BlockCarries::default(),
                 ),
             )
             .unwrap();
@@ -960,7 +966,7 @@ mod resource_template_tests {
                 // each exact class's own topology: blocks of one shape seal
                 // one plan per class (no block here reads a layer scale).
                 let (_, tapped) = block_taps(plan.target(), geometry).unwrap();
-                let shapes = block_graph_shapes(&load, geometry, &state, &tapped, None).unwrap();
+                let shapes = block_graph_shapes(&load, geometry, &state, &tapped, &no_carries(geometry), None).unwrap();
                 let sealed = std::cell::Cell::new((0usize, HostHeap::default()));
                 let seals = |heap: HostHeap| {
                     let (graphs, held) = sealed.get();
@@ -1021,6 +1027,7 @@ mod resource_template_tests {
                             index,
                             staged,
                             if stage == Stage::Once(OnceStage::Pass) { rows } else { pass_rows },
+                            BlockCarries::default(),
                         ),
                     )
                     .unwrap();
@@ -1232,6 +1239,7 @@ mod sinkhorn_graph_tests {
                     index,
                     ((rows, 1, 1, 0, 0), Stage::Run(stage)),
                     rows,
+                    BlockCarries::default(),
                 );
                 let checked = checked_block_graph_draft(NativeGraphMetadata::new(backend), plan.target().blocks()[index], None, inputs);
                 let label = format!("{backend:?} block {index} {rows} rows {stage:?}");
@@ -1266,6 +1274,7 @@ mod sinkhorn_graph_tests {
                     index,
                     ((rows, 1, 1, 0, 0), Stage::Run(RunStage::Whole)),
                     rows,
+                    BlockCarries::default(),
                 );
                 let checked = checked_block_graph_draft(NativeGraphMetadata::new(backend), plan.target().blocks()[index], None, inputs);
                 drop(checked.unwrap_or_else(|error| panic!("{backend:?} block {index} {rows} rows: {error}")));

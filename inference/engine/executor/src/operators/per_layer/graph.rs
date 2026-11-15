@@ -100,7 +100,8 @@ impl<'a, G: GraphDraft + 'a> Clone for TableEntry<'a, G> {
 
 pub(crate) struct PerLayerEntryEntries<'a, G: GraphDraft + 'a> {
     pub round: G::Binding<'a, import_dense::Entry>,
-    pub project: G::Binding<'a, project_rows::Entry>,
+    /// The embedding's projection, by row range.
+    pub project: G::Ranged<'a, project_rows::Entry>,
     pub table: TableEntry<'a, G>,
     pub inputs: G::Binding<'a, per_layer_inputs::Entry>,
     pub copy: G::Binding<'a, conditioning_overlay::Entry>,
@@ -242,7 +243,7 @@ pub(crate) fn per_layer_entry<'a, G: GraphDraft + 'a>(
         .value;
     let projected = graph
         .enqueue(
-            entries.project,
+            G::pick(entries.project, rows),
             &[
                 ("M", rows.clone()),
                 ("G", Dim::from(1)),
@@ -315,8 +316,9 @@ pub(crate) fn per_layer_entry<'a, G: GraphDraft + 'a>(
     })
 }
 
+/// A per-layer input sublayer's entries; each projection's by row range.
 pub(crate) struct PerLayerEntries<'a, G: GraphDraft + 'a> {
-    pub gate: G::Binding<'a, per_layer_gate::Entry>,
+    pub gate: G::Ranged<'a, per_layer_gate::Entry>,
     pub output: PostNormEntries<'a, G>,
 }
 
@@ -385,7 +387,7 @@ pub(crate) fn per_layer<'a, G: GraphDraft + 'a>(
     let PerLayerNumbers { hidden, layers, width } = numbers;
     let gated = graph
         .enqueue(
-            entries.gate,
+            G::pick(entries.gate, rows),
             &[
                 ("M", rows.clone()),
                 ("D", hidden.clone()),

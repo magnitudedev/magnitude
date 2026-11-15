@@ -73,7 +73,8 @@ void routed_experts_stage() {
 }
 
 void routed_experts_quantize() {
-    const uint64_t block = uint64_t(gl_WorkGroupID.x) / SEISMIC_DIM_T;
+    uint64_t block, tile_row;
+    seismic_split(gl_WorkGroupID.x, SEISMIC_DIM_T, block, tile_row);
     const int expert = element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_BLOCKS) + block * SEISMIC_BLOCKS_STRIDE_0 * 4ul);
     if (EXPERTS_SLOT(expert) == -1)
         return;
@@ -99,10 +100,10 @@ void routed_experts_expand() {
     const projection_prologue x = projection_grouped(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED),
         SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_NORMALIZED_STRIDE_1, hidden, order, SEISMIC_ORDER_STRIDE_1);
 #endif
-    const projection_weights gate = routed_expert_weights(SEISMIC_PTR(SEISMIC_BUFFER_RECORDS_GATE),
-        SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_GATE), slot, PACKETS_W0_STACKED_ROWS, hidden);
-    const projection_weights up = routed_expert_weights(SEISMIC_PTR(SEISMIC_BUFFER_RECORDS_UP),
-        SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), slot, PACKETS_W1_STACKED_ROWS, hidden);
+    const projection_weights gate = routed_expert_matrix(slab_experts(SEISMIC_PTR(SEISMIC_BUFFER_RECORDS_GATE),
+        SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_GATE)), slab_source(slot), PACKETS_W0_STACKED_ROWS, hidden);
+    const projection_weights up = routed_expert_matrix(slab_experts(SEISMIC_PTR(SEISMIC_BUFFER_RECORDS_UP),
+        SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP)), slab_source(slot), PACKETS_W1_STACKED_ROWS, hidden);
     const projection_epilogue out_ = projection_scaled(projection_glu(ROUTED_ACT,
             out_offset(out_over_scratch(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT)), block * tile_rows * SEISMIC_DIM_F),
             SEISMIC_DIM_F, 1ul, int(SEISMIC_PARAM_ACTIVATION)),
@@ -129,8 +130,8 @@ void routed_experts_down() {
     const projection_prologue x = projection_plain(ROUTED_ACT,
         SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT) + block * tile_rows * SEISMIC_DIM_F * bytes, SEISMIC_DIM_F, 1ul,
         features, 0ul);
-    const projection_weights down = routed_expert_weights(SEISMIC_PTR(SEISMIC_BUFFER_RECORDS_DOWN),
-        SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_DOWN), slot, PACKETS_W2_STACKED_ROWS, features);
+    const projection_weights down = routed_expert_matrix(slab_experts(SEISMIC_PTR(SEISMIC_BUFFER_RECORDS_DOWN),
+        SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_DOWN)), slab_source(slot), PACKETS_W2_STACKED_ROWS, features);
     const projection_epilogue out_ = projection_store(
         out_offset(SEISMIC_RESULT_0_OUT, block * SEISMIC_RESULT_0_STRIDE_0), SEISMIC_RESULT_0_STRIDE_1,
         SEISMIC_RESULT_0_STRIDE_2, 0ul);

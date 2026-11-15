@@ -112,6 +112,7 @@ native conditioning_overlay for cuda from "cuda/conditioning_overlay.cu":
 # `normalize` is 0); see `vulkan/embedding_rows.comp`.
 native embedding_rows for vulkan from "vulkan/embedding_rows.comp":
     static (D)
+    where form(EW, DECODED) == 1
     scratch inverses bytes (M * 4)
     launch embedding_rows_inverse:
         threadgroups (M, 1, 1)
@@ -180,6 +181,7 @@ native stored_rows for cuda from "cuda/stored_rows.cu":
 native stored_rows for vulkan from "vulkan/stored_rows.comp":
     static (W)
     records (slots)
+    where form(E, DECODED) == 1
     launch stored_rows:
         threadgroups (min(M, 65535), ceil_div(W, 256), 1)
         threads_per_threadgroup (256, 1, 1)

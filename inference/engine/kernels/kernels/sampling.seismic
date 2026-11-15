@@ -283,19 +283,25 @@ native shape_rows for vulkan from "vulkan/shape_rows.comp":
         threadgroups (PARTS, Sx, 1)
         threads_per_threadgroup (WIDTH, 1, 1)
 
-# Native CPU: prepare gives each work item one of PARTS vocabulary slices of
-# a row (constraint mask, penalties, temperature, slice maximum; the slice's history tokens are
-# staged in its private bytes). filter gives each work item one row: a
-# selection finds the top-k threshold and a sort of the top-k and min-p
-# survivors ranks them for top-p, with the GPU forms' integer masses and
-# exact ceil(top_p * total) target, so every decision is theirs bit for bit
-# and independent of PARTS.
+# Native CPU: prepare has one work item per pool participant
+# (`device.units`): the rows' logits, flattened, split into that many equal
+# spans, so every participant shapes the same number of tokens whatever Sx.
+# Each item shapes each row's piece of its span (constraint mask, penalties,
+# temperature, piece maximum; the piece's history tokens are staged in its
+# private bytes) into the piece's slot of `partials` (span + row: at most
+# units + Sx - 1), and the last to finish a row's pieces (`arrivals`)
+# combines them into the row's `maxima` record. filter gives each work item
+# one row: a selection finds the top-k threshold and a sort of the top-k and
+# min-p survivors ranks them for top-p, with the GPU forms' integer masses
+# and exact ceil(top_p * total) target, so every decision is theirs bit for
+# bit and independent of the split.
 native shape_rows for cpu from "cpu/shape_rows.rs":
-    params (PARTS in [32, 8, 64, 1] default 32)
-    scratch partials bytes (Sx * PARTS * 8)
+    scratch partials bytes ((MAX_UNITS + Sx) * 8)
+    scratch maxima bytes (Sx * 8)
+    scratch arrivals bytes (Sx * 4) sync
     scratch order bytes (Sx * V * 8)
     launch shape_rows_prepare:
-        threadgroups (PARTS, Sx, 1)
+        threadgroups (device.units, 1, 1)
         threads_per_threadgroup (1, 1, 1)
         shared_bytes (Hn * 4)
     launch shape_rows_filter:
@@ -344,15 +350,16 @@ native sample_rows for vulkan from "vulkan/sample_rows.comp":
         threadgroups (ceil_div(M, 32), 1, 1)
         threads_per_threadgroup (32, 1, 1)
 
-# Native CPU: the same two stages, one work item per (slice, row) and one per
-# row merging the slice winners in slice order, so the result is independent
-# of PARTS.
+# Native CPU: one launch of one work item per pool participant
+# (`device.units`): the rows' logits, flattened, split into that many equal
+# spans, so every participant scans the same number of tokens whatever M.
+# Each item keeps the winner of each row's piece of its span in the piece's
+# slot of `partials` (slot span + row: at most units + M - 1), and the last
+# to finish a row's pieces (`arrivals`) combines them in span order and
+# writes the row's result, so the result is independent of the split.
 native sample_rows for cpu from "cpu/sample_rows.rs":
-    params (PARTS in [32, 8, 64, 1] default 32)
-    scratch partials bytes (M * PARTS * 12)
+    scratch partials bytes ((MAX_UNITS + M) * 12)
+    scratch arrivals bytes (M * 4) sync
     launch sample_rows_partition:
-        threadgroups (PARTS, M, 1)
-        threads_per_threadgroup (1, 1, 1)
-    launch sample_rows_merge:
-        threadgroups (M, 1, 1)
+        threadgroups (device.units, 1, 1)
         threads_per_threadgroup (1, 1, 1)

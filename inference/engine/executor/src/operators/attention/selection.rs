@@ -103,10 +103,10 @@ pub(crate) fn segment(
 /// The indexer's entries at one graph class.
 pub(crate) struct IndexerEntries<'a, G: GraphDraft + 'a> {
     /// Its projections, each bound to its own weight's and input norm's
-    /// elements: the query's and, for projected head weights, the head
-    /// weights'.
-    pub query_project: G::Binding<'a, attention_project::Entry>,
-    pub weights_project: Option<G::Binding<'a, attention_project::Entry>>,
+    /// elements and by row range: the query's and, for projected head
+    /// weights, the head weights'.
+    pub query_project: G::Ranged<'a, attention_project::Entry>,
+    pub weights_project: Option<G::Ranged<'a, attention_project::Entry>>,
     pub score: G::Binding<'a, indexer_score::Entry>,
     pub topk: G::Binding<'a, rows_topk::Entry>,
     /// A producing indexer's candidate pool ([`candidate_pool`]).
@@ -153,8 +153,9 @@ pub(crate) struct ProjectionInput<'v> {
 /// The write of the keys of the rows a producer completes, by the indexer
 /// keeping its own (`IndexerKeys::Latent`).
 pub(crate) struct KeyWrite<'v, 'a, G: GraphDraft + 'a> {
-    /// The key projection, bound to its weight's element, and the write.
-    pub project: G::Binding<'a, attention_project::Entry>,
+    /// The key projection, bound to its weight's element, by row range,
+    /// and the write.
+    pub project: G::Ranged<'a, attention_project::Entry>,
     pub write: G::Binding<'a, indexer_keys::Entry>,
     /// The F32 rows `[rows, W]` the key projection forms the producer's
     /// pre-rotary latent from (the latent itself, or at rate 1 the tokens'
@@ -263,7 +264,7 @@ pub(crate) struct Indexed {
 /// `[rows, out]` in the activation element.
 fn project<'a, G: GraphDraft + 'a>(
     graph: &mut G,
-    entry: G::Binding<'a, attention_project::Entry>,
+    entry: G::Ranged<'a, attention_project::Entry>,
     rows: &Dim,
     out: Dim,
     input: &ProjectionInput<'_>,
@@ -275,7 +276,7 @@ fn project<'a, G: GraphDraft + 'a>(
     let operands = projection.operands;
     Ok(graph
         .enqueue(
-            entry,
+            G::pick(entry, rows),
             &[
                 query_projection_dimensions(rows.clone(), input.width.clone(), out).as_slice(),
                 AttentionOperands::query_dimensions(operands).as_slice(),

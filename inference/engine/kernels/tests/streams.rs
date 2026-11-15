@@ -48,6 +48,11 @@ fn module() -> CheckedModule {
         path: "streaming_words.seismic".into(),
         text: include_str!("../kernels/streaming_words.seismic").into(),
     });
+    // The projections the entries take (`project`).
+    sources.push(SourceFile {
+        path: "dense.seismic".into(),
+        text: include_str!("../kernels/dense.seismic").into(),
+    });
     crate::common::check(sources)
 }
 
@@ -509,6 +514,33 @@ fn native_stream_mix_matches_portable_bodies() {
                     assert_stages(&label, &case.native(device, &expected), &expected, &bounds);
                 }
             }
+        }
+    }
+}
+
+/// On the CPU, the stream mixes split their weight rows (down | inject, and
+/// up) evenly over one work item per pool participant (`device.units`).
+/// Geometries set against the pool give items without rows (fewer weight
+/// rows than participants), shares that cross the down | inject edge, an
+/// empty inject segment, and shares of several `MAX_ROWS` blocks; each
+/// matches the host replica, at one row and at several.
+#[test]
+fn cpu_stream_mix_row_shares_match_the_host_replica() {
+    use seismic::device::DeviceValues;
+    let device = seismic::Devices::discover(&[]).unwrap().open_backend(seismic::BackendName::Cpu).unwrap();
+    let units = device.properties().value("units") as usize;
+    for (geometry, c) in [
+        ((32, 1, 4), 1),
+        ((64, 2, 8 * units + 3), 1),
+        ((64, 2, units / 2 + 1), 0),
+        ((128, 4, 2 * units + 1), 1),
+    ] {
+        for rows in [1, 5] {
+            let case = Case::new(geometry, c, rows);
+            let expected = case.host();
+            let (h, s, r) = geometry;
+            let label = format!("Cpu H {h} S {s} R {r} C {c} M {rows} on {units} participants");
+            assert_stages(&label, &case.native(&device, &expected), &expected, &case.inject_bounds());
         }
     }
 }

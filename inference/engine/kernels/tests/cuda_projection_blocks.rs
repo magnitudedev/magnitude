@@ -114,7 +114,7 @@ fn recurrent_project_cases(mixes: &[[Option<Format>; 4]], seed: u64) {
             let (normed, flips) = normalized(&hidden_values, &norm_values, m, h);
             let hidden = f32_tensor(&device, &[m as u64, h as u64], &hidden_values);
             let norm = f32_tensor(&device, &[h as u64], &norm_values);
-            for mapping in mappings(m, |mapping| projection.admits(&device, mapping)) {
+            for mapping in mappings("gated_delta_project", m, |mapping| projection.admits(&device, mapping)) {
                 let (x, operand) = operand_rows(&normed, h, mapping, formats[0]);
                 let slack = sum_slack(&flips, &operand);
                 let mut expected = vec![0.0; m * width];
@@ -215,7 +215,7 @@ fn attention_project_cases(sets: &[[Format; 3]], seed: u64) {
             let (normed, flips) = normalized(&hidden_values, &norm_values, m, d);
             let hidden = f32_tensor(&device, &[m as u64, d as u64], &hidden_values);
             let norm = f32_tensor(&device, &[d as u64], &norm_values);
-            for mapping in mappings(m, |mapping| projection.admits(&device, mapping)) {
+            for mapping in mappings("attention_project", m, |mapping| projection.admits(&device, mapping)) {
                 seismic_native_tests::progress(format_args!(
                     "attention project {formats:?} M={m} {mapping:?}"
                 ));
@@ -291,7 +291,7 @@ fn attention_output_projection(
             OW: weight,
         }),
         move |_: &Device, mapping: Mapping| {
-            mapping.projection_params(statics_specialization(&[
+            mapping.single_params(statics_specialization(&[
                 ("D", d),
                 ("SN", 1),
                 ("IN", 0),
@@ -316,7 +316,7 @@ fn attention_output_matches_host_model(format: Format) {
         let hidden_values: Vec<f32> = (0..m * d).map(|_| rng.uniform(-2.0, 2.0)).collect();
         let gated_tensor = bf16_tensor(&device, &[m as u64, q as u64, w as u64], &gated_values);
         let hidden = f32_tensor(&device, &[m as u64, d as u64], &hidden_values);
-        for mapping in mappings(m, |mapping| projection.admits(&device, mapping)) {
+        for mapping in mappings("attention_output", m, |mapping| projection.admits(&device, mapping)) {
             // The heads are exact input, so the INT8 emulation is exact too.
             let (x, _) = operand_rows(&gated_values, q * w, mapping, Some(format));
             let (projected, sums) =
@@ -414,7 +414,7 @@ fn cuda_scaled_projections_match_host_model() {
                 &[m as u64, heads as u64, width as u64],
                 &gated_values,
             );
-            for mapping in mappings(m, |mapping| {
+            for mapping in mappings("attention_project + attention_output", m, |mapping| {
                 projection.admits(&device, mapping) && output_projection.admits(&device, mapping)
             }) {
                 let (x, operand) = operand_rows(&normed, d, mapping, Some(format));

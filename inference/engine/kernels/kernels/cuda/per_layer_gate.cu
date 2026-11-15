@@ -1,18 +1,30 @@
-// per_layer_gate: the shared projection producer publishes semantic Act rows
-// or explicitly selected matrix operands. GEMV retains semantic inputs;
-// small and large matrix row bands share the same operand eligibility.
+// per_layer_gate: the gate projection of the rounded hidden rows, the forms
+// of the `dense` projection (`lib/projection/operator.cuh`) over rows the
+// stage launch always forms.
 #define KERNEL_W0 SEISMIC_GATE_WEIGHT
-#include "lib/projection/projection.cuh"
+#include "lib/projection/operator.cuh"
 
+
+// The staged rows, read in place by every form.
 using Pro = projection::Plain<ELEMENT_OF(SEISMIC_ELEMENT_A), projection::AllRows>;
 using Epi = projection::ActivatedMul<ELEMENT_OF(SEISMIC_ELEMENT_A)>;
 
-#define ROUNDED SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)
-#define ROUNDED_ROWS Pro{ROUNDED, SEISMIC_DIM_D, projection::AllRows{}}
-#define STAGING SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)
-#define GROUPS SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GROUPS)
-#define GATE KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_GATE_WEIGHT))
-#define EPILOGUE                                                                                          \
+#define PROJECTION_M SEISMIC_DIM_M
+#define PROJECTION_K SEISMIC_DIM_D
+#define PROJECTION_N SEISMIC_DIM_P
+#define PROJECTION_G 1
+#define PROJECTION_WA packets::W0
+#define PROJECTION_WB projection::NoWeight
+#define PROJECTION_WEIGHT_TYPES projection::op::Types<packets::W0>
+#define PROJECTION_INT8 PACKETS_FORM_INT8(KERNEL_W0)
+#define PROJECTION_ROWS(g) Pro{PROJECTION_STAGING, SEISMIC_DIM_D, projection::AllRows{}}
+#define PROJECTION_PLACE(g) PROJECTION_STAGING
+#define PROJECTION_PLACE_STRIDE SEISMIC_DIM_D
+#define PROJECTION_STAGING SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)
+#define PROJECTION_GROUPS SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GROUPS)
+#define PROJECTION_PARTIALS(g, parts) reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS))
+#define PROJECTION_WEIGHTS(g) KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_GATE_WEIGHT)), projection::NoWeight{}
+#define PROJECTION_EPILOGUE(g)                                                                            \
     Epi {                                                                                                 \
         SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0,                                  \
             reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_INPUTS)) +                         \
@@ -20,69 +32,50 @@ using Epi = projection::ActivatedMul<ELEMENT_OF(SEISMIC_ELEMENT_A)>;
             SEISMIC_INPUTS_STRIDE_0, (int)SEISMIC_PARAM_ACTIVATION                                        \
     }
 
-// The GEMV over NB column blocks of 8 rows.
-template <int NB, int KSPLIT>
-__device__ __forceinline__ void gate_gemv(const Pro &rounded, unsigned M, unsigned long long D, unsigned long long P,
-                                          const packets::W0 &gate, const Epi &epi) {
-    using Shape = projection::GemvShape<8, 1, KSPLIT, NB>;
-    __shared__ projection::GemvShared<Shape, Pro> shared;
-    const unsigned long long group = Shape::tile_group();
-    projection::gemv_segment<Shape>(shared, rounded, M, D / 64, group, P, gate, projection::NoWeight{}, epi);
-}
-
 // The strided F32 hidden source publishes semantic Act before its selected
-// matrix representation. One producer replaces the separate rounding recipes.
+// matrix representation, formed as the gate weight's operand rows.
 #ifdef SEISMIC_FORMING_PER_LAYER_GATE_STAGE
 template <unsigned INT8, unsigned OPERAND>
 __global__ void per_layer_gate_stage(SEISMIC_KERNEL_PARAMS) {
-    constexpr bool S8 = projection::int8_path<INT8, PACKETS_FORM_INT8(KERNEL_W0)>();
-    using Operands = projection::GemmOperandsOf<OPERAND, packets::W0>;
-    // Formed as the gate weight's operand rows.
     using Raw = projection::Strided<element::F32, projection::AllRows>;
     const projection::Operands<projection::OperandRecipe<packets::W0_OPERANDS_NVFP4>::NVFP4, Raw> source{
         Raw{SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN), SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1, projection::AllRows{}}};
-    projection::stage_projection_row<S8, Operands>(source, blockIdx.x, SEISMIC_DIM_M, SEISMIC_DIM_D, STAGING, GROUPS);
+    PROJECTION_STAGE_OF(source);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_PER_LAYER_GATE_GEMV
-template <unsigned KSPLIT>
-__global__ void per_layer_gate_gemv(SEISMIC_KERNEL_PARAMS) {
-    gate_gemv<1, KSPLIT>(ROUNDED_ROWS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D, SEISMIC_DIM_P, GATE, EPILOGUE);
+template <unsigned STAGING, unsigned KSPLIT, unsigned RESIDENCY>
+__launch_bounds__(256, PROJECTION_GEMV_BLOCKS(KSPLIT, RESIDENCY)) __global__ void per_layer_gate_gemv(SEISMIC_KERNEL_PARAMS) {
+    PROJECTION_GEMV(1, KSPLIT, STAGING, PROJECTION_GEMV_GRID(KSPLIT, RESIDENCY), RESIDENCY,
+                    nullptr);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_PER_LAYER_GATE_GEMV16
-template <unsigned KSPLIT>
+template <unsigned STAGING, unsigned KSPLIT>
 __global__ void per_layer_gate_gemv16(SEISMIC_KERNEL_PARAMS) {
-    gate_gemv<2, KSPLIT>(ROUNDED_ROWS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D, SEISMIC_DIM_P, GATE, EPILOGUE);
+    PROJECTION_GEMV(2, KSPLIT, STAGING, 0, 1, nullptr);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_PER_LAYER_GATE_GEMM_SMALL
-template <unsigned INT8, unsigned OPERAND>
+template <unsigned INT8, unsigned OPERAND, unsigned SPLIT>
 __global__ void per_layer_gate_gemm_small(SEISMIC_KERNEL_PARAMS) {
-    constexpr bool S8 = projection::int8_path<INT8, PACKETS_FORM_INT8(KERNEL_W0)>();
-    extern __shared__ uint4 dynamic_shared[];
-    const unsigned long long column = projection::gemm_column<projection::SmallGemm>();
-    if (column < projection::gemm_columns(SEISMIC_DIM_P))
-        projection::gemm_run<projection::SmallGemm, S8, projection::GemmOperandsOf<OPERAND, packets::W0>>(reinterpret_cast<projection::u8 *>(dynamic_shared),
-                                                        STAGING, SEISMIC_DIM_D, GROUPS,
-                                                        (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D, column,
-                                                        SEISMIC_DIM_P, GATE, projection::NoWeight{}, EPILOGUE);
+    PROJECTION_GEMM(projection::SmallGemm, PROJECTION_OPERANDS);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_PER_LAYER_GATE_GEMM
-template <unsigned INT8, unsigned OPERAND, unsigned ROTATE>
+template <unsigned INT8, unsigned OPERAND, unsigned SPLIT, unsigned ROTATE>
 __global__ void per_layer_gate_gemm(SEISMIC_KERNEL_PARAMS) {
-    constexpr bool S8 = projection::int8_path<INT8, PACKETS_FORM_INT8(KERNEL_W0)>();
-    using Shape = projection::LargeGemm<ROTATE>;
-    extern __shared__ uint4 dynamic_shared[];
-    const unsigned long long column = projection::gemm_column<Shape>();
-    if (column < projection::gemm_columns(SEISMIC_DIM_P))
-        projection::gemm_run<Shape, S8, projection::GemmOperandsOf<OPERAND, packets::W0>>(reinterpret_cast<projection::u8 *>(dynamic_shared), ROUNDED, SEISMIC_DIM_D,
-                                           GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D, column, SEISMIC_DIM_P,
-                                           GATE, projection::NoWeight{}, EPILOGUE);
+    PROJECTION_GEMM(projection::LargeGemm<ROTATE>, PROJECTION_OPERANDS);
+}
+#endif
+
+#ifdef SEISMIC_FORMING_PER_LAYER_GATE_FINALIZE
+template <unsigned SPLIT>
+__global__ void per_layer_gate_finalize(SEISMIC_KERNEL_PARAMS) {
+    PROJECTION_FINALIZE;
 }
 #endif

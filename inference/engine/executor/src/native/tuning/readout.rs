@@ -9,8 +9,8 @@
 
 use super::cases::projection_shape;
 use super::{
-    CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points,
-    served_row_points,
+    CaseState, EntryTuning, Launch, ModelInputs, PointShape, TuningInputs, TuningLimits,
+    row_points, served_row_points,
 };
 use magnitude_batching::{HISTORY_WIDTH, SHAPING_WIDTH};
 use magnitude_family_contracts::{WeightKind, WeightScope};
@@ -201,6 +201,11 @@ impl HeadRowsTuning {
 impl EntryTuning for HeadRowsTuning {
     type Entry = readout_head_rows::Entry;
     type Case = HeadRowsCase;
+    /// A readout's call projects the launch's projected rows, which its
+    /// kernel is bound by (`project_readout`).
+    fn launch_rows(&self, launch: &Launch) -> u64 {
+        launch.projected
+    }
 
     fn launches(&self) -> usize {
         1
@@ -305,6 +310,11 @@ impl SelectedRowsTuning {
 impl EntryTuning for SelectedRowsTuning {
     type Entry = readout_selected_rows::Entry;
     type Case = SelectedRowsCase;
+    /// A readout's call projects the launch's projected rows, which its
+    /// kernel is bound by (`project_readout`).
+    fn launch_rows(&self, launch: &Launch) -> u64 {
+        launch.projected
+    }
 
     fn launches(&self) -> usize {
         1
@@ -405,6 +415,11 @@ pub(crate) struct PreparedProjectionCase {
 impl EntryTuning for PreparedProjectionTuning {
     type Entry = readout_project_rows::Entry;
     type Case = PreparedProjectionCase;
+    /// A readout's call projects the launch's projected rows, which its
+    /// kernel is bound by (`project_readout`).
+    fn launch_rows(&self, launch: &Launch) -> u64 {
+        launch.projected
+    }
     fn launches(&self) -> usize {
         6
     }

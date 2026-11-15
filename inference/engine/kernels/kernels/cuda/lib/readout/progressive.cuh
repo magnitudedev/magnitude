@@ -13,7 +13,12 @@
 // order and the warp reducing in one fixed tree, so a certified selection's
 // exact logits equal the full pass's bit for bit. View comparisons keep a
 // relative margin of PROGRESSIVE_MARGIN, so F32 rounding only keeps extra rows.
-#include "../projection/projection.cuh"
+//
+// The top level and the full pass are the `dense` projection's `planes` form
+// (`../projection/planes.cuh`) over a view here (`Top`, `Exact`), with an
+// epilogue (`Bounds`, `Logits`) and a formation of their rows (`Measured`,
+// `Rows`); the later levels gather the survivors' remaining planes.
+#include "../projection/planes.cuh"
 #include "../core/arrive.cuh"
 #include "../core/gumbel.cuh"
 
@@ -23,7 +28,7 @@
 #define PROGRESSIVE_COARSE_SCALE (1u << PROGRESSIVE_HALF_BITS)
 #define PROGRESSIVE_COARSE_BIAS (0.5f * float(PROGRESSIVE_COARSE_SCALE - 1u) - float(PROGRESSIVE_OFFSET))
 
-#define PROGRESSIVE_CHUNK 1024u
+#define PROGRESSIVE_ROWS unsigned(SEISMIC_CONST_VERIFY_ROWS)
 #define PROGRESSIVE_MARGIN 3.814697265625e-06f
 // The largest Gumbel noise the sampler draws: -log(-log u) at the largest
 // uniform u = 1 - 2^-24, about 16.64.
@@ -36,6 +41,10 @@ using projection::u32;
 using projection::u64;
 using projection::u8;
 typedef element::Out<element::F32> F32Out;
+using projection::planes::warp_sum;
+using projection::planes::X;
+
+static_assert(PROGRESSIVE_ROWS == PROJECTION_PLANES_ROWS, "a selection's rows are one block of the planes form");
 
 // Order-preserving key of an F32 (zero is below every key), and back.
 __device__ __forceinline__ u32 key(float value) {
@@ -60,11 +69,6 @@ template <int J> __device__ __forceinline__ float byte(u32 word, float bias) {
 
 constexpr float UNSIGNED = 8388608.0f;  // 2^23
 constexpr float SIGNED = 8388608.0f + float(PROGRESSIVE_OFFSET);    // 2^23 + 128
-
-// The 32 activations of one group, as pairs (2p, 2p + 1).
-struct X {
-    float2 pair[16];
-};
 
 // sum_e (code_e) x_e over quarter q of a group from even/odd byte words.
 template <bool SIGN>
@@ -148,14 +152,6 @@ __device__ __forceinline__ float exact(float scale, const Codes &codes, const X 
     return __fmul_rn(scale, codes_dot(codes, x));
 }
 
-// The warp's sum in one fixed tree.
-__device__ __forceinline__ float warp_sum(float value) {
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        value = __fadd_rn(value, __shfl_xor_sync(0xffffffffu, value, offset));
-    return value;
-}
-
 // Group g of row m of `features` (A, row stride `stride` elements).
 __device__ __forceinline__ X features_group(const u8 *features, u64 stride, u32 m, u32 g) {
     const uint4 *words = reinterpret_cast<const uint4 *>(features + (m * stride + 32ull * g) * Act::bytes);
@@ -171,6 +167,11 @@ __device__ __forceinline__ X features_group(const u8 *features, u64 stride, u32 
     return x;
 }
 
+// A logit capped at `softcap` (none at 0).
+__device__ __forceinline__ float cap(float softcap, float logit) {
+    return softcap > 0.0f ? functions::softcap(softcap, logit) : logit;
+}
+
 // The selection side of the output rows.
 struct Selection {
     const u32 *draws;
@@ -183,9 +184,7 @@ struct Selection {
     u64 constrained_stride;
     float softcap;
 
-    __device__ __forceinline__ float transform(float logit) const {
-        return softcap > 0.0f ? functions::softcap(softcap, logit) : logit;
-    }
+    __device__ __forceinline__ float transform(float logit) const { return cap(softcap, logit); }
 
     __device__ __forceinline__ bool competes(u32 m, u32 v) const {
         return constrained[m * constrained_stride] == 0 ||
@@ -222,37 +221,6 @@ __device__ __forceinline__ void publish(const u32 *lowest, u32 *bounds, u32 rows
     }
 }
 
-// Row blockIdx.x of the prologue into `features` (A); with GROUPS also its
-// length (over the rounded values, into `*lengths`) and per-group sums
-// ([rows][d / 32]).
-template <bool GROUPS, class Pro>
-__device__ __forceinline__ void form(const Pro &pro, u32 d, element::Out<Act> features, u64 feature_stride, const F32Out *lengths,
-                                     u64 length_stride, float *groups) {
-    __shared__ float factors[Pro::FACTORS > 0 ? Pro::FACTORS : 1];
-    __shared__ float partials[32];
-    const u32 m = blockIdx.x;
-    pro.prepare_row(factors, m, partials);
-    __syncthreads();
-    const u32 lane = threadIdx.x % 32, warps = blockDim.x / 32;
-    float squares = 0.0f;
-    for (u32 g = threadIdx.x / 32; g < d / 32; g += warps) {
-        const float value = pro.value(factors, m, 32ull * g + lane);
-        features.put(m * feature_stride + 32ull * g + lane, value);
-        if constexpr (GROUPS) {
-            squares = seismic_fma_rn(value, value, squares);
-            const float sum = warp_sum(value);
-            if (lane == 0)
-                groups[m * (d / 32) + g] = sum;
-        }
-    }
-    if constexpr (GROUPS) {
-        __syncthreads();
-        const float total = reduce::group_sum(squares, partials);
-        if (threadIdx.x == 0)
-            lengths->put(m * length_stride, sqrtf(total));
-    }
-}
-
 struct Planes {
     const u32 *top;
     u64 top_stride;
@@ -284,109 +252,126 @@ struct Planes {
     }
 };
 
-// The vocabulary GEMV over every row: ROWS vocabulary rows per warp, lane l
-// reading group l of each 1,024-column chunk (the chunk's activations staged
-// in `staged`, SEISMIC_CONST_VERIFY_ROWS x PROGRESSIVE_CHUNK A values of shared memory,
-// quarter-major so a warp's 16-byte reads are conflict-free; `sums` holds
-// SEISMIC_CONST_VERIFY_ROWS x 32 group sums, `lowest` SEISMIC_CONST_VERIFY_ROWS keys). EXACT: the exact logits. Otherwise the 4-bit view
-// `s * (16 H - 120.5)`, whose lower-bound scores raise each row's threshold.
-template <u32 MAXM, u32 ROWS, bool EXACT>
-__device__ __forceinline__ void scan(const u8 *features, u64 feature_stride, const float *groups, const Planes &planes,
-                                     const float *radius, u64 radius_stride, const float *lengths, u64 length_stride,
-                                     const Selection &selection, F32Out logits, u64 logit_row, u64 logit_col,
-                                     const F32Out *threshold, u64 threshold_stride, u32 *bounds, u32 rows, u32 vocabulary,
-                                     u32 d, uint4 *staged, float *sums, u32 *lowest) {
-    const u32 lane = threadIdx.x % 32, warps = blockDim.x / 32;
-    if (!EXACT && threadIdx.x < SEISMIC_CONST_VERIFY_ROWS)
-        lowest[threadIdx.x] = 0u;
-    const u32 first = (blockIdx.x * warps + threadIdx.x / 32) * ROWS;
-    float acc[ROWS][MAXM];
-#pragma unroll
-    for (u32 r = 0; r < ROWS; ++r)
-#pragma unroll
-        for (u32 m = 0; m < MAXM; ++m)
-            acc[r][m] = 0.0f;
-    for (u32 chunk = 0; chunk < d; chunk += PROGRESSIVE_CHUNK) {
-        const u32 width = min(PROGRESSIVE_CHUNK, d - chunk);
-        __syncthreads();
-        for (u32 item = threadIdx.x; item < rows * (width / 8); item += blockDim.x) {
-            const u32 m = item / (width / 8), w = item % (width / 8);
-            staged[(m * 4 + w % 4) * 32 + w / 4] =
-                *reinterpret_cast<const uint4 *>(features + (m * feature_stride + chunk + 8ull * w) * Act::bytes);
-        }
-        if constexpr (!EXACT)
-            for (u32 item = threadIdx.x; item < rows * (width / 32); item += blockDim.x) {
-                const u32 m = item / (width / 32), g = item % (width / 32);
-                sums[m * 32 + g] = groups[m * (d / 32) + chunk / 32 + g];
-            }
-        __syncthreads();
-        if (32 * lane >= width)
-            continue;
-        const u32 g = chunk / 32 + lane;
-        // Every row's words first, so their loads are in flight together.
-        Group group[ROWS];
-#pragma unroll
-        for (u32 r = 0; r < ROWS; ++r) {
-            const u32 v = min(first + r, vocabulary - 1);
-            if constexpr (EXACT) {
-                group[r] = planes.group(v, g);
-            } else {
-                group[r].high = planes.high(v, g);
-                group[r].scale = planes.scale(v, g);
-            }
-        }
-#pragma unroll
-        for (u32 r = 0; r < ROWS; ++r) {
-            const Codes codes = EXACT ? exact_codes(group[r]) : top_codes(group[r].high);
-#pragma unroll
-            for (u32 m = 0; m < MAXM; ++m) {
-                if (m >= rows)
-                    break;
-                X x;
-#pragma unroll
-                for (u32 q = 0; q < 4; ++q) {
-                    const uint4 w = staged[(m * 4 + q) * 32 + lane];
-                    x.pair[4 * q + 0] = Act::unpack2(w.x);
-                    x.pair[4 * q + 1] = Act::unpack2(w.y);
-                    x.pair[4 * q + 2] = Act::unpack2(w.z);
-                    x.pair[4 * q + 3] = Act::unpack2(w.w);
-                }
-                if constexpr (EXACT) {
-                    acc[r][m] = __fadd_rn(acc[r][m], exact(group[r].scale, codes, x));
-                } else {
-                    const float view = seismic_fma_rn(float(PROGRESSIVE_COARSE_SCALE), codes_dot(codes, x),
-                                                      __fmul_rn(PROGRESSIVE_COARSE_BIAS, sums[m * 32 + lane]));
-                    acc[r][m] = seismic_fma_rn(group[r].scale, view, acc[r][m]);
-                }
-            }
+// The full pass's view: the exact codes, by the exact level's routine.
+struct Exact {
+    Planes planes;
+    using Group = progressive::Group;
+    __device__ __forceinline__ void stage(u32, u32, u32, u32, u32) const {}
+    __device__ __forceinline__ Group load(u32 v, u32 g) const { return planes.group(v, g); }
+    __device__ __forceinline__ Codes decode(const Group &group) const { return exact_codes(group); }
+    __device__ __forceinline__ float add(float acc, const Group &group, const Codes &codes, const X &x, u32,
+                                         u32) const {
+        return __fadd_rn(acc, exact(group.scale, codes, x));
+    }
+};
+
+// The top level's view: the 4-bit view `s * (16 H - 120.5)`, over the rows'
+// group sums (`groups`, [rows][d / 32], `Measured`), a chunk's staged in
+// `sums` (PROGRESSIVE_ROWS x 32).
+struct Top {
+    Planes planes;
+    const float *groups;
+    float *sums;
+    struct Group {
+        uint4 high;
+        float scale;
+    };
+    __device__ __forceinline__ void stage(u32 first, u32 rows, u32 chunk, u32 width, u32 d) const {
+        for (u32 item = threadIdx.x; item < rows * (width / 32); item += blockDim.x) {
+            const u32 m = item / (width / 32), g = item % (width / 32);
+            sums[m * 32 + g] = groups[(first + m) * (d / 32) + chunk / 32 + g];
         }
     }
-#pragma unroll
-    for (u32 r = 0; r < ROWS; ++r) {
-        const u32 v = first + r;
-#pragma unroll
-        for (u32 m = 0; m < MAXM; ++m) {
-            if (m >= rows)
-                break;
-            const float logit = warp_sum(acc[r][m]);
-            if (v >= vocabulary || lane != m)
-                continue;
-            logits.put(m * logit_row + v * logit_col, EXACT ? selection.transform(logit) : logit);
-            if (!EXACT && selection.competes(m, v)) {
-                // A score is its noise-free score plus noise of at most
-                // PROGRESSIVE_NOISE: a row that cannot reach the threshold so
-                // far cannot raise it, so it skips the noise.
-                const float lower =
-                    __fsub_rn(logit, __fmul_rn(radius[v * radius_stride], lengths[m * length_stride]));
-                const u32 best = *reinterpret_cast<volatile const u32 *>(&lowest[m]);
-                if (best == 0u || __fdiv_rn(selection.transform(lower), selection.divisor(m)) + PROGRESSIVE_NOISE >= value_of(best))
-                    atomicMax(&lowest[m], key(selection.score(m, v, lower)));
-            }
-        }
+    __device__ __forceinline__ Group load(u32 v, u32 g) const { return Group{planes.high(v, g), planes.scale(v, g)}; }
+    __device__ __forceinline__ Codes decode(const Group &group) const { return top_codes(group.high); }
+    __device__ __forceinline__ float add(float acc, const Group &group, const Codes &codes, const X &x, u32 m,
+                                         u32 lane) const {
+        const float view = seismic_fma_rn(float(PROGRESSIVE_COARSE_SCALE), codes_dot(codes, x),
+                                          __fmul_rn(PROGRESSIVE_COARSE_BIAS, sums[m * 32 + lane]));
+        return seismic_fma_rn(group.scale, view, acc);
     }
-    if constexpr (!EXACT)
-        publish(lowest, bounds, rows, nullptr, 0, lengths, length_stride, *threshold, threshold_stride);
-}
+};
+
+// The full pass's epilogue: the exact logits, capped.
+struct Logits {
+    F32Out logits;
+    u64 row, col;
+    float softcap;
+    __device__ __forceinline__ void begin() const {}
+    __device__ __forceinline__ void store(u32 m, u32 v, float logit) const {
+        logits.put(m * row + v * col, cap(softcap, logit));
+    }
+    __device__ __forceinline__ void end(u32) const {}
+};
+
+// The top level's epilogue: the view logits, each competing row's
+// lower-bound score raising its row's key in `lowest` (PROGRESSIVE_ROWS
+// shared keys), then the thresholds `publish`ed over `bounds`.
+struct Bounds {
+    F32Out logits;
+    u64 logit_row, logit_col;
+    const float *radius;
+    u64 radius_stride;
+    const float *lengths;
+    u64 length_stride;
+    Selection selection;
+    F32Out threshold;
+    u64 threshold_stride;
+    u32 *bounds;
+    u32 *lowest;
+    __device__ __forceinline__ void begin() const {
+        if (threadIdx.x < PROGRESSIVE_ROWS)
+            lowest[threadIdx.x] = 0u;
+    }
+    __device__ __forceinline__ void store(u32 m, u32 v, float logit) const {
+        logits.put(m * logit_row + v * logit_col, logit);
+        if (!selection.competes(m, v))
+            return;
+        // A score is its noise-free score plus noise of at most
+        // PROGRESSIVE_NOISE: a row that cannot reach the threshold so far
+        // cannot raise it, so it skips the noise.
+        const float lower = __fsub_rn(logit, __fmul_rn(radius[v * radius_stride], lengths[m * length_stride]));
+        const u32 best = *reinterpret_cast<volatile const u32 *>(&lowest[m]);
+        if (best == 0u ||
+            __fdiv_rn(selection.transform(lower), selection.divisor(m)) + PROGRESSIVE_NOISE >= value_of(best))
+            atomicMax(&lowest[m], key(selection.score(m, v, lower)));
+    }
+    __device__ __forceinline__ void end(u32 rows) const {
+        publish(lowest, bounds, rows, nullptr, 0, lengths, length_stride, threshold, threshold_stride);
+    }
+};
+
+// The full pass's rows alone.
+struct Rows {
+    struct State {};
+    __device__ __forceinline__ void group(State &, u32, u32, u32, float) const {}
+    __device__ __forceinline__ void finish(State &, u32, float *) const {}
+};
+
+// The top level's rows with their lengths (over the rounded values) and
+// their per-group sums ([rows][d / 32]), which the 4-bit view and the
+// bounds read.
+struct Measured {
+    F32Out lengths;
+    u64 length_stride;
+    float *groups;
+    u32 d;
+    struct State {
+        float squares;
+    };
+    __device__ __forceinline__ void group(State &state, u32 m, u32 g, u32 lane, float value) const {
+        state.squares = seismic_fma_rn(value, value, state.squares);
+        const float sum = warp_sum(value);
+        if (lane == 0)
+            groups[m * (d / 32) + g] = sum;
+    }
+    __device__ __forceinline__ void finish(State &state, u32 m, float *partials) const {
+        __syncthreads();
+        const float total = reduce::group_sum(state.squares, partials);
+        if (threadIdx.x == 0)
+            lengths.put(m * length_stride, sqrtf(total));
+    }
+};
 
 // A later level: one warp per 32 vocabulary rows. Lane l decides row l for
 // every output row (the previous level's upper-bound score against `floor`,

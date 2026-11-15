@@ -10,17 +10,19 @@ use super::cases::scale_extent;
 use super::routed::{
     BankOperands, ExpansionScales, GroupedTables, RoutedShape, bank_sources, bank_statics,
     decode_points, group, grouped_points, lead_ports, no_sources, no_tier, routes, streamed_hint,
+    words, written,
 };
 use super::{
     CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, experts_text, row_points,
 };
 use crate::GeneralRoutedBinding;
 use crate::operators::routed::fused_graph::TILE_ROWS;
-use crate::planning::BankBinding;
+use crate::planning::{BankBinding, HINT_LEADS};
 use magnitude_family_contracts::{GluLimit, WeightKind, WeightScope};
+use magnitude_kernels::constants::{POLICY_WORDS, STEP_LOW, STEP_WORDS};
 use magnitude_kernels::{
-    routed_down, routed_down_project, routed_experts, routed_experts_up, routed_gate_up, routed_scatter, routed_select,
-    routed_select_streamed, routed_up,
+    routed_down, routed_down_project, routed_experts, routed_experts_up, routed_gate_up,
+    routed_hint_select, routed_scatter, routed_select, routed_select_streamed, routed_up,
 };
 use seismic::{BuildError, Element, Tensor};
 
@@ -189,13 +191,10 @@ pub(crate) struct RoutedSelectStreamedTuning {
     /// The streamed layers that launch it.
     pub layers: Vec<WeightScope>,
     pub bank: BankBinding,
-    pub ahead: u64,
 }
 
 pub(crate) struct RoutedSelectStreamedCase {
     select: RoutedSelectCase,
-    /// Each lead's router norm, router and selection bias.
-    leads: [[Tensor; 3]; crate::planning::HINT_LEADS as usize],
     bank: BankOperands,
 }
 
@@ -225,7 +224,7 @@ impl EntryTuning for RoutedSelectStreamedTuning {
 
     fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let mut statics = self.resident.statics(inputs)?;
-        statics.extend(bank_statics(self.bank, self.ahead));
+        statics.extend(bank_statics(self.bank));
         Ok(statics)
     }
 
@@ -240,27 +239,11 @@ impl EntryTuning for RoutedSelectStreamedTuning {
     ) -> Result<Vec<Self::Case>, BuildError> {
         let mut over = self.resident.clone();
         over.scopes = self.layers.clone();
-        // The router's input norm the hints read, as the selection's
-        // (`operators::routed::hint_kinds`).
-        let router_norm = if self.resident.binding.shape.router_norm {
-            WeightKind::RouterInputNorm
-        } else {
-            WeightKind::InputNorm
-        };
-        let scopes = TuningInputs::rotation_scopes(&self.layers, point);
         over.rotation(inputs, point)?
             .into_iter()
-            .zip(scopes)
-            .map(|(select, scope)| {
-                let hinted = streamed_hint(inputs, scope)?;
+            .map(|select| {
                 Ok(RoutedSelectStreamedCase {
-                    leads: lead_ports(
-                        inputs,
-                        &hinted,
-                        [router_norm, WeightKind::Router, WeightKind::RouterSelectionBias],
-                        [&select.router_norm, &select.router, &select.bias],
-                    )?,
-                    bank: BankOperands::new(inputs, self.bank, self.ahead, point.rows)?,
+                    bank: BankOperands::new(inputs, self.bank, point.rows)?,
                     select,
                 })
             })
@@ -268,11 +251,7 @@ impl EntryTuning for RoutedSelectStreamedTuning {
     }
 
     fn args<'a>(case: &'a mut Self::Case) -> routed_select_streamed::Args<'a> {
-        let RoutedSelectStreamedCase {
-            select,
-            leads: [[next_router_norm, next_router, next_bias], [after_router_norm, after_router, after_bias]],
-            bank,
-        } = case;
+        let RoutedSelectStreamedCase { select, bank } = case;
         routed_select_streamed::Args {
             residual: &select.residual,
             norm: &select.norm,
@@ -294,14 +273,6 @@ impl EntryTuning for RoutedSelectStreamedTuning {
             step: &bank.step,
             file: bank.file.tensor_mut(),
             sources: bank.sources.tensor_mut(),
-            next_router_norm,
-            next_router,
-            next_bias,
-            after_router_norm,
-            after_router,
-            after_bias,
-            next_policy: &bank.next_policy,
-            rings: bank.rings.tensor_mut(),
             routing: bank.routing.tensor_mut(),
         }
     }
@@ -313,6 +284,133 @@ impl EntryTuning for RoutedSelectStreamedTuning {
     }
 
     generated_entry!(routed_select_streamed, this => this.elements());
+}
+
+/// `routed_hint_select`: ahead-of-step general-selection hints at `ahead`
+/// (`1..=HINT_LEADS`).
+#[derive(Clone)]
+pub(crate) struct RoutedHintSelectTuning {
+    pub resident: RoutedSelectTuning,
+    pub layers: Vec<WeightScope>,
+    pub bank: BankBinding,
+    pub ahead: u64,
+}
+
+pub(crate) struct RoutedHintSelectCase {
+    residual: Tensor,
+    activation: Tensor,
+    leads: [[Tensor; 3]; HINT_LEADS as usize],
+    score: i32,
+    epsilon: f32,
+    step: Tensor,
+    next_policy: Tensor,
+    rings: CaseState,
+}
+
+impl EntryTuning for RoutedHintSelectTuning {
+    type Entry = routed_hint_select::Entry;
+    type Case = RoutedHintSelectCase;
+
+    fn launches(&self) -> usize {
+        self.layers.len()
+    }
+
+    fn bindings(&self) -> String {
+        self.resident.bindings()
+    }
+
+    fn statics(&self, _inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
+        let shape = self.resident.binding.shape;
+        Ok(vec![
+            ("H", shape.hidden),
+            ("K", shape.selected),
+            ("AHEAD", self.ahead),
+            ("EN", self.bank.next_experts),
+        ])
+    }
+
+    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
+        decode_points(limits)
+    }
+
+    fn rotation(
+        &self,
+        inputs: &mut TuningInputs<'_, '_>,
+        point: &PointShape,
+    ) -> Result<Vec<Self::Case>, BuildError> {
+        let mut over = self.resident.clone();
+        over.scopes = self.layers.clone();
+        let router_norm = if self.resident.binding.shape.router_norm {
+            WeightKind::RouterInputNorm
+        } else {
+            WeightKind::InputNorm
+        };
+        let scopes = TuningInputs::rotation_scopes(&self.layers, point);
+        let ring = self.bank.words.ring_words();
+        over.rotation(inputs, point)?
+            .into_iter()
+            .zip(scopes)
+            .map(|(select, scope)| {
+                let hinted = streamed_hint(inputs, scope)?;
+                let leads = lead_ports(
+                    inputs,
+                    &hinted,
+                    [router_norm, WeightKind::Router, WeightKind::RouterSelectionBias],
+                    [&select.router_norm, &select.router, &select.bias],
+                )?;
+                let step = words(inputs, &[STEP_WORDS])?;
+                step.store_release(4 * STEP_LOW, 1)?;
+                Ok(RoutedHintSelectCase {
+                    residual: select.residual,
+                    activation: inputs.scratch(self.resident.binding.activation, &[0, self.resident.binding.shape.selected])?,
+                    leads,
+                    score: select.shape.score,
+                    epsilon: select.epsilon,
+                    step,
+                    next_policy: words(inputs, &[POLICY_WORDS])?,
+                    rings: written(inputs, words(inputs, &[self.ahead, ring])?)?,
+                })
+            })
+            .collect()
+    }
+
+    fn args<'a>(case: &'a mut Self::Case) -> routed_hint_select::Args<'a> {
+        let RoutedHintSelectCase {
+            residual,
+            activation,
+            leads: [[next_router_norm, next_router, next_bias], [after_router_norm, after_router, after_bias]],
+            score,
+            epsilon,
+            step,
+            next_policy,
+            rings,
+        } = case;
+        routed_hint_select::Args {
+            residual,
+            activation,
+            next_router_norm,
+            next_router,
+            next_bias,
+            after_router_norm,
+            after_router,
+            after_bias,
+            score: *score,
+            epsilon: *epsilon,
+            step,
+            next_policy,
+            rings: rings.tensor_mut(),
+        }
+    }
+
+    fn state(case: &Self::Case) -> Vec<(&'static str, &CaseState)> {
+        vec![("rings", &case.rings)]
+    }
+
+    generated_entry!(routed_hint_select, this => routed_hint_select::Elements {
+        RNW: this.resident.binding.router_norm,
+        RW: this.resident.binding.router,
+        A: this.resident.binding.activation,
+    });
 }
 
 /// The decode expansion: `routed_gate_up` (gated experts) or `routed_up`.
@@ -634,8 +732,8 @@ impl EntryTuning for RoutedDownTuning {
 /// `routed_down_project`: the device's projections of a streamed layer's
 /// general combine, its resident down's (`routed_down`) launches and
 /// parameters publishing the projections for `routed_down_sited`, following
-/// the resident down's unit as `RoutedOutputProjectTuning` follows its
-/// output.
+/// the resident down's unit of each row range as `RoutedOutputProjectTuning`
+/// follows its output's.
 #[derive(Clone)]
 pub(crate) struct RoutedDownProjectTuning {
     /// The resident down it follows, over every layer of the binding.
@@ -765,6 +863,7 @@ impl RoutedExpertTilesTuning {
             ("H", shape.expert_hidden),
             ("E", shape.experts),
             ("F", shape.intermediate),
+            ("T", TILE_ROWS),
         ];
         statics.extend(ExpansionScales::statics(
             inputs,

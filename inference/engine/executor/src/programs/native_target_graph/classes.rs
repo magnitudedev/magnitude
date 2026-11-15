@@ -1,8 +1,9 @@
+use super::block::{BlockCarries, CARRIED_ROWS, CarrySide};
 use super::prepared::{
-    BlockGraphShape, BlockTaps, block_graph_shapes, block_scopes, block_taps, chain_rows,
+    BlockGraphShape, BlockTaps, block_graph_shapes, block_scopes, block_taps, chain_rows, stateless_tail,
 };
 use crate::{
-    ModelLoadPlan, ResourceLimits, StateResourcePlan, TargetBlockProgramSlot, TargetProgramPlan,
+    MixerProgramSlot, ModelLoadPlan, ResourceLimits, StateResourcePlan, TargetBlockProgramSlot, TargetProgramPlan,
     native::OutputScales,
     operators::{
         BlockKeeps, PairedBlock, paired_block,
@@ -15,7 +16,7 @@ use crate::{
 };
 use magnitude_family_contracts::{Decoder, RoutedFfn, WeightScope};
 use magnitude_state::LayerRef;
-use seismic::{BackendName, Element, NativeGraphClassSlice};
+use seismic::{BackendName, Element, NativeGraphClassSlice, OperandForms, OperandRecipe};
 
 /// A block graph's class: (rows, history segments, request slots, the
 /// history row tiles of its launch's rows it lists, 0 for a class that lists
@@ -789,6 +790,110 @@ pub(super) fn block_class_slice(
     }
 }
 
+/// The forms block `block`'s input projection reads its operand in at the
+/// rows a carry exists at (`CARRIED_ROWS`), as its prepared kernels
+/// (`target`) take it there: Q8 blocks where its kernel is of `INT8 == 1`,
+/// and rows under the NVFP4 operand transform where its weight's are. The
+/// forms of the carry into the block, which the graphs of kernels on both
+/// of its sides name (`BlockCarries::formed`).
+pub(super) fn carried_forms(
+    target: &crate::native::AttestedTarget,
+    plan: &TargetProgramPlan,
+    block: usize,
+) -> Result<OperandForms, String> {
+    let reader = "a carried operand's reader";
+    let slot = plan.blocks().get(block).ok_or_else(|| format!("{reader} is no planned block"))?;
+    let handle = target.blocks.get(block).ok_or_else(|| format!("{reader} has no kernels"))?;
+    let (weight, quantized) = match (slot.mixer(), &handle.mixer) {
+        (MixerProgramSlot::Attention(binding), crate::native::AttestedMixer::Attention(kernels)) => {
+            (binding.query, carried_int8(&kernels.project)?)
+        }
+        (MixerProgramSlot::Recurrent(binding), crate::native::AttestedMixer::Recurrent(kernels)) => {
+            let quantized = match &kernels.form {
+                crate::native::RecurrentFormKernels::Gated { project, .. } => carried_int8(project)?,
+                crate::native::RecurrentFormKernels::Kimi(kimi) => carried_int8(&kimi.project)?,
+            };
+            (binding.qkv, quantized)
+        }
+        _ => return Err(format!("{reader} projects no input")),
+    };
+    Ok(OperandForms { quantized, nvfp4: weight.operand_recipe() == OperandRecipe::Nvfp4Rows })
+}
+
+/// The INT8 form of `project`'s kernel at the carried rows.
+fn carried_int8<E: seismic::Entry>(project: &crate::native::RangedKernels<E>) -> Result<bool, String> {
+    match project.for_rows(&seismic::Dim::from(CARRIED_ROWS)).specialization().param("INT8") {
+        Some(form) => Ok(form == 1),
+        None => Err("a carried operand's reader declares no INT8 form".to_string()),
+    }
+}
+
+/// Each block's operand carries (`BlockCarries`): block L's output forms
+/// block L+1's operand on the CPU, where L's feed-forward is the fused
+/// routed one, whose output (`routed_output`) is the block's output (no
+/// residual streams, per-layer input or n-gram input after it), and L+1's
+/// mixer reads that output under its input norm (`SublayerSource::Norm`)
+/// in a projection that forms its operand from it (`attention_project` of
+/// a full query or Kimi Delta Attention, `gated_delta_project` of the step
+/// form), at L's norm's
+/// element (the one `routed_output` binds, `RoutedGraphEntries::operand_norm`)
+/// and L's activation. No carry enters the first block of the stateless
+/// tail (`stateless_tail`), which a step may run over fewer rows than the
+/// block before it. Whether a boundary carries never depends on tuning:
+/// each side names its reader, L+1's mixer binding, whose kernels decide
+/// the forms it is carried in (`CarrySide`).
+pub(super) fn block_carries(
+    backend: BackendName,
+    geometry: &Decoder,
+    plan: &TargetProgramPlan,
+    tail: usize,
+) -> Result<Vec<BlockCarries<MixerProgramSlot>>, String> {
+    let blocks = plan.blocks();
+    let mut carries = vec![BlockCarries::default(); blocks.len()];
+    if backend != BackendName::Cpu || crate::operators::streams::StreamsGeometry::of(geometry).map_err(|error| error.to_string())?.is_some() {
+        return Ok(carries);
+    }
+    let step = crate::operators::gated_delta::graph::StepForm::of(backend)?;
+    for producer in 0..blocks.len().saturating_sub(1) {
+        let (slot, consumer) = (blocks[producer], producer + 1);
+        let Some(crate::FeedForwardProgramSlot::Routed(routed)) = slot.feed_forward() else {
+            continue;
+        };
+        if consumer == tail || slot.per_layer().is_some() || slot.ngram().is_some() {
+            continue;
+        }
+        let paired = paired_block(&geometry.blocks[consumer]).map_err(|error| error.to_string())?;
+        if !matches!(paired.mixer_input, crate::operators::SublayerSource::Norm(_)) {
+            continue;
+        }
+        let reader = blocks[consumer].mixer();
+        let (norm, activation) = match reader {
+            MixerProgramSlot::Attention(binding)
+                if binding.low_rank_query.is_none()
+                    && !binding.key_value_only
+                    && binding.selection.is_none()
+                    && binding.picked.is_none() =>
+            {
+                (binding.norm, binding.activation)
+            }
+            MixerProgramSlot::Recurrent(binding)
+                if matches!(binding.form, crate::RecurrentForm::PerChannel { .. })
+                    || step == crate::operators::gated_delta::graph::StepForm::Step =>
+            {
+                (binding.norm, binding.activation)
+            }
+            _ => continue,
+        };
+        if norm != routed.norm || activation != routed.activation {
+            continue;
+        }
+        let side = CarrySide::new(reader, norm, paired.epsilon() as f32);
+        carries[producer].carry_out = Some(side);
+        carries[consumer].carry_in = Some(side);
+    }
+    Ok(carries)
+}
+
 /// The blocks' output scales as their holder knows them. They are values of
 /// a block's sealed graphs, so blocks share plans only at equal scales.
 #[derive(Clone, Copy)]
@@ -869,6 +974,15 @@ pub(super) struct FamilyOutline {
     /// them.
     pub(super) keeps: Vec<BlockKeeps>,
     pub(super) tapped: Vec<BlockTaps>,
+    /// The first block of the stateless tail (`stateless_tail`).
+    pub(super) stateless_tail: usize,
+    /// The stateless tail and operand carries of the same target without
+    /// its drafter's writes, whose taps no longer keep blocks out of its
+    /// tail (`Self::undrafted`).
+    pub(super) undrafted: (usize, Vec<BlockCarries<MixerProgramSlot>>),
+    /// Per block, its operand carries (`block_carries`), which its shape
+    /// holds.
+    pub(super) carries: Vec<BlockCarries<MixerProgramSlot>>,
     pub(super) shapes: Vec<BlockGraphShape>,
     /// Per block, the first block of its shape ([`Self::first_of_shape`]).
     pub(super) firsts: Vec<usize>,
@@ -907,7 +1021,12 @@ impl FamilyOutline {
         })?;
         let (tap_width, tapped) = block_taps(plan, geometry)?;
         let residual = load.residual_conditioning().map(|_| geometry.blocks.len() - 1);
-        let shapes = block_graph_shapes(load, geometry, state, &tapped, residual)?;
+        let keeps = block_keeps(geometry)?;
+        let stateless_tail = stateless_tail(state, &keeps, &tapped);
+        let carries = block_carries(backend, geometry, plan, stateless_tail)?;
+        let undrafted_tail = super::prepared::stateless_tail(state, &keeps, &vec![BlockTaps::default(); keeps.len()]);
+        let undrafted = (undrafted_tail, block_carries(backend, geometry, plan, undrafted_tail)?);
+        let shapes = block_graph_shapes(load, geometry, state, &tapped, &carries, residual)?;
         Ok(Self {
             backend,
             row_classes,
@@ -923,8 +1042,11 @@ impl FamilyOutline {
                     .ok_or("target segment class overflows")?,
             )
             .map_err(|_| "target segment class exceeds u64")?,
-            keeps: block_keeps(geometry)?,
+            keeps,
             tapped,
+            stateless_tail,
+            undrafted,
+            carries,
             firsts: firsts(&shapes),
             shapes,
             tap_width,
@@ -938,9 +1060,17 @@ impl FamilyOutline {
     /// differed only in them is of one shape again. Every other input of
     /// the family is the target's own.
     pub(super) fn undrafted(&self) -> Self {
-        let shapes = self.shapes.iter().map(BlockGraphShape::undrafted).collect::<Vec<_>>();
+        let (stateless_tail, carries) = self.undrafted.clone();
+        let shapes = self
+            .shapes
+            .iter()
+            .zip(&carries)
+            .map(|(shape, &carries)| shape.undrafted().carrying(carries))
+            .collect::<Vec<_>>();
         Self {
             tapped: vec![BlockTaps::default(); self.tapped.len()],
+            stateless_tail,
+            carries,
             firsts: firsts(&shapes),
             shapes,
             tap_width: None,

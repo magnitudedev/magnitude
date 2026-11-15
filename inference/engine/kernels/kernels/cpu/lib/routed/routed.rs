@@ -194,26 +194,58 @@ pub fn decode_source(rows: u64, source: impl Fn() -> i32, expert: i32) -> Option
     }
 }
 
-/// Writes the grids of an expert pass over `rows` grouped rows and `used`
-/// blocks of `tile_rows` rows (`routed_experts`) into `grids`, in launch
-/// order (stage, expand, quantize, down): a stage item per row,
-/// `expand_items` items of each used block, a quantize item per block row,
-/// `down_items` items of each used block. The one work item of its launch
-/// writes them.
+/// Writes the grids of an expert pass over `used` blocks of `tile_rows`
+/// rows (`routed_experts`) into `grids`, in launch order (expand, down):
+/// `expand_items` items of each used block, `down_items` items of each used
+/// block; and clears the used rows' arrival counters (`arrivals`, a word a
+/// product row), which the expand launch's epilogue counts its stored
+/// features on (`projection::emit`). The one work item of its launch writes
+/// them.
 #[inline(always)]
 pub fn expert_grids(
-    grids: [Scratch<'_>; 4],
-    rows: i32,
+    grids: [Scratch<'_>; 2],
+    arrivals: Scratch<'_>,
     used: i32,
     tile_rows: usize,
     expand_items: usize,
     down_items: usize,
 ) {
-    let values =
-        [[rows, 1, 1], [expand_items as i32, used, 1], [used * tile_rows as i32, 1, 1], [down_items as i32, used, 1]];
+    let values = [[expand_items as i32, used, 1], [down_items as i32, used, 1]];
     for (grid, value) in grids.iter().zip(values) {
         // SAFETY: each grid is a 12-byte scratch buffer the caller alone writes.
         unsafe { grid.slice_mut::<i32>(0, 3) }.copy_from_slice(&value);
+    }
+    let rows = usize::try_from(used).expect("a used block count is not negative") * tile_rows;
+    // SAFETY: a word a product row of the used blocks, this item's alone.
+    unsafe { arrivals.slice_mut::<u32>(0, rows) }.fill(0);
+}
+
+/// The arrival of `arrived` features an expand work item stored into
+/// product row `row` (of `width` values, in `rows`): the row's last arrival
+/// forms the down projection's operand of it in place, its Q8 blocks into
+/// `quantized` where the INT8 form reads them and the NVFP4 transform where
+/// `nvfp4` (the down weight takes NVFP4 operands), as
+/// `projection::emit` forms an operand; a row that needs neither arrives
+/// nowhere, nor does an item that stored none of it (a counter it would
+/// read at its completed value).
+///
+/// # Safety
+/// As `projection::emit`: the buffers are the entry's product rows, their
+/// Q8 blocks and their cleared counters, and each feature of the row
+/// arrives once, after its store.
+#[inline(always)]
+pub unsafe fn product_arrival(
+    rows: Scratch<'_>,
+    quantized: Option<Scratch<'_>>,
+    nvfp4: bool,
+    arrivals: Scratch<'_>,
+    width: usize,
+    row: usize,
+    arrived: usize,
+) {
+    if (quantized.is_some() || nvfp4) && arrived > 0 {
+        // SAFETY: the caller's.
+        unsafe { projection::emit(rows, quantized, nvfp4, arrivals, width, row, arrived, |_| {}) };
     }
 }
 

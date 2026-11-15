@@ -2035,17 +2035,23 @@ mod internals {
         for (operand, rows) in formation.operands.iter().zip(&rows) {
             let formed = cpu_condition(&operand.formed).ok_or_else(|| refuse(format!("a formation of `{}` reads an element or the device in `formed`", entry.name)))?;
             let tiles = cpu_condition(&operand.tiles).ok_or_else(|| refuse(format!("a formation of `{}` reads an element or the device in `tiles`", entry.name)))?;
-            let weights = operand
+            let weight_binds = operand
                 .weights
                 .iter()
-                .map(|weight| format!("cx.{}()", cpu_argument(entry, *weight as usize)))
+                .enumerate()
+                .map(|(index, weight)| format!("let weight_{index} = cx.{}();", cpu_argument(entry, *weight as usize)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let weight_refs = (0..operand.weights.len())
+                .map(|index| format!("&weight_{index} as &dyn operator::Recipe"))
                 .collect::<Vec<_>>()
                 .join(", ");
             let scratch = |ordinal: u32| ident(&definition.scratch[ordinal as usize].name).to_lowercase();
             out.push_str(&format!(
-                "      {{\n        let (rows, width, groups) = ({rows}, {} as usize, {} as usize);\n        let weights = [{weights}];\n        let weights = weights.each_ref();\n",
+                "      {{\n        let (rows, width, groups) = ({rows}, {} as usize, {} as usize);\n        {weight_binds}\n        let weights: [&dyn operator::Recipe; {}] = [{weight_refs}];\n",
                 nat(&operand.width)?,
                 nat(&operand.groups)?,
+                operand.weights.len(),
             ));
             // The rows formed (all, or the window's), whether each is formed
             // whole by its first part, the item's private bytes as the

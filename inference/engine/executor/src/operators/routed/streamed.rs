@@ -28,8 +28,10 @@
 //! runs every step's front of a layer, then each merge set's fills, pass
 //! and backs.
 
-use crate::native::{BankRouteKernels, ExpertBankKernels, LEADS};
-use crate::planning::{BankBinding, BankPart, BankedFeedForward, ExpertBankPlan, RecordTensors, RoutedTensor};
+use crate::native::{BankRouteKernels, ExpertBankKernels};
+use crate::planning::{
+    BankBinding, BankPart, BankedFeedForward, ExpertBankPlan, HINT_LEADS, RecordTensors, RoutedTensor,
+};
 use crate::programs::graph::{GraphError, draft::GraphDraft};
 use crate::programs::graph::facts::Numbers;
 use crate::programs::native_constants::GraphConstant;
@@ -66,21 +68,30 @@ use crate::ModelLoadPlan;
 use crate::programs::native_target_graph::PlannedWeights;
 use magnitude_family_contracts::{WeightRole, WeightScope};
 use magnitude_kernels::{
-    routed_copy, routed_down_project, routed_down_sited, routed_land, routed_list_grid, routed_output_project, routed_pass_map,
-    routed_output_sited, routed_round, routed_route_streamed, routed_scratch_grids, routed_scratch_request,
-    routed_seed_commit, routed_select_streamed, routed_site_request, routed_step,
+    routed_copy, routed_down_project, routed_down_sited, routed_hint_route, routed_hint_select, routed_land,
+    routed_list_grid, routed_output_project, routed_output_sited, routed_pass_map, routed_round,
+    routed_route_streamed, routed_scratch_grids, routed_scratch_request, routed_seed_commit, routed_select_streamed,
+    routed_site_request, routed_step,
 };
 use seismic::{
     Dim, Element, NativeGraph, NativeGraphMetadata, NativePort, NativeTimelinePort, WorkflowTensor,
     WorkflowTensorRef, WorkflowTensorView,
 };
 
-/// A streamed layer's decode route and resolve by its routed form, each by
-/// `AHEAD` ([`LEADS`]) a layer of its binding launches
+/// A streamed layer's decode route and resolve by its routed form, plus its
+/// ahead-of-step hint launches by `AHEAD` (`1..=HINT_LEADS`)
 /// (`native::BankRouteKernels`).
 pub(crate) enum BankRoute<'a, G: GraphDraft + 'a> {
-    Fused([Option<G::Binding<'a, routed_route_streamed::Entry>>; LEADS]),
-    General([Option<G::Binding<'a, routed_select_streamed::Entry>>; LEADS]),
+    Fused {
+        activation: Element,
+        route: G::Ranged<'a, routed_route_streamed::Entry>,
+        hints: [Option<G::Binding<'a, routed_hint_route::Entry>>; HINT_LEADS as usize],
+    },
+    General {
+        activation: Element,
+        select: G::Binding<'a, routed_select_streamed::Entry>,
+        hints: [Option<G::Binding<'a, routed_hint_select::Entry>>; HINT_LEADS as usize],
+    },
 }
 
 impl<'a, G: GraphDraft + 'a> Copy for BankRoute<'a, G> {}
@@ -114,15 +125,15 @@ pub(crate) struct BankSiteEntries<'a, G: GraphDraft + 'a> {
 }
 
 /// A streamed layer's combine with the CPU's answer, by its routed form: its
-/// projections, then their sum waiting for the answer
+/// projections (by row range), then their sum waiting for the answer
 /// (`native::BankCombine`).
 pub(crate) enum BankCombineEntry<'a, G: GraphDraft + 'a> {
     Fused {
-        project: G::Binding<'a, routed_output_project::Entry>,
+        project: G::Ranged<'a, routed_output_project::Entry>,
         sited: G::Binding<'a, routed_output_sited::Entry>,
     },
     General {
-        project: G::Binding<'a, routed_down_project::Entry>,
+        project: G::Ranged<'a, routed_down_project::Entry>,
         sited: G::Binding<'a, routed_down_sited::Entry>,
     },
 }
@@ -168,8 +179,16 @@ impl<'a> From<&'a ExpertBankKernels> for BankGraphEntries<'a, NativeGraph> {
     fn from(kernels: &'a ExpertBankKernels) -> Self {
         Self {
             route: match &kernels.route {
-                BankRouteKernels::Fused(route) => BankRoute::Fused(route.each_ref().map(Option::as_ref)),
-                BankRouteKernels::General(select) => BankRoute::General(select.each_ref().map(Option::as_ref)),
+                BankRouteKernels::Fused { activation, route, hints } => BankRoute::Fused {
+                    activation: *activation,
+                    route,
+                    hints: hints.each_ref().map(Option::as_ref),
+                },
+                BankRouteKernels::General { activation, select, hints } => BankRoute::General {
+                    activation: *activation,
+                    select,
+                    hints: hints.each_ref().map(Option::as_ref),
+                },
             },
             land: &kernels.land,
             step: &kernels.step,
@@ -196,8 +215,14 @@ impl<'a> From<&'a ExpertBankKernels> for BankGraphEntries<'a, NativeGraph> {
 /// The route's element assignments by routed form.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum CheckedRoute {
-    Fused([(&'static str, Element); 5]),
-    General([(&'static str, Element); 4]),
+    Fused {
+        route: [(&'static str, Element); 6],
+        hints: [(&'static str, Element); 3],
+    },
+    General {
+        select: [(&'static str, Element); 4],
+        hints: [(&'static str, Element); 3],
+    },
 }
 
 /// The bank entries' element assignments, from a layer's feed-forward
@@ -250,22 +275,35 @@ impl CheckedBankEntries {
             ("UU", up.resident),
             ("UD", down.resident),
         ];
-        let general = |binding: crate::GeneralRoutedBinding| {
-            CheckedRoute::General([
+        let general = |binding: crate::GeneralRoutedBinding| CheckedRoute::General {
+            select: [
                 ("NW", binding.norm),
                 ("RNW", binding.router_norm),
                 ("RW", binding.router),
                 ("A", binding.activation),
-            ])
+            ],
+            hints: [
+                ("RNW", binding.router_norm),
+                ("RW", binding.router),
+                ("A", binding.activation),
+            ],
         };
         let route = match slot {
-            BankedFeedForward::Routed(binding) => CheckedRoute::Fused([
-                ("NW", binding.norm),
-                ("RW", binding.router),
-                ("SGW", binding.shared_gate),
-                ("SUW", binding.shared_up),
-                ("A", binding.activation),
-            ]),
+            BankedFeedForward::Routed(binding) => CheckedRoute::Fused {
+                route: [
+                    ("NW", binding.norm),
+                    ("RW", binding.router),
+                    ("SRW", Element::f32()),
+                    ("SGW", binding.shared_gate),
+                    ("SUW", binding.shared_up),
+                    ("A", binding.activation),
+                ],
+                hints: [
+                    ("NW", binding.norm),
+                    ("RW", binding.router),
+                    ("A", binding.activation),
+                ],
+            },
             BankedFeedForward::GeneralRouted(binding) => general(binding),
             BankedFeedForward::Parallel(binding) => general(binding.routed),
         };
@@ -299,8 +337,16 @@ impl CheckedBankEntries {
     pub(crate) fn entries(&self) -> BankGraphEntries<'_, NativeGraphMetadata> {
         BankGraphEntries {
             route: match &self.route {
-                CheckedRoute::Fused(route) => BankRoute::Fused([Some(&route[..]); LEADS]),
-                CheckedRoute::General(select) => BankRoute::General([Some(&select[..]); LEADS]),
+                CheckedRoute::Fused { route, hints } => BankRoute::Fused {
+                    activation: hints[2].1,
+                    route: &route[..],
+                    hints: [Some(&hints[..]); HINT_LEADS as usize],
+                },
+                CheckedRoute::General { select, hints } => BankRoute::General {
+                    activation: hints[2].1,
+                    select: &select[..],
+                    hints: [Some(&hints[..]); HINT_LEADS as usize],
+                },
             },
             land: &self.landing,
             step: &self.none,
@@ -1285,18 +1331,16 @@ pub(crate) fn scratch_fill<'a, G: GraphDraft + 'a>(
     layer.fill_scratch(graph, weights, constants)
 }
 
-/// The ports of a bank-served layer's hints (`routed_route_streamed`,
-/// `routed_select_streamed`): `AHEAD`; per lead, the weights its route reads
-/// of the layer it predicts there (`ExpertBankPlan::predicted`: the next
-/// streamed layer, then the one after it) in its own place, in the route's
-/// order (`BankLayer::hinted`); the next layer's policy words, whose
-/// POLICY_RESOLVED encodes the route without its hints while set (nothing
-/// there can be absent, so nothing reads them); and its rings. A lead past
-/// the route's `AHEAD` binds the next layer's weights again, which the route
-/// does not read, so every lead's weights are of the experts the route's
-/// `EN` names (`ExpertBankPlan::lead_layer`); the last streamed layer, which
-/// hints nothing, binds its own weights and policy (its two launches
-/// alike).
+/// The ports of a bank-served layer's ahead-of-step hint launch
+/// (`routed_hint_route`, `routed_hint_select`), when the layer predicts ahead
+/// (`ahead` in `1..=HINT_LEADS`): `AHEAD`; per lead, the weights its hint
+/// launch reads of the layer it predicts there (`ExpertBankPlan::predicted`:
+/// the next streamed layer, then the one after it) in its own place, in the
+/// route's order (`BankLayer::hinted`); the next layer's policy words, whose
+/// POLICY_RESOLVED skips the hint writes while set; and its rings. A lead past
+/// `AHEAD` binds the next layer's weights again, which the hint launch zeros
+/// without reading, so every lead's weights are of the experts `EN` names
+/// (`ExpertBankPlan::lead_layer`).
 pub(crate) struct HintPorts<const N: usize> {
     pub ahead: u64,
     pub weights: [[WorkflowTensor; N]; crate::planning::HINT_LEADS as usize],
@@ -1305,21 +1349,23 @@ pub(crate) struct HintPorts<const N: usize> {
 }
 
 impl<'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'_, 'a, G, W> {
-    /// The hint ports of this layer, whose own hinted weights, in its
-    /// route's order (`operators::routed::hint_kinds`), and policy words are
-    /// `own` and `policy`. A weight the next layer has is its own; one it
-    /// lacks is this layer's port (an absent norm, a bias's zeros), as the
-    /// plan found every streamed layer's hinted weights alike. The last
-    /// layer's hints bind its own words, which are not read.
+    /// The hint ports of this layer when it predicts ahead (`ahead > 0`), or
+    /// `None` on the last streamed layer, which launches no hint entry. A
+    /// weight a predicted layer has is its own; one it lacks is this layer's
+    /// port (`own`: an absent norm, a bias's zeros), as the plan found every
+    /// streamed layer's hinted weights alike.
     pub(crate) fn hints<const N: usize>(
         &mut self,
         graph: &mut G,
         weights: &mut Vec<(WeightPort, NativePort)>,
         own: [&WorkflowTensor; N],
         policy: &WorkflowTensor,
-    ) -> Result<HintPorts<N>, GraphError> {
+    ) -> Result<Option<HintPorts<N>>, GraphError> {
         let topology = self.topology;
         let ahead = topology.ahead;
+        if ahead == 0 {
+            return Ok(None);
+        }
         let mut hinted: [[WorkflowTensor; N]; crate::planning::HINT_LEADS as usize] =
             std::array::from_fn(|_| own.map(Clone::clone));
         let mut policy = policy.clone();
@@ -1340,12 +1386,12 @@ impl<'a, G: GraphDraft + 'a, W: PlannedWeights + ?Sized> StreamedLayer<'_, 'a, G
         if let Some(next) = topology.next_policy {
             policy = bank_port(graph, self.planned, next, BankPart::Policy, self.ports)?.tensor().clone();
         }
-        Ok(HintPorts {
+        Ok(Some(HintPorts {
             ahead,
             weights: hinted,
             policy,
             rings: self.part(graph, BankPart::Rings)?,
-        })
+        }))
     }
 }
 

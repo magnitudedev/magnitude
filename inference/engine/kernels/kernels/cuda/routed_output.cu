@@ -31,3 +31,17 @@
 #include "lib/core/arrive.cuh"
 #include "lib/routed/output_sum.cuh"
 #include "lib/routed/output.cuh"
+
+#ifdef SEISMIC_FORMING_ROUTED_OUTPUT_STAGE
+__global__ void routed_output_stage(SEISMIC_KERNEL_PARAMS) { ROUTED_OUTPUT_STAGE_BODY }
+#endif
+
+#ifdef SEISMIC_FORMING_ROUTED_OUTPUT_SUMMED
+template <int TPW, int KSPLIT>
+__global__ void routed_output_summed(SEISMIC_KERNEL_PARAMS) { ROUTED_OUTPUT_SUMMED_BODY(TPW, KSPLIT) }
+#endif
+
+#ifdef SEISMIC_FORMING_ROUTED_OUTPUT_GATHERED
+template <int TPW, int KSPLIT>
+__global__ void routed_output_gathered(SEISMIC_KERNEL_PARAMS) { ROUTED_OUTPUT_GATHERED_BODY(TPW, KSPLIT) }
+#endif

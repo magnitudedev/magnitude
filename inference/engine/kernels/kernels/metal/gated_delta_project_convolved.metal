@@ -1,6 +1,6 @@
 // gated_delta_project_convolved: `gated_delta_project`'s GEMV and batched
-// GEMV launches (RMS prologue over the F32 residual, one segmented projection
-// qkv | z | alpha | beta), whose qkv segment also convolves. For each row
+// launches (RMS prologue over the F32 residual, the `dense` projection,
+// segmented, qkv | z | alpha | beta), whose qkv segment also convolves. For each row
 // of a channel, `ConvolvedChannel` forms `gated_delta_step`'s convolved
 // channel (`recurrent::convolve`'s F32 tap chain over the rows rounded to A,
 // then SiLU) and the row's share of the successor window: the batched class
@@ -13,6 +13,7 @@
 #define KERNEL_W2 SEISMIC_ALPHA_WEIGHT
 #define KERNEL_W3 SEISMIC_BETA_WEIGHT
 #include "lib/projection/projection.h"
+#include "lib/projection/operator.h"
 #include "lib/recurrent/versions.h"
 #if defined(SEISMIC_FORMING_GATED_DELTA_PROJECT_CONVOLVED_GEMV) || defined(SEISMIC_FORMING_GATED_DELTA_PROJECT_CONVOLVED_GEMV_ROWS) || defined(SEISMIC_FORMING_GATED_DELTA_PROJECT_CONVOLVED_GEMV_PAIR)
 #include "lib/projection/gemv.h"
@@ -20,9 +21,7 @@
 
 typedef element::Act activation;
 typedef ELEMENT_OF(SEISMIC_INPUT_NORM) norm_element;
-// The rows every weight takes (the normalized rows, or NVFP4 operands): the
-// GEMV row classes form them while staging, the normalize launch into the
-// scratch every other form reads.
+// The rows every weight takes (the normalized rows, or NVFP4 operands).
 constant constexpr bool NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4, packets::W1_OPERANDS_NVFP4,
     packets::W2_OPERANDS_NVFP4, packets::W3_OPERANDS_NVFP4>::NVFP4;
 typedef projection::operands<NVFP4> Operands;
@@ -124,6 +123,12 @@ struct ConvolvedChannel {
         }
     }
 
+    // The GEMV classes' store: the projection value alone (the pass after
+    // the projection convolves).
+    void store(uint m, uint n, float value) const {
+        projection.put(ulong(m) * projection0 + ulong(n) * projection1, value);
+    }
+
     // The batched class's column epilogue: the projection value, then the
     // channel from every row's sum of it.
     template <uint N>
@@ -145,7 +150,7 @@ struct ConvolvedChannel {
     }
 };
 
-#define RECURRENT_PROJECT_ARGUMENTS                                                     \
+#define PROJECTION_ARGUMENTS                                                            \
     device const float *hidden [[buffer(SEISMIC_BUFFER_HIDDEN)]],                       \
     device const uchar *input_norm [[buffer(SEISMIC_BUFFER_INPUT_NORM)]],               \
     device const uchar *qkv_weight [[buffer(SEISMIC_BUFFER_QKV_WEIGHT)]],               \
@@ -164,174 +169,109 @@ struct ConvolvedChannel {
     SEISMIC_RESULT_1_PARAM(convolved_cells),                                            \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
 
-#define RECURRENT_PROJECT_OPERANDS                                                      \
-    const uint k = uint(SEISMIC_DIM_H);                                                 \
-    const uint qkv_rows = uint((2 * SEISMIC_DIM_NK + SEISMIC_DIM_NV) * SEISMIC_DIM_W);  \
-    const uint gate_rows = uint(SEISMIC_DIM_NV * SEISMIC_DIM_W);                        \
-    const uint head_rows = uint(SEISMIC_DIM_NV);                                        \
+#define PROJECTION_N0 ((2 * SEISMIC_DIM_NK + SEISMIC_DIM_NV) * SEISMIC_DIM_W)
+#define PROJECTION_N1 (SEISMIC_DIM_NV * SEISMIC_DIM_W)
+#define PROJECTION_N2 SEISMIC_DIM_NV
+#define PROJECTION_N3 SEISMIC_DIM_NV
+
+// `raw` is the residual rows under the norm prologue; `in` the normalized
+// rows of the matrix GEMV; the qkv segment's epilogue convolves, from the
+// rows' slots (`slot_rows`, resolved by its threadgroups first).
+#define RECURRENT_PROJECT_RAW                                                           \
     projection::InputOf<activation, norm_element, projection::AllRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>::type \
-        in{hidden, SEISMIC_HIDDEN_STRIDE_0, \
-        SEISMIC_HIDDEN_STRIDE_1, input_norm, SEISMIC_INPUT_NORM_STRIDE_0,               \
-        as_type<float>(uint(SEISMIC_PARAM_EPSILON)), k, {}};                            \
-    projection::Weights<packets::W0> qkv{qkv_weight, KERNEL_W0_LAYOUT(k), k};           \
-    projection::Weights<packets::W1> gate{gate_weight, KERNEL_W1_LAYOUT(k), k};         \
-    projection::Weights<packets::W2> alpha{alpha_weight, KERNEL_W2_LAYOUT(k), k};       \
-    projection::Weights<packets::W3> beta{beta_weight, KERNEL_W3_LAYOUT(k), k};         \
-    ConvolvedChannel qkv_out{element::Out<activation>(result_cells), SEISMIC_RESULT_0_STRIDE_0, \
+        raw{hidden, SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1, input_norm,        \
+        SEISMIC_INPUT_NORM_STRIDE_0, as_type<float>(uint(SEISMIC_PARAM_EPSILON)), k, {}}
+#define PROJECTION_OPERANDS                                                             \
+    const uint m = uint(SEISMIC_DIM_M), k = uint(SEISMIC_DIM_H);                        \
+    RECURRENT_PROJECT_RAW;                                                              \
+    const projection::Plain<activation, projection::AllRows> in{normalized, k, 1, k, {}}; \
+    threadgroup ConvolvedRow slot_rows[16];                                             \
+    projection::Weights<packets::W0> w0{qkv_weight, KERNEL_W0_LAYOUT(k), k};            \
+    projection::Weights<packets::W1> w1{gate_weight, KERNEL_W1_LAYOUT(k), k};           \
+    projection::Weights<packets::W2> w2{alpha_weight, KERNEL_W2_LAYOUT(k), k};          \
+    projection::Weights<packets::W3> w3{beta_weight, KERNEL_W3_LAYOUT(k), k};           \
+    ConvolvedChannel out0{element::Out<activation>(result_cells), SEISMIC_RESULT_0_STRIDE_0, \
         SEISMIC_RESULT_0_STRIDE_1, element::Out<element::F32>(convolved_cells),         \
         SEISMIC_RESULT_1_STRIDE_0, SEISMIC_RESULT_1_STRIDE_1, convolution, slot_rows,   \
         seismic_words};                                                                 \
-    projection::Store<activation> gate_out{element::Out<activation>(result_cells), SEISMIC_RESULT_0_STRIDE_0, \
-        SEISMIC_RESULT_0_STRIDE_1, qkv_rows};                                           \
-    projection::Store<activation> alpha_out{element::Out<activation>(result_cells), SEISMIC_RESULT_0_STRIDE_0, \
-        SEISMIC_RESULT_0_STRIDE_1, qkv_rows + gate_rows};                               \
-    projection::Store<activation> beta_out{element::Out<activation>(result_cells), SEISMIC_RESULT_0_STRIDE_0, \
-        SEISMIC_RESULT_0_STRIDE_1, qkv_rows + gate_rows + head_rows}
+    projection::Store<activation> out1{element::Out<activation>(result_cells), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, \
+        PROJECTION_FIRST_1};                                                            \
+    projection::Store<activation> out2{element::Out<activation>(result_cells), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, \
+        PROJECTION_FIRST_2};                                                            \
+    projection::Store<activation> out3{element::Out<activation>(result_cells), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, \
+        PROJECTION_FIRST_3}
 
-// The GEMV of a launch that serves COUNT (ONE, SEVERAL) rows. The last
-// simdgroup resolves the rows' slots after its share of the norm; the body's
-// opening barrier publishes them to the convolution pass.
-#define RECURRENT_PROJECT_CONVOLVED_GEMV(ROWS, LANES, COUNT)                            \
-    threadgroup ConvolvedRow slot_rows[16];                                             \
-    RECURRENT_PROJECT_OPERANDS;                                                         \
-    projection::Store<activation> qkv_values{element::Out<activation>(result_cells), SEISMIC_RESULT_0_STRIDE_0, \
-        SEISMIC_RESULT_0_STRIDE_1, 0};                                                  \
-    uint per = simdgroups * ROWS * (32u / LANES);                                       \
-    uint rows = uint(SEISMIC_DIM_M);                                                    \
-    PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);                            \
-    PROJECTION_OPERANDS_SHARED(globals, NVFP4);                                         \
-    projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);   \
-    const auto x = Operands::rows(projection::shared_norm(in, squares), rows, k, globals, simdgroups, sg, lane); \
-    uint t0 = (qkv_rows + per - 1) / per, t1 = (gate_rows + per - 1) / per;             \
-    uint t2 = (head_rows + per - 1) / per;                                              \
-    if (tile < t0 && sg + 1 == simdgroups)                                              \
+// The GEMV's rows: the norm applied as they stage, from their sums of
+// squares over the threadgroup.
+#define PROJECTION_GEMV_INPUT(x)                                                        \
+    PROJECTION_SQUARES_SHARED(squares, decltype(raw)::parts);                           \
+    projection::threadgroup_squares_runtime(raw, m, squares, simdgroups, sg, lane);     \
+    const auto x = projection::shared_norm(raw, squares)
+#define PROJECTION_FRAGMENTS normalized
+#define PROJECTION_ZEROED(s) false
+#define PROJECTION_BOUNDED 0u
+#define PROJECTION_BOUND_TABLES {}
+// The qkv segment: the batched launch's column epilogue receives every row's
+// sum of a channel; a GEMV threadgroup convolves the channels it published
+// after storing them.
+#define PROJECTION_COLUMNS(s) (s == 0)
+// The slots' rows, resolved before the convolution reads them: a GEMV
+// threadgroup's last simdgroup resolves them beside the others' GEMV, and the
+// body's own barrier publishes them to the convolution pass; the batched
+// launch resolves them first and waits.
+#define PROJECTION_GEMV_PROLOGUE(s)                                                     \
+    if (s == 0 && sg + 1 == simdgroups)                                                 \
         convolved_rows({segments, stop, previous_bank, previous_tape, following_bank}, window, slot_rows, lane, \
-            seismic_words);                                                             \
-    if (tile < t0) {                                                                    \
-        PROJECTION_FOR_##COUNT##_ROWS(rows, projection::gemv_runtime<packets::W0, ROWS, MAXM, LANES>( \
-            x, qkv_values, qkv, rows, qkv_rows, k, tile, shared, simdgroups, sg, lane)); \
+            seismic_words);
+#define PROJECTION_BATCH_PROLOGUE(s)                                                    \
+    if (s == 0) {                                                                       \
+        if (sg == 0)                                                                    \
+            convolved_rows({segments, stop, previous_bank, previous_tape, following_bank}, window, slot_rows, lane, \
+                seismic_words);                                                         \
+        threadgroup_barrier(mem_flags::mem_threadgroup);                                \
+    }
+#define PROJECTION_GEMV_EPILOGUE(s, first, count)                                       \
+    if (s == 0) {                                                                       \
         threadgroup_barrier(mem_flags::mem_device);                                     \
-        qkv_out.convolve_channels(tile * per, metal::min(per, qkv_rows - tile * per), rows, \
-            sg * 32u + lane, simdgroups * 32u);                                         \
-    } else if (tile < t0 + t1) {                                                        \
-        PROJECTION_FOR_##COUNT##_ROWS(rows, projection::gemv_runtime<packets::W1, ROWS, MAXM, LANES>( \
-            x, gate_out, gate, rows, gate_rows, k, tile - t0, shared, simdgroups, sg, lane)); \
-    } else if (tile < t0 + t1 + t2) {                                                   \
-        PROJECTION_FOR_##COUNT##_ROWS(rows, projection::gemv_runtime<packets::W2, ROWS, MAXM, LANES>( \
-            x, alpha_out, alpha, rows, head_rows, k, tile - t0 - t1, shared, simdgroups, sg, lane)); \
-    } else {                                                                            \
-        PROJECTION_FOR_##COUNT##_ROWS(rows, projection::gemv_runtime<packets::W3, ROWS, MAXM, LANES>( \
-            x, beta_out, beta, rows, head_rows, k, tile - t0 - t1 - t2, shared, simdgroups, sg, lane)); \
+        out0.convolve_channels(first, count, m, sg * 32u + lane, simdgroups * 32u);     \
     }
 
-// One row.
-#ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_CONVOLVED_GEMV
-template <uint LANES, uint ROWS>
-kernel void gated_delta_project_convolved_gemv(RECURRENT_PROJECT_ARGUMENTS,
-    threadgroup uchar *shared [[threadgroup(0)]],
-    uint tile [[threadgroup_position_in_grid]],
-    uint simdgroups [[simdgroups_per_threadgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]) {
-    RECURRENT_PROJECT_CONVOLVED_GEMV(ROWS, LANES, ONE)
-}
-#endif
-
-// Three rows up to VERIFY_ROWS: the same GEMV under this launch's mapping.
-#ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_CONVOLVED_GEMV_ROWS
-template <uint LANES, uint ROWS>
-kernel void gated_delta_project_convolved_gemv_rows(RECURRENT_PROJECT_ARGUMENTS,
-    threadgroup uchar *shared [[threadgroup(0)]],
-    uint tile [[threadgroup_position_in_grid]],
-    uint simdgroups [[simdgroups_per_threadgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]) {
-    RECURRENT_PROJECT_CONVOLVED_GEMV(ROWS, LANES, SEVERAL)
-}
-#endif
-
-// Two rows: the same GEMV under this launch's mapping.
-#ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_CONVOLVED_GEMV_PAIR
-template <uint LANES, uint ROWS>
-kernel void gated_delta_project_convolved_gemv_pair(RECURRENT_PROJECT_ARGUMENTS,
-    threadgroup uchar *shared [[threadgroup(0)]],
-    uint tile [[threadgroup_position_in_grid]],
-    uint simdgroups [[simdgroups_per_threadgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]) {
-    RECURRENT_PROJECT_CONVOLVED_GEMV(ROWS, LANES, PAIR)
-}
-#endif
-
+// The normalized rows into `normalized` for the matrix GEMV, one row a
+// threadgroup.
 #ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_CONVOLVED_NORMALIZE
-kernel void gated_delta_project_convolved_normalize(RECURRENT_PROJECT_ARGUMENTS,
+template <uint MATRIX>
+kernel void gated_delta_project_convolved_normalize(PROJECTION_ARGUMENTS,
     uint item [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
     PROJECTION_NORMALIZE_SHARED(norms);
-    projection::InputOf<activation, norm_element, projection::AllRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>::type
-        in{hidden, SEISMIC_HIDDEN_STRIDE_0,
-        SEISMIC_HIDDEN_STRIDE_1, input_norm, SEISMIC_INPUT_NORM_STRIDE_0,
-        as_type<float>(uint(SEISMIC_PARAM_EPSILON)), uint(SEISMIC_DIM_H), {}};
-    Operands::normalize<256>(in, item, normalized, uint(SEISMIC_DIM_H), norms, thread_index);
+    const uint k = uint(SEISMIC_DIM_H);
+    RECURRENT_PROJECT_RAW;
+    Operands::normalize<256>(raw, item, normalized, k, norms, thread_index);
 }
 #endif
 
-// A weight's segment: the matrix GEMV where MATRIX takes it and it serves
-// the weight, else the batched rows.
-template <typename W, uint BATCH_ROWS, uint PARTS, uint MATRIX, bool COLUMNS, typename In, typename Out>
-inline void convolved_project_segment(thread const In &in, thread const Out &out,
-    thread const projection::Weights<W> &w, uint m_rows, uint rows, uint k, uint tile,
-    threadgroup uchar *shared, uint simdgroups, uint sg, uint lane) {
-    if constexpr (MATRIX == 1 && projection::matrix_form<W>::available) {
-        if constexpr (COLUMNS)
-            projection::gemv_matrix_columns<W, PARTS>(in, out, w, m_rows, rows, k,
-                tile, shared, simdgroups, sg, lane);
-        else
-            projection::gemv_matrix<W, PARTS>(in, out, w, m_rows, rows, k,
-                tile, shared, simdgroups, sg, lane);
-    } else {
-        if (tile * simdgroups * BATCH_ROWS * 8u >= rows)
-            return;
-        if constexpr (COLUMNS)
-            projection::gemv_batch_columns_runtime<W, BATCH_ROWS>(in, out, w, m_rows, rows, k,
-                tile, shared, simdgroups, sg, lane);
-        else
-            projection::gemv_batch_runtime<W, BATCH_ROWS>(in, out, w, m_rows, rows, k,
-                tile, shared, simdgroups, sg, lane);
-    }
+// The `dense` projection's launches (`lib/projection/operator.h`).
+#ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_CONVOLVED_GEMV
+template <uint LANES, uint TILED, uint ROWS>
+kernel void gated_delta_project_convolved_gemv(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
+    PROJECTION_SEGMENTED_GEMV(ONE, TILED);
 }
-
+#endif
 #ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_CONVOLVED_BATCH
-template <uint BATCH_ROWS, uint BATCH_PARTS, uint MATRIX>
-kernel void gated_delta_project_convolved_batch(RECURRENT_PROJECT_ARGUMENTS,
-    threadgroup uchar *shared [[threadgroup(0)]],
-    uint tile [[threadgroup_position_in_grid]],
-    uint simdgroups [[simdgroups_per_threadgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup ConvolvedRow slot_rows[16];
-    RECURRENT_PROJECT_OPERANDS;
-    uint rows = uint(SEISMIC_DIM_M);
-    projection::Plain<activation, projection::AllRows> x{normalized, SEISMIC_DIM_H, 1, k, {}};
-    uint t0 = projection::gemv_matrix_groups(qkv_rows, BATCH_PARTS, simdgroups);
-    uint t1 = projection::gemv_matrix_groups(gate_rows, BATCH_PARTS, simdgroups);
-    uint t2 = projection::gemv_matrix_groups(head_rows, BATCH_PARTS, simdgroups);
-    if (tile < t0) {
-        if (sg == 0)
-            convolved_rows({segments, stop, previous_bank, previous_tape, following_bank}, window,
-                slot_rows, lane, seismic_words);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        convolved_project_segment<packets::W0, BATCH_ROWS, BATCH_PARTS, MATRIX, true>(x, qkv_out, qkv,
-            rows, qkv_rows, k, tile, shared, simdgroups, sg, lane);
-    } else if (tile < t0 + t1) {
-        convolved_project_segment<packets::W1, BATCH_ROWS, BATCH_PARTS, MATRIX, false>(x, gate_out, gate,
-            rows, gate_rows, k, tile - t0, shared, simdgroups, sg, lane);
-    } else if (tile < t0 + t1 + t2) {
-        convolved_project_segment<packets::W2, BATCH_ROWS, BATCH_PARTS, MATRIX, false>(x, alpha_out, alpha,
-            rows, head_rows, k, tile - t0 - t1, shared, simdgroups, sg, lane);
-    } else if (tile < t0 + t1 + 2u * t2) {
-        convolved_project_segment<packets::W3, BATCH_ROWS, BATCH_PARTS, MATRIX, false>(x, beta_out, beta,
-            rows, head_rows, k, tile - t0 - t1 - t2, shared, simdgroups, sg, lane);
-    }
+template <uint MATRIX, uint BATCH_ROWS, uint BATCH_PARTS>
+kernel void gated_delta_project_convolved_batch(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
+    PROJECTION_SEGMENTED_BATCH;
+}
+#endif
+#ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_CONVOLVED_GEMV_ROWS
+template <uint LANES, uint TILED, uint ROWS>
+kernel void gated_delta_project_convolved_gemv_rows(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
+    PROJECTION_SEGMENTED_GEMV(SEVERAL, TILED);
+}
+#endif
+#ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_CONVOLVED_GEMV_PAIR
+template <uint LANES, uint TILED, uint ROWS>
+kernel void gated_delta_project_convolved_gemv_pair(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
+    PROJECTION_SEGMENTED_GEMV(PAIR, TILED);
 }
 #endif

@@ -274,14 +274,18 @@ pub const SMALL_GEMM_ROWS: usize = 64;
 
 /// A native mapping: the GEMV K split, the small-band GEMM's INT8 operand
 /// path (the large-band GEMM is the 16-bit path), the large-band GEMM's
-/// loader rotation and the dense pair's GEMV residency (blocks of streaming
-/// weights per SM).
+/// loader rotation, the dense pair's GEMV residency (blocks of streaming
+/// weights per SM) and a single-weight entry's split of K over parts for
+/// 17..128 rows (`split`: 1 sums whole sums, as the entries that never split).
 #[derive(Clone, Copy, Debug)]
 pub struct Mapping {
     pub ksplit: u64,
     pub int8: u64,
     pub rotate: u64,
     pub residency: u64,
+    pub split: u64,
+    /// The single-weight GEMV's coefficient staging (STAGING).
+    pub staging: u64,
 }
 
 impl Mapping {
@@ -300,10 +304,25 @@ impl Mapping {
         spec.with_param("INT8", self.int8)
             .with_param("OPERAND", 0)
             .with_param("KSPLIT", self.ksplit)
+            .with_param("STAGING", 0)
             .with_launch_param(4, "ROTATE", self.rotate)
     }
-    /// [`Mapping::projection_params`] of the dense pair (`dense_up`,
-    /// `dense_output`), whose one-to-eight-row GEMV also takes RESIDENCY.
+    /// [`Mapping::projection_params`] of a single-weight entry, whose split GEMM
+    /// shares the K columns over `split` parts for 17..128 rows, whose GEMV
+    /// stages its weight's coefficients where `staging` is 1 and takes the
+    /// residency the segmented entries have no parameter for (a mapping that
+    /// names a parameter an entry lacks is not admitted, so no case runs).
+    pub fn single_params(
+        self,
+        spec: seismic::NativeSpecialization,
+    ) -> seismic::NativeSpecialization {
+        self.projection_params(spec)
+            .with_param("SPLIT", self.split)
+            .with_param("STAGING", self.staging)
+            .with_launch_param(1, "RESIDENCY", self.residency)
+    }
+    /// [`Mapping::single_params`] of the dense pair (`dense_up`,
+    /// `dense_output`), whose GEMV launches share one entry-wide KSPLIT.
     pub fn dense_pair_params(
         self,
         spec: seismic::NativeSpecialization,
@@ -311,6 +330,8 @@ impl Mapping {
         spec.with_param("INT8", self.int8)
             .with_param("OPERAND", 0)
             .with_param("KSPLIT", self.ksplit)
+            .with_param("SPLIT", self.split)
+            .with_param("STAGING", self.staging)
             .with_launch_param(1, "RESIDENCY", self.residency)
             .with_launch_param(4, "ROTATE", self.rotate)
     }
@@ -318,6 +339,9 @@ impl Mapping {
     pub fn head_params(self, spec: seismic::NativeSpecialization) -> seismic::NativeSpecialization {
         spec.with_param("OPERAND", 0)
             .with_param("KSPLIT", self.ksplit)
+            .with_param("SPLIT", self.split)
+            .with_param("STAGING", self.staging)
+            .with_launch_param(1, "RESIDENCY", self.residency)
             .with_launch_param(4, "ROTATE", self.rotate)
     }
     /// Whether `rows` rows use quantized activation operands in a matrix band.
@@ -333,53 +357,78 @@ pub const GEMV_MAPPINGS: [Mapping; 4] = [
         int8: 0,
         rotate: 2,
         residency: 1,
+        split: 2,
+        staging: 0,
     },
     Mapping {
         ksplit: 2,
         int8: 0,
         rotate: 2,
         residency: 2,
+        split: 2,
+        staging: 1,
     },
     Mapping {
         ksplit: 8,
         int8: 1,
         rotate: 2,
         residency: 2,
+        split: 2,
+        staging: 1,
     },
     Mapping {
         ksplit: 4,
         int8: 1,
         rotate: 2,
         residency: 1,
+        split: 2,
+        staging: 0,
     },
 ];
 /// GEMM mappings: both operand paths (the large band ignores INT8) and every
 /// loader rotation of the large band (which ignores INT8 and keeps the
 /// arithmetic).
-pub const GEMM_MAPPINGS: [Mapping; 4] = [
+pub const GEMM_MAPPINGS: [Mapping; 5] = [
     Mapping {
         ksplit: 4,
         int8: 0,
         rotate: 2,
         residency: 1,
+        split: 2,
+        staging: 0,
     },
     Mapping {
         ksplit: 4,
         int8: 1,
         rotate: 2,
         residency: 1,
+        split: 2,
+        staging: 1,
     },
     Mapping {
         ksplit: 4,
         int8: 0,
         rotate: 1,
         residency: 1,
+        split: 2,
+        staging: 0,
     },
     Mapping {
         ksplit: 4,
         int8: 0,
         rotate: 4,
         residency: 1,
+        split: 2,
+        staging: 0,
+    },
+    // Single-weight entries without a split: whole sums, as readout and the gate sum them.
+    Mapping {
+        ksplit: 4,
+        int8: 0,
+        rotate: 2,
+        residency: 1,
+        split: 1,
+        staging: 0,
     },
 ];
 
@@ -412,8 +461,9 @@ pub fn expansion(
 }
 
 /// The mappings of `m` rows that `admits` holds for ([`admitted`]).
-pub fn mappings(m: usize, admits: impl Fn(Mapping) -> bool) -> Vec<Mapping> {
+pub fn mappings(entry: &str, m: usize, admits: impl Fn(Mapping) -> bool) -> Vec<Mapping> {
     admitted(
+        entry,
         if m <= GEMV_ROWS {
             &GEMV_MAPPINGS
         } else {
@@ -424,13 +474,9 @@ pub fn mappings(m: usize, admits: impl Fn(Mapping) -> bool) -> Vec<Mapping> {
 }
 
 /// The `mappings` that `admits` holds for: those every entry a test
-/// prepares under each admits ([`Mapped::admits`]).
-pub fn admitted(mappings: &[Mapping], admits: impl Fn(Mapping) -> bool) -> Vec<Mapping> {
-    mappings
-        .iter()
-        .copied()
-        .filter(|mapping| admits(*mapping))
-        .collect()
+/// prepares under each admits ([`Mapped::admits`]); none fails the test.
+pub fn admitted(entry: &str, mappings: &[Mapping], admits: impl Fn(Mapping) -> bool) -> Vec<Mapping> {
+    mapped::admitted(entry, mappings.iter().copied(), |mapping| admits(*mapping))
 }
 
 /// INT8 quantization of rows of `k` as the INT8 path forms them, per 32

@@ -31,18 +31,12 @@ fn device() -> Option<Device> {
     seismic_native_tests::devices(&[BackendName::Metal, BackendName::Cuda]).into_iter().next()
 }
 
-/// The launch of the top level's and the full pass's vocabulary projection
-/// that takes the scan parameters: Metal's library GEMV (after the full
-/// pass's stage launch), CUDA's scan (after its form launch).
-fn scan_launch(device: &Device, planes: bool) -> usize {
-    match (device.backend(), planes) {
-        (BackendName::Metal, false) => 0,
-        _ => 1,
-    }
-}
-
-/// A top level's or full pass's specialization with the scan parameters;
-/// on Metal also the full pass's batched GEMV and GEMM threadgroups.
+/// A top level's or full pass's specialization with the scan parameters.
+/// CUDA: the `planes` form's, after the stage launch. Metal: the GEMV's tile
+/// mapping (entry-wide, every GEMV row count's), the first row count the
+/// batched GEMV serves (3 with four rows per simdgroup, so the batched path is
+/// exercised, else never), the batched GEMV's (launch 1) and the full pass's
+/// GEMM's (launch 3, after its stage launch).
 fn scan_spec(
     device: &Device,
     head: &Head,
@@ -50,24 +44,24 @@ fn scan_spec(
     scan: u64,
     rows: u64,
 ) -> NativeSpecialization {
-    let launch = scan_launch(device, planes);
-    let spec = formed_statics(head)
-        .with_launch_param(launch, width_param(device), scan)
-        .with_launch_param(launch, "ROWS", rows);
+    let spec = formed_statics(head);
     if device.backend() != BackendName::Metal {
-        return spec;
+        return spec
+            .with_launch_param(1, width_param(device), scan)
+            .with_launch_param(1, "ROWS", rows);
     }
-    // The top level's one launch, the GEMV; the full pass's GEMV, batched
-    // GEMV and GEMM.
-    let spec = spec.with_launch_param(launch, "LANES", 32);
-    if !planes {
-        return spec;
+    let spec = spec
+        .with_param(width_param(device), scan)
+        .with_param("ROWS", rows)
+        .with_param("LANES", 32)
+        .with_launch_param(1, "BATCH_SIMDGROUPS", scan)
+        .with_launch_param(1, "BATCH_ROWS", rows.min(2));
+    if planes {
+        spec.with_launch_param(3, "TILE_M", 64)
+            .with_launch_param(3, "TILE_N", 64)
+    } else {
+        spec
     }
-    let batch = launch + 1;
-    spec.with_launch_param(batch, "BATCH_SIMDGROUPS", scan)
-        .with_launch_param(batch, "BATCH_ROWS", rows.min(2))
-        .with_launch_param(batch + 1, "TILE_M", 64)
-        .with_launch_param(batch + 1, "TILE_N", 64)
 }
 
 /// The threadgroup-size parameter of the scan and gather launches.
@@ -887,6 +881,7 @@ fn module() -> CheckedModule {
             include_str!("../kernels/readout.seismic"),
         ),
         ("target.seismic", include_str!("../kernels/target.seismic")),
+        ("dense.seismic", include_str!("../kernels/dense.seismic")),
         (
             "functions.seismic",
             include_str!("../kernels/functions.seismic"),
@@ -1255,7 +1250,7 @@ fn prepared_full_and_indexed_share_projection_and_mask_invalid_ids() {
             BackendName::Metal => spec
                 .with_launch_param(0, "SIMDGROUPS", 4)
                 .with_launch_param(0, "ROWS", 1)
-                .with_launch_param(0, "LANES", 32),
+                .with_param("LANES", 32),
             BackendName::Cuda => spec
                 .with_param("OPERAND", 0)
                 .with_param("KSPLIT", 4)

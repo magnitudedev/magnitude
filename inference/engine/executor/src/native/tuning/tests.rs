@@ -114,6 +114,7 @@ fn launches_reach_the_points_at_their_rows_sequences_and_histories() {
         rows,
         sequences,
         history,
+        projected: rows,
     };
     counts.launch(launch(0, 8, 8, 1024), 2.);
     counts.launch(launch(1, 8, 1, 4096), 1.);
@@ -3907,16 +3908,57 @@ fn a_streamed_load_searches_every_streamed_case_on_the_device() {
             None,
         )
         .unwrap_or_else(|error| panic!("{streamed}: {error}"));
-        // Every lead's unit is searched; a round that recounts a follower
-        // at its resident unit's replaced choice searches it again.
+        // Every lead's unit with tuning parameters is searched; a round that
+        // recounts a follower at its resident unit's replaced choice searches
+        // it again.
         let finished = observer.0.borrow();
-        let leads = finished
+        let (streamed_tuned, hint_entry, hint_tuned) = if streamed == "routed_route_streamed" {
+            (
+                seismic::generated::native_implementation::<magnitude_kernels::routed_route_streamed::Entry>(&device)
+                    .unwrap()
+                    .unwrap()
+                    .has_tuning_parameters(),
+                "routed_hint_route",
+                seismic::generated::native_implementation::<magnitude_kernels::routed_hint_route::Entry>(&device)
+                    .unwrap()
+                    .unwrap()
+                    .has_tuning_parameters(),
+            )
+        } else {
+            (
+                seismic::generated::native_implementation::<magnitude_kernels::routed_select_streamed::Entry>(&device)
+                    .unwrap()
+                    .unwrap()
+                    .has_tuning_parameters(),
+                "routed_hint_select",
+                seismic::generated::native_implementation::<magnitude_kernels::routed_hint_select::Entry>(&device)
+                    .unwrap()
+                    .unwrap()
+                    .has_tuning_parameters(),
+            )
+        };
+        let route_units = finished
             .iter()
             .filter(|(entry, ..)| *entry == streamed)
             .map(|&(_, ahead, _)| ahead)
             .collect::<BTreeSet<_>>();
-        let every = (0..crate::native::LEADS as u64).map(Some).collect::<BTreeSet<_>>();
-        assert_eq!(leads, every, "{streamed}: every lead's unit is searched: {finished:?}");
+        let expected_route = if streamed_tuned {
+            BTreeSet::from([None])
+        } else {
+            BTreeSet::new()
+        };
+        assert_eq!(route_units, expected_route, "{streamed}: route unit is searched: {finished:?}");
+        let leads = finished
+            .iter()
+            .filter(|(entry, ..)| *entry == hint_entry)
+            .map(|&(_, ahead, _)| ahead)
+            .collect::<BTreeSet<_>>();
+        let every = if hint_tuned {
+            (1..=crate::planning::HINT_LEADS as u64).map(Some).collect::<BTreeSet<_>>()
+        } else {
+            BTreeSet::new()
+        };
+        assert_eq!(leads, every, "{hint_entry}: every lead's unit is searched: {finished:?}");
         // Every decode unit preparation formed for the banked layers is
         // keyed at the bank's slots: units at two slot tables are two
         // records. Both forms read the gate and up stacks, and the down.
@@ -3934,9 +3976,11 @@ fn a_streamed_load_searches_every_streamed_case_on_the_device() {
                 "{streamed}: a decode unit of {kinds:?} is searched: {finished:?}"
             );
         }
+        // Each is keyed by its row range after the slots (`ranged::Ranged`).
         let at_slots = format!(",S={slots}");
         for (entry, _, bindings) in &decode {
-            assert!(bindings.ends_with(&at_slots), "{streamed}: {entry} is keyed at the bank's slots: {bindings}");
+            let unit = bindings.rsplit_once(",M=").map_or(bindings.as_str(), |(unit, _)| unit);
+            assert!(unit.ends_with(&at_slots), "{streamed}: {entry} is keyed at the bank's slots: {bindings}");
         }
     }
 }

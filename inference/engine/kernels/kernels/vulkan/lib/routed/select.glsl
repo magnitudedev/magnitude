@@ -81,8 +81,39 @@ float SELECT_FN(select_normalized)(const int normalization, float weight, float 
     return weight; \
 }
 
+#define SELECT_DEFINE_RANK_AT \
+void SELECT_FN(select_rank_at)(uint64_t logits_base, uint64_t bias_base, uint64_t bias_stride, int score_fn, \
+    uint64_t row, out float chosen[SELECT_K], out int winners[SELECT_K]) { \
+    const uint lane = SEISMIC_LANE; \
+    const uint held = selection_candidates(SELECT_E, lane); \
+    float score[SELECT_P], ranked[SELECT_P]; \
+    int expert[SELECT_P]; \
+    [[unroll]] for (uint i = 0u; i < SELECT_P; ++i) { \
+        expert[i] = i < held ? int(lane + 32u * i) : -1; \
+        score[i] = i < held \
+            ? element_f32_at(logits_base + (row * uint64_t(SELECT_E) + uint64_t(lane + 32u * i)) * 4ul) \
+            : 0.0; \
+    } \
+    SELECT_FN(select_scores)(score_fn, score, held); \
+    [[unroll]] for (uint i = 0u; i < SELECT_P; ++i) \
+        ranked[i] = i < held \
+            ? selection_ranked(score[i] + element_f32_at(bias_base + uint64_t(expert[i]) * bias_stride * 4ul)) \
+            : -uintBitsToFloat(0x7f800000u); \
+    SELECT_FN(select_sort)(ranked, score, expert); \
+    for (uint rank = 0u; rank < SELECT_K; ++rank) { \
+        float best; \
+        const int winner = reduce_argmax(ranked[0], expert[0], REDUCE_HIGHER_INDEX, best); \
+        const float winner_score = seismic_shuffle(score[0], uint(winner) % 32u); \
+        if (expert[0] == winner) \
+            SELECT_FN(select_pop)(ranked, score, expert); \
+        chosen[SELECT_K - 1u - rank] = winner_score; \
+        winners[SELECT_K - 1u - rank] = winner; \
+    } \
+}
+
 #define SELECT_RANKING \
 SELECT_DEFINE_SCORES \
 SELECT_DEFINE_SORT \
 SELECT_DEFINE_POP \
-SELECT_DEFINE_NORMALIZED
+SELECT_DEFINE_NORMALIZED \
+SELECT_DEFINE_RANK_AT

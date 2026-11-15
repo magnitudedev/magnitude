@@ -26,8 +26,9 @@ use magnitude_family_contracts::{ShortConv, WeightKind, WeightScope};
 use magnitude_kernels::{attention_output, short_conv_project, short_conv_rows};
 use seismic::{Dim, Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
 
+/// A short-convolution block's entries; each projection's by row range.
 pub(crate) struct ShortConvGraphEntries<'a, G: GraphDraft + 'a> {
-    pub project: G::Binding<'a, short_conv_project::Entry>,
+    pub project: G::Ranged<'a, short_conv_project::Entry>,
     pub rows: G::Binding<'a, short_conv_rows::Entry>,
     pub output: TailEntries<'a, G, attention_output::Entry>,
 }
@@ -206,7 +207,7 @@ pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
 
     let projection = graph
         .enqueue(
-            kernels.project,
+            G::pick(kernels.project, &block.rows),
             &[
                 shape.project_dimensions(&block.rows).as_slice(),
                 &[
@@ -265,7 +266,7 @@ pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
             let inject = join.inject(graph, &block.rows, constants)?;
             graph
                 .enqueue(
-                    entry,
+                    G::pick(entry, &block.rows),
                     &[
                         shape.output_dimensions(&block.rows).as_slice(),
                         &[

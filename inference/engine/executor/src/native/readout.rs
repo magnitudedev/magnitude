@@ -32,8 +32,8 @@ use std::{cell::RefCell, rc::Rc};
 /// The chosen implementation of a scope-owned vocabulary projection.
 #[derive(Clone, Debug)]
 pub enum ProjectionKernels {
-    RawPacked(NativeKernel<readout_head_rows::Entry>),
-    PreparedPacked(NativeKernel<readout_project_rows::Entry>),
+    RawPacked(super::RangedKernels<readout_head_rows::Entry>),
+    PreparedPacked(super::RangedKernels<readout_project_rows::Entry>),
     /// A scope stored as its planes, and its reader's packed kernels.
     Qualified {
         packed: Box<ProjectionKernels>,

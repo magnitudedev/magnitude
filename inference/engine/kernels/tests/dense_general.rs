@@ -231,6 +231,8 @@ const fn scoped(name: &'static str, launch: usize, value: u64) -> Param {
 #[derive(Clone, Copy)]
 struct Launches {
     metal_gemv: usize,
+    metal_gemv_rows: usize,
+    metal_gemv_pair: usize,
     metal_batch: usize,
     metal_gemm: usize,
     cuda_residency: Option<usize>,
@@ -246,6 +248,7 @@ struct Mapping {
 
 /// The mappings on `device` that `admits` holds for ([`Mapped::admits`]).
 fn mappings(
+    named: &str,
     device: &seismic::Device,
     launches: Launches,
     admits: impl Fn(&Mapping) -> bool,
@@ -269,9 +272,13 @@ fn mappings(
                 parts,
             )| Mapping {
                 params: [
+                    entry("LANES", lanes),
                     scoped("SIMDGROUPS", launches.metal_gemv, simdgroups),
                     scoped("ROWS", launches.metal_gemv, rows),
-                    scoped("LANES", launches.metal_gemv, lanes),
+                    scoped("SIMDGROUPS", launches.metal_gemv_rows, simdgroups),
+                    scoped("ROWS", launches.metal_gemv_rows, rows),
+                    scoped("SIMDGROUPS", launches.metal_gemv_pair, simdgroups),
+                    scoped("ROWS", launches.metal_gemv_pair, rows),
                     scoped("BATCH_SIMDGROUPS", launches.metal_batch, batch_simdgroups),
                     scoped("BATCH_ROWS", launches.metal_batch, batch_rows),
                     scoped("TILE_M", launches.metal_gemm, tile_m),
@@ -329,10 +336,7 @@ fn mappings(
             })
             .collect(),
     };
-    mappings
-        .into_iter()
-        .filter(|mapping| admits(mapping))
-        .collect()
+    mapped::admitted(named, mappings, admits)
 }
 
 /// The statics the device's implementation declares: backends fix different
@@ -376,7 +380,7 @@ fn specialization(
 }
 
 /// `project_rows`' specialization: on Metal the staged tiles of `mapping`
-/// (TALL and PACK off, their launches at their defaults); the tall and PACK
+/// (TALL, INT8 and PACK off, their launches at their defaults); the tall and PACK
 /// forms are compared with them in `projection.rs`.
 fn project_rows_specialization(
     device: &seismic::Device,
@@ -388,19 +392,22 @@ fn project_rows_specialization(
     if device.backend() != seismic::BackendName::Metal {
         return specialization;
     }
+    let launch = crate::common::metal_launch::<project_rows::Entry>;
+    let (batch, tall, packed) = (launch("batch"), launch("tall"), launch("packed"));
     specialization
         .with_static("WB", 0)
         .with_param("TALL", 0)
         .with_param("PACK", 0)
         .with_param("RESIDUE", 1)
-        .with_launch_param(2, "BATCH_PARTS", 2)
+        .with_param("INT8", 0)
+        .with_launch_param(batch, "BATCH_PARTS", 2)
         // Dense weights have no matrix GEMV.
-        .with_launch_param(2, "MATRIX", 0)
-        .with_launch_param(8, "TALL_M", 128)
-        .with_launch_param(8, "TALL_K", 64)
-        .with_launch_param(8, "STAGERS", 2)
-        .with_launch_param(11, "PACK_TOKENS", 4)
-        .with_launch_param(11, "WEIGHTS_AHEAD", 0)
+        .with_param("MATRIX", 0)
+        .with_launch_param(tall, "TALL_M", 128)
+        .with_launch_param(tall, "TALL_K", 64)
+        .with_launch_param(tall, "STAGERS", 2)
+        .with_launch_param(packed, "PACK_TOKENS", 4)
+        .with_launch_param(packed, "WEIGHTS_AHEAD", 0)
 }
 
 /// Row classes: Metal GEMV / batched GEMV / small GEMM / GEMM, CUDA GEMV /
@@ -937,10 +944,13 @@ fn portable_entries_match_host_reference() {
 
 #[test]
 fn native_project_rows_matches_host_reference() {
+    let launch = crate::common::metal_launch::<project_rows::Entry>;
     let launches = Launches {
-        metal_gemv: 0,
-        metal_batch: 2,
-        metal_gemm: 5,
+        metal_gemv: launch("gemv"),
+        metal_gemv_rows: launch("gemv_rows"),
+        metal_gemv_pair: launch("gemv_pair"),
+        metal_batch: launch("batch"),
+        metal_gemm: launch("gemm"),
         cuda_residency: None,
         cuda_gemm: 4,
         split: true,
@@ -1000,7 +1010,7 @@ fn native_project_rows_matches_host_reference() {
                         &[extent],
                         &scale.into_iter().collect::<Vec<_>>(),
                     );
-                    for mapping in mappings(device, launches, |mapping| {
+                    for mapping in mappings("project_rows", device, launches, |mapping| {
                         projection.admits(device, mapping)
                     }) {
                         let label = format!(
@@ -1035,10 +1045,13 @@ fn native_project_rows_matches_host_reference() {
 
 #[test]
 fn native_dense_up_matches_host_reference() {
+    let launch = crate::common::metal_launch::<dense_up::Entry>;
     let launches = Launches {
-        metal_gemv: 1,
-        metal_batch: 2,
-        metal_gemm: 4,
+        metal_gemv: launch("gemv"),
+        metal_gemv_rows: launch("gemv_rows"),
+        metal_gemv_pair: launch("gemv_pair"),
+        metal_batch: launch("batch"),
+        metal_gemm: launch("gemm"),
         cuda_residency: Some(1),
         cuda_gemm: 4,
         split: false,
@@ -1090,7 +1103,7 @@ fn native_dense_up_matches_host_reference() {
                     &[outputs],
                     &rows.iter().map(|r| *r as i32).collect::<Vec<_>>(),
                 );
-                for mapping in mappings(device, launches, |mapping| {
+                for mapping in mappings("dense_up", device, launches, |mapping| {
                     expansion.admits(device, mapping)
                 }) {
                     let label = format!(
@@ -1125,10 +1138,13 @@ fn native_dense_up_matches_host_reference() {
 
 #[test]
 fn native_short_conv_project_matches_host_reference() {
+    let launch = crate::common::metal_launch::<short_conv_project::Entry>;
     let launches = Launches {
-        metal_gemv: 1,
-        metal_batch: 2,
-        metal_gemm: 4,
+        metal_gemv: launch("gemv"),
+        metal_gemv_rows: launch("gemv_rows"),
+        metal_gemv_pair: launch("gemv_pair"),
+        metal_batch: launch("batch"),
+        metal_gemm: launch("gemm"),
         cuda_residency: None,
         cuda_gemm: 4,
         split: false,
@@ -1178,7 +1194,7 @@ fn native_short_conv_project_matches_host_reference() {
                     tensor(device, DType::F32, &[rows, h], &x),
                     tensor(device, DType::F32, &[h], &norm),
                 );
-                for mapping in mappings(device, launches, |mapping| {
+                for mapping in mappings("short_conv_project", device, launches, |mapping| {
                     projection.admits(device, mapping)
                 }) {
                     let label = format!(
@@ -1216,10 +1232,13 @@ fn native_short_conv_project_matches_host_reference() {
 
 #[test]
 fn native_per_layer_gate_matches_host_reference() {
+    let launch = crate::common::metal_launch::<per_layer_gate::Entry>;
     let launches = Launches {
-        metal_gemv: 1,
-        metal_batch: 2,
-        metal_gemm: 4,
+        metal_gemv: launch("gemv"),
+        metal_gemv_rows: launch("gemv_rows"),
+        metal_gemv_pair: launch("gemv_pair"),
+        metal_batch: launch("batch"),
+        metal_gemm: launch("gemm"),
         cuda_residency: None,
         cuda_gemm: 4,
         split: false,
@@ -1271,7 +1290,7 @@ fn native_per_layer_gate_matches_host_reference() {
                     tensor(device, DType::BF16, &[p, d], &gate),
                     tensor(device, DType::F32, &[rows, l, p], &inputs),
                 );
-                for mapping in mappings(device, launches, |mapping| gating.admits(device, mapping))
+                for mapping in mappings("per_layer_gate", device, launches, |mapping| gating.admits(device, mapping))
                 {
                     let label = format!(
                         "{:?} {name} rows {rows} {:?}",

@@ -20,6 +20,11 @@ pub(crate) struct Launch {
     pub rows: u64,
     pub sequences: u64,
     pub history: u64,
+    /// The rows its readout projects: every row of a decode step (a
+    /// verification's drafts and anchor among them), a drafter's proposals,
+    /// the target's one row of the chunk that ends a prompt, and none of
+    /// another chunk.
+    pub projected: u64,
 }
 
 /// Launches by kind: how many of each one term's measurement makes.
@@ -31,6 +36,7 @@ impl InvocationCounts {
     pub fn launch(&mut self, launch: Launch, count: f64) {
         assert!(launch.rows > 0 && count.is_finite() && count >= 0.);
         assert!((1..=launch.rows).contains(&launch.sequences));
+        assert!(launch.projected <= launch.rows);
         *self.0.entry(launch).or_default() += count;
     }
     /// The launches of `rows` rows, of any term, sequences or history.
@@ -70,6 +76,7 @@ impl InvocationCounts {
                     Launch {
                         rows,
                         sequences: launch.sequences.min(rows),
+                        projected: launch.projected.min(rows),
                         ..*launch
                     },
                     *count,
@@ -123,11 +130,12 @@ impl GraphInvocationDemand {
             .unwrap_or(1);
         for (term, spec) in terms.iter().enumerate() {
             let metric = spec.metric;
-            let at = |rows: u64, sequences: u64, history: u64| Launch {
+            let at = |rows: u64, sequences: u64, history: u64, projected: u64| Launch {
                 term,
                 rows,
                 sequences,
                 history,
+                projected,
             };
             match metric.phase {
                 Phase::Prefill => {
@@ -135,11 +143,15 @@ impl GraphInvocationDemand {
                     let mut history = 0;
                     while history < metric.context {
                         let rows = chunk.min(metric.context - history);
-                        let launch = at(rows, 1, history);
+                        // The target reads out the prompt's last row; a
+                        // drafter conditions on the prompt and reads out
+                        // nothing of it.
+                        let ends = history + rows == metric.context;
+                        let launch = at(rows, 1, history, u64::from(ends));
                         let count = metric.sequences as f64;
                         demand.target.launch(launch, count);
                         demand.head_prefix.launch(launch, count);
-                        demand.draft.launch(launch, count);
+                        demand.draft.launch(Launch { projected: 0, ..launch }, count);
                         history += rows;
                     }
                 }
@@ -147,27 +159,32 @@ impl GraphInvocationDemand {
                     let (sequences, history) = (metric.sequences, metric.context);
                     match (method, spec.width) {
                         (PlannedMethod::Plain, _) | (_, None | Some(0)) => {
-                            demand.target.launch(at(sequences, sequences, history), 1.);
-                        }
-                        (PlannedMethod::Mtp { .. }, Some(width)) => {
                             demand
                                 .target
-                                .launch(at((width + 1) * sequences, sequences, history), 1.);
+                                .launch(at(sequences, sequences, history, sequences), 1.);
+                        }
+                        (PlannedMethod::Mtp { .. }, Some(width)) => {
+                            let verified = (width + 1) * sequences;
+                            demand
+                                .target
+                                .launch(at(verified, sequences, history, verified), 1.);
                             demand
                                 .head
-                                .launch(at(sequences, sequences, history), width as f64);
+                                .launch(at(sequences, sequences, history, sequences), width as f64);
                         }
                         (PlannedMethod::DFlash { proposals, .. }, Some(width)) => {
                             let block = draft_definition
                                 .expect("a planned block drafter has its admitted definition")
                                 .block_rows(width);
                             let verified = width.min(u64::from(proposals));
+                            let checked = (verified + 1) * sequences;
                             demand
                                 .target
-                                .launch(at((verified + 1) * sequences, sequences, history), 1.);
-                            demand
-                                .draft
-                                .launch(at(block * sequences, sequences, history), 1.);
+                                .launch(at(checked, sequences, history, checked), 1.);
+                            demand.draft.launch(
+                                at(block * sequences, sequences, history, verified * sequences),
+                                1.,
+                            );
                         }
                     }
                 }

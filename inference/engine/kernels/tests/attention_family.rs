@@ -20,7 +20,9 @@ mod rounding_model;
 use common::bound::{self, Float, Products, assert_within, gamma};
 include!("attention_common/vulkan_prefill.rs");
 
-use magnitude_kernels::{attention_append_dense, attention_decode, attention_prefill, project_rows};
+use magnitude_kernels::{
+    attention_append_dense, attention_decode, attention_output, attention_prefill, project_rows, repack_weight,
+};
 use rounding_model::Rounding;
 use seismic::{
     BackendName, Device, Element, NativeSpecialization, SlabLayout, SlabRegion, SlabTensor,
@@ -713,6 +715,10 @@ fn portable(entry: &str, case: &Case) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         text: include_str!("../kernels/attention.seismic").into(),
     });
     sources.push(SourceFile {
+        path: "dense.seismic".into(),
+        text: include_str!("../kernels/dense.seismic").into(),
+    });
+    sources.push(SourceFile {
         path: "functions.seismic".into(),
         text: include_str!("../kernels/functions.seismic").into(),
     });
@@ -1273,8 +1279,8 @@ fn metal_matrix_configurations(
 /// Tuning configurations of the decode or prefill entry on `device`.
 fn configurations(device: &Device, decode: bool, form: Form) -> Vec<Vec<(&'static str, u64)>> {
     match (device.backend(), decode) {
-        (BackendName::Cpu, true) => vec![vec![("PARTS", 8)], vec![("PARTS", 1)]],
-        (BackendName::Cpu, false) => vec![vec![]],
+        // The CPU's decode partitions are the pool's (`device.units`).
+        (BackendName::Cpu, _) => vec![vec![]],
         (BackendName::Metal, true) => {
             let slices = [8u64, 4, 2, 1]
                 .into_iter()
@@ -1863,6 +1869,255 @@ fn check_natives_against(
         }
     }
     assert!(failures.is_empty(), "failed: {failures:?}");
+}
+
+/// The decode and the output projection as one CPU graph, under the INT8
+/// form at one row: the decode's merge emits the attended row's operand (its
+/// staged rows and their Q8 blocks, formed by the row's last merge) in its
+/// epilogue, and the output projection reads it in place of forming its own.
+/// The attended row, the histories and the output have the bits of the two
+/// entries called alone, the output forming its own operand: at every CPU
+/// decode configuration.
+#[test]
+fn cpu_output_reads_the_operand_the_decode_emits() {
+    let Some(device) = devices().into_iter().find(|device| device.backend() == BackendName::Cpu) else {
+        return;
+    };
+    let device = &device;
+    let case = Case::new(QWEN_SMALL, 64, decode_rows(5)[..1].to_vec(), 16, 1.0, 1.0 / (32f32).sqrt(), 11);
+    let (heads, w, d) = (case.form.heads(), case.form.w(), 64usize);
+    let q8 = Element::stored("q8g32s", device.backend().resident_layout()).unwrap();
+    let output_weight = {
+        let external = Element::named("gguf_q8_0").unwrap();
+        let mut bytes = Vec::new();
+        for block in 0..d * heads * w / 32 {
+            bytes.extend_from_slice(&seismic_lang::registry::f16_bits(1.0 / 64.0).to_le_bytes());
+            bytes.extend((0..32).map(|value| ((((block * 32 + value) * 29 + 7) % 61) as i8 - 30) as u8));
+        }
+        let source = Tensor::from_host(device, external, &[1, d as u64, (heads * w) as u64], &bytes).unwrap();
+        let entry = repack_weight::native_entry_with(repack_weight::Elements { E: external, U: q8 });
+        let specialization = declared::declared(device, &entry, |name| panic!("unexpected static {name}"), &[]).unwrap();
+        entry
+            .prepare(device, &specialization)
+            .unwrap()
+            .call(repack_weight::Args { source: &source })
+            .unwrap()
+            .value
+            .reshape(&[d as u64, (heads * w) as u64])
+            .unwrap()
+    };
+    let hidden = f32_tensor(device, &[1, d], &(0..d).map(|index| index as f32 / 32.0 - 1.0).collect::<Vec<_>>());
+    let inject = Tensor::zeros(device, Element::f32(), &[1, 0]).unwrap();
+    let absent = f32_tensor(device, &[0], &[]);
+    let output = {
+        let entry = attention_output::native_entry_with(attention_output::Elements { OW: q8, A: Element::bf16() });
+        let specialization = declared::declared(
+            device,
+            &entry,
+            |name| match name {
+                "Q" => heads as u64,
+                "W" => w as u64,
+                "OS" => 0,
+                _ => panic!("unexpected static {name}"),
+            },
+            &[("INT8", 1)],
+        )
+        .unwrap();
+        entry.prepare(device, &specialization).unwrap()
+    };
+    let rounding = case.rounding_scalars();
+    for config in configurations(device, true, case.form) {
+        let label = format!("{config:?}");
+        let specialization = config
+            .iter()
+            .fold(statics(device, case.form, case.sink_rows()), |s, (n, v)| s.with_param(*n, *v))
+            .with_static("KR", 0)
+            .with_static("KS", 0);
+        let decode = attention_decode::native_for_device_with(
+            device,
+            attention_decode::Elements { A: Element::bf16() },
+            &specialization,
+        )
+        .unwrap();
+
+        // Alone, the output forms its own operand.
+        let mut bound = Bound::new(device, &case);
+        let attended = decode
+            .call(attention_decode::Args {
+                query: &bound.query,
+                gate: &bound.gate,
+                key: &bound.key,
+                value: &bound.value,
+                query_norm: &bound.query_norm,
+                key_norm: &bound.key_norm,
+                value_norm: &bound.value_norm,
+                sinks: &bound.sinks,
+                rotary_components: &bound.components,
+                rotary_frequencies: &bound.frequencies,
+                rotary_amplitudes: &bound.amplitudes,
+                coordinates: &bound.coordinates,
+                visible: &bound.visible,
+                fresh: &bound.fresh,
+                destinations: &bound.destinations,
+                selected_rows: &bound.selected_rows,
+                selected: &bound.selected,
+                history_key: &mut bound.history_key,
+                history_value: &mut bound.history_value,
+                form: &bound.form,
+                epsilon: case.epsilon,
+                scale: case.scale,
+                gate_function: i32::from(case.form.softplus),
+                slab_rows: case.slab_rows as u32,
+                selected_slab_rows: case.selected_slab_rows as u32,
+                key_block: rounding.block,
+                key_element: rounding.element,
+                key_scale: rounding.scale,
+                key_amax_floor: rounding.amax_floor,
+            })
+            .unwrap()
+            .value;
+        let alone = output
+            .call(attention_output::Args {
+                hidden: &hidden,
+                inject: &inject,
+                gated: &attended,
+                output_weight: &output_weight,
+                output_scale: &absent,
+                output_bound: &absent,
+            })
+            .unwrap()
+            .value;
+
+        // In one graph, the output reads the operand the decode emits.
+        let graph_bound = Bound::new(device, &case);
+        let mut graph = device.native_graph();
+        let mut port = |tensor: &Tensor| graph.port(tensor.element(), &tensor.extents()).unwrap();
+        let inputs = [
+            &graph_bound.query,
+            &graph_bound.gate,
+            &graph_bound.key,
+            &graph_bound.value,
+            &graph_bound.query_norm,
+            &graph_bound.key_norm,
+            &graph_bound.value_norm,
+            &graph_bound.sinks,
+            &graph_bound.components,
+            &graph_bound.frequencies,
+            &graph_bound.amplitudes,
+            &graph_bound.coordinates,
+            &graph_bound.visible,
+            &graph_bound.fresh,
+            &graph_bound.destinations,
+            &graph_bound.selected_rows,
+            &graph_bound.selected,
+            &graph_bound.history_key,
+            &graph_bound.history_value,
+            &graph_bound.form,
+            &hidden,
+            &inject,
+            &output_weight,
+            &absent,
+        ];
+        let mut ports = inputs.map(&mut port);
+        let stored = [
+            Tensor::zeros(device, attended.element(), &attended.extents()).unwrap(),
+            Tensor::zeros(device, alone.element(), &alone.extents()).unwrap(),
+        ];
+        let stored_ports = [&stored[0], &stored[1]].map(&mut port);
+        let [
+            query,
+            gate,
+            key,
+            value,
+            query_norm,
+            key_norm,
+            value_norm,
+            sinks,
+            components,
+            frequencies,
+            amplitudes,
+            coordinates,
+            visible,
+            fresh,
+            destinations,
+            selected_rows,
+            selected,
+            history_key,
+            history_value,
+            form,
+            hidden_port,
+            inject_port,
+            output_weight_port,
+            absent_port,
+        ] = &mut ports;
+        let attended_in_graph = graph
+            .enqueue(
+                &decode,
+                attention_decode::WorkflowArgs {
+                    query: query.tensor().into(),
+                    gate: gate.tensor().into(),
+                    key: key.tensor().into(),
+                    value: value.tensor().into(),
+                    query_norm: query_norm.tensor().into(),
+                    key_norm: key_norm.tensor().into(),
+                    value_norm: value_norm.tensor().into(),
+                    sinks: sinks.tensor().into(),
+                    rotary_components: components.tensor().into(),
+                    rotary_frequencies: frequencies.tensor().into(),
+                    rotary_amplitudes: amplitudes.tensor().into(),
+                    coordinates: coordinates.tensor().into(),
+                    visible: visible.tensor().into(),
+                    fresh: fresh.tensor().into(),
+                    destinations: destinations.tensor().into(),
+                    selected_rows: selected_rows.tensor().into(),
+                    selected: selected.tensor().into(),
+                    history_key: history_key.tensor_mut().into(),
+                    history_value: history_value.tensor_mut().into(),
+                    form: form.tensor().into(),
+                    epsilon: seismic::Argument::from(case.epsilon),
+                    scale: seismic::Argument::from(case.scale),
+                    gate_function: seismic::Argument::from(i32::from(case.form.softplus)),
+                    slab_rows: seismic::Argument::from(case.slab_rows as u32),
+                    selected_slab_rows: seismic::Argument::from(case.selected_slab_rows as u32),
+                    key_block: seismic::Argument::from(rounding.block),
+                    key_element: seismic::Argument::from(rounding.element),
+                    key_scale: seismic::Argument::from(rounding.scale),
+                    key_amax_floor: seismic::Argument::from(rounding.amax_floor),
+                },
+            )
+            .unwrap()
+            .value;
+        let value = graph
+            .enqueue(
+                &output,
+                attention_output::WorkflowArgs {
+                    hidden: hidden_port.tensor().into(),
+                    inject: inject_port.tensor().into(),
+                    gated: (&attended_in_graph).into(),
+                    output_weight: output_weight_port.tensor().into(),
+                    output_scale: absent_port.tensor().into(),
+                    output_bound: absent_port.tensor().into(),
+                },
+            )
+            .unwrap()
+            .value;
+        for (result, port) in [&attended_in_graph, &value].into_iter().zip(&stored_ports) {
+            graph.store(result, port).unwrap();
+        }
+        let plan = graph.seal().unwrap();
+        let mut bindings = plan.bindings();
+        for (port, tensor) in ports.iter().zip(inputs).chain(stored_ports.iter().zip(&stored)) {
+            bindings.set(port, tensor).unwrap();
+        }
+        let (_, completion) =
+            plan.new_slot().unwrap().attach(bindings, plan.new_outputs().unwrap()).unwrap().submit().unwrap();
+        completion.wait().unwrap();
+        let bytes = |tensor: &Tensor| tensor.read_to_host().unwrap();
+        assert_eq!(bytes(&stored[0]), bytes(&attended), "{label} attended row");
+        assert_eq!(bytes(&graph_bound.history_key), bytes(&bound.history_key), "{label} history keys");
+        assert_eq!(bytes(&graph_bound.history_value), bytes(&bound.history_value), "{label} history values");
+        assert_eq!(bytes(&stored[1]), bytes(&alone), "{label} output");
+    }
 }
 
 // ---------------------------------------------------------------------------

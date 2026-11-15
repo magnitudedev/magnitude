@@ -1,6 +1,6 @@
 // attention_project on CPU (contract and portable body in attention.seismic).
-// `attention_project_normalize` publishes each row's RMS-normalized hidden row
-// (rounded to A) as F32 into scratch, one work item per row.
+// The operator's form launch forms each row's RMS-normalized hidden row
+// (rounded to A) as F32 (`rows`) and its Q8 blocks.
 // `attention_project_rows` enumerates the segments query | gate | key | value in
 // order, ROWS weight rows per work item, each projected against every
 // normalized row, times the segment weight's second-level scale where it has
@@ -8,40 +8,6 @@
 
 use lib::core::activation;
 use lib::projection::projection;
-
-#[inline(always)]
-fn attention_project_normalize<L: Isa, E: Elements>(
-    _l: L,
-    cx: &Context<'_, E>,
-    group: [u64; 3],
-    shared: &mut [u8],
-) {
-    let row = group[0] as usize;
-    let d = cx.dim_d() as usize;
-    // SAFETY: each work item writes its own row of the scratch.
-    let normalized = unsafe { cx.scratch_normalized().slice_mut::<f32>(4 * row * d, d) };
-    let norm = cx.arg_input_norm();
-    projection::form_input::<E::A>(
-        cx.arg_hidden().row([row, 0]),
-        (cx.dim_nm() != 0).then_some(&norm),
-        cx.arg_epsilon(),
-        shared,
-        normalized,
-    );
-    if cx.param_int8() == 1 {
-        // SAFETY: this work item alone writes row `row`'s quantized bytes.
-        unsafe { projection::quantize_row(normalized, row, projection::tiled(cx.dim_m() as usize, &[&cx.arg_query_weight(), &cx.arg_gate_weight(), &cx.arg_key_weight(), &cx.arg_value_weight()]), cx.scratch_quantized(), 0) };
-    }
-    projection::operand_row(
-        &[
-            &cx.arg_query_weight(),
-            &cx.arg_gate_weight(),
-            &cx.arg_key_weight(),
-            &cx.arg_value_weight(),
-        ],
-        normalized,
-    );
-}
 
 #[inline(always)]
 fn attention_project_rows<L: Isa, E: Elements>(
@@ -78,8 +44,8 @@ fn attention_project_rows<L: Isa, E: Elements>(
         }
         return;
     }
-    // SAFETY: the normalize launch wrote every row before this launch.
-    let normalized = unsafe { cx.scratch_normalized().slice::<f32>(0, m * d) };
+    // SAFETY: the form launch (or the hidden rows' producer) wrote every row before this launch.
+    let normalized = unsafe { cx.scratch_rows().slice::<f32>(0, m * d) };
     let quantized = (cx.param_int8() == 1).then(|| unsafe {
         projection::quantized(cx.scratch_quantized(), 0, m, d, projection::tiled(m, &[&cx.arg_query_weight(), &cx.arg_gate_weight(), &cx.arg_key_weight(), &cx.arg_value_weight()]))
     });

@@ -1,6 +1,6 @@
 // Prefill combine. The Vulkan form of `metal/routed_combine.metal`.
-// L1 (`routed_combine_shared`): the K1 paired GEMM of the shared
-// expert's gate/up over all M rows with SiluMul into the `shared_product`
+// L1 (`routed_combine_expand`): the K1 paired GEMM of the shared
+// expert's gate/up over all M rows with SiluMul into the `product`
 // scratch. L2 (`routed_combine_down`): the K1 GEMM of the shared down
 // projection into the `shared_output` scratch [M, H], in A. L3
 // (`routed_combine`): the grouped expert outputs of each row unpermuted
@@ -27,13 +27,13 @@
 // Invocations of an L3 workgroup (8 columns each).
 #define COMBINE_THREADS 256u
 
-void routed_combine_shared() {
+void routed_combine_expand() {
     const uint hidden = uint(SEISMIC_DIM_H);
     const projection_prologue x = projection_plain(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED),
         SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_NORMALIZED_STRIDE_1, hidden, 0ul);
     const projection_weights gate = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_GATE), PACKETS_W0_ROWS, 0ul, hidden);
     const projection_weights up = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_UP), PACKETS_W1_ROWS, 0ul, hidden);
-    const projection_epilogue out_ = projection_silu_mul(ROUTED_ACT, out_over_scratch(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_SHARED_PRODUCT)),
+    const projection_epilogue out_ = projection_silu_mul(ROUTED_ACT, out_over_scratch(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT)),
         SEISMIC_DIM_S, 1ul);
     projection_gemm_paired(PACKETS_W0, PACKETS_W1, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N, x, out_, gate, up,
         uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_S), hidden, gl_WorkGroupID.y, gl_WorkGroupID.x, 0xffffffffu);
@@ -41,7 +41,7 @@ void routed_combine_shared() {
 
 void routed_combine_down() {
     const uint shared_features = uint(SEISMIC_DIM_S);
-    const projection_prologue x = projection_plain(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_SHARED_PRODUCT),
+    const projection_prologue x = projection_plain(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT),
         SEISMIC_DIM_S, 1ul, shared_features, 0ul);
     const projection_weights down = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_DOWN), PACKETS_W2_ROWS, 0ul,
         shared_features);

@@ -847,6 +847,10 @@ impl Case {
             text: include_str!("../kernels/recurrent.seismic").into(),
         });
         sources.push(SourceFile {
+            path: "dense.seismic".into(),
+            text: include_str!("../kernels/dense.seismic").into(),
+        });
+        sources.push(SourceFile {
             path: "functions.seismic".into(),
             text: include_str!("../kernels/functions.seismic").into(),
         });
@@ -2490,6 +2494,30 @@ fn convolved_step_form_gives_the_step_bits() {
     }
 }
 
+/// `specialization` with `mapping` on the `dense` projection's GEMV and
+/// batched launches (`launch` names them) of a recurrent projection (SMALL is
+/// the entry's own, set by the one that has a small-row GEMM): every
+/// GEMV launch takes the mapping in its row form, and the batched launch its
+/// batched rows (dense weights have no matrix GEMV).
+fn gemv_mappings(
+    specialization: NativeSpecialization,
+    launch: fn(&str) -> usize,
+    mapping: ProjectionMapping,
+) -> NativeSpecialization {
+    let specialization = ["gemv", "gemv_rows", "gemv_pair"].into_iter().fold(specialization, |specialization, gemv| {
+        specialization
+            .with_launch_param(launch(gemv), "SIMDGROUPS", mapping.simdgroups)
+            .with_launch_param(launch(gemv), "ROWS", mapping.rows)
+    });
+    specialization
+        .with_param("LANES", mapping.lanes)
+        .with_param("TILED", 0)
+        .with_param("MATRIX", 0)
+        .with_launch_param(launch("batch"), "BATCH_SIMDGROUPS", mapping.batch_simdgroups)
+        .with_launch_param(launch("batch"), "BATCH_ROWS", mapping.batch_rows)
+        .with_launch_param(launch("batch"), "BATCH_PARTS", 2)
+}
+
 /// `gated_delta_project`, then `gated_delta_step` (ROWS 32): the projection
 /// and the outcome.
 fn step_form(
@@ -2501,33 +2529,31 @@ fn step_form(
 ) -> (Vec<f32>, Outcome) {
     use magnitude_kernels::gated_delta_project;
     let g = case.geometry;
-    // gated_delta_project's launches: stage, gemv, batch, gemm_small, gemm,
-    // stage_tall, tall, then the PACK form's four (its tile launch the third
-    // of them).
-    let specialization = NativeSpecialization::new()
-        .with_static("H", hidden as u64)
-        .with_static("NK", g.key_heads as u64)
-        .with_static("NV", g.value_heads as u64)
-        .with_static("W", g.width as u64)
-        .with_static("QB", 0)
-        .with_static("ZB", 0)
-        .with_static("PT", 1)
-        .with_static("NM", hidden as u64)
-        .with_param("TALL", 0)
-        .with_param("PACK", 0)
-        .with_param("RESIDUE", 1)
-        .with_launch_param(9, "PACK_TOKENS", 4)
-        .with_launch_param(9, "WEIGHTS_AHEAD", 0)
-        .with_launch_param(1, "SIMDGROUPS", mapping.simdgroups)
-        .with_launch_param(1, "ROWS", mapping.rows)
-        .with_launch_param(1, "LANES", mapping.lanes)
-        .with_launch_param(2, "BATCH_SIMDGROUPS", mapping.batch_simdgroups)
-        .with_launch_param(2, "BATCH_ROWS", mapping.batch_rows)
-        .with_launch_param(4, "TILE_M", 64)
-        .with_launch_param(4, "TILE_N", 64)
-        .with_launch_param(6, "TALL_M", 128)
-        .with_launch_param(6, "TALL_K", 64)
-        .with_launch_param(6, "STAGERS", 2);
+    let launch = crate::common::metal_launch::<gated_delta_project::Entry>;
+    let specialization = gemv_mappings(
+        NativeSpecialization::new()
+            .with_static("H", hidden as u64)
+            .with_static("NK", g.key_heads as u64)
+            .with_static("NV", g.value_heads as u64)
+            .with_static("W", g.width as u64)
+            .with_static("QB", 0)
+            .with_static("ZB", 0)
+            .with_static("PT", 1)
+            .with_static("NM", hidden as u64)
+            .with_param("TALL", 0)
+            .with_param("PACK", 0)
+            .with_param("RESIDUE", 1)
+            .with_param("SMALL", 1)
+            .with_launch_param(launch("packed"), "PACK_TOKENS", 4)
+            .with_launch_param(launch("packed"), "WEIGHTS_AHEAD", 0)
+            .with_launch_param(launch("gemm"), "TILE_M", 64)
+            .with_launch_param(launch("gemm"), "TILE_N", 64)
+            .with_launch_param(launch("tall"), "TALL_M", 128)
+            .with_launch_param(launch("tall"), "TALL_K", 64)
+            .with_launch_param(launch("tall"), "STAGERS", 2),
+        launch,
+        mapping,
+    );
     let projection = gated_delta_project::native_for_device_with(
         device,
         gated_delta_project::Elements {
@@ -2583,30 +2609,18 @@ fn convolved_form(
 ) -> (Vec<f32>, Outcome) {
     use magnitude_kernels::{gated_delta_project_convolved, gated_delta_step_convolved};
     let g = case.geometry;
-    // Launches: normalize, gemv (one row), batch, gemv_rows (three rows up to
-    // VERIFY_ROWS), gemv_pair (two rows). Every GEMV launch takes the
-    // mapping, as `gated_delta_project`'s one GEMV launch does for every row
-    // count.
-    let specialization = NativeSpecialization::new()
-        .with_static("H", hidden as u64)
-        .with_static("NK", g.key_heads as u64)
-        .with_static("NV", g.value_heads as u64)
-        .with_static("W", g.width as u64)
-        .with_static("C", g.convolution as u64)
-        .with_static("PT", 1)
-        .with_static("NM", hidden as u64)
-        .with_param("LANES", mapping.lanes)
-        .with_launch_param(1, "SIMDGROUPS", mapping.simdgroups)
-        .with_launch_param(1, "ROWS", mapping.rows)
-        .with_launch_param(2, "BATCH_SIMDGROUPS", mapping.batch_simdgroups)
-        .with_launch_param(2, "BATCH_ROWS", mapping.batch_rows)
-        .with_launch_param(2, "BATCH_PARTS", 2)
-        // Dense weights have no matrix GEMV.
-        .with_launch_param(2, "MATRIX", 0)
-        .with_launch_param(3, "SIMDGROUPS", mapping.simdgroups)
-        .with_launch_param(3, "ROWS", mapping.rows)
-        .with_launch_param(4, "SIMDGROUPS", mapping.simdgroups)
-        .with_launch_param(4, "ROWS", mapping.rows);
+    let specialization = gemv_mappings(
+        NativeSpecialization::new()
+            .with_static("H", hidden as u64)
+            .with_static("NK", g.key_heads as u64)
+            .with_static("NV", g.value_heads as u64)
+            .with_static("W", g.width as u64)
+            .with_static("C", g.convolution as u64)
+            .with_static("PT", 1)
+            .with_static("NM", hidden as u64),
+        crate::common::metal_launch::<gated_delta_project_convolved::Entry>,
+        mapping,
+    );
     let mut t = case.tensors(device, Element::bf16());
     let projected = gated_delta_project_convolved::native_for_device_with(
         device,

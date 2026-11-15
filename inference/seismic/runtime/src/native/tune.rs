@@ -9101,10 +9101,10 @@ mod tests {
             panic!("the first piece is whole configurations");
         };
         assert!(run.structural, "the first piece is the other forms'");
-        // Five forms: TALL, INT8, PACK, TILED (a form of the native now, as
-        // its launches share it) and RESIDUE, each at its other values that
-        // the declaration's restrictions admit.
-        assert!(first.len() <= 5, "{}", first.len());
+        // Forms: TALL, INT8, PACK, RESIDUE, MATRIX, SMALL, and TILED (two
+        // non-default values), each at its other values that the
+        // declaration's restrictions admit.
+        assert!(first.len() <= 7, "{}", first.len());
         let packing = first
             .iter()
             .find(|form| form.param("PACK") == Some(1))
@@ -9112,7 +9112,7 @@ mod tests {
         // Each differs from the defaults in its form, and in what that
         // form's restrictions couple to it alone.
         assert!(first.iter().all(|form| {
-            ["TALL", "INT8", "PACK", "TILED", "RESIDUE"]
+            ["TALL", "INT8", "PACK", "RESIDUE", "MATRIX", "SMALL", "TILED"]
                 .iter()
                 .filter(|name| form.param(name) != seed.param(name))
                 .count()

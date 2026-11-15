@@ -1,5 +1,5 @@
 // How every expert selection holds and orders its experts (`rank_experts`,
-// functions.seismic): the routes' `rank_row` (route.h, also the hints) and
+// functions.seismic): the routes' `rank_row` (also the hints) and
 // `routed_select` (select.h). The counterpart of
 // `cuda/lib/routed/ranked.cuh`, `vulkan/lib/routed/ranked.glsl` and
 // `cpu/lib/routed/ranked.rs`.
@@ -13,10 +13,11 @@
 //     Over ranked values it is a total order, so every rank names an
 //     expert whatever a row holds, and an excluded entry precedes nothing.
 //   out: an entry out of the ranking, for a selection that keeps no expert
-//     array (route.h): a NaN, which no ranked value is, so `precedes`
-//     neither chooses it nor lets it hold a best. Every library compiles
-//     with MTLMathMode::Safe (seismic's Metal profile), whose comparisons
-//     of a NaN are false.
+//     array: a NaN, which no ranked value is, so `precedes` neither chooses
+//     it nor lets it hold a best. Every library compiles with
+//     MTLMathMode::Safe (seismic's Metal profile), whose comparisons of a NaN
+//     are false.
+#include "../core/reduce.h"
 
 namespace selection {
 
@@ -35,6 +36,64 @@ inline float ranked(float value) {
 
 inline bool precedes(float value, int expert, float best, int best_expert) {
     return value > best || (value == best && expert > best_expert);
+}
+
+template <uint K>
+struct Ranked {
+    float chosen[K];
+    int winners[K];
+};
+
+// The ranking of one row by one simdgroup, reading the row's logit of expert
+// `e` as `logit_of(e)`: softmax over `EXPERTS` experts, then K rounds of
+// simdgroup argmax (`precedes`).
+template <uint EXPERTS, uint K, typename LogitOf>
+inline Ranked<K> rank_row(LogitOf logit_of, uint lane) {
+    constexpr uint per_lane = (EXPERTS + 31u) / 32u;
+    const uint held = candidates<EXPERTS>(lane);
+    float probability[per_lane];
+    float maximum = -INFINITY;
+    _Pragma("clang loop unroll(full)")
+    for (uint i = 0; i < per_lane; ++i) {
+        probability[i] = i < held ? logit_of(lane + 32u * i) : -INFINITY;
+        maximum = metal::max(maximum, probability[i]);
+    }
+    maximum = simd_max(maximum);
+    float total = 0.0f;
+    _Pragma("clang loop unroll(full)")
+    for (uint i = 0; i < per_lane; ++i) {
+        if (i < held) {
+            probability[i] = metal::exp(probability[i] - maximum);
+            total += probability[i];
+        }
+    }
+    total = simd_sum(total);
+    _Pragma("clang loop unroll(full)")
+    for (uint i = 0; i < per_lane; ++i)
+        probability[i] = i < held ? ranked(probability[i] / total) : out;
+
+    Ranked<K> result;
+    _Pragma("clang loop unroll(full)")
+    for (uint rank = 0; rank < K; ++rank) {
+        float best = -INFINITY;
+        int best_expert = -1;
+        _Pragma("clang loop unroll(full)")
+        for (uint i = 0; i < per_lane; ++i) {
+            if (probability[i] >= best) {
+                best = probability[i];
+                best_expert = int(lane + 32u * i);
+            }
+        }
+        float winner_probability;
+        const int winner = reduce::argmax<reduce::HigherIndex>(best, best_expert, winner_probability);
+        _Pragma("clang loop unroll(full)")
+        for (uint i = 0; i < per_lane; ++i)
+            if (winner == int(lane + 32u * i))
+                probability[i] = out;
+        result.chosen[rank] = winner_probability;
+        result.winners[rank] = winner;
+    }
+    return result;
 }
 
 } // namespace selection

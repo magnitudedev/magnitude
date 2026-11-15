@@ -31,11 +31,566 @@
 # activation dtype) before it is weighted; weighted choices accumulate in
 # slot order, then the shared expert, then the residual.
 
+# The decode row bound: the largest row class the routed decode forms (the
+# route and select GEMVs, the expansion and output, the bank-served
+# streamed decode) serve, and the decode rows their natives size their
+# per-row memory by. The executor's decode classes are the classes up to it
+# The routed projections: the forms of projecting activation rows by a
+# mixture's experts, written once per backend and taken by each routed entry
+# with one `project routed VARIANT (WEIGHT, ..)` line
+# (`seismic/lang/src/projection.rs`). Variants:
+#   choice   row y = (m, k) projects activation row m by expert routes[m, k]'s
+#            weights into its own product row (`routed_gate_up`, `routed_up`,
+#            `routed_expand`); with `shared (..)` the shared expert's weights
+#            project every row as one more grid row, y = M * K.
+#   summed   a row's choices projected by their experts' weights and summed
+#            in slot order (`routed_down`, `routed_output`); with
+#            `shared (..)` the shared expert's projection beside them.
+#   grouped  the rows grouped by expert (`routed_group`: `order`, `blocks`,
+#            `used`), each block expanded by its expert's weights, its
+#            products projected by the `down (..)` weight (`routed_experts`,
+#            `routed_experts_up`); over dense weights (`routed_combine`, the
+#            shared expert), every row one group.
+# One or two weights expand (a gate and an up weight one activation row
+# serves, or an up weight alone: `SERVED`). The text names the routed
+# entries' own extents (M rows, K choices, H, F, S, XS, B, T); its formals are
+# a weight's rows and columns (`N`, `WIDTH`), whether it stacks one matrix an
+# expert (`STACKED`), is of the first list (`FIRST`), the shared expert's
+# presence (`SHARED`), record ports (`RECORDS`: the experts' weights read
+# through record tables, which a resident launch's `records (W)` lists) and
+# a bank-policy port (`WHOLE`), and whether each row is its own expert
+# (`PER_ROW`: a per-row gathered entry's rows, each over the weight rows it
+# selects; the gathered choice forms, which serve rows that share an expert,
+# are not its). An expert's weights are read where its
+# source names (`slab::Source`, `slab::Experts`); a resident layer's (XS 0)
+# and a whole bank's read with plain loads (Metal), which is where their
+# launches differ: the address space of a record port is fixed when a launch
+# is formed.
+
+# Metal. choice: the K1 GEMV over one row (`projection::gemv_*_runtime`),
+# SIMDGROUPS x 32 / LANES lane groups of ROWS weight rows a threadgroup
+# (LANES sets the reduction order, so it is arithmetic), or gathered
+# (GATHERED, `routed::gather`): a choice's threadgroups run where it is its
+# expert's first and stage the rows of every choice of the expert, so a step
+# reads each chosen expert once (rows that share experts: the 8-row verify
+# touched 4.49x one row's experts), up to VERIFY_ROWS rows (a call of more
+# runs the per-choice launch); a row's bits are its one-row bits in
+# either. The shared expert's row stages every activation row. summed: the K choices (and the shared
+# expert) side by side, one simdgroup each, over (32 / LANES) * ROWS output
+# channels a threadgroup, meeting in threadgroup memory; or gathered
+# (GATHERED, `routed::project_gathered`): a choice's simdgroup runs where it
+# is its expert's first and projects every choice of the expert in turn
+# (the shared expert's, in row 0, every row), each its side-by-side
+# projection, so one simdgroup reads an expert's weights for all its
+# choices; each slot's projection is published in A (`published`,
+# [M, K + SHARED, H]), and the last of a channel tile's threadgroups to
+# arrive (`arrivals`) joins the tile's channels of every row in slot order,
+# up to VERIFY_ROWS rows (a call of more runs the side-by-side launch).
+# Either way a slot's projection and the join are bit for bit the same. grouped: a first
+# one-thread launch writes the others' grids from `rows` and `used`; the
+# paired (or single) expansion GEMM, then the down GEMM, over each block's
+# live rows in TILE_M x TILE_N simdgroup-matrix tiles; NVFP4 operands are
+# formed by a stage launch (the rows) and in place (the products).
+# Each of the two GEMMs takes the forms of `projection dense for metal` by
+# its rules (`form(W, X)` of its own weights, the expansion's TALL, INT8 and
+# PACK, the down's DOWN_TALL, DOWN_INT8 and DOWN_PACK, each with dense's
+# guards over its weights' N and WIDTH and its launches' parameters held as
+# dense holds them), over its rows: over dense weights (`routed_combine`)
+# every row of one group, with dense's code, past 64 rows (dense's TALL the
+# default there); over stacked experts each block of T rows (T % 32 == 0) one
+# expert's, at every row count, the default form the staged tiles:
+# TALL       the block's rows in the tall GEMM's order, whole 64-row fragment
+#            tiles (`relayout`: gathered through `order`, padding rows zero;
+#            row-major with tensor operations), then 64-row tall tiles;
+# INT8       the grouped rows quantized per (row, 32 columns) at their
+#            positions (block b's from b * T, whole 32-row tiles), each used
+#            expert's block coefficients and biases, formed by its first
+#            block, then 32-row int8 tiles of 128 weight rows (64 features
+#            where paired), a block's rows whole tiles of their own;
+# PACK       the grouped rows as integer codes at their positions, two
+#            adjacent rows of a block packed per operand element, so a row's
+#            result depends on the row it is packed with, as dense's
+#            (`int8_token_packing`); each used expert's block scales and
+#            biases, formed by its first block; then 32-token packed tiles
+#            (PACK_TOKENS 2) in the INT8 tiles' grid. The routed entries
+#            carry no packing bound: RESIDUE is 1.
+# The INT8 tiles on a device without tensor operations, and the `unpacked`
+# launch on one with them, run the staged 32 x 64 tiles with the default
+# form's results. MATRIX, dense's batched GEMV for VERIFY_ROWS..16 rows of a
+# call, is no grouped form: a block's live rows are data, not the call's
+# row class, and a row's result never depends on how many rows share its
+# block. The forms are exclusive within a GEMM and the GEMMs run in turn, so
+# they share their scratch (Metal binds 31 buffers): `operand`, the form's
+# rows over the widest of the GEMMs' columns, and `tables`, the used blocks'
+# expert ordinals then the weights' tables of each used expert
+# (`routed::weight_table`), at most min(E, B) of them. A stacked form's
+# grids, which the `grids` launch writes (and `down_grids` for the down's,
+# after the expansion): its row pass in the GEMM's own grid (`expand_grid`,
+# `down_grid`), whose default tiles it replaces, its tables pass in
+# `table_grid` and its tiles in `tile_grid`.
+projection routed for metal:
+    let CHOICE_GROUPS = ceil_div(most(W, N), SIMDGROUPS * ROWS * 32 / LANES) for choice
+    let CHOICE_SHARED = min(ceil_div(WIDTH, 32) * (1 + SHARED * (min(M, 2) - 1 + 2 * min(M / 3, 1) + 4 * min(M / 5, 1))), 448) * 64 for choice
+    let GATHERED_SHARED = min(ceil_div(WIDTH, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64 for choice
+    let SUMMED_GROUPS = ceil_div(most(W, N), ROWS * 32 / LANES) for summed
+    let SUMMED_PACKETS = ceil_div(most(W, WIDTH), 32) for summed
+    let SUMMED_STAGE = min(SUMMED_PACKETS, 256 / (K + SHARED)) for summed
+    let SUMMED_STAGES_16 = (1 - SHARED) * min(1, ceil_div(SUMMED_PACKETS, 16) / 3) for summed
+    let ROW_TILES = STACKED * B * ceil_div(T, TILE_M) + (1 - STACKED) * ceil_div(M, TILE_M) for grouped
+    let BLOCKS = STACKED * B + 1 - STACKED for grouped
+    let GROUP_ROWS = STACKED * T + (1 - STACKED) * M for grouped
+    let PADDED = STACKED * ceil_div(B * T, 64) * 64 + (1 - STACKED) * ceil_div(M, 128) * 128 for grouped
+    let WIDEST = most(W, WIDTH) for grouped
+    let FRAGMENT_BYTES = BLOCKS * ceil_div(GROUP_ROWS, 64) * 64 * WIDEST * 2 for grouped
+    let INT8_BYTES = PADDED * (WIDEST + WIDEST / 16 + ceil_div(WIDEST, 1024) * 64) for grouped
+    let PACK_BYTES = PADDED * (WIDEST * 2 + WIDEST / 8 + 4) + 1024 for grouped
+    let EXPANSION_OPERAND = (TALL - INT8 - PACK) * FRAGMENT_BYTES + INT8 * INT8_BYTES + PACK * PACK_BYTES for grouped
+    let DOWN_OPERAND = (DOWN_TALL - DOWN_INT8 - DOWN_PACK) * FRAGMENT_BYTES + DOWN_INT8 * INT8_BYTES + DOWN_PACK * PACK_BYTES for grouped
+    let EXPANSION_TABLES = sum(W, FIRST * (INT8 * (N * (WIDTH / 32) * 4 + ceil_div(N, 32) * 32 * ceil_div(WIDTH, 1024) * 64) + PACK * (N * (WIDTH / 32) * 4 + N * 4))) for grouped
+    let DOWN_TABLES = sum(W, (1 - FIRST) * (DOWN_INT8 * (N * (WIDTH / 32) * 4 + ceil_div(N, 32) * 32 * ceil_div(WIDTH, 1024) * 64) + DOWN_PACK * (N * (WIDTH / 32) * 4 + N * 4))) for grouped
+    let USED_EXPERTS = STACKED * min(E, B) + 1 - STACKED for grouped
+    let ORDINAL_BYTES = STACKED * ceil_div(B, 4) * 16 for grouped
+    params (SIMDGROUPS in [2, 4, 8, 16] default 2 for choice, ROWS in [1, 2, 4] default 1 for choice,
+        arithmetic LANES in [32, 16] default 32 for choice, form GATHERED in [0, 1] default 0 for choice,
+        ROWS in [2, 1, 4, 8] default 2 for summed, arithmetic LANES in [16, 32, 8, 4] default 16 for summed,
+        form GATHERED in [0, 1] default 0 for summed,
+        TILE_M in [32, 64, 128] default 32 for grouped, TILE_N in [128, 64] default 128 for grouped,
+        form TALL in [0, 1] default (1 - STACKED) for grouped, arithmetic form INT8 in [0, 1] default 0 for grouped,
+        arithmetic form PACK in [0, 1] default 0 for grouped, form DOWN_TALL in [0, 1] default (1 - STACKED) for grouped,
+        arithmetic form DOWN_INT8 in [0, 1] default 0 for grouped, arithmetic form DOWN_PACK in [0, 1] default 0 for grouped)
+    where K + SHARED <= 32 for summed
+    where ROWS * ceil_div(SUMMED_PACKETS - (1 - min(1, LANES / 16) + (min(1, LANES / 16) - LANES / 32) * SUMMED_STAGES_16) * (SUMMED_PACKETS - SUMMED_STAGE), LANES) <= 8 for summed
+    where (SHARED == 1 or 2 * ceil_div(SUMMED_PACKETS - SUMMED_STAGES_16 * (SUMMED_PACKETS - SUMMED_STAGE), 16) <= 8) for summed
+    where (TALL == 0 or (WIDTH % 128 == 0 and (STACKED == 0 or T % 32 == 0))) for grouped
+    where (DOWN_TALL == 0 or (each(W, FIRST == 1 or WIDTH % 128 == 0) and (STACKED == 0 or T % 32 == 0))) for grouped
+    where (INT8 == 0 or (TALL == 1 and (STACKED == 1 or SERVED == 2) and WIDTH % 512 == 0 and N % (64 / SERVED) == 0 and each(W, FIRST == 0 or form(W, INT8) == 1) and sum(W, FIRST * form(W, INT8_INTERLEAVED)) % SERVED == 0)) for grouped
+    where (DOWN_INT8 == 0 or (DOWN_TALL == 1 and each(W, FIRST == 1 or (WIDTH % 512 == 0 and N % 64 == 0 and form(W, INT8) == 1)))) for grouped
+    where (DOWN_INT8 == 1 or STACKED == 1 or INT8_TILE == 128) for grouped
+    where (PACK == 0 or (TALL == 1 and INT8 == 0 and WIDTH % 256 == 0 and WIDTH < 1048576 and N % (64 / SERVED) == 0 and each(W, FIRST == 0 or form(W, PACK) == 1) and sum(W, FIRST * form(W, PACK_FOLDS)) == SERVED * most(W, FIRST * form(W, PACK_FOLDS)) and sum(W, FIRST * form(W, PACK_RESIDUE)) % SERVED == 0)) for grouped
+    where (DOWN_PACK == 0 or (DOWN_TALL == 1 and DOWN_INT8 == 0 and each(W, FIRST == 1 or (WIDTH % 256 == 0 and WIDTH < 1048576 and N % 64 == 0 and form(W, PACK) == 1)))) for grouped
+    where (PACK == 1 or ((STACKED == 1 or PACK_TOKENS == 4) and WEIGHTS_AHEAD == 0)) for grouped
+    where (DOWN_PACK == 1 or ((STACKED == 1 or DOWN_PACK_TOKENS == 4) and DOWN_WEIGHTS_AHEAD == 0)) for grouped
+    where (PACK == 0 or ((STACKED == 1 or TALL_M == 128) and TALL_K == 64 and STAGERS == 2)) for grouped
+    where (DOWN_PACK == 0 or ((STACKED == 1 or DOWN_TALL_M == 128) and DOWN_TALL_K == 64 and DOWN_STAGERS == 2)) for grouped
+    where (STACKED == 0 or TALL == 0 or DOWN_TALL == 0 or (TILE_M == 32 and TILE_N == 128)) for grouped
+    scratch staged bytes (M * WIDTH * 2) when STACKED == 1 and any(W, FIRST == 1 and operands(W) == 1) for grouped
+    scratch product bytes (STACKED * B * T * N * 2 + (1 - STACKED) * M * N * 2) for grouped
+    scratch stage_grid bytes (12) when STACKED == 1 for grouped
+    scratch expand_grid bytes (12) when STACKED == 1 for grouped
+    scratch quantize_grid bytes (12) when STACKED == 1 for grouped
+    scratch down_grid bytes (12) when STACKED == 1 for grouped
+    scratch table_grid bytes (12) when STACKED == 1 for grouped
+    scratch tile_grid bytes (12) when STACKED == 1 for grouped
+    scratch operand bytes (max(EXPANSION_OPERAND, DOWN_OPERAND)) when (STACKED == 1 or M > 64) and (TALL == 1 or DOWN_TALL == 1) for grouped
+    scratch tables bytes (ORDINAL_BYTES + USED_EXPERTS * max(EXPANSION_TABLES, DOWN_TABLES)) when (STACKED == 1 or M > 64) and INT8 + PACK + DOWN_INT8 + DOWN_PACK > 0 for grouped
+    launch choice for choice when (GATHERED == 0 or M > VERIFY_ROWS or PER_ROW == 1) and (RECORDS == 0 or SHARED == 1 or XS > 0):
+        reads (ROWS, LANES)
+        threadgroups (CHOICE_GROUPS, M * K + SHARED, 1)
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (CHOICE_SHARED)
+    launch resident for choice when (GATHERED == 0 or M > VERIFY_ROWS) and RECORDS == 1 and SHARED == 0 and XS == 0:
+        reads (ROWS, LANES)
+        records (W)
+        threadgroups (CHOICE_GROUPS, M * K + SHARED, 1)
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (CHOICE_SHARED)
+    launch gathered for choice when GATHERED == 1 and M <= VERIFY_ROWS and PER_ROW == 0 and (RECORDS == 0 or SHARED == 1 or XS > 0):
+        reads (ROWS, LANES)
+        threadgroups (CHOICE_GROUPS, M * K + SHARED, 1)
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (GATHERED_SHARED)
+    launch gathered_resident for choice when GATHERED == 1 and M <= VERIFY_ROWS and RECORDS == 1 and SHARED == 0 and XS == 0:
+        reads (ROWS, LANES)
+        records (W)
+        threadgroups (CHOICE_GROUPS, M * K + SHARED, 1)
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (GATHERED_SHARED)
+    launch summed for summed when (GATHERED == 0 or M > VERIFY_ROWS) and XS > 0 and WHOLE == 0:
+        reads (ROWS, LANES)
+        threadgroups (SUMMED_GROUPS, M, 1)
+        threads_per_threadgroup (32 * (K + SHARED), 1, 1)
+    launch summed for summed when (GATHERED == 0 or M > VERIFY_ROWS) and XS > 0 and WHOLE == 1:
+        reads (ROWS, LANES)
+        threadgroups (SUMMED_GROUPS, M, 1)
+        unless (policy[POLICY_WHOLE])
+        threads_per_threadgroup (32 * (K + SHARED), 1, 1)
+    launch whole for summed when (GATHERED == 0 or M > VERIFY_ROWS) and XS > 0 and WHOLE == 1:
+        reads (ROWS, LANES)
+        threadgroups (SUMMED_GROUPS, M, 1)
+        if (policy[POLICY_WHOLE])
+        threads_per_threadgroup (32 * (K + SHARED), 1, 1)
+    launch resident for summed when (GATHERED == 0 or M > VERIFY_ROWS) and XS == 0:
+        reads (ROWS, LANES)
+        records (W)
+        threadgroups (SUMMED_GROUPS, M, 1)
+        threads_per_threadgroup (32 * (K + SHARED), 1, 1)
+    launch gathered for summed when GATHERED == 1 and M <= VERIFY_ROWS and XS > 0 and WHOLE == 0:
+        reads (ROWS, LANES)
+        threadgroups (SUMMED_GROUPS, M, 1)
+        threads_per_threadgroup (32 * (K + SHARED), 1, 1)
+    launch gathered for summed when GATHERED == 1 and M <= VERIFY_ROWS and XS > 0 and WHOLE == 1:
+        reads (ROWS, LANES)
+        threadgroups (SUMMED_GROUPS, M, 1)
+        unless (policy[POLICY_WHOLE])
+        threads_per_threadgroup (32 * (K + SHARED), 1, 1)
+    launch gathered_whole for summed when GATHERED == 1 and M <= VERIFY_ROWS and XS > 0 and WHOLE == 1:
+        reads (ROWS, LANES)
+        threadgroups (SUMMED_GROUPS, M, 1)
+        if (policy[POLICY_WHOLE])
+        threads_per_threadgroup (32 * (K + SHARED), 1, 1)
+    launch gathered_resident for summed when GATHERED == 1 and M <= VERIFY_ROWS and XS == 0:
+        reads (ROWS, LANES)
+        records (W)
+        threadgroups (SUMMED_GROUPS, M, 1)
+        threads_per_threadgroup (32 * (K + SHARED), 1, 1)
+    launch grids for grouped when STACKED == 1:
+        reads (TILE_M, TILE_N, TALL, INT8, PACK, DOWN_INT8, DOWN_PACK)
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+    launch stage for grouped when STACKED == 1 and any(W, FIRST == 1 and operands(W) == 1):
+        staging
+        threadgroups (M, 1, 1)
+        grid (stage_grid)
+        threads_per_threadgroup (256, 1, 1)
+    launch expand for grouped when TALL == 0 or (STACKED == 0 and M <= 64):
+        threadgroups (ceil_div(N * SERVED, TILE_N), ROW_TILES, 1)
+        grid (expand_grid)
+        threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
+    launch relayout for grouped when TALL == 1 and INT8 == 0 and PACK == 0 and (STACKED == 1 or M > 64):
+        threadgroups (ceil_div(ceil_div(GROUP_ROWS, 64) * WIDTH, 256), BLOCKS, 1)
+        grid (expand_grid)
+        threads_per_threadgroup (256, 1, 1)
+    launch tall for grouped when STACKED == 0 and TALL == 1 and INT8 == 0 and PACK == 0 and M > 64:
+        params (TALL_M in [128, 256, 512] default 128, TALL_K in [64, 128] default 64, STAGERS in [2, 1] default 2)
+        threadgroups (ceil_div(N, 32 / SERVED), ceil_div(M, TALL_M), 1)
+        threads_per_threadgroup ((TALL_M / 32 + STAGERS) * 32, 1, 1)
+    launch tall for grouped when STACKED == 1 and TALL == 1 and INT8 == 0 and PACK == 0:
+        params (TALL_K in [64, 128] default 64, STAGERS in [2, 1] default 2)
+        threadgroups (ceil_div(N, 32 / SERVED), B * ceil_div(T, 64), 1)
+        grid (tile_grid)
+        threads_per_threadgroup ((2 + STAGERS) * 32, 1, 1)
+    launch int8_rows for grouped when INT8 == 1 and (STACKED == 1 or M > 64):
+        threadgroups (STACKED * B * T + (1 - STACKED) * ceil_div(M, 128 / SERVED) * (128 / SERVED), 1, 1)
+        grid (expand_grid)
+        threads_per_threadgroup (256, 1, 1)
+    launch int8_coefficients for grouped when INT8 == 1 and (STACKED == 1 or M > 64):
+        threadgroups (ceil_div(N * (WIDTH / 256), 1024), BLOCKS, 1)
+        grid (table_grid)
+        threads_per_threadgroup (256, 1, 1)
+    launch int8 for grouped when STACKED == 0 and INT8 == 1 and M > 64:
+        threadgroups (ceil_div(N, 32), ceil_div(M, 64), 1)
+        threads_per_threadgroup (128, 1, 1)
+    launch int8 for grouped when STACKED == 1 and INT8 == 1:
+        threadgroups (ceil_div(N * SERVED, 128), B * (T / 32), 1)
+        grid (tile_grid)
+        threads_per_threadgroup (128, 1, 1)
+    launch pack for grouped when PACK == 1 and (STACKED == 1 or M > 64):
+        threadgroups (STACKED * B * (T / 4) + (1 - STACKED) * ceil_div(M, 128 / SERVED) * (32 / SERVED), 1, 1)
+        grid (expand_grid)
+        threads_per_threadgroup (256, 1, 1)
+    launch pack_coefficients for grouped when PACK == 1 and (STACKED == 1 or M > 64):
+        threadgroups (N / 32, BLOCKS, 1)
+        grid (table_grid)
+        threads_per_threadgroup (256, 1, 1)
+    launch packed for grouped when STACKED == 0 and PACK == 1 and M > 64:
+        params (PACK_TOKENS in [4, 2] default 4, WEIGHTS_AHEAD in [0, 1] default 0)
+        threadgroups (ceil_div(M, 128 / SERVED) * (N / 32), 1, 1)
+        threads_per_threadgroup (128, 1, 1)
+    launch packed for grouped when STACKED == 1 and PACK == 1:
+        params (WEIGHTS_AHEAD in [0, 1] default 0)
+        threadgroups (ceil_div(N * SERVED, 128), B * (T / 32), 1)
+        grid (tile_grid)
+        threads_per_threadgroup (128, 1, 1)
+    launch unpacked for grouped when STACKED == 0 and PACK == 1 and M > 64:
+        threadgroups (ceil_div(N * SERVED, 64), ceil_div(M, 64), 1)
+        threads_per_threadgroup (128, 1, 1)
+    launch unpacked for grouped when STACKED == 1 and PACK == 1:
+        threadgroups (ceil_div(N * SERVED, 128), B * (T / 32), 1)
+        grid (tile_grid)
+        threads_per_threadgroup (128, 1, 1)
+    launch quantize for grouped when STACKED == 1 and any(W, FIRST == 0 and operands(W) == 1):
+        threadgroups (B * T, 1, 1)
+        grid (quantize_grid)
+        threads_per_threadgroup (256, 1, 1)
+    launch down_grids for grouped when STACKED == 1 and DOWN_TALL == 1:
+        reads (DOWN_INT8, DOWN_PACK)
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+    launch down for grouped when DOWN_TALL == 0 or (STACKED == 0 and M <= 64):
+        threadgroups (ceil_div(WIDTH, TILE_N), ROW_TILES, 1)
+        grid (down_grid)
+        threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
+    launch down_relayout for grouped when DOWN_TALL == 1 and DOWN_INT8 == 0 and DOWN_PACK == 0 and (STACKED == 1 or M > 64):
+        threadgroups (ceil_div(ceil_div(GROUP_ROWS, 64) * N, 256), BLOCKS, 1)
+        grid (down_grid)
+        threads_per_threadgroup (256, 1, 1)
+    launch down_tall for grouped when STACKED == 0 and DOWN_TALL == 1 and DOWN_INT8 == 0 and DOWN_PACK == 0 and M > 64:
+        params (DOWN_TALL_M in [128, 256, 512] default 128, DOWN_TALL_K in [64, 128] default 64, DOWN_STAGERS in [2, 1] default 2)
+        threadgroups (ceil_div(WIDTH, 32), ceil_div(M, DOWN_TALL_M), 1)
+        threads_per_threadgroup ((DOWN_TALL_M / 32 + DOWN_STAGERS) * 32, 1, 1)
+    launch down_tall for grouped when STACKED == 1 and DOWN_TALL == 1 and DOWN_INT8 == 0 and DOWN_PACK == 0:
+        params (DOWN_TALL_K in [64, 128] default 64, DOWN_STAGERS in [2, 1] default 2)
+        threadgroups (ceil_div(WIDTH, 32), B * ceil_div(T, 64), 1)
+        grid (tile_grid)
+        threads_per_threadgroup ((2 + DOWN_STAGERS) * 32, 1, 1)
+    launch down_int8_rows for grouped when DOWN_INT8 == 1 and (STACKED == 1 or M > 64):
+        threadgroups (STACKED * B * T + (1 - STACKED) * ceil_div(M, 128) * 128, 1, 1)
+        grid (down_grid)
+        threads_per_threadgroup (256, 1, 1)
+    launch down_int8_coefficients for grouped when DOWN_INT8 == 1 and (STACKED == 1 or M > 64):
+        threadgroups (ceil_div(WIDTH * (N / 256), 1024), BLOCKS, 1)
+        grid (table_grid)
+        threads_per_threadgroup (256, 1, 1)
+    launch down_int8 for grouped when STACKED == 0 and DOWN_INT8 == 1 and M > 64:
+        params (INT8_TILE in [128, 64] default 128)
+        threadgroups (ceil_div(M, INT8_TILE), (INT8_TILE / 128) * ceil_div(WIDTH, 32) + (1 - INT8_TILE / 128) * ceil_div(WIDTH, 64), 1)
+        threads_per_threadgroup (128, 1, 1)
+    launch down_int8 for grouped when STACKED == 1 and DOWN_INT8 == 1:
+        threadgroups (ceil_div(WIDTH, 128), B * (T / 32), 1)
+        grid (tile_grid)
+        threads_per_threadgroup (128, 1, 1)
+    launch down_pack for grouped when DOWN_PACK == 1 and (STACKED == 1 or M > 64):
+        threadgroups (STACKED * B * (T / 4) + (1 - STACKED) * ceil_div(M, 128) * 32, 1, 1)
+        grid (down_grid)
+        threads_per_threadgroup (256, 1, 1)
+    launch down_pack_coefficients for grouped when DOWN_PACK == 1 and (STACKED == 1 or M > 64):
+        threadgroups (WIDTH / 32, BLOCKS, 1)
+        grid (table_grid)
+        threads_per_threadgroup (256, 1, 1)
+    launch down_packed for grouped when STACKED == 0 and DOWN_PACK == 1 and M > 64:
+        params (DOWN_PACK_TOKENS in [4, 2] default 4, DOWN_WEIGHTS_AHEAD in [0, 1] default 0)
+        threadgroups (ceil_div(M, 128) * (WIDTH / 32), 1, 1)
+        threads_per_threadgroup (128, 1, 1)
+    launch down_packed for grouped when STACKED == 1 and DOWN_PACK == 1:
+        params (DOWN_WEIGHTS_AHEAD in [0, 1] default 0)
+        threadgroups (ceil_div(WIDTH, 128), B * (T / 32), 1)
+        grid (tile_grid)
+        threads_per_threadgroup (128, 1, 1)
+    launch down_unpacked for grouped when STACKED == 0 and DOWN_PACK == 1 and M > 64:
+        threadgroups (ceil_div(WIDTH, 64), ceil_div(M, 64), 1)
+        threads_per_threadgroup (128, 1, 1)
+    launch down_unpacked for grouped when STACKED == 1 and DOWN_PACK == 1:
+        threadgroups (ceil_div(WIDTH, 128), B * (T / 32), 1)
+        grid (tile_grid)
+        threads_per_threadgroup (128, 1, 1)
+
+# CUDA. choice and summed: the mma16 swap-AB GEMV, TPW 16-row tiles a warp
+# group, KSPLIT-way K split reduced in part order. A choice's experts take
+# their operand row formed in the block (the one-row form) or, gathered
+# (GATHERED, valid at every M), a chosen expert runs once over the rows of
+# each of its choices (`routed::gather`), its records streamed once a
+# step, over rows a stage launch formed where the experts take NVFP4
+# operands. With the shared expert (`routed_expand`), whose row y = M * K
+# stages every activation row, both forms read the staged rows. summed
+# publishes each slot's projection in A (`published`, [M, K + SHARED, H])
+# for the entry's slot-order join. grouped: fixed 32-row (by expert) or
+# 64-row (every row) x 128-column mma.sync tiles, 3 cp.async stages; the
+# rows staged where OPERAND or the experts' NVFP4 operands ask, the products
+# formed in place. INT8 is the int8 candidate of `projection dense for cuda`
+# for both GEMMs (arithmetic: the tuner keeps it only where it is faster
+# within tolerance), admitted where every weight takes the int8 GEMM
+# (`form(W, INT8)`): the stage launch quantizes the rows per 32 codes as q8_1
+# (`staged` codes, `groups` of (d, d * sum q)), the quantize launch each
+# live product row (`product_codes`, `product_groups`), and s8 MMAs fold
+# them under the weights' groups as the dense int8 GEMM does, one k-block a
+# stage, so a row's projection is the one the dense int8 GEMM (unsplit)
+# gives it by its expert's weights.
+projection routed for cuda:
+    let DECODE_GROUPS = ceil_div(ceil_div(ceil_div(most(W, N), 16), TPW), 4 / KSPLIT) for choice | summed
+    let TILE = 64 - 32 * STACKED for grouped
+    let ROW_TILES = STACKED * ceil_div(T, TILE) + (1 - STACKED) * ceil_div(M, TILE) for grouped
+    let TILE_BLOCKS = STACKED * B + (1 - STACKED) for grouped
+    let PRODUCT_ROWS = STACKED * B * T + (1 - STACKED) * M for grouped
+    params (TPW in [1, 2] default 1 for choice | summed, arithmetic KSPLIT in [1, 2, 4] default 1 for choice | summed,
+        form GATHERED in [0, 1] default SHARED for choice, arithmetic INT8 in [0, 1] default 0 for grouped,
+        arithmetic OPERAND in [0, 1] default 0 for grouped)
+    where each(W, WIDTH % 64 == 0)
+    where (OPERAND == 0 or INT8 == 0) for grouped
+    where (INT8 == 0 or each(W, form(W, INT8) == 1)) for grouped
+    scratch operands bytes (M * WIDTH * 2) when (SHARED == 1 or (GATHERED == 1 and PER_ROW == 0)) and any(W, operands(W) == 1) for choice
+    each W:
+        scratch operands bytes (M * K * WIDTH * 2) when STACKED == 1 and (SHARED == 1 or M > 1) and operands(W) == 1 for summed
+        scratch operands bytes (M * WIDTH * 2) when STACKED == 0 and operands(W) == 1 for summed
+    scratch staged bytes (M * WIDTH * (2 - INT8)) when OPERAND == 1 or INT8 == 1 or any(W, FIRST == 1 and operands(W) == 1) for grouped
+    scratch groups bytes (M * WIDTH / 4) when INT8 == 1 for grouped
+    scratch product bytes (STACKED * B * T * N * 2 + (1 - STACKED) * M * N * 2) for grouped
+    scratch product_codes bytes (PRODUCT_ROWS * N) when INT8 == 1 for grouped
+    scratch product_groups bytes (PRODUCT_ROWS * N / 4) when INT8 == 1 for grouped
+    scratch stage_grid bytes (12) when STACKED == 1 for grouped
+    scratch expand_grid bytes (12) when STACKED == 1 for grouped
+    scratch quantize_grid bytes (12) when STACKED == 1 for grouped
+    scratch down_grid bytes (12) when STACKED == 1 for grouped
+    launch stage for choice when (SHARED == 1 or (GATHERED == 1 and PER_ROW == 0)) and any(W, operands(W) == 1):
+        staging
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch choice for choice when GATHERED == 0 or PER_ROW == 1:
+        reads (TPW, KSPLIT)
+        threadgroups (DECODE_GROUPS, M * K + SHARED, 1)
+        threads_per_threadgroup (128, 1, 1)
+        shared_bytes ((1 - SHARED) * most(W, operands(W)) * WIDTH * 2)
+    launch gathered for choice when GATHERED == 1 and PER_ROW == 0:
+        reads (TPW, KSPLIT)
+        threadgroups (DECODE_GROUPS, M * K + SHARED, 1)
+        threads_per_threadgroup (128, 1, 1)
+    launch stage for summed when (SHARED == 1 or M > 1) and any(W, operands(W) == 1):
+        staging
+        threadgroups (M * (K + SHARED), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch summed for summed when M == 1:
+        reads (TPW, KSPLIT)
+        threadgroups (DECODE_GROUPS, M * (K + SHARED), 1)
+        threads_per_threadgroup (128, 1, 1)
+        shared_bytes ((1 - SHARED) * most(W, operands(W)) * WIDTH * 2)
+    launch gathered for summed when M > 1:
+        reads (TPW, KSPLIT)
+        alike (summed)
+        threadgroups (DECODE_GROUPS, M * (K + SHARED), 1)
+        threads_per_threadgroup (128, 1, 1)
+    launch grids for grouped when STACKED == 1:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+    launch stage for grouped when (OPERAND == 1 or INT8 == 1 or any(W, FIRST == 1 and operands(W) == 1)):
+        reads (INT8, OPERAND)
+        staging
+        threadgroups (M, 1, 1)
+        grid (stage_grid)
+        threads_per_threadgroup (256, 1, 1)
+    launch expand for grouped:
+        reads (INT8, OPERAND)
+        threadgroups (ceil_div(ceil_div(N, 16), 8), ROW_TILES, TILE_BLOCKS)
+        grid (expand_grid)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (3 * (TILE * 144 + SERVED * 10240) + SERVED * 4096)
+    launch quantize for grouped when INT8 == 1 or (STACKED == 1 and any(W, FIRST == 0 and operands(W) == 1)):
+        reads (INT8, OPERAND)
+        threadgroups (PRODUCT_ROWS, 1, 1)
+        grid (quantize_grid)
+        threads_per_threadgroup (256, 1, 1)
+    launch down for grouped:
+        reads (INT8, OPERAND)
+        threadgroups (ceil_div(ceil_div(WIDTH, 16), 8), ROW_TILES, TILE_BLOCKS)
+        grid (down_grid)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (3 * (TILE * 144 + 10240) + 4096)
+
+# Vulkan. choice: the Metal GEMV with whole-subgroup lane groups, row y =
+# choice (m, k) (`<entry>_choice`), or gathered (GATHERED: a one-workgroup
+# launch tables each expert's choices, then each expert's first choice runs
+# over the rows of all its choices, one launch per activation-row bound).
+# The shared expert's row y = M * K stages every activation row: its
+# per-choice form takes one launch per activation-row bound too (`choice`
+# at one row, `choice2`..`choice8`).
+# summed: the choices' projections in slot order in one launch, each through
+# the entry's epilogue (`routed_down` weights and sums them,
+# `routed_down_project` publishes them); with the shared expert, each (row,
+# slot)'s projection, the shared expert's the last slot, in its own
+# workgroup (`project`), A-rounded into what the entry's epilogue names
+# (`routed_output`'s scratch, which its own launch joins;
+# `routed_output_project`'s result). grouped: the
+# Metal form on the projection library's GEMM (TILE_M x TILE_N tiles of
+# SUB_M x SUB_N subgroup tiles). Every record is read with plain loads: a
+# Vulkan device reads a host write across a submission boundary.
+projection routed for vulkan:
+    let CHOICE_GROUPS = ceil_div(most(W, N), SIMDGROUPS * ROWS) for choice
+    let CHOICE_SHARED = 256 + 32 * most(W, operands(W)) + min(8 * ceil_div(WIDTH, 32), 288) * 72 for choice
+    let SUMMED_GROUPS = ceil_div(most(W, N), SIMDGROUPS * ROWS * 32 / LANES) for summed
+    let SUMMED_SHARED = 256 + 32 * most(W, operands(W)) + min(ceil_div(most(W, WIDTH), 32), 288) * 72 for summed
+    let ROW_TILES = STACKED * B * ceil_div(T, TILE_M) + (1 - STACKED) * ceil_div(M, TILE_M) for grouped
+    let GEMM_THREADS = TILE_M * TILE_N * 32 / (SUB_M * SUB_N) for grouped
+    let GEMM_SHARED = (TILE_M + TILE_N) * 80 for grouped
+    params (SIMDGROUPS in [2, 4, 8] default 2 for choice | summed, ROWS in [1, 2, 4] default 1 for choice | summed,
+        form GATHERED in [0, 1] default 0 for choice, arithmetic LANES in [32, 16, 8] default 32 for summed,
+        TILE_M in [32, 64, 128] default 32 for grouped, TILE_N in [128, 64] default 128 for grouped,
+        SUB_M in [32, 64] default 32 for grouped, SUB_N in [32, 64] default 32 for grouped)
+    where SUB_M <= TILE_M and SUB_N <= TILE_N for grouped
+    where each(W, form(W, DECODED) == 1)
+    scratch gathered bytes (M * K * (1 + 2 * VERIFY_ROWS) * 4) when GATHERED == 1 and PER_ROW == 0 for choice
+    scratch staged bytes (M * WIDTH * 2) when STACKED == 1 and any(W, FIRST == 1 and operands(W) == 1) for grouped
+    scratch product bytes (STACKED * B * T * N * 2 + (1 - STACKED) * M * N * 2) for grouped
+    scratch stage_grid bytes (12) when STACKED == 1 for grouped
+    scratch expand_grid bytes (12) when STACKED == 1 for grouped
+    scratch quantize_grid bytes (12) when STACKED == 1 for grouped
+    scratch down_grid bytes (12) when STACKED == 1 for grouped
+    launch choice for choice when (GATHERED == 0 or PER_ROW == 1) and (SHARED == 0 or M <= 1):
+        threadgroups (CHOICE_GROUPS, M * K + SHARED, 1)
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (CHOICE_SHARED)
+    launch choice2 for choice when (GATHERED == 0 or PER_ROW == 1) and SHARED == 1 and M == 2:
+        alike (choice)
+        threadgroups (CHOICE_GROUPS, M * K + SHARED, 1)
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (CHOICE_SHARED)
+    launch choice4 for choice when (GATHERED == 0 or PER_ROW == 1) and SHARED == 1 and M >= 3 and M <= 4:
+        alike (choice)
+        threadgroups (CHOICE_GROUPS, M * K + SHARED, 1)
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (CHOICE_SHARED)
+    launch choice8 for choice when (GATHERED == 0 or PER_ROW == 1) and SHARED == 1 and M >= 5:
+        alike (choice)
+        threadgroups (CHOICE_GROUPS, M * K + SHARED, 1)
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (CHOICE_SHARED)
+    launch gather for choice when GATHERED == 1 and PER_ROW == 0:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch gathered1 for choice when GATHERED == 1 and PER_ROW == 0 and M <= 1:
+        threadgroups (CHOICE_GROUPS, M * K + SHARED, 1)
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (CHOICE_SHARED)
+    launch gathered2 for choice when GATHERED == 1 and PER_ROW == 0 and M == 2:
+        alike (gathered1)
+        threadgroups (CHOICE_GROUPS, M * K + SHARED, 1)
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (CHOICE_SHARED)
+    launch gathered4 for choice when GATHERED == 1 and PER_ROW == 0 and M >= 3 and M <= 4:
+        alike (gathered1)
+        threadgroups (CHOICE_GROUPS, M * K + SHARED, 1)
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (CHOICE_SHARED)
+    launch gathered8 for choice when GATHERED == 1 and PER_ROW == 0 and M >= 5:
+        alike (gathered1)
+        threadgroups (CHOICE_GROUPS, M * K + SHARED, 1)
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (CHOICE_SHARED)
+    launch summed for summed when SHARED == 0:
+        threadgroups (SUMMED_GROUPS, M, 1)
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (SUMMED_SHARED)
+    launch project for summed when SHARED == 1:
+        threadgroups (SUMMED_GROUPS, M * (K + 1), 1)
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (SUMMED_SHARED)
+    launch grids for grouped when STACKED == 1:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+    launch stage for grouped when STACKED == 1 and any(W, FIRST == 1 and operands(W) == 1):
+        staging
+        threadgroups (M, 1, 1)
+        grid (stage_grid)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (128)
+    launch expand for grouped:
+        threadgroups (ceil_div(N * SERVED, TILE_N), ROW_TILES, 1)
+        grid (expand_grid)
+        threads_per_threadgroup (GEMM_THREADS, 1, 1)
+        shared_bytes (GEMM_SHARED)
+    launch quantize for grouped when STACKED == 1 and any(W, FIRST == 0 and operands(W) == 1):
+        threadgroups (B * T, 1, 1)
+        grid (quantize_grid)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (128)
+    launch down for grouped:
+        threadgroups (ceil_div(WIDTH, TILE_N), ROW_TILES, 1)
+        grid (down_grid)
+        threads_per_threadgroup (GEMM_THREADS, 1, 1)
+        shared_bytes (GEMM_SHARED)
+
 fn routed_route[M, H, PT, NM, E, K, ES](residual: &tensor[M, PT * H] f32, norm: &tensor[NM] NW,
-    router: &tensor[E, H] RW, shared_router: &tensor[H] f32,
+    router: &tensor[E, H] RW, shared_router: &tensor[H] SRW,
     routes: &mut tensor[M, K] i32, scores: &mut tensor[M, K] f32,
     eps: f32, normalize: i32, expert_scale: &tensor[ES] f32) -> (tensor[M, H] A, tensor[M] f32)
-    where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and ES >= 0 and (ES == 0 or ES == E) and operands(RW) == 0:
+    where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and ES >= 0 and (ES == 0 or ES == E) and operands(RW) == 0 and operands(SRW) == 0:
     let mut normalized = tensor[M, H] A
     let mut logits = tensor[M, E] f32
     let mut coefficient = tensor[M] f32
@@ -54,104 +609,48 @@ fn routed_route[M, H, PT, NM, E, K, ES](residual: &tensor[M, PT * H] f32, norm: 
         coefficient[row] = 1.0 / (1.0 + exp(-gate))
     return (normalized, coefficient)
 
-# Both backends: rows <= VERIFY_ROWS form the router logits as a GEMV (one simdgroup or
-# warp per logit column); larger classes normalize once per row (`stage`),
-# then a tiled GEMM (Metal 64 x 32, CUDA 32 x 32; edge tiles guarded);
-# selection with one
-# simdgroup or warp per row, ceil(E / 32) experts per lane (lanes at or past
-# E % 32 exclude their last register). SIMDGROUPS (columns per GEMV
-# threadgroup) never changes result bits.
-#
-# Metal: the GEMV is the K1 GEMV body (32-lane groups, dense rows loaded a
-# whole packet at a time) over the normalized rows each threadgroup stages,
-# plus one threadgroup for the shared-expert gate row; F32 activations,
-# which the GEMV body does not stage, run one simdgroup per column that
-# normalizes on the fly, in the same sum order. The last GEMV threadgroup to
-# arrive (`arrivals`, sync scratch) selects every row, so rows <= VERIFY_ROWS route in
-# one launch. The GEMM forms 64 x 32 tiles on 8x8 F32 simdgroup matrices
-# (128 threads, `metal/lib/routed/logits.h`).
-# (CUDA: the GEMV normalizes on the fly; scalar FMAs over shared tiles, 256
-# threads; a separate selection launch.)
+# GPU backends: `dense` segmented projection over `(router, shared_router)` in
+# the 8-lane reference order (`ordered`), publishing `normalized` (`result 0`)
+# directly from the decode GEMV's first tile or the prefill stage launch.
+# On Metal and CUDA, decode rows (M <= VERIFY_ROWS) select in the last GEMV
+# tile to arrive (`arrivals`); larger classes and Vulkan select in one launch
+# of a subgroup/warp per row.
 native routed_route for metal from "metal/routed_route.metal":
     static (H, PT, NM, E, K, ES)
-    params (SIMDGROUPS in [8, 16, 4, 2] default 8)
     where H % 32 == 0 and E <= 1024
+    project dense segmented (router, shared_router) rows rms publishes (result 0) ordered (router, shared_router)
     scratch logits bytes (M * (E + 1) * 4)
-    scratch arrivals bytes (4) sync
-    launch routed_route_stage when M > VERIFY_ROWS:
-        staging
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch routed_route_gemv when M <= VERIFY_ROWS:
-        threadgroups (ceil_div(E, SIMDGROUPS) + 1, 1, 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (min(ceil_div(H, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
-    launch routed_route_gemm when M > VERIFY_ROWS:
-        threadgroups (ceil_div(E + 1, 32), ceil_div(M, 64), 1)
-        threads_per_threadgroup (128, 1, 1)
+    scratch arrivals bytes (4) sync when M <= VERIFY_ROWS
     launch routed_route_select when M > VERIFY_ROWS:
         threadgroups (ceil_div(M, 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
-# CUDA: decode rows (M <= VERIFY_ROWS) form the logits in one GEMV launch whose last
-# block to arrive selects. Larger classes run the GEMM: scalar FMAs over
-# 32 x 32 shared tiles (256 threads), split over the hidden axis into SPLIT
-# partial planes that the selection launch sums in order (SPLIT changes the
-# logit summation order, so it is arithmetic). (Metal: F32 simdgroup
-# matrices, unsplit.)
 native routed_route for cuda from "cuda/routed_route.cu":
     static (H, PT, NM, E, K, ES)
-    params (SIMDGROUPS in [8, 4, 2] default 8, arithmetic SPLIT in [8, 4, 16] default 8)
     where H % 32 == 0 and E <= 1024
-    scratch logits bytes (SPLIT * M * (E + 1) * 4)
-    scratch arrivals bytes (4) sync
-    launch routed_route_stage when M > VERIFY_ROWS:
-        staging
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch routed_route_gemv when M <= VERIFY_ROWS:
-        threadgroups (ceil_div(E + 1, SIMDGROUPS), 1, 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-    launch routed_route_gemm when M > VERIFY_ROWS:
-        threadgroups (ceil_div(E + 1, 32), ceil_div(M, 32), SPLIT)
-        threads_per_threadgroup (256, 1, 1)
+    project dense segmented (router, shared_router) rows rms publishes (result 0) ordered (router, shared_router)
+    scratch logits bytes (M * (E + 1) * 4)
+    scratch arrivals bytes (4) sync when M <= VERIFY_ROWS
     launch routed_route_select when M > VERIFY_ROWS:
         threadgroups (ceil_div(M, 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
-# Vulkan: the Metal form over `vulkan/common/{projection,routed}.glsl`. Rows
-# <= VERIFY_ROWS form the router logits as a GEMV (one subgroup per logit column,
-# normalizing in the workgroup, workgroup 0 publishing the normalized rows);
-# larger classes stage the normalized rows once, then a 32 x 32 F32 tile
-# GEMM; selection with one subgroup per row. SIMDGROUPS never changes bits.
 native routed_route for vulkan from "vulkan/routed_route.comp":
     static (H, PT, NM, E, K, ES)
-    params (SIMDGROUPS in [8, 4, 2] default 8)
     where H % 32 == 0 and E <= 1024
+    project dense segmented (router, shared_router) rows rms publishes (result 0) ordered (router, shared_router)
     scratch logits bytes (M * (E + 1) * 4)
-    launch routed_route_stage when M > VERIFY_ROWS:
-        staging
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes (32)
-    launch routed_route_gemv when M <= VERIFY_ROWS:
-        threadgroups (ceil_div(E + 1, SIMDGROUPS), 1, 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (4 * VERIFY_ROWS * (8 + 1))
-    launch routed_route_gemm when M > VERIFY_ROWS:
-        threadgroups (ceil_div(E + 1, 32), ceil_div(M, 32), 1)
-        threads_per_threadgroup (128, 1, 1)
-        shared_bytes (9216)
     launch routed_route_select:
         threadgroups (ceil_div(M, 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
-# CPU: each row normalized once (F32 in scratch); ROWS router rows per work
-# item against every row; one row's selection per work item (its E
-# probabilities, then a sort of its E experts). ROWS never changes result
-# bits.
+# CPU: each row normalized once (F32 in scratch); the router rows split
+# evenly over one work item per pool participant (`device.units`, at most
+# E), each against every row; one row's selection per work item (its E
+# probabilities, then a sort of its E experts). Each logit is its own row's
+# dot whichever item forms it, so the split never changes result bits.
 native routed_route for cpu from "cpu/routed_route.rs":
-    params (ROWS in [8, 4, 2, 1] default 8)
+    project quantized emits (result 0 over (M, H))
     scratch normalized bytes (M * H * 4)
     scratch logits bytes (M * E * 4)
     launch routed_route_normalize:
@@ -160,7 +659,7 @@ native routed_route for cpu from "cpu/routed_route.rs":
         threads_per_threadgroup (1, 1, 1)
         shared_bytes (H * 4)
     launch routed_route_logits:
-        threadgroups (ceil_div(E, ROWS), 1, 1)
+        threadgroups (min(E, device.units), 1, 1)
         threads_per_threadgroup (1, 1, 1)
     launch routed_route_select:
         threadgroups (M, 1, 1)
@@ -169,18 +668,14 @@ native routed_route for cpu from "cpu/routed_route.rs":
 
 
 # Decode routing with the shared expert's expansion (M <= VERIFY_ROWS): `routed_route`,
-# then the shared half of `routed_expand` over the normalized rows. The
-# shared expert does not depend on the routes, so a backend that declares
-# this entry expands it in the router's launch and the choices alone with
-# `routed_gate_up` (SiLU); the others run `routed_route`, then
-# `routed_expand`.
+# then the shared half of `routed_expand` over the normalized rows.
 fn routed_route_shared[M, H, PT, NM, E, K, S, ES](residual: &tensor[M, PT * H] f32,
-    norm: &tensor[NM] NW, router: &tensor[E, H] RW, shared_router: &tensor[H] f32,
+    norm: &tensor[NM] NW, router: &tensor[E, H] RW, shared_router: &tensor[H] SRW,
     shared_gate: &tensor[S, H] SGW, shared_up: &tensor[S, H] SUW,
     routes: &mut tensor[M, K] i32, scores: &mut tensor[M, K] f32,
     eps: f32, normalize: i32, expert_scale: &tensor[ES] f32)
     -> (tensor[M, H] A, tensor[M] f32, tensor[M, S] A)
-    where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and ES >= 0 and (ES == 0 or ES == E) and operands(RW) == 0 and operands(SGW) == operands(SUW):
+    where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and ES >= 0 and (ES == 0 or ES == E) and operands(RW) == 0 and operands(SRW) == 0 and operands(SGW) == operands(SUW) and M <= VERIFY_ROWS:
     let mut normalized = tensor[M, H] A
     let mut coefficient = tensor[M] f32
     let mut shared_product = tensor[M, S] A
@@ -188,50 +683,28 @@ fn routed_route_shared[M, H, PT, NM, E, K, S, ES](residual: &tensor[M, PT * H] f
         normalize, expert_scale, routes, scores, normalized, coefficient, shared_product)
     return (normalized, coefficient, shared_product)
 
-# Metal: the `routed_route` GEMV threadgroups
-# (`metal/lib/routed/route.h`: the logits, the shared-expert gate column, the
-# selection in the last of them to arrive), followed by the shared expert's
-# gate/up threadgroups. A shared threadgroup forms the normalized rows as a
-# router threadgroup does (the published `normalized` bits), then runs the
-# rows16 paired GEMV of `routed_expand`'s shared row: ROWS weight rows per
-# lane group of LANES lanes (LANES sets the reduction order, so it is
-# arithmetic), SIMDGROUPS x 32 / LANES lane groups. For equal LANES,
-# `shared_product` carries `routed_expand`'s bits.
 native routed_route_shared for metal from "metal/routed_route_shared.metal":
     static (H, PT, NM, E, K, S, ES)
-    params (SIMDGROUPS in [8, 16, 4, 2] default 8, ROWS in [1, 2, 4] default 1, arithmetic LANES in [32, 16] default 32)
     where H % 32 == 0 and E <= 1024
+    project dense segmented (router, shared_router, (shared_gate, shared_up)) rows rms publishes (result 0) ordered (router, shared_router)
     scratch logits bytes (M * (E + 1) * 4)
     scratch arrivals bytes (4) sync
-    launch routed_route_shared:
-        threadgroups (ceil_div(E, SIMDGROUPS) + 1 + ceil_div(S, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (min(ceil_div(H, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
 
-# CUDA: the `routed_route` GEMV blocks (`cuda/lib/routed/route.cuh`: a warp a
-# logit column, the shared-expert gate column in the last block, the
-# selection in the last of them to arrive), followed by the shared expert's
-# blocks. Every block stages the decode rows in its shared memory (the
-# published `normalized` bits), which a router block's columns read; a
-# shared block (with their NVFP4 operands as `routed_expand`'s stage launch
-# forms them) then runs `routed_expand`'s shared row
-# (`cuda/lib/routed/shared.cuh`): the swap-AB GEMV, TPW tiles per warp
-# group, KSPLIT splitting K across a group's warps (KSPLIT sets the
-# reduction order, so it is arithmetic), one tile group a shared block, so
-# the shared part takes a block per tile group whatever SIMDGROUPS the router
-# takes. For equal KSPLIT, `shared_product` carries `routed_expand`'s bits.
-# The first configuration is `routed_route`'s and `routed_expand`'s, so the
-# decode form keeps their bits at their defaults.
 native routed_route_shared for cuda from "cuda/routed_route_shared.cu":
     static (H, PT, NM, E, K, S, ES)
-    params (SIMDGROUPS in [8, 4, 2] default 8, TPW in [1, 2] default 1, arithmetic KSPLIT in [1, 2, 4] default 1)
-    where H % 64 == 0 and E <= 1024 and SIMDGROUPS % KSPLIT == 0
+    where H % 64 == 0 and E <= 1024
+    project dense segmented (router, shared_router, (shared_gate, shared_up)) rows rms publishes (result 0) ordered (router, shared_router)
     scratch logits bytes (M * (E + 1) * 4)
     scratch arrivals bytes (4) sync
-    launch routed_route_shared:
-        threadgroups (ceil_div(E + 1, SIMDGROUPS) + ceil_div(ceil_div(S, 16), TPW), 1, 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (M * H * 2)
+
+native routed_route_shared for vulkan from "vulkan/routed_route_shared.comp":
+    static (H, PT, NM, E, K, S, ES)
+    where H % 32 == 0 and E <= 1024
+    project dense segmented (router, shared_router, (shared_gate, shared_up)) rows rms publishes (result 0) ordered (router, shared_router)
+    scratch logits bytes (M * (E + 1) * 4)
+    launch routed_route_select:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
 
 
 # Decode expansion (M <= VERIFY_ROWS): each choice's expert gate/up and the shared
@@ -298,83 +771,40 @@ fn routed_expand[M, H, E, K, F, S, GS, US](normalized: &tensor[M, H] A,
 native routed_expand for metal from "metal/routed_expand.metal":
     static (H, K, F, S, GS, US)
     records (expert_gate, expert_up)
-    launch routed_expand:
-        params (SIMDGROUPS in [2, 4, 8, 16] default 2, ROWS in [1, 2, 4] default 1, arithmetic LANES in [32, 16] default 32)
-        threadgroups (ceil_div(max(F, S), SIMDGROUPS * ROWS * 32 / LANES), M * K + 1, 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (min(ceil_div(H, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
+    project routed choice (expert_gate, expert_up) shared (shared_gate, shared_up)
 
 # CUDA: the swap-AB GEMV (TPW tiles per warp group; KSPLIT splits K across
-# the warps of a group and reduces in part order). Several rows run the
-# gathered form: a choice's blocks run only for its expert's first choice,
-# over the rows of every choice of that expert, so a step streams each chosen
-# expert once; one row has nothing to share and runs the per-choice form.
+# the warps of a group and reduces in part order), per choice or gathered (a
+# choice's blocks run only for its expert's first choice, over the rows of
+# every choice of that expert, so a step streams each chosen expert once).
 # Both forms share TPW and KSPLIT, so a choice's product has its one-row bits
-# in either. (Metal: the rows16 GEMV.)
+# in either. Gathered by default (the projection's, where a shared expert is
+# projected too): both forms read the rows the stage launch
+# formed, and at one row each choice is its expert's first and gathers its
+# own row alone, the per-choice GEMV after one table write and block
+# barrier. (Metal: the rows16 GEMV.)
 native routed_expand for cuda from "cuda/routed_expand.cu":
     static (H, K, F, S, GS, US)
-    params (TPW in [1, 2] default 1, arithmetic KSPLIT in [1, 2, 4] default 1)
     records (expert_gate, expert_up)
-    where H % 64 == 0
-    scratch operands bytes (M * H * 2) when operands(EGW) + operands(SGW) > 0
-    launch routed_expand_stage when operands(EGW) + operands(SGW) > 0:
-        staging
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch routed_expand when M == 1:
-        reads (TPW, KSPLIT)
-        threadgroups (ceil_div(ceil_div(ceil_div(max(F, S), 16), TPW), 4 / KSPLIT), M * K + 1, 1)
-        threads_per_threadgroup (128, 1, 1)
-    launch routed_expand_gathered when M > 1:
-        reads (TPW, KSPLIT)
-        alike (routed_expand)
-        threadgroups (ceil_div(ceil_div(ceil_div(max(F, S), 16), TPW), 4 / KSPLIT), M * K + 1, 1)
-        threads_per_threadgroup (128, 1, 1)
+    project routed choice (expert_gate, expert_up) shared (shared_gate, shared_up)
 
-# Vulkan: the Metal form; decode lane groups are whole subgroups. One launch
-# per activation-row bound of the shared expert's GEMV (see `dense_expand`).
+# Vulkan: the Metal form, per choice or gathered (as `routed_gate_up`'s);
+# decode lane groups are whole subgroups. One launch per activation-row
+# bound of the shared expert's GEMV (see `dense_expand`).
 native routed_expand for vulkan from "vulkan/routed_expand.comp":
     static (H, K, F, S, GS, US)
-    params (SIMDGROUPS in [2, 4, 8] default 2, ROWS in [1, 2, 4] default 1)
     records (expert_gate, expert_up)
-    let GEMV_GROUPS = ceil_div(max(F, S), SIMDGROUPS * ROWS)
-    let GEMV_GROUPS_Y = M * K + 1
-    let GEMV_THREADS = 32 * SIMDGROUPS
-    let GEMV_SHARED = 256 + 32 * max(operands(EGW), operands(SGW)) + min(8 * ceil_div(H, 32), 288) * 72
-    launch routed_expand1 when M <= 1:
-        threadgroups (GEMV_GROUPS, GEMV_GROUPS_Y, 1)
-        threads_per_threadgroup (GEMV_THREADS, 1, 1)
-        shared_bytes (GEMV_SHARED)
-    launch routed_expand2 when M == 2:
-        alike (routed_expand1)
-        threadgroups (GEMV_GROUPS, GEMV_GROUPS_Y, 1)
-        threads_per_threadgroup (GEMV_THREADS, 1, 1)
-        shared_bytes (GEMV_SHARED)
-    launch routed_expand4 when M >= 3 and M <= 4:
-        alike (routed_expand1)
-        threadgroups (GEMV_GROUPS, GEMV_GROUPS_Y, 1)
-        threads_per_threadgroup (GEMV_THREADS, 1, 1)
-        shared_bytes (GEMV_SHARED)
-    launch routed_expand8 when M >= 5 and M <= VERIFY_ROWS:
-        alike (routed_expand1)
-        threadgroups (GEMV_GROUPS, GEMV_GROUPS_Y, 1)
-        threads_per_threadgroup (GEMV_THREADS, 1, 1)
-        shared_bytes (GEMV_SHARED)
+    project routed choice (expert_gate, expert_up) shared (shared_gate, shared_up)
 
-# CPU: the normalized rows staged once as F32; work item (x, y) expands ROWS
-# features of choice y < M * K, or of the shared expert (y = M * K) for
-# every row.
+# CPU: the normalized rows are the projection's operand, formed once as F32
+# rows (NVFP4 operands where every expert takes them; where only one expert
+# does, its NVFP4 copy after the rows) and their Q8 blocks by the operator's
+# `form` launch, left out where `routed_route` emits them. Work item (x, y)
+# expands ROWS features of choice y < M * K, or of the shared expert
+# (y = M * K) for every row. The products' operands go to `routed_output`.
 native routed_expand for cpu from "cpu/routed_expand.rs":
-    params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
     records (expert_gate, expert_up)
-    where (INT8 == 0 or form(EGW, INT8) == 1 or form(EUW, INT8) == 1 or form(SGW, INT8) == 1 or form(SUW, INT8) == 1)
-    scratch quantized bytes (M * ceil_div(H, Q8_VALUES) * Q8_BYTES)
-    scratch staged bytes (M * H * 4)
-    scratch operands bytes (M * H * 4) when operands(EGW) + operands(SGW) > 0
-    launch routed_expand_stage:
-        staging
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (1, 1, 1)
+    project quantized rows (EGW, EUW, SGW, SUW) over (M, H) operand (normalized) emits (result 0 over (M * K, F), result 1 over (M, S))
     launch routed_expand_rows:
         threadgroups (ceil_div(max(F, S), ROWS), M * K + 1, 1)
         threads_per_threadgroup (1, 1, 1)
@@ -383,14 +813,19 @@ native routed_expand for cpu from "cpu/routed_expand.rs":
 # Decode output (M <= VERIFY_ROWS): each choice's down projection, published in A,
 # weighted by its score in slot order; then the shared expert's down
 # projection times its coefficient; then the residual. Each choice's down
-# weights are read where `decode_source` names.
-fn routed_output[M, H, SN, IN, E, K, F, S, XS, TR](residual: &tensor[M, SN * H] f32,
+# weights are read where `decode_source` names. `operand_norm` and
+# `operand_epsilon` are the norm the next projection forms its input under
+# (`NO = 0`: none): no result reads them; a CPU graph whose consumer forms
+# its operand under the same norm takes that operand from this call's
+# epilogue (`emits (.. normed (..))`).
+fn routed_output[M, H, SN, IN, E, K, F, S, XS, TR, NO](residual: &tensor[M, SN * H] f32,
     inject: &tensor[M, IN] f32,
     expert_product: &tensor[M, K, F] A, shared_product: &tensor[M, S] A,
     routes: &tensor[M, K] i32, sources: &tensor[XS, M, K] i32, scores: &tensor[M, K] f32,
     coefficient: &tensor[M] f32, expert_down: &tensor[E, H, F] EDW,
-    tier_down: &tensor[TR, H, F] EDW, shared_down: &tensor[H, S] SDW) -> tensor[M, SN * H] f32
-    where IN >= 0 and ((IN == 0 and SN == 1) or (IN == SN and SN >= 1)) and XS >= 0 and (XS == 0 or XS == SOURCE_ROWS) and TR >= 0 and (TR == 0 or XS > 0):
+    tier_down: &tensor[TR, H, F] EDW, shared_down: &tensor[H, S] SDW,
+    operand_norm: &tensor[NO] NW, operand_epsilon: f32) -> tensor[M, SN * H] f32
+    where IN >= 0 and ((IN == 0 and SN == 1) or (IN == SN and SN >= 1)) and XS >= 0 and (XS == 0 or XS == SOURCE_ROWS) and TR >= 0 and (TR == 0 or XS > 0) and NO >= 0 and (NO == 0 or (NO == H and SN == 1)):
     let mut value = tensor[M, SN * H] f32
     let mut published = tensor[M, K + 1, H] A
     decode_output_published(expert_product, shared_product, routes, sources, expert_down, tier_down, shared_down,
@@ -451,22 +886,16 @@ fn decode_output_join[M, H, SN, IN, K, SF, R](residual: &tensor[M, SN * H] f32,
 # their `_project` forms) admits at most 8, as more spill: natural
 # expressions have no comparisons, so `1 - min(1, LANES / 16)` reads
 # LANES < 16, `min(1, LANES / 16) - LANES / 32` LANES == 16, and
-# `min(1, X / 3)` X > 2. (CUDA: the mma16
+# `min(1, X / 3)` X > 2. Gathered (GATHERED), the same projections, each
+# chosen expert's by one simdgroup for every choice of it, publish in A and
+# the last threadgroup of a tile to arrive joins them. (CUDA: the mma16
 # swap-AB GEMV per choice in slot order.)
 native routed_output for metal from "metal/routed_output.metal":
     static (H, SN, IN, K, F, S)
-    params (ROWS in [2, 1, 4, 8] default 2, arithmetic LANES in [16, 32, 8, 4] default 16)
     records (expert_down, tier_down)
-    where K < 32 and ROWS * ceil_div(ceil_div(max(F, S), 32) - (1 - min(1, LANES / 16)) * (ceil_div(max(F, S), 32) - min(ceil_div(max(F, S), 32), 256 / (K + 1))), LANES) <= 8
-    launch routed_output when XS > 0:
-        threadgroups (ceil_div(H, ROWS * 32 / LANES), M, 1)
-        threads_per_threadgroup (32 * (K + 1), 1, 1)
-    # A resident layer's (XS 0) reads its expert records with plain loads, as
-    # `routed_gate_up_resident` does.
-    launch routed_output_resident when XS == 0:
-        records (expert_down, tier_down)
-        threadgroups (ceil_div(H, ROWS * 32 / LANES), M, 1)
-        threads_per_threadgroup (32 * (K + 1), 1, 1)
+    project routed summed (expert_down) shared (shared_down)
+    scratch published bytes (M * (K + 1) * H * 2) when GATHERED == 1 and M <= VERIFY_ROWS
+    scratch arrivals bytes (ceil_div(H, ROWS * 32 / LANES) * 4) sync when GATHERED == 1 and M <= VERIFY_ROWS
 
 # CUDA: the swap-AB GEMV (TPW, KSPLIT as in the expansion), the choices and
 # the shared expert in separate blocks publishing A-rounded channels per
@@ -478,62 +907,40 @@ native routed_output for metal from "metal/routed_output.metal":
 # in place, over the link.
 native routed_output for cuda from "cuda/routed_output.cu":
     static (H, SN, IN, K, F, S)
-    params (TPW in [1, 2] default 1, arithmetic KSPLIT in [1, 2, 4] default 1)
     records (expert_down, tier_down)
-    where F % 64 == 0 and S % 64 == 0
+    project routed summed (expert_down) shared (shared_down)
     scratch published bytes (M * (K + 1) * H * 2)
     scratch arrivals bytes (ceil_div(H, 16) * 4) sync
-    scratch expert_operands bytes (M * K * F * 2) when operands(EDW) == 1
-    scratch shared_operands bytes (M * S * 2) when operands(SDW) == 1
-    launch routed_output_stage when operands(EDW) + operands(SDW) > 0:
-        staging
-        threadgroups (M * (K + 1), 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch routed_output when M == 1:
-        reads (TPW, KSPLIT)
-        threadgroups (ceil_div(ceil_div(ceil_div(H, 16), TPW), 4 / KSPLIT), M * (K + 1), 1)
-        threads_per_threadgroup (128, 1, 1)
-    launch routed_output_gathered when M > 1:
-        reads (TPW, KSPLIT)
-        alike (routed_output)
-        threadgroups (ceil_div(ceil_div(ceil_div(H, 16), TPW), 4 / KSPLIT), M * (K + 1), 1)
-        threads_per_threadgroup (128, 1, 1)
 
-# Vulkan: project the expert choices and shared expert in separate workgroups,
-# then combine their A-rounded outputs in choice order. A lane group of
-# LANES lanes owns ROWS channels; LANES sets the summation order (so it is
-# arithmetic). A tier-served choice's workgroups read its tier record in
-# place, over the link.
+# Vulkan: project the expert choices and shared expert in separate workgroups
+# into `projected`, then combine their A-rounded outputs in choice order,
+# an invocation a channel of a row (`lib/routed/output_sum.glsl`). A lane
+# group of LANES lanes owns ROWS channels; LANES sets the summation order (so
+# it is arithmetic). A tier-served choice's workgroups read its tier record
+# in place, over the link.
 native routed_output for vulkan from "vulkan/routed_output.comp":
     static (H, SN, IN, K, F, S)
-    params (SIMDGROUPS in [2, 4, 8] default 2, ROWS in [1, 2, 4] default 1, arithmetic LANES in [32, 16, 8] default 32)
     records (expert_down, tier_down)
+    project routed summed (expert_down) shared (shared_down)
     scratch projected bytes (M * (K + 1) * H * 2)
-    launch routed_output_project:
-        threadgroups (ceil_div(H, SIMDGROUPS * ROWS * 32 / LANES), M * (K + 1), 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (256 + 32 * max(operands(EDW), operands(SDW)) + min(ceil_div(max(F, S), 32), 288) * 72)
     launch routed_output_combine:
         threadgroups (ceil_div(H, 256), M, 1)
         threads_per_threadgroup (256, 1, 1)
 
-# CPU: the products staged once as F32; work item (x, m) owns ROWS output
-# channels of row m and carries their running sum across the choices.
+# CPU: the products are the projection's operands, each formed once as F32
+# rows (NVFP4 operands where its down weight takes them) and their Q8 blocks
+# by the operator's `form` launch, left out where `routed_expand` emits
+# them. Work item (x, m) owns ROWS output channels of row m
+# and carries their running sum across the choices; the row's last item
+# emits the next projection's operand under `operand_norm` (its norm
+# decoded into the item's `shared_bytes`).
 native routed_output for cpu from "cpu/routed_output.rs":
-    params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
     records (expert_down, tier_down)
-    where (INT8 == 0 or form(EDW, INT8) == 1 or form(SDW, INT8) == 1)
-    scratch expert_q8 bytes (M * K * ceil_div(F, Q8_VALUES) * Q8_BYTES)
-    scratch shared_q8 bytes (M * ceil_div(S, Q8_VALUES) * Q8_BYTES)
-    scratch expert bytes (M * K * F * 4)
-    scratch shared bytes (M * S * 4)
-    launch routed_output_stage:
-        staging
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (1, 1, 1)
+    project quantized rows (EDW over (M * K, F), SDW over (M, S)) operand (expert_product, shared_product) emits (result 0 over (M, H) normed (operand_norm, operand_epsilon))
     launch routed_output_rows:
         threadgroups (ceil_div(H, ROWS), M, 1)
         threads_per_threadgroup (1, 1, 1)
+        shared_bytes (NO * 4)
 
 
 # Groups the choices of the `rows[0]` rows from row `first[0]` of the M rows
@@ -720,148 +1127,49 @@ fn routed_experts[M, H, E, F, B, T, GS, US, X, QS, R, LB](first: &tensor[1] i32,
 # `expand_grid` and `down_grid` the used blocks' tiles, `quantize_grid` the
 # used blocks' rows); each launch's declared groups are its grid's bound.
 # Metal: the paired gate/up GEMM, then the down GEMM, over each block's live
-# rows in TILE_M x TILE_N simdgroup-matrix tiles. (CUDA: fixed 32 x 128
-# mma.sync tiles, 3 cp.async stages.)
+# rows in TILE_M x TILE_N simdgroup-matrix tiles, or each in a form of the
+# grouped projection over whole blocks (T static: its tiles take T % 32 == 0).
+# (CUDA: fixed 32 x 128 mma.sync tiles, 3 cp.async stages.)
 native routed_experts for metal from "metal/routed_experts.metal":
-    static (H, F, GS, US, LB)
-    params (TILE_M in [32, 64] default 32, TILE_N in [128, 64] default 128)
+    static (H, F, T, GS, US, LB)
     records (expert_gate, expert_up, expert_down, records_gate, records_up, records_down)
-    scratch staged bytes (M * H * 2) when operands(EGW) + operands(EUW) > 0
-    scratch product bytes (B * T * F * 2)
-    scratch stage_grid bytes (12)
-    scratch expand_grid bytes (12)
-    scratch quantize_grid bytes (12)
-    scratch down_grid bytes (12)
-    launch routed_experts_grids:
-        threadgroups (1, 1, 1)
-        threads_per_threadgroup (1, 1, 1)
-    launch routed_experts_stage when operands(EGW) + operands(EUW) > 0:
-        staging
-        threadgroups (M, 1, 1)
-        grid (stage_grid)
-        threads_per_threadgroup (256, 1, 1)
-    launch routed_experts_expand:
-        threadgroups (ceil_div(F * 2, TILE_N), B * ceil_div(T, TILE_M), 1)
-        grid (expand_grid)
-        threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
-    launch routed_experts_quantize when operands(EDW) == 1:
-        threadgroups (B * T, 1, 1)
-        grid (quantize_grid)
-        threads_per_threadgroup (256, 1, 1)
-    launch routed_experts_down:
-        threadgroups (ceil_div(H, TILE_N), B * ceil_div(T, TILE_M), 1)
-        grid (down_grid)
-        threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
+    project routed grouped (expert_gate, expert_up) down (expert_down)
+    restate TILE_M in [32, 64] default 32
 
 # CUDA: 32-row x 128-column block tiles over mma16 weights. (Metal: tunable
 # simdgroup-matrix tiles.)
 native routed_experts for cuda from "cuda/routed_experts.cu":
     static (H, F, GS, US, LB)
-    params (arithmetic OPERAND in [0, 1] default 0)
     records (expert_gate, expert_up, expert_down, records_gate, records_up, records_down)
-    where H % 64 == 0 and F % 64 == 0
-    scratch staged bytes (M * H * 2) when OPERAND == 1 or operands(EGW) + operands(EUW) > 0
-    scratch product bytes (B * T * F * 2)
-    scratch stage_grid bytes (12)
-    scratch expand_grid bytes (12)
-    scratch quantize_grid bytes (12)
-    scratch down_grid bytes (12)
-    launch routed_experts_grids:
-        threadgroups (1, 1, 1)
-        threads_per_threadgroup (1, 1, 1)
-    launch routed_experts_stage when OPERAND == 1 or operands(EGW) + operands(EUW) > 0:
-        reads (OPERAND)
-        staging
-        threadgroups (M, 1, 1)
-        grid (stage_grid)
-        threads_per_threadgroup (256, 1, 1)
-    launch routed_experts_expand:
-        reads (OPERAND)
-        threadgroups (ceil_div(ceil_div(F, 16), 8), ceil_div(T, 32), B)
-        grid (expand_grid)
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes (3 * (32 * 144 + 2 * 10240) + 2 * 4096)
-    launch routed_experts_quantize when operands(EDW) == 1:
-        reads (OPERAND)
-        threadgroups (B * T, 1, 1)
-        grid (quantize_grid)
-        threads_per_threadgroup (256, 1, 1)
-    launch routed_experts_down:
-        reads (OPERAND)
-        threadgroups (ceil_div(ceil_div(H, 16), 8), ceil_div(T, 32), B)
-        grid (down_grid)
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes (3 * (32 * 144 + 10240) + 4096)
+    project routed grouped (expert_gate, expert_up) down (expert_down)
 
 # Vulkan: the Metal form on the projection library's GEMM (paired gate/up
 # tiles, then the down tiles; over NVFP4 weights the stage launch forms the
 # normalized rows' operands, the quantize launch the products' in place).
 native routed_experts for vulkan from "vulkan/routed_experts.comp":
     static (H, F, GS, US, LB)
-    params (TILE_M in [32, 64] default 32, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32)
     records (expert_gate, expert_up, expert_down, records_gate, records_up, records_down)
-    where SUB_M <= TILE_M and SUB_N <= TILE_N
-    scratch staged bytes (M * H * 2) when operands(EGW) + operands(EUW) > 0
-    scratch product bytes (B * T * F * 2)
-    scratch stage_grid bytes (12)
-    scratch expand_grid bytes (12)
-    scratch quantize_grid bytes (12)
-    scratch down_grid bytes (12)
-    launch routed_experts_grids:
-        threadgroups (1, 1, 1)
-        threads_per_threadgroup (1, 1, 1)
-    launch routed_experts_stage when operands(EGW) + operands(EUW) > 0:
-        staging
-        threadgroups (M, 1, 1)
-        grid (stage_grid)
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes (128)
-    launch routed_experts_expand:
-        threadgroups (ceil_div(F * 2, TILE_N), B * ceil_div(T, TILE_M), 1)
-        grid (expand_grid)
-        threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
-        shared_bytes ((TILE_M + TILE_N) * 80)
-    launch routed_experts_quantize when operands(EDW) == 1:
-        threadgroups (B * T, 1, 1)
-        grid (quantize_grid)
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes (128)
-    launch routed_experts_down:
-        threadgroups (ceil_div(H, TILE_N), B * ceil_div(T, TILE_M), 1)
-        grid (down_grid)
-        threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
-        shared_bytes ((TILE_M + TILE_N) * 80)
+    project routed grouped (expert_gate, expert_up) down (expert_down)
+    restate TILE_M in [32, 64] default 32
 
-# CPU: the normalized rows staged once as F32; work item (x, b) owns ROWS
-# features (then ROWS output channels) of block b across its live rows, with
-# the products as F32 in scratch.
+# CPU: the grouped window of the normalized rows is the projection's operand,
+# formed once by the operator's `form` launch; work item (x, b) owns ROWS
+# features (then ROWS output channels) of block b across its live rows. The
+# products are the down weight's own rows, which the expand launch stores
+# and forms in its epilogue (`emitted`), each row's last feature completing
+# it on the row's counter (`product_arrivals`, cleared by the grids launch).
 native routed_experts for cpu from "cpu/routed_experts.rs":
-    params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
     records (expert_gate, expert_up, expert_down, records_gate, records_up, records_down)
-    where (INT8 == 0 or form(EGW, INT8) == 1 or form(EUW, INT8) == 1 or form(EDW, INT8) == 1)
-    scratch quantized bytes (M * ceil_div(H, Q8_VALUES) * Q8_BYTES)
-    scratch product_q8 bytes (B * T * ceil_div(F, Q8_VALUES) * Q8_BYTES)
-    scratch staged bytes (M * H * 4)
-    scratch product bytes (B * T * F * 4)
-    scratch stage_grid bytes (12)
+    project quantized rows (EGW, EUW, EDW over (B * T, F)) over (M, H) operand (normalized within (first, rows), emitted)
+    scratch product_arrivals bytes (B * T * 4)
     scratch expand_grid bytes (12)
-    scratch quantize_grid bytes (12)
     scratch down_grid bytes (12)
     launch routed_experts_grids:
         threadgroups (1, 1, 1)
-        threads_per_threadgroup (1, 1, 1)
-    launch routed_experts_stage:
-        staging
-        threadgroups (M, 1, 1)
-        grid (stage_grid)
         threads_per_threadgroup (1, 1, 1)
     launch routed_experts_expand:
         threadgroups (ceil_div(F, ROWS), B, 1)
         grid (expand_grid)
-        threads_per_threadgroup (1, 1, 1)
-    launch routed_experts_quantize when INT8 == 1 or operands(EDW) == 1:
-        threadgroups (B * T, 1, 1)
-        grid (quantize_grid)
         threads_per_threadgroup (1, 1, 1)
     launch routed_experts_down:
         threadgroups (ceil_div(H, ROWS), B, 1)
@@ -915,19 +1223,16 @@ fn routed_combine[M, H, SN, IN, K, B, T, S](residual: &tensor[M, SN * H] f32,
     return value
 
 # Metal: the shared gate/up GEMM, the shared down GEMM into scratch
-# (`combine_down`), then an unpermuting pass (3 launches). (CUDA: the down
-# GEMM's epilogue unpermutes, 2 launches.)
+# (`routed_combine_down`), each in the grouped projection's forms over every
+# row (dense's code, its TALL the default past 64 rows as dense's), then an
+# unpermuting pass (3 launches). (CUDA: the down GEMM's epilogue unpermutes,
+# 2 launches.)
 native routed_combine for metal from "metal/routed_combine.metal":
     static (H, SN, IN, K, S)
-    params (TILE_M in [64, 128, 32] default 64, TILE_N in [64, 128] default 64)
-    scratch shared_product bytes (M * S * 2)
+    project routed grouped (shared_gate, shared_up) down (shared_down)
+    restate TILE_M in [64, 128, 32] default 64
+    restate TILE_N in [64, 128] default 64
     scratch shared_output bytes (M * H * 2)
-    launch routed_combine_shared:
-        threadgroups (ceil_div(S * 2, TILE_N), ceil_div(M, TILE_M), 1)
-        threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
-    launch routed_combine_down:
-        threadgroups (ceil_div(H, TILE_N), ceil_div(M, TILE_M), 1)
-        threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
     launch routed_combine:
         threadgroups (ceil_div(H, 2048), M, 1)
         threads_per_threadgroup (256, 1, 1)
@@ -936,65 +1241,31 @@ native routed_combine for metal from "metal/routed_combine.metal":
 # unpermutes the grouped expert outputs (2 launches). (Metal: 3 launches.)
 native routed_combine for cuda from "cuda/routed_combine.cu":
     static (H, SN, IN, K, S)
-    params (arithmetic OPERAND in [0, 1] default 0)
-    where H % 64 == 0 and S % 64 == 0
-    scratch staged bytes (M * H * 2) when OPERAND == 1
-    scratch shared_product bytes (M * S * 2)
-    launch routed_combine_stage when OPERAND == 1:
-        reads (OPERAND)
-        staging
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch routed_combine_shared:
-        reads (OPERAND)
-        threadgroups (ceil_div(ceil_div(S, 16), 8), ceil_div(M, 64), 1)
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes (3 * (64 * 144 + 2 * 10240) + 2 * 4096)
-    launch routed_combine:
-        reads (OPERAND)
-        threadgroups (ceil_div(ceil_div(H, 16), 8), ceil_div(M, 64), 1)
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes (3 * (64 * 144 + 10240) + 4096)
+    project routed grouped (shared_gate, shared_up) down (shared_down)
 
 # Vulkan: the Metal form (3 launches): the shared expert's paired GEMM, its
 # down GEMM, then the unpermuting combine.
 native routed_combine for vulkan from "vulkan/routed_combine.comp":
     static (H, SN, IN, K, S)
-    params (TILE_M in [128, 64, 32] default 64, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32)
-    where SUB_M <= TILE_M and SUB_N <= TILE_N
-    scratch shared_product bytes (M * S * 2)
+    project routed grouped (shared_gate, shared_up) down (shared_down)
+    restate TILE_M in [128, 64, 32] default 64
     scratch shared_output bytes (M * H * 2)
-    launch routed_combine_shared:
-        threadgroups (ceil_div(S * 2, TILE_N), ceil_div(M, TILE_M), 1)
-        threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
-        shared_bytes ((TILE_M + TILE_N) * 80)
-    launch routed_combine_down:
-        threadgroups (ceil_div(H, TILE_N), ceil_div(M, TILE_M), 1)
-        threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
-        shared_bytes ((TILE_M + TILE_N) * 80)
     launch routed_combine:
         threadgroups (ceil_div(H, 2048), M, 1)
         threads_per_threadgroup (256, 1, 1)
 
-# CPU: the normalized rows staged once as F32; ROWS shared features per work
-# item against every row (F32 products in scratch); then ROWS output channels
-# per work item: the shared down projection and the unpermuting combine.
+# CPU: the normalized rows are the projection's operand, formed once by the
+# operator's `form` launch; ROWS shared features per work item against every
+# row (from a row of its own), the F32 products the shared down weight's own
+# rows, which the shared launch stores and forms in its epilogue (`emitted`,
+# each row's last feature completing it on the row's counter); then ROWS
+# output channels per work item: the shared down projection and the
+# unpermuting combine.
 native routed_combine for cpu from "cpu/routed_combine.rs":
-    params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
-    where (INT8 == 0 or form(SGW, INT8) == 1 or form(SUW, INT8) == 1 or form(SDW, INT8) == 1)
-    scratch quantized bytes (M * ceil_div(H, Q8_VALUES) * Q8_BYTES)
-    scratch shared_q8 bytes (M * ceil_div(S, Q8_VALUES) * Q8_BYTES)
-    scratch staged bytes (M * H * 4)
-    scratch shared_product bytes (M * S * 4)
-    launch routed_combine_stage:
-        staging
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (1, 1, 1)
+    project quantized rows (SGW, SUW, SDW over (M, S)) over (M, H) operand (normalized, emitted)
+    scratch product_arrivals bytes (M * 4) sync
     launch routed_combine_shared:
         threadgroups (ceil_div(S, ROWS), 1, 1)
-        threads_per_threadgroup (1, 1, 1)
-    launch routed_combine_quantize when INT8 == 1 or operands(SDW) == 1:
-        threadgroups (M, 1, 1)
         threads_per_threadgroup (1, 1, 1)
     launch routed_combine:
         threadgroups (ceil_div(H, ROWS), 1, 1)
@@ -1076,78 +1347,39 @@ fn routed_select[M, H, E, K, ES](residual: &tensor[M, H] f32, norm: &tensor[H] N
 # `routed_route`'s tiles (`metal/lib/routed/logits.h`).
 native routed_select for metal from "metal/routed_select.metal":
     static (H, E, K, ES)
-    params (SIMDGROUPS in [8, 16, 4, 2] default 8)
     where H % 32 == 0 and E <= 1024 and K <= E
+    project dense single (router) rows rms ordered (router)
     scratch logits bytes (M * E * 4)
-    scratch router_rows bytes (M * H * 4) when M > VERIFY_ROWS
     scratch arrivals bytes (4) sync when M <= VERIFY_ROWS
-    launch routed_select_stage when M > VERIFY_ROWS:
-        staging
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch routed_select_gemv when M <= VERIFY_ROWS:
-        threadgroups (ceil_div(E, SIMDGROUPS), 1, 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (min(ceil_div(H, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
-    launch routed_select_gemm when M > VERIFY_ROWS:
-        threadgroups (ceil_div(E, 32), ceil_div(M, 64), 1)
-        threads_per_threadgroup (128, 1, 1)
     launch routed_select_select when M > VERIFY_ROWS:
         threadgroups (ceil_div(M, 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
-# CUDA: the GEMV (one warp per logit column over a hidden share whose router
-# input rows each threadgroup forms in shared memory) and the GEMM split the
-# hidden axis into SPLIT partial planes that the selection sums in order
-# (SPLIT is arithmetic).
 native routed_select for cuda from "cuda/routed_select.cu":
     static (H, E, K, ES)
-    params (SIMDGROUPS in [8, 4, 2] default 8, arithmetic SPLIT in [8, 4, 16] default 8)
     where H % 32 == 0 and E <= 1024 and K <= E
-    scratch logits bytes (SPLIT * M * E * 4)
-    scratch router_rows bytes (M * H * 4) when M > VERIFY_ROWS
-    launch routed_select_stage when M > VERIFY_ROWS:
-        staging
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch routed_select_gemv when M <= VERIFY_ROWS:
-        threadgroups (ceil_div(E, SIMDGROUPS), 1, SPLIT)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-    launch routed_select_gemm when M > VERIFY_ROWS:
-        threadgroups (ceil_div(E, 32), ceil_div(M, 32), SPLIT)
-        threads_per_threadgroup (256, 1, 1)
-    launch routed_select_select:
+    project dense single (router) rows rms ordered (router)
+    scratch logits bytes (M * E * 4)
+    scratch arrivals bytes (4) sync when M <= VERIFY_ROWS
+    launch routed_select_select when M > VERIFY_ROWS:
         threadgroups (ceil_div(M, 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
 native routed_select for vulkan from "vulkan/routed_select.comp":
     static (H, E, K, ES)
-    params (SIMDGROUPS in [8, 4, 2] default 8)
     where H % 32 == 0 and E <= 1024 and K <= E
+    project dense single (router) rows rms ordered (router)
     scratch logits bytes (M * E * 4)
-    scratch router_rows bytes (M * H * 4) when M > VERIFY_ROWS
-    launch routed_select_stage when M > VERIFY_ROWS:
-        staging
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes (32)
-    launch routed_select_gemv when M <= VERIFY_ROWS:
-        threadgroups (ceil_div(E, SIMDGROUPS), 1, 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (4 * VERIFY_ROWS * (8 + 1))
-    launch routed_select_gemm when M > VERIFY_ROWS:
-        threadgroups (ceil_div(E, 32), ceil_div(M, 32), 1)
-        threads_per_threadgroup (128, 1, 1)
-        shared_bytes (9216)
     launch routed_select_select:
         threadgroups (ceil_div(M, 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
-# CPU: each row normalized once (the router input as F32 in scratch); ROWS
-# router rows per work item against every row; one row's selection per work
-# item (a sort of its E experts).
+# CPU: each row normalized once (the router input as F32 in scratch); the
+# router rows split evenly over one work item per pool participant
+# (`device.units`, at most E), each against every row, which never changes
+# result bits (`routed_route`'s split); one row's selection per work item (a
+# sort of its E experts).
 native routed_select for cpu from "cpu/routed_select.rs":
-    params (ROWS in [8, 4, 2, 1] default 8)
     scratch router_rows bytes (M * H * 4)
     scratch logits bytes (M * E * 4)
     launch routed_select_normalize:
@@ -1156,7 +1388,7 @@ native routed_select for cpu from "cpu/routed_select.rs":
         threads_per_threadgroup (1, 1, 1)
         shared_bytes (H * 12)
     launch routed_select_logits:
-        threadgroups (ceil_div(E, ROWS), 1, 1)
+        threadgroups (min(E, device.units), 1, 1)
         threads_per_threadgroup (1, 1, 1)
     launch routed_select_select:
         threadgroups (M, 1, 1)
@@ -1429,169 +1661,46 @@ fn routed_scatter[M, H, K, B, T](base: &tensor[M, H] f32,
 # default ran 1.38x and 1.89x).
 native routed_gate_up for metal from "metal/routed_gate_up.metal":
     static (H, K, F, GS, US, LB)
-    params (SIMDGROUPS in [2, 4, 8, 16] default 8, ROWS in [1, 2, 4] default 1, arithmetic LANES in [32, 16] default 16)
     records (expert_gate, expert_up, tier_gate, tier_up)
-    launch routed_gate_up when XS > 0:
-        threadgroups (ceil_div(F, SIMDGROUPS * ROWS * 32 / LANES), M * K, 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (min(ceil_div(H, 32), 448) * 64)
-    # A resident layer's (XS 0) reads its experts' records, a held layer's
-    # stack or a whole bank's homes, as the launches above do, by the
-    # expert itself (`decode_source`), with plain loads, as nothing writes
-    # them while it runs. It lists its record ports itself so that it forms
-    # its own source, which is where the plain loads are chosen.
-    launch routed_gate_up_resident when XS == 0:
-        records (expert_gate, expert_up, tier_gate, tier_up)
-        threadgroups (ceil_div(F, SIMDGROUPS * ROWS * 32 / LANES), M * K, 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (min(ceil_div(H, 32), 448) * 64)
+    project routed choice (expert_gate, expert_up)
+    restate SIMDGROUPS in [2, 4, 8, 16] default 8
+    restate arithmetic LANES in [32, 16] default 16
 
 native routed_gate_up for cuda from "cuda/routed_gate_up.cu":
     static (H, K, F, GS, US, LB)
-    params (TPW in [1, 2] default 1, arithmetic KSPLIT in [1, 2, 4] default 1, form GATHERED in [0, 1] default 0)
     records (expert_gate, expert_up, tier_gate, tier_up)
-    where H % 64 == 0
-    scratch operands bytes (M * H * 2) when GATHERED == 1 and operands(EGW) == 1
-    launch routed_gate_up when GATHERED == 0:
-        reads (TPW, KSPLIT)
-        threadgroups (ceil_div(ceil_div(ceil_div(F, 16), TPW), 4 / KSPLIT), M * K, 1)
-        threads_per_threadgroup (128, 1, 1)
-        shared_bytes (operands(EGW) * H * 2)
-    launch routed_gate_up_stage when GATHERED == 1 and operands(EGW) == 1:
-        staging
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch routed_gate_up_gathered when GATHERED == 1:
-        reads (TPW, KSPLIT)
-        alike (routed_gate_up)
-        threadgroups (ceil_div(ceil_div(ceil_div(F, 16), TPW), 4 / KSPLIT), M * K, 1)
-        threads_per_threadgroup (128, 1, 1)
+    project routed choice (expert_gate, expert_up)
 
 native routed_gate_up for vulkan from "vulkan/routed_gate_up.comp":
     static (H, K, F, GS, US, LB)
-    params (SIMDGROUPS in [2, 4, 8] default 2, ROWS in [1, 2, 4] default 1, form GATHERED in [0, 1] default 0)
     records (expert_gate, expert_up, tier_gate, tier_up)
-    scratch gathered bytes (M * K * (1 + 2 * VERIFY_ROWS) * 4) when GATHERED == 1
-    launch routed_gate_up when GATHERED == 0:
-        threadgroups (ceil_div(F, SIMDGROUPS * ROWS), M * K, 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (256 + 32 * operands(EGW) + min(8 * ceil_div(H, 32), 288) * 72)
-    launch routed_gate_up_gather when GATHERED == 1:
-        threadgroups (1, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch routed_gate_up_gathered1 when GATHERED == 1 and M <= 1:
-        threadgroups (ceil_div(F, SIMDGROUPS * ROWS), M * K, 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (256 + 32 * operands(EGW) + min(8 * ceil_div(H, 32), 288) * 72)
-    launch routed_gate_up_gathered2 when GATHERED == 1 and M == 2:
-        alike (routed_gate_up_gathered1)
-        threadgroups (ceil_div(F, SIMDGROUPS * ROWS), M * K, 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (256 + 32 * operands(EGW) + min(8 * ceil_div(H, 32), 288) * 72)
-    launch routed_gate_up_gathered4 when GATHERED == 1 and M >= 3 and M <= 4:
-        alike (routed_gate_up_gathered1)
-        threadgroups (ceil_div(F, SIMDGROUPS * ROWS), M * K, 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (256 + 32 * operands(EGW) + min(8 * ceil_div(H, 32), 288) * 72)
-    launch routed_gate_up_gathered8 when GATHERED == 1 and M >= 5 and M <= VERIFY_ROWS:
-        alike (routed_gate_up_gathered1)
-        threadgroups (ceil_div(F, SIMDGROUPS * ROWS), M * K, 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (256 + 32 * operands(EGW) + min(8 * ceil_div(H, 32), 288) * 72)
+    project routed choice (expert_gate, expert_up)
 
 native routed_gate_up for cpu from "cpu/routed_gate_up.rs":
-    params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
     records (expert_gate, expert_up, tier_gate, tier_up)
-    where (INT8 == 0 or form(EGW, INT8) == 1 or form(EUW, INT8) == 1)
-    scratch quantized bytes (M * ceil_div(H, Q8_VALUES) * Q8_BYTES)
-    scratch staged bytes (M * H * 4)
-    launch routed_gate_up_stage:
-        staging
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (1, 1, 1)
+    project quantized rows (EGW, EUW) over (M, H) operand (normalized)
     launch routed_gate_up_rows:
         threadgroups (ceil_div(F, ROWS), M * K, 1)
         threads_per_threadgroup (1, 1, 1)
 
 native routed_up for metal from "metal/routed_up.metal":
     static (H, K, F, US)
-    params (SIMDGROUPS in [2, 4, 8, 16] default 2, ROWS in [1, 2, 4] default 1, arithmetic LANES in [32, 16] default 32)
     records (expert_up, tier_up)
-    launch routed_up when XS > 0:
-        threadgroups (ceil_div(F, SIMDGROUPS * ROWS * 32 / LANES), M * K, 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (min(ceil_div(H, 32), 448) * 64)
-    # A resident layer's (XS 0) reads its expert records with plain loads, as
-    # `routed_gate_up_resident` does.
-    launch routed_up_resident when XS == 0:
-        records (expert_up, tier_up)
-        threadgroups (ceil_div(F, SIMDGROUPS * ROWS * 32 / LANES), M * K, 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (min(ceil_div(H, 32), 448) * 64)
+    project routed choice (expert_up)
 
 native routed_up for cuda from "cuda/routed_up.cu":
     static (H, K, F, US)
-    params (TPW in [1, 2] default 1, arithmetic KSPLIT in [1, 2, 4] default 1, form GATHERED in [0, 1] default 0)
     records (expert_up, tier_up)
-    where H % 64 == 0
-    scratch operands bytes (M * H * 2) when GATHERED == 1 and operands(EUW) == 1
-    launch routed_up when GATHERED == 0:
-        reads (TPW, KSPLIT)
-        threadgroups (ceil_div(ceil_div(ceil_div(F, 16), TPW), 4 / KSPLIT), M * K, 1)
-        threads_per_threadgroup (128, 1, 1)
-        shared_bytes (operands(EUW) * H * 2)
-    launch routed_up_stage when GATHERED == 1 and operands(EUW) == 1:
-        staging
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch routed_up_gathered when GATHERED == 1:
-        reads (TPW, KSPLIT)
-        alike (routed_up)
-        threadgroups (ceil_div(ceil_div(ceil_div(F, 16), TPW), 4 / KSPLIT), M * K, 1)
-        threads_per_threadgroup (128, 1, 1)
+    project routed choice (expert_up)
 
 native routed_up for vulkan from "vulkan/routed_up.comp":
     static (H, K, F, US)
-    params (SIMDGROUPS in [2, 4, 8] default 2, ROWS in [1, 2, 4] default 1, form GATHERED in [0, 1] default 0)
     records (expert_up, tier_up)
-    scratch gathered bytes (M * K * (1 + 2 * VERIFY_ROWS) * 4) when GATHERED == 1
-    launch routed_up when GATHERED == 0:
-        threadgroups (ceil_div(F, SIMDGROUPS * ROWS), M * K, 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (256 + 32 * operands(EUW) + min(8 * ceil_div(H, 32), 288) * 72)
-    launch routed_up_gather when GATHERED == 1:
-        threadgroups (1, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch routed_up_gathered1 when GATHERED == 1 and M <= 1:
-        threadgroups (ceil_div(F, SIMDGROUPS * ROWS), M * K, 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (256 + 32 * operands(EUW) + min(8 * ceil_div(H, 32), 288) * 72)
-    launch routed_up_gathered2 when GATHERED == 1 and M == 2:
-        alike (routed_up_gathered1)
-        threadgroups (ceil_div(F, SIMDGROUPS * ROWS), M * K, 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (256 + 32 * operands(EUW) + min(8 * ceil_div(H, 32), 288) * 72)
-    launch routed_up_gathered4 when GATHERED == 1 and M >= 3 and M <= 4:
-        alike (routed_up_gathered1)
-        threadgroups (ceil_div(F, SIMDGROUPS * ROWS), M * K, 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (256 + 32 * operands(EUW) + min(8 * ceil_div(H, 32), 288) * 72)
-    launch routed_up_gathered8 when GATHERED == 1 and M >= 5 and M <= VERIFY_ROWS:
-        alike (routed_up_gathered1)
-        threadgroups (ceil_div(F, SIMDGROUPS * ROWS), M * K, 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (256 + 32 * operands(EUW) + min(8 * ceil_div(H, 32), 288) * 72)
+    project routed choice (expert_up)
 
 native routed_up for cpu from "cpu/routed_up.rs":
-    params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
     records (expert_up, tier_up)
-    where (INT8 == 0 or form(EUW, INT8) == 1)
-    scratch quantized bytes (M * ceil_div(H, Q8_VALUES) * Q8_BYTES)
-    scratch staged bytes (M * H * 4)
-    launch routed_up_stage:
-        staging
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (1, 1, 1)
+    project quantized rows (EUW) over (M, H) operand (normalized)
     launch routed_up_rows:
         threadgroups (ceil_div(F, ROWS), M * K, 1)
         threads_per_threadgroup (1, 1, 1)
@@ -1599,56 +1708,26 @@ native routed_up for cpu from "cpu/routed_up.rs":
 # Decode output, as `routed_output` without the shared expert. Metal runs the
 # K choices side by side, one simdgroup each, over (32 / LANES) * ROWS
 # output channels per threadgroup; the projections meet in threadgroup
-# memory, and one thread per channel carries the slot-order sum. (CUDA: the
-# storing lane carries each channel's running sum across the choices in
-# registers.) Metal stages at 16 lanes too, past 2 packets a lane
-# (`routed::stage_packets`), and admits a call only where its defaults
-# (ROWS 2 LANES 16) hold, so a call they cannot serve is outside its domain.
+# memory, and one thread per channel carries the slot-order sum; gathered
+# (GATHERED), as `routed_output`'s. (CUDA: the storing lane carries each
+# channel's running sum across the choices in registers.) Metal stages at
+# 16 lanes too, past 2 packets a lane (`routed::stage_packets`), and admits
+# a call only where its defaults (ROWS 2 LANES 16) hold, so a call they
+# cannot serve is outside its domain.
 native routed_down for metal from "metal/routed_down.metal":
     static (H, K, F)
-    params (ROWS in [2, 1, 4, 8] default 2, arithmetic LANES in [16, 32, 8, 4] default 16)
     records (expert_down, tier_down)
-    where K <= 32 and ROWS * ceil_div(ceil_div(F, 32) - (1 - min(1, LANES / 16) + (min(1, LANES / 16) - LANES / 32) * min(1, ceil_div(ceil_div(F, 32), LANES) / 3)) * (ceil_div(F, 32) - min(ceil_div(F, 32), 256 / K)), LANES) <= 8 and 2 * ceil_div(ceil_div(F, 32) - min(1, ceil_div(ceil_div(F, 32), 16) / 3) * (ceil_div(F, 32) - min(ceil_div(F, 32), 256 / K)), 16) <= 8
-    launch routed_down when XS > 0:
-        threadgroups (ceil_div(H, ROWS * 32 / LANES), M, 1)
-        unless (policy[POLICY_WHOLE])
-        threads_per_threadgroup (32 * K, 1, 1)
-    # Each launch forms its own source: the whole one reads its records with
-    # plain loads, as the resident one does.
-    launch routed_down_whole when XS > 0:
-        threadgroups (ceil_div(H, ROWS * 32 / LANES), M, 1)
-        if (policy[POLICY_WHOLE])
-        threads_per_threadgroup (32 * K, 1, 1)
-    # A resident layer's (XS 0) reads its expert records with plain loads, as
-    # `routed_gate_up_resident` does.
-    launch routed_down_resident when XS == 0:
-        records (expert_down, tier_down)
-        threadgroups (ceil_div(H, ROWS * 32 / LANES), M, 1)
-        threads_per_threadgroup (32 * K, 1, 1)
+    project routed summed (expert_down)
+    scratch published bytes (M * K * H * 2) when GATHERED == 1 and M <= VERIFY_ROWS
+    scratch arrivals bytes (ceil_div(H, ROWS * 32 / LANES) * 4) sync when GATHERED == 1 and M <= VERIFY_ROWS
 
 # CUDA: the choices' projections in parallel blocks, A-rounded into
 # `projected`, then the slot-order combine, which adds the sum to the base.
 native routed_down for cuda from "cuda/routed_down.cu":
     static (H, K, F)
-    params (TPW in [1, 2] default 1, arithmetic KSPLIT in [1, 2, 4] default 1)
     records (expert_down, tier_down)
-    where F % 64 == 0
-    scratch projected bytes (M * K * H * 2)
-    scratch operands bytes (M * K * F * 2) when M > 1 and operands(EDW) == 1
-    launch routed_down when M == 1:
-        reads (TPW, KSPLIT)
-        threadgroups (ceil_div(ceil_div(ceil_div(H, 16), TPW), 4 / KSPLIT), M * K, 1)
-        threads_per_threadgroup (128, 1, 1)
-        shared_bytes (operands(EDW) * F * 2)
-    launch routed_down_stage when M > 1 and operands(EDW) == 1:
-        staging
-        threadgroups (M * K, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch routed_down_gathered when M > 1:
-        reads (TPW, KSPLIT)
-        alike (routed_down)
-        threadgroups (ceil_div(ceil_div(ceil_div(H, 16), TPW), 4 / KSPLIT), M * K, 1)
-        threads_per_threadgroup (128, 1, 1)
+    project routed summed (expert_down)
+    scratch published bytes (M * K * H * 2)
     launch routed_down_combine:
         threadgroups (ceil_div(H, 256), M, 1)
         threads_per_threadgroup (256, 1, 1)
@@ -1658,25 +1737,14 @@ native routed_down for cuda from "cuda/routed_down.cu":
 # tier record in place, over the link.
 native routed_down for vulkan from "vulkan/routed_down.comp":
     static (H, K, F)
-    params (SIMDGROUPS in [2, 4, 8] default 2, ROWS in [1, 2, 4] default 1, arithmetic LANES in [32, 16, 8] default 32)
     records (expert_down, tier_down)
-    launch routed_down:
-        threadgroups (ceil_div(H, SIMDGROUPS * ROWS * 32 / LANES), M, 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (256 + 32 * operands(EDW) + min(ceil_div(F, 32), 288) * 72)
+    project routed summed (expert_down)
 
 # CPU: work item (x, m) owns ROWS output channels of row m: the choices'
 # weighted projections in slot order.
 native routed_down for cpu from "cpu/routed_down.rs":
-    params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
     records (expert_down, tier_down)
-    where (INT8 == 0 or form(EDW, INT8) == 1)
-    scratch quantized bytes (M * K * ceil_div(F, Q8_VALUES) * Q8_BYTES)
-    scratch staged bytes (M * K * F * 4)
-    launch routed_down_stage:
-        staging
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (1, 1, 1)
+    project quantized rows (EDW) over (M * K, F) operand (product)
     launch routed_down_rows:
         threadgroups (ceil_div(H, ROWS), M, 1)
         threads_per_threadgroup (1, 1, 1)
@@ -1685,137 +1753,34 @@ native routed_down for cpu from "cpu/routed_down.rs":
 # weight (Metal TILE_M x TILE_N simdgroup-matrix tiles; CUDA 32 x 128
 # mma.sync tiles; Vulkan the Metal form; CPU ROWS features per work item).
 native routed_experts_up for metal from "metal/routed_experts_up.metal":
-    static (H, F, US)
-    params (TILE_M in [32, 64] default 32, TILE_N in [128, 64] default 128)
+    static (H, F, T, US)
     records (expert_up, expert_down, records_up, records_down)
-    scratch staged bytes (M * H * 2) when operands(EUW) == 1
-    scratch product bytes (B * T * F * 2)
-    scratch stage_grid bytes (12)
-    scratch expand_grid bytes (12)
-    scratch quantize_grid bytes (12)
-    scratch down_grid bytes (12)
-    launch routed_experts_up_grids:
-        threadgroups (1, 1, 1)
-        threads_per_threadgroup (1, 1, 1)
-    launch routed_experts_up_stage when operands(EUW) == 1:
-        staging
-        threadgroups (M, 1, 1)
-        grid (stage_grid)
-        threads_per_threadgroup (256, 1, 1)
-    launch routed_experts_up_expand:
-        threadgroups (ceil_div(F, TILE_N), B * ceil_div(T, TILE_M), 1)
-        grid (expand_grid)
-        threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
-    launch routed_experts_up_quantize when operands(EDW) == 1:
-        threadgroups (B * T, 1, 1)
-        grid (quantize_grid)
-        threads_per_threadgroup (256, 1, 1)
-    launch routed_experts_up_down:
-        threadgroups (ceil_div(H, TILE_N), B * ceil_div(T, TILE_M), 1)
-        grid (down_grid)
-        threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
+    project routed grouped (expert_up) down (expert_down)
+    restate TILE_M in [32, 64] default 32
 
 native routed_experts_up for cuda from "cuda/routed_experts_up.cu":
     static (H, F, US)
-    params (arithmetic OPERAND in [0, 1] default 0)
     records (expert_up, expert_down, records_up, records_down)
-    where H % 64 == 0 and F % 64 == 0
-    scratch staged bytes (M * H * 2) when OPERAND == 1 or operands(EUW) == 1
-    scratch product bytes (B * T * F * 2)
-    scratch stage_grid bytes (12)
-    scratch expand_grid bytes (12)
-    scratch quantize_grid bytes (12)
-    scratch down_grid bytes (12)
-    launch routed_experts_up_grids:
-        threadgroups (1, 1, 1)
-        threads_per_threadgroup (1, 1, 1)
-    launch routed_experts_up_stage when OPERAND == 1 or operands(EUW) == 1:
-        reads (OPERAND)
-        staging
-        threadgroups (M, 1, 1)
-        grid (stage_grid)
-        threads_per_threadgroup (256, 1, 1)
-    launch routed_experts_up_expand:
-        reads (OPERAND)
-        threadgroups (ceil_div(ceil_div(F, 16), 8), ceil_div(T, 32), B)
-        grid (expand_grid)
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes (3 * (32 * 144 + 10240) + 4096)
-    launch routed_experts_up_quantize when operands(EDW) == 1:
-        reads (OPERAND)
-        threadgroups (B * T, 1, 1)
-        grid (quantize_grid)
-        threads_per_threadgroup (256, 1, 1)
-    launch routed_experts_up_down:
-        reads (OPERAND)
-        threadgroups (ceil_div(ceil_div(H, 16), 8), ceil_div(T, 32), B)
-        grid (down_grid)
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes (3 * (32 * 144 + 10240) + 4096)
+    project routed grouped (expert_up) down (expert_down)
 
 native routed_experts_up for vulkan from "vulkan/routed_experts_up.comp":
     static (H, F, US)
-    params (TILE_M in [32, 64] default 32, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32)
     records (expert_up, expert_down, records_up, records_down)
-    where SUB_M <= TILE_M and SUB_N <= TILE_N
-    scratch staged bytes (M * H * 2) when operands(EUW) == 1
-    scratch product bytes (B * T * F * 2)
-    scratch stage_grid bytes (12)
-    scratch expand_grid bytes (12)
-    scratch quantize_grid bytes (12)
-    scratch down_grid bytes (12)
-    launch routed_experts_up_grids:
-        threadgroups (1, 1, 1)
-        threads_per_threadgroup (1, 1, 1)
-    launch routed_experts_up_stage when operands(EUW) == 1:
-        staging
-        threadgroups (M, 1, 1)
-        grid (stage_grid)
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes (128)
-    launch routed_experts_up_expand:
-        threadgroups (ceil_div(F, TILE_N), B * ceil_div(T, TILE_M), 1)
-        grid (expand_grid)
-        threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
-        shared_bytes ((TILE_M + TILE_N) * 80)
-    launch routed_experts_up_quantize when operands(EDW) == 1:
-        threadgroups (B * T, 1, 1)
-        grid (quantize_grid)
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes (128)
-    launch routed_experts_up_down:
-        threadgroups (ceil_div(H, TILE_N), B * ceil_div(T, TILE_M), 1)
-        grid (down_grid)
-        threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
-        shared_bytes ((TILE_M + TILE_N) * 80)
+    project routed grouped (expert_up) down (expert_down)
+    restate TILE_M in [32, 64] default 32
 
 native routed_experts_up for cpu from "cpu/routed_experts_up.rs":
-    params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
     records (expert_up, expert_down, records_up, records_down)
-    where (INT8 == 0 or form(EUW, INT8) == 1 or form(EDW, INT8) == 1)
-    scratch quantized bytes (M * ceil_div(H, Q8_VALUES) * Q8_BYTES)
-    scratch product_q8 bytes (B * T * ceil_div(F, Q8_VALUES) * Q8_BYTES)
-    scratch staged bytes (M * H * 4)
-    scratch product bytes (B * T * F * 4)
-    scratch stage_grid bytes (12)
+    project quantized rows (EUW, EDW over (B * T, F)) over (M, H) operand (normalized within (first, rows), emitted)
+    scratch product_arrivals bytes (B * T * 4)
     scratch expand_grid bytes (12)
-    scratch quantize_grid bytes (12)
     scratch down_grid bytes (12)
     launch routed_experts_up_grids:
         threadgroups (1, 1, 1)
-        threads_per_threadgroup (1, 1, 1)
-    launch routed_experts_up_stage:
-        staging
-        threadgroups (M, 1, 1)
-        grid (stage_grid)
         threads_per_threadgroup (1, 1, 1)
     launch routed_experts_up_expand:
         threadgroups (ceil_div(F, ROWS), B, 1)
         grid (expand_grid)
-        threads_per_threadgroup (1, 1, 1)
-    launch routed_experts_up_quantize when INT8 == 1 or operands(EDW) == 1:
-        threadgroups (B * T, 1, 1)
-        grid (quantize_grid)
         threads_per_threadgroup (1, 1, 1)
     launch routed_experts_up_down:
         threadgroups (ceil_div(H, ROWS), B, 1)
@@ -2248,51 +2213,49 @@ fn assign[M, K](routes: &tensor[M, K] i32, policy: &tensor[POLICY_WORDS] i32,
 #
 # Its host answers the step's slot of the layer's `file` table as it lands
 # the absent experts (`routed_land` awaits it).
-fn routed_route_streamed[M, H, PT, NM, E, K, S, ES, FW, AHEAD, FLIGHT, RING, P, EN, GM, TM](residual: &tensor[M, PT * H] f32,
-    norm: &tensor[NM] NW, router: &tensor[E, H] RW, shared_router: &tensor[H] f32,
+fn routed_route_streamed[M, H, PT, NM, E, K, S, ES, FW, FLIGHT, P, GM, TM](residual: &tensor[M, PT * H] f32,
+    norm: &tensor[NM] NW, router: &tensor[E, H] RW, shared_router: &tensor[H] SRW,
     shared_gate: &tensor[S, H] SGW, shared_up: &tensor[S, H] SUW,
     routes: &mut tensor[M, K] i32, scores: &mut tensor[M, K] f32,
     eps: f32, normalize: i32, expert_scale: &tensor[ES] f32,
     map: &tensor[GM, MAP_WORDS] i32, tier: &tensor[TM] i32, policy: &tensor[POLICY_WORDS] i32,
     sited: i32, step: &tensor[STEP_WORDS] i32,
     file: &mut tensor[FLIGHT, FW] i32, sources: &mut tensor[SOURCE_ROWS, M, K] i32,
-    next_norm: &tensor[NM] NW, next_router: &tensor[EN, H] RW,
-    after_norm: &tensor[NM] NW, after_router: &tensor[EN, H] RW,
-    next_policy: &tensor[POLICY_WORDS] i32,
-    rings: &mut tensor[AHEAD, RING] i32, routing: &mut tensor[FLIGHT, RING_EXPERTS + 2 * P] i32)
+    routing: &mut tensor[FLIGHT, RING_EXPERTS + 2 * P] i32)
     -> (tensor[M, H] A, tensor[M] f32, tensor[M, S] A)
-    where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and ES >= 0 and (ES == 0 or ES == E) and operands(RW) == 0 and operands(SGW) == operands(SUW) and M <= VERIFY_ROWS and FW >= FILE_ENTRIES + FILE_ENTRY_WORDS * P and FW % 2 == 0 and AHEAD >= 0 and AHEAD <= 2 and FLIGHT > 0 and FLIGHT < 65536 and RING >= RING_EXPERTS + HINT_ENTRY_WORDS * M * K and P >= M * K and EN > 0 and GM >= E and TM >= 0 and (TM == 0 or TM == E):
+    where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and ES >= 0 and (ES == 0 or ES == E) and operands(RW) == 0 and operands(SRW) == 0 and operands(SGW) == operands(SUW) and M <= VERIFY_ROWS and FW >= FILE_ENTRIES + FILE_ENTRY_WORDS * P and FW % 2 == 0 and FLIGHT > 0 and FLIGHT < 65536 and P >= M * K and GM >= E and TM >= 0 and (TM == 0 or TM == E):
     let mut normalized = tensor[M, H] A
     let mut coefficient = tensor[M] f32
     let mut shared_product = tensor[M, S] A
     route_shared(residual, norm, router, shared_router, shared_gate, shared_up, eps,
         normalize, expert_scale, routes, scores, normalized, coefficient, shared_product)
     resolve[P = P, E = E](routes, map, tier, policy, sited, step, file, routing, sources)
+    return (normalized, coefficient, shared_product)
+
+# Gate-ahead hints (`hint`) for the next one or two streamed fused layers
+# (`AHEAD` in 1..=2), guarded by `next_policy[POLICY_RESOLVED]`.
+fn routed_hint_route[M, H, PT, NM, K, AHEAD, RING, EN](residual: &tensor[M, PT * H] f32,
+    activation: &host tensor[0, K] A,
+    next_norm: &tensor[NM] NW, next_router: &tensor[EN, H] RW,
+    after_norm: &tensor[NM] NW, after_router: &tensor[EN, H] RW,
+    eps: f32, step: &tensor[STEP_WORDS] i32, next_policy: &tensor[POLICY_WORDS] i32,
+    rings: &mut tensor[AHEAD, RING] i32)
+    where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and operands(RW) == 0 and M <= VERIFY_ROWS and AHEAD >= 1 and AHEAD <= 2 and RING >= RING_EXPERTS + HINT_ENTRY_WORDS * M * K and EN > 0 and K > 0 and K <= EN:
     let mut predicted = tensor[M, H] A
     let mut predicted_logits = tensor[M, EN] f32
     let mut after = tensor[M, H] A
     let mut after_logits = tensor[M, EN] f32
-    if AHEAD >= 1 and next_policy[POLICY_RESOLVED] == 0:
+    if next_policy[POLICY_RESOLVED] == 0:
         hint[K = K](residual, next_norm, next_router, eps, step, predicted,
             predicted_logits, rings[0, :])
-        # The second lead's row, where the route has it (AHEAD 2).
         for lead in 1..AHEAD:
             hint[K = K](residual, after_norm, after_router, eps, step, after,
                 after_logits, rings[lead, :])
-    return (normalized, coefficient, shared_product)
 
 # Decode selection of a streamed layer of the general form: `routed_select`'s
 # ports and results, bit for bit, then `resolve` (a layer whose POLICY_WHOLE
-# word is set resolves only its hits), and the gate-ahead hints
-# (`hint_selected`) of the next streamed layer over its router norm, router
-# and selection bias (`next_*`; the model's layers share the score
-# function) into the ring `rings[0]` while that layer may lack an expert, as
-# `routed_route_streamed`'s, and those of the layer after it over its
-# (`after_*`) into `rings[1]`: AHEAD is the leads the route has, as
-# `routed_route_streamed`'s, a lead past them binding the next layer's
-# tensors (the last layer's its own), which are not read. Both layers ahead route over EN experts. Its host answers the step's slot of the
-# layer's `file` table as it lands the absent experts.
-fn routed_select_streamed[M, H, E, K, ES, FW, AHEAD, FLIGHT, RING, P, EN, GM, TM](residual: &tensor[M, H] f32,
+# word is set resolves only its hits).
+fn routed_select_streamed[M, H, E, K, ES, FW, FLIGHT, P, GM, TM](residual: &tensor[M, H] f32,
     norm: &tensor[H] NW, router_norm: &tensor[H] RNW, router: &tensor[E, H] RW, bias: &tensor[E] f32,
     expert_scale: &tensor[ES] f32, routes: &mut tensor[M, K] i32,
     weights: &mut tensor[M, K] f32, epsilon: f32, score: i32, normalization: i32,
@@ -2300,18 +2263,25 @@ fn routed_select_streamed[M, H, E, K, ES, FW, AHEAD, FLIGHT, RING, P, EN, GM, TM
     map: &tensor[GM, MAP_WORDS] i32, tier: &tensor[TM] i32, policy: &tensor[POLICY_WORDS] i32,
     sited: i32, step: &tensor[STEP_WORDS] i32,
     file: &mut tensor[FLIGHT, FW] i32, sources: &mut tensor[SOURCE_ROWS, M, K] i32,
-    next_router_norm: &tensor[H] RNW, next_router: &tensor[EN, H] RW, next_bias: &tensor[EN] f32,
-    after_router_norm: &tensor[H] RNW, after_router: &tensor[EN, H] RW, after_bias: &tensor[EN] f32,
-    next_policy: &tensor[POLICY_WORDS] i32,
-    rings: &mut tensor[AHEAD, RING] i32, routing: &mut tensor[FLIGHT, RING_EXPERTS + 2 * P] i32)
+    routing: &mut tensor[FLIGHT, RING_EXPERTS + 2 * P] i32)
     -> tensor[M, H] A
-    where ES >= 0 and (ES == 0 or ES == E) and operands(RW) == 0 and M <= VERIFY_ROWS and FW >= FILE_ENTRIES + FILE_ENTRY_WORDS * P and FW % 2 == 0 and AHEAD >= 0 and AHEAD <= 2 and FLIGHT > 0 and FLIGHT < 65536 and RING >= RING_EXPERTS + HINT_ENTRY_WORDS * M * K and P >= M * K and EN > 0 and GM >= E and TM >= 0 and (TM == 0 or TM == E):
+    where ES >= 0 and (ES == 0 or ES == E) and operands(RW) == 0 and M <= VERIFY_ROWS and FW >= FILE_ENTRIES + FILE_ENTRY_WORDS * P and FW % 2 == 0 and FLIGHT > 0 and FLIGHT < 65536 and P >= M * K and GM >= E and TM >= 0 and (TM == 0 or TM == E):
     let normalized = routed_select(residual, norm, router_norm, router, bias, expert_scale, routes,
         weights, epsilon, score, normalization, normalization_epsilon, scale)
     resolve[P = P, E = E](routes, map, tier, policy, sited, step, file, routing, sources)
+    return normalized
+
+# Gate-ahead hints (`hint_selected`) for the next one or two streamed general
+# layers (`AHEAD` in 1..=2), guarded by `next_policy[POLICY_RESOLVED]`.
+fn routed_hint_select[M, H, K, AHEAD, RING, EN](residual: &tensor[M, H] f32,
+    activation: &host tensor[0, K] A,
+    next_router_norm: &tensor[H] RNW, next_router: &tensor[EN, H] RW, next_bias: &tensor[EN] f32,
+    after_router_norm: &tensor[H] RNW, after_router: &tensor[EN, H] RW, after_bias: &tensor[EN] f32,
+    score: i32, epsilon: f32, step: &tensor[STEP_WORDS] i32, next_policy: &tensor[POLICY_WORDS] i32,
+    rings: &mut tensor[AHEAD, RING] i32)
+    where operands(RW) == 0 and M <= VERIFY_ROWS and AHEAD >= 1 and AHEAD <= 2 and RING >= RING_EXPERTS + HINT_ENTRY_WORDS * M * K and EN > 0 and K > 0 and K <= EN:
     let mut predicted = tensor[M, H] A
     let mut predicted_logits = tensor[M, EN] f32
-    # Initialized as `hint`'s routes are, for the `&mut` argument.
     let mut predicted_routes = tensor[M, K] i32
     for row in 0..M:
         for choice in 0..K:
@@ -2322,14 +2292,12 @@ fn routed_select_streamed[M, H, E, K, ES, FW, AHEAD, FLIGHT, RING, P, EN, GM, TM
     for row in 0..M:
         for choice in 0..K:
             after_routes[row, choice] = -1
-    if AHEAD >= 1 and next_policy[POLICY_RESOLVED] == 0:
+    if next_policy[POLICY_RESOLVED] == 0:
         hint_selected(residual, next_router_norm, next_router, next_bias, score, epsilon, step,
             predicted, predicted_logits, predicted_routes, rings[0, :])
-        # The second lead's row, where the route has it (AHEAD 2).
         for lead in 1..AHEAD:
             hint_selected(residual, after_router_norm, after_router, after_bias, score, epsilon, step,
                 after, after_logits, after_routes, rings[lead, :])
-    return normalized
 
 
 # A streamed decode layer's site request (streaming_words.seismic's site

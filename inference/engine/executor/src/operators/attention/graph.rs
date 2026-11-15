@@ -52,14 +52,15 @@ use seismic::{
     WorkflowTensorRef, WorkflowTensorView,
 };
 
+/// An attention block's entries; each projection's by row range.
 pub(crate) struct AttentionGraphEntries<'a, G: GraphDraft + 'a> {
-    pub project: G::Binding<'a, attention_project::Entry>,
+    pub project: G::Ranged<'a, attention_project::Entry>,
     pub history: AttentionHistoryEntries<'a, G>,
     pub output: TailEntries<'a, G, attention_output::Entry>,
     /// A grouped output's first product (`project_rows` over its groups).
-    pub grouped: Option<G::Binding<'a, project_rows::Entry>>,
+    pub grouped: Option<G::Ranged<'a, project_rows::Entry>>,
     /// An absorbed query's per-head products (`project_rows` over its heads).
-    pub absorbed: Option<G::Binding<'a, project_rows::Entry>>,
+    pub absorbed: Option<G::Ranged<'a, project_rows::Entry>>,
     /// A selected read's indexer entries.
     pub selection: Option<SelectionGraphEntries<'a, G>>,
     /// A low-rank query's up projection.
@@ -79,7 +80,7 @@ impl<'a, G: GraphDraft + 'a> Clone for AttentionGraphEntries<'a, G> {
 /// rows widened to F32, then normalized and projected to the query heads.
 pub(crate) struct LowRankQueryEntries<'a, G: GraphDraft + 'a> {
     pub widen: G::Binding<'a, widen_rows::Entry>,
-    pub project: G::Binding<'a, attention_project::Entry>,
+    pub project: G::Ranged<'a, attention_project::Entry>,
 }
 
 impl<'a, G: GraphDraft + 'a> Copy for LowRankQueryEntries<'a, G> {}
@@ -92,7 +93,7 @@ impl<'a, G: GraphDraft + 'a> Clone for LowRankQueryEntries<'a, G> {
 /// A selected read's entries ([`select`]): its keys' projection, widening
 /// and pooling, its indexer, its reads and the codec's WorkList prefill.
 pub(crate) struct SelectionGraphEntries<'a, G: GraphDraft + 'a> {
-    pub project: G::Binding<'a, attention_project::Entry>,
+    pub project: G::Ranged<'a, attention_project::Entry>,
     pub widen: G::Binding<'a, widen_rows::Entry>,
     pub pool: G::Binding<'a, pool_rows::Entry>,
     pub indexer: IndexerEntries<'a, G>,
@@ -1005,7 +1006,7 @@ fn select<'a, G: GraphDraft + 'a>(
     let operand = |extent: Option<&Dim>| extent.cloned().unwrap_or(Dim::from(0));
     let x = &selection.x;
     let projected = graph.enqueue(
-        entries.project,
+        G::pick(entries.project, rows),
         &[
             [
                 ("M", rows.clone()),
@@ -1528,7 +1529,7 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
     // no query).
     let query_rows = numbers.query_projection_rows(form);
     let projected = graph.enqueue(
-        kernels.project,
+        G::pick(kernels.project, &rows),
         &[
             if inject_only {
                 widths.key_value_dimensions(form, rows.clone())
@@ -1595,7 +1596,7 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
             let absent = GraphConstant::absent(graph, constants)?.tensor().clone();
             let query = graph
                 .enqueue(
-                    entries.project,
+                    G::pick(entries.project, &rows),
                     &[
                         query_projection_dimensions(rows.clone(), rank.clone(), query_rows.clone()).as_slice(),
                         AttentionOperands::query_dimensions(up_operands).as_slice(),
@@ -1639,7 +1640,7 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
         (false, Some(absorbed), Some(entry), Some(weight)) => {
             graph
                 .enqueue(
-                    entry,
+                    G::pick(entry, &rows),
                     &[
                         ("M", rows.clone()),
                         ("G", absorbed.heads.clone()),
@@ -1796,7 +1797,7 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
         (Some(grouped), Some(entry), Some(weight)) => {
             let products = graph
                 .enqueue(
-                    entry,
+                    G::pick(entry, &rows),
                     &[
                         ("M", rows.clone()),
                         ("G", grouped.groups.clone()),
@@ -1826,7 +1827,7 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
             let inject = join.inject(graph, rows.clone(), constants)?;
             graph
                 .enqueue(
-                    output,
+                    G::pick(output, &rows),
                     &[
                         [
                             ("M", rows.clone()),
@@ -1993,11 +1994,11 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
             ..
         } => graph.control_for(topology.controls, *kernel, name, &dimensions),
         AttentionHistoryEntries::Dense {
-            decode: DenseDecodeEntries::Prefill(kernel),
+            decode: DenseDecodeEntries::Prefill(prefill),
             ..
         } => graph.control_for(
             topology.controls,
-            *kernel,
+            *prefill,
             name,
             &prefill_dimensions(&dimensions, &words, &block_keys),
         ),
@@ -2454,7 +2455,9 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
         } => {
             let kernel = match (&selected_prefill, dense_decode) {
                 (Some(SelectedPrefillEntries::Dense(selected)), _) => selected,
-                (None, DenseDecodeEntries::Prefill(kernel)) if decode_rows => kernel,
+                (None, DenseDecodeEntries::Prefill(decode_prefill)) if decode_rows => {
+                    decode_prefill
+                }
                 (None, _) => prefill,
                 (Some(_), _) => return Err("a selected prefill of another codec".into()),
             };

@@ -25,7 +25,7 @@ use crate::programs::graph::facts::Numbers;
 use crate::programs::native_target_graph::{
     PlannedWeights, WeightPart, WeightPort, WeightScale, weight, weight_port,
 };
-use magnitude_kernels::{routed_output_project, routed_output_sited, routed_route_streamed};
+use magnitude_kernels::{routed_hint_route, routed_output_project, routed_output_sited, routed_route_streamed};
 use crate::{
     ModelLoadPlan, RoutedBinding,
     planning::BankPart,
@@ -38,7 +38,9 @@ use magnitude_kernels::{
     routed_combine, routed_expand, routed_experts, routed_gate_up, routed_group, routed_output,
     routed_route, routed_route_shared,
 };
-use seismic::{Argument, BackendName, Dim, Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
+use seismic::{
+    Argument, BackendName, Dim, Element, NativeGraph, NativeGraphMetadata, NativePort, OperandCarry, WorkflowTensor,
+};
 
 /// How a backend runs the decode rows' expansions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,21 +71,26 @@ impl DecodeForm {
     }
 }
 
+/// A fused routed layer's entries; each projection's by row range.
 pub(crate) struct RoutedGraphEntries<'a, G: GraphDraft + 'a> {
     pub route: G::Binding<'a, routed_route::Entry>,
     pub decode: RoutedDecodeEntries<'a, G>,
-    pub output: G::Binding<'a, routed_output::Entry>,
+    pub output: G::Ranged<'a, routed_output::Entry>,
+    /// The element `output` binds its operand norm at (`NW`): the layer's
+    /// own norm's (`RoutedBinding::norm`), the absent norm's where the layer
+    /// forms no operand for another graph.
+    pub operand_norm: Element,
     pub group: G::Binding<'a, routed_group::Entry>,
-    pub experts: G::Binding<'a, routed_experts::Entry>,
-    pub combine: G::Binding<'a, routed_combine::Entry>,
+    pub experts: G::Ranged<'a, routed_experts::Entry>,
+    pub combine: G::Ranged<'a, routed_combine::Entry>,
 }
 
 /// The decode rows' routing and expansion entries of a [`DecodeForm`].
 pub(crate) enum RoutedDecodeEntries<'a, G: GraphDraft + 'a> {
-    Expand(G::Binding<'a, routed_expand::Entry>),
+    Expand(G::Ranged<'a, routed_expand::Entry>),
     SharedRoute {
-        route: G::Binding<'a, routed_route_shared::Entry>,
-        choices: G::Binding<'a, routed_gate_up::Entry>,
+        route: G::Ranged<'a, routed_route_shared::Entry>,
+        choices: G::Ranged<'a, routed_gate_up::Entry>,
     },
 }
 
@@ -105,6 +112,7 @@ impl<'a> From<&'a RoutedKernels> for RoutedGraphEntries<'a, NativeGraph> {
                 }
             },
             output: &kernels.output,
+            operand_norm: kernels.operand_norm,
             group: &kernels.group,
             experts: &kernels.experts,
             combine: &kernels.combine,
@@ -114,9 +122,9 @@ impl<'a> From<&'a RoutedKernels> for RoutedGraphEntries<'a, NativeGraph> {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CheckedRoutedEntries {
-    route: [(&'static str, Element); 3],
+    route: [(&'static str, Element); 4],
     decode: CheckedDecodeEntries,
-    output: [(&'static str, Element); 3],
+    output: [(&'static str, Element); 4],
     group: [(&'static str, Element); 0],
     experts: [(&'static str, Element); 4],
     combine: [(&'static str, Element); 4],
@@ -126,7 +134,7 @@ pub(crate) struct CheckedRoutedEntries {
 enum CheckedDecodeEntries {
     Expand([(&'static str, Element); 5]),
     SharedRoute {
-        route: [(&'static str, Element); 5],
+        route: [(&'static str, Element); 6],
         choices: [(&'static str, Element); 3],
     },
 }
@@ -138,6 +146,7 @@ impl CheckedRoutedEntries {
             route: [
                 ("NW", binding.norm),
                 ("RW", binding.router),
+                ("SRW", Element::f32()),
                 ("A", binding.activation),
             ],
             decode: match DecodeForm::of(backend)? {
@@ -152,6 +161,7 @@ impl CheckedRoutedEntries {
                     route: [
                         ("NW", binding.norm),
                         ("RW", binding.router),
+                        ("SRW", Element::f32()),
                         ("SGW", binding.shared_gate),
                         ("SUW", binding.shared_up),
                         ("A", binding.activation),
@@ -167,6 +177,7 @@ impl CheckedRoutedEntries {
                 ("EDW", binding.expert_down),
                 ("SDW", binding.shared_down),
                 ("A", binding.activation),
+                ("NW", binding.norm),
             ],
             group: [],
             experts: [
@@ -197,11 +208,25 @@ impl CheckedRoutedEntries {
                 }
             },
             output: &self.output,
+            operand_norm: self.output[3].1,
             group: &self.group,
             experts: &self.experts,
             combine: &self.combine,
         }
     }
+}
+
+/// The operand a fused layer's output forms for the next block's input
+/// projection, in another graph (`routed_output`'s `operand_norm`): the
+/// carry it writes (`GraphDraft::carry_out`), in the forms `F` its graph
+/// names it in (`GraphDraft::Forms`), and the norm and epsilon that
+/// projection normalizes under. Only a decode layer combining resident
+/// forms one.
+pub(crate) struct OperandOut<'c, F> {
+    pub carry: &'c OperandCarry,
+    pub forms: F,
+    pub norm: &'c WorkflowTensor,
+    pub epsilon: f32,
 }
 
 /// What decides a fused routed layer's graph beside its numbers: how it
@@ -494,10 +519,14 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
     rows: &Dim,
     epsilon: Argument<f32>,
     split: Option<Split<'_>>,
+    operand: Option<OperandOut<'_, G::Forms>>,
 ) -> Result<(WorkflowTensor, Option<NativePort>), GraphError> {
     let part = bank.stacks();
     let mut streamed = StreamedLayer::of(planned, &topology.bank, shape.bank.as_ref(), scope, bank)?;
     let decode = decodes(rows);
+    if operand.is_some() && (!decode || split.is_some()) {
+        return Err("a routed layer forms an operand only at a whole decode".into());
+    }
     let scratch = streamed.is_some() && !decode;
     match (split, &mut streamed) {
         (None, _) if !scratch => {}
@@ -566,6 +595,10 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
         injected,
         ("XS", Dim::from(0)),
         ("TR", Dim::from(0)),
+        ("NO", match operand {
+            Some(_) => shape.hidden.clone(),
+            None => Dim::from(0),
+        }),
     ];
     let mut routes = graph.local_for(handle.route, "routes", &choices)?;
     let mut scores = graph.local_for(handle.route, "scores", &choices)?;
@@ -602,7 +635,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                     epsilon,
                 )?;
                 let expanded = graph.enqueue(
-                    expand,
+                    G::pick(expand, rows),
                     &experts_dims,
                     routed_expand::WorkflowArgs {
                         normalized: (&normalized).into(),
@@ -632,7 +665,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                     match &mut streamed {
                         None => {
                             let routed = graph.enqueue(
-                                route,
+                                G::pick(route, rows),
                                 &[
                                     ("M", rows.clone()),
                                     ("H", shape.hidden.clone()),
@@ -663,12 +696,6 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                         Some(layer) => {
                             let bank = layer.numbers();
                             let mut ports = layer.decode_ports(graph)?;
-                            let mut hints = layer.hints(
-                                graph,
-                                weights,
-                                [norm, router],
-                                ports.policy.tensor(),
-                            )?;
                             let mut routing = layer.part(graph, BankPart::Routing)?;
                             let tier = layer.route_tier(graph, &ports, constants)?;
                             let route_dims = [
@@ -681,18 +708,15 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                                 norm_extent.clone(),
                                 ("ES", expert_scale.extent.clone()),
                                 ("FW", bank.file_width.clone()),
-                                ("AHEAD", Dim::from(hints.ahead)),
                                 ("FLIGHT", bank.flight.clone()),
-                                ("RING", bank.ring_words.clone()),
                                 ("P", bank.choices.clone()),
-                                ("EN", bank.next_experts.clone()),
                                 ("GM", bank.map_words.clone()),
                                 ("TM", tier.experts.clone()),
                             ];
-                            let BankRoute::Fused(route) = layer.route() else {
+                            let BankRoute::Fused { activation, route, hints: hint_kernels } = layer.route() else {
                                 return Err("a fused layer's bank holds another form's route".into());
                             };
-                            let route = route[hints.ahead as usize].ok_or("a streamed layer's lead was not prepared with its binding")?;
+                            let route = G::pick(route, rows);
                             // The step's sources, which the route writes and its
                             // later entries read.
                             let mut locals = RouteLocals { sources: graph.local_for(route, "sources", &route_dims)? };
@@ -718,15 +742,45 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                                     step: ports.step.tensor().into(),
                                     file: ports.file.tensor_mut().into(),
                                     sources: locals.sources.tensor_mut().into(),
-                                    next_norm: (&hints.weights[0][0]).into(),
-                                    next_router: (&hints.weights[0][1]).into(),
-                                    after_norm: (&hints.weights[1][0]).into(),
-                                    after_router: (&hints.weights[1][1]).into(),
-                                    next_policy: (&hints.policy).into(),
-                                    rings: hints.rings.tensor_mut().into(),
                                     routing: routing.tensor_mut().into(),
                                 },
                             )?;
+                            if let Some(mut hints) = layer.hints(
+                                graph,
+                                weights,
+                                [norm, router],
+                                ports.policy.tensor(),
+                            )? {
+                                let hint = hint_kernels[hints.ahead as usize - 1]
+                                    .ok_or("a streamed layer's lead was not prepared with its binding")?;
+                                let empty = GraphConstant::empty_of(graph, activation, &[Dim::from(0u64), shape.selected.clone()], constants)?;
+                                let hint_dims = [
+                                    ("M", rows.clone()),
+                                    ("H", shape.hidden.clone()),
+                                    parts.clone(),
+                                    norm_extent.clone(),
+                                    ("K", shape.selected.clone()),
+                                    ("AHEAD", Dim::from(hints.ahead)),
+                                    ("RING", bank.ring_words.clone()),
+                                    ("EN", bank.next_experts.clone()),
+                                ];
+                                graph.enqueue(
+                                    hint,
+                                    &hint_dims,
+                                    routed_hint_route::WorkflowArgs {
+                                        residual: input.rows.into(),
+                                        activation: (&empty).into(),
+                                        next_norm: (&hints.weights[0][0]).into(),
+                                        next_router: (&hints.weights[0][1]).into(),
+                                        after_norm: (&hints.weights[1][0]).into(),
+                                        after_router: (&hints.weights[1][1]).into(),
+                                        eps: epsilon.into(),
+                                        step: ports.step.tensor().into(),
+                                        next_policy: (&hints.policy).into(),
+                                        rings: hints.rings.tensor_mut().into(),
+                                    },
+                                )?;
+                            }
                             let decode_shape = DecodeShape { rows };
                             let mut sources = locals.sources.tensor().clone();
                             layer.land(
@@ -758,7 +812,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                     };
                 let expert_product = graph
                     .enqueue(
-                        gate_up,
+                        G::pick(gate_up, rows),
                         &[
                             [
                                 ("M", rows.clone()),
@@ -794,6 +848,11 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
             }
         };
         let inject = join.inject(graph, rows, constants)?;
+        // The norm the operand is formed under, or none (`NO` 0).
+        let (operand_norm, operand_epsilon) = match &operand {
+            Some(operand) => (operand.norm.clone(), operand.epsilon),
+            None => (GraphConstant::empty(graph, handle.operand_norm, constants)?, 0.0),
+        };
         let mut dimensions = output_dims;
         dimensions[2] = ("E", experts);
         [dimensions[8], dimensions[9]] = reads.dimensions();
@@ -809,6 +868,8 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
             expert_down: down_records.tensor().into(),
             tier_down: (&reads.tier.down).into(),
             shared_down: (&shared_down).into(),
+            operand_norm: (&operand_norm).into(),
+            operand_epsilon: operand_epsilon.into(),
         };
         // A layer with a site combines, while its group is not whole
         // (`policy[POLICY_WHOLE]` clear), with the CPU's answer: its
@@ -826,14 +887,18 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
             _ => None,
         };
         let output = match combine {
+            // A sited join forms no operand.
+            Some(_) if operand.is_some() => {
+                return Err("a routed layer with a site forms no operand for another graph".into());
+            }
             Some((layer, mut site, (BankCombineEntry::Fused { project, sited }, site_dimensions), ports)) => {
                 let (policy, whole) = (ports.policy, magnitude_kernels::constants::POLICY_WHOLE);
                 let resident = graph
-                    .enqueue_under(handle.output, &dimensions, resident_args(), &policy, whole, LaunchEncoding::WhileSet)?
+                    .enqueue_under(G::pick(handle.output, rows), &dimensions, resident_args(), &policy, whole, LaunchEncoding::WhileSet)?
                     .value;
                 let published = graph
                     .enqueue_under(
-                        project,
+                        G::pick(project, rows),
                         &dimensions,
                         routed_output_project::WorkflowArgs {
                             expert_product: (&expert_product).into(),
@@ -876,8 +941,11 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
             Some((_, _, (BankCombineEntry::General { .. }, _), _)) => {
                 return Err("a fused layer's bank holds another form's combine".into());
             }
-            None => graph.enqueue(handle.output, &dimensions, resident_args())?.value,
+            None => graph.enqueue(G::pick(handle.output, rows), &dimensions, resident_args())?.value,
         };
+        if let Some(operand) = &operand {
+            graph.carry_out(&output, operand.carry, operand.forms)?;
+        }
         return Ok((output, sequence));
     }
 
@@ -979,7 +1047,7 @@ fn shared_weights<G: GraphDraft>(
 /// (`grouped`), with `experts`' scales.
 fn expand<'a, G: GraphDraft + 'a>(
     graph: &mut G,
-    entry: G::Binding<'a, routed_experts::Entry>,
+    entry: G::Ranged<'a, routed_experts::Entry>,
     experts: &ExpertWeights,
     grouped: Grouped<'_, [WorkflowTensor; 3]>,
     shape: &ExpertShape,
@@ -1005,7 +1073,7 @@ fn expand<'a, G: GraphDraft + 'a>(
     ];
     Ok(graph
         .enqueue(
-            entry,
+            G::pick(entry, rows),
             &dimensions,
             routed_experts::WorkflowArgs {
                 first: first.into(),
@@ -1063,7 +1131,7 @@ fn combine<'a, G: GraphDraft + 'a>(
     let inject = join.inject(graph, rows, constants)?;
     Ok(graph
         .enqueue(
-            handle.combine,
+            G::pick(handle.combine, rows),
             &dimensions,
             routed_combine::WorkflowArgs {
                 residual: residual.into(),
@@ -1095,7 +1163,7 @@ mod tests {
         let (m, h, e, k, f, s) = (1, 256, 8, 2, 16_384, 256);
         let weight = Element::stored("q4k", Layout::Rows16).unwrap();
         let activation = Element::bf16();
-        let elements = [("EDW", weight), ("SDW", weight), ("A", activation)];
+        let elements = [("EDW", weight), ("SDW", weight), ("A", activation), ("NW", Element::f32())];
         let mut graph = NativeGraphMetadata::new(BackendName::Metal);
         let mut port =
             |element, extents: &[u64]| graph.port(element, extents).unwrap().tensor().clone();
@@ -1110,6 +1178,7 @@ mod tests {
         let expert_down = port(weight, &[e, h, f]);
         let shared_down = port(weight, &[h, s]);
         let tier_down = port(weight, &[0, h, f]);
+        let operand_norm = port(Element::f32(), &[0]);
         let Err(error) = GraphDraft::enqueue::<routed_output::Entry>(
             &mut graph,
             &elements,
@@ -1124,6 +1193,7 @@ mod tests {
                 ("IN", 0),
                 ("XS", 0),
                 ("TR", 0),
+                ("NO", 0),
             ],
             routed_output::WorkflowArgs {
                 residual: (&residual).into(),
@@ -1137,6 +1207,8 @@ mod tests {
                 expert_down: (&expert_down).into(),
                 tier_down: (&tier_down).into(),
                 shared_down: (&shared_down).into(),
+                operand_norm: (&operand_norm).into(),
+                operand_epsilon: 0.0f32.into(),
             },
         ) else {
             panic!("an out-of-domain call enqueued");

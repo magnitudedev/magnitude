@@ -1312,6 +1312,7 @@ fn routed_route(ctx: &Ctx) -> Vec<Variant> {
         ("f16", f16(), f32e(), f16(), false),
     ]
     .into_iter()
+    .filter(|(_, a, ..)| ctx.device.backend() == BackendName::Cpu || *a != f32e())
     .map(|(label, a, nw, rw, every)| {
         let mut rng = Rng::keyed(13);
         let router = ctx.dense(
@@ -1364,7 +1365,7 @@ fn routed_route(ctx: &Ctx) -> Vec<Variant> {
             .collect();
         Variant {
             label: label.into(),
-            elements: vec![("NW", nw), ("RW", rw), ("A", a)],
+            elements: vec![("NW", nw), ("RW", rw), ("SRW", f32e()), ("A", a)],
             statics: vec![
                 ("H", ROUTED_HIDDEN as u64),
                 ("E", ROUTED_EXPERTS as u64),

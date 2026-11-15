@@ -4,13 +4,19 @@
 // head's key and value of every row it reads (and its own, whose part 0
 // appends at its destination); a row's keys (spans in order, then its fresh
 // span) split into consecutive partitions of max(PARTITION_KEYS, ceil(keys /
-// PARTS)) keys, each absorbed for the kv head's G query heads into a partial
-// state. The last of a (kv head, row)'s items to arrive (`lib/core/arrive`)
+// parts)) keys, parts the grid's second extent (sized by the pool), each
+// absorbed for the kv head's G query heads into a partial state. The last of a (kv head, row)'s items to arrive (`lib/core/arrive`)
 // merges each of its G query heads' partitions in order and applies its
-// output gates.
+// output gates, and emits those heads toward the row's operand
+// (`projection::emit`, whose row's last arrival stages the stored row and
+// forms its Q8 blocks and NVFP4 operand rows) for the output projection
+// (`attention_output`), in the forms its graph pairs
+// (`emits_result_0_rows()`, `emits_result_0_quantized()`,
+// `nvfp4_result_0_rows()`).
 
 use lib::attention::attention::{self, Form, Layout, Online, BLOCK};
 use lib::core::{arrive, spans};
+use lib::projection::projection;
 use seismic::cpu::slab::SlabTensor;
 
 #[inline(always)]
@@ -38,7 +44,7 @@ fn attention_decode_attend<L: Isa, E: Elements>(l: L, cx: &Context<'_, E>, group
     let (kv_head, part, row) = (group[0] as usize, group[1] as usize, group[2] as usize);
     let form = form(cx);
     let (g, w, kv) = (form.heads.g, form.heads.w, form.heads.kv);
-    let (m, r, parts) = (cx.dim_m() as usize, cx.dim_r() as usize, cx.param_parts() as usize);
+    let (m, r, parts) = (cx.dim_m() as usize, cx.dim_r() as usize, cx.groups()[1] as usize);
     let (visible, fresh) = (cx.arg_visible(), cx.arg_fresh());
     let spans = (0..r)
         .map(move |span| spans::span(visible.get([row, span, 0]), visible.get([row, span, 1])))
@@ -152,7 +158,7 @@ fn attention_decode_attend<L: Isa, E: Elements>(l: L, cx: &Context<'_, E>, group
         );
     }
     // SAFETY: one counter a (row, kv head) of the launch's `arrivals` scratch,
-    // each of the group's PARTS items arriving once, after its partial state.
+    // each of the group's partition items arriving once, after its partial state.
     let last = unsafe { arrive::last(cx.scratch_arrivals().pointer::<u32>(4 * (row * kv + kv_head)), parts as u32) };
     if last {
         merge(cx, form, kv_head, row, merged);
@@ -164,7 +170,7 @@ fn attention_decode_attend<L: Isa, E: Elements>(l: L, cx: &Context<'_, E>, group
 #[inline(always)]
 fn merge<E: Elements>(cx: &Context<'_, E>, form: Form, kv_head: usize, row: usize, work: &mut [f32]) {
     let (g, w, kv) = (form.heads.g, form.heads.w, form.heads.kv);
-    let (m, parts) = (cx.dim_m() as usize, cx.param_parts() as usize);
+    let (m, parts) = (cx.dim_m() as usize, cx.groups()[1] as usize);
     // SAFETY: every item of the group stored its partial state before it arrived.
     let (partials, statistics) = unsafe {
         (
@@ -209,5 +215,23 @@ fn merge<E: Elements>(cx: &Context<'_, E>, form: Form, kv_head: usize, row: usiz
         if let Some((cosines, sines)) = turned {
             attention::output_rotary::<E::A>(&mut out, form.layout, cosines, sines);
         }
+    }
+    // The kv head's G heads of the row, stored, toward the row's operand.
+    if cx.emits_result_0_rows() {
+        let width = kv * g * w;
+        // SAFETY: the emitted operand's buffers; this merge stored the kv
+        // head's heads of the row, which arrive once.
+        unsafe {
+            projection::emit(
+                cx.scratch_result_0_rows(),
+                cx.emits_result_0_quantized().then(|| cx.scratch_result_0_quantized()),
+                cx.nvfp4_result_0_rows(),
+                cx.scratch_result_0_arrivals(),
+                width,
+                row,
+                g * w,
+                |out| projection::stage_heads::<E::A>(&result, row, out),
+            )
+        };
     }
 }

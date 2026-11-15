@@ -1,6 +1,6 @@
 // attention_output: the output projection of the Q gated attention
 // heads plus the F32 residual. The Vulkan form of
-// `metal/attention_output.metal` over `lib/projection/projection.glsl`; the
+// `metal/attention_output.metal` on the `dense` projection (`lib/projection/operator.glsl`); the
 // GEMM class may split K.
 #define KERNEL_W0 SEISMIC_OUTPUT_WEIGHT
 #include "lib/core/activation.glsl"
@@ -26,19 +26,28 @@
 
 #define OUTPUT_K uint(SEISMIC_DIM_Q * SEISMIC_DIM_W)
 
+#define PROJECTION_SINGLE
+#define PROJECTION_M uint(SEISMIC_DIM_M)
+#define PROJECTION_N uint(SEISMIC_DIM_D)
+#define PROJECTION_K OUTPUT_K
+#define PROJECTION_G 1
+#define PROJECTION_NORM PROJECTION_NORM_NONE
+#define PROJECTION_STAGED SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)
+#define PROJECTION_SPLIT SEISMIC_TUNE_SPLIT
+#define PROJECTION_PARTIALS SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS)
+
 // The gated heads [M, Q, W] are read as rows of Q * W (contiguous heads), as
 // the output weight's operands.
-projection_prologue attention_output_input() {
+projection_prologue projected_input(uint g) {
     return projection_operands(projection_plain(OUTPUT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_GATED),
         SEISMIC_GATED_STRIDE_0, SEISMIC_GATED_STRIDE_2, OUTPUT_K, 0ul), OUTPUT_OPERANDS);
 }
 
 // The rows the GEMM reads: the gated rows, or the operands the stage launch
 // formed.
-projection_prologue attention_output_rows() {
+projection_prologue projected_rows(uint g) {
 #if defined(SEISMIC_OUTPUT_WEIGHT_OPERANDS_NVFP4)
-    return projection_plain(OUTPUT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED), uint64_t(OUTPUT_K), 1ul,
-        OUTPUT_K, 0ul);
+    return projection_plain(OUTPUT_ACT, PROJECTION_STAGED, uint64_t(OUTPUT_K), 1ul, OUTPUT_K, 0ul);
 #else
     return projection_plain(OUTPUT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_GATED), SEISMIC_GATED_STRIDE_0,
         SEISMIC_GATED_STRIDE_2, OUTPUT_K, 0ul);
@@ -46,7 +55,7 @@ projection_prologue attention_output_rows() {
 }
 
 // The residual join after the weight's second-level scale, where it has one.
-projection_epilogue attention_output_output() {
+projection_epilogue projected_output(uint g) {
     return projection_scaled(projection_output(OUTPUT_ACT, SEISMIC_RESULT_0_OUT,
         SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN),
         SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1, 0ul, SEISMIC_PTR(SEISMIC_BUFFER_INJECT),
@@ -54,46 +63,17 @@ projection_epilogue attention_output_output() {
         projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_OUTPUT_SCALE), SEISMIC_DIM_OS, 0ul, 0ul), 1.0);
 }
 
-projection_weights attention_output_weight() {
+projection_weights projected_weight(uint g) {
     return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_OUTPUT_WEIGHT), PACKETS_W0_ROWS, OUTPUT_K, 0ul, 1ul, 0u);
 }
 
-// The GEMV with the activation-row bound `maxm` (`projection_gemv`: one bound
-// per pipeline, so one entry per bound).
-void attention_output_gemv_bounded(const uint maxm) {
-    const projection_weights w = attention_output_weight();
-    projection_gemv(PACKETS_W0, PACKETS_W0, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, maxm, PROJECTION_NORM_NONE,
-        attention_output_input(), attention_output_output(), w, w, uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_D),
-        OUTPUT_K, gl_WorkGroupID.x);
-}
+#include "lib/projection/operator.glsl"
 
-void attention_output_gemv1() { attention_output_gemv_bounded(1u); }
-void attention_output_gemv2() { attention_output_gemv_bounded(2u); }
-void attention_output_gemv4() { attention_output_gemv_bounded(4u); }
-void attention_output_gemv8() { attention_output_gemv_bounded(8u); }
-
-// The gated rows as NVFP4 operands into `staged`, one row a workgroup.
-void attention_output_stage() {
-    projection_stage(attention_output_input(), gl_WorkGroupID.x, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED),
-        OUTPUT_K);
-}
-
-void attention_output_gemm() {
-    const uint m = uint(SEISMIC_DIM_M), n = uint(SEISMIC_DIM_D);
-#if SEISMIC_TUNE_SPLIT == 1
-    projection_gemm(PACKETS_W0, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N,
-        attention_output_rows(),
-        attention_output_output(), attention_output_weight(), m, n, OUTPUT_K, gl_WorkGroupID.y, gl_WorkGroupID.x,
-        0xffffffffu);
-#else
-    projection_gemm_part(PACKETS_W0, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N,
-        attention_output_rows(),
-        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS), attention_output_weight(), m, n, OUTPUT_K, SEISMIC_TUNE_SPLIT,
-        gl_WorkGroupID.z, gl_WorkGroupID.y, gl_WorkGroupID.x);
-#endif
-}
-
-void attention_output_finalize() {
-    projection_gemm_finalize(attention_output_output(), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS),
-        uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_D), SEISMIC_TUNE_SPLIT, gl_GlobalInvocationID.x);
-}
+// The `dense` projection's launches (`lib/projection/operator.glsl`).
+void attention_output_stage() { projection_dense_stage(); }
+void attention_output_gemv1() { projection_single_gemv(1u); }
+void attention_output_gemv2() { projection_single_gemv(2u); }
+void attention_output_gemv4() { projection_single_gemv(4u); }
+void attention_output_gemv8() { projection_single_gemv(8u); }
+void attention_output_gemm() { projection_single_gemm(); }
+void attention_output_finalize() { projection_single_finalize(); }

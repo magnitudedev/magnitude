@@ -1,8 +1,8 @@
 // attention_project: RMS prologue over the F32 residual, then one
 // segmented projection query | key | value into three results (a segment of
 // zero rows has no tiles). The
-// Vulkan form of `metal/attention_project.metal` over
-// `lib/projection/projection.glsl`.
+// Vulkan form of `metal/attention_project.metal` on the `dense` projection
+// (`lib/projection/operator.glsl`).
 #define KERNEL_W0 SEISMIC_QUERY_WEIGHT
 #define KERNEL_W1 SEISMIC_GATE_WEIGHT
 #define KERNEL_W2 SEISMIC_KEY_WEIGHT
@@ -46,7 +46,7 @@
 #define PROJECT_KEY_ROWS uint(SEISMIC_DIM_K)
 #define PROJECT_VALUE_ROWS uint(SEISMIC_DIM_V)
 
-projection_prologue attention_project_input() {
+projection_prologue projected_input(uint g) {
     return projection_operands(projection_input(PROJECT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN),
         SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_INPUT_NORM),
         SEISMIC_INPUT_NORM_STRIDE_0, PROJECT_NORM, element_word_f32(SEISMIC_PARAM_EPSILON), PROJECT_K, 0ul,
@@ -89,113 +89,36 @@ projection_epilogue attention_project_value_out() {
         projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_VALUE_SCALE), SEISMIC_DIM_VS, 0ul, 0ul), 1.0);
 }
 
-void attention_project_zero_tile(projection_epilogue out_, uint rows, uint columns,
-    uint row_start, uint row_count, uint column_start, uint column_count) {
-    for (uint item = gl_LocalInvocationIndex; item < row_count * column_count;
-        item += gl_WorkGroupSize.x) {
-        const uint row = row_start + item / column_count;
-        const uint column = column_start + item % column_count;
-        if (row < rows && column < columns)
-            projection_put(out_, row, column, 0.0);
-    }
+#define PROJECTION_M uint(SEISMIC_DIM_M)
+#define PROJECTION_K PROJECT_K
+#define PROJECTION_NORM PROJECTION_NORM_SHARED
+#define PROJECTION_STAGED SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)
+#define PROJECTION_N0 PROJECT_QUERY_ROWS
+#define PROJECTION_N1 PROJECT_GATE_ROWS
+#define PROJECTION_N2 PROJECT_KEY_ROWS
+#define PROJECTION_N3 PROJECT_VALUE_ROWS
+#define PROJECTION_WEIGHT0 attention_project_query()
+#define PROJECTION_WEIGHT1 attention_project_gate()
+#define PROJECTION_WEIGHT2 attention_project_key()
+#define PROJECTION_WEIGHT3 attention_project_value()
+#define PROJECTION_OUTPUT0 attention_project_query_out()
+#define PROJECTION_OUTPUT1 attention_project_gate_out()
+#define PROJECTION_OUTPUT2 attention_project_key_out()
+#define PROJECTION_OUTPUT3 attention_project_value_out()
+// Mode 1 has no query or gate projection.
+#define PROJECTION_ZEROED(s) (SEISMIC_PARAM_PROJECT_MODE != 0 && s < 2)
+
+// The normalized rows the stage launch formed.
+projection_prologue projected_rows(uint g) {
+    return projection_plain(PROJECT_ACT, PROJECTION_STAGED, uint64_t(PROJECT_K), 1ul, PROJECT_K, 0ul);
 }
 
-// The GEMV with the activation-row bound `maxm` (`projection_gemv`: one bound
-// per pipeline, so one entry per bound).
-void attention_project_gemv_bounded(const uint maxm) {
-    const uint per = projection_gemv_rows(SEISMIC_TUNE_SIMDGROUPS, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES);
-    const uint rows = uint(SEISMIC_DIM_M), tile = gl_WorkGroupID.x;
-    const uint t0 = (PROJECT_QUERY_ROWS + per - 1u) / per, t1 = (PROJECT_GATE_ROWS + per - 1u) / per;
-    const uint t2 = (PROJECT_KEY_ROWS + per - 1u) / per;
-    if (SEISMIC_PARAM_PROJECT_MODE != 0 && tile < t0 + t1) {
-        if (tile < t0)
-            attention_project_zero_tile(attention_project_query_out(), rows, PROJECT_QUERY_ROWS,
-                0u, rows, tile * per, per);
-        else
-            attention_project_zero_tile(attention_project_gate_out(), rows, PROJECT_GATE_ROWS,
-                0u, rows, (tile - t0) * per, per);
-        return;
-    }
-    const projection_prologue x = attention_project_input();
-    if (tile < t0) {
-        const projection_weights w = attention_project_query();
-        projection_gemv(PACKETS_W0, PACKETS_W0, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, maxm,
-            PROJECTION_NORM_SHARED, x, attention_project_query_out(), w, w, rows, PROJECT_QUERY_ROWS, PROJECT_K, tile);
-    } else if (tile < t0 + t1) {
-        const projection_weights w = attention_project_gate();
-        projection_gemv(PACKETS_W1, PACKETS_W1, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, maxm,
-            PROJECTION_NORM_SHARED, x, attention_project_gate_out(), w, w, rows, PROJECT_GATE_ROWS, PROJECT_K,
-            tile - t0);
-    } else if (tile < t0 + t1 + t2) {
-        const projection_weights w = attention_project_key();
-        projection_gemv(PACKETS_W2, PACKETS_W2, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, maxm,
-            PROJECTION_NORM_SHARED, x, attention_project_key_out(), w, w, rows, PROJECT_KEY_ROWS, PROJECT_K,
-            tile - t0 - t1);
-    } else {
-        const projection_weights w = attention_project_value();
-        projection_gemv(PACKETS_W3, PACKETS_W3, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, maxm,
-            PROJECTION_NORM_SHARED, x, attention_project_value_out(), w, w, rows, PROJECT_VALUE_ROWS, PROJECT_K,
-            tile - t0 - t1 - t2);
-    }
-}
+#include "lib/projection/operator.glsl"
 
-void attention_project_gemv1() { attention_project_gemv_bounded(1u); }
-void attention_project_gemv2() { attention_project_gemv_bounded(2u); }
-void attention_project_gemv4() { attention_project_gemv_bounded(4u); }
-void attention_project_gemv8() { attention_project_gemv_bounded(8u); }
-
-void attention_project_stage() {
-    projection_stage(attention_project_input(), gl_WorkGroupID.x,
-        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_NORMALIZED), PROJECT_K);
-}
-
-// Workgroup column n belongs to the segment whose tiles hold it; the GEMM
-// body runs once with that segment's kind, weights and result.
-void attention_project_gemm() {
-    const uint tn = SEISMIC_TUNE_TILE_N;
-    const projection_prologue x = projection_plain(PROJECT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_NORMALIZED),
-        uint64_t(PROJECT_K), 1ul, PROJECT_K, 0ul);
-    const uint m = uint(SEISMIC_DIM_M), n = gl_WorkGroupID.x;
-    const uint t0 = (PROJECT_QUERY_ROWS + tn - 1u) / tn, t1 = (PROJECT_GATE_ROWS + tn - 1u) / tn;
-    const uint t2 = (PROJECT_KEY_ROWS + tn - 1u) / tn;
-    if (SEISMIC_PARAM_PROJECT_MODE != 0 && n < t0 + t1) {
-        if (n < t0)
-            attention_project_zero_tile(attention_project_query_out(), m, PROJECT_QUERY_ROWS,
-                gl_WorkGroupID.y * SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_M, n * tn, tn);
-        else
-            attention_project_zero_tile(attention_project_gate_out(), m, PROJECT_GATE_ROWS,
-                gl_WorkGroupID.y * SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_M, (n - t0) * tn, tn);
-        return;
-    }
-    int kind;
-    projection_weights w;
-    projection_epilogue out_;
-    uint rows, tile;
-    if (n < t0) {
-        kind = PACKETS_W0;
-        w = attention_project_query();
-        out_ = attention_project_query_out();
-        rows = PROJECT_QUERY_ROWS;
-        tile = n;
-    } else if (n < t0 + t1) {
-        kind = PACKETS_W1;
-        w = attention_project_gate();
-        out_ = attention_project_gate_out();
-        rows = PROJECT_GATE_ROWS;
-        tile = n - t0;
-    } else if (n < t0 + t1 + t2) {
-        kind = PACKETS_W2;
-        w = attention_project_key();
-        out_ = attention_project_key_out();
-        rows = PROJECT_KEY_ROWS;
-        tile = n - t0 - t1;
-    } else {
-        kind = PACKETS_W3;
-        w = attention_project_value();
-        out_ = attention_project_value_out();
-        rows = PROJECT_VALUE_ROWS;
-        tile = n - t0 - t1 - t2;
-    }
-    projection_gemm(kind, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N, x, out_, w,
-        m, rows, PROJECT_K, gl_WorkGroupID.y, tile, 0xffffffffu);
-}
+// The `dense` projection's launches (`lib/projection/operator.glsl`).
+void attention_project_stage() { projection_dense_stage(); }
+void attention_project_gemv1() { projection_segmented_gemv(1u); }
+void attention_project_gemv2() { projection_segmented_gemv(2u); }
+void attention_project_gemv4() { projection_segmented_gemv(4u); }
+void attention_project_gemv8() { projection_segmented_gemv(8u); }
+void attention_project_gemm() { projection_segmented_gemm(); }

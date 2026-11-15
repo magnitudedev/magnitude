@@ -363,8 +363,8 @@ impl<'a> QualificationView<'a> {
             require_zero_result(&result, "project_rows", label)?;
             Ok::<_, CatalogFailure>(result)
         };
-        let key = project(&kernels.key, WeightKind::NGramKey, binding.key, s * h)?;
-        let value = project(&kernels.value, WeightKind::NGramValue, binding.value, h)?;
+        let key = project(kernels.key.first(), WeightKind::NGramKey, binding.key, s * h)?;
+        let value = project(kernels.value.first(), WeightKind::NGramValue, binding.value, h)?;
 
         let streams_values = vec![1.0_f32; (s * h) as usize];
         let streams = semantic_f32(device, &[1, s * h], &streams_values, entry, label)?;
@@ -481,6 +481,7 @@ fn qualify_stream_binding(
         };
         let mixed = kernels
             .down
+            .first()
             .call(stream_mix_down::Args {
                 hidden: &hidden,
                 norm: &norm,
@@ -500,6 +501,7 @@ fn qualify_stream_binding(
         let up = semantic_zeros(device, site.up.up, &[s * h, r], entry, &label)?;
         let partials = kernels
             .up
+            .first()
             .call(stream_mix_up::Args {
                 low: &mixed.r0,
                 up_weight: &up,

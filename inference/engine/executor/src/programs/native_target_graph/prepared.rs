@@ -1,6 +1,6 @@
 use super::{
     GroupExtents, GroupRows,
-    block::{BlockGraphInputs, BlockGraphs, SealedBlockGraph},
+    block::{BlockCarries, BlockGraphInputs, BlockGraphs, PreparedTargetBlockGraph, SealedBlockGraph, certify_carry},
     bound::{
         BlockBindings, BoundPerLayerEntry, BoundTargetGraphs, GroupBuffers, PassBuffers, TokenRows,
         bind_block_graphs, zeros,
@@ -8,7 +8,7 @@ use super::{
     certify::{TargetFamilyCertificate, certify_target_family},
     classes::{
         BlockGraphEnumeration, BlockListings, BlockOutputScales, BlockServed, Holder, LaunchControlLayout,
-        Passes, StagedClass, block_sealed_stages, block_stages, chained_once_runs, class_topology, decode_launch, enumerate_block_graphs, LaunchRuns, once_class,
+        Passes, StagedClass, block_sealed_stages, block_stages, carried_forms, chained_once_runs, class_topology, decode_launch, enumerate_block_graphs, LaunchRuns, once_class,
         slot_selection,
     },
     entry::{
@@ -18,7 +18,7 @@ use super::{
     heap::{GraphCounts, PlannedSealedGraphs, SealedGraphsHeap, SealedHeap, block_graph_storage},
 };
 use crate::{
-    ModelLoadPlan, ResidentTarget, ResourceLimits, StateResourcePlan, TargetProgramPlan,
+    MixerProgramSlot, ModelLoadPlan, ResidentTarget, ResourceLimits, StateResourcePlan, TargetProgramPlan,
     native::AttestedTarget,
     operators,
     operators::{
@@ -84,6 +84,10 @@ pub struct PreparedTargetGraphs {
     pub(super) served: Vec<BlockServed>,
     /// The passes a group runs (`group_pass_rows`).
     pub(super) passes: Passes,
+    /// An operand carry of the load's decode graphs (`block_carries`), of
+    /// the one shape every carry takes: what a run's carry tensors are
+    /// allocated as (`OperandCarry::allocate`); none where no block carries.
+    operand: Option<seismic::OperandCarry>,
     seal: SealReport,
 }
 
@@ -159,13 +163,26 @@ pub(super) struct BlockGraphShape {
     /// none for a block that streams none or the first streamed one. A
     /// graph shared by blocks binds each one's predictor at the same offset.
     hinted_by: Option<u32>,
+    /// The operand carries its decode graphs declare (`block_carries`):
+    /// the first block's reads none, the last block's writes none, so
+    /// neither shares an interior block's plans. Each names its reader's
+    /// mixer binding, whose kernels decide the forms a sealed graph
+    /// carries it in (`CarrySide`): blocks share plans only over equal
+    /// readers, so over equal forms, whatever a load's tuning chose.
+    carries: BlockCarries<MixerProgramSlot>,
 }
 
 impl BlockGraphShape {
     /// The shape without its drafter's writes: no taps, no exported
-    /// residual (`FamilyOutline::undrafted`).
+    /// residual (`FamilyOutline::untapped`), its carries the target's own,
+    /// as a tapped block's untapped graphs run in its load.
     pub(super) fn undrafted(&self) -> Self {
         Self { tapped: TapPositions::default(), residual: false, ..self.clone() }
+    }
+
+    /// The shape with the operand carries `carries` (`block_carries`).
+    pub(super) fn carrying(self, carries: BlockCarries<MixerProgramSlot>) -> Self {
+        Self { carries, ..self }
     }
 }
 
@@ -211,7 +228,7 @@ fn pooled_sources(geometry: &Decoder) -> Result<Vec<Option<PooledSource>>, Strin
 /// taps. A row's output from such a block reaches nothing but later blocks
 /// of the run and the readout, so a step need run the run only over the
 /// rows its readout consumes. The block count when the last block publishes state.
-fn stateless_tail(state: &StateResourcePlan, keeps: &[BlockKeeps], taps: &[BlockTaps]) -> usize {
+pub(super) fn stateless_tail(state: &StateResourcePlan, keeps: &[BlockKeeps], taps: &[BlockTaps]) -> usize {
     trailing_run(keeps.len(), |index| {
         let block = index as u32;
         let layer = LayerRef::Target(block);
@@ -388,6 +405,7 @@ pub(super) fn block_graph_shapes(
     geometry: &Decoder,
     state: &StateResourcePlan,
     tapped: &[BlockTaps],
+    carries: &[BlockCarries<MixerProgramSlot>],
     residual: Option<usize>,
 ) -> Result<Vec<BlockGraphShape>, String> {
     let components = &state.target_state().recurrent_components;
@@ -478,6 +496,7 @@ pub(super) fn block_graph_shapes(
                 predicts: predicted_layers(load, index)?,
                 banked: banked_layer(load, index)?,
                 hinted_by: hinted_by(load, index)?,
+                carries: carries[index],
             })
         })
         .collect()
@@ -547,12 +566,20 @@ impl PreparedTargetGraphs {
             ));
         }
         let certificate =
-            certify_target_family::<seismic::NativeGraphLayout>(device.backend(), load, geometry, state, plan, limits, pass)
-                .map_err(|error| error.to_string())?;
+            certify_target_family::<seismic::NativeGraphLayout>(
+                device.backend(),
+                load,
+                geometry,
+                state,
+                plan,
+                limits,
+                pass,
+            )
+            .map_err(|error| error.to_string())?;
         let TargetFamilyCertificate { outline, served, passes, group: certificate_group, .. } = certificate;
         let largest_rows = outline.largest_rows;
         let tap_width = outline.tap_width;
-        let stateless_tail = stateless_tail(state, &outline.keeps, &outline.tapped);
+        let stateless_tail = outline.stateless_tail;
         // Output scales are values of the sealed graph.
         let scales = handles
             .blocks
@@ -679,8 +706,9 @@ impl PreparedTargetGraphs {
                 BlockGraphInputs {
                     output_scales: handles.blocks[index].output_scales,
                     residual: !untapped && outline.exports_residual(index),
-                    ..BlockGraphInputs::of_class(load, geometry, state, index, staged, capacity)
+                    ..BlockGraphInputs::of_class(load, geometry, state, index, staged, capacity, outline.carries[index])
                 },
+                |reader| carried_forms(handles, plan, index + reader as usize),
                 &certified_of(index, staged, untapped)?.layout,
                 &constants,
             )
@@ -785,6 +813,35 @@ impl PreparedTargetGraphs {
             let graph = graphs[at].1.clone();
             blocks_by_class[index].untapped.push((class, graph));
         }
+        // Every decode boundary's graphs agree on its carry, in each form a
+        // step runs either side in (tapped or untapped, whole or
+        // resident): none into the first block, none out of the last.
+        let decode_runs = |graphs: &BlockGraphs| {
+            graphs
+                .runs
+                .iter()
+                .chain(&graphs.untapped)
+                .filter(|((class, stage), _)| class.0 == 1 && matches!(stage, Stage::Run(run) if run.place() == RunStage::Whole))
+                .map(|(_, graph)| Arc::clone(graph))
+                .collect::<Vec<_>>()
+        };
+        let decodes = blocks_by_class.iter().map(decode_runs).collect::<Vec<_>>();
+        let unpaired = |graphs: &[Arc<PreparedTargetBlockGraph>], side: fn(&PreparedTargetBlockGraph) -> bool| {
+            graphs.iter().any(|graph| side(graph))
+        };
+        if decodes.first().is_some_and(|first| unpaired(first, |graph| graph.operand_in.is_some()))
+            || decodes.last().is_some_and(|last| unpaired(last, |graph| graph.operand.is_some()))
+        {
+            return Err("an operand carried into the first block or out of the last".into());
+        }
+        for (index, pair) in decodes.windows(2).enumerate() {
+            for from in &pair[0] {
+                for to in &pair[1] {
+                    certify_carry(index, from, to)?;
+                }
+            }
+        }
+        let operand = decodes.iter().flatten().find_map(|graph| graph.operand.as_ref().map(|ports| ports.carry.clone()));
         let storage = block_graph_storage(&class_counts, sealed_counts)?;
         let held_storage = block_graph_storage(
             &blocks_by_class
@@ -945,8 +1002,16 @@ impl PreparedTargetGraphs {
             group: certificate_group,
             served,
             passes,
+            operand,
             seal,
         })
+    }
+
+    /// An operand carry of the load's decode graphs, of the shape every
+    /// carry takes, which a run's carry tensors are allocated as; none
+    /// where no block carries.
+    pub(super) fn operand_carry(&self) -> Option<&seismic::OperandCarry> {
+        self.operand.as_ref()
     }
 
     /// The stages of block `index`'s graph of a launch of `rows` rows

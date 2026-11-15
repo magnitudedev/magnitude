@@ -72,25 +72,26 @@ impl StepForm {
     }
 }
 
+/// A recurrent block's entries; each projection's by row range.
 pub(crate) struct RecurrentGraphEntries<'a, G: GraphDraft + 'a> {
     pub form: RecurrentFormEntries<'a, G>,
-    pub output: G::Binding<'a, attention_output::Entry>,
+    pub output: G::Ranged<'a, attention_output::Entry>,
 }
 
 /// The entries of a layer's [`RecurrentForm`].
 pub(crate) enum RecurrentFormEntries<'a, G: GraphDraft + 'a> {
     /// Gated DeltaNet.
     Gated {
-        project: G::Binding<'a, gated_delta_project::Entry>,
+        project: G::Ranged<'a, gated_delta_project::Entry>,
         step: RecurrentStepEntries<'a, G>,
         chunk: G::Binding<'a, gated_delta_chunk::Entry>,
     },
     /// Kimi Delta Attention: the projection, the gate's and the decay's up
     /// projections, and the state entries.
     Kimi {
-        project: G::Binding<'a, attention_project::Entry>,
-        gate_up: G::Binding<'a, project_rows::Entry>,
-        alpha_up: G::Binding<'a, project_rows::Entry>,
+        project: G::Ranged<'a, attention_project::Entry>,
+        gate_up: G::Ranged<'a, project_rows::Entry>,
+        alpha_up: G::Ranged<'a, project_rows::Entry>,
         step: G::Binding<'a, kimi_delta_step::Entry>,
         chunk: G::Binding<'a, kimi_delta_chunk::Entry>,
     },
@@ -100,7 +101,7 @@ pub(crate) enum RecurrentFormEntries<'a, G: GraphDraft + 'a> {
 pub(crate) enum RecurrentStepEntries<'a, G: GraphDraft + 'a> {
     Step(G::Binding<'a, gated_delta_step::Entry>),
     Convolved {
-        project: G::Binding<'a, gated_delta_project_convolved::Entry>,
+        project: G::Ranged<'a, gated_delta_project_convolved::Entry>,
         step: G::Binding<'a, gated_delta_step_convolved::Entry>,
     },
 }
@@ -423,7 +424,7 @@ pub(crate) fn split(
 /// A layer's projection entries and weights, by its form.
 enum Projected<'a, G: GraphDraft + 'a> {
     Gated {
-        project: G::Binding<'a, gated_delta_project::Entry>,
+        project: G::Ranged<'a, gated_delta_project::Entry>,
         step: RecurrentStepEntries<'a, G>,
         chunk: G::Binding<'a, gated_delta_chunk::Entry>,
         /// The packed projections' bounds, where `gated_delta_project` runs.
@@ -434,9 +435,9 @@ enum Projected<'a, G: GraphDraft + 'a> {
         beta: WorkflowTensor,
     },
     Kimi {
-        project: G::Binding<'a, attention_project::Entry>,
-        gate_up: G::Binding<'a, project_rows::Entry>,
-        alpha_up: G::Binding<'a, project_rows::Entry>,
+        project: G::Ranged<'a, attention_project::Entry>,
+        gate_up: G::Ranged<'a, project_rows::Entry>,
+        alpha_up: G::Ranged<'a, project_rows::Entry>,
         step: G::Binding<'a, kimi_delta_step::Entry>,
         chunk: G::Binding<'a, kimi_delta_chunk::Entry>,
         qkv: PackedWeight,
@@ -599,7 +600,7 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
                 };
                 graph
                     .enqueue(
-                        project_entry,
+                        G::pick(project_entry, &block.rows),
                         &[
                             ("M", block.rows.clone()),
                             ("H", block.hidden.clone()),
@@ -689,7 +690,7 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
                         // successor windows; the step advances from its
                         // convolved channels.
                         let projected = graph.enqueue(
-                            project,
+                            G::pick(project, &block.rows),
                             &[
                                 ("M", block.rows.clone()),
                                 ("B", block.slots.clone()),
@@ -776,7 +777,7 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
             };
             // q | k | v, the gate's and decay's down products and beta, in A.
             let projection = graph.enqueue(
-                project,
+                G::pick(project, &block.rows),
                 &[
                     ("M", block.rows.clone()),
                     ("D", block.hidden.clone()),
@@ -821,13 +822,13 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
             let alpha_up_weight =
                 packed_weight(graph, weights, scope, WeightKind::RecurrentAlphaUp, ports, constants)?;
             let expand = |graph: &mut G,
-                              entry: G::Binding<'a, project_rows::Entry>,
+                              entry: G::Ranged<'a, project_rows::Entry>,
                               source: &WorkflowTensor,
                               rank: &Dim,
                               up: &PackedWeight| {
                 graph
                     .enqueue(
-                        entry,
+                        G::pick(entry, &block.rows),
                         &[
                             ("M", block.rows.clone()),
                             ("G", Dim::from(1)),
@@ -917,7 +918,7 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
     let [streams, injected] = join.dimensions();
     let output = graph
         .enqueue(
-            kernels.output,
+            G::pick(kernels.output, &block.rows),
             &[
                 ("M", block.rows.clone()),
                 ("D", block.hidden.clone()),

@@ -1,132 +1,123 @@
-// General expert selection for M rows (the `routed_route` structure without
-// the shared-expert column):
-//   routed_select_stage (M > VERIFY_ROWS, one threadgroup per row): the row's RMS and
-//     its two normalized forms, published once: `normalized` (norm, the
-//     experts' input) and the router input (router_norm) into scratch.
-//   routed_select_gemv (M <= VERIFY_ROWS, the decode's one launch): the
-//     router logits (`lib/routed/router.h`), one simdgroup per logit column
-//     over the router input each threadgroup forms from RMS partials of its
-//     own; threadgroup 0 publishes `normalized`; the last threadgroup to
-//     arrive (`arrivals`, sync scratch) selects every row.
-//   routed_select_gemm (M > VERIFY_ROWS): the logits tiles of `lib/routed/logits.h`
-//     over the staged router input.
-//   routed_select_select (M > VERIFY_ROWS, one simdgroup per row): scores,
-//     biased ranking, single-pass top-K (`lib/routed/select.h`),
-//     normalization, scales.
-// The decode launches' bodies are `lib/routed/selection.h`'s, which
-// `routed_select_streamed` shares.
-// Every logit accumulates over the hidden axis in the same order for every
-// expert, so experts with equal router rows tie exactly.
-
+// General expert selection (`routed_select`) on the `dense` projection
+// operator, single over `router` in the CPU 8-lane reference order; `norm` and
+// `router_norm` share the row's RMS inverse.
 #define KERNEL_W0 SEISMIC_ROUTER
+#include "lib/projection/projection.h"
 #include "lib/routed/selection.h"
-#include "lib/routed/logits.h"
 
-kernel void routed_select_stage(
-    device const float *residual [[buffer(SEISMIC_BUFFER_RESIDUAL)]],
-    device const uchar *norm [[buffer(SEISMIC_BUFFER_NORM)]],
-    device const uchar *router_norm [[buffer(SEISMIC_BUFFER_ROUTER_NORM)]],
-    SEISMIC_RESULT_0_PARAM(normalized_cells),
-    device uchar *router_rows [[buffer(SEISMIC_BUFFER_SCRATCH_ROUTER_ROWS)]],
-    constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
-    uint row_index [[threadgroup_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]],
-    uint simd [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup float partials[select_simdgroups];
-    const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> normalized(normalized_cells);
-    const ulong row = ulong(row_index);
-    const float eps = as_type<float>(uint(SEISMIC_PARAM_EPSILON));
-    float squares = 0.0f;
-    for (uint source = tid; source < SEISMIC_DIM_H; source += select_threads) {
-        const float value = residual[row * SEISMIC_RESIDUAL_STRIDE_0 + source * SEISMIC_RESIDUAL_STRIDE_1];
-        squares = metal::fma(value, value, squares);
-    }
-    const float total = reduce::group_sum<select_simdgroups>(squares, partials, simd, lane);
-    const float inverse = metal::rsqrt(total / float(SEISMIC_DIM_H) + eps);
-    for (uint source = tid; source < SEISMIC_DIM_H; source += select_threads) {
-        const float value = residual[row * SEISMIC_RESIDUAL_STRIDE_0 + source * SEISMIC_RESIDUAL_STRIDE_1];
-        normalized.put(row * SEISMIC_RESULT_0_STRIDE_0 + source * SEISMIC_RESULT_0_STRIDE_1,
-            value * inverse * element::at<Norm>(norm, source * SEISMIC_NORM_STRIDE_0));
-        element::put<Act>(router_rows, row * SEISMIC_DIM_H + source,
-            Act::round(value * inverse * element::at<RouterNorm>(router_norm, source * SEISMIC_ROUTER_NORM_STRIDE_0)));
-    }
+typedef element::Act Act;
+typedef ELEMENT_OF(SEISMIC_NORM) Norm;
+typedef ELEMENT_OF(SEISMIC_ROUTER_NORM) RouterNorm;
+
+#define PROJECTION_ARGUMENTS                                                                \
+    device const float *residual [[buffer(SEISMIC_BUFFER_RESIDUAL)]],                       \
+    device const uchar *norm [[buffer(SEISMIC_BUFFER_NORM)]],                               \
+    device const uchar *router_norm [[buffer(SEISMIC_BUFFER_ROUTER_NORM)]],                 \
+    device const uchar *router [[buffer(SEISMIC_BUFFER_ROUTER)]],                           \
+    device const float *bias [[buffer(SEISMIC_BUFFER_BIAS)]],                               \
+    device const float *expert_scale [[buffer(SEISMIC_BUFFER_EXPERT_SCALE)]],               \
+    device int *routes [[buffer(SEISMIC_BUFFER_ROUTES)]],                                   \
+    SEISMIC_OUT_WEIGHTS_PARAM(weights_cells),                                               \
+    SEISMIC_RESULT_0_PARAM(normalized_cells),                                               \
+    arrive::coherent_device<float> logits [[buffer(SEISMIC_BUFFER_SCRATCH_LOGITS)]],        \
+    device uchar *staged [[buffer(SEISMIC_BUFFER_SCRATCH_STAGED)]],                         \
+    device atomic_uint *arrivals [[buffer(SEISMIC_BUFFER_SCRATCH_ARRIVALS)]],               \
+    constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
+
+#define PROJECTION_STAGE_K SEISMIC_DIM_H
+
+#define PROJECTION_OPERANDS(group)                                                          \
+    const uint m = uint(SEISMIC_DIM_M), n = uint(SEISMIC_DIM_E), k = uint(SEISMIC_DIM_H);   \
+    const float eps = as_type<float>(uint(SEISMIC_PARAM_EPSILON));                          \
+    const projection::OrderedRms<Act, RouterNorm, projection::AllRows> router_raw{          \
+        residual, SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1, router_norm,        \
+        SEISMIC_ROUTER_NORM_STRIDE_0, eps, k, {}};                                          \
+    const projection::OrderedRms<Act, Norm, projection::AllRows> norm_raw{                  \
+        residual, SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1, norm,               \
+        SEISMIC_NORM_STRIDE_0, eps, k, {}};                                                 \
+    const projection::Plain<Act, projection::AllRows> in{staged, k, 1, k, {}};              \
+    const projection::Weights<packets::W0> w{router, KERNEL_W0_LAYOUT(k), k};               \
+    const projection::CoherentStore out{logits, SEISMIC_DIM_E, 1ul, 0ul}
+
+#define PROJECTION_GEMV_INPUT(x) const auto x = router_raw
+
+#define PROJECTION_STAGE_EXTRA(row, row_inv)                                                \
+    do {                                                                                    \
+        const uint tid = sg * 32u + lane;                                                   \
+        const uint h = uint(SEISMIC_DIM_H), h8 = h & ~7u;                                   \
+        const element::Out<Act> pub(normalized_cells);                                      \
+        if (SEISMIC_RESULT_0_STRIDE_1 == 1ul && (SEISMIC_RESULT_0_STRIDE_0 & 7ul) == 0ul) { \
+            for (uint c = tid * 8u; c < h8; c += 2048u) {                                   \
+                float4 even, odd;                                                           \
+                norm_raw.load8(row, c, (row_inv), even, odd);                               \
+                pub.put8(ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + ulong(c), even, odd);     \
+            }                                                                               \
+            for (uint c = h8 + tid; c < h; c += 256u)                                       \
+                pub.put(ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + ulong(c),                  \
+                    norm_raw.ordered_at(row, c, (row_inv)));                                \
+        } else {                                                                            \
+            for (uint c = tid; c < h; c += 256u) {                                          \
+                pub.put(ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + ulong(c) * SEISMIC_RESULT_0_STRIDE_1, \
+                    norm_raw.ordered_at(row, c, (row_inv)));                                \
+            }                                                                               \
+        }                                                                                   \
+    } while (0)
+
+#define PROJECTION_ORDERED_FIRST_TILE()                                                     \
+    do {                                                                                    \
+        threadgroup const float *smem_inv = reinterpret_cast<threadgroup const float *>(shared); \
+        const uint tid = sg * 32u + lane, threads = simdgroups * 32u;                       \
+        const element::Out<Act> pub(normalized_cells);                                      \
+        if (SEISMIC_RESULT_0_STRIDE_1 == 1ul && (SEISMIC_RESULT_0_STRIDE_0 & 7ul) == 0ul && (k & 7u) == 0u) { \
+            const uint vecs = k >> 3u;                                                      \
+            for (uint idx = tid; idx < m * vecs; idx += threads) {                          \
+                const uint r = idx / vecs, c = (idx % vecs) * 8u;                           \
+                float4 even, odd;                                                           \
+                norm_raw.load8(r, c, smem_inv[r], even, odd);                               \
+                pub.put8(ulong(r) * SEISMIC_RESULT_0_STRIDE_0 + ulong(c), even, odd);       \
+            }                                                                               \
+        } else {                                                                            \
+            for (uint idx = tid; idx < m * k; idx += threads) {                             \
+                const uint r = idx / k, c = idx % k;                                        \
+                pub.put(ulong(r) * SEISMIC_RESULT_0_STRIDE_0 + ulong(c) * SEISMIC_RESULT_0_STRIDE_1, \
+                    norm_raw.ordered_at(r, c, smem_inv[r]));                                \
+            }                                                                               \
+        }                                                                                   \
+    } while (0)
+
+#define PROJECTION_ORDERED_EPILOGUE(ordered_tiles)                                          \
+    do {                                                                                    \
+        if (arrive::last(arrivals, ordered_tiles, reinterpret_cast<threadgroup uint *>(shared), sg * 32u + lane)) {           \
+            for (uint r = sg; r < m; r += simdgroups) {                                     \
+                select_row(r, logits, bias, expert_scale, routes,                           \
+                    element::Out<element::F32>(weights_cells), seismic_words, lane);        \
+            }                                                                               \
+        }                                                                                   \
+    } while (0)
+
+#include "lib/projection/operator.h"
+
+kernel void routed_select_ordered_stage(PROJECTION_ARGUMENTS, PROJECTION_ORDERED_STAGE_ARGS) {
+    PROJECTION_OPERANDS(0u);
+    PROJECTION_ORDERED_STAGE_BODY(router_raw, element::out_over_scratch<Act>(staged), ulong(k), 1ul);
 }
 
-// M <= VERIFY_ROWS, the whole selection in one launch: the threadgroup
-// computes its rows' RMS inverses (in the stage launch's order); threadgroup
-// 0 publishes the normalized rows; each threadgroup then forms the logits of
-// SIMDGROUPS router rows over the router input (`routing::Gemv`); the last
-// to arrive selects every row, a simdgroup a row.
-kernel void routed_select_gemv(
-    device const float *residual [[buffer(SEISMIC_BUFFER_RESIDUAL)]],
-    device const uchar *norm [[buffer(SEISMIC_BUFFER_NORM)]],
-    device const uchar *router_norm [[buffer(SEISMIC_BUFFER_ROUTER_NORM)]],
-    device const uchar *router [[buffer(SEISMIC_BUFFER_ROUTER)]],
-    device const float *bias [[buffer(SEISMIC_BUFFER_BIAS)]],
-    device const float *expert_scale [[buffer(SEISMIC_BUFFER_EXPERT_SCALE)]],
-    device int *routes [[buffer(SEISMIC_BUFFER_ROUTES)]],
-    SEISMIC_OUT_WEIGHTS_PARAM(weights_cells),
-    SEISMIC_RESULT_0_PARAM(normalized_cells),
-    arrive::coherent_device<float> logits [[buffer(SEISMIC_BUFFER_SCRATCH_LOGITS)]],
-    device atomic_uint *arrivals [[buffer(SEISMIC_BUFFER_SCRATCH_ARRIVALS)]],
-    constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
-    threadgroup uchar *shared [[threadgroup(0)]],
+kernel void routed_select_ordered_gemv(PROJECTION_ARGUMENTS, PROJECTION_ORDERED_GEMV_ARGS) {
+    constexpr uint simdgroups = SEISMIC_TUNE_SIMDGROUPS;
+    PROJECTION_ORDERED_GEMV_SINGLE;
+}
+
+kernel void routed_select_ordered_gemm(PROJECTION_ARGUMENTS, PROJECTION_ORDERED_GEMM_ARGS) {
+    PROJECTION_ORDERED_GEMM_SINGLE;
+}
+
+kernel void routed_select_select(PROJECTION_ARGUMENTS,
     uint group [[threadgroup_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]],
-    uint simd [[simdgroup_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup float parts[SEISMIC_CONST_VERIFY_ROWS * select_simdgroups];
-    threadgroup float inverses[SEISMIC_CONST_VERIFY_ROWS];
-    threadgroup uint last;
-    const element::Out<ELEMENT_OF(SEISMIC_WEIGHTS)> weights(weights_cells);
-    const element::Out<ELEMENT_OF(SEISMIC_RESULT_0)> normalized(normalized_cells);
-    decode_inverses(residual, parts, inverses, seismic_words, simd, lane, tid);
-    if (group == 0)
-        publish_normalized(residual, norm, normalized, inverses, seismic_words, tid);
-    select_columns(residual, router_norm, SEISMIC_ROUTER_NORM_STRIDE_0, router, logits, inverses, group, shared,
-        seismic_words, simd, lane);
-    if (!arrive::last(arrivals, (uint(SEISMIC_DIM_E) + SEISMIC_TUNE_SIMDGROUPS - 1) / SEISMIC_TUNE_SIMDGROUPS, &last,
-            tid))
-        return;
-    for (uint row = simd; row < uint(SEISMIC_DIM_M); row += SEISMIC_TUNE_SIMDGROUPS)
-        select_row(row, logits, bias, expert_scale, routes, weights, seismic_words, lane);
-}
-
-// M > VERIFY_ROWS: the logits tiles (`lib/routed/logits.h`) over the staged router
-// input.
-kernel void routed_select_gemm(
-    device const uchar *router [[buffer(SEISMIC_BUFFER_ROUTER)]],
-    device const uchar *router_rows [[buffer(SEISMIC_BUFFER_SCRATCH_ROUTER_ROWS)]],
-    device float *logits [[buffer(SEISMIC_BUFFER_SCRATCH_LOGITS)]],
-    constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
-    uint2 group [[threadgroup_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]],
-    uint simd [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]) {
-    constexpr uint H = SEISMIC_DIM_H;
-    threadgroup float shared[logits::extent];
-    const logits::RouterColumns columns{{router, KERNEL_W0_LAYOUT(H), H, nullptr}};
-    logits::tile<H>(SEISMIC_DIM_M, SEISMIC_DIM_E, ulong(group.y) * logits::rows_per_tile,
-        ulong(group.x) * logits::columns_per_tile,
-        [&](ulong row, ulong k) { return element::at<Act>(router_rows, row * H + k); }, columns,
-        [&](ulong row, ulong expert, float value) { logits[row * SEISMIC_DIM_E + expert] = value; }, shared, tid,
-        simd, lane);
-}
-
-kernel void routed_select_select(
-    device const float *bias [[buffer(SEISMIC_BUFFER_BIAS)]],
-    device const float *expert_scale [[buffer(SEISMIC_BUFFER_EXPERT_SCALE)]],
-    device int *routes [[buffer(SEISMIC_BUFFER_ROUTES)]],
-    SEISMIC_OUT_WEIGHTS_PARAM(weights_cells),
-    device const float *logits [[buffer(SEISMIC_BUFFER_SCRATCH_LOGITS)]],
-    constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
-    uint group [[threadgroup_position_in_grid]],
-    uint simd [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]) {
-    const ulong row = ulong(group) * select_simdgroups + simd;
-    if (row >= SEISMIC_DIM_M)
-        return;
-    const element::Out<ELEMENT_OF(SEISMIC_WEIGHTS)> weights(weights_cells);
-    select_row(row, logits, bias, expert_scale, routes, weights, seismic_words, lane);
+    const ulong row = ulong(group) * 8ul + sg;
+    if (row < SEISMIC_DIM_M) {
+        select_row(row, logits, bias, expert_scale, routes,
+            element::Out<element::F32>(weights_cells), seismic_words, lane);
+    }
 }

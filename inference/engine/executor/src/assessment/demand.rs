@@ -814,8 +814,7 @@ fn route(
     step: &mut Step<'_>,
     load: &ModelLoadPlan,
     scope: WeightScope,
-    resident: Kernel,
-    streamed: Kernel,
+    [resident, streamed, hint]: [Kernel; 3],
     work: Work,
 ) -> Result<(), AssessmentError> {
     let Some((bank, index)) = streamed::served(load, scope) else {
@@ -824,16 +823,20 @@ fn route(
     if bank.sets_step(index) {
         step.call(Kernel::of::<kernels::routed_step::Entry>(), Work::default())?;
     }
-    let layers = bank.layers();
-    let hinted = bank
-        .predicted(index)
-        .flat_map(|target| {
-            let layer = &layers[target];
-            layer.hinted.iter().filter_map(move |hint| hint.element.map(|element| (layer.scope, hint.kind, element)))
-        })
-        .map(|(scope, kind, element)| planned(load, scope, kind, element))
-        .collect::<Result<Vec<_>, _>>()?;
-    step.call_with(streamed, &[("AHEAD", bank.ahead(index))], join([work, projection(&hinted)?])?)?;
+    step.call(streamed, work)?;
+    let ahead = bank.ahead(index);
+    if ahead > 0 {
+        let layers = bank.layers();
+        let hinted = bank
+            .predicted(index)
+            .flat_map(|target| {
+                let layer = &layers[target];
+                layer.hinted.iter().filter_map(move |hint| hint.element.map(|element| (layer.scope, hint.kind, element)))
+            })
+            .map(|(scope, kind, element)| planned(load, scope, kind, element))
+            .collect::<Result<Vec<_>, _>>()?;
+        step.call_with(hint, &[("AHEAD", ahead)], projection(&hinted)?)?;
+    }
     step.park();
     // The landing launch converts the bank's records, from their stored
     // element into their resident one: its operands are the records', not a
@@ -904,8 +907,11 @@ fn general_routed(
         step,
         load,
         scope,
-        Kernel::of::<kernels::routed_select::Entry>(),
-        Kernel::of::<kernels::routed_select_streamed::Entry>(),
+        [
+            Kernel::of::<kernels::routed_select::Entry>(),
+            Kernel::of::<kernels::routed_select_streamed::Entry>(),
+            Kernel::of::<kernels::routed_hint_select::Entry>(),
+        ],
         projection(&[weight(WeightKind::Router, binding.router)?])?,
     )?;
     if let Some((down, up)) = binding.latent {
@@ -1681,8 +1687,11 @@ impl DecodeDemand {
                                 &mut step,
                                 load,
                                 scope,
-                                Kernel::of::<kernels::routed_route_shared::Entry>(),
-                                Kernel::of::<kernels::routed_route_streamed::Entry>(),
+                                [
+                                    Kernel::of::<kernels::routed_route_shared::Entry>(),
+                                    Kernel::of::<kernels::routed_route_streamed::Entry>(),
+                                    Kernel::of::<kernels::routed_hint_route::Entry>(),
+                                ],
                                 join([router, shared])?,
                             )?;
                             step.call_with(

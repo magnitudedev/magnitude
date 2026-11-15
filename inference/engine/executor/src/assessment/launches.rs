@@ -18,7 +18,7 @@ use crate::{ModelLoadPlan, ProgramPlan, TuningLimits};
 use magnitude_family_contracts::ModelDefinition;
 use seismic::{
     BackendName, CheckedBundleError, Element, Entry, KernelRequest, NativeImplementation,
-    DeviceBound, NativeSpecialization, OperandRecipe,
+    NativeSpecialization, OperandRecipe,
 };
 use std::collections::BTreeMap;
 use std::fmt;
@@ -84,7 +84,7 @@ fn launch_error(message: impl Into<String>) -> AssessmentError {
 /// the load prepares it with.
 #[derive(Clone, Debug)]
 struct Prepared {
-    implementation: DeviceBound<&'static NativeImplementation>,
+    implementation: &'static NativeImplementation,
     specialization: NativeSpecialization,
 }
 
@@ -171,14 +171,14 @@ impl Declarations {
                     });
                 // An assessment names a backend, not a device: a declaration
                 // whose defaults read the device has no default here.
-                let implementation = implementation.device_independent().ok_or_else(|| {
-                    launch_error(format!(
-                        "`{}`'s defaults read the device's properties, and an assessment has no device",
-                        kernel.name
-                    ))
-                })?;
                 let specialization = implementation
-                    .default_specialization(&statics)
+                    .default_specialization_without_device(&statics)
+                    .ok_or_else(|| {
+                        launch_error(format!(
+                            "`{}`'s defaults read the device's properties, and an assessment has no device",
+                            kernel.name
+                        ))
+                    })?
                     .map_err(|error| launch_error(format!("{request}: {error}")))?;
                 Ok(Prepared {
                     implementation,

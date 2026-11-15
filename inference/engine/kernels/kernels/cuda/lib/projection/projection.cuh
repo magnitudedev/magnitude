@@ -512,6 +512,9 @@ template <class W> struct GemvRecords {
 template <class G, class K> struct GemvRecords<packets::Records<G, K>> {
     static constexpr bool value = true;
 };
+// A gathered view's (below) of its weight's.
+template <class W> struct Gathered;
+template <class W> struct GemvRecords<Gathered<W>> : GemvRecords<W> {};
 
 // The K-split reduction and epilogue of a GEMV group's accumulators (the
 // MMA C-fragment places: (row g, col 2t), (row g, col 2t+1), (row g+8, col
@@ -973,6 +976,69 @@ template <class W> struct Window : W {
     }
     __device__ __forceinline__ typename W::Block block(u64 tile, u64 superblock, u32 lane) const {
         return W::block(tile, first + superblock, lane);
+    }
+};
+
+// A weight read at the rows a table selects (a per-row gathered entry's
+// routed `choice`, routed.seismic): its row n is the weight's row
+// table[n * table_stride] for n < count. A selection outside the weight's `extent`
+// rows, and a row of the last tile past `count`, read row 0, whose results
+// the entry masks or no epilogue stores. Every decoder reads a lane's rows g
+// and g + 8 as any two rows (`fetch_rows`, `block_rows`, `record_rows`,
+// `fetch_entries_rows`; packets.cuh), so each 16-row tile of the selection is
+// a tile of the GEMV, which runs as over any weight (`gemv_mma_group`,
+// `gemv_entries_group`, `gemv_records_group`): every decode and MMA serves 16
+// selected rows. A code plane holds rows g and g + 8 in alternate slots of
+// one lane chunk, so a selected row reads its pair's codes too: twice its
+// own, an eighth of the whole tile a GEMV of the stored tile reads for it.
+// Coefficients are read per row, never staged per tile (`GEMV_STAGED`).
+template <class W> struct Gathered : W {
+    static constexpr bool GEMV_STAGED = false;
+    const int *table;
+    u64 table_stride;
+    u64 count;
+    u64 extent;
+    __device__ __forceinline__ Gathered(const W &w, const int *table_, u64 table_stride_, u64 count_, u64 extent_)
+        : W(w), table(table_), table_stride(table_stride_), count(count_), extent(extent_) {}
+    // The stored row of selected row n.
+    __device__ __forceinline__ u64 stored(u64 n) const {
+        const u64 row = n < count ? (u64)(long long)table[n * table_stride] : 0;
+        return row < extent ? row : 0;
+    }
+    __device__ __forceinline__ u64 row_g(u64 tile, u32 lane) const { return stored(tile * 16 + lane / 4); }
+    __device__ __forceinline__ u64 row_g8(u64 tile, u32 lane) const { return stored(tile * 16 + lane / 4 + 8); }
+    struct Super {
+        typename W::Raw raw[4];
+    };
+    __device__ __forceinline__ Super fetch_superblock(u64 tile, u64 superblock, u64 kblocks, u32 lane) const {
+        const u64 a = row_g(tile, lane), b = row_g8(tile, lane);
+        Super super;
+#pragma unroll
+        for (int q = 0; q < 4; ++q)
+            if (4 * superblock + q < kblocks)
+                super.raw[q] = W::fetch_rows(a, b, 4 * superblock + q, lane % 4);
+        return super;
+    }
+    __device__ __forceinline__ Super fetch_superblock_permuted(u64 tile, u64 superblock, u64 kblocks,
+                                                               u32 lane) const {
+        const u64 a = row_g(tile, lane), b = row_g8(tile, lane);
+        Super super;
+#pragma unroll
+        for (int q = 0; q < 4; ++q)
+            if (4 * superblock + q < kblocks)
+                super.raw[q] = W::fetch_rows_permuted(a, b, 4 * superblock + q, lane % 4);
+        return super;
+    }
+    __device__ __forceinline__ typename W::Raw raw(const Super &super, int q, u32) const { return super.raw[q]; }
+    __device__ __forceinline__ typename W::Block block(u64 tile, u64 superblock, u32 lane) const {
+        return W::block_rows(row_g(tile, lane), row_g8(tile, lane), superblock);
+    }
+    __device__ static __forceinline__ auto fetch_entries(const Gathered &w, u64 tile, u64 kblock, u32 lane) {
+        return W::fetch_entries_rows(static_cast<const W &>(w), w.row_g(tile, lane), w.row_g8(tile, lane), kblock,
+                                     lane % 4);
+    }
+    __device__ __forceinline__ auto record(u64 tile, u64 superblock, u32 lane) const {
+        return W::record_rows(row_g(tile, lane), row_g8(tile, lane), superblock, lane % 4);
     }
 };
 
@@ -2119,8 +2185,10 @@ __device__ __forceinline__ void gemm_tile_s8(float acc[Shape::MI][2][4], const W
     }
 }
 
-template <class Shape, class WA, class WB, class Epi>
-__device__ __forceinline__ void gemm_segment_s8(u8 *shared, const QuantizedRows &x, u32 M, u64 K, u64 nblock,
+// One int8 GEMM block over the s8 rows of `source` (`QuantizedRows`, or any
+// s8 row source), as `gemm_segment` over A rows.
+template <class Shape, class Rows, class WA, class WB, class Epi>
+__device__ __forceinline__ void gemm_segment_s8(u8 *shared, const Rows &source, u32 M, u64 K, u64 nblock,
                                                 u64 rows, const WA &wa, const WB &wb, const Epi &epi, u64 part = 0,
                                                 u64 parts = 1) {
     using Weights = GemmWeights<Shape, WA, WB, true>;
@@ -2144,21 +2212,45 @@ __device__ __forceinline__ void gemm_segment_s8(u8 *shared, const QuantizedRows 
     // As in `gemm_segment`: a warp whose rows all lie at or past M only loads.
     const bool active = m0 + wm * (MI * 16) < M;
 
+    // A thread's code chunks (16 bytes of one tile row per k-block) and
+    // group rows keep their rows across k-blocks, so their addresses are
+    // formed once; a chunk past M reads zeros from a valid address.
+    constexpr int CHUNKS = (Shape::BM * 4 + THREADS - 1) / THREADS;
+    constexpr int GROUP_ROWS = (Shape::BM + THREADS - 1) / THREADS;
+    const u8 *chunk[CHUNKS];
+    bool valid[CHUNKS];
+#pragma unroll
+    for (int i = 0; i < CHUNKS; ++i) {
+        const int c = (int)threadIdx.x + i * THREADS;
+        const u64 row = m0 + c / 4;
+        valid[i] = c < Shape::BM * 4 && row < M;
+        chunk[i] = source.row(valid[i] ? row : 0) + (c % 4) * 16;
+    }
+    const float2 *group_row[GROUP_ROWS];
+    bool grouped[GROUP_ROWS];
+#pragma unroll
+    for (int i = 0; i < GROUP_ROWS; ++i) {
+        const int r = (int)threadIdx.x + i * THREADS;
+        const u64 row = m0 + r;
+        grouped[i] = r < Shape::BM && row < M;
+        group_row[i] = source.groups_of(grouped[i] ? row : 0);
+    }
     auto load = [&](int stage, u64 index) {
         const u64 kb = kbegin + index;
         u8 *base = weights.stage(stage);
-        for (int c = threadIdx.x; c < Shape::BM * 4; c += THREADS) {
-            const u64 row = m0 + c / 4;
-            const bool valid = row < M;
-            seismic_cp_async_16_zfill(base + (c / 4) * PITCH + (c % 4) * 16,
-                                      x.q + (valid ? row : 0) * K + kb * 64 + (c % 4) * 16, valid ? 16u : 0u);
+#pragma unroll
+        for (int i = 0; i < CHUNKS; ++i) {
+            const int c = (int)threadIdx.x + i * THREADS;
+            if (c < Shape::BM * 4)
+                seismic_cp_async_16_zfill(base + (c / 4) * PITCH + (c % 4) * 16, chunk[i] + kb * 64,
+                                          valid[i] ? 16u : 0u);
         }
         u8 *staged_groups = base + Shape::BM * PITCH;
-        for (int r = threadIdx.x; r < Shape::BM; r += THREADS) {
-            const u64 row = m0 + r;
-            const bool valid = row < M;
-            seismic_cp_async_16_zfill(staged_groups + r * 16, x.groups + (valid ? row : 0) * (K / 32) + kb * 2,
-                                      valid ? 16u : 0u);
+#pragma unroll
+        for (int i = 0; i < GROUP_ROWS; ++i) {
+            const int r = (int)threadIdx.x + i * THREADS;
+            if (r < Shape::BM)
+                seismic_cp_async_16_zfill(staged_groups + r * 16, group_row[i] + kb * 2, grouped[i] ? 16u : 0u);
         }
         weights.template load<THREADS>(stage, index, threadIdx.x);
     };
@@ -2308,20 +2400,39 @@ __device__ __forceinline__ auto source_after_dependency(const Pro &pro, u8 *row,
     };
 }
 
-// One GEMM block on either path: `act` is the A rows (row stride
-// `act_stride`) for the 16-bit path or the staged s8 rows (with their
-// `groups`) for S8.
+// One GEMM block on either path over the row source `source`: A rows
+// (`ActivationRows`, or any source of their `row(m)`) for the 16-bit path,
+// s8 rows (`QuantizedRows`, or any source of their `row(m)` and
+// `groups_of(m)`) for S8.
+template <class Shape, bool S8, class Operands = SemanticGemmOperands, class Rows, class WA, class WB, class Epi>
+__device__ __forceinline__ void gemm_rows(u8 *shared, const Rows &source, u32 M, u64 K, u64 nblock, u64 rows,
+                                          const WA &wa, const WB &wb, const Epi &epi, u64 part = 0, u64 parts = 1) {
+    static_assert(!S8 || Same<Operands, SemanticGemmOperands>::value,
+                  "quantized activation GEMM requires the semantic operand policy");
+    if constexpr (S8)
+        gemm_segment_s8<Shape>(shared, source, M, K, nblock, rows, wa, wb, epi, part, parts);
+    else
+        gemm_segment<Shape, Operands>(shared, source, M, K, nblock, rows, wa, wb, epi, part, parts);
+}
+
+// The rows a GEMM reads on either path: `act` is the A rows (row stride
+// `act_stride`) for the 16-bit path or the staged s8 rows (K wide, with
+// their `groups`) for S8.
+template <bool S8>
+__device__ __forceinline__ auto gemm_source(const u8 *act, u64 act_stride, const void *groups, u64 K) {
+    if constexpr (S8)
+        return QuantizedRows{act, K, reinterpret_cast<const float2 *>(groups)};
+    else
+        return ActivationRows{act, act_stride};
+}
+
+// One GEMM block on either path over `gemm_source`'s rows.
 template <class Shape, bool S8, class Operands = SemanticGemmOperands, class WA, class WB, class Epi>
 __device__ __forceinline__ void gemm_run(u8 *shared, const u8 *act, u64 act_stride, const void *groups, u32 M,
                                          u64 K, u64 nblock, u64 rows, const WA &wa, const WB &wb, const Epi &epi,
                                          u64 part = 0, u64 parts = 1) {
-    static_assert(!S8 || Same<Operands, SemanticGemmOperands>::value,
-                  "quantized activation GEMM requires the semantic operand policy");
-    if constexpr (S8)
-        gemm_segment_s8<Shape>(shared, QuantizedRows{act, K, reinterpret_cast<const float2 *>(groups)}, M, K, nblock,
-                               rows, wa, wb, epi, part, parts);
-    else
-        gemm_segment<Shape, Operands>(shared, ActivationRows{act, act_stride}, M, K, nblock, rows, wa, wb, epi, part, parts);
+    gemm_rows<Shape, S8, Operands>(shared, gemm_source<S8>(act, act_stride, groups, K), M, K, nblock, rows, wa, wb,
+                                   epi, part, parts);
 }
 
 // Block columns of a segment of `rows` rows.

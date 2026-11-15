@@ -1,15 +1,16 @@
 // stream_mix_down: the per-stream RMS prologue (`GroupRms`) over the S
-// hyper-connection streams, then one segmented projection down | inject (an
-// inject segment of zero rows, the exit site's, has no tiles), and the
-// streams' inverses. Rows are staged by the staging launch past one row. The
-// GEMV classes split K by stream: a block serves one stream (a one-row block
-// forms that stream's row itself, and the stream's first block publishes its
-// inverse) over tiles of down | inject, into F32 partial sums that the last
-// block to arrive adds in stream order through the epilogues.
+// hyper-connection streams, then the `dense` projection (segmented, K in S
+// parts, the streams) down | inject (an inject segment of zero rows, the
+// exit site's, has no tiles), and the streams' inverses. Rows are staged by
+// the staging launch past one row. The GEMV classes are the projection's
+// parts GEMV (a one-row block forms its stream's row itself, and the
+// stream's first block publishes its inverse), the GEMMs its segmented tiles
+// (`lib/projection/operator.cuh`).
 #define KERNEL_W0 SEISMIC_DOWN_WEIGHT
 #define KERNEL_W1 SEISMIC_INJECT_WEIGHT
+#define PROJECTION_PARTS SEISMIC_DIM_S
 #include "lib/core/arrive.cuh"
-#include "lib/projection/projection.cuh"
+#include "lib/projection/operator.cuh"
 
 SEISMIC_PROGRAMMATIC_DEPENDENCY
 
@@ -40,125 +41,59 @@ using StreamSource = projection::GemvSource<Stream>::type;
     }
 
 // The two segments: rows, weights and results in segment order.
-struct Segments {
-    unsigned long long rows[2];
-    packets::W0 down;
-    packets::W1 inject;
-    Low low;
-    projection::MixInject injected;
-};
-
+#define SEGMENT_ROWS SEISMIC_DIM_LR, SEISMIC_DIM_C * SEISMIC_DIM_S
+using Segments = projection::op::SegmentSet<0, projection::op::Types<packets::W0, packets::W1>,
+                                            projection::op::Types<Low, projection::MixInject>,
+                                            projection::op::empty_mask(SEGMENT_ROWS)>;
 #define SEGMENTS                                                                                          \
     Segments {                                                                                            \
-        {SEISMIC_DIM_LR, SEISMIC_DIM_C * SEISMIC_DIM_S},                                                   \
-            KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_DOWN_WEIGHT)),                                         \
-            KERNEL_W1_AT(SEISMIC_PTR(SEISMIC_BUFFER_INJECT_WEIGHT)),                                       \
-            Low{SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0, (float)SEISMIC_DIM_S},                    \
-            projection::MixInject {                                                                       \
-            SEISMIC_RESULT_1_OUT, SEISMIC_RESULT_1_STRIDE_0,                                              \
-                (float)SEISMIC_DIM_S                                                                      \
-        }                                                                                                 \
+        {SEGMENT_ROWS},                                                                                   \
+            {KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_DOWN_WEIGHT)),                                        \
+             KERNEL_W1_AT(SEISMIC_PTR(SEISMIC_BUFFER_INJECT_WEIGHT))},                                     \
+        {Low{SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0, (float)SEISMIC_DIM_S},       \
+         projection::MixInject{SEISMIC_RESULT_1_OUT,            \
+                               SEISMIC_RESULT_1_STRIDE_0, (float)SEISMIC_DIM_S}}                          \
     }
 
-// One stream's F32 partial sums of the down | inject outputs: output n of
-// row m from stream s at partials[(m * S + s) * outputs + column + n].
-struct StreamPartial {
-    float *out;
-    unsigned long long row;
-    unsigned long long column;
-    __device__ __forceinline__ void operator()(unsigned m, unsigned long long n, float projected, float) const {
-        out[m * row + column + n] = projected;
-    }
-};
-
-// The segmented GEMV over NB column blocks of 8 rows, K split by stream:
-// the block's tile groups serve stream `tile_group / per` (`per` the tile groups
-// of one stream's down | inject) over its window of H inputs.
+// The parts GEMV over NB column blocks of 8 rows: stream `part`'s rows, staged
+// past one row, else formed by the block (block-collective), the stream's
+// first block publishing its inverse.
 template <int NB, int KSPLIT>
-__device__ __forceinline__ void mix_gemv(const Stream &first_stream, projection::u8 *row,
-                                         const projection::u8 *staged, element::Out<element::F32> inverse,
-                                         unsigned long long inverse_stride, float *partials, unsigned *arrivals,
-                                         unsigned M, const Segments &s) {
-    using Shape = projection::GemvShape<8, 1, KSPLIT, NB>;
-    __shared__ projection::GemvShared<Shape, StreamSource> shared;
-    constexpr unsigned long long kblocks = SEISMIC_DIM_H / 64;
-    const unsigned long long outputs = s.rows[0] + s.rows[1];
-    const unsigned long long groups[2] = {projection::gemv_segment_groups<Shape>(s.rows[0]),
-                                          projection::gemv_segment_groups<Shape>(s.rows[1])};
-    const unsigned long long per = groups[0] + groups[1];
-    const unsigned long long tile_group = Shape::tile_group();
-    const unsigned stream = (unsigned)(tile_group / per);
-    unsigned long long group = tile_group % per;
-    const int segment = projection::locate_segment(group, groups);
-    const unsigned long long first = (unsigned long long)stream * SEISMIC_DIM_H;
-    Stream pro = first_stream;
-    pro.x += first;
-    pro.norm += first * Norm::bytes;
-    // Block-collective at M = 1: every warp forms the stream's row; the
-    // stream's first block publishes its inverse.
-    const bool first_block = tile_group % per < Shape::GROUPS;
-    const element::Out<element::F32> stream_inverse = inverse.offset(stream * inverse_stride);
-    const auto x = [=] {
-        seismic_dependency_start();
-        if (M > 1)
-            return StreamSource{staged + first * element::Act::bytes, WIDTH, projection::AllRows{}};
-        projection::form_row_publishing(pro, 0, SEISMIC_DIM_H, row,
-                                        first_block ? &stream_inverse : nullptr, 1);
-        __syncthreads();
-        return StreamSource{row, SEISMIC_DIM_H, projection::AllRows{}};
+__device__ __forceinline__ void mix_gemv(projection::u8 *row, const projection::u8 *staged,
+                                         element::Out<element::F32> inverse, unsigned long long inverse_stride,
+                                         unsigned M) {
+    const Stream streams = STREAM;
+    const auto source = [=](unsigned part, bool first) {
+        const unsigned long long offset = (unsigned long long)part * SEISMIC_DIM_H;
+        Stream pro = streams;
+        pro.x += offset;
+        pro.norm += offset * Norm::bytes;
+        return [=] {
+            seismic_dependency_start();
+            if (M > 1)
+                return StreamSource{staged + offset * element::Act::bytes, WIDTH, projection::AllRows{}};
+            const element::Out<element::F32> part_inverse = inverse.offset(part * inverse_stride);
+            projection::form_row_publishing(pro, 0, SEISMIC_DIM_H, row, first ? &part_inverse : nullptr, 1);
+            __syncthreads();
+            return StreamSource{row, SEISMIC_DIM_H, projection::AllRows{}};
+        };
     };
-    const StreamPartial partial{partials, SEISMIC_DIM_S * outputs, stream * outputs};
-    const unsigned long long window = stream * (kblocks / 4);
-    if (segment == 0)
-        projection::gemv_segment_ready<Shape>(shared, x, M, kblocks, group, s.rows[0],
-                                              projection::Window<packets::W0>(s.down, window),
-                                              projection::NoWeight{}, partial);
-    else
-        projection::gemv_segment_ready<Shape>(shared, x, M, kblocks, group, s.rows[1],
-                                              projection::Window<packets::W1>(s.inject, window),
-                                              projection::NoWeight{},
-                                              StreamPartial{partial.out, partial.row, partial.column + s.rows[0]});
-    __shared__ unsigned last;
-    if (!arrive::last(arrivals, gridDim.x, &last))
-        return;
-    for (unsigned long long item = threadIdx.x; item < M * outputs; item += blockDim.x) {
-        const unsigned m = (unsigned)(item / outputs);
-        const unsigned long long n = item % outputs;
-        float sum = 0.0f;
-        for (unsigned stream_ = 0; stream_ < SEISMIC_DIM_S; ++stream_)
-            sum += __ldcg(partials + (m * SEISMIC_DIM_S + stream_) * outputs + n);
-        if (n < s.rows[0])
-            s.low(m, n, sum, 0.0f);
-        else
-            s.injected(m, n - s.rows[0], sum, 0.0f);
-    }
+    projection::op::gemv_parts<NB, KSPLIT, SEISMIC_DIM_S, SEISMIC_DIM_H, Stream>(source, PARTIALS, ARRIVALS, M,
+                                                                                 SEGMENTS);
 }
 
-// The segmented GEMM of one row band over the staged rows: block column
-// `gemm_column` of down | inject.
-template <class Shape>
-__device__ __forceinline__ void mix_gemm(const projection::u8 *staged, unsigned M, const Segments &s) {
+// The projection's segmented GEMM of one row band over the staged rows.
+template <class Shape> __device__ __forceinline__ void mix_gemm(unsigned M) {
     extern __shared__ uint4 dynamic_shared[];
-    seismic_dependency_start();
-    projection::u8 *shared = reinterpret_cast<projection::u8 *>(dynamic_shared);
-    unsigned long long column = projection::gemm_column<Shape>();
-    const unsigned long long columns[2] = {projection::gemm_columns(s.rows[0]), projection::gemm_columns(s.rows[1])};
-    switch (projection::locate_segment(column, columns)) {
-    case 0:
-        projection::gemm_run<Shape, false>(shared, staged, WIDTH, nullptr, M, WIDTH, column, s.rows[0], s.down,
-                                           projection::NoWeight{}, s.low);
-        break;
-    case 1:
-        projection::gemm_run<Shape, false>(shared, staged, WIDTH, nullptr, M, WIDTH, column, s.rows[1], s.inject,
-                                           projection::NoWeight{}, s.injected);
-        break;
-    }
+    projection::op::gemm_segmented<Shape, false, projection::SemanticGemmOperands>(
+        reinterpret_cast<projection::u8 *>(dynamic_shared), STAGING, nullptr, M, WIDTH, SEGMENTS, 0u);
 }
 
 // Past one row: one block per row stages its normalized streams and
 // publishes their inverses.
 #ifdef SEISMIC_FORMING_STREAM_MIX_DOWN_STAGE
-extern "C" __global__ void stream_mix_down_stage(SEISMIC_KERNEL_PARAMS) {
+template <unsigned INT8, unsigned OPERAND>
+__global__ void stream_mix_down_stage(SEISMIC_KERNEL_PARAMS) {
     seismic_dependency_start();
     const element::Out<element::F32> inverse = INVERSE.offset((unsigned long long)blockIdx.x * SEISMIC_RESULT_2_STRIDE_0);
     projection::form_row_publishing(PROLOGUE, blockIdx.x, WIDTH, STAGING, &inverse, 1);
@@ -166,31 +101,31 @@ extern "C" __global__ void stream_mix_down_stage(SEISMIC_KERNEL_PARAMS) {
 #endif
 
 #ifdef SEISMIC_FORMING_STREAM_MIX_DOWN_GEMV
-template <unsigned KSPLIT>
+template <unsigned STAGING, unsigned KSPLIT>
 __global__ void stream_mix_down_gemv(SEISMIC_KERNEL_PARAMS) {
     extern __shared__ uint4 dynamic_shared[];
-    mix_gemv<1, KSPLIT>(STREAM, reinterpret_cast<projection::u8 *>(dynamic_shared), STAGING, INVERSE,
-                        SEISMIC_RESULT_2_STRIDE_1, PARTIALS, ARRIVALS, (unsigned)SEISMIC_DIM_M, SEGMENTS);
+    mix_gemv<1, KSPLIT>(reinterpret_cast<projection::u8 *>(dynamic_shared), STAGING, INVERSE,
+                        SEISMIC_RESULT_2_STRIDE_1, (unsigned)SEISMIC_DIM_M);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_STREAM_MIX_DOWN_GEMV16
-template <unsigned KSPLIT>
+template <unsigned STAGING, unsigned KSPLIT>
 __global__ void stream_mix_down_gemv16(SEISMIC_KERNEL_PARAMS) {
-    mix_gemv<2, KSPLIT>(STREAM, nullptr, STAGING, INVERSE, SEISMIC_RESULT_2_STRIDE_1, PARTIALS, ARRIVALS,
-                        (unsigned)SEISMIC_DIM_M, SEGMENTS);
+    mix_gemv<2, KSPLIT>(nullptr, STAGING, INVERSE, SEISMIC_RESULT_2_STRIDE_1, (unsigned)SEISMIC_DIM_M);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_STREAM_MIX_DOWN_GEMM_SMALL
-extern "C" __global__ void stream_mix_down_gemm_small(SEISMIC_KERNEL_PARAMS) {
-    mix_gemm<projection::SmallGemm>(STAGING, (unsigned)SEISMIC_DIM_M, SEGMENTS);
+template <unsigned INT8, unsigned OPERAND>
+__global__ void stream_mix_down_gemm_small(SEISMIC_KERNEL_PARAMS) {
+    mix_gemm<projection::SmallGemm>((unsigned)SEISMIC_DIM_M);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_STREAM_MIX_DOWN_GEMM
-template <unsigned ROTATE>
+template <unsigned INT8, unsigned OPERAND, unsigned ROTATE>
 __global__ void stream_mix_down_gemm(SEISMIC_KERNEL_PARAMS) {
-    mix_gemm<projection::LargeGemm<ROTATE>>(STAGING, (unsigned)SEISMIC_DIM_M, SEGMENTS);
+    mix_gemm<projection::LargeGemm<ROTATE>>((unsigned)SEISMIC_DIM_M);
 }
 #endif

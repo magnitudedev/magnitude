@@ -1,32 +1,13 @@
 // readout_project_rows on CPU (contract and portable body in draft.seismic).
 // The entry only reads its A features, so they reach the kernel as a dense
-// operand: `readout_project_rows_stage` decodes each feature row as F32 into
-// scratch, one work item per row. `readout_project_rows_rows` gives each work item
-// ROWS vocabulary weight rows, which it projects against every staged row
-// into the F32 logits: all the rows at once where every row reads the same
+// operand: the operator's form launch decodes each feature row as F32
+// (`rows`) and its Q8 blocks, as tiles only without token rows.
+// `readout_project_rows_rows` gives each work item ROWS vocabulary weight
+// rows, which it projects against every operand row into the F32 logits: all the rows at once where every row reads the same
 // vocabulary rows (no token rows), else each row its own.
 
 use lib::core::functions;
 use lib::projection::projection;
-
-#[inline(always)]
-fn readout_project_rows_stage<L: Isa, E: Elements>(
-    _l: L,
-    cx: &Context<'_, E>,
-    group: [u64; 3],
-    _shared: &mut [u8],
-) {
-    let row = group[0] as usize;
-    let d = cx.dim_d() as usize;
-    // SAFETY: each work item writes its own row of the scratch.
-    let staged = unsafe { cx.scratch_staged().slice_mut::<f32>(4 * row * d, d) };
-    projection::stage::<E::A>(cx.arg_features().row([row, 0]), staged);
-    if cx.param_int8() == 1 {
-        // SAFETY: this work item alone writes row `row`'s quantized bytes.
-        unsafe { projection::quantize_row(staged, row, tiles(cx), cx.scratch_quantized(), 0) };
-    }
-    projection::operand_row(&[&cx.arg_weight()], staged);
-}
 
 /// Whether the rows are quantized as tiles: every row reads the same
 /// vocabulary rows (`projection::tiled`).
@@ -49,8 +30,8 @@ fn readout_project_rows_rows<L: Isa, E: Elements>(
     );
     let rows = projection::item_rows(group[0], cx.param_rows(), v);
     let result = cx.result_0();
-    // SAFETY: the stage launch wrote every row before this launch.
-    let staged = unsafe { cx.scratch_staged().slice::<f32>(0, o * d) };
+    // SAFETY: the form launch (or the operand's producer) wrote every row before this launch.
+    let staged = unsafe { cx.scratch_rows().slice::<f32>(0, o * d) };
     let blocks = seismic::cpu::quant::blocks(d);
     let quantized = (cx.param_int8() == 1).then(|| unsafe { projection::quantized(cx.scratch_quantized(), 0, o, d, tiles(cx)) });
     let cap = cx.arg_softcap();

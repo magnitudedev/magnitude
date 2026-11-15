@@ -1,5 +1,62 @@
+// Routing (`routed_route`) on the `dense` projection operator, segmented over
+// `(router, shared_router)` in the CPU 8-lane reference order.
+#define KERNEL_W0 SEISMIC_ROUTER
+#define KERNEL_W1 SEISMIC_SHARED_ROUTER
+#include "lib/core/activation.glsl"
+#include "lib/projection/projection.glsl"
+#define ROUTE_E uint(SEISMIC_DIM_E)
+#define ROUTE_STRIDE (uint(SEISMIC_DIM_E) + 1u)
 #include "lib/routed/route.glsl"
-void routed_route_gemv() { route_gemv(); }
-void routed_route_select() { route_select(); }
-void routed_route_stage() { route_stage(); }
-void routed_route_gemm() { route_gemm(); }
+
+#if defined(SEISMIC_NORM_REPRESENTATION_F32)
+#define ROUTE_NORM ELEMENT_F32
+#elif defined(SEISMIC_NORM_REPRESENTATION_F16)
+#define ROUTE_NORM ELEMENT_F16
+#elif defined(SEISMIC_NORM_REPRESENTATION_BF16)
+#define ROUTE_NORM ELEMENT_BF16
+#else
+#error "routed norm must be dense"
+#endif
+
+#define ROUTE_H uint(SEISMIC_DIM_H)
+
+projection_prologue projected_input(uint g) {
+    return projection_ordered_input(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL),
+        SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_NORM),
+        SEISMIC_NORM_STRIDE_0, ROUTE_NORM, element_word_f32(SEISMIC_PARAM_EPS), ROUTE_H, 0ul,
+        uint(SEISMIC_DIM_NM), uint(SEISMIC_DIM_PT));
+}
+
+projection_prologue projected_rows(uint g) {
+    return projection_plain(ELEMENT_ACT, out_stored(SEISMIC_RESULT_0_OUT, 0ul),
+        SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, ROUTE_H, 0ul);
+}
+
+#define PROJECTION_M uint(SEISMIC_DIM_M)
+#define PROJECTION_K ROUTE_H
+#define PROJECTION_NORM PROJECTION_NORM_SHARED
+#define PROJECTION_ORDERED_PUBLISH true
+#define PROJECTION_ORDERED_PUB_OUT SEISMIC_RESULT_0_OUT
+#define PROJECTION_ORDERED_PUB_S0 SEISMIC_RESULT_0_STRIDE_0
+#define PROJECTION_ORDERED_PUB_S1 SEISMIC_RESULT_0_STRIDE_1
+#define PROJECTION_N0 uint(SEISMIC_DIM_E)
+#define PROJECTION_N1 1u
+#define PROJECTION_WEIGHT0 projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_ROUTER), PACKETS_W0_ROWS, ROUTE_H, 0ul, 1ul, 0u)
+#define PROJECTION_WEIGHT1 projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_ROUTER), PACKETS_W1_ROWS, ROUTE_H, 0ul, 1ul, 0u)
+#define PROJECTION_OUTPUT0 projection_store(out_over_scratch(ELEMENT_F32, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS)), SEISMIC_DIM_E + 1ul, 1ul, 0ul)
+#define PROJECTION_OUTPUT1 projection_store(out_over_scratch(ELEMENT_F32, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS)), SEISMIC_DIM_E + 1ul, 1ul, SEISMIC_DIM_E)
+#include "lib/projection/ordered.glsl"
+
+void routed_route_ordered_stage() {
+    projection_ordered_stage_row(projected_input(0u), gl_WorkGroupID.x, SEISMIC_RESULT_0_OUT,
+        SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1);
+}
+
+void routed_route_ordered_gemv() { projection_segmented_ordered_gemv_all(); }
+void routed_route_ordered_gemm() { projection_segmented_ordered_gemm(); }
+
+void routed_route_select() {
+    const uint64_t row = uint64_t(gl_WorkGroupID.x) * SEISMIC_SUBGROUPS + SEISMIC_SUBGROUP;
+    if (row < SEISMIC_DIM_M)
+        route_select_row(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS), row);
+}

@@ -200,13 +200,13 @@ fn select_experts[M, E, K](logits: &tensor[M, E] f32, bias: &tensor[E] f32, scor
 # normalized when `normalize` is set and scaled by `expert_scale` when
 # ES > 0, the shared gate's coefficient, and the shared expert's SiLU `glu`.
 fn route_shared[M, H, PT, NM, E, K, S, ES](residual: &tensor[M, PT * H] f32,
-    norm: &tensor[NM] NW, router: &tensor[E, H] RW, shared_router: &tensor[H] f32,
+    norm: &tensor[NM] NW, router: &tensor[E, H] RW, shared_router: &tensor[H] SRW,
     shared_gate: &tensor[S, H] SGW, shared_up: &tensor[S, H] SUW,
     eps: f32, normalize: i32, expert_scale: &tensor[ES] f32,
     routes: &mut tensor[M, K] i32, scores: &mut tensor[M, K] f32,
     normalized: &mut tensor[M, H] A, coefficient: &mut tensor[M] f32,
     shared_product: &mut tensor[M, S] A)
-    where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and ES >= 0 and (ES == 0 or ES == E) and operands(RW) == 0 and operands(SGW) == operands(SUW):
+    where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and ES >= 0 and (ES == 0 or ES == E) and operands(RW) == 0 and operands(SRW) == 0 and operands(SGW) == operands(SUW):
     let mut logits = tensor[M, E] f32
     let mut gates = tensor[M, S] A
     let mut ups = tensor[M, S] A

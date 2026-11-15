@@ -359,7 +359,7 @@ mod tests {
         check(projection, key_of, ("RESIDUE", 1), 2);
         let route = metal(seismic::generated::native_implementation_at::<magnitude_kernels::routed_route_streamed::Entry>(
             BackendName::Metal,
-            &[("NW", activation), ("RW", weights), ("SGW", weights), ("SUW", weights), ("A", activation)],
+            &[("NW", activation), ("RW", weights), ("SRW", activation), ("SGW", weights), ("SUW", weights), ("A", weights)],
         ));
         let key_of = at("routed_route_streamed", &route, ("LANES", 16));
         check(route, key_of, ("LANES", 16), 32);

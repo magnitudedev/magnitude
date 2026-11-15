@@ -107,7 +107,7 @@ fn dense_expand_matches_host_model(format: Format) {
         let residual = f32_tensor(&device, &[case.m as u64, h as u64], &case.residual);
         let norm = f32_tensor(&device, &[h as u64], &case.norm);
         let out_rows = i32_tensor(&device, &[o as u64], &case.out_rows);
-        for mapping in mappings(o, |mapping| expand.admits(&device, mapping)) {
+        for mapping in mappings("dense_expand", o, |mapping| expand.admits(&device, mapping)) {
             let (expected, tolerance) = case.expand(&gate, &up, Some(format), mapping);
             let product = expand
                 .kernel(&device, mapping)
@@ -166,7 +166,7 @@ fn dense_output_cases(device: &Device, format: Format, h: usize, f: usize, rng: 
         let product = bf16_tensor(&device, &[o as u64, f as u64], &product_values);
         let residual = f32_tensor(&device, &[m as u64, h as u64], &residual_values);
         let out_rows = i32_tensor(&device, &[o as u64], &out_rows_values);
-        for mapping in mappings(o, |mapping| output.admits(&device, mapping)) {
+        for mapping in mappings("dense_output", o, |mapping| output.admits(&device, mapping)) {
             // The product is exact input, so the INT8 emulation is exact too.
             let (x, _) = operand_rows(&product_values, f, mapping, Some(format));
             let (projected, sums) = project(&x, &down.values, format.resident(), o, h, f, mapping);
@@ -216,7 +216,7 @@ fn grouped_project_rows_match_host_model(format: Format) {
             Y: Element::f32(),
         }),
         move |_: &Device, mapping: Mapping| {
-            mapping.projection_params(
+            mapping.single_params(
                 NativeSpecialization::new()
                     .with_static("G", groups as u64)
                     .with_static("K", k as u64)
@@ -230,7 +230,7 @@ fn grouped_project_rows_match_host_model(format: Format) {
             .map(|_| bf16_round(rng.uniform(-1.0, 1.0)))
             .collect();
         let source_tensor = bf16_tensor(&device, &[o as u64, (groups * k) as u64], &source);
-        let mappings = mappings(o, |mapping| projection.admits(&device, mapping));
+        let mappings = mappings("project_rows", o, |mapping| projection.admits(&device, mapping));
         assert_eq!(
             mappings.is_empty(),
             format.operands == OperandRecipe::Nvfp4Rows,
@@ -652,7 +652,7 @@ fn cuda_dense_weights_match_host_model() {
         let residual = f32_tensor(&device, &[case.m as u64, h as u64], &case.residual);
         let norm = f32_tensor(&device, &[h as u64], &case.norm);
         let out_rows = i32_tensor(&device, &[o as u64], &case.out_rows);
-        for mapping in mappings(o, |mapping| {
+        for mapping in mappings("dense_expand + dense_output", o, |mapping| {
             expand.admits(&device, mapping) && output.admits(&device, mapping)
         }) {
             let (expected, tolerance) = case.expand(&gate, &up, None, mapping);
@@ -738,7 +738,7 @@ fn gemv_rows_match_single_row_bits(format: Format) {
         .collect();
     let expansion = expansion(format.resident(), format.resident(), h, f);
     let projection = output_projection(format.resident(), h, f);
-    for mapping in admitted(&GEMV_MAPPINGS, |mapping| {
+    for mapping in admitted("dense_expand + dense_output", &GEMV_MAPPINGS, |mapping| {
         expansion.admits(&device, mapping) && projection.admits(&device, mapping)
     }) {
         let expand = expansion.kernel(&device, mapping);
@@ -851,7 +851,7 @@ fn head_rows_match_host_model(format: Format) {
         let hidden = f32_tensor(&device, &[case.m as u64, d as u64], &case.residual);
         let norm = f32_tensor(&device, &[d as u64], &case.norm);
         let out_rows = i32_tensor(&device, &[o as u64], &case.out_rows);
-        for mapping in mappings(o, |mapping| readout.admits(&device, mapping)) {
+        for mapping in mappings("readout_head_rows", o, |mapping| readout.admits(&device, mapping)) {
             // The head's GEMMs are the 16-bit path.
             let (expected, tolerance) = head_expected(
                 &case,
@@ -910,10 +910,7 @@ fn cuda_head_logits_scoped_launches_match_host_model() {
                 .with_static("D", d as u64)
                 .with_static("S", v as u64)
                 .with_static("I", 0)
-                .with_static("WS", 0)
-                .with_param("OPERAND", 0)
-                .with_param("KSPLIT", 4)
-                .with_launch_param(4, "ROTATE", 2);
+                .with_static("WS", 0);
             let kernel = readout_project_rows::native_for_device_with(
                 &device,
                 readout_project_rows::Elements {

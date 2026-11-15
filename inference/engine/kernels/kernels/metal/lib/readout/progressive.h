@@ -11,8 +11,10 @@
 // shift and mask away: `(plane >> q) & 0x11111111` holds the bit of code
 // 8q + e in nibble e, as `top` holds its high bits.
 //
-// The top level and the full pass are the projection library's GEMV,
-// batched GEMV and GEMM over the views' packets; the later levels gather the
+// The top level and the full pass are the `dense` projection's GEMV, batched
+// GEMV and GEMM over the views' packets, the exact view's GEMV by the exact
+// level's own recipe (`gemv_recipe`), so the full pass and a certified
+// selection project a row alike bit for bit; the later levels gather the
 // survivors' remaining planes. The views are bounded (`radius`) rather than
 // exact; their comparisons keep a relative margin of PROGRESSIVE_MARGIN, so
 // F32 rounding only ever keeps extra rows.
@@ -456,3 +458,20 @@ inline void gather(device const uchar *features, ulong feature_stride, thread co
 }
 
 } // namespace progressive
+
+namespace projection {
+
+// The exact view at the GEMV's rows: the exact level's recipe.
+template <>
+struct gemv_recipe<packets::ProgressiveExact> {
+    static constant constexpr bool value = true;
+    static progressive::Codes decode(thread const packets::ProgressiveExact::packet &packet) {
+        return progressive::exact_codes(packet);
+    }
+    static float dot(thread const packets::ProgressiveExact::packet &packet, thread const progressive::Codes &codes,
+        thread const float4 (&even)[4], thread const float4 (&odd)[4]) {
+        return progressive::exact(packet.scale, codes, even, odd);
+    }
+};
+
+} // namespace projection

@@ -6,4 +6,4 @@
     (m) * SEISMIC_RESULT_0_STRIDE_0 + (k) * SEISMIC_RESULT_0_STRIDE_1 + (n) * SEISMIC_RESULT_0_STRIDE_2, value)
 #include "lib/routed/output.glsl"
 
-void routed_output_project() { routed_output_projection(); }
+void routed_output_project_project() { routed_output_projection(); }

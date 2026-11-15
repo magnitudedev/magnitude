@@ -1,6 +1,6 @@
-// dense_expand: the shared projection producer publishes semantic Act rows
-// or explicitly selected matrix operands. GEMV retains semantic inputs;
-// small and large matrix row bands share the same operand eligibility.
+// dense_expand: the gate and up projections of the normalized rows combined
+// by the GLU epilogue, the forms of the `dense` projection
+// (`lib/projection/operator.cuh`).
 #define KERNEL_W0 SEISMIC_GATE_WEIGHT
 #define KERNEL_W1 SEISMIC_UP_WEIGHT
 // The expansion's limit as its F32 bits LB (0: none), which the Glu epilogue
@@ -8,16 +8,23 @@
 #if SEISMIC_STATIC_LB != 0
 #define PROJECTION_GLU_LIMIT SEISMIC_STATIC_LB
 #endif
-#include "lib/projection/projection.cuh"
+#include "lib/projection/operator.cuh"
+
 
 using Raw = projection::Rms<ELEMENT_OF(SEISMIC_NORM), projection::SelectedRows>;
 using Pro = projection::Operands<
     projection::OperandRecipe<packets::W0_OPERANDS_NVFP4, packets::W1_OPERANDS_NVFP4>::NVFP4, Raw>;
-using Source = projection::GemvSource<Pro>;
 using Scaling = projection::scaling<(SEISMIC_DIM_GS != 0 || SEISMIC_DIM_US != 0)>;
-using Epi = Scaling::type<projection::Glu<ELEMENT_OF(SEISMIC_ELEMENT_A)>>;
 
-#define PROLOGUE                                                                                              \
+#define PROJECTION_G 1
+#define PROJECTION_M SEISMIC_DIM_O
+#define PROJECTION_K SEISMIC_DIM_H
+#define PROJECTION_N SEISMIC_DIM_F
+#define PROJECTION_WA packets::W0
+#define PROJECTION_WB packets::W1
+#define PROJECTION_WEIGHT_TYPES projection::op::Types<packets::W0, packets::W1>
+#define PROJECTION_INT8 PACKETS_FORM_INT8(KERNEL_W0), PACKETS_FORM_INT8(KERNEL_W1)
+#define PROJECTION_ROWS(g)                                                                                       \
     Pro {                                                                                                     \
         Raw {                                                                                                 \
             reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL)), SEISMIC_RESIDUAL_STRIDE_0,  \
@@ -25,83 +32,52 @@ using Epi = Scaling::type<projection::Glu<ELEMENT_OF(SEISMIC_ELEMENT_A)>>;
                 projection::SelectedRows{reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS))}  \
         }                                                                                                     \
     }
-#define STAGING SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)
-#define GROUPS SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GROUPS)
-#define GATE KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_GATE_WEIGHT))
-#define UP KERNEL_W1_AT(SEISMIC_PTR(SEISMIC_BUFFER_UP_WEIGHT))
-#define EPILOGUE                                                                                          \
+#define PROJECTION_PLACE(g) SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)
+#define PROJECTION_PLACE_STRIDE SEISMIC_DIM_H
+#define PROJECTION_STAGING SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)
+#define PROJECTION_GROUPS SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GROUPS)
+#define PROJECTION_PARTIALS(g, parts) nullptr
+#define PROJECTION_WEIGHTS(g) KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_GATE_WEIGHT)), KERNEL_W1_AT(SEISMIC_PTR(SEISMIC_BUFFER_UP_WEIGHT))
+#define PROJECTION_EPILOGUE(g)                                                                               \
     Scaling::wrap(projection::Glu<ELEMENT_OF(SEISMIC_ELEMENT_A)>{SEISMIC_RESULT_0_OUT,     \
                                                                  SEISMIC_RESULT_0_STRIDE_0,               \
                                                                  (int)SEISMIC_PARAM_ACTIVATION},          \
                   projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_GATE_SCALE), SEISMIC_DIM_GS, 0, 0), \
                   projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_US, 0, 0))
 
-// The GEMV over NB column blocks of 8 rows.
-template <int NB, int KSPLIT>
-__device__ __forceinline__ void expand_gemv(const Pro &pro, projection::u8 *row, const projection::u8 *staged,
-                                            unsigned M, unsigned long long H, unsigned long long F,
-                                            const packets::W0 &gate, const packets::W1 &up, const Epi &epi) {
-    using Shape = projection::GemvShape<8, 1, KSPLIT, NB>;
-    __shared__ projection::GemvShared<Shape, Source::type> shared;
-    const Source::type x = Source::make(pro, row, M, H, staged);
-    const unsigned long long group = Shape::tile_group();
-    projection::gemv_segment<Shape>(shared, x, M, H / 64, group, F, gate, up, epi);
-}
-
-// The GEMM of one row band over the staged rows (A rows, or q8_1 rows with Q).
-template <class Shape, bool Q, class Operands = projection::SemanticGemmOperands>
-__device__ __forceinline__ void expand_gemm(const projection::u8 *staged, const void *groups, unsigned M,
-                                            unsigned long long H, unsigned long long F, const packets::W0 &gate,
-                                            const packets::W1 &up, const Epi &epi) {
-    extern __shared__ uint4 dynamic_shared[];
-    const unsigned long long column = projection::gemm_column<Shape>();
-    if (column < projection::gemm_columns(F))
-        projection::gemm_run<Shape, Q, Operands>(reinterpret_cast<projection::u8 *>(dynamic_shared), staged, H, groups, M, H,
-                                       column, F, gate, up, epi);
-}
-
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_STAGE
 template <unsigned INT8, unsigned OPERAND>
 __global__ void dense_expand_stage(SEISMIC_KERNEL_PARAMS) {
-    constexpr bool S8 = projection::int8_path<INT8, PACKETS_FORM_INT8(KERNEL_W0), PACKETS_FORM_INT8(KERNEL_W1)>();
-    using Operands = projection::GemmOperandsOf<OPERAND, packets::W0, packets::W1>;
-    projection::stage_projection_row<S8, Operands>(PROLOGUE, blockIdx.x, SEISMIC_DIM_O, SEISMIC_DIM_H, STAGING, GROUPS);
+    PROJECTION_STAGE;
 }
 #endif
 
-
-
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_GEMV
-template <unsigned KSPLIT>
-__global__ void dense_expand_gemv(SEISMIC_KERNEL_PARAMS) {
+template <unsigned STAGING, unsigned KSPLIT, unsigned RESIDENCY>
+__launch_bounds__(256, PROJECTION_GEMV_BLOCKS(KSPLIT, RESIDENCY)) __global__ void dense_expand_gemv(SEISMIC_KERNEL_PARAMS) {
     extern __shared__ uint4 dynamic_shared[];
-    expand_gemv<1, KSPLIT>(PROLOGUE, reinterpret_cast<projection::u8 *>(dynamic_shared), STAGING, (unsigned)SEISMIC_DIM_O,
-                   SEISMIC_DIM_H, SEISMIC_DIM_F, GATE, UP, EPILOGUE);
+    PROJECTION_GEMV(1, KSPLIT, STAGING, PROJECTION_GEMV_GRID(KSPLIT, RESIDENCY), RESIDENCY,
+                    reinterpret_cast<projection::u8 *>(dynamic_shared));
 }
 #endif
 
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_GEMV16
-template <unsigned KSPLIT>
+template <unsigned STAGING, unsigned KSPLIT>
 __global__ void dense_expand_gemv16(SEISMIC_KERNEL_PARAMS) {
-    expand_gemv<2, KSPLIT>(PROLOGUE, nullptr, STAGING, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_H, SEISMIC_DIM_F, GATE, UP,
-                   EPILOGUE);
+    PROJECTION_GEMV(2, KSPLIT, STAGING, 0, 1, nullptr);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_GEMM_SMALL
 template <unsigned INT8, unsigned OPERAND>
 __global__ void dense_expand_gemm_small(SEISMIC_KERNEL_PARAMS) {
-    constexpr bool S8 = projection::int8_path<INT8, PACKETS_FORM_INT8(KERNEL_W0), PACKETS_FORM_INT8(KERNEL_W1)>();
-    expand_gemm<projection::SmallGemm, S8, projection::GemmOperandsOf<OPERAND, packets::W0, packets::W1>>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_H, SEISMIC_DIM_F, GATE,
-                                           UP, EPILOGUE);
+    PROJECTION_GEMM(projection::SmallGemm, PROJECTION_OPERANDS);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_GEMM
 template <unsigned INT8, unsigned OPERAND, unsigned ROTATE>
 __global__ void dense_expand_gemm(SEISMIC_KERNEL_PARAMS) {
-    constexpr bool S8 = projection::int8_path<INT8, PACKETS_FORM_INT8(KERNEL_W0), PACKETS_FORM_INT8(KERNEL_W1)>();
-    expand_gemm<projection::LargeGemm<ROTATE>, S8, projection::GemmOperandsOf<OPERAND, packets::W0, packets::W1>>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_H,
-                                                      SEISMIC_DIM_F, GATE, UP, EPILOGUE);
+    PROJECTION_GEMM(projection::LargeGemm<ROTATE>, PROJECTION_OPERANDS);
 }
 #endif

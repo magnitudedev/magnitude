@@ -143,7 +143,7 @@ native per_layer_inputs for cuda from "cuda/per_layer_inputs.cu":
 
 native per_layer_inputs for vulkan from "vulkan/per_layer_inputs.comp":
     static (L, P)
-    where P % 32 == 0 and P <= 1024
+    where P % 32 == 0 and P <= 1024 and form(TW, DECODED) == 1
     launch per_layer_inputs:
         threadgroups (L, M, 1)
         threads_per_threadgroup (P, 1, 1)

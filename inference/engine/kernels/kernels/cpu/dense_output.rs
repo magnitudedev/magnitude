@@ -1,30 +1,11 @@
 // dense_output on CPU (contract and portable body in feed_forward.seismic).
-// `dense_output_stage` stages each product row as F32 in scratch, one work
-// item per row. `dense_output_rows` gives each work item ROWS down weight
-// rows, which it projects against every staged row: result = the residual row
+// The operator's form launch forms each product row as F32 (`rows`) and its
+// Q8 blocks. `dense_output_rows` gives each work item ROWS down weight rows,
+// which it projects against every operand row: result = the residual row
 // plus the projection published to A, as the portable body adds it.
 
 use lib::core::activation;
 use lib::projection::projection;
-
-#[inline(always)]
-fn dense_output_stage<L: Isa, E: Elements>(
-    _l: L,
-    cx: &Context<'_, E>,
-    group: [u64; 3],
-    _shared: &mut [u8],
-) {
-    let row = group[0] as usize;
-    let f = cx.dim_f() as usize;
-    // SAFETY: each work item writes its own row of the scratch.
-    let staged = unsafe { cx.scratch_staged().slice_mut::<f32>(4 * row * f, f) };
-    projection::stage::<E::A>(cx.arg_product().row([row, 0]), staged);
-    if cx.param_int8() == 1 {
-        // SAFETY: this work item alone writes row `row`'s quantized bytes.
-        unsafe { projection::quantize_row(staged, row, projection::tiled(cx.dim_o() as usize, &[&cx.arg_down_weight()]), cx.scratch_quantized(), 0) };
-    }
-    projection::operand_row(&[&cx.arg_down_weight()], staged);
-}
 
 #[inline(always)]
 fn dense_output_rows<L: Isa, E: Elements>(
@@ -46,8 +27,8 @@ fn dense_output_rows<L: Isa, E: Elements>(
         cx.result_0(),
     );
     let down_scale = if cx.dim_ds() == 0 { 1.0 } else { cx.arg_down_scale().get([0]) };
-    // SAFETY: the stage launch wrote every row before this launch.
-    let staged = unsafe { cx.scratch_staged().slice::<f32>(0, o * f) };
+    // SAFETY: the form launch (or the operand's producer) wrote every row before this launch.
+    let staged = unsafe { cx.scratch_rows().slice::<f32>(0, o * f) };
     let quantized = (cx.param_int8() == 1).then(|| unsafe {
         projection::quantized(cx.scratch_quantized(), 0, o, f, projection::tiled(o, &[&cx.arg_down_weight()]))
     });

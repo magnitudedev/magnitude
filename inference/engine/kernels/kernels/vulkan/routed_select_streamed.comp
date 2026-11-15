@@ -1,94 +1,83 @@
-#define SELECT_DECODE_ONLY
+// Expert streaming's decode general selection (`routed_select_streamed`) on the
+// `dense` projection operator, single over `router`, followed by selection and
+// resolve.
+#define KERNEL_W0 SEISMIC_ROUTER
+#include "lib/core/activation.glsl"
+#include "lib/projection/projection.glsl"
+#define SELECT_E uint(SEISMIC_DIM_E)
 #include "lib/routed/selection.glsl"
 #include "lib/routed/streamed.glsl"
 
-void routed_select_gemv() { select_gemv(); }
+#if defined(SEISMIC_NORM_REPRESENTATION_F32)
+#define SELECT_NORM ELEMENT_F32
+#elif defined(SEISMIC_NORM_REPRESENTATION_F16)
+#define SELECT_NORM ELEMENT_F16
+#elif defined(SEISMIC_NORM_REPRESENTATION_BF16)
+#define SELECT_NORM ELEMENT_BF16
+#else
+#error "routed norm must be dense"
+#endif
+#if defined(SEISMIC_ROUTER_NORM_REPRESENTATION_F32)
+#define SELECT_ROUTER_NORM ELEMENT_F32
+#elif defined(SEISMIC_ROUTER_NORM_REPRESENTATION_F16)
+#define SELECT_ROUTER_NORM ELEMENT_F16
+#elif defined(SEISMIC_ROUTER_NORM_REPRESENTATION_BF16)
+#define SELECT_ROUTER_NORM ELEMENT_BF16
+#else
+#error "routed router norm must be dense"
+#endif
 
-void routed_select_streamed_select() {
-    select_select();
-    routed_resolve(false);
-}
-void routed_select_whole_select() {
-    select_select();
-    routed_resolve(true);
-}
+#define SELECT_H uint(SEISMIC_DIM_H)
 
-#undef SELECT_FN
-#define SELECT_FN(name) hint_ ## name
-#undef SELECT_E
-#define SELECT_E uint(SEISMIC_DIM_EN)
-#undef SELECT_ROUTER_NORM_BUFFER
-#define SELECT_ROUTER_NORM_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_NEXT_ROUTER_NORM)
-#undef SELECT_ROUTER_NORM_STRIDE
-#define SELECT_ROUTER_NORM_STRIDE SEISMIC_NEXT_ROUTER_NORM_STRIDE_0
-#undef SELECT_ROUTER_BUFFER
-#define SELECT_ROUTER_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_NEXT_ROUTER)
-#undef SELECT_ROUTER_STRIDE_0
-#define SELECT_ROUTER_STRIDE_0 SEISMIC_NEXT_ROUTER_STRIDE_0
-#undef SELECT_ROUTER_STRIDE_1
-#define SELECT_ROUTER_STRIDE_1 SEISMIC_NEXT_ROUTER_STRIDE_1
-#undef SELECT_ROUTER_ROWS
-#define SELECT_ROUTER_ROWS PACKETS_ROWS_PACKED(SEISMIC_NEXT_ROUTER)
-#undef SELECT_LOGITS
-#define SELECT_LOGITS (SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS) + SEISMIC_DIM_M * SEISMIC_DIM_E * 4ul)
-#undef SELECT_BIAS_BUFFER
-#define SELECT_BIAS_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_NEXT_BIAS)
-#undef SELECT_BIAS_STRIDE
-#define SELECT_BIAS_STRIDE SEISMIC_NEXT_BIAS_STRIDE_0
-#undef SELECT_PUBLISH
-#define SELECT_PUBLISH false
-SELECT_RANKING
-SELECT_NUMERICAL
-// And the selection of the layer two ahead (`after_*`), into the logits
-// after the next layer's [M, EN].
-#undef SELECT_FN
-#define SELECT_FN(name) after_ ## name
-#undef SELECT_E
-#define SELECT_E uint(SEISMIC_DIM_EN)
-#undef SELECT_ROUTER_NORM_BUFFER
-#define SELECT_ROUTER_NORM_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_AFTER_ROUTER_NORM)
-#undef SELECT_ROUTER_NORM_STRIDE
-#define SELECT_ROUTER_NORM_STRIDE SEISMIC_AFTER_ROUTER_NORM_STRIDE_0
-#undef SELECT_ROUTER_BUFFER
-#define SELECT_ROUTER_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_AFTER_ROUTER)
-#undef SELECT_ROUTER_STRIDE_0
-#define SELECT_ROUTER_STRIDE_0 SEISMIC_AFTER_ROUTER_STRIDE_0
-#undef SELECT_ROUTER_STRIDE_1
-#define SELECT_ROUTER_STRIDE_1 SEISMIC_AFTER_ROUTER_STRIDE_1
-#undef SELECT_ROUTER_ROWS
-#define SELECT_ROUTER_ROWS PACKETS_ROWS_PACKED(SEISMIC_AFTER_ROUTER)
-#undef SELECT_LOGITS
-#define SELECT_LOGITS (SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS) + SEISMIC_DIM_M * SEISMIC_DIM_E * 4ul + SEISMIC_DIM_M * SEISMIC_DIM_EN * 4ul)
-#undef SELECT_BIAS_BUFFER
-#define SELECT_BIAS_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_AFTER_BIAS)
-#undef SELECT_BIAS_STRIDE
-#define SELECT_BIAS_STRIDE SEISMIC_AFTER_BIAS_STRIDE_0
-#undef SELECT_PUBLISH
-#define SELECT_PUBLISH false
-SELECT_RANKING
-SELECT_NUMERICAL
-// Each lead's router GEMV (workgroup row y: 0 one layer ahead, 1 two).
-void hint_routed_select_gemv() {
-    if (gl_WorkGroupID.y == 0u)
-        hint_select_gemv();
-    else
-        after_select_gemv();
+projection_prologue projected_input(uint g) {
+    return projection_ordered_rms(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL),
+        SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_ROUTER_NORM),
+        SEISMIC_ROUTER_NORM_STRIDE_0, SELECT_ROUTER_NORM, element_word_f32(SEISMIC_PARAM_EPSILON), SELECT_H, 0ul);
 }
 
-// Each lead's ranking and hints (workgroup row y), into the lead's ring row.
-void routed_select_hint() {
-    const uint lead = gl_WorkGroupID.y;
-    const uint64_t row = SEISMIC_SUBGROUP;
-    if (row < SEISMIC_DIM_M) {
-        float chosen[SELECT_K];
-        int winners[SELECT_K];
-        if (lead == 0u)
-            hint_select_rank(row, chosen, winners);
-        else
-            after_select_rank(row, chosen, winners);
-        if (SEISMIC_LANE == 0u)
-            for (uint rank = 0u; rank < SELECT_K; ++rank)
-                seismic_shared_i32[uint(row) * SELECT_K + rank] = winners[SELECT_K - 1u - rank];
+projection_prologue select_norm_input() {
+    return projection_ordered_rms(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL),
+        SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_NORM),
+        SEISMIC_NORM_STRIDE_0, SELECT_NORM, element_word_f32(SEISMIC_PARAM_EPSILON), SELECT_H, 0ul);
+}
+
+projection_prologue projected_rows(uint g) { return projected_input(g); }
+
+projection_weights projected_weight(uint g) {
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_ROUTER), PACKETS_W0_ROWS, SELECT_H, 0ul, 1ul, 0u);
+}
+
+projection_epilogue projected_output(uint g) {
+    return projection_store(out_over_scratch(ELEMENT_F32, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS)),
+        SEISMIC_DIM_E, 1ul, 0ul);
+}
+
+void select_publish_decode_rows() {
+    const projection_prologue norm_in = select_norm_input();
+    const uint m = uint(SEISMIC_DIM_M);
+    for (uint idx = gl_LocalInvocationIndex; idx < m * SELECT_H; idx += gl_WorkGroupSize.x) {
+        const uint r = idx / SELECT_H, c = idx % SELECT_H;
+        out_put(SEISMIC_RESULT_0_OUT,
+            uint64_t(r) * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(c) * SEISMIC_RESULT_0_STRIDE_1,
+            projection_ordered_at(norm_in, r, c, seismic_shared_f32[r]));
     }
-    routed_hint_publish(lead);
 }
+
+#define PROJECTION_SINGLE
+#define PROJECTION_M uint(SEISMIC_DIM_M)
+#define PROJECTION_N SELECT_E
+#define PROJECTION_K SELECT_H
+#define PROJECTION_NORM PROJECTION_NORM_SHARED
+#define PROJECTION_ORDERED_FIRST_TILE() select_publish_decode_rows();
+#include "lib/projection/ordered.glsl"
+
+void routed_select_streamed_ordered_gemv() { projection_single_ordered_gemv(); }
+
+void routed_select_finish(const bool whole) {
+    for (uint64_t row = SEISMIC_SUBGROUP; row < SEISMIC_DIM_M; row += SEISMIC_SUBGROUPS)
+        select_select_row(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS), row);
+    routed_resolve(whole);
+}
+
+void routed_select_streamed_select() { routed_select_finish(false); }
+void routed_select_whole_select() { routed_select_finish(true); }

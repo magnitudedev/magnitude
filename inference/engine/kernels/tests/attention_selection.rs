@@ -44,6 +44,7 @@ fn portable(case: &Case, bits: &[u32], words: usize) -> Vec<f32> {
     let mut sources = seismic_std::sources();
     for (path, text) in [
         ("attention.seismic", include_str!("../kernels/attention.seismic")),
+        ("dense.seismic", include_str!("../kernels/dense.seismic")),
         ("functions.seismic", include_str!("../kernels/functions.seismic")),
         ("rounding.seismic", include_str!("../kernels/rounding.seismic")),
     ] {

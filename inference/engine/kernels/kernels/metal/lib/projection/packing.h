@@ -1117,18 +1117,15 @@ inline uint2 packing_tile_origin(uint index, uint padded) {
     return uint2((index % across) * packing_tile<TOKENS>::tokens, (index / across) * packing_tile<TOKENS>::rows);
 }
 
-// The PACK launch: every simdgroup one `packing_tile<TOKENS>`, tile
-// threadgroup x simdgroups + sg of the tiles over `padded` tokens and `rows`
-// weight rows (a multiple of 32). The simdgroups of a threadgroup are
-// independent: their number sets only how many tiles a core runs together,
-// whose best differs by device.
+// One simdgroup's `packing_tile<TOKENS>` at tokens m0 by weight rows n0 (a
+// tile at or past `m_rows` or `rows` has nothing to do): `gemm_packed`'s
+// tile, and that of a launch placing its tiles itself (a grouped expert
+// block's tokens, which share their weights only within the block).
 // WIDTH is the operand's residue width for weights with residue bits.
 template <typename W, uint WIDTH, uint TOKENS, uint WEIGHTS_AHEAD, typename Out>
-inline void gemm_packed(thread const Out &out, thread const Weights<W> &w, thread const packing_scratch &s,
-    uint m_rows, uint padded, uint rows, uint k, uint index, uint lane) {
+inline void gemm_packed_tile(thread const Out &out, thread const Weights<W> &w, thread const packing_scratch &s,
+    uint m_rows, uint m0, uint n0, uint rows, uint k, uint lane) {
     typedef packing_tile<TOKENS> tile;
-    const uint2 origin = packing_tile_origin<TOKENS>(index, padded);
-    const uint m0 = origin.x, n0 = origin.y;
     if (m0 >= m_rows || n0 >= rows)
         return;
     const ushort2 at = fragment_coordinate(lane);
@@ -1146,7 +1143,7 @@ inline void gemm_packed(thread const Out &out, thread const Weights<W> &w, threa
         for (uint t = 0; t < 4; ++t) {
             const uint m = m0 + 2u * (8u * i + at.x) + t;
             if (m < m_rows) {
-                const auto row = out.row(m);
+                const auto row = row_of(out, m);
                 PROJECTION_UNROLL
                 for (uint j = 0; j < tile::tj; ++j)
                     row.store(n0 + 8u * j + at.y, y[i][j][t]);
@@ -1155,14 +1152,25 @@ inline void gemm_packed(thread const Out &out, thread const Weights<W> &w, threa
     }
 }
 
-// One segment of a segmented entry's PACK launch: the segment's `rows` weight
-// rows (a multiple of 32) take ceil(padded rows / 1024 / simdgroups)
-// threadgroups of the launch, in segment order. A threadgroup `group` at or
-// past them belongs to a later segment, whose first is then `group` 0;
-// weights the operand (laid out for FOLDS runs a block and coded for RESIDUE
-// residue bits) does not serve leave theirs empty (the entry's exact tiles
-// run that segment).
-template <typename W, uint FOLDS, uint RESIDUE, uint TOKENS, uint WEIGHTS_AHEAD, typename Out>
+// The PACK launch: every simdgroup one `packing_tile<TOKENS>`, tile
+// threadgroup x simdgroups + sg of the tiles over `padded` tokens and `rows`
+// weight rows (a multiple of 32). The simdgroups of a threadgroup are
+// independent: their number sets only how many tiles a core runs together,
+// whose best differs by device.
+template <typename W, uint WIDTH, uint TOKENS, uint WEIGHTS_AHEAD, typename Out>
+inline void gemm_packed(thread const Out &out, thread const Weights<W> &w, thread const packing_scratch &s,
+    uint m_rows, uint padded, uint rows, uint k, uint index, uint lane) {
+    const uint2 origin = packing_tile_origin<TOKENS>(index, padded);
+    gemm_packed_tile<W, WIDTH, TOKENS, WEIGHTS_AHEAD>(out, w, s, m_rows, origin.x, origin.y, rows, k, lane);
+}
+
+// One segment of a segmented projection's PACK launch: the segment's `rows`
+// weight rows take ceil(padded rows / 1024 / simdgroups) threadgroups of the
+// launch per 32 of them, in segment order. A threadgroup `group` at or past
+// them belongs to a later segment, whose first is then `group` 0; a segment
+// the operand (coded for RESIDUE residue bits) does not serve (SERVES, its
+// rows then any) leaves its threadgroups empty (the staged tiles run it).
+template <typename W, bool SERVES, uint RESIDUE, uint TOKENS, uint WEIGHTS_AHEAD, typename Out>
 inline bool gemm_packed_segment(thread const Out &out, thread const Weights<W> &w, thread const packing_scratch &s,
     uint m_rows, uint padded, uint rows, uint k, thread uint &group, uint simdgroups, uint sg, uint lane) {
     const uint groups = (padded / 32u * (rows / 32u) + simdgroups - 1u) / simdgroups;
@@ -1170,7 +1178,7 @@ inline bool gemm_packed_segment(thread const Out &out, thread const Weights<W> &
         group -= groups;
         return false;
     }
-    if constexpr (packing_serves<W, FOLDS, RESIDUE>::value)
+    if constexpr (SERVES)
         gemm_packed<W, (RESIDUE != 0 ? RESIDUE : 1), TOKENS, WEIGHTS_AHEAD>(out, w, s, m_rows, padded, rows, k,
             group * simdgroups + sg, lane);
     return true;
@@ -1180,21 +1188,18 @@ inline bool gemm_packed_segment(thread const Out &out, thread const Weights<W> &
 // eight per lane.
 constant constexpr uint packing_exchange = 32 * 8;
 
-// The paired PACK launch (gate and up weights over one operand): simdgroups
-// 2 p and 2 p + 1 share tile threadgroup x (simdgroups / 2) + p; the even one
-// sums the gate weights' products, the odd one the up weights' and stores
-// the pair with the gate sums, exchanged through `exchange`
-// (`packing_exchange` quadruples per pair). `gate_scratch` and `up_scratch`
-// share the operand and differ in the weights' factors.
+// A paired tile of tokens m0 by features n0 (`packing_tile<TOKENS>` of each
+// weight) for simdgroups 2 pair and 2 pair + 1: the even one sums the gate
+// weights' products, the odd one the up weights' and stores the pair with
+// the gate sums, exchanged through `exchange` (`packing_exchange` quadruples
+// per pair). Every simdgroup of the threadgroup reaches its barrier, a tile
+// at or past `m_rows` or `rows` with nothing to do. `gate_scratch` and
+// `up_scratch` share the operand and differ in the weights' factors.
 template <typename G, typename U, uint WIDTH, uint TOKENS, uint WEIGHTS_AHEAD, typename Out>
-inline void gemm_packed_paired(thread const Out &out, thread const Weights<G> &gate, thread const Weights<U> &up,
-    thread const packing_scratch &gate_scratch, thread const packing_scratch &up_scratch, uint m_rows,
-    uint padded, uint rows, uint k, uint threadgroup_index, uint simdgroups, threadgroup float4 *exchange, uint sg,
-    uint lane) {
+inline void gemm_packed_paired_tile(thread const Out &out, thread const Weights<G> &gate,
+    thread const Weights<U> &up, thread const packing_scratch &gate_scratch, thread const packing_scratch &up_scratch,
+    uint m_rows, uint m0, uint n0, uint rows, uint k, uint pair, threadgroup float4 *exchange, uint sg, uint lane) {
     typedef packing_tile<TOKENS> tile;
-    const uint pair = sg / 2u;
-    const uint2 origin = packing_tile_origin<TOKENS>(threadgroup_index * (simdgroups / 2u) + pair, padded);
-    const uint m0 = origin.x, n0 = origin.y;
     const bool live = m0 < m_rows && n0 < rows;
     const ushort2 at = fragment_coordinate(lane);
     const bool second = (sg % 2u) != 0;
@@ -1232,6 +1237,20 @@ inline void gemm_packed_paired(thread const Out &out, thread const Weights<G> &g
             }
         }
     }
+}
+
+// The paired PACK launch (gate and up weights over one operand): simdgroups
+// 2 p and 2 p + 1 share tile threadgroup x (simdgroups / 2) + p of the tiles
+// over `padded` tokens and `rows` features.
+template <typename G, typename U, uint WIDTH, uint TOKENS, uint WEIGHTS_AHEAD, typename Out>
+inline void gemm_packed_paired(thread const Out &out, thread const Weights<G> &gate, thread const Weights<U> &up,
+    thread const packing_scratch &gate_scratch, thread const packing_scratch &up_scratch, uint m_rows,
+    uint padded, uint rows, uint k, uint threadgroup_index, uint simdgroups, threadgroup float4 *exchange, uint sg,
+    uint lane) {
+    const uint pair = sg / 2u;
+    const uint2 origin = packing_tile_origin<TOKENS>(threadgroup_index * (simdgroups / 2u) + pair, padded);
+    gemm_packed_paired_tile<G, U, WIDTH, TOKENS, WEIGHTS_AHEAD>(out, gate, up, gate_scratch, up_scratch, m_rows,
+        origin.x, origin.y, rows, k, pair, exchange, sg, lane);
 }
 
 } // namespace projection

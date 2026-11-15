@@ -26,12 +26,13 @@ use magnitude_kernels::{
 };
 use seismic::{Dim, Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
 
+/// A state-space block's entries; each projection's by row range.
 pub(crate) struct StateSpaceGraphEntries<'a, G: GraphDraft + 'a> {
-    pub project: G::Binding<'a, attention_project::Entry>,
+    pub project: G::Ranged<'a, attention_project::Entry>,
     pub step: G::Binding<'a, state_space_step::Entry>,
     pub chunk: G::Binding<'a, state_space_chunk::Entry>,
     pub gate: G::Binding<'a, state_space_gate::Entry>,
-    pub output: G::Binding<'a, attention_output::Entry>,
+    pub output: G::Ranged<'a, attention_output::Entry>,
 }
 
 impl<'a> From<&'a StateSpaceKernels> for StateSpaceGraphEntries<'a, NativeGraph> {
@@ -202,7 +203,7 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
     let none = || Dim::from(0u64);
     let projection = graph
         .enqueue(
-            kernels.project,
+            G::pick(kernels.project, &block.rows),
             &[
                 shape.project_dimensions(&block.rows).as_slice(),
                 &[
@@ -306,7 +307,7 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
     let inject = join.inject(graph, &block.rows, constants)?;
     let output = graph
         .enqueue(
-            kernels.output,
+            G::pick(kernels.output, &block.rows),
             &[
                 shape.output_dimensions(&block.rows).as_slice(),
                 &[

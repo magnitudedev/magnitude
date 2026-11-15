@@ -1,4 +1,4 @@
-use super::{AttentionKernels, DenseKernels};
+use super::{AttentionKernels, DenseKernels, RangedKernels};
 use crate::{AttentionBinding, DenseBinding, ScalableWeight};
 use magnitude_family_contracts::{
     AffinePart, CorrectorSite, CorrectorWeight, SublayerIndex, WeightKind, WeightScope,
@@ -48,7 +48,7 @@ pub type DraftProjectionKey = (WeightKind, Element, Element);
 
 /// A plain `project_rows` per [`DraftProjectionKey`], prepared once for
 /// every scope that shares it.
-pub type DraftProjections = HashMap<DraftProjectionKey, NativeKernel<project_rows::Entry>>;
+pub type DraftProjections = HashMap<DraftProjectionKey, RangedKernels<project_rows::Entry>>;
 
 /// A norm over rows (`readout_features_rows`): its weight element and width.
 pub type DraftNormKey = (Element, u64);
@@ -104,7 +104,7 @@ pub struct DraftBlockKernels {
 #[derive(Clone, Debug)]
 pub struct MarkovKernels {
     pub embedding: NativeKernel<embedding_rows::Entry>,
-    pub projection: NativeKernel<dense_output::Entry>,
+    pub projection: RangedKernels<dense_output::Entry>,
 }
 
 /// One convolved draft layer's unfused entries, in graph order: the
@@ -114,16 +114,16 @@ pub struct MarkovKernels {
 #[derive(Clone, Debug)]
 pub struct ConvolvedLayerKernels {
     pub attention_norm: NativeKernel<readout_features_rows::Entry>,
-    pub attention_coefficients: NativeKernel<project_rows::Entry>,
-    pub query: NativeKernel<project_rows::Entry>,
-    pub key: NativeKernel<project_rows::Entry>,
-    pub value: NativeKernel<project_rows::Entry>,
-    pub output: NativeKernel<project_rows::Entry>,
+    pub attention_coefficients: RangedKernels<project_rows::Entry>,
+    pub query: RangedKernels<project_rows::Entry>,
+    pub key: RangedKernels<project_rows::Entry>,
+    pub value: RangedKernels<project_rows::Entry>,
+    pub output: RangedKernels<project_rows::Entry>,
     pub feed_forward_norm: NativeKernel<readout_features_rows::Entry>,
-    pub feed_forward_coefficients: NativeKernel<project_rows::Entry>,
-    pub gate: NativeKernel<project_rows::Entry>,
-    pub up: NativeKernel<project_rows::Entry>,
-    pub down: NativeKernel<project_rows::Entry>,
+    pub feed_forward_coefficients: RangedKernels<project_rows::Entry>,
+    pub gate: RangedKernels<project_rows::Entry>,
+    pub up: RangedKernels<project_rows::Entry>,
+    pub down: RangedKernels<project_rows::Entry>,
 }
 
 /// A convolved backbone's entries resolved in draft order.
@@ -140,7 +140,7 @@ pub struct AttestedConvolved {
 #[derive(Clone, Debug)]
 pub struct AttestedSelector {
     pub features: NativeKernel<readout_features_rows::Entry>,
-    pub hidden: NativeKernel<project_rows::Entry>,
+    pub hidden: RangedKernels<project_rows::Entry>,
     pub top_k: NativeKernel<draft_top_k::Entry>,
     pub predecessor: NativeKernel<embedding_rows::Entry>,
     pub successor: NativeKernel<embedding_rows::Entry>,
@@ -151,13 +151,13 @@ pub struct AttestedSelector {
 #[derive(Clone, Debug)]
 pub struct CorrectorLayerKernels {
     pub attention_norm: NativeKernel<readout_features_rows::Entry>,
-    pub attention_input: NativeKernel<project_rows::Entry>,
-    pub attention_output: NativeKernel<project_rows::Entry>,
+    pub attention_input: RangedKernels<project_rows::Entry>,
+    pub attention_output: RangedKernels<project_rows::Entry>,
     pub attention_residual: NativeKernel<corrector_rows::Entry>,
     pub mlp_norm: NativeKernel<readout_features_rows::Entry>,
-    pub up: NativeKernel<project_rows::Entry>,
+    pub up: RangedKernels<project_rows::Entry>,
     pub activated: NativeKernel<corrector_rows::Entry>,
-    pub down: NativeKernel<project_rows::Entry>,
+    pub down: RangedKernels<project_rows::Entry>,
     pub down_residual: NativeKernel<corrector_rows::Entry>,
 }
 
@@ -170,22 +170,22 @@ pub struct AttestedCorrector {
     pub anchor_rows: NativeKernel<readout_features_rows::Entry>,
     pub top_k: NativeKernel<draft_top_k::Entry>,
     pub features: NativeKernel<corrector_features::Entry>,
-    pub feature_down: NativeKernel<project_rows::Entry>,
-    pub token: Option<NativeKernel<project_rows::Entry>>,
-    pub pass: NativeKernel<project_rows::Entry>,
+    pub feature_down: RangedKernels<project_rows::Entry>,
+    pub token: Option<RangedKernels<project_rows::Entry>>,
+    pub pass: RangedKernels<project_rows::Entry>,
     pub nodes: NativeKernel<corrector_nodes::Entry>,
-    pub context: NativeKernel<project_rows::Entry>,
+    pub context: RangedKernels<project_rows::Entry>,
     pub context_bias: NativeKernel<corrector_rows::Entry>,
     pub anchor_norm: NativeKernel<readout_features_rows::Entry>,
     pub attention: NativeKernel<corrector_attention::Entry>,
     pub layers: Vec<CorrectorLayerKernels>,
     pub output_norm: NativeKernel<readout_features_rows::Entry>,
     pub factors: NativeKernel<corrector_factors::Entry>,
-    pub factor_input: NativeKernel<project_rows::Entry>,
+    pub factor_input: RangedKernels<project_rows::Entry>,
     pub factor_activated: NativeKernel<corrector_rows::Entry>,
-    pub outgoing: NativeKernel<project_rows::Entry>,
-    pub incoming: NativeKernel<project_rows::Entry>,
-    pub anchor: NativeKernel<project_rows::Entry>,
+    pub outgoing: RangedKernels<project_rows::Entry>,
+    pub incoming: RangedKernels<project_rows::Entry>,
+    pub anchor: RangedKernels<project_rows::Entry>,
     pub unit: NativeKernel<corrector_rows::Entry>,
     pub path: NativeKernel<corrector_path::Entry>,
 }
@@ -383,7 +383,7 @@ impl DraftKernels {
         kind: WeightKind,
         weight: ScalableWeight,
         output: Element,
-    ) -> Result<NativeKernel<project_rows::Entry>, String> {
+    ) -> Result<RangedKernels<project_rows::Entry>, String> {
         self.projections
             .get(&(kind, weight.element, output))
             .cloned()

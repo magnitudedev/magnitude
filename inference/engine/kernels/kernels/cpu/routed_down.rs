@@ -1,47 +1,21 @@
 // routed_down on CPU (contract and portable body in routed.seismic).
-// `routed_down_stage` stages each row's choice products as F32 in scratch,
-// one work item per row. `routed_down_rows`: work item (x, m) owns ROWS
-// output channels of row m. It projects each choice's expert down rows
-// (none for a choice its sources name none for), weighting each published (A-rounded) projection in slot order, and
-// publishes base + selected.
+// The operator's form launch forms each row's choice products as F32
+// (`rows`) and their Q8 blocks. `routed_down_rows`: work item (x, m) owns
+// ROWS output channels of row m. It projects each choice's expert down rows
+// (none for a choice its sources name none for), weighting each published
+// (A-rounded) projection in slot order, and publishes base + selected.
 
 use lib::core::activation;
 use lib::projection::projection;
 use lib::routed::routed;
 
 #[inline(always)]
-fn routed_down_stage<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
-    let row = group[0] as usize;
-    let (k, f) = (cx.dim_k() as usize, cx.dim_f() as usize);
-    let product = cx.arg_product();
-    for slot in 0..k {
-        let choice = row * k + slot;
-        // SAFETY: each work item writes its own row's choices of the scratch.
-        let staged = unsafe { cx.scratch_staged().slice_mut::<f32>(4 * choice * f, f) };
-        projection::stage::<E::A>(product.row([row, slot, 0]), staged);
-        if cx.param_int8() == 1 {
-            let blocks = seismic::cpu::quant::blocks(f);
-            // SAFETY: this work item owns the corresponding choice row.
-            let q8 = unsafe {
-                cx.scratch_quantized()
-                    .slice_mut::<seismic::cpu::quant::Q8Block>(
-                        choice * blocks * seismic::cpu::quant::Q8_BYTES,
-                        blocks,
-                    )
-            };
-            projection::quantize(staged, q8);
-        }
-        projection::operand_row(&[&cx.arg_expert_down()], staged);
-    }
-}
-
-#[inline(always)]
 fn routed_down_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let (m, h, k, f) = (cx.dim_m() as usize, cx.dim_h() as usize, cx.dim_k() as usize, cx.dim_f() as usize);
     let row = group[1] as usize;
     let columns = projection::item_rows(group[0], cx.param_rows(), h);
-    // SAFETY: the stage launch wrote every row before this launch.
-    let staged = unsafe { cx.scratch_staged().slice::<f32>(0, m * k * f) };
+    // SAFETY: the form launch (or the operand's producer) wrote every row before this launch.
+    let staged = unsafe { cx.scratch_rows().slice::<f32>(0, m * k * f) };
     let blocks = seismic::cpu::quant::blocks(f);
     let quantized = (cx.param_int8() == 1)
         .then(|| unsafe { cx.scratch_quantized().slice::<seismic::cpu::quant::Q8Block>(0, m * k * blocks) });

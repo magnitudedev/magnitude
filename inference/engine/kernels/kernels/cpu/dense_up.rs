@@ -1,28 +1,11 @@
 // dense_up on CPU (contract and portable body in feed_forward.seismic).
-// `dense_up_normalize` publishes the RMS-normalized residual row of each
-// output row (rounded to A) as F32 into scratch, one work item per row.
+// The operator's form launch forms the RMS-normalized residual row of each
+// output row (rounded to A) as F32 (`rows`) and its Q8 blocks.
 // `dense_up_rows` gives each work item ROWS up weight rows, projected against
 // every normalized row and published A(act(A(up_scale * up))).
 
 use lib::core::functions;
 use lib::projection::projection;
-
-#[inline(always)]
-fn dense_up_normalize<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
-    let row = group[0] as usize;
-    let h = cx.dim_h() as usize;
-    let source = cx.arg_out_rows().get([row]) as usize;
-    let weight = seismic::cpu::tensor::floats(shared, h);
-    cx.arg_norm().decode_row(0, weight);
-    // SAFETY: each work item writes its own row of the scratch.
-    let normalized = unsafe { cx.scratch_normalized().slice_mut::<f32>(4 * row * h, h) };
-    projection::rms_row::<E::A>(cx.arg_residual().row([source, 0]), weight, cx.arg_eps(), normalized);
-    if cx.param_int8() == 1 {
-        // SAFETY: this work item alone writes row `row`'s quantized bytes.
-        unsafe { projection::quantize_row(normalized, row, projection::tiled(cx.dim_o() as usize, &[&cx.arg_up_weight()]), cx.scratch_quantized(), 0) };
-    }
-    projection::operand_row(&[&cx.arg_up_weight()], normalized);
-}
 
 #[inline(always)]
 fn dense_up_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
@@ -31,8 +14,8 @@ fn dense_up_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3
     let result = cx.result_0();
     let function = cx.arg_activation();
     let scale = if cx.dim_us() == 0 { 1.0 } else { cx.arg_up_scale().get([0]) };
-    // SAFETY: the normalize launch wrote every row before this launch.
-    let normalized = unsafe { cx.scratch_normalized().slice::<f32>(0, o * h) };
+    // SAFETY: the form launch (or the operand's producer) wrote every row before this launch.
+    let normalized = unsafe { cx.scratch_rows().slice::<f32>(0, o * h) };
     let quantized = (cx.param_int8() == 1).then(|| unsafe {
         projection::quantized(cx.scratch_quantized(), 0, o, h, projection::tiled(o, &[&cx.arg_up_weight()]))
     });

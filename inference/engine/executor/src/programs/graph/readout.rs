@@ -470,7 +470,8 @@ enum FeatureEntries<'a, G: GraphDraft + 'a> {
     Residual(G::Binding<'a, feature_rows::Entry>),
     Output(G::Binding<'a, readout_features_rows::Entry>),
     Taps {
-        fusion: G::Binding<'a, project_rows::Entry>,
+        /// The taps' fusion, by row range.
+        fusion: G::Ranged<'a, project_rows::Entry>,
         features: G::Binding<'a, feature_rows::Entry>,
     },
 }
@@ -1107,7 +1108,7 @@ fn feature_topology<'a, G: GraphDraft + 'a>(
             let fusion_bound = graph.port(Element::f32(), &[plan.bound])?;
             let fused = graph
                 .enqueue::<project_rows::Entry>(
-                    fusion,
+                    G::pick(fusion, &Dim::from(class.rows)),
                     &[
                         ("M", class.rows),
                         ("G", 1),
@@ -1157,9 +1158,10 @@ fn feature_topology<'a, G: GraphDraft + 'a>(
     Ok((graph, final_rows, out_rows, features, taps, residual))
 }
 
-/// The head entries of a readout graph, by its head plans.
+/// The head entries of a readout graph, by its head plans; the packed
+/// projection's by row range.
 enum HeadEntries<'a, G: GraphDraft + 'a> {
-    Packed(G::Binding<'a, readout_head_rows::Entry>),
+    Packed(G::Ranged<'a, readout_head_rows::Entry>),
     Progressive {
         top: G::Binding<'a, readout_top_rows::Entry>,
         refine: G::Binding<'a, readout_refine_rows::Entry>,
@@ -1214,9 +1216,11 @@ pub(crate) enum ReadoutInput<'p> {
     },
 }
 
+/// A vocabulary projection's entries; a packed projection's by the range of
+/// the rows it projects.
 pub(crate) enum ProjectionEntries<'a, G: GraphDraft + 'a> {
-    RawPacked(G::Binding<'a, readout_head_rows::Entry>),
-    PreparedPacked(G::Binding<'a, readout_project_rows::Entry>),
+    RawPacked(G::Ranged<'a, readout_head_rows::Entry>),
+    PreparedPacked(G::Ranged<'a, readout_project_rows::Entry>),
     Progressive(ProgressiveEntries<'a, G>),
     Qualified {
         packed: Box<ProjectionEntries<'a, G>>,
@@ -1236,7 +1240,7 @@ impl<'a, G: GraphDraft + 'a> ProjectionEntries<'a, G> {
     ) -> Result<NativePort, GraphError> {
         match (self, ports) {
             (Self::RawPacked(entry), ProjectionPorts::Packed { .. }) => {
-                graph.input_for::<readout_head_rows::Entry>(*entry, "out_rows", dimensions)
+                graph.input_for::<readout_head_rows::Entry>(G::first(*entry), "out_rows", dimensions)
             }
             (Self::Qualified { packed, .. }, ProjectionPorts::Packed { .. }) => {
                 packed.raw_out_rows(graph, ports, dimensions)
@@ -1441,6 +1445,8 @@ pub(crate) fn project_readout<'a, G: GraphDraft + 'a>(
             ProjectionPorts::Packed { weight, scale, scale_extent }) => {
             if !geometry.columns.equals(&geometry.vocabulary) { return Err("raw packed full projection columns disagree with its table".into()); }
             let [parts, normalized] = form.dimensions(geometry.hidden.clone());
+            // A projection's kernel is the range of the rows it projects.
+            let entry = G::pick(entry, &geometry.projected);
             let dims = [("M", geometry.rows), ("O", geometry.projected), ("V", geometry.vocabulary),
                 ("D", geometry.hidden), parts, normalized, ("WS", scale_extent.clone())];
             Ok(Readout { logits: graph.enqueue(entry, &dims, readout_head_rows::WorkflowArgs {
@@ -1450,6 +1456,7 @@ pub(crate) fn project_readout<'a, G: GraphDraft + 'a>(
         }
         (ReadoutInput::PreparedFeatures { features, canonical_rows }, ProjectionEntries::PreparedPacked(entry),
             ProjectionPorts::Packed { weight, scale, scale_extent }) => {
+            let entry = G::pick(entry, &geometry.projected);
             let operands = [geometry.projected.clone(), Dim::from(u64::from(canonical_rows.is_some())), geometry.columns.clone()];
             let empty = if canonical_rows.is_none() {
                 let constant = crate::programs::native_constants::GraphConstant::i32(graph, &[])?;
@@ -1695,7 +1702,7 @@ fn head_topology<'a, G: GraphDraft + 'a>(
         {
             dimensions.push(("WS", scale_extent.clone()));
             (
-                graph.input_for(entry, "out_rows", &dimensions)?,
+                graph.input_for(G::first(entry), "out_rows", &dimensions)?,
                 ProjectionEntries::RawPacked(entry),
             )
         }

@@ -1,0 +1,78 @@
+// Ahead-of-step general-selection hints (`routed_hint_select`) on the `dense`
+// projection operator, segmented over `(next_router, after_router)` in the CPU
+// 8-lane reference order; segment 1 is zeroed when `AHEAD < 2`.
+#define KERNEL_W0 SEISMIC_NEXT_ROUTER
+#define KERNEL_W1 SEISMIC_AFTER_ROUTER
+#include "lib/core/activation.glsl"
+#include "lib/projection/projection.glsl"
+#include "lib/core/precise.glsl"
+#include "lib/routed/ranked.glsl"
+#define SELECT_E uint(SEISMIC_DIM_EN)
+#define SELECT_K uint(SEISMIC_DIM_K)
+#define SELECT_P ((SELECT_E + 31u) / 32u)
+#define SELECT_FN(name) name
+#include "lib/routed/select.glsl"
+SELECT_RANKING
+#include "lib/streaming/control.glsl"
+#include "../streaming/hint.hpp"
+
+#if defined(SEISMIC_NEXT_ROUTER_NORM_REPRESENTATION_F32)
+#define HINT_ROUTER_NORM ELEMENT_F32
+#elif defined(SEISMIC_NEXT_ROUTER_NORM_REPRESENTATION_F16)
+#define HINT_ROUTER_NORM ELEMENT_F16
+#elif defined(SEISMIC_NEXT_ROUTER_NORM_REPRESENTATION_BF16)
+#define HINT_ROUTER_NORM ELEMENT_BF16
+#else
+#error "routed hint router norm must be dense"
+#endif
+
+#define HINT_H uint(SEISMIC_DIM_H)
+
+projection_prologue hint_segment_input(const uint s) {
+    const uint64_t norm_ptr = s == 0u
+        ? SEISMIC_PTR(SEISMIC_BUFFER_NEXT_ROUTER_NORM)
+        : SEISMIC_PTR(SEISMIC_BUFFER_AFTER_ROUTER_NORM);
+    const uint64_t norm_s0 = s == 0u ? SEISMIC_NEXT_ROUTER_NORM_STRIDE_0 : SEISMIC_AFTER_ROUTER_NORM_STRIDE_0;
+    return projection_ordered_rms(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL),
+        SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1, norm_ptr, norm_s0, HINT_ROUTER_NORM,
+        element_word_f32(SEISMIC_PARAM_EPSILON), HINT_H, 0ul);
+}
+
+projection_prologue projected_input(uint g) { return hint_segment_input(0u); }
+projection_prologue projected_rows(uint g) { return hint_segment_input(0u); }
+
+#define PROJECTION_M uint(SEISMIC_DIM_M)
+#define PROJECTION_K HINT_H
+#define PROJECTION_NORM PROJECTION_NORM_SHARED
+#define PROJECTION_ZEROED(s) ((s) == 1 && SEISMIC_DIM_AHEAD < 2ul)
+#define PROJECTION_SEGMENT_INPUT(s) hint_segment_input(uint(s))
+#define PROJECTION_N0 uint(SEISMIC_DIM_EN)
+#define PROJECTION_N1 uint(SEISMIC_DIM_EN)
+#define PROJECTION_WEIGHT0 projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_NEXT_ROUTER), PACKETS_W0_ROWS, HINT_H, 0ul, 1ul, 0u)
+#define PROJECTION_WEIGHT1 projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_AFTER_ROUTER), PACKETS_W1_ROWS, HINT_H, 0ul, 1ul, 0u)
+#define PROJECTION_OUTPUT0 projection_store(out_over_scratch(ELEMENT_F32, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS)), SEISMIC_DIM_EN, 1ul, 0ul)
+#define PROJECTION_OUTPUT1 projection_store(out_over_scratch(ELEMENT_F32, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS) + SEISMIC_DIM_M * SEISMIC_DIM_EN * 4ul), SEISMIC_DIM_EN, 1ul, 0ul)
+#include "lib/projection/ordered.glsl"
+
+void routed_hint_select_ordered_gemv() { projection_segmented_ordered_gemv_all(); }
+
+void routed_hint_select_publish() {
+    const uint lead = gl_WorkGroupID.y;
+    const uint64_t plane = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS)
+        + uint64_t(lead) * SEISMIC_DIM_M * SEISMIC_DIM_EN * 4ul;
+    const uint64_t bias_ptr = lead == 0u ? SEISMIC_PTR(SEISMIC_BUFFER_NEXT_BIAS) : SEISMIC_PTR(SEISMIC_BUFFER_AFTER_BIAS);
+    const uint64_t bias_s0 = lead == 0u ? SEISMIC_NEXT_BIAS_STRIDE_0 : SEISMIC_AFTER_BIAS_STRIDE_0;
+    const int score_fn = int(SEISMIC_PARAM_SCORE);
+    for (uint64_t row = SEISMIC_SUBGROUP; row < SEISMIC_DIM_M; row += SEISMIC_SUBGROUPS) {
+        float chosen[SELECT_K];
+        int winners[SELECT_K];
+        select_rank_at(plane, bias_ptr, bias_s0, score_fn, row, chosen, winners);
+        if (SEISMIC_LANE == 0u)
+            for (uint r = 0u; r < SELECT_K; ++r)
+                seismic_shared_i32[uint(STREAMING_HINT_CHOSEN(uint(row))) + r] = winners[SELECT_K - 1u - r];
+    }
+    streaming_hint(uint(SEISMIC_DIM_M), SEISMIC_PTR(SEISMIC_BUFFER_RINGS) + uint64_t(lead) * SEISMIC_RINGS_STRIDE_0 * 4ul,
+        SEISMIC_RINGS_STRIDE_1,
+        streaming_device_load(SEISMIC_PTR(SEISMIC_BUFFER_STEP) + SEISMIC_CONST_STEP_LOW * SEISMIC_STEP_STRIDE_0 * 4ul),
+        0u, gl_LocalInvocationIndex, gl_WorkGroupSize.x);
+}

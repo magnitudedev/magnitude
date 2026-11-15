@@ -355,8 +355,14 @@ struct projection_weights {
     uint packet_first;  // the stored packet of packet 0 (a window of whole packets; `k` stays the row's)
 };
 
+// An entry whose table may select past the tensor's rows states them
+// (`PROJECTION_TABLE_ROWS`): such a row reads row 0, whose results the entry
+// masks.
 uint64_t projection_weights_row(projection_weights w, uint n) {
-    const uint64_t r = w.table == 0ul ? uint64_t(n) : uint64_t(element_i32_at(w.table + uint64_t(n) * w.table_stride * 4ul));
+    uint64_t r = w.table == 0ul ? uint64_t(n) : uint64_t(element_i32_at(w.table + uint64_t(n) * w.table_stride * 4ul));
+#ifdef PROJECTION_TABLE_ROWS
+    r = r < uint64_t(PROJECTION_TABLE_ROWS) ? r : 0ul;
+#endif
     return w.base + r * w.geometry.stride;
 }
 
@@ -535,6 +541,10 @@ uint projection_gemv_first_row(const uint r_rows, const uint lanes, uint tile) {
 // opening barrier publishes them.
 void projection_gemv_squares(projection_prologue in_, uint m_rows) {
     const uint slots = PROJECTION_RMS_PARTS;
+    if (in_.kind == PROJECTION_ORDERED_RMS || in_.kind == PROJECTION_ORDERED_SUMMED) {
+        projection_ordered_inverses(in_, m_rows, 0u, slots, 0u, m_rows * slots <= 64u, 64u);
+        return;
+    }
     for (uint item = SEISMIC_SUBGROUP; item < m_rows * slots; item += SEISMIC_SUBGROUPS) {
         const float sum = seismic_subgroup_sum_f32(
             projection_rms_squares(in_, item / slots, item % slots, SEISMIC_LANE));
@@ -545,6 +555,8 @@ void projection_gemv_squares(projection_prologue in_, uint m_rows) {
 
 float projection_gemv_inverse(projection_prologue in_, uint m) {
     const uint at = m * PROJECTION_RMS_PARTS;
+    if (in_.kind == PROJECTION_ORDERED_RMS || in_.kind == PROJECTION_ORDERED_SUMMED)
+        return seismic_shared_f32[at];
     const float sum = ((seismic_shared_f32[at] + seismic_shared_f32[at + 1u])
                           + (seismic_shared_f32[at + 2u] + seismic_shared_f32[at + 3u]))
         + ((seismic_shared_f32[at + 4u] + seismic_shared_f32[at + 5u])
@@ -1319,5 +1331,272 @@ void projection_gemm_paired(const int gk, const int uk, const uint tm, const uin
         const uint n = first + projection_gemm_pair_column(tn, wn, q) / 2u;
         if (m < m_rows && n < rows)
             projection_put_pair(out_, m, n, c.x, c.y);
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Reference-order (`ordered`) forms (`projection_ordered_stage_row`,
+// `projection_ordered_gemv`, `projection_ordered_gemm`): 8-lane dot products
+// matching the CPU reference order bit for bit.
+
+float projection_ordered_stage_row(projection_prologue in_, uint m, Out out_, uint64_t stride0, uint64_t stride1) {
+    const uint tid = SEISMIC_SUBGROUP * 32u + SEISMIC_LANE, threads = SEISMIC_SUBGROUPS * 32u;
+    projection_ordered_inverses(in_, 1u, 0u, 1u, m, true, 4u);
+    const float inv = seismic_shared_f32[0];
+    for (uint c = tid; c < in_.columns; c += threads)
+        out_put(out_, uint64_t(m) * stride0 + uint64_t(c) * stride1, projection_ordered_at(in_, m, c, inv));
+    return inv;
+}
+
+void projection_ordered_transpose8(inout float v[8], uint u) {
+    [[unroll]] for (uint i = 0u; i < 8u; i += 2u) {
+        const float send = (u & 1u) != 0u ? v[i] : v[i + 1u];
+        const float recv = subgroupShuffleXor(send, 1u);
+        if ((u & 1u) != 0u)
+            v[i] = recv;
+        else
+            v[i + 1u] = recv;
+    }
+    [[unroll]] for (uint g = 0u; g < 8u; g += 4u) {
+        [[unroll]] for (uint j = 0u; j < 2u; ++j) {
+            const uint i = g + j;
+            const float send = (u & 2u) != 0u ? v[i] : v[i + 2u];
+            const float recv = subgroupShuffleXor(send, 2u);
+            if ((u & 2u) != 0u)
+                v[i] = recv;
+            else
+                v[i + 2u] = recv;
+        }
+    }
+    [[unroll]] for (uint i = 0u; i < 4u; ++i) {
+        const float send = (u & 4u) != 0u ? v[i] : v[i + 4u];
+        const float recv = subgroupShuffleXor(send, 4u);
+        if ((u & 4u) != 0u)
+            v[i] = recv;
+        else
+            v[i + 4u] = recv;
+    }
+}
+
+void projection_ordered_gemv(const int kind, const bool publish, const uint maxm, projection_prologue in_,
+    projection_epilogue out_, projection_weights w, Out pub_out, uint64_t pub_s0, uint64_t pub_s1, bool publish_rows,
+    uint m, uint n, uint k, uint local_tile) {
+    const uint sg = SEISMIC_SUBGROUP, lane = SEISMIC_LANE;
+    const uint tid = sg * 32u + lane, threads = SEISMIC_SUBGROUPS * 32u;
+    const uint q = lane >> 3u, u = lane & 7u;
+    const uint groups = SEISMIC_SUBGROUPS * 4u;
+    projection_ordered_inverses(in_, m, 0u, 1u, 0u, true, 64u);
+    const uint w_row = local_tile * groups + sg * 4u + q;
+    const uint hw_first_row = local_tile * groups + 4u * (sg & ~(SEISMIC_SUBGROUP_LANES / 32u - 1u));
+    float acc[8];
+    [[unroll]] for (uint r = 0u; r < 8u; ++r)
+        acc[r] = 0.0;
+    for (uint k0 = 0u; k0 < k; k0 += 256u) {
+        const uint chunk = min(256u, k - k0);
+        for (uint idx = tid; idx < m * chunk; idx += threads) {
+            const uint r = chunk == 256u ? (idx >> 8u) : (idx / chunk);
+            const uint c = chunk == 256u ? (idx & 255u) : (idx % chunk);
+            const float val = projection_ordered_at(in_, r, k0 + c, seismic_shared_f32[r]);
+            seismic_shared_f32[64u + r * 256u + c] = val;
+            if (publish && publish_rows)
+                out_put(pub_out, uint64_t(r) * pub_s0 + uint64_t(k0 + c) * pub_s1, val);
+        }
+        barrier();
+        if (hw_first_row < n) {
+            for (uint sub = 0u; sub < chunk; sub += 64u) {
+                const uint p_own = (k0 + sub) / 32u + (u >> 2u);
+                const uint s_own = u & 3u;
+                const uint base_col = k0 + sub + 8u * u;
+                float wt[8];
+                if (w_row < n && base_col < k) {
+                    const packets_packet pkt = projection_packet(kind, w, w_row, p_own);
+                    vec4 even, odd;
+                    packets_exact_values(kind, pkt, s_own, even, odd);
+                    [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+                        wt[2u * j] = (base_col + 2u * j < k) ? even[j] : 0.0;
+                        wt[2u * j + 1u] = (base_col + 2u * j + 1u < k) ? odd[j] : 0.0;
+                    }
+                } else {
+                    [[unroll]] for (uint j = 0u; j < 8u; ++j)
+                        wt[j] = 0.0;
+                }
+                projection_ordered_transpose8(wt, u);
+                if (w_row < n) {
+                    if (sub + 64u <= chunk) {
+                        [[unroll]] for (uint s = 0u; s < 8u; ++s) {
+                            const uint col = sub + 8u * s + u;
+                            const float w_val = wt[s];
+                            [[unroll]] for (uint r = 0u; r < maxm; ++r) {
+                                if (r < m)
+                                    acc[r] = seismic_fma_rn(seismic_shared_f32[64u + r * 256u + col], w_val, acc[r]);
+                            }
+                        }
+                    } else {
+                        [[unroll]] for (uint s = 0u; s < 8u; ++s) {
+                            const uint col = sub + 8u * s + u;
+                            if (col < chunk) {
+                                const float w_val = wt[s];
+                                [[unroll]] for (uint r = 0u; r < maxm; ++r) {
+                                    if (r < m)
+                                        acc[r] = seismic_fma_rn(seismic_shared_f32[64u + r * 256u + col], w_val, acc[r]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        barrier();
+    }
+    [[unroll]] for (uint r = 0u; r < maxm; ++r) {
+        if (r < m) {
+            const float sum = projection_ordered_combine8(acc[r]);
+            if (w_row < n && u == 0u)
+                projection_put(out_, r, w_row, sum);
+        }
+    }
+}
+
+void projection_ordered_gemm(const int kind, projection_prologue in_, projection_epilogue out_, projection_weights w,
+    uint m, uint n, uint k, uint tile_m, uint tile_n) {
+    const uint sg = SEISMIC_SUBGROUP, lane = SEISMIC_LANE;
+    const uint gn = lane >> 3u, u = lane & 7u;
+    const uint act_lo = tile_m * 64u + sg * 4u;
+    const uint act_hi = act_lo + 32u;
+    const bool has_lo = act_lo < m;
+    const bool has_hi = act_hi < m;
+    const bool has_cols = (tile_n * 32u + 8u * gn) < n;
+    const uint my_row0 = act_lo + gn;
+    const uint my_row1 = act_hi + gn;
+    const uint c_dec = lane, s_dec = sg;
+    const uint dec_row = tile_n * 32u + c_dec;
+    float acc0[4][8];
+    float acc1[4][8];
+    [[unroll]] for (uint i = 0u; i < 4u; ++i)
+        [[unroll]] for (uint j = 0u; j < 8u; ++j) {
+            acc0[i][j] = 0.0;
+            acc1[i][j] = 0.0;
+        }
+    const uint packets = (k + 31u) / 32u;
+    if (packets == 0u)
+        return;
+    const uint64_t my_src_row0 = my_row0 < m ? uint64_t(projection_row(in_.rows, my_row0)) * in_.x0 : 0ul;
+    const uint64_t my_src_row1 = my_row1 < m ? uint64_t(projection_row(in_.rows, my_row1)) * in_.x0 : 0ul;
+    if (sg < 4u) {
+        const uint base_col = 8u * s_dec;
+        if (dec_row < n && base_col < k) {
+            const packets_packet pkt = projection_packet(kind, w, dec_row, 0u);
+            vec4 even, odd;
+            packets_exact_values(kind, pkt, s_dec, even, odd);
+            [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+                seismic_shared_f32[(8u * s_dec + 2u * j) * 36u + c_dec] = (base_col + 2u * j < k) ? even[j] : 0.0;
+                seismic_shared_f32[(8u * s_dec + 2u * j + 1u) * 36u + c_dec] =
+                    (base_col + 2u * j + 1u < k) ? odd[j] : 0.0;
+            }
+        } else {
+            [[unroll]] for (uint j = 0u; j < 8u; ++j)
+                seismic_shared_f32[(8u * s_dec + j) * 36u + c_dec] = 0.0;
+        }
+    }
+    for (uint p = 0u; p < packets; ++p) {
+        const uint k0 = 32u * p;
+        float cur_x0[4];
+        float cur_x1[4];
+        [[unroll]] for (uint s = 0u; s < 4u; ++s) {
+            cur_x0[s] = 0.0;
+            cur_x1[s] = 0.0;
+        }
+        if (has_lo) {
+            [[unroll]] for (uint s = 0u; s < 4u; ++s) {
+                const uint col = k0 + 8u * s + u;
+                cur_x0[s] = (my_row0 < m && col < k) ? stored_at(in_.x, my_src_row0 + uint64_t(col) * in_.x1) : 0.0;
+            }
+        }
+        if (has_hi) {
+            [[unroll]] for (uint s = 0u; s < 4u; ++s) {
+                const uint col = k0 + 8u * s + u;
+                cur_x1[s] = (my_row1 < m && col < k) ? stored_at(in_.x, my_src_row1 + uint64_t(col) * in_.x1) : 0.0;
+            }
+        }
+        barrier();
+        const uint cur_buf = (p & 1u) * 1152u;
+        float next_w[8];
+        [[unroll]] for (uint j = 0u; j < 8u; ++j)
+            next_w[j] = 0.0;
+        if (p + 1u < packets && sg < 4u) {
+            const uint base_col = k0 + 32u + 8u * s_dec;
+            if (dec_row < n && base_col < k) {
+                const packets_packet pkt = projection_packet(kind, w, dec_row, p + 1u);
+                vec4 even, odd;
+                packets_exact_values(kind, pkt, s_dec, even, odd);
+                [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+                    next_w[2u * j] = (base_col + 2u * j < k) ? even[j] : 0.0;
+                    next_w[2u * j + 1u] = (base_col + 2u * j + 1u < k) ? odd[j] : 0.0;
+                }
+            }
+        }
+        if (has_lo) {
+            [[unroll]] for (uint s = 0u; s < 4u; ++s) {
+                const float x0 = seismic_shuffle(cur_x0[s], u);
+                const float x1 = seismic_shuffle(cur_x0[s], 8u + u);
+                const float x2 = seismic_shuffle(cur_x0[s], 16u + u);
+                const float x3 = seismic_shuffle(cur_x0[s], 24u + u);
+                float y0 = 0.0, y1 = 0.0, y2 = 0.0, y3 = 0.0;
+                if (has_hi) {
+                    y0 = seismic_shuffle(cur_x1[s], u);
+                    y1 = seismic_shuffle(cur_x1[s], 8u + u);
+                    y2 = seismic_shuffle(cur_x1[s], 16u + u);
+                    y3 = seismic_shuffle(cur_x1[s], 24u + u);
+                }
+                if (has_cols && (k0 + 32u <= k || k0 + 8u * s + u < k)) {
+                    const uint row_off = cur_buf + (8u * s + u) * 36u + 8u * gn;
+                    float wc[8];
+                    [[unroll]] for (uint j = 0u; j < 8u; ++j)
+                        wc[j] = seismic_shared_f32[row_off + j];
+                    [[unroll]] for (uint j = 0u; j < 8u; ++j) {
+                        acc0[0][j] = seismic_fma_rn(x0, wc[j], acc0[0][j]);
+                        acc0[1][j] = seismic_fma_rn(x1, wc[j], acc0[1][j]);
+                        acc0[2][j] = seismic_fma_rn(x2, wc[j], acc0[2][j]);
+                        acc0[3][j] = seismic_fma_rn(x3, wc[j], acc0[3][j]);
+                    }
+                    if (has_hi) {
+                        [[unroll]] for (uint j = 0u; j < 8u; ++j) {
+                            acc1[0][j] = seismic_fma_rn(y0, wc[j], acc1[0][j]);
+                            acc1[1][j] = seismic_fma_rn(y1, wc[j], acc1[1][j]);
+                            acc1[2][j] = seismic_fma_rn(y2, wc[j], acc1[2][j]);
+                            acc1[3][j] = seismic_fma_rn(y3, wc[j], acc1[3][j]);
+                        }
+                    }
+                }
+            }
+        }
+        if (p + 1u < packets && sg < 4u) {
+            const uint dst_buf = ((p + 1u) & 1u) * 1152u;
+            [[unroll]] for (uint j = 0u; j < 8u; ++j)
+                seismic_shared_f32[dst_buf + (8u * s_dec + j) * 36u + c_dec] = next_w[j];
+        }
+    }
+    if (has_lo && has_cols) {
+        [[unroll]] for (uint i = 0u; i < 4u; ++i) {
+            const uint out_r = act_lo + i;
+            [[unroll]] for (uint j = 0u; j < 8u; ++j) {
+                const float sum = projection_ordered_combine8(acc0[i][j]);
+                const uint out_c = tile_n * 32u + 8u * gn + j;
+                if (u == 0u && out_r < m && out_c < n)
+                    projection_put(out_, out_r, out_c, sum);
+            }
+        }
+    }
+    if (has_hi && has_cols) {
+        [[unroll]] for (uint i = 0u; i < 4u; ++i) {
+            const uint out_r = act_hi + i;
+            [[unroll]] for (uint j = 0u; j < 8u; ++j) {
+                const float sum = projection_ordered_combine8(acc1[i][j]);
+                const uint out_c = tile_n * 32u + 8u * gn + j;
+                if (u == 0u && out_r < m && out_c < n)
+                    projection_put(out_, out_r, out_c, sum);
+            }
+        }
     }
 }

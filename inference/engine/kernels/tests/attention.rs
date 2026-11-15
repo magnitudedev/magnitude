@@ -177,27 +177,16 @@ fn stored_bytes(element: Element, values: &[f32]) -> Vec<u8> {
     }
 }
 
-/// The CPU decode's partition counts.
-const CPU_PARTS: [u64; 4] = [8, 4, 16, 1];
-
 /// The decode specializations to run on `device`, labelled: on the GPU the
 /// statics with each (SPAN, PARTS, SIMDS) of `configs`; on CPU (no statics)
-/// each of its declared PARTS.
+/// its one form, partitioned by the pool (`device.units`).
 fn decode_specializations_on(
     device: &Device,
     geometry: Geometry,
     configs: &[(u64, u64, u64)],
 ) -> Vec<(String, NativeSpecialization)> {
     if is_cpu(device) {
-        return CPU_PARTS
-            .iter()
-            .map(|parts| {
-                (
-                    format!("Cpu PARTS {parts}"),
-                    cpu_statics(geometry).with_param("PARTS", *parts),
-                )
-            })
-            .collect();
+        return vec![("Cpu".to_owned(), cpu_statics(geometry))];
     }
     configs
         .iter()
@@ -583,6 +572,10 @@ fn check_host_model_against_portable_body(entry: &str, case: &Case) {
     sources.push(SourceFile {
         path: "attention.seismic".into(),
         text: include_str!("../kernels/attention.seismic").into(),
+    });
+    sources.push(SourceFile {
+        path: "dense.seismic".into(),
+        text: include_str!("../kernels/dense.seismic").into(),
     });
     sources.push(SourceFile {
         path: "functions.seismic".into(),
@@ -1233,9 +1226,9 @@ const LFM: Geometry = Geometry { kv: 8, g: 4, p: 32, s: 0 };
 /// The CPU's vector tier against its portable tier, bit for bit: x86-64-v2
 /// runs the portable body (over rows widened into scratch,
 /// the body every x86 tier ran before the vector body), the detected tier
-/// the vector body. Dense decode at each activation element, PARTS 1, 8 and
-/// 16, histories of 17, 77 and 1000 keys (none a whole number of 32-key
-/// blocks), and query groups of 2, 4 and 12.
+/// the vector body. Dense decode at each activation element over the pool's
+/// partitions, histories of 17, 77 and 1000 keys (none a whole number of
+/// 32-key blocks), and query groups of 2, 4 and 12.
 #[test]
 #[cfg(target_arch = "x86_64")]
 fn cpu_vector_tier_matches_portable_tier() {
@@ -1246,22 +1239,47 @@ fn cpu_vector_tier_matches_portable_tier() {
     for (geometry, base) in [(SMALL, 5), (WIDE_GROUP, 65), (LFM, 988)] {
         let case = Case::new(geometry, base as usize + 64, 2, &decode_rows(base), 31);
         for element in [Element::bf16(), Element::f16(), Element::f32()] {
-            for parts in [1, 8, 16] {
-                let run = |tier: u64| {
-                    let specialization = cpu_statics(geometry).with_param("PARTS", parts).with_param("cpu.tier", tier);
-                    let kernel = decode_kernel_in(&device, &specialization, element);
-                    let mut bound = Bound::new_with_options(&device, &case, 48, false, element);
-                    run_decode(&kernel, &mut bound, &case).read_to_host().unwrap()
-                };
-                // Tier 0 is the detected tier; 1 names x86-64-v2.
-                assert!(
-                    run(0) == run(1),
-                    "KV {} G {} W {} {element:?} PARTS {parts}: the vector tier differs from the portable tier",
-                    geometry.kv,
-                    geometry.g,
-                    geometry.w()
-                );
-            }
+            let run = |tier: u64| {
+                let specialization = cpu_statics(geometry).with_param("cpu.tier", tier);
+                let kernel = decode_kernel_in(&device, &specialization, element);
+                let mut bound = Bound::new_with_options(&device, &case, 48, false, element);
+                run_decode(&kernel, &mut bound, &case).read_to_host().unwrap()
+            };
+            // Tier 0 is the detected tier; 1 names x86-64-v2.
+            assert!(
+                run(0) == run(1),
+                "KV {} G {} W {} {element:?}: the vector tier differs from the portable tier",
+                geometry.kv,
+                geometry.g,
+                geometry.w()
+            );
         }
+    }
+}
+
+/// On the CPU, each (kv head, row) splits its keys into one partition per
+/// pool participant (`device.units`), max(128, ceil(keys / units)) keys
+/// each. Histories set against the pool fill one partition and leave the
+/// rest empty (one partition's merge), fill about half of them, and fill
+/// every one with more than 128 keys; each matches the host model, beside a
+/// row that sees nothing (every partition empty).
+#[test]
+fn cpu_decode_matches_host_model_at_every_partition_fill() {
+    use seismic::device::DeviceValues;
+    let device = seismic::Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+    let units = device.properties().value("units") as i32;
+    for base in [5, 64 * units, 128 * units + 65] {
+        let case = Case::new(SMALL, base as usize + 64, 2, &decode_rows(base), 43);
+        let expected = case.expected();
+        let kernel = decode_kernel(&device, &cpu_statics(SMALL));
+        let mut bound = Bound::new(&device, &case);
+        let gated = run_decode(&kernel, &mut bound, &case);
+        check(
+            &format!("Cpu decode over {} history keys on {units} participants", base + 12),
+            &case,
+            &gated,
+            &bound,
+            &expected,
+        );
     }
 }

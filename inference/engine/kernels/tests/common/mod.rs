@@ -51,3 +51,17 @@ pub fn slab_tensor(
     let layout = seismic::SlabLayout::for_regions(rows_per_slab, logical_rows, regions).unwrap();
     seismic::SlabTensor::in_pool(&slab_pool(device, &[layout]), rows_per_slab, logical_rows, regions).unwrap()
 }
+
+/// The ordinal of `E`'s Metal launch `launch`, its kernel `<entry>_<launch>`.
+#[allow(dead_code)]
+pub fn metal_launch<E: seismic::Entry>(launch: &str) -> usize {
+    let native = seismic::generated::native_implementation_for_backend::<E>(seismic::BackendName::Metal)
+        .expect("the kernel bundle decodes")
+        .unwrap_or_else(|| panic!("`{}` has a Metal implementation", E::NAME));
+    let kernel = format!("{}_{launch}", E::NAME);
+    native
+        .launches
+        .iter()
+        .position(|candidate| candidate.kernel == kernel)
+        .unwrap_or_else(|| panic!("`{}` has no Metal launch `{kernel}`", E::NAME))
+}

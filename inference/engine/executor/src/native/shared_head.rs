@@ -13,12 +13,12 @@ use seismic::NativeKernel;
 #[derive(Debug, Default)]
 pub struct SharedHeadKernels {
     pub(super) join: Option<NativeKernel<tap_rows::Entry>>,
-    pub(super) input: Option<NativeKernel<project_rows::Entry>>,
+    pub(super) input: Option<super::RangedKernels<project_rows::Entry>>,
     pub(super) features: Option<NativeKernel<readout_features_rows::Entry>>,
     pub(super) projection: Option<super::ProjectionKernels>,
-    pub(super) centroids: Option<NativeKernel<readout_project_rows::Entry>>,
+    pub(super) centroids: Option<super::RangedKernels<readout_project_rows::Entry>>,
     pub(super) cluster_selection: Option<NativeKernel<draft_top_k::Entry>>,
     pub(super) cluster_rows: Option<NativeKernel<cluster_token_rows::Entry>>,
     pub(super) placement: Option<NativeKernel<place_logits_rows::Entry>>,
-    pub(super) chain: Option<NativeKernel<project_rows::Entry>>,
+    pub(super) chain: Option<super::RangedKernels<project_rows::Entry>>,
 }

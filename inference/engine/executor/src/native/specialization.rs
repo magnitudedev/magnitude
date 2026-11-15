@@ -7,12 +7,14 @@
 //! can have: the kernels crate's build proves it, so preparation never meets
 //! a missing one.
 
-use super::CatalogFailure;
+use super::tuning::ranged::{Ranged, row_cuts, row_ranges};
 use super::tuning::{EntryTuning, ModelInputs, Tuner};
+use super::{CatalogFailure, RangedKernels};
 use seismic::{
     BackendName, BoundEntry, Device, Entry, KernelRequest, NativeImplementation, NativeKernel,
     NativeSpecialization, NativeSpecializationError,
 };
+use std::ops::Range;
 
 pub(super) struct Specializer<'a> {
     backend: BackendName,
@@ -445,9 +447,122 @@ impl<'a> Specializer<'a> {
         tuning: &mut Tuning<'_>,
         case: &T,
     ) -> Result<Option<NativeKernel<T::Entry>>, CatalogFailure> {
+        let specialization = self.specialization(tuning, case)?;
+        self.form(case.entry(), &case.bindings(), &specialization)
+    }
+
+    /// The specialization [`Self::tuned`] prepares `case`'s entry at.
+    fn specialization<T: EntryTuning>(
+        &mut self,
+        tuning: &mut Tuning<'_>,
+        case: &T,
+    ) -> Result<NativeSpecialization, CatalogFailure> {
         let implementation = self.implementation(&case.entry(), &case.bindings())?;
         let fixed = case_statics(&tuning.model(), case, implementation)?;
-        self.specialized(tuning, case, implementation, fixed)
+        self.chosen(tuning, case, implementation, fixed)
+    }
+
+    /// [`Self::tuned`] of `case` at each range of the rows `served` that it
+    /// is tuned by ([`Self::partition`]), each range a unit of its own
+    /// ([`Ranged`]), and the kernels bound by rows, one for each run of
+    /// neighbouring ranges tuned to one choice ([`Self::by_range`]). `None`
+    /// as `tuned` is.
+    pub fn tuned_ranges<T: EntryTuning>(
+        &mut self,
+        tuning: &mut Tuning<'_>,
+        served: Range<u64>,
+        case: T,
+    ) -> Result<Option<RangedKernels<T::Entry>>, CatalogFailure> {
+        let ranges = self.partition(tuning, served, &case)?;
+        self.by_range(&case, ranges, |this, unit| this.specialization(&mut *tuning, unit))
+    }
+
+    /// [`Self::tuned_following`] of `case` at each range of
+    /// `prerequisite`'s partition of `served` ([`Self::tuned_ranges`]): each
+    /// range follows the unit of `prerequisite`'s same range, so its kernel
+    /// keeps the bits of the prerequisite's kernel at those rows. An
+    /// implementation without tuning parameters has nothing to follow and
+    /// one specialization at every row.
+    pub fn tuned_ranges_following<T: EntryTuning, P: EntryTuning>(
+        &mut self,
+        tuning: &mut Tuning<'_>,
+        served: Range<u64>,
+        case: T,
+        prerequisite: P,
+    ) -> Result<Option<RangedKernels<T::Entry>>, CatalogFailure> {
+        if !self.implementation(&case.entry(), &case.bindings())?.has_tuning_parameters() {
+            return self.tuned_ranges(tuning, served, case);
+        }
+        let ranges = self.partition(tuning, served, &prerequisite)?;
+        self.by_range(&case, ranges, |this, unit| {
+            this.specialization_following(
+                &mut *tuning,
+                unit,
+                &Ranged::new(prerequisite.clone(), unit.rows().clone()),
+            )
+        })
+    }
+
+    /// The ranges `case` is tuned at over `served`: `served` cut where its
+    /// declaration says its choice can differ by its rows between the
+    /// case's points, and between every two of them on a backend where a
+    /// unit forms no program ([`row_cuts`], at the case's statics), each
+    /// range holding points of the case's own ([`row_ranges`]). An implementation
+    /// without tuning parameters has one specialization at every row: its
+    /// partition is the one range `served`.
+    fn partition<T: EntryTuning>(
+        &self,
+        tuning: &Tuning<'_>,
+        served: Range<u64>,
+        case: &T,
+    ) -> Result<Vec<Range<u64>>, CatalogFailure> {
+        let implementation = self.implementation(&case.entry(), &case.bindings())?;
+        if !implementation.has_tuning_parameters() {
+            return Ok(vec![served]);
+        }
+        let model = tuning.model();
+        let statics = case_statics(&model, case, implementation)?;
+        let points = case
+            .points(model.limits)
+            .into_iter()
+            .map(|point| point.rows)
+            .collect::<Vec<_>>();
+        let cuts = row_cuts(implementation, &statics, &served, &points);
+        Ok(row_ranges(served, &cuts, &points))
+    }
+
+    /// `case`'s kernels at the specialization `choose` gives its unit of
+    /// each of `ranges` (a partition, ascending), bound by rows. Each range
+    /// is a unit with a choice of its own; neighbouring ranges of one
+    /// choice are one kernel's, prepared once and serving the rows of them
+    /// all, so the kernels are the entry's distinct choices by its rows
+    /// and nothing is prepared twice.
+    fn by_range<T: EntryTuning>(
+        &mut self,
+        case: &T,
+        ranges: Vec<Range<u64>>,
+        mut choose: impl FnMut(&mut Self, &Ranged<T>) -> Result<NativeSpecialization, CatalogFailure>,
+    ) -> Result<Option<RangedKernels<T::Entry>>, CatalogFailure> {
+        let mut choices: Vec<(Range<u64>, String, NativeSpecialization)> = Vec::new();
+        for rows in ranges {
+            let unit = Ranged::new(case.clone(), rows.clone());
+            let specialization = choose(&mut *self, &unit)?;
+            match choices.last_mut() {
+                Some((served, _, last)) if *last == specialization => served.end = rows.end,
+                _ => choices.push((rows, unit.bindings(), specialization)),
+            }
+        }
+        let mut parts = Vec::with_capacity(choices.len());
+        for (rows, bindings, specialization) in choices {
+            parts.push(
+                self.form(case.entry(), &bindings, &specialization)?
+                    .map(|kernel| (rows, kernel)),
+            );
+        }
+        Ok(parts
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .map(RangedKernels::new))
     }
 
     /// Prepare an entry through its tuning case as [`Self::tuned`] does, a
@@ -460,8 +575,23 @@ impl<'a> Specializer<'a> {
         case: &T,
         prerequisite: &P,
     ) -> Result<Option<NativeKernel<T::Entry>>, CatalogFailure> {
+        let specialization = self.specialization_following(tuning, case, prerequisite)?;
+        self.form(case.entry(), &case.bindings(), &specialization)
+    }
+
+    /// The specialization [`Self::tuned_following`] prepares `case`'s entry
+    /// at.
+    fn specialization_following<T: EntryTuning, P: EntryTuning>(
+        &mut self,
+        tuning: &mut Tuning<'_>,
+        case: &T,
+        prerequisite: &P,
+    ) -> Result<NativeSpecialization, CatalogFailure> {
         let bindings = case.bindings();
         let implementation = self.implementation(&case.entry(), &bindings)?;
+        if !implementation.has_tuning_parameters() {
+            return self.specialization(tuning, case);
+        }
         let fixed = case_statics(&tuning.model(), case, implementation)?;
         let fixed = tuning.following(
             prerequisite,
@@ -469,22 +599,22 @@ impl<'a> Specializer<'a> {
             implementation,
             fixed,
         )?;
-        self.specialized(tuning, case, implementation, fixed)
+        self.chosen(tuning, case, implementation, fixed)
     }
 
-    /// Prepare `case`'s entry at `fixed`: tuned in its free parameters by a
-    /// tuner, specialized at `fixed` by any other walk.
-    fn specialized<T: EntryTuning>(
+    /// The specialization `case`'s entry is prepared at from `fixed`: tuned
+    /// in its free parameters by a tuner, `fixed` in any other walk.
+    fn chosen<T: EntryTuning>(
         &mut self,
         tuning: &mut Tuning<'_>,
         case: &T,
         implementation: &NativeImplementation,
         fixed: NativeSpecialization,
-    ) -> Result<Option<NativeKernel<T::Entry>>, CatalogFailure> {
+    ) -> Result<NativeSpecialization, CatalogFailure> {
         let entry = <T::Entry as Entry>::NAME;
         let bindings = case.bindings();
         let tuning_model = tuning.model();
-        let specialization = match tuning {
+        Ok(match tuning {
             Tuning::Tuner(tuner) if implementation.has_tuning_parameters() => {
                 tuner.tune(case, implementation, &fixed)?
             }
@@ -506,14 +636,13 @@ impl<'a> Specializer<'a> {
                     .scaled(if *repeat_case { case.launches() } else { 1 });
                 invocations
                     .units
-                    .entry((entry, bindings.clone(), fixed.statics().clone()))
+                    .entry((entry, bindings, fixed.statics().clone()))
                     .or_default()
                     .add(&calls);
                 fixed
             }
             Tuning::Tuner(_) | Tuning::Listing(_) => fixed,
-        };
-        self.form(case.entry(), &bindings, &specialization)
+        })
     }
 }
 
@@ -575,6 +704,15 @@ mod tests {
             let streamed = seismic::generated::native_implementation_for_backend::<S>(backend)
                 .unwrap()
                 .unwrap();
+            if !streamed.has_tuning_parameters() {
+                assert!(
+                    !resident.has_tuning_parameters(),
+                    "{} on {backend:?} has parameters that {} does not follow",
+                    R::NAME,
+                    S::NAME
+                );
+                return;
+            }
             // A resident choice away from every default.
             let choice = resident
                 .params
@@ -603,7 +741,7 @@ mod tests {
                 assert_eq!(choice.param(&name), Some(value));
             }
         }
-        for backend in [BackendName::Metal, BackendName::Cuda] {
+        for backend in [BackendName::Metal, BackendName::Cuda, BackendName::Vulkan] {
             follows::<routed_route_shared::Entry, routed_route_streamed::Entry>(backend);
             follows::<routed_select::Entry, routed_select_streamed::Entry>(backend);
         }

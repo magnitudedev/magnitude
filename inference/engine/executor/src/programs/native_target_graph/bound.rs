@@ -260,6 +260,12 @@ pub(crate) struct GroupBuffers {
     /// buffers, of a load whose blocks split.
     split: Option<SplitValues<seismic::Tensor>>,
     blocks: Vec<Option<SplitValues<seismic::Tensor>>>,
+    /// Per place, the two operand carries its run alternates between, of a
+    /// load whose decode graphs carry (`PreparedTargetGraphs::operand_carry`):
+    /// a block's graph reads the one the block before wrote and writes the
+    /// other, which the next block's reads. A place's graphs run in queue
+    /// order, so a carry is rewritten only after its reader.
+    operands: Vec<[[seismic::Tensor; 2]; 2]>,
 }
 
 impl GroupBuffers {
@@ -295,6 +301,15 @@ impl GroupBuffers {
             None => Vec::new(),
         };
         let allocate = |value: &Option<Extents>| value.as_ref().map(|value| zeros(device, value)).transpose();
+        let operands = match prepared.operand_carry() {
+            None => Vec::new(),
+            Some(carry) => (0..places)
+                .map(|_| {
+                    let pair = || carry.allocate(device).map_err(AllocationError::Tensor);
+                    Ok::<_, AllocationError>([pair()?, pair()?])
+                })
+                .collect::<Result<_, _>>()?,
+        };
         Ok(Self {
             places,
             taps: allocate(&extents.taps)?,
@@ -302,7 +317,13 @@ impl GroupBuffers {
             token_rows: allocate(&extents.tokens)?,
             split,
             blocks,
+            operands,
         })
+    }
+
+    /// The two operand carries of place `place`'s run (`Self::operands`).
+    pub(crate) fn operands(&self, place: usize) -> Result<&[[seismic::Tensor; 2]; 2], String> {
+        self.operands.get(place).ok_or_else(|| format!("place {place} of a group holds no operand carries"))
     }
 
     /// The group's places: one, the floor's, or those `hold_group` granted.
@@ -322,7 +343,8 @@ impl GroupBuffers {
     /// The buffers the group owns.
     fn storage(&self) -> impl Iterator<Item = &seismic::Tensor> {
         let split = self.split.iter().flat_map(|split| split.crossing.iter().chain([&split.merged.inverse]));
-        self.taps.iter().chain(&self.per_layer_rows).chain(&self.token_rows).chain(split)
+        let operands = self.operands.iter().flatten().flatten();
+        self.taps.iter().chain(&self.per_layer_rows).chain(&self.token_rows).chain(split).chain(operands)
     }
 }
 

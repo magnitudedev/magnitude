@@ -704,10 +704,8 @@ fn decode_configs(backend: BackendName, geometry: Geometry) -> Vec<Vec<(&'static
             ));
             configs
         }
-        BackendName::Cpu => [8, 4, 16, 1]
-            .into_iter()
-            .map(|parts| vec![("PARTS", parts)])
-            .collect(),
+        // The CPU's partitions are the pool's (`device.units`), not a setting.
+        BackendName::Cpu => vec![Vec::new()],
         // The last configuration slices the query group as finely as the
         // group and the simdgroups admit.
         BackendName::Metal => {
@@ -1921,6 +1919,10 @@ fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
     sources.push(SourceFile {
         path: "attention.seismic".into(),
         text: include_str!("../kernels/attention.seismic").into(),
+    });
+    sources.push(SourceFile {
+        path: "dense.seismic".into(),
+        text: include_str!("../kernels/dense.seismic").into(),
     });
     sources.push(SourceFile {
         path: "functions.seismic".into(),
@@ -4616,7 +4618,7 @@ const LFM: Geometry = Geometry { kv: 8, g: 4, p: 32, s: 0 };
 /// The CPU's vector tier against its portable tier over affine history, bit
 /// for bit: x86-64-v2 runs the portable body (each row decoded into scratch
 /// by the portable `affine_decode`, the body every x86 tier ran before the
-/// vector body), the detected tier the vector body. PARTS 1, 8 and 16,
+/// vector body), the detected tier the vector body. The pool's partitions,
 /// histories of 17, 77 and 1000 keys (none a whole number of 32-key blocks)
 /// across 48-row slabs, and query groups of 2, 4 and 12.
 #[test]
@@ -4630,21 +4632,46 @@ fn cpu_vector_tier_matches_portable_tier() {
         // Whole 48-row slabs past every row's destination.
         let history_rows = (base as usize + 64).next_multiple_of(48);
         let encoded = Encoded::new(Case::new(geometry, history_rows, 2, &decode_rows(base), 37));
-        for parts in [1, 8, 16] {
-            let run = |tier: u64| {
-                let kernel = decode_kernel(&device, geometry, &[("PARTS", parts), ("cpu.tier", tier)]);
-                let mut bound = Bound::new_with_slab_rows(&device, &encoded, 48, false);
-                let gated = kernel.call(args!(attention_decode_k8v4, bound, encoded.case)).unwrap().value;
-                gated.read_to_host().unwrap()
-            };
-            // Tier 0 is the detected tier; 1 names x86-64-v2.
-            assert!(
-                run(0) == run(1),
-                "KV {} G {} W {} PARTS {parts}: the vector tier differs from the portable tier",
-                geometry.kv,
-                geometry.g,
-                geometry.w()
-            );
-        }
+        let run = |tier: u64| {
+            let kernel = decode_kernel(&device, geometry, &[("cpu.tier", tier)]);
+            let mut bound = Bound::new_with_slab_rows(&device, &encoded, 48, false);
+            let gated = kernel.call(args!(attention_decode_k8v4, bound, encoded.case)).unwrap().value;
+            gated.read_to_host().unwrap()
+        };
+        // Tier 0 is the detected tier; 1 names x86-64-v2.
+        assert!(
+            run(0) == run(1),
+            "KV {} G {} W {}: the vector tier differs from the portable tier",
+            geometry.kv,
+            geometry.g,
+            geometry.w()
+        );
+    }
+}
+
+/// On the CPU, each (kv head, row) splits its keys into one partition per
+/// pool participant (`device.units`), max(128, ceil(keys / units)) keys
+/// each. Histories set against the pool fill one partition and leave the
+/// rest empty (one partition's merge), fill about half of them, and fill
+/// every one with more than 128 keys; each matches the host model, beside a
+/// row that sees nothing (every partition empty).
+#[test]
+fn cpu_decode_matches_host_model_at_every_partition_fill() {
+    use seismic::device::DeviceValues;
+    let device = seismic::Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+    let units = device.properties().value("units") as i32;
+    for base in [5, 64 * units, 128 * units + 65] {
+        let encoded = Encoded::new(Case::new(GROUPED, base as usize + 64, 2, &decode_rows(base), 43));
+        let expected = encoded.expected();
+        let kernel = decode_kernel(&device, GROUPED, &[]);
+        let mut bound = Bound::new(&device, &encoded);
+        let gated = kernel.call(args!(attention_decode_k8v4, bound, encoded.case)).unwrap().value;
+        check(
+            &format!("Cpu decode over {} history keys on {units} participants", base + 12),
+            &encoded,
+            &gated,
+            &bound,
+            &expected,
+        );
     }
 }

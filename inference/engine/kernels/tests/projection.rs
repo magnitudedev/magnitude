@@ -835,22 +835,10 @@ fn split_specialization_on(
     specialization_on(device, statics, mapping).with_param("SPLIT", mapping.split)
 }
 
-struct ProjectionLaunches {
-    gemv: usize,
-    batch: usize,
-    gemm: usize,
-    /// Where the entry launches its GEMV per row count on Metal: its launch
-    /// for three rows up to VERIFY_ROWS (`gemv_rows`; the next, `gemv_pair`,
-    /// serves two). Both take `gemv`'s threadgroup, and the row classes read
-    /// the entry's one LANES; with none, LANES is `gemv`'s own.
-    gemv_rows: Option<usize>,
-}
-
-fn scoped_projection_specialization_on(
+fn scoped_projection_specialization_on<E: seismic::Entry>(
     device: &Device,
     statics: &[(&str, usize)],
     mapping: Mapping,
-    launches: ProjectionLaunches,
     split: bool,
 ) -> NativeSpecialization {
     if device.backend() != BackendName::Metal {
@@ -860,26 +848,19 @@ fn scoped_projection_specialization_on(
             specialization_on(device, statics, mapping)
         };
     }
+    let (gemv, batch, gemm) = (common::metal_launch::<E>("gemv"), common::metal_launch::<E>("batch"), common::metal_launch::<E>("gemm"));
     let choice = statics
         .iter()
         .fold(NativeSpecialization::new(), |choice, (name, value)| {
             choice.with_static(*name, *value as u64)
         })
-        .with_launch_param(launches.gemv, "SIMDGROUPS", mapping.simdgroups)
-        .with_launch_param(launches.gemv, "ROWS", mapping.rows)
-        .with_launch_param(launches.batch, "BATCH_SIMDGROUPS", mapping.batch_simdgroups)
-        .with_launch_param(launches.batch, "BATCH_ROWS", mapping.batch_rows)
-        .with_launch_param(launches.gemm, "TILE_M", mapping.tile_m)
-        .with_launch_param(launches.gemm, "TILE_N", mapping.tile_n);
-    let choice = match launches.gemv_rows {
-        Some(launch) => choice
-            .with_param("LANES", mapping.lanes)
-            .with_launch_param(launch, "SIMDGROUPS", mapping.simdgroups)
-            .with_launch_param(launch, "ROWS", mapping.rows)
-            .with_launch_param(launch + 1, "SIMDGROUPS", mapping.simdgroups)
-            .with_launch_param(launch + 1, "ROWS", mapping.rows),
-        None => choice.with_launch_param(launches.gemv, "LANES", mapping.lanes),
-    };
+        .with_param("LANES", mapping.lanes)
+        .with_launch_param(gemv, "SIMDGROUPS", mapping.simdgroups)
+        .with_launch_param(gemv, "ROWS", mapping.rows)
+        .with_launch_param(batch, "BATCH_SIMDGROUPS", mapping.batch_simdgroups)
+        .with_launch_param(batch, "BATCH_ROWS", mapping.batch_rows)
+        .with_launch_param(gemm, "TILE_M", mapping.tile_m)
+        .with_launch_param(gemm, "TILE_N", mapping.tile_n);
     if split {
         choice.with_param("SPLIT", mapping.split)
     } else {
@@ -887,25 +868,36 @@ fn scoped_projection_specialization_on(
     }
 }
 
-/// The `gemv_rows` launches on Metal, each followed by its entry's last
-/// launch, `gemv_pair`.
-const DENSE_OUTPUT_GEMV_ROWS_LAUNCH: usize = 12;
-const DENSE_EXPAND_GEMV_ROWS_LAUNCH: usize = 10;
-const ATTENTION_OUTPUT_GEMV_ROWS_LAUNCH: usize = 9;
-const ATTENTION_PROJECT_GEMV_ROWS_LAUNCH: usize = 7;
-const READOUT_HEAD_GEMV_ROWS_LAUNCH: usize = 4;
+/// `mapping`'s GEMV threadgroup on the Metal launches for three rows up to
+/// VERIFY_ROWS and for two rows of an entry that launches its GEMV per row
+/// count.
+fn with_gemv_rows<E: seismic::Entry>(
+    device: &Device,
+    specialization: NativeSpecialization,
+    mapping: Mapping,
+) -> NativeSpecialization {
+    if device.backend() != BackendName::Metal {
+        return specialization;
+    }
+    ["gemv_rows", "gemv_pair"].into_iter().fold(specialization, |specialization, launch| {
+        let launch = common::metal_launch::<E>(launch);
+        specialization
+            .with_launch_param(launch, "SIMDGROUPS", mapping.simdgroups)
+            .with_launch_param(launch, "ROWS", mapping.rows)
+    })
+}
 
 /// The TALL form of a Metal dense entry and the tile of its tall launch
 /// (`launch`), which takes the declaration defaults under the staged form.
-fn with_tall(
+fn with_tall<E: seismic::Entry>(
     device: &Device,
     specialization: NativeSpecialization,
-    launch: usize,
     tall: Option<Tall>,
 ) -> NativeSpecialization {
     if device.backend() != BackendName::Metal {
         return specialization;
     }
+    let launch = common::metal_launch::<E>("tall");
     let tile = tall.unwrap_or(TALL_DEFAULT);
     specialization
         .with_param("TALL", u64::from(tall.is_some()))
@@ -929,55 +921,65 @@ fn with_absent_bounds(
         .fold(specialization, |specialization, name| specialization.with_static(*name, 0))
 }
 
-/// `mapping` as Metal's `dense_expand` and `dense_output` admit it: their GEMV
-/// lane groups own one or two weight rows.
-fn dense_gemv_mapping(device: &Device, mapping: Mapping) -> Mapping {
+/// `specialization` with `mapping` on the Metal launches of `E`, an entry
+/// projecting through `dense`: the staged forms (PACK off), TALL as `mapping`
+/// gives it, the GEMV threadgroups and tile forms, and the batched launch's
+/// parts.
+fn with_projection_forms<E: seismic::Entry>(
+    device: &Device,
+    specialization: NativeSpecialization,
+    mapping: Mapping,
+) -> NativeSpecialization {
     if device.backend() != BackendName::Metal {
-        return mapping;
+        return specialization;
     }
-    Mapping {
-        rows: mapping.rows.min(2),
-        ..mapping
-    }
+    let specialization = with_tall::<E>(device, specialization, mapping.tall);
+    let specialization = with_gemv_rows::<E>(device, specialization, mapping);
+    with_pack::<E>(specialization, PACK_DEFAULT)
+        .with_param("TILED", mapping.tiled)
+        .with_param("SMALL", 1)
+        .with_param("PACK", 0)
+        .with_launch_param(common::metal_launch::<E>("batch"), "BATCH_PARTS", mapping.batch_parts)
 }
 
-/// `dense_output`'s INT8 tile launch on Metal, and the dense entries' PACK
-/// tile launches.
-const DENSE_OUTPUT_INT8_LAUNCH: usize = 11;
-const DENSE_OUTPUT_PACKED_LAUNCH: usize = 16;
-const DENSE_EXPAND_PACKED_LAUNCH: usize = 14;
+/// `with_projection_forms` for an entry projecting `paired` or `single`
+/// (INT8 off).
+fn with_dense_projection<E: seismic::Entry>(
+    device: &Device,
+    specialization: NativeSpecialization,
+    mapping: Mapping,
+) -> NativeSpecialization {
+    let specialization = with_projection_forms::<E>(device, specialization, mapping);
+    if device.backend() != BackendName::Metal {
+        return specialization;
+    }
+    specialization.with_param("INT8", 0)
+}
+
+/// `with_dense_projection` for an entry projecting `single`, with its INT8
+/// tile.
+fn with_single_projection<E: seismic::Entry>(
+    device: &Device,
+    specialization: NativeSpecialization,
+    mapping: Mapping,
+) -> NativeSpecialization {
+    let specialization = with_dense_projection::<E>(device, specialization, mapping);
+    if device.backend() != BackendName::Metal {
+        return specialization;
+    }
+    specialization.with_launch_param(common::metal_launch::<E>("int8"), "INT8_TILE", mapping.int8_tile)
+}
 
 fn dense_output_specialization_on(
     device: &Device,
     statics: &[(&str, usize)],
     mapping: Mapping,
 ) -> NativeSpecialization {
-    let mapping = dense_gemv_mapping(device, mapping);
-    let specialization = scoped_projection_specialization_on(
-        device,
-        statics,
-        mapping,
-        ProjectionLaunches {
-            gemv: 0,
-            batch: 2,
-            gemm: 5,
-            gemv_rows: Some(DENSE_OUTPUT_GEMV_ROWS_LAUNCH),
-        },
-        true,
-    )
-    .with_static("DS", 0);
+    let specialization =
+        scoped_projection_specialization_on::<dense_output::Entry>(device, statics, mapping, true)
+            .with_static("DS", 0);
     let specialization = with_absent_bounds(device, specialization, &["DB"]);
-    let specialization = with_tall(device, specialization, 8, mapping.tall);
-    if device.backend() == BackendName::Metal {
-        with_pack(specialization, DENSE_OUTPUT_PACKED_LAUNCH, PACK_DEFAULT)
-            .with_param("PACK", 0)
-            .with_param("INT8", 0)
-            .with_param("TILED", mapping.tiled)
-            .with_launch_param(2, "BATCH_PARTS", mapping.batch_parts)
-            .with_launch_param(DENSE_OUTPUT_INT8_LAUNCH, "INT8_TILE", mapping.int8_tile)
-    } else {
-        specialization
-    }
+    with_single_projection::<dense_output::Entry>(device, specialization, mapping)
 }
 
 fn attention_output_specialization_on(
@@ -997,68 +999,37 @@ fn attention_output_specialization_on(
             })
             .with_static("OS", scale);
     }
-    let specialization = scoped_projection_specialization_on(
-        device,
-        statics,
-        mapping,
-        ProjectionLaunches {
-            gemv: 0,
-            batch: 2,
-            gemm: 5,
-            gemv_rows: Some(ATTENTION_OUTPUT_GEMV_ROWS_LAUNCH),
-        },
-        true,
-    )
-    .with_static("OS", scale);
+    let specialization =
+        scoped_projection_specialization_on::<attention_output::Entry>(device, statics, mapping, true)
+            .with_static("OS", scale);
     let specialization = with_absent_bounds(device, specialization, &["OB"]);
-    let specialization = with_tall(device, specialization, 8, mapping.tall);
     let specialization = joined(device, specialization);
-    if device.backend() == BackendName::Metal {
-        with_pack(specialization, ATTENTION_OUTPUT_PACKED_LAUNCH, PACK_DEFAULT)
-            .with_param("PACK", 0)
-            .with_launch_param(2, "BATCH_PARTS", mapping.batch_parts)
-    } else {
-        specialization
-    }
+    with_single_projection::<attention_output::Entry>(device, specialization, mapping)
 }
 
-/// The PACK tile launches on Metal: `attention_output`'s, `attention_project`'s
-/// and `gated_delta_project`'s.
-const ATTENTION_OUTPUT_PACKED_LAUNCH: usize = 13;
-const ATTENTION_PROJECT_PACKED_LAUNCH: usize = 11;
-const RECURRENT_PROJECT_PACKED_LAUNCH: usize = 9;
-
-/// The specialization of a segmented projection (`attention_project`,
-/// `gated_delta_project`) on `device`; `packed` is its PACK tile launch on
-/// Metal.
-fn segmented_projection_specialization_on(
+/// The specialization of a segmented projection `E` (`attention_project`,
+/// `gated_delta_project`) on `device`, its segments' packing bounds `bounds`
+/// absent, its batched launch the batched rows (`with_matrix` takes the
+/// matrix GEMV).
+fn segmented_projection_specialization_on<E: seismic::Entry>(
     device: &Device,
     statics: &[(&str, usize)],
     mapping: Mapping,
-    packed: usize,
+    bounds: &[&str],
 ) -> NativeSpecialization {
-    let specialization = scoped_projection_specialization_on(
+    let specialization = scoped_projection_specialization_on::<E>(
         device,
         statics,
         mapping,
-        ProjectionLaunches {
-            gemv: 1,
-            batch: 2,
-            gemm: 4,
-            gemv_rows: (packed == ATTENTION_PROJECT_PACKED_LAUNCH).then_some(ATTENTION_PROJECT_GEMV_ROWS_LAUNCH),
-        },
         false,
     );
-    let bounds: &[&str] = if packed == ATTENTION_PROJECT_PACKED_LAUNCH {
-        &["QB", "GB", "KB", "VB"]
-    } else {
-        &["QB", "ZB"]
-    };
     let specialization = with_absent_bounds(device, specialization, bounds);
-    let specialization = with_tall(device, specialization, 6, mapping.tall);
     let specialization = formed(device, specialization, row_width(statics));
+    let specialization = with_projection_forms::<E>(device, specialization, mapping);
     if device.backend() == BackendName::Metal {
-        with_pack(specialization, packed, PACK_DEFAULT).with_param("PACK", 0)
+        specialization
+            .with_param("MATRIX", 0)
+            .with_launch_param(common::metal_launch::<E>("batch"), "BATCH_PARTS", 2)
     } else {
         specialization
     }
@@ -1087,13 +1058,18 @@ fn attention_project_specialization_on(
                 .with_static("D", row_width(statics) as u64),
         );
     }
-    scaled(segmented_projection_specialization_on(
+    scaled(segmented_projection_specialization_on::<attention_project::Entry>(
         device,
         statics,
         mapping,
-        ATTENTION_PROJECT_PACKED_LAUNCH,
+        ATTENTION_PROJECT_BOUNDS,
     ))
 }
+
+/// The segments' packing bounds of `attention_project` and
+/// `gated_delta_project`.
+const ATTENTION_PROJECT_BOUNDS: &[&str] = &["QB", "GB", "KB", "VB"];
+const RECURRENT_PROJECT_BOUNDS: &[&str] = &["QB", "ZB"];
 
 /// The value `statics` gives the scale port static `name`, else 0 (absent).
 fn static_or_absent(statics: &[(&str, usize)], name: &str) -> u64 {
@@ -1108,33 +1084,13 @@ fn dense_expand_specialization_on(
     statics: &[(&str, usize)],
     mapping: Mapping,
 ) -> NativeSpecialization {
-    let mapping = dense_gemv_mapping(device, mapping);
-    let specialization = scoped_projection_specialization_on(
-        device,
-        statics,
-        mapping,
-        ProjectionLaunches {
-            gemv: 1,
-            batch: 2,
-            gemm: 4,
-            gemv_rows: Some(DENSE_EXPAND_GEMV_ROWS_LAUNCH),
-        },
-        false,
-    )
-    .with_static("GS", 0)
-    .with_static("US", 0);
+    let specialization =
+        scoped_projection_specialization_on::<dense_expand::Entry>(device, statics, mapping, false)
+            .with_static("GS", 0)
+            .with_static("US", 0);
     let specialization = with_glu_limit(device, specialization, 0);
     let specialization = with_absent_bounds(device, specialization, &["GB", "UB"]);
-    let specialization = with_tall(device, specialization, 6, mapping.tall);
-    if device.backend() == BackendName::Metal {
-        with_pack(specialization, DENSE_EXPAND_PACKED_LAUNCH, PACK_DEFAULT)
-            .with_param("PACK", 0)
-            .with_param("INT8", 0)
-            .with_launch_param(2, "BATCH_PARTS", mapping.batch_parts)
-            .with_param("TILED", mapping.tiled)
-    } else {
-        specialization
-    }
+    with_dense_projection::<dense_expand::Entry>(device, specialization, mapping)
 }
 
 /// A PACK tile launch of the Metal projection entries: operand fragments per
@@ -1185,11 +1141,8 @@ fn pack_tiles() -> Vec<Pack> {
 }
 
 /// `specialization` under the PACK form with the tile launch `pack`.
-fn with_pack(
-    specialization: NativeSpecialization,
-    launch: usize,
-    pack: Pack,
-) -> NativeSpecialization {
+fn with_pack<E: seismic::Entry>(specialization: NativeSpecialization, pack: Pack) -> NativeSpecialization {
+    let launch = common::metal_launch::<E>("packed");
     specialization
         .with_param("PACK", 1)
         .with_param("RESIDUE", pack.residue)
@@ -1197,34 +1150,21 @@ fn with_pack(
         .with_launch_param(launch, "WEIGHTS_AHEAD", pack.weights_ahead)
 }
 
-/// The specialization of a readout projection on `device`; `gemv_rows` as
-/// [`ProjectionLaunches::gemv_rows`].
-fn readout_projection_specialization_on(
+fn readout_projection_specialization_on<E: seismic::Entry>(
     device: &Device,
     statics: &[(&str, usize)],
     mapping: Mapping,
-    gemv_rows: Option<usize>,
+    split: bool,
 ) -> NativeSpecialization {
-    let specialization = scoped_projection_specialization_on(
-        device,
-        statics,
-        mapping,
-        ProjectionLaunches {
-            gemv: 1,
-            batch: 2,
-            gemm: 3,
-            gemv_rows,
-        },
-        false,
-    );
+    let specialization = scoped_projection_specialization_on::<E>(device, statics, mapping, split);
     formed(device, specialization, row_width(statics))
 }
 
-/// The specialization of `readout_head_rows` on `device`: the readout
-/// projection's, with the GEMV launch for two rows up to VERIFY_ROWS.
-/// `specialization` with Metal's batched launch (2) taking the matrix GEMV
+/// `specialization` with Metal's batched launch taking the matrix GEMV
 /// (`MATRIX`) where the declaration admits it for `elements`, as the declared
-/// default does; other backends have no such choice.
+/// default does, else the batched rows; other backends have no such choice.
+/// The batched rows' BATCH_ROWS, and the matrix GEMV's BATCH_PARTS, are the
+/// declaration's default where the other form runs.
 fn with_matrix<E: seismic::Entry>(
     device: &Device,
     specialization: NativeSpecialization,
@@ -1233,26 +1173,49 @@ fn with_matrix<E: seismic::Entry>(
     if device.backend() != BackendName::Metal {
         return specialization;
     }
-    let matrix = specialization.clone().with_launch_param(2, "MATRIX", 1);
+    let batch = common::metal_launch::<E>("batch");
+    let matrix = specialization.clone().with_param("MATRIX", 1).with_launch_param(batch, "BATCH_ROWS", 2);
     if seismic::generated::native_specialization_valid::<E>(device, &matrix, elements).unwrap() {
         matrix
     } else {
-        specialization.with_launch_param(2, "MATRIX", 0)
+        specialization.with_param("MATRIX", 0).with_launch_param(batch, "BATCH_PARTS", 2)
     }
 }
 
+/// The specialization of `readout_selected_rows` on `device`: through `dense` on
+/// Metal, whose gathered weights offer neither the tall, INT8, PACK nor the
+/// matrix forms and no tile form of the weight rows.
+fn readout_selected_specialization_on(
+    device: &Device,
+    statics: &[(&str, usize)],
+    mapping: Mapping,
+) -> NativeSpecialization {
+    let metal = device.backend() == BackendName::Metal;
+    let specialization = readout_projection_specialization_on::<readout_selected_rows::Entry>(device, statics, mapping, metal);
+    if !metal {
+        return specialization;
+    }
+    with_single_projection::<readout_selected_rows::Entry>(
+        device,
+        specialization,
+        Mapping { tall: None, tiled: 0, int8_tile: 128, ..mapping },
+    )
+    .with_param("MATRIX", 0)
+    .with_launch_param(common::metal_launch::<readout_selected_rows::Entry>("batch"), "BATCH_PARTS", 2)
+}
+
+/// The specialization of `readout_head_rows` on `device`: the readout
+/// projection's, through `dense` on Metal.
 fn readout_head_specialization_on(
     device: &Device,
     statics: &[(&str, usize)],
     mapping: Mapping,
 ) -> NativeSpecialization {
-    let specialization =
-        readout_projection_specialization_on(device, statics, mapping, Some(READOUT_HEAD_GEMV_ROWS_LAUNCH));
-    if device.backend() == BackendName::Metal {
-        specialization.with_launch_param(2, "BATCH_PARTS", mapping.batch_parts)
-    } else {
-        specialization
-    }
+    with_single_projection::<readout_head_rows::Entry>(
+        device,
+        readout_projection_specialization_on::<readout_head_rows::Entry>(device, statics, mapping, true),
+        mapping,
+    )
 }
 
 fn prepared_projection_specialization_on(
@@ -1270,9 +1233,9 @@ fn prepared_projection_specialization_on(
     }
     match device.backend() {
         BackendName::Metal => spec
+            .with_param("LANES", mapping.lanes)
             .with_launch_param(0, "SIMDGROUPS", mapping.simdgroups)
-            .with_launch_param(0, "ROWS", mapping.rows)
-            .with_launch_param(0, "LANES", mapping.lanes),
+            .with_launch_param(0, "ROWS", mapping.rows),
         BackendName::Vulkan => spec
             .with_param("SIMDGROUPS", mapping.simdgroups)
             .with_param("ROWS", mapping.rows)
@@ -1327,6 +1290,14 @@ fn module() -> CheckedModule {
             include_str!("../kernels/attention.seismic"),
         ),
         (
+            "per_layer_gate.seismic",
+            include_str!("../kernels/per_layer_gate.seismic"),
+        ),
+        (
+            "short_conv.seismic",
+            include_str!("../kernels/short_conv.seismic"),
+        ),
+        (
             "functions.seismic",
             include_str!("../kernels/functions.seismic"),
         ),
@@ -1339,6 +1310,93 @@ fn module() -> CheckedModule {
         });
     }
     crate::common::check(sources)
+}
+
+/// The `dense` projection's launches (`dense.seismic`) for each
+/// variant, in its order.
+const PAIRED_LAUNCHES: [&str; 14] = [
+    "gemv", "batch", "gemm_small", "gemm", "tall", "quantize", "coefficients", "int8", "gemv_rows", "gemv_pair",
+    "pack", "pack_coefficients", "packed", "unpacked",
+];
+const SINGLE_LAUNCHES: [&str; 17] = [
+    "gemv", "batch", "gemm_small", "reduce_small", "gemm", "reduce", "relayout", "tall", "quantize",
+    "coefficients", "int8", "gemv_rows", "gemv_pair", "pack", "pack_coefficients", "packed", "unpacked",
+];
+const SEGMENTED_LAUNCHES: [&str; 11] = [
+    "gemv", "batch", "gemm_small", "gemm", "tall", "gemv_rows", "gemv_pair", "pack", "pack_coefficients", "packed",
+    "unpacked",
+];
+/// A segmented projection whose contract bounds its rows at 16 keeps the
+/// launches of up to 16 rows.
+const DECODE_SEGMENTED_LAUNCHES: [&str; 4] = ["gemv", "batch", "gemv_rows", "gemv_pair"];
+
+/// Every Metal entry that projects through `dense` checks to the
+/// projection's launches for its variant, each named for the entry, with
+/// the entry's own launches (`own`: each before the projection launch it
+/// names) in place.
+#[test]
+fn metal_projecting_entries_check_to_their_projections_launches() {
+    let module = module();
+    let cases: [(&str, &[&str], &[(&str, &str)]); 8] = [
+        (
+            "dense_expand",
+            &PAIRED_LAUNCHES,
+            &[("normalize", "gemv"), ("normalize_tall", "tall")],
+        ),
+        ("dense_output", &SINGLE_LAUNCHES, &[("stage", "batch")]),
+        ("attention_output", &SINGLE_LAUNCHES, &[("stage", "batch")]),
+        ("readout_head_rows", &SINGLE_LAUNCHES, &[("stage", "batch")]),
+        ("project_rows", &SINGLE_LAUNCHES, &[("stage", "batch")]),
+        ("attention_project", &SEGMENTED_LAUNCHES, &[("stage", "batch"), ("stage_tall", "tall")]),
+        ("gated_delta_project", &SEGMENTED_LAUNCHES, &[("stage", "batch"), ("stage_tall", "tall")]),
+        ("gated_delta_project_convolved", &DECODE_SEGMENTED_LAUNCHES, &[("normalize", "batch")]),
+    ];
+    for (entry, projected, own) in cases {
+        let mut expected = Vec::new();
+        for launch in projected {
+            for (name, _) in own.iter().filter(|(_, before)| before == launch) {
+                expected.push(format!("{entry}_{name}"));
+            }
+            expected.push(format!("{entry}_{launch}"));
+        }
+        let id = module.entry_named(entry).unwrap_or_else(|| panic!("`{entry}` is declared"));
+        let native = module
+            .native_implementation(id, BackendName::Metal)
+            .unwrap_or_else(|| panic!("`{entry}` has a Metal implementation"));
+        let launches = native.launches.iter().map(|launch| launch.kernel.clone()).collect::<Vec<_>>();
+        assert_eq!(launches, expected, "`{entry}`'s Metal launches");
+    }
+}
+
+/// Every CUDA entry that projects through `dense` checks to the projection's
+/// launches for its variant, each named for the entry.
+#[test]
+fn cuda_projecting_entries_check_to_their_projections_launches() {
+    /// The paired and segmented variants do not split.
+    const WHOLE: [&str; 5] = ["stage", "gemv", "gemv16", "gemm_small", "gemm"];
+    const SINGLE: [&str; 6] = ["stage", "gemv", "gemv16", "gemm_small", "gemm", "finalize"];
+    let module = module();
+    let cases: [(&str, &[&str]); 10] = [
+        ("dense_expand", &WHOLE),
+        ("dense_output", &SINGLE),
+        ("dense_up", &SINGLE),
+        ("attention_output", &SINGLE),
+        ("project_rows", &SINGLE),
+        ("readout_head_rows", &SINGLE),
+        ("per_layer_gate", &SINGLE),
+        ("attention_project", &WHOLE),
+        ("gated_delta_project", &WHOLE),
+        ("short_conv_project", &WHOLE),
+    ];
+    for (entry, launches) in cases {
+        let id = module.entry_named(entry).unwrap_or_else(|| panic!("`{entry}` is declared"));
+        let native = module
+            .native_implementation(id, BackendName::Cuda)
+            .unwrap_or_else(|| panic!("`{entry}` has a CUDA implementation"));
+        let kernels = native.launches.iter().map(|launch| launch.kernel.clone()).collect::<Vec<_>>();
+        let expected = launches.iter().map(|launch| format!("{entry}_{launch}")).collect::<Vec<_>>();
+        assert_eq!(kernels, expected, "`{entry}`'s CUDA launches");
+    }
 }
 
 enum Input {
@@ -2065,6 +2123,119 @@ fn metal_tall_gemm_is_bit_identical_to_the_staged_tiles() {
     }
 }
 
+/// `attention_project`'s batched launch (VERIFY_ROWS + 1..16 rows) takes the matrix GEMV
+/// where every segment's weights admit it at the width, else the batched rows;
+/// at widths that fill whole 32-value groups of a symmetric product but not
+/// whole 256-value blocks (288) and whole blocks (512), in both project modes
+/// (mode 1 skips the query segment's rows), its results are the batched
+/// rows' within a reassociation of the same sums.
+#[test]
+fn metal_attention_project_matrix_gemv_matches_the_batched_rows() {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let act = Act::Bf16;
+    let mapping = gemm_mapping(64, 64, 1);
+    let (kv, g, w) = (1, 3, 40);
+    let rows_of = [kv * g * 2 * w, kv * w, kv * w];
+    for (repr, d) in [(Repr::Q8, 288usize), (Repr::Q8, 512), (Repr::Q4k, 512)] {
+        let weights = (0..3).map(|i| weight(repr, rows_of[i], d, 71 + i as u64, 1.0)).collect::<Vec<_>>();
+        let norm = norm_values(d, 74);
+        for rows in [9usize, 12, 16] {
+            let mut rng = Rng::new(rows as u64 + 75);
+            let hidden = (0..rows * d).map(|_| rng.symmetric()).collect::<Vec<_>>();
+            for project_mode in [0, 1] {
+                let project = |matrix: bool| {
+                    let element = repr.resident(&device);
+                    let elements = [
+                        ("NW", Element::bf16()),
+                        ("QW", element),
+                        ("GW", Element::bf16()),
+                        ("KW", element),
+                        ("VW", element),
+                        ("A", act.element()),
+                        ("Y", act.element()),
+                    ];
+                    let specialization =
+                        attention_project_specialization_on(&device, &attention_project_statics(d, kv, g, w), mapping);
+                    let specialization = if matrix {
+                        let admitted = with_matrix::<attention_project::Entry>(&device, specialization.clone(), &elements);
+                        assert!(
+                            seismic::generated::native_specialization_valid::<attention_project::Entry>(
+                                &device,
+                                &specialization
+                                    .with_param("MATRIX", 1)
+                                    .with_launch_param(common::metal_launch::<attention_project::Entry>("batch"), "BATCH_ROWS", 2),
+                                &elements,
+                            )
+                            .unwrap(),
+                            "attention_project {repr:?} D {d}: the matrix GEMV is not admitted, so the comparison would be vacuous"
+                        );
+                        admitted
+                    } else {
+                        specialization
+                    };
+                    let out = attention_project::native_for_device_with(
+                        &device,
+                        attention_project::Elements {
+                            NW: Element::bf16(),
+                            QW: element,
+                            GW: Element::bf16(),
+                            KW: element,
+                            VW: element,
+                            A: act.element(),
+                            Y: act.element(),
+                        },
+                        &specialization,
+                    )
+                    .unwrap()
+                    .call(attention_project::Args {
+                        hidden: &f32_tensor(&device, &[rows, d], &hidden),
+                        input_norm: &bf16_norm(&device, &norm),
+                        query_weight: &weights[0].tensor(&device),
+                        gate_weight: &act_tensor(&device, Act::Bf16, &[0, d], &[]),
+                        key_weight: &weights[1].tensor(&device),
+                        value_weight: &weights[2].tensor(&device),
+                        epsilon: 1e-6,
+                        project_mode,
+                        query_scale: &no_scale(&device),
+                        gate_scale: &no_scale(&device),
+                        key_scale: &no_scale(&device),
+                        value_scale: &no_scale(&device),
+                        query_bound: &absent_bound(&device),
+                        gate_bound: &absent_bound(&device),
+                        key_bound: &absent_bound(&device),
+                        value_bound: &absent_bound(&device),
+                    })
+                    .unwrap();
+                    [read_act(act, &out.r0), read_act(act, &out.r2), read_act(act, &out.r3)]
+                };
+                let (matrix, batched) = (project(true), project(false));
+                for (segment, (matrix, batched)) in matrix.iter().zip(&batched).enumerate() {
+                    if project_mode == 1 && segment == 0 {
+                        assert!(
+                            matrix.iter().chain(batched).all(|value| *value == 0.0),
+                            "attention_project {repr:?} D {d} M {rows}: mode 1 leaves the query segment nonzero"
+                        );
+                        continue;
+                    }
+                    let (relative, worst) = relative_difference(
+                        &batched.iter().map(|value| f64::from(*value)).collect::<Vec<_>>(),
+                        &matrix.iter().map(|value| f64::from(*value)).collect::<Vec<_>>(),
+                    );
+                    assert!(
+                        relative <= 1e-2,
+                        "attention_project {repr:?} D {d} M {rows} mode {project_mode} segment {segment}: {relative:.2e}, {worst:.2e}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// The attention and recurrent projections under TALL 1 reproduce TALL 0 bit
 /// for bit, as the dense entries do: the segmented projections (query | key |
 /// value, with and without the zeroed query; qkv | z | alpha | beta), and the
@@ -2190,11 +2361,11 @@ fn metal_tall_segmented_projections_are_bit_identical_to_the_staged_tiles() {
                     BW: recurrent_reprs[3].resident(&device),
                     A: act.element(),
                 },
-                &segmented_projection_specialization_on(
+                &segmented_projection_specialization_on::<gated_delta_project::Entry>(
                     &device,
                     &[("H", d), ("NK", nk), ("NV", nv), ("W", head_width)],
                     mapping,
-                    RECURRENT_PROJECT_PACKED_LAUNCH,
+                    RECURRENT_PROJECT_BOUNDS,
                 ),
             )
             .unwrap()
@@ -2521,8 +2692,6 @@ fn relative_difference(reference: &[f64], actual: &[f64]) -> (f64, f64) {
 }
 
 /// `project_rows`' launches on Metal: the tall tile and the PACK tile.
-const PROJECT_ROWS_TALL_LAUNCH: usize = 8;
-const PROJECT_ROWS_PACKED_LAUNCH: usize = 11;
 
 /// `project_rows` (activation rows in, F32 rows out, no scale port) on Metal
 /// under `mapping`, with the PACK tile launch `pack` or in an exact form.
@@ -2537,23 +2706,16 @@ fn project_rows_native(
     let (n, k) = (weight.rows, weight.k);
     let rows = source.len() / k;
     let (bound, bound_extent) = weight.bound(device);
-    let specialization = with_tall(
+    let specialization = with_single_projection::<project_rows::Entry>(
         device,
-        scoped_projection_specialization_on(
+        scoped_projection_specialization_on::<project_rows::Entry>(
             device,
             &[("G", 1), ("K", k), ("N", n)],
             mapping,
-            ProjectionLaunches {
-                gemv: 0,
-                batch: 2,
-                gemm: 5,
-                gemv_rows: None,
-            },
             true,
         )
         .with_static("WS", 0),
-        PROJECT_ROWS_TALL_LAUNCH,
-        mapping.tall,
+        mapping,
     );
     let specialization = with_absent_bounds(device, specialization, &["WB"]);
     let specialization = if bound_extent != 0 {
@@ -2561,13 +2723,12 @@ fn project_rows_native(
     } else {
         specialization
     };
-    let specialization = with_pack(
+    let specialization = with_pack::<project_rows::Entry>(
         specialization,
-        PROJECT_ROWS_PACKED_LAUNCH,
         pack.unwrap_or(PACK_DEFAULT),
     )
     .with_param("PACK", u64::from(pack.is_some()))
-    .with_launch_param(2, "BATCH_PARTS", mapping.batch_parts);
+    .with_launch_param(common::metal_launch::<project_rows::Entry>("batch"), "BATCH_PARTS", mapping.batch_parts);
     let specialization = with_matrix::<project_rows::Entry>(
         device,
         specialization,
@@ -2675,9 +2836,8 @@ fn dense_output_packed(
 ) -> Vec<f32> {
     let (h, f) = (down.rows, down.k);
     let (bound, bound_extent) = down.bound(device);
-    let specialization = with_pack(
+    let specialization = with_pack::<dense_output::Entry>(
         dense_output_specialization_on(device, &[("H", h), ("F", f)], pack_mapping()),
-        DENSE_OUTPUT_PACKED_LAUNCH,
         pack,
     )
     .with_static("DB", bound_extent as u64);
@@ -2858,9 +3018,8 @@ fn metal_packed_dense_expand_agrees_with_the_staged_form() {
                 && up.repr.takes_residue(&device);
             let mut narrow = 0.0;
             for pack in pack_tiles().into_iter().chain(bytes.then_some(PACK_WIDE)) {
-                let specialization = with_pack(
+                let specialization = with_pack::<dense_expand::Entry>(
                     dense_expand_specialization_on(&device, &[("H", h), ("F", f)], pack_mapping()),
-                    DENSE_EXPAND_PACKED_LAUNCH,
                     pack,
                 )
                 .with_static("GB", gate_bound_extent as u64)
@@ -3074,7 +3233,7 @@ fn metal_packed_recurrent_and_attention_projections_agree_with_the_staged_tiles(
                     Y: act.element(),
                 },
                 &match pack {
-                    Some(pack) => with_pack(specialization, ATTENTION_PROJECT_PACKED_LAUNCH, pack),
+                    Some(pack) => with_pack::<attention_project::Entry>(specialization, pack),
                     None => specialization,
                 },
             )
@@ -3128,7 +3287,7 @@ fn metal_packed_recurrent_and_attention_projections_agree_with_the_staged_tiles(
                     A: act.element(),
                 },
                 &match pack {
-                    Some(pack) => with_pack(specialization, ATTENTION_OUTPUT_PACKED_LAUNCH, pack),
+                    Some(pack) => with_pack::<attention_output::Entry>(specialization, pack),
                     None => specialization,
                 },
             )
@@ -3151,7 +3310,7 @@ fn metal_packed_recurrent_and_attention_projections_agree_with_the_staged_tiles(
                 .collect::<Vec<_>>()
         };
         let recurrent = |pack: Option<Pack>| {
-            let specialization = segmented_projection_specialization_on(
+            let specialization = segmented_projection_specialization_on::<gated_delta_project::Entry>(
                 &device,
                 &[("H", d), ("NK", nk), ("NV", nv), ("W", head_width)],
                 if pack.is_some() {
@@ -3159,13 +3318,13 @@ fn metal_packed_recurrent_and_attention_projections_agree_with_the_staged_tiles(
                 } else {
                     staged
                 },
-                RECURRENT_PROJECT_PACKED_LAUNCH,
+                RECURRENT_PROJECT_BOUNDS,
             );
             let out = gated_delta_project::native_for_device_with(
                 &device,
                 recurrent_project_elements(&device, recurrent_reprs, act),
                 &match pack {
-                    Some(pack) => with_pack(specialization, RECURRENT_PROJECT_PACKED_LAUNCH, pack),
+                    Some(pack) => with_pack::<gated_delta_project::Entry>(specialization, pack),
                     None => specialization,
                 },
             )
@@ -4376,7 +4535,7 @@ fn decode_rows_on(device: &Device) -> DecodeRows {
         gated_delta_project_convolved, per_layer_gate, readout_planes_rows, routed_expand, routed_gate_up,
         routed_up, short_conv_project, stream_mix_down, stream_mix_up,
     };
-    use seismic::{SlabRegion, SlabTensor};
+    use seismic::SlabRegion;
     let act = Act::Bf16;
     let a = act.element();
     let q4k = Repr::Q4k.resident(device);
@@ -5179,6 +5338,30 @@ fn recurrent_project_cases_on(device: &Device, cases: Cases) {
             (expected, bound)
         };
         let native = |hidden: &[f32], rows: usize, mapping: Mapping| {
+            let specialization = segmented_projection_specialization_on::<gated_delta_project::Entry>(
+                device,
+                &[("H", h), ("NK", nk), ("NV", nv), ("W", w)],
+                mapping,
+                RECURRENT_PROJECT_BOUNDS,
+            );
+            // A mapping that names the matrix GEMV's parts takes it where
+            // a segment admits it (the others' batched rows beside it).
+            let specialization = if mapping.batch_parts == 2 {
+                specialization
+            } else {
+                with_matrix::<gated_delta_project::Entry>(
+                    device,
+                    specialization,
+                    &[
+                        ("NW", Element::bf16()),
+                        ("QW", reprs[0].resident(&device)),
+                        ("GW", reprs[1].resident(&device)),
+                        ("AW", reprs[2].resident(&device)),
+                        ("BW", reprs[3].resident(&device)),
+                        ("A", act.element()),
+                    ],
+                )
+            };
             let kernel = gated_delta_project::native_for_device_with(
                 &device,
                 gated_delta_project::Elements {
@@ -5189,12 +5372,7 @@ fn recurrent_project_cases_on(device: &Device, cases: Cases) {
                     BW: reprs[3].resident(&device),
                     A: act.element(),
                 },
-                &segmented_projection_specialization_on(
-                    device,
-                    &[("H", h), ("NK", nk), ("NV", nv), ("W", w)],
-                    mapping,
-                    RECURRENT_PROJECT_PACKED_LAUNCH,
-                ),
+                &specialization,
             )
             .unwrap();
             let out = kernel
@@ -5884,7 +6062,7 @@ fn scaled_projections_on(device: &Device) {
                     Y: act.element(),
                 },
                 &match pack {
-                    Some(pack) => with_pack(specialization, ATTENTION_PROJECT_PACKED_LAUNCH, pack),
+                    Some(pack) => with_pack::<attention_project::Entry>(specialization, pack),
                     None => specialization,
                 },
             )
@@ -5930,7 +6108,7 @@ fn scaled_projections_on(device: &Device) {
                     },
                     &match pack {
                         Some(pack) => {
-                            with_pack(specialization, ATTENTION_OUTPUT_PACKED_LAUNCH, pack)
+                            with_pack::<attention_output::Entry>(specialization, pack)
                         }
                         None => specialization,
                     },
@@ -6474,7 +6652,7 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(
                         OW: repr.resident(&device),
                         A: act.element(),
                     },
-                    &readout_projection_specialization_on(device, &[("V", v), ("D", d)], mapping, None),
+                    &readout_selected_specialization_on(device, &[("V", v), ("D", d)], mapping),
                 )
                 .unwrap()
                 .call(readout_selected_rows::Args {
@@ -6839,6 +7017,28 @@ fn dense_output_at_partial_block_widths(format: Format) {
     }
 }
 
+/// The readout head over rows of `format` whose K is not a multiple of 256, at
+/// each model width whole blocks of it fill: the matrix GEMV is admitted only
+/// where its blocks are whole, so the head still matches the host reference.
+fn readout_head_at_partial_block_widths(format: Format) {
+    let reprs: &'static [Repr] = Box::leak(Box::new([Repr::of(format)]));
+    for device in devices() {
+        for d in format.partial_block_widths() {
+            let check = ReadoutCheck {
+                v: 40,
+                d,
+                reprs,
+                output_classes: &ROW_CLASSES,
+                mappings: &MAPPINGS[..1],
+                softcap: 0.0,
+                weight_scale: None,
+                portable: false,
+            };
+            readout_entries_match_their_portable_bodies_and_the_host_reference_on(&device, &check);
+        }
+    }
+}
+
 fn embedding_rows_decode_exactly_as_the_portable_body(format: Format) {
     for device in devices() {
         embedding_rows_decode_exactly_as_the_portable_body_on(&device, Repr::of(format));
@@ -6848,7 +7048,7 @@ fn embedding_rows_decode_exactly_as_the_portable_body(format: Format) {
 gguf_format_tests! {
     rows16;
     every: [dense_output_matches_its_portable_body_and_the_host_reference];
-    partial_block: [dense_output_at_partial_block_widths];
+    partial_block: [dense_output_at_partial_block_widths readout_head_at_partial_block_widths];
     own_storage: [
         embedding_rows_decode_exactly_as_the_portable_body
         metal_tall_and_packed_project_rows_agree_with_the_staged_form
@@ -7428,6 +7628,7 @@ fn grouped_projection_at_deepseek_v41_wo_a_matches_the_per_group_products() {
 fn metal_convolved_matrix_columns_match_host() {
     use magnitude_kernels::gated_delta_project_convolved;
     use seismic::SlabRegion;
+    let launch = common::metal_launch::<gated_delta_project_convolved::Entry>;
     let Some(device) = devices()
         .into_iter()
         .find(|d| d.backend() == BackendName::Metal)
@@ -7530,13 +7731,14 @@ fn metal_convolved_matrix_columns_match_host() {
                     h,
                 )
                 .with_param("LANES", 16)
-                .with_launch_param(2, "BATCH_SIMDGROUPS", 8)
-                .with_launch_param(2, "BATCH_ROWS", 2)
-                .with_launch_param(2, "BATCH_PARTS", parts);
-                for launch in [1, 3, 4] {
+                .with_param("TILED", 0)
+                .with_launch_param(launch("batch"), "BATCH_SIMDGROUPS", 8)
+                .with_launch_param(launch("batch"), "BATCH_ROWS", 2)
+                .with_launch_param(launch("batch"), "BATCH_PARTS", parts);
+                for gemv in ["gemv", "gemv_rows", "gemv_pair"] {
                     spec = spec
-                        .with_launch_param(launch, "SIMDGROUPS", 8)
-                        .with_launch_param(launch, "ROWS", 2);
+                        .with_launch_param(launch(gemv), "SIMDGROUPS", 8)
+                        .with_launch_param(launch(gemv), "ROWS", 2);
                 }
                 let spec = with_matrix::<gated_delta_project_convolved::Entry>(
                     &device,

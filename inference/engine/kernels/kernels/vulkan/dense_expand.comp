@@ -1,6 +1,6 @@
 // dense_expand: RMS prologue over the `out_rows` residual rows, the
 // paired gate/up projection, and SiLU(gate)·up. The Vulkan form of
-// `metal/dense_expand.metal` over `lib/projection/projection.glsl`.
+// `metal/dense_expand.metal` on the `dense` projection (`lib/projection/operator.glsl`).
 #define KERNEL_W0 SEISMIC_GATE_WEIGHT
 #define KERNEL_W1 SEISMIC_UP_WEIGHT
 // The expansion's limit as its F32 bits LB (0: none), which the Glu epilogue
@@ -38,50 +38,46 @@
 
 
 
-projection_prologue dense_expand_input() {
+#define PROJECTION_PAIR
+#define PROJECTION_M uint(SEISMIC_DIM_O)
+#define PROJECTION_N uint(SEISMIC_DIM_F)
+#define PROJECTION_K uint(SEISMIC_DIM_H)
+#define PROJECTION_NORM PROJECTION_NORM_SHARED
+#define PROJECTION_STAGED SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)
+
+projection_prologue projected_input(uint g) {
     return projection_operands(projection_rms(DENSE_ACT, SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL), SEISMIC_RESIDUAL_STRIDE_0,
         SEISMIC_RESIDUAL_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_NORM), SEISMIC_NORM_STRIDE_0, DENSE_NORM,
         element_word_f32(SEISMIC_PARAM_EPS), uint(SEISMIC_DIM_H), SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS)),
         DENSE_OPERANDS);
 }
 
-projection_epilogue dense_expand_output() {
+// The normalized rows the stage launch formed.
+projection_prologue projected_rows(uint g) {
+    return projection_plain(DENSE_ACT, PROJECTION_STAGED, SEISMIC_DIM_H, 1ul, uint(SEISMIC_DIM_H), 0ul);
+}
+
+projection_epilogue projected_output(uint g) {
     return projection_scaled(projection_glu(DENSE_ACT, SEISMIC_RESULT_0_OUT,
         SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, int(SEISMIC_PARAM_ACTIVATION)),
         projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_GATE_SCALE), SEISMIC_DIM_GS, 0ul, 0ul),
         projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_US, 0ul, 0ul));
 }
 
-projection_weights dense_expand_gate() {
+projection_weights projected_weight(uint g) {
     return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_GATE_WEIGHT), PACKETS_W0_ROWS, uint(SEISMIC_DIM_H), 0ul, 1ul, 0u);
 }
 
-projection_weights dense_expand_up() {
+projection_weights projected_partner(uint g) {
     return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_UP_WEIGHT), PACKETS_W1_ROWS, uint(SEISMIC_DIM_H), 0ul, 1ul, 0u);
 }
 
-// The GEMV with the activation-row bound `maxm` (`projection_gemv`: one bound
-// per pipeline, so one entry per bound).
-void dense_expand_gemv_bounded(const uint maxm) {
-    projection_gemv(PACKETS_W0, PACKETS_W1, true, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, maxm, PROJECTION_NORM_SHARED,
-        dense_expand_input(), dense_expand_output(), dense_expand_gate(), dense_expand_up(), uint(SEISMIC_DIM_O),
-        uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H), gl_WorkGroupID.x);
-}
+#include "lib/projection/operator.glsl"
 
-void dense_expand_gemv1() { dense_expand_gemv_bounded(1u); }
-void dense_expand_gemv2() { dense_expand_gemv_bounded(2u); }
-void dense_expand_gemv4() { dense_expand_gemv_bounded(4u); }
-void dense_expand_gemv8() { dense_expand_gemv_bounded(8u); }
-
-void dense_expand_stage() {
-    projection_stage(dense_expand_input(), gl_WorkGroupID.x, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_NORMALIZED),
-        uint(SEISMIC_DIM_H));
-}
-
-void dense_expand_gemm() {
-    const projection_prologue x = projection_plain(DENSE_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_NORMALIZED),
-        SEISMIC_DIM_H, 1ul, uint(SEISMIC_DIM_H), 0ul);
-    projection_gemm_paired(PACKETS_W0, PACKETS_W1, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M,
-        SEISMIC_TUNE_SUB_N, x, dense_expand_output(), dense_expand_gate(), dense_expand_up(), uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H),
-        gl_WorkGroupID.y, gl_WorkGroupID.x, 0xffffffffu);
-}
+// The `dense` projection's launches (`lib/projection/operator.glsl`).
+void dense_expand_stage() { projection_dense_stage(); }
+void dense_expand_gemv1() { projection_paired_gemv(1u); }
+void dense_expand_gemv2() { projection_paired_gemv(2u); }
+void dense_expand_gemv4() { projection_paired_gemv(4u); }
+void dense_expand_gemv8() { projection_paired_gemv(8u); }
+void dense_expand_gemm() { projection_paired_gemm(); }

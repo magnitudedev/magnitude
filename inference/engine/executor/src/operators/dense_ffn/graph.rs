@@ -21,8 +21,9 @@ use seismic::{Argument, Dim, Element, NativeGraph, NativeGraphMetadata, NativePo
 
 /// The same dense topology accepts prepared entries or checked metadata
 /// bindings. The latter carries only element assignments, never shapes.
+/// Each projection's entries are by row range.
 pub(crate) struct DenseGraphEntries<'a, G: GraphDraft + 'a> {
-    pub expand: G::Binding<'a, dense_expand::Entry>,
+    pub expand: G::Ranged<'a, dense_expand::Entry>,
     pub output: TailEntries<'a, G, dense_output::Entry>,
 }
 
@@ -171,7 +172,7 @@ pub(crate) fn dense<'a, G: GraphDraft + 'a>(
     .concat();
     let product = graph
         .enqueue(
-            kernels.expand,
+            G::pick(kernels.expand, rows),
             &expand_dimensions,
             dense_expand::WorkflowArgs {
                 residual: input.into(),
@@ -193,7 +194,7 @@ pub(crate) fn dense<'a, G: GraphDraft + 'a>(
         (TailEntries::Residual(output), None) => {
             graph
                 .enqueue(
-                    output,
+                    G::pick(output, rows),
                     &output_dimensions,
                     dense_output::WorkflowArgs {
                         residual: sum.into(),

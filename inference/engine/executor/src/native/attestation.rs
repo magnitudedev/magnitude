@@ -236,9 +236,9 @@ pub(crate) struct AttestedHeadBlock {
     pub copy: NativeKernel<feature_copy::Entry>,
     pub gather: NativeKernel<feature_rows::Entry>,
     pub binding: HeadBinding,
-    pub input: NativeKernel<draft_rows::Entry>,
+    pub input: super::RangedKernels<draft_rows::Entry>,
     pub attention: AttentionKernels,
-    pub priming_project: NativeKernel<attention_project::Entry>,
+    pub priming_project: super::RangedKernels<attention_project::Entry>,
     pub feed_forward: AttestedFeedForward,
     pub features: NativeKernel<readout_features_rows::Entry>,
     pub logits: ProjectionKernels,
@@ -253,15 +253,15 @@ pub(crate) struct AttestedHeadBlock {
 pub(crate) struct AttestedSharedHead {
     pub embedding: NativeKernel<embedding_rows::Entry>,
     pub join: NativeKernel<tap_rows::Entry>,
-    pub input: NativeKernel<project_rows::Entry>,
+    pub input: super::RangedKernels<project_rows::Entry>,
     pub blocks: Vec<AttestedTargetBlock>,
     pub features: NativeKernel<readout_features_rows::Entry>,
     pub projection: ProjectionKernels,
-    pub centroids: Option<NativeKernel<readout_project_rows::Entry>>,
+    pub centroids: Option<super::RangedKernels<readout_project_rows::Entry>>,
     pub cluster_selection: Option<NativeKernel<draft_top_k::Entry>>,
     pub cluster_rows: Option<NativeKernel<cluster_token_rows::Entry>>,
     pub placement: Option<NativeKernel<place_logits_rows::Entry>>,
-    pub chain: NativeKernel<project_rows::Entry>,
+    pub chain: super::RangedKernels<project_rows::Entry>,
     pub shape: NativeKernel<shape_rows::Entry>,
     pub sample: NativeKernel<sample_rows::Entry>,
     /// Each proposal's probability under the readout logits it was selected
@@ -345,14 +345,10 @@ fn missing(entry: &'static str, binding: impl fmt::Debug) -> CatalogFailure {
     }
 }
 
-fn slot<K, E>(
-    handles: &HashMap<K, NativeKernel<E>>,
-    binding: K,
-    entry: &'static str,
-) -> Result<NativeKernel<E>, CatalogFailure>
+fn slot<K, V>(handles: &HashMap<K, V>, binding: K, entry: &'static str) -> Result<V, CatalogFailure>
 where
     K: Copy + Eq + std::hash::Hash + fmt::Debug,
-    E: seismic::Entry,
+    V: Clone,
 {
     handles
         .get(&binding)

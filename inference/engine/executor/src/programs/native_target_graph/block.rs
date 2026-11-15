@@ -3,10 +3,10 @@ use super::classes::BlockClass;
 use super::{
     classes::{StagedClass, block_routed},
     heap::owned_vectors_heap,
-    weights::{BankPort, BlockWeights, GraphTimeline, GraphWeights, PlannedWeights, WeightPort, activation},
+    weights::{BankPort, BlockWeights, GraphTimeline, GraphWeights, PlannedWeights, WeightPart, WeightPort, activation, weight_port},
 };
 use crate::{
-    ModelLoadPlan, StateResourcePlan, TargetBlockProgramSlot,
+    MixerProgramSlot, ModelLoadPlan, StateResourcePlan, TargetBlockProgramSlot,
     native::{AttestedTargetBlock, OutputScales},
     operators::{
         ExitMix, block,
@@ -18,6 +18,7 @@ use crate::{
         paired_block,
         per_layer::graph::{CheckedPerLayerEntries, PerLayerEntries},
         routed::{
+            fused_graph::OperandOut,
             split::{self, OnceStage, PassPorts, RunStage, SplitBuild, SplitForm, SplitLayer, SplitPorts, Stage},
             streamed::{BankGraph, BankGraphEntries, CheckedBankEntries, LayerBank},
         },
@@ -36,13 +37,13 @@ use crate::{
         native_constants::{FamilyConstants, GraphConstant, RecordedConstant},
     },
 };
-use magnitude_family_contracts::{Decoder, ExitNorm, WeightScope};
+use magnitude_family_contracts::{Decoder, ExitNorm, SublayerIndex, WeightKind, WeightRole, WeightScope};
 #[cfg(test)]
 use seismic::NativeGraphStorageBytes;
 use seismic::{
     BackendName, ClassFact, Device, Dim, Element, HostHeap, NativeGraphClassSlice, NativeGraphLayout,
     NativeGraphMetadata, NativeGraphPlan, NativeGraphResourceTemplate, NativeGraphTraces, NativePort,
-    NativeTimelinePort, Reals, Table, TraceOutput, WorkflowTensor, Argument,
+    NativeTimelinePort, OperandCarry, OperandForms, Reals, Table, TraceOutput, WorkflowTensor, Argument,
 };
 use std::sync::Arc;
 
@@ -62,6 +63,172 @@ fn slot_lists(
         }
         _ => false,
     }
+}
+
+/// The rows of the one class an operand carry exists in: a decode step's,
+/// whose block graphs run whole (`BlockGraphInputs::split`). The carry's
+/// forms are its reader's at these rows, one choice there.
+pub(super) const CARRIED_ROWS: u64 = 1;
+
+/// One block boundary's operand carry at the decode class
+/// (`seismic::OperandCarry`), as the graphs on both of its sides declare it
+/// (`block_carries`): its reader's input norm's resident element, and the
+/// epsilon the reader normalizes under, as its projection reads it (an
+/// `f32`, held by its bits). Block L's fused routed output forms block
+/// L+1's operand into the carry's ports, and block L+1's projection reads
+/// it there in place of its formation launch.
+///
+/// The forms the operand is carried in (`seismic::OperandForms`) are the
+/// reader's kernel's at the carried rows, a tuning outcome. `R` is what a
+/// side holds of them, one of three by what is known where it stands:
+/// - the reader's mixer binding (`MixerProgramSlot`), in a family's
+///   outline: a load prepares one set of kernels per binding
+///   (`AttestedTarget`), so sides naming one reader are carried in one
+///   form, whichever it is, and blocks share a sealed graph only over
+///   equal readers (`BlockGraphShape`);
+/// - nothing (`()`), in a graph built to be sized: a carry's ports and
+///   everything a graph reserves for it are the same in every form;
+/// - the forms themselves, in a graph of kernels, whose seal writes them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct CarrySide<R = ()> {
+    reader: R,
+    norm: Element,
+    epsilon: u32,
+}
+
+impl<R> CarrySide<R> {
+    pub(super) fn new(reader: R, norm: Element, epsilon: f32) -> Self {
+        Self { reader, norm, epsilon: epsilon.to_bits() }
+    }
+
+    fn epsilon(&self) -> f32 {
+        f32::from_bits(self.epsilon)
+    }
+
+    /// The side holding `reader` of its reader's forms.
+    fn reading<S>(self, reader: S) -> CarrySide<S> {
+        CarrySide { reader, norm: self.norm, epsilon: self.epsilon }
+    }
+}
+
+/// The operand carries of a block's decode graphs (`block_carries`): the
+/// one it reads, formed by the block before (none into block 0), and the
+/// one it writes, which the block after reads (none out of the last block).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct BlockCarries<R = ()> {
+    pub(super) carry_in: Option<CarrySide<R>>,
+    pub(super) carry_out: Option<CarrySide<R>>,
+}
+
+impl<R> Default for BlockCarries<R> {
+    fn default() -> Self {
+        Self { carry_in: None, carry_out: None }
+    }
+}
+
+impl<R> BlockCarries<R> {
+    /// The carries as a graph built to be sized declares them: in no form.
+    fn sized(self) -> BlockCarries {
+        BlockCarries {
+            carry_in: self.carry_in.map(|side| side.reading(())),
+            carry_out: self.carry_out.map(|side| side.reading(())),
+        }
+    }
+}
+
+impl BlockCarries {
+    /// The carries in the forms `forms` gives of each one's reader, the
+    /// block that many after this one: 0 its own, which reads the carry in;
+    /// 1 the next, which reads the carry out (as `carried_norm` names
+    /// their norms).
+    fn formed<F, E>(self, mut forms: impl FnMut(u32) -> Result<F, E>) -> Result<BlockCarries<F>, E> {
+        let mut formed = |side: Option<CarrySide>, reader: u32| {
+            side.map(|side| Ok::<_, E>(side.reading(forms(reader)?))).transpose()
+        };
+        Ok(BlockCarries { carry_in: formed(self.carry_in, 0)?, carry_out: formed(self.carry_out, 1)? })
+    }
+}
+
+/// The input norm a carry's operand is formed under, as a block graph
+/// names it relative to its block (`relative_scope`): the reading block's
+/// own (block 0), or the next block's (block 1) in the graph that forms it.
+/// Through `block_scope`, the two sides of one boundary name one weight.
+pub(super) fn carried_norm(block: u32) -> WeightPort {
+    WeightPort {
+        role: WeightRole {
+            scope: WeightScope::TargetSublayer(SublayerIndex { block, sublayer: 0 }),
+            kind: WeightKind::InputNorm,
+        },
+        part: WeightPart::Values,
+    }
+}
+
+/// An operand carry a block graph declares: its ports, which each run
+/// binds, the forms `F` its graph names it in (`GraphDraft::Forms`), and
+/// the norm weight port its operand is formed under.
+#[derive(Clone)]
+pub(crate) struct CarryPorts<F = OperandForms> {
+    pub carry: OperandCarry,
+    pub forms: F,
+    pub norm: WeightPort,
+}
+
+/// Certify the boundary between block `index`'s decode graph `from` and
+/// block `index + 1`'s decode graph `to`, which a step runs one after the
+/// other in either form each block has there (tapped or untapped, whole or
+/// resident): `from` carries out exactly where `to` carries in, at one
+/// activation, and the norms the two name relative to their blocks are,
+/// through `block_scope`, one weight: block `index + 1`'s input norm.
+///
+/// # Panics
+///
+/// Where `from` writes the operand in other forms than `to` reads it in.
+/// Each sealed its side in the forms of the kernels of its carry's reader
+/// (`BlockCarries::formed`), and blocks hold one sealed graph only over
+/// equal readers (`BlockGraphShape`), whose kernels are one preparation's:
+/// two forms at one boundary mean kernels of one binding that differ.
+pub(super) fn certify_carry<P, Q>(
+    index: usize,
+    from: &PreparedTargetBlockGraph<P>,
+    to: &PreparedTargetBlockGraph<Q>,
+) -> Result<(), String> {
+    let next = index + 1;
+    let (out, into) = match (&from.operand, &to.operand_in) {
+        (None, None) => return Ok(()),
+        (Some(out), Some(into)) => (out, into),
+        (out, into) => {
+            return Err(format!(
+                "block {index}'s decode graph carries out {} operand, block {next}'s carries in {}",
+                if out.is_some() { "an" } else { "no" },
+                if into.is_some() { "one" } else { "none" },
+            ));
+        }
+    };
+    let named = |ports: &CarryPorts, block: usize| {
+        let role = ports.norm.role;
+        super::prepared::block_scope(role.scope, block).map(|scope| WeightPort { role: WeightRole { scope, ..role }, part: ports.norm.part })
+    };
+    let (formed, read) = (named(out, index)?, named(into, next)?);
+    let own = WeightPort {
+        role: WeightRole { scope: super::prepared::block_scopes(next)?[0], kind: WeightKind::InputNorm },
+        part: WeightPart::Values,
+    };
+    if formed != read || read != own {
+        return Err(format!(
+            "block {index} forms its carried operand under {formed:?}, block {next} reads it under {read:?}, not its input norm"
+        ));
+    }
+    if out.carry.activation != into.carry.activation {
+        return Err(format!(
+            "block {index} carries an operand at {:?}, block {next} reads one at {:?}",
+            out.carry.activation, into.carry.activation
+        ));
+    }
+    assert_eq!(
+        out.forms, into.forms,
+        "block {index} carries its operand out in other forms than block {next}'s kernels read it in"
+    );
+    Ok(())
 }
 
 /// A prepared block graph and the ports of its stage (`StagePorts`): a
@@ -110,6 +277,11 @@ pub(crate) struct PreparedTargetBlockGraph<P = Option<SplitPorts>> {
     /// row, which carries no pre), or a front's carry after its mixer,
     /// which its back reads as its `hidden`; a pass's merged rows.
     pub output: ResidualCarry<WorkflowTensor>,
+    /// The next block's operand its output forms (`BlockCarries::carry_out`).
+    pub operand: Option<CarryPorts>,
+    /// The operand its mixer's projection reads, formed by the block before
+    /// (`BlockCarries::carry_in`).
+    pub operand_in: Option<CarryPorts>,
 }
 
 /// A sealed block graph, by the ports its stage formed: a run's stage's or
@@ -154,13 +326,17 @@ pub(super) struct BlockGraphs {
 
 impl SealedBlockGraph {
     /// The block graph `inputs` names, built from its split at the model's
-    /// own numbers over the load's weights into `layout`.
+    /// own numbers over the load's weights into `layout`, its operand
+    /// carries in the forms `forms` gives of each one's reader's kernels
+    /// (`BlockCarries::formed`).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn prepare<'a>(
         device: &Device,
         handle: &'a AttestedTargetBlock,
         tap: Option<(u64, TapEntry<'a, seismic::NativeGraph>)>,
         slot: TargetBlockProgramSlot,
         inputs: BlockGraphInputs<'_>,
+        forms: impl FnMut(u32) -> Result<OperandForms, String>,
         layout: &NativeGraphLayout,
         family: &FamilyConstants,
     ) -> Result<Self, String> {
@@ -175,7 +351,7 @@ impl SealedBlockGraph {
         let bank = layer_bank(stage, handle.bank.as_ref().map(BankGraphEntries::from), &mut banks, &mut parks);
         let (shape, numbers) =
             inputs.split(slot, &bank, tap.as_ref().map(|(width, tap)| (*width, tap.positions))).map_err(text)?;
-        let (shape, numbers) = (constant_reals(shape).tables(Table::from), constant(numbers));
+        let (shape, numbers) = (constant_reals(shape).tables(Table::from).formed(forms)?, constant(numbers));
         let hidden = numbers
             .input
             .clone()
@@ -193,7 +369,7 @@ impl SealedBlockGraph {
         let parts = block_graph(
             &mut graph,
             entries,
-            hidden.as_ref().map(|carry| carry.as_ref().map(NativePort::tensor)),
+            hidden.as_ref().map(ResidualCarry::as_ref),
             &shape,
             &numbers,
             &planned,
@@ -244,6 +420,8 @@ impl SealedBlockGraph {
                     ports: $ports,
                     residual: parts.residual,
                     output: parts.output,
+                    operand: parts.operand,
+                    operand_in: parts.operand_in,
                 })
             };
         }
@@ -289,11 +467,15 @@ pub(super) struct BlockGraphInputs<'a> {
     /// output: the exit block's, for a head conditioned on it
     /// (`FamilyOutline::exports_residual`).
     pub(super) residual: bool,
+    /// The block's operand carries (`FamilyOutline::carries`), which its
+    /// graphs of a one-row class declare.
+    pub(super) carries: BlockCarries<MixerProgramSlot>,
 }
 
 impl<'a> BlockGraphInputs<'a> {
     /// The inputs of block `block_index`'s graph of `staged`, at unit output
     /// scales: scalar arguments leave its checked shapes and storage alone.
+    /// The block carries `carries` (`FamilyOutline::carries`).
     pub(super) fn of_class(
         load: &'a ModelLoadPlan,
         geometry: &'a Decoder,
@@ -301,6 +483,7 @@ impl<'a> BlockGraphInputs<'a> {
         block_index: usize,
         ((rows, segments, slots, listed, scored), stage): StagedClass,
         capacity: u64,
+        carries: BlockCarries<MixerProgramSlot>,
     ) -> Self {
         Self {
             load,
@@ -316,6 +499,7 @@ impl<'a> BlockGraphInputs<'a> {
             stage,
             capacity,
             residual: false,
+            carries,
         }
     }
 }
@@ -323,10 +507,11 @@ impl<'a> BlockGraphInputs<'a> {
 /// What a block graph's builder branches on apart from its kernel entries
 /// (`BlockGraphInputs::split`): its stage, whether it exports its residual,
 /// its draft taps' positions and element, its routed layer's crossing, the
-/// decoder exit it ends with (the last block of residual streams), and its
-/// sublayers'. No model number.
+/// decoder exit it ends with (the last block of residual streams), its
+/// sublayers' and its operand carries, in the forms `F` its graph names
+/// them in (`GraphDraft::Forms`). No model number.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(super) struct BlockShape<R = Argument<f64>, T = Table> {
+pub(super) struct BlockShape<R = Argument<f64>, T = Table, F = ()> {
     stage: Stage,
     /// Block 0, which widens the embedded rows into residual streams.
     first: bool,
@@ -336,11 +521,16 @@ pub(super) struct BlockShape<R = Argument<f64>, T = Table> {
     split: Option<SplitForm>,
     exit: Option<ExitTopology<R>>,
     sublayers: SublayersTopology<R, T>,
+    /// The operand carries it declares: the block's
+    /// (`BlockGraphInputs::carries`) in a whole run of one row, the decode
+    /// step's, where the consumer's projection pairs (`M == 1`); none in
+    /// every other graph.
+    carries: BlockCarries<F>,
 }
 
-impl<R, T> BlockShape<R, T> {
+impl<R, T, F> BlockShape<R, T, F> {
     /// It with its tables `f` of its own (`SublayersTopology::tables`).
-    fn tables<U>(self, f: impl FnMut(T) -> U) -> BlockShape<R, U> {
+    fn tables<U>(self, f: impl FnMut(T) -> U) -> BlockShape<R, U, F> {
         BlockShape {
             stage: self.stage,
             first: self.first,
@@ -350,13 +540,32 @@ impl<R, T> BlockShape<R, T> {
             split: self.split,
             exit: self.exit,
             sublayers: self.sublayers.tables(f),
+            carries: self.carries,
         }
     }
 }
 
-impl<R, T> Numbers<R> for BlockShape<R, T> {
-    type Of<E> = BlockShape<E, T>;
-    fn map<E>(self, f: &mut impl FnMut(R) -> E) -> BlockShape<E, T> {
+impl<R, T> BlockShape<R, T> {
+    /// It as a graph of kernels declares it: its carries in the forms
+    /// `forms` gives (`BlockCarries::formed`).
+    fn formed<F, E>(self, forms: impl FnMut(u32) -> Result<F, E>) -> Result<BlockShape<R, T, F>, E> {
+        Ok(BlockShape {
+            stage: self.stage,
+            first: self.first,
+            residual: self.residual,
+            tap: self.tap,
+            activation: self.activation,
+            split: self.split,
+            exit: self.exit,
+            sublayers: self.sublayers,
+            carries: self.carries.formed(forms)?,
+        })
+    }
+}
+
+impl<R, T, F> Numbers<R> for BlockShape<R, T, F> {
+    type Of<E> = BlockShape<E, T, F>;
+    fn map<E>(self, f: &mut impl FnMut(R) -> E) -> BlockShape<E, T, F> {
         BlockShape {
             stage: self.stage,
             first: self.first,
@@ -369,6 +578,7 @@ impl<R, T> Numbers<R> for BlockShape<R, T> {
                 ExitTopology::Collapse(exit) => ExitTopology::Collapse(exit),
             }),
             sublayers: self.sublayers.map(f),
+            carries: self.carries,
         }
     }
 }
@@ -443,6 +653,7 @@ impl<'a> BlockGraphInputs<'a> {
             stage,
             capacity,
             residual,
+            carries,
         } = *self;
         let block = geometry.blocks.get(block_index).ok_or("target block geometry is absent")?;
         let paired = paired_block(block).map_err(|error| error.to_string())?;
@@ -482,6 +693,12 @@ impl<'a> BlockGraphInputs<'a> {
             (Some(_), _) => return Err("residual streams without their exit".into()),
         };
         let split = block_routed(geometry, block_index)?.map(|routed| split::split(routed, geometry));
+        // Both sides of a boundary run each decode step at one row, whole,
+        // in either form of a streamed block (`RunStage::Resident`).
+        let carries = match stage {
+            Stage::Run(run) if rows == CARRIED_ROWS && run.place() == RunStage::Whole => carries.sized(),
+            _ => BlockCarries::default(),
+        };
         Ok((
             BlockShape {
                 stage,
@@ -492,6 +709,7 @@ impl<'a> BlockGraphInputs<'a> {
                 split: split.as_ref().map(|(form, _)| *form),
                 exit,
                 sublayers,
+                carries,
             },
             BlockNumbers {
                 capacity,
@@ -547,7 +765,7 @@ pub(super) fn stage_input(geometry: &Decoder, block_index: usize, stage: Stage) 
     })
 }
 
-struct BlockGraphParts {
+struct BlockGraphParts<F> {
     residual: Option<WorkflowTensor>,
     output: ResidualCarry<WorkflowTensor>,
     state: BlockState,
@@ -563,9 +781,12 @@ struct BlockGraphParts {
     /// streams, which a sampled decode step's run times its block between
     /// (`BankRun::block_sampled`).
     span: Option<(usize, usize)>,
+    /// The operand carries it declares (`BlockShape::carries`).
+    operand: Option<CarryPorts<F>>,
+    operand_in: Option<CarryPorts<F>>,
 }
 
-impl BlockGraphParts {
+impl<F> BlockGraphParts<F> {
     /// The state ports the graph holds.
     fn state_ports(&self) -> [usize; 2] {
         [
@@ -587,19 +808,20 @@ struct BlockEntries<'p, 'a, G: GraphDraft + 'a> {
 
 /// One decoder block's graph fragment, built from its split alone (`shape`
 /// at `numbers`, over `planned`): its draft tap when tapped, then its mixer
-/// then its feed-forward over `hidden`. The production graph and the
-/// recorded metadata route both build blocks through this one function.
+/// then its feed-forward over the carry bound to the ports `hidden`. The
+/// production graph and the recorded metadata route both build blocks
+/// through this one function.
 #[allow(clippy::too_many_arguments)]
 fn block_graph<'a, G: GraphDraft + 'a>(
     graph: &mut G,
     entries: BlockEntries<'_, 'a, G>,
-    hidden: Option<ResidualCarry<&WorkflowTensor>>,
-    shape: &BlockShape,
+    hidden: Option<ResidualCarry<&NativePort>>,
+    shape: &BlockShape<Argument<f64>, Table, G::Forms>,
     numbers: &BlockNumbers,
     planned: &(impl PlannedWeights + ?Sized),
     weights: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
-) -> Result<BlockGraphParts, GraphError> {
+) -> Result<BlockGraphParts<G::Forms>, GraphError> {
     let BlockEntries { tap: tap_entry, mixer: mixer_entries, feed_forward, per_layer, ngram, streams: streams_entries } =
         entries;
     // A target block's graph names its own block as block 0, the others
@@ -635,6 +857,8 @@ fn block_graph<'a, G: GraphDraft + 'a>(
                 sequence: None,
                 ports,
                 span: None,
+                operand: None,
+                operand_in: None,
             });
         }
         Stage::Run(stage) => stage,
@@ -664,8 +888,27 @@ fn block_graph<'a, G: GraphDraft + 'a>(
     // its merge set's pass, as this graph's ports.
     let split_layer = shape.split.as_ref().zip(numbers.split.as_ref());
     let mut split = SplitPorts::of(graph, stage, split_layer, rows, &numbers.capacity)?;
-    let hidden = hidden.ok_or("a block graph of no input rows")?;
-    let hidden = ResidualCarry { rows: hidden.rows.clone(), pre: hidden.pre.cloned() };
+    let hidden_ports = hidden.ok_or("a block graph of no input rows")?;
+    let hidden = ResidualCarry {
+        rows: hidden_ports.rows.tensor().clone(),
+        pre: hidden_ports.pre.map(|pre| pre.tensor().clone()),
+    };
+    let carries = shape.carries;
+    // A carry's operand is of the block's input or output rows alone: none
+    // of residual streams, nor of an output a later sublayer or the exit
+    // changes after the feed-forward.
+    if carries.carry_out.is_some()
+        && (streams.is_some()
+            || shape.exit.is_some()
+            || shape.sublayers.per_layer.is_some()
+            || shape.sublayers.ngram.is_some())
+    {
+        return Err("a block carries its output's operand past a later sublayer".into());
+    }
+    if carries.carry_in.is_some() && streams.is_some() {
+        return Err("a block reads a carried operand of residual streams".into());
+    }
+    let mut operand_in = None;
     // A back reads the carry its front's mixer left.
     let (mixed, mut state_ports) = match stage {
         RunStage::Combine => (hidden, BlockState::default()),
@@ -682,6 +925,19 @@ fn block_graph<'a, G: GraphDraft + 'a>(
             };
             let (mixed, state_ports) =
                 sublayers.mixer(graph, mixer_entries, streams_entries, &hidden, weights, constants)?;
+            // The mixer's projection reads the operand the block before
+            // formed under this block's input norm, the port it bound.
+            if let Some(side) = carries.carry_in {
+                let norm = carried_norm(0);
+                let port = weights
+                    .iter()
+                    .find_map(|(weight, port)| (*weight == norm).then_some(port))
+                    .ok_or("a carried operand's reader binds no input norm")?
+                    .clone();
+                let carry = graph.operand_carry(CARRIED_ROWS, &numbers.sublayers.hidden, shape.activation)?;
+                graph.carry_in(hidden_ports.rows, &carry, side.reader, &port, side.epsilon())?;
+                operand_in = Some(CarryPorts { carry, forms: side.reader, norm });
+            }
             if let Some(taps) = taps.as_mut().filter(|taps| taps.positions.middle) {
                 if shape.sublayers.feed_forward.is_none() {
                     return Err("a draft taps the feed-forward of a lone mixer block".into());
@@ -691,6 +947,17 @@ fn block_graph<'a, G: GraphDraft + 'a>(
             (mixed, state_ports)
         }
     };
+    // The output forms the next block's operand under that block's input
+    // norm, which this graph binds (`carried_norm`).
+    let operand = carries
+        .carry_out
+        .map(|side| {
+            let norm = carried_norm(1);
+            let port = weight_port(graph, planned, norm.role, norm.part, weights)?;
+            let carry = graph.operand_carry(CARRIED_ROWS, &numbers.sublayers.hidden, shape.activation)?;
+            Ok::<_, GraphError>((side, CarryPorts { carry, forms: side.reader, norm }, port))
+        })
+        .transpose()?;
     let (output, sequence) = sublayers.feed_forward(
         graph,
         feed_forward,
@@ -699,7 +966,14 @@ fn block_graph<'a, G: GraphDraft + 'a>(
         weights,
         constants,
         split.as_mut().map(SplitBuild::split),
+        operand.as_ref().map(|(side, ports, norm)| OperandOut {
+            carry: &ports.carry,
+            forms: side.reader,
+            norm: norm.tensor(),
+            epsilon: side.epsilon(),
+        }),
     )?;
+    let operand = operand.map(|(_, ports, _)| ports);
     let ports = StagePorts::Run(split.map(SplitBuild::into_ports));
     // A front ends with its request: its output is the residual it mixed.
     if stage == RunStage::Front {
@@ -713,6 +987,8 @@ fn block_graph<'a, G: GraphDraft + 'a>(
             sequence,
             ports,
             span: None,
+            operand,
+            operand_in,
         });
     }
     let ResidualCarry { rows: output, pre } = output;
@@ -774,6 +1050,8 @@ fn block_graph<'a, G: GraphDraft + 'a>(
         sequence,
         ports,
         span,
+        operand,
+        operand_in,
     })
 }
 
@@ -846,7 +1124,7 @@ fn checked_block_graph(
             ngram: entries.ngram.as_ref().map(CheckedNGramEntries::entries),
             streams: entries.streams.as_ref().map(CheckedStreamsEntries::entries),
         },
-        hidden.as_ref().map(|carry| carry.as_ref().map(NativePort::tensor)),
+        hidden.as_ref().map(ResidualCarry::as_ref),
         shape,
         numbers,
         planned,
@@ -949,7 +1227,10 @@ pub(super) fn certify_block<L: Certified>(
     // The key names what the block reads relative to it (`relative_scope`),
     // as its graph does.
     let block = inputs.block()?;
-    let weights = facts.index(GraphWeights::of_block(inputs.load, block, shape.exit.is_some())?.relative_to(block));
+    let weights = facts.index(
+        GraphWeights::of_block(inputs.load, block, shape.exit.is_some(), shape.carries.carry_out.is_some())?
+            .relative_to(block),
+    );
     let classes = classes
         .iter()
         .map(|&(scope, dimension, number)| {
@@ -1001,7 +1282,7 @@ pub(crate) fn checked_block_graph_resources(
         NativeGraphMetadata::new(backend),
         slot,
         None,
-        BlockGraphInputs::of_class(load, geometry, state, block_index, staged, class.0),
+        BlockGraphInputs::of_class(load, geometry, state, block_index, staged, class.0, BlockCarries::default()),
     )?;
     Ok((GraphDraft::seal(graph)?, constants))
 }

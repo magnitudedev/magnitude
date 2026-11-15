@@ -32,7 +32,7 @@ use crate::{GeneralRoutedBinding, GeneralRoutedShape, ModelLoadPlan};
 use magnitude_family_contracts::{GluLimit, WeightKind, WeightRole, WeightScope};
 use magnitude_kernels::{
     dense_expand, dense_output, dense_up, project_rows, routed_down, routed_down_project, routed_down_sited, routed_experts,
-    routed_experts_up, routed_gate_up, routed_group, routed_scatter, routed_select,
+    routed_experts_up, routed_gate_up, routed_group, routed_hint_select, routed_scatter, routed_select,
     routed_select_streamed, routed_up,
 };
 use seismic::{Dim, Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
@@ -80,15 +80,15 @@ pub(crate) fn split<G: GraphDraft>(
     Ok((GeneralRoutedTopology { form, bank }, GeneralRoutedLayer { shape: numbers, bank: bank_numbers }))
 }
 
-/// The experts' expansion entries.
+/// The experts' expansion entries, each by row range.
 pub(crate) enum ExpertEntries<'a, G: GraphDraft + 'a> {
     Gated {
-        decode: G::Binding<'a, routed_gate_up::Entry>,
-        grouped: G::Binding<'a, routed_experts::Entry>,
+        decode: G::Ranged<'a, routed_gate_up::Entry>,
+        grouped: G::Ranged<'a, routed_experts::Entry>,
     },
     Plain {
-        decode: G::Binding<'a, routed_up::Entry>,
-        grouped: G::Binding<'a, routed_experts_up::Entry>,
+        decode: G::Ranged<'a, routed_up::Entry>,
+        grouped: G::Ranged<'a, routed_experts_up::Entry>,
     },
 }
 
@@ -102,22 +102,23 @@ pub(crate) enum RoutedSum {
     Branch,
 }
 
-/// A dense expansion entry.
+/// A dense expansion entry, by row range.
 pub(crate) enum ExpansionEntry<'a, G: GraphDraft + 'a> {
-    Gated(G::Binding<'a, dense_expand::Entry>),
-    Plain(G::Binding<'a, dense_up::Entry>),
+    Gated(G::Ranged<'a, dense_expand::Entry>),
+    Plain(G::Ranged<'a, dense_up::Entry>),
 }
 
+/// A general routed layer's entries; each projection's by row range.
 pub(crate) struct GeneralRoutedGraphEntries<'a, G: GraphDraft + 'a> {
     pub select: G::Binding<'a, routed_select::Entry>,
     pub experts: ExpertEntries<'a, G>,
-    pub down: G::Binding<'a, routed_down::Entry>,
+    pub down: G::Ranged<'a, routed_down::Entry>,
     pub group: G::Binding<'a, routed_group::Entry>,
     pub scatter: G::Binding<'a, routed_scatter::Entry>,
-    pub shared: Option<(ExpansionEntry<'a, G>, G::Binding<'a, dense_output::Entry>)>,
+    pub shared: Option<(ExpansionEntry<'a, G>, G::Ranged<'a, dense_output::Entry>)>,
     pub latent: Option<(
-        G::Binding<'a, project_rows::Entry>,
-        G::Binding<'a, dense_output::Entry>,
+        G::Ranged<'a, project_rows::Entry>,
+        G::Ranged<'a, dense_output::Entry>,
     )>,
 }
 
@@ -442,7 +443,7 @@ impl ExpertStacks {
 #[allow(clippy::too_many_arguments)]
 fn expert_input<'a, G: GraphDraft + 'a>(
     graph: &mut G,
-    entry: Option<G::Binding<'a, project_rows::Entry>>,
+    entry: Option<G::Ranged<'a, project_rows::Entry>>,
     planned: &(impl PlannedWeights + ?Sized),
     scope: WeightScope,
     weights: &mut Vec<(WeightPort, NativePort)>,
@@ -460,7 +461,7 @@ fn expert_input<'a, G: GraphDraft + 'a>(
     let down = packed_weight(graph, planned, scope, WeightKind::LatentDown, weights, constants)?;
     Ok(graph
         .enqueue(
-            entry,
+            G::pick(entry, rows),
             &[
                 ("M", rows.clone()),
                 ("G", Dim::from(1)),
@@ -498,7 +499,7 @@ impl SumBase {
     #[allow(clippy::too_many_arguments)]
     fn of<'a, G: GraphDraft + 'a>(
         graph: &mut G,
-        shared: Option<(ExpansionEntry<'a, G>, G::Binding<'a, dense_output::Entry>)>,
+        shared: Option<(ExpansionEntry<'a, G>, G::Ranged<'a, dense_output::Entry>)>,
         planned: &(impl PlannedWeights + ?Sized),
         scope: WeightScope,
         weights: &mut Vec<(WeightPort, NativePort)>,
@@ -539,7 +540,7 @@ impl SumBase {
                         let up = packed_weight(graph, planned, scope, WeightKind::SharedUp, weights, constants)?;
                         graph
                             .enqueue(
-                                entry,
+                                G::pick(entry, rows),
                                 &[
                                     dimensions.as_slice(),
                                     &[
@@ -572,7 +573,7 @@ impl SumBase {
                         let up = scaled_weight(graph, planned, scope, WeightKind::SharedUp, weights, constants)?;
                         graph
                             .enqueue(
-                                entry,
+                                G::pick(entry, rows),
                                 &[dimensions.as_slice(), &[("US", up.scale.extent.clone())]].concat(),
                                 dense_up::WorkflowArgs {
                                     residual: residual.into(),
@@ -591,7 +592,7 @@ impl SumBase {
                 let down = packed_weight(graph, planned, scope, WeightKind::SharedDown, weights, constants)?;
                 graph
                     .enqueue(
-                        output,
+                        G::pick(output, rows),
                         &[
                             dimensions.as_slice(),
                             &[("DS", down.operands.scale.extent.clone()), ("DB", down.operands.bound.extent.clone())],
@@ -628,7 +629,7 @@ impl SumBase {
     fn finish<'a, G: GraphDraft + 'a>(
         self,
         graph: &mut G,
-        entry: Option<G::Binding<'a, dense_output::Entry>>,
+        entry: Option<G::Ranged<'a, dense_output::Entry>>,
         planned: &(impl PlannedWeights + ?Sized),
         scope: WeightScope,
         weights: &mut Vec<(WeightPort, NativePort)>,
@@ -643,7 +644,7 @@ impl SumBase {
                 let table = self.row_table.as_ref().ok_or("general routed row table is absent")?.port().tensor().clone();
                 let output = graph
                     .enqueue(
-                        entry,
+                        G::pick(entry, rows),
                         &[
                             ("M", rows.clone()),
                             ("O", rows.clone()),
@@ -704,7 +705,7 @@ fn expand<'a, G: GraphDraft + 'a>(
         (ExpertEntries::Gated { grouped, .. }, Some(gate), Some(records_gate), Some((_, gate_scale))) => {
             graph
                 .enqueue(
-                    grouped,
+                    G::pick(grouped, rows),
                     &[
                         dimensions.as_slice(),
                         &[
@@ -740,7 +741,7 @@ fn expand<'a, G: GraphDraft + 'a>(
         (ExpertEntries::Plain { grouped, .. }, None, None, None) => {
             graph
                 .enqueue(
-                    grouped,
+                    G::pick(grouped, rows),
                     &[dimensions.as_slice(), &[("US", stacks.up_scale.extent.clone())]].concat(),
                     routed_experts_up::WorkflowArgs {
                         first: first.into(),
@@ -772,9 +773,9 @@ fn expand<'a, G: GraphDraft + 'a>(
 #[allow(clippy::too_many_arguments)]
 fn combine<'a, G: GraphDraft + 'a>(
     graph: &mut G,
-    shared: Option<(ExpansionEntry<'a, G>, G::Binding<'a, dense_output::Entry>)>,
+    shared: Option<(ExpansionEntry<'a, G>, G::Ranged<'a, dense_output::Entry>)>,
     scatter: G::Binding<'a, routed_scatter::Entry>,
-    latent_up: Option<G::Binding<'a, dense_output::Entry>>,
+    latent_up: Option<G::Ranged<'a, dense_output::Entry>>,
     planned: &(impl PlannedWeights + ?Sized),
     scope: WeightScope,
     weights: &mut Vec<(WeightPort, NativePort)>,
@@ -950,37 +951,28 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
     let (normalized, reads, experts_read, sequence, mut sited) = match &mut streamed {
         Some(layer) => {
             let Selection { norm, router_norm, router, bias, expert_scale } = &selection;
-            let BankRoute::General(route) = layer.route() else {
+            let BankRoute::General { activation, select: route, hints: hint_kernels } = layer.route() else {
                 return Err("a general layer's bank holds another form's route".into());
             };
             let bank = layer.numbers();
             let mut ports = layer.decode_ports(graph)?;
-            let mut hints = layer.hints(
-                graph,
-                weights,
-                [router_norm, router, bias],
-                ports.policy.tensor(),
-            )?;
             let mut routing = layer.part(graph, BankPart::Routing)?;
             let tier = layer.route_tier(graph, &ports, constants)?;
-            let route = route[hints.ahead as usize].ok_or("a streamed layer's lead was not prepared with its binding")?;
             let select_dims = [
                 dimensions.as_slice(),
                 &[
                     ("FW", bank.file_width.clone()),
-                    ("AHEAD", Dim::from(hints.ahead)),
                     ("FLIGHT", bank.flight.clone()),
-                    ("RING", bank.ring_words.clone()),
                     ("GM", bank.map_words.clone()),
                     ("TM", tier.experts.clone()),
                     ("P", bank.choices.clone()),
-                    ("EN", bank.next_experts.clone()),
                 ],
             ]
             .concat();
             // The step's sources, which the selection writes and its later
             // entries read.
             let mut locals = RouteLocals { sources: graph.local_for(route, "sources", &select_dims)? };
+            let score = scalar(&shape.score, "a route's score code")?;
             let selected = graph.enqueue(
                 route,
                 &select_dims,
@@ -994,7 +986,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                     routes: routes.tensor_mut().into(),
                     weights: route_weights.tensor_mut().into(),
                     epsilon,
-                    score: scalar(&shape.score, "a route's score code")?,
+                    score,
                     normalization: scalar(&shape.normalization, "a route's normalization code")?,
                     normalization_epsilon: form.normalization_epsilon.f32(),
                     scale: form.scale.f32(),
@@ -1005,17 +997,46 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                     step: ports.step.tensor().into(),
                     file: ports.file.tensor_mut().into(),
                     sources: locals.sources.tensor_mut().into(),
-                    next_router_norm: (&hints.weights[0][0]).into(),
-                    next_router: (&hints.weights[0][1]).into(),
-                    next_bias: (&hints.weights[0][2]).into(),
-                    after_router_norm: (&hints.weights[1][0]).into(),
-                    after_router: (&hints.weights[1][1]).into(),
-                    after_bias: (&hints.weights[1][2]).into(),
-                    next_policy: (&hints.policy).into(),
-                    rings: hints.rings.tensor_mut().into(),
                     routing: routing.tensor_mut().into(),
                 },
             )?;
+            if let Some(mut hints) = layer.hints(
+                graph,
+                weights,
+                [router_norm, router, bias],
+                ports.policy.tensor(),
+            )? {
+                let hint = hint_kernels[hints.ahead as usize - 1]
+                    .ok_or("a streamed layer's lead was not prepared with its binding")?;
+                let empty = GraphConstant::empty_of(graph, activation, &[Dim::from(0u64), shape.selected.clone()], constants)?;
+                let hint_dims = [
+                    ("M", rows.clone()),
+                    ("H", shape.hidden.clone()),
+                    ("K", shape.selected.clone()),
+                    ("AHEAD", Dim::from(hints.ahead)),
+                    ("RING", bank.ring_words.clone()),
+                    ("EN", bank.next_experts.clone()),
+                ];
+                graph.enqueue(
+                    hint,
+                    &hint_dims,
+                    routed_hint_select::WorkflowArgs {
+                        residual: residual.into(),
+                        activation: (&empty).into(),
+                        next_router_norm: (&hints.weights[0][0]).into(),
+                        next_router: (&hints.weights[0][1]).into(),
+                        next_bias: (&hints.weights[0][2]).into(),
+                        after_router_norm: (&hints.weights[1][0]).into(),
+                        after_router: (&hints.weights[1][1]).into(),
+                        after_bias: (&hints.weights[1][2]).into(),
+                        score,
+                        epsilon,
+                        step: ports.step.tensor().into(),
+                        next_policy: (&hints.policy).into(),
+                        rings: hints.rings.tensor_mut().into(),
+                    },
+                )?;
+            }
             let decode_shape = DecodeShape { rows };
             let mut sources = locals.sources.tensor().clone();
             layer.land(graph, LandPorts { decode: &mut ports, sources: &mut sources, records: stacks.records() }, &decode_shape, constants)?;
@@ -1067,7 +1088,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
         (ExpertEntries::Gated { decode, .. }, Some((gate, gate_scale))) => {
             graph
                 .enqueue(
-                    decode,
+                    G::pick(decode, rows),
                     &[
                         dimensions.as_slice(),
                         &[
@@ -1097,7 +1118,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
         (ExpertEntries::Plain { decode, .. }, None) => {
             graph
                 .enqueue(
-                    decode,
+                    G::pick(decode, rows),
                     &[dimensions.as_slice(), &[("US", up_scale.extent.clone())], &map_dimension].concat(),
                     routed_up::WorkflowArgs {
                         normalized: (&input).into(),
@@ -1152,11 +1173,11 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
         Some((layer, mut site, (BankCombineEntry::General { project, sited }, site_dimensions), ports)) => {
             let (policy, whole) = (ports.policy, magnitude_kernels::constants::POLICY_WHOLE);
             let resident = graph
-                .enqueue_under(down, &down_dimensions, resident_args(), &policy, whole, LaunchEncoding::WhileSet)?
+                .enqueue_under(G::pick(down, rows), &down_dimensions, resident_args(), &policy, whole, LaunchEncoding::WhileSet)?
                 .value;
             let published = graph
                 .enqueue_under(
-                    project,
+                    G::pick(project, rows),
                     &[dimensions.as_slice(), &map_dimension].concat(),
                     routed_down_project::WorkflowArgs {
                         product: (&product).into(),
@@ -1199,7 +1220,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
         Some((_, _, (BankCombineEntry::Fused { .. }, _), _)) => {
             return Err("a general layer's bank holds another form's combine".into());
         }
-        None => graph.enqueue(down, &down_dimensions, resident_args())?.value,
+        None => graph.enqueue(G::pick(down, rows), &down_dimensions, resident_args())?.value,
     };
     let output = base.finish(graph, latent_up, planned, scope, weights, constants, routed, rows, shape)?;
     Ok((output, sequence))

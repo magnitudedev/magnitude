@@ -223,134 +223,66 @@ fn repeat_rows[M, H, S](rows: &tensor[M, H] f32, scales: &tensor[S] f32) -> tens
                 result[row, stream * H + column] = rows[row, column] * scales[stream]
     return result
 
-# Metal: the projection library's row classes (`lib/projection`). The GEMV
-# class splits K by stream: a threadgroup normalizes one stream (the first
-# row tile of each publishes its inverses) and projects it over a row tile
-# of down | inject into F32 partial sums, which the last of a row tile's S
-# threadgroups to arrive adds in stream order through the epilogues (a
-# counter a row tile: a tile has at least one output, so outputs bound
-# them). The batched GEMV (to 16 rows) reduces every stream's square sum in
-# each threadgroup and normalizes while staging; the first threadgroup
-# publishes the inverses. Past 16 rows
-# `stage` publishes the normalized streams in A to scratch with the
-# inverses, one threadgroup per row and stream, and the GEMM reads them.
+# Metal: the `dense` projection (segmented) in S parts, the streams: the
+# GEMV row classes split K by stream (each threadgroup normalizes its stream;
+# the first row tile of each publishes its inverses), their partials added
+# in stream order by the last of a row tile's S threadgroups to arrive; the
+# batched rows (to 16) reduce every stream's square sums in each threadgroup
+# and normalize while staging, the first threadgroup publishing the
+# inverses. Past 16 rows `stage` publishes the normalized streams in A to
+# `normalized` with the inverses, one threadgroup per row and stream, and
+# the GEMM reads them. Every GEMV row class keeps the one GEMV launch's
+# tile mapping and lanes the entry ran; the matrix GEMV, the small and tall
+# GEMMs, PACK and the tile GEMVs read no parts (the projection's rule).
 native stream_mix_down for metal from "metal/stream_mix_down.metal":
     static (H, S, LR, C)
     where H % 32 == 0 and C <= 1
+    project dense segmented (down_weight, inject_weight) parts S rows rms
+    restate gemv SIMDGROUPS in [16, 8, 4, 2, 32] default 4
+    restate gemv_rows SIMDGROUPS in [16, 8, 4, 2, 32] default 4
+    restate gemv_rows ROWS in [1, 2, 4] default 1
+    restate gemv_pair SIMDGROUPS in [16, 8, 4, 2, 32] default 4
+    restate gemv_pair ROWS in [1, 2, 4] default 1
     scratch normalized bytes (M * S * H * 2) when M > 16
-    scratch partials bytes (M * S * (LR + C * S) * 4) when M <= VERIFY_ROWS
-    scratch arrivals bytes ((LR + C * S) * 4) sync when M <= VERIFY_ROWS
-    launch stream_mix_down_gemv when M <= VERIFY_ROWS:
-        params (SIMDGROUPS in [16, 8, 4, 2, 32] default 4, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32, 8] default 16)
-        threadgroups (S * (ceil_div(LR, SIMDGROUPS * ROWS * 32 / LANES)
-            + ceil_div(C * S, SIMDGROUPS * ROWS * 32 / LANES)), 1, 1)
-        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (min(ceil_div(H, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
-    launch stream_mix_down_batch when M > VERIFY_ROWS and M <= 16:
-        params (BATCH_SIMDGROUPS in [8, 4, 16, 32] default 8, BATCH_ROWS in [2, 1, 4] default 2)
-        threadgroups (ceil_div(LR, BATCH_SIMDGROUPS * BATCH_ROWS * 8)
-            + ceil_div(C * S, BATCH_SIMDGROUPS * BATCH_ROWS * 8), 1, 1)
-        threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
-        shared_bytes (16640)
-    launch stream_mix_down_stage when M > 16:
+    launch stream_mix_down_stage before gemm when M > 16:
         staging
         threadgroups (M * S, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch stream_mix_down_gemm when M > 16:
-        params (TILE_M in [64, 128, 32] default 64, TILE_N in [64, 128] default 64)
-        threadgroups (ceil_div(LR, TILE_N) + ceil_div(C * S, TILE_N), ceil_div(M, TILE_M), 1)
-        threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
 
-# CUDA: the projection library's classes (`attention_project`'s). Past one
+# CUDA: the `dense` projection (segmented) in S parts, the streams. Past one
 # row `stage` stages the normalized streams and publishes the inverses, one
 # block per row. The GEMV classes split K by stream: a block serves one
 # stream over tiles of down | inject (a one-row block forms the stream's row
 # itself, and the stream's first block publishes its inverse) into F32
 # partial sums, which the last block to arrive adds in stream order through
-# the epilogues. A stream is whole superblocks of 256 inputs.
+# the epilogues. A stream is whole superblocks of 256 inputs. The int8 and
+# operand GEMMs and coefficient staging read no parts (the projection's rule).
 native stream_mix_down for cuda from "cuda/stream_mix_down.cu":
     static (H, S, LR, C)
-    params (arithmetic KSPLIT in [8, 4, 2] default 8)
     where H % 256 == 0 and C <= 1
-    scratch staged bytes (M * S * H * 2) when M > 1
-    scratch partials bytes (M * S * (LR + C * S) * 4) when M <= 16
-    scratch arrivals bytes (4) sync when M <= 16
-    launch stream_mix_down_stage when M > 1:
-        staging
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch stream_mix_down_gemv when M <= 8:
-        threadgroups (S * (ceil_div(ceil_div(LR, 16), 8 / KSPLIT) + ceil_div(ceil_div(C * S, 16), 8 / KSPLIT)), 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes ((1 - min(1, M - 1)) * H * 2)
-    launch stream_mix_down_gemv16 when M > 8 and M <= 16:
-        alike (stream_mix_down_gemv)
-        threadgroups (S * (ceil_div(ceil_div(LR, 16), 8 / KSPLIT) + ceil_div(ceil_div(C * S, 16), 8 / KSPLIT)), 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch stream_mix_down_gemm_small when M > 16 and M <= 64:
-        threadgroups (ceil_div(ceil_div(LR, 16), 8) + ceil_div(ceil_div(C * S, 16), 8), 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes (3 * (64 * 144 + 10240) + 2048)
-    launch stream_mix_down_gemm when M > 64:
-        params (ROTATE in [2, 1, 4] default 2)
-        threadgroups (ceil_div(ceil_div(LR, 16), 8) + ceil_div(ceil_div(C * S, 16), 8), ceil_div(M, 128), 1)
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes (2 * (128 * 144 + 10240) + 2048)
+    project dense segmented (down_weight, inject_weight) parts S rows rms
+    restate arithmetic KSPLIT in [8, 4, 2] default 8
 
-# Vulkan: the GEMV classes (to 8 rows) split K by stream: a workgroup
-# normalizes one stream through the library's GEMV prologue (one norm group
-# a row; the stream's first workgroup publishes its inverses) over a row
-# tile of down | inject into F32 partial sums, which `combine` adds in
-# stream order through the epilogues. Past 8 rows `stage` normalizes every
-# stream into scratch and publishes its inverse (one workgroup per row and
-# stream), and the GEMM reads the staged rows.
+# Vulkan: the `dense` projection (segmented) in S parts, the streams: the
+# GEMV classes (to 8 rows) split K by stream (a workgroup normalizes its
+# stream through the library's GEMV prologue, one norm group a row; the
+# stream's first workgroup publishes its inverses) into F32 partials, which
+# `combine` adds in stream order through the epilogues. Past 8 rows `stage`
+# normalizes every stream into `staged` (and publishes its inverse), one
+# workgroup per row and stream, and the GEMM reads the staged rows.
 native stream_mix_down for vulkan from "vulkan/stream_mix_down.comp":
     static (H, S, LR, C)
-    params (SIMDGROUPS in [16, 8, 4, 2, 32] default 4, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default 16,
-            TILE_M in [128, 64, 32] default 64, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32)
-    let GEMV_GROUPS = S * (ceil_div(LR, SIMDGROUPS * ROWS * 32 / LANES) + ceil_div(C * S, SIMDGROUPS * ROWS * 32 / LANES))
-    let GEMV_THREADS = SIMDGROUPS * 32
-    let GEMV_SHARED = 256 + min(8 * ceil_div(H, 32), 288) * 72
-    where H % 32 == 0 and C <= 1 and SUB_M <= TILE_M and SUB_N <= TILE_N
-    scratch normalized bytes (M * S * H * 2) when M > VERIFY_ROWS
-    scratch partials bytes (M * S * (LR + C * S) * 4) when M <= VERIFY_ROWS
-    launch stream_mix_down_stage when M > VERIFY_ROWS:
-        staging
-        threadgroups (M * S, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes (128)
-    launch stream_mix_down_gemv1 when M <= 1:
-        threadgroups (GEMV_GROUPS, 1, 1)
-        threads_per_threadgroup (GEMV_THREADS, 1, 1)
-        shared_bytes (GEMV_SHARED)
-    launch stream_mix_down_gemv2 when M == 2:
-        alike (stream_mix_down_gemv1)
-        threadgroups (GEMV_GROUPS, 1, 1)
-        threads_per_threadgroup (GEMV_THREADS, 1, 1)
-        shared_bytes (GEMV_SHARED)
-    launch stream_mix_down_gemv4 when M >= 3 and M <= 4:
-        alike (stream_mix_down_gemv1)
-        threadgroups (GEMV_GROUPS, 1, 1)
-        threads_per_threadgroup (GEMV_THREADS, 1, 1)
-        shared_bytes (GEMV_SHARED)
-    launch stream_mix_down_gemv8 when M >= 5 and M <= VERIFY_ROWS:
-        alike (stream_mix_down_gemv1)
-        threadgroups (GEMV_GROUPS, 1, 1)
-        threads_per_threadgroup (GEMV_THREADS, 1, 1)
-        shared_bytes (GEMV_SHARED)
-    launch stream_mix_down_combine when M <= VERIFY_ROWS:
-        threadgroups (ceil_div(M * (LR + C * S), 256), 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch stream_mix_down_gemm when M > VERIFY_ROWS:
-        threadgroups (ceil_div(LR, TILE_N) + ceil_div(C * S, TILE_N), ceil_div(M, TILE_M), 1)
-        threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
-        shared_bytes ((TILE_M + TILE_N) * 80)
+    where H % 32 == 0 and C <= 1
+    project dense segmented (down_weight, inject_weight) parts S rows rms
+    restate SIMDGROUPS in [16, 8, 4, 2, 32] default 4
 
 # CPU: one work item per row normalizes its streams (the norm decoded into
-# its shared bytes) and publishes the inverses; then ROWS weight rows per
-# work item over the segments down | inject.
+# its shared bytes) and publishes the inverses; then the combined weight rows
+# of the segments down | inject split evenly over one work item per pool
+# participant (`device.units`, at most LR + C S), each against every row.
+# Each output column is its own row's dot whichever item forms it, so the
+# split never changes result bits.
 native stream_mix_down for cpu from "cpu/stream_mix_down.rs":
-    params (ROWS in [8, 4, 2, 1] default 8)
     scratch normalized bytes (M * S * H * 4)
     launch stream_mix_down_normalize:
         staging
@@ -358,98 +290,42 @@ native stream_mix_down for cpu from "cpu/stream_mix_down.rs":
         threads_per_threadgroup (1, 1, 1)
         shared_bytes (H * 4)
     launch stream_mix_down_rows:
-        threadgroups (ceil_div(LR, ROWS) + ceil_div(C * S, ROWS), 1, 1)
+        threadgroups (min(LR + C * S, device.units), 1, 1)
         threads_per_threadgroup (1, 1, 1)
 
-# Metal: the projection library's row classes over the plain low-rank rows,
-# with the `Mix` epilogue.
+# Metal: the `dense` projection (single) over the plain low-rank rows, with
+# the `Mix` epilogue; one GEMV mapping for every row count below VERIFY_ROWS,
+# as it ran before the projection.
 native stream_mix_up for metal from "metal/stream_mix_up.metal":
     static (H, S, LR)
     where H % 32 == 0 and LR % 32 == 0
-    launch stream_mix_up_gemv when M <= VERIFY_ROWS:
-        params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32, 8] default 16)
-        threadgroups (ceil_div(S * H, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
-        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (min(ceil_div(LR, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
-    launch stream_mix_up_batch when M > VERIFY_ROWS and M <= 16:
-        params (BATCH_SIMDGROUPS in [8, 4, 16, 32] default 8, BATCH_ROWS in [2, 1, 4] default 2)
-        threadgroups (ceil_div(S * H, BATCH_SIMDGROUPS * BATCH_ROWS * 8), 1, 1)
-        threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
-        shared_bytes (16640)
-    launch stream_mix_up_gemm when M > 16:
-        params (TILE_M in [64, 128, 32] default 64, TILE_N in [64, 128] default 64)
-        threadgroups (ceil_div(S * H, TILE_N), ceil_div(M, TILE_M), 1)
-        threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
+    project dense single (up_weight)
+    restate single_gemv
 
-# CUDA: the projection library's classes over the low-rank rows read in
-# place (`attention_output`'s, without split-K: S * H columns are many).
+# CUDA: the `dense` projection (single) over the low-rank rows read in
+# place, without split-K by default (S * H columns are many).
 native stream_mix_up for cuda from "cuda/stream_mix_up.cu":
     static (H, S, LR)
-    params (arithmetic KSPLIT in [4, 2, 8] default 4)
-    where LR % 64 == 0
-    launch stream_mix_up_gemv when M <= 8:
-        threadgroups (ceil_div(ceil_div(S * H, 16), 8 / KSPLIT), 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch stream_mix_up_gemv16 when M > 8 and M <= 16:
-        alike (stream_mix_up_gemv)
-        threadgroups (ceil_div(ceil_div(S * H, 16), 8 / KSPLIT), 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch stream_mix_up_gemm_small when M > 16 and M <= 64:
-        threadgroups (ceil_div(ceil_div(S * H, 16), 8), 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes (3 * (64 * 144 + 10240) + 2048)
-    launch stream_mix_up_gemm when M > 64:
-        params (ROTATE in [2, 1, 4] default 2)
-        threadgroups (ceil_div(ceil_div(S * H, 16), 8), ceil_div(M, 128), 1)
-        threads_per_threadgroup (256, 1, 1)
-        shared_bytes (2 * (128 * 144 + 10240) + 2048)
+    project dense single (up_weight)
+    restate arithmetic SPLIT in [1, 2] default 1
 
-# Vulkan: the projection library's classes over the low-rank rows.
+# Vulkan: the `dense` projection (single) over the low-rank rows read in
+# place.
 native stream_mix_up for vulkan from "vulkan/stream_mix_up.comp":
     static (H, S, LR)
-    params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default 16,
-            TILE_M in [128, 64, 32] default 64, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32)
-    let GEMV_GROUPS = ceil_div(S * H, SIMDGROUPS * ROWS * 32 / LANES)
-    let GEMV_THREADS = SIMDGROUPS * 32
-    let GEMV_SHARED = 256 + min(8 * ceil_div(LR, 32), 288) * 72
-    where SUB_M <= TILE_M and SUB_N <= TILE_N
-    launch stream_mix_up_gemv1 when M <= 1:
-        threadgroups (GEMV_GROUPS, 1, 1)
-        threads_per_threadgroup (GEMV_THREADS, 1, 1)
-        shared_bytes (GEMV_SHARED)
-    launch stream_mix_up_gemv2 when M == 2:
-        alike (stream_mix_up_gemv1)
-        threadgroups (GEMV_GROUPS, 1, 1)
-        threads_per_threadgroup (GEMV_THREADS, 1, 1)
-        shared_bytes (GEMV_SHARED)
-    launch stream_mix_up_gemv4 when M >= 3 and M <= 4:
-        alike (stream_mix_up_gemv1)
-        threadgroups (GEMV_GROUPS, 1, 1)
-        threads_per_threadgroup (GEMV_THREADS, 1, 1)
-        shared_bytes (GEMV_SHARED)
-    launch stream_mix_up_gemv8 when M >= 5 and M <= VERIFY_ROWS:
-        alike (stream_mix_up_gemv1)
-        threadgroups (GEMV_GROUPS, 1, 1)
-        threads_per_threadgroup (GEMV_THREADS, 1, 1)
-        shared_bytes (GEMV_SHARED)
-    launch stream_mix_up_gemm when M > VERIFY_ROWS:
-        threadgroups (ceil_div(S * H, TILE_N), ceil_div(M, TILE_M), 1)
-        threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
-        shared_bytes ((TILE_M + TILE_N) * 80)
+    project dense single (up_weight)
 
-# CPU: the low-rank rows staged as F32, then ROWS weight rows per work item
-# (the norm decoded into its shared bytes).
+# CPU: the projection operator over the low-rank rows, its operand (formed by
+# the operator's `form` launch); the row launch gives each work item ROWS
+# weight rows, the norm's columns of them decoded through its shared bytes (a
+# stream's H values at most). Each output column is its own row's dot
+# whichever item forms it.
 native stream_mix_up for cpu from "cpu/stream_mix_up.rs":
-    params (ROWS in [8, 4, 2, 1] default 8)
-    scratch staged bytes (M * LR * 4)
-    launch stream_mix_up_stage:
-        staging
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (1, 1, 1)
+    project quantized tiled (UW) over (M, LR) operand (low)
     launch stream_mix_up_rows:
         threadgroups (ceil_div(S * H, ROWS), 1, 1)
         threads_per_threadgroup (1, 1, 1)
-        shared_bytes (S * H * 4)
+        shared_bytes (H * 4)
 
 # The threadgroups a Sinkhorn mix site's decode row is split across
 # (`stream_mix_sinkhorn`, Metal, CUDA and Vulkan): enough that a row's

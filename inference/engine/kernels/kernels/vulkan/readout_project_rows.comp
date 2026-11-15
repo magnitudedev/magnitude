@@ -1,8 +1,17 @@
 // readout_project_rows: the draft head's readout, the vocabulary projection of
-// feature rows that are already normalized (K1 projection without a
-// prologue). The Vulkan form of `metal/readout_project_rows.metal`.
+// feature rows that are already normalized into F32 logits, scaled by a
+// present `weight_scale` and softcapped. The Vulkan form of
+// `metal/readout_project_rows.metal`: where I is 0 the `dense` projection
+// (`lib/projection/operator.glsl`) over the weight's first S rows; where I is
+// 1 the routed projection's `choice` over the S rows each feature row
+// selects (`gather_choice`), a selection past the vocabulary -inf.
 #define KERNEL_W0 SEISMIC_WEIGHT
 #include "lib/core/activation.glsl"
+#if SEISMIC_STATIC_WS != 0
+#define PROJECTION_SCALED
+#endif
+// A selection past the vocabulary reads row 0 (`projection_weights_row`).
+#define PROJECTION_TABLE_ROWS SEISMIC_DIM_V
 #include "lib/projection/projection.glsl"
 
 #if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
@@ -10,44 +19,94 @@
 #else
 #error "readout_project_rows requires a bf16 or f16 activation"
 #endif
-// The weight's operand row (the feature row, or NVFP4 operands), formed
-// while the GEMV stages it.
+// The weight's operand rows (the feature rows, or NVFP4 operands): the GEMV
+// forms them while staging, the stage launch into the scratch the GEMM reads.
 #if defined(SEISMIC_WEIGHT_OPERANDS_NVFP4)
 #define HEAD_OPERANDS PROJECTION_OPERANDS_NVFP4
 #else
 #define HEAD_OPERANDS PROJECTION_OPERANDS_ROUNDED
 #endif
 
-
 #define HEAD_K uint(SEISMIC_DIM_D)
 
-projection_prologue prepared_input() {
-    const uint64_t row = uint64_t(gl_WorkGroupID.y);
+#define PROJECTION_SINGLE
+#define PROJECTION_M uint(SEISMIC_DIM_O)
+#define PROJECTION_N uint(SEISMIC_DIM_S)
+#define PROJECTION_K HEAD_K
+#define PROJECTION_G 1
+#define PROJECTION_NORM PROJECTION_NORM_NONE
+#define PROJECTION_STAGED SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)
+#define PROJECTION_SPLIT SEISMIC_TUNE_SPLIT
+#define PROJECTION_PARTIALS SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS)
+
+// Feature row `row` onward, as the weight's operands.
+projection_prologue feature_rows(uint64_t row) {
     return projection_operands(projection_plain(HEAD_ACT,
-        SEISMIC_PTR(SEISMIC_BUFFER_FEATURES) + row * SEISMIC_FEATURES_STRIDE_0 * 2ul, SEISMIC_FEATURES_STRIDE_0,
-        SEISMIC_FEATURES_STRIDE_1, HEAD_K, 0ul), HEAD_OPERANDS);
+        SEISMIC_PTR(SEISMIC_BUFFER_FEATURES) + row * SEISMIC_FEATURES_STRIDE_0 * uint64_t(ELEMENT_BYTES(HEAD_ACT)),
+        SEISMIC_FEATURES_STRIDE_0, SEISMIC_FEATURES_STRIDE_1, HEAD_K, 0ul), HEAD_OPERANDS);
 }
-projection_epilogue prepared_output() {
-    const uint64_t column = SEISMIC_DIM_I == 0 ? 0ul : uint64_t(gl_WorkGroupID.x);
-    return projection_scaled(projection_logits(out_offset(SEISMIC_RESULT_0_OUT,
-        uint64_t(gl_WorkGroupID.y) * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1), SEISMIC_RESULT_0_STRIDE_0,
-        SEISMIC_RESULT_0_STRIDE_1, element_word_f32(SEISMIC_PARAM_SOFTCAP)),
+
+// The logits from those at `at`, scaled, then softcapped.
+projection_epilogue logits_at(Out at) {
+    return projection_scaled(projection_logits(at, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1,
+        element_word_f32(SEISMIC_PARAM_SOFTCAP)),
         projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT_SCALE), SEISMIC_DIM_WS, 0ul, 0ul), 1.0);
 }
-void readout_project_rows_gemv() {
-    const uint64_t table = SEISMIC_DIM_I == 0 ? 0ul : SEISMIC_PTR(SEISMIC_BUFFER_TOKEN_ROWS) +
-        (uint64_t(gl_WorkGroupID.y) * SEISMIC_TOKEN_ROWS_STRIDE_0 + uint64_t(gl_WorkGroupID.x) * SEISMIC_TOKEN_ROWS_STRIDE_2) * 4ul;
-    if (SEISMIC_DIM_I == 1) {
-        const int token = element_i32_at(table);
-        if (token < 0 || uint64_t(token) >= SEISMIC_DIM_V) {
-            if (gl_LocalInvocationIndex == 0u)
-                out_put(SEISMIC_RESULT_0_OUT,
-                    uint64_t(gl_WorkGroupID.y) * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(gl_WorkGroupID.x) * SEISMIC_RESULT_0_STRIDE_1, uintBitsToFloat(0xff800000u));
-            return;
-        }
+
+projection_prologue projected_input(uint g) { return feature_rows(0ul); }
+
+// The rows the GEMM reads: the feature rows, or the operands the stage
+// launch formed.
+projection_prologue projected_rows(uint g) {
+#if defined(SEISMIC_WEIGHT_OPERANDS_NVFP4)
+    return projection_plain(HEAD_ACT, PROJECTION_STAGED, uint64_t(HEAD_K), 1ul, HEAD_K, 0ul);
+#else
+    return projection_plain(HEAD_ACT, SEISMIC_PTR(SEISMIC_BUFFER_FEATURES), SEISMIC_FEATURES_STRIDE_0,
+        SEISMIC_FEATURES_STRIDE_1, HEAD_K, 0ul);
+#endif
+}
+
+projection_epilogue projected_output(uint g) { return logits_at(SEISMIC_RESULT_0_OUT); }
+
+// The weight's first S rows.
+projection_weights projected_weight(uint g) {
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT), PACKETS_W0_ROWS, HEAD_K, 0ul, 1ul, 0u);
+}
+
+#include "lib/projection/operator.glsl"
+
+// The `dense` projection's launches (`lib/projection/operator.glsl`).
+void readout_project_rows_stage() { projection_dense_stage(); }
+void readout_project_rows_gemv1() { projection_single_gemv(1u); }
+void readout_project_rows_gemv2() { projection_single_gemv(2u); }
+void readout_project_rows_gemv4() { projection_single_gemv(4u); }
+void readout_project_rows_gemv8() { projection_single_gemv(8u); }
+void readout_project_rows_gemm() { projection_single_gemm(); }
+void readout_project_rows_finalize() { projection_single_finalize(); }
+
+// The routed projection's `choice` over row m's selected rows (choice y % I):
+// workgroup x a tile of SUBGROUPS x ROWS selected rows, the K1 GEMV of the
+// feature row against them. Once the tile's logits are stored (the GEMV
+// stages through shared memory, so every invocation reaches its end), a
+// selection past the vocabulary's logit is -inf.
+void readout_project_rows_gather_choice() {
+    const uint rows_per_tile = SEISMIC_SUBGROUPS * SEISMIC_TUNE_GATHER_ROWS;
+    const uint tile = gl_WorkGroupID.x, s = uint(SEISMIC_DIM_S);
+    uint64_t m, choice;
+    seismic_split(gl_WorkGroupID.y, SEISMIC_DIM_I, m, choice);
+    const uint64_t selected = SEISMIC_PTR(SEISMIC_BUFFER_TOKEN_ROWS)
+        + (m * SEISMIC_TOKEN_ROWS_STRIDE_0 + choice * SEISMIC_TOKEN_ROWS_STRIDE_1) * 4ul;
+    const Out row = out_offset(SEISMIC_RESULT_0_OUT, m * SEISMIC_RESULT_0_STRIDE_0);
+    const projection_weights w = projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT), PACKETS_W0_ROWS, HEAD_K,
+        selected, SEISMIC_TOKEN_ROWS_STRIDE_2, 0u);
+    projection_gemv(PACKETS_W0, PACKETS_W0, false, SEISMIC_TUNE_GATHER_ROWS, 32u, 1u, PROJECTION_NORM_NONE,
+        feature_rows(m), logits_at(row), w, w, 1u, s, HEAD_K, tile);
+    memoryBarrierBuffer();
+    barrier();
+    for (uint n = tile * rows_per_tile + gl_LocalInvocationIndex; n < min(s, (tile + 1u) * rows_per_tile);
+         n += gl_WorkGroupSize.x) {
+        const int token = element_i32_at(selected + uint64_t(n) * SEISMIC_TOKEN_ROWS_STRIDE_2 * 4ul);
+        if (token < 0 || uint64_t(token) >= SEISMIC_DIM_V)
+            out_put(row, uint64_t(n) * SEISMIC_RESULT_0_STRIDE_1, uintBitsToFloat(0xff800000u));
     }
-    const projection_weights w = projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT), PACKETS_W0_ROWS,
-        HEAD_K, table, SEISMIC_TOKEN_ROWS_STRIDE_2, 0u);
-    projection_gemv(PACKETS_W0, PACKETS_W0, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, 1u, PROJECTION_NORM_NONE,
-        prepared_input(), prepared_output(), w, w, 1u, SEISMIC_DIM_I == 1 ? 1u : uint(SEISMIC_DIM_S), HEAD_K, SEISMIC_DIM_I == 1 ? 0u : gl_WorkGroupID.x);
 }

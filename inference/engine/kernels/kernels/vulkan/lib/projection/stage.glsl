@@ -11,6 +11,8 @@ uint projection_row(uint64_t table, uint m) {
 #define PROJECTION_RMS 1
 #define PROJECTION_GROUPED 2
 #define PROJECTION_SUMMED 3
+#define PROJECTION_ORDERED_RMS 4
+#define PROJECTION_ORDERED_SUMMED 5
 
 // The operand recipe of the weights a prologue's rows feed (the portable
 // `operand_rows`): the rows as they are, or as NVFP4 operands. An entry reads
@@ -149,7 +151,7 @@ void projection_load8(projection_prologue in_, uint m, uint k, float inverse, ou
         }
         projection_load8_strided(in_.x, uint64_t(row) * in_.x0 + uint64_t(k) * in_.x1, in_.x1, valid,
             in_.x1 == 1ul && (in_.x0 & 7ul) == 0ul && stored_aligned16(in_.x), even, odd);
-    } else if (in_.kind == PROJECTION_SUMMED) {
+    } else if (in_.kind == PROJECTION_SUMMED || in_.kind == PROJECTION_ORDERED_SUMMED) {
         float v[8];
         [[unroll]] for (uint i = 0u; i < 8u; ++i)
             v[i] = i < valid ? element_round(in_.act, projection_summed_at(in_, m, k + i)) : 0.0;
@@ -304,4 +306,143 @@ void projection_operand_load8(projection_prologue in_, uint m, uint k, float inv
     const bool upper = (k & 8u) != 0u;
     even = nvfp4_values(upper ? e1 : e0, d);
     odd = nvfp4_values(upper ? o1 : o0, d);
+}
+
+
+// ---------------------------------------------------------------------------
+// Reference-order prologues (`projection_ordered_rms`,
+// `projection_ordered_summed`, `projection_ordered_input`): 8-lane reduction
+// (`reduce_lanes_sum(v, 8u)` = xor 4, 2, 1) and `1 / sqrt(...)`.
+
+projection_prologue projection_ordered_rms(const int act, uint64_t x, uint64_t stride0, uint64_t stride1,
+    uint64_t norm, uint64_t norm_stride, const int norm_kind, float eps, uint columns, uint64_t rows) {
+    return projection_prologue(PROJECTION_ORDERED_RMS, act, stored_at_buffer(ELEMENT_F32, x), stride0, stride1, columns,
+        rows, 1ul, norm, norm_stride, norm_kind, eps, 1u, PROJECTION_OPERANDS_ROUNDED);
+}
+
+projection_prologue projection_ordered_summed(const int act, uint64_t x, uint64_t stride0, uint64_t stride1,
+    uint columns, uint64_t rows, uint parts) {
+    return projection_prologue(PROJECTION_ORDERED_SUMMED, act, stored_at_buffer(ELEMENT_F32, x), stride0, stride1,
+        columns, rows, 1ul, 0ul, 0ul, ELEMENT_F32, 0.0, parts, PROJECTION_OPERANDS_ROUNDED);
+}
+
+projection_prologue projection_ordered_input(const int act, uint64_t x, uint64_t stride0, uint64_t stride1,
+    uint64_t norm, uint64_t norm_stride, const int norm_kind, float eps, uint columns, uint64_t rows,
+    const uint norm_extent, const uint parts) {
+    return norm_extent == 0u
+        ? projection_ordered_summed(act, x, stride0, stride1, columns, rows, parts)
+        : projection_ordered_rms(act, x, stride0, stride1, norm, norm_stride, norm_kind, eps, columns, rows);
+}
+
+float projection_ordered_combine8(float value) {
+    value = seismic_add_rn(value, subgroupShuffleXor(value, 4u));
+    value = seismic_add_rn(value, subgroupShuffleXor(value, 2u));
+    value = seismic_add_rn(value, subgroupShuffleXor(value, 1u));
+    return value;
+}
+
+void projection_ordered_inverses(projection_prologue in_, uint m_rows, uint inv_off, uint inv_stride,
+    uint first_row, bool has_scratch, uint scratch_off) {
+    const uint tid = SEISMIC_SUBGROUP * 32u + SEISMIC_LANE, threads = SEISMIC_SUBGROUPS * 32u;
+    if (in_.kind == PROJECTION_ORDERED_SUMMED) {
+        for (uint r = tid; r < m_rows; r += threads)
+            seismic_shared_f32[inv_off + r * inv_stride] = 1.0;
+        barrier();
+        return;
+    }
+    const uint group_id = tid / 8u, u = tid & 7u, groups = threads / 8u;
+    if (has_scratch && in_.x1 == 1ul && m_rows == 1u) {
+        const uint64_t row = uint64_t(projection_row(in_.rows, first_row)) * in_.x0;
+        float sum = 0.0;
+        for (uint k0 = 0u; k0 < in_.columns; k0 += 512u) {
+            const uint chunk = min(512u, in_.columns - k0);
+            for (uint c = tid; c < chunk; c += threads)
+                seismic_shared_f32[scratch_off + c] = stored_at(in_.x, row + uint64_t(k0 + c));
+            barrier();
+            if (group_id == 0u) {
+                uint c = u;
+                for (; c + 56u < chunk; c += 64u) {
+                    const float v0 = seismic_shared_f32[scratch_off + c];
+                    const float v1 = seismic_shared_f32[scratch_off + c + 8u];
+                    const float v2 = seismic_shared_f32[scratch_off + c + 16u];
+                    const float v3 = seismic_shared_f32[scratch_off + c + 24u];
+                    const float v4 = seismic_shared_f32[scratch_off + c + 32u];
+                    const float v5 = seismic_shared_f32[scratch_off + c + 40u];
+                    const float v6 = seismic_shared_f32[scratch_off + c + 48u];
+                    const float v7 = seismic_shared_f32[scratch_off + c + 56u];
+                    sum = seismic_fma_rn(v0, v0, sum);
+                    sum = seismic_fma_rn(v1, v1, sum);
+                    sum = seismic_fma_rn(v2, v2, sum);
+                    sum = seismic_fma_rn(v3, v3, sum);
+                    sum = seismic_fma_rn(v4, v4, sum);
+                    sum = seismic_fma_rn(v5, v5, sum);
+                    sum = seismic_fma_rn(v6, v6, sum);
+                    sum = seismic_fma_rn(v7, v7, sum);
+                }
+                for (; c < chunk; c += 8u) {
+                    const float v = seismic_shared_f32[scratch_off + c];
+                    sum = seismic_fma_rn(v, v, sum);
+                }
+            }
+            barrier();
+        }
+        const float total_sq = projection_ordered_combine8(sum);
+        if (tid == 0u)
+            seismic_shared_f32[inv_off] =
+                seismic_div_rn(1.0, sqrt(seismic_div_rn(total_sq, float(in_.columns)) + in_.eps));
+        barrier();
+        return;
+    }
+    for (uint base = 0u; base < m_rows; base += groups) {
+        const uint r = base + group_id;
+        float sum = 0.0;
+        if (r < m_rows) {
+            const uint64_t row = uint64_t(projection_row(in_.rows, first_row + r)) * in_.x0;
+            if (in_.x1 == 1ul) {
+                uint k0 = 0u;
+                for (; k0 + 64u <= in_.columns; k0 += 64u) {
+                    const uint c = k0 + u;
+                    const float v0 = stored_at(in_.x, row + uint64_t(c));
+                    const float v1 = stored_at(in_.x, row + uint64_t(c + 8u));
+                    const float v2 = stored_at(in_.x, row + uint64_t(c + 16u));
+                    const float v3 = stored_at(in_.x, row + uint64_t(c + 24u));
+                    const float v4 = stored_at(in_.x, row + uint64_t(c + 32u));
+                    const float v5 = stored_at(in_.x, row + uint64_t(c + 40u));
+                    const float v6 = stored_at(in_.x, row + uint64_t(c + 48u));
+                    const float v7 = stored_at(in_.x, row + uint64_t(c + 56u));
+                    sum = seismic_fma_rn(v0, v0, sum);
+                    sum = seismic_fma_rn(v1, v1, sum);
+                    sum = seismic_fma_rn(v2, v2, sum);
+                    sum = seismic_fma_rn(v3, v3, sum);
+                    sum = seismic_fma_rn(v4, v4, sum);
+                    sum = seismic_fma_rn(v5, v5, sum);
+                    sum = seismic_fma_rn(v6, v6, sum);
+                    sum = seismic_fma_rn(v7, v7, sum);
+                }
+                for (uint c = k0 + u; c < in_.columns; c += 8u) {
+                    const float v = stored_at(in_.x, row + uint64_t(c));
+                    sum = seismic_fma_rn(v, v, sum);
+                }
+            } else {
+                for (uint c = u; c < in_.columns; c += 8u) {
+                    const float v = stored_at(in_.x, row + uint64_t(c) * in_.x1);
+                    sum = seismic_fma_rn(v, v, sum);
+                }
+            }
+        }
+        const float total_sq = projection_ordered_combine8(sum);
+        if (r < m_rows && u == 0u)
+            seismic_shared_f32[inv_off + r * inv_stride] =
+                seismic_div_rn(1.0, sqrt(seismic_div_rn(total_sq, float(in_.columns)) + in_.eps));
+    }
+    barrier();
+}
+
+float projection_ordered_at(projection_prologue in_, uint m, uint c, float inv) {
+    if (in_.kind == PROJECTION_ORDERED_SUMMED)
+        return element_round(in_.act, projection_summed_at(in_, m, c));
+    const uint64_t row = uint64_t(projection_row(in_.rows, m)) * in_.x0;
+    const float v = stored_at(in_.x, row + uint64_t(c) * in_.x1);
+    const float nw = element_at(in_.norm_kind, in_.norm, uint64_t(c) * in_.norm_stride);
+    return element_round(in_.act, v * inv * nw);
 }

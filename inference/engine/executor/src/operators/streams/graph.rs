@@ -19,10 +19,11 @@ use magnitude_kernels::{
 use seismic::{Argument, Dim, Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
 
 /// The kernel entries of one mix site: `stream_mix_down` (with inject
-/// values at a sublayer's site, without at the exit) and `stream_mix_up`.
+/// values at a sublayer's site, without at the exit) and `stream_mix_up`,
+/// each by row range.
 pub(crate) struct SiteEntries<'a, G: GraphDraft + 'a> {
-    pub down: G::Binding<'a, stream_mix_down::Entry>,
-    pub up: G::Binding<'a, stream_mix_up::Entry>,
+    pub down: G::Ranged<'a, stream_mix_down::Entry>,
+    pub up: G::Ranged<'a, stream_mix_up::Entry>,
 }
 
 impl<'a, G: GraphDraft + 'a> Copy for SiteEntries<'a, G> {}
@@ -302,7 +303,7 @@ where
         down.slice_leading(0, 0)
     };
     let mixed = graph.enqueue(
-        entries.down,
+        G::pick(entries.down, &rows),
         &[
             ("M", &rows),
             ("H", h),
@@ -320,7 +321,7 @@ where
     )?;
     let partials = graph
         .enqueue(
-            entries.up,
+            G::pick(entries.up, &rows),
             &[("M", &rows), ("H", h), ("S", &s), ("LR", r)],
             stream_mix_up::WorkflowArgs {
                 low: (&mixed.r0).into(),

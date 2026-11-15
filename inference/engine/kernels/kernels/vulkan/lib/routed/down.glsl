@@ -2,7 +2,7 @@
 // (`routed_down`, `routed_down_project`): the counterpart of
 // `metal/lib/routed/down.h`. Workgroup (x, m) owns output channels of tile x
 // for row m; `routed_down_choice` runs the K1 GEMV sums of choice k's down
-// projection (its source's record, `routed_source_weights`: a bank record,
+// projection (its source's record, `routed_expert_matrix`: a bank record,
 // or a host tier record read in place; none for a choice with no record,
 // `routed_decode_source`). Every lane of a lane group (a whole
 // subgroup) receives each channel's total; where the includer publishes them
@@ -40,11 +40,11 @@ void routed_down_choice(const uint64_t m, const uint64_t k, const uint tile, out
     const uint hidden = uint(SEISMIC_DIM_H);
     const uint bytes = ELEMENT_BYTES(ROUTED_ACT);
     float unused[PROJECTION_GEMV_SUMS];
-    const int source = routed_decode_source(SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), ROUTED_SOURCE_ROWS,
+    const slab_source source = routed_decode_source(SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), ROUTED_SOURCE_ROWS,
         SEISMIC_SOURCES_STRIDE_0, SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, m, k,
         element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES)
             + (m * SEISMIC_ROUTES_STRIDE_0 + k * SEISMIC_ROUTES_STRIDE_1) * 4ul));
-    if (source == -1) {
+    if (slab_source_none(source)) {
         // A choice with no record (the CPU's, or a failed one) reads none:
         // a zero projection.
         [[unroll]] for (uint sum = 0u; sum < PROJECTION_GEMV_SUMS; ++sum)
@@ -55,8 +55,8 @@ void routed_down_choice(const uint64_t m, const uint64_t k, const uint tile, out
             SEISMIC_PTR(SEISMIC_BUFFER_PRODUCT)
             + (m * SEISMIC_PRODUCT_STRIDE_0 + k * SEISMIC_PRODUCT_STRIDE_1) * uint64_t(bytes),
         0ul, SEISMIC_PRODUCT_STRIDE_2, uint(SEISMIC_DIM_F), 0ul), DOWN_OPERANDS);
-    const projection_weights down = routed_source_weights(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_DOWN),
-        SEISMIC_PTR(SEISMIC_BUFFER_TIER_DOWN), source, PACKETS_W0_STACKED_ROWS, uint(SEISMIC_DIM_F));
+    const projection_weights down = routed_expert_matrix(slab_experts(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_DOWN),
+        SEISMIC_PTR(SEISMIC_BUFFER_TIER_DOWN)), source, PACKETS_W0_STACKED_ROWS, uint(SEISMIC_DIM_F));
     projection_gemv_sums(PACKETS_W0, PACKETS_W0, false, DOWN_R, DOWN_LANES, 1u, PROJECTION_NORM_NONE, x, down, down, 1u,
         hidden, uint(SEISMIC_DIM_F), tile, totals, unused);
 }

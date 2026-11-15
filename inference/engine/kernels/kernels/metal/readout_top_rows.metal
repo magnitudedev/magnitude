@@ -1,18 +1,27 @@
 // readout_top_rows: level one of a certified selection (`readout.seismic`):
-// the projection library's head GEMV (or batched GEMV) over the 4-bit view
-// of a progressive head (`lib/readout/progressive.h`) with the bound
-// epilogue. Every threadgroup normalizes its rows in place and forms their
-// lengths |x| over the rounded values the GEMV stages; threadgroup 0 also
-// publishes the rows' features (A) and lengths. Each vocabulary row's
-// lower-bound score raises its output row's threshold (a threadgroup atomic
-// maximum, then the sync-scratch keys); the last threadgroup to arrive
-// publishes the thresholds.
+// the `dense` projection (single, `lib/projection/operator.h`) over the
+// packets of the 4-bit view of a progressive head (`lib/readout/progressive.h`)
+// with the bound epilogue. Every threadgroup normalizes its rows in place and
+// forms their lengths |x| over the rounded values the GEMV stages;
+// threadgroup 0 also publishes the rows' features (A) and lengths. Each
+// vocabulary row's lower-bound score raises its output row's threshold (a
+// threadgroup atomic maximum, then the sync-scratch keys); the last
+// threadgroup to arrive publishes the thresholds.
 #include "lib/readout/progressive.h"
-#ifdef SEISMIC_FORMING_READOUT_TOP_ROWS_GEMV
+#include "lib/projection/operator.h"
+#if defined(SEISMIC_FORMING_READOUT_TOP_ROWS_GEMV) || defined(SEISMIC_FORMING_READOUT_TOP_ROWS_GEMV_ROWS) || defined(SEISMIC_FORMING_READOUT_TOP_ROWS_GEMV_PAIR)
 #include "lib/projection/gemv.h"
 #endif
 
+// The plane set's weight: its 4-bit view.
+namespace packets {
+typedef ProgressiveTop W0;
+}
+
+typedef progressive::activation activation;
 typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
+constant constexpr bool NVFP4 = false;
+typedef projection::operands<NVFP4> Operands;
 
 // The view logits to `logits`; each competing row's lower-bound score into
 // `lowest`.
@@ -35,7 +44,7 @@ struct BoundOut {
     }
 };
 
-#define TOP_ROWS_ARGUMENTS                                                              \
+#define PROJECTION_ARGUMENTS                                                            \
     device const float *hidden [[buffer(SEISMIC_BUFFER_HIDDEN)]],                       \
     device const uchar *norm [[buffer(SEISMIC_BUFFER_NORM)]],                           \
     device const uint *top [[buffer(SEISMIC_BUFFER_TOP)]],                              \
@@ -53,14 +62,10 @@ struct BoundOut {
     device atomic_uint *bounds [[buffer(SEISMIC_BUFFER_SCRATCH_BOUNDS)]],               \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
 
-#define TOP_ROWS_THREADS                                                                \
-    threadgroup uchar *shared [[threadgroup(0)]],                                       \
-    uint tile [[threadgroup_position_in_grid]],                                         \
-    uint tiles [[threadgroups_per_grid]],                                               \
-    uint tid [[thread_index_in_threadgroup]],                                           \
-    uint simdgroups [[simdgroups_per_threadgroup]],                                     \
-    uint sg [[simdgroup_index_in_threadgroup]],                                         \
-    uint lane [[thread_index_in_simdgroup]]
+// The arguments the bound epilogue reads beside the row launches'.
+#define TOP_ROWS_ARGUMENTS                                                              \
+    uint3 tiles [[threadgroups_per_grid]],                                              \
+    uint tid [[thread_index_in_threadgroup]]
 
 // The rows' normalized lengths into `lengths` (threadgroup 0 also publishes
 // the features and lengths), the threshold keys cleared.
@@ -118,38 +123,60 @@ inline void top_publish(threadgroup atomic_uint *lowest, threadgroup const float
     }
 }
 
-#define TOP_ROWS_OPERANDS                                                               \
-    const uint d = uint(SEISMIC_DIM_D);                                                 \
-    const uint rows = uint(SEISMIC_DIM_O);                                              \
-    projection::InputOf<progressive::activation, norm_element, projection::SelectedRows, SEISMIC_DIM_NM, \
-        SEISMIC_DIM_PT>::type in{hidden, \
-        SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_2, norm, SEISMIC_NORM_STRIDE_0,  \
-        as_type<float>(uint(SEISMIC_PARAM_EPSILON)), d, {out_rows}};                    \
-    const projection::Weights<packets::ProgressiveTop> w{top, SEISMIC_TOP_STRIDE_0, scales, \
-        SEISMIC_SCALES_STRIDE_0};                                                       \
-    threadgroup float lengths[SEISMIC_CONST_VERIFY_ROWS];                               \
+// `raw` is the selected hidden rows under the norm prologue; `out` the bound
+// epilogue over the rows' lengths and threshold keys, which the GEMV's and
+// the batched launch's rows form (`PROJECTION_GEMV_INPUT`).
+#define PROJECTION_OPERANDS(group)                                                      \
+    const uint m = uint(SEISMIC_DIM_O), n = uint(SEISMIC_DIM_V), k = uint(SEISMIC_DIM_D); \
+    projection::InputOf<activation, norm_element, projection::SelectedRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>::type \
+        raw{hidden, SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_2, norm, SEISMIC_NORM_STRIDE_0, \
+        as_type<float>(uint(SEISMIC_PARAM_EPSILON)), k, {out_rows}};                    \
+    const projection::Weights<packets::W0> w{top, SEISMIC_TOP_STRIDE_0, scales, SEISMIC_SCALES_STRIDE_0}; \
+    threadgroup float lengths[SEISMIC_CONST_VERIFY_ROWS];                                        \
     threadgroup atomic_uint lowest[SEISMIC_CONST_VERIFY_ROWS];                                   \
     threadgroup float parts[32];                                                        \
     threadgroup uint last;                                                              \
-    PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);                            \
-    projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);   \
-    threadgroup_barrier(mem_flags::mem_threadgroup);                                    \
-    const auto x = projection::shared_norm(in, squares);                               \
-    top_lengths(x, rows, d, element::Out<progressive::activation>(features),                                \
-        element::Out<element::F32>(lengths_out), SEISMIC_RESULT_3_STRIDE_0, lengths, parts, lowest, tile, tid, simdgroups, sg, lane); \
-    /* Radius column 0: the 4-bit view's. */                                             \
+    /* Radius column 0: the 4-bit view's. */                                            \
     const BoundOut out{element::Out<element::F32>(logits), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, radius, \
         SEISMIC_RADIUS_STRIDE_0, lengths, lowest,                                       \
         {draws, SEISMIC_DRAWS_STRIDE_0, SEISMIC_DRAWS_STRIDE_1, temperature, SEISMIC_TEMPERATURE_STRIDE_0, mask, \
-            SEISMIC_MASK_STRIDE_0, SEISMIC_MASK_STRIDE_1, constrained, SEISMIC_CONSTRAINED_STRIDE_0, as_type<float>(uint(SEISMIC_PARAM_SOFTCAP))}}
+            SEISMIC_MASK_STRIDE_0, SEISMIC_MASK_STRIDE_1, constrained, SEISMIC_CONSTRAINED_STRIDE_0, \
+            as_type<float>(uint(SEISMIC_PARAM_SOFTCAP))}}
 
+// The rows normalized in place from their sums of squares over the
+// threadgroup, with their lengths.
+#define PROJECTION_GROUPS 1
+#define PROJECTION_GEMV_INPUT(x)                                                        \
+    PROJECTION_SQUARES_SHARED(squares, decltype(raw)::parts);                           \
+    projection::threadgroup_squares_runtime(raw, m, squares, simdgroups, sg, lane);     \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                                    \
+    const auto x = projection::shared_norm(raw, squares);                               \
+    top_lengths(x, m, k, element::Out<progressive::activation>(features), element::Out<element::F32>(lengths_out), \
+        SEISMIC_RESULT_3_STRIDE_0, lengths, parts, lowest, tile, tid, simdgroups, sg, lane)
+
+#define TOP_ROWS_PUBLISH                                                                \
+    top_publish(lowest, lengths, bounds, &last, element::Out<element::F32>(threshold), SEISMIC_RESULT_1_STRIDE_0, m, \
+        tiles.x, tid)
+
+// The `dense` projection's launches (`lib/projection/operator.h`).
 #ifdef SEISMIC_FORMING_READOUT_TOP_ROWS_GEMV
-template <uint ROWS, uint LANES>
-kernel void readout_top_rows_gemv(TOP_ROWS_ARGUMENTS, TOP_ROWS_THREADS) {
-    TOP_ROWS_OPERANDS;
-    PROJECTION_FOR_ROWS(rows,
-        projection::gemv_runtime<packets::ProgressiveTop, ROWS, MAXM, LANES>(
-            x, out, w, rows, uint(SEISMIC_DIM_V), d, tile, shared, simdgroups, sg, lane));
-    top_publish(lowest, lengths, bounds, &last, element::Out<element::F32>(threshold), SEISMIC_RESULT_1_STRIDE_0, rows, tiles, tid);
+template <uint LANES, uint TILED, uint ROWS>
+kernel void readout_top_rows_gemv(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS, TOP_ROWS_ARGUMENTS) {
+    PROJECTION_SINGLE_GEMV(ONE, TILED);
+    TOP_ROWS_PUBLISH;
+}
+#endif
+#ifdef SEISMIC_FORMING_READOUT_TOP_ROWS_GEMV_PAIR
+template <uint LANES, uint TILED, uint ROWS>
+kernel void readout_top_rows_gemv_pair(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS, TOP_ROWS_ARGUMENTS) {
+    PROJECTION_SINGLE_GEMV(PAIR, TILED);
+    TOP_ROWS_PUBLISH;
+}
+#endif
+#ifdef SEISMIC_FORMING_READOUT_TOP_ROWS_GEMV_ROWS
+template <uint LANES, uint TILED, uint ROWS>
+kernel void readout_top_rows_gemv_rows(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS, TOP_ROWS_ARGUMENTS) {
+    PROJECTION_SINGLE_GEMV(SEVERAL, TILED);
+    TOP_ROWS_PUBLISH;
 }
 #endif

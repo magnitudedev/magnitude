@@ -31,8 +31,9 @@ use std::sync::Arc;
 pub(crate) struct NGramEntries<'a, G: GraphDraft + 'a> {
     pub rows: G::Binding<'a, ngram_rows::Entry>,
     pub stored: G::Binding<'a, stored_rows::Entry>,
-    pub key: G::Binding<'a, project_rows::Entry>,
-    pub value: G::Binding<'a, project_rows::Entry>,
+    /// The key and value projections, by row range.
+    pub key: G::Ranged<'a, project_rows::Entry>,
+    pub value: G::Ranged<'a, project_rows::Entry>,
     pub gate: G::Binding<'a, ngram_gate::Entry>,
     pub output: NGramOutputEntry<'a, G>,
 }
@@ -465,14 +466,14 @@ pub(crate) fn ngram<'a, G: GraphDraft + 'a>(
         )),
     };
     let mut project = |graph: &mut G,
-                       entry: G::Binding<'a, project_rows::Entry>,
+                       entry: G::Ranged<'a, project_rows::Entry>,
                        kind: WeightKind,
                        outputs: Dim,
                        constants: &mut Vec<GraphConstant>| {
         let projection = packed_weight(graph, load, scope, kind, weights, constants)?;
         graph
             .enqueue(
-                entry,
+                G::pick(entry, rows),
                 &[
                     ("M", rows.clone()),
                     ("G", Dim::from(1)),

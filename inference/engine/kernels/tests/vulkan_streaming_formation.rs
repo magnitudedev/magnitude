@@ -57,7 +57,7 @@ fn vulkan_streaming_forms() {
         ));
         requests.push(request(
             "routed_output",
-            &[("A", b), ("EDW", weight), ("SDW", w)],
+            &[("A", b), ("EDW", weight), ("SDW", w), ("NW", b)],
             &decode.iter().copied().chain([("SN", 1), ("IN", 0), ("S", 512)]).collect::<Vec<_>>(),
         ));
     }
@@ -74,10 +74,11 @@ fn vulkan_streaming_forms() {
         ("S", 512),
         ("ES", 0),
     ];
-    let route_elements = [("A", b), ("NW", b), ("RW", b), ("SGW", w), ("SUW", w)];
+    let f = Element::f32();
+    let route_elements = [("A", b), ("NW", b), ("RW", b), ("SRW", f), ("SGW", w), ("SUW", w)];
     requests.push(request(
         "routed_route",
-        &route_elements[..3],
+        &route_elements[..4],
         &route
             .iter()
             .copied()
@@ -92,28 +93,33 @@ fn vulkan_streaming_forms() {
     let select_elements = [("A", b), ("NW", b), ("RNW", b), ("RW", b)];
     requests.push(request("routed_select", &select_elements, &select));
     // Across a link (a tier, TM = E) and on unified memory (none).
-    for (ahead, linked) in [(0, true), (2, true), (2, false)] {
-        let streaming = |experts: u64| {
-            [
-                ("AHEAD", ahead),
-                ("EN", if ahead == 0 { 1 } else { 32 }),
-                ("TM", if linked { experts } else { 0 }),
-            ]
-        };
+    for linked in [true, false] {
+        let tm = |experts: u64| [("TM", if linked { experts } else { 0 })];
         requests.push(request(
             "routed_route_streamed",
             &route_elements,
-            &route.iter().copied().chain(streaming(256)).collect::<Vec<_>>(),
+            &route.iter().copied().chain(tm(256)).collect::<Vec<_>>(),
         ));
         requests.push(request(
             "routed_select_streamed",
             &select_elements,
-            &select.iter().copied().chain(streaming(64)).collect::<Vec<_>>(),
+            &select.iter().copied().chain(tm(64)).collect::<Vec<_>>(),
+        ));
+    }
+    for ahead in [1, 2] {
+        requests.push(request(
+            "routed_hint_route",
+            &[("A", b), ("NW", b), ("RW", b)],
+            &[("H", 2048), ("PT", 1), ("NM", 2048), ("K", 8), ("AHEAD", ahead), ("EN", 32)],
+        ));
+        requests.push(request(
+            "routed_hint_select",
+            &[("A", b), ("RNW", b), ("RW", b)],
+            &[("H", 2048), ("K", 4), ("AHEAD", ahead), ("EN", 32)],
         ));
     }
     // Packed current and next routers bind separate rows16 geometries.
     // NM=0 additionally selects the unnormalized PT-part input recipe.
-    let hinted = |experts: u64| [("AHEAD", 2), ("EN", 32), ("TM", experts)];
     let mut packed_route = route_elements;
     packed_route.iter_mut().find(|(name, _)| *name == "RW").unwrap().1 = w;
     let mut packed_select = select_elements;
@@ -121,12 +127,22 @@ fn vulkan_streaming_forms() {
     requests.push(request(
         "routed_route_streamed",
         &packed_route,
-        &route.into_iter().chain(hinted(256)).collect::<Vec<_>>(),
+        &route.into_iter().chain([("TM", 256)]).collect::<Vec<_>>(),
     ));
     requests.push(request(
         "routed_select_streamed",
         &packed_select,
-        &select.into_iter().chain(hinted(64)).collect::<Vec<_>>(),
+        &select.into_iter().chain([("TM", 64)]).collect::<Vec<_>>(),
+    ));
+    requests.push(request(
+        "routed_hint_route",
+        &[("A", b), ("NW", b), ("RW", w)],
+        &[("H", 2048), ("PT", 1), ("NM", 2048), ("K", 8), ("AHEAD", 2), ("EN", 32)],
+    ));
+    requests.push(request(
+        "routed_hint_select",
+        &[("A", b), ("RNW", b), ("RW", w)],
+        &[("H", 2048), ("K", 4), ("AHEAD", 2), ("EN", 32)],
     ));
     let mut unnormalized_route = route;
     unnormalized_route.iter_mut().find(|(name, _)| *name == "NM").unwrap().1 = 0;
@@ -134,7 +150,12 @@ fn vulkan_streaming_forms() {
     requests.push(request(
         "routed_route_streamed",
         &route_elements,
-        &unnormalized_route.into_iter().chain(hinted(256)).collect::<Vec<_>>(),
+        &unnormalized_route.into_iter().chain([("TM", 256)]).collect::<Vec<_>>(),
+    ));
+    requests.push(request(
+        "routed_hint_route",
+        &[("A", b), ("NW", b), ("RW", b)],
+        &[("H", 2048), ("PT", 2), ("NM", 0), ("K", 8), ("AHEAD", 2), ("EN", 32)],
     ));
     let results = form_requests(
         module,

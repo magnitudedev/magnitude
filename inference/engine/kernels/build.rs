@@ -67,7 +67,9 @@ const ENTRY_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
 /// experts.
 const STREAMING_ENTRIES: &[&str] = &[
     "routed_route_streamed",
+    "routed_hint_route",
     "routed_select_streamed",
+    "routed_hint_select",
     "routed_land",
     "routed_site_request",
     "routed_down_project",
@@ -148,8 +150,18 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
     ),
     (
         "lib/projection/operator",
-        &[BackendName::Metal],
-        "the `dense` projection's form bodies (`dense.seismic`), which only Metal's entries take so far; the other backends' entries still hold theirs",
+        &[BackendName::Metal, BackendName::Cuda, BackendName::Vulkan],
+        "the `dense` projection's form bodies (`dense.seismic`), which the GPU entries take; the CPU takes its `quantized` projection from `cpu/lib/projection`",
+    ),
+    (
+        "lib/routed/decode",
+        &[BackendName::Cuda],
+        "the routed decode GEMVs' block shape, shared by the routed entries and the per-row gathered `gather_choice` launches, apart from `routed.cuh` so a dense entry binds none of its routed state; Metal and Vulkan size their decode blocks in the routed bodies themselves",
+    ),
+    (
+        "lib/projection/planes",
+        &[BackendName::Cuda],
+        "the `dense` projection's `planes` form (`dense.seismic`), the progressive readout's plane-set GEMV, which only CUDA serves as its own form; Metal projects a plane set through its GEMVs' packets (`gemv.h`)",
     ),
     (
         "lib/core/arrive",
@@ -212,6 +224,11 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "the list spans' one predicate and row walk, shared by the CPU's attention, pooled-row, indexer and candidate entries; the GPU bodies keep theirs in `lib/indexer/indexer`, beside the lane helpers that walk them",
     ),
     (
+        "lib/core/flat",
+        &[BackendName::Cpu],
+        "the split of a launch's rows, flattened, into equal spans over the pool's participants, shared by the CPU's sampling and shaping entries; the GPU bodies split their rows by threadgroup",
+    ),
+    (
         "lib/core/rotary",
         &[BackendName::Metal, BackendName::Cuda, BackendName::Vulkan],
         "rotary layouts and the lane rotation shared by attention, vision, the pooled rows and the indexers; the CPU rotates in `attention.rs`",
@@ -227,44 +244,24 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "the chunked delta-rule entries' common code, shared by `gated_delta_chunk` and `kimi_delta_chunk` (CUDA and Metal: the piece geometry and helpers beside each rule's WY form; Vulkan: both entries' launches); the CPU's chunk entries run the row-sequential advance of `lib/recurrent/recurrent`",
     ),
     (
-        "lib/routed/router",
-        &[BackendName::Metal],
-        "decode router logits shared by the Metal route and select GEMVs over the projection GEMV body (any activation element, unlike `routed.h`); CUDA and Vulkan keep their router GEMVs inline",
-    ),
-    (
         "lib/routed/channels",
         &[BackendName::Metal],
         "the decode down projections over the projection GEMV body, shared by `down.h` and `output.h`, apart from `routed.h` so the expert GEMMs' libraries compile no GEMV; CUDA and Vulkan keep them in their down and output files",
     ),
     (
-        "lib/routed/shared",
-        &[BackendName::Metal, BackendName::Cuda],
-        "the shared expert's expansion in a decode route's launch, shared by `routed_route_shared` and `routed_route_streamed`, on the backends that declare them",
-    ),
-    (
-        "lib/routed/logits",
-        &[BackendName::Metal],
-        "the prefill router logits tile on F32 simdgroup matrices, shared by the Metal route and select GEMMs; CUDA and Vulkan keep their router GEMMs inline",
-    ),
-    (
-        "lib/routed/route_body",
+        "lib/projection/segments",
         &[BackendName::Vulkan],
-        "Vulkan resident router arithmetic rebound to the current or next-layer router's ports",
+        "segmented projection weight and output configuration shared by `operator.glsl` and `ordered.glsl` so non-ordered entries bind no ordered tuning parameters",
     ),
     (
-        "lib/routed/selection_body",
+        "lib/projection/ordered",
         &[BackendName::Vulkan],
-        "Vulkan resident selection arithmetic rebound to the current or next-layer router's ports",
-    ),
-    (
-        "lib/routed/route_shared",
-        &[BackendName::Vulkan],
-        "Vulkan shared expert projection over the resident paired GEMV implementation",
+        "the `dense` projection's ordered 8-lane GEMV and scalar-FMA GEMM bodies (`dense.seismic`), apart from `operator.glsl` so entries with no ordered segment bind none of their tuning parameters",
     ),
     (
         "lib/routed/streamed",
         &[BackendName::Vulkan],
-        "Vulkan workgroup adapters to the shared streaming resolution and hint protocol",
+        "the streamed routes' resolve over their bank ports (`resolve.cuh`'s Vulkan counterpart), apart from Vulkan's streaming shim so the other streaming entries bind none of them",
     ),
 ];
 

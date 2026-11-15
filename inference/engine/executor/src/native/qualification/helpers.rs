@@ -244,9 +244,10 @@ pub(super) fn qualify_attention(
     let selected = zeros(binding.activation, &[0, shape.widths.kv_heads, shape.widths.width])?;
     let selection = Tensor::from_host(device, Element::u32(), &[1, 0], &[])
         .map_err(|error| qualification_dynamic(ENTRY, label, error))?;
-    let scale = |name| unit_scale(device, &kernels.project, name, ENTRY, label);
+    let scale = |name| unit_scale(device, kernels.project.first(), name, ENTRY, label);
     let projected = kernels
         .project
+        .first()
         .call(attention_project::Args {
             hidden: &input,
             input_norm: &input_norm,
@@ -260,10 +261,10 @@ pub(super) fn qualify_attention(
             gate_scale: &scale("GS")?,
             key_scale: &scale("KS")?,
             value_scale: &scale("VS")?,
-            query_bound: &any_row_bound(device, &kernels.project, "QB", ENTRY, label)?,
-            gate_bound: &any_row_bound(device, &kernels.project, "GB", ENTRY, label)?,
-            key_bound: &any_row_bound(device, &kernels.project, "KB", ENTRY, label)?,
-            value_bound: &any_row_bound(device, &kernels.project, "VB", ENTRY, label)?,
+            query_bound: &any_row_bound(device, kernels.project.first(), "QB", ENTRY, label)?,
+            gate_bound: &any_row_bound(device, kernels.project.first(), "GB", ENTRY, label)?,
+            key_bound: &any_row_bound(device, kernels.project.first(), "KB", ENTRY, label)?,
+            value_bound: &any_row_bound(device, kernels.project.first(), "VB", ENTRY, label)?,
         })
         .map_err(|e| qualification_dynamic("attention_project", label, e))?;
     let per_head = |tensor: &Tensor, extents: &[u64]| {
@@ -283,7 +284,7 @@ pub(super) fn qualify_attention(
                 .value;
             let up = zeros(binding.query, &[binding.query_rows(), low_rank.rank])?;
             let empty = zeros(binding.query, &[0, low_rank.rank])?;
-            let kernel = &low_rank_kernels.project;
+            let kernel = low_rank_kernels.project.first();
             let scale = |name| unit_scale(device, kernel, name, ENTRY, label);
             let bound = |name| any_row_bound(device, kernel, name, ENTRY, label);
             kernel
@@ -320,6 +321,7 @@ pub(super) fn qualify_attention(
         (None, None) => query_rows,
         (Some(absorbed), Some(kernel)) => {
             let shape = absorbed.shape;
+            let kernel = kernel.first();
             kernel
                 .call(project_rows::Args {
                     source: &per_head(&query_rows, &[1, shape.heads * shape.width])?,
@@ -411,17 +413,17 @@ pub(super) fn qualify_attention(
             decode, prefill, ..
         } => [
             match decode {
-                DenseDecodeKernels::Decode(single) => (
+                DenseDecodeKernels::Decode(decode) => (
                     "attention_decode",
-                    mix!(@call single, attention_decode, {
+                    mix!(@call decode, attention_decode, {
                         form: &dense_form, selected_rows: &selected_rows, selected: &selected,
                         selected_slab_rows: 1, key_block: rounding.block, key_element: rounding.element,
                         key_scale: rounding.scale, key_amax_floor: rounding.amax_floor()
                     }, history_key: activation, width, 2, history_value: activation, width, value_rows),
                 ),
-                DenseDecodeKernels::Prefill(kernel) => (
+                DenseDecodeKernels::Prefill(prefill) => (
                     "attention_prefill",
-                    mix!(@call kernel, attention_prefill, {
+                    mix!(@call prefill, attention_prefill, {
                         selection: &selection, block_slots: &block_slots,
                         form: &dense_form, selected_rows: &selected_rows, selected: &selected,
                         selected_slab_rows: 1, key_block: rounding.block, key_element: rounding.element,
@@ -474,13 +476,14 @@ pub(super) fn qualify_attention(
             (None, None) => None,
             (Some(kernel), Some(weight)) => Some(
                 kernel
+                    .first()
                     .call(project_rows::Args {
                         source: &gated
                             .reshape(&[1, heads * width])
                             .map_err(|e| qualification_dynamic("project_rows", label, e))?,
                         weight,
-                        weight_scale: &unit_scale(device, kernel, "WS", "project_rows", label)?,
-                        weight_bound: &any_row_bound(device, kernel, "WB", "project_rows", label)?,
+                        weight_scale: &unit_scale(device, kernel.first(), "WS", "project_rows", label)?,
+                        weight_bound: &any_row_bound(device, kernel.first(), "WB", "project_rows", label)?,
                     })
                     .map_err(|e| qualification_dynamic("project_rows", label, e))?
                     .value
@@ -497,6 +500,7 @@ pub(super) fn qualify_attention(
         let gated = products.as_ref().unwrap_or(gated);
         let result = match (&kernels.output, binding.tail) {
             (SublayerOutput::Residual(output_kernel), SublayerTail::Residual) => {
+                let output_kernel = output_kernel.first();
                 output_kernel
                     .call(attention_output::Args {
                         hidden: &residual,
@@ -543,11 +547,12 @@ pub(super) fn qualify_post_norm(
     let hidden = residual.extents()[1];
     let projected = kernels
         .project
+        .first()
         .call(project_rows::Args {
             source,
             weight,
-            weight_scale: &unit_scale(device, &kernels.project, "WS", "project_rows", label)?,
-            weight_bound: &any_row_bound(device, &kernels.project, "WB", "project_rows", label)?,
+            weight_scale: &unit_scale(device, kernels.project.first(), "WS", "project_rows", label)?,
+            weight_bound: &any_row_bound(device, kernels.project.first(), "WB", "project_rows", label)?,
         })
         .map_err(|e| qualification_dynamic("project_rows", label, e))?
         .value;

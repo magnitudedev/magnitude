@@ -405,11 +405,15 @@ __device__ __forceinline__ void form_row_publishing(const Pro &pro, u32 m, u64 K
 // group, x ~= d * q by the rule every backend's INT8 activations follow
 // (`s8_scale`, `s8_code`: the CPU's, `seismic-native-cpu` `quant.rs`), staged
 // by `stage_row_s8` as `q` ([M, width] bytes in the s8 fragments' virtual k
-// order, packets.cuh) and `groups` (each group's (d, d * sum q)).
+// order, packets.cuh) and `groups` (each group's (d, d * sum q)). Any s8 row
+// source gives `row(m)` (the row's codes) and `groups_of(m)` (its groups) for
+// m < M, the rows the int8 GEMM reads.
 struct QuantizedRows {
     const u8 *q;
     u64 width;
     const float2 *groups;
+    __device__ __forceinline__ const u8 *row(u64 m) const { return q + m * width; }
+    __device__ __forceinline__ const float2 *groups_of(u64 m) const { return groups + m * (width / 32); }
 };
 
 // Real offset within a 32-code group of virtual s8 position v.
@@ -495,4 +499,177 @@ __device__ __forceinline__ void stage_row_s8(const Pro &pro, u32 m, u64 K, u8 *q
         out[1] = make_uint4(words[4], words[5], words[6], words[7]);
         groups[m * (K / 32) + group] = make_float2(d, d * (float)total);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Reference-order prologues (`OrderedRms`, `OrderedSummed`, `OrderedInput`):
+// 8-lane reduction (`((l0+l4)+(l2+l6))+((l1+l5)+(l3+l7))`) and `1 / sqrtf(...)`.
+
+__device__ __forceinline__ float ordered_combine8(float v) {
+    const unsigned mask = 0xffu << (threadIdx.x & 24u);
+    v = seismic_add_rn(v, __shfl_xor_sync(mask, v, 4));
+    v = seismic_add_rn(v, __shfl_xor_sync(mask, v, 2));
+    v = seismic_add_rn(v, __shfl_xor_sync(mask, v, 1));
+    return v;
+}
+
+template <class NORM, class Rows> struct OrderedRms {
+    const float *x;
+    u64 stride;
+    const u8 *norm;
+    float eps;
+    u64 width;
+    Rows rows;
+    u64 col_stride = 1;
+    u64 norm_stride = 1;
+    static constexpr bool STAGED = true;
+    static constexpr int FACTORS = 1;
+    __device__ __forceinline__ void ordered_inverses(u32 m_rows, float *inverses, u32 first_row = 0u,
+                                                     float *scratch = nullptr) const {
+        const u32 tid = threadIdx.x, threads = blockDim.x;
+        const u32 group_id = tid / 8u, u = tid & 7u, groups = threads / 8u;
+        if (scratch != nullptr && col_stride == 1ull && m_rows == 1u) {
+            const float *row_ptr = x + rows(first_row) * stride;
+            float sum = 0.0f;
+            for (u64 k0 = 0; k0 < width; k0 += 512ull) {
+                const u32 chunk = (u32)min(512ull, width - k0);
+                for (u32 c = tid; c < chunk; c += threads)
+                    scratch[c] = row_ptr[k0 + c];
+                __syncthreads();
+                if (group_id == 0u) {
+                    u32 c = u;
+                    for (; c + 56u < chunk; c += 64u) {
+                        const float v0 = scratch[c];
+                        const float v1 = scratch[c + 8u];
+                        const float v2 = scratch[c + 16u];
+                        const float v3 = scratch[c + 24u];
+                        const float v4 = scratch[c + 32u];
+                        const float v5 = scratch[c + 40u];
+                        const float v6 = scratch[c + 48u];
+                        const float v7 = scratch[c + 56u];
+                        sum = seismic_fma_rn(v0, v0, sum);
+                        sum = seismic_fma_rn(v1, v1, sum);
+                        sum = seismic_fma_rn(v2, v2, sum);
+                        sum = seismic_fma_rn(v3, v3, sum);
+                        sum = seismic_fma_rn(v4, v4, sum);
+                        sum = seismic_fma_rn(v5, v5, sum);
+                        sum = seismic_fma_rn(v6, v6, sum);
+                        sum = seismic_fma_rn(v7, v7, sum);
+                    }
+                    for (; c < chunk; c += 8u) {
+                        const float v = scratch[c];
+                        sum = seismic_fma_rn(v, v, sum);
+                    }
+                }
+                __syncthreads();
+            }
+            const float total_sq = ordered_combine8(sum);
+            if (tid == 0u)
+                inverses[0] = __fdiv_rn(1.0f, sqrtf(__fdiv_rn(total_sq, (float)width) + eps));
+            __syncthreads();
+            return;
+        }
+        for (u32 base = 0u; base < m_rows; base += groups) {
+            const u32 r = base + group_id;
+            float sum = 0.0f;
+            if (r < m_rows) {
+                const float *row_ptr = x + rows(first_row + r) * stride;
+                if (col_stride == 1ull) {
+                    u64 k0 = 0;
+                    for (; k0 + 64ull <= width; k0 += 64ull) {
+                        const u64 c = k0 + u;
+                        const float v0 = row_ptr[c];
+                        const float v1 = row_ptr[c + 8ull];
+                        const float v2 = row_ptr[c + 16ull];
+                        const float v3 = row_ptr[c + 24ull];
+                        const float v4 = row_ptr[c + 32ull];
+                        const float v5 = row_ptr[c + 40ull];
+                        const float v6 = row_ptr[c + 48ull];
+                        const float v7 = row_ptr[c + 56ull];
+                        sum = seismic_fma_rn(v0, v0, sum);
+                        sum = seismic_fma_rn(v1, v1, sum);
+                        sum = seismic_fma_rn(v2, v2, sum);
+                        sum = seismic_fma_rn(v3, v3, sum);
+                        sum = seismic_fma_rn(v4, v4, sum);
+                        sum = seismic_fma_rn(v5, v5, sum);
+                        sum = seismic_fma_rn(v6, v6, sum);
+                        sum = seismic_fma_rn(v7, v7, sum);
+                    }
+                    for (u64 c = k0 + u; c < width; c += 8ull) {
+                        const float v = row_ptr[c];
+                        sum = seismic_fma_rn(v, v, sum);
+                    }
+                } else {
+                    for (u64 c = u; c < width; c += 8ull) {
+                        const float v = row_ptr[c * col_stride];
+                        sum = seismic_fma_rn(v, v, sum);
+                    }
+                }
+            }
+            const float total_sq = ordered_combine8(sum);
+            if (r < m_rows && u == 0u)
+                inverses[r] = __fdiv_rn(1.0f, sqrtf(__fdiv_rn(total_sq, (float)width) + eps));
+        }
+        __syncthreads();
+    }
+    __device__ __forceinline__ float ordered_at(u32 m, u64 c, float inv) const {
+        return Act::round(x[rows(m) * stride + c * col_stride] * inv * element::at<NORM>(norm, c * norm_stride));
+    }
+    __device__ __forceinline__ void prepare_row(float *shared, u32 m, float *) const {
+        __shared__ float ordered_sram[512];
+        ordered_inverses(1u, shared, m, ordered_sram);
+    }
+    __device__ __forceinline__ float value(const float *factors, u32 m, u64 k) const {
+        return ordered_at(m, k, factors[0]);
+    }
+};
+
+template <class NORM, class Rows, u64 PARTS> struct OrderedSummed {
+    const float *x;
+    u64 stride;
+    const u8 *norm;
+    float eps;
+    u64 width;
+    Rows rows;
+    u64 col_stride = 1;
+    u64 norm_stride = 1;
+    static constexpr bool STAGED = true;
+    static constexpr int FACTORS = 0;
+    __device__ __forceinline__ void ordered_inverses(u32 m_rows, float *inverses, u32 = 0u, float * = nullptr) const {
+        for (u32 r = threadIdx.x; r < m_rows; r += blockDim.x)
+            inverses[r] = 1.0f;
+        __syncthreads();
+    }
+    __device__ __forceinline__ float ordered_at(u32 m, u64 c, float) const {
+        const float *row = x + rows(m) * stride;
+        float sum = 0.0f;
+#pragma unroll
+        for (u64 part = 0; part < PARTS; ++part)
+            sum = seismic_add_rn(sum, row[(part * width + c) * col_stride]);
+        return Act::round(sum);
+    }
+    __device__ __forceinline__ void prepare_row(float *, u32, float *) const {}
+    __device__ __forceinline__ float value(const float *, u32 m, u64 k) const {
+        return ordered_at(m, k, 1.0f);
+    }
+};
+
+template <class NORM, class Rows, u64 NORM_EXTENT, u64 PARTS> struct OrderedInputOf {
+    using type = OrderedRms<NORM, Rows>;
+};
+template <class NORM, class Rows, u64 PARTS> struct OrderedInputOf<NORM, Rows, 0, PARTS> {
+    using type = OrderedSummed<NORM, Rows, PARTS>;
+};
+template <class NORM, class Rows, u64 NORM_EXTENT, u64 PARTS>
+using OrderedInput = typename OrderedInputOf<NORM, Rows, NORM_EXTENT, PARTS>::type;
+
+template <class Pro, class Out>
+__device__ __forceinline__ float ordered_stage_row(const Pro &pro, u32 m, u64 K, Out out, u64 stride0, u64 stride1) {
+    __shared__ float inv_shared[1];
+    __shared__ float stage_scratch[512];
+    pro.ordered_inverses(1u, inv_shared, m, stage_scratch);
+    const float inv = inv_shared[0];
+    for (u64 c = threadIdx.x; c < K; c += blockDim.x)
+        out.put(m * stride0 + c * stride1, pro.ordered_at(m, c, inv));
+    return inv;
 }

@@ -168,6 +168,7 @@ fn module() -> CheckedModule {
             "attention.seismic",
             include_str!("../kernels/attention.seismic"),
         ),
+        ("dense.seismic", include_str!("../kernels/dense.seismic")),
         (
             "functions.seismic",
             include_str!("../kernels/functions.seismic"),
@@ -274,6 +275,24 @@ fn specialization_on(device: &Device, statics: &[(&str, usize)]) -> NativeSpecia
     )
 }
 
+/// The CPU's INT8 forms besides the default (`INT8` 0); a GPU form runs its
+/// default alone.
+fn int8_forms(device: &Device) -> Vec<u64> {
+    if is_cpu(device) { vec![0, 1] } else { vec![0] }
+}
+
+/// `specialization` with the CPU's INT8 form `int8`.
+fn with_int8(device: &Device, specialization: NativeSpecialization, int8: u64) -> NativeSpecialization {
+    if is_cpu(device) { specialization.with_param("INT8", int8) } else { specialization }
+}
+
+/// The CPU's INT8 form: the tuner's relative output-norm defect guard.
+fn assert_int8_norm(label: &str, actual: &[f32], expected: &[f32]) {
+    let error = actual.iter().zip(expected).map(|(a, e)| (a - e).powi(2)).sum::<f32>();
+    let scale = expected.iter().map(|e| e.powi(2)).sum::<f32>();
+    assert!(error <= 0.05f32.powi(2) * scale, "{label}: relative error {}", (error / scale).sqrt());
+}
+
 const EPSILON: f32 = 1e-6;
 
 // ---------------------------------------------------------------------------
@@ -346,50 +365,55 @@ fn patch_stem_matches_its_portable_body() {
                     Input::Tensor(&coefficients),
                 ],
             );
-            let kernel = vision_patch_stem::native_for_device_with(
-                &device,
-                vision_patch_stem::Elements {
-                    W0: frame.element(),
-                    W1: next.element(),
-                    B: bias.element(),
-                    PE: table.element(),
-                },
-                &specialization_on(
+            for int8 in int8_forms(&device) {
+                let kernel = vision_patch_stem::native_for_device_with(
                     &device,
-                    &[
-                        ("C", channels),
-                        ("S", s),
-                        ("P", patch),
-                        ("H", hidden),
-                        ("NB", nb),
-                        ("NT", nt),
-                    ],
-                ),
-            )
-            .unwrap();
-            let t = |host: &Host| host.tensor(&device);
-            let result = kernel
-                .call(vision_patch_stem::Args {
-                    pixels: &t(&pixels),
-                    frame_weight: &t(&frame),
-                    next_frame_weight: &t(&next),
-                    bias: &t(&bias),
-                    table: &t(&table),
-                    indices: &t(&indices),
-                    coefficients: &t(&coefficients),
-                })
-                .unwrap()
-                .value;
-            relative_error(
-                &format!(
-                    "vision_patch_stem {:?} S{s} NB{nb} NT{nt} P{patch} {weights:?}",
+                    vision_patch_stem::Elements {
+                        W0: frame.element(),
+                        W1: next.element(),
+                        B: bias.element(),
+                        PE: table.element(),
+                    },
+                    &with_int8(
+                        &device,
+                        specialization_on(
+                            &device,
+                            &[
+                                ("C", channels),
+                                ("S", s),
+                                ("P", patch),
+                                ("H", hidden),
+                                ("NB", nb),
+                                ("NT", nt),
+                            ],
+                        ),
+                        int8,
+                    ),
+                )
+                .unwrap();
+                let t = |host: &Host| host.tensor(&device);
+                let result = kernel
+                    .call(vision_patch_stem::Args {
+                        pixels: &t(&pixels),
+                        frame_weight: &t(&frame),
+                        next_frame_weight: &t(&next),
+                        bias: &t(&bias),
+                        table: &t(&table),
+                        indices: &t(&indices),
+                        coefficients: &t(&coefficients),
+                    })
+                    .unwrap()
+                    .value;
+                let label = format!(
+                    "vision_patch_stem {:?} S{s} NB{nb} NT{nt} P{patch} {weights:?} INT8 {int8}",
                     device.backend()
-                ),
-                &read_values(&result),
-                &expected,
-                2e-3,
-                2e-4,
-            );
+                );
+                if int8 == 1 {
+                    assert_int8_norm(&label, &read_values(&result), &expected);
+                } else {
+                    relative_error(&label, &read_values(&result), &expected, 2e-3, 2e-4);
+                }
+            }
         }
     }
 }
@@ -668,41 +692,6 @@ fn linear_matches_its_portable_body() {
                     Input::I32(activation),
                 ],
             );
-            let kernel = vision_linear::native_for_device_with(
-                &device,
-                vision_linear::Elements {
-                    A: Element::f16(),
-                    W: weight.element(),
-                    B: bias.element(),
-                    Y: Element::dense(output),
-                },
-                &specialization_on(
-                    &device,
-                    &[
-                        ("N", n),
-                        ("K", k),
-                        ("NB", nb),
-                        ("NR", nr),
-                        ("NG", ng),
-                        ("NC", nc),
-                    ],
-                ),
-            )
-            .unwrap();
-            let t = |host: &Host| host.tensor(&device);
-            let result = kernel
-                .call(vision_linear::Args {
-                    x: &t(&x),
-                    weight: &t(&weight),
-                    bias: &t(&bias),
-                    residual: &t(&residuals),
-                    gate: &t(&gate),
-                    minimum: &t(&minimum),
-                    maximum: &t(&maximum),
-                    activation,
-                })
-                .unwrap()
-                .value;
             let bounds = linear_bounds(
                 device.backend(),
                 &x,
@@ -716,15 +705,56 @@ fn linear_matches_its_portable_body() {
                 output,
                 &expected,
             );
-            common::bound::assert_within(
-                &format!(
-                    "vision_linear {:?} NB{nb} NR{nr} NG{ng} NC{nc} activation {activation} {weights:?} K{k}",
+            for int8 in int8_forms(&device) {
+                let kernel = vision_linear::native_for_device_with(
+                    &device,
+                    vision_linear::Elements {
+                        A: Element::f16(),
+                        W: weight.element(),
+                        B: bias.element(),
+                        Y: Element::dense(output),
+                    },
+                    &with_int8(
+                        &device,
+                        specialization_on(
+                            &device,
+                            &[
+                                ("N", n),
+                                ("K", k),
+                                ("NB", nb),
+                                ("NR", nr),
+                                ("NG", ng),
+                                ("NC", nc),
+                            ],
+                        ),
+                        int8,
+                    ),
+                )
+                .unwrap();
+                let t = |host: &Host| host.tensor(&device);
+                let result = kernel
+                    .call(vision_linear::Args {
+                        x: &t(&x),
+                        weight: &t(&weight),
+                        bias: &t(&bias),
+                        residual: &t(&residuals),
+                        gate: &t(&gate),
+                        minimum: &t(&minimum),
+                        maximum: &t(&maximum),
+                        activation,
+                    })
+                    .unwrap()
+                    .value;
+                let label = format!(
+                    "vision_linear {:?} NB{nb} NR{nr} NG{ng} NC{nc} activation {activation} {weights:?} K{k} INT8 {int8}",
                     device.backend()
-                ),
-                &read_values(&result),
-                &expected,
-                &bounds,
-            );
+                );
+                if int8 == 1 {
+                    assert_int8_norm(&label, &read_values(&result), &expected);
+                } else {
+                    common::bound::assert_within(&label, &read_values(&result), &expected, &bounds);
+                }
+            }
         }
     }
 }

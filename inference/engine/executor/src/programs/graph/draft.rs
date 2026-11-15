@@ -3,9 +3,10 @@
 //! storage layout and interval placement in either route.
 
 use super::GraphError;
+use crate::native::RangedKernels;
 use seismic::{
     Dim, Element, Entry, LaunchEncoding, NativeGraph, NativeGraphMetadata, NativeGraphPlan, NativeGraphStorageBytes,
-    NativeKernel, NativePort, NativeTimelinePort, WorkflowTensor,
+    NativeKernel, NativePort, NativeTimelinePort, OperandCarry, OperandForms, WorkflowTensor,
 };
 
 /// How a block's graph takes its launch's per-step controls (coordinates,
@@ -25,6 +26,22 @@ pub(crate) trait GraphDraft: Sized {
     type Binding<'a, E: Entry + 'a>: Copy
     where
         Self: 'a;
+    /// An entry's bindings by the range of rows a node's launch takes
+    /// ([`RangedKernels`]).
+    type Ranged<'a, E: Entry + 'a>: Copy
+    where
+        Self: 'a;
+    /// The forms the graph names its operand carries in
+    /// (`seismic::OperandForms`), those their readers' kernels take: a
+    /// graph of kernels names them, and its seal writes them; a graph built
+    /// to be sized names none, a carry's ports and everything a graph
+    /// reserves for it being the same in each.
+    type Forms: Copy;
+
+    /// The binding of the range `rows` lie in.
+    fn pick<'a, E: Entry + 'a>(ranged: Self::Ranged<'a, E>, rows: &Dim) -> Self::Binding<'a, E>;
+    /// The binding of the lowest range, whose layout every range shares.
+    fn first<'a, E: Entry + 'a>(ranged: Self::Ranged<'a, E>) -> Self::Binding<'a, E>;
 
     fn port<D: Clone>(&mut self, element: Element, extents: &[D]) -> Result<NativePort, GraphError>
     where
@@ -105,6 +122,29 @@ pub(crate) trait GraphDraft: Sized {
     /// Write the node result `result` into the tensor each run binds to the
     /// external port `port`, which describes exactly that result.
     fn store(&mut self, result: &WorkflowTensor, port: &NativePort) -> Result<(), GraphError>;
+    /// The ports of an operand carry between two graphs
+    /// (`seismic::OperandCarry`): a formed operand of `rows` rows of
+    /// `width` values, rounded to `activation`, which each run binds.
+    fn operand_carry(&mut self, rows: u64, width: &Dim, activation: Element) -> Result<OperandCarry, GraphError>;
+    /// The producer of `result` emits its normed operand into `carry`'s
+    /// ports, in `forms`.
+    fn carry_out(
+        &mut self,
+        result: &WorkflowTensor,
+        carry: &OperandCarry,
+        forms: Self::Forms,
+    ) -> Result<(), GraphError>;
+    /// The consumers of the tensor bound to `hidden` that form their
+    /// operand under the norm bound to `norm` at `epsilon` read it from
+    /// `carry`, which holds it in `forms`, their formation left out.
+    fn carry_in(
+        &mut self,
+        hidden: &NativePort,
+        carry: &OperandCarry,
+        forms: Self::Forms,
+        norm: &NativePort,
+        epsilon: f32,
+    ) -> Result<(), GraphError>;
     /// A timeline node after every node enqueued so far: a host gate or a
     /// signal to the host (`seismic::Timeline`).
     fn timeline<N: seismic::timeline::TimelineNodeKind>(&mut self, node: N) -> NativeTimelinePort<N::Role>;
@@ -142,6 +182,15 @@ fn fixed_dimensions<'n>(dimensions: &[(&'n str, impl Clone + Into<Dim>)]) -> Vec
 impl GraphDraft for NativeGraph {
     type Plan = NativeGraphPlan;
     type Binding<'a, E: Entry + 'a> = &'a NativeKernel<E>;
+    type Ranged<'a, E: Entry + 'a> = &'a RangedKernels<E>;
+    type Forms = OperandForms;
+
+    fn pick<'a, E: Entry + 'a>(ranged: Self::Ranged<'a, E>, rows: &Dim) -> Self::Binding<'a, E> {
+        ranged.for_rows(rows)
+    }
+    fn first<'a, E: Entry + 'a>(ranged: Self::Ranged<'a, E>) -> Self::Binding<'a, E> {
+        ranged.first()
+    }
 
     fn port<D: Clone>(&mut self, element: Element, extents: &[D]) -> Result<NativePort, GraphError>
     where
@@ -204,6 +253,27 @@ impl GraphDraft for NativeGraph {
     fn store(&mut self, result: &WorkflowTensor, port: &NativePort) -> Result<(), GraphError> {
         self.store(result, port).map_err(invalid)
     }
+    fn operand_carry(&mut self, rows: u64, width: &Dim, activation: Element) -> Result<OperandCarry, GraphError> {
+        self.operand_carry(rows, width.fixed(), activation).map_err(invalid)
+    }
+    fn carry_out(
+        &mut self,
+        result: &WorkflowTensor,
+        carry: &OperandCarry,
+        forms: OperandForms,
+    ) -> Result<(), GraphError> {
+        self.carry_out(result, carry, forms).map_err(invalid)
+    }
+    fn carry_in(
+        &mut self,
+        hidden: &NativePort,
+        carry: &OperandCarry,
+        forms: OperandForms,
+        norm: &NativePort,
+        epsilon: f32,
+    ) -> Result<(), GraphError> {
+        self.carry_in(hidden, carry, forms, norm, epsilon).map_err(invalid)
+    }
     fn timeline<N: seismic::timeline::TimelineNodeKind>(&mut self, node: N) -> NativeTimelinePort<N::Role> {
         self.timeline(node)
     }
@@ -218,6 +288,15 @@ impl GraphDraft for NativeGraph {
 impl GraphDraft for NativeGraphMetadata {
     type Plan = NativeGraphStorageBytes;
     type Binding<'a, E: Entry + 'a> = &'a [(&'a str, Element)];
+    type Ranged<'a, E: Entry + 'a> = &'a [(&'a str, Element)];
+    type Forms = ();
+
+    fn pick<'a, E: Entry + 'a>(ranged: Self::Ranged<'a, E>, _rows: &Dim) -> Self::Binding<'a, E> {
+        ranged
+    }
+    fn first<'a, E: Entry + 'a>(ranged: Self::Ranged<'a, E>) -> Self::Binding<'a, E> {
+        ranged
+    }
 
     fn port<D: Clone>(&mut self, element: Element, extents: &[D]) -> Result<NativePort, GraphError>
     where
@@ -294,6 +373,22 @@ impl GraphDraft for NativeGraphMetadata {
     }
     fn store(&mut self, result: &WorkflowTensor, port: &NativePort) -> Result<(), GraphError> {
         Ok(self.store(result, port)?)
+    }
+    fn operand_carry(&mut self, rows: u64, width: &Dim, activation: Element) -> Result<OperandCarry, GraphError> {
+        Ok(self.operand_carry(Dim::from(rows), width.clone(), activation)?)
+    }
+    fn carry_out(&mut self, result: &WorkflowTensor, carry: &OperandCarry, (): ()) -> Result<(), GraphError> {
+        Ok(self.carry_out(result, carry)?)
+    }
+    fn carry_in(
+        &mut self,
+        hidden: &NativePort,
+        carry: &OperandCarry,
+        (): (),
+        norm: &NativePort,
+        epsilon: f32,
+    ) -> Result<(), GraphError> {
+        Ok(self.carry_in(hidden, carry, norm, epsilon)?)
     }
     fn timeline<N: seismic::timeline::TimelineNodeKind>(&mut self, node: N) -> NativeTimelinePort<N::Role> {
         self.timeline(node)

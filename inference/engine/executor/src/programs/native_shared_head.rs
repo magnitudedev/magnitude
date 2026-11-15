@@ -200,20 +200,21 @@ struct SharedHeadEntries<'a, 'e, G: GraphDraft + 'a> {
     landing: Option<LandingEntries<'a, G>>,
     embedding: G::Binding<'a, embedding_rows::Entry>,
     join: G::Binding<'a, tap_rows::Entry>,
-    input: G::Binding<'a, project_rows::Entry>,
+    /// The projections into the head's width and back, by row range.
+    input: G::Ranged<'a, project_rows::Entry>,
     mixer: &'e dyn Fn(usize) -> Result<MixerEntries<'a, G>, String>,
     feed_forward: &'e dyn Fn(usize) -> Result<Option<FeedForwardEntries<'a, G>>, String>,
     features: G::Binding<'a, readout_features_rows::Entry>,
     projection: readout::ProjectionEntries<'a, G>,
     clustered: Option<ClusterEntries<'a, G>>,
-    chain: G::Binding<'a, project_rows::Entry>,
+    chain: G::Ranged<'a, project_rows::Entry>,
     shape: G::Binding<'a, shape_rows::Entry>,
     sample: G::Binding<'a, sample_rows::Entry>,
     confidence: G::Binding<'a, token_confidence::Entry>,
 }
 
 struct ClusterEntries<'a, G: GraphDraft + 'a> {
-    centroids: G::Binding<'a, readout_project_rows::Entry>,
+    centroids: G::Ranged<'a, readout_project_rows::Entry>,
     selection: G::Binding<'a, draft_top_k::Entry>,
     rows: G::Binding<'a, cluster_token_rows::Entry>,
     placement: G::Binding<'a, place_logits_rows::Entry>,
@@ -643,7 +644,7 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
         )?;
         let mut residual = graph
             .enqueue(
-                entries.input,
+                G::pick(entries.input, &slots),
                 &[
                     ("M", slots.clone()),
                     ("G", Dim::from(1)),
@@ -700,6 +701,7 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
                 mixed,
                 &mut weights,
                 &mut constants,
+                None,
                 None,
             )?;
             blocks.push(BlockPorts {
@@ -906,7 +908,7 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
             Some(
                 graph
                     .enqueue(
-                        entries.chain,
+                        G::pick(entries.chain, &slots),
                         &[
                             ("M", slots.clone()),
                             ("G", Dim::from(1)),

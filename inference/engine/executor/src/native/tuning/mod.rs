@@ -153,6 +153,7 @@ pub(crate) mod per_layer;
 pub mod pinned;
 pub(crate) mod post_norm;
 mod precision;
+pub(crate) mod ranged;
 pub(crate) mod readout;
 mod record;
 pub(crate) mod recurrent;
@@ -1090,12 +1091,18 @@ pub(crate) trait EntryTuning: Clone + 'static {
     fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String>;
     fn points(&self, limits: TuningLimits) -> Vec<PointShape>;
 
+    /// The rows of `launch` this entry's call takes, which its points' rows
+    /// stand for and its kernel is bound by: the step's rows, or a readout's
+    /// projected rows.
+    fn launch_rows(&self, launch: &Launch) -> u64 {
+        launch.rows
+    }
     /// Project a logical graph launch onto this entry's performance
     /// representative: the rows of the point that times it, none where the
     /// unit's kernel does not serve it (another kernel for the same layers
     /// does). Numerical support remains `points`/served dimensions.
     fn invocation_rows(&self, launch: &Launch, representatives: &[u64]) -> Option<u64> {
-        let rows = launch.rows;
+        let rows = self.launch_rows(launch);
         (rows > 0)
             .then(|| {
                 representatives
@@ -1116,10 +1123,13 @@ pub(crate) trait EntryTuning: Clone + 'static {
         Vec::new()
     }
     /// Workload-informed admissible configurations to measure at the start
-    /// of a search. A hint in another structural form replaces that form's
-    /// usual nearest-default start within the same budget slot.
+    /// of a search of the unit serving `rows` of the case's rows
+    /// ([`ranged::Ranged`]; [`ranged::EVERY_ROW`] for a case tuned whole).
+    /// A hint in another structural form replaces that form's usual
+    /// nearest-default start within the same budget slot.
     fn search_starts(
         &self,
+        _rows: &Range<u64>,
         _device: &Device,
         _implementation: &seismic::OnDevice,
         _statics: &NativeSpecialization,
@@ -3331,7 +3341,9 @@ impl<'a, T: EntryTuning> SearchedUnit<'a> for CaseUnit<'a, T> {
         self.search.plan(seismic::UnitPlan {
             settings: SEARCH_SETTINGS,
             min_sample_seconds: MIN_SAMPLE_SECONDS,
-            start: self.case.search_starts(tuner.device, &self.implementation, &self.statics, tuner.limits),
+            start: self
+                .case
+                .search_starts(&ranged::EVERY_ROW, tuner.device, &self.implementation, &self.statics, tuner.limits),
         });
         let cutoff = tuner.started + before;
         let searching = Instant::now();

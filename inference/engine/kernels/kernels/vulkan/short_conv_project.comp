@@ -40,7 +40,7 @@
 #define CONV_H uint(SEISMIC_DIM_H)
 #define CONV_CH uint(SEISMIC_DIM_CH)
 
-projection_prologue short_conv_project_input() {
+projection_prologue projected_input(uint g) {
     return projection_operands(projection_rms(CONV_ACT, SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL),
         SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_NORM), SEISMIC_NORM_STRIDE_0,
         CONV_NORM, element_word_f32(SEISMIC_PARAM_EPS), CONV_H, 0ul), CONV_OPERANDS);
@@ -69,45 +69,31 @@ projection_weights short_conv_project_cw() {
     return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_C_WEIGHT), PACKETS_W1_ROWS, CONV_H, 0ul, 1ul, 0u);
 }
 
-// The GEMV with the activation-row bound `maxm` (`projection_gemv`: one bound
-// per pipeline, so one entry per bound).
-void short_conv_project_gemv_bounded(const uint maxm) {
-    const uint per = projection_gemv_rows(SEISMIC_TUNE_SIMDGROUPS, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES);
-    const uint rows = uint(SEISMIC_DIM_M), tile = gl_WorkGroupID.x, segment = (CONV_CH + per - 1u) / per;
-    const projection_prologue x = short_conv_project_input();
-    if (tile < segment) {
-        projection_gemv(PACKETS_W0, PACKETS_W2, true, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, maxm, PROJECTION_NORM_SHARED, x,
-            short_conv_project_u(), short_conv_project_b(), short_conv_project_x(), rows, CONV_CH, CONV_H, tile);
-    } else {
-        const projection_weights w = short_conv_project_cw();
-        projection_gemv(PACKETS_W1, PACKETS_W1, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, maxm, PROJECTION_NORM_SHARED, x,
-            short_conv_project_c(), w, w, rows, CONV_CH, CONV_H, tile - segment);
-    }
+// Segment 0 pairs the B and X weights into u = B * X, segment 1 is C.
+#define PROJECTION_M uint(SEISMIC_DIM_M)
+#define PROJECTION_K CONV_H
+#define PROJECTION_NORM PROJECTION_NORM_SHARED
+#define PROJECTION_STAGED SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)
+#define PROJECTION_N0 CONV_CH
+#define PROJECTION_N1 CONV_CH
+#define PROJECTION_WEIGHT0 short_conv_project_b()
+#define PROJECTION_PARTNER0 short_conv_project_x()
+#define PROJECTION_PARTNER_KIND0 PACKETS_W2
+#define PROJECTION_WEIGHT1 short_conv_project_cw()
+#define PROJECTION_OUTPUT0 short_conv_project_u()
+#define PROJECTION_OUTPUT1 short_conv_project_c()
+
+// The normalized rows the stage launch formed.
+projection_prologue projected_rows(uint g) {
+    return projection_plain(CONV_ACT, PROJECTION_STAGED, SEISMIC_DIM_H, 1ul, CONV_H, 0ul);
 }
 
-void short_conv_project_gemv1() { short_conv_project_gemv_bounded(1u); }
-void short_conv_project_gemv2() { short_conv_project_gemv_bounded(2u); }
-void short_conv_project_gemv4() { short_conv_project_gemv_bounded(4u); }
-void short_conv_project_gemv8() { short_conv_project_gemv_bounded(8u); }
+#include "lib/projection/operator.glsl"
 
-void short_conv_project_stage() {
-    projection_stage(short_conv_project_input(), gl_WorkGroupID.x, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_NORMALIZED),
-        CONV_H);
-}
-
-// Workgroup column n < S (the u segment's TILE_N / 2-feature tiles) runs the
-// paired GEMM, the rest the C segment's TILE_N-feature tiles.
-void short_conv_project_gemm() {
-    const projection_prologue x = projection_plain(CONV_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_NORMALIZED),
-        SEISMIC_DIM_H, 1ul, CONV_H, 0ul);
-    const uint half_tile = SEISMIC_TUNE_TILE_N / 2u, segment = (CONV_CH + half_tile - 1u) / half_tile;
-    const uint m = uint(SEISMIC_DIM_M), n = gl_WorkGroupID.x;
-    if (n < segment)
-        projection_gemm_paired(PACKETS_W0, PACKETS_W2, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M,
-            SEISMIC_TUNE_SUB_N, x, short_conv_project_u(), short_conv_project_b(), short_conv_project_x(), m,
-            CONV_CH, CONV_H, gl_WorkGroupID.y, n, 0xffffffffu);
-    else
-        projection_gemm(PACKETS_W1, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N, x,
-            short_conv_project_c(), short_conv_project_cw(), m, CONV_CH, CONV_H, gl_WorkGroupID.y, n - segment,
-            0xffffffffu);
-}
+// The `dense` projection's launches (`lib/projection/operator.glsl`).
+void short_conv_project_stage() { projection_dense_stage(); }
+void short_conv_project_gemv1() { projection_segmented_gemv(1u); }
+void short_conv_project_gemv2() { projection_segmented_gemv(2u); }
+void short_conv_project_gemv4() { projection_segmented_gemv(4u); }
+void short_conv_project_gemv8() { projection_segmented_gemv(8u); }
+void short_conv_project_gemm() { projection_segmented_gemm(); }

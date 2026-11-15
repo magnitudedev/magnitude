@@ -7,7 +7,7 @@
 #include "lib/routed/down.glsl"
 #include "lib/routed/down_sum.glsl"
 
-void routed_down() {
+void routed_down_summed() {
     const uint tile = gl_WorkGroupID.x;
     const uint64_t m = gl_WorkGroupID.y;
     const uint hidden = uint(SEISMIC_DIM_H);

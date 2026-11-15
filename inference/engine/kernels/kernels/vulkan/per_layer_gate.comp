@@ -18,13 +18,25 @@
 
 
 #define GATE_D uint(SEISMIC_DIM_D)
-#define GATE_ROUNDED SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_ROUNDED)
 
-projection_prologue per_layer_gate_input() {
-    return projection_plain(GATE_ACT, GATE_ROUNDED, SEISMIC_DIM_D, 1ul, GATE_D, 0ul);
+#define PROJECTION_SINGLE
+#define PROJECTION_M uint(SEISMIC_DIM_M)
+#define PROJECTION_N uint(SEISMIC_DIM_P)
+#define PROJECTION_K GATE_D
+#define PROJECTION_G 1
+#define PROJECTION_NORM PROJECTION_NORM_NONE
+#define PROJECTION_STAGED SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)
+#define PROJECTION_SPLIT SEISMIC_TUNE_SPLIT
+#define PROJECTION_PARTIALS SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS)
+
+// The rows `stage` rounded, read by every form.
+projection_prologue projected_input(uint g) {
+    return projection_plain(GATE_ACT, PROJECTION_STAGED, SEISMIC_DIM_D, 1ul, GATE_D, 0ul);
 }
 
-projection_epilogue per_layer_gate_output() {
+projection_prologue projected_rows(uint g) { return projected_input(g); }
+
+projection_epilogue projected_output(uint g) {
     const uint64_t inputs = SEISMIC_PTR(SEISMIC_BUFFER_INPUTS)
         + uint64_t(int(SEISMIC_PARAM_LAYER)) * SEISMIC_INPUTS_STRIDE_1 * 4ul;
     return projection_scaled(projection_activated_mul(GATE_ACT, SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0,
@@ -33,41 +45,34 @@ projection_epilogue per_layer_gate_output() {
         projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_GATE_SCALE), SEISMIC_DIM_GS, 0ul, 0ul), 1.0);
 }
 
-projection_weights per_layer_gate_weight() {
+projection_weights projected_weight(uint g) {
     return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_GATE_WEIGHT), PACKETS_W0_ROWS, GATE_D, 0ul, 1ul, 0u);
 }
 
-void per_layer_gate_stage() {
+// The `staged` rows: the F32 hidden rows rounded to A (as the gate weight's
+// NVFP4 operands over NVFP4 gate rows), one row a workgroup.
+void per_layer_gate_rows() {
 #if defined(SEISMIC_GATE_WEIGHT_OPERANDS_NVFP4)
     // The hidden rows rounded to A (one part, no norm) as the gate weight's
     // NVFP4 operands.
     projection_stage(projection_operands(projection_summed(GATE_ACT, SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN),
         SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1, GATE_D, 0ul, 1u), PROJECTION_OPERANDS_NVFP4),
-        gl_WorkGroupID.x, GATE_ROUNDED, GATE_D);
+        gl_WorkGroupID.x, PROJECTION_STAGED, GATE_D);
 #else
     const uint64_t m = gl_WorkGroupID.x;
     for (uint i = gl_LocalInvocationID.x; i < GATE_D; i += 256u)
-        element_put(GATE_ACT, GATE_ROUNDED, m * SEISMIC_DIM_D + i, element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN)
+        element_put(GATE_ACT, PROJECTION_STAGED, m * SEISMIC_DIM_D + i, element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN)
             + (m * SEISMIC_HIDDEN_STRIDE_0 + uint64_t(i) * SEISMIC_HIDDEN_STRIDE_1) * 4ul));
 #endif
 }
 
-// The GEMV with the activation-row bound `maxm` (`projection_gemv`: one bound
-// per pipeline, so one entry per bound).
-void per_layer_gate_gemv_bounded(const uint maxm) {
-    const projection_weights w = per_layer_gate_weight();
-    projection_gemv(PACKETS_W0, PACKETS_W0, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, maxm, PROJECTION_NORM_NONE,
-        per_layer_gate_input(), per_layer_gate_output(), w, w, uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_P), GATE_D,
-        gl_WorkGroupID.x);
-}
+#include "lib/projection/operator.glsl"
 
-void per_layer_gate_gemv1() { per_layer_gate_gemv_bounded(1u); }
-void per_layer_gate_gemv2() { per_layer_gate_gemv_bounded(2u); }
-void per_layer_gate_gemv4() { per_layer_gate_gemv_bounded(4u); }
-void per_layer_gate_gemv8() { per_layer_gate_gemv_bounded(8u); }
-
-void per_layer_gate_gemm() {
-    projection_gemm(PACKETS_W0, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N,
-        per_layer_gate_input(), per_layer_gate_output(), per_layer_gate_weight(), uint(SEISMIC_DIM_M),
-        uint(SEISMIC_DIM_P), GATE_D, gl_WorkGroupID.y, gl_WorkGroupID.x, 0xffffffffu);
-}
+// The `dense` projection's launches (`lib/projection/operator.glsl`).
+void per_layer_gate_stage() { per_layer_gate_rows(); }
+void per_layer_gate_gemv1() { projection_single_gemv(1u); }
+void per_layer_gate_gemv2() { projection_single_gemv(2u); }
+void per_layer_gate_gemv4() { projection_single_gemv(4u); }
+void per_layer_gate_gemv8() { projection_single_gemv(8u); }
+void per_layer_gate_gemm() { projection_single_gemm(); }
+void per_layer_gate_finalize() { projection_single_finalize(); }

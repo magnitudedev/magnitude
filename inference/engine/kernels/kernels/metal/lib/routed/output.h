@@ -8,7 +8,10 @@
 // channel's row (`routed::project_channels`).
 //
 // The projections meet in threadgroup memory; their join is
-// `lib/routed/output_sum.h`'s.
+// `lib/routed/output_sum.h`'s. Gathered (`routed_output`'s GATHERED,
+// `routed::project_gathered`), a simdgroup projects each choice of its
+// expert, or row 0's shared expert simdgroup every row, in turn, each as
+// that slot's simdgroup of its row projects it.
 
 #define KERNEL_W0 SEISMIC_EXPERT_DOWN
 #define KERNEL_W1 SEISMIC_SHARED_DOWN
@@ -35,25 +38,25 @@ template <uint ROWS, uint LANES> constexpr uint output_region() {
     return projection_region<output_tile<ROWS, LANES>(), output_stage<LANES>()>();
 }
 
-// Simdgroup `sg`'s projection: choice k = sg < K of row m (its down rows of
-// `expert_down`, `choice_record`, `choice_weights`: a bank record of its
-// table or a host tier record of `tier_down` read in place), or the shared
-// expert (sg = K), into
-// `projected` (TILE channels from `first`; its `output_region()` floats, a
-// stage of its product while it projects).
+// Slot `slot`'s projection of row m, by one simdgroup: choice k = slot < K
+// (its down rows of `expert_down`, `decode_source`, `expert_matrix`: a bank
+// record of its table or a host tier record of `tier_down` read in place),
+// or the shared expert (slot K), into `projected` (TILE channels from
+// `first`; its `output_region()` floats, a stage of its product while it
+// projects).
 template <uint ROWS, uint LANES>
 inline void output_project(device const uchar *expert_product, device const uchar *shared_product,
     device const int *routes, device const int *sources, device const ulong *expert_down,
-    device const ulong *tier_down, device const uchar *shared_down, ulong m, uint first, uint sg, uint lane,
+    device const ulong *tier_down, device const uchar *shared_down, ulong m, uint first, uint slot, uint lane,
     threadgroup float *projected, constant ulong *seismic_words) {
     constexpr uint TILE = output_tile<ROWS, LANES>();
     constexpr uint K = uint(SEISMIC_DIM_K);
     const uint rows = uint(SEISMIC_DIM_H);
-    if (sg < K) {
-        const ulong k = sg;
-        const int record = choice_record(expert_down, sources, ROUTED_SOURCE_ROWS, SEISMIC_SOURCES_STRIDE_1,
+    if (slot < K) {
+        const ulong k = slot;
+        const slab::Source source = decode_source(sources, ROUTED_SOURCE_ROWS, SEISMIC_SOURCES_STRIDE_1,
             SEISMIC_SOURCES_STRIDE_2, m, k, routes[m * SEISMIC_ROUTES_STRIDE_0 + k * SEISMIC_ROUTES_STRIDE_1]);
-        if (record == -1) {
+        if (source.none()) {
             // A choice reading no record (the CPU's, or a failed one): a zero
             // projection.
             for (uint channel = lane; channel < TILE; channel += 32)
@@ -63,8 +66,8 @@ inline void output_project(device const uchar *expert_product, device const ucha
         const auto in = activation(expert_product
                 + (m * SEISMIC_EXPERT_PRODUCT_STRIDE_0 + k * SEISMIC_EXPERT_PRODUCT_STRIDE_1) * Act::bytes,
             0, SEISMIC_EXPERT_PRODUCT_STRIDE_2, uint(SEISMIC_DIM_F));
-        const auto down = choice_weights<packets::W0>(expert_down, tier_down, record, KERNEL_W0_LAYOUT(SEISMIC_DIM_F),
-            SEISMIC_DIM_H, SEISMIC_DIM_F);
+        const auto down = expert_matrix<packets::W0>(Experts{expert_down, tier_down}, source,
+            KERNEL_W0_LAYOUT(SEISMIC_DIM_F), SEISMIC_DIM_F);
         // The down weights' operand rows (the product rows, or NVFP4
         // operands), which each simdgroup forms alone.
         const auto x = projection::operands<projection::OperandRecipe<packets::W0_OPERANDS_NVFP4>::NVFP4>::lone_row(

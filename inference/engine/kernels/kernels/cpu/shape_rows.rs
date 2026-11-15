@@ -1,10 +1,12 @@
 // shape_rows on CPU (contract and portable body in sampling.seismic).
 //
-// `shape_rows_prepare` gives each work item one of PARTS contiguous
-// vocabulary slices of a row: it rewrites the slice's logits in place as their
-// penalized and tempered values (-inf where a constrained row's mask rejects a
-// finite value), reading each logit once, and keeps the slice maximum and a
-// non-finite flag in scratch.
+// `shape_rows_prepare` has one work item per pool participant: the rows'
+// logits, flattened, split into equal spans (`lib/core/flat`). For each row's
+// piece of its span, an item rewrites the piece's logits in place as their
+// penalized and tempered values (-inf where a constrained row's mask rejects
+// a finite value), reading each logit once, and keeps the piece's maximum and
+// a non-finite flag in the piece's slot; the last item to finish a row's
+// pieces (`lib/core/arrive`) combines them into the row's `maxima` record.
 // `shape_rows_filter` gives each work item one row: it finds the top-k
 // threshold (the k-th largest value; every tie of it is kept) by selection,
 // applies min-p, and ranks the top-k and min-p survivors by descending value
@@ -18,6 +20,7 @@
 // whose maximum is -inf, is left unfiltered (sampling reports it).
 
 use lib::core::functions::finite_ordered_key;
+use lib::core::{arrive, flat};
 
 /// exp(value - maximum) as a 64-bit 2^-32 fixed-point mass.
 #[inline(always)]
@@ -80,20 +83,48 @@ fn shaping<E: Elements>(cx: &Context<'_, E>, row: usize) -> Shaping {
 
 #[inline(always)]
 fn shape_rows_prepare<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
-    let (part, row) = (group[0] as usize, group[1] as usize);
-    let parts = cx.param_parts() as usize;
-    let vocabulary = cx.dim_v() as usize;
-    let span = vocabulary.div_ceil(parts);
-    let begin = (part * span).min(vocabulary);
-    let end = (begin + span).min(vocabulary);
-    // SAFETY: each work item writes its own (row, part) pair.
-    let partial = unsafe { cx.scratch_partials().slice_mut::<u32>(8 * (row * parts + part), 2) };
-    if begin == end {
-        partial.copy_from_slice(&[f32::NEG_INFINITY.to_bits(), 0]);
-        return;
+    let (span, spans) = (group[0] as usize, cx.groups()[0] as usize);
+    let (rows, vocabulary) = (cx.dim_sx() as usize, cx.dim_v() as usize);
+    // Rows without a token have nothing to shape (`shape_rows_filter`).
+    let Some(flat) = flat::Flat::new(rows, vocabulary, spans) else { return };
+    for piece in flat.pieces(span) {
+        let row = piece.row;
+        let (maximum, nonfinite) = shape_piece(cx, row, piece.columns, shared);
+        // SAFETY: each piece's slot is its own (`Flat`).
+        unsafe { cx.scratch_partials().slice_mut::<u32>(8 * piece.slot, 2) }
+            .copy_from_slice(&[maximum.to_bits(), u32::from(nonfinite)]);
+        let pieces = flat.spans_of(row);
+        // SAFETY: one counter a row of the launch's `arrivals` scratch, each
+        // span holding the row's values arriving once, after its partial.
+        let last = unsafe { arrive::last(cx.scratch_arrivals().pointer::<u32>(4 * row), pieces.len() as u32) };
+        if last {
+            // SAFETY: every piece of the row stored its partial before it
+            // arrived; the last writes the row's record alone.
+            let (partials, record) = unsafe {
+                (
+                    cx.scratch_partials().slice::<u32>(8 * (pieces.start + row), 2 * pieces.len()),
+                    cx.scratch_maxima().slice_mut::<u32>(8 * row, 2),
+                )
+            };
+            let mut maximum = f32::NEG_INFINITY;
+            let mut nonfinite = 0;
+            for partial in partials.chunks_exact(2) {
+                maximum = maximum.max(f32::from_bits(partial[0]));
+                nonfinite |= partial[1];
+            }
+            record.copy_from_slice(&[maximum.to_bits(), nonfinite]);
+        }
     }
+}
+
+/// Shapes `columns` of row `row` in place (the history tokens among them
+/// staged in `shared`): their maximum, and whether any is NaN or +inf.
+#[inline(always)]
+fn shape_piece<E: Elements>(cx: &Context<'_, E>, row: usize, columns: std::ops::Range<usize>, shared: &mut [u8]) -> (f32, bool) {
+    let (begin, end) = (columns.start, columns.end);
     let s = shaping(cx, row);
-    // SAFETY: each work item rewrites its own slice of its row.
+    // SAFETY: a piece is its span's alone, so each work item rewrites its
+    // own columns of the row.
     let mut values = unsafe { cx.arg_logits().span_mut([row, begin], end - begin) };
     values.compute(|values| {
         // The history tokens of this slice, sorted, so each penalized token
@@ -139,28 +170,23 @@ fn shape_rows_prepare<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u
         }
         let maximum = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let nonfinite = values.iter().any(|value| value.is_nan() || *value == f32::INFINITY);
-        partial.copy_from_slice(&[maximum.to_bits(), u32::from(nonfinite)]);
-    });
+        (maximum, nonfinite)
+    })
 }
 
 #[inline(always)]
 fn shape_rows_filter<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let row = group[0] as usize;
-    let parts = cx.param_parts() as usize;
     let vocabulary = cx.dim_v() as usize;
     let s = shaping(cx, row);
     let (top_k, min_p, top_p) = (s.top_k > 0, s.min_p > 0.0, s.top_p < 1.0);
-    if s.temperature == 0.0 || !(top_k || min_p || top_p) {
+    if vocabulary == 0 || s.temperature == 0.0 || !(top_k || min_p || top_p) {
         return;
     }
-    // SAFETY: the prepare launch wrote every pair before this launch.
-    let partials = unsafe { cx.scratch_partials().slice::<u32>(8 * row * parts, 2 * parts) };
-    let mut maximum = f32::NEG_INFINITY;
-    let mut nonfinite = 0;
-    for partial in partials.chunks_exact(2) {
-        maximum = maximum.max(f32::from_bits(partial[0]));
-        nonfinite |= partial[1];
-    }
+    // SAFETY: the prepare launch wrote every row's record before this
+    // launch.
+    let record = unsafe { cx.scratch_maxima().slice::<u32>(8 * row, 2) };
+    let (maximum, nonfinite) = (f32::from_bits(record[0]), record[1]);
     if nonfinite != 0 || maximum == f32::NEG_INFINITY {
         return;
     }

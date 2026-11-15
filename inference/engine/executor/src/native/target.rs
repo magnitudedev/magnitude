@@ -24,8 +24,9 @@ use magnitude_kernels::{short_conv_project, short_conv_rows};
 use magnitude_kernels::{
     candidate_blocks, candidate_rows, indexer_keys, indexer_score, pool_rows, rows_topk, unit_reads,
 };
-use seismic::NativeKernel;
+use seismic::{Dim, Entry, NativeKernel};
 use std::collections::HashMap;
+use std::ops::Range;
 
 /// Immutable decoder-stage specializations keyed by semantic bindings.
 #[derive(Debug, Default)]
@@ -52,21 +53,25 @@ pub struct TargetKernels {
     pub(super) banks: HashMap<(crate::planning::BankedFeedForward, crate::BankBinding), ExpertBankKernels>,
 }
 
-/// A streamed layer's decode routes, one by `AHEAD`: without hints (the
-/// last streamed layer), then at each count of leads up to `HINT_LEADS`
-/// (`ExpertBankPlan::ahead`: the layer before the last has one).
-pub(crate) const LEADS: usize = crate::planning::HINT_LEADS as usize + 1;
-
-/// A streamed layer's decode route and resolve by its routed form, each by
-/// `AHEAD` ([`LEADS`]): a lead's kernel where a layer of the binding
-/// launches it, none where none does (a binding without the last streamed
-/// layer has no `AHEAD` 0 launch, one of only that layer no other).
+/// A streamed layer's decode route and resolve by its routed form, plus its
+/// ahead-of-step hint launches by `AHEAD` (`1..=HINT_LEADS`): a lead's hint
+/// kernel where a layer of the binding launches it, none where none does.
 #[derive(Clone, Debug)]
 pub enum BankRouteKernels {
-    /// The fused form's routing and shared product (`routed_route_shared`'s).
-    Fused([Option<NativeKernel<magnitude_kernels::routed_route_streamed::Entry>>; LEADS]),
-    /// The general form's selection (`routed_select`'s).
-    General([Option<NativeKernel<magnitude_kernels::routed_select_streamed::Entry>>; LEADS]),
+    /// The fused form's routing and shared product (`routed_route_shared`'s),
+    /// by row range, and its hint launches (`routed_hint_route`).
+    Fused {
+        activation: seismic::Element,
+        route: RangedKernels<magnitude_kernels::routed_route_streamed::Entry>,
+        hints: [Option<NativeKernel<magnitude_kernels::routed_hint_route::Entry>>; crate::planning::HINT_LEADS as usize],
+    },
+    /// The general form's selection (`routed_select`'s), and its hint
+    /// launches (`routed_hint_select`).
+    General {
+        activation: seismic::Element,
+        select: NativeKernel<magnitude_kernels::routed_select_streamed::Entry>,
+        hints: [Option<NativeKernel<magnitude_kernels::routed_hint_select::Entry>>; crate::planning::HINT_LEADS as usize],
+    },
 }
 
 /// The routed form whose decode route a bank's entries take.
@@ -163,17 +168,18 @@ impl BankSite {
 
 /// A streamed layer's combine with the CPU's answer, by its routed form:
 /// the GPU's projections (`project`, which run while the CPU computes its
-/// misses), then their sum waiting for the CPU's answer (`sited`): the fused form's output (`routed_output_project`,
-/// `routed_output_sited`) or the general form's down (`routed_down_project`,
-/// `routed_down_sited`).
+/// misses; by row range, each range following its resident combine's), then
+/// their sum waiting for the CPU's answer (`sited`): the fused form's output
+/// (`routed_output_project`, `routed_output_sited`) or the general form's
+/// down (`routed_down_project`, `routed_down_sited`).
 #[derive(Clone, Debug)]
 pub enum BankCombine {
     Fused {
-        project: NativeKernel<magnitude_kernels::routed_output_project::Entry>,
+        project: RangedKernels<magnitude_kernels::routed_output_project::Entry>,
         sited: NativeKernel<magnitude_kernels::routed_output_sited::Entry>,
     },
     General {
-        project: NativeKernel<magnitude_kernels::routed_down_project::Entry>,
+        project: RangedKernels<magnitude_kernels::routed_down_project::Entry>,
         sited: NativeKernel<magnitude_kernels::routed_down_sited::Entry>,
     },
 }
@@ -230,19 +236,21 @@ impl ExpertBankKernels {
         form: BankRouteForm,
     ) -> Result<bool, seismic::CheckedBundleError> {
         use magnitude_kernels::{
-            routed_copy, routed_land, routed_list_grid, routed_pass_map, routed_round, routed_route_streamed,
-            routed_scratch_grids, routed_scratch_request, routed_seed_commit, routed_select_streamed, routed_step,
+            routed_copy, routed_hint_route, routed_hint_select, routed_land, routed_list_grid,
+            routed_pass_map, routed_round, routed_route_streamed, routed_scratch_grids, routed_scratch_request,
+            routed_seed_commit, routed_select_streamed, routed_step,
         };
         type Declares = fn(seismic::BackendName) -> Result<bool, seismic::CheckedBundleError>;
         fn declares<E: seismic::Entry>(backend: seismic::BackendName) -> Result<bool, seismic::CheckedBundleError> {
             seismic::generated::native_implementation_for_backend::<E>(backend).map(|native| native.is_some())
         }
-        let route: Declares = match form {
-            BankRouteForm::Fused => declares::<routed_route_streamed::Entry>,
-            BankRouteForm::General => declares::<routed_select_streamed::Entry>,
+        let (route, hint): (Declares, Declares) = match form {
+            BankRouteForm::Fused => (declares::<routed_route_streamed::Entry>, declares::<routed_hint_route::Entry>),
+            BankRouteForm::General => (declares::<routed_select_streamed::Entry>, declares::<routed_hint_select::Entry>),
         };
-        let bank: [Declares; 10] = [
+        let bank: [Declares; 11] = [
             route,
+            hint,
             declares::<routed_land::Entry>,
             declares::<routed_step::Entry>,
             declares::<routed_scratch_request::Entry>,
@@ -270,8 +278,8 @@ impl ExpertBankKernels {
 pub struct NGramKernels {
     pub rows: NativeKernel<magnitude_kernels::ngram_rows::Entry>,
     pub stored: NativeKernel<magnitude_kernels::stored_rows::Entry>,
-    pub key: NativeKernel<project_rows::Entry>,
-    pub value: NativeKernel<project_rows::Entry>,
+    pub key: RangedKernels<project_rows::Entry>,
+    pub value: RangedKernels<project_rows::Entry>,
     pub gate: NativeKernel<magnitude_kernels::ngram_gate::Entry>,
     pub output: NGramOutputKernel,
 }
@@ -289,8 +297,8 @@ pub enum NGramOutputKernel {
 /// second (`up`).
 #[derive(Clone, Debug)]
 pub struct MixSiteKernels {
-    pub down: NativeKernel<magnitude_kernels::stream_mix_down::Entry>,
-    pub up: NativeKernel<magnitude_kernels::stream_mix_up::Entry>,
+    pub down: RangedKernels<magnitude_kernels::stream_mix_down::Entry>,
+    pub up: RangedKernels<magnitude_kernels::stream_mix_up::Entry>,
 }
 
 /// The entries of Sinkhorn streams (`operators::streams`): every site's
@@ -323,9 +331,8 @@ pub struct StreamsKernels {
 /// site that binds it.
 #[derive(Debug, Default)]
 pub struct StreamsEntryKernels {
-    pub(super) down:
-        HashMap<MixDownBinding, NativeKernel<magnitude_kernels::stream_mix_down::Entry>>,
-    pub(super) up: HashMap<MixUpBinding, NativeKernel<magnitude_kernels::stream_mix_up::Entry>>,
+    pub(super) down: HashMap<MixDownBinding, RangedKernels<magnitude_kernels::stream_mix_down::Entry>>,
+    pub(super) up: HashMap<MixUpBinding, RangedKernels<magnitude_kernels::stream_mix_up::Entry>>,
     pub(super) sinkhorn: HashMap<SinkhornBinding, SinkhornKernels>,
     pub(super) repeat: Option<NativeKernel<magnitude_kernels::repeat_rows::Entry>>,
 }
@@ -359,8 +366,8 @@ impl StreamsEntryKernels {
 /// tail.
 #[derive(Clone, Debug)]
 pub struct ParallelKernels {
-    pub expand: NativeKernel<dense_expand::Entry>,
-    pub down: NativeKernel<magnitude_kernels::project_rows::Entry>,
+    pub expand: RangedKernels<dense_expand::Entry>,
+    pub down: RangedKernels<magnitude_kernels::project_rows::Entry>,
     pub routed: GeneralRoutedKernels,
     pub tail: NativeKernel<magnitude_kernels::moe_tail::Entry>,
 }
@@ -377,7 +384,7 @@ pub struct ParallelKernels {
 #[derive(Clone, Debug)]
 pub struct PerLayerEntryKernels {
     pub round: NativeKernel<magnitude_kernels::import_dense::Entry>,
-    pub project: NativeKernel<magnitude_kernels::project_rows::Entry>,
+    pub project: RangedKernels<magnitude_kernels::project_rows::Entry>,
     pub table: TableConversion,
     pub inputs: NativeKernel<magnitude_kernels::per_layer_inputs::Entry>,
     pub copy: NativeKernel<magnitude_kernels::conditioning_overlay::Entry>,
@@ -394,7 +401,7 @@ pub enum TableConversion {
 /// per-layer inputs, and the post-norm tail of its projection.
 #[derive(Clone, Debug)]
 pub struct PerLayerKernels {
-    pub gate: NativeKernel<magnitude_kernels::per_layer_gate::Entry>,
+    pub gate: RangedKernels<magnitude_kernels::per_layer_gate::Entry>,
     pub output: PostNormKernels,
 }
 
@@ -404,7 +411,7 @@ pub struct PerLayerKernels {
 #[derive(Clone, Debug)]
 pub struct TapKernels {
     pub tap: NativeKernel<tap_rows::Entry>,
-    pub fusion: NativeKernel<project_rows::Entry>,
+    pub fusion: RangedKernels<project_rows::Entry>,
     pub features: NativeKernel<feature_rows::Entry>,
 }
 
@@ -421,8 +428,8 @@ pub struct ReadoutKernels {
 pub enum ReadoutHeadKernels {
     /// The head GEMV, and its projection of selected vocabulary rows.
     Packed {
-        head: NativeKernel<readout_head_rows::Entry>,
-        selected: NativeKernel<readout_selected_rows::Entry>,
+        head: RangedKernels<readout_head_rows::Entry>,
+        selected: RangedKernels<readout_selected_rows::Entry>,
     },
     Qualified {
         packed: Box<ReadoutHeadKernels>,
@@ -446,23 +453,26 @@ pub struct RoutedKernels {
     pub route: NativeKernel<routed_route::Entry>,
     /// Decode form (row classes up to the GEMV bound).
     pub decode: RoutedDecodeKernels,
-    pub output: NativeKernel<routed_output::Entry>,
+    pub output: RangedKernels<routed_output::Entry>,
+    /// The element `output` binds its operand norm at (`NW`): the layer's
+    /// own norm's (`RoutedBinding::norm`).
+    pub operand_norm: seismic::Element,
     /// Grouped form (larger row classes).
     pub group: NativeKernel<routed_group::Entry>,
-    pub experts: NativeKernel<routed_experts::Entry>,
-    pub combine: NativeKernel<routed_combine::Entry>,
+    pub experts: RangedKernels<routed_experts::Entry>,
+    pub combine: RangedKernels<routed_combine::Entry>,
 }
 
 /// The decode rows' routing and expansions, by the backend's
-/// `DecodeForm`.
+/// `DecodeForm`; each projection's by row range.
 #[derive(Clone, Debug)]
 pub enum RoutedDecodeKernels {
     /// `routed_route`, then the choices' and the shared expert's gate/up.
-    Expand(NativeKernel<routed_expand::Entry>),
+    Expand(RangedKernels<routed_expand::Entry>),
     /// The routing with the shared expert's gate/up, then the choices'.
     SharedRoute {
-        route: NativeKernel<routed_route_shared::Entry>,
-        choices: NativeKernel<routed_gate_up::Entry>,
+        route: RangedKernels<routed_route_shared::Entry>,
+        choices: RangedKernels<routed_gate_up::Entry>,
     },
 }
 
@@ -472,13 +482,13 @@ pub enum RoutedDecodeKernels {
 #[derive(Clone, Debug)]
 pub struct AttentionKernels {
     pub codec: magnitude_state::CodecSpec,
-    pub project: NativeKernel<attention_project::Entry>,
+    pub project: RangedKernels<attention_project::Entry>,
     pub history: AttentionHistoryKernels,
-    pub output: SublayerOutput<NativeKernel<attention_output::Entry>>,
+    pub output: SublayerOutput<RangedKernels<attention_output::Entry>>,
     /// A grouped output's first product (`AttentionBinding::grouped`).
-    pub grouped: Option<NativeKernel<project_rows::Entry>>,
+    pub grouped: Option<RangedKernels<project_rows::Entry>>,
     /// An absorbed query's per-head products (`AttentionBinding::absorbed`).
-    pub absorbed: Option<NativeKernel<project_rows::Entry>>,
+    pub absorbed: Option<RangedKernels<project_rows::Entry>>,
     /// A selected read's indexer and selected prefill
     /// (`AttentionBinding::selection`).
     pub selection: Option<SelectionKernels>,
@@ -504,10 +514,10 @@ pub struct PickedKernels {
 /// projection and write.
 #[derive(Clone, Debug)]
 pub struct PooledKernels {
-    pub project: NativeKernel<attention_project::Entry>,
+    pub project: RangedKernels<attention_project::Entry>,
     pub widen: NativeKernel<widen_rows::Entry>,
     pub pool: PoolKernel,
-    pub key_project: NativeKernel<attention_project::Entry>,
+    pub key_project: RangedKernels<attention_project::Entry>,
     pub keys: NativeKernel<indexer_keys::Entry>,
 }
 
@@ -526,8 +536,8 @@ pub enum PoolKernel {
 /// indexer's candidate pool's block scores and rows.
 #[derive(Clone, Debug)]
 pub struct IndexerKernels {
-    pub query_project: NativeKernel<attention_project::Entry>,
-    pub weights_project: Option<NativeKernel<attention_project::Entry>>,
+    pub query_project: RangedKernels<attention_project::Entry>,
+    pub weights_project: Option<RangedKernels<attention_project::Entry>>,
     pub score: NativeKernel<indexer_score::Entry>,
     pub topk: NativeKernel<rows_topk::Entry>,
     pub candidates: Option<CandidateKernels>,
@@ -546,7 +556,7 @@ pub struct CandidateKernels {
 #[derive(Clone, Debug)]
 pub struct LowRankQueryKernels {
     pub widen: NativeKernel<widen_rows::Entry>,
-    pub project: NativeKernel<attention_project::Entry>,
+    pub project: RangedKernels<attention_project::Entry>,
 }
 
 /// A selected read's entries over token rows (`graph::select`): its keys'
@@ -568,7 +578,7 @@ pub struct SelectionKernels {
 /// (`pool_rows`).
 #[derive(Clone, Debug)]
 pub struct SelectionKeyKernels {
-    pub project: NativeKernel<attention_project::Entry>,
+    pub project: RangedKernels<attention_project::Entry>,
     pub widen: NativeKernel<widen_rows::Entry>,
     pub pool: NativeKernel<pool_rows::Entry>,
 }
@@ -591,7 +601,7 @@ pub enum SublayerOutput<K> {
 
 #[derive(Clone, Debug)]
 pub struct PostNormKernels {
-    pub project: NativeKernel<project_rows::Entry>,
+    pub project: RangedKernels<project_rows::Entry>,
     pub residual: NativeKernel<post_norm_residual::Entry>,
 }
 
@@ -619,6 +629,66 @@ pub enum AttentionHistoryKernels {
     },
 }
 
+/// One entry's kernels by the rows its launches take: its distinct choices
+/// over the ranges it is tuned at
+/// ([`row_ranges`](super::tuning::ranged::row_ranges)), neighbouring ranges
+/// tuned to one choice held as one kernel over the rows of them all
+/// (`Specializer::tuned_ranges`). A node binds the kernel of the range its
+/// rows lie in.
+pub struct RangedKernels<E: Entry> {
+    /// Ascending by range, the first starting at the entry's first row:
+    /// each range's kernel serves every row from its start to the next
+    /// range's.
+    parts: Vec<(Range<u64>, NativeKernel<E>)>,
+}
+
+impl<E: Entry> Clone for RangedKernels<E> {
+    fn clone(&self) -> Self {
+        Self {
+            parts: self.parts.clone(),
+        }
+    }
+}
+
+impl<E: Entry> std::fmt::Debug for RangedKernels<E> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_list().entries(&self.parts).finish()
+    }
+}
+
+impl<E: Entry> RangedKernels<E> {
+    /// `parts` are the entry's kernels by the rows each serves, ascending.
+    ///
+    /// # Panics
+    ///
+    /// Without a range, or with ranges out of order.
+    pub fn new(parts: Vec<(Range<u64>, NativeKernel<E>)>) -> Self {
+        assert!(!parts.is_empty(), "a ranged kernel holds a range");
+        assert!(
+            parts.windows(2).all(|pair| pair[0].0.end <= pair[1].0.start),
+            "ranges ascend"
+        );
+        Self { parts }
+    }
+
+    /// The kernel of the lowest range: what a caller that reads only the
+    /// entry's layout, which every range shares, binds.
+    pub fn first(&self) -> &NativeKernel<E> {
+        &self.parts[0].1
+    }
+
+    /// The kernel of the range `rows` lie in: the highest that starts at or
+    /// below them. Each comparison is recorded, so a recorded graph holds
+    /// the kernel only at the rows its trace checks.
+    pub fn for_rows(&self, rows: &Dim) -> &NativeKernel<E> {
+        self.parts[1..]
+            .iter()
+            .rev()
+            .find(|(range, _)| rows.at_least(range.start))
+            .map_or(&self.parts[0].1, |(_, kernel)| kernel)
+    }
+}
+
 /// What attends a dense history's decode row classes
 /// (`graph::dense_decodes`).
 #[derive(Clone, Debug)]
@@ -632,8 +702,8 @@ pub enum DenseDecodeKernels {
 
 #[derive(Clone, Debug)]
 pub struct DenseKernels {
-    pub expand: NativeKernel<dense_expand::Entry>,
-    pub output: SublayerOutput<NativeKernel<dense_output::Entry>>,
+    pub expand: RangedKernels<dense_expand::Entry>,
+    pub output: SublayerOutput<RangedKernels<dense_output::Entry>>,
 }
 
 /// A recurrent block: normed projection, the state advance publishing the
@@ -642,7 +712,7 @@ pub struct DenseKernels {
 #[derive(Clone, Debug)]
 pub struct RecurrentKernels {
     pub form: RecurrentFormKernels,
-    pub output: NativeKernel<attention_output::Entry>,
+    pub output: RangedKernels<attention_output::Entry>,
 }
 
 /// The projection and state entries of a layer's `RecurrentForm`.
@@ -652,7 +722,7 @@ pub enum RecurrentFormKernels {
     Gated {
         /// The chunked row classes' projection, and every row class's in
         /// the step form.
-        project: NativeKernel<gated_delta_project::Entry>,
+        project: RangedKernels<gated_delta_project::Entry>,
         /// The step row classes, by the backend's `StepForm`.
         step: RecurrentStepKernels,
         chunk: NativeKernel<gated_delta_chunk::Entry>,
@@ -666,9 +736,9 @@ pub enum RecurrentFormKernels {
 /// projections (`project_rows`) and the state entries.
 #[derive(Clone, Debug)]
 pub struct KimiKernels {
-    pub project: NativeKernel<attention_project::Entry>,
-    pub gate_up: NativeKernel<project_rows::Entry>,
-    pub alpha_up: NativeKernel<project_rows::Entry>,
+    pub project: RangedKernels<attention_project::Entry>,
+    pub gate_up: RangedKernels<project_rows::Entry>,
+    pub alpha_up: RangedKernels<project_rows::Entry>,
     pub step: NativeKernel<kimi_delta_step::Entry>,
     pub chunk: NativeKernel<kimi_delta_chunk::Entry>,
 }
@@ -680,29 +750,30 @@ pub enum RecurrentStepKernels {
     Step(NativeKernel<gated_delta_step::Entry>),
     /// The projection that also convolves, then the step over its channels.
     Convolved {
-        project: NativeKernel<gated_delta_project_convolved::Entry>,
+        project: RangedKernels<gated_delta_project_convolved::Entry>,
         step: NativeKernel<gated_delta_step_convolved::Entry>,
     },
 }
 
-/// A general routed feed-forward (`operators::routed`).
+/// A general routed feed-forward (`operators::routed`); each projection's
+/// kernels by row range.
 #[derive(Clone, Debug)]
 pub struct GeneralRoutedKernels {
     pub select: NativeKernel<routed_select::Entry>,
     pub experts: ExpertKernels,
     /// Decode rows: the weighted down projections onto the base.
-    pub down: NativeKernel<routed_down::Entry>,
+    pub down: RangedKernels<routed_down::Entry>,
     /// Grouped rows: tiles, and the unpermuted weighted sum onto the base.
     pub group: NativeKernel<routed_group::Entry>,
     pub scatter: NativeKernel<routed_scatter::Entry>,
     /// The shared expert: expansion, then its down projection onto the
     /// residual.
-    pub shared: Option<(DenseExpansionKernel, NativeKernel<dense_output::Entry>)>,
+    pub shared: Option<(DenseExpansionKernel, RangedKernels<dense_output::Entry>)>,
     /// A latent operator's down projection (into activations) and up
     /// projection onto the base.
     pub latent: Option<(
-        NativeKernel<project_rows::Entry>,
-        NativeKernel<dense_output::Entry>,
+        RangedKernels<project_rows::Entry>,
+        RangedKernels<dense_output::Entry>,
     )>,
 }
 
@@ -710,20 +781,20 @@ pub struct GeneralRoutedKernels {
 #[derive(Clone, Debug)]
 pub enum ExpertKernels {
     Gated {
-        decode: NativeKernel<routed_gate_up::Entry>,
-        grouped: NativeKernel<routed_experts::Entry>,
+        decode: RangedKernels<routed_gate_up::Entry>,
+        grouped: RangedKernels<routed_experts::Entry>,
     },
     Plain {
-        decode: NativeKernel<routed_up::Entry>,
-        grouped: NativeKernel<routed_experts_up::Entry>,
+        decode: RangedKernels<routed_up::Entry>,
+        grouped: RangedKernels<routed_experts_up::Entry>,
     },
 }
 
 /// A dense expansion: gated (`dense_expand`) or up-only (`dense_up`).
 #[derive(Clone, Debug)]
 pub enum DenseExpansionKernel {
-    Gated(NativeKernel<dense_expand::Entry>),
-    Plain(NativeKernel<dense_up::Entry>),
+    Gated(RangedKernels<dense_expand::Entry>),
+    Plain(RangedKernels<dense_up::Entry>),
 }
 
 /// A state-space block (`operators::state_space`): the normed projection
@@ -731,11 +802,11 @@ pub enum DenseExpansionKernel {
 /// rest), the gated group norm, and the output projection plus residual.
 #[derive(Clone, Debug)]
 pub struct StateSpaceKernels {
-    pub project: NativeKernel<attention_project::Entry>,
+    pub project: RangedKernels<attention_project::Entry>,
     pub step: NativeKernel<state_space_step::Entry>,
     pub chunk: NativeKernel<state_space_chunk::Entry>,
     pub gate: NativeKernel<state_space_gate::Entry>,
-    pub output: NativeKernel<attention_output::Entry>,
+    pub output: RangedKernels<attention_output::Entry>,
 }
 
 /// A short-convolution block (`operators::short_conv`): the normed
@@ -743,9 +814,9 @@ pub struct StateSpaceKernels {
 /// and the output projection plus residual.
 #[derive(Clone, Debug)]
 pub struct ShortConvKernels {
-    pub project: NativeKernel<short_conv_project::Entry>,
+    pub project: RangedKernels<short_conv_project::Entry>,
     pub rows: NativeKernel<short_conv_rows::Entry>,
-    pub output: SublayerOutput<NativeKernel<attention_output::Entry>>,
+    pub output: SublayerOutput<RangedKernels<attention_output::Entry>>,
 }
 
 #[cfg(test)]

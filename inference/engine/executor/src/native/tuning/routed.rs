@@ -3,7 +3,9 @@
 //! `routed_route_shared` and `routed_gate_up` where the backend declares the
 //! former, and `routed_output`) are tuned at the decode row points, the grouped
 //! entries (`routed_group`, `routed_experts`,
-//! `routed_combine`) at the grouped ones. Routing tables are synthetic:
+//! `routed_combine`) at the grouped ones; each projecting entry is tuned
+//! per row range of the rows it serves (`ranged::row_ranges` of
+//! [`DECODE_SERVED`] or [`GROUPED_SERVED`]). Routing tables are synthetic:
 //! every row selects distinct experts with the uneven expert loads of real
 //! routing (`routes`), and the grouped tables are formed from them exactly as
 //! `routed_group` forms them.
@@ -23,10 +25,11 @@ use magnitude_kernels::constants::{
     MAP_RECORD, MAP_WORDS, POLICY_PRICED, POLICY_WORDS, SOURCE_ROWS, STEP_LOW, STEP_WORDS, VERIFY_ROWS,
 };
 use magnitude_kernels::{
-    routed_combine, routed_expand, routed_experts, routed_gate_up, routed_group, routed_output,
-    routed_output_project, routed_route, routed_route_shared, routed_route_streamed,
+    routed_combine, routed_expand, routed_experts, routed_gate_up, routed_group, routed_hint_route,
+    routed_output, routed_output_project, routed_route, routed_route_shared, routed_route_streamed,
 };
 use seismic::{BuildError, Element, Tensor};
+use std::ops::Range;
 
 /// The routed geometry every case of one binding shares.
 #[derive(Clone, Copy, Debug)]
@@ -51,14 +54,20 @@ impl RoutedShape {
     }
 }
 
+/// The rows the decode form serves.
+pub(crate) const DECODE_SERVED: Range<u64> = 1..VERIFY_ROWS + 1;
+
+/// The rows the grouped form serves: every row past the decode form.
+pub(crate) const GROUPED_SERVED: Range<u64> = VERIFY_ROWS + 1..u64::MAX;
+
 /// The decode points: row counts the decode form serves.
 pub(crate) fn decode_points(limits: TuningLimits) -> Vec<PointShape> {
-    served_row_points(limits, |rows| rows <= VERIFY_ROWS)
+    served_row_points(limits, |rows| DECODE_SERVED.contains(&rows))
 }
 
 /// The grouped points: row counts past the decode form.
 pub(crate) fn grouped_points(limits: TuningLimits) -> Vec<PointShape> {
-    served_row_points(limits, |rows| rows > VERIFY_ROWS)
+    served_row_points(limits, |rows| GROUPED_SERVED.contains(&rows))
 }
 
 /// Distinct experts per row with the uneven expert loads of real routing: the
@@ -185,6 +194,7 @@ impl RoutedRouteTuning {
         routed_route::Elements {
             NW: self.norm,
             RW: self.router,
+            SRW: Element::f32(),
             A: self.activation,
         }
     }
@@ -394,6 +404,7 @@ impl EntryTuning for RoutedRouteSharedTuning {
     generated_entry!(routed_route_shared, this => routed_route_shared::Elements {
         NW: this.route.norm,
         RW: this.route.router,
+        SRW: Element::f32(),
         SGW: this.shared_gate,
         SUW: this.shared_up,
         A: this.route.activation,
@@ -489,8 +500,6 @@ pub(crate) struct BankOperands {
     /// requests.
     pub file: CaseState,
     pub sources: CaseState,
-    pub next_policy: Tensor,
-    pub rings: CaseState,
     pub routing: CaseState,
 }
 
@@ -498,7 +507,6 @@ impl BankOperands {
     pub fn new(
         inputs: &mut TuningInputs<'_, '_>,
         bank: BankBinding,
-        ahead: u64,
         rows: u64,
     ) -> Result<Self, BuildError> {
         let step = words(inputs, &[STEP_WORDS])?;
@@ -506,7 +514,7 @@ impl BankOperands {
         // Priced, over zero lines: a sited route's assignment runs.
         let policy = words(inputs, &[POLICY_WORDS])?;
         policy.store_release(4 * POLICY_PRICED, 1)?;
-        let (ring, flight) = (bank.words.ring_words(), bank.words.flight);
+        let flight = bank.words.flight;
         Ok(Self {
             map: unmapped(inputs, &[bank.experts, MAP_WORDS], MAP_WORDS, MAP_RECORD)?,
             tier: unmapped(inputs, &[tier_experts(bank)], 1, 0)?,
@@ -515,17 +523,14 @@ impl BankOperands {
             step,
             file: written(inputs, words(inputs, &bank.words.file().extents())?)?,
             sources: written(inputs, inputs.scratch(Element::i32(), &[SOURCE_ROWS, rows, bank.selected])?)?,
-            next_policy: words(inputs, &[POLICY_WORDS])?,
-            rings: written(inputs, words(inputs, &[ahead, ring])?)?,
             routing: written(inputs, words(inputs, &[flight, bank.words.routing_words()])?)?,
         })
     }
 
-    pub fn states(&self) -> [(&'static str, &CaseState); 4] {
+    pub fn states(&self) -> [(&'static str, &CaseState); 3] {
         [
             ("file", &self.file),
             ("sources", &self.sources),
-            ("rings", &self.rings),
             ("routing", &self.routing),
         ]
     }
@@ -541,7 +546,7 @@ pub(crate) fn tier_experts(bank: BankBinding) -> u64 {
 }
 
 /// Zeroed i32 words of `extents`, host-shared as the bank holds them.
-fn words(inputs: &TuningInputs<'_, '_>, extents: &[u64]) -> Result<Tensor, BuildError> {
+pub(crate) fn words(inputs: &TuningInputs<'_, '_>, extents: &[u64]) -> Result<Tensor, BuildError> {
     Ok(Tensor::shared(inputs.device, Element::i32(), extents)?)
 }
 
@@ -557,15 +562,16 @@ fn unmapped(inputs: &TuningInputs<'_, '_>, extents: &[u64], width: u64, record: 
 }
 
 /// `tensor` as a state the entry may write whole.
-fn written(inputs: &TuningInputs<'_, '_>, tensor: Tensor) -> Result<CaseState, BuildError> {
+pub(crate) fn written(inputs: &TuningInputs<'_, '_>, tensor: Tensor) -> Result<CaseState, BuildError> {
     let rows = tensor.extents()[0];
     inputs.state(tensor, 0..rows)
 }
 
 /// `routed_route_streamed`: a streamed layer's decode route, its resident
 /// route's (`routed_route_shared`) launch and parameters with the resolve
-/// and, at `AHEAD` 1, the next layer's hints. It follows the resident
-/// route's unit (`Specializer::tuned_following`): LANES (Metal) or KSPLIT
+/// and, at `AHEAD` 1, the next layer's hints. Each row range of it follows
+/// the resident route's unit of that range
+/// (`Specializer::tuned_ranges_following`): LANES (Metal) or KSPLIT
 /// (CUDA), which set the shared expert's reduction order, are the resident
 /// choice's, so its bits are the resident's; SIMDGROUPS and ROWS or TPW,
 /// which change no bit, are searched for its own launch, which does more
@@ -580,13 +586,10 @@ pub(crate) struct RoutedRouteStreamedTuning {
     /// The streamed layers that launch it.
     pub layers: Vec<WeightScope>,
     pub bank: BankBinding,
-    pub ahead: u64,
 }
 
 pub(crate) struct RoutedRouteStreamedCase {
     route: RoutedRouteSharedCase,
-    /// Each lead's norm and router.
-    leads: [[Tensor; 2]; HINT_LEADS as usize],
     bank: BankOperands,
 }
 
@@ -596,6 +599,7 @@ impl RoutedRouteStreamedTuning {
         routed_route_streamed::Elements {
             NW: route.norm,
             RW: route.router,
+            SRW: Element::f32(),
             SGW: self.resident.shared_gate,
             SUW: self.resident.shared_up,
             A: route.activation,
@@ -617,7 +621,7 @@ impl EntryTuning for RoutedRouteStreamedTuning {
 
     fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let mut statics = self.resident.statics(inputs)?;
-        statics.extend(bank_statics(self.bank, self.ahead));
+        statics.extend(bank_statics(self.bank));
         Ok(statics)
     }
 
@@ -632,20 +636,11 @@ impl EntryTuning for RoutedRouteStreamedTuning {
     ) -> Result<Vec<Self::Case>, BuildError> {
         let mut over = self.resident.clone();
         over.route.scopes = self.layers.clone();
-        let scopes = TuningInputs::rotation_scopes(&self.layers, point);
         over.rotation(inputs, point)?
             .into_iter()
-            .zip(scopes)
-            .map(|(route, scope)| {
-                let hinted = streamed_hint(inputs, scope)?;
+            .map(|route| {
                 Ok(RoutedRouteStreamedCase {
-                    leads: lead_ports(
-                        inputs,
-                        &hinted,
-                        [WeightKind::InputNorm, WeightKind::Router],
-                        [&route.route.norm, &route.route.router],
-                    )?,
-                    bank: BankOperands::new(inputs, self.bank, self.ahead, point.rows)?,
+                    bank: BankOperands::new(inputs, self.bank, point.rows)?,
                     route,
                 })
             })
@@ -655,7 +650,6 @@ impl EntryTuning for RoutedRouteStreamedTuning {
     fn args<'a>(case: &'a mut Self::Case) -> routed_route_streamed::Args<'a> {
         let RoutedRouteStreamedCase {
             route: shared,
-            leads: [[next_norm, next_router], [after_norm, after_router]],
             bank,
         } = case;
         let route = &mut shared.route;
@@ -678,12 +672,6 @@ impl EntryTuning for RoutedRouteStreamedTuning {
             step: &bank.step,
             file: bank.file.tensor_mut(),
             sources: bank.sources.tensor_mut(),
-            next_norm,
-            next_router,
-            after_norm,
-            after_router,
-            next_policy: &bank.next_policy,
-            rings: bank.rings.tensor_mut(),
             routing: bank.routing.tensor_mut(),
         }
     }
@@ -697,15 +685,129 @@ impl EntryTuning for RoutedRouteStreamedTuning {
     generated_entry!(routed_route_streamed, this => this.elements());
 }
 
+/// `routed_hint_route`: ahead-of-step expert hints for streamed fused layers
+/// at `ahead` (`1..=HINT_LEADS`).
+#[derive(Clone)]
+pub(crate) struct RoutedHintRouteTuning {
+    pub resident: RoutedRouteTuning,
+    pub layers: Vec<WeightScope>,
+    pub bank: BankBinding,
+    pub ahead: u64,
+}
+
+pub(crate) struct RoutedHintRouteCase {
+    residual: Tensor,
+    activation: Tensor,
+    leads: [[Tensor; 2]; HINT_LEADS as usize],
+    eps: f32,
+    step: Tensor,
+    next_policy: Tensor,
+    rings: CaseState,
+}
+
+impl EntryTuning for RoutedHintRouteTuning {
+    type Entry = routed_hint_route::Entry;
+    type Case = RoutedHintRouteCase;
+
+    fn launches(&self) -> usize {
+        self.layers.len()
+    }
+
+    fn bindings(&self) -> String {
+        self.resident.bindings()
+    }
+
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
+        let shape = self.resident.shape;
+        let (parts, norm) = inputs.input_form(&self.layers, shape.hidden)?;
+        Ok(vec![
+            ("H", shape.hidden),
+            ("PT", parts),
+            ("NM", norm),
+            ("K", shape.selected),
+            ("AHEAD", self.ahead),
+            ("EN", self.bank.next_experts),
+        ])
+    }
+
+    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
+        decode_points(limits)
+    }
+
+    fn rotation(
+        &self,
+        inputs: &mut TuningInputs<'_, '_>,
+        point: &PointShape,
+    ) -> Result<Vec<Self::Case>, BuildError> {
+        let mut over = self.resident.clone();
+        over.scopes = self.layers.clone();
+        let scopes = TuningInputs::rotation_scopes(&self.layers, point);
+        let ring = self.bank.words.ring_words();
+        over.rotation(inputs, point)?
+            .into_iter()
+            .zip(scopes)
+            .map(|(route, scope)| {
+                let hinted = streamed_hint(inputs, scope)?;
+                let leads = lead_ports(
+                    inputs,
+                    &hinted,
+                    [WeightKind::InputNorm, WeightKind::Router],
+                    [&route.norm, &route.router],
+                )?;
+                let step = words(inputs, &[STEP_WORDS])?;
+                step.store_release(4 * STEP_LOW, 1)?;
+                Ok(RoutedHintRouteCase {
+                    residual: route.residual,
+                    activation: inputs.scratch(self.resident.activation, &[0, self.resident.shape.selected])?,
+                    leads,
+                    eps: route.epsilon,
+                    step,
+                    next_policy: words(inputs, &[POLICY_WORDS])?,
+                    rings: written(inputs, words(inputs, &[self.ahead, ring])?)?,
+                })
+            })
+            .collect()
+    }
+
+    fn args<'a>(case: &'a mut Self::Case) -> routed_hint_route::Args<'a> {
+        let RoutedHintRouteCase {
+            residual,
+            activation,
+            leads: [[next_norm, next_router], [after_norm, after_router]],
+            eps,
+            step,
+            next_policy,
+            rings,
+        } = case;
+        routed_hint_route::Args {
+            residual,
+            activation,
+            next_norm,
+            next_router,
+            after_norm,
+            after_router,
+            eps: *eps,
+            step,
+            next_policy,
+            rings: rings.tensor_mut(),
+        }
+    }
+
+    fn state(case: &Self::Case) -> Vec<(&'static str, &CaseState)> {
+        vec![("rings", &case.rings)]
+    }
+
+    generated_entry!(routed_hint_route, this => routed_hint_route::Elements {
+        NW: this.resident.norm,
+        RW: this.resident.router,
+        A: this.resident.activation,
+    });
+}
+
 /// The static values a streamed layer's route or selection adds to its
-/// resident entry's: its bank's words at `ahead` and its tier map's experts
-/// (`TM`, [`tier_experts`]).
-pub(crate) fn bank_statics(bank: BankBinding, ahead: u64) -> [(&'static str, u64); 3] {
-    [
-        ("AHEAD", ahead),
-        ("EN", bank.next_experts),
-        ("TM", tier_experts(bank)),
-    ]
+/// resident entry's: its tier map's experts (`TM`, [`tier_experts`]).
+pub(crate) fn bank_statics(bank: BankBinding) -> [(&'static str, u64); 1] {
+    [("TM", tier_experts(bank))]
 }
 
 /// `routed_group`: the grouped form's expert tiles, formed from the
@@ -1132,6 +1234,8 @@ impl EntryTuning for RoutedChoicesTuning {
 pub(crate) struct RoutedOutputTuning {
     pub expert_down: Element,
     pub shared_down: Element,
+    /// The layer's norm's element, which its operand norm binds (`NW`).
+    pub norm: Element,
     pub activation: Element,
     pub shape: RoutedShape,
     pub scopes: Vec<WeightScope>,
@@ -1153,6 +1257,8 @@ pub(crate) struct RoutedOutputCase {
     expert_down: Tensor,
     tier_down: Tensor,
     shared_down: Tensor,
+    /// No operand norm: a tuned call forms no operand for another.
+    operand_norm: Tensor,
 }
 
 impl RoutedOutputTuning {
@@ -1161,6 +1267,7 @@ impl RoutedOutputTuning {
             EDW: self.expert_down,
             SDW: self.shared_down,
             A: self.activation,
+            NW: self.norm,
         }
     }
 }
@@ -1238,6 +1345,7 @@ impl EntryTuning for RoutedOutputTuning {
                     tier_down: no_tier(&expert_down)?,
                     expert_down,
                     shared_down: inputs.weight(scope, WeightKind::SharedDown)?,
+                    operand_norm: inputs.activation(self.norm, &[0], seed + 7)?,
                 })
             })
             .collect()
@@ -1256,6 +1364,8 @@ impl EntryTuning for RoutedOutputTuning {
             expert_down: &case.expert_down,
             tier_down: &case.tier_down,
             shared_down: &case.shared_down,
+            operand_norm: &case.operand_norm,
+            operand_epsilon: 0.0,
         }
     }
 
@@ -1279,10 +1389,11 @@ pub(crate) fn bank_sources(
 /// `routed_output_project`: the device's projections of a streamed layer's
 /// fused combine, its resident output's (`routed_output`) launches and
 /// parameters publishing the projections for the sum `routed_output_sited`
-/// forms once the CPU site has answered. It follows the resident output's
-/// unit (`Specializer::tuned_following`), so it keeps that output's
-/// arithmetic choice and its bits, and is tuned in its launch shape over the
-/// streamed layers.
+/// forms once the CPU site has answered. Each row range of it follows the
+/// resident output's unit of that range
+/// (`Specializer::tuned_ranges_following`), so it keeps that output's
+/// arithmetic choice and its bits at every row, and is tuned in its launch
+/// shape over the streamed layers.
 #[derive(Clone)]
 pub(crate) struct RoutedOutputProjectTuning {
     /// The resident output it follows, over every layer of the binding.
@@ -1407,7 +1518,12 @@ impl EntryTuning for RoutedExpertsTuning {
     }
 
     fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
-        let mut statics = vec![("H", self.shape.hidden), ("F", self.shape.features), ("LB", GluLimit::word(None))];
+        let mut statics = vec![
+            ("H", self.shape.hidden),
+            ("F", self.shape.features),
+            ("T", TILE_ROWS),
+            ("LB", GluLimit::word(None)),
+        ];
         statics.extend(ExpansionScales::statics(inputs, &self.scopes, true)?);
         Ok(statics)
     }

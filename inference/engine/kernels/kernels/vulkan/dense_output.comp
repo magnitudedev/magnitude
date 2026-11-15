@@ -1,6 +1,6 @@
 // dense_output: the down projection of the product rows plus the F32
 // residual of the `out_rows` rows. The Vulkan form of
-// `metal/dense_output.metal` over `lib/projection/projection.glsl`; the GEMM
+// `metal/dense_output.metal` on the `dense` projection (`lib/projection/operator.glsl`); the GEMM
 // class may split K (SPLIT parts, then an in-order reduction).
 #define KERNEL_W0 SEISMIC_DOWN_WEIGHT
 #include "lib/core/activation.glsl"
@@ -24,70 +24,51 @@
 #endif
 
 
+#define PROJECTION_SINGLE
+#define PROJECTION_M uint(SEISMIC_DIM_O)
+#define PROJECTION_N uint(SEISMIC_DIM_H)
+#define PROJECTION_K uint(SEISMIC_DIM_F)
+#define PROJECTION_G 1
+#define PROJECTION_NORM PROJECTION_NORM_NONE
+#define PROJECTION_STAGED SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)
+#define PROJECTION_SPLIT SEISMIC_TUNE_SPLIT
+#define PROJECTION_PARTIALS SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS)
+
 // The product rows as the down weight's operands.
-projection_prologue dense_output_input() {
+projection_prologue projected_input(uint g) {
     return projection_operands(projection_plain(DENSE_ACT, SEISMIC_PTR(SEISMIC_BUFFER_PRODUCT),
         SEISMIC_PRODUCT_STRIDE_0, SEISMIC_PRODUCT_STRIDE_1, uint(SEISMIC_DIM_F), 0ul), DENSE_OPERANDS);
 }
 
 // The rows the GEMM reads: the product rows, or the operands the stage
 // launch formed.
-projection_prologue dense_output_rows() {
+projection_prologue projected_rows(uint g) {
 #if defined(SEISMIC_DOWN_WEIGHT_OPERANDS_NVFP4)
-    return projection_plain(DENSE_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED), SEISMIC_DIM_F, 1ul,
-        uint(SEISMIC_DIM_F), 0ul);
+    return projection_plain(DENSE_ACT, PROJECTION_STAGED, SEISMIC_DIM_F, 1ul, uint(SEISMIC_DIM_F), 0ul);
 #else
     return projection_plain(DENSE_ACT, SEISMIC_PTR(SEISMIC_BUFFER_PRODUCT), SEISMIC_PRODUCT_STRIDE_0,
         SEISMIC_PRODUCT_STRIDE_1, uint(SEISMIC_DIM_F), 0ul);
 #endif
 }
 
-projection_epilogue dense_output_output() {
+projection_epilogue projected_output(uint g) {
     return projection_scaled(projection_residual(DENSE_ACT, SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0,
         SEISMIC_RESULT_0_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL), SEISMIC_RESIDUAL_STRIDE_0,
         SEISMIC_RESIDUAL_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS)),
         projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_DOWN_SCALE), SEISMIC_DIM_DS, 0ul, 0ul), 1.0);
 }
 
-projection_weights dense_output_down() {
+projection_weights projected_weight(uint g) {
     return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_DOWN_WEIGHT), PACKETS_W0_ROWS, uint(SEISMIC_DIM_F), 0ul, 1ul, 0u);
 }
 
-// The GEMV with the activation-row bound `maxm` (`projection_gemv`: one bound
-// per pipeline, so one entry per bound).
-void dense_output_gemv_bounded(const uint maxm) {
-    const projection_weights w = dense_output_down();
-    projection_gemv(PACKETS_W0, PACKETS_W0, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, maxm, PROJECTION_NORM_NONE,
-        dense_output_input(), dense_output_output(), w, w, uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_H),
-        uint(SEISMIC_DIM_F), gl_WorkGroupID.x);
-}
+#include "lib/projection/operator.glsl"
 
-void dense_output_gemv1() { dense_output_gemv_bounded(1u); }
-void dense_output_gemv2() { dense_output_gemv_bounded(2u); }
-void dense_output_gemv4() { dense_output_gemv_bounded(4u); }
-void dense_output_gemv8() { dense_output_gemv_bounded(8u); }
-
-// The product rows as NVFP4 operands into `staged`, one row a workgroup.
-void dense_output_stage() {
-    projection_stage(dense_output_input(), gl_WorkGroupID.x, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED),
-        uint(SEISMIC_DIM_F));
-}
-
-void dense_output_gemm() {
-    const uint m = uint(SEISMIC_DIM_O), n = uint(SEISMIC_DIM_H), k = uint(SEISMIC_DIM_F);
-#if SEISMIC_TUNE_SPLIT == 1
-    projection_gemm(PACKETS_W0, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N,
-        dense_output_rows(), dense_output_output(),
-        dense_output_down(), m, n, k, gl_WorkGroupID.y, gl_WorkGroupID.x, 0xffffffffu);
-#else
-    projection_gemm_part(PACKETS_W0, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N,
-        dense_output_rows(),
-        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS), dense_output_down(), m, n, k, SEISMIC_TUNE_SPLIT,
-        gl_WorkGroupID.z, gl_WorkGroupID.y, gl_WorkGroupID.x);
-#endif
-}
-
-void dense_output_finalize() {
-    projection_gemm_finalize(dense_output_output(), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS), uint(SEISMIC_DIM_O),
-        uint(SEISMIC_DIM_H), SEISMIC_TUNE_SPLIT, gl_GlobalInvocationID.x);
-}
+// The `dense` projection's launches (`lib/projection/operator.glsl`).
+void dense_output_stage() { projection_dense_stage(); }
+void dense_output_gemv1() { projection_single_gemv(1u); }
+void dense_output_gemv2() { projection_single_gemv(2u); }
+void dense_output_gemv4() { projection_single_gemv(4u); }
+void dense_output_gemv8() { projection_single_gemv(8u); }
+void dense_output_gemm() { projection_single_gemm(); }
+void dense_output_finalize() { projection_single_finalize(); }
