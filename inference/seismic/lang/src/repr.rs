@@ -40,6 +40,7 @@ pub(crate) struct Repr {
     /// values per quantization group
     pub(crate) group: u32,
     pub(crate) coding: Coding,
+    pub(crate) operands: &'static [OperandRecipe],
 }
 
 /// How a representation stores its codes in its words plane.
@@ -1334,6 +1335,7 @@ pub(crate) const REPRS: &[Repr] = &[
                 packet_group: 64,
             },
         },
+        operands: &[OperandRecipe::Rounded],
     },
     // GGUF Q4_1: unsigned 4-bit codes, one f16 scale and one f16 minimum
     // per 32: ggml's `d q + m` exactly, 20 bytes per 32 values as in GGUF.
@@ -1352,6 +1354,7 @@ pub(crate) const REPRS: &[Repr] = &[
                 packet_group: 32,
             },
         },
+        operands: &[OperandRecipe::Rounded],
     },
     Repr {
         name: "q4k",
@@ -1371,6 +1374,7 @@ pub(crate) const REPRS: &[Repr] = &[
                 minimum: Some(MinimumSign::Subtract),
             },
         },
+        operands: &[OperandRecipe::Rounded],
     },
     Repr {
         name: "q5k",
@@ -1390,6 +1394,7 @@ pub(crate) const REPRS: &[Repr] = &[
                 minimum: Some(MinimumSign::Subtract),
             },
         },
+        operands: &[OperandRecipe::Rounded],
     },
     Repr {
         name: "q6k",
@@ -1409,6 +1414,7 @@ pub(crate) const REPRS: &[Repr] = &[
                 minimum: None,
             },
         },
+        operands: &[OperandRecipe::Rounded],
     },
     Repr {
         name: "q8g32s",
@@ -1425,6 +1431,7 @@ pub(crate) const REPRS: &[Repr] = &[
                 packet_group: 32,
             },
         },
+        operands: &[OperandRecipe::Rounded],
     },
     Repr {
         name: "q8g32",
@@ -1441,6 +1448,7 @@ pub(crate) const REPRS: &[Repr] = &[
                 packet_group: 32,
             },
         },
+        operands: &[OperandRecipe::Rounded],
     },
     Repr {
         name: "nvfp4_e2m1_block16",
@@ -1453,6 +1461,7 @@ pub(crate) const REPRS: &[Repr] = &[
                 packet_group: 16,
             },
         },
+        operands: &[OperandRecipe::Rounded, OperandRecipe::Nvfp4Rows],
     },
     // GGUF Q4_0: codes offset by 8, one f16 scale per 32.
     Repr {
@@ -1470,6 +1479,7 @@ pub(crate) const REPRS: &[Repr] = &[
                 packet_group: 32,
             },
         },
+        operands: &[OperandRecipe::Rounded],
     },
     // GGUF IQ4_NL: the IQ4 codebook, one f16 scale per 32: ggml's `d v`
     // exactly, 18 bytes per 32 values as in GGUF.
@@ -1488,6 +1498,7 @@ pub(crate) const REPRS: &[Repr] = &[
                 packet_group: 32,
             },
         },
+        operands: &[OperandRecipe::Rounded],
     },
     // GGUF MXFP4 (OCP MX): E2M1 codes, one E8M0 power-of-two scale per 32.
     Repr {
@@ -1501,6 +1512,7 @@ pub(crate) const REPRS: &[Repr] = &[
                 packet_group: 32,
             },
         },
+        operands: &[OperandRecipe::Rounded],
     },
     // OCP MXFP8: E4M3 codes, one E8M0 power-of-two scale per 32. A GGUF
     // F8_E4M3 weight imports as it under its companion grid of E8M0 block
@@ -1516,6 +1528,7 @@ pub(crate) const REPRS: &[Repr] = &[
                 packet_group: 32,
             },
         },
+        operands: &[OperandRecipe::Rounded],
     },
     // E4M3 codes under one stored F32 scale per 128: a GGUF F8_E4M3
     // weight imports as it under its companion grid of F32 tile scales (an
@@ -1534,6 +1547,7 @@ pub(crate) const REPRS: &[Repr] = &[
                 packet_group: 128,
             },
         },
+        operands: &[OperandRecipe::Rounded],
     },
     // GGUF NVFP4: E2M1 codes, one UE4M3 scale per 16, packets of 64 values
     // (the GGUF block).
@@ -1548,6 +1562,7 @@ pub(crate) const REPRS: &[Repr] = &[
                 packet_group: 64,
             },
         },
+        operands: &[OperandRecipe::Rounded, OperandRecipe::Nvfp4Rows],
     },
     // GGUF Q5_0: 5-bit codes offset by 16, one f16 scale per 32.
     Repr {
@@ -1565,6 +1580,7 @@ pub(crate) const REPRS: &[Repr] = &[
                 packet_group: 32,
             },
         },
+        operands: &[OperandRecipe::Rounded],
     },
     // GGUF Q5_1: unsigned 5-bit codes, one f16 scale and one f16 min per 32.
     Repr {
@@ -1582,6 +1598,7 @@ pub(crate) const REPRS: &[Repr] = &[
                 packet_group: 32,
             },
         },
+        operands: &[OperandRecipe::Rounded],
     },
     // GGUF IQ2_XS: vector codes of eight values (a 9-bit grid index and 7
     // sign bits, ggml's `qs` word), an odd 4-bit scale `2 s + 1` per 16 and
@@ -1601,6 +1618,7 @@ pub(crate) const REPRS: &[Repr] = &[
                 minimum: None,
             },
         },
+        operands: &[OperandRecipe::Rounded],
     },
     // GGUF IQ3_XXS: vector codes of eight values (two 8-bit grid indices of
     // four values and 7 sign bits, in a 24-bit entry), an odd 4-bit scale `2 s + 1` per 32 and
@@ -1620,6 +1638,7 @@ pub(crate) const REPRS: &[Repr] = &[
                 minimum: None,
             },
         },
+        operands: &[OperandRecipe::Rounded],
     },
     // GGUF IQ2_XXS: vector codes of eight values (an 8-bit grid index and 7
     // sign bits, in a 16-bit entry), an odd 4-bit scale `2 s + 1` per 32 and
@@ -1641,6 +1660,7 @@ pub(crate) const REPRS: &[Repr] = &[
                 signed_bias: None,
             },
         },
+        operands: &[OperandRecipe::Rounded],
     },
     // GGUF Q2_K: unsigned 2-bit codes, a 4-bit scale and a 4-bit minimum
     // per 16 values under one f16 factor `d` and one f16 minimum factor
@@ -1664,6 +1684,7 @@ pub(crate) const REPRS: &[Repr] = &[
                 minimum: Some(MinimumSign::Subtract),
             },
         },
+        operands: &[OperandRecipe::Rounded],
     },
     // GGUF TQ2_0: ternary codes stored as 2-bit codes offset by 1, one f16
     // scale per 256: ggml's `(q - 1) d` exactly, 66 bytes per 256 values as
@@ -1683,6 +1704,7 @@ pub(crate) const REPRS: &[Repr] = &[
                 packet_group: 256,
             },
         },
+        operands: &[OperandRecipe::Rounded],
     },
     // GGUF Q2_0: 2-bit codes offset by 1 (-1, 0, +1 or +2), one f16 scale
     // per 64: ggml's `(q - 1) d` exactly, 18 bytes per 64 values as in GGUF.
@@ -1701,6 +1723,7 @@ pub(crate) const REPRS: &[Repr] = &[
                 packet_group: 64,
             },
         },
+        operands: &[OperandRecipe::Rounded],
     },
     // GGUF Q1_0: one-bit codes `2 c - 1`, -1 or +1, one f16 scale per 128:
     // ggml's `±d` exactly, 18 bytes per 128 values as in GGUF.
@@ -1719,6 +1742,7 @@ pub(crate) const REPRS: &[Repr] = &[
                 packet_group: 128,
             },
         },
+        operands: &[OperandRecipe::Rounded],
     },
     // GGUF IQ2_S: vector codes of eight values (a 10-bit index of the
     // 1024-point iq2s grid and 8 explicit sign bits, an 18-bit entry), an
@@ -1740,6 +1764,7 @@ pub(crate) const REPRS: &[Repr] = &[
                 minimum: None,
             },
         },
+        operands: &[OperandRecipe::Rounded],
     },
     // GGUF IQ1_S: vector codes of eight signed values -1, 0 or 1 (an 11-bit
     // index of the iq1s grid), per 32 an odd 3-bit scale `2 s + 1` whose
@@ -1762,6 +1787,7 @@ pub(crate) const REPRS: &[Repr] = &[
                 signed_bias: Some(-3),
             },
         },
+        operands: &[OperandRecipe::Rounded],
     },
     // GGUF IQ1_M: vector codes of eight values (an 11-bit index of the iq1s
     // grid and a delta bit) coding `8 g ± 1`, an odd 3-bit scale `2 s + 1`
@@ -1783,6 +1809,7 @@ pub(crate) const REPRS: &[Repr] = &[
                 minimum: None,
             },
         },
+        operands: &[OperandRecipe::Rounded],
     },
     // GGUF Q3_K: 3-bit codes offset by 4 (a 2-bit low part and a 1-bit high
     // part), a 6-bit scale code offset by 32 per 16 values and one f16
@@ -1806,6 +1833,7 @@ pub(crate) const REPRS: &[Repr] = &[
                 minimum: None,
             },
         },
+        operands: &[OperandRecipe::Rounded],
     },
     // GGUF IQ4_XS: the IQ4 codebook, a 6-bit scale code offset by 32 per 32
     // values and one f16 factor `d` per 256: ggml's `d (s - 32) v` exactly,
@@ -1828,6 +1856,7 @@ pub(crate) const REPRS: &[Repr] = &[
                 minimum: None,
             },
         },
+        operands: &[OperandRecipe::Rounded],
     },
     // GGUF IQ3_S: vector codes of eight values (two 9-bit indices of the
     // 512-point iq3s grid of four values and 8 explicit sign bits, a 26-bit
@@ -1849,6 +1878,7 @@ pub(crate) const REPRS: &[Repr] = &[
                 minimum: None,
             },
         },
+        operands: &[OperandRecipe::Rounded],
     },
 ];
 
@@ -2475,25 +2505,10 @@ impl Repr {
         }
     }
 
-    /// The operand recipes of this representation's elements: every
-    /// representation multiplies the rounded activation, and NVFP4 (E2M1
-    /// codes in 16-value groups under UE4M3 scales) also has its W4A4
-    /// element, whose activation side is the same format.
+    /// The operand recipes of this representation's elements, named on its
+    /// [`REPRS`] entry.
     pub(crate) fn operand_recipes(&self) -> &'static [OperandRecipe] {
-        match (&self.coding, self.group) {
-            (
-                Coding::Direct {
-                    codes: CodeStorage::Float(FloatCodeFormat::E2M1),
-                    scales:
-                        Scales::BlockFloat {
-                            format: FloatCodeFormat::UE4M3,
-                            ..
-                        },
-                },
-                16,
-            ) => &[OperandRecipe::Rounded, OperandRecipe::Nvfp4Rows],
-            _ => &[OperandRecipe::Rounded],
-        }
+        self.operands
     }
 
     /// The power of two the decoding scales the values of plane `field` by:
