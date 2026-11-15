@@ -8,8 +8,8 @@ void ngram_add() {
     const uint64_t channel = uint64_t(gl_WorkGroupID.x) * gl_WorkGroupSize.x + gl_LocalInvocationIndex;
     if (channel >= SEISMIC_DIM_S * SEISMIC_DIM_H)
         return;
-    const uint64_t stream = channel / SEISMIC_DIM_H;
-    const uint64_t column = channel % SEISMIC_DIM_H;
+    uint64_t stream, column;
+    seismic_split_group(gl_WorkGroupID.x, gl_WorkGroupSize.x, gl_LocalInvocationIndex, SEISMIC_DIM_H, stream, column);
     for (uint64_t row = gl_WorkGroupID.y; row < SEISMIC_DIM_M; row += gl_NumWorkGroups.y) {
         const float gated = seismic_mul_rn(
             element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_SCALES)

@@ -36,7 +36,7 @@ uint64_t versions_slot_index_of_row(int row) {
     uint64_t low = 0ul;
     uint64_t high = SEISMIC_DIM_B;
     while (low < high) {
-        const uint64_t middle = (low + high) / 2ul;
+        const uint64_t middle = (low + high) >> 1ul;
         if (element_i32_index(segments, middle * SEISMIC_SEGMENTS_STRIDE_0 + SEISMIC_SEGMENTS_STRIDE_1) <= row)
             low = middle + 1ul;
         else

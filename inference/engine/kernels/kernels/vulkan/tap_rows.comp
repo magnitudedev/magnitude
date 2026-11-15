@@ -9,10 +9,9 @@ void tap_rows() {
     const uint64_t width = SEISMIC_DIM_D;
     const uint64_t count = SEISMIC_DIM_M * width;
     const uint64_t tap = uint64_t(element_i32_index(SEISMIC_PTR(SEISMIC_BUFFER_INDEX), 0ul));
-    const uint64_t step = uint64_t(gl_NumWorkGroups.x) * gl_WorkGroupSize.x;
-    for (uint64_t index = gl_GlobalInvocationID.x; index < count; index += step) {
-        const uint64_t row = index / width;
-        const uint64_t column = index % width;
+    for (seismic_walk at = seismic_walk_grid(count, u64vec3(1ul, 1ul, width)); at.index < count; seismic_walk_next(at)) {
+        const uint64_t row = at.axes.x;
+        const uint64_t column = at.axes.w;
         out_put(taps, row * SEISMIC_TAPS_STRIDE_0 + (tap * width + column) * SEISMIC_TAPS_STRIDE_1,
             element_f32_at(residual + (row * SEISMIC_RESIDUAL_STRIDE_0 + column * SEISMIC_RESIDUAL_STRIDE_1) * 4ul));
     }

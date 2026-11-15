@@ -28,8 +28,10 @@ void routed_scatter() {
             + (m * SEISMIC_INVERSE_STRIDE_0 + k * SEISMIC_INVERSE_STRIDE_1) * 4ul));
         const float weight = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHTS)
             + (m * SEISMIC_WEIGHTS_STRIDE_0 + k * SEISMIC_WEIGHTS_STRIDE_1) * 4ul);
-        const uint64_t row = (position / SEISMIC_DIM_T) * SEISMIC_EXPERT_OUTPUT_STRIDE_0
-            + (position % SEISMIC_DIM_T) * SEISMIC_EXPERT_OUTPUT_STRIDE_1;
+        // Positions are 32-bit: the expert-ordered rows' count.
+        uint64_t tile_at, lane_at;
+        seismic_split(uint(position), SEISMIC_DIM_T, tile_at, lane_at);
+        const uint64_t row = tile_at * SEISMIC_EXPERT_OUTPUT_STRIDE_0 + lane_at * SEISMIC_EXPERT_OUTPUT_STRIDE_1;
         vec4 even, odd;
         projection_load8_strided(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_OUTPUT),
             row + uint64_t(n) * SEISMIC_EXPERT_OUTPUT_STRIDE_2, SEISMIC_EXPERT_OUTPUT_STRIDE_2, valid, vector, even, odd);

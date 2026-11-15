@@ -37,6 +37,21 @@ layout(buffer_reference, scalar, buffer_reference_align = 8) coherent volatile b
 #define u32 uint
 #define u64 uint64_t
 
+// `value` % `divisor` of a step counter by the flight depth, and `value` /
+// `divisor` of a byte count by a part size whose quotient is below 2^32.
+// The flight depth is a small count (below 2^16), as seismic_divide takes.
+uint64_t streaming_modulo(uint64_t value, uint64_t divisor) {
+    uint64_t quotient;
+    uint remainder;
+    seismic_divide(value, uint(divisor), quotient, remainder);
+    return uint64_t(remainder);
+}
+// The quotient is proved below 2^32, as seismic_narrow_divide takes.
+uint streaming_narrow_quotient(uint64_t value, uint64_t divisor) {
+    uint64_t rest = value;
+    return seismic_narrow_divide(rest, divisor);
+}
+
 int streaming_load(uint64_t word) {
     return streaming_word_t(word).v;
 }
@@ -101,7 +116,7 @@ void streaming_publish_barrier() {
 // address admits them, then the tail bytes. Its counters are 32-bit
 // (streaming/contract.hpp).
 void streaming_copy_bytes(uint64_t from, uint64_t to, uint64_t bytes, uint64_t lane, uint64_t lanes) {
-    const uint vectors = ((from | to) % 16ul) == 0ul ? uint(bytes / 16ul) : 0u;
+    const uint vectors = ((from | to) & 15ul) == 0ul ? uint(bytes >> 4ul) : 0u;
     for (uint v = uint(lane); v < vectors; v += uint(lanes))
         seismic_uvec4(to + uint64_t(v) * 16ul).v = seismic_uvec4(from + uint64_t(v) * 16ul).v;
     for (uint b = vectors * 16u + uint(lane); b < uint(bytes); b += uint(lanes))

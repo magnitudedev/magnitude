@@ -156,7 +156,7 @@ STREAMING_FN void streaming_resolve(STREAMING_DEVICE_READ routes, u64 routes0, u
     const u64 q = streaming_step(step, step0);
     const int low = streaming_device_load(STREAMING_AT(step, SEISMIC_CONST_STEP_LOW * step0));
     const int home = streaming_load(STREAMING_AT(policy, SEISMIC_CONST_POLICY_HOME * SEISMIC_POLICY_STRIDE_0));
-    STREAMING_SYSTEM_WORDS record = STREAMING_AT(routing, (q % u64(flight)) * routing0);
+    STREAMING_SYSTEM_WORDS record = STREAMING_AT(routing, streaming_modulo(q, u64(flight)) * routing0);
     if (tid == 0)
         STREAMING_GROUP(0) = 0;
     streaming_device_barrier();
@@ -220,7 +220,7 @@ STREAMING_FN void streaming_resolve(STREAMING_DEVICE_READ routes, u64 routes0, u
         return;
     if (STREAMING_GROUP(0) == 0)
         return;
-    STREAMING_SYSTEM_WORDS slot = STREAMING_AT(file, (q % u64(flight)) * file0);
+    STREAMING_SYSTEM_WORDS slot = STREAMING_AT(file, streaming_modulo(q, u64(flight)) * file0);
     for (u32 c = 0; c < choices; ++c)
         streaming_store(STREAMING_AT(slot,
                             (SEISMIC_CONST_FILE_ENTRIES + SEISMIC_CONST_FILE_ENTRY_WORDS * c + SEISMIC_CONST_FILE_CHOICE)

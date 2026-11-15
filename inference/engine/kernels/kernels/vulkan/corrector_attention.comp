@@ -16,8 +16,9 @@ void corrector_attention() {
     const uint64_t bias = SEISMIC_PTR(SEISMIC_BUFFER_BIAS);
     const Out result = SEISMIC_RESULT_0_OUT;
     const uint64_t nodes = SEISMIC_DIM_N, width = SEISMIC_DIM_W;
-    const uint64_t row = gl_WorkGroupID.x, head = gl_WorkGroupID.y;
-    const uint64_t block = row / nodes, query = row % nodes;
+    const uint64_t head = gl_WorkGroupID.y;
+    uint64_t block, query;
+    seismic_split(gl_WorkGroupID.x, nodes, block, query);
     const float scale = seismic_div_rn(1.0, seismic_sqrt_rn(float(width)));
 
     // Row (block, node, part, head) of qkv and of the input bias.

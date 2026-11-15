@@ -8,6 +8,7 @@
 #include "lib/core/reduce.glsl"
 
 #define CONFIDENCE_PARTS 64ul
+REQUIRE_DIVISOR_BELOW_2_16(confidence_parts_below_2_16, CONFIDENCE_PARTS);
 
 // Shared: one partial per subgroup (reduce_group_* at float 0).
 void token_confidence_partition() {
@@ -16,7 +17,7 @@ void token_confidence_partition() {
     const uint64_t part = gl_WorkGroupID.x, row = gl_WorkGroupID.y;
     const uint64_t lane = gl_LocalInvocationIndex, threads = gl_WorkGroupSize.x;
     const uint64_t vocabulary = SEISMIC_DIM_V;
-    const uint64_t span = (vocabulary + CONFIDENCE_PARTS - 1ul) / CONFIDENCE_PARTS;
+    const uint64_t span = seismic_quotient(vocabulary + CONFIDENCE_PARTS - 1ul, uint(CONFIDENCE_PARTS));
     const uint64_t begin = min(part * span, vocabulary), end = min(begin + span, vocabulary);
     const uint64_t line = logits
         + uint64_t(element_i32_index(SEISMIC_PTR(SEISMIC_BUFFER_ROWS), row * SEISMIC_ROWS_STRIDE_0))

@@ -132,6 +132,9 @@ struct prefill_picked {
     uint64_t statistics;
 };
 #define PREFILL_QT (PREFILL_ROWS / ATTENTION_G)
+REQUIRE_DIVISOR_BELOW_2_16(prefill_tile_rows_below_2_16, PREFILL_QT);
+// `rows` rounded up to whole query tiles.
+uint64_t prefill_padded(uint64_t rows) { return seismic_quotient(rows + PREFILL_QT - 1ul, PREFILL_QT) * PREFILL_QT; }
 // A prefill partition's fewest key tiles.
 #define PREFILL_MIN_TILES 16u
 // Output columns per pass over the keys: the whole head up to FLASH_MAX_W, so
@@ -146,10 +149,10 @@ void prefill_prepare(attention_history h, prefill_scratch scratch_planes) {
     const uint W = ATTENTION_W, E = ATTENTION_E, KV = ATTENTION_KV, G = ATTENTION_G;
     const uint lane = SEISMIC_LANE;
     const uint64_t rows = SEISMIC_DIM_M;
-    const uint64_t padded = (rows + PREFILL_QT - 1ul) / PREFILL_QT * PREFILL_QT;
-    const uint64_t item = uint64_t(gl_WorkGroupID.x) * SEISMIC_SUBGROUPS + SEISMIC_SUBGROUP;
-    const uint64_t row = item / (KV * (G + 1u));
-    const uint head = uint(item % (KV * (G + 1u)));
+    const uint64_t padded = prefill_padded(rows);
+    uint64_t row, head_at;
+    seismic_split_group(gl_WorkGroupID.x, SEISMIC_SUBGROUPS, SEISMIC_SUBGROUP, KV * (G + 1u), row, head_at);
+    const uint head = uint(head_at);
     if (row >= padded)
         return;
     const uint64_t queries = scratch_planes.queries;
@@ -656,7 +659,7 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
     const uint64_t fresh = SEISMIC_PTR(SEISMIC_BUFFER_FRESH);
     const uint64_t rows = SEISMIC_DIM_M;
     const uint64_t spans = SEISMIC_DIM_R;
-    const uint64_t padded = (rows + PREFILL_QT - 1ul) / PREFILL_QT * PREFILL_QT;
+    const uint64_t padded = prefill_padded(rows);
     const float scale = element_word_f32(SEISMIC_PARAM_SCALE) * ATTENTION_LOG2E;
     const uint lane = SEISMIC_LANE;
 #ifdef PREFILL_DECODE
@@ -979,7 +982,7 @@ void prefill_picks(prefill_scratch scratch_planes, prefill_picked picked, uint64
     uint64_t selected, uint64_t selected_slab_rows) {
     const uint W = ATTENTION_W, E = ATTENTION_E, KV = ATTENTION_KV, G = ATTENTION_G;
     const uint64_t rows = SEISMIC_DIM_M;
-    const uint64_t padded = (rows + PREFILL_QT - 1ul) / PREFILL_QT * PREFILL_QT;
+    const uint64_t padded = prefill_padded(rows);
     const uint64_t row = gl_WorkGroupID.x;
     const uint head = gl_WorkGroupID.y;
     const uint kv_head = head / G;

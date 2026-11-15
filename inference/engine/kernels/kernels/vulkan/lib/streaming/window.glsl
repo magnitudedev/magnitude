@@ -57,11 +57,11 @@
 void streaming_window_copy(uint64_t from, uint64_t stride, uint to, uint pitch, uint span, uint rows) {
     const uint tid = gl_LocalInvocationIndex, threads = gl_WorkGroupSize.x;
     const uint64_t starts = from | (rows > 1u ? stride | uint64_t(pitch) : 0ul);
-    const uint unit = starts % 16ul == 0ul ? 16u
-        : starts % 8ul == 0ul              ? 8u
-        : starts % 4ul == 0ul              ? 4u
-        : starts % 2ul == 0ul              ? 2u
-                                           : 1u;
+    const uint unit = (starts & 15ul) == 0ul ? 16u
+        : (starts & 7ul) == 0ul              ? 8u
+        : (starts & 3ul) == 0ul              ? 4u
+        : (starts & 1ul) == 0ul              ? 2u
+                                             : 1u;
     const uint units = span / unit;
     for (uint i = tid; i < rows * units; i += threads) {
         const uint row = i / units, byte = i % units * unit;
@@ -105,7 +105,7 @@ void streaming_window_copy(uint64_t from, uint64_t stride, uint to, uint pitch, 
             uint(S##_LOGICAL_GROUP)); \
     } \
     uint NAME##_source_packets() { \
-        return uint((uint64_t(K) + uint64_t(S##_LOGICAL_GROUP) - 1ul) / uint64_t(S##_LOGICAL_GROUP)); \
+        return uint(seismic_quotient(uint64_t(K) + uint64_t(S##_LOGICAL_GROUP) - 1ul, uint(S##_LOGICAL_GROUP))); \
     } \
     uint NAME##_packet_bytes() { \
         return uint(NAME##_plane_code_bytes()); \
@@ -157,18 +157,21 @@ void streaming_window_copy(uint64_t from, uint64_t stride, uint to, uint pitch, 
         return streaming_window_count(NAME##_row_packets(), NAME##_packets()); \
     } \
     uint64_t NAME##_items() { \
-        return (uint64_t(N) + REPACK_TILE_ROWS - 1u) / REPACK_TILE_ROWS * uint64_t(NAME##_windows()); \
+        return seismic_quotient(uint64_t(N) + REPACK_TILE_ROWS - 1u, uint(REPACK_TILE_ROWS)) * uint64_t(NAME##_windows()); \
     } \
     void NAME##_convert(uint64_t record, uint64_t destination, uint64_t item, uint window) { \
         barrier(); \
         const uint packet_bytes = NAME##_packet_bytes(); \
         const uint windows = NAME##_windows(), packets = NAME##_packets(), stride = NAME##_stride(); \
-        const uint64_t n0 = item / windows * REPACK_TILE_ROWS; \
+        /* An item is 32-bit: `conveyed_items` narrows to uint. */ \
+        uint64_t item_rows, item_window; \
+        seismic_split(uint(item), uint64_t(windows), item_rows, item_window); \
+        const uint64_t n0 = item_rows * REPACK_TILE_ROWS; \
         const uint rows = uint(min(uint64_t(REPACK_TILE_ROWS), uint64_t(N) - n0)); \
         /* The window's packets of each row, and where they lie in the */ \
         /* window: its rows `pitch` apart. */ \
         const bool whole = streaming_window_whole(REPACK_TILE_ROWS, stride, NAME##_codes_bytes()); \
-        const uint first = uint(item % windows) * packets; \
+        const uint first = uint(item_window) * packets; \
         const uint stored = streaming_window_stored(first, packets, NAME##_source_packets()); \
         const uint pitch = streaming_window_pitch(REPACK_TILE_ROWS, packet_bytes, packets, stride, \
             NAME##_codes_bytes()); \

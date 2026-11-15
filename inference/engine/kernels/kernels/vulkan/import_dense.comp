@@ -30,11 +30,9 @@ void import_dense() {
     const uint64_t source = SEISMIC_PTR(SEISMIC_BUFFER_SOURCE);
     const SlabOut destination = SEISMIC_RESULT_0_OUT;
     const uint64_t count = SEISMIC_DIM_B * SEISMIC_DIM_N * SEISMIC_DIM_K;
-    const uint64_t step = uint64_t(gl_NumWorkGroups.x) * gl_WorkGroupSize.x;
-    for (uint64_t index = gl_GlobalInvocationID.x; index < count; index += step) {
-        const uint64_t k = index % SEISMIC_DIM_K;
-        const uint64_t n = index / SEISMIC_DIM_K % SEISMIC_DIM_N;
-        const uint64_t b = index / SEISMIC_DIM_K / SEISMIC_DIM_N;
+    for (seismic_walk at = seismic_walk_grid(count, u64vec3(1ul, SEISMIC_DIM_N, SEISMIC_DIM_K)); at.index < count;
+            seismic_walk_next(at)) {
+        const uint64_t b = at.axes.x, n = at.axes.z, k = at.axes.w;
         out_put(slab_out_region(destination, b),
             n * SEISMIC_RESULT_0_STRIDE_1 + k * SEISMIC_RESULT_0_STRIDE_2,
             element_at(IMPORT_SOURCE_KIND, source,

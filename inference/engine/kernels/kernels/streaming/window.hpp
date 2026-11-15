@@ -50,7 +50,7 @@
 // which may exceed the source row's own packets by padding columns. The
 // rule's `row_packets` is this and nothing else.
 STREAMING_FN u32 streaming_window_row_packets(u64 stored_columns, u32 group) {
-    return u32(stored_columns / group);
+    return streaming_narrow_quotient(stored_columns, group);
 }
 
 // The packets of a window that begins at packet `first` the source row of

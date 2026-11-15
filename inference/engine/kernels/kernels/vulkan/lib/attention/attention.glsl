@@ -244,7 +244,9 @@ uint64_t attention_cursor_seek(inout attention_cursor c, uint64_t visible, uint6
     const uint64_t index = attention_cursor_to(c, visible, fresh, row, spans, picks, position);
     moved = c.span < spans && (index < c.slab_lo || index >= c.slab_hi);
     if (moved) {
-        c.slab = index / slab_rows;
+        // A key's index in its row is 32-bit (positions are), so the quotient is.
+        uint64_t rest = index;
+        c.slab = uint64_t(seismic_narrow_divide(rest, slab_rows));
         c.slab_lo = c.slab * slab_rows;
         c.slab_hi = c.slab_lo + slab_rows;
     }

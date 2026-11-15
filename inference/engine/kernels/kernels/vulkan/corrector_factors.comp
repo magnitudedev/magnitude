@@ -10,9 +10,9 @@ void corrector_factors() {
     const Out result = SEISMIC_RESULT_0_OUT;
     const uint64_t count = SEISMIC_DIM_N, width = SEISMIC_DIM_H;
     const uint64_t total = SEISMIC_DIM_S * count * width;
-    const uint64_t step = uint64_t(gl_NumWorkGroups.x) * gl_WorkGroupSize.x;
-    for (uint64_t index = gl_GlobalInvocationID.x; index < total; index += step) {
-        const uint64_t column = index % width, node = index / width % count, block = index / (count * width);
+    for (seismic_walk walk = seismic_walk_grid(total, u64vec3(1ul, count, width)); walk.index < total;
+            seismic_walk_next(walk)) {
+        const uint64_t column = walk.axes.w, node = walk.axes.z, block = walk.axes.x;
         const float x = element_at(ELEMENT_ACT, nodes,
             block * SEISMIC_NODES_STRIDE_0 + node * SEISMIC_NODES_STRIDE_1 + column * SEISMIC_NODES_STRIDE_2);
         const float a = element_at(ELEMENT_ACT, anchor, block * SEISMIC_ANCHOR_STRIDE_0 + column * SEISMIC_ANCHOR_STRIDE_1);

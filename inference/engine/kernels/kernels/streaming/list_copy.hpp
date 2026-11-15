@@ -17,7 +17,7 @@ STREAMING_FN void streaming_list_copy(STREAMING_RECORDS source, STREAMING_SYSTEM
     const u64 stride = SEISMIC_LIST_STRIDE_0;
     const u32 entries = streaming_step_entries(list, stride, step, streaming_group, tid);
     const u64 part = SEISMIC_CONST_LIST_PART;
-    const u32 parts = u32((bytes + part - 1) / part);
+    const u32 parts = streaming_narrow_quotient(bytes + part - 1, part);
     STREAMING_LIST_ITEMS(item, entries, parts, first, groups) {
         streaming_list_pair(list, stride, item, parts, entries, streaming_group, tid, threads);
         const int from = streaming_list_from(streaming_group), to = streaming_list_to(streaming_group);

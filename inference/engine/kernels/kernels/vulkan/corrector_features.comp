@@ -60,8 +60,10 @@ void corrector_features() {
     }
     barrier();
 
-    for (uint64_t index = lane; index < count * width; index += threads) {
-        const uint64_t rank = index / width, column = index % width;
+    for (seismic_walk at = seismic_walk_begin(gl_LocalInvocationIndex, gl_WorkGroupSize.x, count * width,
+                u64vec3(1ul, 1ul, width));
+            at.index < count * width; seismic_walk_next(at)) {
+        const uint64_t rank = at.axes.x, column = at.axes.w;
         float value = element_f32_at(up_bias + column * SEISMIC_UP_BIAS_STRIDE_0 * 4ul);
         for (uint f = 0u; f < 5u; ++f)
             value = seismic_fma_rn(

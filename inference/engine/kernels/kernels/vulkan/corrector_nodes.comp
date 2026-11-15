@@ -16,10 +16,9 @@ void corrector_nodes() {
     const Out result = SEISMIC_RESULT_0_OUT;
     const uint64_t rows = SEISMIC_DIM_J, count = SEISMIC_DIM_K, width = SEISMIC_DIM_H;
     const uint64_t total = SEISMIC_DIM_S * rows * count * width;
-    const uint64_t step = uint64_t(gl_NumWorkGroups.x) * gl_WorkGroupSize.x;
-    for (uint64_t index = gl_GlobalInvocationID.x; index < total; index += step) {
-        const uint64_t column = index % width, node = index / width;
-        const uint64_t candidate = node % count, mask = node / count % rows, slot = node / (rows * count);
+    for (seismic_walk at = seismic_walk_grid(total, u64vec3(rows, count, width)); at.index < total;
+            seismic_walk_next(at)) {
+        const uint64_t slot = at.axes.x, mask = at.axes.y, candidate = at.axes.z, column = at.axes.w;
         float value = element_f32_at(token + (slot * SEISMIC_TOKEN_STRIDE_0 + mask * SEISMIC_TOKEN_STRIDE_1
                 + candidate * SEISMIC_TOKEN_STRIDE_2 + column * SEISMIC_TOKEN_STRIDE_3) * 4ul)
             + element_f32_at(pass + (slot * SEISMIC_PASS_STRIDE_0 + mask * SEISMIC_PASS_STRIDE_1

@@ -360,7 +360,9 @@ void shape_rows_select() {
             // first reaches the target, counted in ascending token order.
             const uint64_t each = shape_mass(survivor, shape_key_value(key));
             // above < target <= above + ties * each, so each > 0 and rank < ties.
-            const uint64_t rank = (target - above + each - 1ul) / each - 1ul;
+            // The quotient is at most ties, below 2^32.
+            uint64_t rest = target - above + each - 1ul;
+            const uint64_t rank = uint64_t(seismic_narrow_divide(rest, each)) - 1ul;
             const uint chunk = (uint(SEISMIC_DIM_V) + gl_WorkGroupSize.x - 1u) / gl_WorkGroupSize.x;
             const uint first = thread * chunk;
             const uint last = min(first + chunk, uint(SEISMIC_DIM_V));

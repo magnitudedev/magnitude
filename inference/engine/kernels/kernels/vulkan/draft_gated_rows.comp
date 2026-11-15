@@ -8,9 +8,8 @@ void draft_gated_rows() {
     const Out result = SEISMIC_RESULT_0_OUT;
     const uint64_t width = SEISMIC_DIM_F;
     const uint64_t count = SEISMIC_DIM_M * width;
-    const uint64_t step = uint64_t(gl_NumWorkGroups.x) * gl_WorkGroupSize.x;
-    for (uint64_t index = gl_GlobalInvocationID.x; index < count; index += step) {
-        const uint64_t row = index / width, column = index % width;
+    for (seismic_walk at = seismic_walk_grid(count, u64vec3(1ul, 1ul, width)); at.index < count; seismic_walk_next(at)) {
+        const uint64_t row = at.axes.x, column = at.axes.w;
         const float a = element_at(ELEMENT_ACT, gate, row * SEISMIC_GATE_STRIDE_0 + column * SEISMIC_GATE_STRIDE_1);
         const float b = element_at(ELEMENT_ACT, up, row * SEISMIC_UP_STRIDE_0 + column * SEISMIC_UP_STRIDE_1);
         out_put(result, row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1,

@@ -25,7 +25,7 @@ STREAMING_FN void streaming_tier_wait(STREAMING_DEVICE_READ step, u64 step0, STR
     u64 file1, STREAMING_DEVICE_WORDS sources, u64 sources0, u64 sources1, u64 sources2, u32 tid,
     u32 threads STREAMING_WORDS_PARAM) {
     const u64 q = streaming_step(step, step0);
-    STREAMING_SYSTEM_WORDS slot = STREAMING_AT(file, (q % u64(SEISMIC_DIM_FLIGHT)) * file0);
+    STREAMING_SYSTEM_WORDS slot = STREAMING_AT(file, streaming_modulo(q, u64(SEISMIC_DIM_FLIGHT)) * file0);
     if (streaming_load_u64_acquire(STREAMING_AT(slot, SEISMIC_CONST_SLOT_REQUEST * file1)) != q)
         return;
     const bool answered = streaming_await_slot(slot, file1, q);

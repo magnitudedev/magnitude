@@ -207,6 +207,143 @@ float seismic_fma_rn(float a, float b, float c) {
     return fma(a, b, c);
 }
 
+// Coordinates without 64-bit division, which drivers expand into long
+// instruction sequences (Mesa's Intel compiler about 2,300 instructions,
+// copied by every unrolled loop around it). A 32-bit value split by any extent
+// needs only a 32-bit division; a grid-stride walk splits its 32-bit start and
+// stride once and then carries its coordinates. A 64-bit carry is a select,
+// never a branch around the subtraction: NVIDIA 580's compiler crashes on the
+// branch.
+
+// `value` = `quotient` × `extent` + `remainder`, with 0 ≤ `remainder` <
+// `extent`, for `extent` ≥ 1.
+void seismic_split(uint value, uint64_t extent, out uint64_t quotient, out uint64_t remainder) {
+    if (extent > uint64_t(0xffffffffu)) {
+        quotient = 0ul;
+        remainder = uint64_t(value);
+    } else {
+        quotient = uint64_t(value / uint(extent));
+        remainder = uint64_t(value % uint(extent));
+    }
+}
+
+// `value` = `quotient` × `divisor` + `remainder`, with 0 ≤ `remainder` <
+// `divisor`, for 1 ≤ `divisor` < 2^16: long division of the high word and two
+// 16-bit digits, each partial remainder shifted by 16 staying below 2^32.
+void seismic_divide(uint64_t value, uint divisor, out uint64_t quotient, out uint remainder) {
+    const uint high = uint(value >> 32), low = uint(value);
+    const uint q2 = high / divisor;
+    uint rest = high % divisor;
+    uint digit = (rest << 16) | (low >> 16);
+    const uint q1 = digit / divisor;
+    rest = digit % divisor;
+    digit = (rest << 16) | (low & 0xffffu);
+    quotient = (uint64_t(q2) << 32) | (uint64_t(q1) << 16) | uint64_t(digit / divisor);
+    remainder = digit % divisor;
+}
+
+// Refuses, at compile time, a constant divisor outside 1 ≤ `value` < 2^16 (an array of
+// negative size): `seismic_divide` and `seismic_quotient` give a wrong quotient for one.
+// `NAME` is a distinct global per check.
+#define REQUIRE_DIVISOR_BELOW_2_16(NAME, value) \
+    const int NAME[(uint64_t(value) >= 1ul && uint64_t(value) < 65536ul) ? 1 : -1] = int[1](0)
+
+// `value` / `divisor` (1 ≤ `divisor` < 2^16), as `seismic_divide`.
+uint64_t seismic_quotient(uint64_t value, uint divisor) {
+    uint64_t quotient;
+    uint remainder;
+    seismic_divide(value, divisor, quotient, remainder);
+    return quotient;
+}
+
+// `rest` / `divisor` for a quotient below 2^32 (`rest` < `divisor` × 2^32,
+// `divisor` ≥ 1), leaving `rest` % `divisor` in `rest`: restoring division,
+// before the step at `bit` the rest is below `divisor` × 2^(`bit` + 1).
+uint seismic_narrow_divide(inout uint64_t rest, uint64_t divisor) {
+    uint quotient = 0u;
+    [[dont_unroll]] for (int bit = 31; bit >= 0; --bit) {
+        const bool take = (rest >> bit) >= divisor;
+        rest -= take ? divisor << bit : 0ul;
+        quotient |= take ? 1u << bit : 0u;
+    }
+    return quotient;
+}
+
+// The quotient and remainder by `extent` of item `local` of group `group`
+// of `per` items (`local` < `per`), index `group` × `per` + `local`, without
+// forming that index: the group splits first, and the rest, below
+// `extent` × `per`, holds fewer than `per` extents.
+void seismic_split_group(uint group, uint per, uint local, uint64_t extent, out uint64_t quotient,
+    out uint64_t remainder) {
+    uint64_t groups;
+    seismic_split(group, extent, groups, remainder);
+    remainder = remainder * per + local;
+    quotient = groups * per + seismic_narrow_divide(remainder, extent);
+}
+
+// A strided walk over the indices of a flattened [x, y, z, w] extent: it
+// visits index = `start`, `start` + `stride`, ... below `count` (the x extent
+// × `extents`, the y, z and w extents), at
+// `axes` = (index / (y × z × w), index / (z × w) % y, index / w % z, index % w).
+// A walk over fewer axes gives the outer of y, z, w extent 1.
+//
+//     for (seismic_walk at = seismic_walk_grid(rows * width, u64vec3(1ul, 1ul, width));
+//             at.index < rows * width; seismic_walk_next(at)) {
+//         const uint64_t row = at.axes.x, column = at.axes.w; ... }
+//
+// `start` and `stride` are 32-bit, so are their coordinates, and splitting
+// them needs only 32-bit division; each step adds the stride's coordinates and
+// carries, each coordinate staying below twice its extent before its carry.
+struct seismic_walk {
+    uint64_t index, stride;
+    u64vec4 axes, steps;
+    u64vec3 extents;
+};
+
+// The coordinates of 32-bit `value` over the y, z, w `extents`.
+u64vec4 seismic_axes(uint value, u64vec3 extents) {
+    u64vec4 axes;
+    uint64_t rest;
+    seismic_split(value, extents.z, rest, axes.w);
+    seismic_split(uint(rest), extents.y, rest, axes.z);
+    seismic_split(uint(rest), extents.x, axes.x, axes.y);
+    return axes;
+}
+
+seismic_walk seismic_walk_begin(uint start, uint stride, uint64_t count, u64vec3 extents) {
+    seismic_walk walk;
+    walk.index = uint64_t(start);
+    walk.stride = uint64_t(stride);
+    walk.extents = extents;
+    walk.axes = walk.steps = u64vec4(0ul);
+    // An empty extent is never visited; a nonempty one has every extent ≥ 1.
+    if (count != 0ul) {
+        walk.axes = seismic_axes(start, extents);
+        walk.steps = seismic_axes(stride, extents);
+    }
+    return walk;
+}
+
+// The x grid-stride walk: every invocation of the x grid from its global
+// index. gl_GlobalInvocationID.x is 32-bit, so the grid's x invocations are.
+// A macro: the kernel declares its workgroup size after this library.
+#define seismic_walk_grid(count, extents) \
+    seismic_walk_begin(gl_GlobalInvocationID.x, gl_NumWorkGroups.x * gl_WorkGroupSize.x, count, extents)
+
+void seismic_walk_next(inout seismic_walk walk) {
+    walk.index += walk.stride;
+    walk.axes += walk.steps;
+    bool carry = walk.axes.w >= walk.extents.z;
+    walk.axes.w -= carry ? walk.extents.z : 0ul;
+    walk.axes.z += carry ? 1ul : 0ul;
+    carry = walk.axes.z >= walk.extents.y;
+    walk.axes.z -= carry ? walk.extents.y : 0ul;
+    walk.axes.y += carry ? 1ul : 0ul;
+    carry = walk.axes.y >= walk.extents.x;
+    walk.axes.y -= carry ? walk.extents.x : 0ul;
+    walk.axes.x += carry ? 1ul : 0ul;
+}
+
 // Correctly rounded fp32 division and square root (CUDA's `/` and `sqrtf`
 // under --prec-div/--prec-sqrt). Integer long division and square root handle
 // every operand; division of operands and quotient well inside the normal

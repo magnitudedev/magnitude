@@ -16,10 +16,12 @@ void routed_site_request() {
             SEISMIC_SOURCES_STRIDE_2, choices))
         return;
     const uint64_t q = streaming_step(SEISMIC_PTR(SEISMIC_BUFFER_STEP), SEISMIC_STEP_STRIDE_0);
-    const uint64_t slot = q % uint64_t(SEISMIC_DIM_FLIGHT);
+    const uint64_t slot = streaming_modulo(q, SEISMIC_DIM_FLIGHT);
     const uint64_t rows = SEISMIC_DIM_M, columns = SEISMIC_DIM_H;
-    for (uint64_t i = gl_LocalInvocationIndex; i < rows * columns; i += gl_WorkGroupSize.x) {
-        const uint64_t m = i / columns, n = i % columns;
+    for (seismic_walk at = seismic_walk_begin(gl_LocalInvocationIndex, gl_WorkGroupSize.x, rows * columns,
+                u64vec3(1ul, 1ul, columns));
+            at.index < rows * columns; seismic_walk_next(at)) {
+        const uint64_t m = at.axes.x, n = at.axes.w;
         out_put(SEISMIC_OUT_SITE_ROWS, slot * SEISMIC_SITE_ROWS_STRIDE_0
                 + m * SEISMIC_SITE_ROWS_STRIDE_1 + n * SEISMIC_SITE_ROWS_STRIDE_2,
             element_at(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED),

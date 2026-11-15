@@ -17,11 +17,10 @@ void copy_rows() {
     const uint64_t row_elements = SEISMIC_DIM_KV * SEISMIC_DIM_W;
     const uint64_t count = SEISMIC_DIM_N * row_elements;
     const uint slab_rows = uint(SEISMIC_PARAM_SLAB_ROWS);
-    const uint64_t step = uint64_t(gl_NumWorkGroups.x) * gl_WorkGroupSize.x;
-    for (uint64_t index = gl_GlobalInvocationID.x; index < count; index += step) {
-        const uint64_t item = index / row_elements;
-        const uint64_t head = (index % row_elements) / SEISMIC_DIM_W;
-        const uint64_t column = index % SEISMIC_DIM_W;
+    for (seismic_walk walk = seismic_walk_grid(count, u64vec3(1ul, SEISMIC_DIM_KV, SEISMIC_DIM_W)); walk.index < count; seismic_walk_next(walk)) {
+        const uint64_t item = walk.axes.x;
+        const uint64_t head = walk.axes.z;
+        const uint64_t column = walk.axes.w;
         const int source_row = element_i32_index(from, item * SEISMIC_FROM_STRIDE_0);
         const int destination_row = element_i32_index(to, item * SEISMIC_TO_STRIDE_0);
         if (source_row < 0 || destination_row < 0 || uint64_t(source_row) >= SEISMIC_DIM_T

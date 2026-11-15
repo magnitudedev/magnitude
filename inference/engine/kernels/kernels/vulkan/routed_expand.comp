@@ -52,7 +52,8 @@ void routed_expand_bounded(const uint maxm) {
     if (uint64_t(gl_WorkGroupID.y) < choices) {
         if (uint64_t(tile) * rows_per_tile >= SEISMIC_DIM_F)
             return;
-        const uint64_t m = gl_WorkGroupID.y / SEISMIC_DIM_K, k = gl_WorkGroupID.y % SEISMIC_DIM_K;
+        uint64_t m, k;
+        seismic_split(gl_WorkGroupID.y, SEISMIC_DIM_K, m, k);
         const uint64_t expert = uint64_t(element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES)
             + (m * SEISMIC_ROUTES_STRIDE_0 + k * SEISMIC_ROUTES_STRIDE_1) * 4ul));
         const projection_prologue x = projection_operands(projection_plain(ROUTED_ACT,

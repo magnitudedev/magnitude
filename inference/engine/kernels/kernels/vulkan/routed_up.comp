@@ -37,7 +37,8 @@ void routed_up_rows(const uint64_t choice, uint64_t rows, uint64_t outputs, uint
     const uint rows_per_tile = SEISMIC_SUBGROUPS * SEISMIC_TUNE_ROWS;
     const uint tile = gl_WorkGroupID.x;
     const uint hidden = uint(SEISMIC_DIM_H);
-    const uint64_t m = choice / SEISMIC_DIM_K, k = choice % SEISMIC_DIM_K;
+    uint64_t m, k;
+    seismic_split(uint(choice), SEISMIC_DIM_K, m, k);
     const uint64_t expert = uint64_t(element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES)
         + (m * SEISMIC_ROUTES_STRIDE_0 + k * SEISMIC_ROUTES_STRIDE_1) * 4ul));
     const int source = routed_decode_source(SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), SEISMIC_DIM_XS,

@@ -35,6 +35,11 @@
 typedef uint u32;
 typedef ulong u64;
 
+// `value` % `divisor` of a step counter by the flight depth, and `value` /
+// `divisor` of a byte count by a part size whose quotient is below 2^32.
+inline u64 streaming_modulo(u64 value, u64 divisor) { return value % divisor; }
+inline u32 streaming_narrow_quotient(u64 value, u64 divisor) { return u32(value / divisor); }
+
 namespace streaming {
 
 // Metal's system memory scope (AIR scope 3), stated as its value: a kernel's

@@ -32,6 +32,17 @@ void ngram_put(uint64_t entry, int row, int status) {
     element_i32_put(at + SEISMIC_RESULT_0_STRIDE_1 * 4ul, status);
 }
 
+// `mixed` % `size` for a table of fewer than 2^32 rows, by two narrow divides:
+// the high word's remainder is below `size`, so the rest joined to the low
+// word is below `size` × 2^32.
+uint64_t ngram_row_of(uint64_t mixed, uint64_t size) {
+    uint64_t rest = mixed >> 32;
+    seismic_narrow_divide(rest, size);
+    rest = (rest << 32) | (mixed & 0xfffffffful);
+    seismic_narrow_divide(rest, size);
+    return rest;
+}
+
 void ngram_rows() {
     const uint64_t item = uint64_t(gl_WorkGroupID.x) * gl_WorkGroupSize.x + gl_LocalInvocationIndex;
     const uint64_t launch_rows = SEISMIC_DIM_M;
@@ -91,7 +102,7 @@ void ngram_rows() {
         for (uint64_t p = 0ul; p < heads_per_order; ++p) {
             const uint64_t head = uint64_t(distance - 1) * heads_per_order + p;
             const uint64_t table_row = ngram_u64_at(offsets, head * SEISMIC_OFFSETS_STRIDE_0)
-                + mixed % ngram_u64_at(sizes, head * SEISMIC_SIZES_STRIDE_0);
+                + ngram_row_of(mixed, ngram_u64_at(sizes, head * SEISMIC_SIZES_STRIDE_0));
             ngram_put(first + head, int(table_row), status);
         }
     }

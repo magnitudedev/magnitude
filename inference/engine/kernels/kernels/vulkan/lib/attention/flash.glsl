@@ -24,6 +24,7 @@
 #include "../core/matrix.glsl"
 
 #define FLASH_KEYS 32u
+REQUIRE_DIVISOR_BELOW_2_16(flash_keys_below_2_16, FLASH_KEYS);
 #define FLASH_MAX_W 256u
 // Floats of shared scratch per subgroup: the scores 16 x 32; then the f16 P
 // (16 x 32) in its first half, the rescale factors (16 x 16) in its second

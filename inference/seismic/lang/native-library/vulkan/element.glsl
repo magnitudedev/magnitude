@@ -160,7 +160,7 @@ void element_put(const int kind, uint64_t base, uint64_t index, float value) {
 // Elements index and index + 1: one 32-bit store for an even index of a
 // 16-bit kind.
 void element_put2(const int kind, uint64_t base, uint64_t index, float first, float second) {
-    if (kind != ELEMENT_F32 && index % 2ul == 0ul) {
+    if (kind != ELEMENT_F32 && (index & 1ul) == 0ul) {
         element_u32_put(base + index * 2ul, element_pack2(kind, first, second));
     } else {
         element_put(kind, base, index, first);
@@ -269,7 +269,7 @@ float stored_at(Stored view, uint64_t index) {
 }
 // Elements `index` and `index + 1`: one 32-bit load for an even index of a 16-bit kind.
 vec2 stored_at2(Stored view, uint64_t index) {
-    if (view.seismic_kind != ELEMENT_F32 && index % 2ul == 0ul)
+    if (view.seismic_kind != ELEMENT_F32 && (index & 1ul) == 0ul)
         return element_unpack2(view.seismic_kind, element_u32_at(view.seismic_base + index * 2ul));
     return vec2(stored_at(view, index), stored_at(view, index + 1ul));
 }

@@ -553,7 +553,8 @@ native routed_output for cpu from "cpu/routed_output.rs":
 # plain E * (T - 1) padding would dominate every moderate M).
 fn routed_group[M, E, K, B, T](first: &tensor[1] i32, rows: &tensor[1] i32, routes: &tensor[M, K] i32,
     counts: &mut tensor[E] i32, order: &mut tensor[B, T] i32,
-    inverse: &mut tensor[M, K] i32, blocks: &mut tensor[B] i32, used: &mut tensor[1] i32):
+    inverse: &mut tensor[M, K] i32, blocks: &mut tensor[B] i32, used: &mut tensor[1] i32)
+    where K < 65536:
     let mut block = i32(0)
     for expert in 0..E:
         let mut lane = i32(0)
@@ -2108,7 +2109,7 @@ fn resolve[M, K, E, FW, FLIGHT, P, GM, TM](routes: &tensor[M, K] i32, map: &tens
     tier: &tensor[TM] i32, policy: &tensor[POLICY_WORDS] i32, sited: i32,
     step: &tensor[STEP_WORDS] i32, file: &mut tensor[FLIGHT, FW] i32,
     routing: &mut tensor[FLIGHT, RING_EXPERTS + 2 * P] i32, sources: &mut tensor[SOURCE_ROWS, M, K] i32)
-    where FW >= FILE_ENTRIES + FILE_ENTRY_WORDS * P and FW % 2 == 0 and FLIGHT > 0 and P >= M * K and GM >= E and TM >= 0 and (TM == 0 or TM == E):
+    where FW >= FILE_ENTRIES + FILE_ENTRY_WORDS * P and FW % 2 == 0 and FLIGHT > 0 and FLIGHT < 65536 and P >= M * K and GM >= E and TM >= 0 and (TM == 0 or TM == E):
     let home = policy[POLICY_HOME]
     if policy[POLICY_WHOLE] != 0:
         for row in 0..M:
@@ -2260,7 +2261,7 @@ fn routed_route_streamed[M, H, PT, NM, E, K, S, ES, FW, AHEAD, FLIGHT, RING, P, 
     next_policy: &tensor[POLICY_WORDS] i32,
     rings: &mut tensor[AHEAD, RING] i32, routing: &mut tensor[FLIGHT, RING_EXPERTS + 2 * P] i32)
     -> (tensor[M, H] A, tensor[M] f32, tensor[M, S] A)
-    where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and ES >= 0 and (ES == 0 or ES == E) and operands(RW) == 0 and operands(SGW) == operands(SUW) and M <= VERIFY_ROWS and FW >= FILE_ENTRIES + FILE_ENTRY_WORDS * P and FW % 2 == 0 and AHEAD >= 0 and AHEAD <= 2 and FLIGHT > 0 and RING >= RING_EXPERTS + HINT_ENTRY_WORDS * M * K and P >= M * K and EN > 0 and GM >= E and TM >= 0 and (TM == 0 or TM == E):
+    where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and ES >= 0 and (ES == 0 or ES == E) and operands(RW) == 0 and operands(SGW) == operands(SUW) and M <= VERIFY_ROWS and FW >= FILE_ENTRIES + FILE_ENTRY_WORDS * P and FW % 2 == 0 and AHEAD >= 0 and AHEAD <= 2 and FLIGHT > 0 and FLIGHT < 65536 and RING >= RING_EXPERTS + HINT_ENTRY_WORDS * M * K and P >= M * K and EN > 0 and GM >= E and TM >= 0 and (TM == 0 or TM == E):
     let mut normalized = tensor[M, H] A
     let mut coefficient = tensor[M] f32
     let mut shared_product = tensor[M, S] A
@@ -2304,7 +2305,7 @@ fn routed_select_streamed[M, H, E, K, ES, FW, AHEAD, FLIGHT, RING, P, EN, GM, TM
     next_policy: &tensor[POLICY_WORDS] i32,
     rings: &mut tensor[AHEAD, RING] i32, routing: &mut tensor[FLIGHT, RING_EXPERTS + 2 * P] i32)
     -> tensor[M, H] A
-    where ES >= 0 and (ES == 0 or ES == E) and operands(RW) == 0 and M <= VERIFY_ROWS and FW >= FILE_ENTRIES + FILE_ENTRY_WORDS * P and FW % 2 == 0 and AHEAD >= 0 and AHEAD <= 2 and FLIGHT > 0 and RING >= RING_EXPERTS + HINT_ENTRY_WORDS * M * K and P >= M * K and EN > 0 and GM >= E and TM >= 0 and (TM == 0 or TM == E):
+    where ES >= 0 and (ES == 0 or ES == E) and operands(RW) == 0 and M <= VERIFY_ROWS and FW >= FILE_ENTRIES + FILE_ENTRY_WORDS * P and FW % 2 == 0 and AHEAD >= 0 and AHEAD <= 2 and FLIGHT > 0 and FLIGHT < 65536 and RING >= RING_EXPERTS + HINT_ENTRY_WORDS * M * K and P >= M * K and EN > 0 and GM >= E and TM >= 0 and (TM == 0 or TM == E):
     let normalized = routed_select(residual, norm, router_norm, router, bias, expert_scale, routes,
         weights, epsilon, score, normalization, normalization_epsilon, scale)
     resolve[P = P, E = E](routes, map, tier, policy, sited, step, file, routing, sources)
@@ -2347,7 +2348,7 @@ fn routed_site_request[M, H, K, FLIGHT, R](step: &tensor[STEP_WORDS] i32,
     routes: &tensor[M, K] i32, sources: &tensor[SOURCE_ROWS, M, K] i32, weights: &tensor[M, K] f32,
     normalized: &tensor[M, H] A, site: &mut tensor[FLIGHT, R] i32,
     site_rows: &mut tensor[FLIGHT, VERIFY_ROWS, H] f32)
-    where FLIGHT > 0 and M <= VERIFY_ROWS and R >= SITE_ENTRIES + SITE_ENTRY_WORDS * M * K and R % 2 == 0:
+    where FLIGHT > 0 and FLIGHT < 65536 and M <= VERIFY_ROWS and R >= SITE_ENTRIES + SITE_ENTRY_WORDS * M * K and R % 2 == 0:
     let q = step_sequence(step)
     let slot = flight_slot[FLIGHT = FLIGHT](q)
     if any_sited(sources):
@@ -2401,7 +2402,7 @@ fn routed_down_sited[M, H, K, FLIGHT, SW](base: &tensor[M, H] f32,
     published: &tensor[M, K, H] A, sources: &tensor[SOURCE_ROWS, M, K] i32, weights: &tensor[M, K] f32,
     step: &tensor[STEP_WORDS] i32, site: &await mut tensor[FLIGHT, SW] i32,
     site_output: &await tensor[FLIGHT, VERIFY_ROWS, H] f32) -> tensor[M, H] R
-    where FLIGHT > 0 and M <= VERIFY_ROWS and SW % 2 == 0 and SW >= SLOT_PAYLOAD:
+    where FLIGHT > 0 and FLIGHT < 65536 and M <= VERIFY_ROWS and SW % 2 == 0 and SW >= SLOT_PAYLOAD:
     let mut value = tensor[M, H] R
     let q = step_sequence(step)
     let slot = flight_slot[FLIGHT = FLIGHT](q)
@@ -2428,7 +2429,7 @@ fn routed_output_sited[M, H, SN, IN, K, FLIGHT, SW](residual: &tensor[M, SN * H]
     scores: &tensor[M, K] f32, coefficient: &tensor[M] f32,
     step: &tensor[STEP_WORDS] i32, site: &await mut tensor[FLIGHT, SW] i32,
     site_output: &await tensor[FLIGHT, VERIFY_ROWS, H] f32) -> tensor[M, SN * H] f32
-    where IN >= 0 and ((IN == 0 and SN == 1) or (IN == SN and SN >= 1)) and FLIGHT > 0 and M <= VERIFY_ROWS and SW % 2 == 0 and SW >= SLOT_PAYLOAD:
+    where IN >= 0 and ((IN == 0 and SN == 1) or (IN == SN and SN >= 1)) and FLIGHT > 0 and FLIGHT < 65536 and M <= VERIFY_ROWS and SW % 2 == 0 and SW >= SLOT_PAYLOAD:
     let mut value = tensor[M, SN * H] f32
     let q = step_sequence(step)
     let slot = flight_slot[FLIGHT = FLIGHT](q)
@@ -2569,7 +2570,7 @@ fn routed_land[M, K, FW, FLIGHT, L, V, GV, S, GS, F, H](step: &tensor[STEP_WORDS
     landing: &await mut tensor[LANDING_ENTRIES + LANDING_ENTRY_WORDS * L] i32,
     staging_gate: &tensor[GV, F, H] SG, staging_up: &tensor[V, F, H] SU, staging_down: &tensor[V, H, F] SD,
     gate: &mut tensor[GS, F, H] UG, up: &mut tensor[S, F, H] UU, down: &mut tensor[S, H, F] UD)
-    where FW >= FILE_ENTRIES + FILE_ENTRY_WORDS * M * K and FW % 2 == 0 and FLIGHT > 0 and ((V > 0 and S > 0) or (V == 0 and S == 0)) and ((GV == V and GS == S) or (GV == 0 and GS == 0)):
+    where FW >= FILE_ENTRIES + FILE_ENTRY_WORDS * M * K and FW % 2 == 0 and FLIGHT > 0 and FLIGHT < 65536 and ((V > 0 and S > 0) or (V == 0 and S == 0)) and ((GV == V and GS == S) or (GV == 0 and GS == 0)):
     let q = step_sequence(step)
     let slot = flight_slot[FLIGHT = FLIGHT](q)
     if policy[POLICY_RESOLVED] == 0 and pair_at(file, slot, SLOT_REQUEST) == q:
@@ -2602,7 +2603,7 @@ fn scratch_lane(lane: i32) -> i32:
 fn routed_scratch_request[M, K, E, FLIGHT, LANES](routes: &tensor[M, K] i32,
     step: &tensor[STEP_WORDS] i32, flags: &mut tensor[E] i32, scratch: &mut tensor[FLIGHT, SCRATCH_SLOT * LANES] i32,
     resident: &tensor[1] i32)
-    where FLIGHT > 0 and LANES > SCRATCH_ROUND:
+    where FLIGHT > 0 and FLIGHT < 65536 and LANES > SCRATCH_ROUND:
     if resident[0] == 0:
         for expert in 0..E:
             flags[expert] = 0
@@ -2656,7 +2657,7 @@ fn routed_round[FLIGHT, LANES, L, V, GV, S, GS, F, H, E, EL](step: &tensor[STEP_
     gate: &mut tensor[GS, F, H] UG, up: &mut tensor[S, F, H] UU, down: &mut tensor[S, H, F] UD,
     seeds: &host mut tensor[LIST_ENTRIES + LIST_ENTRY_WORDS * E] i32,
     map: &host mut tensor[EL, MAP_WORDS] i32, grid: &tensor[3] i32)
-    where FLIGHT > 0 and LANES > SCRATCH_ROUND and V > 0 and S > 0 and ((GV == V and GS == S) or (GV == 0 and GS == 0)):
+    where FLIGHT > 0 and FLIGHT < 65536 and LANES > SCRATCH_ROUND and V > 0 and S > 0 and ((GV == V and GS == S) or (GV == 0 and GS == 0)):
     let q = step_sequence(step)
     request_slot(scratch, flight_slot[FLIGHT = FLIGHT](q), scratch_lane(SCRATCH_ROUND + window[0] * rounds + round), q)
     land[L = L](landing, step, conveyor_gate, conveyor_up, conveyor_down, gate, up, down)
@@ -2683,7 +2684,7 @@ fn routed_round[FLIGHT, LANES, L, V, GV, S, GS, F, H, E, EL](step: &tensor[STEP_
 fn routed_scratch_grids[FLIGHT, LANES, RW](step: &tensor[STEP_WORDS] i32,
     scratch: &tensor[FLIGHT, SCRATCH_SLOT * LANES] i32, window: &tensor[1] i32,
     grids: &mut tensor[RW, 3] i32, round_records: i32)
-    where FLIGHT > 0 and RW > 0 and LANES >= SCRATCH_ROUND + RW:
+    where FLIGHT > 0 and FLIGHT < 65536 and RW > 0 and LANES >= SCRATCH_ROUND + RW:
     let q = step_sequence(step)
     let slot = flight_slot[FLIGHT = FLIGHT](q)
     let first = scratch_lane(SCRATCH_ROUND + window[0] * i32(RW))
@@ -2800,7 +2801,7 @@ fn routed_copy[S, D, L, N, K](source: &tensor[S, N, K] U, list: &tensor[LIST_ENT
 fn routed_seed_commit[X, BANK, FLIGHT, LANES](list: &tensor[LIST_ENTRIES + LIST_ENTRY_WORDS * X] i32,
     step: &tensor[STEP_WORDS] i32, scratch: &tensor[FLIGHT, SCRATCH_SLOT * LANES] i32,
     window: &tensor[1] i32, rounds: i32, commits: &mut tensor[BANK] i32)
-    where BANK > 0 and FLIGHT > 0 and LANES > SCRATCH_ROUND:
+    where BANK > 0 and FLIGHT > 0 and FLIGHT < 65536 and LANES > SCRATCH_ROUND:
     let q = step_sequence(step)
     let last = scratch_lane(SCRATCH_ROUND + window[0] * rounds + rounds - 1)
     if list[LIST_SEQUENCE] == step[STEP_LOW] and pair_at(scratch, flight_slot[FLIGHT = FLIGHT](q), last + SLOT_ANSWER) == q:

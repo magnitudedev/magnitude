@@ -117,6 +117,24 @@ fn literal(dialect: Dialect, value: u64) -> String {
     }
 }
 
+/// `numerator` / `divisor` for a dialect's 64-bit `numerator` expression and
+/// constant `divisor`. Vulkan divides no 64-bit integers, which drivers
+/// expand into long instruction sequences; its prelude divides by a divisor
+/// below 2^16 in 32-bit arithmetic (`seismic_quotient`).
+fn quotient(dialect: Dialect, numerator: &str, divisor: u64) -> String {
+    match dialect {
+        Dialect::Metal(_) | Dialect::Cuda(_) => format!("(({numerator}) / {divisor})"),
+        #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
+        Dialect::Vulkan(_) => {
+            assert!(
+                (1..1 << 16).contains(&divisor),
+                "a Vulkan quotient's constant divisor {divisor} is below 2^16"
+            );
+            format!("seismic_quotient({numerator}, {divisor}u)")
+        }
+    }
+}
+
 /// Number of 64-bit argument words of an entry schema. The layout depends
 /// only on the schema: every dimension, then each parameter (a tensor's
 /// extents then strides; one word per scalar or index; two per range), then
@@ -540,6 +558,7 @@ fn render_source_with(
         Dialect::Vulkan(features) => {
             // The conversions' tile rows as a signed literal, for the
             // library's `#if`s (`lib/repack/repack.glsl`).
+            const { assert!(conversion::TILE_ROWS < 1 << 16, "the tile rows must be below 2^16, a Vulkan kernel divisor") };
             vulkan::header(features)
                 + vulkan::shared_views().as_str()
                 + format!("#define REPACK_TILE_ROWS_INT {}\n", conversion::TILE_ROWS).as_str()
@@ -1152,25 +1171,28 @@ fn render_symbolic_rows(
 ) {
     let align = registry::ROW_ALIGNMENT;
     let group = rows.group();
-    let groups = format!("(({extent} + {}) / {group})", group - 1);
+    let ceil = |value: &str, divisor: u64| {
+        quotient(dialect, &format!("{value} + {}", divisor - 1), divisor)
+    };
+    let groups = ceil(extent, u64::from(group));
     let groups = match rows.group_multiple {
         1 => groups,
-        multiple => format!("(({groups} + {}) / {multiple} * {multiple})", multiple - 1),
+        multiple => format!("({} * {multiple})", ceil(&groups, u64::from(multiple))),
     };
     out.push_str(&format!("#define {prefix}_ROW_GROUPS {groups}\n"));
     let mut end = String::from("0");
     for plane in &rows.planes {
         let name = native_macro(plane.name);
         out.push_str(&format!(
-            "#define {prefix}_PLANE_{name}_ROW_OFFSET (({end} + {}) / {align} * {align})\n#define {prefix}_PLANE_{name}_BYTES_PER_ROW ({prefix}_ROW_GROUPS * {})\n",
-            align - 1,
+            "#define {prefix}_PLANE_{name}_ROW_OFFSET ({} * {align})\n#define {prefix}_PLANE_{name}_BYTES_PER_ROW ({prefix}_ROW_GROUPS * {})\n",
+            ceil(&end, align),
             plane.bytes_per_group,
         ));
         end = format!("({prefix}_PLANE_{name}_ROW_OFFSET + {prefix}_PLANE_{name}_BYTES_PER_ROW)");
     }
     out.push_str(&format!(
-        "#define {prefix}_ROW_STRIDE_BYTES (({end} + {}) / {align} * {align})\n",
-        align - 1
+        "#define {prefix}_ROW_STRIDE_BYTES ({} * {align})\n",
+        ceil(&end, align)
     ));
     render_row_roles(out, prefix, rows, dialect);
 }
@@ -1475,6 +1497,17 @@ fn render_representation(
             // The grid a planar source's scales lie in (`GridPlanes`), none
             // (zeros) where each packet holds its own.
             let (scale_bytes, tile) = layout.planes.map_or((0, [0, 0]), |planes| (planes.scale_bytes, planes.tile));
+            // Vulkan's kernels divide by these (`seismic_quotient`): a layout past 2^16 is refused here.
+            for (name, value) in [
+                ("logical group", u64::from(layout.logical_group)),
+                ("grid tile rows", u64::from(tile[0])),
+                ("grid tile columns", u64::from(tile[1])),
+            ] {
+                assert!(
+                    value < 1 << 16,
+                    "an external layout's {name} {value} must be below 2^16, a Vulkan kernel divisor"
+                );
+            }
             out.push_str(&format!(
                 "#define {prefix}_GRID_PLANAR {}\n#define {prefix}_GRID_SCALE_BYTES {scale_bytes}\n#define {prefix}_GRID_TILE_ROWS {}\n#define {prefix}_GRID_TILE_COLUMNS {}\n",
                 u32::from(scale_bytes != 0),

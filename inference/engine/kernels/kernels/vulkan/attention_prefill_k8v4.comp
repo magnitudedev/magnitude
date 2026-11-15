@@ -34,10 +34,10 @@
 #define PREFILL_SELECTION_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_SELECTION)
 // A query tile's rows each read at most the bitmap's 32 * B * BR keys, in at
 // most R + 1 runs.
-#define PREFILL_LIST_CAPACITY uint(uint64_t(PREFILL_QT) * ((32ul * SEISMIC_DIM_B * SEISMIC_DIM_BR + FLASH_KEYS - 1ul) / FLASH_KEYS + SEISMIC_DIM_R + 1ul))
+#define PREFILL_LIST_CAPACITY uint(uint64_t(PREFILL_QT) * (seismic_quotient(32ul * SEISMIC_DIM_B * SEISMIC_DIM_BR + FLASH_KEYS - 1ul, FLASH_KEYS) + SEISMIC_DIM_R + 1ul))
 // The worklist scratch: the query tiles' (span, first) lists, their counts,
 // then the rows' span ordinals.
-#define PREFILL_LIST_TILES ((SEISMIC_DIM_M + uint64_t(PREFILL_QT) - 1ul) / uint64_t(PREFILL_QT))
+#define PREFILL_LIST_TILES seismic_quotient(SEISMIC_DIM_M + uint64_t(PREFILL_QT) - 1ul, PREFILL_QT)
 #define PREFILL_LISTS_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_WORKLIST)
 #define PREFILL_LISTED_BUFFER (PREFILL_LISTS_BUFFER + PREFILL_LIST_TILES * uint64_t(PREFILL_LIST_CAPACITY) * 8ul)
 #define PREFILL_BASES_BUFFER (PREFILL_LISTED_BUFFER + PREFILL_LIST_TILES * 4ul)

@@ -23,6 +23,15 @@
 // host-shared words are plain pointers, accessed by `streaming_load` and
 // `streaming_store`.
 #define STREAMING_FN __device__ __forceinline__
+
+// `value` % `divisor` of a step counter by the flight depth, and `value` /
+// `divisor` of a byte count by a part size whose quotient is below 2^32.
+__device__ __forceinline__ unsigned long long streaming_modulo(unsigned long long value, unsigned long long divisor) {
+    return value % divisor;
+}
+__device__ __forceinline__ unsigned streaming_narrow_quotient(unsigned long long value, unsigned long long divisor) {
+    return unsigned(value / divisor);
+}
 #define STREAMING_WORDS_PARAM , const seismic_words_t &seismic_words_value
 #define STREAMING_WORDS_ARG , seismic_words_value
 #define STREAMING_SYSTEM_WORDS int *

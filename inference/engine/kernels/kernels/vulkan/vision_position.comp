@@ -15,9 +15,8 @@
 void vision_position() {
     const uint64_t columns = SEISMIC_DIM_H;
     const uint64_t total = SEISMIC_DIM_M * columns;
-    const uint64_t step = uint64_t(gl_NumWorkGroups.x) * gl_WorkGroupSize.x;
-    for (uint64_t index = gl_GlobalInvocationID.x; index < total; index += step) {
-        const uint64_t row = index / columns, column = index % columns;
+    for (seismic_walk at = seismic_walk_grid(total, u64vec3(1ul, 1ul, columns)); at.index < total; seismic_walk_next(at)) {
+        const uint64_t row = at.axes.x, column = at.axes.w;
         float blended = 0.0;
         [[unroll]] for (uint i = 0u; i < 4u; ++i) {
             const int corner = element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_INDICES) + (row * 4ul + i) * 4ul);

@@ -83,9 +83,9 @@ void routed_experts_quantize() {
 
 void routed_experts_expand() {
     const uint64_t tile_rows = SEISMIC_DIM_T;
-    const uint64_t subtiles = (tile_rows + EXPERTS_TM - 1u) / EXPERTS_TM;
-    const uint64_t block = gl_WorkGroupID.y / subtiles;
-    const uint tm_index = uint(gl_WorkGroupID.y % subtiles);
+    uint64_t block, subtile;
+    seismic_split(gl_WorkGroupID.y, (uint(tile_rows) + EXPERTS_TM - 1u) / EXPERTS_TM, block, subtile);
+    const uint tm_index = uint(subtile);
     const int expert = element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_BLOCKS) + block * SEISMIC_BLOCKS_STRIDE_0 * 4ul);
     const int slot = EXPERTS_SLOT(expert);
     if (slot == -1)
@@ -117,9 +117,9 @@ void routed_experts_expand() {
 
 void routed_experts_down() {
     const uint64_t tile_rows = SEISMIC_DIM_T;
-    const uint64_t subtiles = (tile_rows + EXPERTS_TM - 1u) / EXPERTS_TM;
-    const uint64_t block = gl_WorkGroupID.y / subtiles;
-    const uint tm_index = uint(gl_WorkGroupID.y % subtiles);
+    uint64_t block, subtile;
+    seismic_split(gl_WorkGroupID.y, (uint(tile_rows) + EXPERTS_TM - 1u) / EXPERTS_TM, block, subtile);
+    const uint tm_index = uint(subtile);
     const int expert = element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_BLOCKS) + block * SEISMIC_BLOCKS_STRIDE_0 * 4ul);
     const int slot = EXPERTS_SLOT(expert);
     if (slot == -1)

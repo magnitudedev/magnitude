@@ -27,8 +27,11 @@ void stored_rows() {
             continue;
         }
         const uint64_t per = uint64_t(SEISMIC_DIM_P);
-        const uint64_t record = slab_region(slots, uint64_t(held) / per);
-        const packets_packet packet = packets_load(PACKETS_W0, record + (uint64_t(held) % per) * geometry.stride,
+        // A slot is a nonnegative i32.
+        uint64_t record_at, slot_at;
+        seismic_split(uint(held), per, record_at, slot_at);
+        const uint64_t record = slab_region(slots, record_at);
+        const packets_packet packet = packets_load(PACKETS_W0, record + slot_at * geometry.stride,
             geometry, column / 32u, width);
         out_put(rows, at, packets_value_at(PACKETS_W0, packet, column % 32u));
     }

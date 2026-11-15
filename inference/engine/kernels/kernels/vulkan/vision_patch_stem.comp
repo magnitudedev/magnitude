@@ -41,13 +41,14 @@
 void vision_patch_stem_convert() {
     const uint64_t pixels = SEISMIC_PTR(SEISMIC_BUFFER_PIXELS);
     const uint64_t converted = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_CONVERTED);
-    const uint64_t pieces = SEISMIC_DIM_M * uint64_t(STEM_FRAMES) * STEM_KP / 8ul;
-    const uint64_t step = uint64_t(gl_NumWorkGroups.x) * gl_WorkGroupSize.x;
-    for (uint64_t piece = gl_GlobalInvocationID.x; piece < pieces; piece += step) {
-        const uint64_t index = piece * 8ul;
-        const uint64_t row = index / (uint64_t(STEM_FRAMES) * STEM_KP);
-        const uint frame = uint((index / STEM_KP) % STEM_FRAMES);
-        const uint k = uint(index % STEM_KP);
+    const uint64_t pieces = SEISMIC_DIM_M * uint64_t(STEM_FRAMES) * (STEM_KP / 8u);
+    // STEM_KP is a multiple of 8: a piece's row, frame and k are the walk's axes over (1, frames, STEM_KP / 8).
+    for (seismic_walk at = seismic_walk_grid(pieces, u64vec3(1ul, uint64_t(STEM_FRAMES), uint64_t(STEM_KP / 8u)));
+            at.index < pieces; seismic_walk_next(at)) {
+        const uint64_t index = at.index * 8ul;
+        const uint64_t row = at.axes.x;
+        const uint frame = uint(at.axes.z);
+        const uint k = uint(at.axes.w) * 8u;
         float v[8];
         [[unroll]] for (uint i = 0u; i < 8u; ++i) {
             const uint channel = (k + i) / STEM_AREA, within = (k + i) % STEM_AREA;

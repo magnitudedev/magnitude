@@ -64,8 +64,8 @@ float draft_sum(float value, uint partials) {
 
 void draft_rows() {
     const uint width = uint(SEISMIC_DIM_D);
-    const uint64_t row = gl_WorkGroupID.y / SEISMIC_DIM_S;
-    const uint64_t stream = gl_WorkGroupID.y % SEISMIC_DIM_S;
+    uint64_t row, stream;
+    seismic_split(gl_WorkGroupID.y, SEISMIC_DIM_S, row, stream);
     const uint thread = gl_LocalInvocationIndex, threads = gl_WorkGroupSize.x;
     const uint partials = width;   // floats, after the 2D 16-bit joined row
     const float epsilon = element_word_f32(SEISMIC_PARAM_EPSILON);

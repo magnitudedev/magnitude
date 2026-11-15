@@ -16,6 +16,6 @@
 
 void routed_output_combine() {
     const uint64_t q = streaming_step(SEISMIC_PTR(SEISMIC_BUFFER_STEP), SEISMIC_STEP_STRIDE_0);
-    const uint64_t slot = q % uint64_t(SEISMIC_DIM_FLIGHT);
+    const uint64_t slot = streaming_modulo(q, SEISMIC_DIM_FLIGHT);
     routed_output_join(routed_site_answered(q, slot), slot);
 }

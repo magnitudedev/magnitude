@@ -29,13 +29,12 @@ float ngram_u(uint64_t row, uint64_t stream, uint64_t column) {
     return seismic_mul_rn(seismic_mul_rn(seismic_mul_rn(gate, value), inverse), norm);
 }
 
-// Publishes channel `channel` of slot `index`'s successor window: the source
-// bank's tape rows move unchanged, the rows past the stop are u.
-void ngram_publish(uint64_t index, uint64_t channel) {
+// Publishes channel `channel` (column `column` of stream `stream`) of slot
+// `index`'s successor window: the source bank's tape rows move unchanged, the
+// rows past the stop are u.
+void ngram_publish(uint64_t index, uint64_t channel, uint64_t stream, uint64_t column) {
     const SlabOut window = SEISMIC_OUT_WINDOW;
     const int reach = int(uint(SEISMIC_PARAM_DILATION)) * (int(SEISMIC_DIM_K) - 1);
-    const uint64_t stream = channel / SEISMIC_DIM_H;
-    const uint64_t column = channel % SEISMIC_DIM_H;
     const versions_slot slot = versions_slot_of(index);
     const Out source = versions_out_bank(window, slot.source, SEISMIC_WINDOW_STRIDE_0);
     const Out target = versions_out_bank(window, slot.target, SEISMIC_WINDOW_STRIDE_0);
@@ -53,14 +52,12 @@ void ngram_publish(uint64_t index, uint64_t channel) {
     }
 }
 
-// Channel `channel` of row `row`.
-void ngram_row(int row, uint64_t channel) {
+// Channel `channel` (column `column` of stream `stream`) of row `row`.
+void ngram_row(int row, uint64_t channel, uint64_t stream, uint64_t column) {
     const SlabOut window = SEISMIC_OUT_WINDOW;
     const uint64_t convolution = SEISMIC_PTR(SEISMIC_BUFFER_CONVOLUTION);
     const int dilation = int(uint(SEISMIC_PARAM_DILATION));
     const int reach = dilation * (int(SEISMIC_DIM_K) - 1);
-    const uint64_t stream = channel / SEISMIC_DIM_H;
-    const uint64_t column = channel % SEISMIC_DIM_H;
     const Out result = SEISMIC_RESULT_0_OUT;
     const uint64_t at = uint64_t(row) * SEISMIC_RESULT_0_STRIDE_0 + channel * SEISMIC_RESULT_0_STRIDE_1;
     const uint64_t hidden_index = uint64_t(row) * SEISMIC_HIDDEN_STRIDE_0 + channel * SEISMIC_HIDDEN_STRIDE_1;
@@ -96,11 +93,13 @@ void ngram_inject() {
     const uint64_t channel = uint64_t(gl_WorkGroupID.x) * gl_WorkGroupSize.x + gl_LocalInvocationIndex;
     if (channel >= SEISMIC_DIM_S * SEISMIC_DIM_H)
         return;
+    uint64_t stream, column;
+    seismic_split_group(gl_WorkGroupID.x, gl_WorkGroupSize.x, gl_LocalInvocationIndex, SEISMIC_DIM_H, stream, column);
     const uint64_t rows = SEISMIC_DIM_M;
     for (uint64_t item = gl_WorkGroupID.y; item < rows + SEISMIC_DIM_B; item += gl_NumWorkGroups.y) {
         if (item >= rows)
-            ngram_publish(item - rows, channel);
+            ngram_publish(item - rows, channel, stream, column);
         else
-            ngram_row(int(item), channel);
+            ngram_row(int(item), channel, stream, column);
     }
 }

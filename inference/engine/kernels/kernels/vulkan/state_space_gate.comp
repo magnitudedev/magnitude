@@ -7,12 +7,12 @@
 #include "lib/core/activation.glsl"
 
 // The gated value of `channel` (in the row's flat head-major order).
-float ssg_gated_value(uint64_t row, uint64_t channel) {
-    const uint64_t head = channel / SEISMIC_DIM_P;
+float ssg_gated_value(uint64_t row, uint64_t head, uint64_t within) {
+    const uint64_t channel = head * SEISMIC_DIM_P + within;
     const float gate = element_at(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_PROJECTION),
         row * SEISMIC_PROJECTION_STRIDE_0 + channel * SEISMIC_PROJECTION_STRIDE_1);
     const float value = element_at(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_MIXED),
-        row * SEISMIC_MIXED_STRIDE_0 + head * SEISMIC_MIXED_STRIDE_1 + (channel % SEISMIC_DIM_P) * SEISMIC_MIXED_STRIDE_2);
+        row * SEISMIC_MIXED_STRIDE_0 + head * SEISMIC_MIXED_STRIDE_1 + within * SEISMIC_MIXED_STRIDE_2);
     return seismic_mul_rn(value, seismic_div_rn(gate, 1.0 + exp(-gate)));
 }
 
@@ -21,11 +21,12 @@ void state_space_gate() {
     const Out normalized = SEISMIC_RESULT_0_OUT;
     const uint64_t row = gl_WorkGroupID.x;
     const uint64_t width = SEISMIC_DIM_U * SEISMIC_DIM_P;
-    const uint64_t first = uint64_t(gl_WorkGroupID.y) * width;
     const float epsilon = element_word_f32(SEISMIC_PARAM_EPSILON);
     float squares = 0.0;
     for (uint64_t column = gl_LocalInvocationIndex; column < width; column += gl_WorkGroupSize.x) {
-        const float value = ssg_gated_value(row, first + column);
+        uint64_t head, within;
+        seismic_split(uint(column), SEISMIC_DIM_P, head, within);
+        const float value = ssg_gated_value(row, uint64_t(gl_WorkGroupID.y) * SEISMIC_DIM_U + head, within);
         squares = seismic_fma_rn(value, value, squares);
     }
     const float total = seismic_subgroup_sum_f32(squares);
@@ -37,13 +38,15 @@ void state_space_gate() {
         sum = seismic_add_rn(sum, seismic_shared_f32[index]);
     const float inverse = inversesqrt(seismic_div_rn(sum, float(width)) + epsilon);
     for (uint64_t column = gl_LocalInvocationIndex; column < width; column += gl_WorkGroupSize.x) {
-        const uint64_t channel = first + column;
+        uint64_t unit, within;
+        seismic_split(uint(column), SEISMIC_DIM_P, unit, within);
+        const uint64_t head = uint64_t(gl_WorkGroupID.y) * SEISMIC_DIM_U + unit;
         const float weight = element_f32_at(state_norm + (uint64_t(gl_WorkGroupID.y) * SEISMIC_STATE_NORM_STRIDE_0
-            + (column / SEISMIC_DIM_P) * SEISMIC_STATE_NORM_STRIDE_1 + (column % SEISMIC_DIM_P) * SEISMIC_STATE_NORM_STRIDE_2) * 4ul);
-        const float value = ssg_gated_value(row, channel);
+            + unit * SEISMIC_STATE_NORM_STRIDE_1 + within * SEISMIC_STATE_NORM_STRIDE_2) * 4ul);
+        const float value = ssg_gated_value(row, head, within);
         out_put(normalized,
-            row * SEISMIC_RESULT_0_STRIDE_0 + (channel / SEISMIC_DIM_P) * SEISMIC_RESULT_0_STRIDE_1
-                + (channel % SEISMIC_DIM_P) * SEISMIC_RESULT_0_STRIDE_2,
+            row * SEISMIC_RESULT_0_STRIDE_0 + head * SEISMIC_RESULT_0_STRIDE_1
+                + within * SEISMIC_RESULT_0_STRIDE_2,
             seismic_mul_rn(seismic_mul_rn(value, inverse), weight));
     }
 }

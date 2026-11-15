@@ -7,7 +7,7 @@
 // The first word of lane `lane` of step `q`'s slot (`scratch_lane` in
 // routed.seismic).
 STREAMING_FN u64 streaming_scratch_lane(u64 q, u64 lane STREAMING_WORDS_PARAM) {
-    return (q % u64(SEISMIC_DIM_FLIGHT)) * SEISMIC_SCRATCH_STRIDE_0
+    return streaming_modulo(q, u64(SEISMIC_DIM_FLIGHT)) * SEISMIC_SCRATCH_STRIDE_0
         + lane * u64(SEISMIC_CONST_SCRATCH_SLOT) * SEISMIC_SCRATCH_STRIDE_1;
 }
 

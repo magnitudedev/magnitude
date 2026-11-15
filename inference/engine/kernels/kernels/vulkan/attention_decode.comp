@@ -3,7 +3,7 @@
 // form of `metal/attention_decode.metal` over `lib/attention/attention.glsl`.
 // A workgroup's query heads: one of the vector form's GROUPS groups of the
 // kv head's G (all G at GROUPS 1); SLICES slices of them, one a subgroup.
-#define ATTENTION_HEAD_GROUP uint(SEISMIC_DIM_G / SEISMIC_TUNE_GROUPS)
+#define ATTENTION_HEAD_GROUP (uint(SEISMIC_DIM_G) / uint(SEISMIC_TUNE_GROUPS))
 #define ATTENTION_HEADS (ATTENTION_HEAD_GROUP / uint(SEISMIC_TUNE_SLICES))
 #define ATTENTION_I uint(SEISMIC_DIM_I)
 #define ATTENTION_U uint(SEISMIC_DIM_U)

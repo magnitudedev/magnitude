@@ -44,8 +44,8 @@
 // ROUTED_PROJECTED_PUT(m, slot, n, value).
 void routed_output_projection() {
     const uint tile = gl_WorkGroupID.x;
-    const uint64_t m = gl_WorkGroupID.y / (SEISMIC_DIM_K + 1ul);
-    const uint64_t choice = gl_WorkGroupID.y % (SEISMIC_DIM_K + 1ul);
+    uint64_t m, choice;
+    seismic_split(gl_WorkGroupID.y, SEISMIC_DIM_K + 1ul, m, choice);
     const uint hidden = uint(SEISMIC_DIM_H);
     const uint first = projection_gemv_first_row(OUTPUT_R, OUTPUT_LANES, tile);
     const uint bytes = ELEMENT_BYTES(ROUTED_ACT);

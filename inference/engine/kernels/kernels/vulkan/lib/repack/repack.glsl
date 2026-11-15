@@ -58,11 +58,11 @@
 // grid has no tile (read as 1x1) and is not asked.
 #define REPACK_PLANAR_SOURCE(PFX, S, N, K) \
     uint64_t PFX##_row_packets() { \
-        return (uint64_t(K) + uint64_t(S##_LOGICAL_GROUP) - 1ul) / uint64_t(S##_LOGICAL_GROUP); \
+        return seismic_quotient(uint64_t(K) + uint64_t(S##_LOGICAL_GROUP) - 1ul, uint(S##_LOGICAL_GROUP)); \
     } \
     uint64_t PFX##_grid_columns() { \
         const uint64_t columns = max(uint64_t(S##_GRID_TILE_COLUMNS), 1ul); \
-        return (uint64_t(K) + columns - 1ul) / columns; \
+        return seismic_quotient(uint64_t(K) + columns - 1ul, uint(columns)); \
     } \
     uint64_t PFX##_code_bytes() { \
         return uint64_t(S##_PACKET_SIZE) - uint64_t(S##_GRID_SCALE_BYTES); \
@@ -72,7 +72,7 @@
     } \
     uint64_t PFX##_matrix_bytes() { \
         const uint64_t rows = max(uint64_t(S##_GRID_TILE_ROWS), 1ul); \
-        return PFX##_codes_bytes() + (uint64_t(N) + rows - 1ul) / rows * PFX##_grid_columns() \
+        return PFX##_codes_bytes() + seismic_quotient(uint64_t(N) + rows - 1ul, uint(rows)) * PFX##_grid_columns() \
             * uint64_t(S##_GRID_SCALE_BYTES); \
     } \
     uint64_t PFX##_code_at(uint64_t row, uint64_t packet) { \
@@ -81,7 +81,8 @@
     uint64_t PFX##_scale_at(uint64_t row, uint64_t packet) { \
         const uint64_t rows = max(uint64_t(S##_GRID_TILE_ROWS), 1ul), columns = max(uint64_t(S##_GRID_TILE_COLUMNS), 1ul); \
         return PFX##_codes_bytes() \
-            + ((row / rows) * PFX##_grid_columns() + packet * uint64_t(S##_LOGICAL_GROUP) / columns) \
+            + (seismic_quotient(row, uint(rows)) * PFX##_grid_columns() \
+                + seismic_quotient(packet * uint64_t(S##_LOGICAL_GROUP), uint(columns))) \
             * uint64_t(S##_GRID_SCALE_BYTES); \
     }
 

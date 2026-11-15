@@ -37,7 +37,7 @@
 // boundary, the subgroups' staging tiles [SIMDS][32][HISTORY_STAGE_PITCH]
 // (uvec4). The merge columns [SIMDS][W] (floats) alias them: every subgroup
 // has finished its walk before the publication's first barrier.
-#define ATTENTION_HEADS uint(SEISMIC_DIM_G / SEISMIC_TUNE_SLICES)
+#define ATTENTION_HEADS (uint(SEISMIC_DIM_G) / uint(SEISMIC_TUNE_SLICES))
 #define ATTENTION_I uint(SEISMIC_DIM_I)
 #define ATTENTION_U uint(SEISMIC_DIM_U)
 #define ATTENTION_FRESH (SEISMIC_DIM_F != 0)

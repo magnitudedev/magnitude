@@ -12,10 +12,11 @@ void draft_convolve_residual() {
     const Out result = SEISMIC_RESULT_0_OUT;
     const uint64_t channels = SEISMIC_DIM_C, width = SEISMIC_DIM_G * channels;
     const uint64_t count = SEISMIC_DIM_M * width;
-    const uint64_t step = uint64_t(gl_NumWorkGroups.x) * gl_WorkGroupSize.x;
-    for (uint64_t index = gl_GlobalInvocationID.x; index < count; index += step) {
-        const uint64_t row = index / width, column = index % width, group = column / channels;
-        const uint64_t position = row % uint64_t(SEISMIC_PARAM_BLOCK);
+    // Rows in blocks of SEISMIC_PARAM_BLOCK, a row's width in groups of channels.
+    for (seismic_walk at = seismic_walk_grid(count, u64vec3(uint64_t(SEISMIC_PARAM_BLOCK), SEISMIC_DIM_G, channels));
+            at.index < count; seismic_walk_next(at)) {
+        const uint64_t position = at.axes.y, row = at.axes.x * uint64_t(SEISMIC_PARAM_BLOCK) + position;
+        const uint64_t group = at.axes.z, column = group * channels + at.axes.w;
         float sum = 0.0;
         for (uint64_t offset = 0ul; offset < SEISMIC_DIM_K && offset <= position; ++offset) {
             const float coefficient =

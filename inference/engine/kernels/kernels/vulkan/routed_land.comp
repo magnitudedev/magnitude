@@ -25,7 +25,7 @@ void routed_land() {
     const uint64_t file = SEISMIC_PTR(SEISMIC_BUFFER_FILE);
     if (SEISMIC_DIM_V > 0)
         streaming_land(STREAMING_LAND_WINDOW, SEISMIC_PTR(SEISMIC_BUFFER_LANDING), SEISMIC_LANDING_STRIDE_0,
-            STREAMING_AT(file, (q % uint64_t(SEISMIC_DIM_FLIGHT)) * SEISMIC_FILE_STRIDE_0), SEISMIC_FILE_STRIDE_1, q,
+            STREAMING_AT(file, streaming_modulo(q, uint64_t(SEISMIC_DIM_FLIGHT)) * SEISMIC_FILE_STRIDE_0), SEISMIC_FILE_STRIDE_1, q,
             SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_COUNTERS), uint(SEISMIC_DIM_L),
             gl_NumWorkGroups.x * gl_NumWorkGroups.y * gl_NumWorkGroups.z, 0u, tid);
     if (gl_WorkGroupID.x == 0u)

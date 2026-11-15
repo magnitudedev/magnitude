@@ -11,8 +11,8 @@ void stream_join() {
     const uint64_t h = SEISMIC_DIM_H;
     if (index >= SEISMIC_DIM_M * h)
         return;
-    const uint64_t row = index / h;
-    const uint64_t column = index % h;
+    uint64_t row, column;
+    seismic_split_group(gl_WorkGroupID.x, gl_WorkGroupSize.x, gl_LocalInvocationIndex, h, row, column);
     const float y = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_Y)
         + (row * SEISMIC_Y_STRIDE_0 + column * SEISMIC_Y_STRIDE_1) * 4ul);
     const Out result = out_offset(SEISMIC_RESULT_0_OUT, row * SEISMIC_RESULT_0_STRIDE_0);
