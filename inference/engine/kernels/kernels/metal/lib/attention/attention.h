@@ -3609,6 +3609,11 @@ struct decode_picks {
     ulong rows_per_slab;
 };
 
+// The ABI prefix of `selected`. It is pasted, not written out: entries
+// without picks include this file too, and a header may name only ABI symbols
+// every including entry has.
+#define ATTENTION_SELECTED ELEMENT_CAT(SEISMIC, _SELECTED)
+
 // The picked rows as a dense history plane (key and value alike): rows of
 // `selected`, read as the activation element.
 template <uint PICKS>
