@@ -925,6 +925,9 @@ namespace projection {
 
 template <typename W>
 struct OrderedWeight {
+    // Whether a lane fetches a block's columns in the reference order's
+    // stride (`fetch_strided`), so the walk needs no transpose.
+    static constant constexpr bool strided = false;
     struct fetched {
         typename W::packet pkt;
         bool valid;
@@ -1013,6 +1016,26 @@ struct OrderedWeight<packets::Dense<E>> {
         } else {
             out.raw[0] = as_type<uint4>(float4(s[0], s[1], s[2], s[3]));
             out.raw[1] = as_type<uint4>(float4(s[4], s[5], s[6], s[7]));
+        }
+        return out;
+    }
+    static constant constexpr bool strided = true;
+    // Columns 64 block + 8 s + u (s = 0..7) of a whole block, value s in
+    // place s: lane u's operands after `ordered_transpose8`, each read where
+    // the eight lanes of a row read 16 consecutive bytes.
+    static fetched fetch_strided(thread const Weights<packets::Dense<E>> &w, uint row, uint block, uint u) {
+        fetched out;
+        const auto geom = w.geometry(row);
+        const auto s = slab::as<typename E::storage>(w.row(row) + geom.codes + ulong(64u * block + u) * E::bytes);
+        if constexpr (E::bytes == 2u) {
+            uint pair[4];
+            PROJECTION_UNROLL
+            for (uint j = 0; j < 4u; ++j)
+                pair[j] = uint(as_type<ushort>(s[16u * j])) | (uint(as_type<ushort>(s[16u * j + 8u])) << 16u);
+            out.raw[0] = uint4(pair[0], pair[1], pair[2], pair[3]);
+        } else {
+            out.raw[0] = as_type<uint4>(float4(s[0], s[8], s[16], s[24]));
+            out.raw[1] = as_type<uint4>(float4(s[32], s[40], s[48], s[56]));
         }
         return out;
     }
@@ -1379,18 +1402,26 @@ inline void ordered_gemv_maxm_run(thread const In &in, thread const Out &out, th
                     // block; the sum keeps the block order.
                     constexpr uint WALK = ordered_walk_batch<W>();
                     const uint blocks = k >> 6u;
+                    // A block's fetch: lane u's own columns where the weights
+                    // fetch in stride, else its eight consecutive ones, which
+                    // `ordered_transpose8` exchanges.
+                    const auto fetch_block = [&](uint block) {
+                        if constexpr (Ow::strided)
+                            return Ow::fetch_strided(w, w_row, block, u);
+                        else
+                            return Ow::fetch_full(w, w_row, 2u * block + p_own, s_own);
+                    };
                     typename Ow::fetched cur[WALK];
-                    cur[0] = cur_w;
+                    cur[0] = Ow::strided ? (has_row && blocks > 0u ? fetch_block(0u) : Ow::empty()) : cur_w;
                     PROJECTION_UNROLL
                     for (uint d = 1u; d < WALK; ++d)
-                        cur[d] = (has_row && d < blocks) ? Ow::fetch_full(w, w_row, 2u * d + p_own, s_own) : Ow::empty();
+                        cur[d] = (has_row && d < blocks) ? fetch_block(d) : Ow::empty();
                     for (uint b = 0u; b < blocks; b += WALK) {
                         typename Ow::fetched next[WALK];
                         PROJECTION_UNROLL
                         for (uint d = 0u; d < WALK; ++d) {
                             const uint nb = b + WALK + d;
-                            next[d] = (has_row && nb < blocks) ? Ow::fetch_full(w, w_row, 2u * nb + p_own, s_own)
-                                                               : Ow::empty();
+                            next[d] = (has_row && nb < blocks) ? fetch_block(nb) : Ow::empty();
                         }
                         PROJECTION_UNROLL
                         for (uint d = 0u; d < WALK; ++d) {
@@ -1403,7 +1434,8 @@ inline void ordered_gemv_maxm_run(thread const In &in, thread const Out &out, th
                                     for (uint j = 0u; j < 8u; ++j)
                                         wt[j] = 0.0f;
                                 }
-                                ordered_transpose8(wt, u);
+                                if constexpr (!Ow::strided)
+                                    ordered_transpose8(wt, u);
                                 float4 xe, xo;
                                 A::split8(x_packed[(b + d) * 8u + u], xe, xo);
                                 acc = metal::fma(xe.x, wt[0], acc);
