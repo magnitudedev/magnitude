@@ -67,7 +67,12 @@ pub struct Recording {
     /// Every recorded configuration, in the survey's order: the defaults
     /// first.
     configurations: Vec<NativeSpecialization>,
-    positions: HashMap<Configuration, usize>,
+    /// Each configuration's value of every surveyed parameter, in
+    /// `parameters`' order: the replay finds and compares configurations by
+    /// these, so asking whether it holds one neither clones nor allocates.
+    assignments: Vec<Vec<u64>>,
+    /// The configuration of each assignment.
+    positions: HashMap<Vec<u64>, usize>,
     weights: Vec<f64>,
     labels: Vec<String>,
     /// Per configuration; `None` when the survey excluded it.
@@ -89,6 +94,12 @@ pub enum RecordingError {
     /// A declared parameter belongs to a launch: a replay's record is of a
     /// declaration's entry parameters alone.
     LaunchDeclared { parameter: String },
+    /// A recorded configuration differs from the defaults outside the
+    /// surveyed parameters: the replay knows a configuration by its surveyed
+    /// values alone.
+    Unsurveyed { values: ParameterValues },
+    /// The survey records a configuration more than once.
+    Repeated { values: ParameterValues },
 }
 
 impl std::fmt::Display for RecordingError {
@@ -106,6 +117,13 @@ impl std::fmt::Display for RecordingError {
                 f,
                 "the surveyed parameter `{parameter}` is a launch's; a replay's record holds entry parameters alone"
             ),
+            Self::Unsurveyed { values } => write!(
+                f,
+                "the surveyed configuration {values:?} differs from the defaults outside the surveyed parameters"
+            ),
+            Self::Repeated { values } => {
+                write!(f, "the survey records the configuration {values:?} more than once")
+            }
         }
     }
 }
@@ -138,6 +156,23 @@ impl Recording {
                     });
                 }
             }
+        }
+        // What a configuration is besides its surveyed values, which every
+        // recorded one shares with the defaults.
+        let unsurveyed = |configuration: &Configuration| {
+            let mut configuration = configuration.clone();
+            for declared in &result.parameters {
+                configuration.params.remove(&declared.name);
+            }
+            configuration
+        };
+        let fixed = result.configurations.first().map(|record| unsurveyed(&record.configuration));
+        if let Some(record) = result
+            .configurations
+            .iter()
+            .find(|record| Some(unsurveyed(&record.configuration)) != fixed)
+        {
+            return Err(RecordingError::Unsurveyed { values: record.configuration.params.clone() });
         }
         let mut points = Vec::with_capacity(result.configurations.len());
         for record in &result.configurations {
@@ -196,19 +231,30 @@ impl Recording {
                 .total(),
             })
             .collect();
+        let configurations = result
+            .configurations
+            .iter()
+            .map(|record| record.configuration.specialization())
+            .collect::<Vec<_>>();
+        let assignments = configurations
+            .iter()
+            .map(|configuration| {
+                let mut assignment = Vec::new();
+                assign(&parameters, configuration, &mut assignment);
+                assignment
+            })
+            .collect::<Vec<_>>();
+        let mut positions = HashMap::with_capacity(assignments.len());
+        for (index, assignment) in assignments.iter().enumerate() {
+            if positions.insert(assignment.clone(), index).is_some() {
+                return Err(RecordingError::Repeated { values: configurations[index].params().clone() });
+            }
+        }
         Ok(Self {
             parameters,
-            configurations: result
-                .configurations
-                .iter()
-                .map(|record| record.configuration.specialization())
-                .collect(),
-            positions: result
-                .configurations
-                .iter()
-                .enumerate()
-                .map(|(index, record)| (record.configuration.clone(), index))
-                .collect(),
+            configurations,
+            assignments,
+            positions,
             weights,
             labels,
             points,
@@ -306,17 +352,69 @@ impl Recording {
         plan::whole(&self.parameters, working, points)
     }
 
-    /// `base` with `parameters` at `values`.
+    /// The position of `address` among the surveyed parameters. The replay
+    /// plans the record's own parameters ([`Self::partition`]), so it is
+    /// asked of no other.
+    fn coordinate(&self, address: &ParameterAddress) -> usize {
+        let ParameterAddress::Entry(name) = address else {
+            panic!("the replay plans only the surveyed entry parameters");
+        };
+        self.parameters
+            .iter()
+            .position(|(surveyed, _, _)| surveyed == name)
+            .expect("the replay plans only the surveyed entry parameters")
+    }
+
+    /// `base`'s assignment with `parameters` at `values`, into `assignment`.
     fn moved(
+        &self,
         base: &NativeSpecialization,
         parameters: &[ParameterAddress],
         values: &[u64],
-    ) -> NativeSpecialization {
-        parameters
-            .iter()
-            .zip(values)
-            .fold(base.clone(), |moved, (address, value)| address.set(moved, *value))
+        assignment: &mut Vec<u64>,
+    ) {
+        assign(&self.parameters, base, assignment);
+        for (address, value) in parameters.iter().zip(values) {
+            assignment[self.coordinate(address)] = *value;
+        }
     }
+
+    /// The record as changes of the assignment `base`.
+    fn changes_of(&self, base: &[u64]) -> Changes {
+        let mut changes = Changes::new();
+        for (index, recorded) in self.assignments.iter().enumerate() {
+            let changed = (0..base.len())
+                .filter(|&coordinate| recorded[coordinate] != base[coordinate])
+                .collect();
+            changes.entry(changed).or_insert_with(|| (None, Vec::new())).1.push(index);
+        }
+        changes
+    }
+
+    /// Where `value` stands in the declared values of the surveyed
+    /// parameter at `coordinate`.
+    fn ordinal(&self, coordinate: usize, value: u64) -> usize {
+        self.parameters[coordinate]
+            .1
+            .iter()
+            .position(|declared| *declared == value)
+            .expect("a recorded value is a declared one of a surveyed parameter")
+    }
+}
+
+/// `specialization`'s value of each of `parameters`, in their order, into
+/// `assignment`.
+fn assign(
+    parameters: &[(String, Vec<u64>, bool)],
+    specialization: &NativeSpecialization,
+    assignment: &mut Vec<u64>,
+) {
+    assignment.clear();
+    assignment.extend(parameters.iter().map(|(name, _, _)| {
+        specialization
+            .param(name)
+            .expect("a recorded configuration values every surveyed parameter")
+    }));
 }
 
 /// A recording as the domain of a search: it admits what the survey
@@ -325,61 +423,39 @@ impl Recording {
 struct Replayed<'r> {
     recording: &'r Recording,
     objective: Objective,
-    /// The record as changes of each base configuration a search asked
-    /// what it admits under ([`plan::Domain::admissible`]): the record is
-    /// read whole once per base, never again per set of parameters asked
-    /// for or per batch of them.
-    changes: RefCell<HashMap<Configuration, Changes>>,
+    /// The assignment each question is answered at, reused across them.
+    assignment: RefCell<Vec<u64>>,
+    /// The record as changes of each base assignment a search asked what
+    /// it admits under ([`plan::Domain::admissible`]): the record is read
+    /// whole once per base, never again per set of parameters asked for or
+    /// per batch of them.
+    changes: RefCell<HashMap<Vec<u64>, Changes>>,
 }
 
-/// The recorded configurations as changes of one base configuration, by
-/// the names of the parameters each changes from it (and nothing else):
-/// their indices in the record and, once asked for, the addresses they are
-/// sorted for, in the declaration's walk's order over them.
-type Changes = HashMap<BTreeSet<String>, (Option<Vec<ParameterAddress>>, Vec<usize>)>;
+/// The recorded configurations as changes of one base assignment, by the
+/// coordinates of the parameters each changes from it (and nothing else),
+/// ascending: their indices in the record and, once asked for, the
+/// coordinates in the order they are sorted for, the declaration's walk's
+/// order over them.
+type Changes = HashMap<Vec<usize>, (Option<Vec<usize>>, Vec<usize>)>;
 
 impl<'r> Replayed<'r> {
     fn new(recording: &'r Recording, objective: Objective) -> Self {
-        Self { recording, objective, changes: RefCell::new(HashMap::new()) }
-    }
-
-    /// The record as changes of `base`.
-    fn changes_of(&self, base: &NativeSpecialization) -> Changes {
-        let mut changes = Changes::new();
-        for (index, recorded) in self.recording.configurations.iter().enumerate() {
-            let changed = self
-                .recording
-                .parameters
-                .iter()
-                .map(|(name, _, _)| ParameterAddress::Entry(name.clone()))
-                .filter(|address| address.value(recorded) != address.value(base))
-                .collect::<Vec<_>>();
-            let values = changed.iter().map(|address| address.value(recorded)).collect::<Vec<_>>();
-            if Configuration::of(&Recording::moved(base, &changed, &values)) != Configuration::of(recorded) {
-                continue;
-            }
-            let names = changed.iter().map(|address| address.site().1.to_owned()).collect();
-            changes.entry(names).or_insert_with(|| (None, Vec::new())).1.push(index);
+        Self {
+            recording,
+            objective,
+            assignment: RefCell::new(Vec::with_capacity(recording.parameters.len())),
+            changes: RefCell::new(HashMap::new()),
         }
-        changes
     }
 
-    /// Where `value` stands in the declared values of the record's entry
-    /// parameter `address`.
-    fn position(&self, address: &ParameterAddress, value: u64) -> usize {
-        let (None, name) = address.site() else {
-            panic!("a record surveys entry parameters alone");
-        };
-        self.recording
-            .parameters
-            .iter()
-            .find(|(declared, _, _)| declared == name)
-            .and_then(|(_, values, _)| values.iter().position(|declared| *declared == value))
-            .expect("a recorded value is a declared one of a surveyed parameter")
+    /// The recorded configuration `specialization` is, if it is one.
+    fn position(&self, specialization: &NativeSpecialization) -> Option<usize> {
+        let mut assignment = self.assignment.borrow_mut();
+        assign(&self.recording.parameters, specialization, &mut assignment);
+        self.recording.positions.get(assignment.as_slice()).copied()
     }
-}
 
-impl Replayed<'_> {
     /// The key configuration `index` is measured under at `point`: the
     /// recorded one, or under independent sampling one no other
     /// configuration has. An excluded configuration has none recorded: it
@@ -410,12 +486,13 @@ impl plan::Domain for Replayed<'_> {
         parameters: &[ParameterAddress],
         values: &[u64],
     ) -> Result<Option<NativeSpecialization>, PlanError> {
-        let moved = Recording::moved(base, parameters, values);
+        let mut moved = self.assignment.borrow_mut();
+        self.recording.moved(base, parameters, values, &mut moved);
         Ok(self
             .recording
             .positions
-            .contains_key(&Configuration::of(&moved))
-            .then_some(moved))
+            .get(moved.as_slice())
+            .map(|index| self.recording.configurations[*index].clone()))
     }
 
     /// The recorded configurations that change from `base` exactly
@@ -431,38 +508,49 @@ impl plan::Domain for Replayed<'_> {
         after: Option<&[u64]>,
         limit: usize,
     ) -> Result<Vec<Vec<u64>>, PlanError> {
+        let recording = self.recording;
+        let coordinates = parameters
+            .iter()
+            .map(|address| recording.coordinate(address))
+            .collect::<Vec<_>>();
         let mut changes = self.changes.borrow_mut();
-        let changes = changes
-            .entry(Configuration::of(base))
-            .or_insert_with(|| self.changes_of(base));
-        let names = parameters.iter().map(|address| address.site().1.to_owned()).collect::<BTreeSet<_>>();
-        let Some((order, indices)) = changes.get_mut(&names) else {
+        let mut assignment = self.assignment.borrow_mut();
+        assign(&recording.parameters, base, &mut assignment);
+        if !changes.contains_key(assignment.as_slice()) {
+            changes.insert(assignment.clone(), recording.changes_of(&assignment));
+        }
+        let changes = changes.get_mut(assignment.as_slice()).expect("indexed above");
+        drop(assignment);
+        let mut changed = coordinates.clone();
+        changed.sort_unstable();
+        let Some((order, indices)) = changes.get_mut(&changed) else {
             return Ok(Vec::new());
         };
-        // An assignment's place in the walk: its values' declared
-        // positions, in the order of `parameters`.
-        let values_of = |index: usize| {
-            parameters
-                .iter()
-                .map(|address| address.value(&self.recording.configurations[index]))
-                .collect::<Vec<_>>()
+        // A recorded assignment's values of `parameters`, in their order,
+        // and its place in the walk: those values' declared positions.
+        let values = |index: usize| {
+            let assignment = &recording.assignments[index];
+            coordinates.iter().map(move |&coordinate| assignment[coordinate])
         };
-        let place = |values: &[u64]| {
-            parameters
+        let place = |index: usize| {
+            coordinates
                 .iter()
-                .zip(values)
-                .map(|(address, value)| self.position(address, *value))
-                .collect::<Vec<_>>()
+                .zip(values(index))
+                .map(|(&coordinate, value)| recording.ordinal(coordinate, value))
         };
-        if order.as_deref() != Some(parameters) {
-            indices.sort_by_cached_key(|&index| place(&values_of(index)));
-            *order = Some(parameters.to_vec());
+        if order.as_deref() != Some(coordinates.as_slice()) {
+            indices.sort_by_cached_key(|&index| place(index).collect::<Vec<_>>());
+            *order = Some(coordinates.clone());
         }
         let from = after.map_or(0, |after| {
-            let after = place(after);
-            indices.partition_point(|&index| place(&values_of(index)) <= after)
+            let after = coordinates
+                .iter()
+                .zip(after)
+                .map(|(&coordinate, value)| recording.ordinal(coordinate, *value))
+                .collect::<Vec<_>>();
+            indices.partition_point(|&index| place(index).le(after.iter().copied()))
         });
-        Ok(indices[from..].iter().take(limit).map(|&index| values_of(index)).collect())
+        Ok(indices[from..].iter().take(limit).map(|&index| values(index).collect()).collect())
     }
 
     /// The definition of [`plan::TuningPartition::nearest`] over the
@@ -473,25 +561,31 @@ impl plan::Domain for Replayed<'_> {
         parameters: &[ParameterAddress],
         values: &[u64],
     ) -> Result<Option<NativeSpecialization>, PlanError> {
-        let moved = Recording::moved(base, parameters, values);
-        let declared = self
-            .recording
-            .parameters
+        let recording = self.recording;
+        let held = parameters
             .iter()
-            .map(|(name, values, _)| (ParameterAddress::Entry(name.clone()), values.as_slice()))
+            .zip(values)
+            .map(|(address, value)| (recording.coordinate(address), *value))
             .collect::<Vec<_>>();
-        Ok(self
-            .recording
-            .configurations
+        let mut moved = self.assignment.borrow_mut();
+        recording.moved(base, parameters, values, &mut moved);
+        Ok(recording
+            .assignments
             .iter()
-            .filter(|candidate| {
-                parameters
-                    .iter()
-                    .zip(values)
-                    .all(|(address, value)| address.value(candidate) == *value)
+            .enumerate()
+            .filter(|(_, candidate)| {
+                held.iter().all(|(coordinate, value)| candidate[*coordinate] == *value)
             })
-            .min_by_key(|candidate| plan::distance(&declared, &moved, candidate))
-            .cloned())
+            .min_by_key(|(_, candidate)| {
+                plan::distance_of(
+                    recording
+                        .parameters
+                        .iter()
+                        .zip(moved.iter().zip(candidate.iter()))
+                        .map(|((_, declared, _), (from, to))| (declared.as_slice(), *from, *to)),
+                )
+            })
+            .map(|(index, _)| recording.configurations[index].clone()))
     }
 
     fn forecast(
@@ -500,12 +594,7 @@ impl plan::Domain for Replayed<'_> {
         _baseline: &LaunchKey,
         specialization: &NativeSpecialization,
     ) -> LaunchKey {
-        let index = self
-            .recording
-            .positions
-            .get(&Configuration::of(specialization))
-            .copied();
-        self.key(index, point, specialization)
+        self.key(self.position(specialization), point, specialization)
     }
 }
 
@@ -735,7 +824,10 @@ pub fn replay(
                     break 'search;
                 }
                 evaluated += 1;
-                let index = recording.positions[&Configuration::of(challenger)];
+                let index = evaluator
+                    .domain
+                    .position(challenger)
+                    .expect("the search asks only for what the record admits");
                 let points = evaluator.measure(index, &mut shared);
                 search.record(challenger, points.clone());
                 if let Some(points) = points {
@@ -802,6 +894,11 @@ mod tests {
     /// The same survey with the second point's samples spread by `spread`
     /// of its time a step.
     fn recording_spreading(spread: f64) -> Recording {
+        Recording::new(&survey(spread)).unwrap()
+    }
+
+    /// The survey [`recording_spreading`] reads.
+    fn survey(spread: f64) -> TuningResult {
         let mut configurations = Vec::new();
         for a in [1u64, 2, 3, 4] {
             for b in [1u64, 2] {
@@ -842,7 +939,7 @@ mod tests {
                 });
             }
         }
-        let result = TuningResult {
+        TuningResult {
             disposition: crate::native::tune::TuningDisposition::QualifiedCandidate,
             tuning_identity: String::new(),
             entry: "test".into(),
@@ -886,8 +983,19 @@ mod tests {
             time: TuningTime::default(),
             coverage: None,
             default_launches: Vec::new(),
-        };
-        Recording::new(&result).unwrap()
+        }
+    }
+
+    /// The replay knows a configuration by its surveyed values, so a record
+    /// in which those do not tell configurations apart is refused.
+    #[test]
+    fn a_record_whose_surveyed_values_do_not_identify_its_configurations_is_refused() {
+        let mut unsurveyed = survey(0.02);
+        unsurveyed.configurations[3].configuration.statics.insert("S".into(), 1);
+        assert!(matches!(Recording::new(&unsurveyed), Err(RecordingError::Unsurveyed { .. })));
+        let mut repeated = survey(0.02);
+        repeated.configurations.push(repeated.configurations[3].clone());
+        assert!(matches!(Recording::new(&repeated), Err(RecordingError::Repeated { .. })));
     }
 
     fn settings() -> SearchSettings {
@@ -1094,7 +1202,10 @@ mod tests {
         let mut asked = BTreeSet::new();
         while let Some(piece) = search.plan(&counted).unwrap() {
             for challenger in piece.challengers() {
-                let index = recording.positions[&Configuration::of(challenger)];
+                let index = evaluator
+                    .domain
+                    .position(challenger)
+                    .expect("the search asks only for what the record admits");
                 asked.insert(index);
                 let points = evaluator.measure(index, &mut shared);
                 search.record(challenger, points);
@@ -1102,6 +1213,62 @@ mod tests {
         }
         assert_eq!(asked.len(), 27, "every other recorded configuration is asked for");
         assert!(counted.placed.get() <= 500, "{} placed", counted.placed.get());
+    }
+
+    /// Allocations made by the current thread, counted by this test
+    /// binary's allocator.
+    mod counted {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+        }
+
+        struct Counting;
+
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                let _ = ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
+                unsafe { System.alloc(layout) }
+            }
+
+            unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+                unsafe { System.dealloc(pointer, layout) }
+            }
+        }
+
+        #[global_allocator]
+        static ALLOCATOR: Counting = Counting;
+
+        pub fn allocations() -> usize {
+            ALLOCATIONS.with(Cell::get)
+        }
+    }
+
+    /// A search asks the record for configurations a step from what it
+    /// holds, most of which a survey did not record: asking for one the
+    /// record does not hold allocates nothing, and one it holds costs only
+    /// the configuration returned.
+    #[test]
+    fn asking_the_record_allocates_only_the_configuration_it_answers() {
+        let recording = recording();
+        let domain = Replayed::new(&recording, Objective::Keyed);
+        let parameters = [
+            ParameterAddress::Entry("A".into()),
+            ParameterAddress::Entry("B".into()),
+        ];
+        let ask = |values: &[u64]| {
+            plan::Domain::place(&domain, &recording.configurations[0], &parameters, values)
+                .expect("a record admits or refuses")
+        };
+        let before = counted::allocations();
+        for a in 5..1005 {
+            assert!(ask(&[a, 2]).is_none());
+        }
+        assert_eq!(counted::allocations(), before, "a refused configuration allocates");
+        let held = ask(&[4, 2]).expect("the survey recorded A=4, B=2");
+        assert_eq!((held.param("A"), held.param("B")), (Some(4), Some(2)));
     }
 
     #[test]

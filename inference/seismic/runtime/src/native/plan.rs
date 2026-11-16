@@ -103,9 +103,21 @@ pub fn distance(
     base: &NativeSpecialization,
     candidate: &NativeSpecialization,
 ) -> (usize, usize) {
+    distance_of(
+        parameters
+            .iter()
+            .map(|(address, values)| (*values, address.value(base), address.value(candidate))),
+    )
+}
+
+/// [`distance`] over each parameter's declared values with its value in the
+/// base and in the candidate, for a domain that holds its configurations'
+/// values by position rather than by name.
+pub(crate) fn distance_of<'v>(
+    parameters: impl IntoIterator<Item = (&'v [u64], u64, u64)>,
+) -> (usize, usize) {
     let mut distance = (0, 0);
-    for (address, values) in parameters {
-        let (from, to) = (address.value(base), address.value(candidate));
+    for (values, from, to) in parameters {
         if from != to {
             let between = values
                 .iter()
