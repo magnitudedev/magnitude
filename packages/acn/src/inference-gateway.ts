@@ -15,6 +15,16 @@ const HOP_BY_HOP_HEADERS = [
   "upgrade",
 ] as const
 
+/** Headers that describe a body's bytes, and so are stale once those bytes are rewritten. */
+const BYTE_DESCRIBING_HEADERS = [
+  "content-encoding",
+  "content-length",
+  "content-md5",
+  "digest",
+  "content-digest",
+  "repr-digest",
+] as const
+
 export const LOCAL_ANTHROPIC_MODEL_PREFIX = "anthropic-local/"
 export const LOCAL_CODEX_MODEL_PREFIX = "magnitude-local/"
 export const MAX_ANTHROPIC_ROUTING_BODY_BYTES = 32 * 1024 * 1024
@@ -81,13 +91,40 @@ export class CodexGateway extends Context.Tag("@magnitudedev/acn/CodexGateway")<
   }
 >() {}
 
-const forwardedHeaders = (source: Headers): Headers => {
+/**
+ * The body a request forwards, in its transport's representation. `Original` is the source's
+ * bytes exactly as received, so the source's body headers still describe them. `Rewritten` is
+ * new identity-encoded bytes of the same media type, whose length the transport supplies.
+ * `Absent` forwards no body, as on a GET or a WebSocket handshake.
+ */
+type ForwardedBody =
+  | { readonly _tag: "Original"; readonly payload: BodyInit | null }
+  | { readonly _tag: "Rewritten"; readonly payload: ArrayBuffer }
+  | { readonly _tag: "Absent"; readonly payload: undefined }
+
+const originalBody = (payload: BodyInit | null): ForwardedBody => ({ _tag: "Original", payload })
+const rewrittenBody = (payload: ArrayBuffer): ForwardedBody => ({ _tag: "Rewritten", payload })
+const noBody: ForwardedBody = { _tag: "Absent", payload: undefined }
+
+/**
+ * The headers and body forwarded for `body`. This is the only place a forwarded request's
+ * headers are derived from its source, so headers describing bytes a route does not forward
+ * are never sent.
+ */
+const forwardedRequest = (
+  source: Headers,
+  body: ForwardedBody,
+): { readonly headers: Headers; readonly body: ForwardedBody["payload"] } => {
   const headers = new Headers(source)
   headers.delete("host")
   headers.delete("x-magnitude-acn-id")
   headers.delete("magnitude-gateway-model")
   for (const header of HOP_BY_HOP_HEADERS) headers.delete(header)
-  return headers
+  if (body._tag !== "Original") {
+    for (const header of BYTE_DESCRIBING_HEADERS) headers.delete(header)
+  }
+  if (body._tag === "Absent") headers.delete("content-type")
+  return { headers, body: body.payload }
 }
 
 const responseFromUpstream = (response: Response): Response => {
@@ -121,14 +158,14 @@ export const proxyOpenAiInferenceRequest = async (
   if (targetPath !== "/v1" && !targetPath.startsWith("/v1/")) {
     return new Response("Not found", { status: 404 })
   }
-  const headers = forwardedHeaders(source.headers)
+  const { headers, body } = forwardedRequest(source.headers, originalBody(source.body))
   localAuthorization(headers, icn)
   const response = await fetchTarget(
     new URL(`${targetPath}${incoming.search}`, icn.origin),
     {
       method: source.method,
       headers,
-      body: source.body,
+      body,
       signal,
       ...localEngineFetch,
     },
@@ -281,10 +318,9 @@ const localResponseItemId = (value: unknown): value is string =>
  * minted by ICN must not cross back into the upstream service. A local
  * reasoning item has no portable encrypted payload and is omitted; message
  * items remain inline conversation content with only their local ID removed.
+ * Returns the rewritten bytes, or undefined when the body is already portable.
  */
-const upstreamCodexBody = (
-  body: RoutingBody,
-): { readonly bytes: Uint8Array; readonly changed: boolean } => {
+const portableCodexBody = (body: RoutingBody): Uint8Array | undefined => {
   const value = JSON.parse(body.source) as Record<string, unknown>
   let changed = false
   if (typeof value.previous_response_id === "string" && value.previous_response_id.startsWith("resp_icn_")) {
@@ -303,9 +339,7 @@ const upstreamCodexBody = (
       return [inline]
     })
   }
-  return changed
-    ? { bytes: new TextEncoder().encode(JSON.stringify(value)), changed: true }
-    : { bytes: body.bytes, changed: false }
+  return changed ? new TextEncoder().encode(JSON.stringify(value)) : undefined
 }
 
 const requestBody = (bytes: Uint8Array): ArrayBuffer => {
@@ -370,7 +404,7 @@ const localModels = async (
   fetchTarget: InferenceFetch,
   signal: AbortSignal,
 ): Promise<Response> => {
-  const headers = forwardedHeaders(source.headers)
+  const { headers } = forwardedRequest(source.headers, noBody)
   localAuthorization(headers, icn)
   const response = await fetchTarget(new URL("/v1/models", icn.origin), {
     method: "GET",
@@ -422,10 +456,7 @@ const loadedLocalModel = async (
   fetchTarget: InferenceFetch,
   signal: AbortSignal,
 ): Promise<string | undefined> => {
-  const headers = forwardedHeaders(source.headers)
-  headers.delete("content-length")
-  headers.delete("content-type")
-  headers.delete("content-encoding")
+  const { headers } = forwardedRequest(source.headers, noBody)
   localAuthorization(headers, icn)
   const response = await fetchTarget(new URL("/api/v1/instances", icn.origin), {
     method: "GET",
@@ -452,7 +483,6 @@ const proxyClassifiedRequest = async (
   const classified = await classifyRoutingBody(source)
   if (classified._tag === "Invalid") return classified.response
   const { body } = classified
-  const headers = forwardedHeaders(source.headers)
   const placeholder = carriesPlaceholderCredential(source.headers)
   if (body.model.startsWith(LOCAL_ANTHROPIC_MODEL_PREFIX) || placeholder) {
     const canonicalModel = body.model.startsWith(LOCAL_ANTHROPIC_MODEL_PREFIX)
@@ -479,24 +509,28 @@ const proxyClassifiedRequest = async (
         "not_found_error",
       )
     }
-    localAuthorization(headers, icn)
-    headers.set("magnitude-gateway-model", `${LOCAL_ANTHROPIC_MODEL_PREFIX}${canonicalModel}`)
-    headers.delete("content-length")
+    const local = forwardedRequest(
+      source.headers,
+      rewrittenBody(requestBody(rewrittenLocalBody(body, canonicalModel))),
+    )
+    localAuthorization(local.headers, icn)
+    local.headers.set("magnitude-gateway-model", `${LOCAL_ANTHROPIC_MODEL_PREFIX}${canonicalModel}`)
     const response = await fetchTarget(new URL(localPath, icn.origin), {
       method: source.method,
-      headers,
-      body: requestBody(rewrittenLocalBody(body, canonicalModel)),
+      headers: local.headers,
+      body: local.body,
       signal,
       ...localEngineFetch,
     })
     return responseFromUpstream(response)
   }
+  const upstream = forwardedRequest(source.headers, originalBody(requestBody(body.bytes)))
   const response = await fetchTarget(
     new URL(`${targetPath}${incoming.search}`, anthropicOrigin),
     {
       method: source.method,
-      headers,
-      body: requestBody(body.bytes),
+      headers: upstream.headers,
+      body: upstream.body,
       signal,
       redirect: "manual",
       decompress: false,
@@ -618,8 +652,12 @@ const websocketUrl = (url: URL): URL => {
   return target
 }
 
+/**
+ * The handshake for a new outgoing socket. It carries no body and is reused for every later
+ * frame on its route, so no header describing request bytes crosses it.
+ */
 const forwardedWebSocketHeaders = (source: Headers): Headers => {
-  const headers = forwardedHeaders(source)
+  const { headers } = forwardedRequest(source, noBody)
   for (const name of [...headers.keys()]) {
     if (name.startsWith("sec-websocket-")) headers.delete(name)
   }
@@ -652,17 +690,12 @@ export const codexWebSocketTarget = (
   const { body } = classified
   const headers = forwardedWebSocketHeaders(sourceHeaders)
   if (!body.model.startsWith(LOCAL_CODEX_MODEL_PREFIX)) {
-    const upstream = upstreamCodexBody(body)
-    if (upstream.changed) {
-      headers.delete("content-encoding")
-      headers.delete("content-length")
-    }
     return {
       _tag: "Target",
       route: "upstream",
       url: websocketUrl(fixedOpenAiUrl(headers, "/responses", "")),
       headers,
-      firstMessage: upstream.changed ? upstream.bytes : firstMessage,
+      firstMessage: portableCodexBody(body) ?? firstMessage,
     }
   }
   const canonicalModel = body.model.slice(LOCAL_CODEX_MODEL_PREFIX.length)
@@ -686,11 +719,11 @@ const proxyOpaqueCodexUpstream = async (
   fetchTarget: InferenceFetch,
   signal: AbortSignal,
 ): Promise<Response> => {
-  const headers = forwardedHeaders(source.headers)
+  const { headers, body } = forwardedRequest(source.headers, originalBody(source.body))
   const response = await fetchTarget(fixedOpenAiUrl(headers, targetPath, incoming.search), {
     method: source.method,
     headers,
-    body: source.body,
+    body,
     signal,
     redirect: "manual",
     decompress: false,
@@ -717,17 +750,16 @@ export const proxyCodexInferenceRequest = async (
   const classified = await classifyCodexRoutingBody(source)
   if (classified._tag === "Invalid") return classified.response
   const { body } = classified
-  const headers = forwardedHeaders(source.headers)
   if (!body.model.startsWith(LOCAL_CODEX_MODEL_PREFIX)) {
-    const upstream = upstreamCodexBody(body)
-    if (upstream.changed) {
-      headers.delete("content-encoding")
-      headers.delete("content-length")
-    }
-    const response = await fetchTarget(fixedOpenAiUrl(headers, targetPath, incoming.search), {
+    const portable = portableCodexBody(body)
+    const upstream = forwardedRequest(
+      source.headers,
+      portable === undefined ? originalBody(requestBody(body.bytes)) : rewrittenBody(requestBody(portable)),
+    )
+    const response = await fetchTarget(fixedOpenAiUrl(upstream.headers, targetPath, incoming.search), {
       method: source.method,
-      headers,
-      body: requestBody(upstream.bytes),
+      headers: upstream.headers,
+      body: upstream.body,
       signal,
       redirect: "manual",
       decompress: false,
@@ -743,13 +775,15 @@ export const proxyCodexInferenceRequest = async (
       "invalid_model",
     )
   }
-  localAuthorization(headers, icn)
-  headers.delete("content-encoding")
-  headers.delete("content-length")
+  const local = forwardedRequest(
+    source.headers,
+    rewrittenBody(requestBody(rewrittenLocalBody(body, canonicalModel))),
+  )
+  localAuthorization(local.headers, icn)
   const response = await fetchTarget(new URL("/v1/responses", icn.origin), {
     method: source.method,
-    headers,
-    body: requestBody(rewrittenLocalBody(body, canonicalModel)),
+    headers: local.headers,
+    body: local.body,
     signal,
     ...localEngineFetch,
   })
@@ -767,12 +801,12 @@ export const proxyLocalAnthropicInferenceRequest = async (
   if (targetPath !== "/anthropic" && !targetPath.startsWith("/anthropic/")) {
     return new Response("Not found", { status: 404 })
   }
-  const headers = forwardedHeaders(source.headers)
+  const { headers, body } = forwardedRequest(source.headers, originalBody(source.body))
   localAuthorization(headers, icn)
   const response = await fetchTarget(new URL(`${targetPath}${incoming.search}`, icn.origin), {
     method: source.method,
     headers,
-    body: source.body,
+    body,
     signal,
     ...localEngineFetch,
   })
