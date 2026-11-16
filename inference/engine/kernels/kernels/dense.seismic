@@ -600,7 +600,14 @@ projection dense for cuda:
 # `form(W, TABLE)` bytes, rounded to 8) and a 4-byte pad: the region's u32 length
 # is then odd, and odd only then, which is how the library tells it stages
 # the tables there once a workgroup (`packets_stage_tables`) rather than
-# reading them in place. Every weight is one the packet decoder reads
+# reading them in place. The GEMV stages fewer packets at once to hold them
+# (GEMV_FIT, whole 72-byte packet rows, what the floor leaves beside the
+# tables), as long as a chunk still gives every lane of a group a packet of
+# each of 8 rows (8 * LANES packets); the library reads its chunk from the
+# region (`projection_gemv_stage_packets`). An iq1_s weight's 16 KiB grid is
+# so held by the decode row too: dense_output's decode row (H 4096, F 12288)
+# on a GB10 read it in place in 760 us against 111 us held. Every weight is one
+# the packet decoder reads
 # (`form(W, DECODED)`, `vulkan/producers.decl`). Groups: every launch but the stage runs group g at
 # grid z (z = g * SPLIT + part in the GEMM), over the group's columns, weight
 # rows and output columns, and its own G-th of the split partials; the
@@ -613,11 +620,16 @@ projection dense for vulkan:
     let ORDERED_ANY = min(1, sum(W, ORDERED))
     let ORDERED_ALL = sum(W, ORDERED) / WEIGHTS
     let OPERANDS = min(1, sum(W, operands(W)))
-    let GEMV_SHARED = 256 + 32 * OPERANDS + min(8 * ceil_div(K / P, 32), 288) * 72
+    let GEMV_HEAD = 256 + 32 * OPERANDS
+    let GEMV_STAGING = min(8 * ceil_div(K / P, 32), 288) * 72
+    let GEMV_SHARED = GEMV_HEAD + GEMV_STAGING
     let TABLE_SUM = sum(W, form(W, TABLE))
     let TABLE_REGION = min(1, TABLE_SUM) * (8 * ceil_div(TABLE_SUM, 8) + 4)
     let GEMV_REGION = 8 * ceil_div(GEMV_SHARED, 8)
-    let GEMV_HELD = GEMV_REGION + TABLE_REGION * (1 - min(1, 16 * ceil_div(GEMV_REGION + TABLE_REGION, 16) / (FLOOR_SHARED_BYTES + 1)))
+    let GEMV_ROOM = max(FLOOR_SHARED_BYTES, GEMV_HEAD + TABLE_REGION + 16) - GEMV_HEAD - TABLE_REGION - 16
+    let GEMV_FIT = min(GEMV_STAGING, 72 * (GEMV_ROOM / 72))
+    let GEMV_FITS = min(1, TABLE_SUM) * min(1, GEMV_FIT / min(GEMV_STAGING, 8 * LANES * 72))
+    let GEMV_HELD = GEMV_FITS * (8 * ceil_div(GEMV_HEAD + GEMV_FIT, 8) + TABLE_REGION) + (1 - GEMV_FITS) * GEMV_REGION
     let GEMM_REGION = (TILE_M + TILE_N) * 80
     let GEMM_HELD = GEMM_REGION + TABLE_REGION * (1 - min(1, 16 * ceil_div(GEMM_REGION + TABLE_REGION, 16) / (FLOOR_SHARED_BYTES + 1)))
     let ORDERED_GEMV_REGION = 8448

@@ -511,6 +511,19 @@ uint projection_gemv_stage_word(projection_prologue in_) {
     return (PROJECTION_GEMV_SQUARES_BYTES
                + (in_.operands == PROJECTION_OPERANDS_NVFP4 ? PROJECTION_GEMV_GLOBALS_BYTES : 0)) / 16u;
 }
+
+// The packets of every activation row the GEMV stages at once, 72 bytes
+// each (their values and two 16-column sums a row): PROJECTION_GEMV_STAGE_PACKETS,
+// or, where the launch holds its weights' tables at its region's end
+// (`packets_held`), what the region holds before them, which its declaration
+// sizes to at least 8 * LANES (`dense.seismic`).
+uint projection_gemv_stage_packets(projection_prologue in_) {
+#if defined(PACKETS_STAGING)
+    if (packets_held)
+        return min(PROJECTION_GEMV_STAGE_PACKETS, (4u * PACKETS_TABLES_AT - 16u * projection_gemv_stage_word(in_)) / 72u);
+#endif
+    return PROJECTION_GEMV_STAGE_PACKETS;
+}
 // The register arrays are sized for the largest R and bound; every loop over
 // weight rows runs to `r_rows` and every loop over activation rows to `maxm`,
 // both literals in each pipeline, so the driver unrolls only the iterations
@@ -731,7 +744,10 @@ void projection_gemv_sums(const int wk, const int uk, const bool paired, const u
     uint rows, uint k, uint tile, out float totals[PROJECTION_GEMV_SUMS], out float totals2[PROJECTION_GEMV_SUMS]) {
     const uint sub = SEISMIC_LANE % lanes;
     const uint packets = (k + 31u) / 32u;
-    const uint chunk = min(packets, (PROJECTION_GEMV_STAGE_PACKETS / maxm) / lanes * lanes);
+    // Every packet at once where the staging holds them, else a multiple of
+    // LANES of them.
+    const uint staged = projection_gemv_stage_packets(in_) / maxm;
+    const uint chunk = staged >= packets ? packets : staged / lanes * lanes;
     const bool double_buffer = !paired || maxm == 1u;
     packets_packet current_a[PROJECTION_GEMV_MAX_R], current_b[PROJECTION_GEMV_MAX_R];
     if (double_buffer) {

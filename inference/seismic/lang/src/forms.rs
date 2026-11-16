@@ -1352,8 +1352,8 @@ mod tests {
     /// 32 KiB floor wherever its own region does. A pair of iq1_s weights
     /// (`dense_expand`, 32 KiB of tables) forms with every region within the
     /// floor and its tables read in place; one iq1_s weight (`dense_output`,
-    /// 16 KiB) is held by the GEMM's region and not the GEMV's; iq2_xxs's
-    /// 2 KiB grid by both.
+    /// 16 KiB) is held by the GEMM's region and by the GEMV's, which stages
+    /// fewer packets at once to hold it; iq2_xxs's 2 KiB grid by both.
     #[test]
     fn vulkan_tables_are_held_where_every_device_holds_them() {
         const DECODING: [&str; 11] = [
@@ -1417,7 +1417,7 @@ mod tests {
         };
         for (regions, gemv, gemm) in [
             (expand, false, false),
-            (output(iq1s), false, true),
+            (output(iq1s), true, true),
             (output(id("iq2xxs@rows16")), true, true),
         ] {
             assert!(!regions.is_empty(), "the projection decodes");
