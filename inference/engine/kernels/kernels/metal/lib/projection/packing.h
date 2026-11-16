@@ -35,8 +35,9 @@
 // A tensor's rows lie well inside the format's worst case (for 8-bit values
 // B is about 0.6 of 128 sqrt(32)), so the bound raises the gain of every
 // format. Weights with a scale every 16 columns have blocks of two runs of
-// 16, each with its own accumulation, sum pair, fold and bound, and no min
-// term. The
+// 16, each with its own accumulation, sum pair, fold and bound, and where
+// they have a min term (`sums`), each run its own, the product of the
+// tokens' code sums of the run and the run's bias. The
 // top sum is then exact for every input, and the low sum
 // carries the accumulator's rounding: a token's result depends on the token
 // it is packed with, so the form is an error class of its entry. A token is
@@ -89,8 +90,10 @@ namespace projection {
 //            read ahead and never used.
 //   tokens   4 F16 per (token tile, block, pair): 64 / gain of the pair's two
 //            tokens over their token scales, then their code sums / 64; for
-//            weights of two runs a block (which have no min) the gains are
-//            a run's, the first run's pair then the second's; for weights
+//            weights of two runs a block without a min term the gains are
+//            a run's, the first run's pair then the second's; with a min
+//            term a run (`sums`) each run's four as one run's are, the
+//            first run's then the second's (8 F16 a pair); for weights
 //            with residue bits the two scales, then the low bit plane of
 //            the top token's codes (bit c: the block's column c), and with
 //            two residue bits its second plane (8 F16 a pair)
@@ -98,7 +101,8 @@ namespace projection {
 //            held over
 //   weights  2 F16 per (32-row weight tile, block, row % 8, row / 8): the
 //            block's two factors (`packing_factors`), over the row's weight
-//            scale
+//            scale; with a min term a run (`sums`) 4, each run's two
+//            factors as one run's are
 //   weight_scales  1 F32 per weight row: the power of two its block factors
 //            are held over
 struct packing_scratch {
@@ -134,7 +138,8 @@ inline float4 packing_scale(float4 value) {
 // (centre - offset) scale + bias where that is not zero (`biased`). A block
 // has `folds` runs of 32 / folds columns under one weight scale each (the
 // coefficient groups of a packet), a sum pair and a bound per run (`folds`
-// 0: no packed codes). A lane's `words` are the codes of its columns of one
+// 0: no packed codes), and with two runs and a min term (`sums`) a min term
+// per run. A lane's `words` are the codes of its columns of one
 // weight row and block, loaded from the lane's place `at` in that row's
 // planes (the lane holds the two columns x, x + 1 of an 8-column step; lanes
 // 0, 2, 4 and 6 hold a block); `step` yields its two codes of step s, of run
@@ -147,7 +152,7 @@ inline float4 packing_scale(float4 value) {
 // operations its `unpacked` launch runs the staged tiles of the default form
 // instead, with their results. `factors` gives a row's block factors of a 256-column
 // block for `packing_coefficients`: `reach` a bound on what the fold
-// multiplies, `start` and `take` each block's two factors in turn. `residue`
+// multiplies, `start` and `take` each block's factors (`width`) in turn. `residue`
 // is the bits of the top sum the code planes resolve (0: the sums fit 16
 // bits each); weights with a residue bit give a row's low bit plane of a
 // block from its lanes' words (`planes`), and their steps' columns are bytes
@@ -297,14 +302,16 @@ struct packing_layout<L, 1, true> {
 
 // The factors of coefficients K of codes (in planes P, whose entries may
 // carry K's local codes) centred at CENTRE whose value is zero at OFFSET, a
-// block's runs K's groups of a packet: a block's factors
-// are scale 32767 / 64 and its min term (CENTRE - OFFSET) scale + bias, or
-// with two runs the runs' scales 32767 / 64. The fold takes a sum of at most
-// 1 of the first and a code sum / 64 below 128 of the second, so 512 |scale|
-// + 128 |min term| bounds what it multiplies (`reach`). Implemented for a
-// block of two runs without a min term and the run of a 256-column block's
-// factors one factor group's or eight packets'; a power of two scaling the
-// codes is in their scales (`packets::Direct`, `packets::Hier`).
+// block's runs K's groups of a packet: a run's factors are its scale
+// 32767 / 64 and, where the block has a min term (`biased`), its min term
+// (CENTRE - OFFSET) scale + bias. A block of one run has its two (or its
+// scale and 0); a block of two runs has its runs' scales, or with a min term
+// (`sums`) each run's two in turn (`width` 4). The fold takes a sum of at
+// most 1 of the first and a code sum / 64 below 128 of the second, so 512
+// |scale| + 128 |min term| of each run bounds what it multiplies (`reach`).
+// Implemented for the run of a 256-column block's factors one factor
+// group's or eight packets'; a power of two scaling the codes is in their
+// scales (`packets::Direct`, `packets::Hier`).
 template <typename K, uint CENTRE, uint OFFSET, typename P>
 struct packing_factors {
     static constant constexpr bool implemented = false;
@@ -316,38 +323,56 @@ constexpr float packing_shift() {
     return float(int(CENTRE) - int(OFFSET));
 }
 
-// The min term (CENTRE - OFFSET) scale + bias of a block of one run from the
-// coefficients `k` (of K) of its packet; none where the block has none
-// (`packing_factors::biased`).
+// Whether a block of coefficients K centred at CENTRE, zero at OFFSET, has a
+// min term, and whether its two runs each fold one (`sums`): their tokens'
+// entries then carry each run's code sums, and its factors each run's two.
 template <typename K, uint CENTRE, uint OFFSET>
-inline float packing_min_term(thread const typename K::coefficients &k) {
-    if constexpr (K::biased || CENTRE != OFFSET)
-        return packing_shift<CENTRE, OFFSET>() * k.scale(0) + k.bias(0);
+struct packing_terms {
+    static constant constexpr bool biased = K::biased || CENTRE != OFFSET;
+    static constant constexpr bool sums = K::groups == 2 && biased;
+    // A block's factors as the weights' table holds them: `width` of them.
+    static constant constexpr uint width = sums ? 4u : 2u;
+    typedef metal::vec<float, width> entry;
+};
+
+// The min term (CENTRE - OFFSET) scale + bias of group `g` from the
+// coefficients `k` (of K) of its packet; none where the block has none
+// (`packing_terms::biased`).
+template <typename K, uint CENTRE, uint OFFSET>
+inline float packing_min_term(thread const typename K::coefficients &k, uint g) {
+    if constexpr (packing_terms<K, CENTRE, OFFSET>::biased)
+        return packing_shift<CENTRE, OFFSET>() * k.scale(g) + k.bias(g);
     else
         return 0.0f;
 }
 
-// A block's two factors from the coefficients `k` (of K) of its packet.
+// A block's factors from the coefficients `k` (of K) of its packet.
 template <typename K, uint CENTRE, uint OFFSET>
-inline float2 packing_block_factors(thread const typename K::coefficients &k) {
-    if (K::groups == 2)
-        return float2(k.scale(0), k.scale(1)) * (32767.0f / 64.0f);
-    return float2(k.scale(0) * (32767.0f / 64.0f), packing_min_term<K, CENTRE, OFFSET>(k));
+inline typename packing_terms<K, CENTRE, OFFSET>::entry packing_block_factors(
+    thread const typename K::coefficients &k) {
+    constexpr float SCALE = 32767.0f / 64.0f;
+    if constexpr (packing_terms<K, CENTRE, OFFSET>::sums)
+        return float4(k.scale(0) * SCALE, packing_min_term<K, CENTRE, OFFSET>(k, 0),
+            k.scale(1) * SCALE, packing_min_term<K, CENTRE, OFFSET>(k, 1));
+    else if constexpr (K::groups == 2)
+        return float2(k.scale(0), k.scale(1)) * SCALE;
+    else
+        return float2(k.scale(0) * SCALE, packing_min_term<K, CENTRE, OFFSET>(k, 0));
 }
 
 // Hierarchical coefficients: a block's factors from the factor group's run
 // (`packets::Hier::run`), each packet's field from the scales plane or, where
 // its grid entries (in planes P) carry it, from its entries; bounded by the
 // local codes' largest magnitude under the group's factors, with a signed
-// bias's offset beside the min term's shift.
+// bias's offset beside the min term's shift, alike for each run.
 template <typename FS, int EXPONENT, int CODE_EXPONENT, uint LOCAL_BITS, typename L, uint GROUP, bool MIN,
     int BIAS_SIGN, uint CARRIED_BIT, typename SB, uint CENTRE, uint OFFSET, typename P>
 struct packing_factors<
     packets::Hier<FS, 256u, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP, MIN, BIAS_SIGN, CARRIED_BIT, SB>, CENTRE,
-    OFFSET, P> {
+    OFFSET, P> : packing_terms<packets::Hier<FS, 256u, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP, MIN, BIAS_SIGN,
+                     CARRIED_BIT, SB>, CENTRE, OFFSET> {
     typedef packets::Hier<FS, 256u, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP, MIN, BIAS_SIGN, CARRIED_BIT, SB> K;
-    static constant constexpr bool biased = K::biased || CENTRE != OFFSET;
-    static_assert(K::groups == 1 || !biased, "a block of two runs has no min term");
+    typedef packing_terms<K, CENTRE, OFFSET> terms;
     static constant constexpr bool implemented = true;
     struct run {
         typename K::run fields;
@@ -358,7 +383,7 @@ struct packing_factors<
     static run start(packets::weight_bytes row, Rows16 layout, uint block) {
         return run{K::start(row, layout, block * K::packets), row, layout, block * K::packets};
     }
-    static float2 take(thread run &state) {
+    static typename terms::entry take(thread run &state) {
         uint field;
         if constexpr (K::carries)
             field = K::template carried<P>(P::load(state.row, state.layout, state.p));
@@ -379,10 +404,10 @@ struct packing_factors<
 // Direct coefficients: a block's factors from its eight packets' own,
 // bounded by the largest of them.
 template <typename S, uint GROUP, bool BIAS, uint STORAGE, int EXPONENT, uint CENTRE, uint OFFSET, typename P>
-struct packing_factors<packets::Direct<S, GROUP, BIAS, STORAGE, EXPONENT>, CENTRE, OFFSET, P> {
+struct packing_factors<packets::Direct<S, GROUP, BIAS, STORAGE, EXPONENT>, CENTRE, OFFSET, P>
+    : packing_terms<packets::Direct<S, GROUP, BIAS, STORAGE, EXPONENT>, CENTRE, OFFSET> {
     typedef packets::Direct<S, GROUP, BIAS, STORAGE, EXPONENT> K;
-    static constant constexpr bool biased = BIAS || CENTRE != OFFSET;
-    static_assert(K::groups == 1 || !biased, "a block of two runs has no min term");
+    typedef packing_terms<K, CENTRE, OFFSET> terms;
     static_assert(256u % GROUP == 0u, "a 256-column block holds whole groups");
     static constant constexpr bool implemented = true;
     // A 256-column block's share of the supers plane, from its first
@@ -398,7 +423,7 @@ struct packing_factors<packets::Direct<S, GROUP, BIAS, STORAGE, EXPONENT>, CENTR
     static run start(packets::weight_bytes row, Rows16 layout, uint block) {
         return run{block_supers(row, layout, block), 0u};
     }
-    static float2 take(thread run &state) {
+    static typename terms::entry take(thread run &state) {
         return packing_block_factors<K, CENTRE, OFFSET>(K::at(state.supers, state.p++));
     }
     static float reach(packets::weight_bytes row, Rows16 layout, uint block) {
@@ -409,12 +434,15 @@ struct packing_factors<packets::Direct<S, GROUP, BIAS, STORAGE, EXPONENT>, CENTR
         PROJECTION_UNROLL
         for (uint i = 0; i < 8; ++i) {
             const typename K::coefficients k = K::at(supers, i);
-            const float scale = K::groups == 1 ? metal::abs(k.scale(0))
-                : metal::max(metal::abs(k.scale(0)), metal::abs(k.scale(1)));
-            largest = metal::max(largest, biased
-                ? metal::fma(128.0f, metal::abs(packing_min_term<K, CENTRE, OFFSET>(k)), 512.0f * scale) : scale);
+            PROJECTION_UNROLL
+            for (uint g = 0; g < K::groups; ++g) {
+                const float scale = metal::abs(k.scale(g));
+                largest = metal::max(largest, terms::biased
+                    ? metal::fma(128.0f, metal::abs(packing_min_term<K, CENTRE, OFFSET>(k, g)), 512.0f * scale)
+                    : scale);
+            }
         }
-        return biased ? largest : 512.0f * largest;
+        return terms::biased ? largest : 512.0f * largest;
     }
 };
 
@@ -423,7 +451,7 @@ struct packing_factors<packets::Direct<S, GROUP, BIAS, STORAGE, EXPONENT>, CENTR
 // factors of an admitted weight's codes. None otherwise.
 template <typename W, bool ADMITTED>
 struct packing_codes_of {
-    static constant constexpr bool available = false, biased = false;
+    static constant constexpr bool available = false, biased = false, sums = false;
     static constant constexpr uint centre = 0, folds = 0, residue = 0;
 };
 template <typename P, typename C, typename K, typename F>
@@ -437,7 +465,10 @@ struct packing_codes_of<packets::Packet<P, C, K, F>, true> {
     typedef packing_factors<K, centre, F::pack_offset, P> factors;
     static_assert(factors::implemented, "an admitted weight's coefficients have packing factors");
     static constant constexpr bool available = packing_forms;
-    static constant constexpr bool biased = factors::biased;
+    static constant constexpr bool biased = factors::biased, sums = factors::sums;
+    // The runtime sizes the operand's and the factors' scratch by its
+    // admission's PACK_SUMS: it is this layout's.
+    static_assert(F::pack_sums == sums, "PACK_SUMS is the packed codes' layout");
     typedef typename layout::place place;
     typedef typename layout::fetched fetched;
     typedef typename layout::words words;
@@ -509,43 +540,47 @@ struct packing_fields {
         (0.5f + float((1u << RESIDUE) - 1u) / float(2u << RESIDUE)) / 32767.0f;
 };
 
-// Whether an operand laid out for blocks of FOLDS runs and coded for RESIDUE
-// residue bits (any width where nonzero) serves the weights W.
-template <typename W, uint FOLDS, uint RESIDUE>
+// Whether an operand laid out for blocks of FOLDS runs, with each run's code
+// sums where SUMS, and coded for RESIDUE residue bits (any width where
+// nonzero) serves the weights W.
+template <typename W, uint FOLDS, uint RESIDUE, bool SUMS>
 struct packing_serves {
     static constant constexpr bool value = packing_codes<W>::available && packing_codes<W>::folds == FOLDS
-        && (packing_codes<W>::residue != 0) == (RESIDUE != 0);
+        && (packing_codes<W>::residue != 0) == (RESIDUE != 0) && packing_codes<W>::sums == SUMS;
 };
 
 // The operand shared by the weights A .. D of RA .. RD weight rows: one
 // operand serves weights of one layout (one run a block, two runs a block,
-// or one run with residue bits), and the shared one is laid out for the
-// layout that serves the most weight rows (`folds`; 0: no weight has a
-// packed path), a layout without residue bits before one with them where
-// they serve as many. It is coded for the largest centre among the weights it
-// serves, whose gain limits are the tightest, and with residue bits for
-// WIDTH of them (the form's PACK).
+// two runs a block each with its code sums, or one run with residue bits),
+// and the shared one is laid out for the layout that serves the most weight
+// rows (`folds`, `sums`; folds 0: no weight has a packed path), the first of
+// those in that order where several serve as many. It is coded for the
+// largest centre among the weights it serves, whose gain limits are the
+// tightest, and with residue bits for WIDTH of them (the form's PACK).
 template <uint WIDTH, typename A, uint RA, typename B = A, uint RB = 0, typename C = A, uint RC = 0,
     typename D = A, uint RD = 0>
 struct packing_shared {
     static_assert(WIDTH == 1 || WIDTH == 2, "an operand's residue is one or two bits");
-    // The weight rows an operand of FOLDS runs a block and RESIDUE residue
-    // bits serves.
-    template <uint FOLDS, uint RESIDUE>
+    // The weight rows an operand of FOLDS runs a block, RESIDUE residue bits
+    // and SUMS serves.
+    template <uint FOLDS, uint RESIDUE, bool SUMS>
     struct rows {
-        static constant constexpr uint value = (packing_serves<A, FOLDS, RESIDUE>::value ? RA : 0)
-            + (packing_serves<B, FOLDS, RESIDUE>::value ? RB : 0)
-            + (packing_serves<C, FOLDS, RESIDUE>::value ? RC : 0)
-            + (packing_serves<D, FOLDS, RESIDUE>::value ? RD : 0);
+        static constant constexpr uint value = (packing_serves<A, FOLDS, RESIDUE, SUMS>::value ? RA : 0)
+            + (packing_serves<B, FOLDS, RESIDUE, SUMS>::value ? RB : 0)
+            + (packing_serves<C, FOLDS, RESIDUE, SUMS>::value ? RC : 0)
+            + (packing_serves<D, FOLDS, RESIDUE, SUMS>::value ? RD : 0);
     };
-    static constant constexpr uint one = rows<1, 0>::value, two = rows<2, 0>::value,
-        bytes = rows<1, 1>::value;
-    static constant constexpr uint folds = one + two + bytes == 0 ? 0 : (two > one && two >= bytes) ? 2 : 1;
-    static constant constexpr uint residue = folds == 1 && bytes > one ? WIDTH : 0;
-    static constant constexpr uint a = packing_serves<A, folds, residue>::value ? packing_codes<A>::centre : 0;
-    static constant constexpr uint b = packing_serves<B, folds, residue>::value ? packing_codes<B>::centre : 0;
-    static constant constexpr uint c = packing_serves<C, folds, residue>::value ? packing_codes<C>::centre : 0;
-    static constant constexpr uint d = packing_serves<D, folds, residue>::value ? packing_codes<D>::centre : 0;
+    static constant constexpr uint one = rows<1, 0, false>::value, two = rows<2, 0, false>::value,
+        summed = rows<2, 0, true>::value, bytes = rows<1, 1, false>::value;
+    static constant constexpr uint unsummed = one > two ? one : two, other = summed > bytes ? summed : bytes;
+    static constant constexpr uint most = unsummed > other ? unsummed : other;
+    static constant constexpr uint folds = most == 0 ? 0 : (one == most || (two != most && summed != most)) ? 1 : 2;
+    static constant constexpr bool sums = folds == 2 && two != most;
+    static constant constexpr uint residue = folds == 1 && one != most ? WIDTH : 0;
+    static constant constexpr uint a = packing_serves<A, folds, residue, sums>::value ? packing_codes<A>::centre : 0;
+    static constant constexpr uint b = packing_serves<B, folds, residue, sums>::value ? packing_codes<B>::centre : 0;
+    static constant constexpr uint c = packing_serves<C, folds, residue, sums>::value ? packing_codes<C>::centre : 0;
+    static constant constexpr uint d = packing_serves<D, folds, residue, sums>::value ? packing_codes<D>::centre : 0;
     static constant constexpr uint ab = a > b ? a : b, cd = c > d ? c : d;
     static constant constexpr uint centre = ab > cd ? ab : cd;
 };
@@ -703,21 +738,23 @@ inline ushort2 packing_scales_over(ushort2 held, float2 scale) {
 // The block scales are first stored as their bits; once the threadgroup has
 // the four tokens' largest (through `peaks`, one entry per simdgroup) their
 // token scales are stored and the block scales rewritten over them. CENTRE,
-// FOLDS and RESIDUE are the centre, the runs a block and the residue bits of
-// the weights the operand multiplies (`packing_shared`), whose steps' columns
-// it is laid out in (`packing_codes`); `bounds` the packing bounds of the
-// weights it serves.
-template <uint CENTRE, uint FOLDS, uint RESIDUE, uint BOUNDS, typename In>
+// FOLDS, SUMS and RESIDUE are the centre, the runs a block, whether each run
+// carries its code sums and the residue bits of the weights the operand
+// multiplies (`packing_shared`), whose steps' columns it is laid out in
+// (`packing_codes`); `bounds` the packing bounds of the weights it serves.
+template <uint CENTRE, uint FOLDS, bool SUMS, uint RESIDUE, uint BOUNDS, typename In>
 inline void packing_operand(thread const In &in, thread const packing_scratch &s,
     thread const packing_bounds<BOUNDS> &bounds, uint m_rows, uint columns, uint pairs, threadgroup float4 *peaks,
     uint thread_index, uint sg, uint lane) {
     static_assert(RESIDUE == 0 || FOLDS == 1, "weights with a residue bit scale every 32 columns");
+    static_assert(!SUMS || FOLDS == 2, "a run's own code sums are those of two runs a block");
     typedef packing_fields<RESIDUE> fields;
     const uint groups = columns / 32u, steps = columns / 8u;
     const float3 limits = packing_limits<RESIDUE>(CENTRE, FOLDS);
     const uint tile = pairs / 16u, within = (2u * pairs) & 31u;
-    // A pair's entry of a block is 8 bytes, 16 with two residue bits.
-    constexpr uint ENTRY = RESIDUE > 1 ? 16u : 8u;
+    // A pair's entry of a block is 8 bytes, 16 with two residue bits or each
+    // run's code sums.
+    constexpr uint ENTRY = RESIDUE > 1 || SUMS ? 16u : 8u;
     device uchar *entries = reinterpret_cast<device uchar *>(s.tokens) + (ulong(tile) * groups * 32u + within) * ENTRY;
     float4 largest = float4(0.0f);
     for (uint chunk = thread_index; chunk < steps; chunk += 256u) {
@@ -755,9 +792,9 @@ inline void packing_operand(thread const In &in, thread const packing_scratch &s
             largest[2u * p + 1u] = metal::max(largest[2u * p + 1u], second.x);
             device uchar *entry = entries + (g * 32u + p) * ENTRY;
             // A run's first lane stores its entry: the block's scales and
-            // code sums, with two runs a block each run's scales, or with
-            // residue bits the block's scales and the top token's low plane
-            // (and with two its second).
+            // code sums, with two runs a block each run's scales (and with
+            // SUMS its code sums), or with residue bits the block's scales
+            // and the top token's low plane (and with two its second).
             if constexpr (RESIDUE > 1) {
                 const uint2 planes = uint2(packing_plane(top_even, top_odd, 0u, word),
                     packing_plane(top_even, top_odd, 1u, word));
@@ -769,6 +806,11 @@ inline void packing_operand(thread const In &in, thread const packing_scratch &s
                 if ((lane & 3u) == 0)
                     *reinterpret_cast<device uint2 *>(entry) = uint2(uint(packing_scale_bits(first.x))
                         | (uint(packing_scale_bits(second.x)) << 16), plane);
+            } else if constexpr (SUMS) {
+                if ((lane & 1u) == 0)
+                    reinterpret_cast<device metal::vec<ushort, 4> *>(entry)[word >> 1] = metal::vec<ushort, 4>(
+                        packing_scale_bits(first.x), packing_scale_bits(second.x),
+                        as_type<ushort>(half(first.y)), as_type<ushort>(half(second.y)));
             } else if constexpr (FOLDS == 2) {
                 if ((lane & 1u) == 0)
                     reinterpret_cast<device ushort2 *>(entry)[word >> 1] = ushort2(
@@ -813,9 +855,9 @@ inline void packing_operand(thread const In &in, thread const packing_scratch &s
         PROJECTION_UNROLL
         for (uint p = 0; p < 2; ++p) {
             // The scales this lane stored: the entry's first pair, or with
-            // two runs a block its run's pair.
+            // two runs a block its run's pair (with SUMS, before its sums).
             device ushort2 *entry = reinterpret_cast<device ushort2 *>(entries + ((chunk / 4u) * 32u + p) * ENTRY)
-                + (FOLDS == 2 ? (chunk % 4u) >> 1 : 0u);
+                + (FOLDS == 2 ? ((chunk % 4u) >> 1) * (SUMS ? 2u : 1u) : 0u);
             *entry = packing_scales_over(*entry, float2(scale[2u * p], scale[2u * p + 1u]));
         }
     }
@@ -846,8 +888,9 @@ inline void packing_coefficients(thread const Weights<W> &w, thread const packin
             typename coded::run run = coded::start(row, layout, block);
             PROJECTION_UNROLL
             for (uint i = 0; i < 8; ++i)
-                reinterpret_cast<device half2 *>(s.weights)[((ulong(tile) * groups + block * 8u + i) * 8u
-                    + (within & 7u)) * 4u + (within >> 3)] = half2(coded::take(run) * inverse);
+                reinterpret_cast<device metal::vec<half, coded::width> *>(s.weights)[((ulong(tile) * groups
+                    + block * 8u + i) * 8u + (within & 7u)) * 4u + (within >> 3)] =
+                    metal::vec<half, coded::width>(coded::take(run) * inverse);
         }
     }
 }
@@ -885,8 +928,9 @@ inline void packing_tile_coefficients(thread const Weights<W> &w, thread const p
             typename coded::run run = coded::start(w.row(n), w.geometry(n), block);
             PROJECTION_UNROLL
             for (uint i = 0; i < 8; ++i)
-                reinterpret_cast<device half2 *>(s.weights)[((ulong(tile) * groups + block * 8u + i) * 8u
-                    + (within & 7u)) * 4u + (within >> 3)] = half2(coded::take(run) * inverse);
+                reinterpret_cast<device metal::vec<half, coded::width> *>(s.weights)[((ulong(tile) * groups
+                    + block * 8u + i) * 8u + (within & 7u)) * 4u + (within >> 3)] =
+                    metal::vec<half, coded::width>(coded::take(run) * inverse);
         }
     }
 }
@@ -935,18 +979,23 @@ inline void gemm_packed_sums(thread const Weights<W> &w, thread const packing_sc
     // folds them.
     constexpr uint RUN = 4 / coded::folds;
     constexpr uint RESIDUE = coded::residue != 0 ? WIDTH : 0;
+    // A pair's entry of a block is 16 bytes with two residue bits or each
+    // run's code sums (`packing_operand`), else 8.
+    constexpr bool WIDE = RESIDUE > 1 || coded::sums;
     typedef packing_fields<RESIDUE> fields;
     device const float4 *operand = reinterpret_cast<device const float4 *>(s.operand);
     device const uint4 *tokens = reinterpret_cast<device const uint4 *>(s.tokens);
-    device const uint2 *weights = reinterpret_cast<device const uint2 *>(s.weights);
+    // Two weight rows' factors (`packing_factors::width` F16 each).
+    typedef metal::conditional_t<coded::sums, uint4, uint2> factor_pair;
+    device const factor_pair *weights = reinterpret_cast<device const factor_pair *>(s.weights);
     // The tile's first operand fragment of its 64-token tile, and its first
     // 8-row group of its 32-row weight tile.
     const uint tile_m = m0 / 64u, fragment0 = (m0 % 64u) / 16u, rows0 = (n0 % 32u) / 8u;
     const uint operand_at = (tile_m * (k / 8u) * 32u + lane) * 2u + fragment0 / 2u;
-    // The lane's two pairs' entries of a block: one quadruple, or with two
-    // residue bits one each.
-    const uint tokens_at = RESIDUE > 1 ? tile_m * groups * 32u + 8u * fragment0 + at.x
-                                       : tile_m * groups * 16u + 4u * fragment0 + (at.x >> 1);
+    // The lane's two pairs' entries of a block: one quadruple, or wide one
+    // each.
+    const uint tokens_at = WIDE ? tile_m * groups * 32u + 8u * fragment0 + at.x
+                                : tile_m * groups * 16u + 4u * fragment0 + (at.x >> 1);
     const uint weights_at = ((n0 / 32u) * groups * 8u + at.y) * 2u + rows0 / 2u;
     // The centre as a code: the stored codes are F16 subnormals of the same
     // exponent (the operand carries the 2^24), which the matrix unit
@@ -991,7 +1040,7 @@ inline void gemm_packed_sums(thread const Weights<W> &w, thread const packing_sc
             uint4 token[TI], second_token[TI];
             PROJECTION_UNROLL
             for (uint i = 0; i < TI; ++i) {
-                if constexpr (RESIDUE > 1) {
+                if constexpr (WIDE) {
                     token[i] = tokens[tokens_at + g * 32u + 8u * i];
                     second_token[i] = tokens[tokens_at + g * 32u + 8u * i + 1u];
                 } else {
@@ -1006,7 +1055,7 @@ inline void gemm_packed_sums(thread const Weights<W> &w, thread const packing_sc
                 for (uint j = 0; j < TJ; ++j)
                     planes[j] = coded::template planes<RESIDUE>(words[j], at.x);
             }
-            uint2 weight[TJ / 2];
+            factor_pair weight[TJ / 2];
             PROJECTION_UNROLL
             for (uint q = 0; q < TJ / 2; ++q)
                 weight[q] = weights[weights_at + g * 16u + q];
@@ -1081,14 +1130,32 @@ inline void gemm_packed_sums(thread const Weights<W> &w, thread const packing_sc
                         }
                         continue;
                     }
-                    const half4 first = as_type<half4>(token[i].xy), second = as_type<half4>(token[i].zw);
-                    // The tokens' scales of the block, then their code sums
-                    // or their scales of its second run.
+                    // The two pairs' entries of the run: one run's four
+                    // each, the tokens' scales then their code sums, or
+                    // without sums of each run the block's, whose second
+                    // two are its second run's scales.
+                    const uint run = step / RUN;
+                    half4 first, second;
+                    if constexpr (coded::sums) {
+                        first = as_type<half4>(run == 0 ? token[i].xy : token[i].zw);
+                        second = as_type<half4>(run == 0 ? second_token[i].xy : second_token[i].zw);
+                    } else {
+                        first = as_type<half4>(token[i].xy);
+                        second = as_type<half4>(token[i].zw);
+                    }
                     const half4 sums = half4(first.zw, second.zw);
-                    const half4 scales = step / RUN == 0 ? half4(first.xy, second.xy) : sums;
+                    const half4 scales = coded::sums || run == 0 ? half4(first.xy, second.xy) : sums;
                     PROJECTION_UNROLL
                     for (uint j = 0; j < TJ; ++j) {
-                        const half2 factors = as_type<half2>(weight[j / 2u][j & 1u]);
+                        // The row's factors of the run: its scale and min
+                        // term, or without sums of each run the block's.
+                        half2 factors;
+                        if constexpr (coded::sums) {
+                            const half4 both = as_type<half4>((j & 1u) ? weight[j / 2u].zw : weight[j / 2u].xy);
+                            factors = run == 0 ? both.xy : both.zw;
+                        } else {
+                            factors = as_type<half2>(weight[j / 2u][j & 1u]);
+                        }
                         const float2 v = reinterpret_cast<thread float2 &>(acc[i][j].thread_elements());
                         // Each element's (low, top) sums as two's complement
                         // 16-bit halves of one word.
@@ -1096,12 +1163,12 @@ inline void gemm_packed_sums(thread const Weights<W> &w, thread const packing_sc
                         const half2 e0 = unpack_snorm2x16_to_half(split.x), e1 = unpack_snorm2x16_to_half(split.y);
                         const half4 sum = swapped ? half4(e0.x, e0.y, e1.x, e1.y) : half4(e0.y, e0.x, e1.y, e1.x);
                         // A term of at most 1 (normalized factors): the
-                        // block's scale and bias, or the run's scale.
+                        // run's scale and min term, or the run's scale.
                         half4 term;
                         if constexpr (coded::biased)
                             term = metal::fma(sum, half4(factors.x), sums * factors.y);
                         else
-                            term = sum * half4(factors[step / RUN]);
+                            term = sum * half4(factors[run]);
                         folded[i][j] = metal::fma(scales, term, folded[i][j]);
                     }
                 }
@@ -1222,7 +1289,7 @@ inline void gemm_packed_paired_tile(thread const Out &out, thread const Weights<
     const bool second = (sg % 2u) != 0;
     typename tile::sums y;
     if constexpr (packing_codes<G>::available
-        && packing_serves<U, packing_codes<G>::folds, packing_codes<G>::residue>::value) {
+        && packing_serves<U, packing_codes<G>::folds, packing_codes<G>::residue, packing_codes<G>::sums>::value) {
         if (live) {
             if (second)
                 gemm_packed_sums<U, WIDTH, TOKENS, WEIGHTS_AHEAD>(up, up_scratch, k, m0, n0, lane, y);

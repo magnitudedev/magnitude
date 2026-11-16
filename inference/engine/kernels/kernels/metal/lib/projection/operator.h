@@ -237,8 +237,8 @@
     PROJECTION_PACKING_SCRATCH;                                                                                 \
     PROJECTION_BOUNDS;                                                                                          \
     typedef projection::packing_codes<packets::W0> coded;                                                       \
-    projection::packing_operand<coded::centre, coded::folds, (coded::residue != 0 ? RESIDUE : 0), BOUNDS>(in,   \
-        scratch, bounds, m, k, index, peaks, thread_index, sg, lane)
+    projection::packing_operand<coded::centre, coded::folds, coded::sums, (coded::residue != 0 ? RESIDUE : 0),   \
+        BOUNDS>(in, scratch, bounds, m, k, index, peaks, thread_index, sg, lane)
 
 #define PROJECTION_SINGLE_PACK_COEFFICIENTS                                                                     \
     if constexpr (!projection::packing_path<packets::W0>())                                                     \
@@ -359,13 +359,14 @@
 // and biases, then the paired packed tiles; on a device without the packed
 // path, the staged tiles of the default form, with its results. PACK = 1
 // names them only for a gate and an up weight one operand serves, of one
-// layout (`PACK_FOLDS`, `PACK_RESIDUE`), which the projection's `where`
-// requires.
+// layout (`PACK_FOLDS`, `PACK_RESIDUE`, `PACK_SUMS`), which the projection's
+// `where` requires.
 #define PROJECTION_PAIRED_PACKING_PATH projection::packing_path<packets::W0, packets::W1>()
 #define PROJECTION_PAIRED_PACKING_ADMITTED                                                                      \
     static_assert(projection::packing_codes<packets::W0>::folds == projection::packing_codes<packets::W1>::folds \
             && (projection::packing_codes<packets::W0>::residue != 0)                                           \
-                == (projection::packing_codes<packets::W1>::residue != 0),                                      \
+                == (projection::packing_codes<packets::W1>::residue != 0)                                       \
+            && projection::packing_codes<packets::W0>::sums == projection::packing_codes<packets::W1>::sums,    \
         "PACK = 1 names the packed GEMM of weights one operand serves")
 
 // The operand serves both weights: their bounds, where both have one.
@@ -379,8 +380,8 @@
     typedef projection::packing_shared<RESIDUE, packets::W0, 1, packets::W1, 1> coded;                          \
     constexpr uint BOUNDS = projection::packing_bounded<3u, PROJECTION_BOUNDED>::value;                         \
     const projection::packing_bounds<BOUNDS> bounds{PROJECTION_BOUND_TABLES};                                   \
-    projection::packing_operand<coded::centre, coded::folds, coded::residue, BOUNDS>(in, scratch0, bounds, m, k, \
-        index, peaks, thread_index, sg, lane)
+    projection::packing_operand<coded::centre, coded::folds, coded::sums, coded::residue, BOUNDS>(in, scratch0,  \
+        bounds, m, k, index, peaks, thread_index, sg, lane)
 
 #define PROJECTION_PAIRED_PACK_COEFFICIENTS                                                                     \
     PROJECTION_PAIRED_PACKING_ADMITTED;                                                                         \
@@ -771,7 +772,8 @@ inline void segment_tall(thread const In &in, thread const Out &out, thread cons
 #define PROJECTION_PACKING PROJECTION_PACKING_OF(1)
 #define PROJECTION_SERVED(s)                                                                                    \
     (PROJECTION_N##s != 0 && PROJECTION_N##s % 32 == 0                                                          \
-        && projection::packing_serves<PROJECTION_PACKET(s), PROJECTION_PACKING::folds, PROJECTION_PACKING::residue>::value)
+        && projection::packing_serves<PROJECTION_PACKET(s), PROJECTION_PACKING::folds, PROJECTION_PACKING::residue, \
+            PROJECTION_PACKING::sums>::value)
 #define PROJECTION_SERVED_BIT(s, ...) (PROJECTION_SERVED(s) ? 1u << s##u : 0u) |
 #define PROJECTION_ADMITTED(s, ...)                                                                             \
     (projection::packing_admitted<PROJECTION_PACKET(s)>::value && PROJECTION_N##s != 0 && PROJECTION_N##s % 32 == 0) ||
@@ -780,10 +782,13 @@ inline void segment_tall(thread const In &in, thread const Out &out, thread cons
 #define PROJECTION_PACKING_ADMITTED                                                                             \
     static_assert(PROJECTION_EACH_SEGMENT(PROJECTION_ADMITTED, ) false,                                         \
         "PACK = 1 names the packed GEMM of a segment of weights admitted to it")
-// Segment s's factor tables, beside the shared operand.
+// Segment s's factor tables, beside the shared operand: the served weights'
+// factors are its layout's (two F16 a row and block, four with each run's
+// sums).
 #define PROJECTION_SEGMENT_SCRATCH(s)                                                                           \
     projection::packing_scratch{packed, token_factors, token_scales,                                            \
-        factors + ulong(PROJECTION_FIRST_##s) * (k / 32u) * 2u, scales + PROJECTION_FIRST_##s}
+        factors + ulong(PROJECTION_FIRST_##s) * (k / 32u) * (PROJECTION_PACKING::sums ? 4u : 2u),              \
+        scales + PROJECTION_FIRST_##s}
 
 #define PROJECTION_SEGMENTED_PACK                                                                               \
     PROJECTION_PACKING_ADMITTED;                                                                                \
@@ -794,7 +799,7 @@ inline void segment_tall(thread const In &in, thread const Out &out, thread cons
     constexpr uint SERVED = PROJECTION_EACH_SEGMENT(PROJECTION_SERVED_BIT, ) 0u;                                \
     constexpr uint BOUNDS = projection::packing_bounded<SERVED, PROJECTION_BOUNDED>::value;                     \
     const projection::packing_bounds<BOUNDS> bounds{PROJECTION_BOUND_TABLES};                                   \
-    projection::packing_operand<PROJECTION_PACKING::centre, PROJECTION_PACKING::folds,                          \
+    projection::packing_operand<PROJECTION_PACKING::centre, PROJECTION_PACKING::folds, PROJECTION_PACKING::sums, \
         PROJECTION_PACKING_OF(RESIDUE)::residue, BOUNDS>(in, PROJECTION_SEGMENT_SCRATCH(0), bounds, m, k, index, \
         peaks, thread_index, sg, lane)
 

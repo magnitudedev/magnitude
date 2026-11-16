@@ -1156,16 +1156,17 @@ struct Hier {
 // The consumer forms the runtime admits a weight to (`<prefix>_FORM_<NAME>`,
 // its one form admission, `abi/forms.rs`), which projection libraries select
 // on: the token-packing GEMM (`PACK`, with its codes' entry: a code enters as
-// its value + PACK_OFFSET, centred at PACK_CENTRE, and its sums take
-// PACK_RESIDUE residue bits), the int8 GEMM (`INT8`) and the matrix GEMV
+// its value + PACK_OFFSET, centred at PACK_CENTRE, its sums take
+// PACK_RESIDUE residue bits, and PACK_SUMS where each of a block's two runs
+// folds a min term), the int8 GEMM (`INT8`) and the matrix GEMV
 // folding a block's scale codes, over a block's runs or of symmetric 32
 // columns (`MATRIX_CODES`, `MATRIX_RUNS`, `MATRIX_SYMMETRIC`, at most one;
 // `MATRIX_RUNS` 2 where a run's products are exact F16 operands,
 // `matrix_runs_halves`).
-template <bool PACK, uint PACK_CENTRE, uint PACK_OFFSET, uint PACK_RESIDUE, bool INT8, bool MATRIX_CODES,
-    uint MATRIX_RUNS, bool MATRIX_SYMMETRIC>
+template <bool PACK, uint PACK_CENTRE, uint PACK_OFFSET, uint PACK_RESIDUE, bool PACK_SUMS, bool INT8,
+    bool MATRIX_CODES, uint MATRIX_RUNS, bool MATRIX_SYMMETRIC>
 struct Forms {
-    static constant constexpr bool pack = PACK, int8 = INT8;
+    static constant constexpr bool pack = PACK, pack_sums = PACK_SUMS, int8 = INT8;
     static constant constexpr uint pack_centre = PACK_CENTRE, pack_offset = PACK_OFFSET, pack_residue = PACK_RESIDUE;
     static constant constexpr bool matrix_codes = MATRIX_CODES, matrix_runs = MATRIX_RUNS != 0u,
         matrix_symmetric = MATRIX_SYMMETRIC;
@@ -1492,7 +1493,8 @@ struct CoefficientsOf<SEISMIC_COEFF_HIER, CODES, SCALE, BIAS, BIAS_SIGN, GROUP, 
             ELEMENT_CAT(P, _COEFF_LOCAL_OFFSET),                                                                \
             ELEMENT_CAT(P, _COEFF_CARRIED), ELEMENT_CAT(P, _COEFF_SIGNED_BIAS_EXPONENT)>::type,                 \
         packets::Forms<ELEMENT_CAT(P, _FORM_PACK) != 0, ELEMENT_CAT(P, _FORM_PACK_CENTRE),                       \
-            ELEMENT_CAT(P, _FORM_PACK_OFFSET), ELEMENT_CAT(P, _FORM_PACK_RESIDUE), ELEMENT_CAT(P, _FORM_INT8) != 0,  \
+            ELEMENT_CAT(P, _FORM_PACK_OFFSET), ELEMENT_CAT(P, _FORM_PACK_RESIDUE),                              \
+            ELEMENT_CAT(P, _FORM_PACK_SUMS) != 0, ELEMENT_CAT(P, _FORM_INT8) != 0,                              \
             ELEMENT_CAT(P, _FORM_MATRIX_CODES) != 0, ELEMENT_CAT(P, _FORM_MATRIX_RUNS),                          \
             ELEMENT_CAT(P, _FORM_MATRIX_SYMMETRIC) != 0>>
 #define PACKETS_ROWS(P)                                                                                \

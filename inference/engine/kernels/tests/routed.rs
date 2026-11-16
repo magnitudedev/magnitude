@@ -2303,6 +2303,9 @@ enum Experts {
     /// Nemotron 3.5 Bolt's vector codes: every expert and shared weight
     /// iq2xxs (IQ2_XXS).
     Iq2Xxs,
+    /// A Q2_K quant's experts: gate and up q2k, whose two runs a block each
+    /// fold a min term, down q3k.
+    Q2,
 }
 
 /// The 35B-A3B storage mix at reduced width: expert weights per `Experts`,
@@ -2356,6 +2359,7 @@ impl PackedBlock {
             Experts::Fp4A4 => ["nvfp4g16a4", "nvfp4g16a4", "q5g32s"],
             Experts::Grid => ["iq2xs", "iq3xxs", "iq2xs"],
             Experts::Iq2Xxs => ["iq2xxs"; 3],
+            Experts::Q2 => ["q2k", "q2k", "q3k"],
         };
         let expert_weight = |which: usize, shape: &[u64], seed: u32| match experts {
             Experts::Bf16 => bf16_weight(device, shape, seed),
@@ -4094,6 +4098,15 @@ fn native_routed_experts_match_reference_with_iq4_block_experts() {
             PackedBlock::new(&device, Experts::Iq4Blocks),
             0,
         );
+    }
+}
+
+/// Q2_K experts in the grouped (prefill) expert GEMMs: on Metal the packed
+/// GEMM of gate and up weights whose runs each fold a min term.
+#[test]
+fn native_grouped_prefill_matches_reference_with_q2k_experts() {
+    for device in seismic_native_tests::every_device() {
+        native_grouped_prefill_matches_reference_on(&device, PackedBlock::new(&device, Experts::Q2), 0);
     }
 }
 

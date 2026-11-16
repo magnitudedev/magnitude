@@ -109,10 +109,11 @@
 # padded row and column, plus one step read ahead), the rows' scales and
 # code sums, or for 8-bit entries (`PACK_RESIDUE`) the rows' scales and the
 # RESIDUE low bit planes of their codes (`token_factors`, 4 bytes per padded
-# row and 32 columns, 8 with two planes; RESIDUE 2 takes a packing bound,
-# `bound(W)`, and applies only to weights whose packed entries are 8 bits)
-# and each weight's block scales and biases (`<stem>_factors`, 4 bytes per
-# weight row and 32 columns), both held over one power of two per row
+# row and 32 columns, 8 with two planes or with each run's code sums,
+# `PACK_SUMS`; RESIDUE 2 takes a packing bound, `bound(W)`, and applies only
+# to weights whose packed entries are 8 bits) and each weight's block scales
+# and biases (`<stem>_factors`, 4 bytes per weight row and 32 columns, 8
+# with each run's min term), both held over one power of two per row
 # (`token_scales`, `<stem>_scales`, 4 bytes a row; a weight tile's 32 rows
 # share theirs) so that the F16 fold cannot overflow. Packed and quantized
 # operands pad the rows to TOKENS, 64 where paired (a tile serves both
@@ -180,7 +181,7 @@ projection dense for metal:
     where (SPLIT == 1 or PLANES == 0) for single
     where (INT8 == 0 or (GATHERED == 0 and TALL == 1 and K % 512 == 0 and N % (64 / WEIGHTS) == 0 and each(W, form(W, INT8) == 1) and agree(W, form(W, INT8_INTERLEAVED)))) for paired | single
     where (INT8 == 1 or INT8_TILE == 128) for single
-    where (PACK == 0 or (GATHERED == 0 and TALL == 1 and INT8 == 0 and K % 256 == 0 and K < 1048576 and N % (64 / WEIGHTS) == 0 and each(W, form(W, PACK) == 1) and agree(W, form(W, PACK_FOLDS)) and agree(W, form(W, PACK_RESIDUE)))) for paired | single
+    where (PACK == 0 or (GATHERED == 0 and TALL == 1 and INT8 == 0 and K % 256 == 0 and K < 1048576 and N % (64 / WEIGHTS) == 0 and each(W, form(W, PACK) == 1) and agree(W, form(W, PACK_FOLDS)) and agree(W, form(W, PACK_RESIDUE)) and agree(W, form(W, PACK_SUMS)))) for paired | single
     where (PACK == 0 or (PARTED == 0 and TALL == 1 and K % 256 == 0 and K < 1048576 and SERVED == 1 and any(W, N > 0 and N % 32 == 0 and form(W, PACK) == 1))) for segmented
     where (PACK == 1 or (PACK_TOKENS == 4 and WEIGHTS_AHEAD == 0))
     where (PACK == 0 or (TILE_M == 64 and TILE_N == 64))
@@ -198,10 +199,10 @@ projection dense for metal:
     scratch small_partials bytes (4 * G * M * N * 4) when ORDERED_ANY == 0 and M > 16 and M <= 64 and SMALL == 1 and PLANES == 0 for single
     scratch fragments bytes (G * ceil_div(M, 64) * 64 * K * 2) when ORDERED_ANY == 0 and M > 64 and TALL == 1 and INT8 == 0 and PACK == 0 and PLANES == 0 for single
     scratch packed bytes (ceil_div(M, TOKENS) * TOKENS * K * 2 + 1024) when ORDERED_ANY == 0 and M > 64 and PACK == 1 and PLANES == 0
-    scratch token_factors bytes (ceil_div(M, TOKENS) * TOKENS * (K / 32) * 4 * RESIDUE) when ORDERED_ANY == 0 and M > 64 and PACK == 1 and PLANES == 0
+    scratch token_factors bytes (ceil_div(M, TOKENS) * TOKENS * (K / 32) * 4 * max(RESIDUE, 1 + most(W, form(W, PACK_SUMS)))) when ORDERED_ANY == 0 and M > 64 and PACK == 1 and PLANES == 0
     each W:
-        scratch factors bytes (N * (K / 32) * 4) when ORDERED_ANY == 0 and M > 64 and PACK == 1 and PLANES == 0 for paired | single
-    scratch factors bytes (sum(W, N) * (K / 32) * 4) when ORDERED_ANY == 0 and M > 64 and PACK == 1 for segmented
+        scratch factors bytes (N * (K / 32) * 4 * (1 + form(W, PACK_SUMS))) when ORDERED_ANY == 0 and M > 64 and PACK == 1 and PLANES == 0 for paired | single
+    scratch factors bytes (sum(W, N) * (K / 32) * 4 * (1 + most(W, form(W, PACK_SUMS)))) when ORDERED_ANY == 0 and M > 64 and PACK == 1 for segmented
     scratch token_scales bytes (ceil_div(M, TOKENS) * TOKENS * 4) when ORDERED_ANY == 0 and M > 64 and PACK == 1 and PLANES == 0
     each W:
         scratch scales bytes (N * 4) when ORDERED_ANY == 0 and M > 64 and PACK == 1 and PLANES == 0 for paired | single

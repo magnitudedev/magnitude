@@ -119,21 +119,24 @@ constant constexpr uint TALL_TILES = (uint(SEISMIC_DIM_T) + 63u) / 64u;
     routed::GroupedProducts{routed::activation(product, SEISMIC_DIM_F, 1, uint(SEISMIC_DIM_F)), EXPERTS_UP_ROWS(0)}
 
 // The forms' scratch (`routed.h`): the GEMM's operand over every block's
-// positions (64-row padded), and the table of weight `weight` of the GEMM's
-// `weights` (of `n` rows by `k` columns) of block `block`'s expert; the
-// operand alone for its own pass.
+// positions (64-row padded), and the table of weight `weight` (packets W)
+// of the GEMM's `weights` (of `n` rows by `k` columns) of block `block`'s
+// expert, of `bytes` a weight; the operand alone for its own pass, laid out
+// with each run's code sums where `sums`.
 #define EXPERTS_UP_OPERAND_ROWS ((ulong(SEISMIC_DIM_B) * SEISMIC_DIM_T + 63u) / 64u * 64u)
-#define EXPERTS_UP_TABLE(FORM, block, weights, weight, n, k)                                                    \
-    routed::weight_table(tables, uint(SEISMIC_DIM_B), routed::ordinals(tables)[block], weights, weight,         \
-        routed::FORM##_table_bytes(n, k))
+#define EXPERTS_UP_TABLE(block, weights, weight, bytes)                                                         \
+    routed::weight_table(tables, uint(SEISMIC_DIM_B), routed::ordinals(tables)[block], weights, weight, bytes)
 #define EXPERTS_UP_INT8(block, weights, weight, n, k)                                                           \
-    routed::int8_forms(operand, EXPERTS_UP_OPERAND_ROWS, EXPERTS_UP_TABLE(int8, block, weights, weight, n, k), n, k)
-#define EXPERTS_UP_PACKING(block, weights, weight, n, k)                                                        \
+    routed::int8_forms(operand, EXPERTS_UP_OPERAND_ROWS,                                                        \
+        EXPERTS_UP_TABLE(block, weights, weight, routed::int8_table_bytes(n, k)), n, k)
+#define EXPERTS_UP_PACKING(block, weights, weight, n, k, W)                                                     \
     routed::packing_forms<projection::packing_scratch>(operand, EXPERTS_UP_OPERAND_ROWS,                        \
-        EXPERTS_UP_TABLE(packing, block, weights, weight, n, k), n, k)
+        EXPERTS_UP_TABLE(block, weights, weight,                                                                \
+            routed::packing_table_bytes(n, k, projection::packing_codes<W>::sums)),                             \
+        n, k, projection::packing_codes<W>::sums)
 #define EXPERTS_UP_INT8_OPERAND(k) routed::int8_forms(operand, EXPERTS_UP_OPERAND_ROWS, tables, 0, k)
-#define EXPERTS_UP_PACKING_OPERAND(k)                                                                           \
-    routed::packing_forms<projection::packing_scratch>(operand, EXPERTS_UP_OPERAND_ROWS, tables, 0, k)
+#define EXPERTS_UP_PACKING_OPERAND(k, sums)                                                                     \
+    routed::packing_forms<projection::packing_scratch>(operand, EXPERTS_UP_OPERAND_ROWS, tables, 0, k, sums)
 
 // The default grids, the expansion's form's (TALL: `grids`' runtime
 // words), and the used blocks' expert ordinals where a form takes tables.
@@ -267,8 +270,8 @@ kernel void routed_experts_up_pack(EXPERTS_UP_ARGUMENTS, PROJECTION_THREADGROUP_
     const routed::Grouped in = EXPERTS_UP_ROWS(0);
     const projection::packing_bounds<0> bounds{};
     typedef projection::packing_codes<packets::W0> coded;
-    projection::packing_operand<coded::centre, coded::folds, (coded::residue != 0 ? 1 : 0), 0>(in,
-        EXPERTS_UP_PACKING_OPERAND(uint(SEISMIC_DIM_H)), bounds, uint(SEISMIC_DIM_B) * uint(SEISMIC_DIM_T),
+    projection::packing_operand<coded::centre, coded::folds, coded::sums, (coded::residue != 0 ? 1 : 0), 0>(in,
+        EXPERTS_UP_PACKING_OPERAND(uint(SEISMIC_DIM_H), coded::sums), bounds, uint(SEISMIC_DIM_B) * uint(SEISMIC_DIM_T),
         uint(SEISMIC_DIM_H), index, peaks, thread_index, sg, lane);
 }
 #endif
@@ -284,7 +287,7 @@ kernel void routed_experts_up_pack_coefficients(EXPERTS_UP_ARGUMENTS, PROJECTION
     EXPERTS_UP_BLOCK(tile.y);
     EXPERTS_UP_EXPANSION;
     const uint f = uint(SEISMIC_DIM_F), h = uint(SEISMIC_DIM_H);
-    projection::packing_tile_coefficients(up, EXPERTS_UP_PACKING(tile.y, 1, 0, f, h), h, tile.x, peaks,
+    projection::packing_tile_coefficients(up, EXPERTS_UP_PACKING(tile.y, 1, 0, f, h, packets::W0), h, tile.x, peaks,
         thread_index, sg, lane);
 }
 #endif
@@ -301,7 +304,8 @@ kernel void routed_experts_up_packed(EXPERTS_UP_ARGUMENTS, PROJECTION_TILE_ARGUM
     EXPERTS_UP_BLOCK(block);
     EXPERTS_UP_EXPANSION;
     const auto out = routed::positioned(EXPERTS_UP_PRODUCTS(block), first_row);
-    projection::gemm_packed_tile<packets::W0, 1, 2, WEIGHTS_AHEAD>(out, up, EXPERTS_UP_PACKING(block, 1, 0, f, h),
+    projection::gemm_packed_tile<packets::W0, 1, 2, WEIGHTS_AHEAD>(
+        out, up, EXPERTS_UP_PACKING(block, 1, 0, f, h, packets::W0),
         first_row + EXPERTS_UP_LIVE(block), tile.y * 32u, tile.x * 128u + sg * 32u, f, h, lane);
 }
 #endif
@@ -439,8 +443,8 @@ kernel void routed_experts_up_down_pack(EXPERTS_UP_ARGUMENTS, PROJECTION_THREADG
     const routed::GroupedProducts in = EXPERTS_UP_PRODUCT_ROWS;
     const projection::packing_bounds<0> bounds{};
     typedef projection::packing_codes<packets::W1> coded;
-    projection::packing_operand<coded::centre, coded::folds, (coded::residue != 0 ? 1 : 0), 0>(in,
-        EXPERTS_UP_PACKING_OPERAND(uint(SEISMIC_DIM_F)), bounds, uint(SEISMIC_DIM_B) * uint(SEISMIC_DIM_T),
+    projection::packing_operand<coded::centre, coded::folds, coded::sums, (coded::residue != 0 ? 1 : 0), 0>(in,
+        EXPERTS_UP_PACKING_OPERAND(uint(SEISMIC_DIM_F), coded::sums), bounds, uint(SEISMIC_DIM_B) * uint(SEISMIC_DIM_T),
         uint(SEISMIC_DIM_F), index, peaks, thread_index, sg, lane);
 }
 #endif
@@ -456,7 +460,7 @@ kernel void routed_experts_up_down_pack_coefficients(EXPERTS_UP_ARGUMENTS, PROJE
     EXPERTS_UP_BLOCK(tile.y);
     EXPERTS_UP_DOWN;
     const uint h = uint(SEISMIC_DIM_H), f = uint(SEISMIC_DIM_F);
-    projection::packing_tile_coefficients(down, EXPERTS_UP_PACKING(tile.y, 1, 0, h, f), f, tile.x, peaks,
+    projection::packing_tile_coefficients(down, EXPERTS_UP_PACKING(tile.y, 1, 0, h, f, packets::W1), f, tile.x, peaks,
         thread_index, sg, lane);
 }
 #endif
@@ -473,7 +477,8 @@ kernel void routed_experts_up_down_packed(EXPERTS_UP_ARGUMENTS, PROJECTION_TILE_
     EXPERTS_UP_BLOCK(block);
     EXPERTS_UP_DOWN;
     const auto out = routed::positioned(EXPERTS_UP_OUTPUT(block), first_row);
-    projection::gemm_packed_tile<packets::W1, 1, 2, DOWN_WEIGHTS_AHEAD>(out, down, EXPERTS_UP_PACKING(block, 1, 0, h, f),
+    projection::gemm_packed_tile<packets::W1, 1, 2, DOWN_WEIGHTS_AHEAD>(
+        out, down, EXPERTS_UP_PACKING(block, 1, 0, h, f, packets::W1),
         first_row + EXPERTS_UP_LIVE(block), tile.y * 32u, tile.x * 128u + sg * 32u, h, f, lane);
 }
 #endif

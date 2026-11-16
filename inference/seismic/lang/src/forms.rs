@@ -51,12 +51,13 @@ const VULKAN_FORMS: [&str; 2] = ["DECODED", "TABLE"];
 
 /// Metal's forms, in emission order (`packets::Forms` reads those its
 /// library selects on). [`metal_forms`] values them in this order.
-const METAL_FORMS: [&str; 11] = [
+const METAL_FORMS: [&str; 12] = [
     "PACK",
     "PACK_CENTRE",
     "PACK_OFFSET",
     "PACK_RESIDUE",
     "PACK_FOLDS",
+    "PACK_SUMS",
     "INT8",
     "INT8_INTERLEAVED",
     "MATRIX_CODES",
@@ -413,7 +414,8 @@ fn cuda_int8_local(weight: &Weight, operands: OperandRecipe) -> Option<bool> {
 
 /// Metal's forms, in the order of [`METAL_FORMS`]: the token-packing GEMM
 /// with its codes' entry and its operand's layout (`PACK`, `PACK_CENTRE`,
-/// `PACK_OFFSET`, `PACK_RESIDUE`, `PACK_FOLDS`; 0 where not admitted), the
+/// `PACK_OFFSET`, `PACK_RESIDUE`, `PACK_FOLDS`, `PACK_SUMS`; 0 where not
+/// admitted), the
 /// int8 GEMM with its operand's order (`INT8`, `INT8_INTERLEAVED`) and the
 /// matrix GEMV, by one of its three products or none (`MATRIX_CODES`,
 /// `MATRIX_RUNS` with its operands' type, `MATRIX_SYMMETRIC`; `MATRIX`
@@ -421,8 +423,8 @@ fn cuda_int8_local(weight: &Weight, operands: OperandRecipe) -> Option<bool> {
 /// alternative to). Each admits
 /// the weight on any device; whether a device runs the form (tensor
 /// operations) is the library's condition. One operand serves several weights of a declaration only
-/// where their operand layout (`PACK_FOLDS`, `PACK_RESIDUE`) or order
-/// (`INT8_INTERLEAVED`) agree.
+/// where their operand layout (`PACK_FOLDS`, `PACK_RESIDUE`, `PACK_SUMS`) or
+/// order (`INT8_INTERLEAVED`) agree.
 fn metal_forms(weight: &Weight) -> [u32; METAL_FORMS.len()] {
     let packing = metal_packing(weight);
     let int8 = metal_int8(weight);
@@ -433,6 +435,7 @@ fn metal_forms(weight: &Weight) -> [u32; METAL_FORMS.len()] {
         packing.map_or(0, |packing| packing.offset),
         packing.map_or(0, |packing| u32::from(packing.residue)),
         packing.map_or(0, |packing| packing.folds),
+        packing.map_or(0, |packing| u32::from(packing.sums)),
         u32::from(int8.is_some()),
         u32::from(int8 == Some(MetalInt8::Nibbles)),
         u32::from(matrix == Some(MetalMatrix::Codes)),
@@ -472,6 +475,10 @@ pub struct MetalPacking {
     /// the entries are values of 8 bits, whose sums 16 bits a token do not
     /// hold at a useful gain.
     pub residue: bool,
+    /// Whether each of a block's two runs folds a min term of its own: the
+    /// operand then carries each run's code sums beside its scales, and the
+    /// weight's factors are each run's scale and min term.
+    pub sums: bool,
 }
 
 impl MetalPacking {
@@ -487,13 +494,14 @@ impl MetalPacking {
 /// storage other than packed rows, or which the form does not serve.
 pub fn metal_packing_of(id: RepresentationId) -> Option<MetalPacking> {
     let values = values(BackendName::Metal, id)?;
-    let [pack, centre, offset, residue, folds, ..] = *<&[u32; METAL_FORMS.len()]>::try_from(values)
+    let [pack, centre, offset, residue, folds, sums, ..] = *<&[u32; METAL_FORMS.len()]>::try_from(values)
         .expect("Metal's forms are valued in the order of its names");
     (pack == 1).then_some(MetalPacking {
         folds,
         centre,
         offset,
         residue: residue == 1,
+        sums: sums == 1,
     })
 }
 
@@ -501,10 +509,11 @@ pub fn metal_packing_of(id: RepresentationId) -> Option<MetalPacking> {
 ///
 /// Its arithmetic requires integer values whose coefficients fold per run
 /// of a 32-column block: a factor per 256 columns over local codes, or
-/// direct groups of whole runs in 256 columns; and a block of two runs only
-/// without a bias term, (centre - offset) scale + bias. A power of two
-/// scaling the values (E2M1's halves) is in the coefficients, which the
-/// decoder folds it into.
+/// direct groups of whole runs in 256 columns. A block with a bias term,
+/// (centre - offset) scale + bias, folds it per run, so a block of two runs
+/// with one carries each run's code sums (`sums`). A power of two scaling
+/// the values (E2M1's halves) is in the coefficients, which the decoder
+/// folds it into.
 ///
 /// Its producer packs a weight's lane codes (`producers::lanes`) as entries,
 /// the values + `offset`, of the fewest bits that hold them centred as the
@@ -535,12 +544,12 @@ fn metal_packing(weight: &Weight) -> Option<MetalPacking> {
         Some(upper) => upper.group == 256,
         None => 256 % profile.local.group == 0,
     };
-    let requires = factors && (folds == 1 || !biased);
-    (requires && entries).then_some(MetalPacking {
+    (factors && entries).then_some(MetalPacking {
         folds,
         centre,
         offset,
         residue: bits == 8,
+        sums: folds == 2 && biased,
     })
 }
 
@@ -990,7 +999,7 @@ mod tests {
     }
 
     /// Metal's admissions of every representation it imports: PACK (folds,
-    /// centre, offset, residue), INT8 and the matrix GEMV product, as
+    /// centre, offset, residue, sums), INT8 and the matrix GEMV product, as
     /// `metal_packing`, `metal_int8` and `metal_matrix` admit each over the
     /// lane codes `producers::lanes` delivers (every code-plane split up to 8
     /// bits, one-bit odd codes, codebook and grid of `i8` values).
@@ -1002,6 +1011,7 @@ mod tests {
                 centre,
                 offset,
                 residue,
+                sums: false,
             })
         };
         let expected = [
@@ -1055,7 +1065,7 @@ mod tests {
             ),
             ("iq2xxs", pack(1, 64, 64, false), None, None),
             ("q4g32", pack(1, 8, 0, false), None, Some(MetalMatrix::Symmetric)),
-            ("q2k", None, None, None),
+            ("q2k", Some(MetalPacking { folds: 2, centre: 2, offset: 0, residue: false, sums: true }), None, None),
             (
                 "q2g256",
                 pack(1, 4, 4, false),
