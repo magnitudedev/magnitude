@@ -1018,12 +1018,42 @@ impl ExpertBankPlan {
             .ok_or_else(|| "bank storage demand overflows".to_owned())
     }
 
-    /// The pools' granules of the records the bank commits at its load: the
-    /// bank's at its slots, a host tier's at no host slots.
+    /// The pools' granules of the records the bank commits at its load
+    /// ([`Self::pooled_charges`]).
     fn pooled_demand(&self) -> Result<ClaimDemand, String> {
-        ClaimDemand::pooled(BankTier::Bank, self.resident_charge(self.slots)?)
-            .checked_plus(ClaimDemand::pooled(BankTier::Host, self.host_charge(0)?))
-            .ok_or_else(|| "bank storage demand overflows".to_owned())
+        self.pooled_charges()?.into_iter().try_fold(ClaimDemand::default(), |total, (_, demand)| {
+            total.checked_plus(demand).ok_or_else(|| "bank storage demand overflows".to_owned())
+        })
+    }
+
+    /// The pools' granules of the records the bank commits at its load, by
+    /// what commits them: the bank's for its slots
+    /// ([`Self::resident_charge`]) and for its stored tables, every record
+    /// held ([`Self::tables_charge`]), and a host tier's at no host slots
+    /// ([`Self::host_charge`]), where the bank has a tier.
+    pub(super) fn pooled_charges(&self) -> Result<Vec<(&'static str, ClaimDemand)>, String> {
+        let mut pooled = vec![("group: records", ClaimDemand::pooled(BankTier::Bank, self.resident_charge(self.slots)?))];
+        if !self.tables.is_empty() {
+            pooled.push(("stored tables", ClaimDemand::pooled(BankTier::Bank, self.tables_charge()?)));
+        }
+        if self.tiered() {
+            pooled.push(("host tier", ClaimDemand::pooled(BankTier::Host, self.host_charge(0)?)));
+        }
+        Ok(pooled)
+    }
+
+    /// What the bank's pool is charged for its stored tables at the load,
+    /// every record of each held: each table's whole blocks
+    /// ([`BankTable::charge`]), as the load backs them
+    /// (`memory::ledger::DeviceLedgers::split_records`). Each table's
+    /// records are its own ([`BankTable::held_bytes`]); the rest are the
+    /// pool's spare granules.
+    pub fn tables_charge(&self) -> Result<u64, String> {
+        self.tables.iter().try_fold(0u64, |sum, table| {
+            BankTable::charge(self.block, self.granule(), table.records.get())?
+                .checked_add(sum)
+                .ok_or_else(|| "banked table charge overflows".to_owned())
+        })
     }
 
     /// What layer `layer`'s banked expert stack of each routed tensor
@@ -1067,6 +1097,12 @@ impl ExpertBankPlan {
         // The bank's pool is charged as device storage (`ClaimDemand::pooled`).
         let pooled = records.min(self.resident_charge(self.slots)?);
         demand.device -= pooled;
+        // Each stored table's held records are its weight's, every one in
+        // the pool (`BankTable::plan`).
+        for table in &self.tables {
+            demand.device = demand.device.checked_sub(BankTable::held_bytes(self.granule(), table.records.get())?)
+                .ok_or("a bank holds less than its stored tables' records charge")?;
+        }
         let lent = match self.host().contract(BankTier::Bank) {
             seismic::Contract::DeviceOnly => &mut demand.device,
             _ => &mut demand.shared,

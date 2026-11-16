@@ -141,7 +141,7 @@ impl ModelLoadPlan {
             let Some(table) = BankTable::of(weight, step_rows, granule).map_err(PlanError::InvalidDefinition)? else {
                 continue;
             };
-            *weight = table.plan(block, granule).map_err(PlanError::ResourcePlanning)?;
+            *weight = table.plan(granule).map_err(PlanError::ResourcePlanning)?;
             tables.push(table);
         }
         let bank = ExpertBankPlan {

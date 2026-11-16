@@ -232,16 +232,13 @@ impl ExpertBankPlan {
 
     /// What the bank demands ([`Self::storage_demand`]), by the part that
     /// owns each byte: its layout's ([`BankLayout::owned`]), the places a
-    /// group holds at its floor's one, and its pools' granules, its group
-    /// records' and its host tier's, each part's sum.
+    /// group holds at its floor's one, and its pools' granules
+    /// ([`Self::pooled_charges`]), each part's sum.
     pub fn charges(&self) -> Result<Vec<(&'static str, ClaimDemand)>, String> {
         let (layout, floor) = (self.layout()?, self.placed_allocations(NonZeroU64::MIN)?);
         let mut charges = Vec::<(&'static str, ClaimDemand)>::new();
         let owned = layout.owned().into_iter().chain(floor.iter().map(|allocation| ("places", allocation)));
-        let mut pooled = vec![("group: records", ClaimDemand::pooled(BankTier::Bank, self.resident_charge(self.slots)?))];
-        if self.tiered() {
-            pooled.push(("host tier", ClaimDemand::pooled(BankTier::Host, self.host_charge(0)?)));
-        }
+        let pooled = self.pooled_charges()?;
         let owned = owned
             .map(|(owner, allocation)| Ok::<_, String>((owner, allocation.storage_demand(self.host())?)))
             .chain(pooled.into_iter().map(Ok));

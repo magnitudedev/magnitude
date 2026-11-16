@@ -664,23 +664,37 @@ fn the_largest_lent_allocation_is_the_lenders_largest_record_tensor() {
 #[test]
 fn a_bank_holds_its_stored_table_in_granule_records() {
     use crate::planning::fixtures::{qwen4exp_fixture_definition, streamed_experts_manifest};
-    // A whole table (its fixed slots are its rows) of rows no number of
-    // records fills exactly.
-    const TABLE_ROWS: u64 = (1 << 20) + 1;
-    let mut definition = qwen4exp_fixture_definition();
-    let (heads, width) = match &mut definition.decoder.blocks[0].sublayers[2].op {
-        Operator::NGramInput(input) => {
-            input.table.shape[0] = TABLE_ROWS;
-            (input.hash.heads().unwrap(), input.width)
-        }
-        _ => unreachable!("the fixture's first block ends in its n-gram input"),
+    // The load of a whole table (its fixed slots are its rows) of `rows`
+    // rows, resident and banked.
+    let load = |rows: u64| {
+        let mut definition = qwen4exp_fixture_definition();
+        let (heads, width) = match &mut definition.decoder.blocks[0].sublayers[2].op {
+            Operator::NGramInput(input) => {
+                input.table.shape[0] = rows;
+                (input.hash.heads().unwrap(), input.width)
+            }
+            _ => unreachable!("the fixture's first block ends in its n-gram input"),
+        };
+        let manifest = streamed_experts_manifest(&definition);
+        let selection = crate::ComponentSelection { head: false, vision: false };
+        let resident = ModelLoadPlan::derive(&manifest, &definition, selection, Layout::Rows32, crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS).unwrap();
+        // CUDA's 2 MiB allocation granularity: the pool's blocks hold
+        // several granules.
+        let substrate = BankSubstrate {
+            allocations: seismic::NativeAllocations { least: 0, granularity: 2 << 20 },
+            ..cuda(HostTier::Unified(Parking::InKernels))
+        };
+        let banked = resident.clone().with_expert_bank_at_floor(&definition, substrate).unwrap();
+        (definition, heads, width, resident, banked)
     };
-    let manifest = streamed_experts_manifest(&definition);
-    let selection = crate::ComponentSelection { head: false, vision: false };
-    let resident = ModelLoadPlan::derive(&manifest, &definition, selection, Layout::Rows32, crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS).unwrap();
+    // Rows no number of records fills exactly, a record short of the
+    // probe's: the table's records leave spare granules in their last block.
+    let probe = load((1 << 20) + 1).4;
+    let probe = probe.expert_bank().unwrap();
+    let table_rows = (1 << 20) + 1 - probe.tables[0].record_rows.get();
+    let (definition, heads, width, resident, banked) = load(table_rows);
     let fixed = resident.target().iter().find(|weight| weight.stored_in_slots()).unwrap().clone();
-    assert_eq!(fixed.shape, [1, TABLE_ROWS, width]);
-    let banked = resident.clone().with_expert_bank_at_floor(&definition, cuda(HostTier::Unified(Parking::InKernels))).unwrap();
+    assert_eq!(fixed.shape, [1, table_rows, width]);
     let bank = banked.expert_bank().unwrap();
     let [table] = &bank.tables[..] else {
         panic!("the bank holds the stored table");
@@ -691,14 +705,27 @@ fn a_bank_holds_its_stored_table_in_granule_records() {
     assert_eq!(record_rows, granule / row);
     assert_eq!(record_bytes, record_rows * row);
     assert!(record_bytes <= granule && granule - record_bytes < row);
-    assert_eq!(records, TABLE_ROWS / record_rows);
-    assert!(records * record_rows <= TABLE_ROWS);
+    assert_eq!(records, table_rows / record_rows);
+    assert!(records * record_rows <= table_rows);
     let step_rows = heads * magnitude_batching::MAX_CLASS_ROWS as u64;
     assert_eq!(table.floor, step_rows.div_ceil(record_rows));
     let held = banked.target().iter().find(|weight| weight.role == fixed.role).unwrap();
     assert_eq!(held.shape, [records, record_rows, width]);
-    assert_eq!(held.resident_bytes, records * granule);
-    assert_eq!(BankTable::charge(bank.block(), granule, records).unwrap(), held.resident_bytes);
+    // The table's records are its own, a granule each: what its slots are
+    // charged as they hold them (`StoredTable::charged_bytes`). They leave
+    // spare granules in the last block, the bank's pool's, which the bank
+    // is charged beyond its records' (`ExpertBankPlan::storage_beyond_records`).
+    assert_eq!(held.resident_bytes, BankTable::held_bytes(granule, records).unwrap());
+    assert_ne!(records % bank.block().granules(granule), 0, "the table's records leave spare granules in their last block");
+    let blocks = BankTable::charge(bank.block(), granule, records).unwrap();
+    assert!(blocks > held.resident_bytes);
+    assert_eq!(bank.tables_charge().unwrap(), blocks);
+    let bare = ExpertBankPlan { tables: Vec::new(), ..bank.clone() };
+    assert_eq!(
+        bank.charged_beyond_records().unwrap() - bare.charged_beyond_records().unwrap(),
+        blocks - held.resident_bytes,
+        "the pool's spare granules are the bank's"
+    );
     assert_eq!(held.record_table_entries().unwrap(), records);
     let ported = banked.clone().with_record_ports(seismic::BackendName::Cuda);
     assert_eq!(ported.weight_device_allocations(held).unwrap(), Vec::<u64>::new(), "banked stored table's slot table is host-shared, not device-only");

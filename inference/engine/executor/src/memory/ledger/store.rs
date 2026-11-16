@@ -497,13 +497,9 @@ impl DeviceLedgers {
         let Some(bank) = load.expert_bank() else {
             return Ok(());
         };
-        let tables = bank.tables.iter().try_fold(0u64, |sum, table| {
-            crate::planning::BankTable::charge(bank.block(), bank.granule(), table.records.get())
-                .and_then(|bytes| sum.checked_add(bytes).ok_or_else(|| "banked table charge overflows".to_owned()))
-        })?;
         let on_bank = bank
             .resident_charge(bank.slots)?
-            .checked_add(tables)
+            .checked_add(bank.tables_charge()?)
             .ok_or_else(|| "bank record charge overflows".to_owned())?;
         if on_bank > 0 {
             let backing = weights.split_backing(self.of(BankTier::Bank), on_bank);

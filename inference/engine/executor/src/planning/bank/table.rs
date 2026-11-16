@@ -65,19 +65,28 @@ impl BankTable {
 
     /// What `committed` of its records are charged in a pool of `granule`
     /// bytes in `block`s: a granule each, in the whole blocks holding them
-    /// ([`seismic::BlockSize::charge`]).
+    /// ([`seismic::BlockSize::charge`]). The pool's charge: what its blocks
+    /// cost, the granules no record holds with them.
     pub fn charge(block: seismic::BlockSize, granule: u64, committed: u64) -> Result<u64, String> {
         block.charge(granule, committed).ok_or_else(|| "banked table charge overflows".to_owned())
     }
 
-    /// The table's plan as the bank holds it, every record committed in a
-    /// pool of `granule` bytes in `block`s ([`Self::charge`]), beside the
-    /// table of them every stored table's slots hold
-    /// (`WeightPlan::record_table_entries`).
-    pub(super) fn plan(&self, block: seismic::BlockSize, granule: u64) -> Result<WeightPlan, String> {
+    /// What `held` of its records hold in a pool of `granule` bytes: a
+    /// granule each. The table's own charge, its plan's and its slots'
+    /// (`StoredTable::charged_bytes`); the rest of the whole blocks holding
+    /// them ([`Self::charge`]) are the pool's spare granules, the bank's
+    /// (`ExpertBankPlan::storage_beyond_records`).
+    pub fn held_bytes(granule: u64, held: u64) -> Result<u64, String> {
+        granule.checked_mul(held).ok_or_else(|| "banked table records' bytes overflow".to_owned())
+    }
+
+    /// The table's plan as the bank holds it, every record held in a pool
+    /// of `granule` bytes ([`Self::held_bytes`]), beside the table of them
+    /// every stored table's slots hold (`WeightPlan::record_table_entries`).
+    pub(super) fn plan(&self, granule: u64) -> Result<WeightPlan, String> {
         let mut plan = self.fixed.clone();
         plan.shape = vec![self.records.get(), self.record_rows.get(), self.fixed.table_width()];
-        plan.resident_bytes = Self::charge(block, granule, self.records.get())?;
+        plan.resident_bytes = Self::held_bytes(granule, self.records.get())?;
         let slots = plan.table_slots();
         if let Holding::Streamed(streamed) = &mut plan.holding {
             streamed.directory = super::super::DirectoryForm::of(streamed.table_rows, slots);

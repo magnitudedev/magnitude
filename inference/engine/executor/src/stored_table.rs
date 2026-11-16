@@ -771,15 +771,18 @@ impl StoredTable {
         self.shared.stack.lock().expect("stored table stack lock").curve.clone()
     }
 
-    /// What the slots are charged now: of a banked table, a granule of its
-    /// pool per record held; of one allocated whole, its allocation, which
-    /// the table holds for its life. The slab store's address table, which
-    /// the slots' logical view lies in (`Self::slots_tensor`), is not theirs.
+    /// What the slots are charged now: of a banked table, the records it
+    /// holds, a granule of its pool each
+    /// ([`crate::planning::BankTable::held_bytes`], its plan's charge too);
+    /// of one allocated whole, its allocation, which the table holds for its
+    /// life. The slab store's address table, which the slots' logical view
+    /// lies in (`Self::slots_tensor`), is not theirs.
     pub fn charged_bytes(&self) -> u64 {
         let state = self.shared.state.lock().expect("stored table lock");
         match &state.slots.backing {
             Backing::Whole(allocation) => allocation.charged_bytes(),
-            Backing::Banked(pool) => state.slots.records().count() as u64 * pool.granule(),
+            Backing::Banked(pool) => crate::planning::BankTable::held_bytes(pool.granule(), state.slots.records().count() as u64)
+                .expect("invariant violated: a table's held records' bytes fit u64"),
         }
     }
 
@@ -1676,6 +1679,9 @@ mod tests {
         assert!(slots.iter().all(|slot| *slot >= 16), "the first record holds no row");
         table.resize(3).unwrap().unwrap();
         assert_eq!(held(&table), [1, 2, 3]);
+        // Its records leave a spare granule in the pool's last block of
+        // two: the pool's, not the table's, as its plan charges it
+        // (`BankTable::held_bytes`).
         assert_eq!(table.charged_bytes(), 3 * pool.granule());
         // Every row stays in its slot.
         for (row, slot) in first.iter().zip(&slots) {
