@@ -41,14 +41,37 @@ use magnitude_kernels::project_rows;
 use seismic::measure::{measure, Measure, Pending, Stop, Work};
 use seismic::{BackendName, Device, Element, GgufScales, NativeSpecialization, OperandRecipe, Tensor};
 
-/// Each quant: its name, encoding, and scale fields (byte offset, the code
-/// magnitude the field's f16 divides a block's reach by).
-const QUANTS: [(&str, Encoding, &[(usize, f32)]); 5] = [
-    ("q4_k", Encoding::Q4K, &[(0, 945.0), (2, 63.0)]),
-    ("q5_k", Encoding::Q5K, &[(0, 1953.0), (2, 63.0)]),
-    ("q6_k", Encoding::Q6K, &[(208, 4096.0)]),
-    ("q8_0", Encoding::Q8_0, &[(0, 127.0)]),
-    ("iq4_nl", Encoding::Iq4Nl, &[(0, 128.0)]),
+/// A block's scale field, set so the block's largest code reaches `reach`:
+/// an f16 at a byte offset; an f16 whose four nibbles are the top nibbles
+/// of the four u16 words from a byte offset (IQ1_M's); or an E8M0 exponent
+/// byte (`2^(e - 128)` a code unit). Each with the code magnitude it
+/// scales.
+enum Scale {
+    F16(usize, f32),
+    F16Nibbles(usize, f32),
+    E8M0(usize, f32),
+}
+
+/// Each quant: its name, encoding, and scale fields. Every type of the
+/// direct (q8_0), hierarchical (q4_k, q5_k, q6_k), table (iq4_nl), float
+/// code (mxfp4) and odd (q1_0) classes the head-to-head has timed, and every
+/// grid type (iq1_s .. iq3_s).
+const QUANTS: [(&str, Encoding, &[Scale]); 14] = [
+    ("q4_k", Encoding::Q4K, &[Scale::F16(0, 945.0), Scale::F16(2, 63.0)]),
+    ("q5_k", Encoding::Q5K, &[Scale::F16(0, 1953.0), Scale::F16(2, 63.0)]),
+    ("q6_k", Encoding::Q6K, &[Scale::F16(208, 4096.0)]),
+    ("q8_0", Encoding::Q8_0, &[Scale::F16(0, 127.0)]),
+    ("iq4_nl", Encoding::Iq4Nl, &[Scale::F16(0, 128.0)]),
+    ("mxfp4", Encoding::Mxfp4, &[Scale::E8M0(0, 12.0)]),
+    ("q1_0", Encoding::Q1_0, &[Scale::F16(0, 1.0)]),
+    // Grid magnitudes: the largest local scale times the largest point.
+    ("iq2_xxs", Encoding::Iq2Xxs, &[Scale::F16(0, 167.0)]),
+    ("iq2_xs", Encoding::Iq2Xs, &[Scale::F16(0, 167.0)]),
+    ("iq2_s", Encoding::Iq2S, &[Scale::F16(0, 167.0)]),
+    ("iq3_xxs", Encoding::Iq3Xxs, &[Scale::F16(0, 481.0)]),
+    ("iq3_s", Encoding::Iq3S, &[Scale::F16(0, 465.0)]),
+    ("iq1_s", Encoding::Iq1S, &[Scale::F16(0, 17.0)]),
+    ("iq1_m", Encoding::Iq1M, &[Scale::F16Nibbles(48, 17.0)]),
 ];
 /// Weight rows × K: Qwen3.6-35B-A3B's expert gate_up and down, a dense 4B
 /// projection, and the standard 14336 × 4096.
@@ -96,8 +119,21 @@ fn write_data(dir: &std::path::Path, quants: &[String], shapes: &[(usize, usize)
             for block in data.chunks_exact_mut(bytes) {
                 block.iter_mut().for_each(|byte| *byte = rng.next() as u8);
                 let reach = scale * (0.5 + rng.unit() as f32);
-                for &(at, magnitude) in *fields {
-                    block[at..at + 2].copy_from_slice(&seismic::f16_bits(reach / magnitude).to_le_bytes());
+                for field in *fields {
+                    match *field {
+                        Scale::F16(at, magnitude) => {
+                            block[at..at + 2].copy_from_slice(&seismic::f16_bits(reach / magnitude).to_le_bytes())
+                        }
+                        Scale::F16Nibbles(at, magnitude) => {
+                            let bits = seismic::f16_bits(reach / magnitude);
+                            for (i, word) in block[at..at + 8].chunks_exact_mut(2).enumerate() {
+                                let top = (bits >> (4 * i)) & 0xf;
+                                let kept = u16::from_le_bytes([word[0], word[1]]) & 0x0fff;
+                                word.copy_from_slice(&(kept | (top << 12)).to_le_bytes());
+                            }
+                        }
+                        Scale::E8M0(at, magnitude) => block[at] = (128.0 + (reach / magnitude).log2().round()) as u8,
+                    }
                 }
             }
             std::fs::write(dir.join(format!("w-{name}-{n}x{k}.bin")), data).expect("weights file");
