@@ -1106,6 +1106,15 @@ inline float ordered_weight_at(thread const Weights<packets::Dense<E>> &w, uint 
     return E::load(slab::as<typename E::storage>(w.row(row) + w.geometry(row).codes)[col]);
 }
 
+// Blocks a 1-row ordered walk fetches together (`ordered_gemv_maxm_run`):
+// as many as 64 bytes of fetched weights hold, so a batch and the next one in
+// flight fit a lane's registers; one where a block's fetch is larger.
+template <typename W>
+constexpr uint ordered_walk_batch() {
+    constexpr uint fit = 64u / uint(sizeof(typename OrderedWeight<W>::fetched));
+    return fit < 1u ? 1u : (fit > 8u ? 8u : fit);
+}
+
 template <uint MAXM>
 constexpr uint ordered_mixed_w_per_sg() {
     return (MAXM == 1u) ? 4u : ((MAXM == 2u) ? 2u : 1u);
@@ -1364,37 +1373,57 @@ inline void ordered_gemv_maxm_run(thread const In &in, thread const Out &out, th
                 if (sg_has_rows) {
                     threadgroup const uint4 *x_packed = reinterpret_cast<threadgroup const uint4 *>(shared);
                     float acc = 0.0f;
-                    uint col0 = 0u;
-                    for (; col0 + 64u <= k; col0 += 64u) {
-                        float wt[8];
-                        if (has_row)
-                            Ow::decode_full(cur_w, s_own, wt);
-                        else {
-                            PROJECTION_UNROLL
-                            for (uint j = 0u; j < 8u; ++j)
-                                wt[j] = 0.0f;
+                    // The row's whole blocks in batches of WALK, the next
+                    // batch's loads in flight while this one is summed, so
+                    // the walk waits on memory once a batch, not once a
+                    // block; the sum keeps the block order.
+                    constexpr uint WALK = ordered_walk_batch<W>();
+                    const uint blocks = k >> 6u;
+                    typename Ow::fetched cur[WALK];
+                    cur[0] = cur_w;
+                    PROJECTION_UNROLL
+                    for (uint d = 1u; d < WALK; ++d)
+                        cur[d] = (has_row && d < blocks) ? Ow::fetch_full(w, w_row, 2u * d + p_own, s_own) : Ow::empty();
+                    for (uint b = 0u; b < blocks; b += WALK) {
+                        typename Ow::fetched next[WALK];
+                        PROJECTION_UNROLL
+                        for (uint d = 0u; d < WALK; ++d) {
+                            const uint nb = b + WALK + d;
+                            next[d] = (has_row && nb < blocks) ? Ow::fetch_full(w, w_row, 2u * nb + p_own, s_own)
+                                                               : Ow::empty();
                         }
-                        const uint next_col = col0 + 64u;
-                        if (has_row) {
-                            if (next_col + 64u <= k)
-                                cur_w = Ow::fetch_full(w, w_row, (next_col >> 5u) + p_own, s_own);
-                            else if (next_col + 8u * u < k)
-                                cur_w = Ow::fetch(w, w_row, (next_col >> 5u) + p_own, s_own);
-                            else
-                                cur_w = Ow::empty();
+                        PROJECTION_UNROLL
+                        for (uint d = 0u; d < WALK; ++d) {
+                            if (b + d < blocks) {
+                                float wt[8];
+                                if (has_row)
+                                    Ow::decode_full(cur[d], s_own, wt);
+                                else {
+                                    PROJECTION_UNROLL
+                                    for (uint j = 0u; j < 8u; ++j)
+                                        wt[j] = 0.0f;
+                                }
+                                ordered_transpose8(wt, u);
+                                float4 xe, xo;
+                                A::split8(x_packed[(b + d) * 8u + u], xe, xo);
+                                acc = metal::fma(xe.x, wt[0], acc);
+                                acc = metal::fma(xo.x, wt[1], acc);
+                                acc = metal::fma(xe.y, wt[2], acc);
+                                acc = metal::fma(xo.y, wt[3], acc);
+                                acc = metal::fma(xe.z, wt[4], acc);
+                                acc = metal::fma(xo.z, wt[5], acc);
+                                acc = metal::fma(xe.w, wt[6], acc);
+                                acc = metal::fma(xo.w, wt[7], acc);
+                            }
                         }
-                        ordered_transpose8(wt, u);
-                        float4 xe, xo;
-                        A::split8(x_packed[(col0 >> 6u) * 8u + u], xe, xo);
-                        acc = metal::fma(xe.x, wt[0], acc);
-                        acc = metal::fma(xo.x, wt[1], acc);
-                        acc = metal::fma(xe.y, wt[2], acc);
-                        acc = metal::fma(xo.y, wt[3], acc);
-                        acc = metal::fma(xe.z, wt[4], acc);
-                        acc = metal::fma(xo.z, wt[5], acc);
-                        acc = metal::fma(xe.w, wt[6], acc);
-                        acc = metal::fma(xo.w, wt[7], acc);
+                        PROJECTION_UNROLL
+                        for (uint d = 0u; d < WALK; ++d)
+                            cur[d] = next[d];
                     }
+                    const uint col0 = blocks << 6u;
+                    if (col0 < k)
+                        cur_w = (has_row && col0 + 8u * u < k) ? Ow::fetch(w, w_row, (col0 >> 5u) + p_own, s_own)
+                                                               : Ow::empty();
                     if (col0 < k) {
                         float wt[8];
                         if (has_row && col0 + 8u * u < k)
