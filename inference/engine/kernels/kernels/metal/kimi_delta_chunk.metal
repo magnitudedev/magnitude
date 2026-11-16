@@ -62,11 +62,13 @@ kernel void kimi_delta_chunk_scan(
 kernel void kimi_delta_chunk_gate(
     device const recurrent::Storage *gate [[buffer(SEISMIC_BUFFER_GATE)]],
     device const uchar *recurrent_norm [[buffer(SEISMIC_BUFFER_RECURRENT_NORM)]],
+    device const int *segments [[buffer(SEISMIC_BUFFER_SEGMENTS)]],
     SEISMIC_RESULT_0_PARAM(gated),
     device const recurrent::Storage *mixed [[buffer(SEISMIC_BUFFER_SCRATCH_MIXED)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint item [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]) {
-    recurrent::gate_row(mixed, kimi::gate_input(gate, seismic_words), recurrent_norm,
-        element::Out<element::Act>(gated), item / RCH_VALUE_HEADS, item % RCH_VALUE_HEADS, lane, seismic_words);
+    recurrent::gate_row(mixed, versions::covered_end(segments, seismic_words), kimi::gate_input(gate, seismic_words),
+        recurrent_norm, element::Out<element::Act>(gated), item / RCH_VALUE_HEADS, item % RCH_VALUE_HEADS, lane,
+        seismic_words);
 }

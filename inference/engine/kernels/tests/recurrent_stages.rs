@@ -3000,3 +3000,133 @@ fn kda_prefill_then_decode_equals_decode_alone_on(entries: &PerChannelEntries) {
         }
     }
 }
+
+/// Seconds per call of `point` (a kernel point with `submit`): 200
+/// back-to-back calls per sample timed on the device, after one warm-up
+/// sample; the (median, min) of 15 samples.
+macro_rules! time_point {
+    ($point:expr) => {{
+        const CALLS: usize = 200;
+        $point.submit(CALLS).unwrap().wait().unwrap();
+        let mut seconds = (0..15)
+            .map(|_| $point.submit(CALLS).unwrap().seconds().unwrap() / CALLS as f64)
+            .collect::<Vec<_>>();
+        seconds.sort_by(f64::total_cmp);
+        (seconds[7], seconds[0])
+    }};
+}
+
+/// Device time of the delta steps per mapping at their models' recurrent
+/// geometries, for one decode slot of 1 to 8 rows (one-row decode and MTP
+/// verify), on every GPU this host has: `gated_delta_step` at Qwen3.5-4B's
+/// (16 key heads, 32 value heads, W 128, C 4) and, on CUDA,
+/// `kimi_delta_step` at GLM-5.3-Flash's (`kda`), in bf16 activations.
+#[test]
+#[ignore = "timing at shape; run alone on a quiet host"]
+fn step_timing_at_decode_shapes() {
+    use seismic::measure::{Pending, Work};
+    let geometry = Geometry {
+        key_heads: 16,
+        value_heads: 32,
+        width: 128,
+        decay_width: 1,
+        convolution: 4,
+        banks: 3,
+        tape: 0,
+    };
+    let statics = |g: Geometry| {
+        NativeSpecialization::new()
+            .with_static("NK", g.key_heads as u64)
+            .with_static("NV", g.value_heads as u64)
+            .with_static("W", g.width as u64)
+            .with_static("C", g.convolution as u64)
+    };
+    let cuda_mappings = |g: Geometry| -> Vec<(String, NativeSpecialization)> {
+        [(2u64, 4u64), (4, 4), (2, 8), (4, 8)]
+            .into_iter()
+            .map(|(rows, warps)| {
+                let mapping =
+                    statics(g).with_launch_param(0, "ROWS", rows).with_launch_param(0, "WARPS", warps);
+                (format!("ROWS {rows} WARPS {warps}"), mapping)
+            })
+            .collect()
+    };
+    let backends = [BackendName::Metal, BackendName::Cuda, BackendName::Vulkan];
+    for device in seismic_native_tests::devices(&backends) {
+        let backend = device.backend();
+        let mappings: Vec<(String, NativeSpecialization)> = match backend {
+            BackendName::Metal => [32u64, 16, 64]
+                .into_iter()
+                .map(|rows| (format!("ROWS {rows}"), statics(geometry).with_param("ROWS", rows)))
+                .collect(),
+            BackendName::Cuda => cuda_mappings(geometry),
+            BackendName::Vulkan => [(2u64, 4u64), (4, 4), (2, 8), (4, 8)]
+                .into_iter()
+                .map(|(rows, warps)| {
+                    let mapping = statics(geometry).with_param("ROWS", rows).with_param("WARPS", warps);
+                    (format!("ROWS {rows} WARPS {warps}"), mapping)
+                })
+                .collect(),
+            other => panic!("no step mappings for {other:?}"),
+        };
+        for rows in 1..=8 {
+            let case = Case::new(geometry, rows, vec![slot(rows, rows, 1, 2)], true, 7);
+            for (label, specialization) in &mappings {
+                let kernel = gated_delta_step::native_for_device_with(
+                    &device,
+                    gated_delta_step::Elements {
+                        RN: Element::f32(),
+                        A: Element::bf16(),
+                    },
+                    specialization,
+                )
+                .unwrap();
+                let mut t = case.tensors(&device, Element::bf16());
+                let point = kernel.point(vec![t.step_args(&case)]).unwrap();
+                let (median, min) = time_point!(point);
+                eprintln!(
+                    "{backend:?} gated_delta_step M={rows} {label}: {:.2} us (min {:.2})",
+                    1e6 * median,
+                    1e6 * min
+                );
+            }
+        }
+        if backend != BackendName::Cuda {
+            continue;
+        }
+        let kimi = kda(3, 0);
+        for rows in 1..=8 {
+            let case = Case::new(kimi, rows, vec![slot(rows, rows, 1, 2)], false, 63)
+                .with_bf16_activations()
+                .with_bounded_decay();
+            for (label, specialization) in &cuda_mappings(kimi) {
+                let kernel = kimi_delta_step::native_for_device_with(
+                    &device,
+                    kimi_delta_step::Elements {
+                        RN: Element::f32(),
+                        A: Element::bf16(),
+                    },
+                    specialization,
+                )
+                .unwrap();
+                let mut t = case.tensors(&device, Element::bf16());
+                let Inputs::Kimi { projection, beta, gate, decay, lower } = &t.inputs else {
+                    panic!("a Kimi Delta Attention case has Kimi inputs")
+                };
+                let (projection, beta, gate, decay, lower) =
+                    (projection.clone(), beta.clone(), gate.clone(), decay.clone(), *lower);
+                let point = kernel
+                    .point(vec![state_args!(kimi_delta_step, t, case, {
+                        projection: &projection, beta: &beta, gate: &gate, decay: &decay, decay_lower: lower,
+                    })])
+                    .unwrap();
+                let (median, min) = time_point!(point);
+                eprintln!(
+                    "{backend:?} kimi_delta_step M={rows} {label}: {:.2} us (min {:.2})",
+                    1e6 * median,
+                    1e6 * min
+                );
+            }
+        }
+    }
+}

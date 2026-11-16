@@ -56,7 +56,8 @@ kernel void gated_delta_step(
             seismic_words);
     recurrent::step<RST_LANE_ROWS, RST_BLOCK>(recurrent::Convolving{projection, window, convolution, slot},
         recurrent::HeadRule{projection, rate, time_bias}, recurrent::projected_gate(projection, seismic_words),
-        recurrent_norm, element::Out<element::Act>(gated), mixed, arrivals, delta, tape, slot, group, query_block,
+        recurrent_norm, element::Out<element::Act>(gated), mixed, arrivals, delta, tape, slot,
+        versions::covered_end(segments, seismic_words), group, query_block,
         key_block, value_block, beta_block, decay_block, &last, thread_index, threadgroup_shape.x, simdgroup, lane,
         seismic_words);
 }

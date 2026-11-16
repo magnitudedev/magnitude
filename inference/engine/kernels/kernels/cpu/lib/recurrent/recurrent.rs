@@ -344,16 +344,6 @@ impl<'a, A: Dense> Recurrence<'a, A> {
         unsafe { self.mixed.slice_mut::<f32>(4 * at, rows.len()) }
     }
 
-    /// Zeroes state rows `rows` of value head `head` in the raw rows no slot
-    /// covers.
-    #[inline(always)]
-    pub fn zero_uncovered(&self, head: usize, rows: Range<usize>) {
-        for row in self.covered_end()..self.rows {
-            // SAFETY: each work item writes its own state rows of the head.
-            unsafe { self.raw_mut(row, head, &rows) }.fill(0.0);
-        }
-    }
-
     /// Stores state rows `rows` of `head` to the successor bank.
     #[inline(always)]
     fn publish_state(&self, slot: &Slot, head: usize, rows: &Range<usize>, state: &[f32]) {
@@ -424,9 +414,10 @@ pub trait Rule<'a> {
         }
     }
 
-    /// The `gate` launch of every entry: row `row`'s raw outputs, per value
-    /// head RMS-normalized over W with `epsilon` and scaled by the recurrent
-    /// norm (`norm`, decoded; A), times the output gate of z (A; code
+    /// The `gate` launch of every entry: row `row`'s raw outputs (zero in a
+    /// row no slot covers, which no advance stores), per value head
+    /// RMS-normalized over W with `epsilon` and scaled by the recurrent norm
+    /// (`norm`, decoded; A), times the output gate of z (A; code
     /// `gate_function`), published to A in `gated`. `values` holds W floats.
     #[inline(always)]
     fn gate_row(
@@ -440,11 +431,14 @@ pub trait Rule<'a> {
     ) {
         let r = self.recurrence();
         let (w, nv) = (r.width, r.value_heads);
-        // SAFETY: the advance launch wrote every raw row before this launch;
-        // this one only reads them.
-        let raw = unsafe { r.mixed.slice::<f32>(4 * row * nv * w, nv * w) };
+        // SAFETY: the advance launch wrote every raw row a slot covers before
+        // this launch; this one only reads them.
+        let raw = (row < r.covered_end()).then(|| unsafe { r.mixed.slice::<f32>(4 * row * nv * w, nv * w) });
         for head in 0..nv {
-            values.copy_from_slice(&raw[head * w..(head + 1) * w]);
+            match raw {
+                Some(raw) => values.copy_from_slice(&raw[head * w..(head + 1) * w]),
+                None => values.fill(0.0),
+            }
             let inverse = reduce::rms_inverse(values, epsilon);
             let gates = self.gate_input(row, head);
             // SAFETY: each work item writes its own row.
@@ -462,9 +456,8 @@ pub trait Rule<'a> {
 
     /// The step entry's launch (`*_step`): work item `group` = (value head,
     /// state-row block of `block_rows` (`ROWS`), slot) advances its rows with
-    /// the inputs computed in place (`Fused`); grid z = B zeroes the raw rows
-    /// no slot covers, and each head's first work item publishes its share of
-    /// the successor window.
+    /// the inputs computed in place (`Fused`), and each head's first work
+    /// item publishes its share of the successor window.
     #[inline(always)]
     fn step(&self, group: [u64; 3], block_rows: u64, shared: &mut [u8])
     where
@@ -473,10 +466,6 @@ pub trait Rule<'a> {
         let r = self.recurrence();
         let head = group[0] as usize;
         let rows = state_rows(group[1], block_rows, r.width);
-        if group[2] as usize == r.slots {
-            r.zero_uncovered(head, rows);
-            return;
-        }
         let slot = r.slot(group[2] as usize);
         if rows.start == 0 {
             r.publish_window(&slot, head);
@@ -511,10 +500,6 @@ pub trait Rule<'a> {
         let r = self.recurrence();
         let head = group[0] as usize;
         let rows = state_rows(group[1], block_rows, r.width);
-        if group[2] as usize == r.slots {
-            r.zero_uncovered(head, rows);
-            return;
-        }
         let slot = r.slot(group[2] as usize);
         if rows.start == 0 {
             r.publish_window(&slot, head);

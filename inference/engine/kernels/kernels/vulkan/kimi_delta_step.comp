@@ -5,11 +5,10 @@
 //
 // One workgroup per (value head, state-row block, slot); each subgroup owns
 // ROWS state rows, a lane W / 32 columns of each, held in registers for the
-// whole slot. The raw outputs go to the `mixed` scratch; grid z = B zeroes
-// the raw rows no slot covers. `kimi_delta_step_gate` then gates each
-// (head, row) from the gate operand (`recurrent_gate`: the GEMV staging's lane
-// order to 8 rows, the staging launch's order beyond). ROWS and WARPS never
-// change result bits.
+// whole slot. The raw outputs of the slots' rows go to the `mixed` scratch.
+// `kimi_delta_step_gate` then gates each (head, row) from the gate operand
+// (`recurrent_gate`: the GEMV staging's lane order to 8 rows, the staging
+// launch's order beyond). ROWS and WARPS never change result bits.
 #include "lib/recurrent/kimi.glsl"
 
 #if SEISMIC_TUNE_ROWS > RECURRENT_MAX_ROWS

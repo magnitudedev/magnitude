@@ -374,9 +374,7 @@ constant constexpr uint INPUT_WIDTH = 2 * G * N + 2 * NH;
 template <uint LANE_ROWS>
 inline void zero_uncovered(Operands in, versions::Slots slots, uint head, ulong row0, uint lane) {
     constant ulong *seismic_words = in.seismic_words;
-    const ulong count = SEISMIC_DIM_B;
-    const long covered = count == 0 ? 0 : versions::slot_end(slots, count - 1, seismic_words);
-    for (ulong row = ulong(covered); row < SEISMIC_DIM_M; ++row) {
+    for (ulong row = ulong(versions::covered_end(slots.segments, seismic_words)); row < SEISMIC_DIM_M; ++row) {
         if (lane < LANE_ROWS) {
             in.mixed.put(row * SEISMIC_RESULT_0_STRIDE_0 + head * SEISMIC_RESULT_0_STRIDE_1
                 + (row0 + lane) * SEISMIC_RESULT_0_STRIDE_2, 0.0f);

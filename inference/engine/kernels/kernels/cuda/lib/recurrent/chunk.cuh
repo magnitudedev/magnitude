@@ -35,10 +35,10 @@
 //
 // A slot of at most recurrent::SEQUENTIAL_ROWS rows (an MTP verify) has no
 // pieces: its scan blocks advance all its rows row-sequentially with the
-// step's bits. The scan stores the raw outputs to the `mixed` scratch, and
-// grid z = B zeroes the raw rows no slot covers; the gate launch then gates
-// each row (`recurrent::gate_row`, one block per row). ROWS never changes
-// result bits.
+// step's bits. The scan stores the raw outputs of the slots' rows to the
+// `mixed` scratch; the gate launch then gates each row (`recurrent::gate_row`,
+// one block per row, a row no slot covers from zero raw outputs). ROWS never
+// changes result bits.
 
 #include "recurrent.cuh"
 
@@ -606,12 +606,11 @@ template <class Rule, unsigned ROWS>
 __device__ __forceinline__ void scan(const typename Rule::Inputs &in, u8 *pieces, u8 *mixed) {
     using Form = Decay<Rule>;
     using Staged = Stage<Form, ROWS>;
-    constexpr int SCAN_THREADS = ROWS * 2;
     constexpr int QK_PITCH = Staged::QK_PITCH;
     constexpr int V_PITCH = Staged::V_PITCH;
     static_assert(ROWS % 16 == 0 && W % ROWS == 0, "chunk scan geometry");
     static_assert(sizeof(Staged) == Form::STAGE_BYTES + 32 * ROWS, "the declaration's shared_bytes");
-    static_assert(sizeof(recurrent::SequentialShared<ROWS>) <= STAGES * sizeof(Staged),
+    static_assert(sizeof(recurrent::SequentialShared<ROWS, Rule::DECAYS>) <= STAGES * sizeof(Staged),
                   "the sequential advance fits the stage ring");
     const recurrent::Inputs &base = Rule::base(in);
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *base.words;
@@ -624,22 +623,14 @@ __device__ __forceinline__ void scan(const typename Rule::Inputs &in, u8 *pieces
     const int t4 = lane % 4;
     const int warp_row = row0 + 16 * warp;  // this warp's first state row
     auto mixed_at = [&](int row, int state_row) { return recurrent::raw_index(row, head, state_row); };
-    if (slot_index == SEISMIC_DIM_B) {
-        const u64 covered = recurrent::covered_end(base);
-        for (u64 index = covered * ROWS + threadIdx.x; index < SEISMIC_DIM_M * ROWS;
-             index += SCAN_THREADS)
-            element::put<Act>(mixed, mixed_at(static_cast<int>(index / ROWS), row0 + index % ROWS),
-                          0.0f);
-        return;
-    }
     const recurrent::Slot slot = recurrent::slot_of(base, slot_index);
     recurrent::publish_window(base, slot, head * gridDim.x + blockIdx.x, NV * gridDim.x);
     extern __shared__ __align__(16) unsigned char scan_shared[];
-    auto &sequential = *reinterpret_cast<recurrent::SequentialShared<ROWS> *>(scan_shared);
+    auto &sequential = *reinterpret_cast<recurrent::SequentialShared<ROWS, Rule::DECAYS> *>(scan_shared);
     if (slot.hi - slot.lo <= recurrent::SEQUENTIAL_ROWS) {
         recurrent::WarpRows<16> rows;
         recurrent::load_version<16>(base, Rule{in}, slot, head, warp_row, rows);
-        recurrent::advance_rows<16, ROWS>(base, Rule{in}, slot, slot.lo, head, row0, true, warp_row, rows, mixed,
+        recurrent::advance_rows<16, ROWS>(base, Rule{in}, slot, slot.lo, head, row0, warp_row, rows, mixed,
                                           sequential);
         return;
     }
@@ -847,8 +838,8 @@ __device__ __forceinline__ void scan(const typename Rule::Inputs &in, u8 *pieces
         __syncthreads();
         recurrent::WarpRows<16> rows;
         recurrent::load_rows<16>(base, slot.target, head, warp_row, rows);
-        recurrent::advance_rows<16, ROWS>(base, Rule{in}, slot, slot.lo + slot.stop, head, row0, true, warp_row,
-                                          rows, mixed, sequential);
+        recurrent::advance_rows<16, ROWS>(base, Rule{in}, slot, slot.lo + slot.stop, head, row0, warp_row, rows,
+                                          mixed, sequential);
     }
 }
 }  // namespace chunk

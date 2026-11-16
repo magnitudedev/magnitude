@@ -7,10 +7,10 @@
 // columns (key coordinates) of each, held in registers for the whole slot.
 // The state is read from bank previous_bank[slot] and published to
 // following_bank[slot] after the slot's first stop[slot] rows; the window
-// likewise. The raw outputs go to the `mixed` scratch; grid z = B zeroes the
-// raw rows no slot covers. `gated_delta_step_gate` then gates each (head, row)
-// (`recurrent_gate`: the GEMV staging's lane order to 8 rows, the staging
-// launch's order beyond). ROWS and WARPS never change result bits.
+// likewise. The raw outputs of the slots' rows go to the `mixed` scratch.
+// `gated_delta_step_gate` then gates each (head, row) (`recurrent_gate`: the
+// GEMV staging's lane order to 8 rows, the staging launch's order beyond).
+// ROWS and WARPS never change result bits.
 #include "lib/recurrent/recurrent.glsl"
 
 #if SEISMIC_TUNE_ROWS > RECURRENT_MAX_ROWS

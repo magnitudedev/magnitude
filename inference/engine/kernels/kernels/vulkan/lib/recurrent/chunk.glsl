@@ -332,11 +332,11 @@ void chunk_sequential_rows(float state[CHUNK_MAX_COLUMNS], out float rows[RECURR
 
 // The scan launch: a slot of more than CHUNK_SEQUENTIAL_ROWS rows with a
 // nonzero stop scans its rows before the stop row from the staged pieces,
-// then advances the rest row-sequentially; any other slot (and the
-// uncovered rows) advances row-sequentially throughout.
+// then advances the rest row-sequentially; any other slot advances
+// row-sequentially throughout.
 void chunk_scan() {
     const uint64_t slot_index = gl_WorkGroupID.z;
-    if (slot_index == SEISMIC_DIM_B || !chunk_long(recurrent_slot_of(slot_index))) {
+    if (!chunk_long(recurrent_slot_of(slot_index))) {
         recurrent_sequential(CHUNK_ROWS);
         return;
     }

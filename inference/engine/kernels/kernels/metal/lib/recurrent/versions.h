@@ -46,6 +46,12 @@ inline long slot_end(Slots slots, ulong slot, constant ulong *seismic_words) {
     return slots.segments[slot * SEISMIC_SEGMENTS_STRIDE_0 + SEISMIC_SEGMENTS_STRIDE_1];
 }
 
+// The first row no slot covers: the slots partition a prefix of the rows.
+inline long covered_end(device const int *segments, constant ulong *seismic_words) {
+    return SEISMIC_DIM_B == 0 ? 0
+                              : segments[(SEISMIC_DIM_B - 1) * SEISMIC_SEGMENTS_STRIDE_0 + SEISMIC_SEGMENTS_STRIDE_1];
+}
+
 // The index of the slot holding `row`, or B when no slot does: the slots
 // partition a prefix of the rows in ascending order.
 inline ulong slot_index_of_row(Slots slots, long row, constant ulong *seismic_words) {

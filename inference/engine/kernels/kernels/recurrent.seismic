@@ -47,7 +47,9 @@ const CUDA_CHUNK_PIECE = 16
 # SiLU, or sigmoid, by `gate_function`; rounded to A); the product is
 # rounded to A. The raw output is internal to the entry: each native keeps it
 # in its `mixed` scratch, in A on the GPUs (sized for elements of up to four
-# bytes) and as F32 values rounded to A on the CPU.
+# bytes) and as F32 values rounded to A on the CPU. Only the slots' rows are
+# stored there: every native's gating reads a row outside every slot as zero
+# raw outputs, so no launch or workgroup zeroes them.
 
 fn gated_delta_project[M, H, PT, NM, NK, NV, W, QB, ZB](hidden: &tensor[M, PT * H] f32,
     input_norm: &tensor[NM] NW, qkv_weight: &tensor[(2 * NK + NV) * W, H] QW,
@@ -393,36 +395,38 @@ native gated_delta_step for metal from "metal/gated_delta_step.metal":
         threadgroups (NV, W / ROWS, B)
         threads_per_threadgroup (128, 1, 1)
 
-# CUDA: warp per state row, each warp owning ROWS state rows (W / 32 float
-# columns per lane) for the whole slot; grid z adds one layer that zeroes the
-# raw rows no slot covers. The last block of a value head to arrive
-# (`arrivals`, one counter per head) gates the head's rows (one warp per row:
-# lanes stride the head's columns, then a warp sum). (Metal: lanes advance
-# four rows in flight; the uncovered rows are zeroed by the slot layer.)
+# CUDA: each warp owns ROWS state rows (W / 32 float columns per lane) for
+# the whole slot. Per span of 8 rows the block stages every row's prologue in
+# one pass (q and k L2-normalized once per block, the block's v channels, the
+# gates), then the warps advance through the span. The last block of a value
+# head to arrive (`arrivals`, one counter per head) gates the head's rows
+# (one warp per row: lanes stride the head's columns, then a warp sum).
+# Every block repeats the key head's q and k prologue, so the default takes
+# the largest block (32 state rows) over more, smaller ones. (Metal: lanes
+# advance four rows in flight.)
 native gated_delta_step for cuda from "cuda/gated_delta_step.cu":
     static (NK, NV, W, C)
     where W % 32 == 0 and NV % 4 == 0
     scratch mixed bytes (M * NV * W * 4)
     scratch arrivals bytes (NV * 4) sync
     launch gated_delta_step:
-        params (ROWS in [2, 4] default 2, WARPS in [4, 8] default 4)
-        threadgroups (NV, W / (ROWS * WARPS), B + 1)
+        params (ROWS in [2, 4] default 4, WARPS in [4, 8] default 8)
+        threadgroups (NV, W / (ROWS * WARPS), B)
         threads_per_threadgroup (WARPS * 32, 1, 1)
 
-# Vulkan: the CUDA step. Workgroup (value head, state-row block, slot), grid
-# z = B zeroes the raw rows no slot covers; each subgroup holds ROWS state
-# rows in registers for the whole slot. ROWS and WARPS never change result
-# bits. Shared: a span's prepared q | k | v channels and gates. `gate` forms
-# each (head, row): to 8 rows W / 8 lanes each sum eight columns' squares in
-# order, then a butterfly; beyond, lanes stride the columns, then a subgroup
-# sum.
+# Vulkan: the CUDA step. Workgroup (value head, state-row block, slot); each
+# subgroup holds ROWS state rows in registers for the whole slot. ROWS and
+# WARPS never change result bits. Shared: a span's prepared q | k | v
+# channels and gates. `gate` forms each (head, row): to 8 rows W / 8 lanes
+# each sum eight columns' squares in order, then a butterfly; beyond, lanes
+# stride the columns, then a subgroup sum.
 native gated_delta_step for vulkan from "vulkan/gated_delta_step.comp":
     static (NK, NV, W, C)
     params (ROWS in [2, 4] default 2, WARPS in [4, 8] default 4)
     where W % 32 == 0 and W <= 256 and W % (ROWS * WARPS) == 0 and C <= 8
     scratch mixed bytes (M * NV * W * 4)
     launch gated_delta_step:
-        threadgroups (NV, W / (ROWS * WARPS), B + 1)
+        threadgroups (NV, W / (ROWS * WARPS), B)
         threads_per_threadgroup (WARPS * 32, 1, 1)
         shared_bytes ((8 * (2 * W + ROWS * WARPS) + 16) * 4)
     launch gated_delta_step_gate:
@@ -431,16 +435,16 @@ native gated_delta_step for vulkan from "vulkan/gated_delta_step.comp":
         shared_bytes (128)
 
 # CPU: a work item per (value head, ROWS state rows, slot) holds its state
-# rows privately for the whole slot and computes each row's prologue itself;
-# grid z = B zeroes the raw rows no slot covers. ROWS never changes result
-# bits. Private bytes: the state rows, the key head's q and k, the rows' v and
-# the head's decay. `gate` then forms each row (one work item per row).
+# rows privately for the whole slot and computes each row's prologue itself.
+# ROWS never changes result bits. Private bytes: the state rows, the key
+# head's q and k, the rows' v and the head's decay. `gate` then forms each
+# row (one work item per row).
 native gated_delta_step for cpu from "cpu/gated_delta_step.rs":
     params (ROWS in [32, 16, 64, 128] default 32)
     scratch mixed bytes (M * NV * W * 4)
     project quantized emits (result 0 over (M, NV * W))
     launch gated_delta_step:
-        threadgroups (NV, ceil_div(W, ROWS), B + 1)
+        threadgroups (NV, ceil_div(W, ROWS), B)
         threads_per_threadgroup (1, 1, 1)
         shared_bytes ((min(ROWS, W) * W + 2 * W + min(ROWS, W) + 1) * 4)
     launch gated_delta_step_gate:
@@ -603,7 +607,7 @@ native gated_delta_chunk for cuda from "cuda/gated_delta_chunk.cu":
         threads_per_threadgroup (256, 1, 1)
     launch gated_delta_chunk_scan:
         params (ROWS in [128, 64, 32] default 128)
-        threadgroups (W / ROWS, NV, B + 1)
+        threadgroups (W / ROWS, NV, B)
         threads_per_threadgroup (2 * ROWS, 1, 1)
         shared_bytes (3 * (96 * W + 32 * ROWS + 1680) + ROWS / 16 * 16 * 17 * 4)
     launch gated_delta_chunk_gate:
@@ -629,7 +633,7 @@ native gated_delta_chunk for vulkan from "vulkan/gated_delta_chunk.comp":
         threadgroups (M, ceil_div(2 * NK + NV, 4), 1)
         threads_per_threadgroup (128, 1, 1)
     launch gated_delta_chunk_scan:
-        threadgroups (NV, W / (ROWS * WARPS), B + 1)
+        threadgroups (NV, W / (ROWS * WARPS), B)
         threads_per_threadgroup (WARPS * 32, 1, 1)
         shared_bytes ((8 * (2 * W + ROWS * WARPS) + 16) * 4)
     launch gated_delta_chunk_gate:
@@ -642,8 +646,7 @@ native gated_delta_chunk for vulkan from "vulkan/gated_delta_chunk.comp":
 # slot row-sequentially from the staged rows, a work item per (value head,
 # ROWS state rows, slot) with private state rows, so every slot gets the
 # step's bits (no WY form: on the CPU the sequential rule is the cheaper
-# schedule). Grid z = B zeroes the raw rows no slot covers, and `gate` forms
-# each row as the step's does.
+# schedule). `gate` forms each row as the step's does.
 native gated_delta_chunk for cpu from "cpu/gated_delta_chunk.rs":
     params (ROWS in [64, 32, 128] default 64)
     scratch inputs bytes (M * ((2 * NK + NV) * W + 2 * NV) * 4)
@@ -652,7 +655,7 @@ native gated_delta_chunk for cpu from "cpu/gated_delta_chunk.rs":
         threadgroups (M, 1, 1)
         threads_per_threadgroup (1, 1, 1)
     launch gated_delta_chunk_scan:
-        threadgroups (NV, ceil_div(W, ROWS), B + 1)
+        threadgroups (NV, ceil_div(W, ROWS), B)
         threads_per_threadgroup (1, 1, 1)
         shared_bytes (min(ROWS, W) * W * 4)
     launch gated_delta_chunk_gate:
@@ -753,15 +756,16 @@ native kimi_delta_step for metal from "metal/kimi_delta_step.metal":
         threadgroups (NV, W / ROWS, B)
         threads_per_threadgroup (128, 1, 1)
 
-# CUDA: `gated_delta_step`'s launch, staging W decay factors per row.
+# CUDA: `gated_delta_step`'s launch and default, staging W decay factors
+# per row.
 native kimi_delta_step for cuda from "cuda/kimi_delta_step.cu":
     static (NK, NV, W, C)
     where W % 32 == 0 and NV % 4 == 0
     scratch mixed bytes (M * NV * W * 4)
     scratch arrivals bytes (NV * 4) sync
     launch kimi_delta_step:
-        params (ROWS in [2, 4] default 2, WARPS in [4, 8] default 4)
-        threadgroups (NV, W / (ROWS * WARPS), B + 1)
+        params (ROWS in [2, 4] default 4, WARPS in [4, 8] default 8)
+        threadgroups (NV, W / (ROWS * WARPS), B)
         threads_per_threadgroup (WARPS * 32, 1, 1)
 
 # Vulkan: `gated_delta_step`'s launches; shared: a span's prepared q | k | v
@@ -772,7 +776,7 @@ native kimi_delta_step for vulkan from "vulkan/kimi_delta_step.comp":
     where W % 32 == 0 and W <= 256 and W % (ROWS * WARPS) == 0 and C <= 8
     scratch mixed bytes (M * NV * W * 4)
     launch kimi_delta_step:
-        threadgroups (NV, W / (ROWS * WARPS), B + 1)
+        threadgroups (NV, W / (ROWS * WARPS), B)
         threads_per_threadgroup (WARPS * 32, 1, 1)
         shared_bytes (8 * (3 * W + ROWS * WARPS + 1) * 4)
     launch kimi_delta_step_gate:
@@ -787,7 +791,7 @@ native kimi_delta_step for cpu from "cpu/kimi_delta_step.rs":
     scratch mixed bytes (M * NV * W * 4)
     project quantized emits (result 0 over (M, NV * W))
     launch kimi_delta_step:
-        threadgroups (NV, ceil_div(W, ROWS), B + 1)
+        threadgroups (NV, ceil_div(W, ROWS), B)
         threads_per_threadgroup (1, 1, 1)
         shared_bytes ((min(ROWS, W) * W + 3 * W + min(ROWS, W)) * 4)
     launch kimi_delta_step_gate:
@@ -861,7 +865,7 @@ native kimi_delta_chunk for cuda from "cuda/kimi_delta_chunk.cu":
         threads_per_threadgroup (256, 1, 1)
     launch kimi_delta_chunk_scan:
         params (ROWS in [128, 64, 32] default 128)
-        threadgroups (W / ROWS, NV, B + 1)
+        threadgroups (W / ROWS, NV, B)
         threads_per_threadgroup (2 * ROWS, 1, 1)
         shared_bytes (3 * (164 * W + 32 * ROWS + 1536) + ROWS / 16 * 16 * 17 * 4)
     launch kimi_delta_chunk_gate:
@@ -880,7 +884,7 @@ native kimi_delta_chunk for vulkan from "vulkan/kimi_delta_chunk.comp":
         threadgroups (M, ceil_div(2 * NK + NV, 4), 1)
         threads_per_threadgroup (128, 1, 1)
     launch kimi_delta_chunk_scan:
-        threadgroups (NV, W / (ROWS * WARPS), B + 1)
+        threadgroups (NV, W / (ROWS * WARPS), B)
         threads_per_threadgroup (WARPS * 32, 1, 1)
         shared_bytes (8 * (3 * W + ROWS * WARPS + 1) * 4)
     launch kimi_delta_chunk_gate:
@@ -898,7 +902,7 @@ native kimi_delta_chunk for cpu from "cpu/kimi_delta_chunk.rs":
         threadgroups (M, 1, 1)
         threads_per_threadgroup (1, 1, 1)
     launch kimi_delta_chunk_scan:
-        threadgroups (NV, ceil_div(W, ROWS), B + 1)
+        threadgroups (NV, ceil_div(W, ROWS), B)
         threads_per_threadgroup (1, 1, 1)
         shared_bytes (min(ROWS, W) * W * 4)
     launch kimi_delta_chunk_gate:

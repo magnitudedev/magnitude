@@ -80,20 +80,6 @@ inline bool rch_row_slot(device const int *segments, device const int *stop, dev
     return false;
 }
 
-// Rows after the last slot belong to no sequence: this simdgroup's 16 state
-// rows of their raw output are zero.
-inline void rch_zero_tail(device recurrent::Storage *mixed, ulong slot, long hi, ulong head, ulong row0,
-    ushort lane, constant ulong *seismic_words) {
-    if (slot + 1 != SEISMIC_DIM_B) {
-        return;
-    }
-    const ulong rows = SEISMIC_DIM_M - ulong(hi);
-    for (ulong index = lane; index < rows * 16; index += 32) {
-        mixed[recurrent::raw_index(ulong(hi) + index / 16, head, row0 + index % 16, seismic_words)]
-            = element::Act::store(0.0f);
-    }
-}
-
 // The inputs launch's work for channel head `head` (the q heads, the k heads,
 // then the v heads) of chunked row `row` of `slot`, by one simdgroup, lane l
 // holding channel quads l, l + 32, ...: SiLU of the causal convolution of
@@ -433,7 +419,6 @@ inline void rch_scan(Rule rule, RchDecays<Rule::DECAYS> decays, device const rec
     if (geometry.hi - geometry.lo <= RECURRENT_SEQUENTIAL_ROWS) {
         // A short slot (an MTP verify) is not chunked.
         RCH_SEQUENTIAL(geometry.lo);
-        rch_zero_tail(mixed, slot, geometry.hi, head, row0, lane, seismic_words);
         return;
     }
 
@@ -606,5 +591,4 @@ inline void rch_scan(Rule rule, RchDecays<Rule::DECAYS> decays, device const rec
         RCH_SEQUENTIAL(geometry.lo + geometry.stop);
     }
 #undef RCH_SEQUENTIAL
-    rch_zero_tail(mixed, slot, geometry.hi, head, row0, lane, seismic_words);
 }

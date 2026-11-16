@@ -357,9 +357,10 @@ inline void advance_rows(Inputs inputs, RowGates gates,
 // Gating: the result's value (row, head, i) is
 //   round_A(round_A(raw * inverse * norm[i]) * round_A(gate(z)))
 // with gate the output gate of `gate_function` (`functions::output_gate`)
-// with raw the stored raw output, z column head * W + i of the row's
-// `GateInput` and inverse = rsqrt(sum_head raw^2 / W + epsilon). The
-// entries differ only in how a head's square sum is reduced.
+// with raw the stored raw output (zero in a row no slot covers, which no
+// advance stores), z column head * W + i of the row's `GateInput` and
+// inverse = rsqrt(sum_head raw^2 / W + epsilon). The entries differ only in
+// how a head's square sum is reduced.
 
 typedef ELEMENT_OF(SEISMIC_RECURRENT_NORM) Norm;
 
@@ -381,15 +382,17 @@ struct Gated8 {
     float4 raw_even, raw_odd, z_even, z_odd, norm_even, norm_odd;
 };
 
+// `covered` is the first row no slot covers.
 template <typename Mixed>
-inline Gated8 gated_inputs8(Mixed mixed, GateInput input,
+inline Gated8 gated_inputs8(Mixed mixed, long covered, GateInput input,
     device const uchar *norm, ulong row, ulong head, uint i, constant ulong *seismic_words) {
     const auto raw = mixed + raw_index(row, head, i, seismic_words);
+    const bool slotted = long(row) < covered;
     device const Storage *z = input.first + row * input.stride + head * SEISMIC_DIM_W + i;
     Gated8 v;
     RECURRENT_UNROLL for (uint j = 0; j < 4; ++j) {
-        v.raw_even[j] = element::Act::load(raw[2 * j]);
-        v.raw_odd[j] = element::Act::load(raw[2 * j + 1]);
+        v.raw_even[j] = slotted ? element::Act::load(raw[2 * j]) : 0.0f;
+        v.raw_odd[j] = slotted ? element::Act::load(raw[2 * j + 1]) : 0.0f;
         v.z_even[j] = element::Act::load(z[2 * j]);
         v.z_odd[j] = element::Act::load(z[2 * j + 1]);
         v.norm_even[j] = element::at<Norm>(norm, ulong(i + 2 * j) * SEISMIC_RECURRENT_NORM_STRIDE_0);
@@ -419,8 +422,9 @@ inline void store_gated8(thread const Gated8 &v, float inverse, element::Out<ele
 // raw values in column order, and a butterfly over the lanes gives each the
 // head's square sum. This is the lane grouping of the projection GEMV
 // staging. All threads of the threadgroup (whole simdgroups) call it.
-inline void gate_head(arrive::coherent_device<const Storage> mixed, GateInput input, device const uchar *norm,
-    element::Out<element::Act> gated, ulong head, uint thread_index, uint threads, constant ulong *seismic_words) {
+inline void gate_head(arrive::coherent_device<const Storage> mixed, long covered, GateInput input,
+    device const uchar *norm, element::Out<element::Act> gated, ulong head, uint thread_index, uint threads,
+    constant ulong *seismic_words) {
     constexpr uint LANES = SEISMIC_DIM_W / 8;
     static_assert(SEISMIC_DIM_W % 8 == 0 && LANES <= 32 && (LANES & (LANES - 1)) == 0,
         "a head is gated over W / 8 lanes, a power of two up to 32");
@@ -432,7 +436,7 @@ inline void gate_head(arrive::coherent_device<const Storage> mixed, GateInput in
         // butterfly group takes part; they store nothing.
         const ulong row = metal::min(ulong(item / LANES), ulong(SEISMIC_DIM_M) - 1);
         const uint i = 8 * (item % LANES);
-        const Gated8 v = gated_inputs8(mixed, input, norm, row, head, i, seismic_words);
+        const Gated8 v = gated_inputs8(mixed, covered, input, norm, row, head, i, seismic_words);
         float squares = 0.0f;
         RECURRENT_UNROLL for (uint j = 0; j < 4; ++j) {
             squares = metal::fma(v.raw_even[j], v.raw_even[j], squares);
@@ -449,32 +453,34 @@ inline void gate_head(arrive::coherent_device<const Storage> mixed, GateInput in
 // Gates (row, head) with one simdgroup (the chunk): lane l sums the squares
 // of columns l, l + 32, ... in order, then one simd_sum. This is the
 // projection family's normalizing pre-pass order.
-inline void gate_row(device const Storage *mixed, GateInput input, device const uchar *norm,
+inline void gate_row(device const Storage *mixed, long covered, GateInput input, device const uchar *norm,
     element::Out<element::Act> gated, ulong row, ulong head, uint lane, constant ulong *seismic_words) {
     const float epsilon = as_type<float>(uint(SEISMIC_PARAM_EPSILON));
     device const Storage *raw = mixed + raw_index(row, head, 0, seismic_words);
+    const bool slotted = long(row) < covered;
     float squares = 0.0f;
     for (uint i = lane; i < SEISMIC_DIM_W; i += 32) {
-        const float value = element::Act::load(raw[i]);
+        const float value = slotted ? element::Act::load(raw[i]) : 0.0f;
         squares = metal::fma(value, value, squares);
     }
     const float inverse = metal::rsqrt(simd_sum(squares) / float(SEISMIC_DIM_W) + epsilon);
     for (uint i = 8 * lane; i < SEISMIC_DIM_W; i += 8 * 32)
-        store_gated8(gated_inputs8(mixed, input, norm, row, head, i, seismic_words), inverse, gated, row,
+        store_gated8(gated_inputs8(mixed, covered, input, norm, row, head, i, seismic_words), inverse, gated, row,
             head, i, seismic_words);
 }
 
 // A step entry's threadgroup (value head group.x, block group.y of ROWS
 // state rows, slot `slot` = group.z) after the entry stages its blocks of
-// SPAN rows: it advances the slot's rows under `rule` (`advance_rows`),
-// zeroes the raw rows after the last slot, and the last of the head's
-// threadgroups to arrive (`arrivals[head]`, over every row block and slot)
-// gates the head's rows into the result (`gate_head`).
+// SPAN rows: it advances the slot's rows under `rule` (`advance_rows`), and
+// the last of the head's threadgroups to arrive (`arrivals[head]`, over every
+// row block and slot) gates the head's rows into the result (`gate_head`,
+// the rows from `covered` on from zero raw outputs).
 template <uint LANE_ROWS, uint SPAN, typename Inputs, typename Rule>
 inline void step(Inputs inputs, Rule rule, GateInput gate, device const uchar *norm,
     element::Out<element::Act> gated, arrive::coherent_device<Storage> mixed, device atomic_uint *arrivals,
     device const slab::Table<element::F32> *delta, device const slab::Table<element::F32> *tape, Slot slot,
-    uint3 group, threadgroup float *query_block, threadgroup float *key_block, threadgroup float *value_block, threadgroup float *beta_block, threadgroup float *decay_block,
+    long covered, uint3 group, threadgroup float *query_block, threadgroup float *key_block,
+    threadgroup float *value_block, threadgroup float *beta_block, threadgroup float *decay_block,
     threadgroup uint *last, uint thread_index, uint threads, uint simdgroup, uint lane,
     constant ulong *seismic_words) {
     const ulong head = group.x;
@@ -483,15 +489,10 @@ inline void step(Inputs inputs, Rule rule, GateInput gate, device const uchar *n
     advance_rows<LANE_ROWS, SEISMIC_TUNE_ROWS, SPAN, SEISMIC_DIM_W, SEISMIC_TUNE_ROWS>(inputs,
         rule.gates(head, seismic_words), delta, tape, mixed, slot, slot.lo, head, block_row0, row0, query_block,
         key_block, value_block, beta_block, decay_block, thread_index, threads, simdgroup, lane, seismic_words);
-    // Rows after the last slot belong to no sequence; their raw output is zero.
-    if (group.z + 1 == SEISMIC_DIM_B && lane < LANE_ROWS) {
-        for (ulong row = ulong(slot.hi); row < SEISMIC_DIM_M; ++row)
-            mixed[raw_index(row, head, row0 + lane, seismic_words)] = element::Act::store(0.0f);
-    }
     const uint expected = uint(SEISMIC_DIM_W / SEISMIC_TUNE_ROWS * SEISMIC_DIM_B);
     if (!arrive::last(arrivals + head, expected, last, thread_index))
         return;
-    gate_head(mixed, gate, norm, gated, head, thread_index, threads, seismic_words);
+    gate_head(mixed, covered, gate, norm, gated, head, thread_index, threads, seismic_words);
 }
 
 } // namespace recurrent
