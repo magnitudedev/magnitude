@@ -20,25 +20,18 @@ fn attention_append_dense<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group
         cx.arg_coordinates().row([row, 0]), cx.arg_rotary_components().row([0]),
         cx.arg_rotary_frequencies().row([0]), cx.arg_rotary_amplitudes().row([0]), cosines, sines);
     let (keys, values) = vectors.split_at_mut(kv * w);
-    let queries = &mut [];
     let (key_norm, value_norm) = (cx.arg_key_norm(), cx.arg_value_norm());
-    let norms = (
-        None,
-        form.key_norm.then(|| key_norm.row([0, 0])),
-        form.value_norm.then(|| value_norm.row([0, 0])),
-    );
+    let norms = (form.key_norm.then(|| key_norm.row([0, 0])), form.value_norm.then(|| value_norm.row([0, 0])));
     let (key, value) = (cx.arg_key(), cx.arg_value());
     let value = if form.own_values() { value.row([0, row, 0]) } else { &[][..] };
     attention::prepare_form_row::<E::A>(
         form,
-        |_| &[],
         key.row([0, row, 0]),
         value,
         norms,
         cosines,
         sines,
         cx.arg_epsilon(),
-        queries,
         keys,
         values,
     );

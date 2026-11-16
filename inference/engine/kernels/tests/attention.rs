@@ -306,8 +306,8 @@ fn cpu_statics(geometry: Geometry) -> NativeSpecialization {
 }
 
 /// The prefill specializations to run on `device`, labelled: on the GPU the
-/// statics with each (QT, SPLIT_GROUPS) of `configs`; on CPU its one form
-/// (no statics, no parameters).
+/// statics with each (QT, SPLIT_GROUPS) of `configs`; on CPU its statics
+/// alone, every parameter at its declared default.
 fn prefill_specializations_on(
     device: &Device,
     geometry: Geometry,
@@ -1281,5 +1281,98 @@ fn cpu_decode_matches_host_model_at_every_partition_fill() {
             &bound,
             &expected,
         );
+    }
+}
+
+/// Qwen3-8B's attention: eight kv heads of four query heads, 128 columns.
+const QWEN3_8B: Geometry = Geometry { kv: 8, g: 4, p: 64, s: 0 };
+
+/// The CPU prefill's row blocks never change result bits: every declared
+/// ROWS gives the same bits over rows of two sequences (blocks whose rows
+/// share their keys, blocks across the boundary, padding rows), and they
+/// match the host model.
+#[test]
+fn cpu_prefill_row_blocks_keep_result_bits() {
+    let device = seismic::Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+    let case = Case::new(QWEN35B, 448, 2, &prefill_rows(70, 300), 61);
+    let expected = case.expected();
+    let mut first = None;
+    for rows in [16, 8, 32, 4] {
+        let kernel = prefill_kernel(&device, &cpu_statics(QWEN35B).with_param("ROWS", rows));
+        let mut bound = Bound::new(&device, &case);
+        let gated = run_prefill(&kernel, &mut bound, &case);
+        check(&format!("Cpu prefill ROWS {rows}"), &case, &gated, &bound, &expected);
+        let bits = gated.read_to_host().unwrap();
+        assert!(first.get_or_insert_with(|| bits.clone()) == &bits, "ROWS {rows} changes the result bits");
+    }
+}
+
+/// The CPU prefill's shared key blocks give the bits each row's own walk
+/// gives: rows of two sequences (runs sharing their keys' whole blocks)
+/// against the same rows with a WorkList bitmap that reads every key, whose
+/// rows share none and each walk their keys alone.
+#[test]
+fn cpu_prefill_shared_blocks_match_each_row_alone() {
+    let device = seismic::Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+    let rows = 70;
+    let case = Case::new(QWEN35B, 448, 2, &prefill_rows(rows, 300), 67);
+    let kernel = prefill_kernel(&device, &cpu_statics(QWEN35B));
+    let mut shared = Bound::new(&device, &case);
+    let mut alone = Bound::new(&device, &case);
+    // Sixteen words a row: 512 one-key blocks, past every row's keys.
+    let every = vec![u32::MAX; rows * 16].iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
+    alone.selection = Tensor::from_host(&device, Element::u32(), &[rows as u64, 16], &every).unwrap();
+    let shared = run_prefill(&kernel, &mut shared, &case).read_to_host().unwrap();
+    let alone = run_prefill(&kernel, &mut alone, &case).read_to_host().unwrap();
+    assert!(shared == alone, "shared key blocks change the result bits");
+}
+
+/// This process's CPU seconds (user and system, every thread): the work a
+/// call does, which a shared host's other load does not stretch as it
+/// stretches the call's wall time.
+#[cfg(unix)]
+fn cpu_seconds() -> f64 {
+    // `struct rusage`: user and system `timeval`s, then fourteen longs.
+    unsafe extern "C" {
+        fn getrusage(who: i32, usage: *mut [i64; 18]) -> i32;
+    }
+    let mut usage = [0i64; 18];
+    // SAFETY: RUSAGE_SELF (0) into a buffer of the struct's 144 bytes.
+    assert_eq!(unsafe { getrusage(0, &mut usage) }, 0);
+    let seconds = |at: usize| usage[at] as f64 + (usage[at + 1] & 0xffff_ffff) as f64 * 1e-6;
+    seconds(0) + seconds(2)
+}
+
+/// CPU prefill attention at a long prompt's last 512-row chunk (after 24,576
+/// and 39,424 history rows: a 25k and a 40k prompt), Qwen3-8B's geometry, at
+/// each declared ROWS: the median wall and CPU seconds of five calls after
+/// one warm call, per call and layer, and a hash of the result.
+#[test]
+#[cfg(unix)]
+#[ignore = "timing at shape; run alone on a quiet host"]
+fn cpu_prefill_timing_at_shape() {
+    let device = seismic::Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+    for history in [24_576, 39_424] {
+        let case = Case::new(QWEN3_8B, history as usize + 512, 1, &speculative_rows(512, history), 53);
+        for rows in [16, 8, 32, 4] {
+            let kernel = prefill_kernel(&device, &cpu_statics(QWEN3_8B).with_param("ROWS", rows));
+            let mut bound = Bound::new(&device, &case);
+            let bits = run_prefill(&kernel, &mut bound, &case).read_to_host().unwrap();
+            let hash = bits.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3));
+            let (mut wall, mut cpu): (Vec<f64>, Vec<f64>) = (0..5)
+                .map(|_| {
+                    let (started, used) = (std::time::Instant::now(), cpu_seconds());
+                    run_prefill(&kernel, &mut bound, &case).read_to_host().unwrap();
+                    (started.elapsed().as_secs_f64(), cpu_seconds() - used)
+                })
+                .unzip();
+            wall.sort_by(f64::total_cmp);
+            cpu.sort_by(f64::total_cmp);
+            eprintln!(
+                "cpu prefill: 512 rows after {history} history rows, ROWS {rows}: wall {:.1} ms, cpu {:.2} s, result hash {hash:016x}",
+                1e3 * wall[2],
+                cpu[2]
+            );
+        }
     }
 }

@@ -876,8 +876,8 @@ fn prefill_configs(backend: BackendName, geometry: Geometry) -> Vec<Vec<(&'stati
             ]
         })
         .collect(),
-        // One CPU form, without parameters.
-        BackendName::Cpu => vec![Vec::new()],
+        // Each declared row block, which never changes result bits.
+        BackendName::Cpu => [16, 8, 32, 4].into_iter().map(|rows| vec![("ROWS", rows)]).collect(),
         // ROWS = 64 is admissible at every tested geometry (ROWS / G <= 32,
         // and the W = 256 tile fits the shared bound).
         BackendName::Vulkan => [1, 256, 512]

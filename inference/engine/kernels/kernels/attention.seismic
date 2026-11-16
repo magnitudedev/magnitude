@@ -1123,12 +1123,20 @@ native attention_prefill for vulkan from "vulkan/attention_prefill.comp":
         threadgroups (M, KV * G, 1)
         threads_per_threadgroup (ceil_div(P, 32) * 32, 1, 1)
 
-# CPU (`cpu/lib/attention/attention.rs`): `prepare` per row (queries, and the
-# keys and values of a layer with fresh rows, into F32 scratch; the K/V
-# append), `attend` per (row, kv head) over the row's whole key sequence,
-# storing the gated outputs directly.
+# CPU (`cpu/lib/attention/attention.rs`): `prepare` per row (queries, by kv
+# head, and the keys and values of a layer with fresh rows, into F32 scratch;
+# the K/V append), `attend` per (block of consecutive rows, kv head) over each
+# row's whole key sequence, storing the gated outputs directly. Each run of a
+# block's rows of one sequence shares the whole 32-key blocks all of its rows
+# see, scored and absorbed for all of the run's query heads at once
+# (`attend_rows`), so a key is read once a run, not once a row, and each row's blocks are
+# still its own: the block never changes result bits. A block is at most ROWS
+# rows, and at most M / ceil(units / KV) rows (at least one), so the blocks'
+# KV items are at least the pool's participants (`device.units`) wherever M
+# rows can give them that many.
 native attention_prefill for cpu from "cpu/attention_prefill.rs":
     static (P, S, I, U, F, NQ, N, NV, SK, RA, RT, RO, VK, KR, AB, KS)
+    params (ROWS in [16, 8, 32, 4] default 16)
     where KR <= 1 and NQ <= 1 and RA <= 1 and RT <= 1 and RO <= 1 and (RO == 0 or (P > 0 and I == 0 and U == 0)) and VK <= 1 and SK <= 1 and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1
     scratch queries bytes (M * KV * G * (2 * P + S) * 4)
     scratch keys bytes (M * KV * (2 * P + S) * 4)
@@ -1138,9 +1146,9 @@ native attention_prefill for cpu from "cpu/attention_prefill.rs":
         threads_per_threadgroup (1, 1, 1)
         shared_bytes (P * 8)
     launch attention_prefill_attend:
-        threadgroups (M, KV, 1)
+        threadgroups (ceil_div(M, max(1, min(ROWS, M / ceil_div(device.units, KV)))), KV, 1)
         threads_per_threadgroup (1, 1, 1)
-        shared_bytes ((2 * G + G * (2 * P + S) + G * 32 + 2 * P + S + 2 * P * RO) * 4)
+        shared_bytes ((ROWS * (2 * G + G * (2 * P + S) + G * 32) + 2 * P + S + 2 * P * RO) * 4)
 
 
 # The family over affine K8/V4 history (the `affine_k8_uniform_v4` codec;
@@ -1840,12 +1848,13 @@ native attention_prefill_k8v4 for vulkan from "vulkan/attention_prefill_k8v4.com
         threadgroups (ceil_div(M, ROWS / G), KV * G, 1)
         threads_per_threadgroup (2 * P + S, 1, 1)
 
-# CPU: the dense CPU prefill's launches; `prepare` appends the encoded row and
-# leaves each fresh key and value in the scratch as history will hold them
-# (encoded and decoded back), and `attend` decodes history keys and values
-# (F32) as it absorbs them. W is whole affine groups.
+# CPU: the dense CPU prefill's launches and row blocks; `prepare` appends the
+# encoded row and leaves each fresh key and value in the scratch as history
+# will hold them (encoded and decoded back), and `attend` decodes history keys
+# and values (F32) as it absorbs them. W is whole affine groups.
 native attention_prefill_k8v4 for cpu from "cpu/attention_prefill_k8v4.rs":
     static (P, S, I, U, F, NQ, N, NV, KC, KP, VC, VP, SK, RA, RT, RO, VK)
+    params (ROWS in [16, 8, 32, 4] default 16)
     where NQ <= 1 and RA <= 1 and RT <= 1 and RO <= 1 and (RO == 0 or (P > 0 and I == 0 and U == 0)) and VK == 0 and SK <= 1 and 32 * KC == 8 * (2 * P + S) and 32 * VC == 4 * (2 * P + S) and 16 * KP == 2 * P + S and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0
     scratch queries bytes (M * KV * G * (2 * P + S) * 4)
     scratch keys bytes (M * KV * (2 * P + S) * 4)
@@ -1855,9 +1864,9 @@ native attention_prefill_k8v4 for cpu from "cpu/attention_prefill_k8v4.rs":
         threads_per_threadgroup (1, 1, 1)
         shared_bytes (P * 8)
     launch attention_prefill_k8v4_attend:
-        threadgroups (M, KV, 1)
+        threadgroups (ceil_div(M, max(1, min(ROWS, M / ceil_div(device.units, KV)))), KV, 1)
         threads_per_threadgroup (1, 1, 1)
-        shared_bytes ((2 * G + G * (2 * P + S) + G * 32 + 3 * (2 * P + S) + 2 * P * RO) * 4)
+        shared_bytes ((ROWS * (2 * G + G * (2 * P + S) + G * 32) + 3 * (2 * P + S) + 2 * P * RO) * 4)
 
 
 

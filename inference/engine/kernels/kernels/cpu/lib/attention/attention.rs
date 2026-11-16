@@ -12,7 +12,8 @@
 // Numerics follow the portable bodies (`attention.seismic`): prepared queries
 // and keys are F32 rounded once to the activation element; scores, the
 // softmax state and the output accumulate in F32; the history codec decodes
-// in F32 (code * scale + zero). The online softmax absorbs keys in blocks of
+// in F32 (code * scale + zero); the softmax's exponentials are [`exp`], the
+// same bits on every tier and platform. The online softmax absorbs keys in blocks of
 // BLOCK (the portable `attention_update` absorbs a span at a time), and decode
 // partitions merge in partition order: the reassociations every native
 // backend is qualified under.
@@ -385,7 +386,8 @@ pub fn prepare_kv_head<A: Dense>(
 /// row's own when `own_row` (its history append). `angles(r, cosines, sines)`
 /// writes row r's amplitude-scaled angles; `key(r)` and `value(r)` are batch
 /// row r's key and value rows over all kv heads (`value` empty for stored-key
-/// values). Each head is prepared by the arithmetic of [`prepare_form_row`].
+/// values). Each head is prepared by the arithmetic of [`prepare_queries`] and
+/// [`prepare_form_row`].
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_group<'q, A: Dense>(
@@ -440,35 +442,25 @@ pub fn prepare_group<'q, A: Dense>(
     }
 }
 
-/// Prepares one row of an `attention_*` entry: its KV * G queries (the first
-/// W columns of each `query(head)`) into `queries`, and when the layer has
-/// fresh rows its KV keys into `keys` and its KV values (`head_norm`ed with
+/// Prepares one row of a layer with fresh rows for an `attention_*` entry:
+/// its KV keys into `keys` and its KV values (`head_norm`ed with
 /// `value_norm` when present, or the prepared keys for stored-key values,
 /// whose `value` is empty) into `values`, all F32 values of the activation
-/// element.
+/// element. Its queries are prepared by [`prepare_queries`].
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-pub fn prepare_form_row<'q, A: Dense>(
+pub fn prepare_form_row<A: Dense>(
     form: Form,
-    query: impl Fn(usize) -> &'q [A::Storage],
     key: &[A::Storage],
     value: &[A::Storage],
-    norms: (Option<&[f32]>, Option<&[f32]>, Option<&[f32]>),
+    (key_norm, value_norm): (Option<&[f32]>, Option<&[f32]>),
     cosines: &[f32],
     sines: &[f32],
     epsilon: f32,
-    queries: &mut [f32],
     keys: &mut [f32],
     values: &mut [f32],
-) where
-    A::Storage: 'q,
-{
+) {
     let w = form.heads.w;
-    let (query_norm, key_norm, value_norm) = norms;
-    prepare_queries::<A>(form, 0, form.heads.queries(), query, query_norm, cosines, sines, epsilon, queries);
-    if !form.fresh {
-        return;
-    }
     for head in 0..form.heads.kv {
         let value = if form.stored_key { &[][..] } else { &value[head * w..] };
         prepare_kv_head::<A>(
@@ -551,8 +543,37 @@ pub fn sink_weight(sink: f32, maximum: f32) -> f32 {
     if maximum == f32::NEG_INFINITY {
         f32::INFINITY
     } else {
-        math::exp(sink - maximum)
+        exp(sink - maximum)
     }
+}
+
+/// Cody-Waite reduction of `exp`: n ln 2 split into a short C1 (exact in
+/// n C1) and its remainder C2.
+const LN2_HIGH: f32 = 0.693_359_375;
+const LN2_LOW: f32 = -2.121_944_4e-4;
+/// `exp`'s polynomial in the reduced argument r: e^r = 1 + r + r^2 p(r).
+const EXP_POLYNOMIAL: [f32; 6] = [1.987_569_1e-4, 1.398_199_9e-3, 8.333_452e-3, 4.166_579_6e-2, 0.166_666_65, 0.5];
+
+/// e^x of the attention softmax (its weights, carries, partition merge and
+/// sink weights), within two ulps, the same bits on every tier and
+/// platform: [`F8::exp`] lane by lane, operation for operation (a
+/// platform's `expf` is neither vectorizable nor the same everywhere). x
+/// is clamped to [-104, 89], past which e^x is 0 or infinite in F32: x = n
+/// ln 2 + r, n = floor(x log2 e + 1/2), |r| <= ln 2 / 2, and 2^n applies as
+/// two powers of two, so every intermediate is normal. NaN stays NaN.
+#[inline(always)]
+pub fn exp(x: f32) -> f32 {
+    let clamped = x.max(-104.0).min(89.0);
+    let n = (clamped * std::f32::consts::LOG2_E + 0.5).floor();
+    let r = n.mul_add(-LN2_LOW, n.mul_add(-LN2_HIGH, clamped));
+    let [p0, p1, p2, p3, p4, p5] = EXP_POLYNOMIAL;
+    let p = p0.mul_add(r, p1).mul_add(r, p2).mul_add(r, p3).mul_add(r, p4).mul_add(r, p5);
+    let y = p.mul_add(r * r, r) + 1.0;
+    let (n, bias) = (n as i32, 127);
+    let low = f32::from_bits((((n >> 1) + bias) as u32) << 23);
+    let high = f32::from_bits((((n - (n >> 1)) + bias) as u32) << 23);
+    let y = y * low * high;
+    if x.is_nan() { x } else { y }
 }
 
 /// One query head's output stored to `A`: `accumulator / max(denominator,
@@ -686,6 +707,18 @@ macro_rules! tile {
     };
 }
 
+/// [`tile!`] of at most four query heads, for two keys' scores at once.
+macro_rules! quarter {
+    ($left:expr, $tile:ident => $body:expr) => {
+        match $left {
+            1 => { const $tile: usize = 1; $body }
+            2 => { const $tile: usize = 2; $body }
+            3 => { const $tile: usize = 3; $body }
+            _ => { const $tile: usize = 4; $body }
+        }
+    };
+}
+
 /// The online-softmax state of G query heads: maximum and denominator per
 /// head, the unnormalized output [G][W].
 pub struct Online<'s> {
@@ -701,6 +734,17 @@ impl Online<'_> {
         self.maximum.fill(f32::NEG_INFINITY);
         self.denominator.fill(0.0);
         self.accumulator.fill(0.0);
+    }
+
+    /// The state of the `count` heads from `first`.
+    #[inline(always)]
+    pub fn heads(&mut self, first: usize, count: usize) -> Online<'_> {
+        let w = self.accumulator.len() / self.maximum.len();
+        Online {
+            maximum: &mut self.maximum[first..][..count],
+            denominator: &mut self.denominator[first..][..count],
+            accumulator: &mut self.accumulator[first * w..][..count * w],
+        }
     }
 
     /// Scores key `row` (F32, its W columns) against the G `queries`
@@ -730,16 +774,26 @@ impl Online<'_> {
     /// maximum grows to cover its scores, which become their weights
     /// exp(score - maximum), and its denominator and output carry to the new
     /// maximum, the denominator taking the weights' sum.
+    /// On a tier with [`F8`] vectors (`VECTORS`) the weights form eight at a
+    /// time by [`F8::exp`], the same bits as [`exp`].
+    ///
+    /// # Safety
+    /// The tier runs [`F8`] where `VECTORS`.
     #[inline(always)]
-    fn rescale(&mut self, scores: &mut [f32], n: usize) {
+    unsafe fn rescale<const VECTORS: bool>(&mut self, scores: &mut [f32], n: usize) {
         let w = self.accumulator.len() / self.maximum.len();
         for head in 0..self.maximum.len() {
             let scores = &mut scores[head * BLOCK..][..n];
             let next = self.maximum[head].max(reduce::max(scores));
-            for score in scores.iter_mut() {
-                *score = math::exp(*score - next);
+            let vectored = if VECTORS { n / 8 * 8 } else { 0 };
+            for chunk in scores[..vectored].chunks_exact_mut(8) {
+                // SAFETY: the caller's tier; eight values.
+                unsafe { F8::load(chunk.as_ptr()).sub(F8::splat(next)).exp().store(chunk.as_mut_ptr()) };
             }
-            let carry = math::exp(self.maximum[head] - next);
+            for score in &mut scores[vectored..] {
+                *score = exp(*score - next);
+            }
+            let carry = exp(self.maximum[head] - next);
             self.denominator[head] = self.denominator[head].mul_add(carry, reduce::sum(scores));
             for value in &mut self.accumulator[head * w..][..w] {
                 *value *= carry;
@@ -787,7 +841,8 @@ impl Online<'_> {
         block: &mut Block<usize>,
         (history, fresh): (&H, &F),
     ) {
-        self.rescale(scores, block.n);
+        // SAFETY: no vectors.
+        unsafe { self.rescale::<false>(scores, block.n) };
         for j in 0..block.n {
             if j < block.split {
                 history.load(block.values[j], row);
@@ -834,28 +889,52 @@ impl Online<'_> {
             key.prefetch(&mut key_ahead, w);
             value.prefetch(&mut value_ahead, w);
         }
-        for ahead in PREFETCH_KEYS..PREFETCH_KEYS + count {
-            if ahead < count {
-                key.prefetch(&mut key_ahead, w);
-                value.prefetch(&mut value_ahead, w);
+        let (first_coefficients, second_coefficients) = key_coefficients.split_at_mut(per_key);
+        let mut index = 0;
+        while index < count {
+            // Two keys at once while both fit the block, each query chunk
+            // loaded once for both.
+            let pair = index + 1 < count && block.n + 1 < BLOCK;
+            let taken = 1 + usize::from(pair);
+            for ahead in index + PREFETCH_KEYS..index + PREFETCH_KEYS + taken {
+                if ahead < count {
+                    key.prefetch(&mut key_ahead, w);
+                    value.prefetch(&mut value_ahead, w);
+                }
             }
             // SAFETY: the caller's tier.
-            let row = unsafe { key.next(&mut key_walk, w, &mut key_coefficients[..per_key]) };
-            let mut head = 0;
-            while head < g {
-                // SAFETY: the caller's tier; `row` holds w columns.
-                tile!(g - head, T => unsafe {
-                    score::<K, T>(queries, scale, scores, row, key_coefficients, head, block.n, w);
-                    head += T;
-                });
+            let row = unsafe { key.next(&mut key_walk, w, &mut first_coefficients[..per_key]) };
+            if pair {
+                // SAFETY: the caller's tier.
+                let second = unsafe { key.next(&mut key_walk, w, &mut second_coefficients[..per_key]) };
+                let mut head = 0;
+                while head < g {
+                    // SAFETY: the caller's tier; both rows hold w columns.
+                    quarter!(g - head, T => unsafe {
+                        score_pair::<K, T>(queries, scale, scores, [row, second], [&*first_coefficients, &*second_coefficients], head, block.n, w);
+                        head += T;
+                    });
+                }
+            } else {
+                let mut head = 0;
+                while head < g {
+                    // SAFETY: the caller's tier; `row` holds w columns.
+                    tile!(g - head, T => unsafe {
+                        score::<K, T>(queries, scale, scores, row, first_coefficients, head, block.n, w);
+                        head += T;
+                    });
+                }
             }
-            // SAFETY: the caller's tier.
-            let value_row = unsafe { value.next(&mut value_walk, w, &mut value_coefficients[block.n * per..][..per_value]) };
-            block.push(keys, value_row);
+            for _ in 0..taken {
+                // SAFETY: the caller's tier.
+                let value_row = unsafe { value.next(&mut value_walk, w, &mut value_coefficients[block.n * per..][..per_value]) };
+                block.push(keys, value_row);
+            }
             if block.n == BLOCK {
                 // SAFETY: the caller's tier.
                 unsafe { self.flush_vectors::<H, F>(scores, value_coefficients, per, block) };
             }
+            index += taken;
         }
     }
 
@@ -875,7 +954,8 @@ impl Online<'_> {
         per: usize,
         block: &mut Block<*const u8>,
     ) {
-        self.rescale(scores, block.n);
+        // SAFETY: the caller's tier.
+        unsafe { self.rescale::<true>(scores, block.n) };
         let (g, w) = (self.maximum.len(), self.accumulator.len() / self.maximum.len());
         let (split, n) = (block.split, block.n);
         let mut head = 0;
@@ -963,6 +1043,48 @@ unsafe fn score<K: Rows, const T: usize>(
     }
 }
 
+/// [`score`] of two keys at once (`rows`, with their widened
+/// `coefficients`), into columns `j` and `j + 1`: each query chunk is loaded
+/// once for both, and every score is fused lane by lane as [`score`] fuses
+/// it, so its bits are [`score`]'s.
+///
+/// # Safety
+/// As [`score`], for both rows.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn score_pair<K: Rows, const T: usize>(
+    queries: &[f32],
+    scale: f32,
+    scores: &mut [f32],
+    rows: [*const u8; 2],
+    coefficients: [&[f32]; 2],
+    head: usize,
+    j: usize,
+    w: usize,
+) {
+    unsafe {
+        let mut lanes = [[F8::zero(); T]; 2];
+        let chunks = w / 8;
+        for from in (0..chunks).step_by(K::GROUP_CHUNKS) {
+            let group = from / K::GROUP_CHUNKS;
+            let scales = [K::scale(coefficients[0], group), K::scale(coefficients[1], group)];
+            for c in from..chunks.min(from.saturating_add(K::GROUP_CHUNKS)) {
+                let keys = [K::chunk(rows[0], scales[0], c), K::chunk(rows[1], scales[1], c)];
+                for t in 0..T {
+                    let query = F8::load(queries.as_ptr().add((head + t) * w + 8 * c));
+                    lanes[0][t] = lanes[0][t].fma(query, keys[0]);
+                    lanes[1][t] = lanes[1][t].fma(query, keys[1]);
+                }
+            }
+        }
+        for (k, lanes) in lanes.into_iter().enumerate() {
+            for (t, lane) in lanes.into_iter().enumerate() {
+                scores[(head + t) * BLOCK + j + k] = lane.sum() * scale;
+            }
+        }
+    }
+}
+
 /// Absorbs the block's value `rows` `keys` (their widened `coefficients`,
 /// `per` a row) into the output of the T query heads from `head`, each
 /// weighted by its score: eight columns at a time, fused in key order.
@@ -993,9 +1115,11 @@ unsafe fn values<R: Rows, const T: usize>(
                 *lane = F8::load(output.add((head + t) * w + 8 * c));
             }
             for j in keys.clone() {
-                let value = R::chunk(rows[j], R::scale(&coefficients[j * per..], c / R::GROUP_CHUNKS), c);
+                // SAFETY: j < n <= BLOCK keys of the block, each with its
+                // coefficients, and the T heads' scores.
+                let value = R::chunk(*rows.get_unchecked(j), R::scale(coefficients.get_unchecked(j * per..), c / R::GROUP_CHUNKS), c);
                 for (t, lane) in lanes.iter_mut().enumerate() {
-                    *lane = lane.fma(F8::splat(scores[(head + t) * BLOCK + j]), value);
+                    *lane = lane.fma(F8::splat(*scores.get_unchecked((head + t) * BLOCK + j)), value);
                 }
             }
             for (t, lane) in lanes.into_iter().enumerate() {
@@ -1013,8 +1137,8 @@ fn vectors<L: Isa>() -> bool {
 }
 
 /// Floats of an absorb's `work` at head width `w` over `affine` history or
-/// not: a row for the portable body; a key's and a block of values'
-/// widened coefficients (w / 16 + BLOCK * w / 16) for the vector body over
+/// not: a row for the portable body; two keys' and a block of values'
+/// widened coefficients (2 w / 16 + BLOCK * w / 16) for the vector body over
 /// affine rows.
 #[inline(always)]
 pub const fn work(w: usize, affine: bool) -> usize {
@@ -1350,6 +1474,40 @@ mod lanes {
             unsafe { Self(_mm256_fmadd_ps(a.0, b.0, self.0)) }
         }
 
+        /// `self - other` lane by lane.
+        #[inline(always)]
+        pub unsafe fn sub(self, other: Self) -> Self {
+            unsafe { Self(_mm256_sub_ps(self.0, other.0)) }
+        }
+
+        /// [`super::exp`] of each lane, operation for operation.
+        #[inline(always)]
+        pub unsafe fn exp(self) -> Self {
+            use super::{EXP_POLYNOMIAL, LN2_HIGH, LN2_LOW};
+            unsafe {
+                let x = self.0;
+                let clamped = _mm256_min_ps(_mm256_max_ps(x, _mm256_set1_ps(-104.0)), _mm256_set1_ps(89.0));
+                let n = _mm256_floor_ps(_mm256_add_ps(
+                    _mm256_mul_ps(clamped, _mm256_set1_ps(std::f32::consts::LOG2_E)),
+                    _mm256_set1_ps(0.5),
+                ));
+                let r = _mm256_fmadd_ps(n, _mm256_set1_ps(-LN2_HIGH), clamped);
+                let r = _mm256_fmadd_ps(n, _mm256_set1_ps(-LN2_LOW), r);
+                let mut p = _mm256_set1_ps(EXP_POLYNOMIAL[0]);
+                for coefficient in &EXP_POLYNOMIAL[1..] {
+                    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(*coefficient));
+                }
+                let y = _mm256_add_ps(_mm256_fmadd_ps(p, _mm256_mul_ps(r, r), r), _mm256_set1_ps(1.0));
+                let n = _mm256_cvttps_epi32(n);
+                let half = _mm256_srai_epi32::<1>(n);
+                let bias = _mm256_set1_epi32(127);
+                let low = _mm256_castsi256_ps(_mm256_slli_epi32::<23>(_mm256_add_epi32(half, bias)));
+                let high = _mm256_castsi256_ps(_mm256_slli_epi32::<23>(_mm256_add_epi32(_mm256_sub_epi32(n, half), bias)));
+                let y = _mm256_mul_ps(_mm256_mul_ps(y, low), high);
+                Self(_mm256_blendv_ps(x, y, _mm256_cmp_ps::<_CMP_ORD_Q>(x, x)))
+            }
+        }
+
         /// The lanes combined by `reduce::combine`'s tree:
         /// ((l0 + l4) + (l2 + l6)) + ((l1 + l5) + (l3 + l7)).
         #[inline(always)]
@@ -1430,6 +1588,18 @@ mod lanes {
             unsafe { Self([vfmaq_f32(self.0[0], a.0[0], b.0[0]), vfmaq_f32(self.0[1], a.0[1], b.0[1])]) }
         }
 
+        /// `self - other` lane by lane.
+        #[inline(always)]
+        pub unsafe fn sub(self, other: Self) -> Self {
+            unsafe { Self([vsubq_f32(self.0[0], other.0[0]), vsubq_f32(self.0[1], other.0[1])]) }
+        }
+
+        /// [`super::exp`] of each lane, operation for operation.
+        #[inline(always)]
+        pub unsafe fn exp(self) -> Self {
+            unsafe { Self([exp4(self.0[0]), exp4(self.0[1])]) }
+        }
+
         /// The lanes combined by `reduce::combine`'s tree:
         /// ((l0 + l4) + (l2 + l6)) + ((l1 + l5) + (l3 + l7)).
         #[inline(always)]
@@ -1470,6 +1640,30 @@ mod lanes {
             }
         }
     }
+
+    /// [`super::exp`] of four lanes, operation for operation.
+    #[inline(always)]
+    unsafe fn exp4(x: float32x4_t) -> float32x4_t {
+        use super::{EXP_POLYNOMIAL, LN2_HIGH, LN2_LOW};
+        unsafe {
+            let clamped = vminq_f32(vmaxq_f32(x, vdupq_n_f32(-104.0)), vdupq_n_f32(89.0));
+            let n = vrndmq_f32(vaddq_f32(vmulq_f32(clamped, vdupq_n_f32(std::f32::consts::LOG2_E)), vdupq_n_f32(0.5)));
+            let r = vfmaq_f32(clamped, n, vdupq_n_f32(-LN2_HIGH));
+            let r = vfmaq_f32(r, n, vdupq_n_f32(-LN2_LOW));
+            let mut p = vdupq_n_f32(EXP_POLYNOMIAL[0]);
+            for coefficient in &EXP_POLYNOMIAL[1..] {
+                p = vfmaq_f32(vdupq_n_f32(*coefficient), p, r);
+            }
+            let y = vaddq_f32(vfmaq_f32(r, p, vmulq_f32(r, r)), vdupq_n_f32(1.0));
+            let n = vcvtq_s32_f32(n);
+            let half = vshrq_n_s32::<1>(n);
+            let bias = vdupq_n_s32(127);
+            let low = vreinterpretq_f32_s32(vshlq_n_s32::<23>(vaddq_s32(half, bias)));
+            let high = vreinterpretq_f32_s32(vshlq_n_s32::<23>(vaddq_s32(vsubq_s32(n, half), bias)));
+            let y = vmulq_f32(vmulq_f32(y, low), high);
+            vbslq_f32(vceqq_f32(x, x), y, x)
+        }
+    }
 }
 
 /// Absorbs the part `range` of a row's key sequence (its admitted history
@@ -1504,8 +1698,8 @@ pub fn attend<L: Isa, HK: Rows, HV: Rows, BK: Rows, BV: Rows>(
     if vectors::<L>() && w % 8 == 0 {
         let per_key = history.0.coefficients(w).max(batch.0.coefficients(w));
         let per = history.1.coefficients(w).max(batch.1.coefficients(w));
-        assert!(work.len() >= per_key + BLOCK * per);
-        let (key_coefficients, value_coefficients) = work.split_at_mut(per_key);
+        assert!(work.len() >= 2 * per_key + BLOCK * per);
+        let (key_coefficients, value_coefficients) = work.split_at_mut(2 * per_key);
         let mut block = Block::new(std::ptr::null());
         for (keys, first, count) in walk(spans, fresh, range, selected) {
             let work = (&mut *key_coefficients, &mut *value_coefficients, per);
@@ -1537,6 +1731,91 @@ pub fn attend<L: Isa, HK: Rows, HV: Rows, BK: Rows, BV: Rows>(
         if block.n > 0 {
             state.flush_portable(scores, row, &mut block, (history.1, batch.1));
         }
+    }
+}
+
+/// Absorbs the key sequences of a block of `rows` prefill rows into `state`,
+/// row `local`'s G query heads at heads [local G, (local + 1) G) of it (its
+/// queries at local G W of `queries`): bit for bit, each row's state is
+/// [`attend`]'s over its whole sequence alone. `sequence(local)` is row
+/// `local`'s admitted history spans, fresh span and WorkList bitmap (empty:
+/// every key read), `block_rows` keys a bitmap block. Each run of
+/// consecutive rows of one sequence (the same spans and fresh start) that
+/// read every key shares the whole BLOCK-key blocks every row of the run
+/// sees: those are absorbed once over all of the run's heads, so each of
+/// their keys and values is read once for the run, not once a row; each row
+/// then absorbs the rest of its sequence alone. The shared keys end on a
+/// block boundary, so each row's blocks, and so its reduction order, are
+/// those it absorbs alone. A row with a bitmap reads its own keys and
+/// shares none.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub fn attend_rows<'b, L: Isa, S: Iterator<Item = (i32, i32)> + Clone, HK: Rows, HV: Rows, BK: Rows, BV: Rows>(
+    l: L,
+    state: &mut Online<'_>,
+    queries: &[f32],
+    scale: f32,
+    scores: &mut [f32],
+    work: &mut [f32],
+    rows: usize,
+    sequence: impl Fn(usize) -> (S, (i32, i32), &'b [u32]),
+    block_rows: i32,
+    history: (&HK, &HV),
+    batch: (&BK, &BV),
+) {
+    let g = state.maximum.len() / rows;
+    let w = state.accumulator.len() / state.maximum.len();
+    let mut start = 0;
+    while start < rows {
+        let (spans, fresh, bitmap) = sequence(start);
+        let reads_all = bitmap.is_empty();
+        let mut end = start + 1;
+        while reads_all && end < rows {
+            let (other, other_fresh, other_bitmap) = sequence(end);
+            if !(other_bitmap.is_empty() && other_fresh.0 == fresh.0 && other.eq(spans.clone())) {
+                break;
+            }
+            end += 1;
+        }
+        let fewest = (start..end).map(|local| {
+            let (spans, fresh, _) = sequence(local);
+            total(spans, fresh)
+        });
+        let shared = if reads_all { fewest.min().unwrap_or(0) / BLOCK * BLOCK } else { 0 };
+        let heads = start * g..end * g;
+        attend(
+            l,
+            &mut state.heads(heads.start, heads.len()),
+            &queries[heads.start * w..heads.end * w],
+            scale,
+            scores,
+            work,
+            spans,
+            fresh,
+            0..shared,
+            |_| true,
+            history,
+            batch,
+        );
+        for local in start..end {
+            let (spans, fresh, bitmap) = sequence(local);
+            let keys = shared..total(spans.clone(), fresh);
+            attend(
+                l,
+                &mut state.heads(local * g, g),
+                &queries[local * g * w..][..g * w],
+                scale,
+                scores,
+                work,
+                spans,
+                fresh,
+                keys,
+                |ordinal| selected(bitmap, block_rows, ordinal),
+                history,
+                batch,
+            );
+        }
+        start = end;
     }
 }
 
@@ -1611,7 +1890,7 @@ pub fn merge<'p>(
         if part_maximum == f32::NEG_INFINITY {
             continue;
         }
-        let factor = math::exp(part_maximum - overall);
+        let factor = exp(part_maximum - overall);
         total = denominator(part).mul_add(factor, total);
         for (value, partial) in out.iter_mut().zip(partial(part)) {
             *value = partial.mul_add(factor, *value);
