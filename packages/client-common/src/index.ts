@@ -48,3 +48,6 @@ export { hostlessApplication } from "./state/client-services"
 export * from "./chat/draft"
 export * from "./chat/models"
 export * from "./chat/model-defaults"
+
+// Cost estimation
+export * from "./cost-estimation/index"

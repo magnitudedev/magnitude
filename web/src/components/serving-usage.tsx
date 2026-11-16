@@ -1,12 +1,19 @@
 import { ErrorNotice } from "./error-notice"
 import { UsageActivity } from "./serving-usage-activity"
 import { LoadingRegion, SkeletonLine } from "./page-skeletons"
+import { ApiEquivalentCost } from "./api-equivalent-cost"
 import { pageLayout } from "./page-layout"
 import { useState } from "react"
 import { Result, useAtomValue } from "@effect-atom/atom-react"
-import { Option } from "effect"
+import { Either, Option } from "effect"
 import { ServingModelId, type ServingUsageSnapshot } from "@magnitudedev/sdk"
-import { useAgentClient, useLocalModels, formatLocalModelDisplayName } from "@magnitudedev/client-common"
+import {
+  useAgentClient,
+  useLocalModels,
+  formatLocalModelDisplayName,
+  calculateModelCost,
+  resolveModelPricing,
+} from "@magnitudedev/client-common"
 import { GaugeIcon, TimerIcon, ArrowDownIcon, ArrowUpIcon, StackIcon, InfoIcon, ArrowsLeftRightIcon } from "@phosphor-icons/react"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select"
 
@@ -22,6 +29,19 @@ export function ServingUsage() {
   const catalog = useLocalModels()
   const names = Result.isSuccess(catalog) ? new Map(catalog.value.models.map(model => [String(model.modelId), formatLocalModelDisplayName(model)])) : new Map<string, string>()
   const snapshot = Result.isSuccess(result) ? result.value : null
+  const pricingResolution = resolveModelPricing(model || "claude-3-5-sonnet-20241022")
+  let costPerToken: number | undefined
+  let costCurrency: string | undefined
+  if (snapshot?._tag === "Available" && pricingResolution._tag === "Resolved" && snapshot.totalTokens > 0) {
+    const costEither = calculateModelCost(
+      { inputTokens: snapshot.inputTokens, cachedInputTokens: snapshot.cachedInputTokens, outputTokens: snapshot.outputTokens },
+      pricingResolution.entry,
+    )
+    if (Either.isRight(costEither)) {
+      costPerToken = costEither.right.totalCost / snapshot.totalTokens
+      costCurrency = costEither.right.currency
+    }
+  }
   return <section aria-label="Local usage" className="mt-6 space-y-6">
     <div className="flex flex-wrap items-center justify-between gap-3">
       <Select value={model} onValueChange={value => setModel(value ?? "")}>
@@ -41,9 +61,15 @@ export function ServingUsage() {
         </div>
       </div>
     </div>
-    {snapshot?._tag === "Available" ? <UsageActivity days={snapshot.dailyActivity} /> : Result.isInitial(result) ? <UsageActivity days={null} /> : null}
+    {snapshot?._tag === "Available" ? <UsageActivity days={snapshot.dailyActivity} costPerToken={costPerToken} currency={costCurrency} /> : Result.isInitial(result) ? <UsageActivity days={null} /> : null}
     <div className="space-y-6 border-t border-slate-200 pt-6 dark:border-slate-750">
-      {snapshot?._tag === "Available" ? <UsageFigures usage={snapshot} /> : Result.isInitial(result) ? <LoadingRegion label="Loading usage"><div className="space-y-6"><UsageFigures usage={null} /></div></LoadingRegion> : <ErrorNotice title="Couldn’t load usage history" description="Usage information is unavailable right now. This does not mean there has been no activity." />}
+      {snapshot?._tag === "Available" ? <>
+        <UsageFigures usage={snapshot} />
+        <ApiEquivalentCost usage={snapshot} selectedModelId={model} selectedModelDisplayName={model ? names.get(model) ?? model : undefined} period={period} />
+      </> : Result.isInitial(result) ? <LoadingRegion label="Loading usage"><div className="space-y-6">
+        <UsageFigures usage={null} />
+        <ApiEquivalentCost usage={null} selectedModelId={model} selectedModelDisplayName={model ? names.get(model) ?? model : undefined} period={period} />
+      </div></LoadingRegion> : <ErrorNotice title="Couldn’t load usage history" description="Usage information is unavailable right now. This does not mean there has been no activity." />}
     </div>
   </section>
 }

@@ -27,3 +27,8 @@ it("keeps unobserved totals and streaks unknown", () => {
   expect(html).not.toContain('0 tokens')
   expect(html).not.toContain('<button')
 })
+it("exposes estimated API-equivalent cost in daily label when costPerToken is provided", () => {
+  // 100,000 tokens @ $0.00001/token ($10/1M) = $1.00
+  const html = renderToStaticMarkup(<UsageActivity days={days([100_000])} costPerToken={0.00001} currency="USD" />)
+  expect(html).toContain('100,000 tokens (~$1.00 API equiv.) on')
+})

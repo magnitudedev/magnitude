@@ -21,4 +21,5 @@ export const pageLayout = {
   harnessGrid: "grid grid-cols-1 items-start gap-5",
   usageTokens: "grid gap-5 min-[1100px]:grid-cols-3",
   usageTiming: "grid gap-5 min-[1100px]:grid-cols-3",
+  usageCost: "grid gap-5 min-[1100px]:grid-cols-3",
 } as const
