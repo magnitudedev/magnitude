@@ -184,10 +184,11 @@ struct Fields {
 
 // Code planes (`registry::code_planes`): a low plane of LOW bits a code and a
 // high plane of HIGH. `floats` yields a step's codes, their bytes with `mask`
-// flipped, as exact floats less `offset - 1024`; `pair` the step's codes 2j
-// and 2j + 1, the second in bits 16.., with `mask` flipped alike; `nibbles`
-// the step's eight 4-bit codes as one word and `nibble_pair` its byte j (two
-// codes), the indices a codebook reads.
+// flipped, each first shifted left by AT bits within its byte, as exact
+// floats less `offset - 1024`; `pair` the step's codes 2j and 2j + 1, the
+// second in bits 16.., with `mask` flipped alike; `nibbles` the step's eight
+// 4-bit codes as one word and `nibble_pair` its byte j (two codes), the
+// indices a codebook reads.
 
 // The words of a packet's codes below a nibble: its low plane's
 // (`Fields<LOW>`) and, HIGH, its high plane's (`Fields<HIGH>`).
@@ -216,13 +217,14 @@ struct Planes {
             w.high = high_plane::load(row, layout, layout.high, p);
         return w;
     }
-    template <uint MASK>
+    template <uint MASK, uint AT = 0u>
     static void floats(thread const words &w, uint step, half offset, thread float4 &even, thread float4 &odd) {
+        static_assert(LOW + HIGH + AT <= 8u, "a shifted code fills at most its byte");
         uint e, o;
-        split_fields<LOW, 0>(low_plane::step(w.low, step), e, o);
+        split_fields<LOW, AT>(low_plane::step(w.low, step), e, o);
         if constexpr (HIGH != 0u) {
             uint he, ho;
-            split_fields<HIGH, LOW>(high_plane::step(w.high, step), he, ho);
+            split_fields<HIGH, LOW + AT>(high_plane::step(w.high, step), he, ho);
             e |= he;
             o |= ho;
         }
@@ -478,8 +480,9 @@ struct Entries<3> {
 // any other constant costs a subtraction more a step (M4 Pro, prefill
 // `attention_project` staging q6k: 9.74 against 9.54 ms); a product
 // operand takes the zero off as the exact bias -(zero scale)
-// (`Packet::values`). `pair` takes it off in its half subtraction, so a value
-// of zero keeps its sign.
+// (`Packet::values`). `pair` and `centered` (the codes less the zero code,
+// which an exact or factored decode takes) take it off in their half
+// subtraction, so a value of zero keeps its sign.
 template <uint MASK, int ZERO>
 struct Linear {
     static_assert(ZERO >= 0 && (ZERO & (ZERO - 1)) == 0, "a zero code is a power of two: -(zero scale) is exact");
@@ -487,6 +490,10 @@ struct Linear {
     template <typename P>
     static void codes(thread const typename P::words &w, uint step, thread float4 &even, thread float4 &odd) {
         P::template floats<MASK>(w, step, 1024.0h, even, odd);
+    }
+    template <typename P>
+    static void centered(thread const typename P::words &w, uint step, thread float4 &even, thread float4 &odd) {
+        P::template floats<MASK>(w, step, half(1024 + ZERO), even, odd);
     }
     template <typename P>
     static float2 pair(thread const typename P::words &w, uint step, uint j) {
@@ -503,16 +510,16 @@ using Offset = Linear<0u, ZERO>;
 typedef Offset<0> Unsigned;
 typedef Linear<0x80808080u, 128> Twos;
 
-// Odd codes `2 (c - K) + 1` (`registry::CodeInterpretation::Odd`): the codes'
-// bytes as exact floats, doubled and moved by 1 - 2K by one exact fma.
+// Odd codes `2 (c - K) + 1` (`registry::CodeInterpretation::Odd`): the
+// codes doubled in their bytes (shifted left a bit) and moved by 1 - 2K in
+// the half subtraction that makes them floats, exactly.
 template <int K>
 struct OddCodes {
+    static_assert(-512 < K && K < 512, "the moved code's offset, 1023 + 2K, is an exact half");
     static constant constexpr int zero = 0;
     template <typename P>
     static void codes(thread const typename P::words &w, uint step, thread float4 &even, thread float4 &odd) {
-        P::template floats<0u>(w, step, 1024.0h, even, odd);
-        even = metal::fma(even, float4(2.0f), float4(float(1 - 2 * K)));
-        odd = metal::fma(odd, float4(2.0f), float4(float(1 - 2 * K)));
+        P::template floats<0u, 1u>(w, step, half(1023 + 2 * K), even, odd);
     }
     template <typename P>
     static float2 pair(thread const typename P::words &w, uint step, uint j) {
@@ -1165,6 +1172,16 @@ struct Forms {
     static constexpr bool matrix_runs_halves() { return MATRIX_RUNS == 2u; }
 };
 
+// A step's codes less their zero code, exactly (`Linear::centered`; codes
+// of zero code 0 are their codes).
+template <typename C, typename P>
+inline void centered_codes(thread const typename P::words &w, uint step, thread float4 &even, thread float4 &odd) {
+    if constexpr (C::zero != 0)
+        C::template centered<P>(w, step, even, odd);
+    else
+        C::template codes<P>(w, step, even, odd);
+}
+
 // A decoder of codes in planes `P` interpreted by `C` under coefficients `K`,
 // admitted to the consumer forms `F` (`Forms`).
 template <typename P, typename C, typename K, typename F>
@@ -1195,11 +1212,7 @@ struct Packet {
     // its zero code, moved by its group's signed bias over its scale.
     static void codes(thread const packet &k, uint step, thread float4 &even, thread float4 &odd) {
         static_assert(factored(), "a factored decoder's bias is an offset of its codes");
-        C::template codes<P>(k.codes, step, even, odd);
-        if constexpr (C::zero != 0) {
-            even -= float(C::zero);
-            odd -= float(C::zero);
-        }
+        centered_codes<C, P>(k.codes, step, even, odd);
         if constexpr (K::offsets) {
             const float offset = k.coefficients.offset(group(step));
             even += offset;
@@ -1226,11 +1239,7 @@ struct Packet {
     // them: scale * (code - zero code), the difference exact, plus a stored
     // bias by one fma, so a zero keeps the sign of scale * 0.
     static void exact_values(thread const packet &k, uint step, thread float4 &even, thread float4 &odd) {
-        C::template codes<P>(k.codes, step, even, odd);
-        if (C::zero != 0) {
-            even -= float(C::zero);
-            odd -= float(C::zero);
-        }
+        centered_codes<C, P>(k.codes, step, even, odd);
         const float s = scale(k, step);
         if (K::biased) {
             const float b = k.coefficients.bias(group(step));
