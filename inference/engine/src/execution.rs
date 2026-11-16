@@ -976,7 +976,7 @@ fn build_held(
         pools.clone(),
     )
     .map_err(|error| internal(error.to_string()))?;
-    residency.with_upload(&upload_window);
+    residency.with_upload(upload_window);
     // The rows steps name of a streamed table are kept beside the kernels,
     // for the next load of the model.
     if let Some(cache) = &manifest.kernel_cache {
@@ -1001,7 +1001,7 @@ fn build_held(
             )
             .map_err(|error| import_refused(error, &device, &startup.ledgers))
     })?;
-    drop(upload_window);
+    residency.release_upload();
     startup.recorded.record(weights);
     startup.recorded.record(host_tables);
     tracing::info!(

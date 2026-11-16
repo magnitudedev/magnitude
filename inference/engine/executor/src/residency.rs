@@ -803,10 +803,10 @@ pub struct ResidencyStore {
     /// bank has host slots ([`crate::memory::ledger::DeviceLedgers::host_backing`]),
     /// split from the target import's claim as the store is made for it.
     host_backing: Option<crate::memory::ledger::Claim>,
-    /// The target import's transient upload window entries, when claimed apart
-    /// from `weights`: temporary import workspaces charge here so their drops
+    /// The target import's transient upload window, when claimed apart from
+    /// `weights`: temporary import workspaces charge here so their drops
     /// never resize `weights`.
-    upload: Vec<std::sync::Arc<dyn seismic::memory::Entry>>,
+    upload: RefCell<Option<crate::memory::ledger::Held>>,
     /// The load's granule pools (`experts::LoadPools`): the state's, which
     /// its whole stored tables lie in, the bank's records pool, which its
     /// records and banked tables claim from, and a linked host tier's.
@@ -834,8 +834,13 @@ impl ResidencyStore {
 
     /// Charge temporary import workspaces to `upload` while importing the
     /// target's weights.
-    pub fn with_upload(&mut self, upload: &crate::memory::ledger::Held) {
-        self.upload = upload.charging_entries();
+    pub fn with_upload(&mut self, upload: crate::memory::ledger::Held) {
+        *self.upload.get_mut() = Some(upload);
+    }
+
+    /// Release the target import's upload window once the import ends.
+    pub fn release_upload(&mut self) {
+        drop(self.upload.get_mut().take());
     }
 
     /// The store of a component that opens no expert bank (the vision
@@ -882,7 +887,7 @@ impl ResidencyStore {
             cpu_site: Default::default(),
             changes,
             host_backing,
-            upload: Vec::new(),
+            upload: RefCell::new(None),
             pools,
         })
     }
@@ -1416,10 +1421,9 @@ impl ResidencyStore {
                 self.domain.clone(),
             )
         };
-        let workspace = if self.upload.is_empty() {
-            allocate_workspace()
-        } else {
-            seismic::memory::charging(&self.upload, allocate_workspace)
+        let workspace = match self.upload.borrow_mut().as_mut() {
+            Some(upload) => upload.allocate(allocate_workspace),
+            None => allocate_workspace(),
         }
         .map_err(|error| WeightImportError::of_allocation(seismic::Contract::DeviceOnly, error))?;
         let launch = ValidatedImportLaunch::new(
@@ -1780,23 +1784,6 @@ type ComponentImport<T> = fn(
     &magnitude_artifacts::Package,
 ) -> Result<Option<T>, crate::ResidencyError>;
 
-/// `make`, an allocation, its every byte charged to the claim of its store
-/// among `claims` (`seismic::memory::charging`), within one change of the
-/// ledgers' scope `changes`. Never a pooled holding's: the pool's entry
-/// allocates its granules.
-pub(crate) fn charged<R>(
-    changes: &std::sync::Arc<crate::memory::ledger::Changes>,
-    claims: &[crate::memory::ledger::Claim],
-    make: impl FnOnce() -> R,
-) -> R {
-    let entries: Vec<_> = claims
-        .iter()
-        .filter(|claim| !claim.pooled())
-        .map(crate::memory::ledger::Claim::entry)
-        .collect();
-    changes.change(|_| seismic::memory::charging(&entries, make))
-}
-
 /// A one-shot optional component authority. Numerical stages receive this
 /// typed loader, never direct mutable access to the weight cache. Success or
 /// failure is retained so concurrent request paths cannot trigger a second
@@ -1877,15 +1864,13 @@ impl<T: Clone> ComponentLoader<T> {
     /// Import the component under `held`, the claims of the bytes its
     /// import brings into its cache, kept until [`Self::unload`]. An attempt
     /// made before is returned as it ended, `held` released.
-    pub fn import(&self, held: crate::memory::ledger::Held) -> Result<T, Rc<crate::ResidencyError>> {
+    pub fn import(&self, mut held: crate::memory::ledger::Held) -> Result<T, Rc<crate::ResidencyError>> {
         assert!(!self.imported(), "invariant violated: a component is imported once until unloaded");
-        let claims = held.into_claims();
-        let changes = self.store.borrow().changes.clone();
         // The import's allocations charge its claims as Seismic makes them,
         // one change with the import.
-        let imported = charged(&changes, &claims, || self.load());
+        let imported = held.allocate(|| self.load());
         if imported.is_ok() {
-            *self.claims.borrow_mut() = claims;
+            *self.claims.borrow_mut() = held.into_claims();
         }
         imported
     }

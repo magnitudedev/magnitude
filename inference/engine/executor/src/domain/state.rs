@@ -90,13 +90,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             seismic::Element::dense(crate::planning::activation_dtype(decoder.activation_dtype))
         };
         let bytes = self.head_conditioning_bytes() as u64;
-        let held = self.claim_growth(
+        let mut held = self.claim_growth(
             crate::memory::ledger::CommittedKind::Component,
             crate::memory::ClaimDemand { device: bytes, ..Default::default() },
         )?;
-        let changes = self.resources.ledgers().changes().clone();
         let device = self.domain.device();
-        let tensor = crate::residency::charged(&changes, held.claims(), || Tensor::zeros(device, element, &[1, width]))
+        let tensor = held
+            .allocate(|| Tensor::zeros(device, element, &[1, width]))
             .map_err(|error| DomainError::Input(error.to_string()))?;
         self.domain
             .publish_features(tensor, held.into_claims())
@@ -656,15 +656,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if demand == crate::memory::ClaimDemand::default() {
             return Ok(());
         }
-        let held = match self.claim_growth(crate::memory::ledger::CommittedKind::Component, demand) {
+        let mut held = match self.claim_growth(crate::memory::ledger::CommittedKind::Component, demand) {
             Ok(held) => held,
             Err(refused) => {
                 self.unbind(super::OptionalComponent::Drafter);
                 return Err(refused);
             }
         };
-        let changes = self.resources.ledgers().changes().clone();
-        let bound = crate::residency::charged(&changes, held.claims(), || self.family.hold_bound_head(places));
+        let bound = held.allocate(|| self.family.hold_bound_head(places));
         if let Err(error) = bound {
             self.unbind(super::OptionalComponent::Drafter);
             return Err(DomainError::invariant(error));

@@ -561,10 +561,10 @@ pub(crate) fn fixture_charged<T>(
     demand: crate::memory::ClaimDemand,
     make: impl FnOnce() -> T,
 ) -> T {
-    let held = ledgers
+    let mut held = ledgers
         .claim(device, kind, demand)
         .expect("the fixture's ledgers hold what it allocates");
-    let made = crate::residency::charged(ledgers.changes(), held.claims(), make);
+    let made = held.allocate(make);
     recorded.record(held);
     made
 }

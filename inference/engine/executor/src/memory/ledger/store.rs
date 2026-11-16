@@ -617,7 +617,11 @@ impl Held {
     /// ([`Changes::change`]): every allocation it makes in a store the device
     /// reaches is charged to this holding's non-pooled claim there, at its
     /// exact bytes, as Seismic makes it ([`seismic::memory::charging`]).
-    pub fn allocate<T, E>(&mut self, make: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+    ///
+    /// This is the only way an allocation is charged to a holding: it names
+    /// every store the device reaches, those this holding placed no bytes in
+    /// included, so no allocation it makes is left outside a charging scope.
+    pub fn allocate<T>(&mut self, make: impl FnOnce() -> T) -> T {
         let changes = self
             .claims
             .first()
@@ -656,15 +660,6 @@ impl Held {
             self.unclaimed = retained;
             outcome
         })
-    }
-
-    /// Non-pooled charging entries of this holding's claims.
-    pub(crate) fn charging_entries(&self) -> Vec<Arc<dyn seismic::memory::Entry>> {
-        self.claims
-            .iter()
-            .filter(|claim| !claim.pooled())
-            .map(Claim::entry)
-            .collect()
     }
 
     /// The claims, one per store.
