@@ -253,6 +253,7 @@ impl State {
             | WorkerMessage::Unprepared
             | WorkerMessage::LoadFailed { .. } => return Err("load message after readiness".into()),
             WorkerMessage::Attempting { .. }
+            | WorkerMessage::Opening { .. }
             | WorkerMessage::Recorded { .. }
             | WorkerMessage::MeasureFinished { .. } => {
                 return Err("measurement message from a serving worker".into())
