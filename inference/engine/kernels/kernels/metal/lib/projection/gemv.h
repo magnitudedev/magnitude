@@ -128,10 +128,10 @@ inline float gemv_step_dot(float acc, float4 we, float4 wo, float4 xe, float4 xo
     return acc;
 }
 
-// Whether a packet decoder is factored: its `codes` are a packet's values
-// over one `factor` of the packet, exactly, so a step's eight products are
-// summed over its codes and scaled once, where any other decoder's are
-// summed over its values (`fma(scale, code, bias)` a weight).
+// Whether a packet decoder is factored (`W::factored()`): its `codes` are
+// a step's values over one `factor` of that step, exactly, so a step's eight
+// products are summed over its codes and scaled once, where any other
+// decoder's are summed over its values (`fma(scale, code, bias)` a weight).
 template <typename T>
 struct gemv_void {
     typedef void type;
@@ -141,8 +141,8 @@ struct gemv_factored {
     static constant constexpr bool value = false;
 };
 template <typename W>
-struct gemv_factored<W, typename gemv_void<decltype(&W::factor)>::type> {
-    static constant constexpr bool value = true;
+struct gemv_factored<W, typename gemv_void<decltype(&W::factored)>::type> {
+    static constant constexpr bool value = W::factored();
 };
 
 // Step `step`'s eight weights of packet k as its decoder sums them: its
@@ -155,12 +155,12 @@ inline void gemv_step_weights(thread const typename W::packet &k, uint step, thr
         W::values(k, step, even, odd);
 }
 
-// acc plus one step's products of packet k (its `gemv_step_weights`).
+// acc plus step `step`'s products of packet k (its `gemv_step_weights`).
 template <typename W>
-inline float gemv_step_add(float acc, thread const typename W::packet &k, float4 we, float4 wo, float4 xe,
+inline float gemv_step_add(float acc, thread const typename W::packet &k, uint step, float4 we, float4 wo, float4 xe,
     float4 xo) {
     if constexpr (gemv_factored<W>::value)
-        return metal::fma(W::factor(k), gemv_step_dot(0.0f, we, wo, xe, xo), acc);
+        return metal::fma(W::factor(k, step), gemv_step_dot(0.0f, we, wo, xe, xo), acc);
     else
         return gemv_step_dot(acc, we, wo, xe, xo);
 }
@@ -185,9 +185,9 @@ inline void gemv_accumulate(thread float (&acc)[R][MAXM], thread float (&acc2)[R
             A::split8(words[gemv_word(local, step, m, count)], xe, xo);
             PROJECTION_UNROLL
             for (uint r = 0; r < R; ++r) {
-                acc[r][m] = gemv_step_add<W>(acc[r][m], packets.a[r], ae[r], ao[r], xe, xo);
+                acc[r][m] = gemv_step_add<W>(acc[r][m], packets.a[r], step, ae[r], ao[r], xe, xo);
                 if (PAIRED)
-                    acc2[r][m] = gemv_step_add<U>(acc2[r][m], packets.b[r], be[r], bo[r], xe, xo);
+                    acc2[r][m] = gemv_step_add<U>(acc2[r][m], packets.b[r], step, be[r], bo[r], xe, xo);
             }
         }
     }
@@ -781,9 +781,9 @@ inline void gemv_tile_row(thread const In &in, thread const Out &out, thread con
                         for (uint m = 0; m < MAXM; ++m) {
                             float4 xe, xo;
                             A::split8(words[gemv_word(chunk.slot(range) + at, step, m, slots)], xe, xo);
-                            acc[j][m] = gemv_step_add<W>(acc[j][m], a[j].current, ae, ao, xe, xo);
+                            acc[j][m] = gemv_step_add<W>(acc[j][m], a[j].current, step, ae, ao, xe, xo);
                             if (PAIRED)
-                                acc2[j][m] = gemv_step_add<U>(acc2[j][m], b[j].current, be, bo, xe, xo);
+                                acc2[j][m] = gemv_step_add<U>(acc2[j][m], b[j].current, step, be, bo, xe, xo);
                         }
                     }
                 }

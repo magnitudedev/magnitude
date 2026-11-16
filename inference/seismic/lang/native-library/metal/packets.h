@@ -859,6 +859,24 @@ struct Coefficients<GROUPS, false> {
     float bias(uint) const { return 0.0f; }
 };
 
+// The coefficients of a packet's GROUPS groups under a signed bias
+// (`SignedBias`): each group's scale and its bias over its scale, ±2^X
+// (`offset(g)`), so the bias, their product, is exact, and so is a code
+// moved by the offset (`Packet::codes`). `make` takes the offsets in place
+// of the biases.
+template <uint GROUPS>
+struct SignedCoefficients {
+    typedef GroupFloats<GROUPS> F;
+    typename F::type scales;
+    typename F::type offsets;
+    static SignedCoefficients make(float2 scale, float2 offset) {
+        return SignedCoefficients{F::of(scale), F::of(offset)};
+    }
+    float scale(uint g) const { return F::at(scales, g); }
+    float offset(uint g) const { return F::at(offsets, g); }
+    float bias(uint g) const { return offset(g) * scale(g); }
+};
+
 // Direct coefficients: a scale `S` (with BIAS a bias after it) per GROUP
 // values; the scale times 2^EXPONENT. A biased storage group is one
 // coefficient group. A packet has `groups` of them (one per 32
@@ -869,6 +887,7 @@ struct Direct {
     static_assert(!BIAS || STORAGE == GROUP, "a group's bias follows its scale");
     static constant constexpr uint groups = GROUP < 32u ? 32u / GROUP : 1u;
     static constant constexpr bool biased = BIAS;
+    static constant constexpr bool offsets = false;
     typedef Coefficients<groups, biased> coefficients;
     // Byte offset of group G's scale in the row's share of the supers
     // plane; its bias follows it.
@@ -1006,7 +1025,9 @@ struct Hier {
     static_assert(!carries || (!MIN && LOCAL_BITS <= GROUP / 8u), "a group's entries carry its scale code");
     static constant constexpr uint groups = 32u / GROUP;
     static constant constexpr bool biased = MIN || signed_bias();
-    typedef Coefficients<groups, biased> coefficients;
+    // Whether its bias is an offset of its codes (`SignedCoefficients`).
+    static constant constexpr bool offsets = signed_bias();
+    typedef metal::conditional_t<offsets, SignedCoefficients<groups>, Coefficients<groups, biased>> coefficients;
     static constant constexpr uint width = LOCAL_BITS * (MIN ? 2u : 1u);
     static constant constexpr uint field_bits = width * groups;
     static_assert(field_bits < 32u, "a packet's field is below a word: a run shifts by it");
@@ -1046,7 +1067,7 @@ struct Hier {
                 const uint code = scale_code(field, g);
                 scale[g] = factor.scale(0) * L::value(code & ((1u << SB::scale_bits()) - 1u));
                 bias[g] = (((code >> SB::scale_bits()) & 1u) != 0u ? -1.0f : 1.0f)
-                    * (scale[g] * power2<SB::exponent() - CODE_EXPONENT>());
+                    * power2<SB::exponent() - CODE_EXPONENT>();
             }
         } else if (MIN) {
             for (uint g = 0; g < groups; ++g) {
@@ -1162,6 +1183,30 @@ struct Packet {
     // The coefficient group of step `step` (two steps a group of 16).
     static uint group(uint step) { return groups == 1 ? 0u : step / 2u; }
     static float scale(thread const packet &k, uint step) { return k.coefficients.scale(group(step)); }
+    // Whether its values are a factor of their step (`factor`, the scale)
+    // times exact codes (`codes`): every decoder but those whose bias is a
+    // term of its own (a stored bias or minimum), which a factored product
+    // would sum apart from its codes. A GEMV then sums a step's products over
+    // its codes and scales the sum once (`projection::gemv_factored`): at
+    // two bits a weight and below, the per-weight scale bounds the one-row
+    // GEMV on instruction issue.
+    static constexpr bool factored() { return !K::biased || K::offsets; }
+    // Step `step`'s eight codes over its factor, each exact: the code less
+    // its zero code, moved by its group's signed bias over its scale.
+    static void codes(thread const packet &k, uint step, thread float4 &even, thread float4 &odd) {
+        static_assert(factored(), "a factored decoder's bias is an offset of its codes");
+        C::template codes<P>(k.codes, step, even, odd);
+        if constexpr (C::zero != 0) {
+            even -= float(C::zero);
+            odd -= float(C::zero);
+        }
+        if constexpr (K::offsets) {
+            const float offset = k.coefficients.offset(group(step));
+            even += offset;
+            odd += offset;
+        }
+    }
+    static float factor(thread const packet &k, uint step) { return scale(k, step); }
     // Step `step`'s eight values (even, odd) as product operands: scale *
     // code with one rounding, plus by the same fma a stored bias, the exact
     // -(zero code scale) (`Linear`) or +0, so a value of zero is +0. Where

@@ -93,7 +93,8 @@ struct ProgressiveTop {
         even = float4(c04.x, c26.x, c04.y, c26.y);
         odd = float4(c15.x, c37.x, c15.y, c37.y);
     }
-    static float factor(thread const packet &k) { return k.scale; }
+    static constexpr bool factored() { return true; }
+    static float factor(thread const packet &k, uint) { return k.scale; }
 };
 
 // The exact view: the offset-binary codes u of every plane, as c = u - 128,
