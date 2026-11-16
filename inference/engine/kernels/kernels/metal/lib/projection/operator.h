@@ -1142,6 +1142,18 @@ template <uint MAXM>
 constexpr uint ordered_mixed_w_per_sg() {
     return (MAXM == 1u) ? 4u : ((MAXM == 2u) ? 2u : 1u);
 }
+// The simdgroups of a threadgroup that hold an ordered segment's rows: at one
+// row, two (a tile of 8 rows), so a router of a few hundred rows reads its
+// weights from many cores rather than a few; the rest of the threadgroup
+// stages the row and leaves. `dense.seismic`'s `ordered_gemv1` grid matches.
+template <uint MAXM, uint SIMDGROUPS>
+constexpr uint ordered_mixed_sgs() {
+    return (MAXM == 1u && SIMDGROUPS > 2u) ? 2u : SIMDGROUPS;
+}
+template <uint MAXM, uint SIMDGROUPS>
+constexpr uint ordered_mixed_rows() {
+    return ordered_mixed_sgs<MAXM, SIMDGROUPS>() * ordered_mixed_w_per_sg<MAXM>();
+}
 
 // Unified reference-order GEMV (`M <= 8`): four weight rows per simdgroup
 // (`q = lane >> 3`, `u = lane & 7`, `w_row = local_tile * (4 * SIMDGROUPS) + sg * 4 + q`,
@@ -1377,10 +1389,10 @@ inline void ordered_gemv_maxm_run(thread const In &in, thread const Out &out, th
     const uint u = lane & 7u;
     const uint w_off = (MAXM == 1u) ? q : ((MAXM == 2u) ? (q >> 1u) : 0u);
     const uint r0 = (MAXM == 1u) ? 0u : ((MAXM == 2u) ? (q & 1u) : q);
-    const uint sg_base_row = local_tile * (SIMDGROUPS * W_PER_SG) + sg * W_PER_SG;
+    const uint sg_base_row = local_tile * ordered_mixed_rows<MAXM, SIMDGROUPS>() + sg * W_PER_SG;
     const uint w_row = sg_base_row + w_off;
-    const bool sg_has_rows = sg_base_row < n;
-    const bool has_row = w_row < n;
+    const bool sg_has_rows = sg < ordered_mixed_sgs<MAXM, SIMDGROUPS>() && sg_base_row < n;
+    const bool has_row = sg_has_rows && w_row < n;
     const uint p_own = u >> 2u;
     const uint s_own = u & 3u;
     typename Ow::fetched cur_w = Ow::empty();
@@ -2157,7 +2169,7 @@ inline void ordered_gemm_run(thread const In &in, thread const Out &out, thread 
     PROJECTION_ORDERED_EPILOGUE(ordered_tiles)
 
 #define PROJECTION_SEGMENTED_ORDERED_GEMV_MIXED(MAXM)                                                           \
-    constexpr uint ord_per = simdgroups * projection::ordered_mixed_w_per_sg<(MAXM)>();                                                                   \
+    constexpr uint ord_per = projection::ordered_mixed_rows<(MAXM), simdgroups>();                                                                   \
     constexpr uint unord_per = simdgroups * ROWS * (32u / LANES);                                               \
     PROJECTION_OPERANDS;                                                                                        \
     const uint ordered_tiles = 0u PROJECTION_EACH_SEGMENT(PROJECTION_ORDERED_ADD_TILES, ord_per);               \

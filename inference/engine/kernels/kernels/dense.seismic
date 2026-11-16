@@ -222,7 +222,7 @@ projection dense for metal:
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (ORDERED_GEMV_SHARED)
     launch ordered_gemv1 for segmented when ORDERED_ANY == 1 and ORDERED_ALL == 0 and M <= 1:
-        threadgroups (tiles(W, ORDERED * ceil_div(N, SIMDGROUPS * 4) + (1 - ORDERED) * ceil_div(N, SIMDGROUPS * ROWS * 32 / LANES)), 1, G)
+        threadgroups (tiles(W, ORDERED * ceil_div(N, min(SIMDGROUPS, 2) * 4) + (1 - ORDERED) * ceil_div(N, SIMDGROUPS * ROWS * 32 / LANES)), 1, G)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (max(1024, MIXED_GEMV_SHARED))
     launch ordered_gemv2 for segmented when ORDERED_ANY == 1 and ORDERED_ALL == 0 and M == 2:
