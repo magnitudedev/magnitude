@@ -2904,18 +2904,19 @@ struct matrix_runs<packets::Packet<P, C,
     static constexpr bool halves() { return F::matrix_runs_halves(); }
 };
 
-// The weights the symmetric matrix GEMV serves: integer codes
+// The weights the 32-column matrix GEMV serves: integer codes
 // (`lane_codes`) under a direct scale per 32 columns or per a multiple of
-// them, which every 32-column block of a group repeats
-// (`gemv_matrix_symmetric_body`).
+// them, which every 32-column block of a group repeats, and, `biased`, a
+// bias per 32 columns after it (`gemv_matrix_symmetric_body`).
 template <typename W>
 struct matrix_symmetric {
     static constexpr bool implemented() { return false; }
 };
-template <typename P, typename C, typename S, uint GROUP, uint STORAGE, int EXPONENT, typename F>
-struct matrix_symmetric<packets::Packet<P, C, packets::Direct<S, GROUP, false, STORAGE, EXPONENT>, F>> {
-    typedef packets::Direct<S, GROUP, false, STORAGE, EXPONENT> K;
+template <typename P, typename C, typename S, uint GROUP, bool BIAS, uint STORAGE, int EXPONENT, typename F>
+struct matrix_symmetric<packets::Packet<P, C, packets::Direct<S, GROUP, BIAS, STORAGE, EXPONENT>, F>> {
+    typedef packets::Direct<S, GROUP, BIAS, STORAGE, EXPONENT> K;
     typedef lane_codes<P, C> lanes;
+    static constant constexpr bool biased = BIAS;
     static constexpr bool implemented() { return lanes::implemented() && GROUP % 32u == 0u; }
 };
 
@@ -3140,15 +3141,50 @@ inline void gemv_matrix_runs_body(thread const In &in, thread const Out &out,
     }
 }
 
-// The symmetric 32-column matrix GEMV (`matrix_symmetric`): decode each code
-// once into an exact integer matrix operand (`lane_operands`), share it
-// across the activation rows, then fold the block scale into the F32 sums. No rounded weight
-// operand or token packing.
-template <bool PAIRED, uint NB, uint PARTS, bool UNIT, typename W, typename U, typename In, typename Out>
+// The biases of blocks b, b + 1 of a biased 32-column weight's row whose
+// share of the supers plane is at `supers`, 0 outside blocks [first, end).
+template <typename W>
+inline float2 matrix_block_biases(packets::weight_bytes supers, uint b, uint first, uint end) {
+    float2 biases = float2(0.0f);
+    PROJECTION_UNROLL for (uint i = 0; i < 2; ++i) {
+        if (b + i >= first && b + i < end)
+            biases[i] = matrix_symmetric<W>::K::at(supers, b + i).bias(0);
+    }
+    return biases;
+}
+
+// Stages the activation rows' block sums once per threadgroup behind the
+// exchange of a matrix GEMV of NB fragments (block_sums[(8 NB) g + m],
+// `matrix_block_sum`), which the products folding a min term or a bias read.
+template <uint NB, bool UNIT, typename In>
+inline threadgroup float *matrix_stage_block_sums(thread const In &in, uint m_rows, uint k,
+    threadgroup uchar *shared, uint simdgroups, uint sg, uint lane, bool stage) {
+    threadgroup float *block_sums =
+        reinterpret_cast<threadgroup float *>(reinterpret_cast<threadgroup float2 *>(shared) + simdgroups * 32u * NB);
+    if (stage) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint item = sg * 32u + lane; item < 8u * NB * (k / 32u); item += simdgroups * 32u) {
+            const uint row_m = item % (8u * NB);
+            block_sums[item] = row_m < m_rows ? matrix_block_sum<UNIT>(in, row_m, item / (8u * NB)) : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return block_sums;
+}
+
+// The 32-column matrix GEMV (`matrix_symmetric`): decode each code once
+// into an exact integer matrix operand (`lane_operands`), share it across
+// the activation rows, then fold the block scale into the F32 sums, and a
+// biased block's bias times the activation rows' block sums (staged where
+// STAGED, already by the gate's product where PREPARED, else the lane's
+// own). No rounded weight operand or token packing.
+template <bool PAIRED, uint NB, uint PARTS, bool UNIT, bool STAGED, bool PREPARED, typename W, typename U,
+    typename In, typename Out>
 inline void gemv_matrix_symmetric_body(thread const In &in, thread const Out &out,
     thread const Weights<W> &w, thread const Weights<U> &u,
     uint m_rows, uint rows, uint k, uint group, threadgroup uchar *shared,
     uint simdgroups, uint sg, uint lane) {
+    constexpr bool BIASED = matrix_symmetric<W>::biased || (PAIRED && matrix_symmetric<U>::biased);
     typedef typename In::activation A;
     threadgroup float2 *parts = reinterpret_cast<threadgroup float2 *>(shared);
     const ushort2 at = fragment_coordinate(lane);
@@ -3172,6 +3208,9 @@ inline void gemv_matrix_symmetric_body(thread const In &in, thread const Out &ou
             stored_rows[f][j] = reinterpret_cast<device const typename A::storage *>(in.x)
                 + ulong(in.rows.at(min(8u * f + at.x + j, m_rows - 1u))) * in.stride0;
     }
+    threadgroup float *block_sums = nullptr;
+    if constexpr (BIASED && STAGED)
+        block_sums = matrix_stage_block_sums<NB, UNIT>(in, m_rows, k, shared, simdgroups, sg, lane, !PREPARED);
     for (uint g = part * blocks / PARTS; g < (part + 1u) * blocks / PARTS; ++g) {
         const typename lanes::words word = lanes::template load<true>(w, codes, g);
         const lane_operands<lanes> pairs = lane_operands<lanes>::of(word);
@@ -3213,6 +3252,43 @@ inline void gemv_matrix_symmetric_body(thread const In &in, thread const Out &ou
             y[f] = metal::fma(float2(d), reinterpret_cast<thread float2 &>(acc[f].thread_elements()), y[f]);
             if constexpr (PAIRED)
                 y_up[f] = metal::fma(float2(up_d), reinterpret_cast<thread float2 &>(acc_up[f].thread_elements()), y_up[f]);
+        }
+    }
+    if constexpr (BIASED) {
+        // The biases times the activation rows' block sums, eight blocks a
+        // product: the left operand is the lane's row's biases of blocks
+        // c + x, c + x + 1, the right one the block sums of block c + y of
+        // the lane's two activation rows; blocks outside the part's are 0.
+        const uint first = part * blocks / PARTS, end = (part + 1u) * blocks / PARTS;
+        for (uint c = first & ~7u; c < end; c += 8u) {
+            simdgroup_float8x8 left, up_left;
+            if constexpr (matrix_symmetric<W>::biased)
+                reinterpret_cast<thread float2 &>(left.thread_elements()) =
+                    matrix_block_biases<W>(supers, c + at.x, first, end);
+            if constexpr (PAIRED && matrix_symmetric<U>::biased)
+                reinterpret_cast<thread float2 &>(up_left.thread_elements()) =
+                    matrix_block_biases<U>(up_supers, c + at.x, first, end);
+            const uint b = c + at.y;
+            PROJECTION_UNROLL for (uint f = 0; f < NB; ++f) {
+                float2 sums = float2(0.0f);
+                if (b >= first && b < end) {
+                    if constexpr (STAGED)
+                        sums = *reinterpret_cast<threadgroup const float2 *>(block_sums + b * 8u * NB + 8u * f + at.x);
+                    else
+                        sums = matrix_block_sums<UNIT>(in, min(8u * f + at.x, m_rows - 1u),
+                            min(8u * f + at.x + 1u, m_rows - 1u), b);
+                }
+                simdgroup_float8x8 right, product;
+                reinterpret_cast<thread float2 &>(right.thread_elements()) = sums;
+                if constexpr (matrix_symmetric<W>::biased) {
+                    simdgroup_multiply(product, left, right);
+                    y[f] += reinterpret_cast<thread float2 &>(product.thread_elements());
+                }
+                if constexpr (PAIRED && matrix_symmetric<U>::biased) {
+                    simdgroup_multiply(product, up_left, right);
+                    y_up[f] += reinterpret_cast<thread float2 &>(product.thread_elements());
+                }
+            }
         }
     }
     if constexpr (PAIRED) {
@@ -3283,18 +3359,10 @@ inline void gemv_matrix_products(thread const In &in, thread const Out &out, thr
         if constexpr (PAIRED)
             y_up[f] = float2(0.0f);
     }
-    // The activation rows' block sums, staged once per threadgroup behind
-    // the exchange where they fit (block_sums[(8 NB) g + m]); a lane sums its
-    // own otherwise. Either way a sum is `matrix_block_sum`.
-    threadgroup float *block_sums = reinterpret_cast<threadgroup float *>(parts + simdgroups * 32u * NB);
-    if constexpr (STAGED && !PREPARED) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint item = sg * 32u + lane; item < 8u * NB * (k / 32u); item += simdgroups * 32u) {
-            const uint row_m = item % (8u * NB);
-            block_sums[item] = row_m < m_rows ? matrix_block_sum<UNIT>(in, row_m, item / (8u * NB)) : 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+    // The activation rows' block sums, staged where they fit; a lane sums
+    // its own otherwise. Either way a sum is `matrix_block_sum`.
+    threadgroup float *block_sums = matrix_stage_block_sums<NB, UNIT>(in, m_rows, k, shared, simdgroups, sg, lane,
+        STAGED && !PREPARED);
     for (uint block = part * blocks / PARTS; block < (part + 1u) * blocks / PARTS; ++block) {
         const typename K::fields::words fields = K::group_fields(row.row, row.geometry, block);
         const typename K::group_factors factors = K::factors(row.row, row.geometry, block);
@@ -3496,20 +3564,42 @@ struct matrix_form<W, false, true, false> {
                 lane);
     }
 };
+// The 32-column matrix GEMV of `gate` and, PAIRED, `up` (`matrix_symmetric`),
+// for the operand's strides and, where a weight is biased, whether the block
+// sums are staged (PREPARED: by a product before it).
+template <bool PAIRED, uint NB, uint PARTS, bool PREPARED, typename W, typename U, typename In, typename Out>
+inline void gemv_matrix_symmetric(thread const In &in, thread const Out &out, thread const Weights<W> &w,
+    thread const Weights<U> &u, uint m_rows, uint rows, uint k, uint group, threadgroup uchar *shared,
+    uint simdgroups, uint sg, uint lane) {
+    const bool staged = (matrix_symmetric<W>::biased || (PAIRED && matrix_symmetric<U>::biased))
+        && gemv_matrix_shared_bytes(k, NB, simdgroups) <= gemv_matrix_staged_bytes;
+    if (matrix_unit(in)) {
+        if (staged)
+            gemv_matrix_symmetric_body<PAIRED, NB, PARTS, true, true, PREPARED>(in, out, w, u, m_rows, rows, k, group,
+                shared, simdgroups, sg, lane);
+        else
+            gemv_matrix_symmetric_body<PAIRED, NB, PARTS, true, false, false>(in, out, w, u, m_rows, rows, k, group,
+                shared, simdgroups, sg, lane);
+    } else if (staged) {
+        gemv_matrix_symmetric_body<PAIRED, NB, PARTS, false, true, PREPARED>(in, out, w, u, m_rows, rows, k, group,
+            shared, simdgroups, sg, lane);
+    } else {
+        gemv_matrix_symmetric_body<PAIRED, NB, PARTS, false, false, false>(in, out, w, u, m_rows, rows, k, group,
+            shared, simdgroups, sg, lane);
+    }
+}
 template <typename W>
 struct matrix_form<W, false, false, true> {
     static_assert(matrix_symmetric<W>::implemented(), "an admitted weight has the symmetric matrix GEMV");
     static constant constexpr bool available = true;
-    static constant constexpr bool stages_block_sums = false;
+    static constant constexpr bool stages_block_sums = matrix_symmetric<W>::biased;
     static constant constexpr bool symmetric32 = true;
     template <uint NB, uint PARTS, bool PREPARED = false, typename In, typename Out>
     static void run(thread const In &in, thread const Out &out, thread const Weights<W> &w,
         uint m_rows, uint rows, uint k, uint group, threadgroup uchar *shared,
         uint simdgroups, uint sg, uint lane) {
-        if (matrix_unit(in))
-            gemv_matrix_symmetric_body<false, NB, PARTS, true>(in, out, w, w, m_rows, rows, k, group, shared, simdgroups, sg, lane);
-        else
-            gemv_matrix_symmetric_body<false, NB, PARTS, false>(in, out, w, w, m_rows, rows, k, group, shared, simdgroups, sg, lane);
+        gemv_matrix_symmetric<false, NB, PARTS, PREPARED>(in, out, w, w, m_rows, rows, k, group, shared, simdgroups,
+            sg, lane);
     }
 };
 
@@ -3606,10 +3696,8 @@ inline void gemv_matrix_paired_body(thread const In &in, thread const Out &out,
     uint rows, uint k, uint group, threadgroup uchar *shared, uint simdgroups,
     uint sg, uint lane) {
     if constexpr (matrix_form<G>::symmetric32 && matrix_form<U>::symmetric32) {
-        if (matrix_unit(in))
-            gemv_matrix_symmetric_body<true, NB, PARTS, true>(in, out, gate, up, m_rows, rows, k, group, shared, simdgroups, sg, lane);
-        else
-            gemv_matrix_symmetric_body<true, NB, PARTS, false>(in, out, gate, up, m_rows, rows, k, group, shared, simdgroups, sg, lane);
+        gemv_matrix_symmetric<true, NB, PARTS, false>(in, out, gate, up, m_rows, rows, k, group, shared, simdgroups,
+            sg, lane);
         return;
     }
     // The two products share each loaded and decoded activation fragment.

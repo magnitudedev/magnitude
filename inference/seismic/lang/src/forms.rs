@@ -693,7 +693,9 @@ enum MetalMatrix {
     /// F16 integer (`matrix_runs`, `MATRIX_RUNS` 2).
     Runs { halves: bool },
     /// Codes of `i8` under a direct scale per 32 columns or a multiple of
-    /// them without a bias, exact F16 integers (`matrix_symmetric`).
+    /// them, with or without a stored bias, exact F16 integers
+    /// (`matrix_symmetric`): a bias folds as itself times the activation
+    /// rows' block sums.
     Symmetric,
 }
 
@@ -725,7 +727,7 @@ fn metal_matrix(weight: &Weight) -> Option<MetalMatrix> {
                 halves: product < 2048,
             })
         }
-        (group, LocalScale::Stored(_), Bias::None)
+        (group, LocalScale::Stored(_), Bias::None | Bias::Stored)
             if group % 32 == 0
                 && profile.codes.fits_i8()
                 && producers::lanes(METAL_MATRIX_SYMMETRIC, weight).is_some() =>
@@ -1035,7 +1037,7 @@ mod tests {
                 None,
                 Some(MetalMatrix::Symmetric),
             ),
-            ("q5g32", pack(1, 16, 0, false), None, None),
+            ("q5g32", pack(1, 16, 0, false), None, Some(MetalMatrix::Symmetric)),
             ("mxfp4g32", pack(1, 16, 16, false), None, Some(MetalMatrix::Symmetric)),
             ("nvfp4g16", pack(2, 16, 16, false), None, None),
             ("nvfp4g16a4", pack(2, 16, 16, false), None, None),
@@ -1052,7 +1054,7 @@ mod tests {
                 Some(MetalMatrix::Runs { halves: true }),
             ),
             ("iq2xxs", None, None, None),
-            ("q4g32", pack(1, 8, 0, false), None, None),
+            ("q4g32", pack(1, 8, 0, false), None, Some(MetalMatrix::Symmetric)),
             ("q2k", None, None, None),
             (
                 "q2g256",
