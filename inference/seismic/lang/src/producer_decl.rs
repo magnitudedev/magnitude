@@ -19,7 +19,8 @@
 //! takes the producer's patterns (narrowed to its `codes`, where it names
 //! them) and requirements, read with its `locals`. `enter` states how a
 //! lane producer's codes enter its lanes: as `pairs` at any zero from the
-//! code's own, or as `bytes` at the code's own zero, or at `bytes:ZERO`.
+//! code's own, or as `bytes` at the code's own zero, or at `bytes:ZERO`;
+//! a producer of bytes also serves pairs at any zero (`Lanes::enter_at`).
 //! `values=i8` takes only weights whose values are signed bytes.
 //!
 //! A requirement is an expression in C preprocessor syntax (`|| && & == !=

@@ -6,7 +6,8 @@
 # (low.high bits), `locals` (direct, plane[:unsigned], carried); `*` is any.
 # A lane producer's pattern also states how its codes `enter` the lanes:
 # as `pairs`, at any zero from the code's own, or as `bytes`, at the code's
-# own zero or at `bytes:ZERO`; form admission and the decode functions both
+# own zero or at `bytes:ZERO`, which also serve pairs at any zero (one add
+# moves a pair, `byte_lane_pair`); form admission and the decode functions both
 # read it (`producers::lane_bytes`, `producers::lane_zero`). `values=i8`
 # takes only weights whose values are signed bytes, which admission reads.
 # A declared pattern without a decode function fails the library's build

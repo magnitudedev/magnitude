@@ -499,11 +499,12 @@ pub fn metal_packing_of(id: RepresentationId) -> Option<MetalPacking> {
 
 /// The token-packing GEMM (`packing_layout`, `packing_factors`).
 ///
-/// Its arithmetic requires integer values, not scaled by a power of two of
-/// their own, whose coefficients fold per run of a 32-column block: a factor
-/// per 256 columns over local codes, or direct groups of whole runs in 256
-/// columns; and a block of two runs only without a bias term,
-/// (centre - offset) scale + bias.
+/// Its arithmetic requires integer values whose coefficients fold per run
+/// of a 32-column block: a factor per 256 columns over local codes, or
+/// direct groups of whole runs in 256 columns; and a block of two runs only
+/// without a bias term, (centre - offset) scale + bias. A power of two
+/// scaling the values (E2M1's halves) is in the coefficients, which the
+/// decoder folds it into.
 ///
 /// Its producer packs a weight's lane codes (`producers::lanes`) as entries,
 /// the values + `offset`, of the fewest bits that hold them centred as the
@@ -534,7 +535,7 @@ fn metal_packing(weight: &Weight) -> Option<MetalPacking> {
         Some(upper) => upper.group == 256,
         None => 256 % profile.local.group == 0,
     };
-    let requires = profile.code_exponent == 0 && factors && (folds == 1 || !biased);
+    let requires = factors && (folds == 1 || !biased);
     (requires && entries).then_some(MetalPacking {
         folds,
         centre,
@@ -698,17 +699,15 @@ enum MetalMatrix {
 
 /// The matrix GEMV product serving a weight.
 ///
-/// Each product's arithmetic requires integer codes not scaled by a power
-/// of two of their own, under its levels (`MetalMatrix`). Its producer takes
+/// Each product's arithmetic requires integer codes under its levels
+/// (`MetalMatrix`), a power of two scaling them folded into their scales
+/// (E2M1's halves, `packets::Direct`). Its producer takes
 /// the weight's lane codes (`producers::lanes`): unsigned codes with plain
 /// unsigned local codes of the scales plane (`Codes`), any lane codes with
 /// local codes of the scales plane (`Runs`), or any lane codes
 /// (`Symmetric`), as its declaration states.
 fn metal_matrix(weight: &Weight) -> Option<MetalMatrix> {
     let profile = weight.axes.profile();
-    if profile.code_exponent != 0 {
-        return None;
-    }
     let factors = profile.upper.is_some_and(|upper| upper.group == 256);
     match (profile.local.group, profile.local.scale, profile.local.bias) {
         (32, LocalScale::Code(locals), Bias::Minimum { .. })
@@ -974,7 +973,14 @@ mod tests {
             assert_eq!(folds.of(info.id), pack.of(info.id) * groups, "{}", info.name);
             assert_eq!(interleaved.of(info.id), int8.of(info.id) * u32::from(nibbles), "{}", info.name);
         }
-        let expected = [("q4k", 1, 1), ("q6k", 2, 0), ("q8g32s", 1, 0), ("q4g32s", 1, 0), ("mxfp4g32", 0, 0)];
+        let expected = [
+            ("q4k", 1, 1),
+            ("q6k", 2, 0),
+            ("q8g32s", 1, 0),
+            ("q4g32s", 1, 0),
+            ("mxfp4g32", 1, 0),
+            ("nvfp4g16", 2, 0),
+        ];
         for (storage, runs, nibbles) in expected {
             let id = registry::storage(storage, registry::Layout::Rows32).unwrap();
             assert_eq!((folds.of(id), interleaved.of(id)), (runs, nibbles), "{storage}");
@@ -1030,9 +1036,9 @@ mod tests {
                 Some(MetalMatrix::Symmetric),
             ),
             ("q5g32", pack(1, 16, 0, false), None, None),
-            ("mxfp4g32", None, None, None),
-            ("nvfp4g16", None, None, None),
-            ("nvfp4g16a4", None, None, None),
+            ("mxfp4g32", pack(1, 16, 16, false), None, Some(MetalMatrix::Symmetric)),
+            ("nvfp4g16", pack(2, 16, 16, false), None, None),
+            ("nvfp4g16a4", pack(2, 16, 16, false), None, None),
             (
                 "iq2xs",
                 pack(2, 64, 64, false),

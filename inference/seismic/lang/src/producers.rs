@@ -219,13 +219,16 @@ pub struct Lanes {
 
 impl Lanes {
     /// Whether the codes enter as their values + `offset`, in a layout of
-    /// bytes (`bytes`) or of pairs: a producer of bytes serves either at
-    /// its zero, a producer of pairs only pairs, at any zero from its own.
+    /// bytes (`bytes`) or of pairs: a producer of bytes serves bytes at its
+    /// zero and pairs at any zero (one add moves a pair's two codes), a
+    /// producer of pairs only pairs, at any zero from its own. The form
+    /// takes an offset at which its values are non-negative.
     pub fn enter_at(self, offset: u32, bytes: bool) -> bool {
-        if self.bytes {
-            offset == self.zero
-        } else {
-            !bytes && offset >= self.zero
+        match (self.bytes, bytes) {
+            (true, true) => offset == self.zero,
+            (true, false) => true,
+            (false, true) => false,
+            (false, false) => offset >= self.zero,
         }
     }
 }

@@ -966,7 +966,7 @@ pub struct DecodeRecipe {
 
 impl DecodeRecipe {
     /// Resolve a semantic role from the same recipe that decodes this value.
-    /// Floating-code formats intentionally have no integer-code role.
+    /// Floating codes without a codebook (E4M3) have no integer-code role.
     pub fn component(&self, role: QuantizedComponent) -> Option<DecodeComponent> {
         match role {
             QuantizedComponent::Code => self.integer_code.map(DecodeComponent::Temporary),
@@ -2695,7 +2695,16 @@ impl Repr {
         };
         let raw = recipe.read(PlaneField::Words, 0);
         let (code_value, integer_code) = match self.coding.codes() {
-            CodeStorage::Float(format) => (recipe.float_code(raw, format), None),
+            // A codebook's floating codes are its integers under the
+            // codebook's exponent (`FloatCodeFormat::codebook`, as the
+            // decode axes read them); E4M3's have no integer code. The
+            // value is the raw code's last reader, its decode.
+            CodeStorage::Float(format) => {
+                let code = format.codebook().map(|(codebook, _)| {
+                    recipe.interpret(raw, format.bits(), CodeInterpretation::Table(codebook))
+                });
+                (recipe.float_code(raw, format), code)
+            }
             CodeStorage::Fields {
                 bits,
                 interpretation,

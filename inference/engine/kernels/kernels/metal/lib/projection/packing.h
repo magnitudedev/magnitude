@@ -300,10 +300,10 @@ struct packing_layout<L, 1, true> {
 // are scale 32767 / 64 and its min term (CENTRE - OFFSET) scale + bias, or
 // with two runs the runs' scales 32767 / 64. The fold takes a sum of at most
 // 1 of the first and a code sum / 64 below 128 of the second, so 512 |scale|
-// + 128 |min term| bounds what it multiplies (`reach`). Implemented for
-// codes not scaled by a power of two of their own, a block of two runs
-// without a min term and the run of a 256-column block's factors one factor
-// group's or eight packets'.
+// + 128 |min term| bounds what it multiplies (`reach`). Implemented for a
+// block of two runs without a min term and the run of a 256-column block's
+// factors one factor group's or eight packets'; a power of two scaling the
+// codes is in their scales (`packets::Direct`, `packets::Hier`).
 template <typename K, uint CENTRE, uint OFFSET>
 struct packing_factors {
     static constant constexpr bool implemented = false;
@@ -337,11 +337,11 @@ inline float2 packing_block_factors(thread const typename K::coefficients &k) {
 // Hierarchical coefficients in the scales plane: a block's factors from the
 // factor group's run (`packets::Hier::run`), bounded by the local codes'
 // largest magnitude under the group's factors.
-template <typename FS, int EXPONENT, uint LOCAL_BITS, typename L, uint GROUP, bool MIN, int BIAS_SIGN,
-    uint CENTRE, uint OFFSET>
-struct packing_factors<packets::Hier<FS, 256u, EXPONENT, 0, LOCAL_BITS, L, GROUP, MIN, BIAS_SIGN, 0u>, CENTRE,
-    OFFSET> {
-    typedef packets::Hier<FS, 256u, EXPONENT, 0, LOCAL_BITS, L, GROUP, MIN, BIAS_SIGN, 0u> K;
+template <typename FS, int EXPONENT, int CODE_EXPONENT, uint LOCAL_BITS, typename L, uint GROUP, bool MIN,
+    int BIAS_SIGN, uint CENTRE, uint OFFSET>
+struct packing_factors<packets::Hier<FS, 256u, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP, MIN, BIAS_SIGN, 0u>,
+    CENTRE, OFFSET> {
+    typedef packets::Hier<FS, 256u, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP, MIN, BIAS_SIGN, 0u> K;
     static constant constexpr bool biased = MIN || CENTRE != OFFSET;
     static_assert(K::groups == 1 || !biased, "a block of two runs has no min term");
     static constant constexpr bool implemented = true;
@@ -361,9 +361,9 @@ struct packing_factors<packets::Hier<FS, 256u, EXPONENT, 0, LOCAL_BITS, L, GROUP
 
 // Direct coefficients: a block's factors from its eight packets' own,
 // bounded by the largest of them.
-template <typename S, uint GROUP, bool BIAS, uint STORAGE, uint CENTRE, uint OFFSET>
-struct packing_factors<packets::Direct<S, GROUP, BIAS, STORAGE, 0>, CENTRE, OFFSET> {
-    typedef packets::Direct<S, GROUP, BIAS, STORAGE, 0> K;
+template <typename S, uint GROUP, bool BIAS, uint STORAGE, int EXPONENT, uint CENTRE, uint OFFSET>
+struct packing_factors<packets::Direct<S, GROUP, BIAS, STORAGE, EXPONENT>, CENTRE, OFFSET> {
+    typedef packets::Direct<S, GROUP, BIAS, STORAGE, EXPONENT> K;
     static constant constexpr bool biased = BIAS || CENTRE != OFFSET;
     static_assert(K::groups == 1 || !biased, "a block of two runs has no min term");
     static_assert(256u % GROUP == 0u, "a 256-column block holds whole groups");

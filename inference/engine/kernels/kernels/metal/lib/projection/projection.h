@@ -2439,10 +2439,12 @@ inline void gemm_row_paired(thread const In &in, thread const Out &out, thread c
 // `fields`) and their words (`spread`, or `moved` on by positions), which
 // PACK carries ahead apart (`packing_fetch`). One reader per code source:
 // linear codes of code planes of every split the registry makes
-// (`registry::code_planes`), entering as their stored codes or above them; a
-// codebook's values, entering at 128 (`codebooks::pairs`); and grid entries'
-// values, entering at any ZERO. Where `bytes()`, a chunk's words are its
-// eight codes as bytes in column order, as `packing_byte_step` reads them.
+// (`registry::code_planes`), entering as their stored codes or above them
+// (8-bit codes as bytes at their zero, or as pairs at any ZERO); a
+// codebook's values, as bytes at 128 (`codebooks::pairs`) or as pairs at any
+// ZERO; and grid entries' values, entering at any ZERO. Where `bytes()`, a
+// chunk's words are its eight codes as bytes in column order, as
+// `packing_byte_step` reads them.
 
 // The codes of one plane of B-bit codes (B 1, 2 or 4) in a chunk: B bytes at
 // byte B k of the packet's unit of 4 B bytes, code i at bit B i
@@ -2503,6 +2505,18 @@ struct chunk_plane {
 // byte p of each word.
 inline uint chunk_byte_pair(uint2 codes, uint p) {
     return ((codes.x >> (8u * p)) & 0xffu) | (((codes.y >> (8u * p)) & 0xffu) << 16);
+}
+
+// A byte lane's pair p (`chunk_byte_pair`) of codes stored at zero OWN,
+// entering at ZERO: one add moves both halves, which the form's admission
+// keeps non-negative (`producers::Lanes::enter_at`).
+template <int OWN, int ZERO>
+inline uint byte_lane_pair(uint2 codes, uint p) {
+    const uint pair = chunk_byte_pair(codes, p);
+    if constexpr (ZERO != OWN)
+        return pair + uint(ZERO - OWN) * 0x00010001u;
+    else
+        return pair;
 }
 
 // The zero code a producer's codes enter at by themselves: a linear code's
@@ -2620,7 +2634,8 @@ struct lane_codes<packets::Planes<LOW, HIGH>, packets::Linear<MASK, Z>, ZERO> {
 };
 
 // Linear codes of a plane of bytes, MASK flipped (two's complement bytes
-// become offset binary), entering at their zero.
+// become offset binary): bytes entering at their zero, or pairs at any ZERO
+// (`byte_lane_pair`).
 template <uint MASK, int Z, int ZERO>
 struct lane_codes<packets::Planes<8, 0>, packets::Linear<MASK, Z>, ZERO> {
     typedef uint place;
@@ -2628,11 +2643,11 @@ struct lane_codes<packets::Planes<8, 0>, packets::Linear<MASK, Z>, ZERO> {
     static constexpr bool implemented() {
         return producers::lane(code_of<packets::Linear<MASK, Z>>::value(), 8u, 0u)
             && producers::lane_bytes(code_of<packets::Linear<MASK, Z>>::value(), 8u, 0u)
-            && ZERO == producers::lane_zero(code_of<packets::Linear<MASK, Z>>::value(), 8u, 0u, Z) && ZERO == Z;
+            && producers::lane_zero(code_of<packets::Linear<MASK, Z>>::value(), 8u, 0u, Z) == Z;
     }
-    static constexpr int zero() { return Z; }
-    static constexpr bool bytes() { return true; }
-    static constexpr bool byte_words() { return true; }
+    static constexpr int zero() { return ZERO; }
+    static constexpr bool bytes() { return ZERO == Z; }
+    static constexpr bool byte_words() { return bytes(); }
     static uint2 byte_codes(words codes) { return codes; }
     template <typename W>
     static place at(thread const Weights<W> &w, thread const typename Weights<W>::located &row, uint k) {
@@ -2646,24 +2661,24 @@ struct lane_codes<packets::Planes<8, 0>, packets::Linear<MASK, Z>, ZERO> {
         else
             return *slab::as<uint2>(w.base + at + g * 32u * w.layout.tile + chunks * 8u) ^ MASK;
     }
-    static uint pair(words codes, uint p) { return chunk_byte_pair(codes, p); }
+    static uint pair(words codes, uint p) { return byte_lane_pair<Z, ZERO>(codes, p); }
     static words shift(words codes, uint positions) { return codes >> (8u * positions); }
 };
 
 // A codebook's 4-bit codes: the lane's four bytes of codes become its eight
 // values + 128 (`codebooks::pairs`, each code byte's two values), a byte
-// each.
+// each: bytes entering at 128, or pairs at any ZERO (`byte_lane_pair`).
 template <uint ID, int ZERO>
 struct lane_codes<packets::Planes<4, 0>, packets::Table<ID>, ZERO> {
     typedef uint place;
     typedef uint2 words;
+    static constexpr int own() { return producers::lane_zero(producers::TABLE, 4u, 0u, 0); }
     static constexpr bool implemented() {
-        return producers::lane(producers::TABLE, 4u, 0u) && producers::lane_bytes(producers::TABLE, 4u, 0u)
-            && ZERO == producers::lane_zero(producers::TABLE, 4u, 0u, 0);
+        return producers::lane(producers::TABLE, 4u, 0u) && producers::lane_bytes(producers::TABLE, 4u, 0u);
     }
-    static constexpr int zero() { return producers::lane_zero(producers::TABLE, 4u, 0u, 0); }
-    static constexpr bool bytes() { return true; }
-    static constexpr bool byte_words() { return true; }
+    static constexpr int zero() { return ZERO; }
+    static constexpr bool bytes() { return ZERO == own(); }
+    static constexpr bool byte_words() { return bytes(); }
     static uint2 byte_codes(words codes) { return codes; }
     template <typename W>
     static place at(thread const Weights<W> &w, thread const typename Weights<W>::located &row, uint k) {
@@ -2676,7 +2691,7 @@ struct lane_codes<packets::Planes<4, 0>, packets::Table<ID>, ZERO> {
         return uint2(uint(pairs[codes & 0xffu]) | (uint(pairs[(codes >> 8) & 0xffu]) << 16),
             uint(pairs[(codes >> 16) & 0xffu]) | (uint(pairs[codes >> 24]) << 16));
     }
-    static uint pair(words codes, uint p) { return chunk_byte_pair(codes, p); }
+    static uint pair(words codes, uint p) { return byte_lane_pair<own(), ZERO>(codes, p); }
     static words shift(words codes, uint positions) { return codes >> (8u * positions); }
 };
 
@@ -2875,11 +2890,11 @@ template <typename W>
 struct matrix_runs {
     static constexpr bool implemented() { return false; }
 };
-template <typename P, typename C, typename FS, int EXPONENT, uint LOCAL_BITS, typename L, uint GROUP, int BIAS_SIGN,
-    typename F>
-struct matrix_runs<packets::Packet<P, C, packets::Hier<FS, 256u, EXPONENT, 0, LOCAL_BITS, L, GROUP, false, BIAS_SIGN, 0u>,
-    F>> {
-    typedef packets::Hier<FS, 256u, EXPONENT, 0, LOCAL_BITS, L, GROUP, false, BIAS_SIGN, 0u> K;
+template <typename P, typename C, typename FS, int EXPONENT, int CODE_EXPONENT, uint LOCAL_BITS, typename L, uint GROUP,
+    int BIAS_SIGN, typename F>
+struct matrix_runs<packets::Packet<P, C,
+    packets::Hier<FS, 256u, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP, false, BIAS_SIGN, 0u>, F>> {
+    typedef packets::Hier<FS, 256u, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP, false, BIAS_SIGN, 0u> K;
     typedef L local;
     typedef lane_codes<P, C> lanes;
     static constexpr bool implemented() { return lanes::implemented(); }
@@ -2897,9 +2912,9 @@ template <typename W>
 struct matrix_symmetric {
     static constexpr bool implemented() { return false; }
 };
-template <typename P, typename C, typename S, uint GROUP, uint STORAGE, typename F>
-struct matrix_symmetric<packets::Packet<P, C, packets::Direct<S, GROUP, false, STORAGE, 0>, F>> {
-    typedef packets::Direct<S, GROUP, false, STORAGE, 0> K;
+template <typename P, typename C, typename S, uint GROUP, uint STORAGE, int EXPONENT, typename F>
+struct matrix_symmetric<packets::Packet<P, C, packets::Direct<S, GROUP, false, STORAGE, EXPONENT>, F>> {
+    typedef packets::Direct<S, GROUP, false, STORAGE, EXPONENT> K;
     typedef lane_codes<P, C> lanes;
     static constexpr bool implemented() { return lanes::implemented() && GROUP % 32u == 0u; }
 };
