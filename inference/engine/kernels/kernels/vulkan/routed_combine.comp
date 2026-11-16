@@ -20,6 +20,12 @@
 #else
 #error "routed_combine requires a bf16 or f16 activation"
 #endif
+// The shared expert's GEMMs: the declaration's tuned tile and sub-tile.
+#define PROJECTION_GEMM_TM SEISMIC_TUNE_TILE_M
+#define PROJECTION_GEMM_TN SEISMIC_TUNE_TILE_N
+#define PROJECTION_GEMM_WM SEISMIC_TUNE_SUB_M
+#define PROJECTION_GEMM_WN SEISMIC_TUNE_SUB_N
+#include "lib/projection/gemm.glsl"
 
 
 
@@ -35,7 +41,7 @@ void routed_combine_expand() {
     const projection_weights up = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_UP), PACKETS_W1_ROWS, 0ul, hidden);
     const projection_epilogue out_ = projection_silu_mul(ROUTED_ACT, out_over_scratch(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT)),
         SEISMIC_DIM_S, 1ul);
-    projection_gemm_paired(PACKETS_W0, PACKETS_W1, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N, x, out_, gate, up,
+    projection_gemm_paired(PACKETS_W0, PACKETS_W1, x, out_, gate, up,
         uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_S), hidden, gl_WorkGroupID.y, gl_WorkGroupID.x, 0xffffffffu);
 }
 
@@ -47,7 +53,7 @@ void routed_combine_down() {
         shared_features);
     const projection_epilogue out_ = projection_store(
         out_over_scratch(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_SHARED_OUTPUT)), SEISMIC_DIM_H, 1ul, 0ul);
-    projection_gemm(PACKETS_W2, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N, x, out_, down, uint(SEISMIC_DIM_M),
+    projection_gemm(PACKETS_W2, x, out_, down, uint(SEISMIC_DIM_M),
         uint(SEISMIC_DIM_H), shared_features, gl_WorkGroupID.y, gl_WorkGroupID.x, 0xffffffffu);
 }
 

@@ -39,6 +39,13 @@
 // PACKETS_STAGED_TABLES before including `projection.glsl` reads from the
 // end of each such launch's shared region (`dense.seismic` holds them there).
 
+// The GEMM's shape: the declaration's tuned tile and sub-tile.
+#define PROJECTION_GEMM_TM SEISMIC_TUNE_TILE_M
+#define PROJECTION_GEMM_TN SEISMIC_TUNE_TILE_N
+#define PROJECTION_GEMM_WM SEISMIC_TUNE_SUB_M
+#define PROJECTION_GEMM_WN SEISMIC_TUNE_SUB_N
+#include "gemm.glsl"
+
 #define PROJECTION_GROUP(z) (PROJECTION_G == 1 ? 0u : uint(z))
 
 // The stage launch of `rms` and `plain` rows: one row a workgroup, the
@@ -75,12 +82,10 @@ void projection_single_gemm() {
     packets_stage_tables();
     const uint g = PROJECTION_GROUP(gl_WorkGroupID.z / PROJECTION_SPLIT);
 #if PROJECTION_SPLIT == 1
-    projection_gemm(PACKETS_W0, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N,
-        projected_rows(g), projected_output(g), projected_weight(g), PROJECTION_M, PROJECTION_N, PROJECTION_K,
+    projection_gemm(PACKETS_W0, projected_rows(g), projected_output(g), projected_weight(g), PROJECTION_M, PROJECTION_N, PROJECTION_K,
         gl_WorkGroupID.y, gl_WorkGroupID.x, 0xffffffffu);
 #else
-    projection_gemm_part(PACKETS_W0, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N,
-        projected_rows(g), projection_single_partials(g), projected_weight(g), PROJECTION_M, PROJECTION_N,
+    projection_gemm_part(PACKETS_W0, projected_rows(g), projection_single_partials(g), projected_weight(g), PROJECTION_M, PROJECTION_N,
         PROJECTION_K, PROJECTION_SPLIT, gl_WorkGroupID.z % PROJECTION_SPLIT, gl_WorkGroupID.y, gl_WorkGroupID.x);
 #endif
 }
@@ -107,8 +112,7 @@ void projection_paired_gemv(const uint maxm) {
 // A pair's tile takes TILE_N / 2 features of each weight.
 void projection_paired_gemm() {
     packets_stage_tables();
-    projection_gemm_paired(PACKETS_W0, PACKETS_W1, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M,
-        SEISMIC_TUNE_SUB_N, projected_rows(0u), projected_output(0u), projected_weight(0u), projected_partner(0u),
+    projection_gemm_paired(PACKETS_W0, PACKETS_W1, projected_rows(0u), projected_output(0u), projected_weight(0u), projected_partner(0u),
         PROJECTION_M, PROJECTION_N, PROJECTION_K, gl_WorkGroupID.y, gl_WorkGroupID.x, 0xffffffffu);
 }
 #endif
@@ -179,8 +183,8 @@ void projection_segmented_gemv(const uint maxm) {
                 return;                                                                                 \
             }                                                                                           \
             if (PROJECTION_PAIRED##s) {                                                                 \
-                projection_gemm_paired(PROJECTION_KIND##s, PROJECTION_PARTNER_KIND##s, tm, tn,          \
-                    SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N, x, PROJECTION_OUTPUT##s, PROJECTION_WEIGHT##s, \
+                projection_gemm_paired(PROJECTION_KIND##s, PROJECTION_PARTNER_KIND##s, x,               \
+                    PROJECTION_OUTPUT##s, PROJECTION_WEIGHT##s,                                         \
                     PROJECTION_PARTNER##s, m, uint(PROJECTION_N##s), PROJECTION_K, gl_WorkGroupID.y, tile, \
                     0xffffffffu);                                                                       \
                 return;                                                                                 \
@@ -206,7 +210,7 @@ void projection_segmented_gemm() {
     projection_epilogue out_;
     uint rows = 0u;
     PROJECTION_EACH_SEGMENT(PROJECTION_SEGMENT_GEMM)
-    projection_gemm(kind, tm, tn, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N, x, out_, w, m, rows, PROJECTION_K,
+    projection_gemm(kind, x, out_, w, m, rows, PROJECTION_K,
         gl_WorkGroupID.y, tile, 0xffffffffu);
 }
 

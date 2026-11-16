@@ -16,7 +16,7 @@ fn every_vulkan_user_of_the_projection_gemm_excludes_its_spilling_sub_tile() {
     let module = common::kernels();
     let manifest = std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR");
     let directory = std::path::Path::new(&manifest).join("kernels");
-    let template = std::fs::read_to_string(directory.join("vulkan/lib/projection/projection.glsl"))
+    let template = std::fs::read_to_string(directory.join("vulkan/lib/projection/gemm.glsl"))
         .expect("the template is readable");
     let stated = |name: &str| -> u64 {
         template
