@@ -133,7 +133,7 @@ impl WeightKernels {
             out.len()
         );
         let width = out.len() / activations;
-        if let Some(span) = self.span(geometry) {
+        if let Some(span) = self.span(geometry, activations) {
             return unsafe { span(rows, geometry, width, x.as_ptr(), activations, k, out.as_mut_ptr()) };
         }
         let block = row_block(width);
@@ -163,16 +163,22 @@ impl WeightKernels {
     }
 
     /// The call that takes any number of rows and activation rows at once
-    /// ([`Self::dot_q8`]'s whole span), for rows laid out `rows8` of an
-    /// element with the tile form.
-    fn span(&self, geometry: &RowGeometry) -> Option<SpanFn> {
-        self.dot_q8_span.filter(|_| geometry.placement == Placement::Rows8)
+    /// ([`Self::dot_q8`]'s whole span), for `activations` rows against
+    /// `rows8` rows of an element with the tile form, where it is the
+    /// cheaper: always for codes in panels, which its tiles read where they
+    /// lie; for grid entries, which both forms decode alike, only for more
+    /// activation rows than a row call takes, since a row call feeds each
+    /// decoded packet to its dots directly where the tile form transposes
+    /// it into a panel first.
+    fn span(&self, geometry: &RowGeometry, activations: usize) -> Option<SpanFn> {
+        let pays = !geometry.grids || activations > ACTIVATION_GROUPS[ACTIVATION_GROUPS.len() - 1];
+        self.dot_q8_span.filter(|_| geometry.placement == Placement::Rows8 && pays)
     }
 
     /// Whether [`Self::dot_q8`] takes any row count in one call, not row
-    /// blocks ([`ROW_BLOCKS`]) a call.
+    /// blocks ([`ROW_BLOCKS`]) a call, for every count of activation rows.
     pub fn spans(&self, geometry: &RowGeometry) -> bool {
-        self.span(geometry).is_some()
+        self.span(geometry, 1).is_some()
     }
 
     /// Whether the element has the tile form ([`Self::tile_q8`]).

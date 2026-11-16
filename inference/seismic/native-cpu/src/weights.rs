@@ -1290,6 +1290,27 @@ pub trait Codes: Copy + Send + Sync + 'static {
         use std::arch::x86_64::*;
         unsafe { _mm256_sub_epi8(Self::x86(at), _mm256_set1_epi8(Self::LEAST as i8)) }
     }
+
+    /// [`Codes::x86_pair`] of packet `at` and the next of
+    /// [`Codes::MAGNITUDES`] codes, each as its values' magnitudes and their
+    /// signs: `[|v|, s]`, `s` a lane all ones where `v` is negative, else 1,
+    /// so that `|v| sign(a, s) = v a` exactly. The form the x86 row dots take
+    /// them in; other codes have none.
+    ///
+    /// # Safety
+    /// As [`Codes::x86_pair`].
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn x86_signed_pair(at: At) -> [[std::arch::x86_64::__m256i; 2]; 2] {
+        let _ = at;
+        unreachable!("only magnitude codes (`Codes::MAGNITUDES`) take the signed form")
+    }
+
+    /// Whether the codes are magnitudes (at most 128) under lane signs that
+    /// [`Codes::x86_signed_pair`] gives apart at no cost: the x86 row dots
+    /// then take the magnitudes as unsigned bytes against the activations
+    /// signed by the codes, with no shift (`packed_x86::row_shift`).
+    const MAGNITUDES: bool = false;
 }
 
 /// Codes in a `LOW`-bit low plane and a `HIGH`-bit high plane
@@ -2282,13 +2303,59 @@ impl<
     unsafe fn x86(at: At) -> std::arch::x86_64::__m256i {
         use std::arch::x86_64::*;
         unsafe {
-            let (points, signs, deltas) = Self::parts(at);
-            let mut values = _mm256_set_epi64x(points[3] as i64, points[2] as i64, points[1] as i64, points[0] as i64);
-            if Self::SIGN_BITS > 0 {
-                let negative = packed_x86::lane_masks(signs);
-                values = _mm256_sub_epi8(_mm256_xor_si256(values, negative), negative);
-            }
+            let (points, negative, deltas) = Self::x86_parts(at);
+            let values = if Self::SIGN_BITS > 0 {
+                _mm256_sub_epi8(_mm256_xor_si256(points, negative), negative)
+            } else {
+                points
+            };
             D::x86(values, deltas)
+        }
+    }
+
+    // A signed grid's points are its magnitudes, its lane signs their signs.
+    const MAGNITUDES: bool = Self::SIGN_BITS > 0 && D::BITS == 0;
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn x86_signed_pair(at: At) -> [[std::arch::x86_64::__m256i; 2]; 2] {
+        use std::arch::x86_64::*;
+        assert!(Self::MAGNITUDES, "only a signed grid's points are magnitudes");
+        let mut pair = [[unsafe { _mm256_setzero_si256() }; 2]; 2];
+        for (packet, pair) in pair.iter_mut().enumerate() {
+            let (magnitudes, negative, _) = unsafe { Self::x86_parts(at.packet(at.packet + packet)) };
+            *pair = [magnitudes, unsafe { _mm256_or_si256(negative, _mm256_set1_epi8(1)) }];
+        }
+        pair
+    }
+}
+
+impl<
+        const GRID: usize,
+        const INDEX_BITS: u32,
+        const BYTES: usize,
+        const HIGH: u32,
+        const SIGNS: usize,
+        D: GridDelta,
+        const LEAST: i32,
+        const GREATEST: i32,
+    > Grid<GRID, INDEX_BITS, BYTES, HIGH, SIGNS, D, LEAST, GREATEST>
+{
+    /// The packet's points (each entry's in its eight lanes), its negative
+    /// lanes (all ones where the lane sign is set; none without signs) and
+    /// its deltas (`Grid::parts`).
+    ///
+    /// # Safety
+    /// As [`Codes::x86`].
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn x86_parts(at: At) -> (std::arch::x86_64::__m256i, std::arch::x86_64::__m256i, u32) {
+        use std::arch::x86_64::*;
+        unsafe {
+            let (points, signs, deltas) = Self::parts(at);
+            let points = _mm256_set_epi64x(points[3] as i64, points[2] as i64, points[1] as i64, points[0] as i64);
+            let negative = if Self::SIGN_BITS > 0 { packed_x86::lane_masks(signs) } else { _mm256_setzero_si256() };
+            (points, negative, deltas)
         }
     }
 }
@@ -3698,7 +3765,7 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
         #[cfg(target_arch = "x86_64")]
         let least = if V::QUANTIZED_DOTS >= 1 {
             const {
-                match packed_x86::shift::<C>(packed_x86::Products::Bytes16) {
+                match packed_x86::row_shift::<C>() {
                     Some(least) => least,
                     None => 0,
                 }
@@ -3786,21 +3853,35 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
             unsafe {
                 use std::arch::x86_64::*;
                 // The pair products take one 16-bit scale code per half.
-                let shift = const { packed_x86::shift::<C>(packed_x86::Products::Bytes16) };
+                let shift = const { packed_x86::row_shift::<C>() };
                 let mut lanes = [[_mm256_setzero_si256(); M]; N];
                 // A k-block's two packets read together (`Codes::x86_pair`;
                 // the group's packets are whole k-blocks), of both rows of a
-                // pair at once.
+                // pair at once: each packet as its unsigned operand and,
+                // without a shift, the signs its activations take.
                 for pair in packets_of(packets.div_ceil(2)) {
                     let first = 2 * pair;
-                    let weights: [[__m256i; 2]; N] = if N == 2 {
-                        let both = C::x86_partners(groups[0].packet(first), groups[N - 1].packet(first));
-                        std::array::from_fn(|n| both[n])
+                    let mut weights = [[[_mm256_setzero_si256(); 2]; 2]; N];
+                    if N == 1 && C::MAGNITUDES {
+                        weights[0] = C::x86_signed_pair(groups[0].packet(first));
                     } else {
-                        [C::x86_pair(groups[0].packet(first)); N]
-                    };
+                        let values: [[__m256i; 2]; N] = if N == 2 {
+                            let both = C::x86_partners(groups[0].packet(first), groups[N - 1].packet(first));
+                            std::array::from_fn(|n| both[n])
+                        } else {
+                            [C::x86_pair(groups[0].packet(first)); N]
+                        };
+                        for (weights, values) in weights.iter_mut().zip(values) {
+                            for (weights, values) in weights.iter_mut().zip(values) {
+                                *weights = match shift {
+                                    Some(least) => [packed_x86::operands(values, least), values],
+                                    None => [_mm256_abs_epi8(values), values],
+                                };
+                            }
+                        }
+                    }
                     for n in 0..N {
-                        for (local, weights) in (first..(first + 2).min(packets)).zip(weights[n]) {
+                        for (local, [weights, signs]) in (first..(first + 2).min(packets)).zip(weights[n]) {
                             let (first, second) = (codes[n][local][0].0, codes[n][local][1].0);
                             let scales = if whole {
                                 _mm256_set1_epi16(first as i16)
@@ -3813,15 +3894,8 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
                             for m in 0..M {
                                 let activations =
                                     packed_x86::load(x[m].codes.as_ptr().add(PACKET * local));
-                                lanes[n][m] = match shift {
-                                    Some(least) => packed_x86::dot_scaled(lanes[n][m], packed_x86::operands(weights, least), activations, scales),
-                                    None => packed_x86::dot_scaled(
-                                        lanes[n][m],
-                                        _mm256_abs_epi8(weights),
-                                        _mm256_sign_epi8(activations, weights),
-                                        scales,
-                                    ),
-                                };
+                                let activations = if shift.is_some() { activations } else { _mm256_sign_epi8(activations, signs) };
+                                lanes[n][m] = packed_x86::dot_scaled(lanes[n][m], weights, activations, scales);
                             }
                         }
                     }
@@ -5197,6 +5271,18 @@ mod packed_x86 {
             );
             let bits = _mm256_set1_epi64x(0x8040_2010_0804_0201u64 as i64);
             _mm256_cmpeq_epi8(_mm256_and_si256(spread, bits), bits)
+        }
+    }
+
+    /// How the x86 row dots (`Hier::dot_rows`) take codes `C` into
+    /// `maddubs` products: as [`shift`] says, but magnitudes
+    /// (`Codes::MAGNITUDES`) in the sign form, unshifted.
+    pub(super) const fn row_shift<C: Codes>() -> Option<i32> {
+        if C::MAGNITUDES {
+            assert!(-C::LEAST <= Products::Bytes16.greatest() && C::GREATEST <= Products::Bytes16.greatest(), "magnitudes the products take");
+            None
+        } else {
+            shift::<C>(Products::Bytes16)
         }
     }
 
