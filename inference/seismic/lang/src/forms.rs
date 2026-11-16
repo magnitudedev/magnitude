@@ -993,7 +993,7 @@ mod tests {
     /// centre, offset, residue), INT8 and the matrix GEMV product, as
     /// `metal_packing`, `metal_int8` and `metal_matrix` admit each over the
     /// lane codes `producers::lanes` delivers (every code-plane split up to 8
-    /// bits, codebook and grid of `i8` values; no odd codes).
+    /// bits, one-bit odd codes, codebook and grid of `i8` values).
     #[test]
     fn metal_admissions_are_pinned() {
         let pack = |folds, centre, offset, residue| {
@@ -1068,7 +1068,7 @@ mod tests {
                 None,
                 Some(MetalMatrix::Symmetric),
             ),
-            ("q1g128", None, None, None),
+            ("q1g128", pack(1, 2, 2, false), None, Some(MetalMatrix::Symmetric)),
             (
                 "iq2s",
                 pack(2, 64, 64, false),

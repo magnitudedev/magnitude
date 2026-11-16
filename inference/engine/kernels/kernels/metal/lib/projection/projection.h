@@ -2532,6 +2532,10 @@ template <typename P, uint MASK, int Z>
 struct lane_zero<P, packets::Linear<MASK, Z>> {
     static constexpr int value() { return Z; }
 };
+template <uint LOW, uint HIGH, int K>
+struct lane_zero<packets::Planes<LOW, HIGH>, packets::OddCodes<K>> {
+    static constexpr int value() { return 2 * K - 1; }
+};
 template <uint LOW, uint HIGH, uint ID>
 struct lane_zero<packets::Planes<LOW, HIGH>, packets::Table<ID>> {
     static constexpr int value() { return producers::lane_zero(producers::TABLE, LOW, HIGH, 0); }
@@ -2632,6 +2636,23 @@ struct lane_codes<packets::Planes<LOW, HIGH>, packets::Linear<MASK, Z>, ZERO> {
             return low_plane::moved(codes, positions);
         else
             return uint2(low_plane::moved(codes.x, positions), chunk_plane<HIGH>::moved(codes.y, positions));
+    }
+};
+
+// One-bit odd codes 2 (c - K) + 1 (-1 and +1 under K = 1), entering at any
+// ZERO from their own, 2K - 1: the plane's stored codes (`Unsigned`'s
+// lanes), each pair doubled and moved by ZERO + 1 - 2K.
+template <int K, int ZERO>
+struct lane_codes<packets::Planes<1, 0>, packets::OddCodes<K>, ZERO>
+    : lane_codes<packets::Planes<1, 0>, packets::Unsigned, 0> {
+    typedef lane_codes<packets::Planes<1, 0>, packets::Unsigned, 0> stored;
+    static constexpr bool implemented() {
+        return producers::lane(producers::ODD, 1u, 0u) && !producers::lane_bytes(producers::ODD, 1u, 0u)
+            && ZERO >= producers::lane_zero(producers::ODD, 1u, 0u, 2 * K - 1);
+    }
+    static constexpr int zero() { return ZERO; }
+    static uint pair(typename stored::words codes, uint p) {
+        return (stored::pair(codes, p) << 1) + uint(ZERO + 1 - 2 * K) * 0x00010001u;
     }
 };
 
@@ -2845,6 +2866,10 @@ struct declared_lane<producers::OFFSET, LOW, HIGH> {
 template <uint LOW, uint HIGH>
 struct declared_lane<producers::TWOS, LOW, HIGH> {
     typedef lane_codes<packets::Planes<LOW, HIGH>, packets::Twos> type;
+};
+template <uint LOW, uint HIGH>
+struct declared_lane<producers::ODD, LOW, HIGH> {
+    typedef lane_codes<packets::Planes<LOW, HIGH>, packets::OddCodes<1>> type;
 };
 template <uint LOW, uint HIGH>
 struct declared_lane<producers::TABLE, LOW, HIGH> {
