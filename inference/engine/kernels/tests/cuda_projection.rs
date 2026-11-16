@@ -1701,12 +1701,16 @@ fn cuda_shape_rows_match_portable_semantics() {
 }
 
 /// `dense_output` at Qwen3.5-9B's feed-forward down shape (H 4096, F 12288)
-/// over the grid and codebook formats, q4_K and F8_E4M3, at a decode row and
-/// a 512-row prefill chunk, under the declaration's default configuration:
-/// the median device time of a call over 15 samples. The grid formats are
-/// timed again over uniform weights (every code 0, so every lookup reads
-/// one table entry): what time their lookups take. A shape timing for
-/// before/after comparisons of the decoders.
+/// over the types of every decode-axis class (direct, k-quant, table,
+/// float, grid and odd widths), at a decode row and a 512-row prefill
+/// chunk: every configuration the declaration admits at the row count, each
+/// the median device time of a call over 7 samples, reported as the
+/// default's and the fastest admitted one's time and the weight's resident
+/// bytes per second. The grid formats are timed again over uniform weights
+/// (every code 0, so every lookup reads one table entry): what time their
+/// lookups take. A shape timing for before/after comparisons of the
+/// decoders and forms; `CUDA_TIMING_TYPES` narrows it to some types and
+/// `CUDA_TIMING_ROWS` to some row counts.
 #[test]
 #[ignore = "timing at shape"]
 fn dense_output_timing_at_shape() {
@@ -1714,6 +1718,16 @@ fn dense_output_timing_at_shape() {
     let Some(device) = cuda() else { return };
     let (h, f) = (4096usize, 12288usize);
     let random = [
+        Encoding::Q4_0,
+        Encoding::Q4_1,
+        Encoding::Q8_0,
+        Encoding::Q2K,
+        Encoding::Q3K,
+        Encoding::Q4K,
+        Encoding::Q6K,
+        Encoding::Iq4Nl,
+        Encoding::Iq4Xs,
+        Encoding::Mxfp4,
         Encoding::Iq1S,
         Encoding::Iq1M,
         Encoding::Iq2Xxs,
@@ -1721,18 +1735,28 @@ fn dense_output_timing_at_shape() {
         Encoding::Iq2S,
         Encoding::Iq3Xxs,
         Encoding::Iq3S,
-        Encoding::Iq4Nl,
-        Encoding::Iq4Xs,
-        Encoding::Mxfp4,
-        Encoding::Q4K,
+        Encoding::Q1_0,
+        Encoding::Q2_0,
+        Encoding::Tq2_0,
     ]
     .map(Format::rounded)
     .into_iter()
     .chain([Format::F8_E4M3])
     .map(|format| (format, false));
     let uniform = [Encoding::Iq1S, Encoding::Iq2Xxs, Encoding::Iq3Xxs].map(|encoding| (Format::rounded(encoding), true));
+    // `CUDA_TIMING_TYPES` (representation names, comma-separated, such as
+    // `q4k,iq1s`) times only those types.
+    let only = std::env::var("CUDA_TIMING_TYPES").ok();
+    let timed = |format: &Format| {
+        only.as_deref().is_none_or(|only| only.split(',').any(|name| name == format.name()))
+    };
+    // `CUDA_TIMING_ROWS` (comma-separated, such as `1`) times only those
+    // row counts.
+    let row_counts: Vec<usize> = std::env::var("CUDA_TIMING_ROWS")
+        .map(|rows| rows.split(',').map(|count| count.parse().expect("CUDA_TIMING_ROWS names row counts")).collect())
+        .unwrap_or_else(|_| vec![1, 512]);
     let mut rng = Rng(97);
-    for (format, uniform) in random.chain(uniform) {
+    for (format, uniform) in random.chain(uniform).filter(|(format, _)| timed(format)) {
         // The weight's bytes alone: its host values (an interpreted decode
         // of 50M values) are no part of a timing.
         let shape = [h as u64, f as u64];
@@ -1742,11 +1766,7 @@ fn dense_output_timing_at_shape() {
         let down_weight = Tensor::from_host(&device, format.resident(), &shape, &bytes).unwrap();
         let elements = || dense_output::Elements { DW: format.resident(), A: Element::bf16() };
         let statics = NativeSpecialization::new().with_static("H", h as u64).with_static("F", f as u64).with_static("DS", 0);
-        let configuration = dense_output::native_entry_with(elements())
-            .default_specialization(&device, &statics)
-            .unwrap()
-            .expect("dense_output has a default configuration");
-        for rows in [1usize, 512] {
+        for &rows in &row_counts {
             let product: Vec<f32> = (0..rows * f).map(|_| bf16_round(rng.uniform(-1.0, 1.0))).collect();
             let residual: Vec<f32> = (0..rows * h).map(|_| rng.uniform(-2.0, 2.0)).collect();
             let product = bf16_tensor(&device, &[rows as u64, f as u64], &product);
@@ -1773,32 +1793,49 @@ fn dense_output_timing_at_shape() {
             let result = dense_output::native_tune_with(
                 &device,
                 elements(),
-                &configuration,
+                &statics,
                 vec![point],
                 seismic::NumericalRequirement::RoundingSteps {
                     alpha: 8.,
                     activation: Some(seismic::DType::BF16),
                 },
                 seismic::Strategy::Survey(seismic::SurveyPlan {
-                    samples: 15,
-                    min_sample_seconds: 0.05,
+                    samples: 7,
+                    min_sample_seconds: 0.02,
                     domains: Default::default(),
                 }),
             )
             .unwrap();
-            let median = result
+            // A record's time where the requirement admits it. The survey
+            // visits the default first.
+            let admitted = |record: &seismic::ConfigurationRecord| match &record.outcome {
+                seismic::Outcome::Measured { points, .. } if result.admitted(record).is_ok() => {
+                    Some(points[0].median_seconds)
+                }
+                _ => None,
+            };
+            let default = admitted(&result.configurations[0]).expect("the default configuration is measured and admitted");
+            let (best, chosen) = result
                 .configurations
                 .iter()
-                .find_map(|record| match &record.outcome {
-                    seismic::Outcome::Measured { points, .. } => Some(points[0].median_seconds),
-                    seismic::Outcome::Excluded(_) => None,
-                })
-                .expect("the default configuration is measured");
+                .filter_map(|record| admitted(record).map(|seconds| (seconds, &record.configuration)))
+                .min_by(|a, b| a.0.total_cmp(&b.0))
+                .unwrap();
+            let report = |seconds: f64| {
+                format!(
+                    "{:.1} us, {:.0} G values/s, {:.0} GB/s",
+                    1e6 * seconds,
+                    (h * f) as f64 / seconds / 1e9,
+                    bytes.len() as f64 / seconds / 1e9
+                )
+            };
             eprintln!(
-                "timing Cuda dense_output {format:?}{} H {h} F {f} M {rows}: {:.1} us per call, {:.0} G values/s",
+                "timing Cuda dense_output {format:?}{} H {h} F {f} M {rows}: default {}; best {} at {:?} {:?}",
                 if uniform { " uniform" } else { "" },
-                1e6 * median,
-                (h * f) as f64 / median / 1e9
+                report(default),
+                report(best),
+                chosen.params,
+                chosen.launches.iter().filter(|launch| !launch.is_empty()).collect::<Vec<_>>()
             );
         }
     }
