@@ -1710,3 +1710,107 @@ fn cuda_shape_rows_match_portable_semantics() {
         }
     }
 }
+
+/// `dense_output` at Qwen3.5-9B's feed-forward down shape (H 4096, F 12288)
+/// over the grid and codebook formats, q4_K and F8_E4M3, at a decode row and
+/// a 512-row prefill chunk, under the declaration's default configuration:
+/// the median device time of a call over 15 samples. The grid formats are
+/// timed again over uniform weights (every code 0, so every lookup reads
+/// one table entry): what time their lookups take. A shape timing for
+/// before/after comparisons of the decoders.
+#[test]
+#[ignore = "timing at shape"]
+fn dense_output_timing_at_shape() {
+    use magnitude_ggml::Encoding;
+    let Some(device) = cuda() else { return };
+    let (h, f) = (4096usize, 12288usize);
+    let random = [
+        Encoding::Iq1S,
+        Encoding::Iq1M,
+        Encoding::Iq2Xxs,
+        Encoding::Iq2Xs,
+        Encoding::Iq2S,
+        Encoding::Iq3Xxs,
+        Encoding::Iq3S,
+        Encoding::Iq4Nl,
+        Encoding::Iq4Xs,
+        Encoding::Mxfp4,
+        Encoding::Q4K,
+    ]
+    .map(Format::rounded)
+    .into_iter()
+    .chain([Format::F8_E4M3])
+    .map(|format| (format, false));
+    let uniform = [Encoding::Iq1S, Encoding::Iq2Xxs, Encoding::Iq3Xxs].map(|encoding| (Format::rounded(encoding), true));
+    let mut rng = Rng(97);
+    for (format, uniform) in random.chain(uniform) {
+        // The weight's bytes alone: its host values (an interpreted decode
+        // of 50M values) are no part of a timing.
+        let shape = [h as u64, f as u64];
+        let external = format.external(&mut rng, &shape, 2.0 / (f as f32).sqrt());
+        let external = if uniform { vec![0; external.len()] } else { external };
+        let bytes = format.resident().repack_host(format.source(), &shape, &external).unwrap();
+        let down_weight = Tensor::from_host(&device, format.resident(), &shape, &bytes).unwrap();
+        let elements = || dense_output::Elements { DW: format.resident(), A: Element::bf16() };
+        let statics = NativeSpecialization::new().with_static("H", h as u64).with_static("F", f as u64).with_static("DS", 0);
+        let configuration = dense_output::native_entry_with(elements())
+            .default_specialization(&device, &statics)
+            .unwrap()
+            .expect("dense_output has a default configuration");
+        for rows in [1usize, 512] {
+            let product: Vec<f32> = (0..rows * f).map(|_| bf16_round(rng.uniform(-1.0, 1.0))).collect();
+            let residual: Vec<f32> = (0..rows * h).map(|_| rng.uniform(-2.0, 2.0)).collect();
+            let product = bf16_tensor(&device, &[rows as u64, f as u64], &product);
+            let residual = f32_tensor(&device, &[rows as u64, h as u64], &residual);
+            let out_rows = i32_tensor(&device, &[rows as u64], &(0..rows as i32).collect::<Vec<_>>());
+            let absent = f32_tensor(&device, &[0], &[]);
+            let point = seismic::TuningPoint {
+                label: format!("m{rows}"),
+                weight: 1.0,
+                class: None,
+                cost: 1.0,
+                workload: seismic::WorkloadRotation::All,
+                rotation: vec![dense_output::Args {
+                    residual: &residual,
+                    product: &product,
+                    down_weight: &down_weight,
+                    out_rows: &out_rows,
+                    down_scale: &absent,
+                    down_bound: &absent,
+                }],
+                initialize: None,
+                written: Default::default(),
+            };
+            let result = dense_output::native_tune_with(
+                &device,
+                elements(),
+                &configuration,
+                vec![point],
+                seismic::NumericalRequirement::RoundingSteps {
+                    alpha: 8.,
+                    activation: Some(seismic::DType::BF16),
+                },
+                seismic::Strategy::Survey(seismic::SurveyPlan {
+                    samples: 15,
+                    min_sample_seconds: 0.05,
+                    domains: Default::default(),
+                }),
+            )
+            .unwrap();
+            let median = result
+                .configurations
+                .iter()
+                .find_map(|record| match &record.outcome {
+                    seismic::Outcome::Measured { points, .. } => Some(points[0].median_seconds),
+                    seismic::Outcome::Excluded(_) => None,
+                })
+                .expect("the default configuration is measured");
+            eprintln!(
+                "timing Cuda dense_output {format:?}{} H {h} F {f} M {rows}: {:.1} us per call, {:.0} G values/s",
+                if uniform { " uniform" } else { "" },
+                1e6 * median,
+                (h * f) as f64 / median / 1e9
+            );
+        }
+    }
+}
