@@ -90,8 +90,9 @@ pub struct CudaReport {
     /// `cuDeviceTotalMem`.
     pub total: u64,
     pub max_allocation: u64,
-    /// `cuMemGetAllocationGranularity` (recommended) of its device memory:
-    /// what one allocation's size is rounded up to.
+    /// What one allocation of its device memory's size is rounded up to:
+    /// `cuMemGetAllocationGranularity` (recommended) where the device
+    /// supports virtual memory management, `cuMemAlloc`'s page where not.
     pub allocation_granularity: u64,
     /// `CU_DEVICE_ATTRIBUTE_INTEGRATED`, which describes the device.
     pub integrated: bool,

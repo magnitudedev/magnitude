@@ -955,9 +955,8 @@ fn memory_management_symbol<F: Copy>(symbol: Option<F>) -> Result<F, DriverError
     })
 }
 
-/// The granularity in which the driver backs device memory
-/// (`cuMemGetAllocationGranularity`, recommended): what one allocation's
-/// size is rounded up to.
+/// The granularity in which the driver backs device memory: what one
+/// allocation's size is rounded up to.
 pub(crate) fn allocation_granularity(context: &Context) -> Result<u64, DriverError> {
     device_granularity(&context.driver, context.ordinal())
 }
@@ -965,7 +964,37 @@ pub(crate) fn allocation_granularity(context: &Context) -> Result<u64, DriverErr
 /// [`allocation_granularity`] of device `ordinal`, without a context: what
 /// discovery reports (`DeviceDescriptor::allocation_granularity`).
 pub(crate) fn device_granularity(driver: &Driver, ordinal: c_int) -> Result<u64, DriverError> {
-    granularity(driver, MemoryLocation::device(ordinal))
+    device_memory_granularity(virtual_memory(driver, ordinal)?, || {
+        granularity(driver, MemoryLocation::device(ordinal))
+    })
+}
+
+/// The GPU page `cuMemAlloc` backs device memory in, on every device the
+/// kernels load on (`sm_80` and later, `PtxTarget::BASELINE`): 2 MiB, what
+/// `cuMemGetAllocationGranularity` (recommended) reports for device memory
+/// wherever the device supports virtual memory management.
+const LINEAR_PAGE: u64 = 2 << 20;
+
+/// Device memory's granularity on a device that supports virtual memory
+/// management (`virtual_memory`) or not. Device memory is `cuMemAlloc`'s
+/// (`blocks.rs`) either way: where the device supports it, the driver
+/// reports the page (`query`, `cuMemGetAllocationGranularity`), and a failed
+/// query is an error; where it does not (vGPU slices such as the A10-8Q,
+/// which refuse the query with `CUDA_ERROR_NOT_SUPPORTED`), nothing is
+/// queried and the granularity is `cuMemAlloc`'s [`LINEAR_PAGE`].
+fn device_memory_granularity(
+    virtual_memory: bool,
+    query: impl FnOnce() -> Result<u64, DriverError>,
+) -> Result<u64, DriverError> {
+    if virtual_memory { query() } else { Ok(LINEAR_PAGE) }
+}
+
+/// `CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED` of device
+/// `ordinal`: whether the virtual-memory API (`cuMemCreate`,
+/// `cuMemGetAllocationGranularity` and the rest) serves it.
+fn virtual_memory(driver: &Driver, ordinal: c_int) -> Result<bool, DriverError> {
+    const VIRTUAL_MEMORY_MANAGEMENT: c_int = 102;
+    Ok(driver.attribute(VIRTUAL_MEMORY_MANAGEMENT, ordinal)? != 0)
 }
 
 /// The first driver API that places virtual-memory allocations on a host NUMA
@@ -977,8 +1006,6 @@ const HOST_NUMA_DRIVER: c_int = 12020;
 /// (Grace Blackwell GB10) reads at full device bandwidth (`242 GB/s` vs
 /// `160 GB/s` for `cuMemHostRegister`).
 pub(crate) fn can_create_host_node(context: &Context) -> Result<bool, DriverError> {
-    // CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED
-    const VIRTUAL_MEMORY_MANAGEMENT: c_int = 102;
     let driver = &context.driver;
     if driver.address_reserve.is_none()
         || driver.address_free.is_none()
@@ -987,7 +1014,7 @@ pub(crate) fn can_create_host_node(context: &Context) -> Result<bool, DriverErro
         || driver.map.is_none()
         || driver.unmap.is_none()
         || driver.set_access.is_none()
-        || driver.attribute(VIRTUAL_MEMORY_MANAGEMENT, context.ordinal())? == 0
+        || !virtual_memory(driver, context.ordinal())?
     {
         return Ok(false);
     }
@@ -1145,10 +1172,10 @@ impl Drop for HostNode {
 }
 
 /// `cuMemGetAllocationGranularity` (recommended) for pinned memory at
-/// `location`. A failed query is an error, never a guessed granule: a
-/// driver without it (before driver API 10.2) loads none of the kernels,
-/// whose least target, `sm_80` (`PtxTarget::BASELINE`), CUDA 11.0 first
-/// supports.
+/// `location`, on a device that supports virtual memory management. A
+/// failed query is an error, never a guessed granule: a driver without it
+/// (before driver API 10.2) loads none of the kernels, whose least target,
+/// `sm_80` (`PtxTarget::BASELINE`), CUDA 11.0 first supports.
 fn granularity(driver: &Driver, location: MemoryLocation) -> Result<u64, DriverError> {
     let granularity_of = memory_management_symbol(driver.memory_granularity)?;
     let properties = AllocationProperties::at(location);
@@ -2226,6 +2253,20 @@ pub(crate) fn occupancy_max_active_blocks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A device without virtual memory management (the A10-8Q vGPU slice)
+    /// has `cuMemAlloc`'s page as its granularity, and nothing asks it the
+    /// query it refuses; one that claims support and refuses the query
+    /// (`CUDA_ERROR_NOT_SUPPORTED`, 801) is an error.
+    #[test]
+    fn device_granularity_follows_virtual_memory_support() {
+        let refused = || -> Result<u64, DriverError> {
+            Err(DriverError { operation: "allocation granularity", code: 801, description: "operation not supported".into() })
+        };
+        assert_eq!(device_memory_granularity(false, || panic!("a device without virtual memory is never queried")).unwrap(), LINEAR_PAGE);
+        assert_eq!(device_memory_granularity(true, || Ok(4 << 20)).unwrap(), 4 << 20);
+        assert_eq!(device_memory_granularity(true, refused).unwrap_err().code, 801);
+    }
 
     fn stack_limit(context: &Context) -> usize {
         let _current = context.enter().unwrap();

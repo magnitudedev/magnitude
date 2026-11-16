@@ -184,8 +184,11 @@ pub const RTX3090_VULKAN_HEAP: u64 = 25_769_803_776;
 /// 2^40 alike in reports 52089 (RTX 3090) and 51857 (RTX 4070), of driver
 /// 615.71.09, and 52552 (GB10).
 pub const NVIDIA_VULKAN_MAX_ALLOCATION: u64 = 1_099_511_627_776;
-/// `cuMemGetAllocationGranularity` (recommended) of device memory on every
-/// recorded CUDA device: 2 MiB.
+/// The device memory's granularity discovery reports on every recorded CUDA
+/// device: 2 MiB. Where the device supports virtual memory management, it is
+/// `cuMemGetAllocationGranularity` (recommended); where not (the A10-8Q vGPU
+/// slice, which refuses that query with `CUDA_ERROR_NOT_SUPPORTED`), it is
+/// `cuMemAlloc`'s page, the same 2 MiB.
 pub const CUDA_DEVICE_GRANULARITY: u64 = 2 << 20;
 /// `maxMemoryAllocationCount` of every recorded Vulkan device: 4096.
 pub const VULKAN_MEMORY_OBJECTS: u64 = 4096;
@@ -661,7 +664,9 @@ pub fn ryzen_igpu_and_rtx4070() -> Reports {
 // gives no host, UUID, drivers, L2 or Vulkan limits, and the Vulkan
 // Hardware Database holds no A10-8Q report: the RTX 3090 machine's host,
 // the RTX 3090's UUID and drivers, and NVIDIA's Vulkan allocation limit stand in,
-// and the slice has no L2, which no record gives.
+// and the slice has no L2, which no record gives. The slice does not
+// support virtual memory management, so its device memory's granularity is
+// `cuMemAlloc`'s page (`CUDA_DEVICE_GRANULARITY`), never a query it refuses.
 pub const A10_8Q_CUDA_TOTAL: u64 = 8_589_475_840;
 pub const A10_8Q_CUDA_USABLE: u64 = 6_603_640_832;
 pub const A10_8Q_VULKAN_HEAP: u64 = 7_643_791_360;
