@@ -95,6 +95,36 @@ body is undone when its iteration ends, so the next iteration sees the value fro
 (upstream carried it over). The undo costs only the iteration's own assignments, never the scope's
 size.
 
+Patch 0033 makes a Gemma 4 call opener close the thought it interrupts when tools are callable. The
+tool grammar ends the text before the calls at the first `<|tool_call>`, inside a thought or not, and
+a reply to a tool result starts inside the thought its generation prompt opens. The parser read
+such a thought on to the next `<channel|>`: it streamed the call as reasoning, and when the call's
+arguments held `<channel|>`, read the rest of them as content and a later call opener in them as a
+call, then retracted that call; a thought that never closed lost its calls instead. The thought now
+ends at `<channel|>` or a call opener, as Qwen3-Coder's reasoning does, so the parser reads the
+grammar's text before the calls one way.
+
+Patch 0034 opens a DeepSeek reply as its template renders it. The template opens a reply to the
+user with `<｜Assistant｜>` and a reply to tool results with `\n\n`, each followed by the reasoning
+tag; the handler expected `<｜Assistant｜>` in both, so every reply to tool results failed on its
+first byte. The handler now takes the opener from the rendered generation prompt, before its
+reasoning tag, and a continued reply opens the same way.
+
+Patch 0035 makes DeepSeek's tool grammar and parser read the same text. With tools, the parser
+read reasoning the generation prompt opens as optional, and refused content beginning with
+`<think>` by lookahead, which has no GBNF form: the grammar admitted reasoning closed by `</think>`
+and content beginning with `<think>`, or reasoning skipped and the prompt's `<think>` read as
+content, which the parser then refused or read again as reasoning. Reasoning the generation
+prompt opens is now only reasoning, ending at `</think>` or at the calls block, as Qwen3-Coder's
+does, and content may begin with anything.
+
+Patch 0036 makes Kimi K2's tool grammar and parser read the same text. Its reasoning ends at
+`</think>` or at a call opener, and the closing `</think>` was optional, so the grammar let
+reasoning end anywhere and content take the rest: a call opener split between them was admitted
+without a call after it, and the parser, reading the whole opener, refused the text. Reasoning now
+closes with `</think>`, followed by content and calls, or runs directly into calls that begin with
+their opener.
+
 To refresh the extraction, use the provenance record and patch series in a maintainer workflow,
 then check in the resulting patched sources. Source preparation is deliberately not part of a
 consumer build.

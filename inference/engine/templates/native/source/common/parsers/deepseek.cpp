@@ -104,13 +104,16 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
     const std::string INVOKE_END   = "</" + DSML + TAG_SP + "invoke>";
     const std::string PARAM_START  = "<" + DSML + TAG_SP + "parameter";
     const std::string PARAM_END    = "</" + DSML + TAG_SP + "parameter>";
-    const std::string GEN_PROMPT   = "<｜Assistant｜>";
     const std::string TC_SEPARATOR = "\n\n";
 
     auto rendered = common_chat_template_render_prompt(
         tmpl, inputs, adjusted_messages, std::nullopt, additional_context);
     data.prompt = std::move(rendered.prompt);
     data.generation_prompt = std::move(rendered.generation_prompt);
+    // The reply opens as the template renders it, before any reasoning tag:
+    // `<｜Assistant｜>` after a user turn, `\n\n` after tool results.
+    const std::string opener = data.generation_prompt.substr(0,
+        std::min(data.generation_prompt.find(THINK_START), data.generation_prompt.find(THINK_END)));
     data.format             = COMMON_CHAT_FORMAT_PEG_NATIVE;
     data.supports_thinking  = true;
     data.thinking_start_tag = THINK_START;
@@ -125,12 +128,12 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
         const auto & msg = inputs.continue_msg;
 
         if (is_v4 && msg.reasoning_content.empty()) {
-            data.generation_prompt = GEN_PROMPT + THINK_END;
+            data.generation_prompt = opener + THINK_END;
             if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
                 data.generation_prompt += msg.render_content();
             }
         } else {
-            data.generation_prompt = GEN_PROMPT + THINK_START + msg.reasoning_content;
+            data.generation_prompt = opener + THINK_START + msg.reasoning_content;
             if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
                 data.generation_prompt += THINK_END + msg.render_content();
             }
@@ -143,7 +146,7 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
     bool has_tool_calls = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
 
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
-        auto generation_prompt = p.literal(GEN_PROMPT);
+        auto generation_prompt = p.literal(opener);
         auto end               = p.end();
 
         // build tool call section first since we might need it in reasoning
@@ -214,20 +217,18 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
         }
 
         auto reasoning = p.eps();
-        auto reasoning_with_tc = p.eps();
         auto obligatory_tool_calls = tool_calls;
-        bool allow_reasoning_with_tc = false;
 
         if (!require_tools) {
             tool_calls = p.optional(tool_calls);
         }
 
+        // Reasoning the generation prompt opens is only reasoning: it ends at
+        // `</think>`, or at the calls block, which it may open directly.
+        const bool opened = extract_reasoning && inputs.enable_thinking.value_or(true) &&
+            data.generation_prompt.compare(opener.size(), THINK_START.size(), THINK_START) == 0;
         if (extract_reasoning && inputs.enable_thinking.value_or(true)) {
             reasoning = p.optional(THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END);
-            reasoning_with_tc = THINK_START +
-                p.reasoning(p.until_one_of({ TC_SEPARATOR + FC_START, FC_START, THINK_END })) +
-                p.space() + obligatory_tool_calls;
-            allow_reasoning_with_tc = true;
         } else if (extract_reasoning) {
             // Thinking disabled but reasoning extraction requested: the generation prompt
             // contains an empty <think></think> pair (V3.2) or a bare </think> (V4) that
@@ -249,11 +250,16 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
             return generation_prompt + reasoning + p.content(p.rest()) + end;
         }
 
-        auto content_before_tools = p.text_before_calls(p.negate(p.literal(THINK_START)) +
-            p.content(p.until_one_of({ TC_SEPARATOR + FC_START, FC_START })) +
-            p.space(), inputs.tool_choice);
-        return allow_reasoning_with_tc ? generation_prompt + (reasoning_with_tc | (reasoning + content_before_tools + tool_calls)) + end :
-            generation_prompt + reasoning + content_before_tools + tool_calls + end;
+        // Content may begin with anything, `<think>` included: the reasoning
+        // before it, if any, has closed.
+        auto content_before_tools = p.text_before_calls(
+            p.content(p.until_one_of({ TC_SEPARATOR + FC_START, FC_START })) + p.space(), inputs.tool_choice);
+        if (opened) {
+            auto reasoning_text = p.reasoning(p.until_one_of({ TC_SEPARATOR + FC_START, FC_START, THINK_END }));
+            return generation_prompt + THINK_START + reasoning_text +
+                ((THINK_END + content_before_tools + tool_calls) | (p.space() + obligatory_tool_calls)) + end;
+        }
+        return generation_prompt + reasoning + content_before_tools + tool_calls + end;
     });
 
     data.parser = parser.save();
