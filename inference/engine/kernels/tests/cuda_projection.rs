@@ -1806,29 +1806,39 @@ fn dense_output_timing_at_shape() {
                 }),
             )
             .unwrap();
-            // A record's time where the requirement admits it. The survey
-            // visits the default first.
+            // A record's time where the requirement admits it (its median),
+            // and the least and greatest of its samples. The survey visits
+            // the default first.
             let admitted = |record: &seismic::ConfigurationRecord| match &record.outcome {
                 seismic::Outcome::Measured { points, .. } if result.admitted(record).is_ok() => {
-                    Some(points[0].median_seconds)
+                    let point = &points[0];
+                    let least = point.samples.iter().copied().fold(f64::INFINITY, f64::min);
+                    let greatest = point.samples.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    Some((point.median_seconds, least, greatest))
                 }
                 _ => None,
             };
-            let default = admitted(&result.configurations[0]).expect("the default configuration is measured and admitted");
-            let (best, chosen) = result
-                .configurations
-                .iter()
-                .filter_map(|record| admitted(record).map(|seconds| (seconds, &record.configuration)))
-                .min_by(|a, b| a.0.total_cmp(&b.0))
-                .unwrap();
-            let report = |seconds: f64| {
+            let report = |(seconds, least, greatest): (f64, f64, f64)| {
                 format!(
-                    "{:.1} us, {:.0} G values/s, {:.0} GB/s",
+                    "{:.1} us [{:.1}..{:.1}], {:.0} G values/s, {:.0} GB/s",
                     1e6 * seconds,
+                    1e6 * least,
+                    1e6 * greatest,
                     (h * f) as f64 / seconds / 1e9,
                     bytes.len() as f64 / seconds / 1e9
                 )
             };
+            let default = admitted(&result.configurations[0]).expect("the default configuration is measured and admitted");
+            // The fastest admitted configuration, of those `within` holds.
+            let fastest = |within: &dyn Fn(&seismic::Configuration) -> bool| {
+                result
+                    .configurations
+                    .iter()
+                    .filter(|record| within(&record.configuration))
+                    .filter_map(|record| admitted(record).map(|time| (time, &record.configuration)))
+                    .min_by(|a, b| a.0 .0.total_cmp(&b.0 .0))
+            };
+            let (best, chosen) = fastest(&|_| true).unwrap();
             eprintln!(
                 "timing Cuda dense_output {format:?}{} H {h} F {f} M {rows}: default {}; best {} at {:?} {:?}",
                 if uniform { " uniform" } else { "" },
@@ -1837,6 +1847,16 @@ fn dense_output_timing_at_shape() {
                 chosen.params,
                 chosen.launches.iter().filter(|launch| !launch.is_empty()).collect::<Vec<_>>()
             );
+            // The fastest of each INT8 choice, where the declaration offers
+            // both: how far the form the survey did not choose is behind.
+            for int8 in [0, 1] {
+                let int8_is = |configuration: &seismic::Configuration| {
+                    configuration.params.get("INT8").is_some_and(|value| *value == int8)
+                };
+                if let Some((time, _)) = fastest(&int8_is) {
+                    eprintln!("timing Cuda dense_output {format:?} M {rows} INT8 {int8}: best {}", report(time));
+                }
+            }
         }
     }
 }
