@@ -649,12 +649,23 @@ struct Grid {
     template <uint S>
     static void moved_points(uint entry, half move, thread float4 &even, thread float4 &odd) {
         static_assert(signed_points(), "a move adds to signed points");
-        const uint2 point = points::point(entry);
-        const half offset = 1152.0h - move;
-        const float4 low = byte_floats(scaled_bytes<S>(point.x, 0x01010101u) ^ 0x80808080u, offset);
-        const float4 high = byte_floats(scaled_bytes<S>(point.y, 0x01010101u) ^ 0x80808080u, offset);
-        even = float4(low.x, low.z, high.x, high.z);
-        odd = float4(low.y, low.w, high.y, high.w);
+        if constexpr (grids::trits<GRID>::any) {
+            // Lanes of -1, 0 and 1 as 2-bit codes, value + 1 (`trits`),
+            // spread to bytes at bit S: the half subtraction takes 2^S off
+            // with the move's offset.
+            uint even_codes, odd_codes;
+            split_fields<2u, S>(grids::trits<GRID>::codes()[entry & ((1u << INDEX_BITS) - 1u)], even_codes, odd_codes);
+            const half offset = half(1024u + (1u << S)) - move;
+            even = byte_floats(even_codes, offset);
+            odd = byte_floats(odd_codes, offset);
+        } else {
+            const uint2 point = points::point(entry);
+            const half offset = 1152.0h - move;
+            const float4 low = byte_floats(scaled_bytes<S>(point.x, 0x01010101u) ^ 0x80808080u, offset);
+            const float4 high = byte_floats(scaled_bytes<S>(point.y, 0x01010101u) ^ 0x80808080u, offset);
+            even = float4(low.x, low.z, high.x, high.z);
+            odd = float4(low.y, low.w, high.y, high.w);
+        }
     }
     // Whether a step's codes move (`moved`): signed points without a delta of
     // their own.

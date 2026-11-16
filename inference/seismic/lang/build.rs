@@ -14,7 +14,9 @@
 //! words (`codebooks::words<ID>`: `W0`..`W3`, values 4w..4w + 3 in word w)
 //! and whether they are E2M1 doubled (`codebooks::e2m1<ID>`). On CUDA a grid
 //! whose lane magnitudes are few also has the operands of its magnitudes
-//! (`grids::magnitudes<ID>`, see `magnitudes`). On Vulkan each table's
+//! (`grids::magnitudes<ID>`, see `magnitudes`); on Metal a grid of lanes
+//! -1, 0 and 1 also has its points as 2-bit codes (`grids::trits<ID>`, see
+//! `trits`). On Vulkan each table's
 //! `u32` words (`GRIDS_WORDS_<ID>`, `CODEBOOKS_WORDS_<ID>`, 0 for id 0) size
 //! the copy its library stages in shared memory. A dialect declares some
 //! tables only where its includer reads them (`Dialect::guarded`), each
@@ -130,7 +132,7 @@ impl Dialect {
 const DIALECTS: [Dialect; 3] = [
     Dialect {
         file: "tables.h",
-        begin: "namespace grids { template <uint ID> struct table; }\nnamespace codebooks { template <uint ID> struct table; template <uint ID> struct pairs; }\n\n",
+        begin: "namespace grids { template <uint ID> struct table; template <uint ID> struct trits { static constant constexpr bool any = false; }; }\nnamespace codebooks { template <uint ID> struct table; template <uint ID> struct pairs; }\n\n",
         end: "",
         ty: |element| match element {
             Element::Word => "uint",
@@ -149,7 +151,7 @@ const DIALECTS: [Dialect; 3] = [
                 space.accessor()
             )
         },
-        grid: |_, _| String::new(),
+        grid: trits,
         values: true,
         guarded: &[],
         words: false,
@@ -242,6 +244,33 @@ fn e2m1_doubled(values: [i8; 16]) -> bool {
         let magnitude = if exponent == 0 { mantissa } else { (2 + mantissa) << (exponent - 1) };
         i32::from(values[code as usize]) == if code & 8 != 0 { -magnitude } else { magnitude }
     })
+}
+
+/// On Metal, an eight-lane grid whose lanes are each -1, 0 or 1 (ggml's
+/// `iq1s_grid`) also has its points as 2-bit codes, lane j's value + 1 at
+/// bits 2j of a ushort (`grids::trits<ID>::codes()`): a quarter of the
+/// points' bytes, so the table stays resident in the constant cache, and
+/// `packets::split_fields` spreads a point's codes to its lanes' bytes.
+/// Other grids have none (`trits<ID>::any` false).
+fn trits(id: usize, points: GridPoints) -> String {
+    let GridPoints::Lanes8(points) = points else { return String::new() };
+    let codes: Option<Vec<String>> = points
+        .iter()
+        .map(|point| {
+            (0..8).try_fold(0u16, |codes, lane| {
+                let value = (point >> (8 * lane)) as u8 as i8;
+                (-1..=1).contains(&value).then(|| codes | (((value + 1) as u16) << (2 * lane)))
+            })
+        })
+        .map(|codes| codes.map(|codes| format!("0x{codes:04x}")))
+        .collect();
+    let Some(codes) = codes else { return String::new() };
+    let mut text = format!("namespace grids {{ constant ushort trits_{id}[{}] = {{\n", codes.len());
+    body(&mut text, &codes);
+    text += &format!(
+        "}}; template <> struct trits<{id}> {{ static constant constexpr bool any = true; static constant ushort *codes() {{ return trits_{id}; }} }}; }}\n"
+    );
+    text
 }
 
 /// A grid's magnitude operands, for a grid of at most four distinct lane
