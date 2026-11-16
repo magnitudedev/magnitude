@@ -2,8 +2,8 @@
 // format's packed codes (`projection::packing_codes`): per run of the
 // 32 / folds columns that share a scale, the largest sum over one row's run
 // of (code - centre)^2. One threadgroup per 32-column block: its threads take
-// the rows in turn, each row's block as the four lanes' words of the packed
-// forms (`at`, `load`, `step`), and join their largest per run.
+// the rows in turn, each row's block as the four lanes' own code pairs of the
+// packed forms (`at`, `own`, `run`), and join their largest per run.
 #define KERNEL_W0 SEISMIC_WEIGHT
 #include "lib/projection/projection.h"
 #include "lib/projection/packing.h"
@@ -27,13 +27,16 @@ kernel void packing_bound(device const uchar *weight [[buffer(SEISMIC_BUFFER_WEI
         uint2 squares = uint2(0u);
         PROJECTION_UNROLL
         for (uint x = 0; x < 8u; x += 2u) {
-            const typename coded::words words = coded::load(w, coded::at(w, n, x), block);
+            const typename coded::place place = coded::at(w, n, x);
+            const uint4 pairs = coded::own(w, place, block);
+            uint sum = 0u;
             PROJECTION_UNROLL
             for (uint s = 0; s < 4u; ++s) {
-                const int2 centred = int2(as_type<ushort2>(coded::step(words, s))) - int(coded::centre);
+                const int2 centred = int2(as_type<ushort2>(pairs[s])) - int(coded::centre);
                 const uint2 square = uint2(centred * centred);
-                squares[s * coded::folds / 4u] += square.x + square.y;
+                sum += square.x + square.y;
             }
+            squares[coded::run(place)] += sum;
         }
         largest = metal::max(largest, squares);
     }

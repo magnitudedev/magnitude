@@ -9,7 +9,7 @@ use seismic::BackendName;
 
 use magnitude_kernels::{
     SlotTable, constants, landing_extent, list_extent, routed_combine, routed_copy, routed_down, routed_expand,
-    routed_experts, routed_gate_up, routed_group, routed_land, routed_list_grid, routed_output,
+    routed_experts, routed_experts_up, routed_gate_up, routed_group, routed_land, routed_list_grid, routed_output,
     routed_pass_map, routed_round, routed_route, routed_route_shared, routed_scratch_grids, routed_scratch_request,
     gated_delta_project, routed_seed_commit, routed_select, routed_select_streamed, routed_step, routed_up,
 };
@@ -4107,6 +4107,123 @@ fn native_routed_experts_match_reference_with_iq4_block_experts() {
 fn native_grouped_prefill_matches_reference_with_q2k_experts() {
     for device in seismic_native_tests::every_device() {
         native_grouped_prefill_matches_reference_on(&device, PackedBlock::new(&device, Experts::Q2), 0);
+    }
+}
+
+/// Q2_K experts in the ungated grouped expert pass (`routed_experts_up`,
+/// relu^2): on Metal its packed GEMMs, over up weights whose two runs a
+/// block each fold a min term and q3k down weights, agree with its default
+/// tiles within the packed form's error, as the packed dense projection does
+/// with the staged one (`metal_packed_dense_output_agrees_with_the_staged_form`:
+/// relative RMS error at most 1.5e-2, largest 0.1 of the reference RMS).
+#[test]
+fn metal_packed_experts_up_agrees_with_the_default_form_with_q2k_experts() {
+    let Some(device) = seismic_native_tests::every_device()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let block = PackedBlock::new(&device, Experts::Q2);
+    let (h, e, k, f) = (
+        PackedBlock::HIDDEN as u64,
+        PackedBlock::EXPERTS as u64,
+        PackedBlock::CHOICES as u64,
+        block.routed.features as u64,
+    );
+    let tile = 32u64;
+    let experts = grouped_projection(
+        routed_experts_up::native_entry_with(routed_experts_up::Elements {
+            A: seismic::Element::bf16(),
+            EUW: block.expert_up.element(),
+            EDW: block.expert_down.element(),
+        }),
+        [[("H", h), ("F", f), ("T", tile)].as_slice(), &block.routed.expansion_statics()].concat(),
+        0,
+    );
+    let mappings = grouped_mappings(&device);
+    let default = GroupedForm::default();
+    let packed = GroupedForm {
+        params: vec![("TALL", 1), ("PACK", 1), ("DOWN_TALL", 1), ("DOWN_PACK", 1)],
+        quantized: true,
+    };
+    let at = |form| Grouped {
+        mapping: mappings[0].as_slice(),
+        form,
+    };
+    assert!(experts.admits(&device, at(&packed)), "routed_experts_up takes PACK over q2k up and q3k down weights");
+    let [_, up_scale] = block.routed.expansion_scales(&device);
+    // Past 64 rows, where the forms apply; 200 leaves a partial tile.
+    for rows in [80usize, 200] {
+        let routing = PackedBlock::routing(rows, 190 + rows as u32);
+        let m = rows as u64;
+        let blocks = group_blocks(m * k, e, tile);
+        let fill = |shape: &[u64]| i32_tensor(&device, shape, &vec![-9; shape.iter().product::<u64>() as usize]);
+        let (mut counts, mut order, mut inverse, mut table, mut used) =
+            (fill(&[e]), fill(&[blocks, tile]), fill(&[m, k]), fill(&[blocks]), fill(&[1]));
+        let grouped = i32_tensor(&device, &[1], &[m as i32]);
+        routed_group::native_for_device(&device, &default_group_specialization(&device, e, k))
+            .unwrap()
+            .call(routed_group::Args {
+                first: &first_row(&device),
+                rows: &grouped,
+                routes: &i32_tensor(&device, &[m, k], &routing.routes),
+                counts: &mut counts,
+                order: &mut order,
+                inverse: &mut inverse,
+                blocks: &mut table,
+                used: &mut used,
+            })
+            .unwrap();
+        let normalized = bf16_tensor(&device, &[m, h], &routing.normalized);
+        // Each choice's output row, at its grouped position.
+        let positions = read_i32(&inverse);
+        let output = |form| {
+            let values = read_bf16(
+                &experts
+                    .kernel(&device, at(form))
+                    .call(routed_experts_up::Args {
+                        first: &first_row(&device),
+                        rows: &grouped,
+                        normalized: &normalized,
+                        order: &order,
+                        blocks: &table,
+                        used: &used,
+                        expert_up: &block.expert_up,
+                        expert_down: &block.expert_down,
+                        map: &absent_map(&device),
+                        step: &absent_step(&device),
+                        records_up: &block.expert_up,
+                        records_down: &block.expert_down,
+                        up_scale: &up_scale,
+                        activation: 2,
+                    })
+                    .unwrap()
+                    .value,
+            );
+            positions
+                .iter()
+                .flat_map(|&position| {
+                    values[position as usize * h as usize..(position as usize + 1) * h as usize]
+                        .iter()
+                        .map(|&value| f64::from(value))
+                })
+                .collect::<Vec<_>>()
+        };
+        let (reference, actual) = (output(&default), output(&packed));
+        let rms = |values: &mut dyn Iterator<Item = f64>| {
+            let (sum, count) = values.fold((0.0, 0usize), |(sum, count), value| (sum + value * value, count + 1));
+            (sum / count as f64).sqrt()
+        };
+        let scale = rms(&mut reference.iter().copied());
+        let relative = rms(&mut reference.iter().zip(&actual).map(|(a, b)| a - b)) / scale;
+        let worst = reference.iter().zip(&actual).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max) / scale;
+        eprintln!("packed routed_experts_up q2k rows {rows}: relative RMS error {relative:.2e}, largest {worst:.2e}");
+        assert!(scale > 0.0, "rows {rows}: the default form's outputs are not all zero");
+        assert!(
+            relative <= 1.5e-2 && worst <= 0.1,
+            "packed routed_experts_up q2k rows {rows}: relative RMS error {relative:.2e}, largest {worst:.2e}"
+        );
     }
 }
 

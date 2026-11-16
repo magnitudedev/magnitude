@@ -2434,12 +2434,10 @@ inline void gemm_row_paired(thread const In &in, thread const Out &out, thread c
 // two halves of a word whose values are the codes less `zero()`, each below
 // 1024 (a half of the same bits is the code times 2^-24, exactly). `at` is
 // a lane's place of chunk k in a row's planes (32-bit offsets from the
-// tensor), `load<INDEXED>` its words of packet g (or of the chunk `chunks`
-// chunks on, by the same base), and `shift` words moved on by `positions`
-// positions (pair p of the result is pair p + positions of the words);
-// code planes split a load into its loads alone (`fetch<INDEXED>`, its
-// `fields`) and their words (`spread`, or `moved` on by positions), which
-// PACK carries ahead apart (`packing_fetch`). One reader per code source:
+// tensor) and `load<INDEXED>` its words of packet g; code planes split a
+// load into its loads alone (`fetch<INDEXED>`, its `fields`) and their words
+// (`spread`), which PACK carries ahead apart (`packing_fetch`). One reader
+// per code source:
 // linear codes of code planes of every split the registry makes
 // (`registry::code_planes`), entering as their stored codes or above them
 // (8-bit codes as bytes at their zero, or as pairs at any ZERO); a
@@ -2452,13 +2450,7 @@ inline void gemm_row_paired(thread const In &in, thread const Out &out, thread c
 // byte B k of the packet's unit of 4 B bytes, code i at bit B i
 // (`packets::Fields`, `packets::Planes`); `fetch` reads them, `spread`
 // spreads them, codes 0..3 and 4..7 in the two halves of a word (`load`
-// both), and `moved` spreads them moved on by a lane's `positions`
-// positions. A spread's bits past a half's four codes are no pair's (even
-// moved on by three positions) and every reader masks its pair, so a moved
-// spread, past whose variable shift the compiler cannot drop a mask, takes
-// none; a byte's field and its copy 12 bits above it do not overlap, so
-// one multiply spreads them (exact; a 2-bit plane's 16-bit field and its
-// copy overlap, and the carry of their sum would reach code 4).
+// both).
 template <uint B>
 struct chunk_plane {
     static_assert(B == 1u || B == 2u || B == 4u, "a plane's chunk is one, two or four bytes");
@@ -2469,18 +2461,15 @@ struct chunk_plane {
     }
     // A load INDEXED from the lane's place (a base and a 32-bit index of its
     // units), as the matrix GEMV's block loop takes it, or from the sum of
-    // the place, the packet's 32-bit offset and the chunks' offset, as PACK's
-    // does: indexed, PACK over q5g32s is 1.7% slower (M4 Pro, `dense_output`
-    // at M = 512, 5448 against 5353 µs) and over iq4xs 1%. The chunks'
-    // offset is a constant beside the 32-bit sum, so a load of a later chunk
-    // takes it as the load's own (inside the sum, which may wrap, it is one
-    // more add a load).
+    // the place and the packet's 32-bit offset, as PACK's does: indexed,
+    // PACK over q5g32s is 1.7% slower (M4 Pro, `dense_output` at M = 512,
+    // 5448 against 5353 µs) and over iq4xs 1%.
     template <bool INDEXED, typename W>
-    static uint fetch(thread const Weights<W> &w, uint at, uint g, uint chunks) {
+    static uint fetch(thread const Weights<W> &w, uint at, uint g) {
         if constexpr (INDEXED)
-            return uint(slab::as<unit>(w.base + at)[g * 4u * w.layout.tile + chunks]);
+            return uint(slab::as<unit>(w.base + at)[g * 4u * w.layout.tile]);
         else
-            return uint(*slab::as<unit>(w.base + at + g * 4u * B * w.layout.tile + chunks * B));
+            return uint(*slab::as<unit>(w.base + at + g * 4u * B * w.layout.tile));
     }
     static uint spread(uint field) {
         if constexpr (B == 4u)
@@ -2489,16 +2478,8 @@ struct chunk_plane {
             return (field | (field << (16u - 4u * B))) & (((1u << (4u * B)) - 1u) * 0x00010001u);
     }
     template <bool INDEXED, typename W>
-    static uint load(thread const Weights<W> &w, uint at, uint g, uint chunks) {
-        return spread(fetch<INDEXED>(w, at, g, chunks));
-    }
-    static uint moved(uint field, uint positions) {
-        if constexpr (B == 4u)
-            return field >> (4u * positions);
-        else if constexpr (B == 2u)
-            return (field | (field << 8)) >> (2u * positions);
-        else
-            return (field * 0x1001u) >> positions;
+    static uint load(thread const Weights<W> &w, uint at, uint g) {
+        return spread(fetch<INDEXED>(w, at, g));
     }
     static uint pair(uint spread, uint p) { return (spread >> (B * p)) & (((1u << B) - 1u) * 0x00010001u); }
 };
@@ -2602,12 +2583,12 @@ struct lane_codes<packets::Planes<LOW, HIGH>, packets::Linear<MASK, Z>, ZERO> {
             return uint2(low, chunk_plane<HIGH>::at(w, row, w.layout.high, k));
     }
     template <bool INDEXED, typename W>
-    static fields fetch(thread const Weights<W> &w, place at, uint g, uint chunks = 0u) {
+    static fields fetch(thread const Weights<W> &w, place at, uint g) {
         if constexpr (HIGH == 0u)
-            return low_plane::template fetch<INDEXED>(w, at, g, chunks);
+            return low_plane::template fetch<INDEXED>(w, at, g);
         else
-            return uint2(low_plane::template fetch<INDEXED>(w, at.x, g, chunks),
-                chunk_plane<HIGH>::template fetch<INDEXED>(w, at.y, g, chunks));
+            return uint2(low_plane::template fetch<INDEXED>(w, at.x, g),
+                chunk_plane<HIGH>::template fetch<INDEXED>(w, at.y, g));
     }
     static words spread(fields codes) {
         if constexpr (HIGH == 0u)
@@ -2616,8 +2597,8 @@ struct lane_codes<packets::Planes<LOW, HIGH>, packets::Linear<MASK, Z>, ZERO> {
             return uint2(low_plane::spread(codes.x), chunk_plane<HIGH>::spread(codes.y));
     }
     template <bool INDEXED, typename W>
-    static words load(thread const Weights<W> &w, place at, uint g, uint chunks = 0u) {
-        return spread(fetch<INDEXED>(w, at, g, chunks));
+    static words load(thread const Weights<W> &w, place at, uint g) {
+        return spread(fetch<INDEXED>(w, at, g));
     }
     static uint pair(words codes, uint p) {
         uint stored;
@@ -2629,13 +2610,6 @@ struct lane_codes<packets::Planes<LOW, HIGH>, packets::Linear<MASK, Z>, ZERO> {
             return stored + uint(ZERO - Z) * 0x00010001u;
         else
             return stored;
-    }
-    // Its fetched fields spread moved on by `positions` positions.
-    static words moved(fields codes, uint positions) {
-        if constexpr (HIGH == 0u)
-            return low_plane::moved(codes, positions);
-        else
-            return uint2(low_plane::moved(codes.x, positions), chunk_plane<HIGH>::moved(codes.y, positions));
     }
 };
 
@@ -2678,14 +2652,13 @@ struct lane_codes<packets::Planes<8, 0>, packets::Linear<MASK, Z>, ZERO> {
     }
     // A row tile's rows of one block are adjacent: 32 bytes a row.
     template <bool INDEXED, typename W>
-    static words load(thread const Weights<W> &w, place at, uint g, uint chunks = 0u) {
+    static words load(thread const Weights<W> &w, place at, uint g) {
         if constexpr (INDEXED)
-            return slab::as<uint2>(w.base + at)[g * 4u * w.layout.tile + chunks] ^ MASK;
+            return slab::as<uint2>(w.base + at)[g * 4u * w.layout.tile] ^ MASK;
         else
-            return *slab::as<uint2>(w.base + at + g * 32u * w.layout.tile + chunks * 8u) ^ MASK;
+            return *slab::as<uint2>(w.base + at + g * 32u * w.layout.tile) ^ MASK;
     }
     static uint pair(words codes, uint p) { return byte_lane_pair<Z, ZERO>(codes, p); }
-    static words shift(words codes, uint positions) { return codes >> (8u * positions); }
 };
 
 // A codebook's 4-bit codes: the lane's four bytes of codes become its eight
@@ -2708,21 +2681,20 @@ struct lane_codes<packets::Planes<4, 0>, packets::Table<ID>, ZERO> {
         return chunk_plane<4>::at(w, row, w.layout.codes, k);
     }
     template <bool INDEXED, typename W>
-    static words load(thread const Weights<W> &w, place at, uint g, uint chunks = 0u) {
+    static words load(thread const Weights<W> &w, place at, uint g) {
         constant ushort *pairs = codebooks::pairs<ID>::values();
-        const uint codes = chunk_plane<4>::template load<INDEXED>(w, at, g, chunks);
+        const uint codes = chunk_plane<4>::template load<INDEXED>(w, at, g);
         return uint2(uint(pairs[codes & 0xffu]) | (uint(pairs[(codes >> 8) & 0xffu]) << 16),
             uint(pairs[(codes >> 16) & 0xffu]) | (uint(pairs[codes >> 24]) << 16));
     }
     static uint pair(words codes, uint p) { return byte_lane_pair<own(), ZERO>(codes, p); }
-    static words shift(words codes, uint positions) { return codes >> (8u * positions); }
 };
 
 // Grid codes: a chunk is one entry (`packets::Entries::chunk_entry`), whose
 // eight values (`packets::Grid`: its points, signed by its sign bits, then
 // moved by its delta) enter at ZERO. A lane's place is its entry's in the
-// packet units of the grids plane and of the grid high plane, its shifts
-// there (`packets::EntryChunk`) and the entry. Without a delta an entry's
+// packet units of the grids plane and of the grid high plane, and its shifts
+// there (`packets::EntryChunk`). Without a delta an entry's
 // values + 128 are its words' bytes, formed four at a time when it loads: a
 // two's complement point's bytes with their sign bits flipped, or its
 // magnitudes signed as bytes (`packets::signed_bytes`). With a delta a pair
@@ -2734,7 +2706,7 @@ struct lane_codes<packets::Entries<BYTES, HIGH>,
     packets::Grid<GRID, INDEX_BITS, LANES, SIGNS, DELTA, DELTA_EXPONENT, SIGN_BIT, SIGN_BITS, DELTA_BIT>, ZERO> {
     typedef packets::Entries<BYTES, HIGH> E;
     typedef packets::Grid<GRID, INDEX_BITS, LANES, SIGNS, DELTA, DELTA_EXPONENT, SIGN_BIT, SIGN_BITS, DELTA_BIT> G;
-    typedef uint4 place;
+    typedef uint3 place;
     // The entry's bytes (its values + 128 without a delta; its points with
     // one), its sign bits with a delta (columns 0..3 at bits 0.., 4..7 at
     // bits 16..), and what moves a pair to the values + ZERO, in both halves
@@ -2756,20 +2728,16 @@ struct lane_codes<packets::Entries<BYTES, HIGH>,
     template <typename W>
     static place at(thread const Weights<W> &w, thread const typename Weights<W>::located &row, uint k) {
         const packets::EntryChunk chunk = E::chunk_of(k);
-        return uint4(uint(row.geometry.at(row.row, w.layout.codes, ulong(E::unit_bytes()), 0ul) - w.base) + chunk.offset,
+        return uint3(uint(row.geometry.at(row.row, w.layout.codes, ulong(E::unit_bytes()), 0ul) - w.base) + chunk.offset,
             uint(row.geometry.at(row.row, w.layout.high, ulong(E::high_bytes()), 0ul) - w.base),
-            chunk.shift | (chunk.high_shift << 8), k);
+            chunk.shift | (chunk.high_shift << 8));
     }
     // Addressed by sums either way (INDEXED: the consumer's choice for
     // planes).
     template <bool INDEXED, typename W>
-    static words load(thread const Weights<W> &w, place at, uint g, uint chunks = 0u) {
-        // The entry `chunks` on: its offset from this one's, and its shifts.
-        const packets::EntryChunk later = E::chunk_of(at.w + chunks);
-        const uint offset = later.offset - E::chunk_of(at.w).offset;
-        const uint shifts = chunks == 0u ? at.z : later.shift | (later.high_shift << 8);
-        const uint entry = E::chunk_entry(w.base + at.x + offset + g * E::unit_bytes() * w.layout.tile,
-            w.base + at.y + g * E::high_bytes() * w.layout.tile, packets::EntryChunk{0u, shifts & 0xffu, shifts >> 8});
+    static words load(thread const Weights<W> &w, place at, uint g) {
+        const uint entry = E::chunk_entry(w.base + at.x + g * E::unit_bytes() * w.layout.tile,
+            w.base + at.y + g * E::high_bytes() * w.layout.tile, packets::EntryChunk{0u, at.z & 0xffu, at.z >> 8});
         words codes;
         const uint2 points = G::points::point(entry);
         codes.signs = 0u;
@@ -2809,11 +2777,6 @@ struct lane_codes<packets::Entries<BYTES, HIGH>,
         } else {
             return pair;
         }
-    }
-    static words shift(words codes, uint positions) {
-        codes.points >>= 8u * positions;
-        codes.signs >>= positions;
-        return codes;
     }
 };
 

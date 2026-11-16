@@ -70,8 +70,9 @@
 // `packing_operand` the packed operand and the tokens' scales and code sums,
 // `packing_coefficients` the weights' block scales and biases. Weight codes
 // are read from the resident rows, a lane's chunk of eight codes per weight
-// row and run (`lane_codes`: its share of each code plane, its codebook
-// codes or its grid entry).
+// row and block (`lane_codes`: its share of each code plane, its codebook
+// codes or its grid entry), whose pairs the lanes sharing them exchange where
+// a block has two runs (`packing_layout`).
 //
 // The weights are the left operand (inference/docs/kernels/lane-order.md): a
 // lane at fragment coordinate (x, y) holds weight row y of a weight fragment
@@ -162,39 +163,35 @@ inline float4 packing_scale(float4 value) {
 constant constexpr bool packing_forms = !SEISMIC_HAS_TENSOR_OPS;
 
 // How PACK carries a lane's codes L (`lane_codes`) ahead: a block's loads
-// alone (`fetch`, its `fields`) issue as it starts and become words as it
-// ends (`spread`; `gemm_packed_sums`). A lane moved on by positions
-// (`lane_codes::shift`) moves where its loads are its words (bytes,
-// codebook values, grid entries: `at_load`); code planes move as they
-// spread (`at_take`), the arithmetic being the spread's: a lane whose
-// loads alone are its `fields`.
+// alone (`fetch`, its `fields`: code planes' loads, or the words of a lane
+// without them) issue as it starts and become words as it ends (`spread`;
+// `gemm_packed_sums`).
 template <typename L, typename = void>
 struct packing_fetch {
     typedef typename L::words fields;
     template <typename W>
-    static fields fetch(thread const Weights<W> &w, typename L::place at, uint g, uint chunks = 0u) {
-        return L::template load<false>(w, at, g, chunks);
+    static fields fetch(thread const Weights<W> &w, typename L::place at, uint g) {
+        return L::template load<false>(w, at, g);
     }
     static typename L::words spread(fields codes) { return codes; }
-    static fields at_load(fields codes, uint positions) { return L::shift(codes, positions); }
-    static typename L::words at_take(fields codes, uint) { return codes; }
 };
 template <typename L>
 struct packing_fetch<L, decltype((void)sizeof(typename L::fields))> {
     typedef typename L::fields fields;
     template <typename W>
-    static fields fetch(thread const Weights<W> &w, typename L::place at, uint g, uint chunks = 0u) {
-        return L::template fetch<false>(w, at, g, chunks);
+    static fields fetch(thread const Weights<W> &w, typename L::place at, uint g) {
+        return L::template fetch<false>(w, at, g);
     }
     static typename L::words spread(fields codes) { return L::spread(codes); }
-    static fields at_load(fields codes, uint) { return codes; }
-    static typename L::words at_take(fields codes, uint positions) { return L::moved(codes, positions); }
 };
 
 // The layout of a weight's lane codes L (`lane_codes`) for FOLDS runs a
 // block, in bytes of column order where BYTES (entries of 8 bits, the codes
 // with residue bits; `planes`): `at`, `fetch` (a block's loads, `fetched`),
-// `take` (their words) and `step`. None by default.
+// `take` (their words, which the simdgroup forms together) and `step`. A lane
+// alone has its own chunk's four code pairs (`own`), all of run `run`, which
+// the four lanes of a row hold between them (the packing bound's).
+// None by default.
 template <typename L, uint FOLDS, bool BYTES>
 struct packing_layout {
     static constexpr bool implemented() { return false; }
@@ -216,41 +213,54 @@ struct packing_layout<L, 1, false> {
     static fetched fetch(thread const Weights<W> &w, place at, uint g) { return packing_fetch<L>::fetch(w, at, g); }
     static words take(place, fetched codes) { return packing_fetch<L>::spread(codes); }
     static half2 step(thread const words &codes, uint s) { return as_type<half2>(L::pair(codes, s)); }
+    template <typename W>
+    static uint4 own(thread const Weights<W> &w, place at, uint g) {
+        const words codes = take(at, fetch(w, at, g));
+        return uint4(L::pair(codes, 0u), L::pair(codes, 1u), L::pair(codes, 2u), L::pair(codes, 3u));
+    }
+    static uint run(place) { return 0u; }
 };
 
 // Two runs a block: step 2 h + t multiplies the columns
-// 16 h + 8 (c / 4) + 2 ((c / 2) % 2) + t + 4 (c % 2) of run h: a lane's
-// chunks x / 4 and x / 4 + 2, its pairs x % 4 + t (x even). A lane holds its
-// chunk of each run, shifted to its first pair.
+// 16 h + 8 (c / 4) + 2 ((c / 2) % 2) + t + 4 (c % 2) of run h: chunks x / 4
+// and x / 4 + 2 at the lane's pairs x % 4 + t (x even). Each of the two
+// lanes that share those chunks (x and x ^ 2, lanes l and l ^ 1) loads one
+// whole, x / 4 + x % 4 (run x % 4 / 2), keeps its own pairs of it and gives
+// the other its pairs, so a chunk is loaded and decoded once.
 template <typename L>
 struct packing_layout<L, 2, false> {
     static constexpr bool implemented() { return L::implemented(); }
     struct place {
-        typename L::place first;
-        uint shift;
+        typename L::place chunk;
+        bool second;
     };
-    struct fetched {
-        typename packing_fetch<L>::fields first, second;
-    };
-    struct words {
-        typename L::words first, second;
-    };
+    typedef typename packing_fetch<L>::fields fetched;
+    // The pairs of steps 0..3.
+    typedef uint4 words;
     template <typename W>
     static place at(thread const Weights<W> &w, uint n, uint x) {
-        return place{L::at(w, w.locate(n), x >> 2), x & 2u};
+        return place{L::at(w, w.locate(n), (x >> 2) + (x & 2u)), (x & 2u) != 0u};
     }
     template <typename W>
     static fetched fetch(thread const Weights<W> &w, place at, uint g) {
-        typedef packing_fetch<L> F;
-        return fetched{F::at_load(F::fetch(w, at.first, g), at.shift), F::at_load(F::fetch(w, at.first, g, 2u), at.shift)};
+        return packing_fetch<L>::fetch(w, at.chunk, g);
     }
     static words take(place at, fetched codes) {
-        typedef packing_fetch<L> F;
-        return words{F::at_take(codes.first, at.shift), F::at_take(codes.second, at.shift)};
+        const typename L::words chunk = packing_fetch<L>::spread(codes);
+        const uint2 front = uint2(L::pair(chunk, 0u), L::pair(chunk, 1u));
+        const uint2 back = uint2(L::pair(chunk, 2u), L::pair(chunk, 3u));
+        // The first run's lane keeps its chunk's front pairs and gives the
+        // back ones; the second's keeps the back.
+        const uint2 given = simd_shuffle_xor(at.second ? front : back, ushort(1));
+        return at.second ? uint4(given, back) : uint4(front, given);
     }
-    static half2 step(thread const words &codes, uint s) {
-        return as_type<half2>(L::pair((s & 2u) ? codes.second : codes.first, s & 1u));
+    static half2 step(words codes, uint s) { return as_type<half2>(codes[s]); }
+    template <typename W>
+    static uint4 own(thread const Weights<W> &w, place at, uint g) {
+        const typename L::words chunk = packing_fetch<L>::spread(fetch(w, at, g));
+        return uint4(L::pair(chunk, 0u), L::pair(chunk, 1u), L::pair(chunk, 2u), L::pair(chunk, 3u));
     }
+    static uint run(place at) { return at.second ? 1u : 0u; }
 };
 
 // Codes of 8-bit values: the lane at fragment column x holds its row's eight
@@ -296,6 +306,13 @@ struct packing_layout<L, 1, true> {
     static fetched fetch(thread const Weights<W> &w, place at, uint g) { return packing_fetch<L>::fetch(w, at, g); }
     static words take(place, fetched codes) { return packing_fetch<L>::spread(codes); }
     static half2 step(words codes, uint s) { return packing_byte_step(codes, s); }
+    template <typename W>
+    static uint4 own(thread const Weights<W> &w, place at, uint g) {
+        const words codes = take(at, fetch(w, at, g));
+        return uint4(as_type<uint>(step(codes, 0u)), as_type<uint>(step(codes, 1u)), as_type<uint>(step(codes, 2u)),
+            as_type<uint>(step(codes, 3u)));
+    }
+    static uint run(place) { return 0u; }
     template <uint RESIDUE>
     static uint2 planes(words codes, uint x) { return packing_byte_planes<RESIDUE>(codes, x); }
 };
@@ -477,6 +494,8 @@ struct packing_codes_of<packets::Packet<P, C, K, F>, true> {
     static words take(place at, fetched codes) { return layout::take(at, codes); }
     static words load(thread const Weights<W> &w, place at, uint g) { return take(at, fetch(w, at, g)); }
     static half2 step(words codes, uint s) { return layout::step(codes, s); }
+    static uint4 own(thread const Weights<W> &w, place at, uint g) { return layout::own(w, at, g); }
+    static uint run(place at) { return layout::run(at); }
     template <uint RESIDUE>
     static uint2 planes(words codes, uint x) { return layout::template planes<RESIDUE>(codes, x); }
 };
