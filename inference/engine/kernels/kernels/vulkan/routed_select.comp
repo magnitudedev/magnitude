@@ -2,6 +2,8 @@
 // operator, single over `router` in the CPU 8-lane reference order; `norm` and
 // `router_norm` share the row's RMS inverse.
 #define KERNEL_W0 SEISMIC_ROUTER
+// The projection's decoding launches stage their weights' tables (`packets.glsl`).
+#define PACKETS_STAGED_TABLES 1
 #include "lib/core/activation.glsl"
 #include "lib/projection/projection.glsl"
 #define SELECT_E uint(SEISMIC_DIM_E)

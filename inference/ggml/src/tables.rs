@@ -3433,6 +3433,11 @@ impl GridPoints {
     pub const fn byte(self, index: usize, lane: u32) -> u8 {
         (self.point(index) >> (8 * lane)) as u8
     }
+
+    /// `u32` words the points take packed, a word to four lanes.
+    pub const fn words(self) -> usize {
+        self.len() * self.lanes() as usize / 4
+    }
 }
 
 /// A ggml grid: its name (ggml's without `_grid`) and its points. The name is

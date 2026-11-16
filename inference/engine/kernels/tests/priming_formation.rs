@@ -131,3 +131,74 @@ fn vulkan_priming_abi_forms() {
     assert!(failed.is_empty(), "{} of {} requests fail to form: {failed:#?}", failed.len(), requests.len());
     eprintln!("FORMED {} exact native Vulkan requests", requests.len());
 }
+
+/// Every weight whose Vulkan decoder stages a table in shared memory
+/// (`form(W, TABLE)`, `packets_stage_tables`) forms in a single projection
+/// (`dense_output`) and in a segmented one (`attention_project`) whose four
+/// slots read two tables, one twice (staged once) and one of each other kind,
+/// so every staged reader, copy and place compiles (and, where the slots'
+/// tables pass the bound, every read in place), and the module seals without
+/// 64-bit division (`seal.rs`).
+#[test]
+fn vulkan_staged_table_projections_form() {
+    use seismic_lang::forms::Form;
+    use seismic_lang::registry::{self, Layout, RepresentationKind};
+    let module = magnitude_kernels::module().unwrap();
+    let toolchain = Toolchain::open(BackendName::Vulkan).expect("Vulkan forms on every host");
+    let table = Form::named(BackendName::Vulkan, "TABLE").expect("Vulkan stages tables");
+    let staged: Vec<_> = registry::representations()
+        .iter()
+        .filter(|info| matches!(&info.kind, RepresentationKind::PackedRows(rows) if rows.layout == Layout::Rows16))
+        .filter(|info| table.of(info.id) > 0)
+        .collect();
+    let plain = Element::stored("q8g32s", Layout::Rows16).unwrap();
+    // A segmented projection's weights take one operand recipe, the plain
+    // weight's (rounded rows).
+    let segmented: Vec<Element> = staged
+        .iter()
+        .filter(|info| info.operands == registry::OperandRecipe::Rounded)
+        .map(|info| Element::named(info.name).expect("a registered representation"))
+        .collect();
+    assert!(segmented.len() >= 2, "some rows16 weights of the plain recipe stage tables");
+    let mut requests = Vec::new();
+    for info in &staged {
+        requests.push(request::<magnitude_kernels::dense_output::Entry>(
+            &[("A", Element::bf16()), ("DW", Element::named(info.name).expect("a registered representation"))],
+            &[("H", 2048), ("F", 4096), ("DS", 0)],
+        ));
+    }
+    for (index, &weight) in segmented.iter().enumerate() {
+        let other = segmented[(index + 1) % segmented.len()];
+        requests.push(request::<magnitude_kernels::attention_project::Entry>(
+            &[
+                ("A", Element::bf16()),
+                ("Y", Element::bf16()),
+                ("NW", Element::bf16()),
+                ("QW", weight),
+                ("GW", plain),
+                ("KW", other),
+                ("VW", weight),
+            ],
+            &[
+                ("D", 2048),
+                ("PT", 1),
+                ("NM", 2048),
+                ("Q", 4096),
+                ("GR", 4096),
+                ("K", 512),
+                ("V", 512),
+                ("QS", 0),
+                ("GS", 0),
+                ("KS", 0),
+                ("VS", 0),
+            ],
+        ));
+    }
+    let results = form_requests(module, &toolchain, &InProcess, &requests, &Progress::default());
+    let failed = requests
+        .iter()
+        .zip(results)
+        .filter_map(|(request, result)| result.err().map(|error| format!("{request}: {error}")))
+        .collect::<Vec<_>>();
+    assert!(failed.is_empty(), "{} of {} requests fail to form: {failed:#?}", failed.len(), requests.len());
+}

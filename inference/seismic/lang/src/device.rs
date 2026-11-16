@@ -194,6 +194,11 @@ impl ProbeAnswer for u64 {
     }
 }
 
+/// The least group memory of a Vulkan device the backend opens: its floor
+/// (`seismic_vulkan`'s admission). A declaration sizes what only some
+/// devices hold against it, so every device it runs on holds it.
+pub const VULKAN_FLOOR_SHARED_BYTES: u64 = 32 * 1024;
+
 /// The type of property `name` when `backend` provides it.
 pub fn provided(backend: BackendName, name: &str) -> Option<PropertyKind> {
     let names: &[(&str, PropertyKind)] = match backend {

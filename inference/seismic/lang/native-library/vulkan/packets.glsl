@@ -156,6 +156,170 @@
 #define SEISMIC_TABLES_READ_CODEBOOK(ID) PACKETS_ANY(SEISMIC_AXIS_CODES_TABLE, ID)
 #include <seismic/tables.glsl>
 
+// Staged tables. A grid code's points and a codebook code's values are read
+// at an index each lane forms from its own codes. From a constant array the
+// subgroup's distinct indices are read one after another; from shared memory
+// in parallel, banks apart. An includer whose decoding launches' shared
+// regions may end with the bound slots' tables (the declaration's
+// `form(W, TABLE)` bytes, `dense.seismic`) defines PACKETS_STAGED_TABLES 1
+// before including this file, and each such launch calls
+// `packets_stage_tables()` (workgroup-collective) before it decodes. The
+// declaration holds the tables where every device holds the region with them
+// (the backend's floor), and then pads it to an odd u32 length, which it
+// never has otherwise
+// (`packets_held`, a specialization constant). There the call copies every
+// distinct table the slots read once to the region's end before the pad
+// word, in slot order, a grid's points as `u32` words (an eight-lane point's
+// low word first) and a codebook's values as `f32`s, and the readers of that
+// launch read it there (`packets_staged`). Every other read (a launch that
+// stages nothing, a gathering kernel's few reads, a region the floor cannot
+// hold with the tables) reads the constant arrays.
+
+// A slot's table, as a key equal for slots that read the same one (0: none),
+// and its words (`GRIDS_WORDS_<ID>`, `CODEBOOKS_WORDS_<ID>`; the id of the
+// table a slot does not read is 0, of no words).
+#define PACKETS_TABLE_KEY(AXES) ((AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_ROWS \
+    && AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_GRID) * AXES(SEISMIC_AXIS_CODES_GRID) \
+    + (AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_ROWS && AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_TABLE) \
+    * (64 + AXES(SEISMIC_AXIS_CODES_TABLE)))
+#define PACKETS_TABLE_WORDS_OF(AXES) (PACKETS_CAT(GRIDS_WORDS_, AXES(SEISMIC_AXIS_CODES_GRID)) \
+    + PACKETS_CAT(CODEBOOKS_WORDS_, AXES(SEISMIC_AXIS_CODES_TABLE)))
+#define PACKETS_KEY_0 PACKETS_TABLE_KEY(PACKETS_W0_AXES)
+#define PACKETS_KEY_1 PACKETS_TABLE_KEY(PACKETS_W1_AXES)
+#define PACKETS_KEY_2 PACKETS_TABLE_KEY(PACKETS_W2_AXES)
+#define PACKETS_KEY_3 PACKETS_TABLE_KEY(PACKETS_W3_AXES)
+// Whether slot n stages its table (the first slot that reads it), the words
+// it stages, and the place of its table among the staged ones.
+#define PACKETS_FIRST_0 (PACKETS_KEY_0 != 0)
+#define PACKETS_FIRST_1 (PACKETS_KEY_1 != 0 && PACKETS_KEY_1 != PACKETS_KEY_0)
+#define PACKETS_FIRST_2 (PACKETS_KEY_2 != 0 && PACKETS_KEY_2 != PACKETS_KEY_0 && PACKETS_KEY_2 != PACKETS_KEY_1)
+#define PACKETS_FIRST_3 (PACKETS_KEY_3 != 0 && PACKETS_KEY_3 != PACKETS_KEY_0 && PACKETS_KEY_3 != PACKETS_KEY_1 \
+    && PACKETS_KEY_3 != PACKETS_KEY_2)
+#if PACKETS_FIRST_0
+#define PACKETS_STAGED_0 PACKETS_TABLE_WORDS_OF(PACKETS_W0_AXES)
+#else
+#define PACKETS_STAGED_0 0u
+#endif
+#if PACKETS_FIRST_1
+#define PACKETS_STAGED_1 PACKETS_TABLE_WORDS_OF(PACKETS_W1_AXES)
+#else
+#define PACKETS_STAGED_1 0u
+#endif
+#if PACKETS_FIRST_2
+#define PACKETS_STAGED_2 PACKETS_TABLE_WORDS_OF(PACKETS_W2_AXES)
+#else
+#define PACKETS_STAGED_2 0u
+#endif
+#if PACKETS_FIRST_3
+#define PACKETS_STAGED_3 PACKETS_TABLE_WORDS_OF(PACKETS_W3_AXES)
+#else
+#define PACKETS_STAGED_3 0u
+#endif
+#define PACKETS_PLACE_0 0u
+#if PACKETS_KEY_1 == PACKETS_KEY_0
+#define PACKETS_PLACE_1 PACKETS_PLACE_0
+#else
+#define PACKETS_PLACE_1 (PACKETS_STAGED_0)
+#endif
+#if PACKETS_KEY_2 == PACKETS_KEY_0
+#define PACKETS_PLACE_2 PACKETS_PLACE_0
+#elif PACKETS_KEY_2 == PACKETS_KEY_1
+#define PACKETS_PLACE_2 PACKETS_PLACE_1
+#else
+#define PACKETS_PLACE_2 (PACKETS_STAGED_0 + PACKETS_STAGED_1)
+#endif
+#if PACKETS_KEY_3 == PACKETS_KEY_0
+#define PACKETS_PLACE_3 PACKETS_PLACE_0
+#elif PACKETS_KEY_3 == PACKETS_KEY_1
+#define PACKETS_PLACE_3 PACKETS_PLACE_1
+#elif PACKETS_KEY_3 == PACKETS_KEY_2
+#define PACKETS_PLACE_3 PACKETS_PLACE_2
+#else
+#define PACKETS_PLACE_3 (PACKETS_STAGED_0 + PACKETS_STAGED_1 + PACKETS_STAGED_2)
+#endif
+#define PACKETS_TABLE_WORDS (PACKETS_STAGED_0 + PACKETS_STAGED_1 + PACKETS_STAGED_2 + PACKETS_STAGED_3)
+#if defined(PACKETS_STAGED_TABLES)
+#if PACKETS_STAGED_TABLES && (PACKETS_KEY_0 != 0 || PACKETS_KEY_1 != 0 || PACKETS_KEY_2 != 0 || PACKETS_KEY_3 != 0)
+#define PACKETS_STAGING
+#endif
+#endif
+
+// Word `i` of slot axes `AXES`' table (the place PLACE among the staged
+// ones), an eight-lane grid's point `i` and a codebook's value `i`: staged
+// where the launch staged the tables, in place otherwise.
+#if defined(PACKETS_STAGING)
+const bool packets_held = (SEISMIC_SHARED_U32 & 1u) == 1u;
+bool packets_staged = false;
+#define PACKETS_TABLES_AT (SEISMIC_SHARED_U32 - 1u - PACKETS_TABLE_WORDS)
+#define PACKETS_TABLE_WORD(AXES, PLACE, i) (packets_staged ? seismic_shared_u32[PACKETS_TABLES_AT + (PLACE) + (i)] \
+    : PACKETS_CAT(GRIDS_TABLE_, AXES(SEISMIC_AXIS_CODES_GRID))[i])
+#define PACKETS_TABLE_POINT8(AXES, PLACE, i) (packets_staged \
+    ? uvec2(seismic_shared_u32[PACKETS_TABLES_AT + (PLACE) + 2u * (i)], \
+        seismic_shared_u32[PACKETS_TABLES_AT + (PLACE) + 2u * (i) + 1u]) \
+    : PACKETS_CAT(GRIDS_TABLE_, AXES(SEISMIC_AXIS_CODES_GRID))[i])
+#define PACKETS_TABLE_VALUE(AXES, PLACE, i) (packets_staged ? seismic_shared_f32[PACKETS_TABLES_AT + (PLACE) + (i)] \
+    : PACKETS_CAT(CODEBOOKS_TABLE_, AXES(SEISMIC_AXIS_CODES_TABLE))[i])
+#else
+#define PACKETS_TABLE_WORD(AXES, PLACE, i) PACKETS_CAT(GRIDS_TABLE_, AXES(SEISMIC_AXIS_CODES_GRID))[i]
+#define PACKETS_TABLE_POINT8(AXES, PLACE, i) PACKETS_CAT(GRIDS_TABLE_, AXES(SEISMIC_AXIS_CODES_GRID))[i]
+#define PACKETS_TABLE_VALUE(AXES, PLACE, i) PACKETS_CAT(CODEBOOKS_TABLE_, AXES(SEISMIC_AXIS_CODES_TABLE))[i]
+#endif
+
+// Copies slot axes `AXES`' table to its place PLACE among the staged ones,
+// the workgroup's invocations a word each in turn.
+#define PACKETS_STAGE_GRID8(AXES, PLACE) \
+    for (uint i = gl_LocalInvocationIndex; i < PACKETS_TABLE_WORDS_OF(AXES); i += threads) \
+        seismic_shared_u32[PACKETS_TABLES_AT + (PLACE) + i] = \
+            PACKETS_CAT(GRIDS_TABLE_, AXES(SEISMIC_AXIS_CODES_GRID))[i >> 1u][i & 1u];
+#define PACKETS_STAGE_GRID4(AXES, PLACE) \
+    for (uint i = gl_LocalInvocationIndex; i < PACKETS_TABLE_WORDS_OF(AXES); i += threads) \
+        seismic_shared_u32[PACKETS_TABLES_AT + (PLACE) + i] = PACKETS_CAT(GRIDS_TABLE_, AXES(SEISMIC_AXIS_CODES_GRID))[i];
+#define PACKETS_STAGE_CODEBOOK(AXES, PLACE) \
+    for (uint i = gl_LocalInvocationIndex; i < PACKETS_TABLE_WORDS_OF(AXES); i += threads) \
+        seismic_shared_f32[PACKETS_TABLES_AT + (PLACE) + i] = \
+            PACKETS_CAT(CODEBOOKS_TABLE_, AXES(SEISMIC_AXIS_CODES_TABLE))[i];
+
+// Stages the bound slots' tables (workgroup-collective: every invocation
+// calls it, in uniform control flow), where the includer stages them; a
+// launch calls it before it decodes.
+void packets_stage_tables() {
+#if defined(PACKETS_STAGING)
+    if (!packets_held)
+        return;
+    const uint threads = gl_WorkGroupSize.x * gl_WorkGroupSize.y * gl_WorkGroupSize.z;
+#if PACKETS_FIRST_0 && PACKETS_W0_AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_TABLE
+    PACKETS_STAGE_CODEBOOK(PACKETS_W0_AXES, PACKETS_PLACE_0)
+#elif PACKETS_FIRST_0 && PACKETS_W0_AXES(SEISMIC_AXIS_CODES_GRID_LANES) == 8
+    PACKETS_STAGE_GRID8(PACKETS_W0_AXES, PACKETS_PLACE_0)
+#elif PACKETS_FIRST_0
+    PACKETS_STAGE_GRID4(PACKETS_W0_AXES, PACKETS_PLACE_0)
+#endif
+#if PACKETS_FIRST_1 && PACKETS_W1_AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_TABLE
+    PACKETS_STAGE_CODEBOOK(PACKETS_W1_AXES, PACKETS_PLACE_1)
+#elif PACKETS_FIRST_1 && PACKETS_W1_AXES(SEISMIC_AXIS_CODES_GRID_LANES) == 8
+    PACKETS_STAGE_GRID8(PACKETS_W1_AXES, PACKETS_PLACE_1)
+#elif PACKETS_FIRST_1
+    PACKETS_STAGE_GRID4(PACKETS_W1_AXES, PACKETS_PLACE_1)
+#endif
+#if PACKETS_FIRST_2 && PACKETS_W2_AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_TABLE
+    PACKETS_STAGE_CODEBOOK(PACKETS_W2_AXES, PACKETS_PLACE_2)
+#elif PACKETS_FIRST_2 && PACKETS_W2_AXES(SEISMIC_AXIS_CODES_GRID_LANES) == 8
+    PACKETS_STAGE_GRID8(PACKETS_W2_AXES, PACKETS_PLACE_2)
+#elif PACKETS_FIRST_2
+    PACKETS_STAGE_GRID4(PACKETS_W2_AXES, PACKETS_PLACE_2)
+#endif
+#if PACKETS_FIRST_3 && PACKETS_W3_AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_TABLE
+    PACKETS_STAGE_CODEBOOK(PACKETS_W3_AXES, PACKETS_PLACE_3)
+#elif PACKETS_FIRST_3 && PACKETS_W3_AXES(SEISMIC_AXIS_CODES_GRID_LANES) == 8
+    PACKETS_STAGE_GRID8(PACKETS_W3_AXES, PACKETS_PLACE_3)
+#elif PACKETS_FIRST_3
+    PACKETS_STAGE_GRID4(PACKETS_W3_AXES, PACKETS_PLACE_3)
+#endif
+    barrier();
+    packets_staged = true;
+#endif
+}
+
 // A kind's form, and whether it is dense or has a bias term.
 bool packets_dense(const int kind) {
     return PACKETS_AXIS(kind, SEISMIC_AXIS_FORM) == SEISMIC_FORM_DENSE;
@@ -303,32 +467,31 @@ vec4 packets_unsigned_bytes(uint word) { return vec4(unpack8(word)); }
 // offset of at most 128, so that the difference is a signed byte), two's
 // complement codes (bytes) the signed bytes, odd codes `2 (c - k) + 1`
 // (`CODES_OFFSET` k), and a codebook's codes (nibbles) the codebook's values
-// (`CODEBOOKS_TABLE_<ID>`, `PACKETS_CODEBOOK`), and E4M3 bytes
+// (`packets_codebook`), and E4M3 bytes
 // (`registry::ValueCodes::E4m3`) their values. A product
 // operand takes an offset off as the exact bias -(offset scale)
 // (`packets_values`): the offset is a power of two, without a stored bias
 // (`producers.decl`).
 
-// The codebook value of `code` of slot axes `AXES` (`CODEBOOKS_TABLE_<id>`).
-#define PACKETS_CODEBOOK(AXES) PACKETS_CAT(CODEBOOKS_TABLE_, AXES(SEISMIC_AXIS_CODES_TABLE))
-
+// The codebook value of `code` of a kind (its slot's staged table, or
+// `CODEBOOKS_TABLE_<id>`).
 #if PACKETS_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_TABLE)
 float packets_codebook(const int kind, uint code) {
 #if PACKETS_SLOT(PACKETS_W0_AXES, SEISMIC_AXIS_CODES, SEISMIC_CODES_TABLE)
     if (kind == PACKETS_W0)
-        return PACKETS_CODEBOOK(PACKETS_W0_AXES)[code];
+        return PACKETS_TABLE_VALUE(PACKETS_W0_AXES, PACKETS_PLACE_0, code);
 #endif
 #if PACKETS_SLOT(PACKETS_W1_AXES, SEISMIC_AXIS_CODES, SEISMIC_CODES_TABLE)
     if (kind == PACKETS_W1)
-        return PACKETS_CODEBOOK(PACKETS_W1_AXES)[code];
+        return PACKETS_TABLE_VALUE(PACKETS_W1_AXES, PACKETS_PLACE_1, code);
 #endif
 #if PACKETS_SLOT(PACKETS_W2_AXES, SEISMIC_AXIS_CODES, SEISMIC_CODES_TABLE)
     if (kind == PACKETS_W2)
-        return PACKETS_CODEBOOK(PACKETS_W2_AXES)[code];
+        return PACKETS_TABLE_VALUE(PACKETS_W2_AXES, PACKETS_PLACE_2, code);
 #endif
 #if PACKETS_SLOT(PACKETS_W3_AXES, SEISMIC_AXIS_CODES, SEISMIC_CODES_TABLE)
     if (kind == PACKETS_W3)
-        return PACKETS_CODEBOOK(PACKETS_W3_AXES)[code];
+        return PACKETS_TABLE_VALUE(PACKETS_W3_AXES, PACKETS_PLACE_3, code);
 #endif
     return 0.0;
 }
@@ -397,9 +560,6 @@ vec4 packets_interpret(const int kind, uint bytes, const bool centred) {
     && AXES(SEISMIC_AXIS_CODES_GRID_SIGNS) == SEISMIC_GRID_SIGNS_NONE)
 #define PACKETS_GRID_DELTA(AXES) (PACKETS_GRID_OF(AXES) && AXES(SEISMIC_AXIS_CODES_GRID_DELTA) != 0)
 
-// The grid table of slot axes `AXES` (`GRIDS_TABLE_<id>`).
-#define PACKETS_GRID_TABLE(AXES) PACKETS_CAT(GRIDS_TABLE_, AXES(SEISMIC_AXIS_CODES_GRID))
-
 #if PACKETS_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_GRID)
 // The whole bytes (`LOW` bits) of entry `step` of a packet's four.
 uint packets_grid_entry(const int kind, uvec4 entries, uint step) {
@@ -418,48 +578,50 @@ uint packets_grid_entry(const int kind, uvec4 entries, uint step) {
 }
 
 // An entry's grid point (lanes 0..3 in x, 4..7 in y): one index of an
-// eight-lane grid, or two of a four-lane grid, the first lowest. A grid's
-// points are `uvec2`s or `uint`s by its lanes, so a slot's lanes choose its
-// code here, in the preprocessor.
+// eight-lane grid, or two of a four-lane grid, the first lowest, read from
+// the slot's table (PLACE among the staged ones). A grid's points are
+// `uvec2`s or `uint`s by its lanes, so a slot's lanes choose its code here,
+// in the preprocessor.
 #define PACKETS_GRID_MASK(AXES) ((1u << uint(AXES(SEISMIC_AXIS_CODES_GRID_INDEX_BITS))) - 1u)
-#define PACKETS_GRID_POINT8(AXES, entry) return PACKETS_GRID_TABLE(AXES)[(entry) & PACKETS_GRID_MASK(AXES)];
-#define PACKETS_GRID_POINT4(AXES, entry) \
-    return uvec2(PACKETS_GRID_TABLE(AXES)[(entry) & PACKETS_GRID_MASK(AXES)], \
-        PACKETS_GRID_TABLE(AXES)[((entry) >> AXES(SEISMIC_AXIS_CODES_GRID_INDEX_BITS)) & PACKETS_GRID_MASK(AXES)]);
+#define PACKETS_GRID_POINT8(AXES, PLACE, entry) \
+    return PACKETS_TABLE_POINT8(AXES, PLACE, (entry) & PACKETS_GRID_MASK(AXES));
+#define PACKETS_GRID_POINT4(AXES, PLACE, entry) \
+    return uvec2(PACKETS_TABLE_WORD(AXES, PLACE, (entry) & PACKETS_GRID_MASK(AXES)), \
+        PACKETS_TABLE_WORD(AXES, PLACE, ((entry) >> AXES(SEISMIC_AXIS_CODES_GRID_INDEX_BITS)) & PACKETS_GRID_MASK(AXES)));
 uvec2 packets_grid_point(const int kind, uint entry) {
 #if PACKETS_SLOT(PACKETS_W0_AXES, SEISMIC_AXIS_CODES, SEISMIC_CODES_GRID)
     if (kind == PACKETS_W0) {
 #if PACKETS_W0_AXES(SEISMIC_AXIS_CODES_GRID_LANES) == 8
-        PACKETS_GRID_POINT8(PACKETS_W0_AXES, entry)
+        PACKETS_GRID_POINT8(PACKETS_W0_AXES, PACKETS_PLACE_0, entry)
 #else
-        PACKETS_GRID_POINT4(PACKETS_W0_AXES, entry)
+        PACKETS_GRID_POINT4(PACKETS_W0_AXES, PACKETS_PLACE_0, entry)
 #endif
     }
 #endif
 #if PACKETS_SLOT(PACKETS_W1_AXES, SEISMIC_AXIS_CODES, SEISMIC_CODES_GRID)
     if (kind == PACKETS_W1) {
 #if PACKETS_W1_AXES(SEISMIC_AXIS_CODES_GRID_LANES) == 8
-        PACKETS_GRID_POINT8(PACKETS_W1_AXES, entry)
+        PACKETS_GRID_POINT8(PACKETS_W1_AXES, PACKETS_PLACE_1, entry)
 #else
-        PACKETS_GRID_POINT4(PACKETS_W1_AXES, entry)
+        PACKETS_GRID_POINT4(PACKETS_W1_AXES, PACKETS_PLACE_1, entry)
 #endif
     }
 #endif
 #if PACKETS_SLOT(PACKETS_W2_AXES, SEISMIC_AXIS_CODES, SEISMIC_CODES_GRID)
     if (kind == PACKETS_W2) {
 #if PACKETS_W2_AXES(SEISMIC_AXIS_CODES_GRID_LANES) == 8
-        PACKETS_GRID_POINT8(PACKETS_W2_AXES, entry)
+        PACKETS_GRID_POINT8(PACKETS_W2_AXES, PACKETS_PLACE_2, entry)
 #else
-        PACKETS_GRID_POINT4(PACKETS_W2_AXES, entry)
+        PACKETS_GRID_POINT4(PACKETS_W2_AXES, PACKETS_PLACE_2, entry)
 #endif
     }
 #endif
 #if PACKETS_SLOT(PACKETS_W3_AXES, SEISMIC_AXIS_CODES, SEISMIC_CODES_GRID)
     if (kind == PACKETS_W3) {
 #if PACKETS_W3_AXES(SEISMIC_AXIS_CODES_GRID_LANES) == 8
-        PACKETS_GRID_POINT8(PACKETS_W3_AXES, entry)
+        PACKETS_GRID_POINT8(PACKETS_W3_AXES, PACKETS_PLACE_3, entry)
 #else
-        PACKETS_GRID_POINT4(PACKETS_W3_AXES, entry)
+        PACKETS_GRID_POINT4(PACKETS_W3_AXES, PACKETS_PLACE_3, entry)
 #endif
     }
 #endif

@@ -2,6 +2,8 @@
 // `(router, shared_router)` in the CPU 8-lane reference order.
 #define KERNEL_W0 SEISMIC_ROUTER
 #define KERNEL_W1 SEISMIC_SHARED_ROUTER
+// The projection's decoding launches stage their weights' tables (`packets.glsl`).
+#define PACKETS_STAGED_TABLES 1
 #include "lib/core/activation.glsl"
 #include "lib/projection/projection.glsl"
 #define ROUTE_E uint(SEISMIC_DIM_E)

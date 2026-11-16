@@ -521,7 +521,14 @@ projection dense for cuda:
 # weight takes NVFP4 operands (`operands(W)`), which the GEMV forms while
 # staging and the stage launch past 8 rows. The GEMV's shared region holds the
 # rows' squares, the NVFP4 operands' global scales and the staged packets
-# (`projection.glsl`). Every weight is one the packet decoder reads
+# (`projection.glsl`). Every launch that decodes the weights holds its own
+# region rounded to 8 bytes and, where every device holds that region with
+# them (its footprint, the 16-byte views' largest, within the backend's
+# floor, FLOOR_SHARED_BYTES), their grids' and codebooks' tables (their
+# `form(W, TABLE)` bytes, rounded to 8) and a 4-byte pad: the region's u32 length
+# is then odd, and odd only then, which is how the library tells it stages
+# the tables there once a workgroup (`packets_stage_tables`) rather than
+# reading them in place. Every weight is one the packet decoder reads
 # (`form(W, DECODED)`, `vulkan/producers.decl`). Groups: every launch but the stage runs group g at
 # grid z (z = g * SPLIT + part in the GEMM), over the group's columns, weight
 # rows and output columns, and its own G-th of the split partials; the
@@ -535,6 +542,22 @@ projection dense for vulkan:
     let ORDERED_ALL = sum(W, ORDERED) / WEIGHTS
     let OPERANDS = min(1, sum(W, operands(W)))
     let GEMV_SHARED = 256 + 32 * OPERANDS + min(8 * ceil_div(K / P, 32), 288) * 72
+    let TABLE_SUM = sum(W, form(W, TABLE))
+    let TABLE_REGION = min(1, TABLE_SUM) * (8 * ceil_div(TABLE_SUM, 8) + 4)
+    let GEMV_REGION = 8 * ceil_div(GEMV_SHARED, 8)
+    let GEMV_HELD = GEMV_REGION + TABLE_REGION * (1 - min(1, 16 * ceil_div(GEMV_REGION + TABLE_REGION, 16) / (FLOOR_SHARED_BYTES + 1)))
+    let GEMM_REGION = (TILE_M + TILE_N) * 80
+    let GEMM_HELD = GEMM_REGION + TABLE_REGION * (1 - min(1, 16 * ceil_div(GEMM_REGION + TABLE_REGION, 16) / (FLOOR_SHARED_BYTES + 1)))
+    let ORDERED_GEMV_REGION = 8448
+    let ORDERED_GEMV_HELD = ORDERED_GEMV_REGION + TABLE_REGION * (1 - min(1, 16 * ceil_div(ORDERED_GEMV_REGION + TABLE_REGION, 16) / (FLOOR_SHARED_BYTES + 1)))
+    let ORDERED_GEMM_REGION = 9216
+    let ORDERED_GEMM_HELD = ORDERED_GEMM_REGION + TABLE_REGION * (1 - min(1, 16 * ceil_div(ORDERED_GEMM_REGION + TABLE_REGION, 16) / (FLOOR_SHARED_BYTES + 1)))
+    let MIXED_GEMV1_REGION = 8 * ceil_div(max(2304, GEMV_SHARED), 8)
+    let MIXED_GEMV1_HELD = MIXED_GEMV1_REGION + TABLE_REGION * (1 - min(1, 16 * ceil_div(MIXED_GEMV1_REGION + TABLE_REGION, 16) / (FLOOR_SHARED_BYTES + 1)))
+    let MIXED_GEMV4_REGION = 8 * ceil_div(max(4352, GEMV_SHARED), 8)
+    let MIXED_GEMV4_HELD = MIXED_GEMV4_REGION + TABLE_REGION * (1 - min(1, 16 * ceil_div(MIXED_GEMV4_REGION + TABLE_REGION, 16) / (FLOOR_SHARED_BYTES + 1)))
+    let MIXED_GEMV8_REGION = 8 * ceil_div(max(8448, GEMV_SHARED), 8)
+    let MIXED_GEMV8_HELD = MIXED_GEMV8_REGION + TABLE_REGION * (1 - min(1, 16 * ceil_div(MIXED_GEMV8_REGION + TABLE_REGION, 16) / (FLOOR_SHARED_BYTES + 1)))
     let SPLITS = 1 for paired | segmented
     let SPLITS = SPLIT for single
     params (SIMDGROUPS in [16, 8, 4, 2, 32] default (16 - 8 * ORDERED_ANY), ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default (16 + 16 * ORDERED_ANY * (1 - ORDERED_ALL)),
@@ -562,30 +585,30 @@ projection dense for vulkan:
     launch ordered_gemv when ORDERED_ALL == 1 and M <= VERIFY_ROWS:
         threadgroups (tiles(W, ceil_div(N, 4 * SIMDGROUPS)), 1, G)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (8448)
+        shared_bytes (ORDERED_GEMV_HELD)
     launch ordered_gemv1 for segmented when ORDERED_ANY == 1 and ORDERED_ALL == 0 and M <= 1:
         threadgroups (tiles(W, ORDERED * ceil_div(N, 4 * SIMDGROUPS) + (1 - ORDERED) * ceil_div(N, SIMDGROUPS * ROWS * 32 / LANES)), 1, G)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (max(2304, GEMV_SHARED))
+        shared_bytes (MIXED_GEMV1_HELD)
     launch ordered_gemv2 for segmented when ORDERED_ANY == 1 and ORDERED_ALL == 0 and M == 2:
         alike (ordered_gemv1)
         threadgroups (tiles(W, ORDERED * ceil_div(N, 4 * SIMDGROUPS) + (1 - ORDERED) * ceil_div(N, SIMDGROUPS * ROWS * 32 / LANES)), 1, G)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (max(2304, GEMV_SHARED))
+        shared_bytes (MIXED_GEMV1_HELD)
     launch ordered_gemv4 for segmented when ORDERED_ANY == 1 and ORDERED_ALL == 0 and M >= 3 and M <= 4:
         alike (ordered_gemv1)
         threadgroups (tiles(W, ORDERED * ceil_div(N, 4 * SIMDGROUPS) + (1 - ORDERED) * ceil_div(N, SIMDGROUPS * ROWS * 32 / LANES)), 1, G)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (max(4352, GEMV_SHARED))
+        shared_bytes (MIXED_GEMV4_HELD)
     launch ordered_gemv8 for segmented when ORDERED_ANY == 1 and ORDERED_ALL == 0 and M >= 5 and M <= VERIFY_ROWS:
         alike (ordered_gemv1)
         threadgroups (tiles(W, ORDERED * ceil_div(N, 4 * SIMDGROUPS) + (1 - ORDERED) * ceil_div(N, SIMDGROUPS * ROWS * 32 / LANES)), 1, G)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (max(8448, GEMV_SHARED))
+        shared_bytes (MIXED_GEMV8_HELD)
     launch ordered_gemm when ORDERED_ALL == 1 and M > VERIFY_ROWS:
         threadgroups (tiles(W, ceil_div(N, 32)), ceil_div(M, 64), G)
         threads_per_threadgroup (256, 1, 1)
-        shared_bytes (9216)
+        shared_bytes (ORDERED_GEMM_HELD)
     launch stage for rms when ORDERED_ANY == 0 and M > VERIFY_ROWS:
         staging
         threadgroups (M * P, 1, 1)
@@ -604,29 +627,29 @@ projection dense for vulkan:
     launch gemv1 when ORDERED_ANY == 0 and M <= 1:
         threadgroups (P * tiles(W, ceil_div(N, SIMDGROUPS * ROWS * 32 / LANES)), 1, G)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (GEMV_SHARED)
+        shared_bytes (GEMV_HELD)
     launch gemv2 when ORDERED_ANY == 0 and M == 2:
         alike (gemv1)
         threadgroups (P * tiles(W, ceil_div(N, SIMDGROUPS * ROWS * 32 / LANES)), 1, G)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (GEMV_SHARED)
+        shared_bytes (GEMV_HELD)
     launch gemv4 when ORDERED_ANY == 0 and M >= 3 and M <= 4:
         alike (gemv1)
         threadgroups (P * tiles(W, ceil_div(N, SIMDGROUPS * ROWS * 32 / LANES)), 1, G)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (GEMV_SHARED)
+        shared_bytes (GEMV_HELD)
     launch gemv8 when ORDERED_ANY == 0 and M >= 5 and M <= VERIFY_ROWS:
         alike (gemv1)
         threadgroups (P * tiles(W, ceil_div(N, SIMDGROUPS * ROWS * 32 / LANES)), 1, G)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (GEMV_SHARED)
+        shared_bytes (GEMV_HELD)
     launch combine for segmented when ORDERED_ANY == 0 and M <= VERIFY_ROWS and PARTED == 1:
         threadgroups (ceil_div(M * sum(W, N), 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch gemm when ORDERED_ANY == 0 and M > VERIFY_ROWS:
         threadgroups (tiles(W, ceil_div(N, TILE_N / SERVED)), ceil_div(M, TILE_M), SPLITS * G)
         threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
-        shared_bytes ((TILE_M + TILE_N) * 80)
+        shared_bytes (GEMM_HELD)
     launch finalize for single when ORDERED_ANY == 0 and M > VERIFY_ROWS and SPLIT > 1:
         threadgroups (ceil_div(M * N, 256), 1, G)
         threads_per_threadgroup (256, 1, 1)

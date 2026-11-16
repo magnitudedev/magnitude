@@ -5255,6 +5255,7 @@ enum Cases {
     Checked,
     Scoped,
     Iq4Blocks,
+    Tables,
 }
 
 #[test]
@@ -5270,6 +5271,16 @@ fn recurrent_project_matches_its_portable_body_and_the_host_reference() {
 fn recurrent_project_over_iq4_blocks_matches_its_portable_body_and_the_host_reference() {
     for device in devices() {
         recurrent_project_cases_on(&device, Cases::Iq4Blocks);
+    }
+}
+
+/// Four weights that read four different tables (three grids and a
+/// codebook) in one segmented launch, which a decoder that stages its tables
+/// places one after another (`packets_stage_tables`).
+#[test]
+fn recurrent_project_over_four_tables_matches_its_portable_body_and_the_host_reference() {
+    for device in devices() {
+        recurrent_project_cases_on(&device, Cases::Tables);
     }
 }
 
@@ -5309,6 +5320,18 @@ fn recurrent_project_cases_on(device: &Device, cases: Cases) {
         Cases::Scoped => vec![(256usize, 1usize, 1usize, 64usize, k_quants)],
         Cases::Checked => vec![(512, 2, 4, 32, k_quants)],
         Cases::Iq4Blocks => vec![(640, 2, 4, 32, iq4_blocks)],
+        Cases::Tables => vec![(
+            512,
+            2,
+            4,
+            32,
+            [
+                Repr::gguf(Encoding::Iq2Xxs),
+                Repr::gguf(Encoding::Iq4Xs),
+                Repr::gguf(Encoding::Iq3Xxs),
+                Repr::gguf(Encoding::Iq1S),
+            ],
+        )],
     };
     for (h, nk, nv, w, reprs) in geometries {
         let rows_of = [(2 * nk + nv) * w, nv * w, nv, nv];
@@ -5622,6 +5645,16 @@ fn attention_projections_over_iq4_blocks_match_their_portable_bodies_and_the_hos
     }
 }
 
+/// Query, key and value weights that read three different tables (two grids
+/// and a codebook) in one segmented launch, which a decoder that stages its
+/// tables places one after another (`packets_stage_tables`).
+#[test]
+fn attention_projections_over_three_tables_match_their_portable_bodies_and_the_host_reference() {
+    for device in devices() {
+        attention_projections_match_their_portable_bodies_and_the_host_reference_on(&device, Cases::Tables);
+    }
+}
+
 #[test]
 fn metal_attention_scoped_launches_match_the_host() {
     let Some(device) = devices()
@@ -5701,6 +5734,14 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
             (2560, 4, 4, 256, true, k_quants),
         ],
         Cases::Iq4Blocks => vec![(640, 2, 2, 64, false, iq4_blocks)],
+        Cases::Tables => vec![(
+            512,
+            2,
+            2,
+            64,
+            false,
+            [Repr::gguf(Encoding::Iq2Xxs), Repr::gguf(Encoding::Iq4Xs), Repr::gguf(Encoding::Iq3Xxs)],
+        )],
     };
     for (d, kv, g, w, four_b, reprs) in geometries {
         let (row_classes, mappings) = if scoped {
@@ -5876,6 +5917,8 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
             &[Repr::Q4k]
         } else if cases == Cases::Iq4Blocks {
             &[Repr::gguf(Encoding::Iq4Nl)]
+        } else if cases == Cases::Tables {
+            &[Repr::gguf(Encoding::Iq2Xs)]
         } else {
             &[Repr::Q4k, Repr::Q8, Repr::Bf16]
         };
@@ -8305,5 +8348,114 @@ fn mxfp8_grouped_project_rows_at_deepseek_v41_prefill_wo_a_times() {
             median * 1e3,
             flops / median / 1e12
         );
+    }
+}
+
+/// `dense_output` at Qwen3.5-9B's feed-forward down shape (H 4096, F 12288)
+/// over the grid and codebook formats, q4_K and F8_E4M3, at a decode row and
+/// a 512-row prefill chunk, under the declaration's default GEMV and GEMM
+/// configuration: the median device time of a call over 15 samples. The grid
+/// formats are timed again over uniform weights (every code 0, so every
+/// lookup reads one table entry): what time their lookups take. A shape
+/// timing for before/after comparisons of the decoders.
+#[test]
+#[ignore = "timing at shape"]
+fn dense_output_timing_at_shape() {
+    let (h, f) = (4096usize, 12288usize);
+    let formats = [
+        Encoding::Iq1S,
+        Encoding::Iq1M,
+        Encoding::Iq2Xxs,
+        Encoding::Iq2Xs,
+        Encoding::Iq2S,
+        Encoding::Iq3Xxs,
+        Encoding::Iq3S,
+        Encoding::Iq4Nl,
+        Encoding::Iq4Xs,
+        Encoding::Mxfp4,
+        Encoding::Q4K,
+    ]
+    .map(Format::rounded)
+    .into_iter()
+    .chain([Format::F8_E4M3])
+    .map(|format| (format, false))
+    .chain([Encoding::Iq1S, Encoding::Iq2Xxs, Encoding::Iq3Xxs].map(|encoding| (Format::rounded(encoding), true)));
+    let act = Act::Bf16;
+    for device in devices().into_iter().filter(|device| !is_cpu(device)) {
+        for (format, uniform) in formats.clone() {
+            // The weight's bytes alone: its host values (an interpreted
+            // decode of 50M values) are no part of a timing.
+            let repr = Repr::of(format);
+            let shape = [h as u64, f as u64];
+            let external = format.external(&mut Rng::new(91), &shape, 2.0 / (f as f32).sqrt());
+            let external = if uniform { vec![0; external.len()] } else { external };
+            let bytes = repr.element().repack_host(format.source(), &shape, &external).unwrap();
+            let weight_tensor = Tensor::from_host(&device, repr.resident(&device), &shape, &bytes).unwrap();
+            for rows in [1usize, 512] {
+                let mut rng = Rng::new(rows as u64);
+                let residual = f32_tensor(&device, &[rows, h], &(0..rows * h).map(|_| rng.symmetric()).collect::<Vec<_>>());
+                let product = act_tensor(
+                    &device,
+                    act,
+                    &[rows, f],
+                    &(0..rows * f).map(|_| act.round(rng.symmetric())).collect::<Vec<_>>(),
+                );
+                let out_rows = i32_tensor(&device, &[rows], &(0..rows as i32).collect::<Vec<_>>());
+                let (scale, bound) = (f32_tensor(&device, &[0], &[]), absent_bound(&device));
+                let specialization = with_matrix::<dense_output::Entry>(
+                    &device,
+                    dense_output_specialization_on(&device, &[("H", h), ("F", f)], gemm_mapping(64, 128, 1)),
+                    &[("A", act.element()), ("DW", repr.resident(&device))],
+                );
+                let point = seismic::TuningPoint {
+                    label: format!("m{rows}"),
+                    weight: 1.0,
+                    class: None,
+                    cost: 1.0,
+                    workload: seismic::WorkloadRotation::All,
+                    rotation: vec![dense_output::Args {
+                        residual: &residual,
+                        product: &product,
+                        down_weight: &weight_tensor,
+                        out_rows: &out_rows,
+                        down_scale: &scale,
+                        down_bound: &bound,
+                    }],
+                    initialize: None,
+                    written: Default::default(),
+                };
+                let result = dense_output::native_tune_with(
+                    &device,
+                    dense_output::Elements { A: act.element(), DW: repr.resident(&device) },
+                    &specialization,
+                    vec![point],
+                    seismic::NumericalRequirement::RoundingSteps {
+                        alpha: 8.,
+                        activation: Some(seismic::DType::BF16),
+                    },
+                    seismic::Strategy::Survey(seismic::SurveyPlan {
+                        samples: 15,
+                        min_sample_seconds: 0.05,
+                        domains: Default::default(),
+                    }),
+                )
+                .unwrap();
+                let median = result
+                    .configurations
+                    .iter()
+                    .find_map(|record| match &record.outcome {
+                        seismic::Outcome::Measured { points, .. } => Some(points[0].median_seconds),
+                        seismic::Outcome::Excluded(_) => None,
+                    })
+                    .expect("the fixed configuration is measured");
+                eprintln!(
+                    "timing {:?} dense_output {format:?}{} H {h} F {f} M {rows}: {:.1} us per call, {:.0} G values/s",
+                    device.backend(),
+                    if uniform { " uniform" } else { "" },
+                    1e6 * median,
+                    (h * f) as f64 / median / 1e9
+                );
+            }
+        }
     }
 }

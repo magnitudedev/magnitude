@@ -15,7 +15,7 @@ pub use seismic_lang::device::vulkan::{Probed, Properties};
 
 /// Minimum group memory, invocations, grid and group extents and push
 /// constants of the floor.
-const FLOOR_SHARED_BYTES: u64 = 32 * 1024;
+const FLOOR_SHARED_BYTES: u64 = seismic_lang::device::VULKAN_FLOOR_SHARED_BYTES;
 const FLOOR_INVOCATIONS: u64 = 1024;
 const FLOOR_GROUP_COUNT: u32 = 65_535;
 const FLOOR_GROUP_SIZE: [u32; 3] = [1024, 1024, 64];

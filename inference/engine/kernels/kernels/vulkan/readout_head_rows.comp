@@ -2,6 +2,8 @@
 // vocabulary projection into F32 logits. The Vulkan form of
 // `metal/readout_head_rows.metal` on the `dense` projection (`lib/projection/operator.glsl`).
 #define KERNEL_W0 SEISMIC_WEIGHT
+// The projection's decoding launches stage their weights' tables (`packets.glsl`).
+#define PACKETS_STAGED_TABLES 1
 #include "lib/core/activation.glsl"
 #if SEISMIC_STATIC_WS != 0
 #define PROJECTION_SCALED

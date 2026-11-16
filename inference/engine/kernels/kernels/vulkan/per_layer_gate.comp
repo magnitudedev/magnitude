@@ -4,6 +4,8 @@
 // activated-product epilogue A(A(act(A(gate))) * inputs[m, layer, p]). The
 // Vulkan form of `metal/per_layer_gate.metal`.
 #define KERNEL_W0 SEISMIC_GATE_WEIGHT
+// The projection's decoding launches stage their weights' tables (`packets.glsl`).
+#define PACKETS_STAGED_TABLES 1
 #include "lib/core/activation.glsl"
 #if SEISMIC_STATIC_GS != 0
 #define PROJECTION_SCALED

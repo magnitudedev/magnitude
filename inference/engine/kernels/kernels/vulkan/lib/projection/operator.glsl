@@ -34,6 +34,10 @@
 //                               g's), or the gate weight (`paired`, g = 0),
 //   projected_partner(g)        the up weight (`paired`).
 // A `segmented` projection defines instead the segments' macros (below).
+// Every body that decodes the weights first stages their tables
+// (`packets_stage_tables`), which an includer that defines
+// PACKETS_STAGED_TABLES before including `projection.glsl` reads from the
+// end of each such launch's shared region (`dense.seismic` holds them there).
 
 #define PROJECTION_GROUP(z) (PROJECTION_G == 1 ? 0u : uint(z))
 
@@ -52,6 +56,7 @@ void projection_dense_stage() {
 // The GEMV with the activation-row bound `maxm` (one bound a pipeline, so one
 // launch a bound), group g at grid z.
 void projection_single_gemv(const uint maxm) {
+    packets_stage_tables();
     const uint g = PROJECTION_GROUP(gl_WorkGroupID.z);
     const projection_weights w = projected_weight(g);
     projection_gemv(PACKETS_W0, PACKETS_W0, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, maxm, PROJECTION_NORM,
@@ -67,6 +72,7 @@ uint64_t projection_single_partials(uint g) {
 // The GEMM's tiles, whole or (SPLIT > 1) over K share `part` of SPLIT into
 // partials that `finalize` sums in part order.
 void projection_single_gemm() {
+    packets_stage_tables();
     const uint g = PROJECTION_GROUP(gl_WorkGroupID.z / PROJECTION_SPLIT);
 #if PROJECTION_SPLIT == 1
     projection_gemm(PACKETS_W0, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N,
@@ -92,6 +98,7 @@ void projection_single_finalize() {
 
 #ifdef PROJECTION_PAIR
 void projection_paired_gemv(const uint maxm) {
+    packets_stage_tables();
     projection_gemv(PACKETS_W0, PACKETS_W1, true, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, maxm, PROJECTION_NORM,
         projected_input(0u), projected_output(0u), projected_weight(0u), projected_partner(0u), PROJECTION_M,
         PROJECTION_N, PROJECTION_K, gl_WorkGroupID.x);
@@ -99,6 +106,7 @@ void projection_paired_gemv(const uint maxm) {
 
 // A pair's tile takes TILE_N / 2 features of each weight.
 void projection_paired_gemm() {
+    packets_stage_tables();
     projection_gemm_paired(PACKETS_W0, PACKETS_W1, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M,
         SEISMIC_TUNE_SUB_N, projected_rows(0u), projected_output(0u), projected_weight(0u), projected_partner(0u),
         PROJECTION_M, PROJECTION_N, PROJECTION_K, gl_WorkGroupID.y, gl_WorkGroupID.x, 0xffffffffu);
@@ -149,6 +157,7 @@ void projection_paired_gemm() {
     }
 
 void projection_segmented_gemv(const uint maxm) {
+    packets_stage_tables();
     const uint per = projection_gemv_rows(SEISMIC_TUNE_SIMDGROUPS, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES);
     const uint m = PROJECTION_M;
     uint tile = gl_WorkGroupID.x;
@@ -187,6 +196,7 @@ void projection_segmented_gemv(const uint maxm) {
     }
 
 void projection_segmented_gemm() {
+    packets_stage_tables();
     const uint tm = SEISMIC_TUNE_TILE_M, tn = SEISMIC_TUNE_TILE_N, m = PROJECTION_M;
     const projection_prologue x = projected_rows(0u);
     uint tile = gl_WorkGroupID.x;
@@ -234,6 +244,7 @@ void projection_segmented_gemm() {
     }
 
 void projection_parts_gemv(const uint maxm) {
+    packets_stage_tables();
     const uint per = projection_gemv_rows(SEISMIC_TUNE_SIMDGROUPS, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES);
     const uint m = PROJECTION_M, parts = uint(PROJECTION_PARTS), width = PROJECTION_K / parts;
     const uint outputs = 0u PROJECTION_EACH_SEGMENT(PROJECTION_ADD_ROWS);

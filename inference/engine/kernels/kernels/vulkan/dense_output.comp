@@ -3,6 +3,8 @@
 // `metal/dense_output.metal` on the `dense` projection (`lib/projection/operator.glsl`); the GEMM
 // class may split K (SPLIT parts, then an in-order reduction).
 #define KERNEL_W0 SEISMIC_DOWN_WEIGHT
+// The projection's decoding launches stage their weights' tables (`packets.glsl`).
+#define PACKETS_STAGED_TABLES 1
 #include "lib/core/activation.glsl"
 #if SEISMIC_STATIC_DS != 0
 #define PROJECTION_SCALED

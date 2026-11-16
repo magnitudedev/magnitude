@@ -7,6 +7,8 @@
 #define KERNEL_W1 SEISMIC_GATE_WEIGHT
 #define KERNEL_W2 SEISMIC_KEY_WEIGHT
 #define KERNEL_W3 SEISMIC_VALUE_WEIGHT
+// The projection's decoding launches stage their weights' tables (`packets.glsl`).
+#define PACKETS_STAGED_TABLES 1
 #include "lib/core/activation.glsl"
 #if SEISMIC_STATIC_QS != 0 || SEISMIC_STATIC_GS != 0 || SEISMIC_STATIC_KS != 0 || SEISMIC_STATIC_VS != 0
 #define PROJECTION_SCALED

@@ -21,8 +21,9 @@
 //!
 //! The GPUs' forms are of packed rows, a dense weight having one path; the
 //! CPU's are of every weight, whose dense rows take its quantized
-//! activations too, and so is Vulkan's one form (`DECODED`), which admits a
-//! weight to its natives at all.
+//! activations too, and so are Vulkan's: `DECODED`, which admits a weight
+//! to its natives at all, and the bytes of the table its decoder stages for
+//! the weight (`TABLE`).
 //!
 //! A form whose producer reads every weight admits every weight and has no
 //! row here: Metal's tall GEMM (`TALL`), whose staging simdgroups decode
@@ -31,7 +32,7 @@
 //! guard alone (`dense.seismic`).
 
 use crate::ids::RepresentationId;
-use crate::registry::{self, BackendName, OperandRecipe, RepresentationInfo};
+use crate::registry::{self, BackendName, CodeInterpretation, OperandRecipe, RepresentationInfo, ValueCodes};
 use crate::producers::{self, Weight};
 use crate::registry::profile::{Bias, Domain, LocalScale, Profile, ValueMap};
 use crate::types::DType;
@@ -42,9 +43,11 @@ use crate::types::DType;
 /// (`INT8_LOCAL_NEGATED`). [`cuda_forms`] values them in this order.
 const CUDA_FORMS: [&str; 5] = ["GEMM_FOLD", "INT8", "GEMV_RECORDS", "INT8_LOCAL", "INT8_LOCAL_NEGATED"];
 
-/// Vulkan's forms: whether its packet decoder reads the weight (`DECODED`).
-/// [`vulkan_decoded`] values it.
-const VULKAN_FORMS: [&str; 1] = ["DECODED"];
+/// Vulkan's forms: whether its packet decoder reads the weight (`DECODED`),
+/// and the bytes of the table its decoder stages in shared memory for it
+/// (`TABLE`). [`vulkan_decoded`] and [`vulkan_table`] value them.
+const VULKAN_FORMS: [&str; 2] = ["DECODED", "TABLE"];
+
 
 /// Metal's forms, in emission order (`packets::Forms` reads those its
 /// library selects on). [`metal_forms`] values them in this order.
@@ -101,7 +104,8 @@ pub fn constants(backend: BackendName) -> &'static [(&'static str, u64)] {
             ("Q8_ROWS", CPU_Q8_ROWS),
             ("MAX_UNITS", CPU_MAX_UNITS),
         ],
-        BackendName::Cuda | BackendName::Metal | BackendName::Vulkan => &[],
+        BackendName::Vulkan => &[("FLOOR_SHARED_BYTES", crate::device::VULKAN_FLOOR_SHARED_BYTES)],
+        BackendName::Cuda | BackendName::Metal => &[],
     }
 }
 
@@ -149,7 +153,7 @@ fn values(backend: BackendName, id: RepresentationId) -> Option<&'static [u32]> 
 fn admitted(backend: BackendName, id: RepresentationId) -> Option<Vec<u32>> {
     let info = registry::representation_info(id);
     if backend == BackendName::Vulkan {
-        return Some(vec![u32::from(vulkan_decoded(info))]);
+        return Some(vec![u32::from(vulkan_decoded(info)), vulkan_table(info)]);
     }
     if backend == BackendName::Cpu {
         return Some(cpu_forms(info).to_vec());
@@ -277,6 +281,25 @@ fn vulkan_decoded(info: &RepresentationInfo) -> bool {
         registry::RepresentationKind::Dense(_) => true,
         _ => Weight::of(info).is_some_and(|weight| producers::covers(VULKAN_DECODED, &weight)),
     }
+}
+
+/// The bytes of the table Vulkan's decoder of weight `info` stages in shared
+/// memory once a workgroup (`packets_stage_tables`, `vulkan/packets.glsl`):
+/// its grid's points as `u32` words (`GRIDS_WORDS_<ID>`), its codebook's
+/// values as `f32`s (`CODEBOOKS_WORDS_<ID>`), or 0 for a weight that reads
+/// neither. A declaration's launches that decode hold their weights' sum at
+/// the end of their shared regions where every device holds the region with
+/// it (`dense.seismic`); the library stages each distinct table there once.
+fn vulkan_table(info: &RepresentationInfo) -> u32 {
+    let Some(weight) = Weight::of(info) else {
+        return 0;
+    };
+    let words = match weight.axes.coding.codes() {
+        ValueCodes::Grid(grid) => grid.grid.points.words(),
+        ValueCodes::Fields(CodeInterpretation::Table(codebook)) => codebook.values.len(),
+        ValueCodes::Fields(_) | ValueCodes::E4m3 => 0,
+    };
+    u32::try_from(4 * words).expect("a table of u32 bytes")
 }
 
 /// CUDA's forms of a packed-rows weight, in the order of [`CUDA_FORMS`].
@@ -1220,5 +1243,164 @@ mod tests {
             unadmitted.is_empty(),
             "Vulkan natives bind weights they do not admit by `form(W, DECODED) == 1`: {unadmitted:#?}"
         );
+    }
+
+    /// A decoding launch's region (`dense.seismic`) holds its weights' tables
+    /// where every Vulkan device holds the region with them, marked by an odd
+    /// u32 length, and only there: whatever it holds, its group memory (the
+    /// 16-byte views' largest, as the runtime reserves it) stays within the
+    /// 32 KiB floor wherever its own region does. A pair of iq1_s weights
+    /// (`dense_expand`, 32 KiB of tables) forms with every region within the
+    /// floor and its tables read in place; one iq1_s weight (`dense_output`,
+    /// 16 KiB) is held by the GEMM's region and not the GEMV's; iq2_xxs's
+    /// 2 KiB grid by both.
+    #[test]
+    fn vulkan_tables_are_held_where_every_device_holds_them() {
+        const DECODING: [&str; 11] = [
+            "gemv1", "gemv2", "gemv4", "gemv8", "gemm", "ordered_gemv", "ordered_gemv1", "ordered_gemv2",
+            "ordered_gemv4", "ordered_gemv8", "ordered_gemm",
+        ];
+        let floor = crate::device::VULKAN_FLOOR_SHARED_BYTES;
+        let module = crate::analysis::tests::kernels();
+        let id = |name: &str| registry::representation(name).expect("a registered representation");
+        // Each decoding launch's region at one and at 512 rows: its bytes.
+        let regions = |entry: &str, bindings: crate::entry::ElementBindings, statics: &[(&str, u64)]| {
+            let entry = module.entries().iter().find(|candidate| candidate.name == entry).expect("the entry");
+            let native = module.native_implementation(entry.id, BackendName::Vulkan).expect("a Vulkan native");
+            let bound = native.at_elements(&bindings).expect("the weights form");
+            let independent = bound.device_independent().expect("the declaration reads no device");
+            let specialization = statics
+                .iter()
+                .fold(crate::checked::NativeSpecialization::new(), |spec, (name, value)| spec.with_static(*name, *value));
+            let configuration = independent.default_specialization(&specialization).expect("the statics are admissible");
+            let mut regions = Vec::new();
+            for rows in [1u64, 512] {
+                let dimension = |name: &str| match name {
+                    "M" | "O" => Some(rows),
+                    _ => configuration.static_value(name),
+                };
+                for (ordinal, launch) in bound.launches.iter().enumerate() {
+                    let decoding = launch
+                        .kernel
+                        .strip_prefix(entry.name.as_str())
+                        .and_then(|rest| rest.strip_prefix('_'))
+                        .is_some_and(|suffix| DECODING.contains(&suffix));
+                    if !decoding {
+                        continue;
+                    }
+                    let parameter = |name: &str| configuration.launch_param(ordinal, name).or(configuration.param(name));
+                    let bytes = launch.shared_bytes.evaluate(&dimension, &parameter).expect("the region evaluates");
+                    regions.push((format!("{} M {rows}", launch.kernel), bytes));
+                }
+            }
+            regions
+        };
+        let iq1s = id("iq1s@rows16");
+        let output = |weight| {
+            regions(
+                "dense_output",
+                crate::entry::ElementBindings::new().bind("A", id("bf16")).bind("DW", weight),
+                &[("H", 4096), ("F", 12288), ("DS", 0)],
+            )
+        };
+        let expand = regions(
+            "dense_expand",
+            crate::entry::ElementBindings::new()
+                .bind("A", id("bf16"))
+                .bind("NW", id("f32"))
+                .bind("GW", iq1s)
+                .bind("UW", iq1s),
+            &[("H", 4096), ("F", 12288), ("GS", 0), ("US", 0), ("LB", 0)],
+        );
+        let held = |regions: &[(String, u64)], launch: &str| {
+            regions.iter().any(|(kernel, bytes)| kernel.contains(launch) && (bytes / 4) % 2 == 1)
+        };
+        for (regions, gemv, gemm) in [
+            (expand, false, false),
+            (output(iq1s), false, true),
+            (output(id("iq2xxs@rows16")), true, true),
+        ] {
+            assert!(!regions.is_empty(), "the projection decodes");
+            for (launch, bytes) in &regions {
+                assert!(16 * bytes.div_ceil(16) <= floor, "{launch}: {bytes} bytes past the {floor}-byte floor");
+                assert_eq!(bytes % 4, 0, "{launch}: a whole u32 length");
+            }
+            assert_eq!([held(&regions, "gemv1 "), held(&regions, "gemm ")], [gemv, gemm], "{regions:?}");
+        }
+    }
+
+    /// A native whose launches stage their weights' tables at the end of
+    /// their shared regions (its source defines `PACKETS_STAGED_TABLES` 1,
+    /// `vulkan/packets.glsl`) has every decoding launch of its projection
+    /// (its GEMVs and GEMMs) read `form(W, TABLE)` of every element a slot
+    /// of its binds in its `shared_bytes`: the library stages each distinct
+    /// table once at the region's end.
+    #[test]
+    fn vulkan_staged_tables_are_in_their_launches_shared_regions() {
+        const DECODING: [&str; 11] = [
+            "gemv1", "gemv2", "gemv4", "gemv8", "gemm", "ordered_gemv", "ordered_gemv1", "ordered_gemv2",
+            "ordered_gemv4", "ordered_gemv8", "ordered_gemm",
+        ];
+        fn reads(expression: &NativeNatExpr, element: &str, form: Form) -> bool {
+            match expression {
+                NativeNatExpr::Element(read, ElementQuery::Form(read_form)) => read == element && *read_form == form,
+                NativeNatExpr::Add(a, b)
+                | NativeNatExpr::Sub(a, b)
+                | NativeNatExpr::Mul(a, b)
+                | NativeNatExpr::Div(a, b)
+                | NativeNatExpr::Rem(a, b)
+                | NativeNatExpr::CeilDiv(a, b)
+                | NativeNatExpr::Min(a, b)
+                | NativeNatExpr::Max(a, b) => reads(a, element, form) || reads(b, element, form),
+                _ => false,
+            }
+        }
+        let forms = [Form::named(BackendName::Vulkan, "TABLE").unwrap()];
+        let module = crate::analysis::tests::kernels();
+        let mut staging = 0;
+        let mut unaccounted = Vec::new();
+        for entry in module.entries() {
+            let Some(native) = module.native_implementation(entry.id, BackendName::Vulkan) else { continue };
+            let asset = module.native_asset(entry.id, BackendName::Vulkan).expect("a Vulkan native has a source");
+            if !asset.text.lines().any(|line| line.trim() == "#define PACKETS_STAGED_TABLES 1") {
+                continue;
+            }
+            staging += 1;
+            let elements: std::collections::BTreeSet<&str> = asset
+                .text
+                .lines()
+                .filter_map(slot_binding)
+                .filter_map(|slot| {
+                    let parameter = entry
+                        .parameters
+                        .iter()
+                        .find(|parameter| format!("SEISMIC_{}", native_macro(&parameter.name)) == slot)?;
+                    match &parameter.kind {
+                        ParameterSummaryKind::Tensor { element: ElementSummary::Parameter(element), .. } => {
+                            Some(element.as_str())
+                        }
+                        _ => None,
+                    }
+                })
+                .collect();
+            for launch in &native.launches {
+                let Some(suffix) = launch.kernel.strip_prefix(entry.name.as_str()).and_then(|rest| rest.strip_prefix('_'))
+                else {
+                    continue;
+                };
+                if !DECODING.contains(&suffix) {
+                    continue;
+                }
+                for element in &elements {
+                    for form in &forms {
+                        if !reads(&launch.shared_bytes, element, *form) {
+                            unaccounted.push(format!("{} {}: {element} {}", entry.name, launch.kernel, form.name()));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(staging > 0, "some Vulkan native stages its tables");
+        assert!(unaccounted.is_empty(), "decoding launches whose shared regions omit a slot's table: {unaccounted:#?}");
     }
 }

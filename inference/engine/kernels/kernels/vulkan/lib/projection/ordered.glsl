@@ -22,6 +22,7 @@
 
 #ifdef PROJECTION_SINGLE
 void projection_single_ordered_gemv() {
+    packets_stage_tables();
     const uint g = PROJECTION_GROUP(gl_WorkGroupID.z);
     projection_ordered_gemv(PACKETS_W0, PROJECTION_ORDERED_PUBLISH, 8u, projected_input(g), projected_output(g),
         projected_weight(g), PROJECTION_ORDERED_PUB_OUT, PROJECTION_ORDERED_PUB_S0, PROJECTION_ORDERED_PUB_S1,
@@ -32,6 +33,7 @@ void projection_single_ordered_gemv() {
 }
 
 void projection_single_ordered_gemm() {
+    packets_stage_tables();
     const uint g = PROJECTION_GROUP(gl_WorkGroupID.z);
     projection_ordered_gemm(PACKETS_W0, projected_rows(g), projected_output(g), projected_weight(g), PROJECTION_M,
         PROJECTION_N, PROJECTION_K, gl_WorkGroupID.y, gl_WorkGroupID.x);
@@ -64,6 +66,7 @@ void projection_single_ordered_gemm() {
     }
 
 void projection_segmented_ordered_gemv_all() {
+    packets_stage_tables();
     const uint ord_per = 4u * SEISMIC_TUNE_SIMDGROUPS;
     const uint m = PROJECTION_M;
     uint tile = gl_WorkGroupID.x;
@@ -96,6 +99,7 @@ void projection_segmented_ordered_gemv_all() {
     }
 
 void projection_segmented_ordered_gemv_mixed(const uint maxm, const uint rows, const uint lanes) {
+    packets_stage_tables();
     const uint ord_per = 4u * SEISMIC_TUNE_SIMDGROUPS;
     const uint unord_per = projection_gemv_rows(SEISMIC_TUNE_SIMDGROUPS, rows, lanes);
     const uint m = PROJECTION_M;
@@ -123,6 +127,7 @@ void projection_segmented_ordered_gemv_mixed(const uint maxm, const uint rows, c
     }
 
 void projection_segmented_ordered_gemm() {
+    packets_stage_tables();
     const uint m = PROJECTION_M;
     const projection_prologue x = projected_rows(0u);
     uint tile = gl_WorkGroupID.x;

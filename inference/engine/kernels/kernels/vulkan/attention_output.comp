@@ -3,6 +3,8 @@
 // `metal/attention_output.metal` on the `dense` projection (`lib/projection/operator.glsl`); the
 // GEMM class may split K.
 #define KERNEL_W0 SEISMIC_OUTPUT_WEIGHT
+// The projection's decoding launches stage their weights' tables (`packets.glsl`).
+#define PACKETS_STAGED_TABLES 1
 #include "lib/core/activation.glsl"
 #if SEISMIC_STATIC_OS != 0
 #define PROJECTION_SCALED

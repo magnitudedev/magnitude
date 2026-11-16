@@ -3,6 +3,8 @@
 // `metal/dense_expand.metal` on the `dense` projection (`lib/projection/operator.glsl`).
 #define KERNEL_W0 SEISMIC_GATE_WEIGHT
 #define KERNEL_W1 SEISMIC_UP_WEIGHT
+// The projection's decoding launches stage their weights' tables (`packets.glsl`).
+#define PACKETS_STAGED_TABLES 1
 // The expansion's limit as its F32 bits LB (0: none), which the Glu epilogue
 // clamps at.
 #if SEISMIC_STATIC_LB != 0

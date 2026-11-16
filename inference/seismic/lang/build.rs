@@ -14,7 +14,9 @@
 //! words (`codebooks::words<ID>`: `W0`..`W3`, values 4w..4w + 3 in word w)
 //! and whether they are E2M1 doubled (`codebooks::e2m1<ID>`). On CUDA a grid
 //! whose lane magnitudes are few also has the operands of its magnitudes
-//! (`grids::magnitudes<ID>`, see `magnitudes`). A dialect declares some
+//! (`grids::magnitudes<ID>`, see `magnitudes`). On Vulkan each table's
+//! `u32` words (`GRIDS_WORDS_<ID>`, `CODEBOOKS_WORDS_<ID>`, 0 for id 0) size
+//! the copy its library stages in shared memory. A dialect declares some
 //! tables only where its includer reads them (`Dialect::guarded`), each
 //! under `SEISMIC_TABLES_READ_<TABLE>(ID)`, which the includer defines.
 
@@ -107,6 +109,10 @@ struct Dialect {
     /// The tables the dialect declares only where its includer reads them
     /// (`Table::read`).
     guarded: &'static [Table],
+    /// Whether the dialect states each table's `u32` words
+    /// (`GRIDS_WORDS_<ID>`, `CODEBOOKS_WORDS_<ID>`, 0 for id 0), which its
+    /// library stages in shared memory.
+    words: bool,
 }
 
 impl Dialect {
@@ -146,6 +152,7 @@ const DIALECTS: [Dialect; 3] = [
         grid: |_, _| String::new(),
         values: true,
         guarded: &[],
+        words: false,
         sixteen: |id, name, values, zero| {
             let pairs: Vec<String> = (0..256)
                 .map(|byte| {
@@ -198,6 +205,7 @@ const DIALECTS: [Dialect; 3] = [
         values: false,
         // A grid's magnitude operands' only reader is the records GEMV.
         guarded: &[Table::Magnitudes],
+        words: false,
     },
     Dialect {
         file: "tables.glsl",
@@ -221,6 +229,7 @@ const DIALECTS: [Dialect; 3] = [
         // glslang emits every declared constant array, read or not: a
         // module holds only the tables its includer reads.
         guarded: &[Table::Grid, Table::Codebook],
+        words: true,
     },
 ];
 
@@ -546,6 +555,15 @@ fn main() {
         }
         for (index, codebook) in CODEBOOKS.iter().enumerate() {
             writeln!(text, "#define SEISMIC_CODEBOOK_{} {}", native_macro(codebook.name), index + 1).unwrap();
+        }
+        if dialect.words {
+            text += "#define GRIDS_WORDS_0 0u\n#define CODEBOOKS_WORDS_0 0u\n";
+            for (index, grid) in GRIDS.iter().enumerate() {
+                writeln!(text, "#define GRIDS_WORDS_{} {}u", index + 1, grid.points.words()).unwrap();
+            }
+            for (index, codebook) in CODEBOOKS.iter().enumerate() {
+                writeln!(text, "#define CODEBOOKS_WORDS_{} {}u", index + 1, codebook.values.len()).unwrap();
+            }
         }
         text += "\n";
         for (index, grid) in GRIDS.iter().enumerate() {
