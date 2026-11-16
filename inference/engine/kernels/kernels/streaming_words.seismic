@@ -279,10 +279,13 @@ const LANDING_FROM = 0
 const LANDING_TO = 1
 const LANDING_DONE = 2
 
-# A landing launch's counters (device words, `scratch counters`): the claims
-# taken, the groups arrived, the polling lead, the count heard, then a word
-# per entry counting its items placed, so a launch of L entries holds
-# 4 * (LAND_ITEMS + L) bytes.
+# A landing launch's counters (device words, `scratch counters`): a slice
+# per step parity (`LAND_SLOTS`, so a step and its in-flight successor never
+# share counter words on one graph slot's sync scratch), each holding the
+# claims taken, the groups arrived, the polling lead, the count heard, then a
+# word per entry counting its items placed, so a launch of L entries holds
+# 4 * LAND_SLOTS * (LAND_ITEMS + L) bytes.
+const LAND_SLOTS = 2
 const LAND_CLAIMS = 0
 const LAND_ARRIVALS = 1
 const LAND_LEAD = 2

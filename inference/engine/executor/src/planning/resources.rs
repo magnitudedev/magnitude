@@ -278,6 +278,11 @@ impl FlightDepth {
     pub(crate) const PIPELINED: Self = Self { groups: NonZeroUsize::new(2).unwrap() };
 }
 
+// A landing launch's counters hold a slice per step in flight on one graph
+// slot (`LAND_SLOTS`, indexed by the step's sequence): no deeper flight may
+// share them.
+const _: () = assert!(FlightDepth::PIPELINED.groups.get() as u64 <= magnitude_kernels::constants::LAND_SLOTS);
+
 impl ResourceLimits {
     /// The most rows a decode step's launch takes: a row for each of its
     /// requests, at most a launch's slots, in the row class covering them.

@@ -7446,6 +7446,195 @@ fn streaming_a_landing_stops_once_its_slot_is_answered_or_failed() {
     }
 }
 
+/// Two consecutive steps in flight (`q` and `q + 1`), queued as a load
+/// queues a step and its lookahead successor: each on a family slot of its
+/// own over one shared execution arena (so one `sync` scratch), every
+/// flight's decode graph recorded ahead (`record_decode`). They keep
+/// disjoint counter slices (`LAND_SLOTS`) and system-ordered `HEARD`
+/// publications: even when both steps are submitted before either completes
+/// and their entries land in rapid zero-sleep bursts across all `LAND_GROUPS`
+/// threadgroups, neither raises `SLOT_VIOLATED` and both place every record.
+#[test]
+fn streaming_overlapping_land_steps_isolate_counters_and_order_heads() {
+    let Some(device) = streaming_device() else {
+        return;
+    };
+    let k = 4u64;
+    let form = ServedForm::qwen35b(&device);
+    let kernel = form.land_kernel(&device, k);
+    let staging = landed_staging(&device, &form);
+    let requested = [-1 - LANDED_EXPERTS[0] as i32, LANDED_EXPERTS[1] as i32, LANDED_EXPERTS[2] as i32, LANDED_EXPERTS[3] as i32];
+    let in_kernels = device.backend().parks_in_kernels();
+
+    let step_proto = streaming_step(&device);
+    let (table, proto_words) = file_words(k, STREAMING_SEQUENCE as u64, &requested, &[], None);
+    let file_proto = shared_i32(&device, &table.extents(), &proto_words);
+    let sources_proto = decode_sources(&device, 1, k, &[0, -1, -1, -1]);
+    let policy = shared_i32(&device, &[constants::POLICY_WORDS], &[0; constants::POLICY_WORDS as usize]);
+    let landing_proto = shared_i32(&device, &[landing_extent(3)], &landing_words(0, 0, &[], 3));
+    let bank_proto = form.records(&device, true, 6, |_, _| None);
+
+    let mut graph = device.native_graph();
+    let park_port = graph.timeline(seismic::timeline::Park);
+    let mut port = |tensor: &seismic::Tensor| graph.port(tensor.element(), &tensor.extents()).unwrap();
+    let step_port = port(&step_proto);
+    let mut file_port = port(&file_proto);
+    let mut sources_port = port(&sources_proto);
+    let policy_port = port(&policy);
+    let mut landing_port = port(&landing_proto);
+    let staging_ports = [&staging[0], &staging[1], &staging[2]].map(&mut port);
+    let bank_ports = [&bank_proto[0], &bank_proto[1], &bank_proto[2]].map(&mut port);
+    let [mut gate_port, mut up_port, mut down_port] = bank_ports.clone();
+    graph
+        .enqueue(
+            &kernel,
+            routed_land::WorkflowArgs {
+                step: step_port.tensor().into(),
+                file: file_port.tensor_mut().into(),
+                sources: sources_port.tensor_mut().into(),
+                policy: policy_port.tensor().into(),
+                landing: landing_port.tensor_mut().into(),
+                staging_gate: staging_ports[0].tensor().into(),
+                staging_up: staging_ports[1].tensor().into(),
+                staging_down: staging_ports[2].tensor().into(),
+                gate: gate_port.tensor_mut().into(),
+                up: up_port.tensor_mut().into(),
+                down: down_port.tensor_mut().into(),
+            },
+        )
+        .unwrap();
+    let plan = graph.seal().unwrap();
+    let family = seismic::NativeGraphFamily::new(std::slice::from_ref(&plan), 1).unwrap();
+    let arena = device.execution_arena(family.workspace_bytes()).unwrap();
+    let mut flights = [(); 2].map(|()| family.new_slot_in(&arena, &[family.upload_bytes()]).unwrap());
+    family.record_decode().unwrap();
+    let parks = seismic::Timeline::<seismic::timeline::Parks>::new(&device).unwrap();
+
+    for round in 0..4u64 {
+        let q0 = STREAMING_SEQUENCE as u64 + 2 * round;
+        let q1 = q0 + 1;
+        let step0 = i32_tensor(&device, &[constants::STEP_WORDS], &step_words(q0));
+        let step1 = i32_tensor(&device, &[constants::STEP_WORDS], &step_words(q1));
+        let (_, words0) = file_words(k, q0, &requested, &[], None);
+        let (_, words1) = file_words(k, q1, &requested, &[], None);
+        let file0 = shared_i32(&device, &table.extents(), &words0);
+        let file1 = shared_i32(&device, &table.extents(), &words1);
+        let _pulse0 = pulse(&file0, table);
+        let _pulse1 = pulse(&file1, table);
+        let landing0 = shared_i32(&device, &[landing_extent(3)], &landing_words((q0 - FLIGHT) as i32, 3, &[], 3));
+        let landing1 = shared_i32(&device, &[landing_extent(3)], &landing_words((q1 - FLIGHT) as i32, 3, &[], 3));
+        let sources0 = decode_sources(&device, 1, k, &[0, -1, -1, -1]);
+        let sources1 = decode_sources(&device, 1, k, &[0, -1, -1, -1]);
+        let bank0 = form.records(&device, true, 6, |_, _| None);
+        let bank1 = form.records(&device, true, 6, |_, _| None);
+
+        let serve_one = |q: u64, file: &seismic::Tensor, landing: &seismic::Tensor| {
+            let low = q as i32;
+            let slot = table.lane(q, 0);
+            for (index, &(staged, record, choice)) in LANDED.iter().enumerate() {
+                append_landing(landing, low, index, staged, record);
+                file.store_release(4 * (slot + SlotTable::file_entry(choice) + constants::FILE_RECORD), record as u32)
+                    .unwrap();
+            }
+            file.store_release_u64(4 * (slot + constants::SLOT_ANSWER), q).unwrap();
+        };
+
+        let bind_and_submit = |slot: &mut seismic::NativeGraphFamilySlot,
+                               step: &seismic::Tensor,
+                               file: &seismic::Tensor,
+                               sources: &seismic::Tensor,
+                               landing: &seismic::Tensor,
+                               bank: &[seismic::Tensor; 3]| {
+            let mut bindings = plan.bindings();
+            if in_kernels {
+                bindings.set_park(park_port, &parks).unwrap();
+            } else {
+                bindings.set_answered(park_port).unwrap();
+            }
+            for (port, tensor) in [
+                (&step_port, step),
+                (&file_port, file),
+                (&sources_port, sources),
+                (&policy_port, &policy),
+                (&landing_port, landing),
+                (&staging_ports[0], &staging[0]),
+                (&staging_ports[1], &staging[1]),
+                (&staging_ports[2], &staging[2]),
+                (&bank_ports[0], &bank[0]),
+                (&bank_ports[1], &bank[1]),
+                (&bank_ports[2], &bank[2]),
+            ] {
+                bindings.set(port, tensor).unwrap();
+            }
+            let mut sequence = device.native_sequence(seismic::NativeQueue::Compute);
+            let mut active = slot.activate(&plan).unwrap();
+            active
+                .attach(bindings, plan.new_outputs().unwrap())
+                .unwrap()
+                .queue(&mut sequence)
+                .unwrap();
+            sequence.submit().unwrap()
+        };
+
+        if in_kernels {
+            let c0 = bind_and_submit(&mut flights[0], &step0, &file0, &sources0, &landing0, &bank0);
+            let c1 = bind_and_submit(&mut flights[1], &step1, &file1, &sources1, &landing1, &bank1);
+            let (f0, l0, f1, l1) = (file0.clone(), landing0.clone(), file1.clone(), landing1.clone());
+            std::thread::scope(|scope| {
+                // Serve q1 while q0 is still parked, then burst-serve q0 so all
+                // LAND_GROUPS threadgroups race HEARD -> LANDING_HEAD.
+                scope.spawn(|| serve_one(q1, &f1, &l1));
+                scope.spawn(|| {
+                    std::thread::yield_now();
+                    serve_one(q0, &f0, &l0);
+                });
+            });
+            c0.wait().unwrap();
+            c1.wait().unwrap();
+        } else {
+            serve_one(q0, &file0, &landing0);
+            serve_one(q1, &file1, &landing1);
+            let c0 = bind_and_submit(&mut flights[0], &step0, &file0, &sources0, &landing0, &bank0);
+            let c1 = bind_and_submit(&mut flights[1], &step1, &file1, &sources1, &landing1, &bank1);
+            c0.wait().unwrap();
+            c1.wait().unwrap();
+        }
+
+        for (q, file, landing, sources, bank) in [
+            (q0, &file0, &landing0, &sources0, &bank0),
+            (q1, &file1, &landing1, &sources1, &bank1),
+        ] {
+            let slot = table.lane(q, 0) as usize;
+            assert_eq!(
+                read_i32(file)[slot + constants::SLOT_VIOLATED as usize],
+                0,
+                "round {round} step {q}: SLOT_VIOLATED set"
+            );
+            let words = read_i32(landing);
+            for entry in 0..LANDED.len() {
+                assert_eq!(words[landing_done(entry)], q as i32, "round {round} step {q}: entry {entry} DONE");
+            }
+            assert_eq!(
+                read_i32(sources),
+                magnitude_kernels::source_words(&[0, 1, 4, 5], &[-1; 4]),
+                "round {round} step {q}: sources"
+            );
+            for (tensor, records) in bank.iter().enumerate() {
+                let bytes = records.read_to_host().unwrap();
+                let width = form.kind(tensor).slot_bytes();
+                for &(staged, record, _) in &LANDED {
+                    let record = record as usize;
+                    let held = &bytes[record * width..(record + 1) * width];
+                    assert!(
+                        held == form.import(LANDED_EXPERTS[staged as usize + 1], tensor).as_slice(),
+                        "round {round} step {q}: tensor {tensor} record {record}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// On every backend that streams, each landing launch matches its portable
 /// body on the same words: dense BF16 records landed into F32 ones (the
 /// interpreter binds dense elements alone), at the smallest shapes reaching

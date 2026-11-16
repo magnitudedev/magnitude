@@ -59,7 +59,7 @@ native routed_scratch_request for cuda from "cuda/routed_scratch_request.cu":
 # `routed_land`'s.
 native routed_round for cuda from "cuda/routed_round.cu":
     records (conveyor_gate, conveyor_up, conveyor_down, gate, up, down)
-    scratch counters bytes (4 * (LAND_ITEMS + L)) sync
+    scratch counters bytes (4 * LAND_SLOTS * (LAND_ITEMS + L)) sync
     launch routed_round:
         threadgroups (LAND_GROUPS, 1, 1)
         grid (grid)
@@ -87,7 +87,7 @@ native routed_scratch_grids for cuda from "cuda/routed_scratch_grids.cu":
 native routed_land for cuda from "cuda/routed_land.cu":
     static (K)
     records (staging_gate, staging_up, staging_down, gate, up, down)
-    scratch counters bytes (4 * (LAND_ITEMS + L)) sync
+    scratch counters bytes (4 * LAND_SLOTS * (LAND_ITEMS + L)) sync
     launch routed_land:
         threadgroups (1 + min(V, 1) * (LAND_GROUPS - 1), 1, 1)
         unless (policy[POLICY_RESOLVED])
