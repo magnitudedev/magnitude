@@ -26,8 +26,9 @@ codes=unsigned|offset|twos planes=8.0 enter=bytes
 codes=table planes=4.0 enter=bytes:128
 codes=grid values=i8 enter=pairs
 
-# The forms that take lane codes with the local codes of the scales plane.
-form PACK uses lane locals=direct|plane
+# The forms that take lane codes with the local codes of the scales plane;
+# PACK also with those its grid entries carry (`packing_factors`).
+form PACK uses lane locals=direct|plane|carried
 form MATRIX_RUNS uses lane locals=direct|plane
 form MATRIX_SYMMETRIC uses lane locals=direct|plane
 # Unsigned codes (`packets::Unsigned`) under plain unsigned local codes

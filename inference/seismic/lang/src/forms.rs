@@ -1053,7 +1053,7 @@ mod tests {
                 None,
                 Some(MetalMatrix::Runs { halves: true }),
             ),
-            ("iq2xxs", None, None, None),
+            ("iq2xxs", pack(1, 64, 64, false), None, None),
             ("q4g32", pack(1, 8, 0, false), None, Some(MetalMatrix::Symmetric)),
             ("q2k", None, None, None),
             (
@@ -1075,7 +1075,7 @@ mod tests {
                 None,
                 Some(MetalMatrix::Runs { halves: true }),
             ),
-            ("iq1s", None, None, None),
+            ("iq1s", pack(1, 2, 2, false), None, None),
             (
                 "iq1m",
                 pack(2, 16, 16, false),

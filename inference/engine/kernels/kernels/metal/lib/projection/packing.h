@@ -295,8 +295,9 @@ struct packing_layout<L, 1, true> {
     static uint2 planes(words codes, uint x) { return packing_byte_planes<RESIDUE>(codes, x); }
 };
 
-// The factors of coefficients K of codes centred at CENTRE whose value is
-// zero at OFFSET, a block's runs K's groups of a packet: a block's factors
+// The factors of coefficients K of codes (in planes P, whose entries may
+// carry K's local codes) centred at CENTRE whose value is zero at OFFSET, a
+// block's runs K's groups of a packet: a block's factors
 // are scale 32767 / 64 and its min term (CENTRE - OFFSET) scale + bias, or
 // with two runs the runs' scales 32767 / 64. The fold takes a sum of at most
 // 1 of the first and a code sum / 64 below 128 of the second, so 512 |scale|
@@ -304,7 +305,7 @@ struct packing_layout<L, 1, true> {
 // block of two runs without a min term and the run of a 256-column block's
 // factors one factor group's or eight packets'; a power of two scaling the
 // codes is in their scales (`packets::Direct`, `packets::Hier`).
-template <typename K, uint CENTRE, uint OFFSET>
+template <typename K, uint CENTRE, uint OFFSET, typename P>
 struct packing_factors {
     static constant constexpr bool implemented = false;
 };
@@ -334,35 +335,51 @@ inline float2 packing_block_factors(thread const typename K::coefficients &k) {
     return float2(k.scale(0) * (32767.0f / 64.0f), packing_min_term<K, CENTRE, OFFSET>(k));
 }
 
-// Hierarchical coefficients in the scales plane: a block's factors from the
-// factor group's run (`packets::Hier::run`), bounded by the local codes'
-// largest magnitude under the group's factors.
+// Hierarchical coefficients: a block's factors from the factor group's run
+// (`packets::Hier::run`), each packet's field from the scales plane or, where
+// its grid entries (in planes P) carry it, from its entries; bounded by the
+// local codes' largest magnitude under the group's factors, with a signed
+// bias's offset beside the min term's shift.
 template <typename FS, int EXPONENT, int CODE_EXPONENT, uint LOCAL_BITS, typename L, uint GROUP, bool MIN,
-    int BIAS_SIGN, uint CENTRE, uint OFFSET>
-struct packing_factors<packets::Hier<FS, 256u, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP, MIN, BIAS_SIGN, 0u>,
-    CENTRE, OFFSET> {
-    typedef packets::Hier<FS, 256u, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP, MIN, BIAS_SIGN, 0u> K;
-    static constant constexpr bool biased = MIN || CENTRE != OFFSET;
+    int BIAS_SIGN, uint CARRIED_BIT, typename SB, uint CENTRE, uint OFFSET, typename P>
+struct packing_factors<
+    packets::Hier<FS, 256u, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP, MIN, BIAS_SIGN, CARRIED_BIT, SB>, CENTRE,
+    OFFSET, P> {
+    typedef packets::Hier<FS, 256u, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP, MIN, BIAS_SIGN, CARRIED_BIT, SB> K;
+    static constant constexpr bool biased = K::biased || CENTRE != OFFSET;
     static_assert(K::groups == 1 || !biased, "a block of two runs has no min term");
     static constant constexpr bool implemented = true;
-    typedef typename K::run run;
+    struct run {
+        typename K::run fields;
+        packets::weight_bytes row;
+        Rows16 layout;
+        uint p;
+    };
     static run start(packets::weight_bytes row, Rows16 layout, uint block) {
-        return K::start(row, layout, block * K::packets);
+        return run{K::start(row, layout, block * K::packets), row, layout, block * K::packets};
     }
     static float2 take(thread run &state) {
-        return packing_block_factors<K, CENTRE, OFFSET>(K::form(K::next(state), state.factor));
+        uint field;
+        if constexpr (K::carries)
+            field = K::template carried<P>(P::load(state.row, state.layout, state.p));
+        else
+            field = K::next(state.fields);
+        ++state.p;
+        return packing_block_factors<K, CENTRE, OFFSET>(K::form(field, state.fields.factor));
     }
     static float reach(packets::weight_bytes row, Rows16 layout, uint block) {
         const typename K::group_factors factors = K::factors(row, layout, block);
-        const float scale = (512.0f + 128.0f * metal::abs(packing_shift<CENTRE, OFFSET>())) * metal::abs(factors.scale(0));
+        const float offset = K::signed_bias() ? packets::power2<SB::exponent() - CODE_EXPONENT>() : 0.0f;
+        const float scale = (512.0f + 128.0f * (metal::abs(packing_shift<CENTRE, OFFSET>()) + offset))
+            * metal::abs(factors.scale(0));
         return float(L::largest) * (MIN ? metal::fma(128.0f, metal::abs(factors.bias(0)), scale) : scale);
     }
 };
 
 // Direct coefficients: a block's factors from its eight packets' own,
 // bounded by the largest of them.
-template <typename S, uint GROUP, bool BIAS, uint STORAGE, int EXPONENT, uint CENTRE, uint OFFSET>
-struct packing_factors<packets::Direct<S, GROUP, BIAS, STORAGE, EXPONENT>, CENTRE, OFFSET> {
+template <typename S, uint GROUP, bool BIAS, uint STORAGE, int EXPONENT, uint CENTRE, uint OFFSET, typename P>
+struct packing_factors<packets::Direct<S, GROUP, BIAS, STORAGE, EXPONENT>, CENTRE, OFFSET, P> {
     typedef packets::Direct<S, GROUP, BIAS, STORAGE, EXPONENT> K;
     static constant constexpr bool biased = BIAS || CENTRE != OFFSET;
     static_assert(K::groups == 1 || !biased, "a block of two runs has no min term");
@@ -417,7 +434,7 @@ struct packing_codes_of<packets::Packet<P, C, K, F>, true> {
     static_assert(lanes::zero() == int(F::pack_offset), "an admitted weight's codes enter at their offset");
     typedef packing_layout<lanes, K::groups, (F::pack_residue != 0)> layout;
     static_assert(layout::implemented(), "an admitted weight's codes have a packing layout");
-    typedef packing_factors<K, centre, F::pack_offset> factors;
+    typedef packing_factors<K, centre, F::pack_offset, P> factors;
     static_assert(factors::implemented, "an admitted weight's coefficients have packing factors");
     static constant constexpr bool available = packing_forms;
     static constant constexpr bool biased = factors::biased;

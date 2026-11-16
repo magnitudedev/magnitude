@@ -348,20 +348,24 @@ mod tests {
         }
     }
 
-    /// The lane producers read neither floating nor odd codes, and read the
-    /// scales plane's local codes, never carried ones.
+    /// The lane producers read neither floating nor odd codes; PACK reads
+    /// local codes of the scales plane and those grid entries carry
+    /// (`packing_factors`).
     #[test]
-    fn metal_lane_producers_read_integer_codes_with_plane_locals() {
-        let mut covered = 0;
+    fn metal_lane_producers_read_integer_codes() {
+        let (mut covered, mut carried) = (0, 0);
         for info in registry::representations() {
             let Some(weight) = Weight::of(info) else { continue };
             let key = weight.axes.axis_key();
             let covers = covers(crate::forms::METAL_PACK, &weight);
-            if matches!(key.kind, CodeKind::E4m3 | CodeKind::Odd) || matches!(key.locals, Locals::Carried(_)) {
+            if matches!(key.kind, CodeKind::E4m3 | CodeKind::Odd) {
                 assert!(!covers, "{} is not read by a lane producer", info.name);
+            }
+            if matches!(key.locals, Locals::Carried(_)) {
+                carried += usize::from(covers);
             }
             covered += usize::from(covers);
         }
-        assert!(covered > 0, "some representation has a lane producer");
+        assert!(covered > 0 && carried > 0, "some representation has a lane producer, some with carried codes");
     }
 }
