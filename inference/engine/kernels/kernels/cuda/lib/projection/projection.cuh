@@ -437,6 +437,67 @@ __device__ __forceinline__ void gemv_sums(const u32 (&b)[NB][4][2], GroupSums<NB
     }
 }
 
+// The activation row of a one-row dense GEMV block, formed in its
+// shared memory: K A elements at `row` (16-byte aligned), then the row's
+// operand sums of every biased weight's groups (`form_row_sums`), one area
+// of up to K / 16 sums per weight stream. Every MMA column reads the row:
+// a column past M only feeds C-fragment places no epilogue stores (each
+// column is its own activation row), so the B fragments load with no
+// per-column condition, from shared memory, with no alignment test.
+struct SharedRow {
+    const u8 *row;
+    float *sums;
+    u64 k;
+    static constexpr bool STAGED = false;
+    static constexpr int FACTORS = 0;
+    __device__ __forceinline__ u32 pair(const float *, u32, u64 at) const {
+        return *reinterpret_cast<const u32 *>(row + at * 2);
+    }
+    __device__ __forceinline__ uint4 octet(const float *, u32, u64 at) const {
+        return *reinterpret_cast<const uint4 *>(row + at * 2);
+    }
+    // The sums area of weight stream `stream` (0 or 1).
+    __device__ __forceinline__ float *area(int stream) const { return sums + stream * (k / 16); }
+};
+// Whether a GEMV source is a `SharedRow`, which every column reads.
+template <class Pro> constexpr bool shared_row = Same<Pro, SharedRow>::value;
+
+// The operand sums of a `SharedRow`'s GROUP-code groups, formed by the whole
+// block into `sums`, sum g of group g: each formed as `gemv_sums` forms a
+// row's sum, so in its order of additions (each lane t's values of a group's
+// steps in step order, then lanes t ^ 1, then t ^ 2) and of the same bits.
+template <int GROUP> __device__ __forceinline__ void form_row_sums(const SharedRow &x, float *sums) {
+    constexpr int STEPS = GROUP / 16;
+    static_assert(STEPS == 1 || STEPS == 2 || STEPS == 4, "groups of 16, 32 or 64 codes");
+    for (u64 g = threadIdx.x; g < x.k / GROUP; g += blockDim.x) {
+        const u64 k0 = g * GROUP / 64 * 64;
+        const int h = (int)(g % (64 / GROUP));
+        float own[4];
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            own[t] = 0.0f;
+#pragma unroll
+            for (int j = 0; j < STEPS; ++j) {
+                const u64 low = k0 + 16 * (STEPS * h + j) + 2 * t;
+                const float2 a = Op::unpack(x.pair(nullptr, 0, low));
+                const float2 b = Op::unpack(x.pair(nullptr, 0, low + 8));
+                own[t] += (a.x + a.y) + (b.x + b.y);
+            }
+        }
+        sums[g] = (own[0] + own[1]) + (own[2] + own[3]);
+    }
+}
+
+// A k-block's sums of a `SharedRow` (`form_row_sums`), at every column.
+template <int GROUP>
+__device__ __forceinline__ void row_sums(const float *area, u64 kblock, GroupSums<1, GROUP> &sums) {
+    if constexpr (GROUP != 0) {
+#pragma unroll
+        for (int h = 0; h < 64 / GROUP; ++h)
+            sums.group[0][h][0] = sums.group[0][h][1] = area[kblock * (64 / GROUP) + h];
+    }
+}
+
 template <int NB, class W, class Sums>
 __device__ __forceinline__ void gemv_accumulate(float (&acc)[NB][4], const typename W::Raw &raw, const W &w,
                                                 const typename W::Block &block, int q, const u32 (&b)[NB][4][2],
@@ -661,6 +722,20 @@ __device__ __forceinline__ void gemv_mma_group(const Ready &ready, u32 M, u64 kb
         load(current, begin);
     const auto pro = ready();
     static_assert(decltype(ready())::FACTORS == 0, "a GEMV reads its operands in place");
+    // A one-row block forms its weights' operand sums once (block-collective:
+    // every warp of the block runs the GEMV, as `ready()` requires).
+    constexpr bool ROW = shared_row<decltype(ready())>;
+    static_assert(!ROW || NB == 1, "a shared row is one activation row");
+    static_assert(!PERMUTED || (SUMS_A == 0 && SUMS_B == 0), "permuted weights take no operand sums");
+    if constexpr (ROW && (SUMS_A != 0 || SUMS_B != 0)) {
+        if constexpr (SUMS_A != 0)
+            form_row_sums<SUMS_A>(pro, pro.area(0));
+        if constexpr (OWN_B)
+            form_row_sums<SUMS_B>(pro, pro.area(1));
+        else if constexpr (SUMS_A == 0)
+            form_row_sums<SUMS_B>(pro, pro.area(0));
+        __syncthreads();
+    }
     if constexpr (STAGED) {
         seismic_cp_async_wait_all();
         barrier.sync(KSPLIT * 32);
@@ -675,7 +750,7 @@ __device__ __forceinline__ void gemv_mma_group(const Ready &ready, u32 M, u64 kb
 #pragma unroll
             for (int nb = 0; nb < NB; ++nb) {
                 const u32 m = 8 * nb + g;
-                const bool feeds = m < M;
+                const bool feeds = ROW || m < M;
 #pragma unroll
                 for (int s = 0; s < 4; ++s) {
                     // The B fragment's columns 2t, 2t + 1 and 2t + 8, 2t + 9 of
@@ -687,9 +762,14 @@ __device__ __forceinline__ void gemv_mma_group(const Ready &ready, u32 M, u64 kb
                 }
             }
             GroupSums<NB, SUMS_A != 0 ? SUMS_A : SUMS_B> sums;
-            gemv_sums(b, sums);
             GroupSums<NB, OWN_B ? SUMS_B : 0> sums_b;
-            gemv_sums(b, sums_b);
+            if constexpr (ROW) {
+                row_sums(pro.area(0), 4 * sb + q, sums);
+                row_sums(pro.area(1), 4 * sb + q, sums_b);
+            } else {
+                gemv_sums(b, sums);
+                gemv_sums(b, sums_b);
+            }
 #pragma unroll
             for (int i = 0; i < TPW; ++i)
                 if (tile0 + i < tiles) {
@@ -748,7 +828,8 @@ __device__ __forceinline__ void gemv_entries_kblock(float (&acc)[NB][4], const W
 #pragma unroll
             for (int nb = 0; nb < NB; ++nb) {
                 const u32 m = 8 * nb + g;
-                const u32 b[2] = {m < M ? pro.pair(factors, m, k) : 0u, m < M ? pro.pair(factors, m, k + 2) : 0u};
+                const bool feeds = shared_row<Pro> || m < M;
+                const u32 b[2] = {feeds ? pro.pair(factors, m, k) : 0u, feeds ? pro.pair(factors, m, k + 2) : 0u};
                 Op::mma(d[nb], a, b);
             }
         }
@@ -917,7 +998,8 @@ __device__ __forceinline__ void gemv_records_group(const Ready &ready, u32 M, u6
                     for (int e = 0; e < 4; ++e)
                         d[nb][e] = 0.0f;
                     const u32 m = 8 * nb + g;
-                    const uint4 x = m < M ? pro.octet(factors, m, k) : make_uint4(0u, 0u, 0u, 0u);
+                    const uint4 x = shared_row<decltype(ready())> || m < M ? pro.octet(factors, m, k)
+                                                                       : make_uint4(0u, 0u, 0u, 0u);
                     const u32 a0[4] = {rg[0], rg8[0], rg[1], rg8[1]}, b0[2] = {x.x, x.y};
                     const u32 a1[4] = {rg[2], rg8[2], rg[3], rg8[3]}, b1[2] = {x.z, x.w};
                     Op::mma(d[nb], a0, b0);
@@ -2470,6 +2552,18 @@ __device__ __forceinline__ auto source_after_dependency(const Pro &pro, u8 *row,
     return [=] {
         seismic_dependency_start();
         return GemvSource<Pro>::make(pro, row, M, K, staged);
+    };
+}
+// The one-row dense GEMV block's source (`SharedRow`), whatever the
+// prologue: once the previous launch is done the whole block forms its row
+// into `row`, its dynamic shared memory (K * 2 bytes of row, then two areas
+// of K / 16 sums, as dense.seismic sizes it).
+template <class Pro> __device__ __forceinline__ auto shared_row_after_dependency(const Pro &pro, u8 *row, u64 K) {
+    return [=] {
+        seismic_dependency_start();
+        form_row(pro, 0, K, row);
+        __syncthreads();
+        return SharedRow{row, reinterpret_cast<float *>(row + K * 2), K};
     };
 }
 

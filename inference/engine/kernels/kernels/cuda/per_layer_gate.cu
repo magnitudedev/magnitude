@@ -47,8 +47,9 @@ __global__ void per_layer_gate_stage(SEISMIC_KERNEL_PARAMS) {
 #ifdef SEISMIC_FORMING_PER_LAYER_GATE_GEMV
 template <unsigned STAGING, unsigned KSPLIT, unsigned RESIDENCY>
 __launch_bounds__(256, PROJECTION_GEMV_BLOCKS(KSPLIT, RESIDENCY)) __global__ void per_layer_gate_gemv(SEISMIC_KERNEL_PARAMS) {
+    extern __shared__ uint4 dynamic_shared[];
     PROJECTION_GEMV(1, KSPLIT, STAGING, PROJECTION_GEMV_GRID(KSPLIT, RESIDENCY), RESIDENCY,
-                    nullptr);
+                    reinterpret_cast<projection::u8 *>(dynamic_shared));
 }
 #endif
 

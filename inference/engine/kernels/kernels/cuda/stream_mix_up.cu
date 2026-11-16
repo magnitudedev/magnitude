@@ -44,7 +44,9 @@ __global__ void stream_mix_up_stage(SEISMIC_KERNEL_PARAMS) {
 #ifdef SEISMIC_FORMING_STREAM_MIX_UP_GEMV
 template <unsigned STAGING, unsigned KSPLIT, unsigned RESIDENCY>
 __launch_bounds__(256, PROJECTION_GEMV_BLOCKS(KSPLIT, RESIDENCY)) __global__ void stream_mix_up_gemv(SEISMIC_KERNEL_PARAMS) {
-    PROJECTION_GEMV(1, KSPLIT, STAGING, PROJECTION_GEMV_GRID(KSPLIT, RESIDENCY), RESIDENCY, nullptr);
+    extern __shared__ uint4 dynamic_shared[];
+    PROJECTION_GEMV(1, KSPLIT, STAGING, PROJECTION_GEMV_GRID(KSPLIT, RESIDENCY), RESIDENCY,
+                    reinterpret_cast<projection::u8 *>(dynamic_shared));
 }
 #endif
 

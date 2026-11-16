@@ -399,17 +399,21 @@ projection dense for metal:
 # split up to 128 rows. Staging launches form the rows a launch does not
 # read in place: `stage` a normalized input's A rows (at one row the GEMV
 # block forms its row in its shared memory instead), the shared operand
-# stage the INT8 candidate's q8_1 rows plus (d, d * sum q) groups.
+# stage the INT8 candidate's q8_1 rows plus (d, d * sum q) groups. At one
+# row every GEMV block forms its row in its shared memory, whatever its
+# kind, with the operand sums its biased weights fold (`SharedRow`: the B
+# fragments are unconditional shared reads, and the sums are formed once a
+# block, not once a k-block in every warp).
 
 # The forms below are the `dense` projection (`cuda/lib/projection/operator.cuh`,
 # over the K1 library `cuda/lib/projection/projection.cuh`), `single` and
 # `paired`, over rows of the kind its `project` line names. `rms` rows are
 # formed by the entry's prologue (it normalizes them), so the stage launch
-# always materializes them for more than one row and the GEMV's one-row block
-# forms its row in shared memory; `staged` rows are formed by the stage
-# launch alone, at every row count, and read in place by every form; `plain`
-# rows are read in place unless a weight takes NVFP4 operands (`operands(W)`)
-# or a matrix band takes the INT8 or OPERAND operands. KSPLIT splits K in
+# materializes them only for more than one row; `staged` rows are formed by
+# the stage launch alone, at every row count; `plain` rows are read in place
+# unless a weight takes NVFP4 operands (`operands(W)`) or a matrix band takes
+# the INT8 or OPERAND operands. The one-row GEMV block reads every kind from
+# the row it forms in its shared memory (above). KSPLIT splits K in
 # each GEMV launch, a setting of each, defaulting to 4; an entry whose rows
 # of the band all keep their one-row bits shares one KSPLIT between the two
 # launches by restating it entry-wide (dense_up, dense_output). SPLIT (single) is the GEMM's split over
@@ -450,9 +454,6 @@ projection dense for cuda:
     let ZSPLIT = 1 for paired | segmented
     let ZSPLIT = 1 + (SPLIT - 1) * min(1, 128 / M) for single
     let OPERANDS = min(1, sum(W, operands(W)))
-    let FORMS = 1 for rms
-    let FORMS = 0 for staged
-    let FORMS = OPERANDS for plain
     let HALF_SM_SHARED = 49152
     params (arithmetic INT8 in [0, 1] default 0, arithmetic OPERAND in [0, 1] default 0,
         arithmetic SPLIT in [2, 1] default 2 for single,
@@ -526,7 +527,7 @@ projection dense for cuda:
         reads (STAGING)
         threadgroups (P * tiles(W, ceil_div(ceil_div(N, 16), 8 / KSPLIT)), 1, G)
         threads_per_threadgroup (256, 1, 1)
-        shared_bytes (FORMS * (1 - min(1, M - 1)) * (K / P) * 2)
+        shared_bytes ((1 - min(1, M - 1)) * ((K / P) * 2 + (1 - min(1, P - 1)) * (K / 16) * 8))
     launch gemv16 when ORDERED_ANY == 0 and M > 8 and M <= 16 and PLANES == 0:
         reads (STAGING)
         alike (gemv)
