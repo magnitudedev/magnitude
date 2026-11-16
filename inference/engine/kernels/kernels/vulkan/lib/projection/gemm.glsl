@@ -433,7 +433,25 @@ vec2 projection_gemm_pair(uint q) {
     const uint pair = 4u * SEISMIC_LANE + q % 4u;
     if (q % 4u == 0u) {
         subgroupBarrier();
-        coopMatStore(projection_gemm_c[q / 4u], seismic_shared_f32, scratch, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        // Each fragment by a constant index: indexed by q / 4 at run time
+        // (the callers' pair loops hold barriers, which the NVIDIA
+        // proprietary compiler leaves rolled), the accumulators, and every
+        // multiply-add on them, sat in local memory (GB10: 224-240 B, 1.7x the
+        // time). A case past the last fragment is never taken.
+        switch (q / 4u) {
+#define PROJECTION_GEMM_STORE_FRAGMENT(f) \
+        case f: \
+            coopMatStore(projection_gemm_c[min(f, PROJECTION_GEMM_ACCUMULATORS - 1u)], seismic_shared_f32, scratch, 16u, \
+                gl_CooperativeMatrixLayoutRowMajor); \
+            break;
+        PROJECTION_GEMM_STORE_FRAGMENT(0u) PROJECTION_GEMM_STORE_FRAGMENT(1u) PROJECTION_GEMM_STORE_FRAGMENT(2u)
+        PROJECTION_GEMM_STORE_FRAGMENT(3u) PROJECTION_GEMM_STORE_FRAGMENT(4u) PROJECTION_GEMM_STORE_FRAGMENT(5u)
+        PROJECTION_GEMM_STORE_FRAGMENT(6u) PROJECTION_GEMM_STORE_FRAGMENT(7u) PROJECTION_GEMM_STORE_FRAGMENT(8u)
+        PROJECTION_GEMM_STORE_FRAGMENT(9u) PROJECTION_GEMM_STORE_FRAGMENT(10u) PROJECTION_GEMM_STORE_FRAGMENT(11u)
+        PROJECTION_GEMM_STORE_FRAGMENT(12u) PROJECTION_GEMM_STORE_FRAGMENT(13u) PROJECTION_GEMM_STORE_FRAGMENT(14u)
+        PROJECTION_GEMM_STORE_FRAGMENT(15u)
+#undef PROJECTION_GEMM_STORE_FRAGMENT
+        }
         subgroupMemoryBarrierShared();
         subgroupBarrier();
     }
