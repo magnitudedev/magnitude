@@ -701,7 +701,6 @@ fn check_host_model(entry: &str, case: &Case) {
 /// The portable body of `entry` on `case`: its result and final histories.
 fn portable(entry: &str, case: &Case) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     use seismic_lang::{
-        checked::{SourceFile},
         entry::ElementBindings,
         failure::SourceTermination,
         interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -709,24 +708,7 @@ fn portable(entry: &str, case: &Case) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         registry,
         types::DType,
     };
-    let mut sources = seismic_std::sources();
-    sources.push(SourceFile {
-        path: "attention.seismic".into(),
-        text: include_str!("../kernels/attention.seismic").into(),
-    });
-    sources.push(SourceFile {
-        path: "dense.seismic".into(),
-        text: include_str!("../kernels/dense.seismic").into(),
-    });
-    sources.push(SourceFile {
-        path: "functions.seismic".into(),
-        text: include_str!("../kernels/functions.seismic").into(),
-    });
-    sources.push(SourceFile {
-        path: "rounding.seismic".into(),
-        text: include_str!("../kernels/rounding.seismic").into(),
-    });
-    let module = crate::common::check(sources);
+    let module = crate::common::kernels();
     let logical = module
         .entry(
             module.entry_named(entry).unwrap(),
@@ -1105,7 +1087,7 @@ fn decode_admitted(
             let specialization = config
                 .iter()
                 .fold(statics.clone(), |s, (n, v)| s.with_param(*n, *v));
-            entry.specialization_valid(device, &specialization).unwrap()
+            declared::declared_at(device, &entry, &specialization).is_ok()
         })
         .collect()
 }
@@ -1933,9 +1915,9 @@ fn cpu_output_reads_the_operand_the_decode_emits() {
             .fold(statics(device, case.form, case.sink_rows()), |s, (n, v)| s.with_param(*n, *v))
             .with_static("KR", 0)
             .with_static("KS", 0);
-        let decode = attention_decode::native_for_device_with(
+        let decode = declared::prepared(
             device,
-            attention_decode::Elements { A: Element::bf16() },
+            &attention_decode::native_entry_with(attention_decode::Elements { A: Element::bf16() }),
             &specialization,
         )
         .unwrap();
@@ -2918,7 +2900,7 @@ fn metal_decode_splits_only_groups_it_cannot_hold_whole() {
                 |s, (n, v)| s.with_param(n, v),
             );
             let valid = |specialization: NativeSpecialization| {
-                entry.specialization_valid(&device, &specialization).unwrap()
+                declared::declared_at(&device, &entry, &specialization).is_ok()
             };
             assert_eq!(valid(matrix.clone().with_param("HEADS", 8)), split, "{name}: HEADS 8");
             assert_eq!(
@@ -3402,9 +3384,9 @@ fn run_append(device: &Device, case: &Case) -> Result<(Vec<f32>, Vec<f32>), Stri
         })
         .with_static("KR", kr as u64);
     let rounding = case.rounding_scalars();
-    let kernel = attention_append_dense::native_for_device_with(
+    let kernel = declared::prepared(
         device,
-        attention_append_dense::Elements { A: Element::bf16() },
+        &attention_append_dense::native_entry_with(attention_append_dense::Elements { A: Element::bf16() }),
         &specialization,
     )
     .map_err(|error| error.to_string())?;
@@ -4150,7 +4132,7 @@ fn attention_decode_at_deepseek_v41_decode_shape_times() {
         ]
         .into_iter()
         .fold(statics.clone(), |s, (n, v)| s.with_param(n, v));
-        if !entry.specialization_valid(&device, &configuration).unwrap() {
+        if declared::declared_at(&device, &entry, &configuration).is_err() {
             println!("attention_decode v41 m1 {name}: inadmissible");
             continue;
         }
@@ -4275,7 +4257,7 @@ fn attention_prefill_with_picks_at_deepseek_v41_prefill_shape_times() {
             |s, (n, v)| s.with_param(n, v),
         );
     assert!(
-        entry.specialization_valid(&device, &configuration).unwrap(),
+        declared::declared_at(&device, &entry, &configuration).is_ok(),
         "V4.1's picks layer is admitted at KEYS 8"
     );
     let mut bound = Bound::new(&device, &case);
@@ -4407,7 +4389,7 @@ fn attention_at_deepseek_v41_decode_shape_times_on_vulkan() {
         ($module:ident, $name:expr, $configuration:expr $(, $extra:ident)*) => {{
             let entry = $module::native_entry_with($module::Elements { A: Element::bf16() });
             let configuration = $configuration;
-            if !entry.specialization_valid(&device, &configuration).unwrap() {
+            if declared::declared_at(&device, &entry, &configuration).is_err() {
                 println!("{} v41 m1 {}: inadmissible", stringify!($module), $name);
             } else {
                 let mut bound = Bound::new(&device, &case);
@@ -4669,9 +4651,9 @@ fn native_grouped_rows(
     )
     .unwrap()
     .expect("project_rows admits the case's groups on this backend");
-    let kernel = project_rows::native_for_device_with(
+    let kernel = declared::prepared(
         device,
-        project_rows::Elements { A: Element::bf16(), W: Element::bf16(), Y: Element::bf16() },
+        &project_rows::native_entry_with(project_rows::Elements { A: Element::bf16(), W: Element::bf16(), Y: Element::bf16() }),
         &specialization,
     )
     .unwrap();
@@ -5028,7 +5010,7 @@ fn decode_admitted_absorbed(device: &Device, form: Form, absorbed: bool, matrix:
         .filter(|config| config.iter().any(|(name, value)| *name == "MATRIX" && *value > 0) == matrix)
         .filter(|config| {
             let specialization = config.iter().fold(statics.clone(), |s, (n, v)| s.with_param(*n, *v));
-            entry.specialization_valid(device, &specialization).unwrap()
+            declared::declared_at(device, &entry, &specialization).is_ok()
         })
         .count()
 }
@@ -5061,7 +5043,7 @@ fn prefill_admitted_absorbed(device: &Device, form: Form, absorbed: bool, picks:
         .filter(|(config, slices)| {
             let with_slices = slices.map_or_else(|| statics.clone(), |slices| statics.clone().with_param("SLICES", slices));
             let specialization = config.iter().fold(with_slices, |s, (n, v)| s.with_param(*n, *v));
-            entry.specialization_valid(device, &specialization).unwrap()
+            declared::declared_at(device, &entry, &specialization).is_ok()
         })
         .count()
 }

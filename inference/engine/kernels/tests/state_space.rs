@@ -10,6 +10,7 @@
 // their exact bytes.
 
 mod common;
+mod declared;
 mod versions_common;
 
 use magnitude_kernels::{state_space_chunk, state_space_gate, state_space_step};
@@ -308,7 +309,6 @@ impl Case {
     /// activations).
     fn oracle(&self) -> Outcome {
         use seismic_lang::{
-            checked::{SourceFile},
             entry::ElementBindings,
             failure::SourceTermination,
             interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -317,12 +317,7 @@ impl Case {
             types::DType,
         };
         assert!(!self.bf16);
-        let mut sources = seismic_std::sources();
-        sources.push(SourceFile {
-            path: "state_space.seismic".into(),
-            text: include_str!("../kernels/state_space.seismic").into(),
-        });
-        let module = crate::common::check(sources);
+        let module = crate::common::kernels();
         let elements = ElementBindings::new().bind("A", registry::dense(DType::F32));
         let logical = module
             .entry(module.entry_named("state_space_step").unwrap(), &elements)
@@ -410,9 +405,9 @@ impl Case {
         let specialization = self.specialization(device, rows);
         let activation = self.activation();
         let mixed: Tensor = if chunk {
-            state_space_chunk::native_for_device_with(
+            declared::prepared(
                 device,
-                state_space_chunk::Elements { A: activation },
+                &state_space_chunk::native_entry_with(state_space_chunk::Elements { A: activation }),
                 &specialization,
             )
             .unwrap()
@@ -420,9 +415,9 @@ impl Case {
             .unwrap()
             .value
         } else {
-            state_space_step::native_for_device_with(
+            declared::prepared(
                 device,
-                state_space_step::Elements { A: activation },
+                &state_space_step::native_entry_with(state_space_step::Elements { A: activation }),
                 &specialization,
             )
             .unwrap()
@@ -923,19 +918,13 @@ impl GateCase {
     /// activations).
     fn oracle(&self) -> Vec<f32> {
         use seismic_lang::{
-            checked::{SourceFile},
             entry::ElementBindings,
             interp::{Arg, Interpreter, OutcomeValue, TensorData},
             reference_math::ReferenceScalar,
             registry,
             types::DType,
         };
-        let mut sources = seismic_std::sources();
-        sources.push(SourceFile {
-            path: "state_space.seismic".into(),
-            text: include_str!("../kernels/state_space.seismic").into(),
-        });
-        let module = crate::common::check(sources);
+        let module = crate::common::kernels();
         let elements = ElementBindings::new().bind("A", registry::dense(DType::BF16));
         let logical = module
             .entry(module.entry_named("state_space_gate").unwrap(), &elements)
@@ -969,9 +958,9 @@ impl GateCase {
         let mixed = tensor(device, Element::bf16(), &[self.rows as u64, heads, self.width as u64], &self.mixed);
         let projection = tensor(device, Element::bf16(), &[self.rows as u64, self.columns as u64], &self.projection);
         let norm = tensor(device, Element::f32(), &[self.groups as u64, self.heads as u64, self.width as u64], &self.norm);
-        let out = state_space_gate::native_for_device_with(
+        let out = declared::prepared(
             device,
-            state_space_gate::Elements { A: Element::bf16() },
+            &state_space_gate::native_entry_with(state_space_gate::Elements { A: Element::bf16() }),
             &NativeSpecialization::new(),
         )
         .unwrap()

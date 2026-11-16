@@ -2,6 +2,7 @@
 //! contract; native implementations are checked against them.
 
 mod common;
+mod declared;
 
 use common::bound::{self, Float, Form, Library, Products};
 use seismic::BackendName;
@@ -13,7 +14,7 @@ use magnitude_kernels::{
     gated_delta_project, routed_seed_commit, routed_select, routed_select_streamed, routed_step, routed_up,
 };
 use seismic_lang::{
-    checked::{CheckedModule, SourceFile},
+    checked::CheckedModule,
     entry::ElementBindings,
     failure::SourceTermination,
     interp::{Arg, Interpreter, OracleOutcome, OutcomeValue, TensorData},
@@ -32,34 +33,6 @@ use streaming_words::{map_words, step_words};
 const H: usize = 64;
 const E: usize = 32;
 const K: usize = 4;
-
-/// The checked routed module, checked once per process: every test and
-/// device reads the same sources.
-fn module() -> CheckedModule {
-    static CHECKED: std::sync::OnceLock<CheckedModule> = std::sync::OnceLock::new();
-    CHECKED.get_or_init(check_module).clone()
-}
-
-fn check_module() -> CheckedModule {
-    let mut sources = seismic_std::sources();
-    sources.push(SourceFile {
-        path: "dense.seismic".into(),
-        text: include_str!("../kernels/dense.seismic").into(),
-    });
-    sources.push(SourceFile {
-        path: "routed.seismic".into(),
-        text: include_str!("../kernels/routed.seismic").into(),
-    });
-    sources.push(SourceFile {
-        path: "streaming_words.seismic".into(),
-        text: include_str!("../kernels/streaming_words.seismic").into(),
-    });
-    sources.push(SourceFile {
-        path: "functions.seismic".into(),
-        text: include_str!("../kernels/functions.seismic").into(),
-    });
-    crate::common::check(sources)
-}
 
 enum Input {
     Tensor(DType, Vec<usize>, Vec<f64>),
@@ -231,7 +204,7 @@ impl RouteCase {
 
 #[test]
 fn portable_route_ranks_by_probability_with_ties_to_the_higher_expert() {
-    let module = module();
+    let module = crate::common::kernels();
     let case = RouteCase::new(3, 0, E);
     let (_, _, routes, scores) = case.portable(&module, DType::F32);
     for row in 0..case.rows {
@@ -595,7 +568,7 @@ impl RouteCheck {
             })
         })
         .collect::<Vec<_>>();
-        let module = module();
+        let module = crate::common::kernels();
         let portable = parallel(checks.len(), |index| {
             let (activation, _, expert_scale, case) = &checks[index];
             case.portable_scaled(&module, *activation, expert_scale)
@@ -636,14 +609,14 @@ fn native_route_matches_portable_body_for_every_mapping_on(device: &seismic::Dev
                 ),
                 &route_mapping(&device, simdgroups, split),
             );
-            let kernel = routed_route::native_for_device_with(
+            let kernel = declared::prepared(
                 &device,
-                routed_route::Elements {
+                &routed_route::native_entry_with(routed_route::Elements {
                     NW: seismic::Element::f32(),
                     RW: seismic::Element::f32(),
                     SRW: seismic::Element::f32(),
                     A: element,
-                },
+                }),
                 &specialization,
             )
             .unwrap();
@@ -715,7 +688,7 @@ fn highest(experts: usize, choices: usize) -> Vec<i32> {
 /// native routes as the portable body, in both logit classes (GEMV, GEMM).
 #[test]
 fn native_route_ranks_nan_as_negative_infinity() {
-    let module = module();
+    let module = crate::common::kernels();
     let cases = ROUTE_EXPERTS
         .into_iter()
         .flat_map(|experts| [(5, false), (9, true)].map(|(rows, zeros)| (experts, rows, zeros)))
@@ -755,14 +728,14 @@ fn native_route_ranks_nan_as_negative_infinity() {
             } else {
                 (DType::BF16, seismic::Element::bf16(), portable_bf16)
             };
-            let kernel = routed_route::native_for_device_with(
+            let kernel = declared::prepared(
                 &device,
-                routed_route::Elements {
+                &routed_route::native_entry_with(routed_route::Elements {
                     NW: seismic::Element::f32(),
                     RW: seismic::Element::f32(),
                     SRW: seismic::Element::f32(),
                     A: act_elem,
-                },
+                }),
                 &specialization_on(
                     &device,
                     &route_statics(&[("H", H as u64), ("E", experts as u64), ("K", K as u64)], H as u64, 0),
@@ -806,7 +779,7 @@ fn native_route_ranks_nan_as_negative_infinity() {
 #[test]
 fn native_select_ranks_nan_as_negative_infinity() {
     const CLAMP: f32 = 6.103_515_6e-5;
-    let module = module();
+    let module = crate::common::kernels();
     let cases = [32usize, 240]
         .into_iter()
         .flat_map(|experts| [5usize, 9].map(|rows| (experts, rows)))
@@ -875,14 +848,14 @@ fn native_select_ranks_nan_as_negative_infinity() {
             } else {
                 (DType::BF16, seismic::Element::bf16(), portable_bf16)
             };
-            let kernel = routed_select::native_for_device_with(
+            let kernel = declared::prepared(
                 &device,
-                routed_select::Elements {
+                &routed_select::native_entry_with(routed_select::Elements {
                     NW: seismic::Element::f32(),
                     RNW: seismic::Element::f32(),
                     RW: seismic::Element::f32(),
                     A: act_elem,
-                },
+                }),
                 &specialization_on(
                     &device,
                     &[("H", H as u64), ("E", experts as u64), ("K", choices as u64), ("ES", 0)],
@@ -995,7 +968,7 @@ impl GroupCase {
         routes.resize(capacity * K, 0);
         let (mut counts, mut order) = (fill(&[experts]), fill(&[blocks, tile]));
         let (mut inverse, mut table, mut used) = (fill(&[capacity as u64, K as u64]), fill(&[blocks]), fill(&[1]));
-        routed_group::native_for_device(device, &group_specialization(device, experts, K as u64, parts))
+        declared::prepared(device, &routed_group::native_entry(), &group_specialization(device, experts, K as u64, parts))
             .unwrap()
             .call(routed_group::Args {
                 first: &first_row(device),
@@ -1091,7 +1064,7 @@ impl GroupCase {
 
 #[test]
 fn portable_group_is_a_stable_expert_permutation() {
-    let module = module();
+    let module = crate::common::kernels();
     for (rows, experts, tile) in [(1, 8, 4), (13, 8, 4), (37, 16, 8), (64, 32, 16)] {
         let case = GroupCase::new(rows, experts, tile);
         let tables = case.portable(&module);
@@ -1119,7 +1092,7 @@ fn native_group_matches_portable_tables() {
 }
 
 fn native_group_matches_portable_tables_on(device: &seismic::Device) {
-    let module = module();
+    let module = crate::common::kernels();
     for (rows, experts, tile) in [
         (1, 8, 4),
         (13, 8, 4),
@@ -1420,7 +1393,7 @@ impl Block {
 /// per-expert gate, up and down scales, which move the output.
 #[test]
 fn portable_grouped_prefill_equals_decode_form() {
-    let module = module();
+    let module = crate::common::kernels();
     let unscaled = Block::new(6).decode(&module);
     for block in [Block::new(6), Block::scaled(6)] {
         let decode = block.decode(&module);
@@ -1457,7 +1430,7 @@ fn portable_shared_route_equals_route_then_expand() {
 }
 
 fn portable_shared_route_equals_route_then_expand_for(block: &Block) {
-    let module = module();
+    let module = crate::common::kernels();
     let (m, h, e, k, f, s) = (
         block.rows,
         block.hidden,
@@ -1955,7 +1928,7 @@ fn assert_arithmetic(name: &str, actual: &[f32], expected: &[f32], int8: bool, b
 /// f32 block (no rounding at f32).
 #[test]
 fn host_reference_matches_portable_decode_body() {
-    let module = module();
+    let module = crate::common::kernels();
     let block = Block::new(5);
     let (normalized, coefficient, routes, scores) = block.route(&module);
     let routed = Routed {
@@ -2029,14 +2002,14 @@ fn packed_router_matches_dense_decoding(representation: &str, backend: seismic::
         let residual_values = pattern(rows * HIDDEN, 91 + rows as u32, 0.5);
         let residual = f32_tensor(&device, &[rows as u64, HIDDEN as u64], &residual_values);
         let run = |router: &seismic::Tensor| {
-            let kernel = routed_route::native_for_device_with(
+            let kernel = declared::prepared(
                 &device,
-                routed_route::Elements {
+                &routed_route::native_entry_with(routed_route::Elements {
                     NW: seismic::Element::f32(),
                     RW: router.element(),
                     SRW: seismic::Element::f32(),
                     A: if is_cpu(&device) { seismic::Element::f32() } else { seismic::Element::bf16() },
-                },
+                }),
                 &specialization_on(
                     &device,
                     &route_statics(
@@ -2825,22 +2798,22 @@ fn cpu_decode_reads_the_operands_its_producers_emit() {
             for (int8, mapping) in [0u64, 1].into_iter().flat_map(|int8| decode_mappings(&device).into_iter().map(move |mapping| (int8, mapping))) {
                 let label = format!("{experts:?} rows {rows} INT8 {int8} mapping {mapping:?}");
                 let statics = [("H", h), ("K", k), ("F", f), ("S", s)];
-                let route = routed_route::native_for_device_with(
+                let route = declared::prepared(
                     &device,
-                    routed_route::Elements { NW: seismic::Element::f32(), RW: seismic::Element::f32(), SRW: seismic::Element::f32(), A: activation },
+                    &routed_route::native_entry_with(routed_route::Elements { NW: seismic::Element::f32(), RW: seismic::Element::f32(), SRW: seismic::Element::f32(), A: activation }),
                     // The router's rows split over the pool: it takes no mapping.
                     &decode_specialization::<routed_route::Entry>(&device, &[("H", h), ("E", e), ("K", k)], &[]),
                 )
                 .unwrap();
-                let expand = routed_expand::native_for_device_with(
+                let expand = declared::prepared(
                     &device,
-                    routed_expand::Elements {
+                    &routed_expand::native_entry_with(routed_expand::Elements {
                         A: activation,
                         EGW: block.expert_gate.element(),
                         EUW: block.expert_up.element(),
                         SGW: block.shared_gate.element(),
                         SUW: block.shared_up.element(),
-                    },
+                    }),
                     &decode_specialization::<routed_expand::Entry>(
                         &device,
                         &[statics.as_slice(), &block.routed.expansion_statics()].concat(),
@@ -2849,15 +2822,15 @@ fn cpu_decode_reads_the_operands_its_producers_emit() {
                     .with_param("INT8", int8),
                 )
                 .unwrap();
-                let output = routed_output::native_for_device_with(
+                let output = declared::prepared(
                     &device,
-                    routed_output::Elements { A: activation, EDW: block.expert_down.element(), SDW: block.shared_down.element(), NW: seismic::Element::f32() },
+                    &routed_output::native_entry_with(routed_output::Elements { A: activation, EDW: block.expert_down.element(), SDW: block.shared_down.element(), NW: seismic::Element::f32() }),
                     &decode_specialization::<routed_output::Entry>(&device, &statics, &mapping).with_param("INT8", int8),
                 )
                 .unwrap();
-                let project = gated_delta_project::native_for_device_with(
+                let project = declared::prepared(
                     &device,
-                    gated_delta_project::Elements { NW: seismic::Element::f32(), QW: q8, GW: q8, AW: q8, BW: q8, A: activation },
+                    &gated_delta_project::native_entry_with(gated_delta_project::Elements { NW: seismic::Element::f32(), QW: q8, GW: q8, AW: q8, BW: q8, A: activation }),
                     &decode_specialization::<gated_delta_project::Entry>(
                         &device,
                         &[("H", h), ("NK", nk), ("NV", nv), ("W", w)],
@@ -3135,39 +3108,39 @@ fn cpu_decode_carries_operands_across_block_graphs() {
         let expansion = [statics.as_slice(), &block.routed.expansion_statics()].concat();
         for mapping in decode_mappings(&device) {
             let label = format!("INT8 {int8} mapping {mapping:?}");
-            let route = routed_route::native_for_device_with(
+            let route = declared::prepared(
                 &device,
-                routed_route::Elements { NW: seismic::Element::f32(), RW: seismic::Element::f32(), SRW: seismic::Element::f32(), A: activation },
+                &routed_route::native_entry_with(routed_route::Elements { NW: seismic::Element::f32(), RW: seismic::Element::f32(), SRW: seismic::Element::f32(), A: activation }),
                 // The router's rows split over the pool: it takes no mapping.
                 &decode_specialization::<routed_route::Entry>(&device, &[("H", h), ("E", e), ("K", k)], &[]),
             )
             .unwrap();
-            let expand = routed_expand::native_for_device_with(
+            let expand = declared::prepared(
                 &device,
-                routed_expand::Elements {
+                &routed_expand::native_entry_with(routed_expand::Elements {
                     A: activation,
                     EGW: block.expert_gate.element(),
                     EUW: block.expert_up.element(),
                     SGW: block.shared_gate.element(),
                     SUW: block.shared_up.element(),
-                },
+                }),
                 &decode_specialization::<routed_expand::Entry>(&device, &expansion, &mapping),
             )
             .unwrap();
-            let output = routed_output::native_for_device_with(
+            let output = declared::prepared(
                 &device,
-                routed_output::Elements {
+                &routed_output::native_entry_with(routed_output::Elements {
                     A: activation,
                     EDW: block.expert_down.element(),
                     SDW: block.shared_down.element(),
                     NW: seismic::Element::f32(),
-                },
+                }),
                 &decode_specialization::<routed_output::Entry>(&device, &statics, &mapping).with_param("INT8", int8),
             )
             .unwrap();
-            let project = gated_delta_project::native_for_device_with(
+            let project = declared::prepared(
                 &device,
-                gated_delta_project::Elements { NW: seismic::Element::f32(), QW: q8, GW: q8, AW: q8, BW: q8, A: activation },
+                &gated_delta_project::native_entry_with(gated_delta_project::Elements { NW: seismic::Element::f32(), QW: q8, GW: q8, AW: q8, BW: q8, A: activation }),
                 &decode_specialization::<gated_delta_project::Entry>(
                     &device,
                     &[("H", h), ("NK", nk), ("NV", nv), ("W", w)],
@@ -3479,21 +3452,18 @@ fn native_decode_expand_and_output_match_reference_rows(
             };
             // A mapping the output's declaration does not admit at these
             // statics (a wider expert admits fewer rows per threadgroup).
-            if !routed_output::native_entry_with(output_elements())
-                .specialization_valid(&device, &output_specialization)
-                .unwrap()
-            {
+            if declared::declared_at(&device, &routed_output::native_entry_with(output_elements()), &output_specialization).is_err() {
                 continue;
             }
-            let expanded = routed_expand::native_for_device_with(
+            let expanded = declared::prepared(
                 &device,
-                routed_expand::Elements {
+                &routed_expand::native_entry_with(routed_expand::Elements {
                     A: seismic::Element::bf16(),
                     EGW: block.expert_gate.element(),
                     EUW: block.expert_up.element(),
                     SGW: block.shared_gate.element(),
                     SUW: block.shared_up.element(),
-                },
+                }),
                 &specialization,
             )
             .unwrap()
@@ -3523,7 +3493,7 @@ fn native_decode_expand_and_output_match_reference_rows(
                 &shared_bound,
             );
             let output_native =
-                routed_output::native_for_device_with(&device, output_elements(), &output_specialization).unwrap();
+                declared::prepared(&device, &routed_output::native_entry_with(output_elements()), &output_specialization).unwrap();
             let output = |sources: &seismic::Tensor, scores: &seismic::Tensor, expert_down: &seismic::Tensor| {
                 let value = output_native
                     .call(routed_output::Args {
@@ -3894,7 +3864,7 @@ impl GroupedPass {
             used: fill(&[1]),
             glu_limit: no_limit(device),
         };
-        routed_group::native_for_device(device, &default_group_specialization(device, e as u64, k64))
+        declared::prepared(device, &routed_group::native_entry(), &default_group_specialization(device, e as u64, k64))
             .unwrap()
             .call(routed_group::Args {
                 first: &pass.first,
@@ -4259,7 +4229,7 @@ fn native_grouped_prefill_matches_reference_on(
         let mut table = fill(&[blocks]);
         let mut used = fill(&[1]);
         let grouped = i32_tensor(&device, &[1], &[m as i32]);
-        routed_group::native_for_device(device, &default_group_specialization(device, e, k))
+        declared::prepared(device, &routed_group::native_entry(), &default_group_specialization(device, e, k))
             .unwrap()
             .call(routed_group::Args {
                 first: &first_row(&device),
@@ -4512,14 +4482,14 @@ impl Qwen35b {
         for &simdgroups in route_simdgroups(device, simdgroups) {
             let mut routes = i32_tensor(device, &[m, k], &vec![-7; rows * Self::CHOICES]);
             let mut scores = f32_tensor(device, &[m, k], &vec![-7.0; rows * Self::CHOICES]);
-            let outcome = routed_route::native_for_device_with(
+            let outcome = declared::prepared(
                 device,
-                routed_route::Elements {
+                &routed_route::native_entry_with(routed_route::Elements {
                     NW: bf16,
                     RW: bf16,
                     SRW: seismic::Element::f32(),
                     A: bf16,
-                },
+                }),
                 &specialization_on(
                     device,
                     &route_statics(&[("H", h), ("E", e), ("K", k)], h, 0),
@@ -4848,15 +4818,15 @@ fn native_35b_geometry_chain_matches_reference_on(device: &seismic::Device) {
                 specialization = specialization.with_param("INT8", 0);
                 output_specialization = output_specialization.with_param("INT8", 0);
             }
-            let expanded = routed_expand::native_for_device_with(
+            let expanded = declared::prepared(
                 &device,
-                routed_expand::Elements {
+                &routed_expand::native_entry_with(routed_expand::Elements {
                     A: bf16,
                     EGW: element(&device, "q4k"),
                     EUW: element(&device, "q4k"),
                     SGW: element(&device, "q8g32s"),
                     SUW: element(&device, "q8g32s"),
-                },
+                }),
                 &specialization,
             )
             .unwrap()
@@ -4883,14 +4853,14 @@ fn native_35b_geometry_chain_matches_reference_on(device: &seismic::Device) {
                 &shared,
                 &shared_bound,
             );
-            let output = routed_output::native_for_device_with(
+            let output = declared::prepared(
                 &device,
-                routed_output::Elements {
+                &routed_output::native_entry_with(routed_output::Elements {
                     A: bf16,
                     EDW: element(&device, "q5k"),
                     SDW: element(&device, "q8g32s"),
                     NW: seismic::Element::f32(),
-                },
+                }),
                 &output_specialization,
             )
             .unwrap()
@@ -4953,7 +4923,7 @@ fn native_35b_geometry_chain_matches_reference_on(device: &seismic::Device) {
         let mut table = fill(&[blocks]);
         let mut used = fill(&[1]);
         let grouped = i32_tensor(&device, &[1], &[m as i32]);
-        routed_group::native_for_device(device, &default_group_specialization(device, e, k))
+        declared::prepared(device, &routed_group::native_entry(), &default_group_specialization(device, e, k))
             .unwrap()
             .call(routed_group::Args {
                 first: &first_row(&device),
@@ -5158,15 +5128,15 @@ fn native_35b_shared_route_cases(
         let routing = block.route_mappings(&device, &residual, reference_simdgroups);
         let residual_tensor = f32_tensor(&device, &[m, h], &residual);
         for mappings in mappings {
-            let expanded = routed_expand::native_for_device_with(
+            let expanded = declared::prepared(
                 &device,
-                routed_expand::Elements {
+                &routed_expand::native_entry_with(routed_expand::Elements {
                     A: bf16,
                     EGW: q4k,
                     EUW: q4k,
                     SGW: q8,
                     SUW: q8,
-                },
+                }),
                 &decode_specialization::<routed_expand::Entry>(
                     &device,
                     &[("H", h), ("K", k), ("F", f), ("S", s)],
@@ -5192,16 +5162,16 @@ fn native_35b_shared_route_cases(
                 let mut routes = i32_tensor(&device, &[m, k], &vec![-7; rows * Qwen35b::CHOICES]);
                 let mut scores =
                     f32_tensor(&device, &[m, k], &vec![-7.0; rows * Qwen35b::CHOICES]);
-                let shared = routed_route_shared::native_for_device_with(
+                let shared = declared::prepared(
                     &device,
-                    routed_route_shared::Elements {
+                    &routed_route_shared::native_entry_with(routed_route_shared::Elements {
                         NW: bf16,
                         RW: bf16,
                         SRW: seismic::Element::f32(),
                         A: bf16,
                         SGW: q8,
                         SUW: q8,
-                    },
+                    }),
                     &specialize(
                         &route_statics(&[("H", h), ("E", e), ("K", k), ("S", s)], h, 0),
                         mapping,
@@ -5245,13 +5215,13 @@ fn native_35b_shared_route_cases(
                 );
             }
             for mapping in &mappings.choices {
-                let choices = routed_gate_up::native_for_device_with(
+                let choices = declared::prepared(
                     &device,
-                    routed_gate_up::Elements {
+                    &routed_gate_up::native_entry_with(routed_gate_up::Elements {
                         A: bf16,
                         EGW: q4k,
                         EUW: q4k,
-                    },
+                    }),
                     &decode_specialization::<routed_gate_up::Entry>(
                         &device,
                         &[("H", h), ("K", k), ("F", f)],
@@ -5335,8 +5305,9 @@ fn native_35b_grouped_capacity_keeps_every_bit_on(device: &seismic::Device) {
                 let mut table = fill(&[blocks]);
                 let mut used = fill(&[1]);
                 let grouped = i32_tensor(device, &[1], &[m as i32]);
-                routed_group::native_for_device(
+                declared::prepared(
                     device,
+                    &routed_group::native_entry(),
                     &default_group_specialization(device, e, k),
                 )
                 .unwrap()
@@ -5875,15 +5846,15 @@ fn streaming_tier_records_serve_as_bank_records() {
     let serving = TierServing::new(&device, &kinds, e);
     let shared_down = bf16_tensor(&device, &[h, s], &pattern((h * s) as usize, 71, 0.05));
     for (index, mapping) in mappings.iter().enumerate() {
-        let gate_up = routed_gate_up::native_for_device_with(
+        let gate_up = declared::prepared(
             &device,
-            routed_gate_up::Elements { A: bf16, EGW: kinds[0].resident, EUW: kinds[1].resident },
+            &routed_gate_up::native_entry_with(routed_gate_up::Elements { A: bf16, EGW: kinds[0].resident, EUW: kinds[1].resident }),
             &decode_specialization::<routed_gate_up::Entry>(&device, &[("H", h), ("K", k), ("F", f)], mapping),
         )
         .unwrap();
-        let output = routed_output::native_for_device_with(
+        let output = declared::prepared(
             &device,
-            routed_output::Elements { A: bf16, EDW: kinds[2].resident, SDW: bf16, NW: seismic::Element::f32() },
+            &routed_output::native_entry_with(routed_output::Elements { A: bf16, EDW: kinds[2].resident, SDW: bf16, NW: seismic::Element::f32() }),
             &decode_specialization::<routed_output::Entry>(
                 &device,
                 &[("H", h), ("K", k), ("F", f), ("S", s)],
@@ -5956,15 +5927,15 @@ fn streaming_tier_records_serve_as_bank_records() {
     let (h, f, k, e) = (form.down.matrix[0], form.up.matrix[0], 6u64, 8u64);
     let serving = TierServing::new(&device, &kinds, e);
     for (index, mapping) in mappings.iter().enumerate() {
-        let up = routed_up::native_for_device_with(
+        let up = declared::prepared(
             &device,
-            routed_up::Elements { A: bf16, EUW: kinds[0].resident },
+            &routed_up::native_entry_with(routed_up::Elements { A: bf16, EUW: kinds[0].resident }),
             &decode_specialization::<routed_up::Entry>(&device, &[("H", h), ("K", k), ("F", f)], mapping),
         )
         .unwrap();
-        let down = routed_down::native_for_device_with(
+        let down = declared::prepared(
             &device,
-            routed_down::Elements { A: bf16, EDW: kinds[1].resident, R: seismic::Element::f32() },
+            &routed_down::native_entry_with(routed_down::Elements { A: bf16, EDW: kinds[1].resident, R: seismic::Element::f32() }),
             &decode_specialization::<routed_down::Entry>(&device, &[("H", h), ("K", k), ("F", f)], &output_mapping(&device, index, mapping)),
         )
         .unwrap();
@@ -6034,7 +6005,7 @@ fn a_scratch_request_counts_every_choice_of_every_row() {
             .collect::<Vec<_>>();
         let mut flags = shared_i32(&device, &[experts], &vec![-3; experts as usize]);
         let mut scratch_table = shared_i32(&device, &table.extents(), &vec![0; table.words() as usize]);
-        routed_scratch_request::native_for_device(&device, &specialize(&[("K", k), ("E", experts)], &[]))
+        declared::prepared(&device, &routed_scratch_request::native_entry(), &specialize(&[("K", k), ("E", experts)], &[]))
             .unwrap()
             .call(routed_scratch_request::Args {
                 routes: &i32_tensor(&device, &[rows, k], &routes),
@@ -6096,7 +6067,7 @@ fn streaming_scratch_rounds_fill_the_scratch_bank() {
 
     // The step's sequence.
     let mut step = i32_tensor(&device, &[constants::STEP_WORDS], &[0, 0]);
-    routed_step::native_for_device(&device, &seismic::NativeSpecialization::new())
+    declared::prepared(&device, &routed_step::native_entry(), &seismic::NativeSpecialization::new())
         .unwrap()
         .call(routed_step::Args {
             step: &mut step,
@@ -6116,8 +6087,9 @@ fn streaming_scratch_rounds_fill_the_scratch_bank() {
     let mut scratch_table = shared_i32(&device, &table.extents(), &vec![0; table.words() as usize]);
     let _pulse = pulse(&scratch_table, table);
     let k = 4u64;
-    routed_scratch_request::native_for_device(
+    declared::prepared(
         &device,
+        &routed_scratch_request::native_entry(),
         &specialize(&[("K", k), ("E", experts)], &[]),
     )
     .unwrap()
@@ -6206,7 +6178,7 @@ fn streaming_scratch_rounds_fill_the_scratch_bank() {
             kernel.call_answered(args).unwrap();
         }
     };
-    let scratch_grids = routed_scratch_grids::native_for_device(&device, &seismic::NativeSpecialization::new()).unwrap();
+    let scratch_grids = declared::prepared(&device, &routed_scratch_grids::native_entry(), &seismic::NativeSpecialization::new()).unwrap();
     let grids_of = |scratch: &seismic::Tensor| {
         let mut grids = i32_tensor(&device, &[rounds, 3], &vec![-7; (rounds * 3) as usize]);
         scratch_grids
@@ -6318,7 +6290,7 @@ fn streaming_seed_commit_commits_a_completed_windows_records() {
     let lane = |index: u64| table.lane(q, constants::SCRATCH_ROUND + index);
     let pairs = [(0, 6), (2, 1), (3, 4)];
     let count = 2usize;
-    let kernel = routed_seed_commit::native_for_device(&device, &specialize(&[("X", capacity as u64)], &[])).unwrap();
+    let kernel = declared::prepared(&device, &routed_seed_commit::native_entry(), &specialize(&[("X", capacity as u64)], &[])).unwrap();
     let failed = q | (u64::from(constants::SLOT_FAILED as u32) << 32);
     for (label, list_seq, answered_lane, answer, commits_listed) in [
         ("completed window", STREAMING_SEQUENCE, w * rounds + rounds - 1, q, true),
@@ -6512,16 +6484,16 @@ impl ServedForm {
     /// `routed_land` over these records at K choices.
     fn land_kernel(&self, device: &seismic::Device, k: u64) -> seismic::NativeKernel<routed_land::Entry> {
         let [gate, up, down] = [0, 1, 2].map(|tensor| self.kind(tensor));
-        routed_land::native_for_device_with(
+        declared::prepared(
             device,
-            routed_land::Elements {
+            &routed_land::native_entry_with(routed_land::Elements {
                 SG: gate.source,
                 SU: up.source,
                 SD: down.source,
                 UG: gate.resident,
                 UU: up.resident,
                 UD: down.resident,
-            },
+            }),
             &specialize(&[("K", k)], &[]),
         )
         .unwrap()
@@ -6530,16 +6502,16 @@ impl ServedForm {
     /// `routed_round` over these records.
     fn round_kernel(&self, device: &seismic::Device) -> seismic::NativeKernel<routed_round::Entry> {
         let [gate, up, down] = [0, 1, 2].map(|tensor| self.kind(tensor));
-        routed_round::native_for_device_with(
+        declared::prepared(
             device,
-            routed_round::Elements {
+            &routed_round::native_entry_with(routed_round::Elements {
                 SG: gate.source,
                 SU: up.source,
                 SD: down.source,
                 UG: gate.resident,
                 UU: up.resident,
                 UD: down.resident,
-            },
+            }),
             &seismic::NativeSpecialization::new(),
         )
         .unwrap()
@@ -6589,7 +6561,7 @@ fn served_round(
 /// stored, their resident forms in every resident layout.
 #[test]
 fn streaming_landing_entries_build_at_35b_record_forms() {
-    let module = module();
+    let module = crate::common::kernels();
     for name in ["routed_land", "routed_round"] {
         let entry = module.entry_named(name).unwrap();
         for layout in RESIDENT_LAYOUTS {
@@ -6616,7 +6588,7 @@ fn streaming_landing_entries_build_at_35b_record_forms() {
 fn list_grid(device: &seismic::Device, list: &seismic::Tensor, step: &seismic::Tensor) -> (seismic::Tensor, seismic::Tensor) {
     let mut grid = i32_tensor(device, &[3], &[magnitude_kernels::LIST_BLOCKS as i32, 0, 0]);
     let mut staged = i32_tensor(device, &list.extents(), &vec![0; list.extents()[0] as usize]);
-    routed_list_grid::native_for_device(device, &seismic::NativeSpecialization::new())
+    declared::prepared(device, &routed_list_grid::native_entry(), &seismic::NativeSpecialization::new())
         .unwrap()
         .call(routed_list_grid::Args { list, step, grid: &mut grid, staged: &mut staged })
         .unwrap();
@@ -6695,7 +6667,7 @@ fn streaming_pass_map_resolves_each_experts_record_for_the_step() {
     let window = shared_i32(&device, &[experts], &(0..experts).map(place).collect::<Vec<_>>());
     let mut resolved = i32_tensor(&device, &[experts, words as u64], &vec![0; experts as usize * words]);
     let mut pass_step = i32_tensor(&device, &[constants::STEP_WORDS], &[0, 0]);
-    routed_pass_map::native_for_device(&device, &seismic::NativeSpecialization::new())
+    declared::prepared(&device, &routed_pass_map::native_entry(), &seismic::NativeSpecialization::new())
         .unwrap()
         .call(routed_pass_map::Args { map: &map, window: &window, step: &step, resolved: &mut resolved, pass_step: &mut pass_step })
         .unwrap();
@@ -6734,7 +6706,7 @@ fn streaming_copy_walks_a_list_past_its_first_chunk() {
     let words = list_words(STREAMING_SEQUENCE, records, &pairs, records);
     let list = shared_i32(&device, &[words.len() as u64], &words);
     let (grid, staged) = list_grid(&device, &list, &step);
-    routed_copy::native_for_device_with(&device, routed_copy::Elements { U: byte }, &seismic::NativeSpecialization::new())
+    declared::prepared(&device, &routed_copy::native_entry_with(routed_copy::Elements { U: byte }), &seismic::NativeSpecialization::new())
         .unwrap()
         .call(routed_copy::Args { source: &source, list: &staged, step: &step, destination: &mut destination, grid: &grid })
         .unwrap();
@@ -6775,7 +6747,7 @@ impl TierFill {
             None => grid,
             Some(blocks) => i32_tensor(device, &[3], &[blocks, 1, 1]),
         };
-        let copy = routed_copy::native_for_device_with(device, routed_copy::Elements { U: byte }, &seismic::NativeSpecialization::new()).unwrap();
+        let copy = declared::prepared(device, &routed_copy::native_entry_with(routed_copy::Elements { U: byte }), &seismic::NativeSpecialization::new()).unwrap();
         let mut graph = device.native_graph();
         let mut port = |tensor: &seismic::Tensor| graph.port(tensor.element(), &tensor.extents()).unwrap();
         let ports = [&tier, &staged, &step, &destination, &grid].map(&mut port);
@@ -6830,7 +6802,7 @@ fn compute_reading_a_fills_slots_follows_the_fill() {
     let pairs = (0..records as i32).map(|record| (record, record)).collect::<Vec<_>>();
     let list = shared_i32(&device, &[list_extent(records)], &list_words(STREAMING_SEQUENCE, records as usize, &pairs, records as usize));
     let (grid, staged) = list_grid(&device, &list, step);
-    let copy = routed_copy::native_for_device_with(&device, routed_copy::Elements { U: byte }, &seismic::NativeSpecialization::new()).unwrap();
+    let copy = declared::prepared(&device, &routed_copy::native_entry_with(routed_copy::Elements { U: byte }), &seismic::NativeSpecialization::new()).unwrap();
     let mut slot = fill.plan.new_slot().unwrap();
     let filled = fill.submit(&device, &mut slot, seismic::NativeQueue::Fill);
     copy.call(routed_copy::Args { source: fill.destination(), list: &staged, step, destination: &mut read, grid: &grid })
@@ -6860,7 +6832,7 @@ fn a_fronts_step_words_wait_for_no_other_places_fill() {
     }
     let fill = TierFill::new(&device, 64, 4 << 20, 64, Some(1));
     let mut slot = fill.plan.new_slot().unwrap();
-    let step = routed_step::native_for_device(&device, &seismic::NativeSpecialization::new()).unwrap();
+    let step = declared::prepared(&device, &routed_step::native_entry(), &seismic::NativeSpecialization::new()).unwrap();
     let sequence = i32_tensor(&device, &[constants::STEP_WORDS], &step_words(STREAMING_SEQUENCE as u64));
     let mut other = i32_tensor(&device, &[constants::STEP_WORDS], &[0, 0]);
     let filled = fill.submit(&device, &mut slot, seismic::NativeQueue::Fill);
@@ -6878,7 +6850,7 @@ fn a_fronts_step_words_wait_for_no_other_places_fill() {
 /// holds once the launch returns.
 fn streaming_step(device: &seismic::Device) -> seismic::Tensor {
     let mut step = i32_tensor(device, &[constants::STEP_WORDS], &[0, 0]);
-    routed_step::native_for_device(device, &seismic::NativeSpecialization::new())
+    declared::prepared(device, &routed_step::native_entry(), &seismic::NativeSpecialization::new())
         .unwrap()
         .call(routed_step::Args {
             step: &mut step,
@@ -6911,9 +6883,9 @@ fn streaming_copy_copies_the_listed_records_byte_for_byte() {
             .map(|pattern| kind.import(&kind.stored(pattern, form)))
             .collect::<Vec<_>>();
         let bank = kind.tensor(&device, kind.resident, COPY_RECORDS.0, |record| Some(imports[record].as_slice()));
-        let copy = routed_copy::native_for_device_with(
+        let copy = declared::prepared(
             &device,
-            routed_copy::Elements { U: kind.resident },
+            &routed_copy::native_entry_with(routed_copy::Elements { U: kind.resident }),
             &seismic::NativeSpecialization::new(),
         )
         .unwrap();
@@ -7053,7 +7025,7 @@ fn streaming_pass_reads_cold_experts_from_a_scratch_tier() {
     let map = shared_i32(&device, &[experts, words as u64], &(0..experts).flat_map(row).collect::<Vec<_>>());
     let mut resolved = i32_tensor(&device, &[experts, words as u64], &vec![0; experts as usize * words]);
     let mut pass_step = i32_tensor(&device, &[constants::STEP_WORDS], &[0, 0]);
-    let pass_map = routed_pass_map::native_for_device(&device, &seismic::NativeSpecialization::new()).unwrap();
+    let pass_map = declared::prepared(&device, &routed_pass_map::native_entry(), &seismic::NativeSpecialization::new()).unwrap();
     let round_kernel = ServedForm::qwen35b(&device).round_kernel(&device);
 
     // Rows of 8 distinct choices, hits and cold experts mixed: choice c of
@@ -7063,7 +7035,7 @@ fn streaming_pass_reads_cold_experts_from_a_scratch_tier() {
     let fill = |shape: &[u64]| i32_tensor(&device, shape, &vec![-9; shape.iter().product::<u64>() as usize]);
     let (grouped, mut order, mut inverse, mut table, mut used) =
         (i32_tensor(&device, &[1], &[rows as i32]), fill(&[blocks, t]), fill(&[rows, k]), fill(&[blocks]), fill(&[1]));
-    routed_group::native_for_device(&device, &default_group_specialization(&device, experts, k))
+    declared::prepared(&device, &routed_group::native_entry(), &default_group_specialization(&device, experts, k))
         .unwrap()
         .call(routed_group::Args {
             first: &first_row(&device),
@@ -7649,7 +7621,7 @@ fn native_landings_match_the_portable_body() {
     let Some(device) = streaming_device() else {
         return;
     };
-    let module = module();
+    let module = crate::common::kernels();
     let (k, q, low) = (4usize, STREAMING_SEQUENCE as u64, STREAMING_SEQUENCE);
     let pairs = [(2, 4), (0, 1), (1, 0)];
     // A tensor's interpreter input: its values, of `dtype`.
@@ -7793,19 +7765,7 @@ fn native_landings_match_the_portable_body() {
 /// parks are then none.
 #[test]
 fn the_landing_is_encoded_only_while_an_expert_can_be_absent() {
-    let mut sources = seismic_std::sources();
-    for (path, text) in [
-        ("dense.seismic", include_str!("../kernels/dense.seismic")),
-        ("routed.seismic", include_str!("../kernels/routed.seismic")),
-        ("streaming_words.seismic", include_str!("../kernels/streaming_words.seismic")),
-        ("functions.seismic", include_str!("../kernels/functions.seismic")),
-        ("metal_streaming.seismic", include_str!("../kernels/metal_streaming.seismic")),
-        ("cuda_streaming.seismic", include_str!("../kernels/cuda_streaming.seismic")),
-        ("vulkan_streaming.seismic", include_str!("../kernels/vulkan_streaming.seismic")),
-    ] {
-        sources.push(SourceFile { path: path.into(), text: text.into() });
-    }
-    let module = crate::common::check(sources);
+    let module = crate::common::kernels();
     let entry = module.entry_named("routed_land").unwrap();
     let resolved = seismic_lang::checked::LaunchCondition {
         word: "policy".into(),
@@ -7841,7 +7801,7 @@ fn as_i32(values: Vec<f64>) -> Vec<i32> {
 /// words of each pair compared.
 #[test]
 fn portable_held_holds_a_record_within_its_steps() {
-    let module = module();
+    let module = crate::common::kernels();
     let high = 1u64 << 32;
     let map = map_words(&[(3, 5, u64::MAX), (4, 0, 10), (-1, 0, 0), (2, high + 1, high + 3), (-2 - 5, 1, 10)]);
     let cases = [
@@ -7887,7 +7847,7 @@ fn portable_held_holds_a_record_within_its_steps() {
 /// expert's side.
 #[test]
 fn portable_assign_splits_the_misses_by_the_policy_lines() {
-    let module = module();
+    let module = crate::common::kernels();
     // (rows, routes, records, policy, expected records, expected sites)
     let cases: [(&str, usize, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>); 3] = [
         (
@@ -8116,7 +8076,7 @@ fn a_streamed_route_sources_every_choice_of_an_expert_alike_under_tier_flips() {
 /// layer the host tier places (V = S = 0), its step's high word set.
 #[test]
 fn portable_landing_routes_a_landed_record_to_its_side() {
-    let module = module();
+    let module = crate::common::kernels();
     let (k, step) = (4usize, (1u64 << 32) + 7);
     // Choice 0 held, 1-3 absent: 1 the CPU's (site -2), 2 the link's, 3 the
     // CPU's with a failed read.
@@ -8154,7 +8114,7 @@ fn portable_landing_routes_a_landed_record_to_its_side() {
 /// pair; a step with no CPU choice writes nothing.
 #[test]
 fn portable_site_request_writes_its_slot() {
-    let module = module();
+    let module = crate::common::kernels();
     let (m, k, h) = (2usize, 2usize, 3usize);
     let q = (1u64 << 32) + 7;
     let slot = (q % FLIGHT) as usize;
@@ -8207,7 +8167,7 @@ fn portable_site_request_writes_its_slot() {
 /// another step's answer or request).
 #[test]
 fn portable_sited_combine_adds_an_answered_step_alone() {
-    let module = module();
+    let module = crate::common::kernels();
     let (m, k, h, q) = (2usize, 2usize, 3usize, 7u64);
     let slot = (q % FLIGHT) as usize;
     let rows = constants::VERIFY_ROWS as usize;
@@ -8814,14 +8774,14 @@ fn route_choice_follows_the_reference_order() {
                         ),
                         &route_mapping(dev, 8, 1),
                     );
-                    let kernel = routed_route::native_for_device_with(
+                    let kernel = declared::prepared(
                         dev,
-                        routed_route::Elements {
+                        &routed_route::native_entry_with(routed_route::Elements {
                             NW: seismic::Element::f32(),
                             RW: rw_tensor.element(),
                             SRW: seismic::Element::f32(),
                             A: act_elem,
-                        },
+                        }),
                         &spec,
                     )
                     .unwrap();
@@ -8855,14 +8815,14 @@ fn route_choice_follows_the_reference_order() {
                         &[("H", h as u64), ("E", e as u64), ("K", choices as u64), ("ES", 0)],
                         &route_mapping(dev, 8, 1),
                     );
-                    let kernel = routed_select::native_for_device_with(
+                    let kernel = declared::prepared(
                         dev,
-                        routed_select::Elements {
+                        &routed_select::native_entry_with(routed_select::Elements {
                             NW: seismic::Element::f32(),
                             RNW: seismic::Element::f32(),
                             RW: rw_tensor.element(),
                             A: act_elem,
-                        },
+                        }),
                         &spec,
                     )
                     .unwrap();
@@ -8938,14 +8898,14 @@ fn route_choice_follows_the_reference_order() {
         let patterned_norm = (0..h).map(|c| 0.75 + 0.5 * ((c % 13) as f32 / 13.0)).collect::<Vec<_>>();
         let patterned_shared = pattern(h, seed ^ 0x1234, 0.25);
         let (cpu_packed, _) = packed_weight(&cpu, "q8g32s", &[e as u64, h as u64], seed);
-        let cpu_q8_kernel = routed_route::native_for_device_with(
+        let cpu_q8_kernel = declared::prepared(
             &cpu,
-            routed_route::Elements {
+            &routed_route::native_entry_with(routed_route::Elements {
                 NW: seismic::Element::f32(),
                 RW: cpu_packed.element(),
                 SRW: seismic::Element::f32(),
                 A: seismic::Element::bf16(),
-            },
+            }),
             &specialization_on(
                 &cpu,
                 &route_statics(&[("H", h as u64), ("E", e as u64), ("K", choices as u64)], h as u64, 0),
@@ -8975,14 +8935,14 @@ fn route_choice_follows_the_reference_order() {
         for gpu in &gpus {
             let label = format!("{:?} q8g32s H={h} E={e} M={m}", gpu.backend());
             let (gpu_packed, _) = packed_weight(gpu, "q8g32s", &[e as u64, h as u64], seed);
-            let gpu_q8_kernel = routed_route::native_for_device_with(
+            let gpu_q8_kernel = declared::prepared(
                 gpu,
-                routed_route::Elements {
+                &routed_route::native_entry_with(routed_route::Elements {
                     NW: seismic::Element::f32(),
                     RW: gpu_packed.element(),
                     SRW: seismic::Element::f32(),
                     A: seismic::Element::bf16(),
-                },
+                }),
                 &specialization_on(
                     gpu,
                     &route_statics(&[("H", h as u64), ("E", e as u64), ("K", choices as u64)], h as u64, 0),

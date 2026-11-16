@@ -18,7 +18,7 @@ use magnitude_kernels::{
     attention_output, repeat_rows, stream_mix_down, stream_mix_sinkhorn, stream_mix_up,
 };
 use seismic_lang::{
-    checked::{CheckedModule, SourceFile},
+    checked::CheckedModule,
     entry::ElementBindings,
     failure::SourceTermination,
     interp::{Arg, Interpreter, OracleOutcome, OutcomeValue, TensorData},
@@ -26,35 +26,6 @@ use seismic_lang::{
     registry,
     types::DType,
 };
-
-fn module() -> CheckedModule {
-    let mut sources = seismic_std::sources();
-    // `stream_join` joins through `scatter`.
-    sources.push(SourceFile {
-        path: "functions.seismic".into(),
-        text: include_str!("../kernels/functions.seismic").into(),
-    });
-    sources.push(SourceFile {
-        path: "streams.seismic".into(),
-        text: include_str!("../kernels/streams.seismic").into(),
-    });
-    // The routed declarations beside the words they read; the sites split at
-    // `VERIFY_ROWS`, which `common::check` brings (`verify_rows.seismic`).
-    sources.push(SourceFile {
-        path: "routed.seismic".into(),
-        text: include_str!("../kernels/routed.seismic").into(),
-    });
-    sources.push(SourceFile {
-        path: "streaming_words.seismic".into(),
-        text: include_str!("../kernels/streaming_words.seismic").into(),
-    });
-    // The projections the entries take (`project`).
-    sources.push(SourceFile {
-        path: "dense.seismic".into(),
-        text: include_str!("../kernels/dense.seismic").into(),
-    });
-    crate::common::check(sources)
-}
 
 enum Input {
     Tensor(DType, Vec<usize>, Vec<f32>),
@@ -468,7 +439,7 @@ fn assert_stages(
 /// at every launch's row count, with and without inject values.
 #[test]
 fn host_replica_matches_portable_bodies() {
-    let module = module();
+    let module = crate::common::kernels();
     for c in [1, 0] {
         for rows in ROWS {
             let case = Case::new(GEOMETRIES[0], c, rows);
@@ -492,7 +463,7 @@ fn host_replica_matches_portable_bodies() {
 /// against the host replica at Qwen3.8 Flash Next's.
 #[test]
 fn native_stream_mix_matches_portable_bodies() {
-    let module = module();
+    let module = crate::common::kernels();
     let devices = devices();
     for geometry in GEOMETRIES {
         for c in [1, 0] {
@@ -549,7 +520,7 @@ fn cpu_stream_mix_row_shares_match_the_host_replica() {
 /// (one F32 product each), at scale 1 (the streams' entry) and others.
 #[test]
 fn native_repeat_rows_matches_portable_body() {
-    let module = module();
+    let module = crate::common::kernels();
     for device in devices() {
         for (h, rows, scales) in [
             (256usize, 1usize, vec![1.0f32; 4]),
@@ -881,7 +852,7 @@ impl Projection {
             )
             .unwrap()
             .expect("attention_output joins through the comb on this backend");
-        let joined = attention_output::native_for_device_with(device, elements, &specialization)
+        let joined = declared::prepared(device, &attention_output::native_entry_with(elements), &specialization)
             .unwrap()
             .call(attention_output::Args {
                 hidden: &tensor(device, DType::F32, &[rows, s * h], x),
@@ -913,7 +884,7 @@ fn entry_pre(rows: usize, s: usize) -> Vec<f64> {
 /// carrying none (P = 0).
 #[test]
 fn portable_sinkhorn_site_matches_the_single_pass_formulas() {
-    let module = module();
+    let module = crate::common::kernels();
     let (h, s, n, rows) = (64, 4, V41.2, 3);
     let width = s * h;
     let x = pattern(rows * width, 21, 3.0);
@@ -1367,7 +1338,7 @@ fn native_sinkhorn_split_timing() {
                 .with_static("P", 1),
         )
         .unwrap();
-    let kernel = stream_mix_sinkhorn::native_for_device(&device, &specialization).unwrap();
+    let kernel = declared::prepared(&device, &stream_mix_sinkhorn::native_entry(), &specialization).unwrap();
     // (rows, iterations)
     let cases = [(1usize, n), (1, 0), (8, n), (2048, n)];
     let rows_of = |rows: usize| {

@@ -75,7 +75,6 @@ fn values(random: &mut Random, count: usize, scale: f32) -> Vec<f32> {
 }
 
 fn interpret(
-    source: &str,
     entry: &str,
     norms: bool,
     tensors: Vec<seismic_lang::interp::TensorData>,
@@ -83,19 +82,13 @@ fn interpret(
     mutable: Option<usize>,
 ) -> (Vec<f32>, Option<Vec<f32>>) {
     use seismic_lang::{
-        checked::{SourceFile},
         entry::ElementBindings,
         failure::SourceTermination,
         interp::{Arg, Interpreter, OutcomeValue},
         registry,
         types::DType,
     };
-    let mut sources = seismic_std::sources();
-    sources.push(SourceFile {
-        path: "ngram.seismic".into(),
-        text: source.into(),
-    });
-    let module = crate::common::check(sources);
+    let module = crate::common::kernels();
     let elements = match norms {
         true => ElementBindings::new().bind("NW", registry::dense(DType::F32)),
         false => ElementBindings::new(),
@@ -198,7 +191,6 @@ impl GateCase {
     fn oracle(&self) -> Vec<f32> {
         let (m, s, h) = (self.rows, self.streams, self.hidden);
         interpret(
-            include_str!("../kernels/ngram.seismic"),
             "ngram_gate",
             true,
             vec![
@@ -274,7 +266,6 @@ fn add_natives_match_the_portable_body() {
         let scales = values(&mut random, rows * 2 * streams, 1.0);
         let value = values(&mut random, rows * hidden, 1.5);
         let (oracle, _) = interpret(
-            include_str!("../kernels/ngram.seismic"),
             "ngram_add",
             false,
             vec![
@@ -476,7 +467,6 @@ impl Case {
         };
         let count = self.slots.len();
         let (result, window) = interpret(
-            include_str!("../kernels/ngram.seismic"),
             "ngram_inject",
             true,
             vec![
@@ -944,19 +934,13 @@ impl RowsCase {
 
     fn oracle(&self) -> RowsOutcome {
         use seismic_lang::{
-            checked::{SourceFile},
             entry::ElementBindings,
             failure::SourceTermination,
             interp::{Arg, Interpreter, OutcomeValue, TensorData},
             reference_math::ReferenceScalar,
             types::DType,
         };
-        let mut sources = seismic_std::sources();
-        sources.push(SourceFile {
-            path: "ngram.seismic".into(),
-            text: include_str!("../kernels/ngram.seismic").into(),
-        });
-        let module = crate::common::check(sources);
+        let module = crate::common::kernels();
         let logical = module
             .entry(module.entry_named("ngram_rows").unwrap(), &ElementBindings::new())
             .unwrap();

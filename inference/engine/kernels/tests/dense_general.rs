@@ -13,7 +13,7 @@ use magnitude_kernels::{dense_up, per_layer_gate, project_rows, short_conv_proje
 use mapped::Mapped;
 use seismic::BackendName;
 use seismic_lang::{
-    checked::{CheckedModule, SourceFile},
+    checked::CheckedModule,
     entry::ElementBindings,
     failure::SourceTermination,
     interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -21,38 +21,6 @@ use seismic_lang::{
     registry,
     types::DType,
 };
-
-fn module() -> CheckedModule {
-    let mut sources = seismic_std::sources();
-    for (path, text) in [
-        (
-            "feed_forward.seismic",
-            include_str!("../kernels/feed_forward.seismic"),
-        ),
-        (
-            "dense.seismic",
-            include_str!("../kernels/dense.seismic"),
-        ),
-        (
-            "short_conv.seismic",
-            include_str!("../kernels/short_conv.seismic"),
-        ),
-        (
-            "per_layer_gate.seismic",
-            include_str!("../kernels/per_layer_gate.seismic"),
-        ),
-        (
-            "functions.seismic",
-            include_str!("../kernels/functions.seismic"),
-        ),
-    ] {
-        sources.push(SourceFile {
-            path: path.into(),
-            text: text.into(),
-        });
-    }
-    crate::common::check(sources)
-}
 
 enum Input {
     Tensor(DType, Vec<usize>, Vec<f64>),
@@ -821,7 +789,7 @@ fn per_layer_gate_reference(
 
 #[test]
 fn portable_entries_match_host_reference() {
-    let module = module();
+    let module = crate::common::kernels();
     let (m, k, n) = (3, 96, 40);
     let x = bf16s(pattern(m * k, 11, 1.5));
     let w = weights(n, k, 13);

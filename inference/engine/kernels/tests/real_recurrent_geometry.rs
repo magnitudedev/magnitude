@@ -2,6 +2,7 @@
 //! Run only with MAGNITUDE_REAL_RECURRENT_FIXTURE set to its generated directory.
 
 mod common;
+mod declared;
 
 use magnitude_kernels::{attention_output, gated_delta_project, gated_delta_step, repack_weight};
 use seismic::{BackendName, Device, Element, SlabRegion, Tensor};
@@ -57,12 +58,12 @@ fn repacked(
     let wire = bytes(path, name, "wire");
     let logical = shape.iter().product::<u64>();
     let input = Tensor::from_host(device, source_element, &[1, 1, logical], &wire).unwrap();
-    repack_weight::native_for_device_with(
+    declared::prepared(
         device,
-        repack_weight::Elements {
+        &repack_weight::native_entry_with(repack_weight::Elements {
             E: source_element,
             U: resident_element,
-        },
+        }),
         &seismic::NativeSpecialization::new(),
     )
     .unwrap()
@@ -241,16 +242,16 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf_on(device: &Device, path: &P
     let mut delta = slabs.logical_region(1).unwrap();
     let mut tape = slabs.logical_region(2).unwrap();
 
-    let projection = gated_delta_project::native_for_device_with(
+    let projection = declared::prepared(
         &device,
-        gated_delta_project::Elements {
+        &gated_delta_project::native_entry_with(gated_delta_project::Elements {
             NW: f32e,
             QW: q5,
             GW: q4,
             AW: q8,
             BW: q8,
             A: bf16,
-        },
+        }),
         &seismic::NativeSpecialization::new(),
     )
     .unwrap()
@@ -270,9 +271,9 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf_on(device: &Device, path: &P
     report(path, "projection", read_bf16(&projection));
 
     // The step publishes the gated rows; its raw outputs are internal.
-    let gated = gated_delta_step::native_for_device_with(
+    let gated = declared::prepared(
         &device,
-        gated_delta_step::Elements { RN: f32e, A: bf16 },
+        &gated_delta_step::native_entry_with(gated_delta_step::Elements { RN: f32e, A: bf16 }),
         &step_specialization(device),
     )
     .unwrap()
@@ -299,9 +300,9 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf_on(device: &Device, path: &P
     .unwrap()
     .value;
     report(path, "delta", read_f32(&delta.slice_leading(1, 2).unwrap()));
-    let projected = attention_output::native_for_device_with(
+    let projected = declared::prepared(
         &device,
-        attention_output::Elements { OW: q5, A: bf16 },
+        &attention_output::native_entry_with(attention_output::Elements { OW: q5, A: bf16 }),
         &seismic::NativeSpecialization::new(),
     )
     .unwrap()

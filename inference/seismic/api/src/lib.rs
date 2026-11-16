@@ -5451,7 +5451,10 @@ pub mod generated {
             }
         }
 
-        pub(crate) fn checked(&self) -> &seismic_lang::checked::CheckedModule {
+        /// The checked module the bundle holds: every source the build
+        /// checked, over the standard library, as the generated bindings
+        /// prepare and interpret it.
+        pub fn checked(&self) -> &seismic_lang::checked::CheckedModule {
             &self.checked
         }
         #[doc(hidden)]

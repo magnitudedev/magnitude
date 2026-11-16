@@ -1,4 +1,5 @@
 mod common;
+mod declared;
 
 use magnitude_kernels::{sample_rows, shape_rows};
 
@@ -131,14 +132,10 @@ fn philox_score(value: f32, token: u32, draw: [u32; 6]) -> f32 {
 #[ignore = "Seismic reference math lacks the IDX-to-I32 cast required by Hn=64 history matching"]
 fn portable_shaping_matches_the_ordered_host_reference() {
     use seismic_lang::{
-        checked::{SourceFile, SourceSet},
         interp::{Arg, Interpreter, TensorData},
         types::DType,
     };
-    let module = crate::common::check(SourceSet::new(vec![SourceFile {
-        path: "sampling.seismic".into(),
-        text: include_str!("../kernels/sampling.seismic").into(),
-    }]));
+    let module = crate::common::kernels();
     let logical = module
         .entry(
             module.entry_named("shape_rows").unwrap(),
@@ -349,7 +346,7 @@ fn native_shape_constrained(
         parts,
         &[("V", vocabulary as u64), ("Hn", hn as u64)],
     );
-    shape_rows::native_for_device(device, &specialization)
+    declared::prepared(device, &shape_rows::native_entry(), &specialization)
         .unwrap()
         .call(shape_rows::Args {
             logits: &mut logits,
@@ -421,7 +418,7 @@ fn native_sample(
     let mut result =
         seismic::Tensor::zeros(device, seismic::Element::i32(), &[rows as u64, 2]).unwrap();
     let specialization = specialization_on(device, parts, &[("V", vocabulary as u64)]);
-    sample_rows::native_for_device(device, &specialization)
+    declared::prepared(device, &sample_rows::native_entry(), &specialization)
         .unwrap()
         .call(sample_rows::Args {
             logits: &logits,

@@ -10,6 +10,7 @@
 // no bank other than each slot's successor changes.
 
 mod common;
+mod declared;
 mod versions_common;
 
 use magnitude_kernels::short_conv_rows;
@@ -133,7 +134,6 @@ impl Case {
     /// The portable body executed by the Seismic interpreter.
     fn oracle(&self, activation: Element) -> Outcome {
         use seismic_lang::{
-            checked::{SourceFile},
             entry::ElementBindings,
             failure::SourceTermination,
             interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -141,16 +141,7 @@ impl Case {
             registry,
             types::DType,
         };
-        let mut sources = seismic_std::sources();
-        sources.push(SourceFile {
-            path: "short_conv.seismic".into(),
-            text: include_str!("../kernels/short_conv.seismic").into(),
-        });
-        sources.push(SourceFile {
-            path: "functions.seismic".into(),
-            text: include_str!("../kernels/functions.seismic").into(),
-        });
-        let module = crate::common::check(sources);
+        let module = crate::common::kernels();
         let dtype = if activation == Element::bf16() { DType::BF16 } else { DType::F32 };
         let elements = ElementBindings::new().bind("A", registry::dense(dtype));
         let logical = module
@@ -239,9 +230,9 @@ impl Case {
 }
 
 fn kernel(device: &Device, activation: Element) -> seismic::NativeKernel<short_conv_rows::Entry> {
-    short_conv_rows::native_for_device_with(
+    declared::prepared(
         device,
-        short_conv_rows::Elements { A: activation },
+        &short_conv_rows::native_entry_with(short_conv_rows::Elements { A: activation }),
         &NativeSpecialization::new(),
     )
     .unwrap()

@@ -13,6 +13,7 @@
 //! the result's RMS.
 
 mod common;
+mod declared;
 mod random;
 
 use random::Rng;
@@ -23,7 +24,7 @@ use magnitude_kernels::{
 };
 use seismic::{Device, Element, NativeSpecialization, Tensor};
 use seismic_lang::{
-    checked::{CheckedModule, SourceFile},
+    checked::CheckedModule,
     entry::ElementBindings,
     failure::SourceTermination,
     interp::{Arg, Interpreter, OracleOutcome, OutcomeValue, TensorData},
@@ -160,29 +161,6 @@ fn read_values(tensor: &Tensor) -> Vec<f32> {
 // ---------------------------------------------------------------------------
 // Portable bodies.
 
-fn module() -> CheckedModule {
-    let mut sources = seismic_std::sources();
-    for (path, text) in [
-        ("vision.seismic", include_str!("../kernels/vision.seismic")),
-        (
-            "attention.seismic",
-            include_str!("../kernels/attention.seismic"),
-        ),
-        ("dense.seismic", include_str!("../kernels/dense.seismic")),
-        (
-            "functions.seismic",
-            include_str!("../kernels/functions.seismic"),
-        ),
-        ("rounding.seismic", include_str!("../kernels/rounding.seismic")),
-    ] {
-        sources.push(SourceFile {
-            path: path.into(),
-            text: text.into(),
-        });
-    }
-    crate::common::check(sources)
-}
-
 enum Input<'a> {
     Tensor(&'a Host),
     F32(f32),
@@ -307,7 +285,7 @@ const EPSILON: f32 = 1e-6;
 /// 128-column tiles.
 #[test]
 fn patch_stem_matches_its_portable_body() {
-    let module = module();
+    let module = crate::common::kernels();
     let (rows, channels, table_rows) = (5usize, 3usize, 49usize);
     for device in devices() {
         for (frames, biased, patch, weights, positioned, hidden) in [
@@ -366,14 +344,14 @@ fn patch_stem_matches_its_portable_body() {
                 ],
             );
             for int8 in int8_forms(&device) {
-                let kernel = vision_patch_stem::native_for_device_with(
+                let kernel = declared::prepared(
                     &device,
-                    vision_patch_stem::Elements {
+                    &vision_patch_stem::native_entry_with(vision_patch_stem::Elements {
                         W0: frame.element(),
                         W1: next.element(),
                         B: bias.element(),
                         PE: table.element(),
-                    },
+                    }),
                     &with_int8(
                         &device,
                         specialization_on(
@@ -424,7 +402,7 @@ fn patch_stem_matches_its_portable_body() {
 /// rows span many threads' strides.
 #[test]
 fn norm_matches_its_portable_body() {
-    let module = module();
+    let module = crate::common::kernels();
     let cells = 3usize;
     // (members, centered, weighted, biased, gathered, interleave, activation, output, width)
     let forms = [
@@ -466,13 +444,13 @@ fn norm_matches_its_portable_body() {
                     Input::I32(activation),
                 ],
             );
-            let kernel = vision_norm::native_for_device_with(
+            let kernel = declared::prepared(
                 &device,
-                vision_norm::Elements {
+                &vision_norm::native_entry_with(vision_norm::Elements {
                     NWE: weight.element(),
                     NBE: bias.element(),
                     Y: Element::dense(output),
-                },
+                }),
                 &specialization_on(
                     &device,
                     &[("G", g), ("H", h), ("NW", nw), ("NB", nb), ("NO", no)],
@@ -621,7 +599,7 @@ fn linear_bounds(
 /// rounding bound of each backend's matrix-unit form ([`linear_bounds`]).
 #[test]
 fn linear_matches_its_portable_body() {
-    let module = module();
+    let module = crate::common::kernels();
     let (tiny_m, tiny_n, tiny_k) = (2usize, 2usize, 8usize);
     // (biased, residual, gated, clamped, activation, output, weights, m, n, depth)
     let forms = [
@@ -706,14 +684,14 @@ fn linear_matches_its_portable_body() {
                 &expected,
             );
             for int8 in int8_forms(&device) {
-                let kernel = vision_linear::native_for_device_with(
+                let kernel = declared::prepared(
                     &device,
-                    vision_linear::Elements {
+                    &vision_linear::native_entry_with(vision_linear::Elements {
                         A: Element::f16(),
                         W: weight.element(),
                         B: bias.element(),
                         Y: Element::dense(output),
-                    },
+                    }),
                     &with_int8(
                         &device,
                         specialization_on(
@@ -761,7 +739,7 @@ fn linear_matches_its_portable_body() {
 
 #[test]
 fn clamp_matches_its_portable_body() {
-    let module = module();
+    let module = crate::common::kernels();
     let (m, n) = (5usize, 300usize);
     for device in devices() {
         let mut rng = Rng::new(24);
@@ -778,9 +756,9 @@ fn clamp_matches_its_portable_body() {
                 Input::Tensor(&maximum),
             ],
         );
-        let kernel = vision_clamp::native_for_device_with(
+        let kernel = declared::prepared(
             &device,
-            vision_clamp::Elements { A: Element::f16() },
+            &vision_clamp::native_entry_with(vision_clamp::Elements { A: Element::f16() }),
             &NativeSpecialization::new(),
         )
         .unwrap();
@@ -838,7 +816,7 @@ fn learned_position_attention_matches_its_portable_body() {
 /// through it is chosen by the flags, not by which row is read.
 #[allow(clippy::type_complexity)]
 fn check_attention_forms(forms: &[(usize, usize, usize, bool, bool, bool, bool, bool, usize)]) {
-    let module = module();
+    let module = crate::common::kernels();
     for device in devices() {
         for &(kv_heads, group, quarter, head_norms, value_norm, windows, unit_scale, rotary, rows) in
             forms
@@ -887,9 +865,9 @@ fn check_attention_forms(forms: &[(usize, usize, usize, bool, bool, bool, bool, 
                     Input::I32(i32::from(unit_scale)),
                 ],
             );
-            let kernel = vision_attention::native_for_device_with(
+            let kernel = declared::prepared(
                 &device,
-                vision_attention::Elements { A: Element::f16() },
+                &vision_attention::native_entry_with(vision_attention::Elements { A: Element::f16() }),
                 &specialization_on(
                     &device,
                     &[
@@ -939,7 +917,7 @@ fn check_attention_forms(forms: &[(usize, usize, usize, bool, bool, bool, bool, 
 /// neighbour.
 #[test]
 fn gated_convolution_matches_its_portable_body() {
-    let module = module();
+    let module = crate::common::kernels();
     let (height, width, padding, hidden, side) = (6usize, 8usize, 4usize, 96usize, 3usize);
     let (rows, taps) = (height * width + padding, side * side);
     // Tower row of each grid cell, cell by cell.
@@ -988,12 +966,12 @@ fn gated_convolution_matches_its_portable_body() {
                     Input::Tensor(&neighbors),
                 ],
             );
-            let kernel = vision_gated_convolution::native_for_device_with(
+            let kernel = declared::prepared(
                 &device,
-                vision_gated_convolution::Elements {
+                &vision_gated_convolution::native_entry_with(vision_gated_convolution::Elements {
                     A: Element::f16(),
                     KE: kernel_weights.element(),
-                },
+                }),
                 &specialization_on(&device, &[("H", hidden), ("T", taps)]),
             )
             .unwrap();
@@ -1020,7 +998,7 @@ fn gated_convolution_matches_its_portable_body() {
 
 #[test]
 fn pool_matches_its_portable_body() {
-    let module = module();
+    let module = crate::common::kernels();
     let (cells, g, h) = (4usize, 9usize, 80usize);
     for device in devices() {
         for ns in [0usize, 1] {
@@ -1041,12 +1019,12 @@ fn pool_matches_its_portable_body() {
                     Input::F32(scale),
                 ],
             );
-            let kernel = vision_pool::native_for_device_with(
+            let kernel = declared::prepared(
                 &device,
-                vision_pool::Elements {
+                &vision_pool::native_entry_with(vision_pool::Elements {
                     SB: Element::f32(),
                     SS: Element::f32(),
-                },
+                }),
                 &specialization_on(&device, &[("G", g), ("H", h), ("NS", ns)]),
             )
             .unwrap();
@@ -1074,7 +1052,7 @@ fn pool_matches_its_portable_body() {
 
 #[test]
 fn position_matches_its_portable_body() {
-    let module = module();
+    let module = crate::common::kernels();
     let (rows, h, table_rows) = (6usize, 80usize, 25usize);
     for device in devices() {
         let mut rng = Rng::new(27);
@@ -1099,11 +1077,11 @@ fn position_matches_its_portable_body() {
                 Input::Tensor(&coefficients),
             ],
         );
-        let kernel = vision_position::native_for_device_with(
+        let kernel = declared::prepared(
             &device,
-            vision_position::Elements {
+            &vision_position::native_entry_with(vision_position::Elements {
                 PE: table.element(),
-            },
+            }),
             &specialization_on(&device, &[("H", h)]),
         )
         .unwrap();

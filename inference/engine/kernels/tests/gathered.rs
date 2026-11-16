@@ -165,19 +165,13 @@ fn stored_rows_portable(
     resident: &str,
 ) -> Vec<f32> {
     use seismic_lang::{
-        checked::{SourceFile},
         entry::ElementBindings,
         failure::SourceTermination,
         interp::{Arg, Interpreter, OutcomeValue, TensorData},
         registry,
         types::DType,
     };
-    let mut sources = seismic_std::sources();
-    sources.push(SourceFile {
-        path: "target.seismic".into(),
-        text: include_str!("../kernels/target.seismic").into(),
-    });
-    let module = crate::common::check(sources);
+    let module = crate::common::kernels();
     let elements = ElementBindings::new()
         .bind("E", registry::representation(resident).unwrap())
         .bind("A", registry::dense(DType::BF16));

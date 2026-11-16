@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 
 mod common;
+mod declared;
 
 use magnitude_kernels::{attention_append_k8v4, attention_decode_k8v4, attention_prefill_k8v4};
 use seismic::{
@@ -1012,9 +1013,9 @@ fn decode_kernel_with_sinks(
     params: &[(&'static str, u64)],
     sinks: usize,
 ) -> seismic::NativeKernel<attention_decode_k8v4::Entry> {
-    attention_decode_k8v4::native_for_device_with(
+    declared::prepared(
         device,
-        attention_decode_k8v4::Elements { A: Element::bf16() },
+        &attention_decode_k8v4::native_entry_with(attention_decode_k8v4::Elements { A: Element::bf16() }),
         &specialization_on(device, geometry, params).with_static("SK", sinks as u64),
     )
     .unwrap()
@@ -1084,9 +1085,9 @@ fn prefill_kernel_with_sinks(
     params: &[(&'static str, u64)],
     sinks: usize,
 ) -> seismic::NativeKernel<attention_prefill_k8v4::Entry> {
-    attention_prefill_k8v4::native_for_device_with(
+    declared::prepared(
         device,
-        attention_prefill_k8v4::Elements { A: Element::bf16() },
+        &attention_prefill_k8v4::native_entry_with(attention_prefill_k8v4::Elements { A: Element::bf16() }),
         &prefill_specialization(device, geometry, params).with_static("SK", sinks as u64),
     )
     .unwrap()
@@ -1237,9 +1238,9 @@ fn metal_coissue_prefill_admits_only_launches_that_fit_every_segment_class() {
                 ("DIRECT", 1),
                 ("COISSUE", 1),
             ];
-            let admitted = attention_prefill_k8v4::native_for_device_with(
+            let admitted = declared::prepared(
                 &device,
-                attention_prefill_k8v4::Elements { A: Element::bf16() },
+                &attention_prefill_k8v4::native_entry_with(attention_prefill_k8v4::Elements { A: Element::bf16() }),
                 &prefill_specialization(&device, geometry, &config),
             )
             .is_ok();
@@ -1259,9 +1260,9 @@ fn metal_coissue_prefill_admits_only_launches_that_fit_every_segment_class() {
         ("COISSUE", 1),
     ];
     assert!(
-        attention_prefill_k8v4::native_for_device_with(
+        declared::prepared(
             &device,
-            attention_prefill_k8v4::Elements { A: Element::bf16() },
+            &attention_prefill_k8v4::native_entry_with(attention_prefill_k8v4::Elements { A: Element::bf16() }),
             &prefill_specialization(&device, MINICPM5, &minicpm),
         )
         .is_err()
@@ -1632,9 +1633,9 @@ fn metal_prefill_reads_scattered_history_tiles() {
         // alone, which reads the history in place: the default's result bit
         // for bit. The forms over decoded history are outside its domain.
         let unlisted = |direct: u64| {
-            attention_prefill_k8v4::native_for_device_with(
+            declared::prepared(
                 &device,
-                attention_prefill_k8v4::Elements { A: Element::bf16() },
+                &attention_prefill_k8v4::native_entry_with(attention_prefill_k8v4::Elements { A: Element::bf16() }),
                 &visible_prefill(&device, specialization_on(
                     &device,
                     geometry,
@@ -1906,7 +1907,6 @@ fn check(
 /// tolerance.
 fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
     use seismic_lang::{
-        checked::{SourceFile},
         entry::ElementBindings,
         failure::SourceTermination,
         interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -1915,24 +1915,7 @@ fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
         types::DType,
     };
     let case = &encoded.case;
-    let mut sources = seismic_std::sources();
-    sources.push(SourceFile {
-        path: "attention.seismic".into(),
-        text: include_str!("../kernels/attention.seismic").into(),
-    });
-    sources.push(SourceFile {
-        path: "dense.seismic".into(),
-        text: include_str!("../kernels/dense.seismic").into(),
-    });
-    sources.push(SourceFile {
-        path: "functions.seismic".into(),
-        text: include_str!("../kernels/functions.seismic").into(),
-    });
-    sources.push(SourceFile {
-        path: "rounding.seismic".into(),
-        text: include_str!("../kernels/rounding.seismic").into(),
-    });
-    let module = crate::common::check(sources);
+    let module = crate::common::kernels();
     let logical = module
         .entry(
             module.entry_named(entry).unwrap(),
@@ -2688,9 +2671,9 @@ fn wide_head_decode_and_prefill_match_host_model() {
                 );
                 let mut bound = Bound::new(&device, encoded);
                 let result = if is_decode {
-                    attention_decode_k8v4::native_for_device_with(
+                    declared::prepared(
                         &device,
-                        attention_decode_k8v4::Elements { A: Element::bf16() },
+                        &attention_decode_k8v4::native_entry_with(attention_decode_k8v4::Elements { A: Element::bf16() }),
                         &specialization,
                     )
                     .map(|kernel| {
@@ -2700,9 +2683,9 @@ fn wide_head_decode_and_prefill_match_host_model() {
                             .value
                     })
                 } else {
-                    attention_prefill_k8v4::native_for_device_with(
+                    declared::prepared(
                         &device,
-                        attention_prefill_k8v4::Elements { A: Element::bf16() },
+                        &attention_prefill_k8v4::native_entry_with(attention_prefill_k8v4::Elements { A: Element::bf16() }),
                         &prefill_specialization(&device, geometry, &config),
                     )
                     .map(|kernel| {
@@ -3198,9 +3181,9 @@ fn gemma_form_decode_configurations_agree() {
             )
             .with_static("I", 0)
             .with_static("NV", 1);
-            let kernel = attention_decode_k8v4::native_for_device_with(
+            let kernel = declared::prepared(
                 &device,
-                attention_decode_k8v4::Elements { A: Element::bf16() },
+                &attention_decode_k8v4::native_entry_with(attention_decode_k8v4::Elements { A: Element::bf16() }),
                 &spec,
             )
             .unwrap();
@@ -3361,9 +3344,9 @@ fn gemma_fresh_only_with_scale(scale: f64) {
     };
     for record in &result.configurations {
         if admitted(record) {
-            let kernel = attention_decode_k8v4::native_for_device_with(
+            let kernel = declared::prepared(
                 &device,
-                attention_decode_k8v4::Elements { A: Element::bf16() },
+                &attention_decode_k8v4::native_entry_with(attention_decode_k8v4::Elements { A: Element::bf16() }),
                 &record.configuration.specialization(),
             )
             .unwrap();
@@ -3456,9 +3439,9 @@ fn prepared_causal_verification_matches_committed_prefix() {
             // the query's own row stays fresh, read as its encoding as the
             // serial launch reads it.
             let mut prepared = Bound::new(&device, &batch);
-            let append = attention_append_k8v4::native_for_device_with(
+            let append = declared::prepared(
                 &device,
-                attention_append_k8v4::Elements { A: Element::bf16() },
+                &attention_append_k8v4::native_entry_with(attention_append_k8v4::Elements { A: Element::bf16() }),
                 &append_specialization(&specialization_on(&device, geometry, &[])),
             )
             .unwrap();
@@ -3516,9 +3499,9 @@ fn ordered_append_matches_fused_codec() {
             let encoded = Encoded::new(Case::new(geometry, 64, 2, &decode_rows(16), 731));
             let config = decode_configs(device.backend(), geometry).remove(0);
             let decode = decode_kernel(&device, geometry, &config);
-            let append = attention_append_k8v4::native_for_device_with(
+            let append = declared::prepared(
                 &device,
-                attention_append_k8v4::Elements { A: Element::bf16() },
+                &attention_append_k8v4::native_entry_with(attention_append_k8v4::Elements { A: Element::bf16() }),
                 &append_specialization(&specialization_on(&device, geometry, &[])),
             )
             .unwrap();
@@ -3606,9 +3589,9 @@ fn metal_gemma_fresh_scalar_preserves_bf16_values() {
         )
         .with_static("I", 0)
         .with_static("NV", 1);
-        let kernel = attention_decode_k8v4::native_for_device_with(
+        let kernel = declared::prepared(
             &device,
-            attention_decode_k8v4::Elements { A: Element::bf16() },
+            &attention_decode_k8v4::native_entry_with(attention_decode_k8v4::Elements { A: Element::bf16() }),
             &spec,
         )
         .unwrap();
@@ -3681,9 +3664,9 @@ fn codec_group32_storage_and_single_history_value_match_independent_recipe() {
             .with_static("NQ", 0)
             .with_static("N", 0)
             .with_static("I", 0);
-        let append = attention_append_k8v4::native_for_device_with(
+        let append = declared::prepared(
             &device,
-            attention_append_k8v4::Elements { A: Element::bf16() },
+            &attention_append_k8v4::native_entry_with(attention_append_k8v4::Elements { A: Element::bf16() }),
             &append_specialization(&base),
         )
         .unwrap();
@@ -3715,9 +3698,9 @@ fn codec_group32_storage_and_single_history_value_match_independent_recipe() {
             .with_static("N", 0)
             .with_static("I", 0)
             .with_static("F", 0);
-        let kernel = attention_decode_k8v4::native_for_device_with(
+        let kernel = declared::prepared(
             &device,
-            attention_decode_k8v4::Elements { A: Element::bf16() },
+            &attention_decode_k8v4::native_entry_with(attention_decode_k8v4::Elements { A: Element::bf16() }),
             &spec,
         )
         .unwrap();
@@ -3843,9 +3826,9 @@ fn actual_gemma_dense_and_affine_publication_share_prepared_values() {
             dense_slabs.add_slab(seismic::SlabFill::Zeroed).unwrap();
             let mut dense_key = dense_slabs.logical_region(0).unwrap();
             let mut dense_value = dense_slabs.logical_region(1).unwrap();
-            let dense = magnitude_kernels::attention_append_dense::native_for_device_with(
+            let dense = declared::prepared(
                 &device,
-                magnitude_kernels::attention_append_dense::Elements { A: Element::bf16() },
+                &magnitude_kernels::attention_append_dense::native_entry_with(magnitude_kernels::attention_append_dense::Elements { A: Element::bf16() }),
                 &dense_specialization(&specialization),
             )
             .unwrap();
@@ -3890,9 +3873,9 @@ fn actual_gemma_dense_and_affine_publication_share_prepared_values() {
                     device.backend()
                 );
             }
-            let affine = attention_append_k8v4::native_for_device_with(
+            let affine = declared::prepared(
                 &device,
-                attention_append_k8v4::Elements { A: Element::bf16() },
+                &attention_append_k8v4::native_entry_with(attention_append_k8v4::Elements { A: Element::bf16() }),
                 &specialization,
             )
             .unwrap();
@@ -4221,9 +4204,9 @@ fn actual_gemma_prepared_history_consumers_match_decoded_oracle() {
             let spec = dense_specialization(&append_specialization(
                 &specialization_on(&device, prep_geometry, &[]).with_static("NV", 1),
             ));
-            let publish = magnitude_kernels::attention_append_dense::native_for_device_with(
+            let publish = declared::prepared(
                 &device,
-                magnitude_kernels::attention_append_dense::Elements { A: Element::bf16() },
+                &magnitude_kernels::attention_append_dense::native_entry_with(magnitude_kernels::attention_append_dense::Elements { A: Element::bf16() }),
                 &spec,
             )
             .unwrap();
@@ -4249,9 +4232,9 @@ fn actual_gemma_prepared_history_consumers_match_decoded_oracle() {
                     key_amax_floor: 0.0,
                 })
                 .unwrap();
-            let affine_publish = attention_append_k8v4::native_for_device_with(
+            let affine_publish = declared::prepared(
                 &device,
-                attention_append_k8v4::Elements { A: Element::bf16() },
+                &attention_append_k8v4::native_entry_with(attention_append_k8v4::Elements { A: Element::bf16() }),
                 &append_specialization(
                     &specialization_on(&device, prep_geometry, &[]).with_static("NV", 1),
                 ),
@@ -4357,9 +4340,9 @@ fn actual_gemma_prepared_history_consumers_match_decoded_oracle() {
                 .with_static("N", 0)
                 .with_static("NV", 0);
                 let actual = if prefill {
-                    attention_prefill_k8v4::native_for_device_with(
+                    declared::prepared(
                         &device,
-                        attention_prefill_k8v4::Elements { A: Element::bf16() },
+                        &attention_prefill_k8v4::native_entry_with(attention_prefill_k8v4::Elements { A: Element::bf16() }),
                         &spec,
                     )
                     .unwrap()
@@ -4367,9 +4350,9 @@ fn actual_gemma_prepared_history_consumers_match_decoded_oracle() {
                     .unwrap()
                     .value
                 } else {
-                    attention_decode_k8v4::native_for_device_with(
+                    declared::prepared(
                         &device,
-                        attention_decode_k8v4::Elements { A: Element::bf16() },
+                        &attention_decode_k8v4::native_entry_with(attention_decode_k8v4::Elements { A: Element::bf16() }),
                         &spec,
                     )
                     .unwrap()
@@ -4470,9 +4453,9 @@ fn actual_gemma_sequential_publication_matches_batch() {
             let append_spec = append_specialization(
                 &specialization_on(&device, geometry, &[]).with_static("NV", 1),
             );
-            let append = attention_append_k8v4::native_for_device_with(
+            let append = declared::prepared(
                 &device,
-                attention_append_k8v4::Elements { A: Element::bf16() },
+                &attention_append_k8v4::native_entry_with(attention_append_k8v4::Elements { A: Element::bf16() }),
                 &append_spec,
             )
             .unwrap();
@@ -4513,9 +4496,9 @@ fn actual_gemma_sequential_publication_matches_batch() {
                     .next()
                     .unwrap()
             };
-            let decode = attention_decode_k8v4::native_for_device_with(
+            let decode = declared::prepared(
                 &device,
-                attention_decode_k8v4::Elements { A: Element::bf16() },
+                &attention_decode_k8v4::native_entry_with(attention_decode_k8v4::Elements { A: Element::bf16() }),
                 &specialization_on(&device, geometry, &params)
                     .with_static("I", 0)
                     .with_static("NV", 1),

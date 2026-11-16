@@ -16,9 +16,9 @@ fn cuda_decode(
     geometry: Geometry,
     (parts, warps, slices): (u64, u64, u64),
 ) -> seismic::NativeKernel<attention_decode::Entry> {
-    attention_decode::native_for_device_with(
+    declared::prepared(
         device,
-        attention_decode::Elements { A: Element::bf16() },
+        &attention_decode::native_entry_with(attention_decode::Elements { A: Element::bf16() }),
         &dense_statics(qwen_form(statics(geometry), geometry))
             .with_static("SK", 0)
             .with_param("PARTS", parts)
@@ -37,9 +37,9 @@ fn cuda_prefill(
     geometry: Geometry,
     (warps, split_groups): (u64, u64),
 ) -> seismic::NativeKernel<attention_prefill::Entry> {
-    attention_prefill::native_for_device_with(
+    declared::prepared(
         device,
-        attention_prefill::Elements { A: Element::bf16() },
+        &attention_prefill::native_entry_with(attention_prefill::Elements { A: Element::bf16() }),
         &visible_prefill(device, dense_statics(qwen_form(statics(geometry), geometry)))
             .with_static("SK", 0)
             .with_param("WARPS", warps)

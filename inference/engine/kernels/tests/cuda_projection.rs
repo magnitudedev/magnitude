@@ -5,6 +5,7 @@
 //! CUDA device.
 
 mod common;
+mod declared;
 
 use magnitude_kernels::{
     dense_expand, dense_output, embedding_rows, project_rows, readout_features_rows,
@@ -911,12 +912,12 @@ fn cuda_head_logits_scoped_launches_match_host_model() {
                 .with_static("S", v as u64)
                 .with_static("I", 0)
                 .with_static("WS", 0);
-            let kernel = readout_project_rows::native_for_device_with(
+            let kernel = declared::prepared(
                 &device,
-                readout_project_rows::Elements {
+                &readout_project_rows::native_entry_with(readout_project_rows::Elements {
                     A: Element::bf16(),
                     OW: Format::Q6K.resident(),
-                },
+                }),
                 &specialization,
             )
             .unwrap();
@@ -945,12 +946,12 @@ fn cuda_head_logits_scoped_launches_match_host_model() {
             let ids = (0..rows)
                 .flat_map(|row| [((row * 19) % v) as i32, 8, 15, 16, (v - 1) as i32])
                 .collect::<Vec<_>>();
-            let indexed = readout_project_rows::native_for_device_with(
+            let indexed = declared::prepared(
                 &device,
-                readout_project_rows::Elements {
+                &readout_project_rows::native_entry_with(readout_project_rows::Elements {
                     A: Element::bf16(),
                     OW: Format::Q6K.resident(),
-                },
+                }),
                 &specialization
                     .with_static("S", columns as u64)
                     .with_static("I", 1),
@@ -999,12 +1000,12 @@ fn cuda_indexed_readout_logits_are_the_full_readout_logits() {
     let head = weight(&device, Format::Q6K, v, d, &mut rng);
     let features = (0..16 * d).map(|_| bf16_round(rng.uniform(-1.0, 1.0))).collect::<Vec<_>>();
     let form = |s: usize, indexed: u64| {
-        readout_project_rows::native_for_device_with(
+        declared::prepared(
             &device,
-            readout_project_rows::Elements {
+            &readout_project_rows::native_entry_with(readout_project_rows::Elements {
                 A: Element::bf16(),
                 OW: Format::Q6K.resident(),
-            },
+            }),
             &NativeSpecialization::new()
                 .with_static("V", v as u64)
                 .with_static("D", d as u64)
@@ -1067,12 +1068,12 @@ fn features_and_selected_rows_match_host_model(format: Format) {
         let hidden = f32_tensor(&device, &[case.m as u64, d as u64], &case.residual);
         let norm = f32_tensor(&device, &[d as u64], &case.norm);
         let out_rows = i32_tensor(&device, &[o as u64], &case.out_rows);
-        let features = readout_features_rows::native_for_device_with(
+        let features = declared::prepared(
             &device,
-            readout_features_rows::Elements {
+            &readout_features_rows::native_entry_with(readout_features_rows::Elements {
                 NW: Element::f32(),
                 A: Element::bf16(),
-            },
+            }),
             &NativeSpecialization::new()
                 .with_static("D", d as u64)
                 .with_static("PT", 1)
@@ -1099,13 +1100,13 @@ fn features_and_selected_rows_match_host_model(format: Format) {
             &flips,
         );
         let selected = i32_tensor(&device, &[sv as u64], &selected_values);
-        let actual = readout_selected_rows::native_for_device_with(
+        let actual = declared::prepared(
             &device,
-            readout_selected_rows::Elements {
+            &readout_selected_rows::native_entry_with(readout_selected_rows::Elements {
                 NW: Element::f32(),
                 OW: format.resident(),
                 A: Element::bf16(),
-            },
+            }),
             &NativeSpecialization::new()
                 .with_static("V", v as u64)
                 .with_static("D", d as u64)
@@ -1143,7 +1144,6 @@ fn features_and_selected_rows_match_host_model(format: Format) {
 /// interpreter over the same mma16 bytes agrees with it.
 fn dense_expand_host_model_matches_portable_body(format: Format) {
     use seismic_lang::{
-        checked::{SourceFile},
         entry::ElementBindings,
         failure::SourceTermination,
         interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -1154,20 +1154,7 @@ fn dense_expand_host_model_matches_portable_body(format: Format) {
     let Some(device) = cuda() else { return };
     let mut rng = Rng(3);
     let (o, h, f) = (2, 256, 32);
-    let mut sources = seismic_std::sources();
-    sources.push(SourceFile {
-        path: "feed_forward.seismic".into(),
-        text: include_str!("../kernels/feed_forward.seismic").into(),
-    });
-    sources.push(SourceFile {
-        path: "dense.seismic".into(),
-        text: include_str!("../kernels/dense.seismic").into(),
-    });
-    sources.push(SourceFile {
-        path: "functions.seismic".into(),
-        text: include_str!("../kernels/functions.seismic").into(),
-    });
-    let module = crate::common::check(sources);
+    let module = crate::common::kernels();
     let gate = weight(&device, format, f, h, &mut rng);
     let up = weight(&device, format, f, h, &mut rng);
     let case = DenseCase::new(o, h, f, &mut rng);
@@ -1250,12 +1237,12 @@ fn embedding_rows_decode_table_rows(format: Format) {
         .flat_map(|token| [*token, 0])
         .collect::<Vec<_>>();
     let tokens = i32_tensor(&device, &[tokens_values.len() as u64, 2], &rows);
-    let result = embedding_rows::native_for_device_with(
+    let result = declared::prepared(
         &device,
-        embedding_rows::Elements {
+        &embedding_rows::native_entry_with(embedding_rows::Elements {
             EW: format.resident(),
             A: Element::bf16(),
-        },
+        }),
         &NativeSpecialization::new().with_static("D", d as u64),
     )
     .unwrap()
@@ -1310,12 +1297,12 @@ fn embedding_rows_of_rows16_slots_equal_the_mma16_table(format: Format) {
             .repack_host(source, &shape, &external)
             .expect("registered GGUF conversion");
         let table = Tensor::from_host(&device, element, &shape, &bytes).unwrap();
-        let out = embedding_rows::native_for_device_with(
+        let out = declared::prepared(
             &device,
-            embedding_rows::Elements {
+            &embedding_rows::native_entry_with(embedding_rows::Elements {
                 EW: element,
                 A: Element::bf16(),
-            },
+            }),
             &NativeSpecialization::new().with_static("D", d as u64),
         )
         .unwrap()
@@ -1363,12 +1350,12 @@ fn embedding_rows_read_the_slots_their_directory_names(format: Format) {
     let directory = i32_tensor(&device, &[logical as u64, 1], &directory_values);
     let direct = i32_tensor(&device, &[0, 1], &[]);
     let table = weight(&device, format, v, d, &mut rng);
-    let kernel = embedding_rows::native_for_device_with(
+    let kernel = declared::prepared(
         &device,
-        embedding_rows::Elements {
+        &embedding_rows::native_entry_with(embedding_rows::Elements {
             EW: format.resident(),
             A: Element::bf16(),
-        },
+        }),
         &NativeSpecialization::new().with_static("D", d as u64),
     )
     .unwrap();
@@ -1535,8 +1522,9 @@ fn cuda_sample_rows_match_portable_semantics_for_every_partition() {
     for parts in [16u64, 32, 64, 128] {
         for width in [256u64, 512] {
             let mut result = i32_tensor(&device, &[m as u64, 2], &vec![7; m * 2]);
-            sample_rows::native_for_device(
+            declared::prepared(
                 &device,
+                &sample_rows::native_entry(),
                 &NativeSpecialization::new()
                     .with_static("V", v as u64)
                     .with_param("PARTS", parts)
@@ -1675,8 +1663,9 @@ fn cuda_shape_rows_match_portable_semantics() {
         for width in [256u64, 512] {
             // Shaped in place: every configuration shapes fresh logits.
             let mut shaped = f32_tensor(&device, &[sx as u64, v as u64], &logits);
-            shape_rows::native_for_device(
+            declared::prepared(
                 &device,
+                &shape_rows::native_entry(),
                 &NativeSpecialization::new()
                     .with_static("V", v as u64)
                     .with_static("Hn", hn as u64)

@@ -5,6 +5,8 @@
 //! one step of the candidate path. The CPU test runs everywhere; the
 //! accelerator test covers every other device the host has.
 
+mod declared;
+
 use magnitude_kernels::{
     draft_convolve_input, draft_convolve_residual, draft_gated_rows, draft_path_step, draft_top_k,
 };
@@ -221,8 +223,9 @@ fn convolutions_restart_at_every_block(device: &Device) {
     let implementation = draft_convolve_residual::native_implementation(device)
         .unwrap()
         .expect("draft_convolve_residual has a native implementation on every device");
-    let kernel = draft_convolve_residual::native_for_device(
+    let kernel = declared::prepared(
         device,
+        &draft_convolve_residual::native_entry(),
         &specialization(
             &implementation.statics,
             |fixed| implementation.default_specialization(fixed).unwrap(),
@@ -351,8 +354,9 @@ fn top_k_orders_by_value_then_token(device: &Device, vocabulary: usize, count: u
     let implementation = draft_top_k::native_implementation(device)
         .unwrap()
         .expect("draft_top_k has a native implementation on every device");
-    let kernel = draft_top_k::native_for_device(
+    let kernel = declared::prepared(
         device,
+        &draft_top_k::native_entry(),
         &specialization(
             &implementation.statics,
             |fixed| implementation.default_specialization(fixed).unwrap(),

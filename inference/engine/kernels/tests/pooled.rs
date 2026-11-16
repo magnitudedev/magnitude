@@ -323,7 +323,6 @@ fn model(case: &Case) -> Outcome {
 
 fn portable(case: &Case) -> Outcome {
     use seismic_lang::{
-        checked::SourceFile,
         entry::ElementBindings,
         failure::SourceTermination,
         interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -333,17 +332,7 @@ fn portable(case: &Case) -> Outcome {
     };
     let dtype = |element: Element| if element == Element::bf16() { DType::BF16 } else { DType::F32 };
     let (element, row) = (dtype(case.element), dtype(case.row));
-    let mut sources = seismic_std::sources();
-    for (path, text) in [
-        ("pooled.seismic", include_str!("../kernels/pooled.seismic")),
-        ("attention.seismic", include_str!("../kernels/attention.seismic")),
-        ("dense.seismic", include_str!("../kernels/dense.seismic")),
-        ("functions.seismic", include_str!("../kernels/functions.seismic")),
-        ("rounding.seismic", include_str!("../kernels/rounding.seismic")),
-    ] {
-        sources.push(SourceFile { path: path.into(), text: text.into() });
-    }
-    let module = crate::common::check(sources);
+    let module = crate::common::kernels();
     let logical = module
         .entry(
             module.entry_named("pool_rows").unwrap(),

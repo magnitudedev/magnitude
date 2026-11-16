@@ -4,6 +4,7 @@
 //! Tests return early when no device of either backend is available.
 
 mod common;
+mod declared;
 mod random;
 
 use random::Rng;
@@ -14,7 +15,7 @@ use magnitude_kernels::{
 };
 use seismic::{BackendName, Device, Element, NativeSpecialization, Tensor};
 use seismic_lang::{
-    checked::{CheckedModule, SourceFile},
+    checked::CheckedModule,
     entry::ElementBindings,
     failure::SourceTermination,
     interp::{Arg, Interpreter, OracleOutcome, OutcomeValue, TensorData},
@@ -33,11 +34,10 @@ fn device() -> Option<Device> {
 
 /// A top level's or full pass's specialization with the scan parameters.
 /// CUDA: the `planes` form's, after the stage launch. Metal: the GEMV's tile
-/// mapping (entry-wide, every GEMV row count's), the first row count the
-/// batched GEMV serves (3 with four rows per simdgroup, so the batched path is
-/// exercised, else never), the batched GEMV's (launch 1) and the full pass's
-/// GEMM's (launch 3, after its stage launch).
-fn scan_spec(
+/// mapping (entry-wide, every GEMV row count's), and on the full pass, whose
+/// rows past VERIFY_ROWS the batched GEMV and the GEMM serve, theirs (the top
+/// level serves only GEMV rows).
+fn scan_spec<E: seismic::Entry>(
     device: &Device,
     head: &Head,
     planes: bool,
@@ -46,21 +46,22 @@ fn scan_spec(
 ) -> NativeSpecialization {
     let spec = formed_statics(head);
     if device.backend() != BackendName::Metal {
-        return spec
-            .with_launch_param(1, width_param(device), scan)
-            .with_launch_param(1, "ROWS", rows);
-    }
-    let spec = spec
-        .with_param(width_param(device), scan)
-        .with_param("ROWS", rows)
-        .with_param("LANES", 32)
-        .with_launch_param(1, "BATCH_SIMDGROUPS", scan)
-        .with_launch_param(1, "BATCH_ROWS", rows.min(2));
-    if planes {
-        spec.with_launch_param(3, "TILE_M", 64)
-            .with_launch_param(3, "TILE_N", 64)
+        spec.with_launch_param(1, width_param(device), scan)
+            .with_launch_param(1, "ROWS", rows)
     } else {
-        spec
+        let spec = spec
+            .with_param(width_param(device), scan)
+            .with_param("ROWS", rows)
+            .with_param("LANES", 32);
+        if planes {
+            let (batch, gemm) = (common::metal_launch::<E>("batch"), common::metal_launch::<E>("gemm"));
+            spec.with_launch_param(batch, "BATCH_SIMDGROUPS", scan)
+                .with_launch_param(batch, "BATCH_ROWS", rows.min(2))
+                .with_launch_param(gemm, "TILE_M", 64)
+                .with_launch_param(gemm, "TILE_N", 64)
+        } else {
+            spec
+        }
     }
 }
 
@@ -450,13 +451,13 @@ fn run_with_softcap(
     softcap: f32,
 ) -> Levels {
     let width = width_param(device);
-    let top = readout_top_rows::native_for_device_with(
+    let top = declared::prepared(
         device,
-        readout_top_rows::Elements {
+        &readout_top_rows::native_entry_with(readout_top_rows::Elements {
             NW: Element::bf16(),
             A: Element::bf16(),
-        },
-        &scan_spec(device, head, false, scan, rows),
+        }),
+        &scan_spec::<readout_top_rows::Entry>(device, head, false, scan, rows),
     )
     .unwrap()
     .call(readout_top_rows::Args {
@@ -476,9 +477,9 @@ fn run_with_softcap(
         epsilon: EPSILON,
     })
     .unwrap();
-    let refine = readout_refine_rows::native_for_device_with(
+    let refine = declared::prepared(
         device,
-        readout_refine_rows::Elements { A: Element::bf16() },
+        &readout_refine_rows::native_entry_with(readout_refine_rows::Elements { A: Element::bf16() }),
         &statics(head).with_launch_param(0, width, gather),
     )
     .unwrap()
@@ -499,9 +500,9 @@ fn run_with_softcap(
         constrained: &t.constrained,
     })
     .unwrap();
-    let exact = readout_exact_rows::native_for_device_with(
+    let exact = declared::prepared(
         device,
-        readout_exact_rows::Elements { A: Element::bf16() },
+        &readout_exact_rows::native_entry_with(readout_exact_rows::Elements { A: Element::bf16() }),
         &statics(head).with_launch_param(0, width, gather),
     )
     .unwrap()
@@ -523,13 +524,13 @@ fn run_with_softcap(
     })
     .unwrap()
     .value;
-    let planes = readout_planes_rows::native_for_device_with(
+    let planes = declared::prepared(
         device,
-        readout_planes_rows::Elements {
+        &readout_planes_rows::native_entry_with(readout_planes_rows::Elements {
             NW: Element::bf16(),
             A: Element::bf16(),
-        },
-        &scan_spec(device, head, true, scan, rows),
+        }),
+        &scan_spec::<readout_planes_rows::Entry>(device, head, true, scan, rows),
     )
     .unwrap()
     .call(readout_planes_rows::Args {
@@ -723,13 +724,13 @@ fn planes_readout_projects_every_row_class() {
         let t = case.tensors(&device, &head);
         let (v, d) = (head.v, head.d);
         let planes = read_f32(
-            &readout_planes_rows::native_for_device_with(
+            &declared::prepared(
                 &device,
-                readout_planes_rows::Elements {
+                &readout_planes_rows::native_entry_with(readout_planes_rows::Elements {
                     NW: Element::bf16(),
                     A: Element::bf16(),
-                },
-                &scan_spec(&device, &head, true, 4, 2),
+                }),
+                &scan_spec::<readout_planes_rows::Entry>(&device, &head, true, 4, 2),
             )
             .unwrap()
             .call(readout_planes_rows::Args {
@@ -796,13 +797,13 @@ fn planes_batched_full_pass_selects_what_the_scalar_pass_selects() {
     let scalar_rows = VERIFY_ROWS as usize;
     let project = |t: &Tensors, out_rows: &Tensor| {
         read_f32(
-            &readout_planes_rows::native_for_device_with(
+            &declared::prepared(
                 &device,
-                readout_planes_rows::Elements {
+                &readout_planes_rows::native_entry_with(readout_planes_rows::Elements {
                     NW: Element::bf16(),
                     A: Element::bf16(),
-                },
-                &scan_spec(&device, &head, true, 8, 2),
+                }),
+                &scan_spec::<readout_planes_rows::Entry>(&device, &head, true, 8, 2),
             )
             .unwrap()
             .call(readout_planes_rows::Args {
@@ -872,28 +873,6 @@ fn planes_batched_full_pass_selects_what_the_scalar_pass_selects() {
 
 // ---------------------------------------------------------------------------
 // Portable bodies.
-
-fn module() -> CheckedModule {
-    let mut sources = seismic_std::sources();
-    for (path, text) in [
-        (
-            "readout.seismic",
-            include_str!("../kernels/readout.seismic"),
-        ),
-        ("target.seismic", include_str!("../kernels/target.seismic")),
-        ("dense.seismic", include_str!("../kernels/dense.seismic")),
-        (
-            "functions.seismic",
-            include_str!("../kernels/functions.seismic"),
-        ),
-    ] {
-        sources.push(SourceFile {
-            path: path.into(),
-            text: text.into(),
-        });
-    }
-    crate::common::check(sources)
-}
 
 enum Input {
     Data(TensorData),
@@ -972,7 +951,7 @@ fn assert_covers(label: &str, native: &[f32], portable: &[f32], scale: f32) {
 #[test]
 fn progressive_portable_bodies_match_the_natives() {
     let Some(device) = device() else { return };
-    let module = module();
+    let module = crate::common::kernels();
     let softcap = 30.0;
     // A vocabulary that is no multiple of 32 or of the scan's rows, and a
     // width with a partial 1,024-column chunk.
@@ -1144,9 +1123,9 @@ fn progressive_portable_bodies_match_the_natives() {
         let width = width_param(&device);
         let features_tensor = tensor(&device, Element::bf16(), &[o, d], bf16_bytes(&features));
         let length_tensor = tensor(&device, Element::f32(), &[o], f32s(&length));
-        let native_refine = readout_refine_rows::native_for_device_with(
+        let native_refine = declared::prepared(
             &device,
-            readout_refine_rows::Elements { A: Element::bf16() },
+            &readout_refine_rows::native_entry_with(readout_refine_rows::Elements { A: Element::bf16() }),
             &statics(&head).with_launch_param(0, width, 4),
         )
         .unwrap()
@@ -1179,9 +1158,9 @@ fn progressive_portable_bodies_match_the_natives() {
             &threshold5,
             scale,
         );
-        let native_exact = readout_exact_rows::native_for_device_with(
+        let native_exact = declared::prepared(
             &device,
-            readout_exact_rows::Elements { A: Element::bf16() },
+            &readout_exact_rows::native_entry_with(readout_exact_rows::Elements { A: Element::bf16() }),
             &statics(&head).with_launch_param(0, width, 4),
         )
         .unwrap()
@@ -1257,12 +1236,12 @@ fn prepared_full_and_indexed_share_projection_and_mask_invalid_ids() {
                 .with_launch_param(4, "ROTATE", 2),
             _ => spec,
         };
-        let kernel = magnitude_kernels::readout_project_rows::native_for_device_with(
+        let kernel = declared::prepared(
             &device,
-            magnitude_kernels::readout_project_rows::Elements {
+            &magnitude_kernels::readout_project_rows::native_entry_with(magnitude_kernels::readout_project_rows::Elements {
                 A: Element::bf16(),
                 OW: Element::bf16(),
-            },
+            }),
             &spec,
         )
         .unwrap();

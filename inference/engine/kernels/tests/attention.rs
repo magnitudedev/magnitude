@@ -560,7 +560,6 @@ fn check(
 /// reach.
 fn check_host_model_against_portable_body(entry: &str, case: &Case) {
     use seismic_lang::{
-        checked::{SourceFile},
         entry::ElementBindings,
         failure::SourceTermination,
         interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -568,24 +567,7 @@ fn check_host_model_against_portable_body(entry: &str, case: &Case) {
         registry,
         types::DType,
     };
-    let mut sources = seismic_std::sources();
-    sources.push(SourceFile {
-        path: "attention.seismic".into(),
-        text: include_str!("../kernels/attention.seismic").into(),
-    });
-    sources.push(SourceFile {
-        path: "dense.seismic".into(),
-        text: include_str!("../kernels/dense.seismic").into(),
-    });
-    sources.push(SourceFile {
-        path: "functions.seismic".into(),
-        text: include_str!("../kernels/functions.seismic").into(),
-    });
-    sources.push(SourceFile {
-        path: "rounding.seismic".into(),
-        text: include_str!("../kernels/rounding.seismic").into(),
-    });
-    let module = crate::common::check(sources);
+    let module = crate::common::kernels();
     let logical = module
         .entry(
             module.entry_named(entry).unwrap(),
@@ -1165,9 +1147,9 @@ fn dense_append_publishes_only_the_same_history_as_prefill() {
         } else {
             qwen_form(statics(SMALL), SMALL)
         };
-        let append = attention_append_dense::native_for_device_with(
+        let append = declared::prepared(
             &device,
-            attention_append_dense::Elements { A: Element::bf16() },
+            &attention_append_dense::native_entry_with(attention_append_dense::Elements { A: Element::bf16() }),
             &append_specialization(&specialization),
         )
         .unwrap();

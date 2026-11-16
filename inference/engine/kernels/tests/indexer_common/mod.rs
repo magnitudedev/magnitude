@@ -9,7 +9,6 @@ use crate::rounding_model::{self, Rounding};
 use crate::versions_common::*;
 use seismic::{Device, Element, Tensor};
 use seismic_lang::{
-    checked::SourceFile,
     entry::ElementBindings,
     failure::SourceTermination,
     interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -120,21 +119,6 @@ pub fn near_codes(actual: &[f32], expected: &[f32], rounding: Rounding, flips: u
     differing <= flips
 }
 
-/// The checked kernel module with the indexer's sources.
-fn module() -> seismic_lang::checked::CheckedModule {
-    let mut sources = seismic_std::sources();
-    for (path, text) in [
-        ("indexer.seismic", include_str!("../../kernels/indexer.seismic")),
-        ("pooled.seismic", include_str!("../../kernels/pooled.seismic")),
-        ("attention.seismic", include_str!("../../kernels/attention.seismic")),
-        ("functions.seismic", include_str!("../../kernels/functions.seismic")),
-        ("rounding.seismic", include_str!("../../kernels/rounding.seismic")),
-    ] {
-        sources.push(SourceFile { path: path.into(), text: text.into() });
-    }
-    crate::common::check(sources)
-}
-
 /// An interpreter argument.
 pub enum Input {
     F32(Vec<usize>, Vec<f32>),
@@ -162,7 +146,7 @@ pub fn interpret_with(
     bindings: &ElementBindings,
     inputs: Vec<Input>,
 ) -> (Vec<Vec<f64>>, Vec<(usize, Vec<f64>)>) {
-    let module = module();
+    let module = crate::common::kernels();
     let logical = module.entry(module.entry_named(entry).unwrap(), bindings).unwrap();
     let mut interpreter = Interpreter::new(&logical);
     let args = inputs

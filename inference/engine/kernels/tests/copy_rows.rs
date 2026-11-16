@@ -1,4 +1,5 @@
 mod common;
+mod declared;
 
 use magnitude_kernels::copy_rows;
 use seismic_lang::reference_math::conversion::canonical_nan;
@@ -40,16 +41,12 @@ fn slabbed_rows(
 #[test]
 fn portable_copy_moves_only_the_indexed_dense_rows() {
     use seismic_lang::{
-        checked::{SourceFile, SourceSet},
         entry::ElementBindings,
         interp::{Arg, Interpreter, TensorData},
         registry,
         types::DType,
     };
-    let module = crate::common::check(SourceSet::new(vec![SourceFile {
-        path: "state.seismic".into(),
-        text: include_str!("../kernels/state.seismic").into(),
-    }]));
+    let module = crate::common::kernels();
     let logical = module
         .entry(
             module.entry_named("copy_rows").unwrap(),
@@ -137,9 +134,9 @@ fn copy_word_plane_rows(device: &seismic::Device) {
             .unwrap();
     let to = seismic::Tensor::from_host(&device, seismic::Element::i32(), &[2], &indices(&[0, 2]))
         .unwrap();
-    copy_rows::native_for_device_with(
+    declared::prepared(
         &device,
-        copy_rows::Elements { A: element },
+        &copy_rows::native_entry_with(copy_rows::Elements { A: element }),
         &seismic::NativeSpecialization::new(),
     )
     .unwrap()
@@ -200,9 +197,9 @@ fn assert_native_two_byte_plane_copy(
     let to = seismic::Tensor::from_host(&device, seismic::Element::i32(), &[2], &indices(&[0, 2]))
         .unwrap();
 
-    copy_rows::native_for_device_with(
+    declared::prepared(
         &device,
-        copy_rows::Elements { A: element },
+        &copy_rows::native_entry_with(copy_rows::Elements { A: element }),
         &seismic::NativeSpecialization::new(),
     )
     .unwrap()
@@ -296,9 +293,9 @@ fn native_copy_across_slab_boundary_on(device: &seismic::Device) {
     let to =
         seismic::Tensor::from_host(&device, seismic::Element::i32(), &[1], &2_i32.to_le_bytes())
             .unwrap();
-    copy_rows::native_for_device_with(
+    declared::prepared(
         &device,
-        copy_rows::Elements { A: element },
+        &copy_rows::native_entry_with(copy_rows::Elements { A: element }),
         &seismic::NativeSpecialization::new(),
     )
     .unwrap()

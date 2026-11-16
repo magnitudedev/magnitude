@@ -14,16 +14,13 @@ use versions_common::*;
 
 fn portable(rounding: Rounding, row: &[f32]) -> Vec<f32> {
     use seismic_lang::{
-        checked::SourceFile,
         entry::ElementBindings,
         failure::SourceTermination,
         interp::{Arg, Interpreter, OutcomeValue, TensorData},
         reference_math::ReferenceScalar,
         types::DType,
     };
-    let mut sources = seismic_std::sources();
-    sources.push(SourceFile { path: "rounding.seismic".into(), text: include_str!("../kernels/rounding.seismic").into() });
-    let module = crate::common::check(sources);
+    let module = crate::common::kernels();
     let logical = module.entry(module.entry_named("block_round").unwrap(), &ElementBindings::new()).unwrap();
     let mut interpreter = Interpreter::new(&logical);
     let x = interpreter.add_tensor(TensorData::dense(

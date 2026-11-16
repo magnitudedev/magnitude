@@ -12,6 +12,7 @@
 // banks keep their exact bytes.
 
 mod common;
+mod declared;
 
 use common::{
     bound::Float,
@@ -229,12 +230,12 @@ impl Tensors {
     ) -> Tensor {
         macro_rules! call {
             ($module:ident, $args:expr) => {
-                $module::native_for_device_with(
+                declared::prepared(
                     device,
-                    $module::Elements {
+                    &$module::native_entry_with($module::Elements {
                         RN: Element::f32(),
                         A: activation,
-                    },
+                    }),
                     specialization,
                 )
                 .unwrap()
@@ -833,7 +834,6 @@ impl Case {
     /// The portable body executed by the Seismic interpreter.
     fn oracle(&self) -> Outcome {
         use seismic_lang::{
-            checked::{SourceFile},
             entry::ElementBindings,
             failure::SourceTermination,
             interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -841,20 +841,7 @@ impl Case {
             registry,
             types::DType,
         };
-        let mut sources = seismic_std::sources();
-        sources.push(SourceFile {
-            path: "recurrent.seismic".into(),
-            text: include_str!("../kernels/recurrent.seismic").into(),
-        });
-        sources.push(SourceFile {
-            path: "dense.seismic".into(),
-            text: include_str!("../kernels/dense.seismic").into(),
-        });
-        sources.push(SourceFile {
-            path: "functions.seismic".into(),
-            text: include_str!("../kernels/functions.seismic").into(),
-        });
-        let module = crate::common::check(sources);
+        let module = crate::common::kernels();
         let elements = ElementBindings::new()
             .bind("A", registry::dense(DType::F32))
             .bind("RN", registry::dense(DType::F32));
@@ -1163,12 +1150,12 @@ impl Case {
         activation: Element,
         rows: u64,
     ) -> seismic::NativeKernel<gated_delta_step::Entry> {
-        gated_delta_step::native_for_device_with(
+        declared::prepared(
             device,
-            gated_delta_step::Elements {
+            &gated_delta_step::native_entry_with(gated_delta_step::Elements {
                 RN: Element::f32(),
                 A: activation,
-            },
+            }),
             &self.specialization(device, rows),
         )
         .unwrap()
@@ -2554,16 +2541,16 @@ fn step_form(
         launch,
         mapping,
     );
-    let projection = gated_delta_project::native_for_device_with(
+    let projection = declared::prepared(
         device,
-        gated_delta_project::Elements {
+        &gated_delta_project::native_entry_with(gated_delta_project::Elements {
             NW: Element::bf16(),
             QW: Element::bf16(),
             GW: Element::bf16(),
             AW: Element::bf16(),
             BW: Element::bf16(),
             A: Element::bf16(),
-        },
+        }),
         &specialization,
     )
     .unwrap()
@@ -2622,16 +2609,16 @@ fn convolved_form(
         mapping,
     );
     let mut t = case.tensors(device, Element::bf16());
-    let projected = gated_delta_project_convolved::native_for_device_with(
+    let projected = declared::prepared(
         device,
-        gated_delta_project_convolved::Elements {
+        &gated_delta_project_convolved::native_entry_with(gated_delta_project_convolved::Elements {
             NW: Element::bf16(),
             QW: Element::bf16(),
             GW: Element::bf16(),
             AW: Element::bf16(),
             BW: Element::bf16(),
             A: Element::bf16(),
-        },
+        }),
         &specialization,
     )
     .unwrap()
@@ -2658,12 +2645,12 @@ fn convolved_form(
         .with_static("NV", g.value_heads as u64)
         .with_static("W", g.width as u64)
         .with_param("ROWS", 32);
-    let gated = gated_delta_step_convolved::native_for_device_with(
+    let gated = declared::prepared(
         device,
-        gated_delta_step_convolved::Elements {
+        &gated_delta_step_convolved::native_entry_with(gated_delta_step_convolved::Elements {
             RN: Element::f32(),
             A: Element::bf16(),
-        },
+        }),
         &step,
     )
     .unwrap()
@@ -3072,12 +3059,12 @@ fn step_timing_at_decode_shapes() {
         for rows in 1..=8 {
             let case = Case::new(geometry, rows, vec![slot(rows, rows, 1, 2)], true, 7);
             for (label, specialization) in &mappings {
-                let kernel = gated_delta_step::native_for_device_with(
+                let kernel = declared::prepared(
                     &device,
-                    gated_delta_step::Elements {
+                    &gated_delta_step::native_entry_with(gated_delta_step::Elements {
                         RN: Element::f32(),
                         A: Element::bf16(),
-                    },
+                    }),
                     specialization,
                 )
                 .unwrap();
@@ -3100,12 +3087,12 @@ fn step_timing_at_decode_shapes() {
                 .with_bf16_activations()
                 .with_bounded_decay();
             for (label, specialization) in &cuda_mappings(kimi) {
-                let kernel = kimi_delta_step::native_for_device_with(
+                let kernel = declared::prepared(
                     &device,
-                    kimi_delta_step::Elements {
+                    &kimi_delta_step::native_entry_with(kimi_delta_step::Elements {
                         RN: Element::f32(),
                         A: Element::bf16(),
-                    },
+                    }),
                     specialization,
                 )
                 .unwrap();

@@ -7,6 +7,8 @@
 //! `MAGNITUDE_GGUF_4B` naming the pinned unsloth Q4_K_M file; returns early
 //! without it or without CUDA.
 
+mod declared;
+
 mod cuda_common;
 
 use cuda_common::*;
@@ -389,14 +391,14 @@ fn real_12b_physical_f16_projection_operands() {
     let absent = f32_tensor(&device, &[0], &[]);
     let no_limit = i32_tensor(&device, &[0, 0], &[]);
     let kernel = |operand| {
-        dense_expand::native_for_device_with(
+        declared::prepared(
             &device,
-            dense_expand::Elements {
+            &dense_expand::native_entry_with(dense_expand::Elements {
                 NW: Element::f32(),
                 GW: gate.element(),
                 UW: up.element(),
                 A: Element::bf16(),
-            },
+            }),
             &Mapping {
                 int8: 0,
                 ksplit: 4,
@@ -491,13 +493,13 @@ fn real_12b_physical_f16_projection_operands() {
     let down = Tensor::from_host(&device, resident, &shape, &packed).unwrap();
     let product = baseline.call(args()).unwrap().value;
     let down_kernel = |operand| {
-        project_rows::native_for_device_with(
+        declared::prepared(
             &device,
-            project_rows::Elements {
+            &project_rows::native_entry_with(project_rows::Elements {
                 A: Element::bf16(),
                 W: down.element(),
                 Y: Element::f32(),
-            },
+            }),
             &NativeSpecialization::new()
                 .with_static("G", 1)
                 .with_static("K", intermediate as u64)
@@ -555,13 +557,13 @@ fn real_12b_physical_f16_projection_operands() {
         )
         .unwrap();
         let form = |operand| {
-            project_rows::native_for_device_with(
+            declared::prepared(
                 &device,
-                project_rows::Elements {
+                &project_rows::native_entry_with(project_rows::Elements {
                     A: Element::f16(),
                     W: down.element(),
                     Y: Element::f32(),
-                },
+                }),
                 &NativeSpecialization::new()
                     .with_static("G", 1)
                     .with_static("K", intermediate as u64)
@@ -645,14 +647,14 @@ fn real_26b_grouped_physical_f16_operands() {
     let order = i32_tensor(&device, &[e as u64, t as u64], &order);
     let blocks = i32_tensor(&device, &[e as u64], &(0..e as i32).collect::<Vec<_>>());
     let form = |operand| {
-        magnitude_kernels::routed_experts::native_for_device_with(
+        declared::prepared(
             &device,
-            magnitude_kernels::routed_experts::Elements {
+            &magnitude_kernels::routed_experts::native_entry_with(magnitude_kernels::routed_experts::Elements {
                 A: Element::bf16(),
                 EGW: gate.element(),
                 EUW: up.element(),
                 EDW: down.element(),
-            },
+            }),
             &NativeSpecialization::new()
                 .with_static("H", h as u64)
                 .with_static("F", f as u64)

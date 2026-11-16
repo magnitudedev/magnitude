@@ -12,6 +12,8 @@
 //! scale (`Q8_0`), an F32 grid scale (`fp8g128`), an E8M0 byte (`mxfp8g32`,
 //! `mxfp4`) and UE4M3 fields (`nvfp4`).
 
+mod declared;
+
 use magnitude_kernels::{embedding_rows, stored_rows};
 use seismic::{BackendName, Device, Element, GgufScales, Grid, Layout, NativeSpecialization, Tensor};
 use seismic_lang::registry::bf16_round;
@@ -196,7 +198,7 @@ fn gather(device: &Device, case: &Case, layout: Layout) {
         .default_specialization(device, &fixed)
         .unwrap()
         .unwrap();
-    let out = embedding_rows::native_for_device_with(device, elements(), &specialization)
+    let out = declared::prepared(device, &embedding_rows::native_entry_with(elements()), &specialization)
         .unwrap()
         .call(embedding_rows::Args {
             table: &Tensor::from_host(device, element, &shape, &resident).unwrap(),

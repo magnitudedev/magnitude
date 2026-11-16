@@ -1,3 +1,4 @@
+mod declared;
 use magnitude_kernels::conditioning_overlay;
 use seismic_lang::reference_math::conversion::canonical_nan;
 use seismic_lang::types::DType;
@@ -62,7 +63,7 @@ fn native_overlay_publishes_conditioned_rows_value_exactly() {
                 &bytes(&vec![0xdead_beef; rows * width]),
             )
             .unwrap();
-            conditioning_overlay::native_for_device(&device, &seismic::NativeSpecialization::new())
+            declared::prepared(&device, &conditioning_overlay::native_entry(), &seismic::NativeSpecialization::new())
                 .unwrap()
                 .call(conditioning_overlay::Args {
                     input: &source,

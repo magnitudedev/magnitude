@@ -6,6 +6,7 @@
 //! Super).
 
 mod common;
+mod declared;
 mod mapped;
 
 use magnitude_kernels::{
@@ -13,7 +14,7 @@ use magnitude_kernels::{
     routed_scatter, routed_select, routed_up,
 };
 use seismic_lang::{
-    checked::{CheckedModule, SourceFile},
+    checked::CheckedModule,
     entry::ElementBindings,
     failure::SourceTermination,
     interp::{Arg, Interpreter, OracleOutcome, OutcomeValue, TensorData},
@@ -26,28 +27,6 @@ use mapped::Mapped;
 mod streaming_words;
 
 use streaming_words::{map_words, step_words};
-
-fn module() -> CheckedModule {
-    let mut sources = seismic_std::sources();
-    for (path, text) in [
-        ("dense.seismic", include_str!("../kernels/dense.seismic")),
-        ("routed.seismic", include_str!("../kernels/routed.seismic")),
-        (
-            "streaming_words.seismic",
-            include_str!("../kernels/streaming_words.seismic"),
-        ),
-        (
-            "functions.seismic",
-            include_str!("../kernels/functions.seismic"),
-        ),
-    ] {
-        sources.push(SourceFile {
-            path: path.into(),
-            text: text.into(),
-        });
-    }
-    crate::common::check(sources)
-}
 
 enum Input {
     Tensor(DType, Vec<usize>, Vec<f64>),
@@ -632,7 +611,7 @@ const SELECT_ROWS: [usize; 2] = [1, 9];
 /// the router's H-long dot products, not in the selection).
 #[test]
 fn portable_select_matches_host_reference() {
-    let module = module();
+    let module = crate::common::kernels();
     for routing in ROUTINGS.iter().map(|routing| Routing {
         hidden: 256,
         ..*routing
@@ -661,7 +640,7 @@ fn portable_select_matches_host_reference() {
 /// (checked here, so the case keeps that power).
 #[test]
 fn general_hints_name_what_routed_select_selects() {
-    let module = module();
+    let module = crate::common::kernels();
     let routing = Routing {
         hidden: 256,
         ..ROUTINGS[0]
@@ -746,14 +725,14 @@ fn native_select_matches_host_reference_at_catalog_shapes() {
                     device.backend(),
                     routing.name
                 );
-                let kernel = routed_select::native_for_device_with(
+                let kernel = declared::prepared(
                     &device,
-                    routed_select::Elements {
+                    &routed_select::native_entry_with(routed_select::Elements {
                         NW: seismic::Element::f32(),
                         RNW: seismic::Element::f32(),
                         RW: seismic::Element::f32(),
                         A: seismic::Element::bf16(),
-                    },
+                    }),
                     &specialization(
                         &device,
                         &[("H", h), ("E", e), ("K", k), ("ES", case.expert_scale.len())],
@@ -815,7 +794,7 @@ fn native_select_matches_host_reference_at_catalog_shapes() {
 /// portable body.
 #[test]
 fn portable_select_ranks_ties_to_the_higher_expert() {
-    let module = module();
+    let module = crate::common::kernels();
     let routing = Routing {
         hidden: 256,
         ..ROUTINGS[1]
@@ -1309,7 +1288,7 @@ fn gather_rows(values: &[f32], positions: &[i32], width: usize) -> Vec<f32> {
 /// 4-row tiles.
 #[test]
 fn portable_expert_entries_match_host_reference() {
-    let module = module();
+    let module = crate::common::kernels();
     for shape in EXPERT_SHAPES.map(|shape| ExpertShape {
         hidden: 64,
         features: 32,
@@ -1627,7 +1606,7 @@ fn down_mapping(
                 .filter(|&(rows, lanes)| {
                     let candidate =
                         decode_specialization(device, &entry, index, statics, &[("ROWS", rows), ("LANES", lanes)], false);
-                    entry.specialization_valid(device, &candidate).unwrap()
+                    declared::declared_at(device, &entry, &candidate).is_ok()
                 })
                 .collect::<Vec<_>>();
             let (rows, lanes) = admissible[index % admissible.len()];
@@ -1667,10 +1646,11 @@ fn arithmetic_variants(device: &seismic::Device) -> Vec<bool> {
     }
 }
 
-/// `entry`'s specialization on `device` at `statics` and `mapping`: the
-/// default configuration of its native at its elements, with each mapping
-/// parameter where the native declares it, on the native or on every launch
-/// that declares it; the CPU also takes its arithmetic variant.
+/// `entry`'s specialization on `device` at `statics` and `mapping`: each
+/// mapping parameter where the native declares it, on the native or on every
+/// launch that declares it, every other parameter left to the declaration's
+/// defaults (`declared::prepared`); the CPU also takes its arithmetic
+/// variant.
 fn expert_specialization<E: seismic::Entry>(
     device: &seismic::Device,
     entry: &seismic::BoundEntry<E>,
@@ -1679,11 +1659,7 @@ fn expert_specialization<E: seismic::Entry>(
     int8: bool,
 ) -> seismic::NativeSpecialization {
     let implementation = entry.offered(device).unwrap().unwrap();
-    let defaults = entry
-        .default_specialization(device, &specialization(device, statics, &[]))
-        .unwrap()
-        .unwrap();
-    let specialization = mapping.iter().fold(defaults, |spec, &(name, value)| {
+    let specialization = mapping.iter().fold(specialization(device, statics, &[]), |spec, &(name, value)| {
         if implementation.params.iter().any(|parameter| parameter.name == name) {
             return spec.with_param(name, value);
         }
@@ -2108,13 +2084,13 @@ fn native_decode_experts_match_host_reference_at_catalog_shapes() {
                                     [expansion_statics.as_slice(), &[("LB", shape.limit_word())]].concat();
                                 let specialization =
                                     decode_specialization(device, &entry, index, &gated_statics, &mapping, int8);
-                                DecodeExpansion::Gated(entry.prepare(device, &specialization).unwrap())
+                                DecodeExpansion::Gated(declared::prepared(device, &entry, &specialization).unwrap())
                             }
                             None => {
                                 let entry = routed_up::native_entry_with(routed_up::Elements { A: bf16, EUW: bf16 });
                                 let specialization =
                                     decode_specialization(device, &entry, index, &expansion_statics, &mapping, int8);
-                                DecodeExpansion::Up(entry.prepare(device, &specialization).unwrap())
+                                DecodeExpansion::Up(declared::prepared(device, &entry, &specialization).unwrap())
                             }
                         };
                         let glu_limit = i32_tensor(device, &[0, shape.limit_word()], &[]);
@@ -2145,8 +2121,7 @@ fn native_decode_experts_match_host_reference_at_catalog_shapes() {
                                 EDW: bf16,
                                 R: element(published),
                             });
-                            entry
-                                .prepare(device, &decode_specialization(device, &entry, index, &statics, &down, int8))
+                            declared::prepared(device, &entry, &decode_specialization(device, &entry, index, &statics, &down, int8))
                                 .unwrap()
                         };
                         let project = |native: &seismic::NativeKernel<routed_down::Entry>,
@@ -2303,7 +2278,7 @@ fn native_grouped_experts_match_host_reference_at_catalog_shapes() {
             let (grouped_rows, mut used) = (i32_tensor(device, &[1], &[m as i32]), fill(&[1]));
             let (no_map, no_step) = (fill(&[0, constants::MAP_WORDS as usize]), fill(&[0]));
             let first = i32_tensor(device, &[1], &[0]);
-            routed_group::native_for_device(device, &group)
+            declared::prepared(device, &routed_group::native_entry(), &group)
                 .unwrap()
                 .call(routed_group::Args {
                     first: &first,
@@ -2472,12 +2447,12 @@ fn native_grouped_experts_match_host_reference_at_catalog_shapes() {
                     absolute,
                 );
                 for (published, base, expected) in published_forms(&shape, &case) {
-                    let output = routed_scatter::native_for_device_with(
+                    let output = declared::prepared(
                         device,
-                        routed_scatter::Elements {
+                        &routed_scatter::native_entry_with(routed_scatter::Elements {
                             A: bf16,
                             R: element(published),
-                        },
+                        }),
                         &seismic::NativeSpecialization::new(),
                     )
                     .unwrap()
@@ -2587,7 +2562,7 @@ fn glu_clamps_adversarial_sums_as_the_reference() {
             assert!(agrees, "{label}: gate {g} up {u}: {actual} against the reference's {expected}");
         }
     };
-    let module = module();
+    let module = crate::common::kernels();
     let bf16 = |shape: &[usize], values: &[f32]| floats(DType::BF16, shape, values);
     let no_scale = || floats(DType::F32, &[0], &[]);
     for limit in [10.0, inf] {
@@ -2618,9 +2593,9 @@ fn glu_clamps_adversarial_sums_as_the_reference() {
             let entry = routed_gate_up::native_entry_with(routed_gate_up::Elements { A: bf16, EGW: bf16, EUW: bf16 });
             let statics = [("H", H), ("K", 1), ("F", f), ("GS", 0), ("US", 0), ("LB", word)];
             for (index, mapping) in decode_mappings(device).into_iter().enumerate() {
-                let native = entry
-                    .prepare(device, &decode_specialization(device, &entry, index, &statics, &mapping, false))
-                    .unwrap();
+                let native =
+                    declared::prepared(device, &entry, &decode_specialization(device, &entry, index, &statics, &mapping, false))
+                        .unwrap();
                 let (gate_stack, up_stack) =
                     (tensor(device, DType::BF16, &[1, f, H], &gate), tensor(device, DType::BF16, &[1, f, H], &up));
                 let product = native

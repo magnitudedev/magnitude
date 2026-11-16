@@ -21,6 +21,8 @@
 //! makes 2^128 (F32 inf) and the registry, as OCP MX's E8M0, NaN; no test
 //! takes it.
 
+mod declared;
+
 use magnitude_ggml::Encoding;
 use magnitude_kernels::{embedding_rows, project_rows};
 use seismic::{BackendName, Device, Element, GgufScales, Grid, GridScale, Layout, NativeSpecialization, Tensor};
@@ -340,7 +342,7 @@ fn e4m3_gathers_match_the_reference_on(device: &Device, scales: Vec<Scale>) {
             &statics,
             &[("D", K as u64)],
         );
-        let out = embedding_rows::native_for_device_with(device, elements(), &specialization)
+        let out = declared::prepared(device, &embedding_rows::native_entry_with(elements()), &specialization)
             .unwrap()
             .call(embedding_rows::Args {
                 table: &Tensor::from_host(device, element, &table.shape(), &bytes).unwrap(),
@@ -429,7 +431,7 @@ fn e4m3_gemv_products_match_the_reference_on(device: &Device, scales: Vec<Scale>
             &[("G", 1), ("K", K as u64), ("N", n as u64), ("WS", 0), ("WB", 0)],
         );
         let kernel =
-            project_rows::native_for_device_with(device, elements(), &specialization).unwrap();
+            declared::prepared(device, &project_rows::native_entry_with(elements()), &specialization).unwrap();
         // 1.0 in BF16 and F16.
         let one = if act == Element::bf16() { 0x3f80u16 } else { 0x3c00u16 };
         let mut actual = Vec::with_capacity(K * n);

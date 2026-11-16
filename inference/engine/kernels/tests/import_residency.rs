@@ -1,3 +1,4 @@
+mod declared;
 use magnitude_kernels::{constants, import_dense, landing_extent, repack_weight, routed_round, routed_step, SlotTable};
 
 mod e4m3;
@@ -265,9 +266,9 @@ fn metal_record_ports_bind_graph_workspace_records() {
     let bytes = dense_bytes("f32", &values).repeat(21);
     let [f32, f16] = ["f32", "f16"].map(|name| seismic::Element::named(name).unwrap());
     let import = |source, destination| {
-        import_dense::native_for_device_with(
+        declared::prepared(
             &device,
-            import_dense::Elements { E: source, U: destination },
+            &import_dense::native_entry_with(import_dense::Elements { E: source, U: destination }),
             &seismic::NativeSpecialization::new(),
         )
         .unwrap()
@@ -384,12 +385,12 @@ fn repack_timing(device: &seismic::Device, layouts: &[seismic::Layout]) {
                 .unwrap();
         for &layout in layouts {
             let destination = source_element.converted(layout, operands).unwrap();
-            let kernel = repack_weight::native_for_device_with(
+            let kernel = declared::prepared(
                 device,
-                repack_weight::Elements {
+                &repack_weight::native_entry_with(repack_weight::Elements {
                     E: source_element,
                     U: destination,
-                },
+                }),
                 &seismic::NativeSpecialization::new(),
             )
             .unwrap();
@@ -471,12 +472,12 @@ fn cuda_repack_into_mma16_matches_the_host_at_a_real_shape() {
         let bytes = source_bytes(length, 11);
         let source = seismic::Tensor::from_host(&device, source_element, &shape, &bytes).unwrap();
         let label = format!("{} -> {} over {shape:?}", source_element.name(), destination.name());
-        let native = repack_weight::native_for_device_with(
+        let native = declared::prepared(
             &device,
-            repack_weight::Elements {
+            &repack_weight::native_entry_with(repack_weight::Elements {
                 E: source_element,
                 U: destination,
-            },
+            }),
             &seismic::NativeSpecialization::new(),
         )
         .unwrap()
@@ -588,9 +589,9 @@ fn dense_import_matches_host_for_all_nine_pairs(device: &seismic::Device) {
                     E: source_element,
                     U: destination_element,
                 };
-                let native = import_dense::native_for_device_with(
+                let native = declared::prepared(
                     &device,
-                    elements,
+                    &import_dense::native_entry_with(elements),
                     &seismic::NativeSpecialization::new(),
                 )
                 .unwrap()
@@ -648,7 +649,7 @@ fn streamed_conversion(
     };
     let zeros = |element: seismic::Element, shape: &[u64]| seismic::Tensor::zeros(device, element, shape).unwrap();
     let mut step = words(&[0, 0]);
-    routed_step::native_for_device(device, &seismic::NativeSpecialization::new())
+    declared::prepared(device, &routed_step::native_entry(), &seismic::NativeSpecialization::new())
         .unwrap()
         .call(routed_step::Args {
             step: &mut step,
@@ -675,16 +676,16 @@ fn streamed_conversion(
     let mut slots = zeros(destination, shape);
     let mut down_slots = zeros(bf16, &down);
     let list = magnitude_kernels::list_extent(1);
-    let native = routed_round::native_for_device_with(
+    let native = declared::prepared(
         device,
-        routed_round::Elements {
+        &routed_round::native_entry_with(routed_round::Elements {
             SG: source.element(),
             SU: source.element(),
             SD: bf16,
             UG: destination,
             UU: destination,
             UD: bf16,
-        },
+        }),
         &seismic::NativeSpecialization::new(),
     )
     .unwrap();
@@ -761,12 +762,12 @@ fn repack_matches_the_registered_conversion(
                 {
                     continue;
                 }
-                let native = repack_weight::native_for_device_with(
+                let native = declared::prepared(
                     &device,
-                    repack_weight::Elements {
+                    &repack_weight::native_entry_with(repack_weight::Elements {
                         E: source_element,
                         U: destination,
-                    },
+                    }),
                     &seismic::NativeSpecialization::new(),
                 )
                 .unwrap()

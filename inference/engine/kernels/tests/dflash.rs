@@ -4,6 +4,8 @@
 //! runs everywhere; the accelerator test covers every other device the host
 //! has.
 
+mod declared;
+
 use magnitude_kernels::{draft_confidence, feature_rows, tap_rows, token_confidence};
 use seismic::{BackendName, Device, Element, NativeSpecialization, Tensor};
 
@@ -314,8 +316,9 @@ fn token_confidence_is_the_selected_probability(device: &Device) {
     let (rows, vocabulary) = (5usize, 3001usize);
     // Selection r reads logits row (2 r) mod 5: rows out of order.
     let row_map = (0..rows).map(|row| (2 * row % rows) as i32).collect::<Vec<_>>();
-    let kernel = token_confidence::native_for_device(
+    let kernel = declared::prepared(
         device,
+        &token_confidence::native_entry(),
         &specialization(
             &implementation.statics,
             |fixed| implementation.default_specialization(fixed).unwrap(),

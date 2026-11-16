@@ -15,7 +15,7 @@ use magnitude_kernels::{
 };
 use seismic::{BackendName, Device, Element, NativeSpecialization, Tensor};
 use seismic_lang::{
-    checked::{CheckedModule, SourceFile},
+    checked::CheckedModule,
     entry::ElementBindings,
     failure::SourceTermination,
     ids::RepresentationId,
@@ -289,9 +289,9 @@ impl Weight {
         }
         let runs = self.k / packing.run() as usize;
         let mut bound = f32_tensor(device, &[runs], &vec![0.0; runs]);
-        packing_bound::native_for_device_with(
+        declared::prepared(
             device,
-            packing_bound::Elements { W: resident },
+            &packing_bound::native_entry_with(packing_bound::Elements { W: resident }),
             &NativeSpecialization::new(),
         )
         .unwrap()
@@ -1168,14 +1168,14 @@ fn readout_projection_specialization_on<E: seismic::Entry>(
 fn with_matrix<E: seismic::Entry>(
     device: &Device,
     specialization: NativeSpecialization,
-    elements: &[(&str, Element)],
+    elements: &[(&'static str, Element)],
 ) -> NativeSpecialization {
     if device.backend() != BackendName::Metal {
         return specialization;
     }
     let batch = common::metal_launch::<E>("batch");
     let matrix = specialization.clone().with_param("MATRIX", 1).with_launch_param(batch, "BATCH_ROWS", 2);
-    if seismic::generated::native_specialization_valid::<E>(device, &matrix, elements).unwrap() {
+    if declared::declared_at(device, &seismic::generated::bound_entry::<E>(elements, None), &matrix).is_ok() {
         matrix
     } else {
         specialization.with_param("MATRIX", 0).with_launch_param(batch, "BATCH_PARTS", 2)
@@ -1265,53 +1265,6 @@ fn checked_classes(four_b: bool) -> (Vec<usize>, Vec<Mapping>) {
 // ---------------------------------------------------------------------------
 // Portable bodies.
 
-fn module() -> CheckedModule {
-    let mut sources = seismic_std::sources();
-    for (path, text) in [
-        (
-            "feed_forward.seismic",
-            include_str!("../kernels/feed_forward.seismic"),
-        ),
-        (
-            "dense.seismic",
-            include_str!("../kernels/dense.seismic"),
-        ),
-        (
-            "readout.seismic",
-            include_str!("../kernels/readout.seismic"),
-        ),
-        ("target.seismic", include_str!("../kernels/target.seismic")),
-        (
-            "recurrent.seismic",
-            include_str!("../kernels/recurrent.seismic"),
-        ),
-        (
-            "attention.seismic",
-            include_str!("../kernels/attention.seismic"),
-        ),
-        (
-            "per_layer_gate.seismic",
-            include_str!("../kernels/per_layer_gate.seismic"),
-        ),
-        (
-            "short_conv.seismic",
-            include_str!("../kernels/short_conv.seismic"),
-        ),
-        (
-            "functions.seismic",
-            include_str!("../kernels/functions.seismic"),
-        ),
-        ("rounding.seismic", include_str!("../kernels/rounding.seismic")),
-        ("import.seismic", include_str!("../kernels/import.seismic")),
-    ] {
-        sources.push(SourceFile {
-            path: path.into(),
-            text: text.into(),
-        });
-    }
-    crate::common::check(sources)
-}
-
 /// The `dense` projection's launches (`dense.seismic`) for each
 /// variant, in its order.
 const PAIRED_LAUNCHES: [&str; 14] = [
@@ -1336,7 +1289,7 @@ const DECODE_SEGMENTED_LAUNCHES: [&str; 4] = ["gemv", "batch", "gemv_rows", "gem
 /// names) in place.
 #[test]
 fn metal_projecting_entries_check_to_their_projections_launches() {
-    let module = module();
+    let module = crate::common::kernels();
     let cases: [(&str, &[&str], &[(&str, &str)]); 8] = [
         (
             "dense_expand",
@@ -1375,7 +1328,7 @@ fn cuda_projecting_entries_check_to_their_projections_launches() {
     /// The paired and segmented variants do not split.
     const WHOLE: [&str; 5] = ["stage", "gemv", "gemv16", "gemm_small", "gemm"];
     const SINGLE: [&str; 6] = ["stage", "gemv", "gemv16", "gemm_small", "gemm", "finalize"];
-    let module = module();
+    let module = crate::common::kernels();
     let cases: [(&str, &[&str]); 10] = [
         ("dense_expand", &WHOLE),
         ("dense_output", &SINGLE),
@@ -1584,14 +1537,14 @@ fn dense_expand_native_arithmetic(
             ("A", act.element()),
         ],
     );
-    let kernel = dense_expand::native_for_device_with(
+    let kernel = declared::prepared(
         device,
-        dense_expand::Elements {
+        &dense_expand::native_entry_with(dense_expand::Elements {
             NW: Element::bf16(),
             GW: gate.repr.resident(&device),
             UW: up.repr.resident(&device),
             A: act.element(),
-        },
+        }),
         &specialization,
     )
     .unwrap();
@@ -1675,7 +1628,7 @@ fn dense_expand_iq4_matches_its_portable_body() {
 }
 
 fn dense_expand_matches_its_portable_body_on(device: &Device, pairs: &[(Repr, Repr)]) {
-    let module = module();
+    let module = crate::common::kernels();
     let act = Act::Bf16;
     let (h, f) = (256, 40);
     for &(gate_repr, up_repr) in pairs {
@@ -2164,23 +2117,23 @@ fn metal_attention_project_matrix_gemv_matches_the_batched_rows() {
                     let specialization = if matrix {
                         let admitted = with_matrix::<attention_project::Entry>(&device, specialization.clone(), &elements);
                         assert!(
-                            seismic::generated::native_specialization_valid::<attention_project::Entry>(
+                            declared::declared_at(
                                 &device,
+                                &seismic::generated::bound_entry::<attention_project::Entry>(&elements, None),
                                 &specialization
                                     .with_param("MATRIX", 1)
                                     .with_launch_param(common::metal_launch::<attention_project::Entry>("batch"), "BATCH_ROWS", 2),
-                                &elements,
                             )
-                            .unwrap(),
+                            .is_ok(),
                             "attention_project {repr:?} D {d}: the matrix GEMV is not admitted, so the comparison would be vacuous"
                         );
                         admitted
                     } else {
                         specialization
                     };
-                    let out = attention_project::native_for_device_with(
+                    let out = declared::prepared(
                         &device,
-                        attention_project::Elements {
+                        &attention_project::native_entry_with(attention_project::Elements {
                             NW: Element::bf16(),
                             QW: element,
                             GW: Element::bf16(),
@@ -2188,7 +2141,7 @@ fn metal_attention_project_matrix_gemv_matches_the_batched_rows() {
                             VW: element,
                             A: act.element(),
                             Y: act.element(),
-                        },
+                        }),
                         &specialization,
                     )
                     .unwrap()
@@ -2277,9 +2230,9 @@ fn metal_tall_segmented_projections_are_bit_identical_to_the_staged_tiles() {
             .map(|_| act.round(rng.symmetric()))
             .collect::<Vec<_>>();
         let project = |mapping, project_mode| {
-            let out = attention_project::native_for_device_with(
+            let out = declared::prepared(
                 &device,
-                attention_project::Elements {
+                &attention_project::native_entry_with(attention_project::Elements {
                     NW: Element::bf16(),
                     QW: reprs[0].resident(&device),
                     GW: Element::bf16(),
@@ -2287,7 +2240,7 @@ fn metal_tall_segmented_projections_are_bit_identical_to_the_staged_tiles() {
                     VW: reprs[2].resident(&device),
                     A: act.element(),
                     Y: act.element(),
-                },
+                }),
                 &attention_project_specialization_on(
                     &device,
                     &attention_project_statics(d, kv, g, w),
@@ -2321,12 +2274,12 @@ fn metal_tall_segmented_projections_are_bit_identical_to_the_staged_tiles() {
             ]
         };
         let output = |mapping| {
-            let out = attention_output::native_for_device_with(
+            let out = declared::prepared(
                 &device,
-                attention_output::Elements {
+                &attention_output::native_entry_with(attention_output::Elements {
                     OW: out_weight.repr.resident(&device),
                     A: act.element(),
-                },
+                }),
                 &with_matrix::<attention_output::Entry>(
                     &device,
                     attention_output_specialization_on(
@@ -2351,16 +2304,16 @@ fn metal_tall_segmented_projections_are_bit_identical_to_the_staged_tiles() {
             read_f32(&out)
         };
         let recurrent = |mapping| {
-            let out = gated_delta_project::native_for_device_with(
+            let out = declared::prepared(
                 &device,
-                gated_delta_project::Elements {
+                &gated_delta_project::native_entry_with(gated_delta_project::Elements {
                     NW: Element::bf16(),
                     QW: recurrent_reprs[0].resident(&device),
                     GW: recurrent_reprs[1].resident(&device),
                     AW: recurrent_reprs[2].resident(&device),
                     BW: recurrent_reprs[3].resident(&device),
                     A: act.element(),
-                },
+                }),
                 &segmented_projection_specialization_on::<gated_delta_project::Entry>(
                     &device,
                     &[("H", d), ("NK", nk), ("NV", nv), ("W", head_width)],
@@ -2449,12 +2402,12 @@ fn dense_output_native_arithmetic(
         specialization,
         &[("A", act.element()), ("DW", down.repr.resident(&device))],
     );
-    let kernel = dense_output::native_for_device_with(
+    let kernel = declared::prepared(
         device,
-        dense_output::Elements {
+        &dense_output::native_entry_with(dense_output::Elements {
             A: act.element(),
             DW: down.repr.resident(&device),
-        },
+        }),
         &specialization,
     )
     .unwrap();
@@ -2608,12 +2561,12 @@ fn metal_int8_dense_output_agrees_with_the_tall_form() {
         tall: Some(TALL_DEFAULT),
         ..staged
     };
-    let refused = dense_output::native_for_device_with(
+    let refused = declared::prepared(
         &device,
-        dense_output::Elements {
+        &dense_output::native_entry_with(dense_output::Elements {
             A: act.element(),
             DW: Repr::Q6k.resident(&device),
-        },
+        }),
         &with_matrix::<dense_output::Entry>(
             &device,
             dense_output_specialization_on(&device, &[("H", 192), ("F", 1024)], tall).with_param("INT8", 1),
@@ -2734,13 +2687,13 @@ fn project_rows_native(
         specialization,
         &[("A", act.element()), ("W", weight.repr.resident(device)), ("Y", Element::f32())],
     );
-    let kernel = project_rows::native_for_device_with(
+    let kernel = declared::prepared(
         device,
-        project_rows::Elements {
+        &project_rows::native_entry_with(project_rows::Elements {
             A: act.element(),
             W: weight.repr.resident(device),
             Y: Element::f32(),
-        },
+        }),
         &specialization,
     )
     .unwrap();
@@ -2846,12 +2799,12 @@ fn dense_output_packed(
         specialization,
         &[("A", act.element()), ("DW", down.repr.resident(device))],
     );
-    let kernel = dense_output::native_for_device_with(
+    let kernel = declared::prepared(
         device,
-        dense_output::Elements {
+        &dense_output::native_entry_with(dense_output::Elements {
             A: act.element(),
             DW: down.repr.resident(device),
-        },
+        }),
         &specialization,
     )
     .unwrap();
@@ -3034,14 +2987,14 @@ fn metal_packed_dense_expand_agrees_with_the_staged_form() {
                         ("A", act.element()),
                     ],
                 );
-                let kernel = dense_expand::native_for_device_with(
+                let kernel = declared::prepared(
                     &device,
-                    dense_expand::Elements {
+                    &dense_expand::native_entry_with(dense_expand::Elements {
                         NW: Element::bf16(),
                         GW: gate.repr.resident(&device),
                         UW: up.repr.resident(&device),
                         A: act.element(),
-                    },
+                    }),
                     &specialization,
                 );
                 if !served {
@@ -3221,9 +3174,9 @@ fn metal_packed_recurrent_and_attention_projections_agree_with_the_staged_tiles(
                     staged
                 },
             );
-            let out = attention_project::native_for_device_with(
+            let out = declared::prepared(
                 &device,
-                attention_project::Elements {
+                &attention_project::native_entry_with(attention_project::Elements {
                     NW: Element::bf16(),
                     QW: project_reprs[0].resident(&device),
                     GW: Element::bf16(),
@@ -3231,7 +3184,7 @@ fn metal_packed_recurrent_and_attention_projections_agree_with_the_staged_tiles(
                     VW: project_reprs[2].resident(&device),
                     A: act.element(),
                     Y: act.element(),
-                },
+                }),
                 &match pack {
                     Some(pack) => with_pack::<attention_project::Entry>(specialization, pack),
                     None => specialization,
@@ -3280,12 +3233,12 @@ fn metal_packed_recurrent_and_attention_projections_agree_with_the_staged_tiles(
                 specialization,
                 &[("OW", weight.repr.resident(&device)), ("A", act.element())],
             );
-            let out = attention_output::native_for_device_with(
+            let out = declared::prepared(
                 &device,
-                attention_output::Elements {
+                &attention_output::native_entry_with(attention_output::Elements {
                     OW: weight.repr.resident(&device),
                     A: act.element(),
-                },
+                }),
                 &match pack {
                     Some(pack) => with_pack::<attention_output::Entry>(specialization, pack),
                     None => specialization,
@@ -3320,9 +3273,9 @@ fn metal_packed_recurrent_and_attention_projections_agree_with_the_staged_tiles(
                 },
                 RECURRENT_PROJECT_BOUNDS,
             );
-            let out = gated_delta_project::native_for_device_with(
+            let out = declared::prepared(
                 &device,
-                recurrent_project_elements(&device, recurrent_reprs, act),
+                &gated_delta_project::native_entry_with(recurrent_project_elements(&device, recurrent_reprs, act)),
                 &match pack {
                     Some(pack) => with_pack::<gated_delta_project::Entry>(specialization, pack),
                     None => specialization,
@@ -3450,14 +3403,14 @@ fn metal_int8_dense_expand_agrees_with_the_tall_form() {
         tall: Some(TALL_DEFAULT),
         ..staged
     };
-    let refused = dense_expand::native_for_device_with(
+    let refused = declared::prepared(
         &device,
-        dense_expand::Elements {
+        &dense_expand::native_entry_with(dense_expand::Elements {
             NW: Element::bf16(),
             GW: Repr::Q4k.resident(&device),
             UW: Repr::Q8.resident(&device),
             A: act.element(),
-        },
+        }),
         &with_matrix::<dense_expand::Entry>(
             &device,
             dense_expand_specialization_on(&device, &[("H", 512), ("F", 192)], tall).with_param("INT8", 1),
@@ -3541,7 +3494,7 @@ fn residual_output(act: Act, acc: f32, residual: f32) -> (f32, f32) {
 /// form admits (a generated test a format), at a row count that leaves padding rows in a tile, with
 /// the runs the registry gives the format.
 fn packing_bound_matches_its_portable_body(format: Format) {
-    let module = module();
+    let module = crate::common::kernels();
     for device in devices() {
         if device.backend() != BackendName::Metal {
             continue;
@@ -3567,9 +3520,9 @@ fn packing_bound_matches_its_portable_body(format: Format) {
                 .map(|i| tensor.read(i).unwrap() as f32)
                 .collect::<Vec<_>>();
             let mut bound = f32_tensor(&device, &[runs], &vec![0.0; runs]);
-            packing_bound::native_for_device_with(
+            declared::prepared(
                 &device,
-                packing_bound::Elements { W: resident },
+                &packing_bound::native_entry_with(packing_bound::Elements { W: resident }),
                 &NativeSpecialization::new(),
             )
             .unwrap()
@@ -3635,7 +3588,7 @@ fn dense_expand_gguf_formats_match_their_portable_body() {
 /// its exact form (INT8 = 0 where declared), against its portable body.
 #[test]
 fn dense_up_gguf_formats_match_their_portable_body() {
-    let module = module();
+    let module = crate::common::kernels();
     let act = Act::Bf16;
     let (h, f) = (256, 40);
     for repr in [
@@ -3737,7 +3690,7 @@ fn dense_up_gguf_formats_match_their_portable_body() {
 /// (`Format::partial_block_widths`): on the portable body at the first and
 /// on the host reference over the row classes at each.
 fn dense_output_at_partial_block_widths_on(device: &Device, format: Format) {
-    let module = module();
+    let module = crate::common::kernels();
     let act = Act::Bf16;
     let repr = Repr::of(format);
     let widths = format.partial_block_widths();
@@ -3908,7 +3861,7 @@ fn metal_dense_output_matrix_gemv_matches_the_host() {
 }
 
 fn dense_output_matches_its_portable_body_and_the_host_reference_on(device: &Device, repr: Repr) {
-    let module = module();
+    let module = crate::common::kernels();
     let act = Act::Bf16;
     // Portable body at small shapes.
     let (h, f) = (40, 256);
@@ -4012,9 +3965,9 @@ fn metal_gated_pooled_projection_reproduces_single_rows_up_to_verify_rows() {
     // The pooled and gate results of the rows `input`, `[rows, 512]` each.
     let project = |input: &[f32], mapping: Mapping| -> [Vec<f32>; 2] {
         let rows = input.len() / d;
-        let out = attention_project::native_for_device_with(
+        let out = declared::prepared(
             &device,
-            attention_project::Elements {
+            &attention_project::native_entry_with(attention_project::Elements {
                 NW: Element::bf16(),
                 QW: element,
                 GW: element,
@@ -4022,7 +3975,7 @@ fn metal_gated_pooled_projection_reproduces_single_rows_up_to_verify_rows() {
                 VW: element,
                 A: act.element(),
                 Y: Element::f32(),
-            },
+            }),
             &attention_project_specialization_on(
                 &device,
                 &[("D", d), ("Q", segment), ("GR", segment), ("K", 0), ("V", 0)],
@@ -4386,7 +4339,7 @@ impl DecodeRows {
             }
         };
         for (setting, specialization) in reduction_orders(&implementation, &default) {
-            if !entry.specialization_valid(device, &specialization).unwrap() {
+            if declared::declared_at(device, &entry, &specialization).is_err() {
                 self.inadmissible.push(format!("{case} {setting}"));
                 continue;
             }
@@ -5300,7 +5253,7 @@ fn recurrent_project_matches_its_portable_body_and_the_host_reference_on(device:
 }
 
 fn recurrent_project_cases_on(device: &Device, cases: Cases) {
-    let module = module();
+    let module = crate::common::kernels();
     let act = Act::Bf16;
     let scoped = cases == Cases::Scoped;
     // The smallest geometry that reaches every path, over every mapping and
@@ -5385,16 +5338,16 @@ fn recurrent_project_cases_on(device: &Device, cases: Cases) {
                     ],
                 )
             };
-            let kernel = gated_delta_project::native_for_device_with(
+            let kernel = declared::prepared(
                 &device,
-                gated_delta_project::Elements {
+                &gated_delta_project::native_entry_with(gated_delta_project::Elements {
                     NW: Element::bf16(),
                     QW: reprs[0].resident(&device),
                     GW: reprs[1].resident(&device),
                     AW: reprs[2].resident(&device),
                     BW: reprs[3].resident(&device),
                     A: act.element(),
-                },
+                }),
                 &specialization,
             )
             .unwrap();
@@ -5506,7 +5459,7 @@ fn recurrent_output_matches_its_portable_body_and_the_host_reference_on(device: 
 }
 
 fn recurrent_output_cases_on(device: &Device, scoped: bool) {
-    let module = module();
+    let module = crate::common::kernels();
     let act = Act::Bf16;
     // A small geometry over every representation and mapping, then the pinned
     // 4B geometry (q5k) over the decode and verify rows.
@@ -5552,12 +5505,12 @@ fn recurrent_output_cases_on(device: &Device, scoped: bool) {
                 (expected, bound)
             };
             let native = |hidden: &[f32], gated: &[f32], rows: usize, mapping: Mapping| {
-                let kernel = attention_output::native_for_device_with(
+                let kernel = declared::prepared(
                     &device,
-                    attention_output::Elements {
+                    &attention_output::native_entry_with(attention_output::Elements {
                         OW: repr.resident(&device),
                         A: act.element(),
-                    },
+                    }),
                     &with_matrix::<attention_output::Entry>(
                         device,
                         attention_output_specialization_on(device, &[("D", h), ("Q", nv), ("W", w)], mapping),
@@ -5715,7 +5668,7 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
     device: &Device,
     cases: Cases,
 ) {
-    let module = module();
+    let module = crate::common::kernels();
     let act = Act::Bf16;
     let scoped = cases == Cases::Scoped;
     // A small geometry over every mapping, then the pinned 4B geometry over
@@ -5755,9 +5708,9 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
             .collect::<Vec<_>>();
         let norm = norm_values(d, 7);
         let project = |hidden: &[f32], rows: usize, mapping: Mapping, project_mode: i32| {
-            let kernel = attention_project::native_for_device_with(
+            let kernel = declared::prepared(
                 &device,
-                attention_project::Elements {
+                &attention_project::native_entry_with(attention_project::Elements {
                     NW: Element::bf16(),
                     QW: reprs[0].resident(&device),
                     GW: Element::bf16(),
@@ -5765,7 +5718,7 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                     VW: reprs[2].resident(&device),
                     A: act.element(),
                     Y: act.element(),
-                },
+                }),
                 &attention_project_specialization_on(
                     device,
                     &attention_project_statics(d, kv, g, w),
@@ -5926,12 +5879,12 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
             let (d_out, k) = (if four_b { d } else { 300usize }, q * w);
             let out_weight = weight(repr, d_out, k, 70, 1.0);
             let native = |hidden: &[f32], gated: &[f32], rows: usize, mapping: Mapping| {
-                let kernel = attention_output::native_for_device_with(
+                let kernel = declared::prepared(
                     &device,
-                    attention_output::Elements {
+                    &attention_output::native_entry_with(attention_output::Elements {
                         A: act.element(),
                         OW: repr.resident(&device),
-                    },
+                    }),
                     &with_matrix::<attention_output::Entry>(
                         device,
                         attention_output_specialization_on(device, &[("D", d_out), ("Q", q), ("W", w)], mapping),
@@ -6049,7 +6002,7 @@ fn scaled_projections_on(device: &Device) {
     const SCALES: [f32; 4] = [0.412_5, 0.731_2, 1.368_8, 0.207_5];
     /// The output projection's.
     const SCALE: f32 = 0.412_5;
-    let module = module();
+    let module = crate::common::kernels();
     let act = Act::Bf16;
     // Query, gate, key and value segments of 128, 64, 64 and 64 rows over a
     // 256-wide residual; an output projection of 4 heads of 64 channels
@@ -6093,9 +6046,9 @@ fn scaled_projections_on(device: &Device) {
                 .map(|projection| projection.tensor(device))
                 .collect::<Vec<_>>();
             let scales = SCALES.map(|scale| f32_tensor(device, &[1], &[scale]));
-            let out = attention_project::native_for_device_with(
+            let out = declared::prepared(
                 device,
-                attention_project::Elements {
+                &attention_project::native_entry_with(attention_project::Elements {
                     NW: Element::bf16(),
                     QW: repr.resident(device),
                     GW: repr.resident(device),
@@ -6103,7 +6056,7 @@ fn scaled_projections_on(device: &Device) {
                     VW: repr.resident(device),
                     A: act.element(),
                     Y: act.element(),
-                },
+                }),
                 &match pack {
                     Some(pack) => with_pack::<attention_project::Entry>(specialization, pack),
                     None => specialization,
@@ -6143,12 +6096,12 @@ fn scaled_projections_on(device: &Device) {
                     specialization,
                     &[("OW", repr.resident(device)), ("A", act.element())],
                 );
-                let out = attention_output::native_for_device_with(
+                let out = declared::prepared(
                     device,
-                    attention_output::Elements {
+                    &attention_output::native_entry_with(attention_output::Elements {
                         OW: repr.resident(device),
                         A: act.element(),
-                    },
+                    }),
                     &match pack {
                         Some(pack) => {
                             with_pack::<attention_output::Entry>(specialization, pack)
@@ -6543,7 +6496,7 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(
     device: &Device,
     check: &ReadoutCheck,
 ) {
-    let module = module();
+    let module = crate::common::kernels();
     let act = Act::Bf16;
     let (v, d, cap) = (check.v, check.d, check.softcap);
     for &repr in check.reprs {
@@ -6589,12 +6542,12 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(
             }
             let hidden_tensor = f32_tensor(&device, &[rows, d], &hidden);
             let rows_tensor = i32_tensor(&device, &[outputs], &out_rows);
-            let features_native = readout_features_rows::native_for_device_with(
+            let features_native = declared::prepared(
                 &device,
-                readout_features_rows::Elements {
+                &readout_features_rows::native_entry_with(readout_features_rows::Elements {
                     NW: Element::bf16(),
                     A: act.element(),
-                },
+                }),
                 &formed(device, statics_on(device, &[("D", d)]), d),
             )
             .unwrap()
@@ -6658,13 +6611,13 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(
                     specialization,
                     &[("NW", Element::bf16()), ("OW", repr.resident(&device)), ("A", act.element())],
                 );
-                let head_native = readout_head_rows::native_for_device_with(
+                let head_native = declared::prepared(
                     &device,
-                    readout_head_rows::Elements {
+                    &readout_head_rows::native_entry_with(readout_head_rows::Elements {
                         NW: Element::bf16(),
                         OW: repr.resident(&device),
                         A: act.element(),
-                    },
+                    }),
                     &specialization,
                 )
                 .unwrap()
@@ -6688,13 +6641,13 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(
                     &capped(&scaled_logits),
                     &bounds(&scaled_logit_bound),
                 );
-                let selected_native = readout_selected_rows::native_for_device_with(
+                let selected_native = declared::prepared(
                     &device,
-                    readout_selected_rows::Elements {
+                    &readout_selected_rows::native_entry_with(readout_selected_rows::Elements {
                         NW: Element::bf16(),
                         OW: repr.resident(&device),
                         A: act.element(),
-                    },
+                    }),
                     &readout_selected_specialization_on(device, &[("V", v), ("D", d)], mapping),
                 )
                 .unwrap()
@@ -6801,7 +6754,7 @@ fn uniform_values(count: usize, seed: u64, scale: f32) -> Vec<f32> {
 #[test]
 fn embedding_rows_read_the_slots_their_directory_names() {
     let catalog = seismic::Devices::discover(&[]).unwrap();
-    let module = module();
+    let module = crate::common::kernels();
     let act = Act::Bf16;
     let (v, d) = (300usize, 512usize);
     // Logical rows past the table's slots; every third has a slot.
@@ -6830,12 +6783,12 @@ fn embedding_rows_read_the_slots_their_directory_names() {
         for repr in [Repr::Q4k, Repr::Q6k, Repr::Bf16] {
             let table = weight(repr, v, d, 91, 8.0);
             let resident = table.tensor(&device);
-            let kernel = embedding_rows::native_for_device_with(
+            let kernel = declared::prepared(
                 &device,
-                embedding_rows::Elements {
+                &embedding_rows::native_entry_with(embedding_rows::Elements {
                     EW: repr.resident(&device),
                     A: act.element(),
-                },
+                }),
                 &statics_on(&device, &[("D", d)]),
             )
             .unwrap();
@@ -6922,7 +6875,7 @@ fn bf16_embedding_rows_decode_exactly_as_the_portable_body() {
 
 /// A gather of `repr` rows decodes them exactly as the portable body.
 fn embedding_rows_decode_exactly_as_the_portable_body_on(device: &Device, repr: Repr) {
-    let module = module();
+    let module = crate::common::kernels();
     let act = Act::Bf16;
     let (v, d) = (300usize, 2560usize);
     let table = weight(repr, v, d, 90, 8.0);
@@ -6935,12 +6888,12 @@ fn embedding_rows_decode_exactly_as_the_portable_body_on(device: &Device, repr: 
             .iter()
             .flat_map(|token| [*token, 0])
             .collect::<Vec<_>>();
-        let out = embedding_rows::native_for_device_with(
+        let out = declared::prepared(
             &device,
-            embedding_rows::Elements {
+            &embedding_rows::native_entry_with(embedding_rows::Elements {
                 EW: repr.resident(&device),
                 A: act.element(),
-            },
+            }),
             &statics_on(device, &[("D", d)]),
         )
         .unwrap()
@@ -6960,12 +6913,12 @@ fn embedding_rows_decode_exactly_as_the_portable_body_on(device: &Device, repr: 
         // The scaled (Gemma, √D) and normalized (Muse, weightless RMS)
         // forms: the square sum reassociates, so within an A rounding.
         for (scale, normalize) in [(39.191835f32, 0), (1.0, 1)] {
-            let transformed = embedding_rows::native_for_device_with(
+            let transformed = declared::prepared(
                 &device,
-                embedding_rows::Elements {
+                &embedding_rows::native_entry_with(embedding_rows::Elements {
                     EW: repr.resident(&device),
                     A: act.element(),
-                },
+                }),
                 &statics_on(device, &[("D", d)]),
             )
             .unwrap()
@@ -7286,9 +7239,9 @@ fn query_key_project(
 ) -> (Tensor, Vec<f32>) {
     let d = query.k;
     let element = query.repr.resident(device);
-    let kernel = attention_project::native_for_device_with(
+    let kernel = declared::prepared(
         device,
-        attention_project::Elements {
+        &attention_project::native_entry_with(attention_project::Elements {
             NW: Element::bf16(),
             QW: element,
             GW: element,
@@ -7296,7 +7249,7 @@ fn query_key_project(
             VW: element,
             A: act.element(),
             Y: act.element(),
-        },
+        }),
         &attention_project_specialization_on(
             device,
             &[
@@ -7421,7 +7374,7 @@ fn grouped_project_rows_native(
     let specialization = implementation
         .default_specialization(&statics)
         .unwrap_or_else(|error| panic!("{:?} grouped default: {error:?}", device.backend()));
-    let kernel = project_rows::native_for_device_with(device, elements(), &specialization).unwrap();
+    let kernel = declared::prepared(device, &project_rows::native_entry_with(elements()), &specialization).unwrap();
     let out = kernel
         .call(project_rows::Args {
             source: &act_tensor(device, act, &[rows, groups * k], source),
@@ -7509,9 +7462,9 @@ fn low_rank_query_at_deepseek_v41_shapes_matches_the_host_reference() {
                         fixed.with_static(name.clone(), *extent)
                     },
                 );
-                let widen = widen_rows::native_for_device_with(
+                let widen = declared::prepared(
                     &device,
-                    widen_rows::Elements { A: act.element() },
+                    &widen_rows::native_entry_with(widen_rows::Elements { A: act.element() }),
                     &implementation.default_specialization(&fixed).unwrap(),
                 )
                 .unwrap();
@@ -7536,7 +7489,7 @@ fn low_rank_query_at_deepseek_v41_shapes_matches_the_host_reference() {
 /// decides it) equals them too.
 #[test]
 fn grouped_project_rows_matches_its_portable_body_and_the_per_group_products() {
-    let module = module();
+    let module = crate::common::kernels();
     let act = Act::Bf16;
     let (groups, n, k) = (3usize, 40usize, 256usize);
     for repr in [Repr::Bf16, Repr::Gguf(Format::F8_E4M3)] {
@@ -7795,16 +7748,16 @@ fn metal_convolved_matrix_columns_match_host() {
                         ("A", act.element()),
                     ],
                 );
-                let output = gated_delta_project_convolved::native_for_device_with(
+                let output = declared::prepared(
                     &device,
-                    gated_delta_project_convolved::Elements {
+                    &gated_delta_project_convolved::native_entry_with(gated_delta_project_convolved::Elements {
                         NW: act.element(),
                         QW: reprs[0].resident(&device),
                         GW: reprs[1].resident(&device),
                         AW: reprs[2].resident(&device),
                         BW: reprs[3].resident(&device),
                         A: act.element(),
-                    },
+                    }),
                     &spec,
                 )
                 .unwrap()
@@ -7918,9 +7871,9 @@ fn metal_absent_query_projection_preserves_key_value() {
                 ],
                 gemm_mapping(64, 64, 1),
             );
-            let kernel = attention_project::native_for_device_with(
+            let kernel = declared::prepared(
                 &device,
-                attention_project::Elements {
+                &attention_project::native_entry_with(attention_project::Elements {
                     NW: Element::bf16(),
                     QW: Element::bf16(),
                     GW: Element::bf16(),
@@ -7928,7 +7881,7 @@ fn metal_absent_query_projection_preserves_key_value() {
                     VW: Element::bf16(),
                     A: Element::bf16(),
                     Y: Element::bf16(),
-                },
+                }),
                 &spec,
             )
             .unwrap();
@@ -8001,12 +7954,12 @@ fn metal_attention_output_matrix_matches_host() {
                         batch_parts: parts,
                         ..gemm_mapping(64, 64, 1)
                     };
-                    let kernel = attention_output::native_for_device_with(
+                    let kernel = declared::prepared(
                         &device,
-                        attention_output::Elements {
+                        &attention_output::native_entry_with(attention_output::Elements {
                             A: act.element(),
                             OW: repr.resident(&device),
-                        },
+                        }),
                         &with_matrix::<attention_output::Entry>(
                             &device,
                             attention_output_specialization_on(&device, &[("D", d), ("Q", q), ("W", w)], mapping),
@@ -8144,12 +8097,12 @@ fn metal_normalize_prepass_matches_small_row_tree() {
         let hidden = f32_tensor(&device, &[count, h], &source);
         let nt = bf16_norm(&device, &norm);
         let selected = i32_tensor(&device, &[gemv], &rows[..gemv]);
-        let features = readout_features_rows::native_for_device_with(
+        let features = declared::prepared(
             &device,
-            readout_features_rows::Elements {
+            &readout_features_rows::native_entry_with(readout_features_rows::Elements {
                 NW: Element::bf16(),
                 A: Element::bf16(),
-            },
+            }),
             &formed(
                 &device,
                 NativeSpecialization::new().with_static("D", h as u64),
@@ -8165,13 +8118,13 @@ fn metal_normalize_prepass_matches_small_row_tree() {
         })
         .unwrap()
         .value;
-        let reference = readout_head_rows::native_for_device_with(
+        let reference = declared::prepared(
             &device,
-            readout_head_rows::Elements {
+            &readout_head_rows::native_entry_with(readout_head_rows::Elements {
                 NW: Element::bf16(),
                 OW: Element::bf16(),
                 A: Element::bf16(),
-            },
+            }),
             &with_matrix::<readout_head_rows::Entry>(
                 &device,
                 readout_head_specialization_on(
@@ -8300,7 +8253,7 @@ fn mxfp8_grouped_project_rows_at_deepseek_v41_prefill_wo_a_times() {
     .fold(statics, |spec, (name, value)| spec.with_param(name, value));
     for (name, tall) in [("tall 128x32", 1u64), ("staged 64x64", 0)] {
         let configuration = fixed.clone().with_param("TALL", tall);
-        if !entry.specialization_valid(&device, &configuration).unwrap() {
+        if declared::declared_at(&device, &entry, &configuration).is_err() {
             println!("project_rows v41 wo_a m{m} {name}: inadmissible");
             continue;
         }

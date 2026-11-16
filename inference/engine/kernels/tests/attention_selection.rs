@@ -33,7 +33,6 @@ fn reads(bits: &[u32], words: usize) -> impl Fn(usize, usize) -> bool + '_ {
 
 fn portable(case: &Case, bits: &[u32], words: usize) -> Vec<f32> {
     use seismic_lang::{
-        checked::{SourceFile},
         entry::ElementBindings,
         failure::SourceTermination,
         interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -41,16 +40,7 @@ fn portable(case: &Case, bits: &[u32], words: usize) -> Vec<f32> {
         registry,
         types::DType,
     };
-    let mut sources = seismic_std::sources();
-    for (path, text) in [
-        ("attention.seismic", include_str!("../kernels/attention.seismic")),
-        ("dense.seismic", include_str!("../kernels/dense.seismic")),
-        ("functions.seismic", include_str!("../kernels/functions.seismic")),
-        ("rounding.seismic", include_str!("../kernels/rounding.seismic")),
-    ] {
-        sources.push(SourceFile { path: path.into(), text: text.into() });
-    }
-    let module = crate::common::check(sources);
+    let module = crate::common::kernels();
     let logical = module
         .entry(
             module.entry_named("attention_prefill").unwrap(),

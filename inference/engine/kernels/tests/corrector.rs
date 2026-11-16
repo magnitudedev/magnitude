@@ -8,6 +8,7 @@
 //! accelerator test on every other device the host has.
 
 mod common;
+mod declared;
 
 use magnitude_kernels::{
     corrector_attention, corrector_factors, corrector_features, corrector_nodes, corrector_path,
@@ -315,7 +316,7 @@ fn path_model(
 
 mod portable {
     use seismic_lang::{
-        checked::{CheckedModule, SourceFile},
+        checked::CheckedModule,
         entry::ElementBindings,
         failure::SourceTermination,
         interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -344,15 +345,6 @@ mod portable {
             shape.to_vec(),
             values.iter().map(|v| f64::from(*v)).collect(),
         )
-    }
-
-    pub fn module() -> CheckedModule {
-        let mut sources = seismic_std::sources();
-        sources.push(SourceFile {
-            path: "corrector.seismic".into(),
-            text: include_str!("../kernels/corrector.seismic").into(),
-        });
-        crate::common::check(sources)
     }
 
     /// The first result of `name`, or with `mutated` the values of its input
@@ -525,9 +517,9 @@ impl Path {
 
 #[test]
 fn host_models_match_the_portable_bodies() {
-    use portable::{floats, ints, module, run, Input};
+    use portable::{floats, ints, run, Input};
     use seismic_lang::types::DType;
-    let module = module();
+    let module = crate::common::kernels();
 
     let case = Features::new(2, 40, 4, 6);
     let actual = run(
@@ -776,8 +768,9 @@ fn nodes_match(device: &Device) {
         .expect("corrector_nodes has a native implementation on every device");
     for with_token_bias in [true, false] {
         let token_rows = usize::from(with_token_bias);
-        let kernel = corrector_nodes::native_for_device(
+        let kernel = declared::prepared(
             device,
+            &corrector_nodes::native_entry(),
             &specialization(
                 &implementation.statics,
                 |fixed| implementation.default_specialization(fixed).unwrap(),
@@ -957,8 +950,9 @@ fn path_matches(device: &Device, case: &Path) {
     let implementation = corrector_path::native_implementation(device)
         .unwrap()
         .expect("corrector_path has a native implementation on every device");
-    let kernel = corrector_path::native_for_device(
+    let kernel = declared::prepared(
         device,
+        &corrector_path::native_entry(),
         &specialization(
             &implementation.statics,
             |fixed| implementation.default_specialization(fixed).unwrap(),

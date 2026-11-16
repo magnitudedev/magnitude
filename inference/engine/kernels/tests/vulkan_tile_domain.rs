@@ -3,7 +3,6 @@
 
 mod common;
 
-use seismic_lang::checked::SourceFile;
 use seismic_lang::native_source::identifiers;
 
 /// Every Vulkan implementation whose source includes the projection GEMM
@@ -14,23 +13,9 @@ use seismic_lang::native_source::identifiers;
 /// not matter.
 #[test]
 fn every_vulkan_user_of_the_projection_gemm_excludes_its_spilling_sub_tile() {
-    let mut sources = seismic_std::sources();
-    // Read at run time, as `common::check` reads the native sources.
+    let module = common::kernels();
     let manifest = std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR");
     let directory = std::path::Path::new(&manifest).join("kernels");
-    let mut files = std::fs::read_dir(&directory)
-        .expect("the kernel sources are readable")
-        .map(|entry| entry.expect("a kernel directory entry").path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "seismic"))
-        .collect::<Vec<_>>();
-    files.sort();
-    for path in files {
-        sources.push(SourceFile {
-            path: path.file_name().unwrap().to_string_lossy().into_owned(),
-            text: std::fs::read_to_string(&path).expect("a kernel source is readable"),
-        });
-    }
-    let module = common::check(sources);
     let template = std::fs::read_to_string(directory.join("vulkan/lib/projection/projection.glsl"))
         .expect("the template is readable");
     let stated = |name: &str| -> u64 {

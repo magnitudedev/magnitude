@@ -3,10 +3,11 @@
 //! GPU backend and on the CPU, at the catalog's real row widths.
 
 mod common;
+mod declared;
 
 use magnitude_kernels::{moe_tail, per_layer_inputs, post_norm_residual};
 use seismic_lang::{
-    checked::{CheckedModule, SourceFile},
+    checked::CheckedModule,
     entry::ElementBindings,
     failure::SourceTermination,
     interp::{Arg, Interpreter, OracleOutcome, OutcomeValue, TensorData},
@@ -14,15 +15,6 @@ use seismic_lang::{
     registry,
     types::DType,
 };
-
-fn module() -> CheckedModule {
-    let mut sources = seismic_std::sources();
-    sources.push(SourceFile {
-        path: "residual.seismic".into(),
-        text: include_str!("../kernels/residual.seismic").into(),
-    });
-    crate::common::check(sources)
-}
 
 enum Input {
     Tensor(DType, Vec<usize>, Vec<f64>),
@@ -171,7 +163,7 @@ const WIDTHS: [usize; 4] = [1536, 2816, 5376, 6656];
 
 #[test]
 fn native_post_norm_residual_matches_portable_body() {
-    let module = module();
+    let module = crate::common::kernels();
     for device in devices() {
         for (width, (rows, outputs), norm_dtype) in [
             (WIDTHS[0], (1, 1), DType::F32),
@@ -199,9 +191,9 @@ fn native_post_norm_residual_matches_portable_body() {
                         Input::F32(scale),
                     ],
                 );
-                let kernel = post_norm_residual::native_for_device_with(
+                let kernel = declared::prepared(
                     &device,
-                    post_norm_residual::Elements { NW: element(norm_dtype) },
+                    &post_norm_residual::native_entry_with(post_norm_residual::Elements { NW: element(norm_dtype) }),
                     &seismic::NativeSpecialization::new(),
                 )
                 .unwrap();
@@ -237,7 +229,7 @@ fn native_post_norm_residual_matches_portable_body() {
 
 #[test]
 fn native_moe_tail_matches_portable_body() {
-    let module = module();
+    let module = crate::common::kernels();
     for device in devices() {
         // Gemma 4 26B-A4B (D 2816), and a wider row.
         for (width, rows) in [(2816usize, 1usize), (2816, 9), (2816, 40), (5376, 3)] {
@@ -264,9 +256,9 @@ fn native_moe_tail_matches_portable_body() {
                 ],
             );
             let shape = [rows as u64, width as u64];
-            let outcome = moe_tail::native_for_device_with(
+            let outcome = declared::prepared(
                 &device,
-                moe_tail::Elements { NW: seismic::Element::f32() },
+                &moe_tail::native_entry_with(moe_tail::Elements { NW: seismic::Element::f32() }),
                 &seismic::NativeSpecialization::new(),
             )
             .unwrap()
@@ -313,7 +305,7 @@ fn native_moe_tail_matches_portable_body() {
 
 #[test]
 fn native_per_layer_inputs_match_portable_body() {
-    let module = module();
+    let module = crate::common::kernels();
     for device in devices() {
         // Gemma 4 E2B (35 layers) and E4B (42 layers), P = 256; the table rows
         // as F32 and as BF16.
@@ -340,9 +332,9 @@ fn native_per_layer_inputs_match_portable_body() {
                 ],
             );
             let shape = [rows as u64, width as u64];
-            let outcome = per_layer_inputs::native_for_device_with(
+            let outcome = declared::prepared(
                 &device,
-                per_layer_inputs::Elements { TW: element(table), NW: seismic::Element::f32() },
+                &per_layer_inputs::native_entry_with(per_layer_inputs::Elements { TW: element(table), NW: seismic::Element::f32() }),
                 &statics_on(&device, &[("L", layers as u64), ("P", chunk as u64)]),
             )
             .unwrap()
