@@ -2007,13 +2007,18 @@ impl<const LEAST: i32, const GREATEST: i32> Codes for Planes<8, 0, Twos, LEAST, 
 /// Grid codes (`registry::GridCodes`): entries of grid `GRID` (its position
 /// in `tables::GRIDS`), one per eight values, their `BYTES` whole bytes in
 /// the codes plane and their `HIGH` further bits in the high plane
-/// ([`grid_entry`]). An entry holds `8 / lanes`
+/// ([`grid_entries`]). An entry holds `8 / lanes`
 /// `INDEX_BITS`-bit point indices, first lowest, then the sign bits of
 /// `registry::GridSigns::ALL[SIGNS]`, then delta `D`'s bit. The value at
 /// lane `j` of an entry is byte `j % lanes` of its point `j / lanes`,
 /// negated by lane sign `j` (a two's complement value where the entry has no
 /// signs), then delta `D`'s; the values are the registry's code domain
 /// `LEAST..=GREATEST` (`DecodeAxes::codes`).
+///
+/// A packet's four entries decode to their points and their lane signs and
+/// deltas as bytes ([`Grid::parts`]), which the scalar body applies entry by
+/// entry and the vector bodies to the whole packet at once, bit for bit
+/// alike.
 #[derive(Clone, Copy, Debug)]
 pub struct Grid<
     const GRID: usize,
@@ -2034,6 +2039,18 @@ pub trait GridDelta: Copy + Send + Sync + 'static {
     /// The values of an entry of signed values `values` and delta bits
     /// `delta`.
     fn apply(values: [i8; 8], delta: u32) -> [i8; 8];
+
+    /// [`GridDelta::apply`] of a packet's signed values, entry `e`'s delta
+    /// bit in bit 0 of byte `e` of `deltas`.
+    ///
+    /// # Safety
+    /// The caller's tier has 256-bit integer vectors.
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn x86(values: std::arch::x86_64::__m256i, deltas: u32) -> std::arch::x86_64::__m256i;
+
+    /// [`GridDelta::x86`]'s NEON form: values `0..16` then `16..32`.
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn neon(values: [std::arch::aarch64::int8x16_t; 2], deltas: u32) -> [std::arch::aarch64::int8x16_t; 2];
 }
 
 /// No delta: the signed values themselves.
@@ -2045,6 +2062,18 @@ impl GridDelta for NoDelta {
 
     #[inline(always)]
     fn apply(values: [i8; 8], _: u32) -> [i8; 8] {
+        values
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn x86(values: std::arch::x86_64::__m256i, _: u32) -> std::arch::x86_64::__m256i {
+        values
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    unsafe fn neon(values: [std::arch::aarch64::int8x16_t; 2], _: u32) -> [std::arch::aarch64::int8x16_t; 2] {
         values
     }
 }
@@ -2061,6 +2090,37 @@ impl<const EXPONENT: u32> GridDelta for Delta<EXPONENT> {
     fn apply(values: [i8; 8], delta: u32) -> [i8; 8] {
         let offset = 1 - 2 * (delta & 1) as i8;
         values.map(|value| (value << EXPONENT) + offset)
+    }
+
+    // `2^EXPONENT v` has its low bit clear, so `+ 1` is `| 1`; a set delta
+    // bit's lanes (all ones, -1) add -2 more.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn x86(values: std::arch::x86_64::__m256i, deltas: u32) -> std::arch::x86_64::__m256i {
+        use std::arch::x86_64::*;
+        unsafe {
+            let mut values = values;
+            for _ in 0..EXPONENT {
+                values = _mm256_add_epi8(values, values);
+            }
+            let set = packed_x86::lane_masks(deltas.wrapping_mul(0xff));
+            _mm256_add_epi8(_mm256_or_si256(values, _mm256_set1_epi8(1)), _mm256_add_epi8(set, set))
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    unsafe fn neon(values: [std::arch::aarch64::int8x16_t; 2], deltas: u32) -> [std::arch::aarch64::int8x16_t; 2] {
+        use std::arch::aarch64::*;
+        unsafe {
+            let set = packed_neon::lane_masks(deltas.wrapping_mul(0xff));
+            let mut values = values;
+            for (values, set) in values.iter_mut().zip(set) {
+                let shifted = vshlq_s8(*values, vdupq_n_s8(EXPONENT as i8));
+                *values = vaddq_s8(vorrq_s8(shifted, vdupq_n_s8(1)), vaddq_s8(set, set));
+            }
+            values
+        }
     }
 }
 
@@ -2090,41 +2150,69 @@ impl<
         (LEAST, GREATEST)
     };
 
+    /// The four entries of the packet of `at` decoded: each entry's point
+    /// (lane `j` its byte `j`), and in byte `e` of a word entry `e`'s lane
+    /// signs (`GridSigns::lanes4`) and its delta bit.
+    #[inline(always)]
+    unsafe fn parts(at: At) -> ([u64; 4], u32, u32) {
+        let mask = (1u32 << INDEX_BITS) - 1;
+        let entries = unsafe { grid_entries::<BYTES, HIGH>(at) };
+        let (mut points, mut signs, mut deltas) = ([0u64; 4], 0u32, 0u32);
+        for (e, entry) in entries.into_iter().enumerate() {
+            // The point and the entry's bits past its indices.
+            let (point, rest) = match Self::POINTS {
+                tables::GridPoints::Lanes8(points) => (points[(entry & mask) as usize], entry >> INDEX_BITS),
+                tables::GridPoints::Lanes4(points) => (
+                    u64::from(points[(entry & mask) as usize])
+                        | (u64::from(points[((entry >> INDEX_BITS) & mask) as usize]) << 32),
+                    entry >> (2 * INDEX_BITS),
+                ),
+            };
+            points[e] = point;
+            signs |= (rest & Self::SIGN_MASK) << (8 * e);
+            if D::BITS > 0 {
+                deltas |= ((rest >> Self::SIGN_BITS) & 1) << (8 * e);
+            }
+        }
+        (points, Self::SIGNED.lanes4(signs), deltas)
+    }
 }
 
-/// Entry `e` (of four) of the packet of `at`: its `BYTES` whole bytes in its
-/// grids or records plane, then its `HIGH` further bits ([`grid_high`]) from
-/// bit `8 BYTES`.
+/// The four entries of the packet of `at`: entry `e`'s `BYTES` whole bytes
+/// in its grids or records plane (`At::entry`), then from bit `8 BYTES` its
+/// `HIGH` further bits, which lie in its grid high plane
+/// (`RowPlaneContent::GridHigh`, placed as its grids plane is) as the
+/// packet's whole bytes, entry `e`'s at their bit `HIGH e`.
 #[inline(always)]
-unsafe fn grid_entry<const BYTES: usize, const HIGH: u32>(at: At, e: usize) -> u32 {
-    let bytes = at.entry(e, BYTES);
-    (0..BYTES).fold(0, |entry, byte| {
-        entry | (u32::from(unsafe { *bytes.add(byte) }) << (8 * byte))
-    }) | (unsafe { grid_high::<HIGH>(at, e) } << (8 * BYTES))
-}
-
-/// The `HIGH` further bits of entry `e` (of four) of the packet of `at`, in
-/// its grid high plane (`RowPlaneContent::GridHigh`, placed as its grids
-/// plane is): a packet's are whole bytes ([`packet_bytes`]), entry `e`'s at
-/// their bit `HIGH e`.
-#[inline(always)]
-unsafe fn grid_high<const HIGH: u32>(at: At, e: usize) -> u32 {
+unsafe fn grid_entries<const BYTES: usize, const HIGH: u32>(at: At) -> [u32; 4] {
     const {
         assert!(
-            HIGH <= 8 && HIGH % 2 == 0,
-            "a packet's further entry bits are whole bytes, an entry's within two"
+            BYTES <= 3 && HIGH <= 8 && HIGH % 2 == 0,
+            "an entry's whole bytes fit a word with its further bits, a packet's further bits whole bytes"
         )
     };
-    if HIGH == 0 {
-        return 0;
+    // The entries' whole bytes, entry `e`'s from byte `BYTES e`: a grids
+    // plane's one after another, a records tile's each where it lies.
+    let mut low = [0u8; 16];
+    if at.row.record.is_none() {
+        unsafe { std::ptr::copy_nonoverlapping(at.entry(0, BYTES), low.as_mut_ptr(), 4 * BYTES) };
+    } else {
+        for e in 0..4 {
+            unsafe { std::ptr::copy_nonoverlapping(at.entry(e, BYTES), low.as_mut_ptr().add(BYTES * e), BYTES) };
+        }
     }
-    let bit = HIGH as usize * e;
-    let high = packet_bytes(at, RowPlaneRole::High).wrapping_add(bit / 8);
-    let mut bits = u32::from(unsafe { *high });
-    if bit % 8 + HIGH as usize > 8 {
-        bits |= u32::from(unsafe { *high.add(1) }) << 8;
+    let low = u128::from_le_bytes(low);
+    let mut high = [0u8; 4];
+    if HIGH > 0 {
+        unsafe {
+            std::ptr::copy_nonoverlapping(packet_bytes(at, RowPlaneRole::High), high.as_mut_ptr(), HIGH as usize / 2)
+        };
     }
-    (bits >> (bit % 8)) & ((1 << HIGH) - 1)
+    let high = u32::from_le_bytes(high);
+    let (low_mask, high_mask) = ((1u64 << (8 * BYTES)) - 1, (1u32 << HIGH) - 1);
+    std::array::from_fn(|e| {
+        ((low >> (8 * BYTES * e)) as u64 & low_mask) as u32 | (((high >> (HIGH as usize * e)) & high_mask) << (8 * BYTES))
+    })
 }
 
 /// The eight values one grid entry gives: `point`'s bytes (byte `j` lane
@@ -2158,29 +2246,50 @@ impl<
 
     #[inline(always)]
     unsafe fn values(at: At) -> [i8; PACKET] {
-        let mask = (1u32 << INDEX_BITS) - 1;
+        let (points, signs, deltas) = unsafe { Self::parts(at) };
         let mut values = [0i8; PACKET];
-        for e in 0..PACKET / 8 {
-            let entry = unsafe { grid_entry::<BYTES, HIGH>(at, e) };
-            // The point and the entry's bits past its indices.
-            let (point, rest) = match Self::POINTS {
-                tables::GridPoints::Lanes8(points) => {
-                    (points[(entry & mask) as usize], entry >> INDEX_BITS)
-                }
-                tables::GridPoints::Lanes4(points) => (
-                    u64::from(points[(entry & mask) as usize])
-                        | (u64::from(points[((entry >> INDEX_BITS) & mask) as usize]) << 32),
-                    entry >> (2 * INDEX_BITS),
-                ),
-            };
-            // One expression: named temporaries here change the code
-            // LLVM schedules.
-            values[8 * e..8 * e + 8].copy_from_slice(&D::apply(
-                grid_values(point, Self::SIGNED.lanes(rest & Self::SIGN_MASK)),
-                rest >> Self::SIGN_BITS,
-            ));
+        for (e, point) in points.into_iter().enumerate() {
+            values[8 * e..8 * e + 8]
+                .copy_from_slice(&D::apply(grid_values(point, (signs >> (8 * e)) & 0xff), deltas >> (8 * e)));
         }
         values
+    }
+
+    // The points' bytes, the negative lanes' bytes negated as
+    // `grid_values` negates them (`(m ^ -1) - (-1) = -m`), then the deltas.
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    unsafe fn neon(at: At) -> [std::arch::aarch64::int8x16_t; 2] {
+        use std::arch::aarch64::*;
+        unsafe {
+            let (points, signs, deltas) = Self::parts(at);
+            let mut values = [
+                vcombine_s8(vcreate_s8(points[0]), vcreate_s8(points[1])),
+                vcombine_s8(vcreate_s8(points[2]), vcreate_s8(points[3])),
+            ];
+            if Self::SIGN_BITS > 0 {
+                let negative = packed_neon::lane_masks(signs);
+                for (values, negative) in values.iter_mut().zip(negative) {
+                    *values = vsubq_s8(veorq_s8(*values, negative), negative);
+                }
+            }
+            D::neon(values, deltas)
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn x86(at: At) -> std::arch::x86_64::__m256i {
+        use std::arch::x86_64::*;
+        unsafe {
+            let (points, signs, deltas) = Self::parts(at);
+            let mut values = _mm256_set_epi64x(points[3] as i64, points[2] as i64, points[1] as i64, points[0] as i64);
+            if Self::SIGN_BITS > 0 {
+                let negative = packed_x86::lane_masks(signs);
+                values = _mm256_sub_epi8(_mm256_xor_si256(values, negative), negative);
+            }
+            D::x86(values, deltas)
+        }
     }
 }
 
@@ -3436,23 +3545,35 @@ impl<
 
     #[inline(always)]
     unsafe fn read<const GROUP: usize>(at: At, local: usize) -> (i32, i32) {
-        let width = (BITS + B::SIGN_BITS) as usize;
-        // The group's entries from its first, four a packet: bit `j` of the
-        // code at entry bit `BIT` of entry `j`, in its whole bytes or past
-        // them in its further bits (`grid_entry`).
+        Self::codes::<GROUP>(local, |entry| unsafe { grid_entries::<ENTRY_BYTES, HIGH>(at.packet(entry / 4))[entry % 4] })
+    }
+
+    #[inline(always)]
+    unsafe fn block<const GROUP: usize>(at: At) -> [[(i32, i32); 2]; 8] {
+        const { assert!(PACKET % GROUP == 0, "a group's entries lie in one packet") };
+        // Each packet's entries read once, its groups' codes from them.
+        let mut codes = [[(0, 0); 2]; 8];
+        for (packet, codes) in codes.iter_mut().enumerate() {
+            let at = at.packet(packet);
+            let entries = unsafe { grid_entries::<ENTRY_BYTES, HIGH>(at) };
+            for (half, codes) in codes.iter_mut().enumerate() {
+                *codes = Self::codes::<GROUP>(at.local::<GROUP>(half), |entry| entries[entry % 4]);
+            }
+        }
+        codes
+    }
+}
+
+impl<const BIT: u32, const ENTRY_BYTES: usize, const HIGH: u32, L: Interpretation, const BITS: u32, B: CarriedBias>
+    Carried<BIT, ENTRY_BYTES, HIGH, L, BITS, B>
+{
+    /// The (scale, bias) codes of group `local` of a storage group whose
+    /// entry `i` (four a packet) is `entry(i)`: bit `j` of the code at
+    /// entry bit `BIT` of the group's entry `j`, from its first.
+    #[inline(always)]
+    fn codes<const GROUP: usize>(local: usize, entry: impl Fn(usize) -> u32) -> (i32, i32) {
         let first = (GROUP / 8) * local;
-        let code = (0..width).fold(0u32, |code, j| {
-            let entry = first + j;
-            let at = at.packet(entry / 4);
-            let bit = if (BIT as usize) < 8 * ENTRY_BYTES {
-                let byte = unsafe { *at.entry(entry % 4, ENTRY_BYTES).add(BIT as usize / 8) };
-                u32::from(byte) >> (BIT % 8)
-            } else {
-                let high = unsafe { grid_high::<HIGH>(at, entry % 4) };
-                high >> (BIT as usize - 8 * ENTRY_BYTES)
-            };
-            code | ((bit & 1) << j)
-        });
+        let code = (0..BITS + B::SIGN_BITS).fold(0u32, |code, j| code | (((entry(first + j as usize) >> BIT) & 1) << j));
         let scale = L::value::<BITS>(code & ((1 << BITS) - 1));
         let bias = if B::SIGN_BITS == 0 {
             0
@@ -4562,6 +4683,23 @@ mod packed_neon {
         }
     }
 
+    /// Lane masks of four eight-lane entries, as x86's `lane_masks` gives
+    /// them: lanes `0..16` then `16..32`.
+    #[inline(always)]
+    pub(super) unsafe fn lane_masks(bytes: u32) -> [int8x16_t; 2] {
+        unsafe {
+            let word = vreinterpretq_u8_u32(vdupq_n_u32(bytes));
+            let bits = vreinterpretq_u8_u64(vdupq_n_u64(0x8040_2010_0804_0201));
+            // (A loop, not an array helper: those compile out of line.)
+            let mut masks = [vdupq_n_s8(0); 2];
+            for (half, mask) in masks.iter_mut().enumerate() {
+                let entries = vcombine_u8(vdup_n_u8(2 * half as u8), vdup_n_u8(2 * half as u8 + 1));
+                *mask = vreinterpretq_s8_u8(vtstq_u8(vqtbl1q_u8(word, entries), bits));
+            }
+            masks
+        }
+    }
+
     /// Four rows' sixteen bytes as four vectors of their 4-byte chunks:
     /// vector `c` holds chunk `c` of rows 0..4, a row a lane.
     #[inline(always)]
@@ -5044,6 +5182,22 @@ mod packed_x86 {
     /// the codes.
     pub(super) const fn shift<C: Codes>(products: Products) -> Option<i32> {
         if C::GREATEST - C::LEAST <= products.greatest() { Some(C::LEAST) } else { None }
+    }
+
+    /// Lane masks of four eight-lane entries: lane `8e + j` all ones where
+    /// bit `j` of byte `e` of `bytes` is set, else zero.
+    #[inline(always)]
+    pub(super) unsafe fn lane_masks(bytes: u32) -> __m256i {
+        unsafe {
+            // Byte `e` into the lanes of entry `e` (a shuffle picks within
+            // each 128-bit half, both of which hold the word).
+            let spread = _mm256_shuffle_epi8(
+                _mm256_set1_epi32(bytes as i32),
+                _mm256_set_epi64x(0x0303_0303_0303_0303, 0x0202_0202_0202_0202, 0x0101_0101_0101_0101, 0),
+            );
+            let bits = _mm256_set1_epi64x(0x8040_2010_0804_0201u64 as i64);
+            _mm256_cmpeq_epi8(_mm256_and_si256(spread, bits), bits)
+        }
     }
 
     /// 32 bytes at `bytes`.

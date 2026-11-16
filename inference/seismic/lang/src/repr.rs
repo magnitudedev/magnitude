@@ -483,6 +483,23 @@ impl GridSigns {
             Self::None => 0,
         }
     }
+
+    /// [`GridSigns::lanes`] of four entries at once: byte `e` of `signs`
+    /// holds entry `e`'s sign bits, byte `e` of the result its lane signs.
+    pub const fn lanes4(self, signs: u32) -> u32 {
+        match self {
+            // A byte's parity folds into its bit 0 from its own bits alone
+            // (its bit 7 is clear).
+            Self::ParityPlus7 => {
+                let parity = signs ^ (signs >> 4);
+                let parity = parity ^ (parity >> 2);
+                let parity = parity ^ (parity >> 1);
+                signs | ((parity & 0x0101_0101) << 7)
+            }
+            Self::Explicit8 => signs,
+            Self::None => 0,
+        }
+    }
 }
 
 /// A constant table a kernel's code looks up: a conversion recipe's
@@ -3256,6 +3273,19 @@ mod tests {
                         .count(),
                     usize::from(output != DType::F32)
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn four_entries_take_each_entrys_lane_signs() {
+        for signs in GridSigns::ALL {
+            let mask = (1u32 << signs.bits()) - 1;
+            for first in 0..=mask {
+                // Each byte position sees every code, beside the others.
+                let packed = (0..4).fold(0, |packed, e| packed | (((first + 37 * e) & mask) << (8 * e)));
+                let each = (0..4).fold(0, |lanes, e| lanes | (signs.lanes((packed >> (8 * e)) & 0xff) << (8 * e)));
+                assert_eq!(signs.lanes4(packed), each, "{signs:?} {packed:#x}");
             }
         }
     }
