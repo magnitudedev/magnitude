@@ -170,6 +170,10 @@ def judged(served_run: Path, judge_run: Path) -> tuple[list[str], bool]:
     for answer in answers:
         name, given = answer["id"], answer["served"]
         verdict = verdicts.get(name)
+        if given["tokens"] is None:
+            lines.append(f"{name}: unjudged, the service reported no token count for it ({given['finish']})")
+            failed.add(name)
+            continue
         # The service's count is the answer's tokens and, where it stopped, its end of turn.
         counts = (given["tokens"],) if given["finish"] == "length" else (given["tokens"], given["tokens"] - 1)
         if verdict is None or verdict["rows"] not in counts:
