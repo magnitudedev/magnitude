@@ -1,5 +1,6 @@
 import { ChatPage } from "./components/chat"
 import { ErrorNotice, NoticeAction } from "./components/error-notice"
+import { RestartNotice, reachableAt, restartReason } from "./components/restart-notice"
 import { SkeletonLine, ConnectionsSkeleton } from "./components/page-skeletons"
 import { MachineCardSkeleton, ModelsSkeleton } from "./components/models/skeletons"
 import { Skeleton } from "./components/ui/skeleton"
@@ -37,7 +38,7 @@ import { Atom, Result, useAtomValue, useAtomSet, useAtomMount } from "@effect-at
 import { Cause, Effect, Equivalence, Option } from "effect"
 import { type LocalModelsState, type ProviderModelId } from "@magnitudedev/sdk"
 import type { AppearancePreference } from "@magnitudedev/sdk/desktop-host"
-import { ServerSettingsFailed, type NetworkAccessChange, type NetworkBind } from "@magnitudedev/sdk"
+import { ServerSettingsFailed, type ModelStorageSettings, type NetworkAccessChange, type NetworkAccessSettings, type NetworkBind } from "@magnitudedev/sdk"
 import { FolderPicker, choosePath, useNativeOpenPath } from "./components/folder-picker"
 import { SettingsGroup, SettingsRow } from "./components/settings-row"
 import {
@@ -241,7 +242,9 @@ function ModelStorageRow() {
       control={<>
         {(current?.source === "Configured" || (current && Option.isSome(current.warning))) && <Button size="sm" variant="ghost" disabled={busy} onClick={() => save({ path: Option.none() })}>Use default</Button>}
         <Button size="sm" variant="outline" disabled={!current || busy} onClick={chooseFolder}><FolderOpenIcon />Change…</Button>
-      </>} />
+      </>}>
+      {current && current.path !== current.active && <div className="mt-2"><RestartRequired storage={Option.some(current)} network={Option.none()} /></div>}
+    </SettingsRow>
   </>
 }
 function useRestartPending() {
@@ -249,33 +252,35 @@ function useRestartPending() {
   const storage = useAtomValue(client.Configuration.GetModelStorage({})).result
   const network = useAtomValue(client.Configuration.GetNetworkAccess({})).result
   const storageValue = Result.isSuccess(storage) ? storage.value : null
-  return { storageValue, storagePending: storageValue !== null && storageValue.path !== storageValue.active, networkPending: Result.isSuccess(network) && network.value.pending }
+  return { storageValue, storagePending: storageValue !== null && storageValue.path !== storageValue.active, network: Result.isSuccess(network) && network.value.pending ? Option.some(network.value) : Option.none() }
 }
-function RestartRequiredToast() {
-  const session = useSession()
+/** Restarts Magnitude where its owner can, telling remote viewers first that they will be disconnected. */
+function RestartRequired({ storage, network }: { storage: Option.Option<ModelStorageSettings>; network: Option.Option<NetworkAccessSettings> }) {
   const client = useAgentClient()
   const platform = useServerPlatform()
-  const { storageValue, storagePending, networkPending } = useRestartPending()
   const { supports } = useApplicationOwner()
   const restartApplication = useAtomSet(client.Application.RestartApplication)
   const disconnect = useDisconnectWarning()
-  const relaunch = () => disconnect.warn("Restart", () => restartApplication({}))
   const relaunching = useAtomValue(client.Application.RestartApplication)
-  if (!storagePending && !networkPending) return null
-  const reason = storagePending && networkPending ? "Magnitude is still using the previous model folder and network settings."
-    : storagePending ? "Magnitude is still using the previous model folder." : "Magnitude is still using the previous network settings."
-  return <div className="fixed bottom-4 right-4 z-50 w-96 max-w-[calc(100vw-2rem)] rounded-lg bg-white shadow-md dark:bg-slate-850">
+  return <>
     {disconnect.dialog}
-    <ErrorNotice severity={Result.isFailure(relaunching) && !relaunching.waiting ? "error" : "info"}
-      title={Result.isFailure(relaunching) && !relaunching.waiting ? "Magnitude couldn’t restart" : "Restart to apply your changes"}
-      description={supports("RestartService") ? reason : `${reason} Restart the Magnitude server to apply them.`}
-      actions={supports("RestartService") ? <NoticeAction disabled={relaunching.waiting} onClick={() => relaunch()}>Restart Magnitude</NoticeAction> : undefined}>
-      {storagePending && storageValue && <details className="mt-2 text-xs text-slate-600 dark:text-slate-400">
+    <RestartNotice reason={restartReason({ storage: Option.isSome(storage), network })} canRestart={supports("RestartService")}
+      failed={Result.isFailure(relaunching) && !relaunching.waiting} restarting={relaunching.waiting}
+      onRestart={() => disconnect.warn("Restart", () => restartApplication({}))}>
+      {Option.isSome(storage) && <details className="mt-2 text-xs text-slate-600 dark:text-slate-400">
         <summary className="w-fit cursor-pointer rounded py-0.5 hover:underline focus-visible:outline-2 focus-visible:outline-blue-500">Moving existing models</summary>
         <p className="my-2">Existing downloads stay in the previous folder. To move them, quit Magnitude, run this command, then open Magnitude again.</p>
-        <CopyCommand command={moveModelsCommand(platform, storageValue.active, storageValue.path)} label="Copy move command" />
+        <CopyCommand command={moveModelsCommand(platform, storage.value.active, storage.value.path)} label="Copy move command" />
       </details>}
-    </ErrorNotice>
+    </RestartNotice>
+  </>
+}
+/** Below the page, in its own space, so the page's content scrolls above it rather than under it. */
+function RestartRequiredBar() {
+  const { storageValue, storagePending, network } = useRestartPending()
+  if (!storagePending && Option.isNone(network)) return null
+  return <div className="shrink-0 border-t border-slate-200 px-4 py-3 dark:border-slate-750 md:px-10">
+    <div className="mx-auto max-w-[min(100%,72rem)]"><RestartRequired storage={storagePending ? Option.fromNullable(storageValue) : Option.none()} network={network} /></div>
   </div>
 }
 
@@ -293,12 +298,14 @@ function NetworkAccessRows() {
   const managed = current?.container === true
   const busy = updating.waiting || regenerating.waiting || managed
   const failure = firstFailure([updating, regenerating])
-  const reachable = current?.enabled ? Option.getOrElse(current.bind, () => current.interfaces[0]?.address) : undefined
+  const reachable = current ? Option.getOrUndefined(reachableAt(current)) : undefined
   return <>
     {disconnect.dialog}
     <SettingsRow label="Network access" hint={current ? <>{managed ? "Set by the container: it accepts connections on every interface with an API key. MAGNITUDE_NETWORK_KEY sets the key and MAGNITUDE_ALLOWED_HOSTS adds host names. " : "Let other devices on your network use Magnitude for inference. "}<a href={managed ? "https://docs.magnitude.dev/installation/docker" : "https://docs.magnitude.dev/remote-server"} target="_blank" rel="noreferrer" className="inline-flex items-center gap-0.5 font-medium text-slate-700 hover:underline dark:text-slate-300">{managed ? "Docker guide" : "Remote server guide"}<ArrowUpRightIcon aria-hidden="true" className="size-3" /></a></> : Result.isInitial(settings) ? <SkeletonLine className="h-4 text-xs" width="240px" /> : undefined}
       alert={!busy && failure ? <ErrorNotice title="Network settings weren’t saved" description="Your previous saved settings are still in use." /> : Result.isFailure(settings) ? <ErrorNotice title="Couldn’t read network settings" description="The running service’s network settings have not been changed." /> : current && Option.isSome(current.warning) ? <ErrorNotice severity="warning" title="The saved network address is invalid" description="All interfaces are selected. Choose an address below to save a valid setting." /> : undefined}
-      control={current && <Switch aria-label="Network access" checked={current.enabled} disabled={busy} onCheckedChange={checked => checked ? update({ enabled: Option.some(true) }) : disconnect.warn("TurnOffNetworkAccess", () => update({ enabled: Option.some(false) }))} />} />
+      control={current && <Switch aria-label="Network access" checked={current.enabled} disabled={busy} onCheckedChange={checked => checked ? update({ enabled: Option.some(true) }) : disconnect.warn("TurnOffNetworkAccess", () => update({ enabled: Option.some(false) }))} />}>
+      {current?.pending && !managed && <div className="mt-2"><RestartRequired storage={Option.none()} network={Option.some(current)} /></div>}
+    </SettingsRow>
     {current?.enabled && <>
       {!managed && <SettingsRow nested label="Address" hint={current.interfaces.length === 0 ? "No network interfaces were found." : "Which of this computer's addresses accepts connections."}
         control={<Select items={[{ value: ALL_INTERFACES, label: "All interfaces" }, ...current.interfaces.map(entry => ({ value: entry.address, label: `${entry.address} (${entry.kind === "tailscale" ? "Tailscale" : entry.name})` }))]}
@@ -409,7 +416,6 @@ function SettingsModal({ observation, initial, onClose }: { observation: Service
   // A fresh mount observes hand edits; writes refresh in their own Effect actions.
   const client = useAgentClient()
   const { remote } = useRemoteAccess()
-  const { storagePending, networkPending } = useRestartPending()
   const narrow = useNarrowViewport()
   const [tab, setTab] = useState(initial)
   const [locations, setLocations] = useState(false)
@@ -445,7 +451,6 @@ function SettingsModal({ observation, initial, onClose }: { observation: Service
           {tab === "network" && <SettingsGroup><NetworkAccessRows /></SettingsGroup>}
           {tab === "usage" && <ServingUsage />}
           {tab === "about" && <><SettingsGroup><AboutRow /></SettingsGroup>{remote && <SettingsGroup label="This browser"><SignOutRow /></SettingsGroup>}</>}
-          {(storagePending || networkPending) && <div aria-hidden="true" className="h-44" />}
         </ModalBody>}
       </div>
     </div>
@@ -463,7 +468,7 @@ export function App() {
   const navigate = useNavigate()
   const service = Result.isSuccess(observation.service) ? observation.service.value : null
   const platform = Option.getOrUndefined(Option.map(session.clientWindow, window => window.platform))
-  return <><RestartRequiredToast /><HostNotices /><QuitFailureDialog />{onboarding && <OnboardingScreen />}<SidebarUpdateProvider><AppShell page={main} navigate={navigate} platform={platform}>
+  return <><HostNotices /><QuitFailureDialog />{onboarding && <OnboardingScreen />}<SidebarUpdateProvider><AppShell page={main} navigate={navigate} platform={platform} footer={<RestartRequiredBar />}>
       {service?._tag === "Unreachable" ? <CannotReachMagnitude />
       : service?._tag === "Reconnecting" ? <ReconnectingToMagnitude />
       : service?._tag === "Failed" || service?._tag === "CleanupFailed" ? <MagnitudeCouldNotStart service={service} canRetry={observation.canRetry} onOpenStatus={() => navigate("settings")} />
@@ -530,17 +535,20 @@ function QuitFailureDialog() {
     </AlertDialogContent>
   </AlertDialog>
 }
-export function AppShell({ page, navigate, platform, children }: { page: MainPage; navigate?: (page: ApplicationPage) => void; platform: string | undefined; children: ReactNode }) {
+export function AppShell({ page, navigate, platform, footer, children }: { page: MainPage; navigate?: (page: ApplicationPage) => void; platform: string | undefined; footer?: ReactNode; children: ReactNode }) {
   const narrow = useNarrowViewport()
   const [open, setOpen] = useState(false)
   // Only the navigation chrome changes across `md`; the page stays mounted, so resizing keeps its state.
   return <div className={narrow ? "relative flex h-screen flex-col bg-slate-50 font-sans text-slate-900 dark:bg-slate-925 dark:text-slate-200" : "relative flex h-screen bg-slate-50 font-sans text-slate-900 dark:bg-slate-925 dark:text-slate-200"}>
     {narrow ? <NarrowBar open={open} onOpen={() => setOpen(true)} /> : <DockedSidebar page={page} navigate={navigate} platform={platform} />}
-    <main key={page} className="min-w-0 flex-1 overflow-y-auto" inert={narrow && open}>
-      <div data-page-content className={page === "chat" ? `mx-auto flex h-full w-full max-w-[min(100%,72rem)] flex-col px-4 pb-0 pt-5 md:px-10 ${platform === "win32" ? "md:pt-14" : "md:pt-9"}` : narrow ? "mx-auto w-full max-w-6xl px-4 pb-8 pt-5" : `mx-auto w-[calc(100vw-224px)] max-w-[min(100%,72rem)] px-10 pb-9 ${platform === "win32" ? "pt-14" : "pt-9"}`}>
-        {children}
-      </div>
-    </main>
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col" inert={narrow && open}>
+      <main key={page} className="min-h-0 flex-1 overflow-y-auto">
+        <div data-page-content className={page === "chat" ? `mx-auto flex h-full w-full max-w-[min(100%,72rem)] flex-col px-4 pb-0 pt-5 md:px-10 ${platform === "win32" ? "md:pt-14" : "md:pt-9"}` : narrow ? "mx-auto w-full max-w-6xl px-4 pb-8 pt-5" : `mx-auto w-[calc(100vw-224px)] max-w-[min(100%,72rem)] px-10 pb-9 ${platform === "win32" ? "pt-14" : "pt-9"}`}>
+          {children}
+        </div>
+      </main>
+      {footer}
+    </div>
     {narrow && open && <NavigationDrawer page={page} navigate={navigate} onClose={() => setOpen(false)} />}
   </div>
 }

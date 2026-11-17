@@ -6,7 +6,7 @@ import { join } from "node:path"
 import { describe, expect, it } from "vitest"
 import { LOOPBACK_ONLY, resolveNetworkAccess } from "@magnitudedev/storage"
 import { AcnChanges, AcnChangesLive } from "./changes"
-import { AcnHost, ServerSettings, ServerSettingsLive } from "./server-settings"
+import { AcnHost, ServerSettings, ServerSettingsLive, servedAddresses } from "./server-settings"
 import type { ContainerInstallation } from "./container"
 
 const layerFor = (dataDir: string, activeNetwork = LOOPBACK_ONLY, container: Option.Option<ContainerInstallation> = Option.none()) => ServerSettingsLive.pipe(
@@ -83,6 +83,15 @@ describe("network access", () => {
     expect(settings.enabled).toBe(true)
     expect(Option.getOrThrow(settings.apiKey)).toMatch(/^mag-/)
     expect(settings.pending).toBe(true)
+    expect(settings.reachableAddresses).toEqual([])
+  })
+
+  it("reports only the addresses the running service listens on, not the saved ones", async () => {
+    const dataDir = fresh()
+    writeFileSync(join(dataDir, "config.json"), JSON.stringify({ network: { enabled: true, bind: "10.0.0.9", apiKey: "mag-fixed", requireApiKey: true, allowedHosts: [] } }))
+    const active = resolveNetworkAccess(Option.some({ enabled: true, bind: "192.168.1.67", apiKey: "mag-fixed", requireApiKey: true, allowedHosts: [] }))
+    const settings = await run(dataDir, Effect.flatMap(ServerSettings, service => service.networkAccess), active)
+    expect(settings).toMatchObject({ bind: Option.some("10.0.0.9"), pending: true, reachableAddresses: ["192.168.1.67"] })
   })
 
   it("is not pending when the saved settings match what the service bound", async () => {
@@ -123,6 +132,22 @@ describe("network access", () => {
       return [first.apiKey, second.apiKey] as const
     }))
     expect(Option.isSome(before) && Option.isSome(after) && before.value !== after.value).toBe(true)
+  })
+})
+
+describe("served addresses", () => {
+  const interfaces = [{ name: "en0", address: "192.168.1.67", kind: "lan" as const }, { name: "utun4", address: "100.70.1.2", kind: "tailscale" as const }]
+  it("is empty while the service listens on loopback only", () => {
+    expect(servedAddresses(LOOPBACK_ONLY, interfaces)).toEqual([])
+  })
+  it("is every interface address when the service listens on all interfaces", () => {
+    expect(servedAddresses(resolveNetworkAccess(Option.some({ enabled: true, requireApiKey: true, allowedHosts: [] })), interfaces)).toEqual(["192.168.1.67", "100.70.1.2"])
+  })
+  it("is the one address the service listens on beside loopback", () => {
+    expect(servedAddresses(resolveNetworkAccess(Option.some({ enabled: true, bind: "100.70.1.2", requireApiKey: true, allowedHosts: [] })), interfaces)).toEqual(["100.70.1.2"])
+  })
+  it("leaves out a loopback bind, which other devices cannot reach", () => {
+    expect(servedAddresses(resolveNetworkAccess(Option.some({ enabled: true, bind: "127.0.0.1", requireApiKey: true, allowedHosts: [] })), interfaces)).toEqual([])
   })
 })
 
