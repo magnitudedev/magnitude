@@ -224,10 +224,10 @@ fn fault_in(start: NonNull<u8>, bytes: usize, page: usize) {
 }
 
 /// Run `work` over `[0, items)` in contiguous parts, one on each of the
-/// host's threads (`available_parallelism`, at most one an item): on the
-/// calling thread where that is one.
+/// process's threads (`seismic_threads::share`, at most one an item): on
+/// the calling thread where that is one.
 fn parallel(items: usize, work: impl Fn(usize, usize) + Sync) {
-    let threads = std::thread::available_parallelism().map_or(1, |threads| threads.get()).min(items).max(1);
+    let threads = seismic_threads::share().get().min(items).max(1);
     if threads == 1 {
         return work(0, items);
     }

@@ -1190,11 +1190,7 @@ enum Product {
 /// How many formation calls run at once: each on a thread of its own, as
 /// many as the host runs in parallel.
 fn formation_threads(calls: usize) -> usize {
-    std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(1)
-        .min(calls)
-        .max(1)
+    seismic_threads::share().get().min(calls).max(1)
 }
 
 /// `form` each of `work` on the threads lent to `device`'s former, at most

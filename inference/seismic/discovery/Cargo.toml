@@ -17,6 +17,8 @@ seismic-metal.workspace = true
 # The program store Metal's capability probe answers are kept in.
 seismic-native-target.workspace = true
 seismic-memory.workspace = true
+# The process's quota of CPUs, which bounds its cores.
+seismic-threads.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

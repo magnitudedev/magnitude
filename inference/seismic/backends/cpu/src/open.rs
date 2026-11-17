@@ -18,8 +18,9 @@ pub struct OpenedCpu {
 /// shares it: two pools would place two participants on each core.
 static HOST: Mutex<Weak<Mutex<Workers>>> = Mutex::new(Weak::new());
 
-/// The host CPU over its pool of the `cores` performance cores the process
-/// may run on ([`Workers::host`]): the pool any open CPU device of the
+/// The host CPU over its pool of one participant per core of `cores`, the
+/// performance cores the process may keep busy
+/// (`seismic_discovery::Processors::cores`): the pool any open CPU device of the
 /// process holds already. What the device holds that no allocation names
 /// (the pool scratch its launches grow) is charged to `store`'s own entry.
 pub fn open_host(cores: std::num::NonZeroUsize, store: Arc<dyn Store>) -> Result<OpenedCpu, TargetError> {
@@ -31,7 +32,7 @@ pub fn open_host(cores: std::num::NonZeroUsize, store: Arc<dyn Store>) -> Result
             Some(workers) => workers,
             None => {
                 let workers =
-                    Arc::new(Mutex::new(Workers::host(cores).map_err(|error| {
+                    Arc::new(Mutex::new(Workers::new(cores.get()).map_err(|error| {
                         TargetError::DeviceUnavailable(error.to_string())
                     })?));
                 *host = Arc::downgrade(&workers);

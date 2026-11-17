@@ -1,0 +1,9 @@
+[package]
+name = "seismic-threads"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The threads this process may run at once: its share of the machine, which
+# every thread pool of the process sizes itself by.
+[dependencies]

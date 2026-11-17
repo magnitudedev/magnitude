@@ -1,8 +1,8 @@
 //! The worker pool of one CPU device: its participants, job publication,
 //! work-item claiming, and the barriers participants meet at.
 //!
-//! The pool has one participant per performance core the process may run
-//! on ([`Workers::host`]). The submitting thread is participant 0 and works
+//! The pool has one participant per performance core the process may keep
+//! busy ([`crate::open_host`]). The submitting thread is participant 0 and works
 //! alongside the pool's threads (participants 1..): a job runs on every
 //! participant and the submitter returns once every participant has left
 //! it, so the frame, buffer table, words and scratch the job borrows stay
@@ -742,15 +742,6 @@ impl Workers {
         })
     }
 
-    /// One participant per performance core of `cores`, those the host's
-    /// processors let the process run on (`seismic_discovery::Processors`),
-    /// under the process's quota (`available_parallelism`, which follows a
-    /// cgroup's `cpu.max`): a second hardware thread on a saturated core, or
-    /// a slower core, delays every barrier.
-    pub fn host(cores: std::num::NonZeroUsize) -> Result<Self, std::io::Error> {
-        Self::new(cores.min(std::thread::available_parallelism()?).get())
-    }
-
     /// Participants, the submitting thread included.
     pub fn count(&self) -> usize {
         self.shared.participants
@@ -1179,7 +1170,7 @@ mod tests {
             }
         }
         let quota = std::thread::available_parallelism().expect("host parallelism");
-        let mut workers = Workers::host(quota).expect("pool");
+        let mut workers = Workers::new(quota.get()).expect("pool");
         let count = workers.count();
         for items in [2, 3, 4, 6, 8, 12] {
             // Samples of about 5 ms, as the tuner takes them.
@@ -1235,11 +1226,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_host_pool_is_its_performance_cores_under_the_quota() {
-        let quota = std::thread::available_parallelism().expect("host parallelism");
-        let workers = Workers::host(quota.saturating_add(1)).expect("pool");
-        assert_eq!(workers.count(), quota.get().min(seismic_lang::forms::CPU_MAX_UNITS as usize));
-        assert_eq!(Workers::host(std::num::NonZeroUsize::MIN).expect("pool").count(), 1);
-    }
 }

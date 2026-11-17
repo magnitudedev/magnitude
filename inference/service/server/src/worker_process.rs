@@ -6,6 +6,8 @@ use std::process::Command;
 
 use anyhow::Context;
 
+use crate::machine_budget::ThreadShare;
+
 /// The private subcommands the service executable runs as a contained child.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkerRole {
@@ -127,13 +129,16 @@ impl WorkerLauncher {
         })
     }
 
-    /// The role command with parent-lifetime protection and child telemetry disabled; the caller
+    /// The role command, run on `threads` (the child's share of the machine, its
+    /// `--threads`), with parent-lifetime protection and child telemetry disabled; the caller
     /// appends the role's own arguments.
-    pub fn command(&self, role: WorkerRole) -> anyhow::Result<Command> {
+    pub fn command(&self, role: WorkerRole, threads: ThreadShare) -> anyhow::Result<Command> {
         let mut command = Command::new(&self.executable);
         configure_parent_lifetime(&mut command)?;
         command
             .arg(role.subcommand())
+            .arg("--threads")
+            .arg(threads.get().to_string())
             .env("MAGNITUDE_OTEL", "0")
             // The engine's own reports stay on the stream the service keeps.
             .env("RUST_LOG", "error,magnitude_engine=info,magnitude_executor=info,magnitude_scheduler=info")
@@ -381,6 +386,7 @@ mod tests {
     use std::fs;
 
     use super::{WorkerLauncher, WorkerRole};
+    use crate::machine_budget::{Duty, MachineBudget};
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -483,14 +489,15 @@ mod tests {
     #[test]
     fn every_worker_role_uses_the_same_command_boundary() {
         let launcher = WorkerLauncher::current().expect("service executable");
+        let threads = MachineBudget::host().share(Duty::Background);
         for (role, expected_subcommand) in [(WorkerRole::Inference, "inference-worker")] {
-            let command = launcher.command(role).expect("worker command");
+            let command = launcher.command(role, threads).expect("worker command");
             assert_eq!(
                 command
                     .get_args()
                     .map(|argument| argument.to_string_lossy().into_owned())
                     .collect::<Vec<_>>(),
-                vec![expected_subcommand]
+                vec![expected_subcommand.to_owned(), "--threads".to_owned(), threads.get().to_string()]
             );
             let parent = command
                 .get_envs()

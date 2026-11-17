@@ -62,11 +62,12 @@ pub const EXECUTION_BYTES: usize = 4096;
 /// times (best of 5, alternating, M4 Max).
 const BYTES_PER_THREAD: usize = 1 << 20;
 
-/// Threads converting `bytes` source bytes: every available one, but none
-/// for fewer than [`BYTES_PER_THREAD`] bytes of its own.
+/// Threads converting `bytes` source bytes: every one the process may run
+/// (`seismic_threads::share`), but none for fewer than [`BYTES_PER_THREAD`]
+/// bytes of its own.
 pub fn threads(bytes: usize) -> usize {
-    std::thread::available_parallelism()
-        .map_or(1, usize::from)
+    seismic_threads::share()
+        .get()
         .min(bytes.div_ceil(BYTES_PER_THREAD))
         .max(1)
 }

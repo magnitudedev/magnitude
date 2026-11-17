@@ -15,6 +15,7 @@ seismic-native-target.workspace = true
 seismic-metal.workspace = true
 seismic-cpu.workspace = true
 seismic-memory.workspace = true
+seismic-threads.workspace = true
 seismic-native-cpu.workspace = true
 seismic-cuda.workspace = true
 # Offline formation coverage forms Vulkan sources on every host.

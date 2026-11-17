@@ -656,6 +656,8 @@ pub trait ModelResidencyDriver: Clone + Send + Sync + 'static {
     fn demand_ended(&self);
     /// The ready instance holding `resident` is idle (no lease holds it), or none is.
     fn resident_idle(&self, resident: Option<(&ModelInstanceId, &Self::Resident)>);
+    /// The idle ready instance was leased for a request, which ends its idleness.
+    fn resident_leased(&self);
 }
 
 pub struct ModelResidency<D: ModelResidencyDriver> {
@@ -1047,7 +1049,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         // The instance stops being idle before the lease is handed out, so nothing measured
         // beside it starts once its holder could be served.
         if self.idle.take().is_some() {
-            self.controller.resident_idle(None);
+            self.controller.resident_leased();
         }
         ready.resources.leases.insert(token);
         ready.idle_deadline = None;
@@ -1900,6 +1902,16 @@ mod tests {
     /// Test residents name the model their load was for.
     type TestResident = String;
 
+    /// An idleness residency published.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Published {
+        Idle(TestResident),
+        /// A request's lease ended the idleness.
+        Leased,
+        /// The idleness ended otherwise: no idle instance is ready.
+        Gone,
+    }
+
     #[derive(Clone)]
     struct TestResidencyDriver {
         client: ResidencyClient<TestResident>,
@@ -1909,7 +1921,7 @@ mod tests {
         workers: Arc<Mutex<Vec<Arc<TestResidencyWorker>>>>,
         idle_timeout: std::time::Duration,
         /// Every idleness published, in order.
-        idles: Arc<Mutex<Vec<Option<TestResident>>>>,
+        idles: Arc<Mutex<Vec<Published>>>,
         /// Each load's sequence, held by its load's task until the task ends or is aborted.
         sequences: Arc<Mutex<Vec<std::sync::Weak<LoadSequence>>>>,
         /// How many times residency's demand for the device ended.
@@ -2064,7 +2076,14 @@ mod tests {
         }
 
         fn resident_idle(&self, resident: Option<(&ModelInstanceId, &TestResident)>) {
-            self.idles.lock().unwrap().push(resident.map(|(_, resident)| resident.clone()));
+            self.idles.lock().unwrap().push(match resident {
+                Some((_, resident)) => Published::Idle(resident.clone()),
+                None => Published::Gone,
+            });
+        }
+
+        fn resident_leased(&self) {
+            self.idles.lock().unwrap().push(Published::Leased);
         }
     }
 
@@ -2139,16 +2158,16 @@ mod tests {
         assert!(published().is_empty(), "a leased instance is not idle");
         drop(lease);
         client.snapshot().await.unwrap();
-        assert_eq!(published(), [Some(resident.clone())]);
+        assert_eq!(published(), [Published::Idle(resident.clone())]);
         let lease = client.lease(instance.clone()).await.unwrap();
         assert_eq!(
             published(),
-            [Some(resident), None],
-            "a request ends its idleness before it holds the lease"
+            [Published::Idle(resident), Published::Leased],
+            "a request's lease ends its idleness before it holds the lease"
         );
         drop(lease);
         client.stop(instance).await.unwrap();
-        assert_eq!(published().last(), Some(&None), "a stopped instance is not idle");
+        assert_eq!(published().last(), Some(&Published::Gone), "a stopped instance is not idle, and no lease ended that");
     }
 
     /// Residency's demand for the device holds from the first load through a replacement, the

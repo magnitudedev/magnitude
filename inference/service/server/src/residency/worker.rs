@@ -21,6 +21,7 @@ use magnitude_executor::UnpreparedUnits;
 use super::ResidencyWorker;
 use super::controller::GRACEFUL_EXIT;
 use crate::device_lock::DeviceHold;
+use crate::machine_budget::{Duty, MachineBudget};
 use crate::worker_process::{BlockingChild, BlockingProcess, WorkerLauncher, WorkerRole};
 
 /// The most recent worker diagnostics kept for failure reports.
@@ -44,9 +45,11 @@ pub fn worker_exit_code(exit: &WorkerExit) -> i32 {
     }
 }
 
-/// The `inference-worker` process entry: serve one load over standard streams until shutdown,
+/// The `inference-worker` process entry, on `threads`: its share of the machine, set before
+/// anything of the engine sizes a pool. Serve one load over standard streams until shutdown,
 /// host loss or unload, then end the process, which releases what the load holds.
-pub fn run_inference_worker() -> ! {
+pub fn run_inference_worker(threads: std::num::NonZeroUsize) -> ! {
+    seismic::threads::set_share(threads);
     let served = serve_worker(stdio_worker_transport());
     let code = worker_exit_code(&served.exit);
     if code != 0 {
@@ -139,12 +142,17 @@ pub struct SpawnedWorker {
 }
 
 impl EngineWorker {
-    /// Spawn an `inference-worker` process for the load or optimization holding `device`.
+    /// Spawn an `inference-worker` process for the load or optimization holding `device`: a
+    /// load's serves, on every core; an optimization's is background work.
     pub fn spawn(
         launcher: &WorkerLauncher,
         device: DeviceHold,
     ) -> anyhow::Result<SpawnedWorker> {
-        let command = launcher.command(WorkerRole::Inference)?;
+        let duty = match device {
+            DeviceHold::Share(_) => Duty::Serving,
+            DeviceHold::Job(_) => Duty::Background,
+        };
+        let command = launcher.command(WorkerRole::Inference, MachineBudget::host().share(duty))?;
         let BlockingChild {
             process,
             stdin,
@@ -314,9 +322,10 @@ pub struct JobWorker {
 }
 
 impl JobWorker {
-    /// Spawn an `inference-worker` process, with the host end of its transport.
+    /// Spawn an `inference-worker` process, as background work, with the host end of its
+    /// transport.
     pub fn spawn(launcher: &WorkerLauncher) -> anyhow::Result<(Self, HostEnd)> {
-        let command = launcher.command(WorkerRole::Inference)?;
+        let command = launcher.command(WorkerRole::Inference, MachineBudget::host().share(Duty::Background))?;
         let BlockingChild {
             process,
             stdin,

@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 libc.workspace = true
 seismic-topology.workspace = true
+seismic-threads.workspace = true

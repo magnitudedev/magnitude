@@ -27,6 +27,7 @@ use magnitude_service_server::build_identity;
 use magnitude_service_server::configurations::{LoadBounds, ResolvedConfigurations};
 use magnitude_service_server::device_lock::DeviceLock;
 use magnitude_service_server::hardware::HardwareInventory;
+use magnitude_service_server::machine_budget::{Duty, MachineBudget};
 use magnitude_service_server::model_store::{ServedStore, open_served_store};
 use magnitude_service_server::residency::controller::{
     MODEL_IDLE_TIMEOUT, ModelInstances, ResidencyEnvironment,
@@ -99,7 +100,11 @@ enum Command {
     },
     /// The contained engine worker: load one model and serve it over standard streams.
     #[command(hide = true)]
-    InferenceWorker,
+    InferenceWorker {
+        /// The threads the worker may run at once: its share of the machine.
+        #[arg(long)]
+        threads: std::num::NonZeroUsize,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -114,14 +119,17 @@ fn main() -> anyhow::Result<()> {
         // The engine worker owns standard output for its protocol: it exports no telemetry and
         // runs no async runtime of the service's. Its events go to standard error, which the
         // service records in its log, at the level the launcher sets (`RUST_LOG`).
-        Command::InferenceWorker => {
+        Command::InferenceWorker { threads } => {
             worker_process::install_parent_watchdog()?;
             telemetry::init_worker()?;
-            run_inference_worker()
+            run_inference_worker(threads)
         }
         command => {
             if matches!(command, Command::Serve { .. }) {
                 allocator::configure();
+                // The service's own pools (catalog assessment, inventory scans, the engine's
+                // auxiliary pools it opens) are background work beside a serving worker.
+                seismic::threads::set_share(MachineBudget::host().share(Duty::Background).get());
             }
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -183,6 +191,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
             inventory_config.catalog_models = release_catalog.catalog().models.clone();
             inventory_config.catalog_header_digests = release_catalog.file_header_digests();
             inventory_config.architectures = engine_architectures();
+            inventory_config.scan_threads = seismic::threads::share();
             let ServedStore {
                 store: inventory,
                 devices: catalog,
@@ -377,7 +386,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 println!("{}", env!("CARGO_PKG_VERSION"));
             }
         }
-        Command::InferenceWorker => {
+        Command::InferenceWorker { .. } => {
             unreachable!("the inference worker runs without the service runtime")
         }
     }

@@ -1102,6 +1102,10 @@ impl ModelResidencyDriver for EngineResidency {
             room: Arc::new(resident.client.clone()),
         }));
     }
+
+    fn resident_leased(&self) {
+        self.environment.device.resident_leased();
+    }
 }
 
 /// A measurement beside the resident model reaches its worker through its client.

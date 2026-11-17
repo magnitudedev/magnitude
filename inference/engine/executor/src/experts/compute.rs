@@ -138,9 +138,12 @@ impl ComputeThreads {
 /// each memory node with memory, its performance cores the process may run
 /// on (a core's second thread shares its first's units, so a worker on it
 /// would halve both; a node of CPUs alone reads every byte across the
-/// fabric), as many cores as the quota (`available_parallelism`, which
+/// fabric), as many cores as the quota (`seismic::threads::quota`, which
 /// follows a cgroup's CPU quota and the process's affinity) leaves beside
-/// the runtime's busy threads ([`busy_threads`]).
+/// the runtime's busy threads ([`busy_threads`]). Never the process's thread
+/// share: the pool's size is part of the device's identity, which the
+/// measurement job sizes and serving then opens, so both must see the same
+/// machine.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Machine {
     /// Each memory node's cores: the threads of each the process may run
@@ -167,7 +170,7 @@ impl Machine {
     /// This machine's beside a device of `device_threads` threads on the
     /// host, attached to node `device_node`, and reads of `read_cores`.
     fn beside(device_threads: usize, read_cores: f64, device_node: seismic::DeviceNode) -> Result<Self, String> {
-        let quota = std::thread::available_parallelism().map_err(|error| format!("the process's quota of threads: {error}"))?;
+        let quota = seismic::threads::quota();
         let processors = seismic::Processors::discover().map_err(|error| format!("the host's processors: {error}"))?;
         Ok(Self::of(&processors, quota.get(), busy_threads(device_threads, read_cores), device_node))
     }

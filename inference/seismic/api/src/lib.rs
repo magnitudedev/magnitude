@@ -370,6 +370,9 @@ pub use seismic_discovery::{
     Sample, Status, Supply, Wake, WiredFigures, WiredLimit,
 };
 pub use seismic_lang::forms::MetalPacking;
+/// The threads this process may run at once (`seismic-threads`): its share
+/// of the machine, which every thread pool of the process sizes itself by.
+pub use seismic_threads as threads;
 /// Measuring work on a device (`seismic-measure`): the timing session, the
 /// sustained clock, the statistics and the records of measured points. The
 /// runtime's measurable work is [`KernelPoint`] and [`GraphPoint`].

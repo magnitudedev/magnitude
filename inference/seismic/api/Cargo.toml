@@ -13,6 +13,7 @@ seismic-topology.workspace = true
 seismic-discovery.workspace = true
 seismic-measure.workspace = true
 seismic-native-cpu.workspace = true
+seismic-threads.workspace = true
 serde.workspace = true
 seismic-std.workspace = true
 sha2 = "0.10"

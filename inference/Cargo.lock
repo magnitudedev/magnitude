@@ -4166,6 +4166,7 @@ dependencies = [
  "seismic-native-cpu",
  "seismic-runtime",
  "seismic-std",
+ "seismic-threads",
  "seismic-topology",
  "self_cell",
  "serde",
@@ -4267,6 +4268,7 @@ dependencies = [
  "seismic-metal",
  "seismic-native-cpu",
  "seismic-native-target",
+ "seismic-threads",
  "seismic-topology",
  "seismic-vulkan",
  "serde",
@@ -4338,6 +4340,7 @@ name = "seismic-memory"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "seismic-threads",
  "seismic-topology",
 ]
 
@@ -4372,6 +4375,7 @@ dependencies = [
  "magnitude-ggml",
  "seismic-cpu-tiers",
  "seismic-lang",
+ "seismic-threads",
 ]
 
 [[package]]
@@ -4380,6 +4384,7 @@ version = "0.1.0"
 dependencies = [
  "seismic-ir",
  "seismic-lang",
+ "seismic-threads",
  "serde",
  "sha2 0.10.9",
 ]
@@ -4422,6 +4427,7 @@ dependencies = [
  "seismic-native-cpu",
  "seismic-native-target",
  "seismic-std",
+ "seismic-threads",
  "seismic-topology",
  "seismic-vulkan",
  "serde",
@@ -4437,6 +4443,10 @@ version = "0.1.0"
 dependencies = [
  "seismic-lang",
 ]
+
+[[package]]
+name = "seismic-threads"
+version = "0.1.0"
 
 [[package]]
 name = "seismic-topology"

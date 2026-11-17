@@ -56,6 +56,7 @@ members = [
   "seismic/cli",
   "seismic/compiler",
   "seismic/memory",
+  "seismic/threads",
   "seismic/runtime",
   "seismic/measure",
   "seismic/topology",
@@ -132,6 +133,7 @@ seismic-cuda = { path = "seismic/backends/cuda" }
 seismic-vulkan = { path = "seismic/backends/vulkan" }
 seismic-compiler = { path = "seismic/compiler" }
 seismic-memory = { path = "seismic/memory" }
+seismic-threads = { path = "seismic/threads" }
 seismic-runtime = { path = "seismic/runtime" }
 seismic = { path = "seismic/api" }
 seismic-build = { path = "seismic/build" }

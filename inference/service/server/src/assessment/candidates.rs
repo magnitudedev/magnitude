@@ -3510,8 +3510,7 @@ fn is_projector_name(path: &Path) -> bool {
 }
 
 fn assessment_concurrency() -> usize {
-    std::thread::available_parallelism()
-        .map_or(1, |cores| cores.get().min(MAX_ASSESSMENT_CONCURRENCY))
+    crate::machine_budget::MachineBudget::host().share(crate::machine_budget::Duty::Background).get().get().min(MAX_ASSESSMENT_CONCURRENCY)
 }
 
 fn is_commit(revision: &str) -> bool {

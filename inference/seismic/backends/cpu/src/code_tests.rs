@@ -57,7 +57,7 @@ fn constant_writer(
 fn every_participant_runs_the_kernel_last_compiled_at_a_reused_code_address() {
     let opened = open_quota().unwrap();
     let target = &opened.device;
-    let mut workers = Workers::host(std::thread::available_parallelism().unwrap()).unwrap();
+    let mut workers = Workers::new(std::thread::available_parallelism().unwrap().get()).unwrap();
     let workgroups = workers.count() as u64 * 64;
     let scratch: std::sync::Arc<dyn seismic_memory::entry::Entry> =
         std::sync::Arc::new(seismic_memory::entry::Tally::unbounded(seismic_topology::StoreIdentity::HostRam));

@@ -621,11 +621,14 @@ impl DevicePrograms {
     }
 }
 
-/// The performance cores the process may run on, as the host's processors
-/// report them: the CPU device's pool (`seismic_cpu::open_host`).
+/// The machine's cores as this process sees them (`Processors::cores`): the
+/// CPU device's pool (`seismic_cpu::open_host`). Never the process's thread
+/// share: the pool's size is part of the CPU device's identity, which every
+/// process of the machine, serving or measuring, must open alike.
 pub(crate) fn host_cores() -> Result<std::num::NonZeroUsize, String> {
-    let processors = seismic_discovery::Processors::discover().map_err(|error| format!("the host's processors: {error}"))?;
-    std::num::NonZeroUsize::new(processors.performance_cores()).ok_or_else(|| "the process may run on no performance core".to_owned())
+    seismic_discovery::Processors::discover()
+        .map_err(|error| format!("the host's processors: {error}"))?
+        .cores()
 }
 
 fn open_error(error: ExecutionError) -> OpenError {

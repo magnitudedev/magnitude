@@ -1129,8 +1129,7 @@ fn log_dropped_catalog_models(dropped: Vec<(ModelId, DomainModelFailure)>) {
 }
 
 fn assessment_concurrency() -> usize {
-    std::thread::available_parallelism()
-        .map_or(1, |cores| cores.get().min(MAX_ASSESSMENT_CONCURRENCY))
+    crate::machine_budget::MachineBudget::host().share(crate::machine_budget::Duty::Background).get().get().min(MAX_ASSESSMENT_CONCURRENCY)
 }
 
 #[cfg(test)]

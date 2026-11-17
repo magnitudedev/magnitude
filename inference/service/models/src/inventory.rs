@@ -243,6 +243,9 @@ pub struct InventoryConfig {
     pub hub_endpoint: Option<String>,
     pub architectures: RecognizedArchitectures,
     pub header_cache_capacity: u64,
+    /// The threads root scans may run at once: the service's share of the machine for
+    /// background work; one unless the service sets it.
+    pub scan_threads: std::num::NonZeroUsize,
 }
 
 pub(crate) fn catalog_target(model: &RecommendableModel) -> &ModelPackage {
@@ -369,6 +372,7 @@ impl InventoryConfig {
             architectures: RecognizedArchitectures::default(),
             hub_endpoint: None,
             header_cache_capacity: crate::header_cache::HEADER_CAPACITY_BYTES,
+            scan_threads: std::num::NonZeroUsize::MIN,
         })
     }
 }
@@ -1474,10 +1478,7 @@ fn scan(
             None => stale_roots.push(root.clone()),
         }
     }
-    let concurrency = std::thread::available_parallelism()
-        .map(|value| value.get())
-        .unwrap_or(1)
-        .clamp(1, 8);
+    let concurrency = config.scan_threads.get().min(8);
     for roots in stale_roots.chunks(concurrency) {
         let root_results = std::thread::scope(|scope| {
             roots

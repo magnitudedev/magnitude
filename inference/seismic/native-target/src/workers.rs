@@ -100,14 +100,11 @@ impl Workers {
         }
     }
 
-    /// As many threads as the host runs in parallel: more at work than
-    /// that only take longer each.
+    /// As many threads as the process may run at once
+    /// (`seismic_threads::share`): more at work than that only take longer
+    /// each, and take them from the processes beside it.
     pub fn of_the_host() -> Self {
-        Self::new(
-            std::thread::available_parallelism()
-                .map(std::num::NonZeroUsize::get)
-                .unwrap_or(1),
-        )
+        Self::new(seismic_threads::share().get())
     }
 
     /// The most threads the set runs.

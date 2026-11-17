@@ -9,6 +9,7 @@ pub mod build_identity;
 pub mod configurations;
 pub mod device_lock;
 pub mod hardware;
+pub mod machine_budget;
 pub mod memory_domains;
 pub mod model_store;
 pub mod residency;

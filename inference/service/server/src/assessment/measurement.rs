@@ -639,6 +639,9 @@ async fn run_job<M: MeasuredMachine>(
     // [`RETIREMENT_RETRY`], or at once when the device is wanted meanwhile, its outcome
     // standing until it is shown gone. Its failure to end is no failure of the job.
     let mut reported = matches!(outcome, Ok(Ok(_)));
+    if outcome.is_ok() {
+        exclusive.finished();
+    }
     let mut retiring = (process, exclusive);
     loop {
         let (process, exclusive) = retiring;
@@ -1205,7 +1208,7 @@ mod tests {
         settle().await;
         // A request leases the model, and is served once admitted: by then the job's process has
         // been killed, so no point it times overlaps the request.
-        device.resident_idle(None);
+        device.resident_leased();
         device.admit_request().await;
         assert_eq!(*retired.lock().unwrap(), Some(false), "the job was killed before the request was served");
         status

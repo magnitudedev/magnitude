@@ -112,6 +112,17 @@ impl Processors {
             .count()
     }
 
+    /// The performance cores the process may keep busy at once: those it
+    /// may run on ([`Self::performance_cores`]) under its quota of CPUs
+    /// (`seismic_threads::quota`, which follows a cgroup's `cpu.max`). The
+    /// machine's cores as one process sees them: the CPU device's pool, and
+    /// what the service shares among the processes it starts.
+    pub fn cores(&self) -> Result<std::num::NonZeroUsize, String> {
+        std::num::NonZeroUsize::new(self.performance_cores())
+            .map(|cores| cores.min(seismic_threads::quota()))
+            .ok_or_else(|| "the process may run on no performance core".to_owned())
+    }
+
     /// The CPUs this process may run on.
     pub fn allowed(&self) -> &BTreeSet<usize> {
         &self.allowed
@@ -481,6 +492,8 @@ mod tests {
     fn this_host_reports_its_processors() {
         let processors = Processors::discover().unwrap();
         assert!(processors.performance_cores() >= 1);
+        let cores = processors.cores().unwrap().get();
+        assert_eq!(cores, processors.performance_cores().min(seismic_threads::quota().get()));
         assert!(!processors.memory_cores().is_empty());
         let cpus = processors
             .memory_cores()
