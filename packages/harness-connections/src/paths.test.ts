@@ -17,10 +17,22 @@ it("finds Hermes's home where Hermes itself defaults it on each platform", () =>
   expect(harnessConnectionPaths(undefined, {}, "darwin").hermes).toMatch(/\/\.hermes\/config\.yaml$/)
   expect(harnessConnectionPaths(undefined, {}, "linux").skillInstallations["hermes-user"].skillFile).toMatch(/\/\.hermes\/skills\/magnitude\/SKILL\.md$/)
   const windows = harnessConnectionPaths(undefined, { LOCALAPPDATA: "C:\\Users\\qa\\AppData\\Local" }, "win32")
-  expect(windows.hermes).toBe("C:\\Users\\qa\\AppData\\Local/hermes/config.yaml")
-  expect(windows.skillInstallations["hermes-user"].skillFile).toBe("C:\\Users\\qa\\AppData\\Local/hermes/skills/magnitude/SKILL.md")
-  expect(harnessConnectionPaths(undefined, { LOCALAPPDATA: "C:\\Local", HERMES_HOME: "D:\\hermes" }, "win32").hermes).toBe("D:\\hermes/config.yaml")
-  expect(harnessConnectionPaths("/isolated", { LOCALAPPDATA: "C:\\Local" }, "win32").hermes).toBe("/isolated/AppData/Local/hermes/config.yaml")
+  expect(windows.hermes).toBe("C:\\Users\\qa\\AppData\\Local\\hermes\\config.yaml")
+  expect(windows.skillInstallations["hermes-user"].skillFile).toBe("C:\\Users\\qa\\AppData\\Local\\hermes\\skills\\magnitude\\SKILL.md")
+  expect(harnessConnectionPaths(undefined, { LOCALAPPDATA: "C:\\Local", HERMES_HOME: "D:\\hermes" }, "win32").hermes).toBe("D:\\hermes\\config.yaml")
+  expect(harnessConnectionPaths("C:\\isolated", { LOCALAPPDATA: "C:\\Local" }, "win32").hermes).toBe("C:\\isolated\\AppData\\Local\\hermes\\config.yaml")
+})
+
+it("builds every path for a Windows home with Windows separators only", () => {
+  const paths = harnessConnectionPaths("C:\\Users\\x", {}, "win32")
+  expect(paths.opencode).toBe("C:\\Users\\x\\.config\\opencode\\opencode.json")
+  expect(paths.claude).toBe("C:\\Users\\x\\.claude\\settings.json")
+  expect(paths.piModels).toBe("C:\\Users\\x\\.pi\\agent\\models.json")
+  const all = [paths.manifest, paths.piModels, paths.piSettings, paths.opencode, paths.hermes, paths.openclaw, paths.codex, paths.codexUser,
+    paths.codexModels, paths.claude, paths.ompModels, paths.ompSettings, paths.clineProviders, paths.clineModels,
+    ...paths.claudeLogin.credentialFiles, ...paths.claudeLogin.globalConfigFiles,
+    ...Object.values(paths.skillInstallations).map(installation => installation.skillFile)]
+  for (const path of all) expect(path).not.toContain("/")
 })
 
 it("uses explicit harness config paths and agent directories", () => {
