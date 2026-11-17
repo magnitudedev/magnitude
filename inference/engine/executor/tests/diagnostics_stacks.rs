@@ -2,6 +2,8 @@
 //! blocked on a lock and one holds the allocator: a process of its own
 //! (this test binary run again as the child), whose global allocator a
 //! thread can hold, is sent SIGUSR1, and its report read from its stderr.
+//! A fault gets the same report unasked, its thread first, and still ends
+//! the process with its signal.
 
 #![cfg(unix)]
 
@@ -112,7 +114,7 @@ impl Drop for Reaped {
 
 #[test]
 fn every_thread_is_reported_while_threads_block_and_one_holds_the_allocator() {
-    if std::env::var_os(CHILD).is_some() {
+    if std::env::var_os(CHILD).is_some() || std::env::var_os(FAULTING_CHILD).is_some() {
         return;
     }
     let mut child = Reaped(Command::new(std::env::current_exe().unwrap())
@@ -175,4 +177,59 @@ fn every_thread_is_reported_while_threads_block_and_one_holds_the_allocator() {
         assert!(stack.matches(" 0x").count() >= 3, "{name}'s stack walks past its wait: {stack}");
     }
     assert!(text.contains("magnitude-engine: the images"), "{text}");
+}
+
+const FAULTING_CHILD: &str = "MAGNITUDE_FAULTING_CHILD";
+
+/// An address no process maps: a store to it faults.
+const UNMAPPED: usize = 0x10;
+
+/// The faulting child: a named thread stores to an unmapped address while
+/// the main thread waits on it.
+#[test]
+fn faulting_child() {
+    if std::env::var_os(FAULTING_CHILD).is_none() {
+        return;
+    }
+    magnitude_executor::diagnostics::install();
+    std::thread::Builder::new()
+        .name("faulter".into())
+        .spawn(|| {
+            // SAFETY: none; the store faults, which is what this child is for.
+            unsafe { std::ptr::write_volatile(UNMAPPED as *mut u64, 1) };
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    unreachable!("the store faults");
+}
+
+#[test]
+fn a_fault_reports_its_thread_first_and_ends_the_process_with_its_signal() {
+    if std::env::var_os(FAULTING_CHILD).is_some() || std::env::var_os(CHILD).is_some() {
+        return;
+    }
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "faulting_child", "--nocapture", "--test-threads=1"])
+        .env(FAULTING_CHILD, "1")
+        .env_remove(magnitude_executor::diagnostics::STACKS)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stderr);
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(output.status.signal(), Some(libc::SIGSEGV), "the fault ends the process with its signal:\n{text}");
+    let lines = text.lines().collect::<Vec<_>>();
+    let faulted = lines
+        .iter()
+        .position(|line| line.starts_with("magnitude-engine: thread ") && line.contains(" faulter took SIGSEGV "))
+        .unwrap_or_else(|| panic!("the faulted thread is reported:\n{text}"));
+    let line = lines[faulted];
+    assert!(line.contains(&format!(" at address {UNMAPPED:#x}:")), "the faulting address is reported: {line}");
+    assert!(line.matches(" 0x").count() >= 3, "the faulted thread's stack walks past the fault: {line}");
+    let header = lines.iter().position(|line| line.starts_with("magnitude-engine: the stacks of ")).expect("the other threads are reported");
+    assert!(faulted < header, "the faulted thread is reported first:\n{text}");
+    assert!(!lines[header..].iter().any(|line| line.contains(" faulter:")), "the faulted thread is reported once:\n{text}");
+    assert!(lines.iter().any(|line| line.starts_with("  thread ") && line.contains(" 0x")), "the waiting main thread is reported:\n{text}");
+    assert!(lines.contains(&"magnitude-engine: stacks end"), "{text}");
 }

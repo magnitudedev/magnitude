@@ -83,11 +83,86 @@ fn name(bytes: &[u8]) -> &str {
     std::str::from_utf8(&bytes[..end]).unwrap_or("?")
 }
 
-/// Write every other thread's stack, then the images their addresses fall
-/// in, to `fd`. Allocates nothing, takes no lock a stuck thread can hold.
-pub(super) fn write(fd: libc::c_int) {
+/// A thread's registers a walk begins from: its program counter, its link
+/// register (none on x86-64), frame pointer and stack pointer.
+#[derive(Clone, Copy)]
+pub(super) struct Registers {
+    pub(super) pc: u64,
+    pub(super) link: Option<u64>,
+    pub(super) frame: u64,
+    pub(super) sp: u64,
+}
+
+/// A fatal signal as its thread took it: the signal, the address it names
+/// (the faulting access, for a fault), the thread, and its registers at the
+/// faulting instruction.
+#[derive(Clone, Copy)]
+pub(super) struct Fault {
+    pub(super) signal: libc::c_int,
+    pub(super) address: u64,
+    pub(super) thread: u64,
+    pub(super) registers: Registers,
+}
+
+/// The fault the reporter writes: stored by the faulting thread's handler
+/// before it wakes the reporter, which loads it.
+static FAULT: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+impl Fault {
+    /// The fault the handler's arguments describe.
+    ///
+    /// # Safety
+    ///
+    /// `info` and `context` are a `SA_SIGINFO` handler's.
+    pub(super) unsafe fn taken(signal: libc::c_int, info: *mut libc::siginfo_t, context: *mut libc::c_void) -> Self {
+        // SAFETY: the caller's.
+        let (address, thread, registers) = unsafe { platform::taken(info, context) };
+        Self { signal, address, thread, registers }
+    }
+
+    /// Store it for the reporter: signal-safe, atomics only.
+    pub(super) fn store(&self) {
+        use std::sync::atomic::Ordering;
+        let Registers { pc, link, frame, sp } = self.registers;
+        // A link register of 0 is no return address: none.
+        let words = [self.signal as u64, self.address, self.thread, pc, link.unwrap_or(0), frame, sp];
+        for (slot, word) in FAULT.iter().zip(words) {
+            slot.store(word, Ordering::Release);
+        }
+    }
+
+    /// The fault last stored ([`Fault::store`]).
+    pub(super) fn load() -> Self {
+        use std::sync::atomic::Ordering;
+        let [signal, address, thread, pc, link, frame, sp] = std::array::from_fn(|index| FAULT[index].load(Ordering::Acquire));
+        Self {
+            signal: signal as libc::c_int,
+            address,
+            thread,
+            registers: Registers { pc, link: (link != 0).then_some(link), frame, sp },
+        }
+    }
+
+    /// The report's line naming it, before the thread's frames.
+    fn heading(&self, out: &mut Out, thread: &str) {
+        let signal = match self.signal {
+            libc::SIGSEGV => "SIGSEGV",
+            libc::SIGBUS => "SIGBUS",
+            libc::SIGILL => "SIGILL",
+            libc::SIGFPE => "SIGFPE",
+            libc::SIGABRT => "SIGABRT",
+            _ => "a fatal signal",
+        };
+        let _ = write!(out, "magnitude-engine: thread {} {thread} took {signal} ({}) at address {:#x}:", self.thread, self.signal, self.address);
+    }
+}
+
+/// Write the faulted thread's stack first, when there is one, then every
+/// other thread's, then the images their addresses fall in, to `fd`.
+/// Allocates nothing, takes no lock a stuck thread can hold.
+pub(super) fn write(fd: libc::c_int, fault: Option<&Fault>) {
     let mut out = Out::new(fd);
-    platform::write(&mut out);
+    platform::write(&mut out, fault);
     let _ = writeln!(out, "magnitude-engine: stacks end");
     out.flush();
 }
@@ -99,7 +174,7 @@ pub(super) fn install() {
 
 #[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "x86_64")))]
 mod platform {
-    use super::{name, Out, FRAMES};
+    use super::{name, Fault, Out, Registers, FRAMES};
     use std::fmt::Write as _;
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
@@ -174,27 +249,64 @@ mod platform {
         if cfg!(target_arch = "aarch64") { address & ((1 << 48) - 1) } else { address }
     }
 
-    /// The interrupted program counter, link register (none on x86-64),
-    /// frame pointer and stack pointer.
+    /// The interrupted thread's registers.
     ///
     /// # Safety
     ///
     /// `context` is the handler's `ucontext_t`.
-    unsafe fn registers(context: *mut libc::c_void) -> (u64, Option<u64>, u64, u64) {
+    unsafe fn registers(context: *mut libc::c_void) -> Registers {
         let context = context as *const libc::ucontext_t;
         #[cfg(target_arch = "aarch64")]
         {
             // SAFETY: the caller's.
             let machine = unsafe { &(*context).uc_mcontext };
-            (machine.pc, Some(machine.regs[30]), machine.regs[29], machine.sp)
+            Registers { pc: machine.pc, link: Some(machine.regs[30]), frame: machine.regs[29], sp: machine.sp }
         }
         #[cfg(target_arch = "x86_64")]
         {
             // SAFETY: the caller's.
             let registers = unsafe { &(*context).uc_mcontext.gregs };
             let register = |index: libc::c_int| registers[index as usize] as u64;
-            (register(libc::REG_RIP), None, register(libc::REG_RBP), register(libc::REG_RSP))
+            Registers { pc: register(libc::REG_RIP), link: None, frame: register(libc::REG_RBP), sp: register(libc::REG_RSP) }
         }
+    }
+
+    /// The faulting address, the thread and its registers of a fatal
+    /// signal's handler ([`super::Fault::taken`]).
+    ///
+    /// # Safety
+    ///
+    /// `info` and `context` are a `SA_SIGINFO` handler's.
+    pub(super) unsafe fn taken(info: *mut libc::siginfo_t, context: *mut libc::c_void) -> (u64, u64, Registers) {
+        // SAFETY: the caller's; `gettid` takes nothing and cannot fail.
+        unsafe { ((*info).si_addr() as u64, libc::syscall(libc::SYS_gettid) as u64, registers(context)) }
+    }
+
+    /// The stack from `registers` by its frame records: the program
+    /// counter, the link register (a leaf interrupted before its record is
+    /// made has its caller there, and in no record), then each record's
+    /// return address, into `frames`; how many. Signal-safe.
+    fn walk(registers: Registers, frames: &mut [u64; FRAMES]) -> usize {
+        let mut count = 0;
+        // Whether `frames` has room for more.
+        let mut push = |address: u64| {
+            if count < FRAMES && address != 0 {
+                frames[count] = stripped(address);
+                count += 1;
+            }
+            count < FRAMES
+        };
+        let mut room = push(registers.pc) && registers.link.is_none_or(&mut push);
+        let mut frame = registers.frame;
+        while room && frame != 0 && frame % 8 == 0 {
+            let Some([next, returned]) = record(frame) else { break };
+            room = push(returned);
+            if next <= frame {
+                break;
+            }
+            frame = next;
+        }
+        count
     }
 
     /// SIGUSR2: the asked thread walks its own frame records into the slot.
@@ -209,30 +321,14 @@ mod platform {
             return;
         }
         // SAFETY: the kernel's context for this handler.
-        let (pc, link, mut frame, sp) = unsafe { registers(context) };
-        for (slot, value) in REGISTERS.iter().zip([pc, sp, frame]) {
+        let registers = unsafe { registers(context) };
+        for (slot, value) in REGISTERS.iter().zip([registers.pc, registers.sp, registers.frame]) {
             slot.store(value, Ordering::Relaxed);
         }
-        let mut count = 0;
-        let push = |count: &mut usize, address: u64| {
-            if *count < FRAMES && address != 0 {
-                SLOT[*count].store(stripped(address), Ordering::Relaxed);
-                *count += 1;
-            }
-        };
-        push(&mut count, pc);
-        // A leaf interrupted before its record is made: its caller is in
-        // the link register, and in no record.
-        if let Some(link) = link {
-            push(&mut count, link);
-        }
-        while count < FRAMES && frame != 0 && frame % 8 == 0 {
-            let Some([next, returned]) = record(frame) else { break };
-            push(&mut count, returned);
-            if next <= frame {
-                break;
-            }
-            frame = next;
+        let mut frames = [0u64; FRAMES];
+        let count = walk(registers, &mut frames);
+        for (slot, frame) in SLOT.iter().zip(&frames[..count]) {
+            slot.store(*frame, Ordering::Relaxed);
         }
         COUNT.store(count, Ordering::Release);
         DONE.store(true, Ordering::Release);
@@ -306,16 +402,48 @@ mod platform {
         read.max(0) as usize
     }
 
-    pub(super) fn write(out: &mut Out) {
+    /// Thread `tid`'s name, read into `comm`.
+    fn thread_name(tid: i64, comm: &mut [u8; 32]) -> &str {
+        let mut path = [0u8; 64];
+        let mut cursor = std::io::Cursor::new(&mut path[..]);
+        let _ = std::io::Write::write_fmt(&mut cursor, format_args!("/proc/self/task/{tid}/comm\0"));
+        let length = file(&path, comm);
+        name(&comm[..length])
+    }
+
+    pub(super) fn write(out: &mut Out, fault: Option<&Fault>) {
         // SAFETY: `getpid` and `gettid` take nothing and cannot fail.
         let (pid, me) = unsafe { (libc::getpid(), libc::syscall(libc::SYS_gettid)) };
+        let faulted = fault.map(|fault| fault.thread as i64);
         let mut tids = [0i64; 4096];
         let found = threads(&mut tids);
-        let others = tids[..found].iter().filter(|&&tid| tid != me).count();
+        let listed = |tid: &&i64| **tid != me && Some(**tid) != faulted;
+        let others = tids[..found].iter().filter(listed).count();
         #[cfg(target_arch = "x86_64")]
         let mut images = super::cfi::Images::new();
         #[cfg(target_arch = "x86_64")]
         let read = images.read();
+        // The faulted thread first, from its registers at the fault: it is
+        // held in its handler, which would only add its own frames.
+        if let Some(fault) = fault {
+            fault.heading(out, thread_name(fault.thread as i64, &mut [0; 32]));
+            let mut frames = [0u64; FRAMES];
+            #[allow(unused_mut)]
+            let mut count = 0;
+            #[cfg(target_arch = "x86_64")]
+            if read.is_ok() {
+                let Registers { pc, sp, frame, .. } = fault.registers;
+                count = images.unwind(pc, sp, frame, &mut frames);
+            }
+            // Frame records where no table unwinds it.
+            if count <= 1 {
+                count = walk(fault.registers, &mut frames);
+            }
+            for frame in &frames[..count] {
+                let _ = write!(out, " {frame:#x}");
+            }
+            let _ = writeln!(out);
+        }
         #[cfg(target_arch = "x86_64")]
         let _ = match read {
             Ok(()) => writeln!(out, "magnitude-engine: the stacks of {others} threads, each unwound from its registers through its images' unwind tables (addresses; the images below map them):"),
@@ -323,13 +451,8 @@ mod platform {
         };
         #[cfg(not(target_arch = "x86_64"))]
         let _ = writeln!(out, "magnitude-engine: the stacks of {others} threads, each its frame records from its registers (addresses; the images below map them):");
-        for &tid in tids[..found].iter().filter(|&&tid| tid != me) {
-            let mut path = [0u8; 64];
-            let mut cursor = std::io::Cursor::new(&mut path[..]);
-            let _ = std::io::Write::write_fmt(&mut cursor, format_args!("/proc/self/task/{tid}/comm\0"));
-            let mut comm = [0u8; 32];
-            let length = file(&path, &mut comm);
-            let _ = write!(out, "  thread {tid} {}:", name(&comm[..length]));
+        for &tid in tids[..found].iter().filter(listed) {
+            let _ = write!(out, "  thread {tid} {}:", thread_name(tid, &mut [0; 32]));
             DONE.store(false, Ordering::Release);
             RELEASED.store(false, Ordering::Release);
             TARGET.store(tid, Ordering::Release);
@@ -420,7 +543,7 @@ mod cfi;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod platform {
-    use super::{name, Out, FRAMES};
+    use super::{name, Fault, Out, Registers, FRAMES};
     use std::fmt::Write as _;
 
     type Port = u32;
@@ -461,6 +584,27 @@ mod platform {
         priority: i32,
         max_priority: i32,
         name: [u8; 64],
+    }
+
+    /// `struct __darwin_ucontext`, as a signal handler receives it.
+    #[repr(C)]
+    struct Context {
+        onstack: i32,
+        mask: u32,
+        stack: libc::stack_t,
+        link: *mut libc::c_void,
+        machine_bytes: usize,
+        machine: *const Machine,
+    }
+
+    /// `struct __darwin_mcontext64`: the exception state, then the thread
+    /// state (the floating-point state follows, unread).
+    #[repr(C)]
+    struct Machine {
+        fault_address: u64,
+        syndrome: u32,
+        exception: u32,
+        state: ThreadState,
     }
 
     const ARM_THREAD_STATE64: i32 = 6;
@@ -509,22 +653,45 @@ mod platform {
         (status == 0 && read == 16).then_some(words)
     }
 
-    /// `thread`'s frames: its program counter, its link register, then
-    /// each record's return address.
-    fn walk(state: &ThreadState, frames: &mut [u64; FRAMES]) -> usize {
+    /// A suspended thread's registers ([`state`]).
+    fn registers(state: &ThreadState) -> Registers {
+        Registers { pc: state.pc, link: Some(state.lr), frame: state.fp, sp: state.sp }
+    }
+
+    /// The faulting address, the thread and its registers of a fatal
+    /// signal's handler ([`super::Fault::taken`]).
+    ///
+    /// # Safety
+    ///
+    /// `info` and `context` are a `SA_SIGINFO` handler's.
+    pub(super) unsafe fn taken(info: *mut libc::siginfo_t, context: *mut libc::c_void) -> (u64, u64, Registers) {
+        let mut thread = 0u64;
+        // SAFETY: the caller's: the kernel's machine context of the
+        // interrupted thread; the calling thread's id into a local.
+        unsafe {
+            libc::pthread_threadid_np(0, &mut thread);
+            let state = &(*(*(context as *const Context)).machine).state;
+            ((*info).si_addr() as u64, thread, registers(state))
+        }
+    }
+
+    /// The stack from `registers`: the program counter, the link register,
+    /// then each frame record's return address, into `frames`; how many.
+    fn walk(registers: Registers, frames: &mut [u64; FRAMES]) -> usize {
         let mut count = 0;
+        // Whether `frames` has room for more.
         let mut push = |address: u64| {
             if count < FRAMES && address != 0 {
                 frames[count] = stripped(address);
                 count += 1;
             }
+            count < FRAMES
         };
-        push(state.pc);
-        push(state.lr);
-        let mut frame = stripped(state.fp);
-        while frame != 0 && frame % 8 == 0 {
+        let mut room = push(registers.pc) && registers.link.is_none_or(&mut push);
+        let mut frame = stripped(registers.frame);
+        while room && frame != 0 && frame % 8 == 0 {
             let Some([next, returned]) = record(frame) else { break };
-            push(returned);
+            room = push(returned);
             let next = stripped(next);
             if next <= frame {
                 break;
@@ -534,7 +701,22 @@ mod platform {
         count
     }
 
-    pub(super) fn write(out: &mut Out) {
+    /// `thread`'s id and name.
+    fn identity(thread: Port) -> (u64, Extended) {
+        let mut identifier = Identifier::default();
+        let mut identified = (size_of::<Identifier>() / 4) as u32;
+        // SAFETY: the kernel writes at most `identified` words.
+        unsafe { thread_info(thread, THREAD_IDENTIFIER_INFO, (&raw mut identifier).cast(), &mut identified) };
+        // SAFETY: zeroed is a valid `Extended`; the kernel writes at most
+        // its words.
+        let mut extended: Extended = unsafe { std::mem::zeroed() };
+        let mut words = (size_of::<Extended>() / 4) as u32;
+        // SAFETY: as above.
+        unsafe { thread_info(thread, THREAD_EXTENDED_INFO, (&raw mut extended).cast(), &mut words) };
+        (identifier.thread_id, extended)
+    }
+
+    pub(super) fn write(out: &mut Out, fault: Option<&Fault>) {
         // SAFETY: a send right to the calling thread, released below.
         let me = unsafe { mach_thread_self() };
         let mut threads: *mut Port = std::ptr::null_mut();
@@ -547,26 +729,30 @@ mod platform {
         }
         // SAFETY: `count` ports the kernel wrote.
         let threads = unsafe { std::slice::from_raw_parts(threads, count as usize) };
-        let others = threads.iter().filter(|&&thread| thread != me).count();
+        // The faulted thread first, from its registers at the fault: it is
+        // held in its handler, which would only add its own frames.
+        if let Some(fault) = fault {
+            let named = threads.iter().map(|&thread| identity(thread)).find(|(id, _)| *id == fault.thread);
+            fault.heading(out, named.as_ref().map_or("?", |(_, extended)| name(&extended.name)));
+            let mut frames = [0u64; FRAMES];
+            let count = walk(fault.registers, &mut frames);
+            for frame in &frames[..count] {
+                let _ = write!(out, " {frame:#x}");
+            }
+            let _ = writeln!(out);
+        }
+        let listed = |thread: &&Port| **thread != me && fault.is_none_or(|fault| identity(**thread).0 != fault.thread);
+        let others = threads.iter().filter(listed).count();
         let _ = writeln!(out, "magnitude-engine: the stacks of {others} threads, each its frame records from its registers (addresses; the images below map them):");
-        for &thread in threads.iter().filter(|&&thread| thread != me) {
-            let mut identifier = Identifier::default();
-            let mut identified = (size_of::<Identifier>() / 4) as u32;
-            // SAFETY: the kernel writes at most `identified` words.
-            unsafe { thread_info(thread, THREAD_IDENTIFIER_INFO, (&raw mut identifier).cast(), &mut identified) };
-            // SAFETY: zeroed is a valid `Extended`; the kernel writes at most
-            // its words.
-            let mut extended: Extended = unsafe { std::mem::zeroed() };
-            let mut words = (size_of::<Extended>() / 4) as u32;
-            // SAFETY: as above.
-            unsafe { thread_info(thread, THREAD_EXTENDED_INFO, (&raw mut extended).cast(), &mut words) };
-            let _ = write!(out, "  thread {} {}:", identifier.thread_id, name(&extended.name));
+        for &thread in threads.iter().filter(listed) {
+            let (id, extended) = identity(thread);
+            let _ = write!(out, "  thread {id} {}:", name(&extended.name));
             let mut frames = [0u64; FRAMES];
             // SAFETY: suspends another thread of this task, resumed below;
             // nothing this thread does until then needs a lock it may hold.
             let walked = match unsafe { thread_suspend(thread) } {
                 0 => {
-                    let walked = state(thread).map(|state| walk(&state, &mut frames));
+                    let walked = state(thread).map(|state| walk(registers(&state), &mut frames));
                     // SAFETY: resumes the thread suspended above.
                     unsafe { thread_resume(thread) };
                     walked
@@ -619,12 +805,22 @@ mod platform {
     all(target_os = "macos", target_arch = "aarch64")
 )))]
 mod platform {
-    use super::Out;
+    use super::{Fault, Out, Registers};
     use std::fmt::Write as _;
 
     pub(super) fn install() {}
 
-    pub(super) fn write(out: &mut Out) {
+    /// No registers are read here: a fault reports its signal and address.
+    pub(super) unsafe fn taken(info: *mut libc::siginfo_t, _: *mut libc::c_void) -> (u64, u64, Registers) {
+        // SAFETY: the caller's.
+        (unsafe { (*info).si_addr() } as u64, 0, Registers { pc: 0, link: None, frame: 0, sp: 0 })
+    }
+
+    pub(super) fn write(out: &mut Out, fault: Option<&Fault>) {
+        if let Some(fault) = fault {
+            fault.heading(out, "?");
+            let _ = writeln!(out);
+        }
         let _ = writeln!(out, "magnitude-engine: no thread's stack is collected on this platform");
     }
 }

@@ -19,6 +19,18 @@
 //! stacks first, allocating nothing and taking no lock a stuck thread may
 //! hold ([`stacks`]), so they are out whatever holds the allocator; the
 //! owners' reports, which allocate, follow.
+//!
+//! A fatal signal (a fault, an illegal instruction, an abort) gets the same
+//! report unasked, on stderr, which a worker's service records: the faulted
+//! thread's stack from its registers at the fault first, then every other
+//! thread's and every owner's. Without it a native fault ends the process
+//! with its signal and no word of where. The faulted thread's handler only
+//! stores the fault and wakes the reporter, then waits for the report (at
+//! most [`FAULT_REPORT`]), so it needs no more stack than the alternate
+//! signal stack the runtime gives its threads. It then restores the
+//! signal's previous disposition and returns: the faulting instruction runs
+//! again and ends the process with its signal, through the runtime's own
+//! handler where it had one (which names a stack overflow).
 
 #[cfg(unix)]
 mod stacks;
@@ -101,8 +113,9 @@ pub const STACKS: &str = "MAGNITUDE_STACKS";
 #[cfg(unix)]
 static OUT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(2);
 
-/// Print every thread's stack on SIGUSR1, then every owner's report, for
-/// the life of the process; installed once, at its start.
+/// Print every thread's stack on SIGUSR1, then every owner's report, and
+/// the same on stderr when a fatal signal ends the process, the faulted
+/// thread first, for the life of the process; installed once, at its start.
 #[cfg(unix)]
 pub fn install() {
     static INSTALLED: OnceLock<()> = OnceLock::new();
@@ -118,9 +131,16 @@ pub fn install() {
             let mut byte = 0u8;
             // SAFETY: reading one byte into a local from the pipe's read end.
             while unsafe { libc::read(reader, (&mut byte as *mut u8).cast(), 1) } == 1 {
-                let out = OUT.load(Ordering::Acquire);
-                stacks::write(out);
+                let (out, fault) = match byte {
+                    ASKED => (OUT.load(Ordering::Acquire), None),
+                    FAULTED => (2, Some(stacks::Fault::load())),
+                    other => unreachable!("the diagnostics pipe carries {ASKED} or {FAULTED}, not {other}"),
+                };
+                stacks::write(out, fault.as_ref());
                 write_all(out, format!("{}\n", report()).as_bytes());
+                if fault.is_some() {
+                    REPORTED.store(true, Ordering::Release);
+                }
             }
         })
         .expect("the diagnostics reporter thread starts");
@@ -128,6 +148,35 @@ pub fn install() {
         // SAFETY: a handler that only writes a byte (`wake`).
         let previous = unsafe { libc::signal(libc::SIGUSR1, wake as extern "C" fn(libc::c_int) as libc::sighandler_t) };
         assert_ne!(previous, libc::SIG_ERR, "the report handler installs: {}", std::io::Error::last_os_error());
+        // Each fatal signal's disposition is kept before its handler, which
+        // restores it, can run.
+        let previous = FATAL.map(|signal| {
+            // SAFETY: reads the disposition into a zeroed local.
+            unsafe {
+                let mut previous: libc::sigaction = std::mem::zeroed();
+                if libc::sigaction(signal, std::ptr::null(), &mut previous) != 0 {
+                    panic!("the disposition of signal {signal} reads: {}", std::io::Error::last_os_error());
+                }
+                previous
+            }
+        });
+        if PREVIOUS.set(previous).is_err() {
+            unreachable!("the diagnostics install once");
+        }
+        for signal in FATAL {
+            // SAFETY: a handler of only signal-safe calls (`fatal`), run on
+            // the thread's alternate signal stack where it has one, with
+            // every signal blocked.
+            unsafe {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = fatal as extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) as libc::sighandler_t;
+                action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+                libc::sigfillset(&mut action.sa_mask);
+                if libc::sigaction(signal, &action, std::ptr::null_mut()) != 0 {
+                    panic!("the fault handler of signal {signal} installs: {}", std::io::Error::last_os_error());
+                }
+            }
+        }
         // Only now, the handler in place, may the rig find this process's file.
         if let Some(fd) = stacks_file() {
             OUT.store(fd, Ordering::Release);
@@ -167,15 +216,102 @@ fn write_all(fd: libc::c_int, mut bytes: &[u8]) {
 #[cfg(not(unix))]
 pub fn install() {}
 
-/// The pipe's write end, which the SIGUSR1 handler writes a byte to.
+/// The pipe's write end, which the SIGUSR1 handler writes [`ASKED`] to and
+/// a fatal signal's handler [`FAULTED`].
 #[cfg(unix)]
 static WAKE: AtomicU64 = AtomicU64::new(0);
 
+/// What wakes the reporter: a report asked for (SIGUSR1), or a fault.
 #[cfg(unix)]
-extern "C" fn wake(_: libc::c_int) {
-    let byte = 1u8;
+const ASKED: u8 = 1;
+#[cfg(unix)]
+const FAULTED: u8 = 2;
+
+/// Wake the reporter for `byte`'s report.
+#[cfg(unix)]
+fn wake_reporter(byte: u8) {
     // SAFETY: `write` is async-signal-safe; the descriptor is the pipe's.
     unsafe { libc::write(WAKE.load(Ordering::Relaxed) as libc::c_int, (&byte as *const u8).cast(), 1) };
+}
+
+#[cfg(unix)]
+extern "C" fn wake(_: libc::c_int) {
+    wake_reporter(ASKED);
+}
+
+/// The signals that end the process unasked: faults, illegal instructions
+/// and arithmetic traps, and aborts.
+#[cfg(unix)]
+const FATAL: [libc::c_int; 5] = [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGFPE, libc::SIGABRT];
+
+/// Each fatal signal's disposition before [`install`], in [`FATAL`]'s order.
+#[cfg(unix)]
+static PREVIOUS: OnceLock<[libc::sigaction; FATAL.len()]> = OnceLock::new();
+
+/// A fatal signal is being reported: a second waits for that report.
+#[cfg(unix)]
+static FAULTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The reporter has written the fault's report.
+#[cfg(unix)]
+static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The longest a faulted thread waits for its report: what a stuck owner's
+/// report or a fault of the reporter's own can cost before the process ends.
+#[cfg(unix)]
+const FAULT_REPORT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A fatal signal: the first stores its fault and has the reporter write
+/// it; each waits for that report, restores its signal's previous
+/// disposition and returns. A fault re-executes and ends the process with
+/// that disposition; a signal that was sent (an abort's among them) is
+/// raised again, delivered once the handler returns. Signal-safe calls only.
+#[cfg(unix)]
+extern "C" fn fatal(signal: libc::c_int, info: *mut libc::siginfo_t, context: *mut libc::c_void) {
+    if !FAULTING.swap(true, Ordering::AcqRel) {
+        // SAFETY: this handler's own arguments.
+        unsafe { stacks::Fault::taken(signal, info, context) }.store();
+        wake_reporter(FAULTED);
+    }
+    let began = monotonic();
+    while !REPORTED.load(Ordering::Acquire) && monotonic().saturating_sub(began) < FAULT_REPORT {
+        // SAFETY: yields the processor; takes nothing.
+        unsafe { libc::sched_yield() };
+    }
+    let previous = PREVIOUS.get().expect("a fatal signal's handler is installed after its previous disposition is kept");
+    let index = FATAL.iter().position(|&fatal| fatal == signal).expect("the handler is installed for the fatal signals only");
+    // SAFETY: restores the disposition `install` replaced; `info` is the
+    // kernel's for this signal.
+    unsafe {
+        libc::sigaction(signal, &previous[index], std::ptr::null_mut());
+        if sent(info) {
+            libc::raise(signal);
+        }
+    }
+}
+
+/// Whether the signal was sent (`kill`, `raise`, `abort`), not raised by
+/// the instruction that faulted, which runs again once its handler returns.
+///
+/// # Safety
+///
+/// `info` is a `SA_SIGINFO` handler's.
+#[cfg(unix)]
+unsafe fn sent(info: *const libc::siginfo_t) -> bool {
+    // SAFETY: the caller's.
+    let code = unsafe { (*info).si_code };
+    // Linux marks a sent signal with a code of at most 0 (`SI_USER`,
+    // `SI_TKILL`, `SI_QUEUE`); Darwin with `SI_USER` and `SI_QUEUE`.
+    if cfg!(target_os = "linux") { code <= 0 } else { code == 0x10001 || code == 0x10002 }
+}
+
+/// The monotonic clock, read signal-safely.
+#[cfg(unix)]
+fn monotonic() -> std::time::Duration {
+    let mut time = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: reads the monotonic clock into a local.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) };
+    std::time::Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
 }
 
 #[cfg(test)]
