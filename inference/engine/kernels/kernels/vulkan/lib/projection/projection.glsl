@@ -44,7 +44,7 @@
 //   (A storage) with per-16-element sums for the factored biases.
 // - GEMM (M > 8): TM x TN output tiles over subgroups of 32 x 32, stepping K
 //   by 32. Activations are staged as f16 and weights decoded to f16 once per
-//   tile. Under SEISMIC_HAS_MATRIX (RDNA3/4) cooperative-matrix 16x16x16
+//   tile. Under SEISMIC_HAS_MATRIX (cooperative-matrix devices) 16x16x16
 //   multiplies accumulate in F32; otherwise every lane runs a 4 x 8 register
 //   tile of F32 FMAs over the same staged operands. Small-N outputs may split
 //   K.

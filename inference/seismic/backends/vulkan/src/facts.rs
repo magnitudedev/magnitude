@@ -291,17 +291,14 @@ pub(crate) struct ShaderFma {
     pub(crate) float64: bool,
 }
 
-/// TEMPORARY, and the one place a driver's identity decides anything:
-/// whether the cooperative-matrix path is formed. It is a performance
-/// choice, not a fact (`matrix` reports the device's support), and moves to
-/// a `form MATRIX` default the kernels declare, when this function is
-/// deleted. Not formed on RDNA2 (no WMMA units whatever its
+/// TEMPORARY: whether the cooperative-matrix path is formed. It is a
+/// performance choice, not a fact (`matrix` reports the device's support),
+/// and moves to a `form MATRIX` default the kernels declare, when this
+/// function is deleted. Not formed on RDNA2 (no WMMA units whatever its
 /// driver reports; accelerated mixed-signedness packed dot identifies
-/// RDNA3+), nor on the NVIDIA proprietary driver, whose compiler (580.159.03,
-/// GB10) runs the projection GEMM's cooperative-matrix path 1.3x (paired) to
-/// over 30x (single weight) slower than its FMA path.
-fn matrix_path(driver_id: vk::DriverId, vendor_id: u32, mixed_dot: bool) -> bool {
-    driver_id != vk::DriverId::NVIDIA_PROPRIETARY && (vendor_id != AMD_VENDOR || mixed_dot)
+/// RDNA3+).
+fn matrix_path(vendor_id: u32, mixed_dot: bool) -> bool {
+    vendor_id != AMD_VENDOR || mixed_dot
 }
 
 /// How a device pairs its timestamps with the host clock.
@@ -765,7 +762,7 @@ pub(crate) fn describe(instance: &Arc<Instance>, physical: vk::PhysicalDevice) -
         queue_count: queue_family.map_or(0, |family| families[family].queue_count),
         side_family,
         pipeline_statistics: executables.pipeline_executable_info == vk::TRUE,
-        matrix_path: matrix_path(v12.driver_id, base.vendor_id, mixed_dot),
+        matrix_path: matrix_path(base.vendor_id, mixed_dot),
         calibration,
         luid: (v11.device_luid_valid == vk::TRUE).then_some(v11.device_luid),
         memory,

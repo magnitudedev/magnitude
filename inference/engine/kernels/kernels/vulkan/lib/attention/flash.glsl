@@ -357,7 +357,22 @@ float flash_output_value(inout flash_output o, uint scratch, uint q) {
 #if SEISMIC_HAS_MATRIX
     if (q % 8u == 0u) {
         subgroupBarrier();
-        coopMatStore(o.c[q / 8u], seismic_shared_f32, scratch, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        // Each fragment by a constant index: indexed by q / 8 at run time
+        // (the callers' value loops hold barriers, which the NVIDIA
+        // proprietary compiler leaves rolled), the fragments, and every
+        // multiply-add on them, sat in local memory (as the projection GEMM's
+        // accumulators, `projection_gemm_pair`).
+        switch (q / 8u) {
+#define FLASH_STORE_FRAGMENT(f) \
+        case f: \
+            coopMatStore(o.c[f], seismic_shared_f32, scratch, 16u, gl_CooperativeMatrixLayoutRowMajor); \
+            break;
+        FLASH_STORE_FRAGMENT(0u) FLASH_STORE_FRAGMENT(1u) FLASH_STORE_FRAGMENT(2u) FLASH_STORE_FRAGMENT(3u)
+        FLASH_STORE_FRAGMENT(4u) FLASH_STORE_FRAGMENT(5u) FLASH_STORE_FRAGMENT(6u) FLASH_STORE_FRAGMENT(7u)
+        FLASH_STORE_FRAGMENT(8u) FLASH_STORE_FRAGMENT(9u) FLASH_STORE_FRAGMENT(10u) FLASH_STORE_FRAGMENT(11u)
+        FLASH_STORE_FRAGMENT(12u) FLASH_STORE_FRAGMENT(13u) FLASH_STORE_FRAGMENT(14u) FLASH_STORE_FRAGMENT(15u)
+#undef FLASH_STORE_FRAGMENT
+        }
         subgroupMemoryBarrierShared();
         subgroupBarrier();
     }
