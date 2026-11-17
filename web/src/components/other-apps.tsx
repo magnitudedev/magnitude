@@ -22,7 +22,7 @@ export function OtherApps({ origin, model, platform, remote = false, networkAcce
 }) {
   const [showExample, setShowExample] = useState(false)
   const baseUrl = `${origin}/inference/v1`
-  return <section aria-label="Other apps and agents" className="mt-6">
+  return <section aria-label="Other apps and agents">
     <h2 className={pageLayout.harnessHeading}>Other apps and agents</h2>
     <article className={`${pageLayout.harnessGrid} ${pageLayout.harnessCard}`}>
       <div className="flex min-w-0 items-center gap-3">
