@@ -42,6 +42,12 @@ export interface ModelFilters {
 const passes = (filters: ModelFilters, model: OwnedModel) =>
   (filters.lab === null || model.lab?.name === filters.lab.name) && (!filters.usOnly || model.country === "US")
 
+/** The models the list shows: those passing its filters whose text contains what was typed to find. */
+export const matchingModels = (models: readonly OwnedModel[], filters: ModelFilters, find: string): readonly OwnedModel[] => {
+  const needle = find.trim().toLowerCase()
+  return models.filter(model => passes(filters, model) && model.searchText.toLowerCase().includes(needle))
+}
+
 function useDismiss(open: boolean, close: () => void) {
   const ref = useRef<HTMLSpanElement>(null)
   useEffect(() => {
@@ -165,7 +171,7 @@ export function Unrunnable({ files, title = "Doesn’t run in Magnitude yet" }: 
   </div>
 }
 
-function Hidden({ models, onUnhide }: { models: readonly OwnedModel[]; onUnhide: (model: OwnedModel) => void }) {
+export function Hidden({ models, onUnhide }: { models: readonly OwnedModel[]; onUnhide: (model: OwnedModel) => void }) {
   const [open, setOpen] = useState(false)
   if (models.length === 0) return null
   return <div className="mt-3">
@@ -182,18 +188,19 @@ function Hidden({ models, onUnhide }: { models: readonly OwnedModel[]; onUnhide:
   </div>
 }
 
-/** The user's models: one row each, opened in place, with search and filters for this list only. */
-export function YourModels({ models, hidden, unrunnable, action, onExploreQuants, onRemove, onUnhide, onDrafter }: {
-  models: readonly OwnedModel[]; hidden: readonly OwnedModel[]; unrunnable: readonly UnrunnableFile[]
-  action: (model: OwnedModel) => ReactNode; onExploreQuants: (model: OwnedModel) => void; onRemove: (model: OwnedModel) => void
-  onUnhide: (model: OwnedModel) => void; onDrafter: (model: OwnedModel) => void
+/**
+ * The user's visible models: one row each, opened in place, with search and filters for this list only. It is shown
+ * only while some model is visible, so "No models match." means the search or filters left none.
+ */
+export function YourModels({ models, action, onExploreQuants, onRemove, onDrafter }: {
+  models: readonly OwnedModel[]; action: (model: OwnedModel) => ReactNode; onExploreQuants: (model: OwnedModel) => void
+  onRemove: (model: OwnedModel) => void; onDrafter: (model: OwnedModel) => void
 }) {
   const [open, setOpen] = useState<string | null>(null)
   const [find, setFind] = useState("")
   const [filters, setFilters] = useState<ModelFilters>({ lab: null, usOnly: false })
   const labs = modelLabs.filter(lab => models.some(model => model.lab?.name === lab.name))
-  const needle = find.trim().toLowerCase()
-  const shown = models.filter(model => passes(filters, model) && model.searchText.toLowerCase().includes(needle))
+  const shown = matchingModels(models, filters, find)
   return <section aria-label="Your models">
     <div className="mb-2 flex items-center justify-end gap-1 text-xs text-slate-500">
       <FindToggle value={find} onChange={setFind} placeholder="Find in your models" />
@@ -217,7 +224,5 @@ export function YourModels({ models, hidden, unrunnable, action, onExploreQuants
         </div>
       })}
     </div>
-    <Hidden models={hidden} onUnhide={onUnhide} />
-    <Unrunnable files={unrunnable} />
   </section>
 }

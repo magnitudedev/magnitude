@@ -9,7 +9,7 @@ import { ModelsSkeleton } from "./skeletons"
 import { cn } from "@/lib/utils"
 import { fitLabel } from "./parts"
 import { ownedModel, unrunnableFile } from "./data"
-import { YourModels, type OwnedModel } from "./your-models"
+import { Hidden, Unrunnable, YourModels, type OwnedModel, type UnrunnableFile } from "./your-models"
 import { DrafterDialog } from "./drafter-picker"
 
 const residencyOf = (model: LocalModel) => "residencyState" in model.acquisitionState ? model.acquisitionState.residencyState : undefined
@@ -29,7 +29,21 @@ const quantSearch = (view: OwnedModel) => {
   return repository && repository.length > 0 ? repository : view.name
 }
 
-/** Models: the user's models, or `empty` until there are any. */
+/**
+ * The user's visible models (`list`), or `empty` while none is visible, then those hidden and the files that can't run
+ * yet, so unhiding a model brings the list back in the empty state's place.
+ */
+export function OwnedModels({ list, empty, hidden, unrunnable, onUnhide }: {
+  list: ReactNode | null; empty: ReactNode; hidden: readonly OwnedModel[]; unrunnable: readonly UnrunnableFile[]; onUnhide: (model: OwnedModel) => void
+}) {
+  return <>
+    {list ?? empty}
+    <Hidden models={hidden} onUnhide={onUnhide} />
+    <Unrunnable files={unrunnable} />
+  </>
+}
+
+/** Models: the user's models, or `empty` while none is visible. */
 export function ModelsScreen({ onExplore, empty }: { onExplore: (query: string) => void; empty: ReactNode }) {
   const models = useLocalModels()
   const hardware = useLocalInferenceHardware()
@@ -94,10 +108,9 @@ export function ModelsScreen({ onExplore, empty }: { onExplore: (query: string) 
   }
   const choosing = picking === null ? undefined : byId.get(picking.modelId)
   return <div>
-    {owned.length === 0 && hidden.length === 0 && models.value.unsupported.length === 0
-      ? empty
-      : <YourModels models={owned} hidden={hidden} unrunnable={models.value.unsupported.map(unrunnableFile)} action={action}
-        onExploreQuants={view => onExplore(quantSearch(view))} onRemove={remove} onUnhide={unhide} onDrafter={setPicking} />}
+    <OwnedModels list={owned.length === 0 ? null : <YourModels models={owned} action={action}
+        onExploreQuants={view => onExplore(quantSearch(view))} onRemove={remove} onDrafter={setPicking} />}
+      empty={empty} hidden={hidden} unrunnable={models.value.unsupported.map(unrunnableFile)} onUnhide={unhide} />
     {picking && choosing?._tag === "Custom" && <DrafterDialog model={choosing} bits={picking.quant.bits} onClose={() => setPicking(null)}
       onChoose={choice => mutations.setDrafter(choosing.modelId as CustomFormModelId, choice)} />}
   </div>
