@@ -75,8 +75,12 @@ common_chat_params common_chat_params_init_ministral_3(const common_chat_templat
 
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         auto generation_prompt = p.eps();
-        auto reasoning =
-            extract_reasoning ? p.optional("[THINK]" + p.reasoning(p.until("[/THINK]")) + "[/THINK]") : p.eps();
+        auto reasoning_text    = p.eps();
+        auto reasoning         = p.eps();
+        if (extract_reasoning) {
+            reasoning_text = p.reasoning(p.until("[/THINK]"));
+            reasoning      = p.optional("[THINK]" + reasoning_text + "[/THINK]");
+        }
 
         // Response format parser
         if (has_response_format) {
@@ -101,9 +105,14 @@ common_chat_params common_chat_params_init_ministral_3(const common_chat_templat
             auto max_calls  = inputs.parallel_tool_calls ? -1 : 1;
             auto tool_calls = p.trigger_rule("tool-call", p.repeat("[TOOL_CALLS]" + tool_choice, min_calls, max_calls));
 
-            return generation_prompt +
-                   (reasoning << p.text_before_calls(p.content(p.until("[TOOL_CALLS]")), inputs.tool_choice)
-                              << tool_calls);
+            auto turn = reasoning << p.text_before_calls(p.content(p.until("[TOOL_CALLS]")), inputs.tool_choice)
+                                  << tool_calls;
+            if (extract_reasoning && min_calls == 0) {
+                // Reasoning that never closes ends with the output. It is read
+                // first: content beginning with [THINK] would take it.
+                return generation_prompt + (("[THINK]" + reasoning_text + p.end()) | turn);
+            }
+            return generation_prompt + turn;
         }
 
         // Content only parser

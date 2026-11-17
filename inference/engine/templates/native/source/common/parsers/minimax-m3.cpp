@@ -61,11 +61,16 @@ common_chat_params common_chat_params_init_minimax_m3(const common_chat_template
         auto generation_prompt = p.prefix(GEN_PROMPT, THINK_START);
         auto end = p.end();
 
-        auto reasoning = p.eps();
+        const bool thinking = extract_reasoning && inputs.enable_thinking.value_or(true);
+        auto reasoning      = p.eps();
+        auto reasoning_text = p.eps();
+        if (thinking) {
+            reasoning_text = p.reasoning(p.until(THINK_END));
+        }
         if (extract_reasoning) {
-            auto block = inputs.enable_thinking.value_or(true)
+            auto block = thinking
                              ? p.literal(THINK_START) + p.space() +
-                                   p.ac(p.reasoning(p.until(THINK_END)) + p.literal(THINK_END), THINK_END)
+                                   p.ac(reasoning_text + p.literal(THINK_END), THINK_END)
                              : p.literal(THINK_START) + p.ac(p.until(THINK_END) + p.literal(THINK_END), THINK_END);
 
             // A turn without reasoning is prefixed with a bare </mm:think>, written either by the
@@ -211,6 +216,12 @@ common_chat_params common_chat_params_init_minimax_m3(const common_chat_template
         }
 
         auto content_before_tools = p.text_before_calls(p.content(p.until(FC_START)), inputs.tool_choice);
+        if (thinking && !require_tools) {
+            // Reasoning that never closes ends with the output. It is read
+            // first: content beginning with the reasoning tag would take it.
+            auto unclosed = p.literal(THINK_START) + p.space() + reasoning_text + end;
+            return generation_prompt + (unclosed | (reasoning + content_before_tools + tool_calls)) + end;
+        }
         return generation_prompt + reasoning + content_before_tools + tool_calls + end;
     });
 

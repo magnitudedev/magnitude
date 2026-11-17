@@ -85,11 +85,11 @@ common_chat_params common_chat_params_init_cohere2moe(const common_chat_template
         // The thinking block is always present (the generation prompt forces <|START_THINKING|>).
         // When extracting reasoning, capture its body; otherwise keep the whole block (markers
         // included) inline as content, matching reasoning_format=NONE conventions.
-        common_peg_parser reasoning = p.eps();
+        common_peg_parser reasoning      = p.eps();
+        common_peg_parser reasoning_text = p.eps();
         if (extract_reasoning) {
-            reasoning = p.optional(p.literal(THINK_START) +
-                                   p.reasoning(p.until_one_of({ THINK_END, TEXT_START, ACTION_START })) +
-                                   p.optional(p.literal(THINK_END)));
+            reasoning_text = p.reasoning(p.until_one_of({ THINK_END, TEXT_START, ACTION_START }));
+            reasoning      = p.optional(p.literal(THINK_START) + reasoning_text + p.optional(p.literal(THINK_END)));
         } else {
             reasoning = p.optional(p.content(p.literal(THINK_START) +
                                              p.until_one_of({ THINK_END, TEXT_START, ACTION_START }) +
@@ -121,8 +121,14 @@ common_chat_params common_chat_params_init_cohere2moe(const common_chat_template
 
         // Content and tool calls are mutually exclusive in this format.
         common_peg_parser body = require_tools ? tool_calls : p.choice({ tool_calls, text_content });
-
-        return generation_prompt + reasoning + body + p.optional(p.literal(TURN_END)) + end;
+        auto turn = reasoning + body + p.optional(p.literal(TURN_END));
+        if (extract_reasoning && !require_tools) {
+            // Reasoning that never closes ends with the output. It is read
+            // first: the turn would otherwise refuse it for want of a body.
+            auto unclosed = p.literal(THINK_START) + reasoning_text + end;
+            return generation_prompt + (unclosed | turn) + end;
+        }
+        return generation_prompt + turn + end;
     });
 
     data.parser = parser.save();

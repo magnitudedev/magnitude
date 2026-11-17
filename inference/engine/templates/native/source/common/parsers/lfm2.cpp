@@ -83,9 +83,11 @@ common_chat_params common_chat_params_init_lfm2(const common_chat_template &    
         auto generation_prompt = p.literal(GEN_PROMPT);
         auto end = p.end();
 
-        auto reasoning = p.eps();
+        auto reasoning      = p.eps();
+        auto reasoning_text = p.eps();
         if (extract_reasoning) {
-            reasoning = p.optional(p.rule("reasoning-block", THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END));
+            reasoning_text = p.reasoning(p.until(THINK_END));
+            reasoning      = p.optional(p.rule("reasoning-block", THINK_START + reasoning_text + THINK_END));
         }
 
         if (!has_tools || inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
@@ -114,6 +116,10 @@ common_chat_params common_chat_params_init_lfm2(const common_chat_template &    
             // Text beginning with <think> reads as reasoning whenever it can, so
             // content that no reasoning precedes never begins with it.
             preamble = p.gbnf(preamble, "(reasoning-block content-text | " + UNTHOUGHT_TEXT + ")");
+            // Reasoning that never closes ends with the output. It is read
+            // first: the parser's content would otherwise take its <think>.
+            auto unclosed = THINK_START + reasoning_text + end;
+            return generation_prompt + (unclosed | (preamble + tool_calls)) + end;
         }
 
         return generation_prompt + preamble + tool_calls + end;

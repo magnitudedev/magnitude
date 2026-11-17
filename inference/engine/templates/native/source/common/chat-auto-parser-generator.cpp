@@ -20,6 +20,19 @@ parser_build_context::parser_build_context(common_chat_peg_builder & p, const ge
     inputs(inputs),
     reasoning_parser(p.eps()) {}
 
+// A tool turn: reasoning, then the text and calls that follow it. Without a
+// required call the output may also end in reasoning that never closes; that
+// reading is tried first, since the text after reasoning may begin with its
+// opener, and as the last thing in the turn nothing follows it in the grammar.
+static common_peg_parser tool_turn(const parser_build_context & ctx, const common_peg_parser & after_reasoning) {
+    auto & p    = ctx.p;
+    auto   turn = ctx.reasoning_parser + after_reasoning + p.end();
+    if (ctx.unclosed_reasoning_parser && ctx.inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_REQUIRED) {
+        return *ctx.unclosed_reasoning_parser | turn;
+    }
+    return turn;
+}
+
 common_chat_params peg_generator::generate_parser(const common_chat_template &    tmpl,
                                                   const struct generation_params & inputs) {
     // Run differential analysis to extract template structure
@@ -146,12 +159,15 @@ common_peg_parser analyze_reasoning::build_parser(parser_build_context & ctx) co
 
     if (mode == reasoning_mode::TAG_BASED || mode == reasoning_mode::TOOLS_ONLY) {
         if (!end.empty()) {
+            auto text = p.reasoning(p.until(trim_whitespace(end)));
             if (!start.empty()) {
                 // Standard tag-based: optional(<think>reasoning</think>)
-                return p.optional(p.optspace(start) + p.reasoning(p.until(trim_whitespace(end))) + p.optspace(end));
+                ctx.unclosed_reasoning_parser = p.optspace(start) + text + p.end();
+                return p.optional(p.optspace(start) + text + p.optspace(end));
             }
             // Delimiter-style (empty start)
-            return p.optional(p.reasoning(p.until(trim_whitespace(end))) + p.optspace(end));
+            ctx.unclosed_reasoning_parser = text + p.end();
+            return p.optional(text + p.optspace(end));
         }
     }
 
@@ -238,7 +254,7 @@ common_peg_parser analyze_tools::build_tool_parser_json_native(parser_build_cont
     // Handle content wrappers if present
     auto content = ctx.content && ctx.content->is_always_wrapped() ? ctx.content->build_optional_wrapped(ctx)
                                                                    : p.optional(p.content(p.until(tool_start)));
-    return ctx.reasoning_parser + p.text_before_calls(content, inputs.tool_choice) + tools_parser + p.end();
+    return tool_turn(ctx, p.text_before_calls(content, inputs.tool_choice) + tools_parser);
 }
 
 common_peg_parser analyze_tools::build_func_parser(common_chat_peg_builder & p, const std::string & name,
@@ -367,7 +383,7 @@ common_peg_parser analyze_tools::build_tagged_turn(parser_build_context & ctx, c
     std::string trigger_marker       = !format.section_start.empty() ? format.section_start : format.per_call_start;
     auto        content_before_tools = trigger_marker.empty() ? p.eps() : p.until(trigger_marker);
     auto        content              = p.optional(p.content(content_before_tools));
-    return ctx.reasoning_parser + p.text_before_calls(content, inputs.tool_choice) + tool_calls + p.end();
+    return tool_turn(ctx, p.text_before_calls(content, inputs.tool_choice) + tool_calls);
 }
 
 common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_context & ctx) const {

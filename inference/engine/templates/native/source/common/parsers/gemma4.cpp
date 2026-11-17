@@ -432,9 +432,12 @@ common_chat_params common_chat_params_init_gemma4(const common_chat_template &  
         // opener, inside a thought or not, so with callable tools a call
         // opener also closes the thought it interrupts. A thought read past
         // it would take in the call, then end at a `<channel|>` the call's
-        // arguments contain and read the rest of the call as content.
+        // arguments contain and read the rest of the call as content. Unless
+        // a call is required, the grammar lets the output end anywhere before
+        // the calls, so the end of output closes the thought too.
         auto thought_text  = callable ? p.until_one_of({"<channel|>", "<|tool_call>"}) : p.until("<channel|>");
-        auto thought_close = callable ? p.literal("<channel|>") | p.peek(p.literal("<|tool_call>")) : p.literal("<channel|>");
+        auto thought_close = callable ? p.literal("<channel|>") | p.peek(p.literal("<|tool_call>")) | p.end()
+                                      : p.literal("<channel|>");
         if (extract_reasoning) {
             p.rule("thought", p.literal("<|channel>thought") + p.space() + p.reasoning(thought_text) + thought_close);
         } else {

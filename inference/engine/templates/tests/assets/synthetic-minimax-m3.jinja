@@ -1,0 +1,18 @@
+{#- Synthetic MiniMax-M3-format template: only the markup its handler reads. -#}
+{%- for message in messages -%}
+{%- if message.role == "assistant" -%}
+]~b]ai
+{{ message.content }}
+{%- for call in message.tool_calls or [] -%}
+]<]minimax[>[<tool_call>]<]minimax[>[<invoke name="{{ call.function.name }}">
+{{ call.function.arguments | tojson }}
+]<]minimax[>[</invoke>]<]minimax[>[</tool_call>
+{%- endfor -%}
+[e~[
+{%- else -%}
+]~b]{{ message.role }}
+{{ message.content }}[e~[
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}]~b]ai
+{% endif -%}

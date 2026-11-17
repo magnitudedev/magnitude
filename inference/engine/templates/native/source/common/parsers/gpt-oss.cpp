@@ -80,8 +80,10 @@ common_chat_params common_chat_params_init_gpt_oss(const common_chat_template & 
         auto stray_commentary = p.optional(p.literal("<|channel|>commentary") + p.optional(p.literal(" to=assistant")));
         auto start_analysis = stray_commentary + p.literal("<|channel|>analysis<|message|>");
 
+        auto analysis_text = p.eps();
         if (extract_reasoning) {
-            p.rule("analysis", start_analysis + p.reasoning(content) + end);
+            analysis_text = p.reasoning(content);
+            p.rule("analysis", start_analysis + analysis_text + end);
         } else {
             p.rule("analysis", p.content(start_analysis + content + end));
         }
@@ -133,6 +135,12 @@ common_chat_params common_chat_params_init_gpt_oss(const common_chat_template & 
                 return p.zero_or_more(start + any) + start + tool_call;
             }
 
+            if (extract_reasoning) {
+                // An analysis that never closes ends with the output; as the
+                // last alternative, nothing follows it in the grammar.
+                auto unclosed_analysis = start_analysis + analysis_text + p.end();
+                return p.zero_or_more(start + any) + start + (tool_call | final_msg | unclosed_analysis);
+            }
             return p.zero_or_more(start + any) + start + (tool_call | final_msg);
         }
 

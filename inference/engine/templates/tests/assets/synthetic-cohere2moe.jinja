@@ -1,0 +1,14 @@
+{#- Synthetic Cohere2 MoE-format template: only the markup its handler reads. -#}
+{%- for message in messages -%}
+{%- if message.role == "assistant" -%}
+<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>
+{%- if message.tool_calls -%}<|START_ACTION|>[{%- for call in message.tool_calls -%}{"tool_call_id": "{{ loop.index0 }}", "tool_name": "{{ call.function.name }}", "parameters": {{ call.function.arguments | tojson }}}{%- endfor -%}]<|END_ACTION|>
+{%- else -%}<|START_TEXT|>{{ message.content }}<|END_TEXT|>{%- endif -%}
+<|END_OF_TURN_TOKEN|>
+{%- elif message.role == "tool" -%}
+<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|><|START_TOOL_RESULT|>{{ message.content }}<|END_TOOL_RESULT|><|END_OF_TURN_TOKEN|>
+{%- else -%}
+<|START_OF_TURN_TOKEN|><|USER_TOKEN|>{{ message.content }}<|END_OF_TURN_TOKEN|>
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|><|START_THINKING|>{%- endif -%}

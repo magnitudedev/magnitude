@@ -114,14 +114,19 @@ common_chat_params common_chat_params_init_kimi_k2(const common_chat_template & 
         }
 
         // Reasoning closes with </think>, or runs into calls that begin with
-        // their opener. An optional </think> would let reasoning end anywhere
-        // in the grammar and content begin within a call opener.
+        // their opener, or, when no call is required, ends the output. An
+        // optional </think> would let reasoning end anywhere in the grammar
+        // and content begin within a call opener; the end of output is the
+        // last alternative, so nothing follows it in the grammar either.
         auto opened_calls = p.rule("opened-tool-calls", p.choice({
             p.literal(SECTION_BEGIN) + p.repeat(CALL_BEGIN + tool_choice, min_calls, max_calls) + section_end,
             p.repeat(CALL_BEGIN + tool_choice, std::max(min_calls, 1), max_calls) + section_end,
         }));
-        auto thought = THINK_START + p.reasoning(p.until_one_of({ THINK_END, SECTION_BEGIN, CALL_BEGIN })) +
-            ((THINK_END + content_before_tools + tool_calls) | opened_calls);
+        auto after_thought = (THINK_END + content_before_tools + tool_calls) | opened_calls;
+        if (min_calls == 0) {
+            after_thought |= end;
+        }
+        auto thought = THINK_START + p.reasoning(p.until_one_of({ THINK_END, SECTION_BEGIN, CALL_BEGIN })) + after_thought;
         return generation_prompt + (thought | (content_before_tools + tool_calls)) + end;
     });
 

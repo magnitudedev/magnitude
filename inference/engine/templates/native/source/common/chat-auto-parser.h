@@ -227,6 +227,9 @@ struct parser_build_context {
     common_chat_peg_builder & p;
     const generation_params &         inputs;
     common_peg_parser                 reasoning_parser;
+    // Reasoning that opens and never closes, ending the output, when the
+    // format extracts tagged reasoning.
+    std::optional<common_peg_parser>  unclosed_reasoning_parser;
     bool                              extracting_reasoning = false;
     const analyze_reasoning *         reasoning            = nullptr;
     const analyze_content *           content              = nullptr;

@@ -74,11 +74,8 @@ common_chat_params common_chat_params_init_muse_glimmer(const common_chat_templa
             return start + p.content(p.rest());
         }
 
-        if (extract_reasoning) {
-            p.rule("analysis", p.literal(" to=self<|message|>") + p.reasoning(p.until("<|eom|>")) + p.literal("<|eom|>"));
-        } else {
-            p.rule("analysis", p.literal(" to=self<|message|>") + p.content(p.until("<|eom|>")) + p.literal("<|eom|>"));
-        }
+        auto analysis_text = extract_reasoning ? p.reasoning(p.until("<|eom|>")) : p.content(p.until("<|eom|>"));
+        p.rule("analysis", p.literal(" to=self<|message|>") + analysis_text + p.literal("<|eom|>"));
         auto analysis = p.ref("analysis");
 
         auto recipient  = p.optional(p.literal(" to=user"));
@@ -136,7 +133,10 @@ common_chat_params common_chat_params_init_muse_glimmer(const common_chat_templa
                 return p.zero_or_more(start + analysis) + start + tool_calls;
             }
             auto trailing_calls = p.optional(p.literal("<|eom|>") + start + tool_calls);
-            return p.zero_or_more(start + analysis) + start + (tool_calls | (final_msg + trailing_calls));
+            // An analysis that never closes ends with the output; as the last
+            // alternative, nothing follows it in the grammar.
+            auto unclosed_analysis = p.literal(" to=self<|message|>") + analysis_text + p.end();
+            return p.zero_or_more(start + analysis) + start + (tool_calls | (final_msg + trailing_calls) | unclosed_analysis);
         }
 
         return p.zero_or_more(start + analysis) + start + final_msg;

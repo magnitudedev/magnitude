@@ -5,7 +5,7 @@
 //! named in prose), is fed one byte at a time and at every split. A parser
 //! that read such text as one thing and then as another would fail the stream
 //! with "Output parser would change published output".
-use magnitude_templates::{Event, Request, SpecialTokens, Template, TerminalCause};
+use magnitude_templates::{Event, PreparedRequest, Request, SpecialTokens, Template, TerminalCause};
 use serde_json::{json, Value};
 
 const QWEN3: &str = include_str!("assets/Qwen-Qwen3-0.6B.jinja");
@@ -25,6 +25,12 @@ const KIMI_K2: &str = include_str!("assets/Kimi-K2-Thinking.jinja");
 const DEEPSEEK: &str = include_str!("assets/DeepSeek-V3.2.jinja");
 const DEEPSEEK41: &str = include_str!("../../../conversion/src/magnitude_conversion/deepseek41.jinja");
 const LLAMA32: &str = include_str!("assets/Llama-3.2-3B-Instruct.jinja");
+// Synthetic templates holding only the markup their handlers read.
+const GPT_OSS: &str = include_str!("assets/synthetic-gpt-oss.jinja");
+const COHERE2MOE: &str = include_str!("assets/synthetic-cohere2moe.jinja");
+const MINIMAX_M3: &str = include_str!("assets/synthetic-minimax-m3.jinja");
+const MINISTRAL3: &str = include_str!("assets/synthetic-ministral3.jinja");
+const KIMI_K3: &str = include_str!("assets/synthetic-kimi-k3.jinja");
 
 fn special(bos: &str, eos: &str) -> SpecialTokens {
     [
@@ -483,11 +489,19 @@ fn bare_json_calls_read_once() {
 /// The admitted text is fed one byte at a time and every feed must succeed:
 /// published output is never revised. The seeds reach Gemma 4 calls written
 /// inside the thought a tool result's prompt opens. Llama 3.2 is absent: under
-/// an automatic tool choice it has no grammar.
+/// an automatic tool choice it has no grammar. Functionary v3.2 and GigaChat
+/// v3 are absent: they have no reasoning, and no template of theirs is held.
+///
+/// Each family also writes outputs that open reasoning. Wherever the grammar
+/// admits the end of output inside reasoning still open, ending there
+/// publishes that reasoning and nothing else, and every reasoning family's
+/// grammar must admit such an end somewhere.
 #[test]
 fn grammar_admitted_output_reads_monotonically() {
     const BUDGET: usize = 160;
     const OUTPUTS: usize = 12;
+    const THOUGHTS: usize = 2;
+    const ENDS: usize = 3;
     const SEEDS: [u64; 2] = [38, 234];
     let families: &[(&str, &str, (&str, &str))] = &[
         ("Qwen3", QWEN3, ("", "<|im_end|>")),
@@ -506,38 +520,105 @@ fn grammar_admitted_output_reads_monotonically() {
         ("Kimi K2", KIMI_K2, ("[BOS]", "[EOS]")),
         ("DeepSeek V3.2", DEEPSEEK, ("<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>")),
         ("DeepSeek V4.1", DEEPSEEK41, ("<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>")),
+        ("GPT-OSS", GPT_OSS, ("<|startoftext|>", "<|return|>")),
+        ("Cohere2 MoE", COHERE2MOE, ("<BOS_TOKEN>", "<|END_OF_TURN_TOKEN|>")),
+        ("MiniMax-M3", MINIMAX_M3, ("]~!b[", "[e~[")),
+        ("Ministral 3", MINISTRAL3, ("<s>", "</s>")),
+        ("Kimi K3", KIMI_K3, ("[BOS]", "<|end_of_msg|>")),
     ];
     let mut failures = Vec::new();
     for &(family, source, (bos, eos)) in families {
         let template = Template::new(source, &special(bos, eos)).unwrap();
+        let mut open_ends = 0;
+        let mut thinks = false;
         for turn in [Turn::Tools, Turn::AfterCall] {
             let plan = template.prepare(&request(turn)).unwrap();
             let description = plan.description();
+            thinks |= description.supports_thinking;
             let grammar = gbnf::Grammar::parse(&description.grammar);
             let mut start = grammar.start();
             for c in description.grammar_initial_prefix.chars() {
                 start = grammar.advance(&start, c).unwrap_or_else(|| panic!("{family}'s grammar refuses its initial prefix"));
             }
+            // Where the model may open reasoning itself, outputs that do.
+            let opener = description.thinking_start.as_str();
+            let thought = (!opener.is_empty())
+                .then(|| opener.chars().try_fold(start.clone(), |state, c| grammar.advance(&state, c)))
+                .flatten();
             let atoms = grammar.atoms();
             for seed in SEEDS {
                 let mut random = gbnf::Random(seed);
+                let mut sampler = gbnf::Random(!seed);
                 let mut echoes = Vec::new();
-                for _ in 0..OUTPUTS {
-                    let output = grammar.generate(&start, &atoms, &echoes, &mut random, BUDGET);
+                let origins = std::iter::repeat_n(("", &start), OUTPUTS)
+                    .chain(thought.iter().flat_map(|thought| std::iter::repeat_n((opener, thought), THOUGHTS)));
+                for (lead, origin) in origins {
+                    let output = lead.to_string() + &grammar.generate(origin, &atoms, &echoes, &mut random, BUDGET);
                     echoes.extend(gbnf::pieces(&output, &mut random));
                     let mut stream = plan.stream(1 << 16).unwrap();
+                    let mut reader = Reader::default();
+                    let mut state = start.clone();
+                    let mut ends = Vec::new();
                     for (i, byte) in output.bytes().enumerate() {
-                        if let Err(error) = stream.feed(&[byte]) {
-                            let fed = String::from_utf8_lossy(&output.as_bytes()[..=i]);
-                            failures.push(format!("{family} (seed {seed}): {error} after {fed:?}"));
-                            break;
+                        match stream.feed(&[byte]) {
+                            Ok(events) => reader.accept(events),
+                            Err(error) => {
+                                let fed = String::from_utf8_lossy(&output.as_bytes()[..=i]);
+                                failures.push(format!("{family} (seed {seed}): {error} after {fed:?}"));
+                                break;
+                            }
+                        }
+                        let Some(c) = output.is_char_boundary(i + 1).then(|| output[..=i].chars().next_back().unwrap()) else {
+                            continue;
+                        };
+                        state = grammar.advance(&state, c).expect("generated output is admitted");
+                        if state.admits_end() && reader.content.is_empty() && reader.calls.is_empty() && !reader.reasoning.is_empty() {
+                            ends.push((i + 1, reader.reasoning.clone()));
+                        }
+                    }
+                    // A few of the places the output may end in reasoning
+                    // still open: where text written next would be reasoning.
+                    let picked = (0..ENDS.min(ends.len())).map(|_| ends[sampler.below(ends.len())].clone());
+                    for (length, published) in picked.chain(ends.last().cloned()) {
+                        let prefix = &output[..length];
+                        if !reasons_on(&plan, prefix) {
+                            continue;
+                        }
+                        open_ends += 1;
+                        match end_after(&plan, prefix) {
+                            Ok(ended) if ended.content.is_empty() && ended.calls.is_empty() && ended.reasoning.starts_with(&published) => {}
+                            Ok(ended) => failures.push(format!("{family} (seed {seed}): ending after {prefix:?} reads {ended:?}")),
+                            Err(error) => failures.push(format!("{family} (seed {seed}): ending after {prefix:?}: {error}")),
                         }
                     }
                 }
             }
         }
+        if thinks && open_ends == 0 {
+            failures.push(format!("{family}: no output ends inside reasoning it never closed"));
+        }
     }
     assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Whether text written after `output` is read as reasoning.
+fn reasons_on(plan: &PreparedRequest, output: &str) -> bool {
+    let mut stream = plan.stream(1 << 16).unwrap();
+    let mut reader = Reader::default();
+    let Ok(events) = stream.feed(format!("{output}x").as_bytes()) else {
+        return false;
+    };
+    reader.accept(events);
+    reader.content.is_empty() && reader.calls.is_empty() && reader.reasoning.ends_with('x')
+}
+
+/// Feeds `output` whole and ends it naturally.
+fn end_after(plan: &PreparedRequest, output: &str) -> Result<Transcript, String> {
+    let mut stream = plan.stream(1 << 16).map_err(|error| error.to_string())?;
+    let mut reader = Reader::default();
+    reader.accept(stream.feed(output.as_bytes()).map_err(|error| error.to_string())?);
+    reader.accept(stream.finish(TerminalCause::Natural).map_err(|error| error.to_string())?);
+    Ok(reader.transcript())
 }
 
 /// GBNF, the language a prepared grammar constrains generation to, recognized
@@ -554,8 +635,16 @@ mod gbnf {
     type Stack = Vec<(usize, usize, usize)>;
 
     /// The stacks waiting on a character; an empty stack has completed the root.
+    #[derive(Clone)]
     pub struct State {
         stacks: Vec<Stack>,
+    }
+
+    impl State {
+        /// Whether the output may end here.
+        pub fn admits_end(&self) -> bool {
+            self.stacks.iter().any(Vec::is_empty)
+        }
     }
 
     /// Pieces of `output` for later outputs to repeat: model text quoting

@@ -53,9 +53,11 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         auto generation_prompt = p.literal("<|im_start|>assistant\n");
 
-        auto reasoning = p.eps();
+        auto reasoning      = p.eps();
+        auto reasoning_text = p.eps();
         if (extract_reasoning) {
-            reasoning = p.optional(p.rule("reasoning-block", ("<think>" << p.reasoning(p.until("</think>")) << "</think>") + p.space()));
+            reasoning_text = p.reasoning(p.until("</think>"));
+            reasoning      = p.optional(p.rule("reasoning-block", ("<think>" << reasoning_text << "</think>") + p.space()));
         }
 
         // Response format parser
@@ -123,6 +125,10 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
                 // Text beginning with <think> reads as reasoning whenever it can, so
                 // content that no reasoning precedes never begins with it.
                 preamble = p.gbnf(preamble, "(reasoning-block content-text | " + MINICPM5_UNTHOUGHT_TEXT + ")");
+                // Reasoning that never closes ends with the output. It is read
+                // first: the parser's content would otherwise take its <think>.
+                auto unclosed = ("<think>" << reasoning_text) + p.end();
+                return generation_prompt + (unclosed | (preamble + tool_calls)) + p.end();
             }
 
             return generation_prompt + preamble + tool_calls + p.end();

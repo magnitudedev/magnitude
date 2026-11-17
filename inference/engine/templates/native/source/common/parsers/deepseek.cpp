@@ -225,10 +225,13 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
 
         // Reasoning the generation prompt opens is only reasoning: it ends at
         // `</think>`, or at the calls block, which it may open directly.
-        const bool opened = extract_reasoning && inputs.enable_thinking.value_or(true) &&
+        const bool thinking = extract_reasoning && inputs.enable_thinking.value_or(true);
+        const bool opened = thinking &&
             data.generation_prompt.compare(opener.size(), THINK_START.size(), THINK_START) == 0;
-        if (extract_reasoning && inputs.enable_thinking.value_or(true)) {
-            reasoning = p.optional(THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END);
+        auto thought_text = p.eps();
+        if (thinking) {
+            thought_text = p.reasoning(p.until(THINK_END));
+            reasoning = p.optional(THINK_START + thought_text + THINK_END);
         } else if (extract_reasoning) {
             // Thinking disabled but reasoning extraction requested: the generation prompt
             // contains an empty <think></think> pair (V3.2) or a bare </think> (V4) that
@@ -255,9 +258,21 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
         auto content_before_tools = p.text_before_calls(
             p.content(p.until_one_of({ TC_SEPARATOR + FC_START, FC_START })) + p.space(), inputs.tool_choice);
         if (opened) {
+            // The end of output also ends the reasoning when no call is
+            // required; as the last alternative, nothing follows it in the
+            // grammar.
             auto reasoning_text = p.reasoning(p.until_one_of({ TC_SEPARATOR + FC_START, FC_START, THINK_END }));
-            return generation_prompt + THINK_START + reasoning_text +
-                ((THINK_END + content_before_tools + tool_calls) | (p.space() + obligatory_tool_calls)) + end;
+            auto after_reasoning = (THINK_END + content_before_tools + tool_calls) | (p.space() + obligatory_tool_calls);
+            if (!require_tools) {
+                after_reasoning |= end;
+            }
+            return generation_prompt + THINK_START + reasoning_text + after_reasoning + end;
+        }
+        if (thinking && !require_tools) {
+            // Reasoning the model opens and never closes ends with the output.
+            // It is read first: content beginning with `<think>` would take it.
+            auto unclosed = THINK_START + thought_text + end;
+            return generation_prompt + (unclosed | (reasoning + content_before_tools + tool_calls)) + end;
         }
         return generation_prompt + reasoning + content_before_tools + tool_calls + end;
     });

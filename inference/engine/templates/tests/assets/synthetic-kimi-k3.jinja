@@ -1,0 +1,14 @@
+{#- Synthetic Kimi K3-format template: only the markup its handler reads. -#}
+{%- for message in messages -%}
+<|open|>message role="{{ message.role }}"<|sep|>
+{%- if message.role == "assistant" -%}
+<|open|>response<|sep|>{{ message.content }}<|close|>response<|sep|>
+{%- if message.tool_calls -%}<|open|>tools<|sep|>
+{%- for call in message.tool_calls -%}<|open|>call tool="{{ call.function.name }}" index="{{ loop.index0 }}"<|sep|>
+{{ call.function.arguments | tojson }}
+<|close|>call<|sep|>{%- endfor -%}<|close|>tools<|sep|>
+{%- endif -%}
+{%- else -%}{{ message.content }}{%- endif -%}
+<|close|>message<|sep|><|end_of_msg|>
+{%- endfor -%}
+{%- if add_generation_prompt -%}<|open|>message role="assistant"<|sep|><|open|>think<|sep|>{%- endif -%}

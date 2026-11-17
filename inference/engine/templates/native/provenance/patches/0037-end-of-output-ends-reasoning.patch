@@ -1,0 +1,406 @@
+--- a/common/chat-auto-parser-generator.cpp
++++ b/common/chat-auto-parser-generator.cpp
+@@ -20,6 +20,19 @@ parser_build_context::parser_build_context(common_chat_peg_builder & p, const ge
+     inputs(inputs),
+     reasoning_parser(p.eps()) {}
+ 
++// A tool turn: reasoning, then the text and calls that follow it. Without a
++// required call the output may also end in reasoning that never closes; that
++// reading is tried first, since the text after reasoning may begin with its
++// opener, and as the last thing in the turn nothing follows it in the grammar.
++static common_peg_parser tool_turn(const parser_build_context & ctx, const common_peg_parser & after_reasoning) {
++    auto & p    = ctx.p;
++    auto   turn = ctx.reasoning_parser + after_reasoning + p.end();
++    if (ctx.unclosed_reasoning_parser && ctx.inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_REQUIRED) {
++        return *ctx.unclosed_reasoning_parser | turn;
++    }
++    return turn;
++}
++
+ common_chat_params peg_generator::generate_parser(const common_chat_template &    tmpl,
+                                                   const struct generation_params & inputs) {
+     // Run differential analysis to extract template structure
+@@ -146,12 +159,15 @@ common_peg_parser analyze_reasoning::build_parser(parser_build_context & ctx) co
+ 
+     if (mode == reasoning_mode::TAG_BASED || mode == reasoning_mode::TOOLS_ONLY) {
+         if (!end.empty()) {
++            auto text = p.reasoning(p.until(trim_whitespace(end)));
+             if (!start.empty()) {
+                 // Standard tag-based: optional(<think>reasoning</think>)
+-                return p.optional(p.optspace(start) + p.reasoning(p.until(trim_whitespace(end))) + p.optspace(end));
++                ctx.unclosed_reasoning_parser = p.optspace(start) + text + p.end();
++                return p.optional(p.optspace(start) + text + p.optspace(end));
+             }
+             // Delimiter-style (empty start)
+-            return p.optional(p.reasoning(p.until(trim_whitespace(end))) + p.optspace(end));
++            ctx.unclosed_reasoning_parser = text + p.end();
++            return p.optional(text + p.optspace(end));
+         }
+     }
+ 
+@@ -238,7 +254,7 @@ common_peg_parser analyze_tools::build_tool_parser_json_native(parser_build_cont
+     // Handle content wrappers if present
+     auto content = ctx.content && ctx.content->is_always_wrapped() ? ctx.content->build_optional_wrapped(ctx)
+                                                                    : p.optional(p.content(p.until(tool_start)));
+-    return ctx.reasoning_parser + p.text_before_calls(content, inputs.tool_choice) + tools_parser + p.end();
++    return tool_turn(ctx, p.text_before_calls(content, inputs.tool_choice) + tools_parser);
+ }
+ 
+ common_peg_parser analyze_tools::build_func_parser(common_chat_peg_builder & p, const std::string & name,
+@@ -367,7 +383,7 @@ common_peg_parser analyze_tools::build_tagged_turn(parser_build_context & ctx, c
+     std::string trigger_marker       = !format.section_start.empty() ? format.section_start : format.per_call_start;
+     auto        content_before_tools = trigger_marker.empty() ? p.eps() : p.until(trigger_marker);
+     auto        content              = p.optional(p.content(content_before_tools));
+-    return ctx.reasoning_parser + p.text_before_calls(content, inputs.tool_choice) + tool_calls + p.end();
++    return tool_turn(ctx, p.text_before_calls(content, inputs.tool_choice) + tool_calls);
+ }
+ 
+ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_context & ctx) const {
+--- a/common/chat-auto-parser.h
++++ b/common/chat-auto-parser.h
+@@ -227,6 +227,9 @@ struct parser_build_context {
+     common_chat_peg_builder & p;
+     const generation_params &         inputs;
+     common_peg_parser                 reasoning_parser;
++    // Reasoning that opens and never closes, ending the output, when the
++    // format extracts tagged reasoning.
++    std::optional<common_peg_parser>  unclosed_reasoning_parser;
+     bool                              extracting_reasoning = false;
+     const analyze_reasoning *         reasoning            = nullptr;
+     const analyze_content *           content              = nullptr;
+--- a/common/parsers/cohere2moe.cpp
++++ b/common/parsers/cohere2moe.cpp
+@@ -85,11 +85,11 @@ common_chat_params common_chat_params_init_cohere2moe(const common_chat_template
+         // The thinking block is always present (the generation prompt forces <|START_THINKING|>).
+         // When extracting reasoning, capture its body; otherwise keep the whole block (markers
+         // included) inline as content, matching reasoning_format=NONE conventions.
+-        common_peg_parser reasoning = p.eps();
++        common_peg_parser reasoning      = p.eps();
++        common_peg_parser reasoning_text = p.eps();
+         if (extract_reasoning) {
+-            reasoning = p.optional(p.literal(THINK_START) +
+-                                   p.reasoning(p.until_one_of({ THINK_END, TEXT_START, ACTION_START })) +
+-                                   p.optional(p.literal(THINK_END)));
++            reasoning_text = p.reasoning(p.until_one_of({ THINK_END, TEXT_START, ACTION_START }));
++            reasoning      = p.optional(p.literal(THINK_START) + reasoning_text + p.optional(p.literal(THINK_END)));
+         } else {
+             reasoning = p.optional(p.content(p.literal(THINK_START) +
+                                              p.until_one_of({ THINK_END, TEXT_START, ACTION_START }) +
+@@ -121,8 +121,14 @@ common_chat_params common_chat_params_init_cohere2moe(const common_chat_template
+ 
+         // Content and tool calls are mutually exclusive in this format.
+         common_peg_parser body = require_tools ? tool_calls : p.choice({ tool_calls, text_content });
+-
+-        return generation_prompt + reasoning + body + p.optional(p.literal(TURN_END)) + end;
++        auto turn = reasoning + body + p.optional(p.literal(TURN_END));
++        if (extract_reasoning && !require_tools) {
++            // Reasoning that never closes ends with the output. It is read
++            // first: the turn would otherwise refuse it for want of a body.
++            auto unclosed = p.literal(THINK_START) + reasoning_text + end;
++            return generation_prompt + (unclosed | turn) + end;
++        }
++        return generation_prompt + turn + end;
+     });
+ 
+     data.parser = parser.save();
+--- a/common/parsers/deepseek.cpp
++++ b/common/parsers/deepseek.cpp
+@@ -225,10 +225,13 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
+ 
+         // Reasoning the generation prompt opens is only reasoning: it ends at
+         // `</think>`, or at the calls block, which it may open directly.
+-        const bool opened = extract_reasoning && inputs.enable_thinking.value_or(true) &&
++        const bool thinking = extract_reasoning && inputs.enable_thinking.value_or(true);
++        const bool opened = thinking &&
+             data.generation_prompt.compare(opener.size(), THINK_START.size(), THINK_START) == 0;
+-        if (extract_reasoning && inputs.enable_thinking.value_or(true)) {
+-            reasoning = p.optional(THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END);
++        auto thought_text = p.eps();
++        if (thinking) {
++            thought_text = p.reasoning(p.until(THINK_END));
++            reasoning = p.optional(THINK_START + thought_text + THINK_END);
+         } else if (extract_reasoning) {
+             // Thinking disabled but reasoning extraction requested: the generation prompt
+             // contains an empty <think></think> pair (V3.2) or a bare </think> (V4) that
+@@ -255,9 +258,21 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
+         auto content_before_tools = p.text_before_calls(
+             p.content(p.until_one_of({ TC_SEPARATOR + FC_START, FC_START })) + p.space(), inputs.tool_choice);
+         if (opened) {
++            // The end of output also ends the reasoning when no call is
++            // required; as the last alternative, nothing follows it in the
++            // grammar.
+             auto reasoning_text = p.reasoning(p.until_one_of({ TC_SEPARATOR + FC_START, FC_START, THINK_END }));
+-            return generation_prompt + THINK_START + reasoning_text +
+-                ((THINK_END + content_before_tools + tool_calls) | (p.space() + obligatory_tool_calls)) + end;
++            auto after_reasoning = (THINK_END + content_before_tools + tool_calls) | (p.space() + obligatory_tool_calls);
++            if (!require_tools) {
++                after_reasoning |= end;
++            }
++            return generation_prompt + THINK_START + reasoning_text + after_reasoning + end;
++        }
++        if (thinking && !require_tools) {
++            // Reasoning the model opens and never closes ends with the output.
++            // It is read first: content beginning with `<think>` would take it.
++            auto unclosed = THINK_START + thought_text + end;
++            return generation_prompt + (unclosed | (reasoning + content_before_tools + tool_calls)) + end;
+         }
+         return generation_prompt + reasoning + content_before_tools + tool_calls + end;
+     });
+--- a/common/parsers/gemma4.cpp
++++ b/common/parsers/gemma4.cpp
+@@ -432,9 +432,12 @@ common_chat_params common_chat_params_init_gemma4(const common_chat_template &
+         // opener, inside a thought or not, so with callable tools a call
+         // opener also closes the thought it interrupts. A thought read past
+         // it would take in the call, then end at a `<channel|>` the call's
+-        // arguments contain and read the rest of the call as content.
++        // arguments contain and read the rest of the call as content. Unless
++        // a call is required, the grammar lets the output end anywhere before
++        // the calls, so the end of output closes the thought too.
+         auto thought_text  = callable ? p.until_one_of({"<channel|>", "<|tool_call>"}) : p.until("<channel|>");
+-        auto thought_close = callable ? p.literal("<channel|>") | p.peek(p.literal("<|tool_call>")) : p.literal("<channel|>");
++        auto thought_close = callable ? p.literal("<channel|>") | p.peek(p.literal("<|tool_call>")) | p.end()
++                                      : p.literal("<channel|>");
+         if (extract_reasoning) {
+             p.rule("thought", p.literal("<|channel>thought") + p.space() + p.reasoning(thought_text) + thought_close);
+         } else {
+--- a/common/parsers/gpt-oss.cpp
++++ b/common/parsers/gpt-oss.cpp
+@@ -80,8 +80,10 @@ common_chat_params common_chat_params_init_gpt_oss(const common_chat_template &
+         auto stray_commentary = p.optional(p.literal("<|channel|>commentary") + p.optional(p.literal(" to=assistant")));
+         auto start_analysis = stray_commentary + p.literal("<|channel|>analysis<|message|>");
+ 
++        auto analysis_text = p.eps();
+         if (extract_reasoning) {
+-            p.rule("analysis", start_analysis + p.reasoning(content) + end);
++            analysis_text = p.reasoning(content);
++            p.rule("analysis", start_analysis + analysis_text + end);
+         } else {
+             p.rule("analysis", p.content(start_analysis + content + end));
+         }
+@@ -133,6 +135,12 @@ common_chat_params common_chat_params_init_gpt_oss(const common_chat_template &
+                 return p.zero_or_more(start + any) + start + tool_call;
+             }
+ 
++            if (extract_reasoning) {
++                // An analysis that never closes ends with the output; as the
++                // last alternative, nothing follows it in the grammar.
++                auto unclosed_analysis = start_analysis + analysis_text + p.end();
++                return p.zero_or_more(start + any) + start + (tool_call | final_msg | unclosed_analysis);
++            }
+             return p.zero_or_more(start + any) + start + (tool_call | final_msg);
+         }
+ 
+--- a/common/parsers/kimi-k2.cpp
++++ b/common/parsers/kimi-k2.cpp
+@@ -114,14 +114,19 @@ common_chat_params common_chat_params_init_kimi_k2(const common_chat_template &
+         }
+ 
+         // Reasoning closes with </think>, or runs into calls that begin with
+-        // their opener. An optional </think> would let reasoning end anywhere
+-        // in the grammar and content begin within a call opener.
++        // their opener, or, when no call is required, ends the output. An
++        // optional </think> would let reasoning end anywhere in the grammar
++        // and content begin within a call opener; the end of output is the
++        // last alternative, so nothing follows it in the grammar either.
+         auto opened_calls = p.rule("opened-tool-calls", p.choice({
+             p.literal(SECTION_BEGIN) + p.repeat(CALL_BEGIN + tool_choice, min_calls, max_calls) + section_end,
+             p.repeat(CALL_BEGIN + tool_choice, std::max(min_calls, 1), max_calls) + section_end,
+         }));
+-        auto thought = THINK_START + p.reasoning(p.until_one_of({ THINK_END, SECTION_BEGIN, CALL_BEGIN })) +
+-            ((THINK_END + content_before_tools + tool_calls) | opened_calls);
++        auto after_thought = (THINK_END + content_before_tools + tool_calls) | opened_calls;
++        if (min_calls == 0) {
++            after_thought |= end;
++        }
++        auto thought = THINK_START + p.reasoning(p.until_one_of({ THINK_END, SECTION_BEGIN, CALL_BEGIN })) + after_thought;
+         return generation_prompt + (thought | (content_before_tools + tool_calls)) + end;
+     });
+ 
+--- a/common/parsers/lfm2.cpp
++++ b/common/parsers/lfm2.cpp
+@@ -83,9 +83,11 @@ common_chat_params common_chat_params_init_lfm2(const common_chat_template &
+         auto generation_prompt = p.literal(GEN_PROMPT);
+         auto end = p.end();
+ 
+-        auto reasoning = p.eps();
++        auto reasoning      = p.eps();
++        auto reasoning_text = p.eps();
+         if (extract_reasoning) {
+-            reasoning = p.optional(p.rule("reasoning-block", THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END));
++            reasoning_text = p.reasoning(p.until(THINK_END));
++            reasoning      = p.optional(p.rule("reasoning-block", THINK_START + reasoning_text + THINK_END));
+         }
+ 
+         if (!has_tools || inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
+@@ -114,6 +116,10 @@ common_chat_params common_chat_params_init_lfm2(const common_chat_template &
+             // Text beginning with <think> reads as reasoning whenever it can, so
+             // content that no reasoning precedes never begins with it.
+             preamble = p.gbnf(preamble, "(reasoning-block content-text | " + UNTHOUGHT_TEXT + ")");
++            // Reasoning that never closes ends with the output. It is read
++            // first: the parser's content would otherwise take its <think>.
++            auto unclosed = THINK_START + reasoning_text + end;
++            return generation_prompt + (unclosed | (preamble + tool_calls)) + end;
+         }
+ 
+         return generation_prompt + preamble + tool_calls + end;
+--- a/common/parsers/minicpm5.cpp
++++ b/common/parsers/minicpm5.cpp
+@@ -53,9 +53,11 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
+     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+         auto generation_prompt = p.literal("<|im_start|>assistant\n");
+ 
+-        auto reasoning = p.eps();
++        auto reasoning      = p.eps();
++        auto reasoning_text = p.eps();
+         if (extract_reasoning) {
+-            reasoning = p.optional(p.rule("reasoning-block", ("<think>" << p.reasoning(p.until("</think>")) << "</think>") + p.space()));
++            reasoning_text = p.reasoning(p.until("</think>"));
++            reasoning      = p.optional(p.rule("reasoning-block", ("<think>" << reasoning_text << "</think>") + p.space()));
+         }
+ 
+         // Response format parser
+@@ -123,6 +125,10 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
+                 // Text beginning with <think> reads as reasoning whenever it can, so
+                 // content that no reasoning precedes never begins with it.
+                 preamble = p.gbnf(preamble, "(reasoning-block content-text | " + MINICPM5_UNTHOUGHT_TEXT + ")");
++                // Reasoning that never closes ends with the output. It is read
++                // first: the parser's content would otherwise take its <think>.
++                auto unclosed = ("<think>" << reasoning_text) + p.end();
++                return generation_prompt + (unclosed | (preamble + tool_calls)) + p.end();
+             }
+ 
+             return generation_prompt + preamble + tool_calls + p.end();
+--- a/common/parsers/minimax-m3.cpp
++++ b/common/parsers/minimax-m3.cpp
+@@ -61,11 +61,16 @@ common_chat_params common_chat_params_init_minimax_m3(const common_chat_template
+         auto generation_prompt = p.prefix(GEN_PROMPT, THINK_START);
+         auto end = p.end();
+ 
+-        auto reasoning = p.eps();
++        const bool thinking = extract_reasoning && inputs.enable_thinking.value_or(true);
++        auto reasoning      = p.eps();
++        auto reasoning_text = p.eps();
++        if (thinking) {
++            reasoning_text = p.reasoning(p.until(THINK_END));
++        }
+         if (extract_reasoning) {
+-            auto block = inputs.enable_thinking.value_or(true)
++            auto block = thinking
+                              ? p.literal(THINK_START) + p.space() +
+-                                   p.ac(p.reasoning(p.until(THINK_END)) + p.literal(THINK_END), THINK_END)
++                                   p.ac(reasoning_text + p.literal(THINK_END), THINK_END)
+                              : p.literal(THINK_START) + p.ac(p.until(THINK_END) + p.literal(THINK_END), THINK_END);
+ 
+             // A turn without reasoning is prefixed with a bare </mm:think>, written either by the
+@@ -211,6 +216,12 @@ common_chat_params common_chat_params_init_minimax_m3(const common_chat_template
+         }
+ 
+         auto content_before_tools = p.text_before_calls(p.content(p.until(FC_START)), inputs.tool_choice);
++        if (thinking && !require_tools) {
++            // Reasoning that never closes ends with the output. It is read
++            // first: content beginning with the reasoning tag would take it.
++            auto unclosed = p.literal(THINK_START) + p.space() + reasoning_text + end;
++            return generation_prompt + (unclosed | (reasoning + content_before_tools + tool_calls)) + end;
++        }
+         return generation_prompt + reasoning + content_before_tools + tool_calls + end;
+     });
+ 
+--- a/common/parsers/ministral3.cpp
++++ b/common/parsers/ministral3.cpp
+@@ -75,8 +75,12 @@ common_chat_params common_chat_params_init_ministral_3(const common_chat_templat
+ 
+     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+         auto generation_prompt = p.eps();
+-        auto reasoning =
+-            extract_reasoning ? p.optional("[THINK]" + p.reasoning(p.until("[/THINK]")) + "[/THINK]") : p.eps();
++        auto reasoning_text    = p.eps();
++        auto reasoning         = p.eps();
++        if (extract_reasoning) {
++            reasoning_text = p.reasoning(p.until("[/THINK]"));
++            reasoning      = p.optional("[THINK]" + reasoning_text + "[/THINK]");
++        }
+ 
+         // Response format parser
+         if (has_response_format) {
+@@ -101,9 +105,14 @@ common_chat_params common_chat_params_init_ministral_3(const common_chat_templat
+             auto max_calls  = inputs.parallel_tool_calls ? -1 : 1;
+             auto tool_calls = p.trigger_rule("tool-call", p.repeat("[TOOL_CALLS]" + tool_choice, min_calls, max_calls));
+ 
+-            return generation_prompt +
+-                   (reasoning << p.text_before_calls(p.content(p.until("[TOOL_CALLS]")), inputs.tool_choice)
+-                              << tool_calls);
++            auto turn = reasoning << p.text_before_calls(p.content(p.until("[TOOL_CALLS]")), inputs.tool_choice)
++                                  << tool_calls;
++            if (extract_reasoning && min_calls == 0) {
++                // Reasoning that never closes ends with the output. It is read
++                // first: content beginning with [THINK] would take it.
++                return generation_prompt + (("[THINK]" + reasoning_text + p.end()) | turn);
++            }
++            return generation_prompt + turn;
+         }
+ 
+         // Content only parser
+--- a/common/parsers/muse-glimmer.cpp
++++ b/common/parsers/muse-glimmer.cpp
+@@ -74,11 +74,8 @@ common_chat_params common_chat_params_init_muse_glimmer(const common_chat_templa
+             return start + p.content(p.rest());
+         }
+ 
+-        if (extract_reasoning) {
+-            p.rule("analysis", p.literal(" to=self<|message|>") + p.reasoning(p.until("<|eom|>")) + p.literal("<|eom|>"));
+-        } else {
+-            p.rule("analysis", p.literal(" to=self<|message|>") + p.content(p.until("<|eom|>")) + p.literal("<|eom|>"));
+-        }
++        auto analysis_text = extract_reasoning ? p.reasoning(p.until("<|eom|>")) : p.content(p.until("<|eom|>"));
++        p.rule("analysis", p.literal(" to=self<|message|>") + analysis_text + p.literal("<|eom|>"));
+         auto analysis = p.ref("analysis");
+ 
+         auto recipient  = p.optional(p.literal(" to=user"));
+@@ -136,7 +133,10 @@ common_chat_params common_chat_params_init_muse_glimmer(const common_chat_templa
+                 return p.zero_or_more(start + analysis) + start + tool_calls;
+             }
+             auto trailing_calls = p.optional(p.literal("<|eom|>") + start + tool_calls);
+-            return p.zero_or_more(start + analysis) + start + (tool_calls | (final_msg + trailing_calls));
++            // An analysis that never closes ends with the output; as the last
++            // alternative, nothing follows it in the grammar.
++            auto unclosed_analysis = p.literal(" to=self<|message|>") + analysis_text + p.end();
++            return p.zero_or_more(start + analysis) + start + (tool_calls | (final_msg + trailing_calls) | unclosed_analysis);
+         }
+ 
+         return p.zero_or_more(start + analysis) + start + final_msg;
+--- a/common/parsers/qwen3-coder.cpp
++++ b/common/parsers/qwen3-coder.cpp
+@@ -76,9 +76,10 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
+ 
+         auto reasoning = p.eps();
+         if (supports_reasoning && extract_reasoning) {
++            // Reasoning closes with </think>, at a tool call, or with the output.
+             reasoning = p.optional("<think>" + p.space() +
+                                    p.rule("reasoning-text", p.reasoning(p.until_one_of({ "</think>", "<tool_call>" }))) +
+-                                   (p.literal("</think>") | p.peek(p.literal("<tool_call>"))));
++                                   (p.literal("</think>") | p.peek(p.literal("<tool_call>")) | p.end()));
+         }
+ 
+         // Response format parser. Without tool calls, only </think> closes
+@@ -208,16 +209,17 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
+                 std::string text          = min_calls == 0 ? " space content-text space" : " space";
+                 std::string before_calls  = think + " (\"</think>\"" + text + ")?";
+                 std::string without_calls = closed + text;
+-                // Reasoning the generation prompt opens is only reasoning: it
+-                // closes before the turn ends, as the parser requires of text
+-                // it has streamed as reasoning. Otherwise it may be skipped.
++                // Reasoning the generation prompt opens is only reasoning:
++                // content follows only its close. Otherwise it may be skipped.
+                 if (data.generation_prompt.find("<think>") == std::string::npos) {
+                     before_calls += " |" + text;
+                     without_calls = "(" + closed + ")?" + text;
+                 }
+                 std::string grammar = "((" + before_calls + ") tool-calls";
+                 if (min_calls == 0) {
+-                    grammar += " | " + without_calls;
++                    // Without a required call, the output may also end in
++                    // reasoning that never closes.
++                    grammar += " | " + without_calls + " | " + think;
+                 }
+                 body = p.gbnf(body, grammar + ")");
+             }

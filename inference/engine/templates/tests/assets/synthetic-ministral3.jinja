@@ -1,0 +1,12 @@
+{#- Synthetic Ministral 3-format template: only the markup its handler reads. -#}
+{%- macro text(content) -%}
+{%- if content is string -%}{{ content }}{%- else -%}{%- for block in content -%}{%- if block.type == "thinking" -%}[THINK]{{ block.thinking }}[/THINK]{%- else -%}{{ block.text }}{%- endif -%}{%- endfor -%}{%- endif -%}
+{%- endmacro -%}
+[SYSTEM_PROMPT]A helpful assistant.[/SYSTEM_PROMPT]
+{%- for message in messages -%}
+{%- if message.role == "user" -%}[INST]{{ text(message.content) }}[/INST]
+{%- elif message.role == "assistant" -%}{{ text(message.content) }}
+{%- for call in message.tool_calls or [] -%}[TOOL_CALLS]{{ call.function.name }}[ARGS]{{ call.function.arguments | tojson }}{%- endfor -%}</s>
+{%- elif message.role == "tool" -%}[TOOL_RESULTS]{{ text(message.content) }}[/TOOL_RESULTS]
+{%- endif -%}
+{%- endfor -%}

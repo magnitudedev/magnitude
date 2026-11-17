@@ -1,0 +1,14 @@
+{#- Synthetic gpt-oss-format template: only the markup its handler reads. -#}
+{%- for message in messages -%}
+{%- if message.role == "assistant" -%}
+{%- for call in message.tool_calls or [] -%}
+<|start|>assistant to=functions.{{ call.function.name }}<|channel|>commentary json<|message|>{{ call.function.arguments | tojson }}<|call|>
+{%- endfor -%}
+{%- if message.content -%}<|start|>assistant<|channel|>final<|message|>{{ message.content }}<|end|>{%- endif -%}
+{%- elif message.role == "tool" -%}
+<|start|>functions to=assistant<|channel|>commentary<|message|>{{ message.content }}<|end|>
+{%- else -%}
+<|start|>{{ message.role }}<|message|>{{ message.content }}<|end|>
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}<|start|>assistant{%- endif -%}

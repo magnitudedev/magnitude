@@ -125,6 +125,22 @@ without a call after it, and the parser, reading the whole opener, refused the t
 closes with `</think>`, followed by content and calls, or runs directly into calls that begin with
 their opener.
 
+Patch 0037 makes the end of output end reasoning in every tool grammar and parser, unless a call is
+required. Most tool grammars refused the end of output inside reasoning, so a model that stopped
+there was made to keep reasoning; Kimi K2's grammar admitted it until patch 0036. The stream
+publishes reasoning as it arrives, but the parsers read reasoning only once it closed, so a strict
+reading of the whole output took it as content (Kimi K2, DeepSeek, Qwen3-Coder, LFM2, MiniCPM5,
+MiniMax-M3, Ministral 3, generic formats), as untagged text (Gemma 4, Muse Glimmer, GPT-OSS) or
+refused it (Cohere2 MoE), and only the stream's end-of-output fallback kept the published reading.
+Reasoning that never closes is now read to the end of output as reasoning, with no content and no
+calls, and the grammar admits that end as its last alternative, so no text follows it. Where content
+may begin with the reasoning tag, or the turn needs a body after reasoning (DeepSeek reasoning the
+model opens, LFM2, MiniCPM5, MiniMax-M3, Ministral 3, Cohere2 MoE, generic formats), that reading is
+tried first. Kimi K3 already read and admitted it, and Functionary v3.2 and GigaChat v3 have no
+reasoning. Chat turns, which have no grammar, still rely on the stream: it also keeps the published
+reading when output ends between sections (after a closed GPT-OSS or Muse Glimmer analysis, after
+Cohere2 MoE reasoning with no text) or inside constrained output a stop string cut short.
+
 To refresh the extraction, use the provenance record and patch series in a maintainer workflow,
 then check in the resulting patched sources. Source preparation is deliberately not part of a
 consumer build.
