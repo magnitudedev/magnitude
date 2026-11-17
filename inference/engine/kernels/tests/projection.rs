@@ -632,6 +632,9 @@ struct Mapping {
     batch_parts: u64,
     /// `dense_output`'s INT8 tile rows on Metal (INT8_TILE).
     int8_tile: u64,
+    /// The Metal GEMV launches' activation staging (STAGE), under TILED 0
+    /// and LANES below 32.
+    stage: u64,
 }
 
 /// A tall GEMM threadgroup: TALL_M rows, TALL_K columns per stage, STAGERS
@@ -667,6 +670,7 @@ const fn gemm_mapping(tile_m: u64, tile_n: u64, split: u64) -> Mapping {
         tiled: 0,
         batch_parts: 2,
         int8_tile: 128,
+        stage: 0,
     }
 }
 
@@ -686,6 +690,7 @@ const MAPPINGS: [Mapping; 4] = [
         tiled: 0,
         batch_parts: 2,
         int8_tile: 128,
+        stage: 0,
     },
     Mapping {
         simdgroups: 2,
@@ -702,6 +707,7 @@ const MAPPINGS: [Mapping; 4] = [
         tiled: 1,
         batch_parts: 1,
         int8_tile: 128,
+        stage: 0,
     },
     Mapping {
         simdgroups: 32,
@@ -718,6 +724,7 @@ const MAPPINGS: [Mapping; 4] = [
         tiled: 1,
         batch_parts: 4,
         int8_tile: 128,
+        stage: 0,
     },
     Mapping {
         simdgroups: 16,
@@ -734,6 +741,7 @@ const MAPPINGS: [Mapping; 4] = [
         tiled: 0,
         batch_parts: 2,
         int8_tile: 128,
+        stage: 1,
     },
 ];
 
@@ -932,6 +940,7 @@ fn with_projection_forms<E: seismic::Entry>(
         .with_param("TILED", mapping.tiled)
         .with_param("SMALL", 1)
         .with_param("PACK", 0)
+        .with_param("STAGE", mapping.stage)
         .with_launch_param(common::metal_launch::<E>("batch"), "BATCH_PARTS", mapping.batch_parts)
 }
 
@@ -1306,6 +1315,30 @@ fn metal_projecting_entries_check_to_their_projections_launches() {
             .unwrap_or_else(|| panic!("`{entry}` has a Metal implementation"));
         let launches = native.launches.iter().map(|launch| launch.kernel.clone()).collect::<Vec<_>>();
         assert_eq!(launches, expected, "`{entry}`'s Metal launches");
+    }
+}
+
+/// The `dense` projection's F32 activation staging (STAGE) is declared only
+/// where the row-mapping GEMV reads it: an entry over weights takes both
+/// values, a plane set (the exact view's recipe, the 4-bit view) only 0.
+#[test]
+fn metal_activation_staging_is_declared_only_over_the_row_mapping() {
+    let module = crate::common::kernels();
+    for (entry, values) in [
+        ("dense_output", vec![0, 1]),
+        ("dense_expand", vec![0, 1]),
+        ("readout_top_rows", vec![0]),
+        ("readout_planes_rows", vec![0]),
+    ] {
+        let id = module.entry_named(entry).unwrap_or_else(|| panic!("`{entry}` is declared"));
+        let native = module
+            .native_implementation(id, BackendName::Metal)
+            .unwrap_or_else(|| panic!("`{entry}` has a Metal implementation"));
+        let stage = native
+            .declared_params()
+            .find(|parameter| parameter.name == "STAGE")
+            .unwrap_or_else(|| panic!("`{entry}` declares STAGE"));
+        assert_eq!(stage.values, values, "`{entry}`'s STAGE");
     }
 }
 

@@ -83,19 +83,19 @@ kernel void readout_head_rows_stage(PROJECTION_ARGUMENTS,
 
 // The `dense` projection's launches (`lib/projection/operator.h`).
 #ifdef SEISMIC_FORMING_READOUT_HEAD_ROWS_GEMV
-template <uint LANES, uint TILED, uint ROWS>
+template <uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void readout_head_rows_gemv(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(ONE, TILED);
 }
 #endif
 #ifdef SEISMIC_FORMING_READOUT_HEAD_ROWS_GEMV_PAIR
-template <uint LANES, uint TILED, uint ROWS>
+template <uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void readout_head_rows_gemv_pair(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(PAIR, TILED);
 }
 #endif
 #ifdef SEISMIC_FORMING_READOUT_HEAD_ROWS_GEMV_ROWS
-template <uint LANES, uint TILED, uint ROWS>
+template <uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void readout_head_rows_gemv_rows(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(SEVERAL, TILED);
 }

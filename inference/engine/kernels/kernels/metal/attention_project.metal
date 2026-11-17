@@ -127,7 +127,7 @@ kernel void attention_project_stage_tall(PROJECTION_ARGUMENTS,
 
 // The `dense` projection's launches (`lib/projection/operator.h`).
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_GEMV
-template <uint LANES, uint TILED, uint ROWS>
+template <uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void attention_project_gemv(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SEGMENTED_GEMV(ONE, TILED);
 }
@@ -156,13 +156,13 @@ kernel void attention_project_tall(PROJECTION_ARGUMENTS, PROJECTION_TILE_ARGUMEN
 }
 #endif
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_GEMV_ROWS
-template <uint LANES, uint TILED, uint ROWS>
+template <uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void attention_project_gemv_rows(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SEGMENTED_GEMV(SEVERAL, TILED);
 }
 #endif
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_GEMV_PAIR
-template <uint LANES, uint TILED, uint ROWS>
+template <uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void attention_project_gemv_pair(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SEGMENTED_GEMV(PAIR, TILED);
 }

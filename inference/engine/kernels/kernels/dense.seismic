@@ -118,6 +118,16 @@
 # share theirs) so that the F16 fold cannot overflow. Packed and quantized
 # operands pad the rows to TOKENS, 64 where paired (a tile serves both
 # weights) and 128 where single.
+# STAGE stages the GEMV launches' row-mapping activations as F32,
+# rounded to A first, so the same values: twice the threadgroup bytes, and no
+# split of A at every step of every weight row. It pays where the decode
+# bounds the GEMV and costs where memory does, so it is tuned. It is declared
+# only where the row mapping reads it, a parted entry's partial GEMV among
+# them: not over the row tiles or the class walk (TILED 0), and not over a
+# plane set, whose entries share one declaration while the exact view's
+# recipe stages its own rows and cannot hold them as F32 at 8 rows (a lane
+# stride of 32 packets each). Its halved chunk holds no packet a lane at
+# LANES 32 over 8 rows (LANES < 32).
 # INT8 selects the int8 GEMM past 64 rows over the weights `form(W, INT8)`
 # admits: the rows quantized per (row, 32 columns), each weight's block
 # coefficients and biases, then the int8 tiles.
@@ -168,7 +178,8 @@ projection dense for metal:
         arithmetic form INT8 in [0, 1] default 0 for paired | single, arithmetic form PACK in [0, 1] default 0, arithmetic form RESIDUE in [1, 2] default 1,
         arithmetic form MATRIX in [1, 0] default (1 - ORDERED_ANY),
         arithmetic form SMALL in [1, 0] default (1 - ORDERED_ANY),
-        arithmetic LANES in [16, 32, 8] default (16 + 16 * ORDERED_ANY), arithmetic form TILED in [0, 1, 2] default 0)
+        arithmetic LANES in [16, 32, 8] default (16 + 16 * ORDERED_ANY), arithmetic form TILED in [0, 1, 2] default 0,
+        form STAGE in [0, 1] default 0)
     where dense_bytes(A) == 2
     where (ORDERED_ANY == 0 or (TALL == 0 and PACK == 0 and RESIDUE == 1 and MATRIX == 0 and SMALL == 0 and LANES != 8 and TILED == 0))
     where (ORDERED_ANY == 0 or SPLIT == 1) for single
@@ -176,6 +187,8 @@ projection dense for metal:
     where (ORDERED_ALL == 0 or ROWS == 1) for ordered
     where (ORDERED_ALL == 0 or LANES == 32)
     where (TILED == 0 or (PLANES == 0 and PARTED == 0))
+    where (STAGE == 0 or PLANES == 0)
+    where (STAGE == 0 or (TILED == 0 and LANES < 32))
     where (TALL == 0 or (GATHERED == 0 and PLANES == 0 and PARTED == 0 and SPLITS == 1 and K % 128 == 0))
     where (SMALL == 0 or (PLANES == 0 and PARTED == 0))
     where (SPLIT == 1 or PLANES == 0) for single
@@ -248,7 +261,7 @@ projection dense for metal:
         params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1)
         threadgroups (P * tiles(W, ceil_div(N, SIMDGROUPS * ROWS * 32 / LANES)), 1, G)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (max(min(ceil_div(K / P, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64, TILED * SIMDGROUPS * (128 * SERVED)))
+        shared_bytes (max(min(ceil_div(K / P, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448 / (1 + STAGE)) * 64 * (1 + STAGE), TILED * SIMDGROUPS * (128 * SERVED)))
     launch batch when ORDERED_ANY == 0 and M > VERIFY_ROWS and M <= 16:
         params (BATCH_SIMDGROUPS in [8, 4, 16, 32] default 8, BATCH_ROWS in [2, 1, 4] default 2,
             arithmetic BATCH_PARTS in [2, 4, 1] default 2)
@@ -295,13 +308,13 @@ projection dense for metal:
         alike (gemv)
         threadgroups (P * tiles(W, ceil_div(N, SIMDGROUPS * ROWS * 32 / LANES)), 1, G)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (max(min(ceil_div(K / P, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64, TILED * SIMDGROUPS * (128 * SERVED)))
+        shared_bytes (max(min(ceil_div(K / P, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448 / (1 + STAGE)) * 64 * (1 + STAGE), TILED * SIMDGROUPS * (128 * SERVED)))
     launch gemv_pair when ORDERED_ANY == 0 and M == 2:
         params (SIMDGROUPS in [8, 16, 4, 2, 32] default 8, ROWS in [1, 2, 4] default 1 for paired | segmented, ROWS in [2, 1, 4] default 2 for single)
         alike (gemv)
         threadgroups (P * tiles(W, ceil_div(N, SIMDGROUPS * ROWS * 32 / LANES)), 1, G)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (max(min(ceil_div(K / P, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64, TILED * SIMDGROUPS * (128 * SERVED)))
+        shared_bytes (max(min(ceil_div(K / P, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448 / (1 + STAGE)) * 64 * (1 + STAGE), TILED * SIMDGROUPS * (128 * SERVED)))
     launch pack when ORDERED_ANY == 0 and M > 64 and PACK == 1 and PLANES == 0:
         reads (RESIDUE)
         threadgroups (ceil_div(M, TOKENS) * (TOKENS / 4), 1, 1)

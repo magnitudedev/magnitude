@@ -12,9 +12,10 @@
 // The GEMV of a launch that serves COUNT (ONE, PAIR, SEVERAL) rows of `x`:
 // by the packets' own recipe where they name one (`gemv_recipe`, a single
 // projection's), else with TILED = 1 the row tiles where every weight's rows
-// are tiled, else the row mapping (walked by packet class with TILED = 2).
-// `n` is the rows of each weight, `k` their columns; the kernel provides
-// `tile`, `shared`, `simdgroups`, `sg` and `lane`.
+// are tiled, else the row mapping (walked by packet class with TILED = 2),
+// its activations staged as F32 with STAGE = 1. `n` is the rows of each
+// weight, `k` their columns; the kernel provides `tile`, `shared`,
+// `simdgroups`, `sg`, `lane` and its template's STAGE.
 #define PROJECTION_GEMV(W0, W1, PAIRED, ROWS, LANES, TILED, COUNT, x, out, w0, w1, rows, n, k)                  \
     if constexpr (projection::gemv_recipe<W0>::value) {                                                         \
         projection::gemv_recipe_rows<W0, ROWS, LANES>(x, out, w0, rows, n, k, tile, shared, simdgroups, sg,      \
@@ -26,7 +27,7 @@
                 x, out, w0, w1, rows, n, k, tile, shared, simdgroups, sg, lane));                               \
     } else {                                                                                                    \
         PROJECTION_FOR_##COUNT##_ROWS(rows,                                                                     \
-            projection::gemv_form<W0, W1, PAIRED, ROWS, MAXM, LANES, (TILED == 2)>(                             \
+            projection::gemv_form<W0, W1, PAIRED, ROWS, MAXM, LANES, (TILED == 2), (STAGE == 1)>(              \
                 x, out, w0, w1, rows, n, k, tile, shared, simdgroups, sg, lane));                               \
     }
 
@@ -878,7 +879,8 @@ struct PartPartial {
 
 #define PROJECTION_SEGMENT_PART_GEMV(s, ...)                                                                    \
     else if (segment == s##u)                                                                                   \
-        PROJECTION_FOR_ROWS(m, projection::gemv_runtime<PROJECTION_PACKET(s), ROWS, MAXM, LANES>(x,             \
+        PROJECTION_FOR_ROWS(m,                                                                                  \
+            projection::gemv_runtime<PROJECTION_PACKET(s), ROWS, MAXM, LANES, (STAGE == 1)>(x,                  \
             projection::PartPartial{sums.y, sums.row, sums.column + PROJECTION_FIRST_##s}, w##s, m,             \
             uint(PROJECTION_N##s), width, local, shared, simdgroups, sg, lane, part * (width / 32u)));
 
