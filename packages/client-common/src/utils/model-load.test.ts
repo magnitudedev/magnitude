@@ -6,6 +6,7 @@ import {
   MEMORY_SHORTAGE_TITLE,
   describeMemoryShortage,
   describeModelLoadFailure,
+  modelFailureLabel,
   describeModelOptimization,
   formatModelOptimization,
   modelOptimizationFraction,
@@ -60,6 +61,16 @@ describe("memory shortage and stop wording", () => {
     })).toBe(`${MEMORY_SHORTAGE_TITLE}. This model needs 32.3 GB and 25.8 GB is available. Quit apps you aren’t using, or choose a smaller model.`)
     expect(describeModelLoadFailure({ code: "worker_exited", message: "the worker exited", retryable: true }))
       .toBe("The model’s engine stopped unexpectedly. Try again, or choose another model.")
+  })
+
+  it("says a model couldn't load only when its failure is one only a load can end in", () => {
+    const failure = (code: string) => ({ code, message: "x", retryable: true })
+    expect(modelFailureLabel(failure("model_load_failed"))).toBe("Couldn’t load")
+    expect(modelFailureLabel(failure("insufficient_memory"))).toBe("Couldn’t load")
+    expect(modelFailureLabel({ _tag: "MemoryShortage", code: "memory_shortage", message: "x", retryable: true, shortage: { _tag: "Blocked", requiredBytes: 2, availableBytes: 1 } })).toBe("Couldn’t load")
+    // A worker exits while a model answers as well as while it loads (Gemma on the V710 loaded, then failed answering).
+    expect(modelFailureLabel(failure("worker_exited"))).toBe("Stopped unexpectedly")
+    expect(modelFailureLabel(failure("device_lost"))).toBe("Stopped unexpectedly")
   })
 
   it("recognizes only a stop for memory pressure", () => {

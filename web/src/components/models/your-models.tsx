@@ -25,7 +25,7 @@ export interface OwnedModel {
   readonly drafter: { readonly method: string; readonly sizeBytes: number | null; readonly attached: boolean } | null
   readonly drafterChoosable: boolean
   readonly searchText: string
-  readonly loadFailure: { readonly summary: string; readonly detail: string } | null
+  readonly failure: { readonly label: string; readonly summary: string; readonly detail: string } | null
 }
 
 export interface UnrunnableFile {
@@ -137,7 +137,7 @@ function Details({ model, onDrafter }: { model: OwnedModel; onDrafter: () => voi
         : model.drafterChoosable && <Button size="xs" variant="outline" onClick={event => { event.stopPropagation(); onDrafter() }}><PlusIcon />Add {model.drafter.method} drafter{model.drafter.sizeBytes !== null && ` · ${formatStorageSize(model.drafter.sizeBytes)}`}</Button>}
       {model.drafterChoosable && (model.drafter === null || model.drafter.attached) && <Button size="xs" variant="ghost" onClick={event => { event.stopPropagation(); onDrafter() }}>{model.drafter === null ? "Choose…" : "Change…"}</Button>}
     </span>],
-    ...(model.loadFailure ? [["Last load", <span className="block min-w-0 flex-1"><span className="text-red-600 dark:text-red-400">{model.loadFailure.summary}</span><FailureDetails text={model.loadFailure.detail} /></span>] as const] : []),
+    ...(model.failure ? [["Last failure", <span className="block min-w-0 flex-1"><span className="text-red-600 dark:text-red-400">{model.failure.label}. {model.failure.summary}</span><FailureDetails text={model.failure.detail} /></span>] as const] : []),
     ...(model.developer ? [["Developer", <span className="text-slate-700 dark:text-slate-300">{model.developer}{model.license && <span className="text-slate-500"> · {model.license}</span>}</span>] as const] : []),
   ]
   return <div className="space-y-4">

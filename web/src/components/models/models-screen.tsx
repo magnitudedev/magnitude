@@ -2,7 +2,7 @@ import { useState, type ReactNode } from "react"
 import { Result } from "@effect-atom/atom-react"
 import { CircleNotchIcon, PlayIcon, StopIcon } from "@phosphor-icons/react"
 import type { CustomFormModelId, LocalModel } from "@magnitudedev/sdk"
-import { deriveHardwareRoles, modelDownloadFailureMessage, useLocalInferenceHardware, useLocalModelMutations, useLocalModels } from "@magnitudedev/client-common"
+import { deriveHardwareRoles, modelDownloadFailureMessage, modelFailureLabel, useLocalInferenceHardware, useLocalModelMutations, useLocalModels } from "@magnitudedev/client-common"
 import { Button } from "../ui/button"
 import { ErrorNotice } from "../error-notice"
 import { ModelsSkeleton } from "./skeletons"
@@ -75,7 +75,7 @@ export function ModelsScreen({ onExplore, empty }: { onExplore: (query: string) 
       case "Loading": return <span className="flex items-center gap-2"><Status busy>Loading {Math.round(residency.fraction * 100)}%</Status>{stop}</span>
       case "Ready": return <span className="flex items-center gap-2"><Status tone="running">Running</Status>{stop}</span>
       case "Stopping": return <Status busy>Stopping…</Status>
-      case "Failed": return <span className="flex items-center gap-2"><Status tone="failed" title={view.loadFailure?.summary}>Couldn’t load</Status>{load}</span>
+      case "Failed": return <span className="flex items-center gap-2"><Status tone="failed" title={view.failure?.summary}>{view.failure?.label ?? modelFailureLabel(residency.failure)}</Status>{load}</span>
       default: return load
     }
   }

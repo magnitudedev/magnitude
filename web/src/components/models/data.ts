@@ -1,6 +1,6 @@
 import { Option } from "effect"
 import { localModelResidency, type CustomLocalModel, type DrafterTarget, type LocalModel, type LocalModelAssessment, type LocalModelDeveloper, type LocalModelFamily, type RecommendedModel, type SpeculativeMethod, type UnsupportedLocalModel } from "@magnitudedev/sdk"
-import { describeModelLoadFailure, fitPlacementPhrase, formatStorageSize, ladderBitWidths, localModelSizeBytes, quantBitWidth, type ServingMemory } from "@magnitudedev/client-common"
+import { describeModelLoadFailure, fitPlacementPhrase, modelFailureLabel, formatStorageSize, ladderBitWidths, localModelSizeBytes, quantBitWidth, type ServingMemory } from "@magnitudedev/client-common"
 import { labForDeveloper } from "../model-logo"
 import type { DiscoveredModel } from "./onboarding"
 import type { OfferedModel } from "./expanding-model"
@@ -123,10 +123,10 @@ const drafterOf = (model: LocalModel): OwnedModel["drafter"] => {
 }
 
 /** A model on this computer as the Your models list shows it. */
-/** Why the model last failed to load, in a sentence from its code, with the engine's own report kept for Details. */
-const loadFailureOf = (model: LocalModel): OwnedModel["loadFailure"] => Option.match(localModelResidency(model), {
+/** How the model last failed, named for what its code says happened, in a sentence from it, with the engine's own report kept for Details. */
+const failureOf = (model: LocalModel): OwnedModel["failure"] => Option.match(localModelResidency(model), {
   onNone: () => null,
-  onSome: residency => residency._tag === "Failed" ? { summary: describeModelLoadFailure(residency.failure), detail: residency.failure.message } : null,
+  onSome: residency => residency._tag === "Failed" ? { label: modelFailureLabel(residency.failure), summary: describeModelLoadFailure(residency.failure), detail: residency.failure.message } : null,
 })
 
 export const ownedModel = (model: LocalModel, memory: ServingMemory): OwnedModel => {
@@ -147,7 +147,7 @@ export const ownedModel = (model: LocalModel, memory: ServingMemory): OwnedModel
     drafter: drafterOf(model),
     drafterChoosable: model._tag === "Custom",
     searchText: `${model.presentation.displayName} ${quant.repository ?? ""} ${quant.name}`,
-    loadFailure: loadFailureOf(model),
+    failure: failureOf(model),
   }
 }
 
