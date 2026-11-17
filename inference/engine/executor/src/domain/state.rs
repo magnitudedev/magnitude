@@ -875,7 +875,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     pub(super) fn open_group(&mut self, operations: &[Operation]) -> Result<(), DomainError> {
         // A class whose close waited for a gap between flights serves this
         // group as it stands.
-        if self.resources.group_places() > std::num::NonZeroUsize::MIN {
+        if self.group_class.is_some() {
             return Ok(());
         }
         let capacity = self.chain_capacity().get();
@@ -889,28 +889,24 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let Some(quiet) = self.quiet() else {
             return Ok(());
         };
-        // Idle slots a claim took cache of are released first
-        // (`follow_cache_targets`): their memory is the claim's once freed.
-        if self.idle_slots_taken() {
-            return Ok(());
-        }
         // A closed group's idle slots, which this group's class takes up
-        // again: the class's claims hold what it grows (`class_demand`
-        // counts only slots not yet allocated), and the idle slots' cache
-        // turns committed in place, its allocation kept
-        // (`Cached::into_claim`), so the class covers every slot beyond the
-        // floor, as its close turns them cache again. Opened with none, the
-        // idle slots stay cache. One change: no reading sees them free.
+        // again, are committed in place first (`IdleClass::reclaim`), their
+        // allocation kept: the class's claims then hold only what it grows
+        // (`class_demand` counts only slots not yet allocated), and no claim
+        // of that growth can take the very slots the class reuses as cache.
+        // Idle slots a claim already took are released first
+        // (`follow_cache_targets`): their memory is that claim's once freed,
+        // so the group runs with one place until then. Opened with none, the
+        // slots idle as cache again. One change: no reading sees them free.
         let changes = self.resources.ledgers().changes().clone();
         changes.change(|_| {
+            let Some(idle) = self.idle_class.reclaim() else {
+                return Ok(());
+            };
             let opened = self.claim_group_class(chunks, quiet);
-            if let Some(class) = &mut self.group_class {
-                for cached in std::mem::take(&mut self.idle_class) {
-                    let claim = cached
-                        .into_claim(crate::memory::ledger::CommittedKind::GroupClass)
-                        .unwrap_or_else(|_| panic!("invariant violated: idle slots' cache taken in process as their class opens"));
-                    class.idle.push(claim);
-                }
+            match &mut self.group_class {
+                Some(class) => class.idle.extend(idle),
+                None => self.idle_class.idle(idle),
             }
             opened
         })
@@ -979,13 +975,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(())
     }
 
-    /// Whether a claim took any of a closed group's idle slots' cache in
-    /// process: the slots then still hold memory the ledger lends, so they
-    /// are released at once (`follow_cache_targets`).
-    pub(super) fn idle_slots_taken(&self) -> bool {
-        self.idle_class.iter().any(|cached| cached.releasing() > 0)
-    }
-
     /// Close the group whose class is held, once no chain of it is under
     /// way: its group buffers go back to the floor's, its pools hold one
     /// place again (their slots beyond it idle until released,
@@ -993,18 +982,19 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// the idle slots' cache (`CacheKind::GraphSlots`). Only between flights ([`Self::quiet`]); otherwise the next close
     /// does it.
     pub(super) fn close_group(&mut self) -> Result<(), DomainError> {
-        if self.resources.group_places() == std::num::NonZeroUsize::MIN
-            || matches!(self.queue, super::queue::Queue::Chain(_) | super::queue::Queue::Opening(_))
-        {
+        if matches!(self.queue, super::queue::Queue::Chain(_) | super::queue::Queue::Opening(_)) {
             return Ok(());
         }
-        let Some(quiet) = self.quiet() else {
-            return Ok(());
+        // The held class, its claims with it, is the one record that a
+        // group holds more than one place: the pools hold its places from
+        // its open to its close alone.
+        let (GroupClass { places, claims, idle }, quiet) = match (self.group_class.take(), self.quiet()) {
+            (Some(class), Some(quiet)) => (class, quiet),
+            (class, _) => {
+                self.group_class = class;
+                return Ok(());
+            }
         };
-        // The group's buffers go back to the OS now: its claims shrink by
-        // them, by the store each lies in, and what the pools keep idle
-        // turns cache.
-        let GroupClass { places, claims, idle } = self.group_class.take().expect("invariant violated: a held class without its claims");
         let freed = self.family.group_demand(places).map_err(DomainError::invariant)?;
         let (freed_device, freed_host) = self.resources.ledgers().placed(self.domain.device(), freed);
         let freed = [freed_device, freed_host];
@@ -1019,11 +1009,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     assert_eq!(freed, 0, "invariant violated: a group's buffers lie in a store its class claimed nothing of");
                     continue;
                 };
-                self.idle_class.push(claim.into_cache(crate::memory::ledger::CacheKind::GraphSlots));
+                self.idle_class.idle([claim]);
             }
-            for claim in idle {
-                self.idle_class.push(claim.into_cache(crate::memory::ledger::CacheKind::GraphSlots));
-            }
+            self.idle_class.idle(idle);
             Ok::<(), DomainError>(())
         })
     }
@@ -1197,7 +1185,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if self.resources.releasing_slots() {
             return SlotRelease::Running;
         }
-        match self.resources.release_idle_slots(std::mem::take(&mut self.idle_class), wake) {
+        match self.resources.release_idle_slots(self.idle_class.release(), wake) {
             true => SlotRelease::Began,
             false => SlotRelease::None,
         }
@@ -1281,6 +1269,52 @@ pub fn request_slot_bytes(execution: &ExecutionPlan) -> Result<u64, String> {
 /// is outside its claim.
 pub(crate) fn claimed_through(position: usize, rows: usize, method: crate::PlannedMethod) -> u64 {
     (position + rows + method.draft_rows()) as u64
+}
+
+/// A closed group's class's idle graph slots, beyond one place, until
+/// their pools release them: their one owner. Each is cache
+/// (`CacheKind::GraphSlots`), its allocation kept, which any claim of the
+/// process may take in process; the slots are then released, never
+/// reused, as their memory is that claim's once freed
+/// ([`ExecutorDomain::follow_cache_targets`]).
+#[derive(Default)]
+pub(super) struct IdleClass(Vec<crate::memory::ledger::Cached>);
+
+impl IdleClass {
+    /// Idle `claims`, a class's committed in place, as cache.
+    pub(super) fn idle(&mut self, claims: impl IntoIterator<Item = crate::memory::ledger::Claim>) {
+        self.0.extend(claims.into_iter().map(|claim| claim.into_cache(crate::memory::ledger::CacheKind::GraphSlots)));
+    }
+
+    /// Whether a claim took any of the slots' cache in process: they then
+    /// hold memory the ledger lent, and are released at once.
+    pub(super) fn taken(&self) -> bool {
+        self.0.iter().any(|cached| cached.releasing() > 0)
+    }
+
+    /// Every slot's cache, handed to their release
+    /// (`AllocatedResources::release_idle_slots`).
+    pub(super) fn release(&mut self) -> Vec<crate::memory::ledger::Cached> {
+        std::mem::take(&mut self.0)
+    }
+
+    /// The slots committed in place for a class that takes them up again,
+    /// whole, so no claim can take them as cache: none, every slot left
+    /// idle, where a claim took any of them.
+    fn reclaim(&mut self) -> Option<Vec<crate::memory::ledger::Claim>> {
+        let mut claims = Vec::new();
+        for cached in self.release() {
+            match cached.into_claim(crate::memory::ledger::CommittedKind::GroupClass) {
+                Ok(claim) => claims.push(claim),
+                Err(taken) => self.0.push(taken),
+            }
+        }
+        if self.0.is_empty() {
+            return Some(claims);
+        }
+        self.idle(claims);
+        None
+    }
 }
 
 /// A prompt group's class held beyond one place ([`ExecutorDomain::open_group`]):

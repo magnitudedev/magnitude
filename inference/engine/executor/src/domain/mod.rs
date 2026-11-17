@@ -692,8 +692,8 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// it begins, and freed with them as it ends
     /// (`AllocatedResources::release_idle_slots`), or let go as a group's
     /// class takes the slots again ([`Self::open_group`]). What claims took
-    /// of it in process releases until then ([`Self::idle_slots_taken`]).
-    idle_class: Vec<crate::memory::ledger::Cached>,
+    /// of it in process releases until then ([`state::IdleClass::taken`]).
+    idle_class: state::IdleClass,
 
     /// Identity of the next target flight.
     next_flight: u64,
@@ -2799,7 +2799,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             served: Default::default(),
             measurement_claim: None,
             group_class: None,
-            idle_class: Vec::new(),
+            idle_class: state::IdleClass::default(),
             idle_components: Vec::new(),
             answered: RefCell::default(),
             next_flight: 0,

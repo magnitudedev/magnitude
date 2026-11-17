@@ -261,10 +261,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if self.resources.releasing_slots() {
             return Ok(Yielded::Pending);
         }
-        if self.idle_slots_taken() {
+        if self.idle_class.taken() {
             // The slots' cache goes with their release, freed as it ends;
             // with no slot idling any more, their cache is let go at once.
-            return Ok(match self.resources.release_idle_slots(std::mem::take(&mut self.idle_class), wake) {
+            return Ok(match self.resources.release_idle_slots(self.idle_class.release(), wake) {
                 true => Yielded::Pending,
                 false => Yielded::Released { released: 0, returned: 0 },
             });
