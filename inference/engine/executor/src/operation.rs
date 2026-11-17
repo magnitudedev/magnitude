@@ -723,9 +723,8 @@ pub enum Outcome {
     /// load's pulse: a wait of the step may have ended before its answer),
     /// for `reason`. Its outputs are not to be used, its inputs are whole,
     /// and nothing of it is poisoned: aborting it returns the sequence's
-    /// accepted state, from which its round is re-run where it stays
-    /// `resident`; where it does not (a chunk of a chain, released with its
-    /// holder's state), the sequence re-prefills, as an evicted one.
-    /// Reconciling it is an invariant violation.
-    Interrupted { reason: String, resident: bool },
+    /// accepted state (a chunk of a chain, the state the chain's reconciled
+    /// chunks reached), from which its round is re-run. Reconciling it is an
+    /// invariant violation.
+    Interrupted { reason: String },
 }

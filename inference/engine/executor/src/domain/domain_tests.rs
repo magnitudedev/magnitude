@@ -560,18 +560,19 @@ fn a_waiting_group_of_one_plans_no_chunk_behind() {
     }
 }
 
-/// A chain under way is never orphaned: other work is refused while it is.
-/// A holder that ended releases it, its queued launches waited for and
-/// dropped and its state evicted with it; one that closes drops it, its
-/// launches resolved with the queue.
+/// A chain ends one way, concluded: whatever ends it (another group's
+/// provision, a group of its holder's that is not its queued chunk, its
+/// holder ending or closing), its queued launches are waited for and
+/// dropped, and its holder keeps the state its reconciled chunks reached,
+/// never evicted.
 #[test]
-fn a_chain_is_released_by_its_holder_never_orphaned() {
+fn a_chain_concludes_at_what_its_holder_reconciled_whatever_ends_it() {
     let (mut domain, mut bindings) = chain_fixture();
     let request = RequestId(81);
     open(&mut domain, &mut bindings, request);
-    let held = |domain: &mut ExecutorDomain<TestFamily>, bindings: StateBindings| {
-        domain.plan_successors(vec![prefill(request, 1), prefill(request, 2)]);
-        let flight = submit_reserved_target(domain, bindings, vec![prefill(request, 0)]);
+    let held = |domain: &mut ExecutorDomain<TestFamily>, bindings: StateBindings, at: usize| {
+        domain.plan_successors(vec![prefill(request, at + 1), prefill(request, at + 2)]);
+        let flight = submit_reserved_target(domain, bindings, vec![prefill(request, at)]);
         let (pending, bindings) = finish_one(domain, flight);
         domain
             .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
@@ -579,52 +580,106 @@ fn a_chain_is_released_by_its_holder_never_orphaned() {
         assert_eq!((domain.queue.len(), domain.chain_holder()), (2, Some(request)));
         bindings
     };
-    let mut bindings = held(&mut domain, bindings);
-    // Another request's group while the chain is under way is an invariant
-    // violation; the holder's own group that is not the queued prompt chunk
-    // (a replay row) releases the chain, its state with it, and the holder
-    // replays.
-    assert!(matches!(
-        domain.provision(&mut bindings, &[forward(RequestId(99), 1)], None),
-        Err(DomainError::Invariant(_))
-    ));
-    assert!(matches!(
-        domain.provision(&mut bindings, &[forward(request, 1)], None),
-        Err(DomainError::ChainReleased(holder)) if holder == request
-    ));
-    assert!(domain.queue.is_empty());
-    assert_eq!(domain.chain_holder(), None);
-    assert!(domain.resume_state(request).is_err(), "the holder was evicted");
-
-    domain.open_served(&mut bindings, request, None).unwrap();
-    let mut bindings = held(&mut domain, bindings);
+    let concluded = |domain: &mut ExecutorDomain<TestFamily>, at: usize, how: &str| {
+        assert!(domain.queue.is_empty(), "{how}");
+        assert_eq!(domain.chain_holder(), None, "{how}");
+        assert_eq!(domain.resume_state(request).unwrap().target.position(), at, "{how}: the holder keeps its reconciled state");
+    };
+    // Another request's group concludes it.
+    let mut bindings = held(&mut domain, bindings, 0);
+    domain.provision(&mut bindings, &[forward(RequestId(99), 1)], None).unwrap();
+    concluded(&mut domain, 1, "another group");
+    // The holder's own group that is not the queued chunk (a replay row)
+    // concludes it, and provisions from where it reached.
+    let mut bindings = held(&mut domain, bindings, 1);
+    domain.provision(&mut bindings, &[forward(request, 2)], None).unwrap();
+    concluded(&mut domain, 2, "the holder's other group");
+    // A holder that ended concludes it.
+    let bindings = held(&mut domain, bindings, 2);
+    domain.conclude_chain().unwrap();
+    concluded(&mut domain, 3, "an ended holder");
+    // One that closes drops it, its launches resolved with the queue.
+    let mut bindings = held(&mut domain, bindings, 3);
     domain.close(request).unwrap();
     assert_eq!(domain.chain_holder(), None);
     super::fixtures::shrink_settled(&mut domain, &mut bindings);
     assert!(domain.queue.is_empty());
 }
 
-/// A holder that ended mid-chain and keeps what it computed concludes its
-/// chain: its queued chunks are joined as they finish and the chain
-/// publishes whole, its holder resident at the chain's end, every row of
-/// the group its own.
+/// A chunk of a chain whose outcome is aborted (its request stopped, or its
+/// step interrupted) ends the chain, which cannot run past it: the chain
+/// concludes with the chunks reconciled before it, its holder's state the
+/// one they reached, which a prefix cache keeps; the chunk's own rows are
+/// dropped. The first chunk aborted returns the state the chain opened
+/// from. Either way the holder runs on from that state.
 #[test]
-fn a_concluded_chain_keeps_its_holder_at_its_end() {
-    let (mut domain, mut bindings) = chain_fixture();
-    let request = RequestId(81);
-    open(&mut domain, &mut bindings, request);
-    domain.plan_successors(vec![prefill(request, 1), prefill(request, 2)]);
-    let flight = submit_reserved_target(&mut domain, bindings, vec![prefill(request, 0)]);
-    let (pending, mut bindings) = finish_one(&mut domain, flight);
-    domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }).unwrap();
-    assert_eq!((domain.queue.len(), domain.chain_holder()), (2, Some(request)));
-    assert!(!domain.target.contains_key(&request), "the chain holds its holder's state");
-    domain.conclude_chain(request).unwrap();
-    assert!(domain.queue.is_empty());
-    assert_eq!(domain.chain_holder(), None);
-    assert_eq!(domain.target.get(&request).map(SequenceState::position), Some(3), "resident through the chain's last chunk");
-    domain.close(request).unwrap();
-    super::fixtures::shrink_settled(&mut domain, &mut bindings);
+fn an_aborted_chunk_concludes_its_chain_at_the_chunks_reconciled_before_it() {
+    for aborted in 0..3 {
+        let (mut domain, mut bindings) = chain_fixture();
+        let request = RequestId(83);
+        open(&mut domain, &mut bindings, request);
+        domain.plan_successors(vec![prefill(request, 1), prefill(request, 2)]);
+        let mut flight = submit_reserved_target(&mut domain, bindings, vec![prefill(request, 0)]);
+        let mut position = 0;
+        let bindings = loop {
+            let (pending, returned) = finish_one(&mut domain, flight);
+            if position == aborted {
+                domain.abort(pending).unwrap();
+                break returned;
+            }
+            domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }).unwrap();
+            flight = submit_claimed(&mut domain, returned, vec![prefill(request, position + 1)]);
+            position += 1;
+        };
+        assert!(domain.queue.is_empty(), "chunk {aborted} aborted");
+        assert_eq!(domain.chain_holder(), None, "chunk {aborted} aborted");
+        let state = domain.resume_state(request).unwrap().target;
+        assert_eq!(state.position(), aborted, "chunk {aborted} aborted: the state its reconciled chunks reached");
+        assert_eq!(domain.group_places().get(), 1, "chunk {aborted} aborted: its group's class is freed");
+        let flight = submit_reserved_target(&mut domain, bindings, vec![prefill(request, aborted)]);
+        let (pending, mut bindings) = finish_one(&mut domain, flight);
+        domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }).unwrap();
+        assert_eq!(domain.resume_state(request).unwrap().target.position(), aborted + 1, "chunk {aborted} aborted");
+        super::fixtures::shrink_settled(&mut domain, &mut bindings);
+    }
+}
+
+/// A claimed chunk carries its chain's state until its outcome returns it:
+/// a chain concluded while that outcome is outstanding (its holder ended, or
+/// another group changed bindings) leaves its holder's state with the
+/// outcome, which, reconciled, publishes the chunk's rows with the chain's,
+/// and, aborted, the chain's alone.
+#[test]
+fn a_chunk_outstanding_as_its_chain_concludes_returns_its_holders_state() {
+    for (aborted, another_group) in [(false, false), (false, true), (true, false), (true, true)] {
+        let how = format!("aborted {aborted}, concluded by another group {another_group}");
+        let (mut domain, mut bindings) = chain_fixture();
+        let request = RequestId(85);
+        open(&mut domain, &mut bindings, request);
+        domain.plan_successors(vec![prefill(request, 1), prefill(request, 2)]);
+        let flight = submit_reserved_target(&mut domain, bindings, vec![prefill(request, 0)]);
+        let (pending, bindings) = finish_one(&mut domain, flight);
+        domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }).unwrap();
+        let flight = submit_claimed(&mut domain, bindings, vec![prefill(request, 1)]);
+        let (pending, mut bindings) = finish_one(&mut domain, flight);
+        match another_group {
+            true => domain.provision(&mut bindings, &[forward(RequestId(99), 1)], None).unwrap(),
+            false => domain.conclude_chain().unwrap(),
+        }
+        assert!(domain.queue.is_empty(), "{how}");
+        assert_eq!(domain.chain_holder(), None, "{how}");
+        match aborted {
+            true => domain.abort(pending).unwrap(),
+            false => domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }).unwrap(),
+        }
+        let reached = if aborted { 1 } else { 2 };
+        assert_eq!(domain.resume_state(request).unwrap().target.position(), reached, "{how}");
+        let flight = submit_reserved_target(&mut domain, bindings, vec![prefill(request, reached)]);
+        let (pending, mut bindings) = finish_one(&mut domain, flight);
+        domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }).unwrap();
+        assert_eq!(domain.resume_state(request).unwrap().target.position(), reached + 1, "{how}");
+        super::fixtures::shrink_settled(&mut domain, &mut bindings);
+    }
 }
 
 /// Spare state slabs owed to the ledger wait while a held chain is under way
@@ -694,7 +749,7 @@ fn spare_slabs_owed_wait_for_a_held_chain_and_release_once_it_ends() {
     assert_eq!((domain.queue.len(), domain.chain_holder()), (2, Some(request)));
     assert!(domain.state_slabs.spare_owed() > 0);
 
-    domain.release_chain().unwrap();
+    domain.conclude_chain().unwrap();
     assert_eq!(domain.chain_holder(), None);
     assert!(matches!(
         domain
@@ -1177,7 +1232,7 @@ fn a_shrink_during_a_chain_is_deferred_to_its_end() {
         assert_eq!(shrink(&mut domain, &mut bindings), BankStep::Deferred, "{backend:?}");
         assert_eq!(domain.chain_holder(), Some(request), "{backend:?}: the chain keeps its chunks");
         assert_eq!(domain.expert_bank_slots(), Some(4));
-        domain.release_chain().unwrap();
+        domain.conclude_chain().unwrap();
         assert_eq!(shrink(&mut domain, &mut bindings), BankStep::Begun(crate::planning::BankTier::Bank), "{backend:?}");
         assert!(matches!(finish(&mut domain), crate::BankResized::Shrunk { to: 3, .. }));
     }
@@ -1865,7 +1920,7 @@ fn attach_pending_priming(
     let batch = crate::batching::ValidatedHeadBatch::from_slots(
         &[slot],
         domain.definition.decoder.vocabulary as usize,
-        domain.head_class_limits().unwrap(),
+        domain.head_class_limits(),
     )
     .unwrap();
     let row_bytes = domain.head_conditioning_bytes();

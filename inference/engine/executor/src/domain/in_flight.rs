@@ -129,10 +129,20 @@ pub(super) struct TargetWork<F: ProgramFamily> {
     pub(super) previous_selection: Option<Instant>,
     /// Identifies the step a queued step follows.
     pub(super) id: u64,
-    /// For a claimed queued step, per slot: the accepted state its successor
-    /// advance attaches to at finish, or `None` for a slot nobody claimed
-    /// (its rows are discarded). `None` for an ordinary step.
-    pub(super) continuation: Option<Vec<Option<InFlightState>>>,
+    /// For a claimed queued step, per slot, what its advance continues at
+    /// finish. `None` for an ordinary step.
+    pub(super) continuation: Option<Vec<Source>>,
+}
+
+/// What a claimed queued step's slot continues at finish.
+pub(super) enum Source {
+    /// Nothing: nobody claimed the slot, and its rows are discarded.
+    Unclaimed,
+    /// The accepted state its successor advance attaches to.
+    Accepted(InFlightState),
+    /// The chain its chained chunk joins, which the chunk carries until its
+    /// outcome reconciles or aborts.
+    Chain(OwnedChainAdvance),
 }
 
 pub struct TargetFlight<F: ProgramFamily = NativeFamily> {

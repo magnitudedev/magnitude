@@ -257,3 +257,23 @@ pub trait MethodState {
     fn evict(&mut self);
     fn reclaimable(&self) -> u64;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{DraftCheckpoint, MethodCheckpoint};
+
+    /// A drafter's checkpoint resumes only beside a target state of exactly
+    /// the rows it accounts for (its entered rows and the rows it omits): a
+    /// stop whose checkpoint trails or leads the target's rows is not a
+    /// resume point. A plain request's checkpoint accounts for any rows.
+    #[test]
+    fn a_checkpoint_accounts_only_for_its_own_rows() {
+        let draft = DraftCheckpoint { position: 70, pending: None, open: None, skipped: 2 };
+        for checkpoint in [MethodCheckpoint::Mtp(draft.clone()), MethodCheckpoint::DFlash(draft)] {
+            assert!(checkpoint.accounts_for(72), "{checkpoint:?}");
+            assert!(!checkpoint.accounts_for(70), "{checkpoint:?}: rows it omits are still its own");
+            assert!(!checkpoint.accounts_for(73), "{checkpoint:?}: a row it has not seen");
+        }
+        assert!(MethodCheckpoint::Plain.accounts_for(5));
+    }
+}

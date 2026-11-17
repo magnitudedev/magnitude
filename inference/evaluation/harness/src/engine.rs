@@ -656,12 +656,11 @@ impl Engine {
         if pending.len() != sequences.len() {
             return Err("step outcomes differ from its sequences".into());
         }
-        // A flight is interrupted whole, and a forward step's state stays
-        // resident: only a prefill chain's chunk releases it.
+        // A flight is interrupted whole, and its states stay resident.
         if pending.iter().any(|pending| matches!(pending.outcome(), Outcome::Interrupted { .. })) {
             for pending in pending {
-                if !matches!(pending.outcome(), Outcome::Interrupted { resident: true, .. }) {
-                    return Err("a step's flight was interrupted in part, or released its state".into());
+                if !matches!(pending.outcome(), Outcome::Interrupted { .. }) {
+                    return Err("a step's flight was interrupted in part".into());
                 }
                 self.domain.abort(pending).map_err(text)?;
             }

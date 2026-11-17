@@ -39,7 +39,8 @@ use magnitude_executor::{
 use magnitude_executor::memory::ledger::Relief;
 use magnitude_family_contracts::PreparedModelInput;
 use magnitude_generation::{
-    FinishReason, Generation, OutputToken, RoundStart, StartedRound, TimedLaunch,
+    FinishReason, Generation, InputLayout, MethodCheckpoint, OutputToken, RoundStart, StartedRound,
+    TimedLaunch,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -126,6 +127,15 @@ fn prompt_boundary(record: &Record, generation: &Generation) -> Option<usize> {
         && boundary >= MIN_PREFIX_HIT
         && generation.layout().boundary(boundary))
     .then_some(boundary)
+}
+
+/// Whether a stopped request's work is retained at `position`, the rows its
+/// state reached. A stop lands anywhere in a round, so it is retained only
+/// where a request can resume from it: deep enough to be a hit, at an exact
+/// input boundary of `layout` (never inside an indivisible media span), and
+/// beside a method checkpoint that accounts for the same rows.
+fn resumes_from_stop(layout: &InputLayout, position: usize, method: &MethodCheckpoint) -> bool {
+    position >= MIN_PREFIX_HIT && layout.boundary(position) && method.accounts_for(position)
 }
 
 /// The state every holder occupies, cached prefixes included: what the
@@ -560,7 +570,7 @@ fn classify_domain_error(error: DomainError) -> RequestError {
             RequestError::Invariant(error)
         }
         DomainError::WeightRead(error) => RequestError::WeightRead(error),
-        error @ (DomainError::StateCeiling { .. } | DomainError::ChainReleased(_)) => RequestError::Invariant(InvariantError {
+        error @ DomainError::StateCeiling { .. } => RequestError::Invariant(InvariantError {
             context: "state ceiling",
             detail: error.to_string(),
         }),
@@ -735,10 +745,6 @@ enum Provisioned {
     /// Over budget once every release was tried and it holds one operation:
     /// its requests fail at once with the typed capacity error.
     Refused(OperationGroup, RequestError),
-    /// Its chain's holder's group was not the chain's queued chunk: the
-    /// chain was released with the holder's state, which replays
-    /// (`DomainError::ChainReleased`).
-    Replay(OperationGroup, RequestId),
 }
 
 /// Everything the owner holds except its pipeline.
@@ -2131,11 +2137,11 @@ impl<F: ProgramFamily> Service<F> {
     fn select(&mut self, bindings: &mut StateBindings) -> Result<Selected, Fatal> {
         let mut candidates = self.candidates();
         let mut holder = self.domain.chain_holder();
-        // A holder that is no longer scheduled ended mid-chain: its chain is
-        // released, and its state with it.
+        // A holder that is no longer scheduled ended mid-chain: its chain
+        // concludes, its state the one its reconciled chunks reached.
         if holder.is_some_and(|holder| !candidates.contains_key(&holder)) {
             self.domain
-                .release_chain()
+                .conclude_chain()
                 .map_err(|error| (None, classify_domain_error(error)))?;
             holder = None;
         }
@@ -2670,10 +2676,6 @@ impl<F: ProgramFamily> Service<F> {
                     self.refuse(&mut round, &group_, error);
                     continue;
                 }
-                Ok(Provisioned::Replay(group_, holder)) => {
-                    self.replay(&mut round, &group_, holder).map_err(|error| (None, classify_domain_error(error)))?;
-                    continue;
-                }
                 Err(error) => return Err((Some(round.members), error)),
             };
             match submit_group(&mut self.domain, bindings, &group_, self.wakes.completion()) {
@@ -2780,7 +2782,6 @@ impl<F: ProgramFamily> Service<F> {
             Ok(()) => Ok(Provisioned::Fits(group_)),
             Err(DomainError::Capacity(_)) if pending || self.others_stand(&group_) => Ok(Provisioned::Short(group_, Wait { at: self.epoch, on: WaitsOn::Memory })),
             Err(error @ (DomainError::Capacity(_) | DomainError::Input(_))) => Ok(Provisioned::Refused(group_, refused_alone(error))),
-            Err(DomainError::ChainReleased(holder)) => Ok(Provisioned::Replay(group_, holder)),
             Err(error) => Err(classify_domain_error(error)),
         }
     }
@@ -2815,18 +2816,6 @@ impl<F: ProgramFamily> Service<F> {
             Self::fail_member(round, request, error.clone());
         }
         self.epoch.advance();
-    }
-
-    /// Move a group that cannot proceed out of the round: each of its
-    /// requests takes all of its remaining work with it and waits alone.
-    /// `group_`'s requests leave the round between rounds, and `holder`,
-    /// whose state its chain's release took, replays from its committed
-    /// history, as an evicted request does.
-    fn replay(&mut self, round: &mut Round, group_: &OperationGroup, holder: RequestId) -> Result<(), DomainError> {
-        tracing::info!(?holder, "a chain holder's group is not its queued chunk: the chain is released and the holder replays");
-        let requests = group_.operations().iter().map(Operation::request).collect::<BTreeSet<_>>();
-        self.withdraw(round, &requests);
-        self.evicted(&[holder])
     }
 
     /// Take `requests` out of `round`, their work in its later groups with
@@ -3281,28 +3270,25 @@ impl<F: ProgramFamily> Service<F> {
             branches.clear();
         }
         if reached {
-            self.cache_prefix(id, resident, CachePoint::Branch)?;
+            self.cache_prefix(id, CachePoint::Branch)?;
         }
         Ok(())
     }
 
     /// Cache the request's reconciled state as the prefix of its path ending
-    /// at `position`, where it is resident.
-    fn cache_prefix(
-        &mut self,
-        id: RequestId,
-        position: usize,
-        point: CachePoint,
-    ) -> Result<(), RequestError> {
+    /// where that state does: a chain it holds concludes first, its state
+    /// the one its reconciled chunks reached, and the prefix's position is
+    /// read from the state then. The generation's resident position, which
+    /// advanced as those chunks reconciled, is the same.
+    fn cache_prefix(&mut self, id: RequestId, point: CachePoint) -> Result<(), RequestError> {
+        if self.domain.chain_holder() == Some(id) {
+            self.domain.conclude_chain().map_err(classify_domain_error)?;
+        }
         let state = self
             .domain
             .resume_state(id)
             .map_err(invariant("prefix retention"))?;
-        if state.position() != position {
-            return Err(invariant("prefix retention")(
-                "cached prefix state differs from its path position".into(),
-            ));
-        }
+        let position = state.position();
         let Some(Request {
             state: State::Between(generation, _),
             ..
@@ -3310,6 +3296,11 @@ impl<F: ProgramFamily> Service<F> {
         else {
             return Ok(());
         };
+        if generation.resident_position() != position {
+            return Err(invariant("prefix retention")(
+                "cached prefix state differs from its path position".into(),
+            ));
+        }
         let method = generation
             .method_checkpoint()
             .map_err(invariant("prefix retention"))?;
@@ -3343,79 +3334,50 @@ impl<F: ProgramFamily> Service<F> {
         {
             return Ok(());
         }
-        self.cache_prefix(id, boundary, CachePoint::PromptBoundary)?;
+        self.cache_prefix(id, CachePoint::PromptBoundary)?;
         self.requests.get_mut(&id).unwrap().record.prefill_retained = true;
         Ok(())
     }
 
-    /// Cache a finished request's whole path, prompt and reply: the next turn
-    /// of a conversation extends it.
+    /// Cache a finished request's whole path, prompt and reply, or a stopped
+    /// one's as far as its state reached: the next turn of a conversation
+    /// extends it, and a client that stops a request and sends the
+    /// conversation again resumes where it stopped.
     fn retain_terminal(&mut self, id: RequestId) -> Result<(), RequestError> {
         let Some((record, generation)) = self.between(id) else {
             return Ok(());
         };
-        if record.terminal_retained
-            || !record.prefix_cache
-            || !generation.is_resident()
-            || !matches!(
-                generation.finish_reason(),
-                Some(FinishReason::Stop | FinishReason::Length | FinishReason::Context)
-            )
-        {
+        if record.terminal_retained || !record.prefix_cache || !generation.is_resident() {
             return Ok(());
         }
-        let end = generation.reconciled_position();
-        if generation.resident_position() != end {
-            if generation.pending_reconciliation().is_some() {
-                return Ok(());
+        match generation.finish_reason() {
+            // A completed request's whole path, once its state is reconciled
+            // to it (`owes_reconciliation`).
+            Some(FinishReason::Stop | FinishReason::Length | FinishReason::Context) => {
+                if generation.resident_position() != generation.reconciled_position() {
+                    if generation.pending_reconciliation().is_some() {
+                        return Ok(());
+                    }
+                    return Err(invariant("prefix retention")(
+                        "terminal numerical state is not reconciled at the accepted boundary".into(),
+                    ));
+                }
             }
-            return Err(invariant("prefix retention")(
-                "terminal numerical state is not reconciled at the accepted boundary".into(),
-            ));
+            // A stopped request's work is the rows its state holds, cached
+            // where it reached without computing more, where a request can
+            // resume from it (`resumes_from_stop`).
+            Some(FinishReason::Cancelled) => {
+                let position = generation.resident_position();
+                let resumable = generation
+                    .method_checkpoint()
+                    .is_ok_and(|method| resumes_from_stop(generation.layout(), position, &method));
+                if !resumable {
+                    return Ok(());
+                }
+            }
+            _ => return Ok(()),
         }
-        self.cache_prefix(id, end, CachePoint::Terminal)?;
-        self.requests.get_mut(&id).unwrap().record.terminal_retained = true;
-        Ok(())
-    }
-
-    /// Cache a cancelled request's path where its computed state ends,
-    /// mid-prompt or mid-reply: a client that stops a request keeps what it
-    /// saw and sends the conversation again, which resumes there instead of
-    /// computing it anew. A prompt group's chain under way runs on the
-    /// device whatever happens, so it is concluded and kept whole first. A
-    /// stop lands anywhere in a round, so the state is cached only where it
-    /// is settled and the method's checkpoint accounts for the same rows.
-    fn retain_cancelled(&mut self, id: RequestId) -> Result<(), RequestError> {
-        let Some((record, generation)) = self.between(id) else {
-            return Ok(());
-        };
-        if record.terminal_retained
-            || !record.prefix_cache
-            || !generation.is_resident()
-            || generation.finish_reason() != Some(FinishReason::Cancelled)
-        {
-            return Ok(());
-        }
-        if self.domain.chain_holder() == Some(id) {
-            self.domain.conclude_chain(id).map_err(classify_domain_error)?;
-        }
-        let Ok(state) = self.domain.resume_state(id) else {
-            return Ok(());
-        };
-        let position = state.position();
-        drop(state);
-        let Some((_, generation)) = self.between(id) else {
-            return Ok(());
-        };
-        if position < MIN_PREFIX_HIT
-            || !PrefixPath::of(generation).exact_boundary(position)
-            || !generation
-                .method_checkpoint()
-                .is_ok_and(|method| method.accounts_for(position))
-        {
-            return Ok(());
-        }
-        self.cache_prefix(id, position, CachePoint::Terminal)?;
+        self.cache_prefix(id, CachePoint::Terminal)?;
         self.requests.get_mut(&id).unwrap().record.terminal_retained = true;
         Ok(())
     }
@@ -3517,7 +3479,6 @@ impl<F: ProgramFamily> Service<F> {
                 continue;
             }
             self.retain_terminal(id)?;
-            self.retain_cancelled(id)?;
             let request = self.requests.get_mut(&id).expect("listed request");
             let State::Between(generation, _) = &request.state else {
                 continue;
@@ -3687,8 +3648,9 @@ impl<F: ProgramFamily> MemoryHost for Service<F> {
     }
 
     /// Those that can be evicted now ([`Self::can_evict`]); a chain's
-    /// holder between its chunks is resident and ready, but its state is
-    /// the chain's until the chain ends: never evicted.
+    /// holder between its chunks is kept: its eviction would conclude the
+    /// chain (`ExecutorDomain::release_state`), dropping the chunks it has
+    /// already launched.
     fn evictable(&self) -> BTreeSet<RequestId> {
         let holder = self.domain.chain_holder();
         self.requests.iter().filter(|(id, request)| Some(**id) != holder && Self::can_evict(request)).map(|(id, _)| *id).collect()
@@ -4337,6 +4299,115 @@ let Ok(residency) = service.make_resident(id, &mut record, generation, bindings)
         assert!(matches!(serve(&mut owner, &mut next), Publication::Completed { .. }), "the owner serves the next request");
         drop(owner);
         std::fs::remove_dir_all(&directory).expect("the fixture's directory is removed");
+    }
+
+    /// A request stopped part way through its prompt, while it holds a
+    /// chain of prompt chunks, keeps the prompt work its rounds reconciled:
+    /// its chain concludes there, and that state is cached as its path's
+    /// prefix, as a completed request's whole path is, at the position the
+    /// state holds; a request sharing the prompt resumes from it.
+    #[test]
+    fn a_request_stopped_mid_prompt_caches_the_prompt_it_reached() {
+        use crate::prefix_cache::{PrefixCacheCapacity, PrefixPath};
+        use std::task::{Context, Poll, Waker};
+        const PROMPT: usize = 2 * MIN_PREFIX_HIT;
+        let (directory, definition, domain, bindings) = fixtures::loaded::chaining("stopped-mid-prompt", 2 * PROMPT as u64, 3);
+        let vocabulary = definition.decoder.vocabulary as usize;
+        let prompt = || {
+            let options = Options {
+                max_tokens: 2,
+                output_capacity: 4,
+                context_limit: 2 * PROMPT,
+                vocabulary,
+                stop_tokens: BTreeSet::new(),
+                suppressed_tokens: BTreeSet::new(),
+                sampling: Sampling::Greedy,
+                shaping: Shaping { temperature: 0.0, ..Default::default() },
+                seed: 0,
+                forced_quantum: 0,
+                method: MethodChoice::Plain,
+                end_of_generation: EndOfGeneration::Stop,
+                reasoning_budget: None,
+            };
+            let tokens = (0..PROMPT as u32).map(|token| TokenId(1 + token % 7)).collect::<Vec<_>>();
+            Generation::new(tokens, InputLayout::new(PROMPT, vec![]).unwrap(), options, None).unwrap()
+        };
+        let capacity = PrefixCacheCapacity { max_entries: 4, workload_state_bytes: u64::MAX };
+        let mut owner = Some(Owner::with_prefix_cache_capacity(domain, bindings, limits(), capacity, Arc::new(NoWakes)).unwrap());
+        let retain = PrefixRetention::Retain { cache_points: Vec::new() };
+        let (id, mut receiver) = owner.as_mut().unwrap().admit(prompt(), PreparedModelInput::continuation_only(), retain, 4, 0).unwrap();
+        let mut now = 0u64;
+        let mut run = |owner: &mut Option<Owner<magnitude_executor::NativeFamily>>| {
+            let (ran, _) = owner.take().expect("the owner is between runs").run(now).unwrap_or_else(|error| panic!("the owner stopped: {error}"));
+            *owner = Some(ran);
+            now += 1_000_000;
+        };
+        // Past the least prefix a lookup resumes from, between chunks of a
+        // chain it holds, it is stopped.
+        let stoppable = |owner: &Option<Owner<magnitude_executor::NativeFamily>>| {
+            let owner = owner.as_ref().unwrap();
+            owner.snapshot(id).unwrap().resident_position > MIN_PREFIX_HIT && owner.service.domain.chain_holder() == Some(id)
+        };
+        while !stoppable(&owner) {
+            assert!(owner.as_ref().unwrap().snapshot(id).unwrap().resident_position < PROMPT, "its prompt chains before it ends");
+            run(&mut owner);
+        }
+        let reached = owner.as_ref().unwrap().snapshot(id).unwrap().resident_position;
+        assert!(reached < PROMPT, "stopped mid-prompt, at {reached}");
+        owner.as_mut().unwrap().stop(id);
+        let finish = loop {
+            run(&mut owner);
+            match receiver.poll_next(&mut Context::from_waker(Waker::noop())) {
+                Poll::Ready(Some(Publication::Completed { finish, .. })) => break finish,
+                Poll::Ready(Some(Publication::Output(_))) | Poll::Pending => {}
+                other => panic!("a stopped request completes, not {other:?}"),
+            }
+        };
+        assert_eq!(finish, FinishReason::Cancelled);
+        let served = owner.as_mut().unwrap();
+        assert!(served.snapshot(id).is_none(), "the stopped request is retired");
+        let sharing = prompt();
+        let hit = served.service.prefix_cache.lookup(PrefixPath::of(&sharing), PROMPT).unwrap().expect("its prompt work is cached");
+        assert_eq!(hit.position(), reached, "cached where it reached");
+        let cached = served.service.prefix_cache.entry(hit).unwrap().state().position();
+        assert_eq!(cached, hit.position(), "the cached state holds exactly the prefix it is cached as");
+        drop(owner);
+        std::fs::remove_dir_all(&directory).expect("the fixture's directory is removed");
+    }
+
+    /// A request stopped short of the least prefix a lookup resumes from
+    /// leaves nothing cached; one stopped at it is cached there.
+    #[test]
+    fn a_stop_short_of_a_hit_is_not_retained() {
+        let layout = InputLayout::new(2 * MIN_PREFIX_HIT, vec![]).unwrap();
+        let plain = super::MethodCheckpoint::Plain;
+        assert!(!super::resumes_from_stop(&layout, MIN_PREFIX_HIT - 1, &plain));
+        assert!(super::resumes_from_stop(&layout, MIN_PREFIX_HIT, &plain));
+    }
+
+    /// A request stopped inside an indivisible media span leaves nothing
+    /// cached, since no request resumes there; one stopped at the span's
+    /// end or inside a causal span is cached where it stopped.
+    #[test]
+    fn a_stop_inside_an_indivisible_span_is_not_retained() {
+        use magnitude_generation::{BoundaryRule, InputSpan};
+        let span = |start, end, boundaries| InputSpan {
+            start,
+            end,
+            identity: format!("media-{start}"),
+            boundaries,
+            language_history: false,
+        };
+        let (image, causal) = (MIN_PREFIX_HIT + 2..MIN_PREFIX_HIT + 10, MIN_PREFIX_HIT + 12..MIN_PREFIX_HIT + 20);
+        let layout = InputLayout::new(
+            2 * MIN_PREFIX_HIT,
+            vec![span(image.start, image.end, BoundaryRule::Indivisible), span(causal.start, causal.end, BoundaryRule::Causal)],
+        )
+        .unwrap();
+        let plain = super::MethodCheckpoint::Plain;
+        assert!(!super::resumes_from_stop(&layout, image.start + 3, &plain), "inside the image");
+        assert!(super::resumes_from_stop(&layout, image.end, &plain), "at the image's end");
+        assert!(super::resumes_from_stop(&layout, causal.start + 3, &plain), "inside a causal span");
     }
 
     /// Two loads in one process, each with its own owner, admit in turn:

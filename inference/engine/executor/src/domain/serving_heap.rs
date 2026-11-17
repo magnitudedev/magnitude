@@ -140,8 +140,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         };
         let step = match self.unchained(bindings) {
             None => BankStep::Deferred,
-            Some(mut unchained) => {
-                bank.shrink(holding, to, &mut || self.queue.orphan(self.measures.as_ref().and_then(|measures| measures.experts.as_ref()), &mut unchained), wake)?
+            Some(_) => {
+                let experts = self.measures.as_ref().and_then(|measures| measures.experts.as_ref());
+                bank.shrink(holding, to, &mut || self.queue.conclude(&mut self.target, experts), wake)?
             }
         };
         match step {
@@ -174,9 +175,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let Some(bank) = self.family.expert_bank() else {
             return Ok(None);
         };
-        let count = |value: u64| usize::try_from(value).map_err(|_| DomainError::invariant("bank slots exceed the host"));
+        let count = |value: u64| usize::try_from(value).expect("invariant violated: a bank's slots exceed the host's");
         let host = bank.residency()?.host.map_or(0, |host| host.slots);
-        Ok(Some(crate::assessment::HeldSlots { slots: count(bank.slots())?, host: count(host)? }))
+        Ok(Some(crate::assessment::HeldSlots { slots: count(bank.slots()), host: count(host) }))
     }
 
     /// The workload prior of the load's planned context and limits
@@ -202,7 +203,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     pub fn value_cache(&mut self, prefix: Option<(u64, u64)>) -> Result<(), DomainError> {
         let price = self.decode_price()?;
         if let (Some(bank), Some(price), Some(held), Some(plan)) = (self.family.expert_bank(), price.as_ref(), self.held_slots()?, self.expert_bank_plan()) {
-            let floor = usize::try_from(plan.floor()).map_err(|_| DomainError::invariant("bank slots exceed the host"))?;
+            let floor = usize::try_from(plan.floor()).expect("invariant violated: a bank's slots exceed the host's");
             let saved = price.step(crate::assessment::HeldSlots { slots: floor.min(held.slots), ..held }).total_seconds - price.step(held).total_seconds;
             // A bank at its floor holds no cache to value.
             if let Some(bytes) = std::num::NonZeroU64::new(self.resources.ledgers().device().estimate().cache_of(CacheKind::Bank)) {

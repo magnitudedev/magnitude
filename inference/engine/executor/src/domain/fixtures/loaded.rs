@@ -3,7 +3,7 @@
 //! first work. Test-only: what tests of real steps, and an owner over a
 //! real domain, run on.
 // Most of it is the executor's own tests'; the `fixtures` feature serves
-// only [`drafted`] and [`plain`] above.
+// only [`drafted`], [`plain`] and [`chaining`] above.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use crate::planning::fixtures::{qwen4exp_fixture_definition, stored_table_manifest};
@@ -38,12 +38,17 @@ pub fn drafted(test: &str) -> (std::path::PathBuf, Rc<ModelDefinition>, Executor
 /// directory its GGUF was written to, the definition, the domain and its
 /// bindings, as [`drafted`] gives them.
 pub fn plain(test: &str, context: u64) -> (std::path::PathBuf, Rc<ModelDefinition>, ExecutorDomain, crate::StateBindings) {
+    chaining(test, context, 1)
+}
+
+/// [`plain`], its prompt groups chaining up to `chain_capacity` chunks.
+pub fn chaining(test: &str, context: u64, chain_capacity: usize) -> (std::path::PathBuf, Rc<ModelDefinition>, ExecutorDomain, crate::StateBindings) {
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let mut definition = crate::planning::fixtures::fixture_definition();
     definition.decoder.context_limit = context;
     let (directory, definition, package) = fixture_with(test, definition, crate::planning::fixtures::fixture_manifest);
     let (domain, bindings, _, _) =
-        load_read(&catalog, &definition, &package, seismic::BackendName::Cpu, limits(4, false, 1, 0), Banked::Resident, PlannedMethod::Plain, KvCodec::Dense, Machine::Still);
+        load_read(&catalog, &definition, &package, seismic::BackendName::Cpu, limits(4, false, chain_capacity, 0), Banked::Resident, PlannedMethod::Plain, KvCodec::Dense, Machine::Still);
     (directory, definition, domain, bindings)
 }
 

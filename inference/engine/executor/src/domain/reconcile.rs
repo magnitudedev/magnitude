@@ -19,10 +19,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             return Err(DomainError::WeightRead(error));
         }
         // An interrupted outcome is aborted and re-run, never reconciled.
-        if matches!(pending.outcome, Outcome::Interrupted { .. }) {
-            self.abort(pending)?;
-            return Err(DomainError::invariant("an interrupted outcome is reconciled"));
-        }
+        assert!(
+            !matches!(pending.outcome, Outcome::Interrupted { .. }),
+            "invariant violated: an interrupted outcome is reconciled"
+        );
         if matches!(pending.outcome, Outcome::Head { .. }) {
             // A head commits exactly its entry rows; its chained proposal
             // rows never become visible.
@@ -35,8 +35,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             if pending.advance.is_none() && self.head_reads_target() {
                 return Ok(());
             }
+            // An outcome owns exactly its own rows: a drafter's, its step's.
             let Some(Advance::Step(advance)) = pending.advance.take() else {
-                return Err(DomainError::invariant("head outcome has no owned advance"));
+                panic!("invariant violated: a drafter outcome owns no step of its own");
             };
             let (OwnedAdvanceResolution::Aborted(state) | OwnedAdvanceResolution::Committed(state)) =
                 advance
@@ -54,30 +55,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
             if let (Outcome::Encode { features }, Some(image)) = (&pending.outcome, &pending.image)
             {
-                let Some(input) = self.input.get(&pending.request) else {
-                    return Err(DomainError::invariant(
-                        "vision outcome has no admitted input",
-                    ));
-                };
-                let Some(existing) = input.images.values().find(|slot| &slot.image == image) else {
-                    return Err(DomainError::invariant(
-                        "encoded image is absent from admitted input",
-                    ));
-                };
-                if existing.features.is_some() {
-                    return Err(DomainError::invariant(
-                        "encoded image feature is already installed",
-                    ));
-                }
-                let input = self
+                let slot = self
                     .input
                     .get_mut(&pending.request)
-                    .expect("admitted input checked above");
-                let slot = input
+                    .expect("invariant violated: a vision outcome's request has no admitted input")
                     .images
                     .values_mut()
                     .find(|slot| &slot.image == image)
-                    .expect("admitted image checked above");
+                    .expect("invariant violated: an encoded image is absent from its admitted input");
+                assert!(slot.features.is_none(), "invariant violated: an encoded image's features are already installed");
                 slot.features = Some(features.clone());
             }
             return Ok(());
@@ -89,18 +75,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             return Err("accepted target prefix is outside the submitted row commitment".into());
         }
         let request = pending.request;
-        if self.target.contains_key(&request)
-            || (pending.primed.is_some() && self.head.contains_key(&request))
-        {
-            return Err(DomainError::invariant(
-                "request already has another physical state owner",
-            ));
-        }
-        let Some(advance) = pending.advance.take() else {
-            return Err(DomainError::invariant(
-                "target outcome has no owned target advance",
-            ));
-        };
+        // Its state is the outcome's alone until it reconciles, a chain it
+        // carries with it: no other owner can hold it.
+        assert!(
+            !self.target.contains_key(&request) && !(pending.primed.is_some() && self.head.contains_key(&request)),
+            "invariant violated: a reconciled request has another physical state owner"
+        );
+        let advance = pending.advance.take().expect("invariant violated: a target outcome owns no target advance");
         // A prompt chunk commits whole, and its drafter entry with it.
         if let Some(primed) = pending.primed.take() {
             let rows = primed.rows();
@@ -113,30 +94,27 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 }
                 Err((state, error)) => {
                     self.head.insert(request, state);
-                    if let Some(state) = advance.abort() {
-                        self.target.insert(request, state);
-                    }
+                    self.abort_target(request, advance)?;
                     return Err(error.into());
                 }
             }
         }
-        let published = match advance {
+        match advance {
             Advance::Step(advance) => match advance.commit(decision.accepted_rows) {
                 Ok(
                     OwnedAdvanceResolution::Aborted(state)
                     | OwnedAdvanceResolution::Committed(state),
-                ) => Some(state),
+                ) => {
+                    self.target.insert(request, state);
+                }
                 Err((state, error)) => {
                     self.target.insert(request, state);
                     return Err(error.into());
                 }
             },
-            // Its chain holds its rows (`ExecutorDomain::chain`).
-            Advance::Chained => None,
-            Advance::Chain(chain) => Some(chain.commit()),
-        };
-        if let Some(state) = published {
-            self.target.insert(request, state);
+            // A chain holds its chunks' rows until it concludes.
+            Advance::Opens { flight, first } => self.open_chain(request, flight, first)?,
+            Advance::Chained { flight, joined, chunk } => self.join_chain(request, flight, joined, chunk)?,
         }
         let boundary = match &pending.outcome {
             Outcome::Forward { rows } => rows
@@ -154,9 +132,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// Cancellation while completion is already available makes no physical
-    /// successor visible. A step returns the original accepted sequence; a
-    /// whole chain whose last chunk finished returns the state its chunks
-    /// computed (`Advance::abort`).
+    /// successor visible and returns the original accepted sequence.
     pub fn abort(&mut self, pending: PendingOperationOutcome) -> Result<(), DomainError> {
         let conflicting_owner = match &pending.outcome {
             Outcome::Head { .. } => self.head.contains_key(&pending.request),
@@ -166,44 +142,60 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
             Outcome::Encode { .. } => false,
         };
-        if conflicting_owner {
-            return Err(DomainError::invariant(
-                "request already has another physical state owner",
-            ));
-        }
+        // Its state is the outcome's alone until it aborts, a chain it
+        // carries with it: no other owner can hold it.
+        assert!(!conflicting_owner, "invariant violated: an aborted request has another physical state owner");
         if let Some(primed) = pending.primed {
             self.head.insert(pending.request, primed.abort());
         }
-        if let Some(advance) = pending.advance {
-            let lane = match pending.outcome {
-                Outcome::Head { .. } => &mut self.head,
-                Outcome::Forward { .. } | Outcome::WeightReadFailed(_) | Outcome::Interrupted { .. } => &mut self.target,
-                Outcome::Encode { .. } => {
-                    return Err(DomainError::invariant(
-                        "stateless outcome unexpectedly owns sequence state",
-                    ));
-                }
-            };
-            // A chain's earlier chunk returns nothing: its chain holds the
-            // state, released when its holder is (`release_chain`, `close`).
-            if let Some(state) = advance.abort() {
-                lane.insert(pending.request, state);
+        let Some(advance) = pending.advance else {
+            return Ok(());
+        };
+        match (&pending.outcome, advance) {
+            (Outcome::Head { .. }, Advance::Step(advance)) => {
+                self.head.insert(pending.request, advance.abort());
+                Ok(())
             }
+            (Outcome::Forward { .. } | Outcome::WeightReadFailed(_) | Outcome::Interrupted { .. }, advance) => {
+                self.abort_target(pending.request, advance)
+            }
+            // An outcome owns exactly its own rows: a drafter's never a
+            // chain's, an encode's none.
+            (Outcome::Head { .. }, Advance::Opens { .. } | Advance::Chained { .. }) => {
+                panic!("invariant violated: a drafter outcome owns a chain's rows")
+            }
+            (Outcome::Encode { .. }, _) => panic!("invariant violated: a stateless outcome owns sequence state"),
         }
-        Ok(())
     }
-}
 
-impl Advance {
-    /// The accepted state an aborted outcome returns, when it holds one. A
-    /// whole chain's last chunk finished: every chunk's rows were computed
-    /// and the earlier chunks' already reconciled, so its holder keeps them
-    /// all rather than the state the chain started from.
-    fn abort(self) -> Option<SequenceState> {
-        match self {
-            Self::Step(advance) => Some(advance.abort()),
-            Self::Chained => None,
-            Self::Chain(chain) => Some(chain.commit()),
+    /// Return the accepted target state `request`'s aborted `advance` came
+    /// from.
+    fn abort_target(&mut self, request: RequestId, advance: Advance) -> Result<(), DomainError> {
+        match advance {
+            Advance::Step(advance) => {
+                self.target.insert(request, advance.abort());
+                Ok(())
+            }
+            // A chain's first chunk: the chunks queued behind it follow its
+            // rows, so they are concluded before its state returns.
+            Advance::Opens { flight, first } => {
+                let concluded = match self.queue.opens_chain(flight) {
+                    true => self.conclude_chain(),
+                    false => Ok(()),
+                };
+                self.target.insert(request, first.abort());
+                concluded
+            }
+            // A chunk of a chain: the chain cannot run past it, so it
+            // concludes with the chunks reconciled before, its holder's
+            // state the one they reached, and the chunk's rows are dropped.
+            Advance::Chained { flight, joined, chunk } => {
+                drop(chunk);
+                match self.return_chain(request, flight, joined) {
+                    true => self.conclude_chain(),
+                    false => Ok(()),
+                }
+            }
         }
     }
 }

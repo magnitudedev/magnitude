@@ -124,7 +124,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             let Some(bytes) = std::num::NonZeroU64::new(state.bytes()).filter(|_| state.through() > 0) else {
                 continue;
             };
-            let rows = u32::try_from(state.through()).map_err(|_| DomainError::invariant(format!("{sequence:?} writes rows past a launch's count")))?;
+            let rows = u32::try_from(state.through()).unwrap_or_else(|_| panic!("invariant violated: {sequence:?} writes rows past a launch's count"));
             let replay = step(rows, 0).map_err(|error| DomainError::invariant(format!("the replay of {sequence:?}: {error}")))?.resident;
             state.value(crate::memory::ledger::Value::per_byte(replay, bytes));
         }
@@ -299,21 +299,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if self.claim_slots(operations).is_some() {
             return Ok(());
         }
-        // Only the chain holder's groups are admitted while its chain is
-        // under way (`claims`). One that is not the queued chunk (lowered at
-        // other rows than the chain planned) releases the chain, its state
-        // with it, and the holder replays; any other group is an invariant
-        // violation.
-        if let Some(holder) = self.chain_holder() {
-            if !operations.iter().any(|operation| operation.request() == holder) {
-                return Err(DomainError::invariant("a group other than the chain holder's provisions while its chain is under way"));
-            }
-            self.release_chain()?;
-            return Err(DomainError::ChainReleased(holder));
-        }
-        let mut unchained = self.unchained(bindings).expect("invariant violated: no chain is under way, so the queue is unchained");
-        self.orphan_queue(&mut unchained)?;
-        self.close_group()?;
+        // Any other group resolves the queue: a chain under way concludes,
+        // its holder's state the one its reconciled chunks reached, from
+        // which a group of its holder's that is not its queued chunk
+        // (lowered at other rows than the chain planned) runs.
+        self.conclude_chain()?;
         self.open_group(operations)?;
         for operation in operations {
             if let Operation::Forward { request, .. } | Operation::Head { request, .. } = operation
@@ -376,7 +366,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             let mut growth = 0u64;
             if target_banks != 0 {
                 growth = bindings
-                    .store(false)?
+                    .store(false)
                     .growth_claim(&target, &target_queued, target_banks)?
                     .minimum_bytes;
             }
@@ -384,11 +374,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 growth = growth
                     .checked_add(
                         bindings
-                            .store(true)?
+                            .store(true)
                             .growth_claim(&head, &head_queued, head_banks)?
                             .minimum_bytes,
                     )
-                    .ok_or_else(|| DomainError::invariant("state growth overflows"))?;
+                    .expect("invariant violated: state growth overflows");
             }
             let committed = self.committed_state_bytes();
             if growth != 0 && committed.saturating_add(growth) > ceiling {
@@ -410,7 +400,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             let held = self
                 .state_claims
                 .get(&sequence)
-                .ok_or_else(|| DomainError::invariant("a resident request holds no reservation"))?
+                .expect("invariant violated: a resident request holds no reservation")
                 .rows();
             if through > held {
                 self.change_state(|this| {
@@ -424,7 +414,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         for (sequence, through) in state_rows {
             self.state_claims
                 .get_mut(&sequence)
-                .ok_or_else(|| DomainError::invariant("a resident request holds no reservation"))?
+                .expect("invariant violated: a resident request holds no reservation")
                 .grow(through);
         }
         // Stores without history domains still grow banks.
@@ -486,14 +476,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let pool = self
             .resources
             .vision_graph()
-            .ok_or_else(|| DomainError::invariant("vision graph is absent"))?;
+            .expect("invariant violated: a vision provision on a load without a vision graph");
         let device = self.domain.device();
         let activation = (pool.available_workspace(patch_rows) == 0)
             .then(|| {
                 let graphs = graph_demand(device.graph_cost(), device.graph_budget(), pool.activation_graphs(patch_rows)?).map_err(DomainError::invariant)?;
-                crate::memory::ClaimDemand { device: pool.activation_bytes(patch_rows)?, ..Default::default() }
+                let demand = crate::memory::ClaimDemand { device: pool.activation_bytes(patch_rows)?, ..Default::default() }
                     .checked_plus(graphs)
-                    .ok_or_else(|| DomainError::invariant("a vision activation's demand overflows"))
+                    .expect("invariant violated: a vision activation's demand overflows");
+                Ok::<_, DomainError>(demand)
             })
             .transpose()?;
         let output = (pool.available_output(patch_rows) == 0)
@@ -566,8 +557,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// as it opens and as it extends, within the room its reservation
     /// committed, and no row it writes allocates mid-launch.
     pub(super) fn back_reservation(&mut self, bindings: &mut StateBindings, request: RequestId) -> Result<(), DomainError> {
-        let unwritten = self.unwritten_rows(request)?;
-        let target = self.target.get(&request).ok_or_else(|| DomainError::invariant("a reserved request holds no target state"))?.queued_demands(0, unwritten);
+        let unwritten = self.unwritten_rows(request);
+        let target = self
+            .target
+            .get(&request)
+            .expect("invariant violated: a reserved request holds no target state")
+            .queued_demands(0, unwritten);
         self.grant_state_growth(bindings, false, &[], &target, 0)?;
         if let (Some(head), true) = (self.head.get(&request), self.head_store.is_some()) {
             let head = head.queued_demands(0, unwritten);
@@ -584,10 +579,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// The rows `request`'s reservation holds past its target position.
-    fn unwritten_rows(&self, request: RequestId) -> Result<usize, DomainError> {
-        let reservation = self.state_claims.get(&request).ok_or_else(|| DomainError::invariant("a resident request holds no reservation"))?;
+    fn unwritten_rows(&self, request: RequestId) -> usize {
+        let reservation = self.state_claims.get(&request).expect("invariant violated: a resident request holds no reservation");
         let position = self.target.get(&request).map_or(0, SequenceState::position) as u64;
-        usize::try_from(reservation.rows().saturating_sub(position)).map_err(|_| DomainError::invariant("a reservation's rows fit the host"))
+        usize::try_from(reservation.rows().saturating_sub(position)).expect("invariant violated: a reservation's rows exceed the host's")
     }
 
     pub(super) fn drop_state_claim(&mut self, sequence: RequestId) {
@@ -614,7 +609,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // No backing changes when neither plan adds a slab: the group's
         // demands only admit slabs already backed, so the charge stands as
         // last read.
-        let store = bindings.store(head)?;
+        let store = bindings.store(head);
         let claim = store.growth_claim(demands, queued, banks)?;
         if claim.minimum_bytes == 0 && claim.preferred_bytes == 0 {
             self.change_state(|_| store.provision_with_growth(demands, queued, banks, GrowthChoice::Minimum))?;
@@ -791,7 +786,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// Commit the successor banks a newly opened request needs. Free banks
     /// change no bindings and leave the queued steps running.
     pub fn provision_open(&mut self, unchained: &mut Unchained<'_>) -> Result<(), DomainError> {
-        self.orphan_queue(unchained)?;
+        self.conclude_chain()?;
         let requirements = self.open_requirements();
         self.grant_state_growth(unchained.bindings(), false, &[], &[], requirements.target_banks())?;
         if self.head_store.is_some() {
@@ -814,7 +809,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         bindings: &mut StateBindings,
         wake: crate::CompletionWake,
     ) -> Result<StateShrink, DomainError> {
-        let mut unchained = self.unchained(bindings).ok_or_else(|| DomainError::invariant("a test shrinks the state beside a chain"))?;
+        let mut unchained = self.unchained(bindings).expect("invariant violated: a test shrinks the state beside a chain");
         let state = self.yield_state(&mut unchained)?;
         let slots = self.release_idle_graph_slots(wake);
         Ok(StateShrink { state, slots })
@@ -827,7 +822,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// (`seismic::Pool::return_freed`): the one copy. The queued steps are
     /// orphaned first: their launch bindings pin slab placement.
     pub(super) fn yield_state(&mut self, unchained: &mut Unchained<'_>) -> Result<StateYield, DomainError> {
-        self.orphan_queue(unchained)?;
+        self.conclude_chain()?;
         let bindings = unchained.bindings();
         let pool = bindings.target.pool().clone();
         self.change_state(|this| {
@@ -1205,10 +1200,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let live = if head { &self.head } else { &self.target };
         let mut rows = Vec::new();
         for (request, state) in live {
-            rows.extend(state.demands(self.unwritten_rows(*request)?.max(steps)));
+            rows.extend(state.demands(self.unwritten_rows(*request).max(steps)));
         }
         let next = magnitude_state::NextSteps { rows, banks: steps * live.len() };
-        Ok(bindings.store(head)?.shrink(&next)?)
+        Ok(bindings.store(head).shrink(&next)?)
     }
 
     fn submit_store_copy(
@@ -1226,7 +1221,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 .acquire_workspace()
                 .map_err(DomainError::Capacity)?;
             let class_rows = crate::batching::row_class(chunk.rows())
-                .ok_or_else(|| DomainError::invariant("store copy has no prepared row class"))?;
+                .expect("invariant violated: a store copy has no prepared row class");
             let batch = crate::batching::ValidatedStateBatch::copy(
                 chunk.copies().to_vec(),
                 chunk.row_capacity(),
@@ -1515,12 +1510,13 @@ fn class_demand<F: ProgramFamily>(
     let pools = resources.class_bytes(slots).map_err(DomainError::invariant)?;
     let graphs = resources.class_graphs(slots).map_err(DomainError::invariant)?;
     let graphs = graph_demand(device.graph_cost(), device.graph_budget(), graphs).map_err(DomainError::invariant)?;
-    family
+    let demand = family
         .group_demand(places)
         .map_err(DomainError::Input)?
         .checked_plus(crate::memory::ClaimDemand { device: pools, ..Default::default() })
         .and_then(|demand| demand.checked_plus(graphs))
-        .ok_or_else(|| DomainError::invariant("a group's demand overflows"))
+        .expect("invariant violated: a group's demand overflows");
+    Ok(demand)
 }
 
 /// A failed slot allocation of `bytes`: a capacity deficit when the device

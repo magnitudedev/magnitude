@@ -49,17 +49,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             ));
         }
         // Reservation checked the group and moved its states into the
-        // advances: a mismatch now is a broken domain invariant.
-        let broken = |detail: String| SubmitFailure::Failed(DomainError::invariant(detail));
-        let store = self
-            .head_store
-            .clone()
-            .ok_or_else(|| broken("head advances without a head store".into()))?;
-        if operations.len() != advances.len() {
-            return Err(broken(
-                "head reservation advance count differs from operations".into(),
-            ));
-        }
+        // advances: a mismatch now is a broken domain invariant, which would
+        // drop those states.
+        let store = self.head_store.clone().expect("invariant violated: head advances without a head store");
+        assert_eq!(
+            operations.len(),
+            advances.len(),
+            "invariant violated: a head reservation's advances differ from its operations"
+        );
         let advances = advances
             .into_iter()
             .map(TentativeAdvance::Accepted)
@@ -67,9 +64,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let mut seen = BTreeSet::new();
         let mut steps = 0usize;
         for (operation, advance) in operations.iter().zip(&advances) {
-            operation
-                .validate()
-                .map_err(|error| broken(error.to_string()))?;
+            if let Err(error) = operation.validate() {
+                panic!("invariant violated: a reserved head operation is invalid: {error}");
+            }
             let Operation::Head {
                 request,
                 position,
@@ -77,16 +74,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 ..
             } = operation
             else {
-                return Err(broken("head group contains another operation kind".into()));
+                panic!("invariant violated: a reserved head group holds another operation kind");
             };
-            if !seen.insert(*request) {
-                return Err(broken("head request is repeated".into()));
-            }
-            if advance.position() != *position || advance.rows() != operation.row_count() {
-                return Err(broken(
-                    "head position or rows differ from accepted state".into(),
-                ));
-            }
+            assert!(seen.insert(*request), "invariant violated: a reserved head group repeats a request");
+            assert!(
+                advance.position() == *position && advance.rows() == operation.row_count(),
+                "invariant violated: a reserved head operation's position or rows differ from its accepted state"
+            );
             steps = steps.max(proposals.len());
         }
         if std::env::var_os("MAGNITUDE_TRACE_DRAFT").is_some() {
@@ -135,7 +129,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             ));
         }
         let vocabulary = self.definition.decoder.vocabulary as usize;
-        let class_limits = self.head_class_limits().map_err(SubmitFailure::Failed)?;
+        let class_limits = self.head_class_limits();
         let batch = match form {
             DraftForm::Chained => operations
                 .iter()
@@ -419,8 +413,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let batch = crate::batching::ValidatedHeadBatch::from_slots(
             &slots,
             self.definition.decoder.vocabulary as usize,
-            self.head_class_limits()
-                .map_err(|error| error.to_string())?,
+            self.head_class_limits(),
         )
         .map_err(|error| error.to_string())?;
         let head = self
@@ -739,11 +732,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             landed_reads: _,
         } = output;
         let slots = core.batch().actual_slots();
-        if slots != requests.len() {
-            return Err(DomainError::invariant(
-                "head slot count differs from request count",
-            ));
-        }
+        assert_eq!(slots, requests.len(), "invariant violated: a head flight's slots differ from its requests");
         let read = |tensor: &crate::GraphOutputTensor| {
             tensor.tensor().read_to_host().map_err(|error| {
                 DomainError::Device(crate::DeviceError::Transfer(error.to_string()))
@@ -762,12 +751,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                             .chunks_exact(4)
                             .map(|word| f32::from_le_bytes(word.try_into().expect("four bytes")))
                             .collect::<Vec<_>>();
-                        if !bytes.len().is_multiple_of(4) || confidence.len() != selected.len() {
-                            return Err(DomainError::invariant(
-                                "head confidences differ from its selections",
-                            ));
-                        }
-                        Ok(confidence)
+                        assert!(
+                            bytes.len().is_multiple_of(4) && confidence.len() == selected.len(),
+                            "invariant violated: a head flight's confidences differ from its selections"
+                        );
+                        Ok::<_, DomainError>(confidence)
                     })
                     .transpose()?;
                 (selected, confidence)
@@ -775,11 +763,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             None => (Vec::new(), None),
         };
         let slot_class = selected.len().checked_div(steps).unwrap_or(0);
-        if steps != 0 && (slot_class < slots || selected.len() != steps * slot_class) {
-            return Err(DomainError::invariant(
-                "head selections differ from the batch's steps and slots",
-            ));
-        }
+        assert!(
+            steps == 0 || (slot_class >= slots && selected.len() == steps * slot_class),
+            "invariant violated: a head flight's selections differ from its steps and slots"
+        );
         let passes = core.batch().passes();
         if std::env::var_os("MAGNITUDE_TRACE_DRAFT").is_some() {
             for (slot, (request, _, proposals)) in requests.iter().enumerate() {
@@ -798,20 +785,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // states: the device is done with them, so they return unchanged and
         // its outcomes own no advance.
         let advances = if core.target_reads().is_some() {
-            let reads = core
-                .into_target_reads()
-                .ok_or_else(|| DomainError::invariant("a head flight lost its target reads"))?;
-            if reads.states.len() != requests.len() {
-                return Err(DomainError::invariant(
-                    "head target reads differ from request count",
-                ));
-            }
+            let reads = core.into_target_reads().expect("invariant violated: a head flight lost its target reads");
+            assert_eq!(reads.states.len(), requests.len(), "invariant violated: a head flight's target reads differ from its requests");
             for ((request, _, _), state) in requests.iter().zip(reads.states) {
-                if self.target.insert(*request, state.into_state()).is_some() {
-                    return Err(DomainError::invariant(
-                        "request already has another physical state owner",
-                    ));
-                }
+                assert!(
+                    self.target.insert(*request, state.into_state()).is_none(),
+                    "invariant violated: a head flight's target state has another owner"
+                );
             }
             requests.iter().map(|_| None).collect::<Vec<_>>()
         } else {
@@ -819,12 +799,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             advances
                 .into_iter()
                 .map(|advance| match advance {
-                    TentativeAdvance::Accepted(advance) => Ok(Some(advance)),
-                    TentativeAdvance::Successor(_) | TentativeAdvance::Chained(_) => Err(
-                        DomainError::invariant("a head transaction follows an in-flight advance"),
-                    ),
+                    TentativeAdvance::Accepted(advance) => Some(advance),
+                    TentativeAdvance::Successor(_) | TentativeAdvance::Chained(_) => {
+                        panic!("invariant violated: a head transaction follows an in-flight advance")
+                    }
                 })
-                .collect::<Result<Vec<_>, _>>()?
+                .collect::<Vec<_>>()
         };
         let mut pending: Vec<PendingOperationOutcome> = requests
             .into_iter()

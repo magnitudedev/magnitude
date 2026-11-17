@@ -54,19 +54,13 @@ pub fn reconcile_forward<F: ProgramFamily>(
     pending: PendingOperationOutcome,
 ) -> Result<(Generation, MethodEffects), (Generation, RoundError)> {
     // The round's step was interrupted: its outputs are discarded and its
-    // accepted state returns; the round runs again from it, or, where its
-    // state was released with its chain, the generation re-prefills.
-    if let Outcome::Interrupted { reason, resident } = pending.outcome() {
-        let (reason, resident) = (reason.clone(), *resident);
+    // accepted state returns; the round runs again from it.
+    if let Outcome::Interrupted { reason } = pending.outcome() {
+        let reason = reason.clone();
         if let Err(physical) = domain.abort(pending) {
             return Err((round.fail(), RoundError::Physical(physical)));
         }
-        let generation = if resident {
-            round.abandon()
-        } else {
-            round.evicted().expect("an evicted generation keeps its logical history")
-        };
-        return Err((generation, RoundError::Interrupted(reason)));
+        return Err((round.abandon(), RoundError::Interrupted(reason)));
     }
     // The sequence's table rows could not be read: its outputs are
     // discarded and the round fails with the typed cause.

@@ -112,15 +112,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             self.definition
                 .vision
                 .as_ref()
-                .ok_or_else(|| DomainError::invariant("vision definition is absent"))?
+                .expect("invariant violated: a vision flight on a load without vision")
                 .cell_rows(),
         )
-        .map_err(|_| DomainError::invariant("vision merge area exceeds host domain"))?;
-        if merge == 0 || !patch_rows.is_multiple_of(merge) {
-            return Err(DomainError::invariant(
-                "vision patch rows differ from merge geometry",
-            ));
-        }
+        .expect("invariant violated: a vision merge area exceeds the host's");
+        assert!(
+            merge != 0 && patch_rows.is_multiple_of(merge),
+            "invariant violated: a vision flight's patch rows differ from its merge geometry"
+        );
         let output_rows = patch_rows / merge;
         let view = output
             .slice_leading(0, output_rows as u64)
