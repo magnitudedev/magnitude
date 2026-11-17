@@ -2561,7 +2561,10 @@ mod internals {
         // The tier boundaries: each form is a `#[target_feature]` function
         // of its tier. The asset is included from its authored path, so the
         // rule that everything inlines into them is checked here rather than
-        // written in.
+        // written in. Everything inlining makes each form a whole copy of its
+        // kernel, so each is the one item of its own module: rustc partitions
+        // codegen units by module, and an entry's forms sharing one would
+        // optimize serially in one LLVM job.
         if let Some(function) = out_of_line(cpu.text) {
             return Err(BuildError::CpuNative { path: cpu.path.clone(), reason: out_of_line_reason(function) });
         }
@@ -2570,7 +2573,7 @@ mod internals {
                 for binding in &bindings {
                     let elements = binding_name(binding);
                     out.push_str(&format!(
-                        "    #[cfg(target_arch = {arch:?})]\n    #[target_feature(enable = {features:?})]\n    unsafe fn launch_{launch_index}_{tier}_{elements}(invocation: &CpuInvocation<'_>, group: [u64; 3], shared: &mut [u8]) {{\n      // SAFETY: the runtime calls a form only on a device whose detected tier includes the form's.\n      let l = unsafe {{ <seismic::cpu::{token} as Isa>::assume_detected() }};\n      {kernel}::<seismic::cpu::{token}, {elements}>(l, &Context::new(invocation), group, shared)\n    }}\n",
+                        "    #[cfg(target_arch = {arch:?})]\n    mod launch_{launch_index}_{tier}_{elements} {{\n      #[target_feature(enable = {features:?})]\n      pub(super) unsafe fn form(invocation: &seismic::native_cpu::CpuInvocation<'_>, group: [u64; 3], shared: &mut [u8]) {{\n        // SAFETY: the runtime calls a form only on a device whose detected tier includes the form's.\n        let l = unsafe {{ <seismic::cpu::{token} as seismic::cpu::Isa>::assume_detected() }};\n        super::{kernel}::<seismic::cpu::{token}, super::{elements}>(l, &super::Context::new(invocation), group, shared)\n      }}\n    }}\n",
                         arch = tier.arch(),
                         features = tier.features(),
                         tier = tier.name(),
@@ -2615,7 +2618,7 @@ mod internals {
                             .collect::<Vec<_>>()
                             .join(", ");
                         out.push_str(&format!(
-                            "        CpuVariant {{ tier: seismic::cpu::Tier::{token}, elements: &[{names}], function: launch_{launch_index}_{tier}_{elements} as CpuKernelFn }},\n",
+                            "        CpuVariant {{ tier: seismic::cpu::Tier::{token}, elements: &[{names}], function: launch_{launch_index}_{tier}_{elements}::form as CpuKernelFn }},\n",
                             token = tier.token(),
                             tier = tier.name(),
                             elements = binding_name(binding),
