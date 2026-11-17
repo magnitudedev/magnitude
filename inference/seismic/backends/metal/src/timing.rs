@@ -12,15 +12,14 @@ pub fn host_seconds() -> f64 {
     unsafe { clock_gettime_nsec_np(CLOCK_UPTIME_RAW) as f64 / 1e9 }
 }
 
-/// The lower endpoint of one command's submission envelope. Observation
-/// stores one f64 per committed command in its retained timing vector,
-/// including commands before a host gate or an abandoned batch.
+/// The lower endpoint of a submission envelope: the host clock immediately
+/// before the first commit of the work it bounds.
 pub(crate) struct SubmissionTime {
     before: f64,
 }
 
 impl SubmissionTime {
-    /// Call immediately before committing the command, never after commit.
+    /// Call immediately before the first commit, never after it.
     pub(crate) fn before_commit() -> Self {
         Self { before: host_seconds() }
     }
