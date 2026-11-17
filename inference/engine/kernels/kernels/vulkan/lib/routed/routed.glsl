@@ -51,7 +51,10 @@ projection_weights routed_expert_matrix(slab_experts experts, slab_source source
 
 // Writes the tables of the `rows` x `slots` choices of `routes` (strides
 // `routes0`, `routes1`) whose products lie at element strides `product0`,
-// `product1`, an invocation a choice.
+// `product1`, an invocation a choice. The form runs at most VERIFY_ROWS rows,
+// each naming an expert once, so a choice's count never reaches the bound;
+// the bound (Metal's `routed::gather`'s) keeps the tables in bounds where
+// routes break that invariant, since Vulkan has no trap.
 void routed_gather(uint64_t routes, uint64_t routes0, uint64_t routes1, uint rows, uint slots, uint64_t product0,
     uint64_t product1, uint64_t table) {
     for (uint choice = gl_LocalInvocationIndex; choice < rows * slots; choice += gl_WorkGroupSize.x) {
@@ -63,7 +66,7 @@ void routed_gather(uint64_t routes, uint64_t routes0, uint64_t routes1, uint row
             first = first && element_i32_at(routes + (uint64_t(c / slots) * routes0
                 + uint64_t(c % slots) * routes1) * 4ul) != expert;
         uint count = 0u;
-        for (uint c = choice; first && c < rows * slots; ++c) {
+        for (uint c = choice; first && c < rows * slots && count < uint(SEISMIC_CONST_VERIFY_ROWS); ++c) {
             const uint64_t m = uint64_t(c / slots), k = uint64_t(c % slots);
             if (element_i32_at(routes + (m * routes0 + k * routes1) * 4ul) == expert) {
                 element_i32_put(at + uint64_t(1u + count) * 4ul, int(m));

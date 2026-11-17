@@ -76,7 +76,9 @@ __device__ __forceinline__ bool first_choice(const int *routes, u64 row_stride, 
 
 // The choices of `expert` from `choice` (one of its) in order, one a row:
 // `choice`, then each later row's that names it, into `chosen`; returns
-// their count.
+// their count. The forms run at most VERIFY_ROWS rows, each naming an expert
+// once, so `chosen` is never full when another choice is found; one found
+// then breaks that invariant, and the block traps rather than drop it.
 __device__ __forceinline__ u32 choices_of(const int *routes, u64 row_stride, u64 slot_stride, u32 rows, u32 slots,
                                           u32 choice, int expert, u32 (&chosen)[SEISMIC_CONST_VERIFY_ROWS]) {
     u32 count = 0;
@@ -84,6 +86,8 @@ __device__ __forceinline__ u32 choices_of(const int *routes, u64 row_stride, u64
     for (u32 m = choice / slots + 1; m < rows; ++m)
         for (u32 k = 0; k < slots; ++k)
             if (route(routes, row_stride, slot_stride, slots, m * slots + k) == expert) {
+                if (count == SEISMIC_CONST_VERIFY_ROWS)
+                    __trap();
                 chosen[count++] = m * slots + k;
                 break;
             }
