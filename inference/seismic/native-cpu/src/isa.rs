@@ -27,6 +27,9 @@ pub unsafe trait Isa: Copy + Send + Sync + 'static {
     /// Whether the tier has AVX-512 VNNI (else its VNNI is AVX-VNNI's), as a
     /// constant: the feature search of [`Tier::has`] must not run per dot.
     const AVX512_VNNI: bool = Self::TIER.has("avx512vnni");
+    /// Whether the tier has the NEON integer matrix multiply (`smmla`), as
+    /// a constant for the same reason.
+    const I8MM: bool = Self::TIER.has("i8mm");
 
     /// The token, when the host has the tier's features.
     fn detect() -> Option<Self>;
