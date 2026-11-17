@@ -80,7 +80,7 @@ import { onboardingCompletedHere, recordOnboardingCompleted } from "./components
 import { useRecommendations } from "./components/models/recommendations"
 import { ChatModelSettings } from "./components/chat/model-settings"
 import { ChatTabStatus, SidebarChats } from "./components/chat/sidebar-list"
-import { SidebarUpdatePill, SidebarUpdateProvider, useApplicationOwner, useApplicationUpdateActions, useApplicationUpdateObservation, useSidebarUpdate, type UpdateTransfer } from "./components/application-update"
+import { SidebarUpdatePill, SidebarUpdateProvider, automaticUpdates, useApplicationOwner, useApplicationUpdateActions, useApplicationUpdateObservation, useSidebarUpdate, type UpdateTransfer } from "./components/application-update"
 
 const ALL_INTERFACES = "all"
 const inferenceUrl = (address: string, port: number) => `http://${address}:${port}/inference/v1`
@@ -322,12 +322,17 @@ function AutomaticUpdatesRow() {
   const setAutoDownload = (enabled: boolean) => saveAutoDownload({ enabled })
   const saving = useAtomValue(client.Application.SetApplicationAutoDownload)
   if (Result.isSuccess(owner) && !supports("Updates")) return null
-  const preference = snapshot?.preference
+  const status = automaticUpdates(observation)
   const closed = snapshot?.transfer._tag === "Closed"
   return <SettingsRow label="Automatic updates"
-    hint={Result.isInitial(observation) ? <SkeletonLine className="h-4 text-xs" width="200px" /> : preference?._tag === "Known" ? "Download updates in the background when they are available." : undefined}
-    alert={Result.isFailure(saving) && !saving.waiting ? <ErrorNotice title="Update preferences weren’t saved" description="Your previous preference is still in use." /> : Result.isFailure(observation) || preference?._tag === "Unavailable" ? <ErrorNotice title="Couldn’t read update preferences" description="Automatic downloads are unavailable until your preference can be read." /> : undefined}
-    control={snapshot && <Switch aria-label="Automatic updates" checked={preference?._tag === "Known" && preference.autoDownload} disabled={preference?._tag !== "Known" || saving.waiting || closed} onCheckedChange={checked => setAutoDownload(checked)} />} />
+    hint={status._tag === "Reading" ? <SkeletonLine className="h-4 text-xs" width="200px" />
+      : status._tag === "Known" ? "Download updates in the background when they are available."
+      : status._tag === "NotInThisBuild" ? `Automatic updates aren’t available in this build. ${status.reason}`
+      : undefined}
+    alert={Result.isFailure(saving) && !saving.waiting ? <ErrorNotice title="Update preferences weren’t saved" description="Your previous preference is still in use." /> : status._tag === "ReadFailed" ? <ErrorNotice title="Couldn’t read update preferences" description="Automatic downloads are unavailable until your preference can be read." />
+      : status._tag === "SetupFailed" ? <ErrorNotice title="Automatic updates couldn’t be set up" description={status.reason} />
+      : undefined}
+    control={snapshot && <Switch aria-label="Automatic updates" checked={status._tag === "Known" && status.autoDownload} disabled={status._tag !== "Known" || saving.waiting || closed} onCheckedChange={checked => setAutoDownload(checked)} />} />
 }
 const failedUpdatePhrase = { verify: "couldn’t be verified", install: "failed to install", authorization: "wasn’t authorized to install", startup: "failed to start" } as const
 

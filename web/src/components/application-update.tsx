@@ -8,6 +8,33 @@ import { useDisconnectWarning } from "../remote-access"
 
 export type UpdateTransfer = ApplicationUpdateState["transfer"]
 
+/**
+ * Where the automatic-download preference stands. A build that doesn't update itself (a development build, an
+ * isolated one) has updates unavailable as a whole, with its reason, and is no failure; update setup that failed here
+ * is, with its reason, as is a preference that couldn't be read beside working updates or an owner that couldn't be
+ * asked. While an update installs as the application starts, the preference is still being read.
+ */
+export type AutomaticUpdates =
+  | { readonly _tag: "Reading" }
+  | { readonly _tag: "Known"; readonly autoDownload: boolean }
+  | { readonly _tag: "NotInThisBuild"; readonly reason: string }
+  | { readonly _tag: "SetupFailed"; readonly reason: string }
+  | { readonly _tag: "ReadFailed" }
+
+export const automaticUpdates = (observation: Result.Result<ApplicationUpdateState, unknown>): AutomaticUpdates => {
+  if (Result.isFailure(observation)) return { _tag: "ReadFailed" }
+  if (!Result.isSuccess(observation)) return { _tag: "Reading" }
+  const { transfer, preference } = observation.value
+  if (transfer._tag === "Unavailable") {
+    switch (transfer.kind) {
+      case "NotInThisBuild": return { _tag: "NotInThisBuild", reason: transfer.message }
+      case "SetupFailed": return { _tag: "SetupFailed", reason: transfer.message }
+      case "Installing": return { _tag: "Reading" }
+    }
+  }
+  return preference._tag === "Known" ? { _tag: "Known", autoDownload: preference.autoDownload } : { _tag: "ReadFailed" }
+}
+
 /** The application that owns the service, and whether it supports a request. */
 export function useApplicationOwner() {
   const client = useAgentClient()

@@ -2,7 +2,7 @@ import { MagnitudeHealthResponseSchema } from "@magnitudedev/acn-protocol"
 export { MachineFormFactor, MachineIdentity, MachineIdentityObservation } from "@magnitudedev/acn-protocol"
 import { Schema } from "effect"
 import { ApplicationUpdateState, LoginStartupState } from "@magnitudedev/acn-protocol"
-export { ApplicationUpdateState, LoginStartupState, HuggingFaceArtifactSelectorSchema, HuggingFaceRepositoryIdSchema, type HuggingFaceArtifactSelector, type HuggingFaceRepositoryId } from "@magnitudedev/acn-protocol"
+export { ApplicationUpdateState, ApplicationUpdateUnavailableKind, LoginStartupState, HuggingFaceArtifactSelectorSchema, HuggingFaceRepositoryIdSchema, type HuggingFaceArtifactSelector, type HuggingFaceRepositoryId } from "@magnitudedev/acn-protocol"
 
 export const AppearancePreference = Schema.Literal("system", "light", "dark")
 export type AppearancePreference = typeof AppearancePreference.Type

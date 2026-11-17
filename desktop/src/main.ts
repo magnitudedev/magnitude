@@ -5,6 +5,7 @@ import { makeMacCliRegistration } from "@magnitudedev/daemon-management/desktop-
 import { ApplicationUpdateControlFailed } from "@magnitudedev/sdk/desktop-host"
 import { makeRendererRecovery } from "./renderer-recovery"
 import { makeHostActions } from "./host-actions"
+import { UpdateSetupRefused, updateSetupReason } from "./update-setup"
 import { startupFailureDetail } from "./startup-failure"
 import { nativeQuitFailureDecision, resolveQuitFailure } from "./quit-failure"
 import { buildApplicationMenu } from "./application-menu"
@@ -169,9 +170,9 @@ const program = Effect.scoped(Effect.gen(function* () {
   if (earlyQuitRequested) yield* Queue.offer(quit, "Quit")
   const updateConfiguration = yield* readUpdateConfiguration.pipe(Effect.option)
   let startupFailure: Effect.Effect<void> = Effect.void
-  const updates = Option.isNone(updateConfiguration) ? unavailableApplicationUpdate("Application update configuration is invalid.")
-    : isolatedProfile && !updateConfiguration.value.acceptance ? unavailableApplicationUpdate("Application updates are available in the installed Magnitude app.")
-    : !app.isPackaged ? unavailableApplicationUpdate("Application update recovery is unavailable in this build.")
+  const updates = Option.isNone(updateConfiguration) ? unavailableApplicationUpdate("SetupFailed", "Application update configuration is invalid.")
+    : isolatedProfile && !updateConfiguration.value.acceptance ? unavailableApplicationUpdate("NotInThisBuild", "Application updates are available in the installed Magnitude app.")
+    : !app.isPackaged ? unavailableApplicationUpdate("NotInThisBuild", "Application update recovery is unavailable in this build.")
     : yield* Effect.gen(function* () {
       const privateFiles = (process.platform === "win32" ? windowsPrivateFilePermissions(addonPath) : unixPrivateFilePermissions).pipe(Layer.provideMerge(NodeContext.layer))
       if (process.platform === "win32") {
@@ -195,7 +196,7 @@ const program = Effect.scoped(Effect.gen(function* () {
         if (process.platform === "linux") return yield* makeLinuxUpdateSource(options)
         if (process.platform === "win32") {
           const publisher = updateConfiguration.value.windowsPublisher
-          if (Option.isNone(publisher)) return yield* new ApplicationUpdateFailed({ message: "The Windows update publisher is missing." })
+          if (Option.isNone(publisher)) return yield* new UpdateSetupRefused({ reason: "The Windows update publisher is missing." })
           return yield* makeWindowsUpdateSource({ ...options, applicationPath: process.execPath,
             cliPath: join(process.resourcesPath, "magnitude.exe"), addonPath }).pipe(
               Effect.provide([nativeWindowsInstallerVerifier(addonPath, publisher.value), privateFiles]))
@@ -211,7 +212,7 @@ const program = Effect.scoped(Effect.gen(function* () {
       if (startupUpdateDeferred) {
         // A previously admitted native installer may still be completing its relaunch.
         if (Option.isSome(saved) && !isNewerVersion(saved.value.release.version, app.getVersion())) startupUpdateDeferred = false
-        else return unavailableApplicationUpdate("An application update is being installed.")
+        else return unavailableApplicationUpdate("Installing", "An application update is being installed.")
       }
       if (process.platform === "darwin" && !earlyQuitRequested) {
         const operation = yield* macStartupUpdateOperation(dirname(dirname(process.resourcesPath))).pipe(
@@ -220,7 +221,7 @@ const program = Effect.scoped(Effect.gen(function* () {
           startupMacUpdate = true
           macUpdateOperation = operation.value
           reopenAfterUpdate = !background
-          return unavailableApplicationUpdate("Completing the prepared application update.")
+          return unavailableApplicationUpdate("Installing", "Completing the prepared application update.")
         }
       }
       // A downloaded update waits for Restart; launch never installs it.
@@ -228,8 +229,8 @@ const program = Effect.scoped(Effect.gen(function* () {
       return yield* makeApplicationUpdate(pending).pipe(
         Effect.provideService(ApplicationUpdateSource, platform.source), Effect.provideService(PreparedUpdateStore, store), Effect.provideService(UpdatePreferences, preferences))
     }).pipe(
-      Effect.catchTag("WindowsUpdateDirectoryFailed", error => Effect.succeed(unavailableApplicationUpdate(error.message))),
-      Effect.catchAll(() => Effect.succeed(unavailableApplicationUpdate("Application update setup could not be read."))),
+      Effect.catchTag("WindowsUpdateDirectoryFailed", error => Effect.succeed(unavailableApplicationUpdate("SetupFailed", error.message))),
+      Effect.catchAll(error => Effect.logWarning("Application update setup failed", error).pipe(Effect.as(unavailableApplicationUpdate("SetupFailed", updateSetupReason(error))))),
     )
   if (startupUpdateDeferred) return "Quit" as const
   if (startupMacUpdate) return "InstallMacUpdate" as const
