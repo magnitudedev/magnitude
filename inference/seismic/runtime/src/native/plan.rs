@@ -1241,7 +1241,7 @@ mod tests {
         boundary: &[u64],
     ) -> Option<NativeSpecialization> {
         let default = implementation
-            .device_independent().unwrap().default_specialization(&NativeSpecialization::new())
+            .default_specialization_without_device(&NativeSpecialization::new()).unwrap()
             .unwrap();
         let (parameters, values) = plan.assembled(groups, boundary);
         TuningPartition::place(implementation, &default, &parameters, &values).unwrap()
@@ -1374,7 +1374,7 @@ mod tests {
         assert_eq!(plan.points[1].active, [0, 1]);
         assert_eq!(plan.points[4].active, [2]);
         let defaults = implementation
-            .device_independent().unwrap().default_specialization(&NativeSpecialization::new())
+            .default_specialization_without_device(&NativeSpecialization::new()).unwrap()
             .unwrap();
         assert_eq!(code_values(&implementation, &defaults, 0), [1]);
         assert_eq!(code_values(&implementation, &defaults, 1), [2]);
@@ -1412,7 +1412,7 @@ mod tests {
             )),
         ));
         let statics = NativeSpecialization::new();
-        let default = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
+        let default = implementation.default_specialization_without_device(&statics).unwrap().unwrap();
         let pack = [ParameterAddress::Entry("PACK".into())];
         // The defaults with the boundary moved are not admissible: the
         // packed form needs the other tile.
@@ -1462,7 +1462,7 @@ mod tests {
                 .into(),
         );
         let default = implementation
-            .device_independent().unwrap().default_specialization(&NativeSpecialization::new())
+            .default_specialization_without_device(&NativeSpecialization::new()).unwrap()
             .unwrap();
         let wide = [ParameterAddress::Entry("WIDE".into())];
         let values = |specialization: &NativeSpecialization| {
@@ -1487,7 +1487,7 @@ mod tests {
                 .into(),
         );
         let default = tied
-            .device_independent().unwrap().default_specialization(&NativeSpecialization::new())
+            .default_specialization_without_device(&NativeSpecialization::new()).unwrap()
             .unwrap();
         let nearest = TuningPartition::nearest(&tied, &default, &wide, &[1])
             .unwrap()
@@ -1514,7 +1514,7 @@ mod tests {
             forms(),
         ] {
             let statics = NativeSpecialization::new();
-            let default = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
+            let default = implementation.default_specialization_without_device(&statics).unwrap().unwrap();
             let materialised = Materialised::of(&implementation);
             // Every served range, and ranges that leave launches unserved.
             for served in [&points()[..], &points()[..2], &points()[3..]] {
@@ -1744,7 +1744,7 @@ mod tests {
             Some(5)
         );
         assert_eq!(assemble(&plan, &implementation, &first, &[3]), None);
-        let default = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
+        let default = implementation.default_specialization_without_device(&statics).unwrap().unwrap();
         assert_eq!(
             TuningPartition::nearest(&implementation, &default, &plan.boundary, &[3]),
             Ok(None)

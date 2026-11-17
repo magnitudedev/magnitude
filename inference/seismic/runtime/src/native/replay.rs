@@ -1317,9 +1317,7 @@ mod tests {
     fn attention_decode() -> TuningResult {
         let implementation = declared(V41_ATTENTION_DECODE);
         let defaults = implementation
-            .device_independent()
-            .unwrap()
-            .default_specialization(&NativeSpecialization::new())
+            .default_specialization_without_device(&NativeSpecialization::new()).unwrap()
             .unwrap();
         let mut admitted = Vec::new();
         implementation

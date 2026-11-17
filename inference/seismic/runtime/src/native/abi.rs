@@ -2105,7 +2105,7 @@ mod tests {
             .native_implementation(entry, BackendName::Metal)
             .unwrap();
         let defaults = implementation
-            .device_independent().unwrap().default_specialization(&NativeSpecialization::new())
+            .default_specialization_without_device(&NativeSpecialization::new()).unwrap()
             .unwrap();
         let base = word_count(logical.schema());
         assert_eq!(

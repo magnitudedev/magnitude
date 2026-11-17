@@ -219,8 +219,8 @@ pub enum CoverageError {
     /// A skeleton could not be preprocessed: the coverage machinery, not a
     /// kernel, is at fault.
     Skeleton(String),
-    /// Entry `0`'s declaration reads a device property, so it has no
-    /// defaults offline: coverage forms on no device.
+    /// Entry `0`'s declaration reads a device property, so it cannot be
+    /// formed offline: coverage forms on no device.
     DeviceDependent(String),
 }
 
@@ -904,8 +904,10 @@ impl<'m> Subject<'m> {
         let Some(declaration) = module.native_implementation(info.id, backend) else {
             return Ok(None);
         };
-        // Coverage forms offline, on no device: a declaration whose
-        // defaults read the device has none here.
+        // Coverage forms whole programs offline, on no device: a
+        // declaration that reads the device anywhere (its defaults, or its
+        // launches' geometry, as only CPU declarations do, which coverage
+        // never forms) cannot be formed here.
         if declaration.device_independent().is_none() {
             return Err(CoverageError::DeviceDependent(info.name.clone()));
         }
@@ -996,9 +998,8 @@ impl<'m> Subject<'m> {
         let statics = self.statics(implementation, &[])?;
         Some(Row {
             specialization: implementation
-                .device_independent()
+                .default_specialization_without_device(&statics)
                 .expect(INDEPENDENT)
-                .default_specialization(&statics)
                 .expect("searched statics admit a configuration"),
             bindings,
             configuration,
@@ -1014,9 +1015,8 @@ impl<'m> Subject<'m> {
             Ok(()) => row.specialization.clone(),
             Err(seismic_lang::checked::NativeSpecializationError::Inadmissible) => {
                 match implementation
-                    .device_independent()
+                    .default_specialization_without_device(&statics_of(&row.specialization))
                     .expect(INDEPENDENT)
-                    .default_specialization(&statics_of(&row.specialization))
                 {
                     Ok(specialization) => specialization,
                     Err(seismic_lang::checked::NativeSpecializationError::Inadmissible) => {
@@ -1292,9 +1292,8 @@ impl<'m> Admissible<'m> {
     ) -> Self {
         let mut admissible = Self::new(implementation, statics);
         admissible.first = implementation
-            .device_independent()
+            .default_specialization_without_device(statics)
             .expect(INDEPENDENT)
-            .default_specialization(statics)
             .expect("a row's statics admit its specialization");
         if variant_programs {
             admissible.variants = (0..implementation.launches.len())
@@ -2565,9 +2564,8 @@ fn form_request(
         .expect("a request names an entry with a native implementation");
     let specialization = subject
         .implementation(&request.bindings)
-        .device_independent()
+        .default_specialization_without_device(&request.statics)
         .expect(INDEPENDENT)
-        .default_specialization(&request.statics)
         .map_err(|error| RequestFailure::Inadmissible(error.to_string()))?;
     let row = Row {
         bindings: request.bindings.clone(),

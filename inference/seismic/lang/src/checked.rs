@@ -1266,17 +1266,20 @@ impl NativeImplementation {
     }
 
     /// The implementation as every device offers it, when it reads no
-    /// `device.NAME`: its defaults are then the same on every device.
-    /// `None` when it reads one; it is then bound only on a device
-    /// ([`Self::at_device`]).
+    /// `device.NAME` anywhere, its launches' geometry included: bound as it
+    /// is. `None` when it reads one; it is then bound only on a device
+    /// ([`Self::at_device`]). Its default needs less, and is had only by
+    /// [`Self::default_specialization_without_device`].
     pub fn device_independent(&self) -> Option<DeviceBound<&Self>> {
         (!self.reads_device()).then_some(DeviceBound(self))
     }
 
-    /// The default configuration at the given static values, when neither
-    /// the parameters' defaults nor the domain's constraints read a device
-    /// property (`device.NAME`); `None` when either does, so a default is
-    /// only computed where it does not depend on a device.
+    /// The default configuration at the given static values on no device:
+    /// the one device-free default, had when neither the parameters'
+    /// defaults nor the domain's constraints read a device property
+    /// (`device.NAME`), whatever its launches' geometry reads; `None` when
+    /// either does, so a default is only computed where it does not depend
+    /// on a device.
     pub fn default_specialization_without_device(
         &self,
         statics: &NativeSpecialization,
@@ -4647,7 +4650,7 @@ mod native_tests {
         let configurations = native.admissible(&NativeSpecialization::new()).unwrap();
         assert_eq!(configurations.len(), 8);
         let default = native
-            .device_independent().unwrap().default_specialization(&NativeSpecialization::new())
+            .default_specialization_without_device(&NativeSpecialization::new()).unwrap()
             .unwrap();
         assert_eq!(default.launch_param(0, "ROWS"), Some(1));
         assert_eq!(default.launch_param(1, "ROWS"), Some(4));
@@ -5388,12 +5391,12 @@ mod native_tests {
                 .iter()
                 .all(|configuration| configuration.static_value("N") == Some(256))
         );
-        let default = native.device_independent().unwrap().default_specialization(&statics).unwrap();
+        let default = native.default_specialization_without_device(&statics).unwrap().unwrap();
         assert_eq!(default.param("PARTS"), Some(1));
         assert_eq!(default.param("WIDTH"), Some(64));
         let small = NativeSpecialization::new().with_static("N", 32);
         assert!(matches!(
-            native.device_independent().unwrap().default_specialization(&small),
+            native.default_specialization_without_device(&small).unwrap(),
             Err(NativeSpecializationError::Inadmissible)
         ));
         assert!(native.admissible(&small).unwrap().is_empty());
@@ -5420,14 +5423,14 @@ mod native_tests {
             .native_implementation(module.entries()[0].id, BackendName::Metal)
             .unwrap();
         let at = |n| NativeSpecialization::new().with_static("N", n);
-        let small = native.device_independent().unwrap().default_specialization(&at(300)).unwrap();
+        let small = native.default_specialization_without_device(&at(300)).unwrap().unwrap();
         assert_eq!(
             (small.param("WIDTH"), small.param("ROWS"), small.launch_param(0, "LANES")),
             (Some(128), Some(2), Some(16))
         );
         // No width reaches N: the default has no value.
         assert!(matches!(
-            native.device_independent().unwrap().default_specialization(&at(4096)),
+            native.default_specialization_without_device(&at(4096)).unwrap(),
             Err(NativeSpecializationError::Default { .. })
         ));
         // The launch's `where` is one of the declaration's conjuncts.
@@ -5522,21 +5525,21 @@ mod native_tests {
             .native_implementation(module.entries()[0].id, BackendName::Metal)
             .unwrap();
         let at = |n| NativeSpecialization::new().with_static("N", n);
-        let narrow = native.device_independent().unwrap().default_specialization(&at(512)).unwrap();
+        let narrow = native.default_specialization_without_device(&at(512)).unwrap().unwrap();
         assert_eq!(
             (narrow.param("ROWS"), narrow.param("LANES")),
             (Some(2), Some(16))
         );
         // At N = 4096, ROWS = 2 with LANES = 16 needs 16 packets; ROWS = 2
         // with LANES = 32 needs 8.
-        let wide = native.device_independent().unwrap().default_specialization(&at(4096)).unwrap();
+        let wide = native.default_specialization_without_device(&at(4096)).unwrap().unwrap();
         assert_eq!(
             (wide.param("ROWS"), wide.param("LANES")),
             (Some(2), Some(32))
         );
         assert_eq!(Some(&wide), native.admissible(&at(4096)).unwrap().first());
         assert!(matches!(
-            native.device_independent().unwrap().default_specialization(&at(65_536)),
+            native.default_specialization_without_device(&at(65_536)).unwrap(),
             Err(NativeSpecializationError::Inadmissible)
         ));
     }
@@ -5732,7 +5735,7 @@ mod native_tests {
         let native = module.native_implementation(entry, BackendName::Cuda).unwrap();
         let statics = NativeSpecialization::new();
         assert_eq!(
-            native.device_independent().unwrap().default_specialization(&statics),
+            native.default_specialization_without_device(&statics).unwrap(),
             Err(NativeSpecializationError::Unbound("form(W, INT8)".to_owned()))
         );
         assert!(matches!(

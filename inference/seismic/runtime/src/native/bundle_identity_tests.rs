@@ -91,11 +91,9 @@ fn bindings(
 /// A deterministic admissible specialization of `native`.
 fn specialization(native: &NativeImplementation) -> NativeSpecialization {
     native
-        .device_independent()
-        .unwrap()
-        .default_specialization(&statics(native).unwrap_or_else(|| {
+        .default_specialization_without_device(&statics(native).unwrap_or_else(|| {
             panic!("no admissible specialization of `{}` found", native.source_path)
-        }))
+        })).unwrap()
         .expect("the statics admit the default")
 }
 
@@ -132,7 +130,7 @@ fn statics(native: &NativeImplementation) -> Option<NativeSpecialization> {
                 .wrapping_add(1442695040888963407);
             statics = statics.with_static(name.as_str(), admitted[(state >> 33) as usize % admitted.len()]);
         }
-        if native.device_independent().unwrap().default_specialization(&statics).is_ok() {
+        if native.default_specialization_without_device(&statics).unwrap().is_ok() {
             return Some(statics);
         }
     }

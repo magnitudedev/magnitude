@@ -1368,11 +1368,13 @@ mod tests {
             let entry = module.entries().iter().find(|candidate| candidate.name == entry).expect("the entry");
             let native = module.native_implementation(entry.id, BackendName::Vulkan).expect("a Vulkan native");
             let bound = native.at_elements(&bindings).expect("the weights form");
-            let independent = bound.device_independent().expect("the declaration reads no device");
             let specialization = statics
                 .iter()
                 .fold(crate::checked::NativeSpecialization::new(), |spec, (name, value)| spec.with_static(*name, *value));
-            let configuration = independent.default_specialization(&specialization).expect("the statics are admissible");
+            let configuration = bound
+                .default_specialization_without_device(&specialization)
+                .expect("the declaration's defaults read no device")
+                .expect("the statics are admissible");
             let mut regions = Vec::new();
             for rows in [1u64, 512] {
                 let dimension = |name: &str| match name {

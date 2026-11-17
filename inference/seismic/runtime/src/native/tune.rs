@@ -7269,14 +7269,15 @@ pub fn kernel_digest(
         })?;
     // A kernel's identity names a backend, not a device: a declaration
     // whose defaults read the device has no device-free default to name.
+    // A launch's geometry may read the device; the declaration's digest
+    // names it as declared.
     let default = implementation
-        .device_independent()
+        .default_specialization_without_device(statics)
         .ok_or_else(|| {
             declaration(format!(
                 "`{entry_name}`'s defaults read the device's properties; a kernel identity names no device"
             ))
         })?
-        .default_specialization(statics)
         .map_err(|error| declaration(error.to_string()))?;
     let mut digest = Sha256::new();
     digest.update(b"kernel-identity-v1");
@@ -8478,7 +8479,7 @@ mod tests {
             .collect::<String>();
         let implementation = declared(&bands);
         let statics = NativeSpecialization::new();
-        let default = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
+        let default = implementation.default_specialization_without_device(&statics).unwrap().unwrap();
         let partition = plan::partition(&implementation, &statics, &shapes(&[1, 2, 3])).unwrap();
         let keying = launches(&partition);
         let domain = Declared {
@@ -8557,7 +8558,7 @@ mod tests {
         );
         assert!(!implementation.launch_scoped());
         let statics = NativeSpecialization::new();
-        let default = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
+        let default = implementation.default_specialization_without_device(&statics).unwrap().unwrap();
         let shapes = shapes(&[4, 16]);
         let (unserved, points) = unserved_parameters(&implementation, &statics, &shapes).unwrap();
         assert!(unserved.is_empty());
@@ -8626,7 +8627,7 @@ mod tests {
             "    params (LEFT in [2, 1, 4] default 2, RIGHT in [2, 1, 4] default 2)\n    where LEFT == RIGHT\n    launch gemv:\n        threadgroups (ceil_div(N, LEFT * RIGHT), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
         );
         let statics = NativeSpecialization::new();
-        let default = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
+        let default = implementation.default_specialization_without_device(&statics).unwrap().unwrap();
         let partition = plan::partition(&implementation, &statics, &shapes(&[4])).unwrap();
         let keying = launches(&partition);
         let domain = Declared {
@@ -8652,7 +8653,7 @@ mod tests {
     fn rest_of(body: &str, batch: usize) -> (Vec<Vec<u64>>, Vec<Vec<u64>>) {
         let implementation = declared(body);
         let statics = NativeSpecialization::new();
-        let seed = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
+        let seed = implementation.default_specialization_without_device(&statics).unwrap().unwrap();
         let partition = plan::partition(&implementation, &statics, &shapes(&[1])).unwrap();
         assert_eq!(partition.groups.len(), 1);
         let group = &partition.groups[0];
@@ -8775,7 +8776,7 @@ mod tests {
     fn a_search_over_v41_attention_decode_places_what_its_declaration_admits() {
         let implementation = declared(V41_ATTENTION_DECODE);
         let statics = NativeSpecialization::new();
-        let seed = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
+        let seed = implementation.default_specialization_without_device(&statics).unwrap().unwrap();
         let partition = plan::partition(&implementation, &statics, &shapes(&[1])).unwrap();
         let parameters = partition
             .groups
@@ -8865,7 +8866,7 @@ mod tests {
             "    launch gemv:\n        params (A in [1, 2, 3] default 1, B in [1, 2, 3] default 1)\n        threadgroups (ceil_div(N, A * B), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
         );
         let statics = NativeSpecialization::new();
-        let seed = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
+        let seed = implementation.default_specialization_without_device(&statics).unwrap().unwrap();
         let partition = plan::partition(&implementation, &statics, &shapes(&[4])).unwrap();
         let keying = launches(&partition);
         let group = partition.groups[0].clone();
@@ -8930,7 +8931,7 @@ mod tests {
             "    params (FROM in [3, 2, 5] default 3)\n    launch small when N < FROM:\n        params (A in [1, 2, 3] default 1, T in [0, 1, 2] default 0)\n        threadgroups (ceil_div(N, A + T), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch large when N >= FROM:\n        params (B in [1, 2, 3] default 1)\n        threadgroups (ceil_div(N, B), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
         );
         let statics = NativeSpecialization::new();
-        let seed = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
+        let seed = implementation.default_specialization_without_device(&statics).unwrap().unwrap();
         let rows = [1u64, 2, 4];
         let partition = plan::partition(&implementation, &statics, &shapes(&rows)).unwrap();
         assert_eq!(
@@ -9091,7 +9092,7 @@ mod tests {
         });
         assert_eq!(implementation.launch_scoped(), whole.is_none());
         let statics = NativeSpecialization::new();
-        let seed = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
+        let seed = implementation.default_specialization_without_device(&statics).unwrap().unwrap();
         let (partition, keying) = match whole {
             Some(_) => {
                 let (unserved, points) =
@@ -9220,7 +9221,7 @@ mod tests {
             .with_static("F", 4096)
             .with_static("DS", 0)
             .with_static("DB", 0);
-        let seed = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
+        let seed = implementation.default_specialization_without_device(&statics).unwrap().unwrap();
         let rows = [1u64, 8, 128];
         let shapes = rows
             .iter()
@@ -9798,7 +9799,7 @@ mod tests {
             }
         };
         let statics = NativeSpecialization::new();
-        let seed = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
+        let seed = implementation.default_specialization_without_device(&statics).unwrap().unwrap();
         let partition = plan::partition(&implementation, &statics, &shapes(&[4])).unwrap();
         let reference = vec![measurement(&implementation, &seed)];
         let run = GroupSearch::new(partition, seed, reference, vec![1.], Vec::new());
@@ -10077,7 +10078,7 @@ mod tests {
             .native_implementation(module.entry_named("scale").unwrap(), BackendName::Metal)
             .unwrap();
         let default = implementation
-            .device_independent().unwrap().default_specialization(&NativeSpecialization::new())
+            .default_specialization_without_device(&NativeSpecialization::new()).unwrap()
             .unwrap();
         let split = default.clone().with_param("SPLIT", 2);
         assert_eq!(
@@ -10109,7 +10110,7 @@ mod tests {
             "    launch gemv when N < 16:\n        params (ROWS in [1, 2] default 1)\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch gemm when N >= 16:\n        params (TILE in [4, 8] default 4)\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
         );
         let default = implementation
-            .device_independent().unwrap().default_specialization(&NativeSpecialization::new())
+            .default_specialization_without_device(&NativeSpecialization::new()).unwrap()
             .unwrap();
         let surveyor = PointSurveyor::new(&implementation, false);
         let key = |working: Vec<usize>, specialization: &NativeSpecialization| {
@@ -10177,7 +10178,7 @@ mod tests {
     fn a_formed_variant_is_held_until_given_up_and_never_asked_for_twice() {
         let implementation = declared(ROWS_BY_LAUNCH);
         let default = implementation
-            .device_independent().unwrap().default_specialization(&NativeSpecialization::new())
+            .default_specialization_without_device(&NativeSpecialization::new()).unwrap()
             .unwrap();
         let rows = |rows| default.clone().with_param("ROWS", rows);
         let mut programs = Programs::Launches(LaunchPrograms::default());
@@ -10225,7 +10226,7 @@ mod tests {
     fn the_canonical_programs_are_counted_once_and_never_formed_again() {
         let implementation = declared(ROWS_BY_LAUNCH);
         let default = implementation
-            .device_independent().unwrap().default_specialization(&NativeSpecialization::new())
+            .default_specialization_without_device(&NativeSpecialization::new()).unwrap()
             .unwrap();
         let rows = |rows| default.clone().with_param("ROWS", rows);
         let (_, _, kernel) = project_kernel();
@@ -10344,7 +10345,7 @@ mod tests {
             .native_implementation(module.entry_named("scale").unwrap(), BackendName::Metal)
             .unwrap();
         let default = implementation
-            .device_independent().unwrap().default_specialization(&NativeSpecialization::new())
+            .default_specialization_without_device(&NativeSpecialization::new()).unwrap()
             .unwrap();
         let changed = default.clone().with_param("BATCH_FROM", 9);
         let boundary = [plan::ParameterAddress::Entry("BATCH_FROM".into())];
