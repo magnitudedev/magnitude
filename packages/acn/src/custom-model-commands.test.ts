@@ -304,6 +304,7 @@ const harness = (options: {
       }),
       Layer.succeed(CatalogModelSync, {
         installed: (modelId) => Effect.succeed((options.catalogInstalled ?? []).includes(modelId)),
+        listed: () => Effect.succeed(true),
         sync: (modelId) => Effect.sync(() => {
           recorded.catalogSyncs.push(modelId)
           return { outcome: "Installing" as const }

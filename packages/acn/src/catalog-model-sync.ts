@@ -7,6 +7,8 @@ import { icnCommandFailure } from "./icn-command-failure"
 /** Installing or updating a catalog model, whichever command asked for it. */
 export interface CatalogModelSyncApi {
   readonly installed: (modelId: CatalogFormModelId) => Effect.Effect<boolean>
+  /** Whether the catalog has the model at all, whatever its assessment found. */
+  readonly listed: (modelId: CatalogFormModelId) => Effect.Effect<boolean>
   readonly sync: (modelId: CatalogFormModelId) => Effect.Effect<{ readonly outcome: LocalModelSyncOutcome }, LocalModelMutationFailed>
   /** Fetches only one component the model lacks; false when it is already here. */
   readonly downloadComponent: (modelId: CatalogFormModelId, component: CatalogComponent) =>
@@ -25,7 +27,9 @@ export const CatalogModelSyncLive: Layer.Layer<
   const removals = yield* LocalModelRemovals
   const installed = (modelId: CatalogFormModelId) => catalog.get.pipe(Effect.map(({ state }) =>
     state.models.some((model) => model.id === modelId && model.localState._tag === "Installed")))
+  const listed = (modelId: CatalogFormModelId) => catalog.get.pipe(Effect.map(({ state }) => state.models.some((model) => model.id === modelId)))
   return CatalogModelSync.of({
+    listed,
     installed,
     sync: (modelId) => Effect.gen(function* () {
       yield* removals.forget(modelId)
