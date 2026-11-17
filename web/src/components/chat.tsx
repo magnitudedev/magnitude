@@ -203,7 +203,7 @@ function ChatView({
     const ready = submittable(replaces)
     if (Option.isNone(ready)) {
       // Nothing is sent; say why when it is the model or its settings, which the reader can change.
-      Option.match(submitBlocked({ chosen: modelId !== undefined, available: model !== undefined, settingsValid }), { onNone: () => undefined, onSome: setNotice })
+      Option.match(submitBlocked({ chosen: modelId !== undefined, available: model !== undefined, settingsValid, servable: models.length > 0 }), { onNone: () => undefined, onSome: setNotice })
       return
     }
     const asked = messages.at(-2)
