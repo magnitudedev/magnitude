@@ -2133,6 +2133,18 @@ describe("read-only connection inspection", () => {
       expect(yield* fs.readDirectory(root)).toEqual([])
     }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
   })
+  it("lists only the configuration files a harness actually has, not every one it could write", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-inspection-files-" })
+      const paths = fixturePaths(root)
+      const service = yield* installedService(paths)
+      const pi = () => service.inspect.pipe(Effect.map((rows) => rows.find((row) => row.id === "pi")!.configurationFiles))
+      expect(yield* pi()).toEqual([])
+      yield* writeFixtures({ [paths.piModels]: "{}\n" })
+      expect(yield* pi()).toEqual([paths.piModels])
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
+  })
   it("preserves an invalid receipt and recovers when the file is repaired", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem
