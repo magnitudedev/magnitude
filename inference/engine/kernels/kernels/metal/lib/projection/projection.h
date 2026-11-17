@@ -548,6 +548,8 @@ struct Logits {
 // Row m of an epilogue, for a caller that stores several columns of it (the
 // int8 and packed tiles): the epilogue's own resolved row where it has one
 // (`row`), else its stores at row m, so every epilogue takes every form.
+// The epilogue is taken by value: a wrapping epilogue passes its own member,
+// which Metal 4.1 reaches through `this` in no stated address space.
 template <typename Out>
 struct StoreRow {
     Out out;
@@ -555,15 +557,15 @@ struct StoreRow {
     void store(uint n, float value) const { out.store(m, n, value); }
 };
 template <typename Out>
-inline auto row_of(thread const Out &out, uint m, int) -> decltype(out.row(m)) {
+inline auto row_of(Out out, uint m, int) -> decltype(out.row(m)) {
     return out.row(m);
 }
 template <typename Out>
-inline StoreRow<Out> row_of(thread const Out &out, uint m, long) {
+inline StoreRow<Out> row_of(Out out, uint m, long) {
     return StoreRow<Out>{out, m};
 }
 template <typename Out>
-inline auto row_of(thread const Out &out, uint m) -> decltype(row_of(out, m, 0)) {
+inline auto row_of(Out out, uint m) -> decltype(row_of(out, m, 0)) {
     return row_of(out, m, 0);
 }
 
@@ -2770,7 +2772,7 @@ struct lane_codes<packets::Entries<BYTES, HIGH>,
         }
         return codes;
     }
-    static uint pair(thread const words &codes, uint p) {
+    static uint pair(words codes, uint p) {
         const uint pair = chunk_byte_pair(codes.points, p);
         if constexpr (DELTA) {
             uint shifted;

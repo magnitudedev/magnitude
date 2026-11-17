@@ -931,7 +931,9 @@ struct OrderedWeight {
     static fetched fetch(thread const Weights<W> &w, uint row, uint p, uint) {
         return fetched{w.packet(row, p), true};
     }
-    static void decode_full(thread const fetched &f, uint step, thread float (&wt)[8]) {
+    // A fetch is decoded by value: `GemmPrefetch` holds it as a member,
+    // which Metal 4.1 reaches through `this` in no stated address space.
+    static void decode_full(fetched f, uint step, thread float (&wt)[8]) {
         if (!f.valid) {
             PROJECTION_UNROLL
             for (uint j = 0; j < 8; ++j)
@@ -946,7 +948,7 @@ struct OrderedWeight {
             wt[2u * j + 1u] = odd[j];
         }
     }
-    static void decode(thread const fetched &f, uint step, uint base_col, uint k, thread float (&wt)[8]) {
+    static void decode(fetched f, uint step, uint base_col, uint k, thread float (&wt)[8]) {
         if (!f.valid) {
             PROJECTION_UNROLL
             for (uint j = 0; j < 8; ++j)
@@ -1045,10 +1047,10 @@ struct OrderedWeight<packets::Dense<E>> {
         }
         return out;
     }
-    static void decode_full(thread const fetched &f, uint s, thread float (&wt)[8]) {
+    static void decode_full(fetched f, uint s, thread float (&wt)[8]) {
         decode(f, s, 0u, 8u, wt);
     }
-    static void decode(thread const fetched &f, uint, uint, uint, thread float (&wt)[8]) {
+    static void decode(fetched f, uint, uint, uint, thread float (&wt)[8]) {
         if constexpr (E::bytes == 2u) {
             float4 even, odd;
             E::split8(f.raw[0], even, odd);

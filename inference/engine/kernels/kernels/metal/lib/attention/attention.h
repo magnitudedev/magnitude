@@ -422,20 +422,23 @@ inline void publish_slices(thread const float (&maximum)[H], thread const float 
     }
 }
 
+// The rows [lo, hi) of one span of a row's keys.
+struct key_span {
+    int lo;
+    int hi;
+};
+
 // Span `span` of `row`'s keys: visible history spans 0..R-1, then the fresh
-// span R, which is empty for a layer without fresh rows.
-inline void form_span(device const int *visible, device const int *fresh, ulong row, ulong spans, ulong span,
-    thread int &lo, thread int &hi) {
-    if (span < spans) {
-        lo = visible[(row * spans + span) * 2];
-        hi = visible[(row * spans + span) * 2 + 1];
-    } else if (ATTENTION_FRESH) {
-        lo = fresh[row * 2];
-        hi = fresh[row * 2 + 1];
-    } else {
-        lo = 0;
-        hi = 0;
-    }
+// span R, which is empty for a layer without fresh rows. Returned by value:
+// a member function's caller stores it in its own fields, which Metal 4.1
+// reaches through `this` in no stated address space and so cannot bind to
+// a `thread` reference.
+inline key_span form_span(device const int *visible, device const int *fresh, ulong row, ulong spans, ulong span) {
+    if (span < spans)
+        return key_span{visible[(row * spans + span) * 2], visible[(row * spans + span) * 2 + 1]};
+    if (ATTENTION_FRESH)
+        return key_span{fresh[row * 2], fresh[row * 2 + 1]};
+    return key_span{0, 0};
 }
 
 // The span table is walked cooperatively: every lane of a simdgroup calls
@@ -447,9 +450,8 @@ inline void form_span(device const int *visible, device const int *fresh, ulong 
 inline uint form_total(device const int *visible, device const int *fresh, ulong row, ulong spans, uint lane) {
     uint total = 0;
     for (ulong index = lane; index <= spans; index += 32) {
-        int lo, hi;
-        form_span(visible, fresh, row, spans, index, lo, hi);
-        total += uint(metal::max(hi - lo, 0));
+        const key_span keys = form_span(visible, fresh, row, spans, index);
+        total += uint(metal::max(keys.hi - keys.lo, 0));
     }
     return simd_sum(total);
 }
@@ -468,9 +470,8 @@ inline span_start form_locate(device const int *visible, device const int *fresh
         const ulong index = base + lane;
         uint length = 0;
         if (index <= spans) {
-            int lo, hi;
-            form_span(visible, fresh, row, spans, index, lo, hi);
-            length = uint(metal::max(hi - lo, 0));
+            const key_span keys = form_span(visible, fresh, row, spans, index);
+            length = uint(metal::max(keys.hi - keys.lo, 0));
         }
         const uint before = offset + simd_prefix_exclusive_sum(length);
         const uint hits = uint(uint64_t(simd_ballot(index <= spans && key < before + length)));
@@ -491,22 +492,20 @@ inline bool form_prefix(device const int *visible, device const int *fresh, ulon
     uint lane) {
     int last = -1;
     for (ulong index = lane; index <= spans; index += 32) {
-        int lo, hi;
-        form_span(visible, fresh, row, spans, index, lo, hi);
-        if (hi > lo)
+        const key_span keys = form_span(visible, fresh, row, spans, index);
+        if (keys.hi > keys.lo)
             last = metal::max(last, int(index));
     }
     last = simd_max(last);
     bool prefix = true;
     for (ulong index = lane; index <= spans && int(index) <= last; index += 32) {
-        int lo, hi, lead_lo, lead_hi;
-        form_span(visible, fresh, row, spans, index, lo, hi);
-        form_span(visible, fresh, lead, spans, index, lead_lo, lead_hi);
-        const bool empty = hi <= lo, lead_empty = lead_hi <= lead_lo;
+        const key_span keys = form_span(visible, fresh, row, spans, index);
+        const key_span lead_keys = form_span(visible, fresh, lead, spans, index);
+        const bool empty = keys.hi <= keys.lo, lead_empty = lead_keys.hi <= lead_keys.lo;
         if (int(index) < last)
-            prefix = prefix && (empty ? lead_empty : (lo == lead_lo && hi == lead_hi));
+            prefix = prefix && (empty ? lead_empty : (keys.lo == lead_keys.lo && keys.hi == lead_keys.hi));
         else
-            prefix = prefix && lo == lead_lo && hi <= lead_hi;
+            prefix = prefix && keys.lo == lead_keys.lo && keys.hi <= lead_keys.hi;
     }
     return simd_all(prefix);
 }
@@ -541,9 +540,9 @@ struct key_cursor {
         while (position >= offset + length) {
             offset += length;
             ++span;
-            int hi;
-            form_span(visible, fresh, row, spans, span, lo, hi);
-            length = uint(metal::max(hi - lo, 0));
+            const key_span keys = form_span(visible, fresh, row, spans, span);
+            lo = keys.lo;
+            length = uint(metal::max(keys.hi - keys.lo, 0));
         }
         const uint token = uint(lo) + (position - offset);
         moved = historical() && (token < slab_lo || token >= slab_hi);
@@ -565,9 +564,9 @@ inline key_cursor form_cursor(device const int *visible, device const int *fresh
     const span_start start = form_locate(visible, fresh, row, spans, first, lane);
     key_cursor cursor{visible, fresh, row, spans, uint(slab_rows), uint(start.span), start.offset, 0, 0, 0, 1, 0};
     if (cursor.span <= spans) {
-        int hi;
-        form_span(visible, fresh, row, spans, cursor.span, cursor.lo, hi);
-        cursor.length = uint(metal::max(hi - cursor.lo, 0));
+        const key_span keys = form_span(visible, fresh, row, spans, cursor.span);
+        cursor.lo = keys.lo;
+        cursor.length = uint(metal::max(keys.hi - keys.lo, 0));
     }
     return cursor;
 }
@@ -3234,10 +3233,8 @@ inline void prefill_list(device const int *visible, device const int *fresh, dev
         const bool row_valid = lane < QT && tile_row < M;
         int base = 0;
         for (ulong index = 0; index <= R; ++index) {
-            int lo = 0;
-            int hi = 0;
-            if (row_valid)
-                form_span(visible, fresh, tile_row, R, index, lo, hi);
+            const key_span keys = row_valid ? form_span(visible, fresh, tile_row, R, index) : key_span{0, 0};
+            const int lo = keys.lo, hi = keys.hi;
             if (row_valid) {
                 bases[tile_row * (R + 1) + index] = base;
                 base += metal::max(hi - lo, 0);
@@ -3283,9 +3280,8 @@ inline void prefill_list(device const int *visible, device const int *fresh, dev
                 const ulong row = ulong(tile) * QT + t;
                 if (row >= M)
                     break;
-                int lo = 0;
-                int hi = 0;
-                form_span(visible, fresh, row, R, index, lo, hi);
+                const key_span keys = form_span(visible, fresh, row, R, index);
+                const int lo = keys.lo, hi = keys.hi;
                 const int first_key = metal::max(entry.y, lo);
                 const int last_key = metal::min(end, hi);
                 if (first_key >= last_key)
@@ -3384,10 +3380,9 @@ inline void prefill_attend(History history, device const Scalar *query, device c
         const ulong tile_row = ulong(tile) * QT + lane;
         const bool row_valid = lane < QT && tile_row < M;
         for (ulong index = 0; index <= R; ++index) {
-            int lo = 0;
-            int hi = 0;
-            if (row_valid)
-                form_span(visible, fresh, tile_row, R, index, lo, hi);
+            const key_span keys = row_valid ? form_span(visible, fresh, tile_row, R, index) : key_span{0, 0};
+            int lo = keys.lo;
+            int hi = keys.hi;
             if (index < R) {
                 lo = metal::max(lo, held.lo);
                 hi = metal::min(hi, held.hi);
@@ -3686,9 +3681,9 @@ struct gather_walk {
                         break;
                 }
                 opened = true;
-                int hi;
-                form_span(visible, fresh, row, spans, span, lo, hi);
-                length = uint(metal::max(hi - lo, 0));
+                const key_span keys = form_span(visible, fresh, row, spans, span);
+                lo = keys.lo;
+                length = uint(metal::max(keys.hi - keys.lo, 0));
                 position = metal::max(first, offset);
                 end = metal::min(last, offset + length);
             }
@@ -4234,10 +4229,9 @@ inline void decode_matrix(History history, device const Scalar *query, device co
         // teams that exchange scores take the same rounds); the rest follow
         // one walk of the span tables, located at the first of them
         // (`gather_walk`).
-        int first_lo = 0, first_hi = 0;
-        if (R > 0)
-            form_span(visible, fresh, walked_row, R, 0, first_lo, first_hi);
-        const uint first_len = uint(metal::max(first_hi - first_lo, 0));
+        const key_span first_keys = R > 0 ? form_span(visible, fresh, walked_row, R, 0) : key_span{0, 0};
+        const int first_lo = first_keys.lo;
+        const uint first_len = uint(metal::max(first_keys.hi - first_keys.lo, 0));
         const uint direct_end = metal::min(first_len / KEYS, metal::min(run_hi, own_tiles));
         const uint last_team_lo = partition * run + (TEAMS - 1) * share;
         const uint direct_k = direct_end > last_team_lo ? metal::min(share, direct_end - last_team_lo) : 0;

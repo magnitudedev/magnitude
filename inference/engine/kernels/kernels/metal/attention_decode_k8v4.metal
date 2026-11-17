@@ -241,9 +241,9 @@ kernel void attention_decode_k8v4_partial(
     uint offset = start.offset;
     uint position = first;
     for (ulong span = start.span; span <= R && offset < last; ++span) {
-        int lo, hi;
-        attention::form_span(visible, fresh, row, R, span, lo, hi);
-        const uint length = uint(metal::max(hi - lo, 0));
+        const attention::key_span keys = attention::form_span(visible, fresh, row, R, span);
+        const int lo = keys.lo;
+        const uint length = uint(metal::max(keys.hi - keys.lo, 0));
         const uint end = metal::min(last, offset + length);
         if (span < R) {
             // Each slab's part of the span: its region is resolved once, and
