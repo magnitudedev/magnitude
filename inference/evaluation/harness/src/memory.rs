@@ -275,7 +275,7 @@ pub fn load(load: Load) -> Result<(), String> {
     // passed on once its stream closes.
     drop(engine);
     retire(WorkerReport::Reported)?;
-    forwarding.join().map_err(|_| "the worker's diagnostics reader panicked")?
+    forwarding.join().expect("the worker's diagnostics reader's panic ends the process")
 }
 
 /// What a store's latest memory reading says a press must take past the
@@ -1055,7 +1055,7 @@ impl Pressure {
             if !status.success() {
                 return Err(format!("the occupying process failed: {status}"));
             }
-            reader.join().map_err(|_| "the occupying process's reader panicked")?;
+            reader.join().expect("the occupying process's reader's panic ends the process");
             self.recorded(reports.try_iter().collect())?;
             if self.record.contains_key("started") {
                 self.record.insert("freed".into(), json!({ "at": unix_seconds() }));

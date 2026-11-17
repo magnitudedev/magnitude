@@ -953,7 +953,7 @@ impl Drop for Workers {
         self.shared.shutdown.store(true, Ordering::SeqCst);
         self.shared.wake();
         for thread in self.threads.drain(..) {
-            let _ = thread.join();
+            thread.join().expect("a pool worker's panic ends the process");
         }
     }
 }

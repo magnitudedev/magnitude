@@ -331,7 +331,7 @@ fn probe(file: &std::path::Path, bytes: u64, slots: u64, depth: usize) -> Result
     let mut total = 0;
     let mut ended = began;
     for handle in handles {
-        let (reads, end) = handle.join().map_err(|_| "a probing thread panicked".to_owned())??;
+        let (reads, end) = handle.join().expect("a probing thread's panic ends the process")?;
         total += reads;
         ended = ended.max(end);
     }
@@ -457,7 +457,7 @@ impl ReadStream {
     pub fn stop(self) -> Result<f64, String> {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         for handle in self.handles {
-            handle.join().map_err(|_| "a streaming thread panicked".to_owned())??;
+            handle.join().expect("a streaming thread's panic ends the process")?;
         }
         Ok((self.reads.load(std::sync::atomic::Ordering::Relaxed) * self.bytes) as f64 / self.began.elapsed().as_secs_f64())
     }

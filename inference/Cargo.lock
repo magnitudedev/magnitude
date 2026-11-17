@@ -2620,6 +2620,7 @@ dependencies = [
  "magnitude-service-contracts",
  "magnitude-service-models",
  "seismic-io",
+ "seismic-threads",
  "serde_json",
  "sha2 0.10.9",
  "tokio",

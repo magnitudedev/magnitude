@@ -291,16 +291,16 @@ fn bounded_job(time: Duration, executor: ExecutorSelector, scope: Job) -> Result
         }
     };
     let retire = |report| retire(report).map_err(|error| format!("the measurement job: {error}"));
-    let joined = |reader: std::thread::JoinHandle<_>| reader.join().map_err(|_| "the measurement job's reader panicked".to_string());
+    let joined = |reader: std::thread::JoinHandle<_>| reader.join().expect("the measurement job's reader's panic ends the process");
     let measured = if hung {
         // Killing it ends its stream, and so its reader.
         let ended = retire(WorkerReport::Unreported)?;
-        let _ = joined(reader)?;
+        let _ = joined(reader);
         eprintln!("magnitude-assess: the measurement job hung and was killed ({ended}); what it stored stands");
         false
     } else {
         // Its stream ended, its outcome reported or not: it is waited for.
-        let outcome = joined(reader)?;
+        let outcome = joined(reader);
         let ended = retire(match outcome {
             Ok(_) => WorkerReport::Reported,
             Err(_) => WorkerReport::Ended,

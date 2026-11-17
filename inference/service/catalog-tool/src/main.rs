@@ -545,9 +545,17 @@ async fn publish(output: &Path, bytes: Vec<u8>) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    match Cli::parse().command {
+fn main() -> anyhow::Result<()> {
+    seismic_threads::main("magnitude-catalog", || {
+        let command = Cli::parse().command;
+        seismic_threads::runtime()
+            .context("failed to start the catalog tool runtime")?
+            .block_on(run(command))
+    })
+}
+
+async fn run(command: Command) -> anyhow::Result<()> {
+    match command {
         Command::UpdateLock {
             output,
             models,

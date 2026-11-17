@@ -1498,10 +1498,8 @@ fn scan(
                 .into_iter()
                 .zip(roots)
                 .map(|(handle, root)| {
-                    let result = handle.join().map_err(|_| {
-                        InventoryError::Internal("model discovery worker panicked".to_owned())
-                    })?;
-                    Ok::<_, InventoryError>(result.unwrap_or_else(|error| {
+                    let result = handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                    result.unwrap_or_else(|error| {
                         tracing::warn!(
                             root = %root.path.display(),
                             kind = ?root.kind,
@@ -1509,10 +1507,10 @@ fn scan(
                             "model location could not be scanned"
                         );
                         LocationScan::default()
-                    }))
+                    })
                 })
-                .collect::<Result<Vec<_>, InventoryError>>()
-        })?;
+                .collect::<Vec<_>>()
+        });
         for (root, scan) in roots.iter().zip(root_results) {
             root_scans.insert((root.kind, canonical_or_self(&root.path)), scan);
         }
@@ -1605,11 +1603,7 @@ fn scan(
                 .map(|candidate| seismic_threads::spawn_scoped(scope, "inventory-enrich", move || enrich_candidate(candidate, cache)).expect("invariant violated: the host starts a thread"))
                 .collect::<Vec<_>>()
                 .into_iter()
-                .map(|handle| {
-                    handle.join().map_err(|_| {
-                        InventoryError::Internal("model enrichment worker panicked".to_owned())
-                    })?
-                })
+                .map(|handle| handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
                 .collect::<Result<Vec<_>, InventoryError>>()
         })?;
         for model in enriched {
