@@ -187,7 +187,7 @@ const DIALECTS: [Dialect; 3] = [
         pair: |low, high| format!("{{0x{low:08x}u, 0x{high:08x}u}}"),
         bind: |space, id, name, ty| {
             format!(
-                "namespace {} {{ template <> struct table<{id}> {{ __device__ static const {ty} *{}() {{ return {name}; }} }}; }}\n",
+                "namespace {} {{ template <> struct table<{id}> {{ static constexpr unsigned SIZE = sizeof({name}) / sizeof({name}[0]); __device__ static const {ty} *{}() {{ return {name}; }} }}; }}\n",
                 space.name(),
                 space.accessor()
             )

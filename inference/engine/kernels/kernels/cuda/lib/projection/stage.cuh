@@ -396,10 +396,12 @@ __device__ __forceinline__ void form_packed_row(const Pro &pro, u32 m, u64 K, u8
 // group, x ~= d * q by the rule every backend's INT8 activations follow
 // (`s8_scale`, `s8_code`: the CPU's, `seismic-native-cpu` `quant.rs`), staged
 // by `stage_row_s8` as `q` ([M, width] bytes in the s8 fragments' virtual k
-// order, packets.cuh) and `groups` (each group's (d, d * sum q)). Any s8 row
-// source gives `row(m)` (the row's codes) and `groups_of(m)` (its groups) for
-// m < M, the rows the int8 GEMM reads.
-struct QuantizedRows {
+// order, packets.cuh, in entry order where ENTRIES: `s8_real_offset`) and
+// `groups` (each group's (d, d * sum q)). Any s8 row source gives `row(m)`
+// (the row's codes) and `groups_of(m)` (its groups) for m < M, and
+// `entries()`, their order: the rows the int8 GEMM reads.
+template <bool ENTRIES> struct QuantizedRows {
+    __host__ __device__ static constexpr bool entries() { return ENTRIES; }
     const u8 *q;
     u64 width;
     const float2 *groups;
@@ -407,10 +409,17 @@ struct QuantizedRows {
     __device__ __forceinline__ const float2 *groups_of(u64 m) const { return groups + m * (width / 32); }
 };
 
-// Real offset within a 32-code group of virtual s8 position v.
-__device__ __forceinline__ u32 s8_real_offset(u32 v) {
+// Real offset within a 32-code group of virtual s8 position v (lane t of
+// the m16n8k32 fragment holds virtual 4t .. 4t + 3 and 16 + 4t ..), in the
+// weights' order (`packets::Packed::s8_half`). Slot order: the k16 steps'
+// slots, real {2t, 2t + 1, 2t + 8, 2t + 9} of each step. Entry order
+// (ENTRIES, grid codes): lane t's eight are real 8t .. 8t + 7, one entry.
+template <bool ENTRIES> __device__ __forceinline__ u32 s8_real_offset(u32 v) {
     const u32 half = v / 16, t = (v % 16) / 4, j = v % 4;
-    return half * 16 + 2 * t + (j % 2) + 8 * (j / 2);
+    if constexpr (ENTRIES)
+        return 8 * t + 4 * half + j;
+    else
+        return half * 16 + 2 * t + (j % 2) + 8 * (j / 2);
 }
 
 // The scale of a group whose largest magnitude is `maximum` (NaN ignored):
@@ -456,8 +465,9 @@ __device__ __forceinline__ int s8_code(float x, float d) {
 
 // Staging launch of the INT8 candidate, one block per row m: the prologue's
 // row x[m, :] (rounded to A) quantized per 32 codes into `q` ([M, K] bytes,
-// virtual order) and `groups` ([M, K / 32] (d, d * sum q)).
-template <class Pro>
+// virtual order, ENTRIES: `s8_real_offset`) and `groups` ([M, K / 32]
+// (d, d * sum q)).
+template <bool ENTRIES, class Pro>
 __device__ __forceinline__ void stage_row_s8(const Pro &pro, u32 m, u64 K, u8 *q, float2 *groups) {
     __shared__ float factors[Pro::FACTORS > 0 ? Pro::FACTORS : 1];
     __shared__ float scratch[32];
@@ -479,7 +489,7 @@ __device__ __forceinline__ void stage_row_s8(const Pro &pro, u32 m, u64 K, u8 *q
             u32 word = 0;
 #pragma unroll
             for (int b = 0; b < 4; ++b) {
-                const int code = s8_code(values[s8_real_offset(4 * w + b)], d);
+                const int code = s8_code(values[s8_real_offset<ENTRIES>(4 * w + b)], d);
                 total += code;
                 word |= ((u32)code & 0xFFu) << (8 * b);
             }

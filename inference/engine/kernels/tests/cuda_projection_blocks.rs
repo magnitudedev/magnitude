@@ -169,6 +169,14 @@ fn cuda_attention_project_iq4_matches_host_model() {
     attention_project_cases(&[[Format::IQ4_XS; 3]], 59);
 }
 
+/// Grid weights of three grids (iq2s, iq3xxs, iq1s): the segmented GEMV
+/// stages each grid's points once a block, every weight reading its own.
+#[test]
+fn cuda_attention_project_grids_match_host_model() {
+    use magnitude_ggml::Encoding;
+    attention_project_cases(&[[Encoding::Iq2S, Encoding::Iq3Xxs, Encoding::Iq1S].map(Format::rounded)], 61);
+}
+
 fn attention_project_cases(sets: &[[Format; 3]], seed: u64) {
     let Some(device) = cuda() else { return };
     let mut rng = Rng(seed);

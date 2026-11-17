@@ -67,7 +67,6 @@ using element::u16;
 using element::u32;
 using element::u64;
 using packets::Coefficients;
-using packets::S8Pair;
 using packets::Same;
 using packets::s8_times;
 typedef element::Act Act;
@@ -505,15 +504,112 @@ template <bool ONE_> struct IsS8Rows<S8Rows<ONE_>> {
     static constexpr bool value = true;
     static constexpr bool ONE = ONE_;
 };
+// A list of weight types.
+template <class... Ts> struct Types {};
+
+// The grid whose points weights W decode (`GridPlanes`), 0 for weights that
+// read none.
+template <class W, class = void> struct GridOf {
+    static constexpr u32 value = 0;
+};
+template <class W> struct GridOf<W, decltype(void(W::planes::codes::points::GRID))> {
+    static constexpr u32 value = W::planes::codes::points::GRID;
+};
+template <class G, class K> struct GridOf<packets::Records<G, K>> {
+    static constexpr u32 value = G::points::GRID;
+};
+// The points source of a GEMV block over weights Ws: its own copy where any
+// reads a grid (`stage_points`), else global memory.
+template <class... Ws> struct PointsOf {
+    typedef typename packets::Select<((GridOf<Ws>::value != 0) || ...), packets::BlockPoints,
+                                     packets::GlobalPoints>::type type;
+};
+template <class... Ws> struct PointsOf<Types<Ws...>> : PointsOf<Ws...> {};
+// Fill the block's copy of each distinct grid weights Ws read
+// (block-collective; the caller synchronizes the block before any read).
+template <u32... SEEN> struct PointsStager {
+    __device__ static __forceinline__ void run(Types<>) {}
+    template <class W, class... Rest> __device__ static __forceinline__ void run(Types<W, Rest...>) {
+        constexpr u32 GRID = GridOf<W>::value;
+        if constexpr (GRID != 0 && ((GRID != SEEN) && ...)) {
+            packets::stage_block_points<GRID>();
+            PointsStager<SEEN..., GRID>::run(Types<Rest...>{});
+        } else {
+            PointsStager<SEEN...>::run(Types<Rest...>{});
+        }
+    }
+};
+template <class... Ws> __device__ __forceinline__ void stage_points(Types<Ws...> weights) {
+    PointsStager<>::run(weights);
+}
+
+// The order of weights W's int8 codes in the GEMV (`packets::Packed::S8_ENTRIES`):
+// 1 entry order (grid weights, which read slot order too), 0 slot order, -1
+// none (dense weights, no weight).
+template <class W, class = void> struct S8OrderOf {
+    static constexpr int value = -1;
+};
+template <class W> struct S8OrderOf<W, decltype(void(W::S8_ENTRIES))> {
+    static constexpr int value = W::S8_ENTRIES ? 1 : 0;
+};
+// Whether int8_rule rows (S8) that the GEMV of weights Ws reads are in entry
+// order (`s8_real_offset`): the weights' one order, which `where` makes them
+// agree on (`agree(W, form(W, S8_ENTRIES))`); false where the rows are not
+// int8.
+template <bool S8, class... Ws> __host__ __device__ constexpr bool s8_entries() {
+    static_assert(!S8 || ((S8OrderOf<Ws>::value != 1) && ...) || ((S8OrderOf<Ws>::value != 0) && ...),
+                  "weights that read one launch's int8 rows share one code order (`form(W, S8_ENTRIES)`)");
+    return S8 && ((S8OrderOf<Ws>::value == 1) || ...);
+}
+template <bool S8, class... Ws> __host__ __device__ constexpr bool s8_entries_of(Types<Ws...>) {
+    return s8_entries<S8, Ws...>();
+}
+// Whether weights Ws read int8 rows in entry order (ENTRIES) or slot order:
+// every weight reads slot order, only grid weights entry order.
+template <bool ENTRIES, class... Ws> __host__ __device__ constexpr bool s8_order_read_by() {
+    return !ENTRIES || ((S8OrderOf<Ws>::value != 0) && ...);
+}
+// The order of weights W's int8 codes in the GEMM (`packets::Packed::S8_GEMM_ENTRIES`,
+// `packets::s8_gemm_entries`): 1 entry order, 0 slot order, -1 none (dense
+// weights, no weight).
+template <class W, class = void> struct S8GemmOrderOf {
+    static constexpr int value = -1;
+};
+template <class W> struct S8GemmOrderOf<W, decltype(void(W::S8_GEMM_ENTRIES))> {
+    static constexpr int value = W::S8_GEMM_ENTRIES ? 1 : 0;
+};
+// The order of the int8 rows (S8) a GEMM of weights Ws reads
+// (`QuantizedRows::entries`): entry order where every weight's GEMM reads
+// it, else slot order, which every weight reads. The GEMV reads its weights'
+// own order (`s8_entries`) instead.
+template <bool S8, class... Ws> __host__ __device__ constexpr bool gemm_s8_entries() {
+    return S8 && ((S8GemmOrderOf<Ws>::value != 0) && ...) && ((S8GemmOrderOf<Ws>::value == 1) || ...);
+}
+template <bool S8, class... Ws> __host__ __device__ constexpr bool gemm_s8_entries_of(Types<Ws...>) {
+    return gemm_s8_entries<S8, Ws...>();
+}
+// Of a half's int8 registers (`s8_half`: a = {row g low, row g + 8 low, row g
+// high, row g + 8 high}, lane t), whether register i holds codes of the
+// half's 16-code group `part`: in slot order the registers of step `part`, in
+// entry order all four where the lane's entry is in it.
+template <bool ENTRIES> __device__ __forceinline__ bool s8_holds(int i, int part, u32 t) {
+    return ENTRIES ? (int)(t / 2) == part : i / 2 == part;
+}
+// The coefficient group of GROUP codes register i of half h holds.
+template <bool ENTRIES, int GROUP> __device__ __forceinline__ int s8_group(int h, int i, u32 t) {
+    return ENTRIES ? (32 * h + 8 * (int)t) / GROUP : (32 * h + 16 * (i / 2)) / GROUP;
+}
 // A one-row INT8 GEMV block's source: row 0 of the prologue `pro` under the
-// int8_rule (`stage_row_s8`), formed by the whole block at the start of its
-// dynamic shared memory: K codes, then K / 32 groups (K * 5 / 4 bytes, within
-// the K * 5 / 2 every one-row launch declares).
-template <class Pro> __device__ __forceinline__ S8Rows<true> shared_s8_row(const Pro &pro, u64 K) {
+// int8_rule (`stage_row_s8`, in the weights' order: ENTRIES), formed by the
+// whole block at the start of its dynamic shared memory: K codes, then K / 32
+// groups (K * 5 / 4 bytes, within the shared row's every one-row launch
+// declares).
+template <bool ENTRIES, class Pro> __device__ __forceinline__ S8Rows<true> shared_s8_row(const Pro &pro, u64 K) {
+    require_dynamic_shared(K + K / 32 * sizeof(float2));
     extern __shared__ uint4 dynamic_shared[];
     u8 *q = reinterpret_cast<u8 *>(dynamic_shared);
     float2 *groups = reinterpret_cast<float2 *>(q + K);
-    stage_row_s8(pro, 0, K, q, groups);
+    stage_row_s8<ENTRIES>(pro, 0, K, q, groups);
     __syncthreads();
     return S8Rows<true>{q, groups, K};
 }
@@ -554,7 +650,7 @@ __device__ __forceinline__ void row_sums(const float *area, u64 kblock, GroupSum
     }
 }
 
-template <int NB, class W, class Sums>
+template <int NB, class Src, class W, class Sums>
 __device__ __forceinline__ void gemv_accumulate(float (&acc)[NB][4], const typename W::Raw &raw, const W &w,
                                                 const typename W::Block &block, int q, const u32 (&b)[NB][4][2],
                                                 const Sums &sums) {
@@ -573,7 +669,7 @@ __device__ __forceinline__ void gemv_accumulate(float (&acc)[NB][4], const typen
 #pragma unroll
         for (int j = 0; j < STEPS; ++j) {
             u32 a[4];
-            w.template decode<Op>(raw, group * STEPS + j, a);
+            w.template decode<Op, Src>(raw, group * STEPS + j, a);
 #pragma unroll
             for (int nb = 0; nb < NB; ++nb)
                 Op::mma(p[nb], a, b[nb][group * STEPS + j]);
@@ -603,23 +699,27 @@ constexpr int GEMM_S8_BIAS = 0x4B400000;
 __device__ __forceinline__ float gemm_s8_product(int biased) { return __int_as_float(biased) - 12582912.0f; }
 
 // Half h of one k-block of an INT8 GEMV (`gemv_mma_group` over `S8Rows`) for
-// one tile: the swap-AB transpose of `gemm_tile_s8`. The weight's s8 codes of
-// steps 2h and 2h + 1 (`W::s8`, rows g and g + 8) are the A fragment of one
-// m16n8k32 s8 MMA per column block, whose B fragment `b[nb]` is the 32 codes
-// of the half (virtual order) of activation row 8 nb + g: an exact int32
-// product per (row, column), two half-masked ones for 16-code groups, plus an
-// all-ones MMA for a biased 16-code group's sum q_x. Each folds in k order as
+// one tile: the swap-AB transpose of `gemm_tile_s8`. The weight's int8
+// registers of the half (`W::s8_half`, rows g and g + 8, points from Src) are
+// the A fragment of one m16n8k32 s8 MMA per column block, whose B fragment
+// `b[nb]` is the 32 codes of the half (virtual order, the weights') of
+// activation row 8 nb + g: an exact int32 product per (row, column), two
+// masked ones for 16-code groups (`s8_holds`), plus an all-ones MMA for a
+// biased 16-code group's sum q_x. Each folds in k order as
 // acc += scale * (d_x * P) - bias * (d_x * sum q_x), d_x and d_x sum q_x the
 // group `x[nb][c]` of the C places' column 2t + c (as `gemm_tile_s8` folds),
 // so a row's bits do not depend on the rows beside it. A one-row block (ONE)
 // folds only column 2t's places, column 0 on lanes t = 0 (no other column
 // is stored).
-template <int NB, bool ONE, class W>
+template <int NB, bool ONE, class Src, class W>
 __device__ __forceinline__ void gemv_accumulate_s8(float (&acc)[NB][4], const typename W::Raw &raw, const W &w,
                                                    const Coefficients<W::GROUPS> &c, int h, const u32 (&b)[NB][2],
                                                    const float2 (&x)[NB][2]) {
     static_assert(W::GROUP == 16 || W::GROUP >= 32, "groups of 16 codes, or of 32 or more");
-    const S8Pair first = w.s8(raw, 2 * h), second = w.s8(raw, 2 * h + 1);
+    constexpr bool ENTRIES = W::S8_ENTRIES;
+    const u32 t = threadIdx.x % 4;
+    u32 a[4];
+    w.template s8_half<Src>(raw, h, a);
     auto fold = [&](float(&value)[4], const int (&p)[4], const int (&sum)[4], int group, const float2 (&xs)[2]) {
 #pragma unroll
         for (int e = 0; e < 4; ++e) {
@@ -635,7 +735,6 @@ __device__ __forceinline__ void gemv_accumulate_s8(float (&acc)[NB][4], const ty
     };
     const int none[4] = {0, 0, 0, 0};
     if constexpr (W::GROUP >= 32) {
-        const u32 a[4] = {first.row_g, first.row_g8, second.row_g, second.row_g8};
 #pragma unroll
         for (int nb = 0; nb < NB; ++nb) {
             int p[4] = {GEMM_S8_BIAS, GEMM_S8_BIAS, GEMM_S8_BIAS, GEMM_S8_BIAS};
@@ -645,17 +744,18 @@ __device__ __forceinline__ void gemv_accumulate_s8(float (&acc)[NB][4], const ty
     } else {
 #pragma unroll
         for (int part = 0; part < 2; ++part) {
-            const S8Pair &step = part == 0 ? first : second;
-            const u32 a[4] = {part == 0 ? step.row_g : 0u, part == 0 ? step.row_g8 : 0u, part == 1 ? step.row_g : 0u,
-                              part == 1 ? step.row_g8 : 0u};
-            const u32 ones = 0x01010101u;
-            const u32 all[4] = {part == 0 ? ones : 0u, part == 0 ? ones : 0u, part == 1 ? ones : 0u,
-                                part == 1 ? ones : 0u};
+            u32 held[4], all[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const bool holds = s8_holds<ENTRIES>(i, part, t);
+                held[i] = holds ? a[i] : 0u;
+                all[i] = holds ? 0x01010101u : 0u;
+            }
 #pragma unroll
             for (int nb = 0; nb < NB; ++nb) {
                 int p[4] = {GEMM_S8_BIAS, GEMM_S8_BIAS, GEMM_S8_BIAS, GEMM_S8_BIAS};
                 int sum[4] = {GEMM_S8_BIAS, GEMM_S8_BIAS, GEMM_S8_BIAS, GEMM_S8_BIAS};
-                seismic_mma_m16n8k32_s8(p, a, b[nb]);
+                seismic_mma_m16n8k32_s8(p, held, b[nb]);
                 if constexpr (W::BIAS)
                     seismic_mma_m16n8k32_s8(sum, all, b[nb]);
                 fold(acc[nb], p, sum, 2 * h + part, x[nb]);
@@ -713,6 +813,15 @@ template <class G, class K> struct GemvRecords<packets::Records<G, K>> {
 // A gathered view's (below) of its weight's.
 template <class W> struct Gathered;
 template <class W> struct GemvRecords<Gathered<W>> : GemvRecords<W> {};
+// The weights of a GEMV whose decoders read grid points from the block's
+// source (`GemvShared::points`): none where the pair runs `gemv_records_group`
+// (16-bit rows of records weights, which read the records' own table), else
+// both.
+template <bool S8, class WA, class WB> struct GemvPointReaders {
+    typedef typename packets::Select<!S8 && GemvRecords<WA>::value &&
+                                         (Same<WB, NoWeight>::value || Same<WA, WB>::value),
+                                     Types<>, Types<WA, WB>>::type type;
+};
 
 // The K-split reduction and epilogue of a GEMV group's accumulators (the
 // MMA C-fragment places: (row g, col 2t), (row g, col 2t+1), (row g+8, col
@@ -778,7 +887,8 @@ __device__ __forceinline__ void gemv_finish(float (&acc)[2][TPW][NB][4], u32 M, 
 // an unpaired staged weight (`GemvStaged`) reads its coefficients from the
 // group's copy of its tiles' fields, issued with the first superblock's
 // loads and complete before the first decode.
-template <int TPW, int KSPLIT, int NB, bool STAGING, class Ready, class WA, class WB, class Epi, class Barrier>
+template <int TPW, int KSPLIT, int NB, bool STAGING, class Src, class Ready, class WA, class WB, class Epi,
+          class Barrier>
 __device__ __forceinline__ void gemv_mma_group(const Ready &ready, u32 M, u64 kblocks, u64 tile0, u64 tiles,
                                                u64 rows, const WA &wa, const WB &wb, const Epi &epi, float *reduce,
                                                const Barrier &barrier, u32 part, u8 *staging) {
@@ -913,14 +1023,14 @@ __device__ __forceinline__ void gemv_mma_group(const Ready &ready, u32 M, u64 kb
                         wa.coefficients(stage.ba[i], q, ca);
 #pragma unroll
                     for (int h = 0; h < 2; ++h)
-                        gemv_accumulate_s8<NB, S8_ONE>(acc[0][i], ra, wa, ca, h, b[h], x[h]);
+                        gemv_accumulate_s8<NB, S8_ONE, Src>(acc[0][i], ra, wa, ca, h, b[h], x[h]);
                     if constexpr (PAIR) {
                         const typename WB::Raw rb = wb.raw(stage.rb[i], q, lane);
                         Coefficients<WB::GROUPS> cb;
                         wb.coefficients(stage.bb[i], q, cb);
 #pragma unroll
                         for (int h = 0; h < 2; ++h)
-                            gemv_accumulate_s8<NB, S8_ONE>(acc[1][i], rb, wb, cb, h, b[h], x[h]);
+                            gemv_accumulate_s8<NB, S8_ONE, Src>(acc[1][i], rb, wb, cb, h, b[h], x[h]);
                     }
                 }
             } else {
@@ -953,15 +1063,18 @@ __device__ __forceinline__ void gemv_mma_group(const Ready &ready, u32 M, u64 kb
                 for (int i = 0; i < TPW; ++i)
                     if (tile0 + i < tiles) {
                         if constexpr (STAGED)
-                            gemv_accumulate<NB>(acc[0][i], wa.raw(stage.ra[i], q, lane), wa,
-                                                wa.staged_block(staging + i * staged_tile, kblocks, sb, lane), q, b,
-                                                sums);
+                            gemv_accumulate<NB, Src>(acc[0][i], wa.raw(stage.ra[i], q, lane), wa,
+                                                     wa.staged_block(staging + i * staged_tile, kblocks, sb, lane), q,
+                                                     b, sums);
                         else
-                            gemv_accumulate<NB>(acc[0][i], wa.raw(stage.ra[i], q, lane), wa, stage.ba[i], q, b, sums);
+                            gemv_accumulate<NB, Src>(acc[0][i], wa.raw(stage.ra[i], q, lane), wa, stage.ba[i], q, b,
+                                                     sums);
                         if constexpr (PAIR && OWN_B)
-                            gemv_accumulate<NB>(acc[1][i], wb.raw(stage.rb[i], q, lane), wb, stage.bb[i], q, b, sums_b);
+                            gemv_accumulate<NB, Src>(acc[1][i], wb.raw(stage.rb[i], q, lane), wb, stage.bb[i], q, b,
+                                                     sums_b);
                         else if constexpr (PAIR)
-                            gemv_accumulate<NB>(acc[1][i], wb.raw(stage.rb[i], q, lane), wb, stage.bb[i], q, b, sums);
+                            gemv_accumulate<NB, Src>(acc[1][i], wb.raw(stage.rb[i], q, lane), wb, stage.bb[i], q, b,
+                                                     sums);
                     }
             }
         }
@@ -982,7 +1095,7 @@ __device__ __forceinline__ void gemv_mma_group(const Ready &ready, u32 M, u64 kb
 // NB column blocks. Each scale group's steps accumulate into a fresh MMA
 // sum, which then takes the group's scale once per row; every column is its
 // own activation row, so a row's bits do not depend on M.
-template <int NB, class Pro, class W>
+template <int NB, class Src, class Pro, class W>
 __device__ __forceinline__ void gemv_entries_kblock(float (&acc)[NB][4], const W &, const typename W::EntryRaw &raw,
                                                     const Coefficients<W::GROUPS> &c, const Pro &pro, u32 M,
                                                     u64 kblock) {
@@ -1002,8 +1115,8 @@ __device__ __forceinline__ void gemv_entries_kblock(float (&acc)[NB][4], const W
         for (int step = 0; step < W::GROUP_STEPS; ++step) {
             const int h = W::gemv_half(step, t);
             u32 a[4];
-            W::template entry_pairs<Op>(raw, 0, group, t, h, a[0], a[2]);
-            W::template entry_pairs<Op>(raw, 1, group, t, h, a[1], a[3]);
+            W::template entry_pairs<Op, Src>(raw, 0, group, t, h, a[0], a[2]);
+            W::template entry_pairs<Op, Src>(raw, 1, group, t, h, a[1], a[3]);
             const u64 k = kblock * 64 + 8 * entry + 4 * h;
 #pragma unroll
             for (int nb = 0; nb < NB; ++nb) {
@@ -1028,7 +1141,7 @@ __device__ __forceinline__ void gemv_entries_kblock(float (&acc)[NB][4], const W
 // once) and then decodes it; the next pass's loads follow the decode (on GB10
 // a lane with more superblocks in flight, prefetched or batched, measured
 // slower). The first superblock's loads are issued before `ready()`.
-template <int TPW, int KSPLIT, int NB, class Ready, class WA, class WB, class Epi, class Barrier>
+template <int TPW, int KSPLIT, int NB, class Src, class Ready, class WA, class WB, class Epi, class Barrier>
 __device__ __forceinline__ void gemv_entries_group(const Ready &ready, u32 M, u64 kblocks, u64 tile0, u64 tiles,
                                                    u64 rows, const WA &wa, const WB &wb, const Epi &epi,
                                                    float *reduce, const Barrier &barrier, u32 part) {
@@ -1084,11 +1197,11 @@ __device__ __forceinline__ void gemv_entries_group(const Ready &ready, u32 M, u6
                     continue;
                 Coefficients<WA::GROUPS> ca;
                 wa.coefficients(stage.ba[i], q, ca);
-                gemv_entries_kblock<NB>(acc[0][i], wa, stage.ra[i][q], ca, pro, M, kblock);
+                gemv_entries_kblock<NB, Src>(acc[0][i], wa, stage.ra[i][q], ca, pro, M, kblock);
                 if constexpr (PAIR) {
                     Coefficients<WB::GROUPS> cb;
                     wb.coefficients(stage.bb[i], q, cb);
-                    gemv_entries_kblock<NB>(acc[1][i], wb, stage.rb[i][q], cb, pro, M, kblock);
+                    gemv_entries_kblock<NB, Src>(acc[1][i], wb, stage.rb[i][q], cb, pro, M, kblock);
                 }
             }
         }
@@ -1212,9 +1325,10 @@ __device__ __forceinline__ void gemv_records_group(const Ready &ready, u32 M, u6
 // weights' s8 codes) where the source is int8_rule rows (`S8Rows`), whatever
 // the weights' order; else `gemv_records_group` for records weights,
 // `gemv_entries_group` for entry-order weights, otherwise `gemv_mma_group`
-// (`staging`: see there).
-template <int TPW, int KSPLIT, int NB, bool STAGING = false, class Ready, class WA, class WB, class Epi,
-          class Barrier>
+// (`staging`: see there). Grid points are read from Src (`BlockPoints` where
+// the block staged its weights' tables: `GemvShared::points`).
+template <int TPW, int KSPLIT, int NB, bool STAGING = false, class Src = packets::GlobalPoints, class Ready, class WA,
+          class WB, class Epi, class Barrier>
 __device__ __forceinline__ void gemv_group(const Ready &ready, u32 M, u64 kblocks, u64 tile0, u64 tiles, u64 rows,
                                            const WA &wa, const WB &wb, const Epi &epi, float *reduce,
                                            const Barrier &barrier, u32 part, u8 *staging = nullptr) {
@@ -1227,18 +1341,18 @@ __device__ __forceinline__ void gemv_group(const Ready &ready, u32 M, u64 kblock
             if (tile0 < tiles)
                 __trap();
         } else {
-            gemv_mma_group<TPW, KSPLIT, NB, STAGING>(ready, M, kblocks, tile0, tiles, rows, wa, wb, epi, reduce,
-                                                     barrier, part, staging);
+            gemv_mma_group<TPW, KSPLIT, NB, STAGING, Src>(ready, M, kblocks, tile0, tiles, rows, wa, wb, epi, reduce,
+                                                          barrier, part, staging);
         }
     } else if constexpr (GemvRecords<WA>::value && (Same<WB, NoWeight>::value || Same<WA, WB>::value))
         gemv_records_group<TPW, KSPLIT, NB>(ready, M, kblocks, tile0, tiles, rows, wa, wb, epi, reduce, barrier,
                                             part);
     else if constexpr (GemvEntries<WA>::value && (Same<WB, NoWeight>::value || GemvEntries<WB>::value))
-        gemv_entries_group<TPW, KSPLIT, NB>(ready, M, kblocks, tile0, tiles, rows, wa, wb, epi, reduce, barrier,
-                                            part);
+        gemv_entries_group<TPW, KSPLIT, NB, Src>(ready, M, kblocks, tile0, tiles, rows, wa, wb, epi, reduce, barrier,
+                                                 part);
     else
-        gemv_mma_group<TPW, KSPLIT, NB, STAGING>(ready, M, kblocks, tile0, tiles, rows, wa, wb, epi, reduce, barrier,
-                                                 part, staging);
+        gemv_mma_group<TPW, KSPLIT, NB, STAGING, Src>(ready, M, kblocks, tile0, tiles, rows, wa, wb, epi, reduce,
+                                                      barrier, part, staging);
 }
 
 // A weight read over a window of its K for a GEMV (a K split's share):
@@ -1360,11 +1474,14 @@ template <class Shape, class... WS> __host__ __device__ constexpr u64 gemv_stagi
 }
 
 // Shared memory of a GEMV block: the KSPLIT reduction of each tile group,
-// and its coefficient staging (STAGING bytes, `gemv_staging`).
-template <class Shape, class Pro, u64 STAGING = 0> struct GemvShared {
+// and its coefficient staging (STAGING bytes, `gemv_staging`). Its decoders
+// read grid points from Points: `packets::BlockPoints` where the block staged
+// its weights' tables (`stage_points`), else global memory.
+template <class Shape, class Pro, u64 STAGING = 0, class Points = packets::GlobalPoints> struct GemvShared {
     float reduce[Shape::GROUPS][Shape::REDUCE];
     uint4 staging[Shape::GROUPS][STAGING > 0 ? STAGING / 16 : 1];
     static constexpr bool STAGED = STAGING > 0;
+    typedef Points points;
 };
 
 // Tile groups of a segment of `rows` rows.
@@ -1447,7 +1564,7 @@ __host__ __device__ constexpr int gemv_min_blocks() {
 template <class Shape, u64 GRID = 0, int RESIDENCY = 1, class Ready, class WA, class WB, class Epi, class Shared>
 __device__ __forceinline__ void gemv_segment_ready(Shared &shared, const Ready &ready, u32 M, u64 kblocks, u64 group,
                                                    u64 rows, const WA &wa, const WB &wb, const Epi &epi) {
-    gemv_group<Shape::TPW, Shape::KSPLIT, Shape::NB, Shared::STAGED>(
+    gemv_group<Shape::TPW, Shape::KSPLIT, Shape::NB, Shared::STAGED, typename Shared::points>(
         ready, M, kblocks, group * Shape::TPW, (rows + 15) / 16, rows, wa, wb, epi, shared.reduce[Shape::group()],
         GroupBarrier<Shape::GROUPS, GemvResidency<Shape, WA, WB, GRID, RESIDENCY>::value>{Shape::group()},
         Shape::part(), reinterpret_cast<u8 *>(shared.staging[Shape::group()]));
@@ -2404,14 +2521,18 @@ __device__ __forceinline__ void gemm_segment(u8 *shared, const Rows &source, u32
 // staged groups do not hold (`gemm_s8_sums`).
 template <class W> __host__ __device__ constexpr bool gemm_s8_group_sums() { return W::BIAS && W::GROUP < 32; }
 
-// d_x sum q_x of each 16-code part of each 32-code half h of a warp's
-// activation rows (rows g, g + 8 of each m16 tile), sums[h][part][mi][r]:
-// the exact s8 product of the part's codes with all-ones weights, under the
-// half's d_x. It depends on the activation rows alone, so a warp forms it
-// once a k-block for all its weight tiles.
-template <class Shape>
+// d_x sum q_x of each 16-code group `part` of each 32-code half h of a
+// warp's activation rows (rows g, g + 8 of each m16 tile),
+// sums[h][part][mi][r]: the exact s8 product of the group's codes with
+// all-ones weights, under the half's d_x. In slot order (ENTRIES false) the
+// group is the half's k 16 part..16 part + 15, one k16 MMA; in entry order
+// it is the codes of the lanes whose entry is in it (`s8_holds`), a k32 MMA
+// with the other lanes' ones zero. It depends on the activation rows alone,
+// so a warp forms it once a k-block for all its weight tiles.
+template <class Shape, bool ENTRIES>
 __device__ __forceinline__ void gemm_s8_sums(float (&sums)[2][2][Shape::MI][2], const u32 a[2][Shape::MI][4],
                                              const float2 x[2][Shape::MI][2]) {
+    const u32 t = threadIdx.x % 4;
 #pragma unroll
     for (int h = 0; h < 2; ++h)
 #pragma unroll
@@ -2419,7 +2540,13 @@ __device__ __forceinline__ void gemm_s8_sums(float (&sums)[2][2][Shape::MI][2], 
 #pragma unroll
             for (int mi = 0; mi < Shape::MI; ++mi) {
                 int sum[4] = {GEMM_S8_BIAS, GEMM_S8_BIAS, GEMM_S8_BIAS, GEMM_S8_BIAS};
-                seismic_mma_m16n8k16_s8(sum, a[h][mi][2 * part], a[h][mi][2 * part + 1], 0x01010101u);
+                if constexpr (ENTRIES) {
+                    const u32 ones = s8_holds<true>(0, part, t) ? 0x01010101u : 0u;
+                    const u32 b[2] = {ones, ones};
+                    seismic_mma_m16n8k32_s8(sum, a[h][mi], b);
+                } else {
+                    seismic_mma_m16n8k16_s8(sum, a[h][mi][2 * part], a[h][mi][2 * part + 1], 0x01010101u);
+                }
 #pragma unroll
                 for (int r = 0; r < 2; ++r)
                     sums[h][part][mi][r] = x[h][mi][r].x * gemm_s8_product(sum[2 * r]);
@@ -2429,14 +2556,16 @@ __device__ __forceinline__ void gemm_s8_sums(float (&sums)[2][2][Shape::MI][2], 
 // The INT8 candidate's GEMM: the same block tiling and pipeline over s8
 // activations staged by `stage_row_s8` (BM rows x 64 bytes per k-block, pitch
 // 80, plus each row's two (d, d * sum q) groups) and s8 weight fragments
-// (packets.cuh virtual order). Per 32 codes one m16n8k32 s8 MMA into an
-// exact int32 product (two k16 MMAs, one a group, for 16-code groups), folded
-// with the coefficients of its group (of 32 codes or more) as
+// (packets.cuh virtual order), both in the rows' order (ENTRIES). Per 32
+// codes one m16n8k32 s8 MMA into an exact int32 product (for 16-code groups,
+// one k16 MMA a group in slot order, one k32 MMA a group masked to its lanes
+// in entry order), folded with the
+// coefficients of its group (of 32 codes or more) as
 // acc += scale * (d_x * P) - bias * (d_x * sum q_x). Weights whose local codes
 // multiply their codes (`packets::int8_local`) take the s8 products of each
-// step's codes and its group's local code, so each 32 codes are one MMA under
-// the row's factor whatever their groups.
-template <class Shape, class W>
+// register's codes and its group's local code, so each 32 codes are one MMA
+// under the row's factor whatever their groups.
+template <class Shape, bool ENTRIES, class W>
 __device__ __forceinline__ void gemm_tile_s8(float acc[Shape::MI][2][4], const W &w, const u8 *staged_tile,
                                              const float *coefficients, int j_tile, const u32 a[2][Shape::MI][4],
                                              const float2 x[2][Shape::MI][2], const float (&sums)[2][2][Shape::MI][2]) {
@@ -2469,22 +2598,23 @@ __device__ __forceinline__ void gemm_tile_s8(float acc[Shape::MI][2][4], const W
     };
 #pragma unroll
     for (int h = 0; h < 2; ++h) {
-        S8Pair first = w.s8(raw, 2 * h);
-        S8Pair second = w.s8(raw, 2 * h + 1);
+        // The half's registers (`s8_half`), in the rows' order: {row g low,
+        // row g + 8 low, row g high, row g + 8 high}.
+        u32 r[4];
+        w.template s8_half<packets::GlobalPoints, ENTRIES>(raw, h, r);
         if constexpr (LOCAL) {
-            // Rows g and g + 8 of each step times their group's local code.
+            // Each register times its row's local code of the group it holds.
             const u32 row = j_tile * 16 + lane / 4;
-            const int groups[2] = {2 * h * 16 / W::GROUP, (2 * h + 1) * 16 / W::GROUP};
-            first = S8Pair{s8_times(first.row_g, gemm_multiplier<W>(coefficients, row, groups[0])),
-                           s8_times(first.row_g8, gemm_multiplier<W>(coefficients, row + 8, groups[0]))};
-            second = S8Pair{s8_times(second.row_g, gemm_multiplier<W>(coefficients, row, groups[1])),
-                            s8_times(second.row_g8, gemm_multiplier<W>(coefficients, row + 8, groups[1]))};
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+                r[i] = s8_times(r[i], gemm_multiplier<W>(coefficients, row + 8 * (i % 2),
+                                                         s8_group<ENTRIES, W::GROUP>(h, i, t)));
         }
         if constexpr (W::GROUP >= 32 || LOCAL) {
             // Half h's 32 codes, of group 32 h / GROUP (of any group, under
             // the row's factor, where LOCAL).
-            const u32 b0[2] = {first.row_g, second.row_g};
-            const u32 b1[2] = {first.row_g8, second.row_g8};
+            const u32 b0[2] = {r[0], r[2]};
+            const u32 b1[2] = {r[1], r[3]};
             int p[Shape::MI][2][4];
 #pragma unroll
             for (int mi = 0; mi < Shape::MI; ++mi) {
@@ -2497,22 +2627,40 @@ __device__ __forceinline__ void gemm_tile_s8(float acc[Shape::MI][2][4], const W
             fold(p, 32 * h / W::GROUP, h, 0);
         } else {
             static_assert(W::GROUP == 16, "groups of 16 codes, or of 32 or more");
-            // Each 16-code group is one k16 MMA over its half of the 32
-            // codes' activation fragment (k 0..15: a[0], a[1]; k 16..31:
-            // a[2], a[3]).
 #pragma unroll
             for (int part = 0; part < 2; ++part) {
-                const S8Pair &step = part == 0 ? first : second;
                 int p[Shape::MI][2][4];
+                if constexpr (ENTRIES) {
+                    // In entry order the 16-code group `part` is the codes of
+                    // the lanes whose entry is in it, in both k halves
+                    // (`s8_holds`): a k32 MMA over the half's activation
+                    // fragment with the other lanes' registers zero.
+                    const bool holds = s8_holds<true>(0, part, t);
+                    const u32 b0[2] = {holds ? r[0] : 0u, holds ? r[2] : 0u};
+                    const u32 b1[2] = {holds ? r[1] : 0u, holds ? r[3] : 0u};
 #pragma unroll
-                for (int mi = 0; mi < Shape::MI; ++mi) {
-                    const u32 a0 = a[h][mi][2 * part];
-                    const u32 a1 = a[h][mi][2 * part + 1];
+                    for (int mi = 0; mi < Shape::MI; ++mi) {
 #pragma unroll
-                    for (int e = 0; e < 4; ++e)
-                        p[mi][0][e] = p[mi][1][e] = GEMM_S8_BIAS;
-                    seismic_mma_m16n8k16_s8(p[mi][0], a0, a1, step.row_g);
-                    seismic_mma_m16n8k16_s8(p[mi][1], a0, a1, step.row_g8);
+                        for (int e = 0; e < 4; ++e)
+                            p[mi][0][e] = p[mi][1][e] = GEMM_S8_BIAS;
+                        seismic_mma_m16n8k32_s8(p[mi][0], a[h][mi], b0);
+                        seismic_mma_m16n8k32_s8(p[mi][1], a[h][mi], b1);
+                    }
+                } else {
+                    // In slot order the group is step 2h + part (registers
+                    // 2 part, 2 part + 1), one k16 MMA over its half of the 32
+                    // codes' activation fragment (k 0..15: a[0], a[1]; k
+                    // 16..31: a[2], a[3]).
+#pragma unroll
+                    for (int mi = 0; mi < Shape::MI; ++mi) {
+                        const u32 a0 = a[h][mi][2 * part];
+                        const u32 a1 = a[h][mi][2 * part + 1];
+#pragma unroll
+                        for (int e = 0; e < 4; ++e)
+                            p[mi][0][e] = p[mi][1][e] = GEMM_S8_BIAS;
+                        seismic_mma_m16n8k16_s8(p[mi][0], a0, a1, r[2 * part]);
+                        seismic_mma_m16n8k16_s8(p[mi][1], a0, a1, r[2 * part + 1]);
+                    }
                 }
                 fold(p, 2 * h + part, h, part);
             }
@@ -2530,6 +2678,9 @@ __device__ __forceinline__ void gemm_segment_s8(u8 *shared, const Rows &source, 
     constexpr bool PAIR = Weights::PAIR;
     constexpr int THREADS = Shape::THREADS;
     constexpr int PITCH = Shape::template A_PITCH<true>;
+    // The rows' code order, which the weights' fragments follow.
+    constexpr bool ENTRIES = Rows::entries();
+    static_assert(s8_order_read_by<ENTRIES, WA, WB>(), "only grid weights read entry-order int8 rows");
     constexpr int MI = Shape::MI;
     constexpr int NJ = Shape::NJ;
     const u32 lane = threadIdx.x % 32;
@@ -2637,15 +2788,15 @@ __device__ __forceinline__ void gemm_segment_s8(u8 *shared, const Rows &source, 
             }
         float sums[2][2][MI][2];
         if constexpr (gemm_s8_group_sums<WA>() || gemm_s8_group_sums<WB>())
-            gemm_s8_sums<Shape>(sums, a, groups);
+            gemm_s8_sums<Shape, ENTRIES>(sums, a, groups);
 #pragma unroll
         for (int j = 0; j < NJ; ++j) {
             const int tile_local = wn * NJ + j;
-            gemm_tile_s8<Shape>(acc[0][j], wa, weights.codes(stage, 0, tile_local), coefficients_a, j, a, groups,
-                                sums);
+            gemm_tile_s8<Shape, ENTRIES>(acc[0][j], wa, weights.codes(stage, 0, tile_local), coefficients_a, j, a,
+                                         groups, sums);
             if constexpr (PAIR)
-                gemm_tile_s8<Shape>(acc[1][j], wb, weights.codes(stage, 1, tile_local), coefficients_b, j, a, groups,
-                                    sums);
+                gemm_tile_s8<Shape, ENTRIES>(acc[1][j], wb, weights.codes(stage, 1, tile_local), coefficients_b, j, a,
+                                             groups, sums);
         }
     }
     seismic_cp_async_wait<0>();
@@ -2696,17 +2847,22 @@ __device__ __forceinline__ void form_operands_in_place(u8 *rows, u32 m) {
 }
 
 // One producer contract for every row schedule. Under S8 both bands read
-// int8_rule rows; otherwise the GEMV retains semantic Act and either matrix
-// tile band reads the selected representation. Plain semantic
+// int8_rule rows (`s8_real_offset`), the GEMV in its weights' order
+// (GEMV_ENTRIES), the GEMM in its own (GEMM_ENTRIES: `gemm_s8_entries`);
+// otherwise the GEMV retains semantic Act and either matrix tile band reads
+// the selected representation. Plain semantic
 // sources remain in place, while an owned physical view is always produced.
-template <bool S8, class Operands, class Pro>
+template <bool S8, bool GEMV_ENTRIES, bool GEMM_ENTRIES, class Operands, class Pro>
 __device__ __forceinline__ void stage_projection_row(const Pro &pro, u32 m, u32 rows, u64 K,
                                                      u8 *staged, void *groups) {
     static_assert(!S8 || Same<Operands, SemanticGemmOperands>::value,
                   "activation quantization and coefficient conversion are distinct policies");
     if constexpr (S8) {
-        // Both bands read int8_rule rows.
-        stage_row_s8(pro, m, K, staged, reinterpret_cast<float2 *>(groups));
+        // Both bands read int8_rule rows, each in its order.
+        if (rows <= GEMV_ROWS)
+            stage_row_s8<GEMV_ENTRIES>(pro, m, K, staged, reinterpret_cast<float2 *>(groups));
+        else
+            stage_row_s8<GEMM_ENTRIES>(pro, m, K, staged, reinterpret_cast<float2 *>(groups));
     } else if (rows <= GEMV_ROWS) {
         if constexpr (Pro::STAGED)
             form_row(pro, m, K, staged);
@@ -2746,10 +2902,11 @@ template <class Pro> __device__ __forceinline__ auto shared_row_after_dependency
 // The INT8 GEMV's sources once the previous launch is done: a one-row
 // block's `shared_s8_row`, or the stage launch's int8_rule rows (`staged`
 // codes and `groups`, `stage_row_s8`).
-template <class Pro> __device__ __forceinline__ auto shared_s8_row_after_dependency(const Pro &pro, u64 K) {
+template <bool ENTRIES, class Pro>
+__device__ __forceinline__ auto shared_s8_row_after_dependency(const Pro &pro, u64 K) {
     return [=] {
         seismic_dependency_start();
-        return shared_s8_row(pro, K);
+        return shared_s8_row<ENTRIES>(pro, K);
     };
 }
 __device__ __forceinline__ auto s8_rows_after_dependency(const u8 *staged, const void *groups, u64 K) {
@@ -2780,22 +2937,23 @@ __device__ __forceinline__ void gemm_rows(u8 *shared, const Rows &source, u32 M,
 
 // The rows a GEMM reads on either path: `act` is the A rows (row stride
 // `act_stride`) for the 16-bit path or the staged s8 rows (K wide, with
-// their `groups`) for S8.
-template <bool S8>
+// their `groups`, in entry order where ENTRIES) for S8.
+template <bool S8, bool ENTRIES>
 __device__ __forceinline__ auto gemm_source(const u8 *act, u64 act_stride, const void *groups, u64 K) {
+    static_assert(S8 || !ENTRIES, "only int8 rows have a code order");
     if constexpr (S8)
-        return QuantizedRows{act, K, reinterpret_cast<const float2 *>(groups)};
+        return QuantizedRows<ENTRIES>{act, K, reinterpret_cast<const float2 *>(groups)};
     else
         return ActivationRows{act, act_stride};
 }
 
 // One GEMM block on either path over `gemm_source`'s rows.
-template <class Shape, bool S8, class Operands = SemanticGemmOperands, class WA, class WB, class Epi>
+template <class Shape, bool S8, bool ENTRIES, class Operands = SemanticGemmOperands, class WA, class WB, class Epi>
 __device__ __forceinline__ void gemm_run(u8 *shared, const u8 *act, u64 act_stride, const void *groups, u32 M,
                                          u64 K, u64 nblock, u64 rows, const WA &wa, const WB &wb, const Epi &epi,
                                          u64 part = 0, u64 parts = 1) {
-    gemm_rows<Shape, S8, Operands>(shared, gemm_source<S8>(act, act_stride, groups, K), M, K, nblock, rows, wa, wb,
-                                   epi, part, parts);
+    gemm_rows<Shape, S8, Operands>(shared, gemm_source<S8, ENTRIES>(act, act_stride, groups, K), M, K, nblock, rows,
+                                   wa, wb, epi, part, parts);
 }
 
 // Block columns of a segment of `rows` rows.
@@ -2851,23 +3009,24 @@ __device__ __forceinline__ void split_finalize(const float *partials, u64 parts,
 // `part` of `parts`, its partials when the launch is split (SPLIT shares up
 // to SPLIT_ROWS rows, summed by the finalize launch), else published through
 // `epi`.
-template <class Shape, bool S8, class Operands = SemanticGemmOperands, class W, class Epi>
+template <class Shape, bool S8, bool ENTRIES, class Operands = SemanticGemmOperands, class W, class Epi>
 __device__ __forceinline__ void gemm_run_split(u8 *shared, const u8 *act, u64 act_stride, const void *groups, u32 M,
                                                u64 K, u64 nblock, u64 rows, const W &w, const Epi &epi,
                                                float *partials, u64 part, u64 parts) {
     if (parts > 1)
-        gemm_run<Shape, S8, Operands>(shared, act, act_stride, groups, M, K, nblock, rows, w, NoWeight{},
+        gemm_run<Shape, S8, ENTRIES, Operands>(shared, act, act_stride, groups, M, K, nblock, rows, w, NoWeight{},
                             PartialStore<1>{partials, M, rows, 0, part}, part, parts);
     else
-        gemm_run<Shape, S8, Operands>(shared, act, act_stride, groups, M, K, nblock, rows, w, NoWeight{}, epi);
+        gemm_run<Shape, S8, ENTRIES, Operands>(shared, act, act_stride, groups, M, K, nblock, rows, w, NoWeight{},
+                                               epi);
 }
 // The split over grid z (z = the K share).
-template <class Shape, bool S8, class Operands = SemanticGemmOperands, class W, class Epi>
+template <class Shape, bool S8, bool ENTRIES, class Operands = SemanticGemmOperands, class W, class Epi>
 __device__ __forceinline__ void gemm_run_split(u8 *shared, const u8 *act, u64 act_stride, const void *groups, u32 M,
                                                u64 K, u64 nblock, u64 rows, const W &w, const Epi &epi,
                                                float *partials) {
-    gemm_run_split<Shape, S8, Operands>(shared, act, act_stride, groups, M, K, nblock, rows, w, epi, partials,
-                                        blockIdx.z, gridDim.z);
+    gemm_run_split<Shape, S8, ENTRIES, Operands>(shared, act, act_stride, groups, M, K, nblock, rows, w, epi,
+                                                 partials, blockIdx.z, gridDim.z);
 }
 
 } // namespace projection

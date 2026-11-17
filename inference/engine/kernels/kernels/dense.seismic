@@ -377,9 +377,15 @@ projection dense for metal:
 # two operand paths: the 16-bit path (weights dequantized to A) and the INT8
 # candidate (arithmetic INT8 = 1: activations quantized per 32 codes as q8_1
 # does, s8 MMAs), which `where` admits only for weights the int8 GEMM takes
-# (`form(W, INT8)`); the tuner keeps INT8 only where it is faster within
-# tolerance. The large-band GEMM (`gemm`, beyond 64 rows: 128-row block
-# tiles, 2 stages) is the 16-bit path; each stage's copies are issued by one
+# (`form(W, INT8)`) and whose GEMVs read the rows in one order (`form(W,
+# S8_ENTRIES)`: grid codes a lane's whole entry, every other weight the k16
+# steps' slots); the tuner keeps INT8 only where it is faster within
+# tolerance. The GEMMs read the rows in an order of their own, which the
+# weights' representation derives (`packets::s8_gemm_entries`; the same bits
+# either way): a grid weight's entries where its groups do not straddle the
+# MMA's k16 halves or its grid's points are not magnitudes, else the slots,
+# which every weight reads. The large-band GEMM (`gemm`, beyond 64 rows:
+# 128-row block tiles, 2 stages) is the 16-bit path; each stage's copies are issued by one
 # of ROTATE rotating warp sets (the launch parameter ROTATE, tuned: its best
 # value depends on the weight representation, and the arithmetic does not,
 # so every value gives the same bits; likewise in the `gemm` launches of
@@ -484,8 +490,8 @@ projection dense for cuda:
     where (ORDERED_ALL == 0 or KSPLIT == 1)
     where (PLANES == 1 or K % 64 == 0 or (ORDERED_ALL == 1 and each(W, dense_bytes(W) > 0) and K % 32 == 0))
     where (OPERAND == 0 or (INT8 == 0 and PARTED == 0))
-    where (INT8 == 0 or each(W, form(W, INT8) == 1)) for paired | single
-    where (INT8 == 0 or (PARTED == 0 and each(W, N == 0 or form(W, INT8) == 1))) for segmented
+    where (INT8 == 0 or (each(W, form(W, INT8) == 1) and agree(W, form(W, S8_ENTRIES)))) for paired | single
+    where (INT8 == 0 or (PARTED == 0 and each(W, N == 0 or form(W, INT8) == 1) and agree(W, form(W, S8_ENTRIES)))) for segmented
     where (BLOCKS == 1 or (INT8 == 1 and each(W, N == 0 or form(W, INT8_SHARED) <= HALF_SM_SHARED))) for single | segmented
     where BLOCKS == 1 for paired
     where (STAGING == 0 or PARTED == 0)

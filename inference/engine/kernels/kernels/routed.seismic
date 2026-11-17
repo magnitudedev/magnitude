@@ -397,8 +397,9 @@ projection routed for metal:
 # (`staged` codes, `groups` of (d, d * sum q)), the quantize launch each
 # live product row (`product_codes`, `product_groups`), and s8 MMAs fold
 # them under the weights' groups as the dense int8 GEMM does, one k-block a
-# stage, so a row's projection is the one the dense int8 GEMM (unsplit)
-# gives it by its expert's weights.
+# stage, each GEMM's rows in its weights' order (`packets::s8_gemm_entries`),
+# so a row's projection is the one the dense int8 GEMM (unsplit) gives it by
+# its expert's weights.
 projection routed for cuda:
     let DECODE_GROUPS = ceil_div(ceil_div(ceil_div(most(W, N), 16), TPW), 4 / KSPLIT) for choice | summed
     let TILE = 64 - 32 * STACKED for grouped

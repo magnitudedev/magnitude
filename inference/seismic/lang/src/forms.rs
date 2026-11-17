@@ -40,10 +40,12 @@ use crate::types::DType;
 /// CUDA's forms, in emission order: the folded GEMM recipe (`GEMM_FOLD`),
 /// the int8 GEMM (`INT8`), the records GEMV (`GEMV_RECORDS`) and the int8
 /// GEMM's local scale codes multiplied into the codes (`INT8_LOCAL`), negated
-/// (`INT8_LOCAL_NEGATED`), and the shared bytes that bound the int8 GEMM's
-/// 128-row layout of the weight (`INT8_SHARED`, [`cuda_int8_shared`]).
-/// [`cuda_forms`] values them in this order.
-const CUDA_FORMS: [&str; 6] = ["GEMM_FOLD", "INT8", "GEMV_RECORDS", "INT8_LOCAL", "INT8_LOCAL_NEGATED", "INT8_SHARED"];
+/// (`INT8_LOCAL_NEGATED`), whether its int8 codes are in entry order
+/// (`S8_ENTRIES`), and the shared bytes that bound the int8 GEMM's 128-row
+/// layout of the weight (`INT8_SHARED`, [`cuda_int8_shared`]). [`cuda_forms`]
+/// values them in this order.
+const CUDA_FORMS: [&str; 7] =
+    ["GEMM_FOLD", "INT8", "GEMV_RECORDS", "INT8_LOCAL", "INT8_LOCAL_NEGATED", "S8_ENTRIES", "INT8_SHARED"];
 
 /// Vulkan's forms: whether its packet decoder reads the weight (`DECODED`),
 /// and the bytes of the table its decoder stages in shared memory for it
@@ -319,6 +321,11 @@ fn cuda_forms(rows: &registry::PackedRowLayout, weight: &Weight, operands: Opera
         u32::from(rows.records()),
         u32::from(local.is_some()),
         u32::from(local == Some(true)),
+        // The int8 producer reads grid codes in entry order (a lane's eight
+        // codes of a row are one entry: `GridPlanes::s8_half`), every other
+        // weight's in slot order; a launch's int8 weights that share rows
+        // share one order (`dense.seismic`, `routed.seismic`).
+        u32::from(matches!(weight.axes.coding.codes(), ValueCodes::Grid(_))),
         cuda_int8_shared(rows, &weight.axes, operands),
     ]
 }

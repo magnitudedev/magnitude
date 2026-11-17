@@ -40,6 +40,7 @@ template <class Rows> struct GroupedRows {
     __device__ __forceinline__ const u8 *row(u64 m) const { return rows.row(at(m)); }
     __device__ __forceinline__ const float2 *groups_of(u64 m) const { return rows.groups_of(at(m)); }
     __device__ __forceinline__ bool wide() const { return rows.wide(); }
+    __host__ __device__ static constexpr bool entries() { return Rows::entries(); }
 };
 template <class Rows>
 __device__ __forceinline__ GroupedRows<Rows> grouped_rows(const Rows &rows, const int *order, u64 order_stride) {

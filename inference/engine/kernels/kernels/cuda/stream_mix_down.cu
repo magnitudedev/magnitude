@@ -87,7 +87,7 @@ __device__ __forceinline__ void mix_gemv(const Stream streams, const projection:
 template <class Shape>
 __device__ __forceinline__ void mix_gemm(const projection::u8 *staged, unsigned M, const Segments &segments) {
     extern __shared__ uint4 dynamic_shared[];
-    projection::op::gemm_segmented<Shape, false, projection::SemanticGemmOperands>(
+    projection::op::gemm_segmented<Shape, false, false, projection::SemanticGemmOperands>(
         reinterpret_cast<projection::u8 *>(dynamic_shared), staged, nullptr, M, WIDTH, segments, 0u);
 }
 
