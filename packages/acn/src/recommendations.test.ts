@@ -19,6 +19,7 @@ interface RungFixture {
   readonly fits?: boolean
   readonly assessing?: boolean
   readonly installed?: boolean
+  readonly tools?: boolean
   readonly support?: "Supported" | "Disabled"
   readonly country?: string
   readonly intelligence?: number
@@ -47,6 +48,7 @@ const rung = (fixture: RungFixture): LocalModel => {
       : fits
       ? {
           _tag: "Assessed",
+          capabilities: { vision: false, tools: fixture.tools ?? true, structuredOutput: true, reasoning: { supported: false, efforts: [], defaultEffort: Option.none() } },
           assessment: {
             _tag: "Fits",
             served: { contextLength: 131_072 },
@@ -64,7 +66,7 @@ const rung = (fixture: RungFixture): LocalModel => {
             },
           },
         }
-      : { _tag: "Assessed", assessment: { _tag: "DoesNotFit" } },
+      : { _tag: "Assessed", capabilities: { vision: false, tools: fixture.tools ?? true, structuredOutput: true, reasoning: { supported: false, efforts: [], defaultEffort: Option.none() } }, assessment: { _tag: "DoesNotFit" } },
   } as unknown as LocalModel
 }
 
@@ -165,5 +167,13 @@ describe("recommendations", () => {
     ], { country: "US" })
     expect(models.map(({ base }) => base)).toEqual(["us"])
     expect(listed).toEqual(families)
+  })
+
+  it("never recommends a model that cannot use tools", () => {
+    const { models } = project([
+      rung({ id: "agentic:gguf:q4", storageBytes: 1 * GB, tokensPerSecond: 50 }),
+      rung({ id: "chatonly:gguf:q4", storageBytes: 1 * GB, tokensPerSecond: 50, intelligence: 90, tools: false }),
+    ])
+    expect(models.map(({ base }) => base)).toEqual(["agentic"])
   })
 })

@@ -3,6 +3,7 @@ import {
   LocalModelFamilySchema,
   Models,
   comparisonTokensPerSecond,
+  localModelCapabilities,
   localModelIntelligence,
   parseModelId,
   type CatalogBaseId,
@@ -125,6 +126,8 @@ export const projectRecommendations = (inputs: RecommendationInputs): Recommenda
   const catalogModels = inputs.models.filter((model): model is CatalogLocalModel =>
     model._tag === "Catalog"
     && (model.catalogData.support._tag === "Supported" || comingSoon(model))
+    // Harnesses call tools, so a model known not to support them is never recommended.
+    && !Option.exists(localModelCapabilities(model), (capabilities) => !capabilities.tools)
     && Option.match(inputs.developerCountry, {
       onNone: () => true,
       onSome: (country) => model.catalogData.developer.country === country,
