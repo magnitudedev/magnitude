@@ -10,7 +10,7 @@ import { downloadContents, methodName, onThisComputer, quantView, transferOf } f
 import { AUTO_DRAFTER, DrafterSection, drafterChoice, useDrafters, type DrafterSelection } from "./drafter-picker"
 import type { QuantView } from "./view"
 import type { OfferedModel } from "./expanding-model"
-import { ExploreModal, type ExploreResults, type ExploreRow, type RunnableFamily } from "./explore-modal"
+import { ExploreView, type ExploreResults, type ExploreRow, type RunnableFamily } from "./explore-view"
 
 function useDebounced<A>(value: A, delay: number): A {
   const [settled, setSettled] = useState(value)
@@ -112,14 +112,9 @@ const useRepositoryQuants = (memory: ServingMemory) => function useOpened(model:
 }
 
 interface ExploreProps {
-  readonly open: boolean
-  readonly setOpen: (open: boolean) => void
   readonly query: string
   readonly setQuery: (value: string) => void
   readonly memory: ServingMemory
-  readonly machine: string
-  readonly recommended: readonly OfferedModel[]
-  readonly measuring: { readonly settled: number; readonly total: number } | null
   readonly families: readonly RunnableFamily[]
   readonly owned: ReadonlySet<string>
 }
@@ -154,7 +149,7 @@ function HuggingFaceDownload({ quant, repository, selection, start }: {
 }
 
 /** The footer of an opened model: its quant's Download, or how far that download is, or that it's here. */
-function useDownload(selections: Readonly<Record<string, DrafterSelection>>) {
+export function useDownload(selections: Readonly<Record<string, DrafterSelection>>) {
   const client = useAgentClient()
   const add = useAtomSet(client.Models.AddHuggingFaceModel)
   const { install } = useLocalModelMutations()
@@ -255,10 +250,7 @@ function useSearchResults(settled: string, query: string, memory: ServingMemory,
       }
 }
 
-/**
- * The Explore models modal on the service's data: Hugging Face search, and the recommendations it is given. One modal
- * whatever it shows, so typing a search changes its contents, never the modal itself.
- */
+/** Explore models on the service's data: a Hugging Face search, and what to show before one. */
 export function Explore(props: ExploreProps) {
   const settled = useDebounced(props.query.trim(), 350)
   const tooLong = new TextEncoder().encode(settled).length > HUGGING_FACE_SEARCH_QUERY_MAXIMUM_BYTES
@@ -269,9 +261,9 @@ export function Explore(props: ExploreProps) {
   const download = useDownload(selections)
   const drafters = drafterFor(selections, (key, selection) => setSelections(current => ({ ...current, [key]: selection })))
   const results: ExploreResults = props.query.trim() === ""
-    ? { _tag: "Recommended", models: props.recommended, machine: props.machine, measuring: props.measuring }
+    ? { _tag: "Idle" }
     : tooLong ? { _tag: "Failed", message: "This search is longer than Hugging Face accepts. Shorten it." }
     : searched
   const useOpened = useMemo(() => useRepositoryQuants(props.memory), [props.memory])
-  return <ExploreModal {...props} results={results} download={download} drafters={drafters} useOpened={useOpened} onSeen={setVisible} />
+  return <ExploreView {...props} results={results} download={download} drafters={drafters} useOpened={useOpened} onSeen={setVisible} />
 }

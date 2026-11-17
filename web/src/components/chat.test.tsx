@@ -97,14 +97,33 @@ describe("Chat presentation", () => {
       expect(html).not.toContain("tok/s")
     }
   })
-  it("shows Thinking while a running response has only reasoned", () => {
+  it("counts how long a running response has been thinking while it reasons", () => {
+    const started = Date.now() - 12_400
     const html = renderToStaticMarkup(
       <ChatResponse
-        response={running({ content: [{ type: "reasoning", text: "Hm", time: { started: 200, ended: 300 } }] })}
+        response={running({ content: [{ type: "reasoning", text: "Hm", time: { started, ended: started + 100 } }] })}
         notify={() => {}}
       />
     )
-    expect(html).toContain(">Thinking</summary>")
+    expect(html).toMatch(/>Thinking for 1[23]s<\/summary>/)
+  })
+  it("shows how long it thought once the answer has begun", () => {
+    const html = renderToStaticMarkup(
+      <ChatResponse
+        response={running({ content: [
+          { type: "reasoning", text: "Hm", time: { started: 200, ended: 1_200 } },
+          { type: "text", text: "Yes", time: { started: 1_300, ended: 1_400 } },
+        ] })}
+        notify={() => {}}
+      />
+    )
+    expect(html).not.toContain("Thinking")
+  })
+  it("shows a message's copy and the time its response ended, revealed on hover", () => {
+    const html = renderToStaticMarkup(<ChatResponse response={response()} notify={() => {}} />)
+    expect(html).toContain("chat-hover-group")
+    expect(html).toContain('aria-label="Copy response"')
+    expect(html).toContain(`dateTime="${new Date(1_100).toISOString()}"`)
   })
 
   const statuses = [

@@ -37,7 +37,6 @@ it("reports hardware detection and service start inline without inventing progre
   expect(hardware).toContain("Reading hardware capabilities")
   expect(hardware).not.toContain("<figure")
   const starting = renderToStaticMarkup(<ModelsSkeleton startingService />)
-  expect(starting).toContain("Models</h1>")
   expect(starting).toContain("Starting Magnitude…")
   expect(starting).not.toContain("<progress")
 })

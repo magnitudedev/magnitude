@@ -1,5 +1,5 @@
-import { Atom, Result, useAtomValue } from "@effect-atom/atom-react"
-import { DateTime, Option, Stream } from "effect"
+import { useNow } from "./shared"
+import { DateTime, Option } from "effect"
 import {
   type ChatAssistantMessage,
   type LivePhase,
@@ -8,7 +8,6 @@ import {
 } from "@magnitudedev/sdk"
 import { CircleNotchIcon } from "@phosphor-icons/react"
 
-const tick = Atom.make(Stream.tick("1 second").pipe(Stream.map(() => Date.now())))
 const count = (n: number) => Math.floor(n).toLocaleString()
 const rate = (n: number) => n.toLocaleString(undefined, { minimumFractionDigits: 1, maximumFractionDigits: 1 })
 const bytes = (n: number) => (n / 1024 ** 3).toFixed(1)
@@ -79,8 +78,7 @@ export function ChatRequestStatus({
   response: ChatAssistantMessage
   live: Option.Option<LiveResponse>
 }) {
-  const clock = useAtomValue(tick)
-  const now = Result.isSuccess(clock) ? clock.value : Date.now()
+  const now = useNow()
   return <ChatActivityStatus response={response} live={live} now={now} />
 }
 export function ChatActivityStatus({

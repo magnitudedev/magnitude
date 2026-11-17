@@ -1,24 +1,10 @@
 import { formatStopSequences, parseStopSequences } from "./stop-sequences"
 import { useState, type ReactNode } from "react"
 import { Option } from "effect"
-import type {
-  ChatDefaultsKey,
-  ChatDefaultsStatus,
-  ChatRequestSettings,
-} from "@magnitudedev/client-common"
-import { CaretDownIcon, CaretRightIcon, CheckIcon } from "@phosphor-icons/react"
+import type { ChatDefaultsKey, ChatRequestSettings } from "@magnitudedev/client-common"
+import { CaretDownIcon, CaretRightIcon } from "@phosphor-icons/react"
 import { Input } from "../ui/input"
 import { none, number, value } from "./shared"
-
-/** Where this chat's settings stand against its model's defaults, and what can be done about it. */
-export interface ChatDefaultsState {
-  readonly status: ChatDefaultsStatus
-  readonly changed: ReadonlySet<ChatDefaultsKey>
-  readonly canSave: boolean
-  readonly save: () => void
-  readonly revert: () => void
-  readonly reset: () => void
-}
 
 export function ChangedDot() {
   return (
@@ -27,64 +13,6 @@ export function ChangedDot() {
       aria-label="Changed"
       className="inline-block size-1.5 shrink-0 rounded-full bg-blue-600 dark:bg-blue-400"
     />
-  )
-}
-
-const statusText: { readonly [Status in ChatDefaultsStatus]: string } = {
-  standard: "Standard settings",
-  changedFromStandard: "Changed from standard",
-  yours: "Your defaults",
-  changedFromYours: "Changed from your defaults",
-}
-
-const link =
-  "rounded text-xs font-medium transition-colors outline-none focus-visible:ring-2 focus-visible:ring-blue-500/30 disabled:pointer-events-none disabled:opacity-40"
-const quietLink = `${link} text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-100`
-
-/** Two lines under the model name: where the settings stand, then what can be done, always in the same place. */
-function DefaultsStatus({ d }: { d: ChatDefaultsState }) {
-  const changed = d.status === "changedFromStandard" || d.status === "changedFromYours"
-  return (
-    <div className="mt-1 text-xs">
-      <div className="flex h-5 items-center gap-1.5 text-slate-600 dark:text-slate-300">
-        <span className="flex w-1.5 shrink-0 justify-center">
-          {changed ? (
-            <ChangedDot />
-          ) : d.status === "yours" ? (
-            <CheckIcon weight="bold" className="size-3 text-green-600 dark:text-green-400" />
-          ) : (
-            <span className="size-1.5 rounded-full border border-slate-400 dark:border-slate-500" />
-          )}
-        </span>
-        <span className="truncate">{statusText[d.status]}</span>
-      </div>
-      <div className="flex h-5 items-center gap-3 pl-3">
-        {changed ? (
-          <>
-            <button
-              type="button"
-              disabled={!d.canSave}
-              onClick={d.save}
-              title="Start new chats with this model from these settings"
-              className={`${link} text-blue-700 hover:text-blue-900 dark:text-blue-400 dark:hover:text-blue-300`}
-            >
-              {d.status === "changedFromYours" ? "Update default" : "Save as default"}
-            </button>
-            <button type="button" onClick={d.revert} className={quietLink}>
-              Revert
-            </button>
-          </>
-        ) : d.status === "yours" ? (
-          <button type="button" onClick={d.reset} className={quietLink}>
-            Reset to standard
-          </button>
-        ) : (
-          <span className="truncate text-slate-400 dark:text-slate-500">
-            Edit anything to save it as default
-          </span>
-        )}
-      </div>
-    </div>
   )
 }
 
@@ -128,27 +56,28 @@ const advancedKeys: ReadonlyArray<ChatDefaultsKey> = [
   "stop",
 ]
 
-export function ChatSettingsPanel({
+/** A model's chat settings, each marked when it differs from the model's standard settings. */
+export function ChatSettingsFields({
   settings: s,
   patch,
   context,
   contextLimit,
-  defaults: d,
+  changed: differs,
 }: {
   settings: ChatRequestSettings
   patch: (change: Partial<ChatRequestSettings>) => void
   context?: number
   contextLimit?: number
-  defaults?: ChatDefaultsState
+  changed: ReadonlySet<ChatDefaultsKey>
 }) {
   const [advanced, setAdvanced] = useState(false)
   const [stopText, setStopText] = useState(() => formatStopSequences(s.stop))
-  // Typed text stays as typed while it means these stops; a revert or another model's defaults replace it.
+  // Typed text stays as typed while it means these stops; a reset replaces it.
   const shownStopText =
     JSON.stringify(parseStopSequences(stopText)) === JSON.stringify(s.stop)
       ? stopText
       : formatStopSequences(s.stop)
-  const changed = (key: ChatDefaultsKey) => d?.changed.has(key) ?? false
+  const changed = (key: ChatDefaultsKey) => differs.has(key)
   // Unset temperature uses the inference service's sampling default.
   const temperature = value(s.temperature) ?? 1
   const defaults = {
@@ -197,7 +126,6 @@ export function ChatSettingsPanel({
   )
   return (
     <>
-      {d && <DefaultsStatus d={d} />}
       <Setting title="System prompt" changed={changed("systemPrompt")}>
         <textarea
           aria-label="System prompt"

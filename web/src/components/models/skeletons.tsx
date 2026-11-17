@@ -1,6 +1,5 @@
 import { Skeleton } from "../ui/skeleton"
 import { LoadingRegion, SkeletonLine } from "../page-skeletons"
-import { pageLayout } from "../page-layout"
 import { cn } from "@/lib/utils"
 import { cardClass, Section } from "./parts"
 
@@ -89,34 +88,19 @@ export function MeasuringRecommendations({ settled, total, footer = false }: { s
   </div>
 }
 
-/** The user's models list before it loads, laid out as `YourModels`: its title, find field and filter, and rows in its columns. */
-export function YourModelsSkeleton({ count = 4 }: { count?: number }) {
-  return <Section title={<span className="flex items-center gap-1.5">Your models <Skeleton className="h-3 w-5" /></span>} aside={<><Skeleton className="h-7 w-52" /><Skeleton className="h-7 w-[71px]" /></>}>
-    <LoadingRegion label="Loading your models" className="rounded-xl border border-slate-200 bg-white dark:border-slate-750 dark:bg-slate-850">
-      <div className="divide-y divide-slate-200 dark:divide-slate-750">{Array.from({ length: count }, (_, index) => <div key={index} className="grid grid-cols-[28px_minmax(0,1fr)_64px_72px_auto_28px] items-center gap-4 px-4 py-3 max-lg:grid-cols-[28px_minmax(0,1fr)_64px_auto_28px]">
-        <Skeleton className="size-7" />
-        <span className="min-w-0">
-          <SkeletonLine className="h-5 text-[13px]" width={index % 2 ? "35%" : "50%"} />
-          <SkeletonLine className="h-4 text-xs" width="30%" />
-        </span>
-        <SkeletonLine className="h-5 justify-end text-[13px]" width="3.5rem" />
-        <SkeletonLine className="h-4 justify-end text-xs max-lg:hidden" width="3.5rem" />
-        <Skeleton className="h-7 w-[71px]" />
-        <Skeleton className="size-7" />
-      </div>)}</div>
-    </LoadingRegion>
-  </Section>
-}
-
 /**
- * The Models page before its data, laid out exactly as the page it becomes: the header, machine card and list, nothing
- * else. While the service is still starting, only assistive technology hears so; nothing visible is added.
+ * The Models page under its title before its data, laid out as the page it becomes before any model is downloaded:
+ * the card that says so, then "Recommended for your machine" with its filter and its cards, the first opened with its
+ * download. While the service is still starting, only assistive technology hears so; nothing visible is added.
  */
 export function ModelsSkeleton({ startingService = false }: { startingService?: boolean }) {
   return <div>
     {startingService && <span role="status" className="sr-only">Starting Magnitude…</span>}
-    <div className="mb-5 flex items-end justify-between gap-4"><h1 className={pageLayout.pageTitle}>Models</h1><Skeleton className="h-8 w-[139px]" /></div>
-    <MachineCardSkeleton />
-    <YourModelsSkeleton />
+    <LoadingRegion label="Loading your models" className={cn(cardClass, "px-4 py-3.5")}>
+      <SkeletonLine className="h-[1.5em] text-[13px]" width="22rem" />
+    </LoadingRegion>
+    <Section title="Recommended for your machine" aside={<Skeleton className="h-4 w-48" />}>
+      <OfferedModelsSkeleton firstOpened footer />
+    </Section>
   </div>
 }

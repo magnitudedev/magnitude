@@ -1,12 +1,12 @@
 import { Fragment, useEffect, useRef, useState, type ReactNode } from "react"
-import { CaretDownIcon, CaretRightIcon, CheckIcon, DotsThreeIcon, EyeIcon, EyeSlashIcon, FunnelSimpleIcon, MagnifyingGlassIcon, PlusIcon, TrashIcon } from "@phosphor-icons/react"
+import { ArrowRightIcon, CaretDownIcon, CaretRightIcon, CheckIcon, DotsThreeIcon, EyeIcon, EyeSlashIcon, FunnelSimpleIcon, MagnifyingGlassIcon, PlusIcon, TrashIcon } from "@phosphor-icons/react"
 import { formatStorageSize } from "@magnitudedev/client-common"
 import { Button } from "../ui/button"
 import { Input } from "../ui/input"
 import { Dialog, DialogContent, DialogTitle } from "../ui/dialog"
 import { HuggingFaceLogo, LabLogo, modelLabs, type ModelLab } from "../model-logo"
 import { cn } from "@/lib/utils"
-import { ContextText, LabMark, PlacementBar, RepositoryLink, Section, Speed } from "./parts"
+import { ContextText, LabMark, PlacementBar, RepositoryLink, Speed } from "./parts"
 import type { QuantView } from "./view"
 
 /** A model on this computer, with where it lives and what Magnitude could tell about its source. */
@@ -50,13 +50,34 @@ function useDismiss(open: boolean, close: () => void) {
   return ref
 }
 
+/** Explore models, beside the Models page title whether or not any are downloaded. */
+export function ExploreModelsButton({ onClick }: { onClick: () => void }) {
+  return <Button variant="outline" onClick={onClick}>
+    <HuggingFaceLogo className="size-[18px]" />
+    Explore models
+    <ArrowRightIcon className="size-4" />
+  </Button>
+}
+
+/** Finding in a list: a magnifier that opens into a field, and closes again when left empty or on Escape. */
+function FindToggle({ value, onChange, placeholder }: { value: string; onChange: (value: string) => void; placeholder: string }) {
+  const [open, setOpen] = useState(false)
+  if (!open && value === "") return <Button size="icon-sm" variant="ghost" aria-label={placeholder} title={placeholder} onClick={() => setOpen(true)}><MagnifyingGlassIcon /></Button>
+  return <span className="relative">
+    <MagnifyingGlassIcon className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-slate-400" />
+    <Input autoFocus value={value} onChange={event => onChange(event.target.value)} placeholder={placeholder} className="h-7 w-44 pl-8 text-xs"
+      onBlur={() => { if (value === "") setOpen(false) }}
+      onKeyDown={event => { if (event.key === "Escape") { event.stopPropagation(); onChange(""); setOpen(false) } }} />
+  </span>
+}
+
 /** One small menu for both filters; what's chosen stays shown in the menu and as a count on the button. */
 function FilterMenu({ filters, setFilters, labs }: { filters: ModelFilters; setFilters: (filters: ModelFilters) => void; labs: readonly ModelLab[] }) {
   const [open, setOpen] = useState(false)
   const ref = useDismiss(open, () => setOpen(false))
   const active = (filters.lab ? 1 : 0) + (filters.usOnly ? 1 : 0)
   return <span ref={ref} className="relative">
-    <Button size="sm" variant={active > 0 ? "secondary" : "ghost"} onClick={() => setOpen(value => !value)}><FunnelSimpleIcon />Filter{active > 0 ? ` (${active})` : ""}</Button>
+    <Button size="icon-sm" variant={active > 0 ? "secondary" : "ghost"} aria-label={active > 0 ? `Filter (${active} on)` : "Filter"} title="Filter" onClick={() => setOpen(value => !value)}><FunnelSimpleIcon /></Button>
     {open && <div className="absolute right-0 top-8 z-20 w-56 rounded-lg border border-slate-200 bg-white p-1.5 text-[13px] text-slate-800 shadow-lg dark:border-slate-750 dark:bg-slate-850 dark:text-slate-200">
       <p className="px-2 pb-1 pt-1.5 text-[11px] font-medium text-slate-500">Lab</p>
       {[null, ...labs].map(lab => <button key={lab?.name ?? "any"} type="button" onClick={() => setFilters({ ...filters, lab })} className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-slate-100 dark:hover:bg-slate-800">
@@ -169,14 +190,13 @@ export function YourModels({ models, hidden, unrunnable, action, onExploreQuants
   const labs = modelLabs.filter(lab => models.some(model => model.lab?.name === lab.name))
   const needle = find.trim().toLowerCase()
   const shown = models.filter(model => passes(filters, model) && model.searchText.toLowerCase().includes(needle))
-  return <Section title={`Your models (${models.length})`} aside={<>
-    <span className="relative">
-      <MagnifyingGlassIcon className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-slate-400" />
-      <Input value={find} onChange={event => setFind(event.target.value)} placeholder="Find in your models" className="h-7 w-52 pl-8 text-xs" />
-    </span>
-    <FilterMenu filters={filters} setFilters={setFilters} labs={labs} />
-  </>}>
-    {shown.length === 0 ? <p className="text-[13px] text-slate-500">No models match.</p> : <div className="divide-y divide-slate-200 rounded-xl border border-slate-200 bg-white dark:divide-slate-750 dark:border-slate-750 dark:bg-slate-850">
+  return <section aria-label="Your models">
+    <div className="mb-2 flex items-center justify-end gap-1 text-xs text-slate-500">
+      <FindToggle value={find} onChange={setFind} placeholder="Find in your models" />
+      <FilterMenu filters={filters} setFilters={setFilters} labs={labs} />
+    </div>
+    <div className="divide-y divide-slate-200 rounded-xl border border-slate-200 bg-white dark:divide-slate-750 dark:border-slate-750 dark:bg-slate-850">
+      {shown.length === 0 && <p className="px-4 py-3 text-[13px] text-slate-500">No models match.</p>}
       {shown.map(model => {
         const isOpen = open === model.modelId
         return <div key={model.modelId} className={cn("first:rounded-t-xl last:rounded-b-xl", isOpen && "bg-slate-50 dark:bg-slate-800/40")}>
@@ -192,8 +212,8 @@ export function YourModels({ models, hidden, unrunnable, action, onExploreQuants
           {isOpen && <div className="px-4 pb-5 pl-[60px] pr-16"><Details model={model} onDrafter={() => onDrafter(model)} /></div>}
         </div>
       })}
-    </div>}
+    </div>
     <Hidden models={hidden} onUnhide={onUnhide} />
     <Unrunnable files={unrunnable} />
-  </Section>
+  </section>
 }

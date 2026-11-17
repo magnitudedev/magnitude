@@ -5,9 +5,11 @@ import { Button } from "../ui/button"
 import { HuggingFaceLogo, type ModelLab } from "../model-logo"
 import { Dialog, DialogContent, DialogTitle } from "../ui/dialog"
 import { cn } from "@/lib/utils"
-import { cardClass, LabMark, MachineCard, Section } from "./parts"
+import { cardClass, LabMark, MachineCard } from "./parts"
 import { MachineCardSkeleton, OfferedModelsSkeleton } from "./skeletons"
-import { ExpandingModel, type OfferedModel } from "./expanding-model"
+import type { OfferedModel } from "./expanding-model"
+import { RecommendedForYourMachine, useRecommendedSelection } from "./recommended-for-your-machine"
+import type { Recommendation } from "./recommendations"
 import { downloadContents } from "./data"
 import type { UnrunnableFile } from "./your-models"
 import type { MachineView, QuantView } from "./view"
@@ -21,12 +23,6 @@ export interface DiscoveredModel {
   readonly source: string
   readonly fromHuggingFaceCache: boolean
   readonly warning: string | null
-}
-
-/** One offered model with what onboarding says beside its name. */
-export interface Recommendation {
-  readonly model: OfferedModel
-  readonly note: string | undefined
 }
 
 /** One thing the service does before it can recommend: done, under way (with how far, when it knows), or still to come. */
@@ -81,12 +77,9 @@ export function Onboarding({ machine, preparation, discovered, unrunnable, recom
 }) {
   const measuring = preparation !== null
   const body = useRef<HTMLDivElement>(null)
-  const [selection, setSelection] = useState<string | null | undefined>(undefined)
-  const [quantChoice, setQuantChoice] = useState<string | null>(null)
+  const selection = useRecommendedSelection(recommendations)
   const [showUnrunnable, setShowUnrunnable] = useState(false)
-  const selected = selection === undefined ? recommendations[0]?.model.key ?? null : selection
-  const picked = recommendations.find(entry => entry.model.key === selected)?.model
-  const pickedQuant = picked ? picked.quants.find(quant => quant.key === quantChoice) ?? picked.quants.find(quant => quant.key === picked.recommended) : undefined
+  const { picked, pickedQuant } = selection
   return <Dialog open onOpenChange={open => { if (!open) onFinish() }} disablePointerDismissal>
     <DialogContent showCloseButton={false} initialFocus={body} className="flex h-[88vh] flex-col gap-0 overflow-hidden p-0 sm:max-w-4xl">
     <div className="flex items-center justify-between gap-4 border-b border-slate-200 px-6 py-4 dark:border-slate-750">
@@ -120,14 +113,8 @@ export function Onboarding({ machine, preparation, discovered, unrunnable, recom
         </div>}
       </div>}
 
-      <Section title="Recommended for your machine" className={roomNote && !preparation && discovered.length === 0 ? "mt-5" : "mt-8"} aside={<label className="flex cursor-pointer items-center gap-2 text-xs text-slate-600 dark:text-slate-400"><input type="checkbox" checked={usOnly} onChange={event => { setUsOnly(event.target.checked); setSelection(undefined); setQuantChoice(null) }} className="accent-blue-600" />Only models from US developers</label>}>
-        {measuring ? <OfferedModelsSkeleton firstOpened /> : <div className="space-y-2">
-            {recommendations.map(({ model, note }) => <ExpandingModel key={model.key} model={model} note={note} expanded={selected === model.key} owned={owned}
-              onToggle={() => { setSelection(selected === model.key ? null : model.key); setQuantChoice(null) }}
-              quantChoice={selected === model.key ? quantChoice : null} onQuantChoice={setQuantChoice} />)}
-            {recommendations.length === 0 && <p className="text-[13px] text-slate-500">No model runs well on this computer yet.</p>}
-          </div>}
-      </Section>
+      <RecommendedForYourMachine recommendations={recommendations} placeholder={measuring ? <OfferedModelsSkeleton firstOpened /> : null}
+        usOnly={usOnly} setUsOnly={setUsOnly} owned={owned} selection={selection} className={roomNote && !preparation && discovered.length === 0 ? "mt-5" : "mt-8"} />
 
     </div>
     <div className="flex items-center justify-end gap-2 border-t border-slate-200 px-6 py-4 dark:border-slate-750">

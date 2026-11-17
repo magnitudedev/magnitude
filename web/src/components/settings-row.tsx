@@ -1,8 +1,8 @@
 import type { ReactNode } from "react"
 
-export function SettingsGroup({ label, children }: { label: string; children: ReactNode }) {
-  return <section aria-label={label} className="mt-7">
-    <h2 className="mb-2 px-1 text-xs font-medium uppercase tracking-wide text-slate-500">{label}</h2>
+export function SettingsGroup({ label, children }: { label?: string; children: ReactNode }) {
+  return <section aria-label={label} className={label === undefined ? "mt-4 first:mt-0" : "mt-7"}>
+    {label !== undefined && <h2 className="mb-2 px-1 text-xs font-medium uppercase tracking-wide text-slate-500">{label}</h2>}
     <div className="divide-y divide-slate-200 rounded-lg border border-slate-300 bg-white dark:divide-slate-800 dark:border-slate-750 dark:bg-slate-850">{children}</div>
   </section>
 }

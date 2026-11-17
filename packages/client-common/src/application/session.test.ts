@@ -183,6 +183,25 @@ describe("host actions", () => {
     expect(registry.get(session.mainPage)).toBe("chat")
   })))
 
+  it("starts Models over when Models is chosen while it is shown, but not when Settings closes over it", () => withSession([], (session, registry) => Effect.gen(function* () {
+    yield* session.navigate("models")
+    const opened = registry.get(session.visit)
+    yield* session.navigate("settings")
+    yield* session.navigate("models")
+    expect(registry.get(session.visit)).toBe(opened)
+    yield* session.navigate("models")
+    expect(registry.get(session.visit)).toBe(opened + 1)
+  })))
+
+  it("drops a request to add a model when Models is chosen again, as Explore's back arrow does", () => withSession([], (session, registry) => Effect.gen(function* () {
+    yield* session.requestAddModel({ _tag: "Search", query: "Qwen3.6 27B" })
+    yield* session.navigate("settings")
+    yield* session.navigate("models")
+    expect(registry.get(session.addModelRequest)).toEqual(Option.some({ _tag: "Search", query: "Qwen3.6 27B" }))
+    yield* session.navigate("models")
+    expect(registry.get(session.addModelRequest)).toEqual(Option.none())
+  })))
+
   it("opens a Hugging Face link on Models with the add request set", () => withSession([{ _tag: "OpenHuggingFaceModel", repository, file: Option.some(file) }], (session, registry) => Effect.sync(() => {
     expect(registry.get(session.page)).toBe("models")
     expect(registry.get(session.addModelRequest)).toEqual(Option.some({ _tag: "HuggingFace", repository, file: Option.some(file) }))

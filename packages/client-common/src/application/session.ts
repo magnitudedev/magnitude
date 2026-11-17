@@ -13,7 +13,7 @@ import { landingPage } from "./landing"
 import type { AddModelRequest, ApplicationPage, HostNotice, QuitFailureDecision } from "./contracts"
 import { ModelTrayPresentation, ModelTrayStatus } from "./contracts"
 
-export { AddModelRequest, ApplicationPage, MainPage, HostAction, HostNotice, QuitFailureDecision, ModelTrayPresentation, ModelTrayStatus } from "./contracts"
+export { AddModelRequest, ApplicationPage, type MainPage, HostAction, HostNotice, QuitFailureDecision, ModelTrayPresentation, ModelTrayStatus } from "./contracts"
 
 export const activeLocalModel = (models: LocalModelsState) => {
   for (const model of models.models) {
@@ -98,10 +98,13 @@ const makeApplicationSession = Effect.gen(function* () {
   const notices = Atom.keepAlive(Atom.make<ReadonlyArray<HostNotice>>([]))
   const dismissNotice = (notice: HostNotice) => Effect.sync(() => registry.set(notices, registry.get(notices).filter(entry => entry !== notice)))
   const quitFailed = Atom.keepAlive(Atom.make(false))
-  const addModelRequest = Atom.keepAlive(Atom.make(Option.none<AddModelRequest>()))
+  // A request to add a model belongs to the visit to Models it opened, so opening Models again drops it.
+  const addModelRequested = Atom.keepAlive(Atom.make(Option.none<{ readonly visit: number; readonly request: AddModelRequest }>()))
+  const addModelRequest = Atom.keepAlive(Atom.make(get => Option.flatMap(get(addModelRequested),
+    entry => entry.visit === get(router.visit) ? Option.some(entry.request) : Option.none())))
   const requestAddModel = (request: AddModelRequest) => navigate("models").pipe(
-    Effect.zipRight(Effect.sync(() => registry.set(addModelRequest, Option.some(request)))))
-  const clearAddModelRequest = Effect.sync(() => registry.set(addModelRequest, Option.none()))
+    Effect.zipRight(Effect.sync(() => registry.set(addModelRequested, Option.some({ visit: registry.get(router.visit), request })))))
+  const clearAddModelRequest = Effect.sync(() => registry.set(addModelRequested, Option.none()))
 
   if (Option.isSome(host.shell)) {
     const shell = host.shell.value
@@ -136,6 +139,7 @@ const makeApplicationSession = Effect.gen(function* () {
   return {
     page: router.page,
     mainPage: router.mainPage,
+    visit: router.visit,
     onboardingPending: onboardingPending as Atom.Atom<Option.Option<boolean>>,
     navigate,
     completeOnboarding,

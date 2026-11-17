@@ -146,7 +146,7 @@ export function UpdatePill({ update, busy, onDownload, onRestart, onOpenSettings
 export function SidebarUpdatePill({ navigate, onNavigate }: { navigate?: (page: ApplicationPage) => void; onNavigate?: () => void }) {
   const { update, busy, download, restart } = useSidebarUpdate()
   if (update._tag === "None") return null
-  return <div className="mb-2">
+  return <div className="min-w-0 flex-1">
     <UpdatePill update={update} busy={busy} onDownload={download} onRestart={restart}
       onOpenSettings={() => { navigate?.("settings"); onNavigate?.() }} />
   </div>

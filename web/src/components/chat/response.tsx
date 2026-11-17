@@ -1,5 +1,5 @@
 import { memo, useMemo, useState } from "react"
-import { Option } from "effect"
+import { DateTime, Option } from "effect"
 import {
   type ChatAssistantMessage,
   responseExceedsContext,
@@ -11,12 +11,10 @@ import {
   CaretDownIcon,
   PlusIcon,
   CaretRightIcon,
-  CopyIcon,
-  CheckIcon,
 } from "@phosphor-icons/react"
 import Markdown, { type Components } from "react-markdown"
 import remarkGfm from "remark-gfm"
-import { IconButton, number, seconds } from "./shared"
+import { CopyText, IconButton, SentAt, ThinkingFor, number, seconds } from "./shared"
 import { ChatCodeBlock } from "./code-block"
 import { rehypeLongTokens } from "./long-tokens"
 /** A response's parts of one kind, joined in order. */
@@ -35,11 +33,13 @@ export function ChatResponse({
   notify: (text: string) => void
 }) {
   const [details, setDetails] = useState(false)
-  const [copied, setCopied] = useState(false)
   const m = responseMetrics(g)
   const content = partsText(g, "text")
   const reasoning = partsText(g, "reasoning")
   const running = Option.isNone(g.end)
+  const thinkingSince = running && g.content.at(-1)?._tag === "reasoning"
+    ? g.content.find((part) => part._tag === "reasoning")?.time.started
+    : undefined
   const { label, problem: failure } = responseStatusText(g)
   const metrics = [
     Option.map(m.tokensPerSecond, (n) => `${number(n)} tok/s`),
@@ -57,11 +57,13 @@ export function ChatResponse({
     ["Total", Option.map(m.totalMs, seconds)],
   ]
   return (
-    <article aria-label="Assistant response">
+    <article aria-label="Assistant response" className="chat-hover-group">
       {reasoning && (
         <details className="mb-3">
           <summary className="cursor-pointer py-1 text-xs text-slate-500 dark:text-slate-400">
-            {running && !content
+            {thinkingSince !== undefined
+              ? <ThinkingFor started={DateTime.toEpochMillis(thinkingSince)} />
+              : running && !content
               ? "Thinking"
               : Option.match(m.thoughtForMs, {
                   onNone: () => "Thought process",
@@ -107,19 +109,11 @@ export function ChatResponse({
               ))}
               {details ? <CaretDownIcon /> : <CaretRightIcon />}
             </button>
-            <div className="flex items-center">
-              <IconButton
-                label={copied ? "Copied" : "Copy response"}
-                disabled={!content}
-                onClick={() => {
-                  void navigator.clipboard.writeText(content).then(
-                    () => setCopied(true),
-                    () => notify("Copy is unavailable in this browser.")
-                  )
-                }}
-              >
-                {copied ? <CheckIcon /> : <CopyIcon />}
-              </IconButton>
+            <div className="flex items-center gap-1">
+              <span className="chat-message-actions">
+                {Option.match(g.end, { onNone: () => null, onSome: (end) => <SentAt time={DateTime.toEpochMillis(end.time)} /> })}
+                {content && <CopyText text={content} label="Copy response" notify={notify} />}
+              </span>
               {retry && responseExceedsContext(g) && newChat ? (
                 <IconButton label="New chat" onClick={newChat}>
                   <PlusIcon />

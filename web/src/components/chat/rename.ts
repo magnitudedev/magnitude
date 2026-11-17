@@ -1,6 +1,9 @@
 import { Option } from "effect"
 import type { ChatRenamePayload, SessionId } from "@magnitudedev/sdk"
 
+/** The longest title a rename accepts. */
+export const CHAT_TITLE_MAX_LENGTH = 200
+
 /**
  * A chat's title being edited, with the title it had when editing began: a rename is a
  * compare-and-set from that title, so a rename made meanwhile fails rather than being overwritten.

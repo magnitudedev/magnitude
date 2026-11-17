@@ -3,11 +3,10 @@ import { CircleNotchIcon, InfoIcon, MagnifyingGlassIcon, XIcon } from "@phosphor
 import { cn } from "@/lib/utils"
 import { Button } from "../ui/button"
 import { Input } from "../ui/input"
-import { Dialog, DialogContent, DialogTitle } from "../ui/dialog"
-import { LabLogo, type ModelLab } from "../model-logo"
+import { HuggingFaceLogo, LabLogo, type ModelLab } from "../model-logo"
 import { Badge, LabMark, cardClass } from "./parts"
 import { SkeletonLine } from "../page-skeletons"
-import { MeasuringRecommendations, OfferedModelsSkeleton } from "./skeletons"
+import { OfferedModelsSkeleton } from "./skeletons"
 import { ExpandingModel, type OfferedModel } from "./expanding-model"
 import type { QuantView } from "./view"
 
@@ -21,7 +20,7 @@ export interface RunnableFamily {
 export const runnableSummary = (families: readonly RunnableFamily[]) =>
   `Magnitude runs models built on ${families.filter(family => !family.comingSoon).map(family => family.models).join(", ")}, including their fine-tunes.`
 
-/** The one place that says which models Magnitude runs: by lab and generation, fine-tunes included. */
+/** The one place that says which models Magnitude runs, beside the Explore models title: by lab and generation, fine-tunes included. */
 export function WhatRuns({ families }: { families: readonly RunnableFamily[] }) {
   const [open, setOpen] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
@@ -56,7 +55,7 @@ export type ExploreRow =
   | { readonly _tag: "Offered"; readonly model: OfferedModel; readonly prefetched: boolean }
 
 export type ExploreResults =
-  | { readonly _tag: "Recommended"; readonly models: readonly OfferedModel[]; readonly machine: string; readonly measuring: { readonly settled: number; readonly total: number } | null }
+  | { readonly _tag: "Idle" }
   | { readonly _tag: "Searching" }
   | { readonly _tag: "Results"; readonly rows: readonly ExploreRow[]; readonly more: "Loading" | (() => void) | null }
   | { readonly _tag: "Failed"; readonly message: string }
@@ -135,9 +134,17 @@ function CheckingCard({ name, lab }: { name: string; lab: ModelLab | undefined }
   </div>
 }
 
-/** Exploring Hugging Face in a modal: search and the best models for this machine, each opening in place to its quants. */
-export function ExploreModal({ open, setOpen, query, setQuery, results, families, owned, download, drafters, useOpened, onSeen }: {
-  open: boolean; setOpen: (open: boolean) => void; query: string; setQuery: (value: string) => void
+/** Before a search: what the results will be and where they come from. */
+export function ExploreIdle() {
+  return <div className={cn(cardClass, "flex flex-col items-center gap-3 px-6 py-12 text-center")}>
+    <HuggingFaceLogo className="size-8" />
+    <p className="text-[13px] text-slate-500">Results from Hugging Face show here</p>
+  </div>
+}
+
+/** Explore models, a view of the Models page: a search of Hugging Face, each result opening in place to its quants. */
+export function ExploreView({ query, setQuery, results, families, owned, download, drafters, useOpened, onSeen }: {
+  query: string; setQuery: (value: string) => void
   results: ExploreResults; families: readonly RunnableFamily[]; owned: ReadonlySet<string>; download: (model: OfferedModel, quant: QuantView) => ReactNode
   drafters?: (model: OfferedModel, quant: QuantView) => ReactNode
   useOpened: (model: OfferedModel, open: boolean) => OfferedModel
@@ -145,35 +152,18 @@ export function ExploreModal({ open, setOpen, query, setQuery, results, families
 }) {
   const [chosen, setExpanded] = useState<string | null | undefined>(undefined)
   const [quantChoices, setQuantChoices] = useState<Readonly<Record<string, string>>>({})
-  const offered = results._tag === "Results" ? results.rows.flatMap(row => row._tag === "Offered" ? [row.model] : []) : []
-  const checking = results._tag === "Results" && results.rows.some(row => row._tag === "Checking")
-  const expanded = chosen === undefined ? (results._tag === "Recommended" && results.measuring === null ? results.models[0]?.key ?? null : null) : chosen
+  const expanded = chosen ?? null
   const card = (model: OfferedModel, note?: string, prefetched = false) => <OfferedCard key={model.key} model={model} note={note} expanded={expanded === model.key} owned={owned}
     prefetched={prefetched} onToggle={() => setExpanded(expanded === model.key ? null : model.key)} quantChoice={quantChoices[model.key] ?? null}
     onQuantChoice={key => setQuantChoices(choices => ({ ...choices, [model.key]: key }))} download={download} drafters={drafters} useOpened={useOpened} />
-  return <Dialog open={open} onOpenChange={value => { setOpen(value); if (!value) setExpanded(undefined) }}>
-    <DialogContent className="flex h-[85vh] flex-col gap-0 overflow-hidden p-0 sm:max-w-4xl">
-      <DialogTitle className="sr-only">Explore models</DialogTitle>
-      <div className="border-b border-slate-200 p-5 dark:border-slate-750">
-        <div className="mb-4 flex items-center justify-between gap-4 pr-8"><h2 className="font-heading text-lg font-semibold">Explore models</h2><WhatRuns families={families} /></div>
-        <div className="relative">
-          <MagnifyingGlassIcon className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-slate-400" />
-          <Input autoFocus value={query} onChange={event => { setQuery(event.target.value); setExpanded(undefined) }} placeholder="Search Hugging Face, or paste a link" className="h-10 pl-9 text-sm" />
-          {query && <button type="button" aria-label="Clear search" onClick={() => setQuery("")} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-700"><XIcon className="size-4" /></button>}
-        </div>
-      </div>
-      <div className="min-h-0 flex-1 overflow-y-auto bg-slate-50 p-5 dark:bg-slate-900/40">
-        {results._tag === "Recommended" && <>
-          <p className="mb-3 flex items-baseline justify-between text-xs font-medium text-slate-500"><span>Best for your machine</span><span className="font-normal">{results.machine}</span></p>
-          {results.measuring ? <MeasuringRecommendations {...results.measuring} /> : <div className="space-y-2">{results.models.map((model, index) => card(model, index === 0 ? "Smartest that runs well here" : undefined))}</div>}
-        </>}
+  const body = <>
+        {results._tag === "Idle" && <ExploreIdle />}
         {results._tag === "Searching" && <>
           <SearchStatus>Searching Hugging Face…</SearchStatus>
           <OfferedModelsSkeleton />
         </>}
         {results._tag === "Failed" && <p className="text-[13px] text-red-600 dark:text-red-400">{results.message}</p>}
         {results._tag === "Results" && <>
-          <p className="mb-3 text-xs font-medium text-slate-500">On Hugging Face, running in Magnitude{checking ? "" : ` (${offered.length})`}</p>
           {results.rows.length > 0
             ? <div className="space-y-2">{results.rows.map(row => {
               const key = row._tag === "Offered" ? row.model.key : row.key
@@ -189,8 +179,14 @@ export function ExploreModal({ open, setOpen, query, setQuery, results, families
           {results.more === "Loading" ? <div className="mt-2"><SearchStatus className="mt-4">Loading more results…</SearchStatus><OfferedModelsSkeleton count={2} /></div>
             : results.more && <NextPage onReach={results.more} />}
         </>}
-      </div>
-    </DialogContent>
-  </Dialog>
+  </>
+  return <div>
+    <div className="relative mb-5">
+      <MagnifyingGlassIcon className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-slate-400" />
+      <Input autoFocus value={query} onChange={event => { setQuery(event.target.value); setExpanded(undefined) }} placeholder="Search Hugging Face, or paste a link" className="h-10 bg-white pl-9 text-sm dark:bg-slate-850" />
+      {query && <button type="button" aria-label="Clear search" onClick={() => setQuery("")} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"><XIcon className="size-4" /></button>}
+    </div>
+    {body}
+  </div>
 }
 

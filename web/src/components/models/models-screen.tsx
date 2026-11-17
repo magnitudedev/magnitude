@@ -1,15 +1,13 @@
 import { useState, type ReactNode } from "react"
-import { Result, useAtomValue } from "@effect-atom/atom-react"
-import { CircleNotchIcon, MagnifyingGlassIcon, PlayIcon, StopIcon } from "@phosphor-icons/react"
+import { Result } from "@effect-atom/atom-react"
+import { CircleNotchIcon, PlayIcon, StopIcon } from "@phosphor-icons/react"
 import type { CustomFormModelId, LocalModel } from "@magnitudedev/sdk"
-import { deriveHardwareRoles, modelDownloadFailureMessage, useAgentClient, useLocalInferenceHardware, useLocalModelMutations, useLocalModels } from "@magnitudedev/client-common"
+import { deriveHardwareRoles, modelDownloadFailureMessage, useLocalInferenceHardware, useLocalModelMutations, useLocalModels } from "@magnitudedev/client-common"
 import { Button } from "../ui/button"
 import { ErrorNotice } from "../error-notice"
 import { ModelsSkeleton } from "./skeletons"
-import { pageLayout } from "../page-layout"
 import { cn } from "@/lib/utils"
-import { fitLabel, MachineCard } from "./parts"
-import { machineView } from "./machine"
+import { fitLabel } from "./parts"
 import { ownedModel, unrunnableFile } from "./data"
 import { YourModels, type OwnedModel } from "./your-models"
 import { DrafterDialog } from "./drafter-picker"
@@ -31,16 +29,14 @@ const quantSearch = (view: OwnedModel) => {
   return repository && repository.length > 0 ? repository : view.name
 }
 
-/** Models: the machine, then the user's models, with Explore models for finding more. */
-export function ModelsScreen({ onExplore }: { onExplore: (query: string) => void }) {
-  const client = useAgentClient()
+/** Models: the user's models, or `empty` until there are any. */
+export function ModelsScreen({ onExplore, empty }: { onExplore: (query: string) => void; empty: ReactNode }) {
   const models = useLocalModels()
   const hardware = useLocalInferenceHardware()
-  const machine = useAtomValue(client.Configuration.GetServerMachine({})).result
   const mutations = useLocalModelMutations()
   const [removed, setRemoved] = useState<ReadonlySet<string>>(new Set())
   const [picking, setPicking] = useState<OwnedModel | null>(null)
-  if (Result.isFailure(models)) return <><h1 className={pageLayout.pageTitle}>Models</h1><ErrorNotice title="Couldn’t load your models" description="Model information is unavailable. Check the service in Settings." className="mt-5" /></>
+  if (Result.isFailure(models)) return <ErrorNotice title="Couldn’t load your models" description="Model information is unavailable. Check the service in Settings." />
   if (!Result.isSuccess(models) || !Result.isSuccess(hardware)) return <ModelsSkeleton />
   const memory = deriveHardwareRoles(hardware.value).servingMemory
   const onComputer = models.value.models.filter(model => !removed.has(model.modelId) && (model._tag === "Custom" || model.acquisitionState._tag !== "NotInstalled"))
@@ -98,10 +94,8 @@ export function ModelsScreen({ onExplore }: { onExplore: (query: string) => void
   }
   const choosing = picking === null ? undefined : byId.get(picking.modelId)
   return <div>
-    <div className="mb-5 flex items-end justify-between gap-4"><h1 className={pageLayout.pageTitle}>Models</h1><Button onClick={() => onExplore("")}><MagnifyingGlassIcon />Explore models</Button></div>
-    <MachineCard machine={machineView(hardware.value, Result.isSuccess(machine) ? machine.value.identity : null)} />
     {owned.length === 0 && hidden.length === 0 && models.value.unsupported.length === 0
-      ? <div className={cn("mt-8 rounded-xl border border-slate-200 bg-white px-5 py-6 text-[13px] text-slate-500 dark:border-slate-750 dark:bg-slate-850")}>No models yet. <button type="button" onClick={() => onExplore("")} className="text-blue-700 hover:underline dark:text-blue-400">Explore models</button> to download one.</div>
+      ? empty
       : <YourModels models={owned} hidden={hidden} unrunnable={models.value.unsupported.map(unrunnableFile)} action={action}
         onExploreQuants={view => onExplore(quantSearch(view))} onRemove={remove} onUnhide={unhide} onDrafter={setPicking} />}
     {picking && choosing?._tag === "Custom" && <DrafterDialog model={choosing} bits={picking.quant.bits} onClose={() => setPicking(null)}

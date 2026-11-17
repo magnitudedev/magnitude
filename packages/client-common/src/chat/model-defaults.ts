@@ -12,9 +12,6 @@ import { reasoningEffortFor } from "./models"
 /** A setting a model's defaults hold: every requested setting and the reasoning level. */
 export type ChatDefaultsKey = keyof RequestedResponseSettings | "reasoningEffort"
 
-/** Where a chat's settings stand against the model's starting point. */
-export type ChatDefaultsStatus = "standard" | "changedFromStandard" | "yours" | "changedFromYours"
-
 const settingKeys = Object.keys(defaultResponseSettings) as ReadonlyArray<keyof RequestedResponseSettings>
 
 /** The settings a new chat with this model starts from: its saved defaults, else the standard settings. */
@@ -54,16 +51,3 @@ export const changedChatDefaults = (
   }
   return changed
 }
-
-export const chatDefaultsStatus = (
-  model: InferenceModel,
-  saved: SavedChatModelDefaults,
-  changed: ReadonlySet<ChatDefaultsKey>
-): ChatDefaultsStatus =>
-  ServingModelId.make(model.id) in saved
-    ? changed.size
-      ? "changedFromYours"
-      : "yours"
-    : changed.size
-      ? "changedFromStandard"
-      : "standard"

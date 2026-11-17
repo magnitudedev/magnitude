@@ -6,9 +6,9 @@ import { useSession } from "../../session"
 import { useServiceObservation } from "../../service-view"
 import { discoveredModel, onThisComputer, unrunnableFile } from "./data"
 import { machineView } from "./machine"
-import { Onboarding, preparationLabels, type PreparationStep, type Recommendation } from "./onboarding"
+import { Onboarding, preparationLabels, type PreparationStep } from "./onboarding"
 import { recordOnboardingCompleted } from "./onboarding-record"
-import { useRecommendations } from "./recommendations"
+import { recommendedForYourMachine, useRecommendations } from "./recommendations"
 
 /** First run on the service's data: the machine, models already found, and the top recommendations that run well here. */
 export function OnboardingScreen() {
@@ -41,15 +41,7 @@ export function OnboardingScreen() {
   const steps: readonly PreparationStep[] | null = active === -1 ? null
     : progress.map((step, index) => ({ label: step.label, detail: step.detail, fraction: step.fraction, state: step.done ? "done" : index === active ? "active" : "pending" }))
   const measuring = steps !== null
-  const eligible = recommendations.offered.filter(entry => entry.recommendation.meetsOnboardingFloor).slice(0, 3)
-  const fastest = eligible.reduce<typeof eligible[number] | undefined>((best, entry) => {
-    const speed = (value: typeof entry) => value.model.quants.find(quant => quant.key === value.model.recommended)?.speed ?? 0
-    return best && speed(best) >= speed(entry) ? best : entry
-  }, undefined)
-  const offered: readonly Recommendation[] = eligible.map((entry, index) => {
-    const have = entry.model.quants.find(quant => owned.has(quant.key))
-    return { model: entry.model, note: have ? `You have the ${have.bits}-bit quant` : index === 0 ? "Smartest that runs well here" : entry === fastest ? "Fastest" : undefined }
-  })
+  const offered = recommendedForYourMachine(recommendations.offered, owned)
   return <Onboarding
     machine={Result.isSuccess(hardware) ? machineView(hardware.value, Result.isSuccess(machine) ? machine.value.identity : null) : null}
     preparation={steps}

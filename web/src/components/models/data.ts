@@ -4,7 +4,7 @@ import { fitPlacementPhrase, formatStorageSize, ladderBitWidths, localModelSizeB
 import { labForDeveloper } from "../model-logo"
 import type { DiscoveredModel } from "./onboarding"
 import type { OfferedModel } from "./expanding-model"
-import type { RunnableFamily } from "./explore-modal"
+import type { RunnableFamily } from "./explore-view"
 import type { OwnedModel, UnrunnableFile } from "./your-models"
 import type { PlacementPhrase, PlacementTier, QuantView } from "./view"
 

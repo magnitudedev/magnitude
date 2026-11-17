@@ -6,6 +6,11 @@ export interface ApplicationRouter {
   readonly page: Atom.Atom<ApplicationPage>
   /** Chat or Models, whichever the main area shows; it stays behind Settings while Settings is open over it. */
   readonly mainPage: Atom.Atom<MainPage>
+  /**
+   * Counts the times a main page was opened from the main area, not returned to by closing Settings over it. A page
+   * keyed on it opens at its root, so choosing the page already shown starts it over, as its back arrow would.
+   */
+  readonly visit: Atom.Atom<number>
   readonly navigate: (page: ApplicationPage) => Effect.Effect<void>
   /** Opens the page the app starts on, unless something has navigated already or the window opened on a deep link. */
   readonly land: (page: ApplicationPage) => Effect.Effect<void>
@@ -27,21 +32,26 @@ export const pageFromPath = (path: string): Option.Option<ApplicationPage> => {
 const makePages = (registry: Registry.Registry, initial: ApplicationPage) => {
   const page = Atom.keepAlive(Atom.make<ApplicationPage>(initial))
   const mainPage = Atom.keepAlive(Atom.make<MainPage>(isMainPage(initial) ? initial : DEFAULT_PAGE))
+  const visit = Atom.keepAlive(Atom.make(0))
   const show = (value: ApplicationPage) => {
+    const from = registry.get(page)
     registry.set(page, value)
-    if (isMainPage(value)) registry.set(mainPage, value)
+    if (!isMainPage(value)) return
+    registry.set(mainPage, value)
+    if (isMainPage(from)) registry.set(visit, registry.get(visit) + 1)
   }
-  return { page, mainPage, show }
+  return { page, mainPage, visit, show }
 }
 
 /** In-memory navigation for a native window, where the page is not part of a URL. */
 export const ApplicationRouterMemory = Layer.effect(ApplicationRouter, Effect.gen(function* () {
   const registry = yield* Registry.AtomRegistry
-  const { page, mainPage, show } = makePages(registry, DEFAULT_PAGE)
+  const { page, mainPage, visit, show } = makePages(registry, DEFAULT_PAGE)
   const landable = yield* Ref.make(true)
   return {
     page,
     mainPage,
+    visit,
     navigate: value => Ref.set(landable, false).pipe(Effect.zipRight(Effect.sync(() => show(value)))),
     land: value => Effect.whenEffect(Effect.sync(() => show(value)), Ref.getAndSet(landable, false)).pipe(Effect.asVoid),
   }
@@ -58,7 +68,7 @@ export const ApplicationRouterLocation = Layer.scoped(ApplicationRouter, Effect.
     return DEFAULT_PAGE
   })
   const landable = yield* Ref.make(window.location.pathname === "/")
-  const { page, mainPage, show } = makePages(registry, current())
+  const { page, mainPage, visit, show } = makePages(registry, current())
   const onPopState = () => {
     Effect.runSync(Ref.set(landable, false))
     show(current())
@@ -70,6 +80,7 @@ export const ApplicationRouterLocation = Layer.scoped(ApplicationRouter, Effect.
   return {
     page,
     mainPage,
+    visit,
     navigate: value => Ref.set(landable, false).pipe(Effect.zipRight(Effect.sync(() => {
       if (window.location.pathname !== pagePath(value)) window.history.pushState(null, "", pagePath(value))
       show(value)

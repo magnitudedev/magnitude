@@ -7,11 +7,12 @@ import {
   useAtomSet,
   useAtomValue,
 } from "@effect-atom/atom-react"
-import { Cause, Effect, Option, Schema } from "effect"
+import { Cause, DateTime, Effect, Option, Schema } from "effect"
 import {
   type ChatAssistantMessage,
   chatMessages,
   generateSessionId,
+  type InferenceModel,
   liveResponse,
   type MessageId,
   RequestedResponseSettings,
@@ -26,58 +27,30 @@ import {
   chatRequestSettings,
   chatRetry,
   chatSend,
-  changedChatDefaults,
-  chatDefaultsStatus,
-  chatModelDefaults,
   chatStartingSettings,
   completeChatSubmission,
-  formatLocalModelDisplayName,
+  localModelResidency,
   reasoningEffortFor,
   selectedChat,
-  type ChatDefaultsKey,
   type ChatRequestSettings,
-  localModelProviderModelId,
-  localModelContextLimit,
-  localModelServingProfile,
-  localModelResidency,
-  useLocalModels,
   useAgentClient,
 } from "@magnitudedev/client-common"
 import {
   ArrowUpIcon,
-  ClockCounterClockwiseIcon,
-  PlusIcon,
-  SlidersHorizontalIcon,
-  XIcon,
   SquareIcon,
   CircleNotchIcon,
 } from "@phosphor-icons/react"
 import { Button } from "./ui/button"
-import {
-  Select,
-  SelectTrigger,
-  SelectValue,
-  SelectContent,
-  SelectItem,
-} from "./ui/select"
 import { MagnitudeMark } from "./magnitude-mark"
-import { NamedLogo, labForName } from "./model-logo"
 import { ErrorNotice } from "./error-notice"
-import { useNarrowViewport } from "../lib/viewport"
-import { Dialog, DialogContent, DialogTitle } from "./ui/dialog"
-import { ActionTooltip } from "./ui/tooltip"
-import {
-  IconButton,
-  errorText,
-  none,
-  number,
-  value,
-} from "./chat/shared"
+import { CopyText, SentAt, errorText, none, number } from "./chat/shared"
+import { ComposerAlert, composerError } from "./chat/composer-alert"
 import { ChatResponse } from "./chat/response"
 import { ChatRequestStatus } from "./chat/activity"
-import { ChatSettingsPanel, type ChatDefaultsState } from "./chat/settings"
-import { ChatHistoryPanel } from "./chat/history"
-import { ChatThinkingSelect } from "./chat/thinking"
+import { ChatTitle } from "./chat/chat-title"
+import { ModelPicker, type PickerModel } from "./chat/model-picker"
+import { useChatModels } from "./chat/served-models"
+import { useNavigate } from "../session"
 
 export function ChatPage() {
   const id = useAtomValue(selectedChat)
@@ -93,21 +66,17 @@ function ChatView({
 }) {
   const client = useAgentClient()
   const registry = useContext(RegistryContext)
+  const navigate = useNavigate()
   const clearStart = useAtomSet(client.Chat.StartChat)
   const clearSend = useAtomSet(client.Chat.SendChatMessage)
   const clearRetry = useAtomSet(client.Chat.RetryChatResponse)
   const clearStop = useAtomSet(client.Chat.StopChatResponse)
-  const clearSaveDefaults = useAtomSet(client.Chat.SaveChatModelDefaults)
-  const clearClearDefaults = useAtomSet(client.Chat.ClearChatModelDefaults)
   const clearError = () => {
     clearStart(Atom.Reset)
     clearSend(Atom.Reset)
     clearRetry(Atom.Reset)
     clearStop(Atom.Reset)
-    clearSaveDefaults(Atom.Reset)
-    clearClearDefaults(Atom.Reset)
   }
-  const [panel, setPanel] = useState<"settings" | "history" | null>(null)
   const draftAtom = chatDraft(id)
   const draft = useAtomValue(draftAtom)
   const setDraft = useAtomSet(draftAtom)
@@ -129,92 +98,36 @@ function ChatView({
         (error) => error._tag === "ChatNotFound"
       ))
   const messages = chat ? chatMessages(chat) : []
-  const modelResult = useAtomValue(client.Models.ListServableModels({})).result
-  const models = Result.isSuccess(modelResult)
-    ? modelResult.value.data.filter(
-        (m) =>
-          m.architecture.input_modalities.includes("text") &&
-          m.architecture.output_modalities.includes("text")
-      )
-    : []
+  const { result: modelResult, models, localFor, nameOf, contextFor, contextLimitFor } = useChatModels()
   const savedResult = useAtomValue(client.Chat.ListChatModelDefaults({})).result
   const saved = Result.isSuccess(savedResult) ? savedResult.value : {}
   const transcript = chatRequestSettings(chat?.messages ?? [])
   const modelId =
-    value(draft.settings.model ?? transcript.model) ?? models[0]?.id
+    Option.getOrUndefined(draft.settings.model ?? transcript.model) ?? models[0]?.id
   const model = models.find((m) => m.id === modelId)
-  // A chat with no response yet starts from its model's defaults; one with responses continues from its latest.
+  // Each model's settings live in Settings → Chat; a chat chooses its model and thinking level, keeping the level
+  // its latest response used until it chooses another.
+  const continued = Option.isSome(transcript.model) && transcript.model.value === modelId
   const settings: ChatRequestSettings = {
-    ...(Option.isNone(transcript.model) && model
-      ? chatStartingSettings(model, saved)
-      : transcript),
+    ...(model ? chatStartingSettings(model, saved) : transcript),
+    ...(continued ? { reasoningEffort: transcript.reasoningEffort } : {}),
     ...draft.settings,
   }
-  const changed: ReadonlySet<ChatDefaultsKey> = model
-    ? changedChatDefaults(settings, model, saved)
-    : new Set()
-  const local = useLocalModels()
-  const localFor = (id: string) =>
-    Result.isSuccess(local)
-      ? local.value.models.find((m) =>
-          Option.contains(localModelProviderModelId(m), id)
-        )
-      : undefined
-  const contextFor = (m: (typeof models)[number]) => {
-    const local = localFor(m.id)
-    return local
-      ? Option.getOrElse(
-          Option.map(localModelServingProfile(local), (p) => p.contextLength),
-          () => m.context_length
-        )
-      : m.context_length
-  }
-  /** The model's own context when this computer serves it at less, which the picker names beside it. */
-  const contextLimitFor = (m: (typeof models)[number]) => {
-    const local = localFor(m.id)
-    const limit = local
-      ? Option.getOrUndefined(localModelContextLimit(local))?.contextLength
-      : undefined
-    return limit !== undefined && limit > contextFor(m) ? limit : undefined
-  }
-  const effort = reasoningEffortFor(model, settings.reasoningEffort)
   const effectiveSettings: ChatRequestSettings = {
     ...settings,
     model: modelId ? Option.some(ServingModelId.make(modelId)) : none(),
-    reasoningEffort: effort,
+    reasoningEffort: reasoningEffortFor(model, settings.reasoningEffort),
   }
   const request = chatRequest(effectiveSettings)
   const settingsValid = Schema.is(Schema.typeSchema(RequestedResponseSettings))(
     effectiveSettings
   )
-  // Editing a setting commits the chat to the model it shows, so a model list that changes meanwhile can't move it.
+  // Choosing commits the chat to the model it shows, so a model list that changes meanwhile can't move it.
   const patch = (change: Partial<ChatRequestSettings>) =>
     setDraft({
       ...draft,
       settings: { ...draft.settings, model: effectiveSettings.model, ...change },
     })
-  const saveDefaults = useAtomSet(client.Chat.SaveChatModelDefaults)
-  const clearDefaults = useAtomSet(client.Chat.ClearChatModelDefaults)
-  const saveDefaultsState = useAtomValue(client.Chat.SaveChatModelDefaults)
-  const clearDefaultsState = useAtomValue(client.Chat.ClearChatModelDefaults)
-  const defaults: ChatDefaultsState | undefined =
-    model && Result.isSuccess(savedResult)
-      ? {
-          status: chatDefaultsStatus(model, saved, changed),
-          changed,
-          canSave: settingsValid && !saveDefaultsState.waiting,
-          save: () =>
-            saveDefaults({
-              model: ServingModelId.make(model.id),
-              defaults: chatModelDefaults(settings, model),
-            }),
-          revert: () => patch(chatStartingSettings(model, saved)),
-          reset: () => {
-            clearDefaults({ model: ServingModelId.make(model.id) })
-            patch(chatStartingSettings(model, {}))
-          },
-        }
-      : undefined
   const start = useAtomSet(client.Chat.StartChat, { mode: "promise" })
   const send = useAtomSet(client.Chat.SendChatMessage, { mode: "promise" })
   const retry = useAtomSet(client.Chat.RetryChatResponse, {
@@ -235,7 +148,7 @@ function ChatView({
   const startNewChat = () => {
     clearError()
     select(null)
-    // The new chat keeps this model and starts from its defaults.
+    // The new chat keeps this model and starts from its settings.
     setNewDraft({
       text: "",
       settings: { model: effectiveSettings.model },
@@ -331,78 +244,31 @@ function ChatView({
       /* The mutation's typed failure is rendered below; the draft stays intact. */
     }
   }
-  const error = pending
-    ? null
-    : errorText(startState) ??
-      errorText(sendState) ??
-      errorText(retryState) ??
-      errorText(stopState) ??
-      errorText(saveDefaultsState) ??
-      errorText(clearDefaultsState) ??
-      errorText(savedResult)
-  const narrow = useNarrowViewport()
-  const PanelTitle = narrow ? DialogTitle : "h2"
-  const body = (
-    <>
-      <div className="flex items-center justify-between">
-        <PanelTitle className="min-w-0 truncate font-sans text-sm font-semibold">
-          {panel === "settings" ? model?.name ?? "Chat settings" : "History"}
-        </PanelTitle>
-        <IconButton label="Close panel" onClick={() => setPanel(null)}>
-          <XIcon />
-        </IconButton>
-      </div>
-      {panel === "settings" ? (
-        <ChatSettingsPanel
-          settings={effectiveSettings}
-          patch={patch}
-          context={model ? contextFor(model) : undefined}
-          contextLimit={model ? contextLimitFor(model) : undefined}
-          defaults={defaults}
-        />
-      ) : (
-        <ChatHistoryPanel
-          selected={id}
-          open={(next) => {
-            select(next)
-            setPanel(null)
-          }}
-        />
-      )}
-    </>
-  )
+  // Settings and models often fail for the same reason, such as the service being down; one line says it once, and
+  // not again when the chat that couldn't open already says it.
+  const error = composerError(pending, [startState, sendState, retryState, stopState, savedResult, modelResult], errorText(watched))
+  const shownAlert = notice ?? error
+  const pickerNote = (m: InferenceModel) => {
+    const found = localFor(m.id)
+    const limit = contextLimitFor(m)
+    return [
+      limit === undefined ? null : `${number(contextFor(m))} of ${number(limit)} context`,
+      found && Option.exists(localModelResidency(found), (r) => r._tag === "Ready") ? "Loaded" : null,
+      m.id in saved ? "Your defaults" : null,
+    ].filter(Boolean).join(" · ") || null
+  }
+  const pickerModels: readonly PickerModel[] = models.map((m) => ({
+    model: m,
+    name: nameOf(m),
+    context: contextFor(m),
+    note: pickerNote(m),
+  }))
   return (
     <section aria-label="Chat" className="flex min-h-0 flex-1 flex-col">
-      <div className="mb-5 flex shrink-0 items-center justify-between gap-3">
-        <h1 className="font-heading text-[24px] font-semibold tracking-tight md:text-[28px]">
-          Chat
-        </h1>
-        <div className="flex items-center gap-1">
-          <Button
-            variant="ghost"
-            disabled={pending}
-            onClick={startNewChat}
-          >
-            <PlusIcon />
-            New chat
-          </Button>
-          <IconButton
-            label="History"
-            pressed={panel === "history"}
-            onClick={() => setPanel(panel === "history" ? null : "history")}
-          >
-            <ClockCounterClockwiseIcon />
-          </IconButton>
-          <IconButton
-            label="Chat settings"
-            pressed={panel === "settings"}
-            onClick={() => setPanel(panel === "settings" ? null : "settings")}
-          >
-            <SlidersHorizontalIcon />
-          </IconButton>
-        </div>
+      <div className="mb-5 flex min-h-9 shrink-0 items-center">
+        <ChatTitle chat={chat?.chat ?? null} />
       </div>
-      <div className="relative flex min-h-0 flex-1 gap-7">
+      <div className="relative flex min-h-0 flex-1">
         <div className="flex min-w-0 flex-1 flex-col">
           <div
             ref={scroller}
@@ -436,10 +302,14 @@ function ChatView({
               >
                 {messages.map((message, index) =>
                   message._tag === "user" ? (
-                    <div key={message.id} className="flex justify-end">
-                      <div className="max-w-[88%] whitespace-pre-wrap break-words rounded-2xl bg-slate-150 px-4 py-3 text-sm leading-6 dark:bg-slate-800">
+                    <div key={message.id} className="chat-hover-group ml-auto flex w-fit max-w-[88%] flex-col items-end gap-2">
+                      <div className="max-w-full whitespace-pre-wrap break-words rounded-2xl bg-slate-150 px-4 py-3 text-sm leading-6 dark:bg-slate-800">
                         {message.text}
                       </div>
+                      <span className="chat-message-actions -mt-1">
+                        {message.text.length > 0 && <CopyText text={message.text} label="Copy message" notify={setNotice} />}
+                        <SentAt time={DateTime.toEpochMillis(message.time)} />
+                      </span>
                     </div>
                   ) : (
                     <ChatResponse
@@ -465,32 +335,14 @@ function ChatView({
                 live={liveResponse(chat, active)}
               />
             )}
-            {(notice || error) && (
-              <div
-                role="alert"
-                className="mb-3 flex items-start justify-between gap-3 text-xs leading-5 text-red-600 dark:text-red-400"
-              >
-                <span>{notice ?? error}</span>
-                <button
-                  type="button"
-                  aria-label="Dismiss notice"
-                  onClick={() => {
-                    setNotice(null)
-                    clearError()
-                  }}
-                >
-                  <XIcon />
-                </button>
-              </div>
-            )}
-            {Result.isFailure(modelResult) && (
-              <p role="alert" className="mb-3 text-xs text-red-600">
-                {errorText(modelResult)}
-              </p>
-            )}
+            {shownAlert && <ComposerAlert text={shownAlert} onDismiss={() => { setNotice(null); clearError() }} />}
             {Result.isSuccess(modelResult) && !models.length && (
               <p className="mb-3 text-xs text-slate-500">
-                Install a text model from Discover to start chatting.
+                Download a model in{" "}
+                <button type="button" onClick={() => navigate("models")} className="font-medium text-slate-700 hover:underline dark:text-slate-300">
+                  Models
+                </button>{" "}
+                to start chatting.
               </p>
             )}
             {!settingsValid && (
@@ -498,7 +350,7 @@ function ChatView({
                 role="alert"
                 className="mb-3 text-xs text-red-600 dark:text-red-400"
               >
-                Check the values in Chat settings before sending.
+                Check this model’s values in Settings → Chat before sending.
               </p>
             )}
             <form
@@ -535,106 +387,16 @@ function ChatView({
                 }}
                 className="block max-h-48 min-h-14 w-full resize-none bg-transparent px-1 py-1 text-sm leading-6 outline-none dark:placeholder:text-slate-500"
               />
-              <div className="mt-3 flex items-end justify-between gap-2">
-                <div className="flex min-w-0 flex-wrap items-center gap-1">
-                  <Select
-                    value={modelId ?? ""}
-                    onValueChange={(next) => {
-                      if (next) {
-                        const m = models.find((m) => m.id === next)
-                        // Another model brings its own defaults.
-                        patch(
-                          m
-                            ? chatStartingSettings(m, saved)
-                            : { model: Option.some(ServingModelId.make(next)) }
-                        )
-                      }
-                    }}
-                  >
-                    <SelectTrigger
-                      aria-label="Model"
-                      disabled={!models.length}
-                      variant="inline"
-                      className="h-8 max-w-[230px] px-2 text-xs text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
-                    >
-                      <SelectValue>
-                        {model && (
-                          <NamedLogo
-                            name={model.name}
-                            lab={labForName(model.name)}
-                            className="size-3"
-                          />
-                        )}
-                        <span className="truncate">
-                          {(model && localFor(model.id)
-                            ? formatLocalModelDisplayName(localFor(model.id)!)
-                            : model?.name) ??
-                            (modelId ? "Model unavailable" : "Select model")}
-                        </span>
-                      </SelectValue>
-                    </SelectTrigger>
-                    <SelectContent
-                      side="top"
-                      align="start"
-                      alignItemWithTrigger={false}
-                      className="w-72"
-                    >
-                      {models.map((m) => (
-                        <SelectItem key={m.id} value={m.id}>
-                          <div className="flex flex-col gap-1 py-0.5">
-                            <span className="inline-flex items-center gap-1.5 text-[13px]">
-                              <NamedLogo
-                                name={m.name}
-                                lab={labForName(m.name)}
-                                className="size-3"
-                              />
-                              {localFor(m.id)
-                                ? formatLocalModelDisplayName(localFor(m.id)!)
-                                : m.name}
-                              {m.id in saved && (
-                                <ActionTooltip
-                                  label="New chats start with your defaults"
-                                  trigger={
-                                    <span
-                                      role="img"
-                                      aria-label="New chats start with your defaults"
-                                      className="inline-flex size-4 items-center justify-center text-blue-600 dark:text-blue-400"
-                                    >
-                                      <SlidersHorizontalIcon className="size-3" />
-                                    </span>
-                                  }
-                                />
-                              )}
-                            </span>
-                            <span className="pl-[18px] text-xs font-normal text-slate-500">
-                              {[
-                                contextLimitFor(m) === undefined
-                                  ? `${number(contextFor(m))} context`
-                                  : `${number(contextFor(m))} of ${number(contextLimitFor(m)!)} context`,
-                                localFor(m.id) &&
-                                Option.exists(
-                                  localModelResidency(localFor(m.id)!),
-                                  (r) => r._tag === "Ready"
-                                )
-                                  ? "Loaded"
-                                  : null,
-                              ]
-                                .filter(Boolean)
-                                .join(" · ")}
-                            </span>
-                          </div>
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                  <ChatThinkingSelect
-                    model={model}
-                    selected={settings.reasoningEffort}
-                    onChange={(next) =>
-                      patch({ reasoningEffort: Option.some(next) })
-                    }
-                  />
-                </div>
+              <div className="mt-3 flex items-end justify-end gap-2">
+                <ModelPicker
+                  models={pickerModels}
+                  model={model}
+                  name={model ? nameOf(model) : modelId ? "Model unavailable" : "Select model"}
+                  selected={settings.reasoningEffort}
+                  onModel={(m) => patch({ model: Option.some(ServingModelId.make(m.id)), reasoningEffort: chatStartingSettings(m, saved).reasoningEffort })}
+                  onEffort={(next) => patch({ reasoningEffort: Option.some(next) })}
+                  onManage={() => navigate("models")}
+                />
                 {active ? (
                   <Button
                     type="button"
@@ -665,29 +427,6 @@ function ChatView({
             </form>
           </div>
         </div>
-        {panel && !narrow && (
-          <aside
-            className="w-[280px] shrink-0 overflow-y-auto border-l border-slate-200 py-5 pl-6 dark:border-slate-750"
-            aria-label={panel === "settings" ? "Chat settings" : "Chat history"}
-          >
-            {body}
-          </aside>
-        )}
-        {narrow && (
-          <Dialog
-            open={panel !== null}
-            onOpenChange={(open) => {
-              if (!open) setPanel(null)
-            }}
-          >
-            <DialogContent
-              className="chat-mobile-panel"
-              showCloseButton={false}
-            >
-              {body}
-            </DialogContent>
-          </Dialog>
-        )}
       </div>
     </section>
   )

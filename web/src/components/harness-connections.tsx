@@ -25,36 +25,36 @@ type Props = {
 }
 
 export function HarnessConnections({ connections, busy, canConnect, onConnect, onDisconnect, models, defaultModel, platform }: Props) {
-  return <TooltipProvider><div className="mt-7 space-y-8">{[true, false].map(installed => {
+  return <TooltipProvider><div className="space-y-6">{[true, false].map(installed => {
     const rows = connections.filter(row => row.installed === installed)
       .sort((a, b) => Number(b.inspection._tag === "Connected") - Number(a.inspection._tag === "Connected"))
     if (rows.length === 0) return null
     const title = installed ? "Installed on your machine" : "Not installed"
     return <section key={title} aria-label={title}>
-      <h2 className="mb-4 text-sm font-medium text-slate-500">{title}</h2>
+      <h2 className={pageLayout.harnessHeading}>{title}</h2>
       <div className={pageLayout.harnessGrid}>{rows.map(row => {
         const needsAttention = row.managed && row.inspection._tag === "Disconnected"
         return <article key={row.id} aria-label={row.name} className={pageLayout.harnessCard}>
-        <div className="flex flex-wrap items-center justify-between gap-4 md:flex-nowrap">
+        <div className="flex flex-wrap items-center justify-between gap-3 md:flex-nowrap">
           <div className="flex min-w-0 items-center gap-3">
             <HarnessLogo id={row.id} name={row.name} />
-            <div><h3 className="text-lg font-semibold">{row.name}</h3>
-              <p className={`mt-1 flex items-center gap-2 text-sm ${installed && row.inspection._tag === "Connected" ? "text-green-600 dark:text-green-400" : needsAttention ? "text-orange-600 dark:text-orange-400" : "text-slate-500"}`}>
-                {installed && <span aria-hidden="true" className={`size-2 shrink-0 rounded-full ${row.inspection._tag === "Connected" ? "bg-green-600 dark:bg-green-400" : needsAttention ? "bg-orange-500" : "bg-slate-400"}`} />}
+            <div><h3 className="text-sm font-medium">{row.name}</h3>
+              <p className={`mt-0.5 flex items-center gap-1.5 text-xs ${installed && row.inspection._tag === "Connected" ? "text-green-600 dark:text-green-400" : needsAttention ? "text-orange-600 dark:text-orange-400" : "text-slate-500"}`}>
+                {installed && <span aria-hidden="true" className={`size-1.5 shrink-0 rounded-full ${row.inspection._tag === "Connected" ? "bg-green-600 dark:bg-green-400" : needsAttention ? "bg-orange-500" : "bg-slate-400"}`} />}
                 {!installed ? "Not installed" : row.inspection._tag === "Connected" ? "Connected" : row.inspection._tag === "Unavailable" ? "Status unavailable" : needsAttention ? "Connection needs repair" : "Not connected"}
               </p>
             </div>
           </div>
-          <div className="ml-auto flex shrink-0 flex-wrap items-center justify-end gap-3">
-            {installed && row.id === "pi" && row.plugin._tag === "Some" && <span className="text-sm text-slate-500">Includes <a href="https://pi.dev/packages/@magnitudedev/pi-extension" target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 hover:underline">Pi extension<ArrowUpRightIcon aria-hidden="true" className="size-3.5" /></a></span>}
+          <div className="ml-auto flex shrink-0 flex-wrap items-center justify-end gap-2">
+            {installed && row.id === "pi" && row.plugin._tag === "Some" && <span className="text-xs text-slate-500">Includes <a href="https://pi.dev/packages/@magnitudedev/pi-extension" target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 hover:underline">Pi extension<ArrowUpRightIcon aria-hidden="true" className="size-3.5" /></a></span>}
             {installed ? <>{row.inspection._tag === "Connected"
               ? <ActionTooltip label="Refresh connection" trigger={<Button variant="ghost" size="icon-sm" aria-label="Refresh connection" disabled={busy || !canConnect} onClick={() => onConnect(row.id)}><ArrowClockwiseIcon aria-hidden="true" className="size-4" /></Button>} />
-              : <Button disabled={busy || !canConnect} onClick={() => onConnect(row.id)}>{needsAttention ? "Repair connection" : "Connect"}</Button>}{!needsAttention && (row.managed || row.inspection._tag === "Connected") && <Button variant="outline" disabled={busy} onClick={() => onDisconnect(row.id)}>Disconnect</Button>}</>
-              : <a href={harnessInstallationUrl(row.id)} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-sm text-slate-500 hover:underline">Install {row.name}<ArrowUpRightIcon aria-hidden="true" className="size-4" /></a>}
+              : <Button size="sm" disabled={busy || !canConnect} onClick={() => onConnect(row.id)}>{needsAttention ? "Repair connection" : "Connect"}</Button>}{!needsAttention && (row.managed || row.inspection._tag === "Connected") && <Button size="sm" variant="outline" disabled={busy} onClick={() => onDisconnect(row.id)}>Disconnect</Button>}</>
+              : <a href={harnessInstallationUrl(row.id)} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-xs text-slate-500 hover:underline">Install<ArrowUpRightIcon aria-hidden="true" className="size-3.5" /></a>}
           </div>
         </div>
               {installed && row.inspection._tag === "Unavailable" && <ErrorNotice title="Couldn’t verify this connection" description="The agent’s configuration could not be read or validated. Check it before reconnecting." className="mt-2" />}
-        {installed && row.inspection._tag === "Connected" && <div className="mt-4 border-t border-slate-200 pt-4 text-sm text-slate-500 dark:border-slate-750"><HarnessCommand harness={row.id} name={row.name} version={row.version} models={models} defaultModel={defaultModel} platform={platform} /><div className="relative mt-3 text-xs"><details className="group"><summary className="w-fit cursor-pointer list-none hover:text-slate-700 dark:hover:text-slate-300 [&::-webkit-details-marker]:hidden"><span aria-hidden="true" className="mr-1 inline-block transition-transform group-open:rotate-90">▸</span>Configuration files</summary><ul className="mt-2 space-y-1">{row.configurationFiles.map(file => <li key={file} className="break-all font-mono text-xs">{file}</li>)}</ul></details>{models.length > 0 && <span className="mt-2 block text-slate-500 md:absolute md:right-0 md:top-0 md:mt-0 md:max-w-[calc(100%-9rem)] md:truncate md:text-right">Run this in {platform === "win32" ? "PowerShell" : "your terminal"} from your project folder.</span>}</div></div>}
+        {installed && row.inspection._tag === "Connected" && <div className="mt-3 pl-11 text-xs text-slate-500"><HarnessCommand harness={row.id} name={row.name} version={row.version} models={models} defaultModel={defaultModel} platform={platform} /><div className="relative mt-2 text-xs"><details className="group"><summary className="w-fit cursor-pointer list-none hover:text-slate-700 dark:hover:text-slate-300 [&::-webkit-details-marker]:hidden"><span aria-hidden="true" className="mr-1 inline-block transition-transform group-open:rotate-90">▸</span>Configuration files</summary><ul className="mt-2 space-y-1">{row.configurationFiles.map(file => <li key={file} className="break-all font-mono text-xs">{file}</li>)}</ul></details>{models.length > 0 && <span className="mt-2 block text-slate-500 md:absolute md:right-0 md:top-0 md:mt-0 md:max-w-[calc(100%-9rem)] md:truncate md:text-right">Run this in {platform === "win32" ? "PowerShell" : "your terminal"} from your project folder.</span>}</div></div>}
 
       </article>})}</div>
     </section>
