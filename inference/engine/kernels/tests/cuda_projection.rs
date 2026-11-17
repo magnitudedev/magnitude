@@ -1700,23 +1700,13 @@ fn cuda_shape_rows_match_portable_semantics() {
     }
 }
 
-/// `dense_output` at Qwen3.5-9B's feed-forward down shape (H 4096, F 12288)
-/// over the types of every decode-axis class (direct, k-quant, table,
-/// float, grid and odd widths), at a decode row and a 512-row prefill
-/// chunk: every configuration the declaration admits at the row count, each
-/// the median device time of a call over 7 samples, reported as the
-/// default's and the fastest admitted one's time and the weight's resident
-/// bytes per second. The grid formats are timed again over uniform weights
-/// (every code 0, so every lookup reads one table entry): what time their
-/// lookups take. A shape timing for before/after comparisons of the
-/// decoders and forms; `CUDA_TIMING_TYPES` narrows it to some types and
-/// `CUDA_TIMING_ROWS` to some row counts.
-#[test]
-#[ignore = "timing at shape"]
-fn dense_output_timing_at_shape() {
+/// The types the `dense_output` shape timings cover: every decode-axis class
+/// (direct, k-quant, table, float, grid and odd widths), and the grid
+/// formats again over uniform weights (every code 0, so every lookup reads
+/// one table entry; `true`). `CUDA_TIMING_TYPES` (representation names,
+/// comma-separated, such as `q4k,iq1s`) narrows them to those types.
+fn timed_types() -> Vec<(Format, bool)> {
     use magnitude_ggml::Encoding;
-    let Some(device) = cuda() else { return };
-    let (h, f) = (4096usize, 12288usize);
     let random = [
         Encoding::Q4_0,
         Encoding::Q4_1,
@@ -1744,26 +1734,48 @@ fn dense_output_timing_at_shape() {
     .chain([Format::F8_E4M3])
     .map(|format| (format, false));
     let uniform = [Encoding::Iq1S, Encoding::Iq2Xxs, Encoding::Iq3Xxs].map(|encoding| (Format::rounded(encoding), true));
-    // `CUDA_TIMING_TYPES` (representation names, comma-separated, such as
-    // `q4k,iq1s`) times only those types.
     let only = std::env::var("CUDA_TIMING_TYPES").ok();
-    let timed = |format: &Format| {
-        only.as_deref().is_none_or(|only| only.split(',').any(|name| name == format.name()))
-    };
+    random
+        .chain(uniform)
+        .filter(|(format, _)| only.as_deref().is_none_or(|only| only.split(',').any(|name| name == format.name())))
+        .collect()
+}
+
+/// A timing weight of `format` and `shape` on `device` (random codes, or
+/// every code 0 where `uniform`) and its resident bytes: the weight's bytes
+/// alone, as its host values (an interpreted decode of 50M values) are no
+/// part of a timing.
+fn timing_weight(device: &Device, format: Format, uniform: bool, shape: [u64; 2], rng: &mut Rng) -> (Tensor, Vec<u8>) {
+    let external = format.external(rng, &shape, 2.0 / (shape[1] as f32).sqrt());
+    let external = if uniform { vec![0; external.len()] } else { external };
+    let bytes = format.resident().repack_host(format.source(), &shape, &external).unwrap();
+    (Tensor::from_host(device, format.resident(), &shape, &bytes).unwrap(), bytes)
+}
+
+/// `dense_output` at Qwen3.5-9B's feed-forward down shape (H 4096, F 12288)
+/// over the types of every decode-axis class (direct, k-quant, table,
+/// float, grid and odd widths), at a decode row and a 512-row prefill
+/// chunk: every configuration the declaration admits at the row count, each
+/// the median device time of a call over 7 samples, reported as the
+/// default's and the fastest admitted one's time and the weight's resident
+/// bytes per second. The grid formats are timed again over uniform weights
+/// (every code 0, so every lookup reads one table entry): what time their
+/// lookups take. A shape timing for before/after comparisons of the
+/// decoders and forms; `CUDA_TIMING_TYPES` narrows it to some types and
+/// `CUDA_TIMING_ROWS` to some row counts.
+#[test]
+#[ignore = "timing at shape"]
+fn dense_output_timing_at_shape() {
+    let Some(device) = cuda() else { return };
+    let (h, f) = (4096usize, 12288usize);
     // `CUDA_TIMING_ROWS` (comma-separated, such as `1`) times only those
     // row counts.
     let row_counts: Vec<usize> = std::env::var("CUDA_TIMING_ROWS")
         .map(|rows| rows.split(',').map(|count| count.parse().expect("CUDA_TIMING_ROWS names row counts")).collect())
         .unwrap_or_else(|_| vec![1, 512]);
     let mut rng = Rng(97);
-    for (format, uniform) in random.chain(uniform).filter(|(format, _)| timed(format)) {
-        // The weight's bytes alone: its host values (an interpreted decode
-        // of 50M values) are no part of a timing.
-        let shape = [h as u64, f as u64];
-        let external = format.external(&mut rng, &shape, 2.0 / (f as f32).sqrt());
-        let external = if uniform { vec![0; external.len()] } else { external };
-        let bytes = format.resident().repack_host(format.source(), &shape, &external).unwrap();
-        let down_weight = Tensor::from_host(&device, format.resident(), &shape, &bytes).unwrap();
+    for (format, uniform) in timed_types() {
+        let (down_weight, bytes) = timing_weight(&device, format, uniform, [h as u64, f as u64], &mut rng);
         let elements = || dense_output::Elements { DW: format.resident(), A: Element::bf16() };
         let statics = NativeSpecialization::new().with_static("H", h as u64).with_static("F", f as u64).with_static("DS", 0);
         for &rows in &row_counts {
@@ -1868,6 +1880,78 @@ fn dense_output_timing_at_shape() {
                     eprintln!("timing Cuda dense_output {format:?} M {rows} INT8 1 BLOCKS {blocks}: best {}", report(time));
                 }
             }
+        }
+    }
+}
+
+/// `dense_output`'s int8 GEMM at the shape of
+/// `dense_output_timing_at_shape` and 512 rows, at the declared defaults
+/// but INT8 1, at each BLOCKS the declaration admits for the type, with no
+/// search: the median and least device time of a call (15 samples of 200
+/// calls) and the registers and local bytes a thread of its GEMM launch.
+/// A before/after check of the int8 GEMM's loop; `CUDA_TIMING_TYPES` names
+/// the types.
+#[test]
+#[ignore = "timing at shape"]
+fn dense_output_int8_gemm_at_shape() {
+    use seismic::measure::{Pending, Work};
+    let Some(device) = cuda() else { return };
+    let (h, f, rows) = (4096usize, 12288usize, 512usize);
+    let mut rng = Rng(97);
+    for (format, _) in timed_types().into_iter().filter(|(_, uniform)| !uniform) {
+        let (down_weight, _) = timing_weight(&device, format, false, [h as u64, f as u64], &mut rng);
+        let output = Mapped::new(
+            dense_output::native_entry_with(dense_output::Elements { DW: format.resident(), A: Element::bf16() }),
+            move |_: &Device, blocks: u64| {
+                NativeSpecialization::new()
+                    .with_static("H", h as u64)
+                    .with_static("F", f as u64)
+                    .with_static("DS", 0)
+                    .with_param("INT8", 1)
+                    .with_launch_param(DENSE_PAIR_GEMM, "BLOCKS", blocks)
+            },
+        );
+        let product: Vec<f32> = (0..rows * f).map(|_| bf16_round(rng.uniform(-1.0, 1.0))).collect();
+        let residual: Vec<f32> = (0..rows * h).map(|_| rng.uniform(-2.0, 2.0)).collect();
+        let product = bf16_tensor(&device, &[rows as u64, f as u64], &product);
+        let residual = f32_tensor(&device, &[rows as u64, h as u64], &residual);
+        let out_rows = i32_tensor(&device, &[rows as u64], &(0..rows as i32).collect::<Vec<_>>());
+        let absent = f32_tensor(&device, &[0], &[]);
+        for blocks in [1, 2].into_iter().filter(|&blocks| output.admits(&device, blocks)) {
+            let kernel = output.kernel(&device, blocks);
+            // CUDA reports each function attribute of every formed launch.
+            let programs = kernel.launch_programs();
+            let statistic = |name: &str| {
+                let program = programs[DENSE_PAIR_GEMM].as_ref().expect("the GEMM launch is formed at 512 rows");
+                let statistic = program.statistics.iter().find(|statistic| statistic.name == name);
+                match statistic.map(|statistic| statistic.value) {
+                    Some(seismic::StatisticValue::Uint(value)) => value,
+                    other => panic!("CUDA reports `{name}` of a formed launch as a count, not {other:?}"),
+                }
+            };
+            let point = kernel
+                .point(vec![dense_output::Args {
+                    residual: &residual,
+                    product: &product,
+                    down_weight: &down_weight,
+                    out_rows: &out_rows,
+                    down_scale: &absent,
+                    down_bound: &absent,
+                }])
+                .unwrap();
+            const CALLS: usize = 200;
+            point.submit(CALLS).unwrap().wait().unwrap();
+            let mut seconds = (0..15)
+                .map(|_| point.submit(CALLS).unwrap().seconds().unwrap() / CALLS as f64)
+                .collect::<Vec<_>>();
+            seconds.sort_by(f64::total_cmp);
+            eprintln!(
+                "int8 gemm {format:?} M {rows} BLOCKS {blocks}: {:.1} us (least {:.1}), registers {}, local bytes {}",
+                1e6 * seconds[7],
+                1e6 * seconds[0],
+                statistic("registers"),
+                statistic("local bytes")
+            );
         }
     }
 }

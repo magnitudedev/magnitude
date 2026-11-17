@@ -272,6 +272,10 @@ pub const GEMV_ROWS: usize = bound::gemv_rows(BackendName::Cuda);
 /// (`projection::SMALL_GEMM_ROWS`); larger counts run the large-band GEMM.
 pub const SMALL_GEMM_ROWS: usize = 64;
 
+/// The launch ordinal of the dense pair's (`dense_up`, `dense_output`)
+/// 128-row GEMM, whose scope holds ROTATE and BLOCKS.
+pub const DENSE_PAIR_GEMM: usize = 4;
+
 /// A native mapping: the GEMV K split, the small-band GEMM's INT8 operand
 /// path (the large-band GEMM is the 16-bit path), the large-band GEMM's
 /// loader rotation, the dense pair's GEMV residency (blocks of streaming
@@ -333,7 +337,7 @@ impl Mapping {
             .with_param("SPLIT", self.split)
             .with_param("STAGING", self.staging)
             .with_launch_param(1, "RESIDENCY", self.residency)
-            .with_launch_param(4, "ROTATE", self.rotate)
+            .with_launch_param(DENSE_PAIR_GEMM, "ROTATE", self.rotate)
     }
     /// Readout head GEMVs read the entry-wide KSPLIT, its GEMM owns ROTATE.
     pub fn head_params(self, spec: seismic::NativeSpecialization) -> seismic::NativeSpecialization {

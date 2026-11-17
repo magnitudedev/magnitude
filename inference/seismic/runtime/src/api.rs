@@ -2958,6 +2958,11 @@ pub mod kernel {
         pub fn implementation(&self) -> &seismic_lang::checked::NativeImplementation {
             self.inner.implementation()
         }
+        /// What each launch's program uses, in ordinal order
+        /// ([`crate::native::NativePrepared::launch_programs`]).
+        pub fn launch_programs(&self) -> Vec<Option<seismic_native_target::LaunchProgram>> {
+            self.inner.launch_programs()
+        }
         /// Check the launches of a call whose dimensions are `dimensions`
         /// against the formed functions and the device limits.
         pub fn admits(

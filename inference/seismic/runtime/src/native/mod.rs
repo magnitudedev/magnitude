@@ -80,6 +80,7 @@ use seismic_native_target::Compile;
 pub use budget::{Footprint, Linear, Observed, Quote};
 pub use graph_replays::GraphReplays;
 pub use point::{GraphPending, GraphPoint, GraphTiming, KernelPoint, Point, PointPending};
+pub use seismic_native_target::{LaunchProgram, ProgramStatistic, StatisticValue};
 pub use spans::NativeSpans;
 use seismic_compiler::errors::{ExecutionError, InvocationError, PreparationError};
 use seismic_compiler::graph_cost::{GraphCensus, LaunchGraphs};
