@@ -437,8 +437,8 @@ __device__ __forceinline__ void gemv_sums(const u32 (&b)[NB][4][2], GroupSums<NB
     }
 }
 
-// The activation row of a one-row dense GEMV block, formed in its
-// shared memory: K A elements at `row` (16-byte aligned), then the row's
+// The activation row of every one-row GEMV block (`shared_row`), formed in
+// its shared memory: K A elements at `row` (16-byte aligned), then the row's
 // operand sums of every biased weight's groups (`form_row_sums`), one area
 // of up to K / 16 sums per weight stream. Every MMA column reads the row:
 // a column past M only feeds C-fragment places no epilogue stores (each
@@ -460,7 +460,24 @@ struct SharedRow {
     __device__ __forceinline__ float *area(int stream) const { return sums + stream * (k / 16); }
 };
 // Whether a GEMV source is a `SharedRow`, which every column reads.
-template <class Pro> constexpr bool shared_row = Same<Pro, SharedRow>::value;
+template <class Pro> constexpr bool is_shared_row = Same<Pro, SharedRow>::value;
+// A one-row GEMV block's source: row 0 of the prologue `pro`, formed by the
+// whole block (`form_row`, publishing its factors to `published` when given)
+// at the start of the block's dynamic shared memory: the row, then two areas
+// of K / 16 sums, the K * SHARED_ROW_PAIR_BYTES / 2 bytes every launch of a
+// one-row GEMV block declares (`dense.seismic`).
+static_assert(SEISMIC_CONST_SHARED_ROW_PAIR_BYTES == 2 * 2 + 2 * 2 * sizeof(float) / 16,
+              "a shared row's two columns: two A elements and their part of two sum areas");
+template <class Pro>
+__device__ __forceinline__ SharedRow shared_row(const Pro &pro, u64 K,
+                                                const element::Out<element::F32> *published = nullptr) {
+    require_dynamic_shared(K * SEISMIC_CONST_SHARED_ROW_PAIR_BYTES / 2);
+    extern __shared__ uint4 dynamic_shared[];
+    u8 *row = reinterpret_cast<u8 *>(dynamic_shared);
+    form_row(pro, 0, K, row, published);
+    __syncthreads();
+    return SharedRow{row, reinterpret_cast<float *>(row + K * 2), K};
+}
 
 // The operand sums of a `SharedRow`'s GROUP-code groups, formed by the whole
 // block into `sums`, sum g of group g: each formed as `gemv_sums` forms a
@@ -724,7 +741,7 @@ __device__ __forceinline__ void gemv_mma_group(const Ready &ready, u32 M, u64 kb
     static_assert(decltype(ready())::FACTORS == 0, "a GEMV reads its operands in place");
     // A one-row block forms its weights' operand sums once (block-collective:
     // every warp of the block runs the GEMV, as `ready()` requires).
-    constexpr bool ROW = shared_row<decltype(ready())>;
+    constexpr bool ROW = is_shared_row<decltype(ready())>;
     static_assert(!ROW || NB == 1, "a shared row is one activation row");
     static_assert(!PERMUTED || (SUMS_A == 0 && SUMS_B == 0), "permuted weights take no operand sums");
     if constexpr (ROW && (SUMS_A != 0 || SUMS_B != 0)) {
@@ -828,7 +845,7 @@ __device__ __forceinline__ void gemv_entries_kblock(float (&acc)[NB][4], const W
 #pragma unroll
             for (int nb = 0; nb < NB; ++nb) {
                 const u32 m = 8 * nb + g;
-                const bool feeds = shared_row<Pro> || m < M;
+                const bool feeds = is_shared_row<Pro> || m < M;
                 const u32 b[2] = {feeds ? pro.pair(factors, m, k) : 0u, feeds ? pro.pair(factors, m, k + 2) : 0u};
                 Op::mma(d[nb], a, b);
             }
@@ -998,8 +1015,8 @@ __device__ __forceinline__ void gemv_records_group(const Ready &ready, u32 M, u6
                     for (int e = 0; e < 4; ++e)
                         d[nb][e] = 0.0f;
                     const u32 m = 8 * nb + g;
-                    const uint4 x = shared_row<decltype(ready())> || m < M ? pro.octet(factors, m, k)
-                                                                       : make_uint4(0u, 0u, 0u, 0u);
+                    const uint4 x = is_shared_row<decltype(ready())> || m < M ? pro.octet(factors, m, k)
+                                                                          : make_uint4(0u, 0u, 0u, 0u);
                     const u32 a0[4] = {rg[0], rg8[0], rg[1], rg8[1]}, b0[2] = {x.x, x.y};
                     const u32 a1[4] = {rg[2], rg8[2], rg[3], rg8[3]}, b1[2] = {x.z, x.w};
                     Op::mma(d[nb], a0, b0);
@@ -1268,7 +1285,8 @@ __device__ __forceinline__ void gemv_segment(Shared &shared, const Pro &pro, u32
 // Ready callbacks of a programmatic dependent (SEISMIC_PROGRAMMATIC_DEPENDENCY):
 // wait for the previous launch, let the next one start, and return the
 // source: `after_dependency` for a source read in place,
-// `source_after_dependency` for a `GemvSource` (block-collective at M = 1).
+// `source_after_dependency` for a `GemvSource`, `shared_row_after_dependency`
+// for a one-row block's `shared_row` (block-collective).
 template <class Pro> __device__ __forceinline__ auto after_dependency(const Pro &pro) {
     return [pro] {
         seismic_dependency_start();
@@ -2527,43 +2545,32 @@ __device__ __forceinline__ void stage_projection_row(const Pro &pro, u32 m, u32 
     }
 }
 
-// The GEMV activation source. A prologue read in place is its own source.
-// Any other prologue's rows are the staging launch's A rows, except at M = 1,
-// where the whole GEMV block forms its row into `row` (its dynamic shared
-// memory, K A elements) instead of waiting for a staging launch. `make` is
-// block-collective.
+// The rows a GEMV block of more than one row reads: a prologue read in place
+// is its own source; any other prologue's rows are the staging launch's A
+// rows. A one-row block reads its `shared_row` instead.
 template <bool STAGED, class Pro> struct GemvSourceOf {
     using type = Pro;
-    __device__ static __forceinline__ type make(const Pro &pro, u8 *, u32, u64, const u8 *) { return pro; }
+    __device__ static __forceinline__ type make(const Pro &pro, u64, const u8 *) { return pro; }
 };
 template <class Pro> struct GemvSourceOf<true, Pro> {
     using type = Plain<Act, AllRows>;
-    __device__ static __forceinline__ type make(const Pro &pro, u8 *row, u32 M, u64 K, const u8 *staged) {
-        if (M > 1)
-            return type{staged, K, AllRows{}};
-        form_row(pro, 0, K, row);
-        __syncthreads();
-        return type{row, K, AllRows{}};
+    __device__ static __forceinline__ type make(const Pro &, u64 K, const u8 *staged) {
+        return type{staged, K, AllRows{}};
     }
 };
 template <class Pro> using GemvSource = GemvSourceOf<Pro::STAGED, Pro>;
 template <class Pro>
-__device__ __forceinline__ auto source_after_dependency(const Pro &pro, u8 *row, u32 M, u64 K, const u8 *staged) {
+__device__ __forceinline__ auto source_after_dependency(const Pro &pro, u64 K, const u8 *staged) {
     return [=] {
         seismic_dependency_start();
-        return GemvSource<Pro>::make(pro, row, M, K, staged);
+        return GemvSource<Pro>::make(pro, K, staged);
     };
 }
-// The one-row dense GEMV block's source (`SharedRow`), whatever the
-// prologue: once the previous launch is done the whole block forms its row
-// into `row`, its dynamic shared memory (K * 2 bytes of row, then two areas
-// of K / 16 sums, as dense.seismic sizes it).
-template <class Pro> __device__ __forceinline__ auto shared_row_after_dependency(const Pro &pro, u8 *row, u64 K) {
+// `shared_row` once the previous launch is done.
+template <class Pro> __device__ __forceinline__ auto shared_row_after_dependency(const Pro &pro, u64 K) {
     return [=] {
         seismic_dependency_start();
-        form_row(pro, 0, K, row);
-        __syncthreads();
-        return SharedRow{row, reinterpret_cast<float *>(row + K * 2), K};
+        return shared_row(pro, K);
     };
 }
 

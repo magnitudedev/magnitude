@@ -70,7 +70,7 @@ struct GatheredPublishEpi {
 #define ROUTED_OUTPUT_SUMMED_BODY(TPW, KSPLIT)                                                                     \
     using Shape = routed::DecodeShape<TPW, KSPLIT>;                                                                \
     constexpr projection::u64 CHANNELS = Shape::GROUPS * TPW * 16;                                                 \
-    __shared__ projection::GemvShared<Shape, Pro> shared;                                                          \
+    __shared__ projection::GemvShared<Shape, projection::SharedRow> shared;                                        \
     const projection::u64 H = SEISMIC_DIM_H, K = SEISMIC_DIM_K;                                                    \
     const projection::u64 m = blockIdx.y / (K + 1), slot = blockIdx.y % (K + 1);                                   \
     const projection::u64 group = Shape::tile_group();                                                             \
@@ -86,15 +86,15 @@ struct GatheredPublishEpi {
         } else {                                                                                                   \
             const Pro pro{EXPERT_ROWS + (m * EXPERT_STRIDE_0 + slot * EXPERT_STRIDE_1) * 2, 0,                     \
                           projection::AllRows{}};                                                                  \
-            projection::gemv_segment_ready<Shape>(shared, projection::after_dependency(pro), 1u,                   \
-                                                  SEISMIC_DIM_F / 64, group, H,                                    \
+            projection::gemv_segment_ready<Shape>(shared, projection::shared_row_after_dependency(pro, SEISMIC_DIM_F), \
+                                                  1u, SEISMIC_DIM_F / 64, group, H,                                \
                                                   ROUTED_MATRIX(KERNEL_W0, down),                       \
                                                   projection::NoWeight{}, epi);                                    \
         }                                                                                                          \
     } else {                                                                                                       \
         const Pro pro{SHARED_ROWS + m * SHARED_STRIDE_0 * 2, 0, projection::AllRows{}};                            \
-        projection::gemv_segment_ready<Shape>(shared, projection::after_dependency(pro), 1u,                       \
-                                              SEISMIC_DIM_S / 64, group, H,                                        \
+        projection::gemv_segment_ready<Shape>(shared, projection::shared_row_after_dependency(pro, SEISMIC_DIM_S), \
+                                              1u, SEISMIC_DIM_S / 64, group, H,                                    \
                                               KERNEL_W1_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_DOWN)),               \
                                               projection::NoWeight{}, epi);                                        \
     }                                                                                                              \

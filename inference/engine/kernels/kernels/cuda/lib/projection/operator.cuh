@@ -76,20 +76,20 @@ template <int KSPLIT, int RESIDENCY, u64 N, class WA, class WB> __host__ __devic
 // The GEMV over NB column blocks of 8 rows, a launch of GRID blocks (0: not
 // stated, `GemvResidency`). Every warp runs it, a group past the rows
 // included: once the warps' first weight loads are in flight it waits for the
-// previous launch, and at M = 1 the block forms its row in `row` whatever
-// its prologue (block-collective, `SharedRow`).
+// previous launch, and at M = 1 the block forms its row whatever its
+// prologue (block-collective, `shared_row`).
 template <int NB, int KSPLIT, int STAGING, u64 GRID, int RESIDENCY, u64 K, class Pro, class WA, class WB, class Epi>
-__device__ __forceinline__ void gemv(const Pro &pro, u8 *row, const u8 *staged, u32 M, u64 N, const WA &wa,
-                                     const WB &wb, const Epi &epi) {
+__device__ __forceinline__ void gemv(const Pro &pro, const u8 *staged, u32 M, u64 N, const WA &wa, const WB &wb,
+                                     const Epi &epi) {
     using Shape = GemvShape<8, 1, KSPLIT, NB>;
     __shared__ GemvShared<Shape, typename GemvSource<Pro>::type, gemv_staged_bytes<STAGING, Shape, K, WA, WB>()> shared;
     if constexpr (NB == 1)
         if (M == 1) {
-            gemv_segment_ready<Shape, GRID, RESIDENCY>(shared, shared_row_after_dependency(pro, row, K), 1u, K / 64,
+            gemv_segment_ready<Shape, GRID, RESIDENCY>(shared, shared_row_after_dependency(pro, K), 1u, K / 64,
                                                        Shape::tile_group(), N, wa, wb, epi);
             return;
         }
-    gemv_segment_ready<Shape, GRID, RESIDENCY>(shared, source_after_dependency(pro, row, M, K, staged), M, K / 64,
+    gemv_segment_ready<Shape, GRID, RESIDENCY>(shared, source_after_dependency(pro, K, staged), M, K / 64,
                                                Shape::tile_group(), N, wa, wb, epi);
 }
 
@@ -316,10 +316,10 @@ __device__ __forceinline__ void gemv_segmented_from(Shared &shared, const Ready 
 
 // The segmented GEMV over NB column blocks of 8 rows. With `zero` != 0 the
 // results of segments 0 and 1 are zeros: their groups store them and are
-// otherwise past the last segment. A one-row block reads its shared row
-// (`SharedRow`), any other the rows `GemvSource` reads.
+// otherwise past the last segment. A one-row block reads its `shared_row`,
+// any other the rows `GemvSource` reads.
 template <int NB, int KSPLIT, int STAGING, u64 K, class Weights, class Pro, class Segments>
-__device__ __forceinline__ void gemv_segmented(const Pro &pro, u8 *row, const u8 *staged, u32 M, const Segments &s,
+__device__ __forceinline__ void gemv_segmented(const Pro &pro, const u8 *staged, u32 M, const Segments &s,
                                                unsigned zero) {
     using Shape = GemvShape<8, 1, KSPLIT, NB>;
     __shared__ GemvShared<Shape, typename GemvSource<Pro>::type, StagingOf<STAGING, Shape, K, Weights>::bytes()> shared;
@@ -332,12 +332,11 @@ __device__ __forceinline__ void gemv_segmented(const Pro &pro, u8 *row, const u8
     const int segment = locate_segment(group, groups);
     if constexpr (NB == 1)
         if (M == 1) {
-            gemv_segmented_from<Shape>(shared, shared_row_after_dependency(pro, row, K), 1u, kblocks, group, segment,
-                                       s, zero);
+            gemv_segmented_from<Shape>(shared, shared_row_after_dependency(pro, K), 1u, kblocks, group, segment, s,
+                                       zero);
             return;
         }
-    gemv_segmented_from<Shape>(shared, source_after_dependency(pro, row, M, K, staged), M, kblocks, group, segment, s,
-                               zero);
+    gemv_segmented_from<Shape>(shared, source_after_dependency(pro, K, staged), M, kblocks, group, segment, s, zero);
 }
 
 // One segment's GEMM block, over its weight or served pair.
@@ -415,13 +414,19 @@ struct PartPartial {
     }
 };
 
-// One segment's GEMV warp group over its weight's window of the part.
-template <int I, class Shape, class Ready, class Segments, class Shared>
-__device__ __forceinline__ void gemv_part_of(Shared &shared, const Ready &x, u32 M, u64 kblocks, u64 group,
-                                             u64 window, const PartPartial &partial, const Segments &s) {
+// One segment's GEMV warp group over its weight's window of the part, from
+// the part's `shared_row` at one row, else from its rows `rows`.
+template <int I, class Shape, class Row, class Rows, class Segments, class Shared>
+__device__ __forceinline__ void gemv_part_of(Shared &shared, const Row &row, const Rows &rows, u32 M, u64 kblocks,
+                                             u64 group, u64 window, const PartPartial &partial, const Segments &s) {
     static_assert(Segments::served(I) == 1, "a parts projection's segments are unpaired");
-    gemv_segment_ready<Shape>(shared, x, M, kblocks, group, s.rows[I],
-                              window_of(weight_of<first_weight<Segments, I>()>(s), window), NoWeight{}, partial);
+    const auto weight = window_of(weight_of<first_weight<Segments, I>()>(s), window);
+    if constexpr (Shape::NB == 1)
+        if (M == 1) {
+            gemv_segment_ready<Shape>(shared, row, 1u, kblocks, group, s.rows[I], weight, NoWeight{}, partial);
+            return;
+        }
+    gemv_segment_ready<Shape>(shared, rows, M, kblocks, group, s.rows[I], weight, NoWeight{}, partial);
 }
 
 // Every output's parts, added in part order, through its segment's epilogue.
@@ -430,13 +435,14 @@ __device__ __forceinline__ void store_part_sum(const Segments &s, unsigned m, u6
     out_of<I>(s)(m, n, sum, 0.0f);
 }
 
-// The parts GEMV over NB column blocks of 8 rows. `source(part, first)` is
-// part `part`'s rows as a GEMV ready callback (`first`: the part's first
-// block, which publishes what the part's prologue publishes), of prologue
-// type Part.
-template <int NB, int KSPLIT, int PARTS, u64 PART_K, class Part, class Source, class Segments>
-__device__ __forceinline__ void gemv_parts(const Source &source, float *partials, unsigned *arrivals, u32 M,
-                                           const Segments &s) {
+// The parts GEMV over NB column blocks of 8 rows. `row(part, first)` is part
+// `part`'s one row as a GEMV ready callback giving its `shared_row` (`first`:
+// the part's first block, which publishes what the part's prologue
+// publishes), `rows(part)` its rows past one row as one giving the rows of
+// prologue type Part.
+template <int NB, int KSPLIT, int PARTS, u64 PART_K, class Part, class Row, class Rows, class Segments>
+__device__ __forceinline__ void gemv_parts(const Row &row, const Rows &rows, float *partials, unsigned *arrivals,
+                                           u32 M, const Segments &s) {
     using Shape = GemvShape<8, 1, KSPLIT, NB>;
     __shared__ GemvShared<Shape, typename GemvSource<Part>::type> shared;
     constexpr u64 kblocks = PART_K / 64;
@@ -455,25 +461,26 @@ __device__ __forceinline__ void gemv_parts(const Source &source, float *partials
     u64 group = tile_group % per;
     const bool first = group < Shape::GROUPS;
     const int segment = locate_segment(group, groups);
-    const auto x = source(part, first);
+    const auto x = row(part, first);
+    const auto xs = rows(part);
     const u64 window = part * (kblocks / 4);
     const auto partial = [&](int i) { return PartPartial{partials, PARTS * outputs, part * outputs + firsts[i]}; };
     switch (segment) {
     case 0:
         if constexpr (!Segments::empty(0))
-            gemv_part_of<0, Shape>(shared, x, M, kblocks, group, window, partial(0), s);
+            gemv_part_of<0, Shape>(shared, x, xs, M, kblocks, group, window, partial(0), s);
         break;
     case 1:
         if constexpr (Segments::COUNT > 1 && !Segments::empty(1))
-            gemv_part_of<1, Shape>(shared, x, M, kblocks, group, window, partial(1), s);
+            gemv_part_of<1, Shape>(shared, x, xs, M, kblocks, group, window, partial(1), s);
         break;
     case 2:
         if constexpr (Segments::COUNT > 2 && !Segments::empty(2))
-            gemv_part_of<2, Shape>(shared, x, M, kblocks, group, window, partial(2), s);
+            gemv_part_of<2, Shape>(shared, x, xs, M, kblocks, group, window, partial(2), s);
         break;
     case 3:
         if constexpr (Segments::COUNT > 3 && !Segments::empty(3))
-            gemv_part_of<3, Shape>(shared, x, M, kblocks, group, window, partial(3), s);
+            gemv_part_of<3, Shape>(shared, x, xs, M, kblocks, group, window, partial(3), s);
         break;
     }
     __shared__ unsigned last;
@@ -532,15 +539,14 @@ __device__ __forceinline__ void gemv_parts(const Source &source, float *partials
 
 // A GEMV launch over NB column blocks, group g at grid z (its kernel states
 // `__launch_bounds__(256, PROJECTION_GEMV_BLOCKS(KSPLIT, RESIDENCY))` itself,
-// which the checker reads); at one row a block
-// whose prologue forms its row does it in `ROW`.
+// which the checker reads).
 #define PROJECTION_GEMV_BLOCKS(KSPLIT, RESIDENCY)                                                                  \
     (projection::op::gemv_blocks<KSPLIT, RESIDENCY, PROJECTION_N, PROJECTION_WA, PROJECTION_WB>())
-#define PROJECTION_GEMV(NB, KSPLIT, STAGING, GRID, RESIDENCY, ROW)                                                 \
+#define PROJECTION_GEMV(NB, KSPLIT, STAGING, GRID, RESIDENCY)                                                      \
     do {                                                                                                           \
         const unsigned group_ = PROJECTION_GROUP(blockIdx.z);                                                      \
         projection::op::gemv<NB, KSPLIT, STAGING, GRID, RESIDENCY, PROJECTION_K>(                                  \
-            PROJECTION_ROWS(group_), ROW, PROJECTION_STAGING, (unsigned)PROJECTION_M, PROJECTION_N,                \
+            PROJECTION_ROWS(group_), PROJECTION_STAGING, (unsigned)PROJECTION_M, PROJECTION_N,                     \
             PROJECTION_WEIGHTS(group_), PROJECTION_EPILOGUE(group_));                                              \
     } while (0)
 #define PROJECTION_GEMV_GRID(KSPLIT, RESIDENCY)                                                                    \
@@ -581,11 +587,10 @@ __device__ __forceinline__ void gemv_parts(const Source &source, float *partials
 
 // A segmented projection's launches (`PROJECTION_SEGMENTS`: its `Segments`;
 // `PROJECTION_ZERO`: nonzero where segments 0 and 1 are zeros for the call).
-#define PROJECTION_SEGMENTED_GEMV(NB, KSPLIT, STAGING, ROW)                                                        \
+#define PROJECTION_SEGMENTED_GEMV(NB, KSPLIT, STAGING)                                                             \
     projection::op::gemv_segmented<NB, KSPLIT, STAGING, PROJECTION_K, PROJECTION_WEIGHT_TYPES>(                    \
-        PROJECTION_ROWS(0u), ROW, PROJECTION_STAGING,                                                              \
-                                                             (unsigned)PROJECTION_M, PROJECTION_SEGMENTS,          \
-                                                             (unsigned)PROJECTION_ZERO)
+        PROJECTION_ROWS(0u), PROJECTION_STAGING, (unsigned)PROJECTION_M, PROJECTION_SEGMENTS,                      \
+        (unsigned)PROJECTION_ZERO)
 #define PROJECTION_SEGMENTED_GEMM(SHAPE, OPERANDS_)                                                                \
     do {                                                                                                           \
         constexpr bool S8 = PROJECTION_S8;                                                                         \
@@ -839,9 +844,14 @@ __device__ __forceinline__ void ordered_gemv_segment_of(u8 *shared_raw, const Pr
     if constexpr (Segments::served(I) == 2) {
         using Shape = GemvShape<8, TPW, KSPLIT, 1>;
         __shared__ GemvShared<Shape, typename GemvSource<UnordPro>::type, 0> gemv_shared;
-        const auto x = [&] { return GemvSource<UnordPro>::make(unord_pro, shared_raw, M, K, staged); };
-        gemv_segment_ready<Shape>(gemv_shared, x, M, K / 64, local * Shape::GROUPS + Shape::group(), s.rows[I],
-                                  weight_of<A>(s), weight_of<A + 1>(s), out_of<I>(s));
+        const u64 group = local * Shape::GROUPS + Shape::group();
+        if (M == 1)
+            gemv_segment_ready<Shape>(gemv_shared, [&] { return shared_row(unord_pro, K); }, 1u, K / 64, group,
+                                      s.rows[I], weight_of<A>(s), weight_of<A + 1>(s), out_of<I>(s));
+        else
+            gemv_segment_ready<Shape>(gemv_shared, [&] { return GemvSource<UnordPro>::make(unord_pro, K, staged); },
+                                      M, K / 64, group, s.rows[I], weight_of<A>(s), weight_of<A + 1>(s),
+                                      out_of<I>(s));
     } else {
         ordered_gemv_block<PUBLISH>(shared_raw, pro_fn(SegmentIndex<I>{}), pub_out, pub_s0, pub_s1, publish_rows, M, K,
                                     s.rows[I], local, weight_of<A>(s), out_of<I>(s));

@@ -315,14 +315,20 @@ template <bool NVFP4, class Pro> using Operands = typename OperandsOf<NVFP4, Pro
 
 // The prologue's row m as A into out[m * K .. m * K + K), formed by the whole
 // block: the staging launch (one block per row, global scratch) and a GEMV
-// block at M = 1 (its shared memory) both form rows with it. A row of NVFP4
-// operands is formed per 16-value block (K a multiple of 16).
-template <class Storage = Act, class Pro> __device__ __forceinline__ void form_row(const Pro &pro, u32 m, u64 K, u8 *out) {
+// block at M = 1 (its shared memory, `shared_row`) both form rows with it. A
+// row of NVFP4 operands is formed per 16-value block (K a multiple of 16).
+// With `published` given, the row's FACTORS factors (a group prologue's
+// per-stream inverses) are also published to published[f * step].
+template <class Storage = Act, class Pro>
+__device__ __forceinline__ void form_row(const Pro &pro, u32 m, u64 K, u8 *out,
+                                         const element::Out<element::F32> *published = nullptr, u64 step = 1) {
     static_assert(Storage::bytes == 2, "projection physical operands are 16-bit");
     __shared__ float factors[Pro::FACTORS > 0 ? Pro::FACTORS : 1];
     __shared__ float scratch[32];
     pro.prepare_row(factors, m, scratch);
     __syncthreads();
+    if (published != nullptr && threadIdx.x < (unsigned)Pro::FACTORS)
+        published->put(threadIdx.x * step, factors[threadIdx.x]);
     if constexpr (nvfp4_rows<Pro>::value) {
         const float g = nvfp4::row_global(pro, factors, m, K, scratch);
         for (u64 block = threadIdx.x; block < K / 16; block += blockDim.x) {
@@ -384,21 +390,6 @@ __device__ __forceinline__ void form_packed_row(const Pro &pro, u32 m, u64 K, u8
     }
     if (threadIdx.x == 0)
         *reinterpret_cast<float *>(row + PackedRows::global(K)) = g;
-}
-
-// `form_row`, also publishing the row's FACTORS factors (a group prologue's
-// per-stream inverses) to published[f * step] when `published` is given.
-template <class Pro>
-__device__ __forceinline__ void form_row_publishing(const Pro &pro, u32 m, u64 K, u8 *out, const element::Out<element::F32> *published,
-                                                    u64 step) {
-    __shared__ float factors[Pro::FACTORS > 0 ? Pro::FACTORS : 1];
-    __shared__ float scratch[32];
-    pro.prepare_row(factors, m, scratch);
-    __syncthreads();
-    if (published != nullptr && threadIdx.x < (unsigned)Pro::FACTORS)
-        published->put(threadIdx.x * step, factors[threadIdx.x]);
-    for (u64 k = threadIdx.x; k < K; k += blockDim.x)
-        element::put<Act>(out, m * K + k, pro.value(factors, m, k));
 }
 
 // int8 activations (the GEMM's INT8 candidate): rows quantized per 32-code

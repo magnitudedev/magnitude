@@ -375,13 +375,17 @@ projection routed for metal:
         threads_per_threadgroup (128, 1, 1)
 
 # CUDA. choice and summed: the mma16 swap-AB GEMV, TPW 16-row tiles a warp
-# group, KSPLIT-way K split reduced in part order. A choice's experts take
-# their operand row formed in the block (the one-row form) or, gathered
+# group, KSPLIT-way K split reduced in part order. Every one-row block (a
+# choice, a summed slot, the shared expert's at one row) forms its row in
+# its shared memory with its weights' operand sums (`shared_row`, WIDTH * 5
+# / 2 bytes), from the rows it would read: the activation row, or the row a
+# stage launch formed where the experts take NVFP4 operands. Gathered
 # (GATHERED, valid at every M), a chosen expert runs once over the rows of
-# each of its choices (`routed::gather`), its records streamed once a
-# step, over rows a stage launch formed where the experts take NVFP4
-# operands. With the shared expert (`routed_expand`), whose row y = M * K
-# stages every activation row, both forms read the staged rows. summed
+# each of its choices (`routed::gather`), its records streamed once a step,
+# over those rows in place. With the shared expert (`routed_expand`, its
+# row y = M * K), the stage launch forms every activation row, and at one
+# row the shared expert's block is a one-row block: the gathered launch
+# declares its row's bytes there (SHARED, M 1), and none otherwise. summed
 # publishes each slot's projection in A (`published`, [M, K + SHARED, H])
 # for the entry's slot-order join. grouped: fixed 32-row (by expert) or
 # 64-row (every row) x 128-column mma.sync tiles, 3 cp.async stages; the
@@ -428,11 +432,12 @@ projection routed for cuda:
         reads (TPW, KSPLIT)
         threadgroups (DECODE_GROUPS, M * K + SHARED, 1)
         threads_per_threadgroup (128, 1, 1)
-        shared_bytes ((1 - SHARED) * most(W, operands(W)) * WIDTH * 2)
+        shared_bytes (most(W, WIDTH) * SHARED_ROW_PAIR_BYTES / 2)
     launch gathered for choice when GATHERED == 1 and PER_ROW == 0:
         reads (TPW, KSPLIT)
         threadgroups (DECODE_GROUPS, M * K + SHARED, 1)
         threads_per_threadgroup (128, 1, 1)
+        shared_bytes (SHARED * (1 - min(1, M - 1)) * most(W, WIDTH) * SHARED_ROW_PAIR_BYTES / 2)
     launch stage for summed when (SHARED == 1 or M > 1) and any(W, operands(W) == 1):
         staging
         threadgroups (M * (K + SHARED), 1, 1)
@@ -441,7 +446,7 @@ projection routed for cuda:
         reads (TPW, KSPLIT)
         threadgroups (DECODE_GROUPS, M * (K + SHARED), 1)
         threads_per_threadgroup (128, 1, 1)
-        shared_bytes ((1 - SHARED) * most(W, operands(W)) * WIDTH * 2)
+        shared_bytes (most(W, WIDTH) * SHARED_ROW_PAIR_BYTES / 2)
     launch gathered for summed when M > 1:
         reads (TPW, KSPLIT)
         alike (summed)

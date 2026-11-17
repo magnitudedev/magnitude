@@ -400,10 +400,22 @@ projection dense for metal:
 # read in place: `stage` a normalized input's A rows (at one row the GEMV
 # block forms its row in its shared memory instead), the shared operand
 # stage the INT8 candidate's q8_1 rows plus (d, d * sum q) groups. At one
-# row every GEMV block forms its row in its shared memory, whatever its
-# kind, with the operand sums its biased weights fold (`SharedRow`: the B
-# fragments are unconditional shared reads, and the sums are formed once a
-# block, not once a k-block in every warp).
+# row every GEMV block (an unordered segment's of an ordered entry and a
+# part's included) forms its row in its shared memory, whatever its kind,
+# with the operand sums its biased weights fold (`shared_row`,
+# K * SHARED_ROW_PAIR_BYTES / 2 bytes of K / P: the B fragments are
+# unconditional shared reads, and the sums are formed once a block, not once
+# a k-block in every warp).
+
+# The dynamic shared memory of a one-row CUDA GEMV block's row
+# (`shared_row`), a byte count per two of its K columns: their two A
+# elements (4 bytes), and their part of two areas of one F32 operand sum per
+# 16 columns (1 byte). Every launch that can run a one-row block declares
+# K * SHARED_ROW_PAIR_BYTES / 2 bytes where it runs one (dense's `gemv` and
+# mixed `ordered_gemv`, routed's `choice`, `summed` and the shared expert's
+# `gathered`), and the block traps on less (`require_dynamic_shared`), which
+# also holds the kernels to this layout.
+const SHARED_ROW_PAIR_BYTES = 5
 
 # The forms below are the `dense` projection (`cuda/lib/projection/operator.cuh`,
 # over the K1 library `cuda/lib/projection/projection.cuh`), `single` and
@@ -499,7 +511,7 @@ projection dense for cuda:
     launch ordered_gemv for segmented when ORDERED_ANY == 1 and ORDERED_ALL == 0 and M <= VERIFY_ROWS:
         threadgroups (tiles(W, ORDERED * ceil_div(N, 32) + (1 - ORDERED) * ceil_div(ceil_div(N, 16 * TPW), 8 / KSPLIT)), 1, G)
         threads_per_threadgroup (256, 1, 1)
-        shared_bytes (max(ORDERED_GEMV_SHARED, (1 - min(1, M - 1)) * K * 2))
+        shared_bytes (max(ORDERED_GEMV_SHARED, (1 - min(1, M - 1)) * K * SHARED_ROW_PAIR_BYTES / 2))
     launch ordered_gemm when ORDERED_ALL == 1 and M > VERIFY_ROWS:
         threadgroups (tiles(W, ceil_div(N, 32)), ceil_div(M, 64), G)
         threads_per_threadgroup (256, 1, 1)
@@ -527,7 +539,7 @@ projection dense for cuda:
         reads (STAGING)
         threadgroups (P * tiles(W, ceil_div(ceil_div(N, 16), 8 / KSPLIT)), 1, G)
         threads_per_threadgroup (256, 1, 1)
-        shared_bytes ((1 - min(1, M - 1)) * ((K / P) * 2 + (1 - min(1, P - 1)) * (K / 16) * 8))
+        shared_bytes ((1 - min(1, M - 1)) * (K / P) * SHARED_ROW_PAIR_BYTES / 2)
     launch gemv16 when ORDERED_ANY == 0 and M > 8 and M <= 16 and PLANES == 0:
         reads (STAGING)
         alike (gemv)

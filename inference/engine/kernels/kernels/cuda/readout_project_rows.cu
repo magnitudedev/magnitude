@@ -51,16 +51,14 @@ __global__ void readout_project_rows_stage(SEISMIC_KERNEL_PARAMS) {
 #ifdef SEISMIC_FORMING_READOUT_PROJECT_ROWS_GEMV
 template <unsigned STAGING, unsigned KSPLIT, unsigned RESIDENCY>
 __launch_bounds__(256, PROJECTION_GEMV_BLOCKS(KSPLIT, RESIDENCY)) __global__ void readout_project_rows_gemv(SEISMIC_KERNEL_PARAMS) {
-    extern __shared__ uint4 dynamic_shared[];
-    PROJECTION_GEMV(1, KSPLIT, STAGING, PROJECTION_GEMV_GRID(KSPLIT, RESIDENCY), RESIDENCY,
-                    reinterpret_cast<projection::u8 *>(dynamic_shared));
+    PROJECTION_GEMV(1, KSPLIT, STAGING, PROJECTION_GEMV_GRID(KSPLIT, RESIDENCY), RESIDENCY);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_READOUT_PROJECT_ROWS_GEMV16
 template <unsigned STAGING, unsigned KSPLIT>
 __global__ void readout_project_rows_gemv16(SEISMIC_KERNEL_PARAMS) {
-    PROJECTION_GEMV(2, KSPLIT, STAGING, 0, 1, nullptr);
+    PROJECTION_GEMV(2, KSPLIT, STAGING, 0, 1);
 }
 #endif
 
@@ -103,20 +101,17 @@ struct SelectedLogits {
 
 // Block row y = feature row m's choice (of I): the routed decode GEMV of its
 // one row over the S weight rows it selects, a 16-row tile of them a warp
-// group's, the row formed in the block's shared memory where the weight
-// takes NVFP4 operands.
+// group's, the row formed in the block's shared memory (`shared_row`).
 template <int GATHER_TPW, int GATHER_KSPLIT>
 __launch_bounds__(routed::DECODE_THREADS) __global__ void readout_project_rows_gather_choice(SEISMIC_KERNEL_PARAMS) {
     using Shape = routed::DecodeShape<GATHER_TPW, GATHER_KSPLIT>;
-    using Source = projection::GemvSource<Pro>;
-    __shared__ projection::GemvShared<Shape, Source::type> shared;
-    extern __shared__ uint4 dynamic_shared[];
+    __shared__ projection::GemvShared<Shape, projection::SharedRow> shared;
     const projection::u64 m = blockIdx.y / SEISMIC_DIM_I, choice = blockIdx.y % SEISMIC_DIM_I;
     // Block-collective: before any warp leaves.
-    const Source::type pro = Source::make(
+    const projection::SharedRow pro = projection::shared_row(
         Pro{Raw{SEISMIC_PTR(SEISMIC_BUFFER_FEATURES) + m * SEISMIC_FEATURES_STRIDE_0 * Element::bytes, SEISMIC_FEATURES_STRIDE_0,
                 projection::AllRows{}}},
-        reinterpret_cast<projection::u8 *>(dynamic_shared), 1u, SEISMIC_DIM_D, nullptr);
+        SEISMIC_DIM_D);
     const int *selected = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_TOKEN_ROWS)) +
                           m * SEISMIC_TOKEN_ROWS_STRIDE_0 + choice * SEISMIC_TOKEN_ROWS_STRIDE_1;
     const element::Out<element::F32> row = SEISMIC_RESULT_0_OUT.offset(m * SEISMIC_RESULT_0_STRIDE_0);

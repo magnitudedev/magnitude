@@ -56,15 +56,14 @@ __global__ void short_conv_project_stage(SEISMIC_KERNEL_PARAMS) {
 #ifdef SEISMIC_FORMING_SHORT_CONV_PROJECT_GEMV
 template <unsigned STAGING, unsigned KSPLIT>
 __global__ void short_conv_project_gemv(SEISMIC_KERNEL_PARAMS) {
-    extern __shared__ uint4 dynamic_shared[];
-    PROJECTION_SEGMENTED_GEMV(1, KSPLIT, STAGING, reinterpret_cast<projection::u8 *>(dynamic_shared));
+    PROJECTION_SEGMENTED_GEMV(1, KSPLIT, STAGING);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_SHORT_CONV_PROJECT_GEMV16
 template <unsigned STAGING, unsigned KSPLIT>
 __global__ void short_conv_project_gemv16(SEISMIC_KERNEL_PARAMS) {
-    PROJECTION_SEGMENTED_GEMV(2, KSPLIT, STAGING, nullptr);
+    PROJECTION_SEGMENTED_GEMV(2, KSPLIT, STAGING);
 }
 #endif
 
