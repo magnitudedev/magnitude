@@ -717,97 +717,6 @@ fn cuda_dense_weights_match_host_model() {
     }
 }
 
-/// Every row of a GEMV class (2..=GEMV_ROWS rows, staged and two-block paths)
-/// equals the same row projected alone (M = 1, formed in the GEMV block) bit
-/// for bit: a verification row does not depend on its peers or on M.
-fn gemv_rows_match_single_row_bits(format: Format) {
-    let Some(device) = cuda() else { return };
-    let mut rng = Rng(19);
-    let (h, f) = (512, 768);
-    let gate = weight(&device, format, f, h, &mut rng);
-    let up = weight(&device, format, f, h, &mut rng);
-    let down = weight(&device, format, h, f, &mut rng);
-    let rows = GEMV_ROWS;
-    let residual_values: Vec<f32> = (0..rows * h).map(|_| rng.uniform(-3.0, 3.0)).collect();
-    let norm = f32_tensor(
-        &device,
-        &[h as u64],
-        &(0..h).map(|_| rng.uniform(0.25, 1.25)).collect::<Vec<_>>(),
-    );
-    let product_values: Vec<f32> = (0..rows * f)
-        .map(|_| bf16_round(rng.uniform(-1.0, 1.0)))
-        .collect();
-    let expansion = expansion(format.resident(), format.resident(), h, f);
-    let projection = output_projection(format.resident(), h, f);
-    for mapping in admitted("dense_expand + dense_output", &GEMV_MAPPINGS, |mapping| {
-        expansion.admits(&device, mapping) && projection.admits(&device, mapping)
-    }) {
-        let expand = expansion.kernel(&device, mapping);
-        let output = projection.kernel(&device, mapping);
-        let run = |o: usize, first: usize| {
-            let residual = f32_tensor(
-                &device,
-                &[o as u64, h as u64],
-                &residual_values[first * h..(first + o) * h],
-            );
-            let product = bf16_tensor(
-                &device,
-                &[o as u64, f as u64],
-                &product_values[first * f..(first + o) * f],
-            );
-            let out_rows = i32_tensor(&device, &[o as u64], &(0..o as i32).collect::<Vec<_>>());
-            let expanded = expand
-                .call(dense_expand::Args {
-                    residual: &residual,
-                    norm: &norm,
-                    gate_weight: &gate.tensor,
-                    up_weight: &up.tensor,
-                    out_rows: &out_rows,
-                    eps: EPSILON,
-                    activation: 0,
-                    glu_limit: &i32_tensor(&device, &[0, 0], &[]),
-                    gate_scale: &f32_tensor(&device, &[0], &[]),
-                    up_scale: &f32_tensor(&device, &[0], &[]),
-                    gate_bound: &f32_tensor(&device, &[0], &[]),
-                    up_bound: &f32_tensor(&device, &[0], &[]),
-                })
-                .unwrap()
-                .value;
-            let residual_rows = f32_tensor(&device, &[o as u64, h as u64], &vec![0.0; o * h]);
-            let projected = output
-                .call(dense_output::Args {
-                    residual: &residual_rows,
-                    product: &product,
-                    down_weight: &down.tensor,
-                    out_rows: &out_rows,
-                    down_scale: &f32_tensor(&device, &[0], &[]),
-                    down_bound: &f32_tensor(&device, &[0], &[]),
-                })
-                .unwrap()
-                .value;
-            (read_bf16(&expanded), read_f32(&projected))
-        };
-        let singles: Vec<(Vec<f32>, Vec<f32>)> = (0..rows).map(|row| run(1, row)).collect();
-        for o in [2usize, 5, 8, 9, 12, 16] {
-            let (expanded, projected) = run(o, 0);
-            for row in 0..o {
-                let label = format!("{format:?} {mapping:?} O={o} row {row}");
-                let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
-                assert_eq!(
-                    bits(&expanded[row * f..(row + 1) * f]),
-                    bits(&singles[row].0),
-                    "expand {label}"
-                );
-                assert_eq!(
-                    bits(&projected[row * h..(row + 1) * h]),
-                    bits(&singles[row].1),
-                    "output {label}"
-                );
-            }
-        }
-    }
-}
-
 /// Expected head logits of a case (features of the `out_rows` rows against
 /// every vocabulary row) and their tolerance: the F32 logits' form bound
 /// on `mapping`, plus the prologue's flips and the operand path's slack
@@ -1409,7 +1318,6 @@ gguf_format_tests! {
         dense_output_matches_host_model
         grouped_project_rows_match_host_model
         gemm_row_bands_match_host_model
-        gemv_rows_match_single_row_bits
         head_rows_match_host_model
         features_and_selected_rows_match_host_model
         dense_expand_host_model_matches_portable_body

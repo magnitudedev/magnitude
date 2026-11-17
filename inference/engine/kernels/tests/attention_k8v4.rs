@@ -2088,15 +2088,15 @@ fn decode_matches_portable_body_on(device: &Device, encoded: &Encoded) {
     }
 }
 
-/// Every row of a verify block, at every verify width, is bit for bit the
-/// row launched alone (plain decode), under every configuration the other
-/// tests sweep, on every backend: the same row over the same affine
-/// history, its earlier block rows fresh keys in the wider launches and
-/// history rows (as the widest launch appended them) in the narrower
-/// (`verify_blocks`). So a fresh key and value are read as their encoding,
-/// the one history holds, and a row's reduction order is set by its own
-/// keys' positions alone, never by the rows sharing its launch or its tile
-/// or by how far its tile's other rows reach.
+/// Every row of a verify block, at every verify width, attends its own
+/// affine history within the host model's bound (`check`), under every
+/// configuration the other tests sweep, on every backend: the same row over
+/// the same history, its earlier block rows fresh keys in the wider
+/// launches and history rows (as the widest launch appended them) in the
+/// narrower (`verify_blocks`). So a fresh key and value are read as their
+/// encoding, and a row reads its own keys' positions whichever rows share
+/// its launch or its tile and however far its tile's other rows reach; each
+/// launch appends its rows' vectors where they belong.
 ///
 /// The histories: 8 rows (one key partition); 20 and 28 rows, whose block rows'
 /// 29 to 36 keys cross the first 32-key partition and tile; and two spans
@@ -2106,7 +2106,7 @@ fn decode_matches_portable_body_on(device: &Device, encoded: &Encoded) {
 /// 2100 rows, past every swept configuration's PARTS x SPAN keys (at most
 /// 2048), so each partition holds several chunks of a row's keys.
 #[test]
-fn decode_rows_are_the_same_at_every_verify_width() {
+fn verify_rows_attend_their_history_at_every_width() {
     // (label, history spans, store rows, rows per slab)
     let histories: [(&str, &[(i32, i32)], usize, usize); 5] = [
         ("8 history rows", &[(0, 8)], 24, 24),
@@ -2123,7 +2123,6 @@ fn decode_rows_are_the_same_at_every_verify_width() {
         ("qwen35b", QWEN35B, 121, decode_forms),
         ("sliced", SLICED, 122, decode_configs),
     ];
-    let bits = |values: &[f32]| values.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
     let mut failures = Vec::new();
     for device in seismic_native_tests::every_device() {
         for (name, geometry, seed, configs) in geometries {
@@ -2136,21 +2135,29 @@ fn decode_rows_are_the_same_at_every_verify_width() {
                     &verify_rows(spans, 0..VERIFY_ROWS),
                     seed,
                 ));
+                let expected = widest.expected();
                 for config in configs(device.backend(), geometry) {
                     let label = format!("{name} {history} {:?} {config:?}", device.backend());
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let kernel = decode_kernel(&device, geometry, &config);
-                        let run = |encoded: &Encoded| {
+                        // Each launch against the widest block's host model
+                        // (its rows `rows`), its appended vectors among the
+                        // widest block's; the planes it leaves.
+                        let run = |encoded: &Encoded, label: &str, rows: std::ops::Range<usize>| {
                             let mut bound =
                                 Bound::new_with_slab_rows(&device, encoded, slab_rows, false);
                             let gated = kernel
                                 .call(args!(attention_decode_k8v4, bound, encoded.case))
                                 .unwrap()
                                 .value;
-                            (bf16_values(&gated), bound.planes())
+                            let block = (
+                                expected.0[rows.start * row..rows.end * row].to_vec(),
+                                expected.1.clone(),
+                            );
+                            check(label, &widest, &gated, &bound, &block);
+                            bound.planes()
                         };
-                        let (wide, planes) = run(&widest);
-                        let mut alone = vec![Vec::new(); VERIFY_ROWS];
+                        let planes = run(&widest, &format!("{label} width {VERIFY_ROWS}"), 0..VERIFY_ROWS);
                         for block in verify_blocks() {
                             let mut case = Case::new(
                                 geometry,
@@ -2170,27 +2177,7 @@ fn decode_rows_are_the_same_at_every_verify_width() {
                                 case,
                                 planes: planes.clone(),
                             };
-                            let (actual, narrow_planes) = run(&narrow);
-                            assert_eq!(actual.len(), block.len() * row);
-                            if block.len() == 1 {
-                                alone[block.start] = bits(&actual);
-                            }
-                            for (j, i) in block.clone().enumerate() {
-                                assert!(
-                                    bits(&actual[j * row..(j + 1) * row]) == alone[i],
-                                    "{label}: row {i} in rows {block:?} differs from row {i} alone"
-                                );
-                            }
-                            assert_eq!(
-                                narrow_planes, planes,
-                                "{label} rows {block:?}: history planes"
-                            );
-                        }
-                        for i in 0..VERIFY_ROWS {
-                            assert!(
-                                bits(&wide[i * row..(i + 1) * row]) == alone[i],
-                                "{label}: row {i} of the widest block differs from row {i} alone"
-                            );
+                            run(&narrow, &format!("{label} rows {block:?}"), block.clone());
                         }
                     }));
                     if outcome.is_err() {

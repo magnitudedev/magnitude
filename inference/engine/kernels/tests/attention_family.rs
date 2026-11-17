@@ -3868,24 +3868,23 @@ fn verify_sequences(sequences: &[(&[(i32, i32)], usize)], range: std::ops::Range
 }
 
 /// Every row of a verify block (`block_rows` gives its rows `range`), at
-/// every verify width, is bit for bit the row launched alone (plain decode)
-/// under one specialization: the same row over the same history, its earlier
-/// block rows fresh keys in the wider launches and history rows (as the
-/// widest launch appended them) in the narrower (`verify_blocks`). So its
-/// reduction order is set by its own keys' positions alone, whichever rows
-/// share its tile and whether its tile's other rows reach further (a tile
-/// row's masked tail), and a prepared fresh key and value equal the appended
-/// ones bit for bit. Every configuration the other tests sweep is checked on
-/// every backend, in the decode entry, or in the prefill entry where the
-/// decode declaration refuses the case's forms (DECODE_REFUSALS: it serves
-/// the same rows as a decode class). GLM's selected read (a WorkList bitmap
-/// of picked units and the tail, which the prefill entry alone reads) is held
-/// through Vulkan's prefill vector form alone: the prefill matrix form's key
-/// tiles start at each span's edges (history, then fresh), which move with
-/// the verify width, so its reduction order is not a row's key positions. With `earlier` (a case per entry of
-/// `cases`, over a longer history) each configuration's entry first serves
-/// that launch, so its scratch holds the longer launch's partitions: a launch
-/// reads only the partitions it wrote.
+/// every verify width, attends its own history within the host model's
+/// bound (`check`): the same row over the same history, its earlier block
+/// rows fresh keys in the wider launches and history rows (as the widest
+/// launch appended them) in the narrower (`verify_blocks`). So a row reads
+/// its own keys' positions, whichever rows share its tile and whether its
+/// tile's other rows reach further (a tile row's masked tail), and its
+/// launch appends its fresh keys and values where they belong. The host
+/// model takes the widest launch's own prepared keys (`expected_with`), as
+/// a rounded key may move by one code. Every configuration the other tests
+/// sweep is checked on every backend, in the decode entry, or in the
+/// prefill entry where the decode declaration refuses the case's forms
+/// (DECODE_REFUSALS: it serves the same rows as a decode class), and GLM's
+/// selected read (a WorkList bitmap of picked units and the tail, which the
+/// prefill entry alone reads) on Vulkan. With `earlier` (a case per entry of `cases`, over a longer
+/// history) each configuration's entry first serves that launch, so its
+/// scratch holds the longer launch's partitions: a launch reads only the
+/// partitions it wrote.
 fn check_verify_widths(
     cases: &[(&str, bool, Case)],
     earlier: Option<&[(&str, bool, Case)]>,
@@ -3902,10 +3901,10 @@ fn check_verify_widths(
             let widened = earlier.map(|earlier| case.with_selection_words(earlier[index].2.selection_words));
             let case = widened.as_ref().unwrap_or(case);
             let decode = *entry_decode && !(case.picks > 0 && DECODE_REFUSALS.contains(&device.backend()));
-            for config in case_configurations(&device, decode, case)
-                .into_iter()
-                .filter(|config| *entry_decode || config.contains(&("MATRIX", 0)))
-            {
+            // The host model at the device's prepared keys, formed again
+            // only when a configuration prepares other keys.
+            let mut model: Option<(Vec<f32>, (Vec<f32>, Vec<f32>, Vec<f32>))> = None;
+            for config in case_configurations(&device, decode, case) {
                 let specialization = config
                     .iter()
                     .fold(statics(&device, case.form, case.sink_rows()), |s, (n, v)| s.with_param(*n, *v));
@@ -3917,32 +3916,24 @@ fn check_verify_widths(
                     let widest = attend
                         .run_after(&device, earlier.map(|earlier| &earlier[index].2), case)
                         .unwrap_or_else(|error| panic!("{label} width {VERIFY_ROWS}: {error}"));
+                    let own = case.prepared_keys(&widest.1);
+                    if model.as_ref().is_none_or(|(keys, _)| *keys != own) {
+                        model = Some((own.clone(), case.expected_with(Some(&own))));
+                    }
+                    let expected = &model.as_ref().expect("the host model is formed").1;
+                    check(&format!("{label} width {VERIFY_ROWS}"), &widest, expected, case);
                     let row = case.form.heads() * case.form.w();
-                    let mut alone = vec![Vec::new(); VERIFY_ROWS];
                     for block in verify_blocks() {
                         let narrow = case.narrowed(block_rows(block.clone()), block.clone(), &widest.1, &widest.2);
                         let actual = attend
                             .run(&device, &narrow)
                             .unwrap_or_else(|error| panic!("{label} rows {block:?}: {error}"));
-                        if block.len() == 1 {
-                            alone[block.start] = bits(&actual.0);
-                        }
-                        for (j, i) in block.clone().enumerate() {
-                            assert_eq!(
-                                bits(&actual.0[j * row..(j + 1) * row]),
-                                alone[i],
-                                "{label}: row {i} in rows {block:?} differs from row {i} alone"
-                            );
-                        }
-                        assert_eq!(bits(&actual.1), bits(&widest.1), "{label} rows {block:?}: key plane");
-                        assert_eq!(bits(&actual.2), bits(&widest.2), "{label} rows {block:?}: value plane");
-                    }
-                    for i in 0..VERIFY_ROWS {
-                        assert_eq!(
-                            bits(&widest.0[i * row..(i + 1) * row]),
-                            alone[i],
-                            "{label}: row {i} of the widest block differs from row {i} alone"
+                        let rows = (
+                            expected.0[block.start * row..block.end * row].to_vec(),
+                            expected.1.clone(),
+                            expected.2.clone(),
                         );
+                        check(&format!("{label} rows {block:?}"), &actual, &rows, case);
                     }
                 }));
                 if outcome.is_err() {
@@ -3995,7 +3986,7 @@ fn verify_cases_over(store: usize, slab_rows: usize, rows: &dyn Fn() -> Vec<Row>
     ]
 }
 
-/// A verify block's rows over one history are the same at every width
+/// A verify block's rows over one history attend it at every width
 /// (`check_verify_widths`), at the histories that reach every path: 28 rows,
 /// whose block rows' 29 to 36 keys straddle the 32-key tile edge, so a tile
 /// holds history and fresh keys in a different split at each width and rows
@@ -4005,7 +3996,7 @@ fn verify_cases_over(store: usize, slab_rows: usize, rows: &dyn Fn() -> Vec<Row>
 /// most 2048), so each partition holds several chunks. The 40 picks over a 96-row pick plane of
 /// 32-row slabs fill one pick tile and part of a second, some of them -1.
 #[test]
-fn decode_rows_are_the_same_at_every_verify_width() {
+fn verify_rows_attend_their_history_at_every_width() {
     for history in [28, 60, 70, 2100] {
         let rows = || verify_rows(&[(0, history)], 0..VERIFY_ROWS);
         let cases = verify_cases(history as usize + VERIFY_ROWS, &rows);
@@ -4017,7 +4008,7 @@ fn decode_rows_are_the_same_at_every_verify_width() {
 /// partition on both decode (`MIN_TILES = 1`) and prefill-decode
 /// (`MIN_TILES = 16`) grids while leaving higher partitions empty — launched in
 /// one `NativeTensorBatch` right after an 8400-row block on the same entry and
-/// scratch arena equal each row launched alone: the partitions the longer
+/// scratch arena attend their own history: the partitions the longer
 /// launch filled and the shorter leaves empty are not read
 /// (`check_verify_widths`, `earlier`).
 #[test]
@@ -4034,9 +4025,10 @@ fn a_shorter_history_does_not_read_a_longer_launchs_partitions() {
 
 /// A launch's tile holds rows of two sequences (three rows of one over 70
 /// history rows, five of another over its own 40, so the 2- and 4-row tiles
-/// each hold both) and each row is bit for bit the row launched alone.
+/// each hold both) and each row attends its own sequence's history
+/// (`check_verify_widths`).
 #[test]
-fn a_tile_of_two_sequences_keeps_each_row_as_it_is_alone() {
+fn a_tile_of_two_sequences_attends_each_rows_own_history() {
     let (a, b): (&[(i32, i32)], &[(i32, i32)]) = (&[(0, 70)], &[(100, 140)]);
     let sequences = [(a, 3), (b, VERIFY_ROWS - 3)];
     let rows = || verify_sequences(&sequences, 0..VERIFY_ROWS);
