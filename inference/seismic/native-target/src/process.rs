@@ -476,7 +476,8 @@ impl ProcessId {
     }
 }
 
-/// What a process holds in host RAM at one reading ([`process_footprint`]).
+/// What a process holds in a store at one reading ([`host_footprint`] in
+/// host RAM).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcessFootprint {
     Observed(u64),
@@ -490,7 +491,7 @@ pub enum ProcessFootprint {
 /// footprint's own terms, file-backed pages left out); unobserved
 /// elsewhere, or where the process is gone. A device's own memory is in
 /// neither.
-pub fn process_footprint(process: ProcessId) -> ProcessFootprint {
+pub fn host_footprint(process: ProcessId) -> ProcessFootprint {
     #[cfg(target_os = "macos")]
     let bytes = macos::phys_footprint(process.0);
     #[cfg(target_os = "linux")]

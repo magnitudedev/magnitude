@@ -24,6 +24,25 @@ pub mod toolchain;
 pub mod topology;
 pub mod transfer;
 
+/// What `process` holds on the NVIDIA GPU `uuid` (`cuDeviceGetUuid_v2`,
+/// Vulkan's `deviceUUID`) through CUDA or graphics contexts, as NVML counts
+/// it; unobserved where NVML cannot say, and on Windows, which reads no
+/// NVML.
+pub fn process_footprint(
+    process: seismic_native_target::process::ProcessId,
+    uuid: [u8; 16],
+) -> seismic_native_target::process::ProcessFootprint {
+    #[cfg(not(target_os = "windows"))]
+    {
+        nvml::process_footprint(process, uuid)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = (process, uuid);
+        seismic_native_target::process::ProcessFootprint::Unobserved
+    }
+}
+
 /// The ledger a test's device and allocations charge: one tally of host
 /// RAM that bounds nothing, which every store and entry of a test is, so a
 /// range carved for a test's entry lies in its block's store.

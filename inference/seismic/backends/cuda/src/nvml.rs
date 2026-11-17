@@ -1,14 +1,18 @@
 //! Minimal dynamically loaded NVML: one device's memory accounting
 //! (`nvmlDeviceGetMemoryInfo_v2`), which separates the driver's reserve from
 //! what processes use, and what it holds for one process
-//! (`nvmlDeviceGetComputeRunningProcesses_v3`). Like the CUDA driver it
-//! needs no headers or libraries to build; a host without NVML or without an
-//! entry point yields `None` for what it would read. The device is found by
-//! its CUDA UUID, so CUDA and NVML enumeration order and
+//! (`nvmlDeviceGetComputeRunningProcesses_v3` and
+//! `nvmlDeviceGetGraphicsRunningProcesses_v3`, or their `_v2` where the
+//! library predates them). Like the CUDA driver it needs no headers or libraries to
+//! build, and is loaded and initialized once per process; a host without
+//! NVML or without an entry point yields `None` for what it would read. The
+//! device is found by its CUDA UUID, so CUDA and NVML enumeration order and
 //! `CUDA_VISIBLE_DEVICES` do not matter.
 
 use libloading::Library;
+use seismic_native_target::process::{ProcessFootprint, ProcessId};
 use std::ffi::{c_char, c_int, c_uint, c_void, CString};
+use std::sync::OnceLock;
 
 type Return = c_int;
 type DeviceHandle = *mut c_void;
@@ -36,8 +40,8 @@ pub(crate) struct MemorySample {
     pub free: u64,
 }
 
-/// `nvmlProcessInfo_t`, as `nvmlDeviceGetComputeRunningProcesses_v3` fills
-/// it.
+/// `nvmlProcessInfo_t`, as the `_v3` process queries fill it, and
+/// `nvmlProcessInfo_v2_t`, its layout, as their `_v2` do.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct ProcessInfo {
@@ -55,28 +59,43 @@ const NOT_AVAILABLE: u64 = u64::MAX;
 
 type RunningProcesses = unsafe extern "C" fn(DeviceHandle, *mut c_uint, *mut ProcessInfo) -> Return;
 
-/// An initialized NVML session bound to one device; shut down on drop.
-pub(crate) struct NvmlDevice {
-    shutdown: unsafe extern "C" fn() -> Return,
+/// The two lists of the processes on a device: those with a compute
+/// context (CUDA) and those with a graphics one (Vulkan, OpenGL). NVML
+/// added each version of the two together, so a library has both or
+/// neither.
+#[derive(Clone, Copy)]
+struct ProcessQueries {
+    compute: RunningProcesses,
+    graphics: RunningProcesses,
+}
+
+/// NVML's entry points in an initialized session: loaded and initialized
+/// once per process and kept for its life, as the driver is
+/// ([`crate::driver::Driver::load`]).
+struct Nvml {
+    by_uuid: unsafe extern "C" fn(*const c_char, *mut DeviceHandle) -> Return,
     memory_info: unsafe extern "C" fn(DeviceHandle, *mut MemoryV2) -> Return,
-    running_processes: Option<RunningProcesses>,
-    handle: DeviceHandle,
+    processes: Option<ProcessQueries>,
     _library: Library,
 }
 
-impl NvmlDevice {
-    /// The NVML device whose UUID is `uuid` (`cuDeviceGetUuid_v2`), as a
-    /// whole GPU or a MIG partition.
-    pub fn open(uuid: [u8; 16]) -> Option<Self> {
-        // NVML symbols have the documented C ABI; the library is kept in the
-        // returned value for as long as its function pointers are used.
-        unsafe {
+// NVML's function pointers and the loaded library are plain data; NVML is
+// documented thread-safe.
+unsafe impl Send for Nvml {}
+unsafe impl Sync for Nvml {}
+
+static NVML: OnceLock<Option<Nvml>> = OnceLock::new();
+
+impl Nvml {
+    /// The process's NVML session; none where the library, an entry point
+    /// or its initialization is missing.
+    fn get() -> Option<&'static Self> {
+        // NVML symbols have the documented C ABI; the library is kept with
+        // its function pointers for the life of the process.
+        NVML.get_or_init(|| unsafe {
             let library = Library::new("libnvidia-ml.so.1").ok()?;
             let init = *library
                 .get::<unsafe extern "C" fn() -> Return>(b"nvmlInit_v2\0")
-                .ok()?;
-            let shutdown = *library
-                .get::<unsafe extern "C" fn() -> Return>(b"nvmlShutdown\0")
                 .ok()?;
             let by_uuid = *library
                 .get::<unsafe extern "C" fn(*const c_char, *mut DeviceHandle) -> Return>(
@@ -88,36 +107,64 @@ impl NvmlDevice {
                     b"nvmlDeviceGetMemoryInfo_v2\0",
                 )
                 .ok()?;
-            let running_processes = library
-                .get::<RunningProcesses>(b"nvmlDeviceGetComputeRunningProcesses_v3\0")
-                .ok()
-                .map(|symbol| *symbol);
-            if init() != 0 {
-                return None;
-            }
-            let mut handle = std::ptr::null_mut();
-            let found = ["GPU", "MIG"].into_iter().any(|prefix| {
-                let text = CString::new(uuid_text(prefix, uuid)).expect("UUID text has no NUL");
-                by_uuid(text.as_ptr(), &mut handle) == 0
+            let query = |symbol: &[u8]| library.get::<RunningProcesses>(symbol).ok().map(|symbol| *symbol);
+            let processes = [
+                (
+                    &b"nvmlDeviceGetComputeRunningProcesses_v3\0"[..],
+                    &b"nvmlDeviceGetGraphicsRunningProcesses_v3\0"[..],
+                ),
+                (
+                    &b"nvmlDeviceGetComputeRunningProcesses_v2\0"[..],
+                    &b"nvmlDeviceGetGraphicsRunningProcesses_v2\0"[..],
+                ),
+            ]
+            .into_iter()
+            .find_map(|(compute, graphics)| {
+                Some(ProcessQueries {
+                    compute: query(compute)?,
+                    graphics: query(graphics)?,
+                })
             });
-            if !found {
-                shutdown();
-                return None;
-            }
-            Some(Self {
-                shutdown,
+            (init() == 0).then_some(Self {
+                by_uuid,
                 memory_info,
-                running_processes,
-                handle,
+                processes,
                 _library: library,
             })
-        }
+        })
+        .as_ref()
+    }
+}
+
+/// One device of the process's NVML session.
+pub(crate) struct NvmlDevice {
+    nvml: &'static Nvml,
+    handle: DeviceHandle,
+}
+
+impl NvmlDevice {
+    /// The NVML device whose UUID is `uuid` (`cuDeviceGetUuid_v2`), as a
+    /// whole GPU or a MIG partition.
+    pub fn open(uuid: [u8; 16]) -> Option<Self> {
+        let nvml = Nvml::get()?;
+        let mut handle = std::ptr::null_mut();
+        let found = ["GPU", "MIG"].into_iter().any(|prefix| {
+            let text = CString::new(uuid_text(prefix, uuid)).expect("UUID text has no NUL");
+            // SAFETY: a NUL-terminated UUID and a handle to write.
+            unsafe { (nvml.by_uuid)(text.as_ptr(), &mut handle) == 0 }
+        });
+        found.then_some(Self { nvml, handle })
     }
 
     /// What the device's driver holds for process `pid` (its context and
     /// allocations), as NVML counts it.
     pub fn process_bytes(&self, pid: u32) -> Result<u64, ProcessMemoryError> {
-        let query = self.running_processes.ok_or(ProcessMemoryError::Unsupported)?;
+        let queries = self.nvml.processes.ok_or(ProcessMemoryError::Unsupported)?;
+        own_bytes([&self.listed(queries.compute)?, &self.listed(queries.graphics)?], pid)
+    }
+
+    /// The processes `query` lists on the device.
+    fn listed(&self, query: RunningProcesses) -> Result<Vec<ProcessInfo>, ProcessMemoryError> {
         // A count of zero asks how many processes there are; a process may
         // start between two queries, so the room asked for is the last count.
         let mut processes = Vec::new();
@@ -126,13 +173,12 @@ impl NvmlDevice {
             match unsafe { query(self.handle, &mut count, processes.as_mut_ptr()) } {
                 0 => {
                     processes.truncate(count as usize);
-                    break;
+                    return Ok(processes);
                 }
                 INSUFFICIENT_SIZE => processes.resize(count as usize, ProcessInfo::default()),
                 code => return Err(ProcessMemoryError::Query(code)),
             }
         }
-        own_bytes(&processes, pid)
     }
 
     pub fn sample(&self) -> Option<MemorySample> {
@@ -140,7 +186,7 @@ impl NvmlDevice {
             version: MEMORY_V2_VERSION,
             ..MemoryV2::default()
         };
-        if unsafe { (self.memory_info)(self.handle, &mut memory) } != 0 {
+        if unsafe { (self.nvml.memory_info)(self.handle, &mut memory) } != 0 {
             return None;
         }
         Some(MemorySample {
@@ -156,7 +202,7 @@ impl NvmlDevice {
 pub(crate) enum ProcessMemoryError {
     /// NVML is not loaded, or has no device of this UUID.
     Unavailable,
-    /// NVML lacks `nvmlDeviceGetComputeRunningProcesses_v3`.
+    /// NVML lacks the compute and graphics process queries, `_v3` and `_v2`.
     Unsupported,
     /// The query failed with this NVML return code.
     Query(Return),
@@ -172,7 +218,7 @@ impl std::fmt::Display for ProcessMemoryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unavailable => write!(f, "NVML is unavailable for the device"),
-            Self::Unsupported => write!(f, "NVML lacks nvmlDeviceGetComputeRunningProcesses_v3"),
+            Self::Unsupported => write!(f, "NVML lacks the compute and graphics process queries (_v3 and _v2)"),
             Self::Query(code) => write!(f, "NVML's process query failed ({code})"),
             Self::Unlisted { pid } => write!(
                 f,
@@ -183,16 +229,43 @@ impl std::fmt::Display for ProcessMemoryError {
     }
 }
 
-/// What NVML's `processes` say process `pid` holds.
-fn own_bytes(processes: &[ProcessInfo], pid: u32) -> Result<u64, ProcessMemoryError> {
-    let process = processes
-        .iter()
-        .find(|process| process.pid == pid)
-        .ok_or(ProcessMemoryError::Unlisted { pid })?;
-    match process.used_gpu_memory {
-        NOT_AVAILABLE => Err(ProcessMemoryError::Unreported { pid }),
-        bytes => Ok(bytes),
-    }
+/// What NVML's compute and graphics `lists` say process `pid` holds.
+///
+/// Within a list, the sum of its entries: a GPU's handle lists a process
+/// once per MIG instance it holds a context in. Across the lists, the most
+/// of the two: NVML documents `usedGpuMemory` only as the process's used
+/// memory on the device, not which of its contexts it counts, and
+/// `nvidia-smi` shows a process with both kinds of context (`C+G`) as one
+/// entry with one figure, so a process in both lists may be counted whole
+/// in each; adding them could count it twice, and the larger one counts
+/// all of it whichever way NVML attributes it.
+fn own_bytes(lists: [&[ProcessInfo]; 2], pid: u32) -> Result<u64, ProcessMemoryError> {
+    lists
+        .into_iter()
+        .map(|processes| {
+            processes
+                .iter()
+                .filter(|process| process.pid == pid)
+                .try_fold(None, |sum: Option<u64>, process| match process.used_gpu_memory {
+                    NOT_AVAILABLE => Err(ProcessMemoryError::Unreported { pid }),
+                    bytes => Ok(Some(sum.unwrap_or(0) + bytes)),
+                })
+        })
+        .try_fold(None, |most: Option<u64>, listed| Ok(most.max(listed?)))?
+        .ok_or(ProcessMemoryError::Unlisted { pid })
+}
+
+/// What `process` holds on the device `uuid` (its context and allocations),
+/// as NVML counts it; unobserved where NVML is absent, has no such device,
+/// fails, or reports no figure for the process. NVML lists processes by
+/// their PIDs in the host's PID namespace, so a process in a container's
+/// namespace is not found by the PID it knows itself by, and reads
+/// unobserved there.
+pub(crate) fn process_footprint(process: ProcessId, uuid: [u8; 16]) -> ProcessFootprint {
+    NvmlDevice::open(uuid)
+        .ok_or(ProcessMemoryError::Unavailable)
+        .and_then(|device| device.process_bytes(process.get()))
+        .map_or(ProcessFootprint::Unobserved, ProcessFootprint::Observed)
 }
 
 /// What this process's context holds on the device `uuid`, as NVML counts
@@ -202,14 +275,6 @@ pub(crate) fn context_bytes(uuid: [u8; 16]) -> Result<u64, ProcessMemoryError> {
     NvmlDevice::open(uuid)
         .ok_or(ProcessMemoryError::Unavailable)?
         .process_bytes(std::process::id())
-}
-
-impl Drop for NvmlDevice {
-    fn drop(&mut self) {
-        unsafe {
-            (self.shutdown)();
-        }
-    }
 }
 
 /// NVML's UUID text: `<prefix>-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`.
@@ -247,11 +312,41 @@ mod tests {
             used_gpu_memory,
             ..ProcessInfo::default()
         };
+        let compute = |processes: &[ProcessInfo], pid| own_bytes([processes, &[]], pid);
         let listed = [process(7, 100), process(9, NOT_AVAILABLE), process(11, 5)];
-        assert_eq!(own_bytes(&listed, 11), Ok(5));
-        assert_eq!(own_bytes(&listed, 9), Err(ProcessMemoryError::Unreported { pid: 9 }));
-        assert_eq!(own_bytes(&listed, 8), Err(ProcessMemoryError::Unlisted { pid: 8 }));
-        assert_eq!(own_bytes(&[], 8), Err(ProcessMemoryError::Unlisted { pid: 8 }));
+        assert_eq!(compute(&listed, 11), Ok(5));
+        assert_eq!(compute(&listed, 9), Err(ProcessMemoryError::Unreported { pid: 9 }));
+        assert_eq!(compute(&listed, 8), Err(ProcessMemoryError::Unlisted { pid: 8 }));
+        assert_eq!(compute(&[], 8), Err(ProcessMemoryError::Unlisted { pid: 8 }));
+        // A process listed once per MIG instance holds the sum; one
+        // instance without a figure leaves the whole unreported.
+        let instances = [process(7, 100), process(11, 5), process(7, 20)];
+        assert_eq!(compute(&instances, 7), Ok(120));
+        let partial = [process(7, 100), process(7, NOT_AVAILABLE)];
+        assert_eq!(compute(&partial, 7), Err(ProcessMemoryError::Unreported { pid: 7 }));
+        // A graphics process alone (Vulkan) reads from the graphics list.
+        assert_eq!(own_bytes([&[], &[process(7, 64)]], 7), Ok(64));
+        assert_eq!(own_bytes([&[process(11, 5)], &[process(7, 64)]], 11), Ok(5));
+        // A process in both lists is counted once: the larger list's.
+        assert_eq!(own_bytes([&[process(7, 100)], &[process(7, 100)]], 7), Ok(100));
+        assert_eq!(own_bytes([&instances, &[process(7, 64)]], 7), Ok(120));
+        assert_eq!(own_bytes([&[process(7, 10)], &[process(7, 64)]], 7), Ok(64));
+        // Either list without a figure for it leaves it unreported.
+        assert_eq!(
+            own_bytes([&[process(7, 100)], &[process(7, NOT_AVAILABLE)]], 7),
+            Err(ProcessMemoryError::Unreported { pid: 7 })
+        );
+        assert_eq!(own_bytes([&[], &[]], 7), Err(ProcessMemoryError::Unlisted { pid: 7 }));
+    }
+
+    /// A device NVML cannot read for the process, whether the library is
+    /// absent or it has no device of the UUID, reads unobserved: no figure is
+    /// guessed.
+    #[test]
+    fn a_device_nvml_cannot_read_is_unobserved() {
+        let uuid = *b"no-such-device!!";
+        assert!(NvmlDevice::open(uuid).is_none());
+        assert_eq!(process_footprint(ProcessId::current(), uuid), ProcessFootprint::Unobserved);
     }
 
     #[test]

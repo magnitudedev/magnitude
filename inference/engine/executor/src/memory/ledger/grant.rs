@@ -15,17 +15,13 @@ pub trait Footprints: Send + Sync {
     fn footprint(&self, process: seismic::ProcessId, store: &seismic::StoreIdentity) -> seismic::ProcessFootprint;
 }
 
-/// The system's footprints: a process's host RAM footprint
-/// (`seismic::process_footprint`) in host RAM's store; none in a device's
-/// own memory, which no per-process figure is read of.
+/// The system's footprints (`seismic::process_footprint`): host RAM's
+/// footprint, and a GPU's own memory as NVML counts the process there.
 pub struct SystemFootprints;
 
 impl Footprints for SystemFootprints {
     fn footprint(&self, process: seismic::ProcessId, store: &seismic::StoreIdentity) -> seismic::ProcessFootprint {
-        match store {
-            seismic::StoreIdentity::HostRam => seismic::process_footprint(process),
-            _ => seismic::ProcessFootprint::Unobserved,
-        }
+        seismic::process_footprint(process, store)
     }
 }
 

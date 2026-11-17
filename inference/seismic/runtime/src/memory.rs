@@ -21,7 +21,8 @@
 pub use seismic_memory::entry::{Backed, Carved, Change, Charge, Charging, DropScope, Entry, Refused, Store, Tally, Wiring};
 pub use seismic_memory::{AllocationFailure, HostBlock, PageSize};
 use seismic_compiler::errors::ExecutionError;
-use seismic_topology::{AccessPathId, Contract, DeviceTopology, Executor, StoreId};
+use seismic_native_target::process::{ProcessFootprint, ProcessId};
+use seismic_topology::{AccessPathId, Contract, DeviceTopology, Executor, PhysicalIdentity, StoreId, StoreIdentity};
 use std::collections::BTreeMap;
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -93,6 +94,22 @@ pub(crate) fn store_charges(
         *stores.entry(store).or_default() += bytes;
     }
     stores
+}
+
+/// What `process` holds in `store` now, by the figure the system reports of
+/// it there: in host RAM its footprint
+/// ([`seismic_native_target::process::host_footprint`]); in a GPU's own
+/// memory what NVML counts of it ([`seismic_cuda::process_footprint`]).
+/// Unobserved in every other store, and wherever the system reports no
+/// figure: no figure is guessed.
+pub fn process_footprint(process: ProcessId, store: &StoreIdentity) -> ProcessFootprint {
+    match store {
+        StoreIdentity::HostRam => seismic_native_target::process::host_footprint(process),
+        StoreIdentity::DeviceMemory(PhysicalIdentity::Uuid(uuid)) => seismic_cuda::process_footprint(process, *uuid),
+        StoreIdentity::DeviceMemory(PhysicalIdentity::Host { .. } | PhysicalIdentity::Registry(_)) | StoreIdentity::Volume(_) => {
+            ProcessFootprint::Unobserved
+        }
+    }
 }
 
 /// What a driver grants the process of a device store beyond what it uses
