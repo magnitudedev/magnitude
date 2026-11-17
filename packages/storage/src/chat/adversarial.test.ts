@@ -149,8 +149,8 @@ describe("adversarial: chat store writes", () => {
     ))
     expect(read[0][0]).toEqual(expect.objectContaining({ text: `${"t".repeat(100_000)} ${big}` }))
     expect(read[0][2]).toEqual(output)
-    // The title is the first 80 code points of the text.
-    expect(read[1]).toEqual([record(id, { title: "t".repeat(80) })])
+    // The title is the text cut to 80 code points, the cut marked.
+    expect(read[1]).toEqual([record(id, { title: `${"t".repeat(79)}…` })])
   }, 30_000)
 })
 

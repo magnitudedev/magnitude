@@ -345,11 +345,11 @@ describe("ChatStore sessions", () => {
     expect(broken._tag).toBe("ChatStoreCorrupt")
   })
 
-  it("titles a session by its first message: whitespace collapsed, at most 80 code points", async () => {
+  it("titles a session by its first message: whitespace collapsed, at most 80 code points with the cut marked", async () => {
     const id = newSession()
     await withStore((store) => create(store, id, ` ${"😀".repeat(90)}\n`))
     const stored = Option.getOrThrow(await withStore((store) => store.record(id)))
-    expect(stored.title).toBe("😀".repeat(80))
+    expect(stored.title).toBe(`${"😀".repeat(79)}…`)
   })
 
   it("has no record for a session that does not exist", async () => {
