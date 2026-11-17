@@ -51,6 +51,7 @@ import { ChatRequestStatus } from "./chat/activity"
 import { ChatTitle } from "./chat/chat-title"
 import { ModelPicker, type PickerModel } from "./chat/model-picker"
 import { useChatModels } from "./chat/served-models"
+import { submitBlocked } from "./chat/submit-blocked"
 import { useNavigate } from "../session"
 
 export function ChatPage() {
@@ -198,7 +199,11 @@ function ChatView({
   const canSend = Option.isSome(submittable())
   const submit = async (replaces?: MessageId) => {
     const ready = submittable(replaces)
-    if (Option.isNone(ready)) return
+    if (Option.isNone(ready)) {
+      // Nothing is sent; say why when it is the model or its settings, which the reader can change.
+      Option.match(submitBlocked({ chosen: modelId !== undefined, available: model !== undefined, settingsValid }), { onNone: () => undefined, onSome: setNotice })
+      return
+    }
     const asked = messages.at(-2)
     const text = replaces
       ? asked?._tag === "user"
