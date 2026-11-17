@@ -72,22 +72,6 @@ export function OfferedModelsSkeleton({ count = 3, firstOpened = false, footer =
   </LoadingRegion>
 }
 
-/** Recommendations while the service is still measuring: how far along it is, then the rows about to appear. */
-export function MeasuringRecommendations({ settled, total, footer = false }: { settled: number; total: number; footer?: boolean }) {
-  return <div>
-    <div role="status" aria-live="polite" className="mb-3">
-      <p className="flex items-center justify-between gap-3 text-[13px] text-slate-600 dark:text-slate-400">
-        <span>Measuring how each model runs on your machine…</span>
-        {total > 0 && <span className="text-xs tabular-nums text-slate-500">{settled} of {total} quants</span>}
-      </p>
-      <div className="mt-2 h-1 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-750">
-        <div className="h-full rounded-full bg-blue-600 transition-[width] duration-500 dark:bg-blue-400" style={{ width: `${total > 0 ? Math.max(0.04, settled / total) * 100 : 4}%` }} />
-      </div>
-    </div>
-    <OfferedModelsSkeleton firstOpened footer={footer} />
-  </div>
-}
-
 /**
  * The Models page under its title before its data, laid out as the page it becomes before any model is downloaded:
  * the card that says so, then "Recommended for your machine" with its filter and its cards, the first opened with its

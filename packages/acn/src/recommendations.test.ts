@@ -20,6 +20,7 @@ interface RungFixture {
   readonly assessing?: boolean
   readonly installed?: boolean
   readonly tools?: boolean
+  readonly speedUnavailable?: boolean
   readonly support?: "Supported" | "Disabled"
   readonly country?: string
   readonly intelligence?: number
@@ -54,7 +55,9 @@ const rung = (fixture: RungFixture): LocalModel => {
             served: { contextLength: 131_072 },
             residency: {
               _tag: "Resident",
-              performance: fixture.tokensPerSecond === undefined
+              performance: fixture.speedUnavailable
+                ? { _tag: "Unavailable", failure: { code: "performance_unavailable", message: "cannot be measured", retryable: false } }
+                : fixture.tokensPerSecond === undefined
                 ? { _tag: "Pending", measurement: { _tag: "Measuring" } }
                 : {
                     _tag: "Estimated",
@@ -122,7 +125,7 @@ describe("recommendations", () => {
     expect(project(ladder(true), { freeBytes: 15 * GB }).models[0]?.chosen).toEqual(Option.some("big:gguf:q4"))
   })
 
-  it("chooses no rung without room on disk, even when none reaches 20 tok/s or speeds are still measured", () => {
+  it("chooses no rung without room on disk, even when none reaches 20 tok/s, and none still being measured", () => {
     const slow = [
       rung({ id: "big:gguf:q2", storageBytes: 100 * GB, tokensPerSecond: 12 }),
       rung({ id: "big:gguf:q4", storageBytes: 173 * GB, tokensPerSecond: 12 }),
@@ -130,7 +133,28 @@ describe("recommendations", () => {
     expect(project(slow, { freeBytes: 16 * GB }).models[0]?.chosen).toEqual(Option.none())
     const unmeasured = [rung({ id: "big:gguf:q2", storageBytes: 100 * GB }), rung({ id: "small:gguf:q4", storageBytes: 1 * GB })]
     expect(project(unmeasured, { freeBytes: 16 * GB }).models.map(({ base, chosen }) => [base, Option.getOrNull(chosen)]))
-      .toEqual([["small", "small:gguf:q4"], ["big", null]])
+      .toEqual([["big", null], ["small", null]])
+  })
+
+  it("offers the best measured rung while another stays measuring, and never the one still measuring", () => {
+    const stuck = [
+      rung({ id: "qwen:gguf:q2", storageBytes: 5 * GB, tokensPerSecond: 30 }),
+      rung({ id: "qwen:gguf:q4", storageBytes: 10 * GB }),
+    ]
+    const recommendations = project(stuck, { freeBytes: 100 * GB })
+    expect(recommendations.complete).toBe(false)
+    expect(recommendations.models[0]?.chosen).toEqual(Option.some("qwen:gguf:q2"))
+    expect(project([rung({ id: "lfm:gguf:q4", storageBytes: 1 * GB })]).models[0]?.chosen).toEqual(Option.none())
+  })
+
+  it("offers the smallest fitting rung where no speed can be measured, such as on a CPU, without claiming a speed", () => {
+    const cpu = [
+      rung({ id: "lfm:gguf:q4", storageBytes: 1 * GB, speedUnavailable: true }),
+      rung({ id: "lfm:gguf:q8", storageBytes: 2 * GB, speedUnavailable: true }),
+    ]
+    const [model] = project(cpu).models
+    expect(model?.chosen).toEqual(Option.some("lfm:gguf:q4"))
+    expect([model?.meetsTarget, model?.meetsOnboardingFloor]).toEqual([false, false])
   })
 
   it("names the model that would lead with more free disk, and how much more it needs", () => {

@@ -87,10 +87,11 @@ const NEAR_FASTEST = 0.9
 /**
  * The rung chosen for this machine, among those that fit and have room on disk: the highest that reaches the target
  * speed; else the highest within `NEAR_FASTEST` of the fastest, since a smaller rung a few percent faster is no
- * better choice; else, before any speed is measured, the smallest.
+ * better choice; else, where no speed could be measured, the smallest. A rung still being measured is never chosen:
+ * one whose measurement never ends would otherwise be offered though it may not load.
  */
 const chooseRung = (ladder: readonly Rung[]): Option.Option<Rung> => {
-  const fitting = ladder.filter((candidate) => candidate.fits && candidate.roomOnDisk)
+  const fitting = ladder.filter((candidate) => candidate.fits && candidate.roomOnDisk && candidate.measured)
   const target = fitting.filter((candidate) => reaches(candidate, TARGET_TOKENS_PER_SECOND))
   if (target.length > 0) return Array.last(target)
   const fastest = Math.max(0, ...fitting.flatMap((candidate) => Option.toArray(candidate.speed)))

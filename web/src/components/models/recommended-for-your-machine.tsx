@@ -1,7 +1,8 @@
 import { useState, type ReactNode } from "react"
+import { CircleNotchIcon } from "@phosphor-icons/react"
 import { Section } from "./parts"
 import { ExpandingModel, type OfferedModel } from "./expanding-model"
-import type { Recommendation } from "./recommendations"
+import { measuringBrief, stillMeasuring, type Recommendation, type RecommendationsView } from "./recommendations"
 import type { QuantView } from "./view"
 
 /**
@@ -25,17 +26,34 @@ export function useRecommendedSelection(recommendations: readonly Recommendation
 export type RecommendedSelection = ReturnType<typeof useRecommendedSelection>
 
 /**
+ * The quants still being measured, beside the filter: a spinner and a few words, the whole sentence as its tooltip. The
+ * words give way to the spinner alone where the row is narrow, so the row never grows taller.
+ */
+function MeasuringStatus({ measuring }: { measuring: RecommendationsView["measuring"] }) {
+  const brief = measuringBrief(measuring)
+  if (brief === null) return null
+  return <span role="status" title={stillMeasuring(measuring) ?? undefined} className="flex min-w-0 items-center gap-1.5 whitespace-nowrap text-slate-500">
+    <CircleNotchIcon aria-hidden="true" className="size-3.5 shrink-0 motion-safe:animate-spin" />
+    <span className="max-w-44 truncate max-lg:sr-only">{brief}</span>
+  </span>
+}
+
+/**
  * "Recommended for your machine", as onboarding and an empty Models page show it: the models that run well here, the
  * first opened to its quant ladder and placement, with a filter to US developers' models. `placeholder` stands in for
- * the list while it can't be shown yet; `footer` adds an opened model's own actions, such as its Download.
+ * the list while it can't be shown yet; `footer` adds an opened model's own actions, such as its Download. Quants
+ * still being measured are said in the title's row, so the cards never move as measuring goes on or ends.
  */
-export function RecommendedForYourMachine({ recommendations, placeholder, usOnly, setUsOnly, owned, selection, footer, className }: {
-  recommendations: readonly Recommendation[]; placeholder: ReactNode | null
+export function RecommendedForYourMachine({ recommendations, placeholder, measuring, usOnly, setUsOnly, owned, selection, footer, className }: {
+  recommendations: readonly Recommendation[]; placeholder: ReactNode | null; measuring: RecommendationsView["measuring"]
   usOnly: boolean; setUsOnly: (value: boolean) => void; owned: ReadonlySet<string>; selection: RecommendedSelection
   footer?: (model: OfferedModel, quant: QuantView) => ReactNode; className?: string
 }) {
   return <Section title="Recommended for your machine" {...(className === undefined ? {} : { className })}
-    aside={<label className="flex cursor-pointer items-center gap-2 text-xs text-slate-600 dark:text-slate-400"><input type="checkbox" checked={usOnly} onChange={event => { setUsOnly(event.target.checked); selection.reset() }} className="accent-blue-600" />Only models from US developers</label>}>
+    aside={<>
+      <MeasuringStatus measuring={measuring} />
+      <label className="flex shrink-0 cursor-pointer items-center gap-2 whitespace-nowrap text-xs text-slate-600 dark:text-slate-400"><input type="checkbox" checked={usOnly} onChange={event => { setUsOnly(event.target.checked); selection.reset() }} className="accent-blue-600" />Only models from US developers</label>
+    </>}>
     {placeholder ?? <div className="space-y-2">
         {recommendations.map(({ model, note }) => <ExpandingModel key={model.key} model={model} note={note} expanded={selection.selected === model.key} owned={owned}
           onToggle={() => selection.toggle(model.key)}
