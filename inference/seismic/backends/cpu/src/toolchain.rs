@@ -371,7 +371,7 @@ fn load_image(artifact: &CpuArtifact, branch_targets: bool) -> CpuProgram {
                     .unwrap_or_else(|| {
                         panic!("a CPU program calls `{name}`, which is no host symbol")
                     }),
-                Target::Library(name) => library_symbol(name),
+                Target::Library(name) => crate::library::address(name),
                 Target::Data(index) => base + placed[*index as usize],
             };
             let value = (address as u64).wrapping_add_signed(relocation.addend);
@@ -389,17 +389,6 @@ fn load_image(artifact: &CpuArtifact, branch_targets: bool) -> CpuProgram {
         digest: Sha256::digest(&artifact.code).into(),
         _code: code,
     }
-}
-
-/// The address of the C library function `name` in this process.
-fn library_symbol(name: &str) -> usize {
-    let symbol = std::ffi::CString::new(name).expect("a library function name holds no NUL");
-    // SAFETY: a lookup in the process's global symbol scope.
-    let address = unsafe { libc::dlsym(libc::RTLD_DEFAULT, symbol.as_ptr()) };
-    if address.is_null() {
-        panic!("a CPU program calls the library function `{name}`, which the process does not export");
-    }
-    address as usize
 }
 
 /// The target of a relocation Cranelift emitted into a program whose data

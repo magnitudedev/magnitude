@@ -9,6 +9,14 @@ symptom appears and gets patched too, and the work gets stuck iterating in a loo
 How to run checks and measurements is in the root `AGENTS.md` ("Running checks and
 measurements"); runs on hardware go through `mrig`.
 
+**Check Windows when a change touches the OS.** The rig has no Windows host, so code that calls the
+OS (memory mapping, symbols, threads, files, processes) is checked for Windows by cross-compiling
+the shipped binaries' whole dependency tree: `bun run check:windows` (needs
+`rustup target add x86_64-pc-windows-gnu` and a MinGW-w64 C compiler for the native build scripts,
+`brew install mingw-w64` on macOS). Each OS call has one owner with an implementation per platform
+(host memory and program code pages: `seismic-memory`; the C library functions programs call:
+`seismic-cpu`'s `library`), never a call guarded at its use.
+
 ## Autonomy
 
 **Act with full autonomy.** Make the decisions the work requires and keep going. Do what has been

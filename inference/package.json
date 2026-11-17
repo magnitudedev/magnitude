@@ -16,6 +16,7 @@
   },
   "scripts": {
     "check": "cargo check --workspace",
+    "check:windows": "cargo check --locked --target x86_64-pc-windows-gnu -p magnitude-service-server -p magnitude-kernel-formation -p magnitude-engine-cli",
     "test": "cargo test --workspace",
     "build": "bun run scripts/build-local.ts",
     "serve": "bun run scripts/build-local.ts --serve",

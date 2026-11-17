@@ -20,6 +20,14 @@ cranelift-module = "=0.125.4"
 cranelift-native = "=0.125.4"
 cranelift-reader = "=0.125.4"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_System_LibraryLoader",
+  "Win32_System_ProcessStatus",
+  "Win32_System_Threading",
+] }
+
 [build-dependencies]
 # The formation build identity (`toolchain::FORMATION_BUILD`).
 magnitude-source-identity = { path = "../../../engine/source-identity" }

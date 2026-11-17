@@ -19,14 +19,8 @@ use seismic_native_target::Formed;
 /// entering a launch then discards instructions it fetched before
 /// ([`crate::workers`]).
 pub(crate) struct CoherentCode {
-    base: std::ptr::NonNull<u8>,
-    /// The mapped bytes, whole pages.
-    mapped: usize,
+    pages: seismic_memory::ExecutablePages,
 }
-
-// The mapping is immutable once executable and unmapped once, on drop.
-unsafe impl Send for CoherentCode {}
-unsafe impl Sync for CoherentCode {}
 
 impl CoherentCode {
     /// `bytes` bytes of executable memory, written by `write` (given the
@@ -39,75 +33,22 @@ impl CoherentCode {
         write: impl FnOnce(&mut [u8], usize),
     ) -> Self {
         assert!(bytes > 0, "a program image holds code");
-        // SAFETY: sysconf has no preconditions.
-        let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
-            .expect("the host reports its page size");
-        let mapped = bytes.div_ceil(page) * page;
-        // SAFETY: a fresh private anonymous mapping, owned by this value.
-        let base = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                mapped,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANON,
-                -1,
-                0,
-            )
-        };
-        if base == libc::MAP_FAILED {
-            panic!(
-                "mapping {mapped} bytes for program code failed: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-        let base = std::ptr::NonNull::new(base.cast::<u8>()).expect("mmap returned a mapping");
-        let code = Self { base, mapped };
-        // SAFETY: the mapping is writable and `bytes` long.
-        write(
-            unsafe { std::slice::from_raw_parts_mut(base.as_ptr(), bytes) },
-            base.as_ptr() as usize,
-        );
-        invalidate_instructions(base.as_ptr(), bytes);
-        let protection = libc::PROT_READ | libc::PROT_EXEC | guarded(branch_targets);
-        // SAFETY: the whole mapping, owned by this value.
-        if unsafe { libc::mprotect(base.as_ptr().cast(), mapped, protection) } != 0 {
-            panic!(
-                "making {mapped} bytes of program code executable failed: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-        code
+        let mut pages = seismic_memory::CodePages::allocate(bytes).unwrap_or_else(|failure| {
+            panic!("mapping {bytes} bytes for program code failed: {failure}")
+        });
+        let base = pages.base().as_ptr();
+        write(&mut pages.image()[..bytes], base as usize);
+        invalidate_instructions(base, bytes);
+        let pages = pages.seal(branch_targets).unwrap_or_else(|error| {
+            panic!("making {bytes} bytes of program code executable failed: {error}")
+        });
+        Self { pages }
     }
 
     /// The address the image executes at.
     pub(crate) fn base(&self) -> *const u8 {
-        self.base.as_ptr()
+        self.pages.base().as_ptr()
     }
-}
-
-impl Drop for CoherentCode {
-    fn drop(&mut self) {
-        // SAFETY: every entry into this memory is held by the program that
-        // owns it, so none outlives the mapping.
-        unsafe { libc::munmap(self.base.as_ptr().cast(), self.mapped) };
-    }
-}
-
-/// The protection guarding branch targets (aarch64 BTI) of code that has
-/// landing pads, where the host enforces it.
-#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-fn guarded(branch_targets: bool) -> libc::c_int {
-    const PROT_BTI: libc::c_int = 0x10;
-    if branch_targets && std::arch::is_aarch64_feature_detected!("bti") {
-        PROT_BTI
-    } else {
-        0
-    }
-}
-
-#[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
-fn guarded(_: bool) -> libc::c_int {
-    0
 }
 
 /// Makes the instruction caches of every core agree with the data written

@@ -4234,6 +4234,7 @@ dependencies = [
  "seismic-native-target",
  "seismic-topology",
  "sha2 0.11.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4342,6 +4343,7 @@ dependencies = [
  "libc",
  "seismic-threads",
  "seismic-topology",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

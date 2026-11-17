@@ -28,6 +28,7 @@ mod command;
 mod compile;
 mod emit;
 mod executor;
+mod library;
 pub mod model;
 mod numeric;
 mod open;

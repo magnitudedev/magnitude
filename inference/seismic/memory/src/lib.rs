@@ -3,7 +3,8 @@
 //! expert bank's records and the KV slabs live in ([`pool`]), and host
 //! blocks ([`HostBlock`]): one plain allocation of the OS each, backed whole
 //! as it is made and returned whole as it drops, in large pages where a
-//! device reads it over its link.
+//! device reads it over its link; and program code ([`CodePages`]): pages
+//! written once, then executable.
 
 pub mod entry;
 pub mod pool;
@@ -198,6 +199,71 @@ impl Drop for HostBlock {
     }
 }
 
+/// Pages holding one program's code, still writable: its image is written
+/// ([`CodePages::image`]), then the pages are sealed executable
+/// ([`CodePages::seal`]) and never written again. Returned to the OS whole
+/// as they drop. Nothing is backed until written.
+pub struct CodePages {
+    base: NonNull<u8>,
+    bytes: usize,
+}
+
+/// Program code sealed executable: read-only, at a fixed address, until it
+/// drops.
+pub struct ExecutablePages(CodePages);
+
+// The pages are plain memory owned by the value: written only through
+// `&mut` while writable, immutable once executable.
+unsafe impl Send for CodePages {}
+unsafe impl Sync for CodePages {}
+
+impl CodePages {
+    /// Readable, writable zero pages covering `bytes` (at least one), at a
+    /// host page.
+    pub fn allocate(bytes: usize) -> Result<Self, AllocationFailure> {
+        let page = host::page()?;
+        let bytes = bytes.max(1).checked_next_multiple_of(page).ok_or(AllocationFailure::Unrepresentable)?;
+        Ok(Self { base: host::map(bytes, page)?, bytes })
+    }
+
+    /// The address the code executes at.
+    pub fn base(&self) -> NonNull<u8> {
+        self.base
+    }
+
+    /// The writable image: whole pages, at least the bytes asked for.
+    pub fn image(&mut self) -> &mut [u8] {
+        // SAFETY: the pages are mapped writable and owned by this value.
+        unsafe { std::slice::from_raw_parts_mut(self.base.as_ptr(), self.bytes) }
+    }
+
+    /// Make the pages readable and executable, no longer writable. Where
+    /// the host enforces branch-target landing pads (aarch64 BTI on Linux),
+    /// `branch_targets` marks the pages guarded: their code has the pads.
+    /// The caller has made instruction fetch agree with the written image.
+    /// The OS's refusal is the error; the pages are then released.
+    pub fn seal(self, branch_targets: bool) -> std::io::Result<ExecutablePages> {
+        // SAFETY: the whole mapping, owned by this value.
+        unsafe { host::seal_executable(self.base, self.bytes, branch_targets)? };
+        Ok(ExecutablePages(self))
+    }
+}
+
+impl ExecutablePages {
+    /// The address the code executes at.
+    pub fn base(&self) -> NonNull<u8> {
+        self.0.base
+    }
+}
+
+impl Drop for CodePages {
+    fn drop(&mut self) {
+        // SAFETY: every entry into executable pages is held by the owner of
+        // the `ExecutablePages`, so none outlives the mapping.
+        unsafe { host::unmap(self.base, self.bytes) };
+    }
+}
+
 /// Back every page of a fresh block of `bytes`, whole pages of `page`
 /// bytes starting at a page, at once: a write to the first byte of each
 /// makes the kernel back it with a zero page, so from a page-aligned start
@@ -350,6 +416,28 @@ mod host {
         unreachable!("only Linux reports large pages")
     }
 
+    /// Make the mapped `[base, base + bytes)` readable and executable,
+    /// guarded where `branch_targets` asks and the host enforces it.
+    pub(super) unsafe fn seal_executable(base: NonNull<u8>, bytes: usize, branch_targets: bool) -> std::io::Result<()> {
+        let protection = libc::PROT_READ | libc::PROT_EXEC | guarded(branch_targets);
+        match unsafe { libc::mprotect(base.as_ptr().cast(), bytes, protection) } {
+            0 => Ok(()),
+            _ => Err(std::io::Error::last_os_error()),
+        }
+    }
+
+    /// The protection guarding branch targets (aarch64 BTI) of code that
+    /// has landing pads, where the host enforces it.
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    fn guarded(branch_targets: bool) -> libc::c_int {
+        const PROT_BTI: libc::c_int = 0x10;
+        if branch_targets && std::arch::is_aarch64_feature_detected!("bti") { PROT_BTI } else { 0 }
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
+    fn guarded(_: bool) -> libc::c_int {
+        0
+    }
+
     /// Unmap a whole block, returning its pages at once.
     pub(super) unsafe fn unmap(base: NonNull<u8>, bytes: usize) {
         unsafe { libc::munmap(base.as_ptr().cast(), bytes) };
@@ -359,46 +447,22 @@ mod host {
 #[cfg(windows)]
 mod host {
     use super::AllocationFailure;
-    use std::ffi::c_void;
     use std::ptr::NonNull;
-
-    const MEM_COMMIT: u32 = 0x1000;
-    const MEM_RESERVE: u32 = 0x2000;
-    const MEM_RELEASE: u32 = 0x8000;
-    const PAGE_READWRITE: u32 = 0x04;
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn VirtualAlloc(address: *mut c_void, size: usize, kind: u32, protect: u32)
-            -> *mut c_void;
-        fn VirtualFree(address: *mut c_void, size: usize, kind: u32) -> i32;
-        fn GetSystemInfo(info: *mut SystemInfo);
-    }
-
-    /// `SYSTEM_INFO`, of which only the page size is read.
-    #[repr(C)]
-    struct SystemInfo {
-        _oem_id: u32,
-        page_size: u32,
-        _minimum_application_address: *mut c_void,
-        _maximum_application_address: *mut c_void,
-        _active_processor_mask: usize,
-        _number_of_processors: u32,
-        _processor_type: u32,
-        _allocation_granularity: u32,
-        _processor_level: u16,
-        _processor_revision: u16,
-    }
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        VirtualProtect,
+    };
+    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 
     /// Commit granularity: the system's page size.
     pub(super) fn page() -> Result<usize, AllocationFailure> {
-        let mut info = std::mem::MaybeUninit::<SystemInfo>::uninit();
+        let mut info = std::mem::MaybeUninit::<SYSTEM_INFO>::uninit();
         // SAFETY: `GetSystemInfo` fills the whole structure and cannot fail.
         let info = unsafe {
             GetSystemInfo(info.as_mut_ptr());
             info.assume_init()
         };
-        usize::try_from(info.page_size).map_err(|_| AllocationFailure::PageUnknown)
+        usize::try_from(info.dwPageSize).map_err(|_| AllocationFailure::PageUnknown)
     }
 
     /// Windows backs no block in large pages.
@@ -410,12 +474,22 @@ mod host {
     /// an allocation's own alignment covers it.
     pub(super) fn map(bytes: usize, align: usize) -> Result<NonNull<u8>, AllocationFailure> {
         assert_eq!(align, page()?, "a Windows block aligns to its page");
-        let base = unsafe { VirtualAlloc(std::ptr::null_mut(), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        let base = unsafe { VirtualAlloc(std::ptr::null(), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
         NonNull::new(base.cast()).ok_or(AllocationFailure::OutOfMemory)
     }
 
     pub(super) fn collapse(_start: *mut u8, _bytes: usize, _large: usize) -> usize {
         unreachable!("only Linux reports large pages")
+    }
+
+    /// Make the committed `[base, base + bytes)` readable and executable.
+    /// Windows enforces no branch-target landing pads.
+    pub(super) unsafe fn seal_executable(base: NonNull<u8>, bytes: usize, _branch_targets: bool) -> std::io::Result<()> {
+        let mut previous = 0;
+        match unsafe { VirtualProtect(base.as_ptr().cast(), bytes, PAGE_EXECUTE_READ, &mut previous) } {
+            0 => Err(std::io::Error::last_os_error()),
+            _ => Ok(()),
+        }
     }
 
     /// Release a whole block, returning its pages at once.
