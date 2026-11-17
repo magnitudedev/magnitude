@@ -1587,23 +1587,14 @@ fn bounds_hold_for_a_cpu_model_of_each_form() {
 }
 
 fn metal() -> Option<Device> {
-    seismic::Devices::discover(&[])
-        .ok()
-        .and_then(|catalog| catalog.open_backend(BackendName::Metal).ok())
+    seismic_native_tests::devices(&[BackendName::Metal]).into_iter().next()
 }
 
-/// Metal when present and the CPU device. (Vulkan's mappings are checked in
+/// Metal when present and the CPU device, or a requested one alone
+/// ([`seismic_native_tests::devices`]). (Vulkan's mappings are checked in
 /// `vulkan_recurrent.rs`, CUDA's in `cuda_recurrent.rs`.)
 fn devices() -> Vec<Device> {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    catalog
-        .open_backend(BackendName::Metal)
-        .ok()
-        .into_iter()
-        .chain(std::iter::once(
-            catalog.open_backend(BackendName::Cpu).unwrap(),
-        ))
-        .collect()
+    seismic_native_tests::devices(&[BackendName::Metal, BackendName::Cpu])
 }
 
 fn is_cpu(device: &Device) -> bool {

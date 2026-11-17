@@ -71,11 +71,7 @@ impl Streamed {
 
 #[test]
 fn host_landing_conversions_equal_the_device_repack() {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    for backend in [seismic::BackendName::Metal, seismic::BackendName::Cuda, seismic::BackendName::Vulkan] {
-        let Ok(device) = catalog.open_backend(backend) else {
-            continue;
-        };
+    for device in seismic_native_tests::devices(&[seismic::BackendName::Metal, seismic::BackendName::Cuda, seismic::BackendName::Vulkan]) {
         conversions_equal_on(&device);
     }
 }

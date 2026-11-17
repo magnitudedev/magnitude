@@ -6,10 +6,10 @@
 #[cfg(target_os = "macos")]
 #[test]
 fn a_resident_launchs_phases_meet_at_grid_barriers_launch_after_launch() {
-    use seismic::{BackendName, Devices, Element, NativeSpecialization, Tensor};
+    use seismic::{BackendName, Element, NativeSpecialization, Tensor};
     use seismic_native_tests::resident_reverse;
 
-    let device = Devices::discover(&[]).unwrap().open_backend(BackendName::Metal).unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Metal) else { return };
     let kernel = resident_reverse::native_for_device(&device, &NativeSpecialization::new()).unwrap();
     let skip = Tensor::from_host(&device, Element::i32(), &[1], &0i32.to_le_bytes()).unwrap();
     let read = |tensor: &Tensor| {

@@ -137,13 +137,10 @@ fn report(path: &Path, label: &str, actual: Vec<f32>) {
     }
 }
 
-/// Metal and the CPU device.
+/// Metal and the CPU device; a requested one alone
+/// ([`seismic_native_tests::devices`]).
 fn devices() -> Vec<Device> {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    vec![
-        catalog.open_backend(BackendName::Metal).unwrap(),
-        catalog.open_backend(BackendName::Cpu).unwrap(),
-    ]
+    seismic_native_tests::devices(&[BackendName::Metal, BackendName::Cpu])
 }
 
 #[test]

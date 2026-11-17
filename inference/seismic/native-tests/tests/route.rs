@@ -5,7 +5,7 @@
 
 use seismic::measure::{measure, Measure, Stop};
 use seismic::{
-    AllocationLimit, BackendName, CallError, Device, Devices, Element, Exclusion, ExecutionError,
+    AllocationLimit, BackendName, CallError, Device, Element, Exclusion, ExecutionError,
     InvocationError, NativeGraphFamily, NativeSpecialization, NumericalRequirement, Outcome,
     SearchPlan, SearchSettings, Stage, Strategy, SurveyPlan, SurveyRecord, Tensor,
     TraceDetail, TuneError, TuningInitializer, TuningMethod, TuningPoint, TuningResult, UnitPlan,
@@ -91,8 +91,7 @@ fn statics(n: u64) -> NativeSpecialization {
 
 #[test]
 fn metal_launch_scopes_form_and_execute_independently() {
-    let devices = Devices::discover(&[]).expect("device discovery");
-    let Ok(device) = devices.open_backend(BackendName::Metal) else {
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Metal) else {
         return;
     };
     let implementation = scoped_scale::native_implementation(&device)
@@ -128,8 +127,7 @@ fn metal_launch_scopes_form_and_execute_independently() {
 /// one.
 #[test]
 fn metal_launch_dispatches_the_grid_it_reads() {
-    let devices = Devices::discover(&[]).expect("device discovery");
-    let Ok(device) = devices.open_backend(BackendName::Metal) else {
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Metal) else {
         return;
     };
     let kernel = marked_groups::native_for_device(&device, &NativeSpecialization::new())
@@ -193,8 +191,7 @@ fn a_launch_dispatches_the_grid_its_call_wrote() {
 /// a native graph's port, before anything is encoded.
 #[test]
 fn metal_launch_grid_binds_no_slab_view() {
-    let devices = Devices::discover(&[]).expect("device discovery");
-    let Ok(device) = devices.open_backend(BackendName::Metal) else {
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Metal) else {
         return;
     };
     let kernel = marked_groups::native_for_device(&device, &NativeSpecialization::new())
@@ -244,8 +241,7 @@ fn metal_launch_grid_binds_no_slab_view() {
 /// program is formed a second time.
 #[test]
 fn serving_the_tuned_choice_forms_nothing_again() {
-    let devices = Devices::discover(&[]).expect("device discovery");
-    let Ok(device) = devices.open_backend(BackendName::Metal) else {
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Metal) else {
         return;
     };
     let small = f32_tensor(&device, &[7], &exact_values(7));
@@ -276,8 +272,7 @@ fn serving_the_tuned_choice_forms_nothing_again() {
 
 #[test]
 fn metal_scoped_tuning_searches_launches_separately() {
-    let devices = Devices::discover(&[]).expect("device discovery");
-    let Ok(device) = devices.open_backend(BackendName::Metal) else {
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Metal) else {
         return;
     };
     let small = f32_tensor(&device, &[7], &exact_values(7));
@@ -477,8 +472,7 @@ fn metal_compiles_run_ahead_on_another_thread_and_the_piece_then_compiles_nothin
 
 #[test]
 fn metal_scoped_tuning_without_budget_serves_its_formed_defaults() {
-    let devices = Devices::discover(&[]).expect("device discovery");
-    let Ok(device) = devices.open_backend(BackendName::Metal) else {
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Metal) else {
         return;
     };
     let small = f32_tensor(&device, &[7], &exact_values(7));
@@ -877,10 +871,7 @@ fn surveyed(survey: &TuningResult) -> &SurveyRecord {
 
 #[test]
 fn a_search_freezes_all_positive_demand_representatives_before_candidates() {
-    let device = Devices::discover(&[])
-        .unwrap()
-        .open_backend(BackendName::Cpu)
-        .unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Cpu) else { return };
     let n = 4096u64;
     let short = f32_tensor(&device, &[n], &exact_values(n as usize));
     let long = f32_tensor(&device, &[n], &exact_values(n as usize));
@@ -951,10 +942,7 @@ fn a_search_freezes_all_positive_demand_representatives_before_candidates() {
 fn already_expired_work_keeps_an_unmeasured_default_without_running_witnesses() {
     use std::cell::Cell;
     use std::rc::Rc;
-    let device = Devices::discover(&[])
-        .unwrap()
-        .open_backend(BackendName::Cpu)
-        .unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Cpu) else { return };
     let n = 64u64;
     let x = f32_tensor(&device, &[n], &vec![1.; n as usize]);
     let resets = Rc::new(Cell::new(0));
@@ -1000,10 +988,7 @@ fn expiry_during_reset_preserves_the_choice_without_rejecting_the_candidate() {
     use std::cell::Cell;
     use std::rc::Rc;
     use std::time::Instant;
-    let device = Devices::discover(&[])
-        .unwrap()
-        .open_backend(BackendName::Cpu)
-        .unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Cpu) else { return };
     let n = 64u64;
     let first = f32_tensor(&device, &[n], &vec![1.; n as usize]);
     let second = f32_tensor(&device, &[n], &exact_values(n as usize));
@@ -1093,10 +1078,7 @@ fn expiry_during_reset_preserves_the_choice_without_rejecting_the_candidate() {
 fn a_numerical_observation_is_made_once_per_point_and_key() {
     use std::cell::Cell;
     use std::rc::Rc;
-    let device = Devices::discover(&[])
-        .unwrap()
-        .open_backend(BackendName::Cpu)
-        .unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Cpu) else { return };
     // At 32 the staged launch alone works, whatever `SMALL` is: the mirrored
     // launch's participant count changes nothing there. At 200 the mirrored
     // launch works where `SMALL` is 64, so that count is surveyed there.
@@ -1233,10 +1215,7 @@ fn a_numerical_observation_is_made_once_per_point_and_key() {
 fn the_census_retains_the_default_at_its_performance_invocations() {
     use std::cell::Cell;
     use std::rc::Rc;
-    let device = Devices::discover(&[])
-        .unwrap()
-        .open_backend(BackendName::Cpu)
-        .unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Cpu) else { return };
     let n = 64u64;
     let first = f32_tensor(&device, &[n], &vec![1.; n as usize]);
     let adversarial = f32_tensor(&device, &[n], &exact_values(n as usize));
@@ -1293,10 +1272,7 @@ fn the_census_retains_the_default_at_its_performance_invocations() {
 
 #[test]
 fn canonical_discovery_transports_the_frozen_objective_without_remeasurement() {
-    let device = Devices::discover(&[])
-        .unwrap()
-        .open_backend(BackendName::Cpu)
-        .unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Cpu) else { return };
     let n = 4096u64;
     let x = f32_tensor(&device, &[n], &exact_values(n as usize));
     let points = || {
@@ -1453,10 +1429,7 @@ fn canonical_discovery_transports_the_frozen_objective_without_remeasurement() {
 
 #[test]
 fn a_spent_budget_still_forms_and_serves_the_canonical_defaults() {
-    let device = Devices::discover(&[])
-        .unwrap()
-        .open_backend(BackendName::Cpu)
-        .unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Cpu) else { return };
     let n = 4096u64;
     let x = f32_tensor(&device, &[n], &exact_values(n as usize));
     let Strategy::Search(mut plan) = search() else {
@@ -1505,10 +1478,7 @@ fn a_spent_budget_still_forms_and_serves_the_canonical_defaults() {
 
 #[test]
 fn a_search_choice_passes_validation_at_every_point_or_gives_way_to_the_defaults() {
-    let device = Devices::discover(&[])
-        .unwrap()
-        .open_backend(BackendName::Cpu)
-        .unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Cpu) else { return };
     let n = 4096u64;
     // Exact values sum exactly in any order; these do not, so a
     // configuration that reorders the sum fails the exact policy here.
@@ -2918,10 +2888,7 @@ fn a_disagreeing_candidate_ahead_in_its_rounds_is_witnessed_and_excluded() {
 #[test]
 fn a_search_of_launch_groups_keeps_the_defaults_when_every_candidate_disagrees() {
     use seismic_native_tests::scoped_wrong_default;
-    let Ok(device) = Devices::discover(&[])
-        .unwrap()
-        .open_backend(BackendName::Metal)
-    else {
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Metal) else {
         return;
     };
     let small = f32_tensor(&device, &[7], &[1.; 7]);
@@ -3291,8 +3258,7 @@ fn a_build_the_memory_limit_refuses_prices_its_point_and_is_offered_again() {
     }
 
     // Its own ledgers: the test bounds them alone.
-    let (device, tally) = seismic::testing::open_backend_tallied(&Devices::discover(&[]).unwrap(), BackendName::Cpu, Default::default())
-        .unwrap();
+    let Some((device, tally)) = seismic_native_tests::tallied_device(BackendName::Cpu) else { return };
     let n = 64;
     let large = 8u64 << 20;
     let mut source = Allocated {
@@ -3396,8 +3362,7 @@ fn a_defaults_measurement_the_memory_limit_refuses_prices_its_point_and_is_offer
     }
 
     // Its own ledgers: the test bounds them alone.
-    let (device, tally) = seismic::testing::open_backend_tallied(&Devices::discover(&[]).unwrap(), BackendName::Cpu, Default::default())
-        .unwrap();
+    let Some((device, tally)) = seismic_native_tests::tallied_device(BackendName::Cpu) else { return };
     let n = 64;
     let mut source = Clamping {
         device: &device,
@@ -3515,8 +3480,7 @@ fn a_survey_times_every_launchs_choices_where_it_works() {
         }
     }
 
-    let devices = Devices::discover(&[]).unwrap();
-    let Ok(device) = devices.open_backend(BackendName::Metal) else {
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Metal) else {
         return;
     };
     let implementation = scoped_scale::native_implementation(&device).unwrap().unwrap();

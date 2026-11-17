@@ -9,8 +9,7 @@
 //
 // A host model of the portable body is checked against the reference
 // interpreter at small shapes and stands for it at the others. Natives run on
-// the backends named by ATTENTION_BACKENDS (a comma list of metal, cuda,
-// vulkan and cpu; default: every backend the host opens).
+// every backend the host has, or the one SEISMIC_TEST_BACKEND requests.
 #![allow(dead_code)]
 
 mod common;
@@ -812,23 +811,11 @@ fn portable(entry: &str, case: &Case) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
 // ---------------------------------------------------------------------------
 // Devices.
 
+/// Every backend the host has, or a requested one alone
+/// ([`seismic_native_tests::devices`]).
 fn devices() -> Vec<Device> {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    let names =
-        std::env::var("ATTENTION_BACKENDS").unwrap_or_else(|_| "metal,cuda,vulkan,cpu".into());
-    names
-        .split(',')
-        .filter_map(|name| {
-            let backend = match name.trim() {
-                "metal" => BackendName::Metal,
-                "cuda" => BackendName::Cuda,
-                "vulkan" => BackendName::Vulkan,
-                "cpu" => BackendName::Cpu,
-                other => panic!("ATTENTION_BACKENDS: unknown backend {other}"),
-            };
-            catalog.open_backend(backend).ok()
-        })
-        .collect()
+    use BackendName::{Cpu, Cuda, Metal, Vulkan};
+    seismic_native_tests::devices(&[Metal, Cuda, Vulkan, Cpu])
 }
 
 fn tensor(device: &Device, element: Element, shape: &[usize], bytes: Vec<u8>) -> Tensor {

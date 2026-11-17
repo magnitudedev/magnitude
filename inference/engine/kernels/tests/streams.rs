@@ -498,7 +498,7 @@ fn native_stream_mix_matches_portable_bodies() {
 #[test]
 fn cpu_stream_mix_row_shares_match_the_host_replica() {
     use seismic::device::DeviceValues;
-    let device = seismic::Devices::discover(&[]).unwrap().open_backend(seismic::BackendName::Cpu).unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(seismic::BackendName::Cpu) else { return };
     let units = device.properties().value("units") as usize;
     for (geometry, c) in [
         ((32, 1, 4), 1),

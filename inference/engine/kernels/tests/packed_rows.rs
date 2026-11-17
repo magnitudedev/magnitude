@@ -14,16 +14,7 @@ fn f32_bytes(values: &[f32]) -> Vec<u8> {
 
 #[test]
 fn packed_stages_accept_repacked_q8_weights_and_bf16_activations() {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    for backend in [
-        seismic::BackendName::Metal,
-        seismic::BackendName::Cuda,
-        seismic::BackendName::Vulkan,
-        seismic::BackendName::Cpu,
-    ] {
-        let Ok(device) = catalog.open_backend(backend) else {
-            continue;
-        };
+    for device in seismic_native_tests::devices(&[seismic::BackendName::Metal, seismic::BackendName::Cuda, seismic::BackendName::Vulkan, seismic::BackendName::Cpu]) {
         packed_stages_on(&device);
     }
 }
@@ -136,10 +127,7 @@ fn packed_stages_on(device: &seismic::Device) {
 /// the two entries called alone, the output forming its own operand.
 #[test]
 fn cpu_output_reads_the_operand_the_recurrent_step_emits() {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    let Ok(device) = catalog.open_backend(seismic::BackendName::Cpu) else {
-        return;
-    };
+    let Some(device) = seismic_native_tests::fresh_device(seismic::BackendName::Cpu) else { return };
     let device = &device;
     let (q8, bf16) = (q8_element(device), seismic::Element::bf16());
     let epsilon = 1e-5;

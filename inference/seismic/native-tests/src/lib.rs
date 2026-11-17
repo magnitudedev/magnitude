@@ -148,6 +148,15 @@ pub fn devices_with(
     backends: &[seismic::BackendName],
     options: seismic::DeviceOptions,
 ) -> Vec<seismic::Device> {
+    tallied_devices(backends, options).into_iter().map(|(device, _)| device).collect()
+}
+
+/// [`devices_with`], each device with its device store's tally, which a
+/// test reads and bounds.
+fn tallied_devices(
+    backends: &[seismic::BackendName],
+    options: seismic::DeviceOptions,
+) -> Vec<(seismic::Device, seismic::memory::Tally)> {
     use seismic::Devices;
     let selected = seismic::testing::requested_backend();
     if let Some(backend) = selected.filter(|backend| !backends.contains(backend)) {
@@ -158,14 +167,27 @@ pub fn devices_with(
     let topology = discovery.topology();
     let opened = backends.iter().copied()
         .filter_map(|backend| seismic::testing::selected(&topology, backend).map(|device| (backend, device.id())))
-        .map(|(backend, id)| seismic::testing::open_tallied(&discovery, id, options.clone()).map(|(device, _)| device)
+        .map(|(backend, id)| seismic::testing::open_tallied(&discovery, id, options.clone())
             .unwrap_or_else(|error| panic!("available {backend:?} test device must open: {error}")))
         .collect::<Vec<_>>();
     if let Some(backend) = selected {
         assert!(!opened.is_empty(), "selected {backend:?} test backend is unavailable");
     }
-    eprintln!("native test backends: {:?}", opened.iter().map(seismic::Device::backend).collect::<Vec<_>>());
+    eprintln!("native test backends: {:?}", opened.iter().map(|(device, _)| device.backend()).collect::<Vec<_>>());
     opened
+}
+
+/// The device of `backend` a test of that one backend runs on, as
+/// [`devices`] selects it, with its own ledgers: a test that bounds its
+/// memory sees only its own work.
+pub fn fresh_device(backend: seismic::BackendName) -> Option<seismic::Device> {
+    tallied_device(backend).map(|(device, _)| device)
+}
+
+/// [`fresh_device`] with its device store's tally, which the test reads and
+/// bounds.
+pub fn tallied_device(backend: seismic::BackendName) -> Option<(seismic::Device, seismic::memory::Tally)> {
+    tallied_devices(&[backend], seismic::DeviceOptions::default()).pop()
 }
 
 /// One device of the first backend of `preferred` the host has, then the

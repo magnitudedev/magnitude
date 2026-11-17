@@ -3,19 +3,13 @@ use magnitude_kernels::conditioning_overlay;
 use seismic_lang::reference_math::conversion::canonical_nan;
 use seismic_lang::types::DType;
 
-/// The host's GPU (Metal on macOS, else Vulkan when present), then the CPU.
+/// The host's GPU (Metal on macOS, else Vulkan when present), then the CPU;
+/// a requested backend among them alone
+/// ([`seismic_native_tests::first_and_cpu`]).
 fn devices() -> Vec<seismic::Device> {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    let gpu = if cfg!(target_os = "macos") {
-        Some(catalog.open_backend(seismic::BackendName::Metal).unwrap())
-    } else {
-        catalog.open_backend(seismic::BackendName::Vulkan).ok()
-    };
-    gpu.into_iter()
-        .chain(std::iter::once(
-            catalog.open_backend(seismic::BackendName::Cpu).unwrap(),
-        ))
-        .collect()
+    use seismic::BackendName::{Cpu, Metal, Vulkan};
+    let gpu = if cfg!(target_os = "macos") { Metal } else { Vulkan };
+    seismic_native_tests::first_and_cpu(&[gpu], &[gpu, Cpu])
 }
 
 /// The overlay publishes every conditioned value exactly (infinities, signed

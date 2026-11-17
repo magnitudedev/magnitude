@@ -547,19 +547,12 @@ fn slack_dot(slack: &[f64], w: &[f32]) -> f64 {
 // Device helpers.
 
 /// Metal on macOS, elsewhere Vulkan when present (rows16 is the resident
-/// layout of both), and the CPU device.
+/// layout of both), and the CPU device; a requested backend among them alone
+/// ([`seismic_native_tests::first_and_cpu`]).
 fn devices() -> Vec<Device> {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    let gpu = if cfg!(target_os = "macos") {
-        Some(catalog.open_backend(seismic::BackendName::Metal).unwrap())
-    } else {
-        catalog.open_backend(seismic::BackendName::Vulkan).ok()
-    };
-    gpu.into_iter()
-        .chain(std::iter::once(
-            catalog.open_backend(seismic::BackendName::Cpu).unwrap(),
-        ))
-        .collect()
+    use seismic::BackendName::{Cpu, Metal, Vulkan};
+    let gpu = if cfg!(target_os = "macos") { Metal } else { Vulkan };
+    seismic_native_tests::first_and_cpu(&[gpu], &[gpu, Cpu])
 }
 
 /// `specialization` with the clamp's static LB at `word`, on the GPU
@@ -6748,7 +6741,6 @@ fn uniform_values(count: usize, seed: u64, scale: f32) -> Vec<f32> {
 /// rows. (CUDA's mma16 tables: `cuda_projection.rs`.)
 #[test]
 fn embedding_rows_read_the_slots_their_directory_names() {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
     let module = crate::common::kernels();
     let act = Act::Bf16;
     let (v, d) = (300usize, 512usize);
@@ -6763,15 +6755,8 @@ fn embedding_rows_read_the_slots_their_directory_names() {
             }
         })
         .collect::<Vec<_>>();
-    for backend in [BackendName::Metal, BackendName::Vulkan, BackendName::Cpu] {
-        let device = match catalog.open_backend(backend) {
-            Ok(device) => device,
-            Err(error) if backend != BackendName::Cpu => {
-                eprintln!("gathered rows: {backend:?} unavailable: {error}");
-                continue;
-            }
-            Err(error) => panic!("gathered rows: CPU unavailable: {error}"),
-        };
+    for device in seismic_native_tests::devices(&[BackendName::Metal, BackendName::Vulkan, BackendName::Cpu]) {
+        let backend = device.backend();
         eprintln!("gathered rows: testing {backend:?}");
         let directory = i32_tensor(&device, &[logical, 1], &directory_values);
         let direct = i32_tensor(&device, &[0, 1], &[]);

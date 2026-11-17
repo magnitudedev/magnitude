@@ -6,11 +6,11 @@
 #[cfg(target_os = "macos")]
 #[test]
 fn a_grid_barrier_that_not_every_threadgroup_reaches_loses_the_device() {
-    use seismic::{BackendName, CallError, Devices, Element, ExecutionError, NativeSpecialization, Tensor};
+    use seismic::{BackendName, CallError, Element, ExecutionError, NativeSpecialization, Tensor};
     use seismic_native_tests::resident_reverse;
     use std::time::{Duration, Instant};
 
-    let device = Devices::discover(&[]).unwrap().open_backend(BackendName::Metal).unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Metal) else { return };
     let kernel = resident_reverse::native_for_device(&device, &NativeSpecialization::new()).unwrap();
     let skip = Tensor::from_host(&device, Element::i32(), &[1], &1i32.to_le_bytes()).unwrap();
     let n = 1u64 << 16;

@@ -1021,17 +1021,14 @@ fn entries_match_on(device: &Device) {
 
 #[test]
 fn corrector_entries_match_the_host_model_on_cpu() {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    entries_match_on(&catalog.open_backend(BackendName::Cpu).unwrap());
+    for device in seismic_native_tests::devices(&[BackendName::Cpu]) {
+        entries_match_on(&device);
+    }
 }
 
 #[test]
 fn corrector_entries_match_the_host_model_on_accelerators() {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    for backend in [BackendName::Metal, BackendName::Cuda, BackendName::Vulkan] {
-        let Ok(device) = catalog.open_backend(backend) else {
-            continue;
-        };
+    for device in seismic_native_tests::devices(&[BackendName::Metal, BackendName::Cuda, BackendName::Vulkan]) {
         entries_match_on(&device);
     }
 }

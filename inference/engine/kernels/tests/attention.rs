@@ -831,16 +831,8 @@ fn attention_reads_and_writes_after_reusing_an_interior_slab() {
 
 fn check_attention_slab_case(case: &Case, reused: bool) {
     let expected = case.expected();
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    for backend in [
-        BackendName::Cpu,
-        BackendName::Metal,
-        BackendName::Cuda,
-        BackendName::Vulkan,
-    ] {
-        let Ok(device) = catalog.open_backend(backend) else {
-            continue;
-        };
+    for device in seismic_native_tests::devices(&[BackendName::Cpu, BackendName::Metal, BackendName::Cuda, BackendName::Vulkan]) {
+        let backend = device.backend();
         // CUDA: the vector and the grouped-query matrix forms.
         let decode_specs = if backend == BackendName::Cuda {
             [(4, 0, 2, 1), (1, 1, 3, 2)]
@@ -1137,11 +1129,8 @@ fn dense_append_publishes_only_the_same_history_as_prefill() {
     ];
     let case = Case::new(SMALL, 64, 1, &rows, 97);
     let expected = case.expected();
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    for backend in [BackendName::Cpu, BackendName::Metal] {
-        let Ok(device) = catalog.open_backend(backend) else {
-            continue;
-        };
+    for device in seismic_native_tests::devices(&[BackendName::Cpu, BackendName::Metal]) {
+        let backend = device.backend();
         let specialization = if is_cpu(&device) {
             cpu_statics(SMALL)
         } else {
@@ -1214,7 +1203,9 @@ const LFM: Geometry = Geometry { kv: 8, g: 4, p: 32, s: 0 };
 #[test]
 #[cfg(target_arch = "x86_64")]
 fn cpu_vector_tier_matches_portable_tier() {
-    let device = seismic::Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+    let Some(device) = seismic_native_tests::devices(&[BackendName::Cpu]).into_iter().next() else {
+        return;
+    };
     if !std::arch::is_x86_feature_detected!("avx2") {
         return;
     }
@@ -1248,7 +1239,7 @@ fn cpu_vector_tier_matches_portable_tier() {
 #[test]
 fn cpu_decode_matches_host_model_at_every_partition_fill() {
     use seismic::device::DeviceValues;
-    let device = seismic::Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Cpu) else { return };
     let units = device.properties().value("units") as i32;
     for base in [5, 64 * units, 128 * units + 65] {
         let case = Case::new(SMALL, base as usize + 64, 2, &decode_rows(base), 43);
@@ -1275,7 +1266,7 @@ const QWEN3_8B: Geometry = Geometry { kv: 8, g: 4, p: 64, s: 0 };
 /// match the host model.
 #[test]
 fn cpu_prefill_row_blocks_keep_result_bits() {
-    let device = seismic::Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Cpu) else { return };
     let case = Case::new(QWEN35B, 448, 2, &prefill_rows(70, 300), 61);
     let expected = case.expected();
     let mut first = None;
@@ -1295,7 +1286,7 @@ fn cpu_prefill_row_blocks_keep_result_bits() {
 /// rows share none and each walk their keys alone.
 #[test]
 fn cpu_prefill_shared_blocks_match_each_row_alone() {
-    let device = seismic::Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Cpu) else { return };
     let rows = 70;
     let case = Case::new(QWEN35B, 448, 2, &prefill_rows(rows, 300), 67);
     let kernel = prefill_kernel(&device, &cpu_statics(QWEN35B));

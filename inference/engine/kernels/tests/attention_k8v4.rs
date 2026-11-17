@@ -488,7 +488,7 @@ macro_rules! prefill_args {
 
 /// The Metal device, where one is present: the Metal-only tests' device.
 fn metal_device() -> Option<Device> {
-    seismic_native_tests::every_device().into_iter().find(|device| device.backend() == BackendName::Metal)
+    seismic_native_tests::devices(&[BackendName::Metal]).into_iter().next()
 }
 
 /// Whether Vulkan's vector decode form (SIMDS, SLICES, KEYWISE) is within the
@@ -4607,7 +4607,9 @@ const LFM: Geometry = Geometry { kv: 8, g: 4, p: 32, s: 0 };
 #[test]
 #[cfg(target_arch = "x86_64")]
 fn cpu_vector_tier_matches_portable_tier() {
-    let device = seismic::Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+    let Some(device) = seismic_native_tests::devices(&[BackendName::Cpu]).into_iter().next() else {
+        return;
+    };
     if !std::arch::is_x86_feature_detected!("avx2") {
         return;
     }
@@ -4641,7 +4643,7 @@ fn cpu_vector_tier_matches_portable_tier() {
 #[test]
 fn cpu_decode_matches_host_model_at_every_partition_fill() {
     use seismic::device::DeviceValues;
-    let device = seismic::Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Cpu) else { return };
     let units = device.properties().value("units") as i32;
     for base in [5, 64 * units, 128 * units + 65] {
         let encoded = Encoded::new(Case::new(GROUPED, base as usize + 64, 2, &decode_rows(base), 43));

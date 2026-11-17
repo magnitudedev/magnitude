@@ -85,23 +85,11 @@ pub fn bf16_round(value: f32) -> f32 {
     f32::from_bits((bits + 0x7fff + ((bits >> 16) & 1)) & 0xffff_0000)
 }
 
-/// Every backend this host can open, the CPU always.
+/// Every backend the host has, or a requested one alone
+/// ([`seismic_native_tests::devices`]).
 pub fn devices() -> Vec<Device> {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    let devices = [
-        BackendName::Metal,
-        BackendName::Cuda,
-        BackendName::Vulkan,
-        BackendName::Cpu,
-    ]
-    .into_iter()
-    .filter_map(|backend| catalog.open_backend(backend).ok())
-    .collect::<Vec<_>>();
-    println!(
-        "backends: {}",
-        devices.iter().map(|device| device.backend().as_str()).collect::<Vec<_>>().join(", ")
-    );
-    devices
+    use BackendName::{Cpu, Cuda, Metal, Vulkan};
+    seismic_native_tests::devices(&[Metal, Cuda, Vulkan, Cpu])
 }
 
 /// Every backend this host can open whose declaration offers `entry` at its
