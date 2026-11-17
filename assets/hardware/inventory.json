@@ -200,8 +200,8 @@
     "file": "mini.webp",
     "subject": "Mac mini (2024)",
     "manufacturer": "Apple",
-    "source": "https://support.apple.com/en-us/121555",
-    "imageUrl": "https://store.storeimages.cdn-apple.com/4982/as-images.apple.com/is/mac-mini-202410-gallery-1?wid=4000&hei=3074&fmt=png-alpha",
+    "source": "https://commons.wikimedia.org/wiki/File:Apple_Mac_Mini_M4.svg",
+    "imageUrl": "https://upload.wikimedia.org/wikipedia/commons/thumb/2/2a/Apple_Mac_Mini_M4.svg/1920px-Apple_Mac_Mini_M4.svg.png",
     "match": {
       "_tag": "Apple",
       "models": [
@@ -212,11 +212,11 @@
     "category": "Mini PC",
     "framing": {
       "sourceWidth": 1440,
-      "sourceHeight": 1107,
-      "x": 238,
-      "y": 360,
-      "width": 965,
-      "height": 387
+      "sourceHeight": 873,
+      "x": 61,
+      "y": 67,
+      "width": 1318,
+      "height": 747
     }
   },
   {

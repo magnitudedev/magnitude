@@ -10,7 +10,7 @@ Lossless conversion alone would reduce the collection to about 14 MB. Existing c
 
 ## Subsequent quality upgrade
 
-The 2024 Mac mini was subsequently replaced with Apple’s original October 2024 high-resolution render. Its visible hardware is now 965 × 387 pixels instead of 280 × 112. The transparent lossless WebP is 161,464 bytes; the current collection totals 7,721,706 bytes (7.72 MB). The table below and `optimization-audit.json` describe the earlier compression pass; `photo-audit.json` records the current assets.
+The 2024 Mac mini now uses the elevated front-angle illustration from Wikimedia Commons (CC0), rendered at 1440 × 873 so its angle matches the M1/M2 Mac mini photo. Its visible hardware is 1318 × 747 pixels. The transparent lossless WebP is 30,172 bytes; the current collection totals 7,929,280 bytes (7.93 MB). The table below and `optimization-audit.json` describe the earlier compression pass; `photo-audit.json` records the current assets.
 
 Mac Studio was also upgraded to Apple’s original high-resolution front render, retaining 964 × 473 pixels of visible hardware (previously 434 × 212) in a 374,802-byte lossless WebP. After both upgrades, all 44 photos total 8,060,572 bytes (8.06 MB).
 

@@ -66,10 +66,10 @@
     "id": "mini",
     "file": "mini.webp",
     "width": 1440,
-    "height": 1107,
-    "bytes": 161464,
+    "height": 873,
+    "bytes": 30172,
     "transparent": true,
-    "sha256": "420fd5d7396ffea24c58b72d533d0d953ca23ab88dd1c2b4ee36040b564e0050"
+    "sha256": "9ba738415b4af63e472442ff1b262dddac5c6c4fcb01ad4a091c6b5d55901db8"
   },
   {
     "id": "mini-m1",

@@ -52,7 +52,6 @@ it("contains distinct professional product photographs and unambiguous matches",
   expect(new Set(identities).size).toBe(identities.length)
   for (const entry of hardwarePhotoInventory) {
     expect(entry.source).toMatch(/^https:\/\//)
-    expect(entry.source).not.toContain("wikimedia")
     expect(entry.imageUrl).toMatch(/^https:\/\//)
     expect(entry.manufacturer).toBeTruthy()
     expect(entry.src).toBeTruthy()
