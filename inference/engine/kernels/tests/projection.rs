@@ -8663,8 +8663,112 @@ fn mxfp8_grouped_project_rows_at_deepseek_v41_prefill_wo_a_times() {
     }
 }
 
+/// One timed `dense_output` call at H x F over `rows` activation rows of
+/// `weight` (`format`), under `mapping`: the median device time of a call
+/// over 15 samples, and what the compiler made of each launch (its registers
+/// and local memory, where the driver reports them), or None where `mapping`
+/// is not admitted.
+fn time_dense_output(
+    device: &Device,
+    format: Format,
+    weight: &Tensor,
+    (h, f, rows): (usize, usize, usize),
+    mapping: Mapping,
+) -> Option<(f64, String)> {
+    let repr = Repr::of(format);
+    let act = Act::Bf16;
+    let mut rng = Rng::new(rows as u64);
+    let residual = f32_tensor(device, &[rows, h], &(0..rows * h).map(|_| rng.symmetric()).collect::<Vec<_>>());
+    let product = act_tensor(
+        device,
+        act,
+        &[rows, f],
+        &(0..rows * f).map(|_| act.round(rng.symmetric())).collect::<Vec<_>>(),
+    );
+    let out_rows = i32_tensor(device, &[rows], &(0..rows as i32).collect::<Vec<_>>());
+    let (scale, bound) = (f32_tensor(device, &[0], &[]), absent_bound(device));
+    let elements = [("A", act.element()), ("DW", repr.resident(device))];
+    let specialization = dense_output_specialization_on(device, &[("H", h), ("F", f)], mapping);
+    let specialization = with_matrix::<dense_output::Entry>(device, specialization, &elements);
+    if !seismic::generated::native_specialization_valid::<dense_output::Entry>(device, &specialization, &elements)
+        .unwrap()
+    {
+        return None;
+    }
+    let point = seismic::TuningPoint {
+        label: format!("m{rows}"),
+        weight: 1.0,
+        class: None,
+        cost: 1.0,
+        workload: seismic::WorkloadRotation::All,
+        rotation: vec![dense_output::Args {
+            residual: &residual,
+            product: &product,
+            down_weight: weight,
+            out_rows: &out_rows,
+            down_scale: &scale,
+            down_bound: &bound,
+        }],
+        initialize: None,
+        written: Default::default(),
+    };
+    let result = dense_output::native_tune_with(
+        device,
+        dense_output::Elements { A: act.element(), DW: repr.resident(device) },
+        &specialization,
+        vec![point],
+        seismic::NumericalRequirement::RoundingSteps { alpha: 8., activation: Some(seismic::DType::BF16) },
+        seismic::Strategy::Survey(seismic::SurveyPlan {
+            samples: 15,
+            min_sample_seconds: 0.05,
+            domains: Default::default(),
+        }),
+    )
+    .unwrap();
+    let (median, launches) = result
+        .configurations
+        .iter()
+        .find_map(|record| match &record.outcome {
+            seismic::Outcome::Measured { points, .. } => Some((points[0].median_seconds, &record.launches)),
+            seismic::Outcome::Excluded(_) => None,
+        })
+        .expect("the fixed configuration is measured");
+    let programs = launches
+        .iter()
+        .flatten()
+        .map(|program| {
+            program
+                .statistics
+                .iter()
+                .filter(|statistic| {
+                    ["register", "spill", "local", "scratch", "private"]
+                        .iter()
+                        .any(|word| statistic.name.to_lowercase().contains(word))
+                })
+                .map(|statistic| format!("{} {:?}", statistic.name, statistic.value))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    Some((median, programs))
+}
+
+/// A weight of `format` at H x F, its bytes alone (its host values, an
+/// interpreted decode of 50M values, are no part of a timing); `uniform`
+/// sets every code 0, so every grid lookup reads one table entry.
+fn timing_weight(device: &Device, format: Format, (h, f): (usize, usize), uniform: bool) -> Tensor {
+    let repr = Repr::of(format);
+    let shape = [h as u64, f as u64];
+    let external = format.external(&mut Rng::new(91), &shape, 2.0 / (f as f32).sqrt());
+    let external = if uniform { vec![0; external.len()] } else { external };
+    let bytes = repr.element().repack_host(format.source(), &shape, &external).unwrap();
+    Tensor::from_host(device, repr.resident(device), &shape, &bytes).unwrap()
+}
+
 /// `dense_output` at Qwen3.5-9B's feed-forward down shape (H 4096, F 12288)
-/// over the grid and codebook formats, q4_K and F8_E4M3, at a decode row and
+/// over a format of every decode class (the grid and codebook formats, the
+/// direct linear, k-quant and odd-width ones, q4_K and F8_E4M3), at a decode row and
 /// a 512-row prefill chunk, under the declaration's default GEMV and GEMM
 /// configuration: the median device time of a call over 15 samples. The grid
 /// formats are timed again over uniform weights (every code 0, so every
@@ -8675,6 +8779,13 @@ fn mxfp8_grouped_project_rows_at_deepseek_v41_prefill_wo_a_times() {
 fn dense_output_timing_at_shape() {
     let (h, f) = (4096usize, 12288usize);
     let formats = [
+        Encoding::Q8_0,
+        Encoding::Q4_0,
+        Encoding::Q4_1,
+        Encoding::Q2K,
+        Encoding::Q6K,
+        Encoding::Q1_0,
+        Encoding::Tq2_0,
         Encoding::Iq1S,
         Encoding::Iq1M,
         Encoding::Iq2Xxs,
@@ -8692,81 +8803,54 @@ fn dense_output_timing_at_shape() {
     .chain([Format::F8_E4M3])
     .map(|format| (format, false))
     .chain([Encoding::Iq1S, Encoding::Iq2Xxs, Encoding::Iq3Xxs].map(|encoding| (Format::rounded(encoding), true)));
-    let act = Act::Bf16;
     for device in devices().into_iter().filter(|device| !is_cpu(device)) {
         for (format, uniform) in formats.clone() {
-            // The weight's bytes alone: its host values (an interpreted
-            // decode of 50M values) are no part of a timing.
-            let repr = Repr::of(format);
-            let shape = [h as u64, f as u64];
-            let external = format.external(&mut Rng::new(91), &shape, 2.0 / (f as f32).sqrt());
-            let external = if uniform { vec![0; external.len()] } else { external };
-            let bytes = repr.element().repack_host(format.source(), &shape, &external).unwrap();
-            let weight_tensor = Tensor::from_host(&device, repr.resident(&device), &shape, &bytes).unwrap();
+            let weight = timing_weight(&device, format, (h, f), uniform);
             for rows in [1usize, 512] {
-                let mut rng = Rng::new(rows as u64);
-                let residual = f32_tensor(&device, &[rows, h], &(0..rows * h).map(|_| rng.symmetric()).collect::<Vec<_>>());
-                let product = act_tensor(
-                    &device,
-                    act,
-                    &[rows, f],
-                    &(0..rows * f).map(|_| act.round(rng.symmetric())).collect::<Vec<_>>(),
-                );
-                let out_rows = i32_tensor(&device, &[rows], &(0..rows as i32).collect::<Vec<_>>());
-                let (scale, bound) = (f32_tensor(&device, &[0], &[]), absent_bound(&device));
-                let specialization = with_matrix::<dense_output::Entry>(
-                    &device,
-                    dense_output_specialization_on(&device, &[("H", h), ("F", f)], gemm_mapping(64, 128, 1)),
-                    &[("A", act.element()), ("DW", repr.resident(&device))],
-                );
-                let point = seismic::TuningPoint {
-                    label: format!("m{rows}"),
-                    weight: 1.0,
-                    class: None,
-                    cost: 1.0,
-                    workload: seismic::WorkloadRotation::All,
-                    rotation: vec![dense_output::Args {
-                        residual: &residual,
-                        product: &product,
-                        down_weight: &weight_tensor,
-                        out_rows: &out_rows,
-                        down_scale: &scale,
-                        down_bound: &bound,
-                    }],
-                    initialize: None,
-                    written: Default::default(),
-                };
-                let result = dense_output::native_tune_with(
-                    &device,
-                    dense_output::Elements { A: act.element(), DW: repr.resident(&device) },
-                    &specialization,
-                    vec![point],
-                    seismic::NumericalRequirement::RoundingSteps {
-                        alpha: 8.,
-                        activation: Some(seismic::DType::BF16),
-                    },
-                    seismic::Strategy::Survey(seismic::SurveyPlan {
-                        samples: 15,
-                        min_sample_seconds: 0.05,
-                        domains: Default::default(),
-                    }),
-                )
-                .unwrap();
-                let median = result
-                    .configurations
-                    .iter()
-                    .find_map(|record| match &record.outcome {
-                        seismic::Outcome::Measured { points, .. } => Some(points[0].median_seconds),
-                        seismic::Outcome::Excluded(_) => None,
-                    })
-                    .expect("the fixed configuration is measured");
+                let (median, programs) =
+                    time_dense_output(&device, format, &weight, (h, f, rows), gemm_mapping(64, 128, 1))
+                        .expect("the default configuration is admitted");
                 eprintln!(
-                    "timing {:?} dense_output {format:?}{} H {h} F {f} M {rows}: {:.1} us per call, {:.0} G values/s",
+                    "timing {:?} dense_output {format:?}{} H {h} F {f} M {rows}: {:.1} us per call, {:.0} G values/s, {:.2} TFLOPS [{programs}]",
                     device.backend(),
                     if uniform { " uniform" } else { "" },
                     1e6 * median,
-                    (h * f) as f64 / median / 1e9
+                    (h * f) as f64 / median / 1e9,
+                    2.0 * (h * f * rows) as f64 / median / 1e12
                 );
+            }
+        }
+    }
+}
+
+/// `dense_output`'s 512-row GEMM alone at the same shape, per admitted tile
+/// (TM x TN of WM x WN sub-tiles), for a direct and a grid weight: the GEMM
+/// core is the same for every format and only their B staging differs. A
+/// timing for before/after comparisons and tile choices of the GEMM.
+#[test]
+#[ignore = "timing at shape"]
+fn dense_output_gemm_timing_at_shape() {
+    let (h, f, rows) = (4096usize, 12288usize, 512usize);
+    for device in devices().into_iter().filter(|device| !is_cpu(device)) {
+        for format in [Encoding::Q4_0, Encoding::Iq2Xxs].map(Format::rounded) {
+            let weight = timing_weight(&device, format, (h, f), false);
+            for (tile_m, tile_n) in [(64, 64), (64, 128), (128, 64), (128, 128)] {
+                for (sub_m, sub_n) in [(32, 32), (32, 64), (64, 32), (64, 64)] {
+                    if sub_m > tile_m || sub_n > tile_n {
+                        continue;
+                    }
+                    let mapping = Mapping { sub_m, sub_n, ..gemm_mapping(tile_m, tile_n, 1) };
+                    let Some((median, programs)) = time_dense_output(&device, format, &weight, (h, f, rows), mapping)
+                    else {
+                        continue;
+                    };
+                    eprintln!(
+                        "timing {:?} dense_output {format:?} H {h} F {f} M {rows} tile {tile_m}x{tile_n}/{sub_m}x{sub_n}: {:.1} us per call, {:.2} TFLOPS [{programs}]",
+                        device.backend(),
+                        1e6 * median,
+                        2.0 * (h * f * rows) as f64 / median / 1e12
+                    );
+                }
             }
         }
     }
