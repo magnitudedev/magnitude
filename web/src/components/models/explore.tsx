@@ -1,9 +1,9 @@
 import { useContext, useEffect, useMemo, useState } from "react"
-import { Option } from "effect"
+import { Equal, Option } from "effect"
 import { Atom, RegistryContext, Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { CheckIcon, CircleNotchIcon, DownloadSimpleIcon, LightningIcon } from "@phosphor-icons/react"
 import { HUGGING_FACE_SEARCH_QUERY_MAXIMUM_BYTES, repositoryDisplayName, type CatalogFormModelId, type CustomFormModelId, type DrafterChoice, type HuggingFaceRepositoryCheck, type HuggingFaceRepositoryId, type HuggingFaceSearchResult, type LocalModel } from "@magnitudedev/sdk"
-import { drafterCandidateDownloadBytes, formatStorageSize, readSearchChecks, useAgentClient, useLocalModelMutations, useLocalModels, type QuickSearchCheck, type ServingMemory } from "@magnitudedev/client-common"
+import { drafterCandidateDownloadBytes, formatStorageSize, readSearchChecks, useAgentClient, useLocalModelMutations, useLocalModels, type AgentClient, type QuickSearchCheck, type ServingMemory } from "@magnitudedev/client-common"
 import { Button } from "../ui/button"
 import { labForDeveloper } from "../model-logo"
 import { downloadContents, methodName, onThisComputer, quantView, transferOf } from "./data"
@@ -47,10 +47,50 @@ const quickState = (check: Result.Result<HuggingFaceRepositoryCheck, unknown>): 
  * when `prefetched`.
  */
 /** What a search's schedule has read: each listed repository's quick check it has read, and those it fully checked. */
-interface SearchSchedule {
+export interface SearchSchedule {
   readonly checks: ReadonlyMap<string, Result.Result<HuggingFaceRepositoryCheck, unknown>>
   readonly full: ReadonlySet<string>
 }
+
+/**
+ * Whether two passes of a search's schedule read the same checks to the same results and fully checked the same
+ * repositories. A pass runs whenever any check it reads changes at all (its staleness, a full check's progress); only
+ * a pass that found something new is a new schedule, so the list is drawn again only then.
+ */
+export const sameSchedule = (previous: SearchSchedule, next: SearchSchedule): boolean =>
+  previous.checks.size === next.checks.size
+  && [...next.checks].every(([key, check]) => previous.checks.has(key) && Equal.equals(previous.checks.get(key), check))
+  && previous.full.size === next.full.size
+  && [...next.full].every(key => previous.full.has(key))
+
+/**
+ * A search's schedule over its `listed` repositories, `visible` being those on screen: each pass reads the checks
+ * `readSearchChecks` runs, and stays the same schedule unless it found something new.
+ */
+export const searchSchedule = (client: Pick<AgentClient, "Models">, listed: readonly HuggingFaceSearchResult[], visible: Atom.Atom<ReadonlySet<string>>) =>
+  Atom.make((get): SearchSchedule => {
+    const byKey = new Map<string, HuggingFaceSearchResult>(listed.map(result => [result.repository, result]))
+    const checks = new Map<string, Result.Result<HuggingFaceRepositoryCheck, unknown>>()
+    const full = new Set<string>()
+    const previous = get.self<SearchSchedule>()
+    readSearchChecks({
+      listed: listed.map(result => result.repository),
+      visible: get(visible),
+      read: new Set(Option.match(previous, { onNone: () => [], onSome: value => [...value.checks.keys()] })),
+      quick: (key) => {
+        const check = get(client.Models.CheckHuggingFaceRepository(checkInput(byKey.get(key)!))).result
+        checks.set(key, check)
+        return quickState(check)
+      },
+      full: (key) => {
+        full.add(key)
+        const inspected = get(client.Models.InspectModelCandidate({ reference: key })).result
+        return !Result.isInitial(inspected) && !inspected.waiting
+      },
+    })
+    const next = { checks, full }
+    return Option.match(previous, { onNone: () => next, onSome: value => sameSchedule(value, next) ? value : next })
+  })
 
 const searchRow = (result: HuggingFaceSearchResult, check: Result.Result<HuggingFaceRepositoryCheck, unknown>, prefetched: boolean, retry: () => void, memory: ServingMemory): ExploreRow | null => {
   const developer = Option.getOrNull(result.developer)
@@ -222,27 +262,7 @@ function useSearchResults(settled: string, query: string, memory: ServingMemory,
     setPages({ query: settled, cursor: next, shown: [...current.shown, ...listed.results] })
   }
   const listedResults = useMemo(() => [...current.shown, ...(listed?.results ?? [])], [current.shown, listed])
-  const schedule = useAtomValue(useMemo(() => Atom.make((get): SearchSchedule => {
-    const byKey = new Map<string, HuggingFaceSearchResult>(listedResults.map(result => [result.repository, result]))
-    const checks = new Map<string, Result.Result<HuggingFaceRepositoryCheck, unknown>>()
-    const full = new Set<string>()
-    readSearchChecks({
-      listed: listedResults.map(result => result.repository),
-      visible: get(visible),
-      read: new Set(Option.match(get.self<SearchSchedule>(), { onNone: () => [], onSome: previous => [...previous.checks.keys()] })),
-      quick: (key) => {
-        const check = get(client.Models.CheckHuggingFaceRepository(checkInput(byKey.get(key)!))).result
-        checks.set(key, check)
-        return quickState(check)
-      },
-      full: (key) => {
-        full.add(key)
-        const inspected = get(client.Models.InspectModelCandidate({ reference: key })).result
-        return !Result.isInitial(inspected) && !inspected.waiting
-      },
-    })
-    return { checks, full }
-  }), [client, listedResults, visible]))
+  const schedule = useAtomValue(useMemo(() => searchSchedule(client, listedResults, visible), [client, listedResults, visible]))
   const registry = useContext(RegistryContext)
   return query !== settled || (loading && current.shown.length === 0) ? { _tag: "Searching" }
     : Result.isFailure(page) && current.shown.length === 0 ? { _tag: "Failed", message: "Hugging Face search failed. Check your connection and try again." }
