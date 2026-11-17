@@ -342,7 +342,9 @@ mod tests {
             let statics = statics.statics().iter().map(|(name, &value)| (name.as_str(), value)).collect::<Vec<_>>();
             key(entry, &statics, &[fixed])
         };
-        let (weights, activation) = (seismic::Element::bf16(), seismic::Element::f32());
+        // The dense projection's rows are 16-bit (`dense_bytes(A) == 2`),
+        // and a call site binds its outputs at its rows' element.
+        let (weights, rows, activation) = (seismic::Element::bf16(), seismic::Element::bf16(), seismic::Element::f32());
         let projection = metal(seismic::generated::native_implementation_at::<magnitude_kernels::attention_project::Entry>(
             BackendName::Metal,
             &[
@@ -351,15 +353,15 @@ mod tests {
                 ("GW", weights),
                 ("KW", weights),
                 ("VW", weights),
-                ("A", activation),
-                ("Y", activation),
+                ("A", rows),
+                ("Y", rows),
             ],
         ));
         let key_of = at("attention_project", &projection, ("RESIDUE", 1));
         check(projection, key_of, ("RESIDUE", 1), 2);
         let route = metal(seismic::generated::native_implementation_at::<magnitude_kernels::routed_route_streamed::Entry>(
             BackendName::Metal,
-            &[("NW", activation), ("RW", weights), ("SRW", activation), ("SGW", weights), ("SUW", weights), ("A", weights)],
+            &[("NW", activation), ("RW", weights), ("SRW", activation), ("SGW", weights), ("SUW", weights), ("A", rows)],
         ));
         let key_of = at("routed_route_streamed", &route, ("LANES", 16));
         check(route, key_of, ("LANES", 16), 32);
@@ -367,10 +369,13 @@ mod tests {
 
     /// A configuration recorded before a parameter moved between a native
     /// and its launches replays its values where this build declares them:
-    /// Metal `routed_gate_up`'s parameters, on its native, from a recording
-    /// on its first launch, and `routed_expand`'s, on its launch, from one
-    /// on its native. Launches that recorded different values for what is
-    /// now one native parameter are another build's configuration.
+    /// Metal `routed_expand`'s parameters, on its native since its routed
+    /// projection declares them there, from a recording on the launch that
+    /// declared them before, and Metal `attention_project`'s GEMV tile
+    /// mapping, on each of its dense projection's launches that declares
+    /// it, from a recording on its native. Launches that recorded
+    /// different values for what is now one native parameter are another
+    /// build's configuration.
     #[test]
     fn a_parameter_moved_between_native_and_launches_replays_its_value() {
         let bf16 = seismic::Element::bf16();
@@ -402,45 +407,70 @@ mod tests {
                 Err(error) => panic!("{} resolves: {error}", key.0),
             }
         };
-
-        let gate_up = device_independent(seismic::generated::native_implementation_at::<magnitude_kernels::routed_gate_up::Entry>(
-            BackendName::Metal,
-            &[("A", bf16), ("EGW", bf16), ("EUW", bf16)],
-        ));
-        assert!(gate_up.launches.iter().all(|launch| launch.params.is_empty()), "routed_gate_up's parameters are its native's");
-        let key_of = unit("routed_gate_up", &gate_up);
-        let (chosen, choice) = replayed(
-            &key_of,
-            &gate_up,
-            recorded(&key_of, &[], &[(0, "SIMDGROUPS", 4), (0, "ROWS", 2), (0, "LANES", 32)]),
-        );
-        assert_eq!(choice, PinnedChoice::Replayed);
-        assert_eq!(
-            [chosen.param("SIMDGROUPS"), chosen.param("ROWS"), chosen.param("LANES")],
-            [Some(4), Some(2), Some(32)]
-        );
-        let (_, choice) = replayed(
-            &key_of,
-            &gate_up,
-            recorded(&key_of, &[], &[(0, "SIMDGROUPS", 4), (1, "SIMDGROUPS", 8)]),
-        );
-        assert_eq!(choice, PinnedChoice::NotReplayed, "launches' values that disagree name no one native value");
+        let on_launches = |implementation: &OnDevice, name: &str| {
+            (0..implementation.launches.len())
+                .filter(|&launch| implementation.launches[launch].params.iter().any(|parameter| parameter.name == name))
+                .collect::<Vec<_>>()
+        };
+        let on_native = |implementation: &OnDevice, name: &str| implementation.params.iter().any(|parameter| parameter.name == name);
 
         let expand = device_independent(seismic::generated::native_implementation_at::<magnitude_kernels::routed_expand::Entry>(
             BackendName::Metal,
             &[("A", bf16), ("EGW", bf16), ("EUW", bf16), ("SGW", bf16), ("SUW", bf16)],
         ));
-        assert!(expand.params.is_empty(), "routed_expand's parameters are its launch's");
+        for name in ["SIMDGROUPS", "ROWS", "LANES"] {
+            assert!(
+                on_native(&expand, name) && on_launches(&expand, name).is_empty(),
+                "routed_expand's {name} is its native's"
+            );
+        }
         let key_of = unit("routed_expand", &expand);
         let (chosen, choice) = replayed(
             &key_of,
             &expand,
-            recorded(&key_of, &[("SIMDGROUPS", 4), ("ROWS", 2), ("LANES", 16)], &[]),
+            recorded(&key_of, &[], &[(0, "SIMDGROUPS", 4), (0, "ROWS", 2), (0, "LANES", 16)]),
         );
         assert_eq!(choice, PinnedChoice::Replayed);
         assert_eq!(
-            [chosen.launch_param(0, "SIMDGROUPS"), chosen.launch_param(0, "ROWS"), chosen.launch_param(0, "LANES")],
+            [chosen.param("SIMDGROUPS"), chosen.param("ROWS"), chosen.param("LANES")],
             [Some(4), Some(2), Some(16)]
         );
+        let (_, choice) = replayed(
+            &key_of,
+            &expand,
+            recorded(&key_of, &[], &[(0, "SIMDGROUPS", 4), (1, "SIMDGROUPS", 8)]),
+        );
+        assert_eq!(choice, PinnedChoice::NotReplayed, "launches' values that disagree name no one native value");
+
+        let projection = device_independent(seismic::generated::native_implementation_at::<magnitude_kernels::attention_project::Entry>(
+            BackendName::Metal,
+            &[
+                ("NW", bf16),
+                ("QW", bf16),
+                ("GW", bf16),
+                ("KW", bf16),
+                ("VW", bf16),
+                ("A", bf16),
+                ("Y", bf16),
+            ],
+        ));
+        for name in ["SIMDGROUPS", "ROWS"] {
+            assert!(
+                !on_native(&projection, name) && on_launches(&projection, name).len() > 1,
+                "attention_project's {name} is its GEMV launches'"
+            );
+        }
+        let key_of = unit("attention_project", &projection);
+        let (chosen, choice) = replayed(
+            &key_of,
+            &projection,
+            recorded(&key_of, &[("SIMDGROUPS", 4), ("ROWS", 2)], &[]),
+        );
+        assert_eq!(choice, PinnedChoice::Replayed);
+        for (name, value) in [("SIMDGROUPS", 4), ("ROWS", 2)] {
+            for launch in on_launches(&projection, name) {
+                assert_eq!(chosen.launch_param(launch, name), Some(value), "launch {launch}'s {name}");
+            }
+        }
     }
 }

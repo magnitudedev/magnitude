@@ -965,8 +965,11 @@ mod resource_template_tests {
                 // The graphs a load seals and their plans' host heap, from
                 // each exact class's own topology: blocks of one shape seal
                 // one plan per class (no block here reads a layer scale).
+                // Each block drafts with the operand carries its certificate
+                // holds (`block_carries`), which its shape holds.
+                let carries = &certificate.outline.carries;
                 let (_, tapped) = block_taps(plan.target(), geometry).unwrap();
-                let shapes = block_graph_shapes(&load, geometry, &state, &tapped, &no_carries(geometry), None).unwrap();
+                let shapes = block_graph_shapes(&load, geometry, &state, &tapped, carries, None).unwrap();
                 let sealed = std::cell::Cell::new((0usize, HostHeap::default()));
                 let seals = |heap: HostHeap| {
                     let (graphs, held) = sealed.get();
@@ -1027,7 +1030,7 @@ mod resource_template_tests {
                             index,
                             staged,
                             if stage == Stage::Once(OnceStage::Pass) { rows } else { pass_rows },
-                            BlockCarries::default(),
+                            carries[index],
                         ),
                     )
                     .unwrap();
