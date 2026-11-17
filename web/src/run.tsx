@@ -4,9 +4,9 @@ import { useMemo } from "react"
 import { RegistryProvider, Result, useAtomValue } from "@effect-atom/atom-react"
 import { Deferred, Effect, Either, Exit, Layer, Option, Runtime, Scope } from "effect"
 import { FetchHttpClient } from "@effect/platform"
-import { MagnitudeClient, readRemoteAccess } from "@magnitudedev/sdk"
+import { readRemoteAccess } from "@magnitudedev/sdk"
 import {
-  AgentClientProvider, ApplicationSession, createAgentClient, makeFirstPartyConnection, useAgentClient,
+  AgentClientProvider, ApplicationSession, applicationClientLayer, createAgentClient, makeFirstPartyConnection, useAgentClient,
   type ApplicationHost,
 } from "@magnitudedev/client-common"
 import { initializeAppearance } from "./stores/appearance-store"
@@ -67,7 +67,7 @@ export const renderApplication = <E,>(entry: ApplicationEntry<E>) => {
     const runtime = yield* Effect.runtime<never>()
     // A blocked navigation still fires beforeunload. Close only when the page actually leaves.
     window.addEventListener("pagehide", event => { if (!event.persisted) Runtime.runFork(runtime)(Scope.close(scope, Exit.void)) })
-    const connection = yield* makeFirstPartyConnection(MagnitudeClient.layer({ origin, autoStart: false, reconnect: entry.reconnect }).pipe(Layer.provide(FetchHttpClient.layer))).pipe(Effect.provideService(Scope.Scope, scope))
+    const connection = yield* makeFirstPartyConnection(applicationClientLayer({ origin, host: entry.host, reconnect: entry.reconnect }).pipe(Layer.provide(FetchHttpClient.layer))).pipe(Effect.provideService(Scope.Scope, scope))
     const client = createAgentClient(connection.client, { host: entry.host, navigation: entry.navigation })
     const readError = Either.isLeft(appearance) ? "The saved appearance could not be read. Using System appearance." : null
     root.render(<RegistryProvider initialValues={[[appearanceReadError, readError]]}><AgentClientProvider tag={client}><ServiceConnectionProvider connection={connection.client.connection}><RemoteAccessProvider access={{ origin, canSignIn: entry.canSignIn, remote }}><SessionGate platform={platform} /></RemoteAccessProvider></ServiceConnectionProvider></AgentClientProvider></RegistryProvider>)
