@@ -12,7 +12,7 @@ import {
   type LocalModel,
   type ModelParameterization,
   type ModelReleaseDate,
-  type ModelVariantLabel,
+  ModelVariantLabelSchema,
   type SpeculativeMethod,
   type UnsupportedLocalModel,
 } from "@magnitudedev/sdk"
@@ -28,11 +28,17 @@ export const formatLocalInferenceBackend = (backend: LocalInferenceBackend): str
   }
 }
 
-export const formatLocalModelDisplayName = (
-  model: { readonly presentation: { readonly displayName: string; readonly variantLabel: ModelVariantLabel } },
-): string => formatModelDisplayName(
+/**
+ * A model's quant by its full name, the same wherever it is named: a recommended model's quant as published
+ * ("UD-Q4_K_XL", "QAD-Q4_0"), any other model's variant label. A recommended model's variant label is a shorthand
+ * ("Q4", "Q4 QAT") that several quants share.
+ */
+export const localModelQuantName = (model: LocalModel): string =>
+  model._tag === "Catalog" ? model.catalogData.quant.name : model.presentation.variantLabel
+
+export const formatLocalModelDisplayName = (model: LocalModel): string => formatModelDisplayName(
   model.presentation.displayName,
-  Option.some(model.presentation.variantLabel),
+  Option.some(ModelVariantLabelSchema.make(localModelQuantName(model))),
 )
 
 /** Whether a model's weights were trained at the precision they ship in; only the catalog knows this. */

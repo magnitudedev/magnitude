@@ -35,3 +35,11 @@ describe("a model whose download failed", () => {
     expect(ownedModel(ladder[0]!, "Device").downloadFailure).toBeNull()
   })
 })
+
+describe("a model's quant name", () => {
+  it("is its quant's full name, the name Chat gives it too, not the shorthand of its variant label", () => {
+    const model = { ...ladder[0]!, presentation: { ...ladder[0]!.presentation, variantLabel: "Q4 QAT" },
+      catalogData: { ...(ladder[0] as { catalogData: object }).catalogData, quant: { name: "QAD-Q4_0", repository: "LiquidAI/LFM3-1.7B-GGUF" } } } as unknown as LocalModel
+    expect(ownedModel(model, "Device").quant.name).toBe("QAD-Q4_0")
+  })
+})

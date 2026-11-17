@@ -1,6 +1,6 @@
 import { Option } from "effect"
 import { localModelResidency, type CustomLocalModel, type DrafterTarget, type LocalModel, type LocalModelAssessment, type LocalModelDeveloper, type LocalModelFamily, type RecommendedModel, type SpeculativeMethod, type UnsupportedLocalModel } from "@magnitudedev/sdk"
-import { describeModelLoadFailure, fitPlacementPhrase, modelDownloadFailureMessage, modelFailureLabel, formatStorageSize, ladderBitWidths, localModelSizeBytes, quantBitWidth, type ServingMemory } from "@magnitudedev/client-common"
+import { describeModelLoadFailure, fitPlacementPhrase, modelDownloadFailureMessage, modelFailureLabel, formatStorageSize, ladderBitWidths, localModelQuantName, localModelSizeBytes, quantBitWidth, type ServingMemory } from "@magnitudedev/client-common"
 import { labForDeveloper } from "../model-logo"
 import type { DiscoveredModel } from "./onboarding"
 import type { OfferedModel } from "./expanding-model"
@@ -25,7 +25,7 @@ const repositoryOf = (model: LocalModel): string | null => {
   return model.catalogData.quant.repository
 }
 
-const quantNameOf = (model: LocalModel): string => model._tag === "Catalog" ? model.catalogData.quant.name : model.presentation.variantLabel
+const quantNameOf = localModelQuantName
 
 const assessmentOf = (model: LocalModel): LocalModelAssessment | null =>
   model.servingState._tag === "Assessed" ? model.servingState.assessment : null

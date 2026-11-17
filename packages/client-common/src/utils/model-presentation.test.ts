@@ -1,6 +1,6 @@
 import { Option } from "effect"
 import { describe, expect, it } from "vitest"
-import { ModelReleaseDateSchema, ModelVariantLabelSchema } from "@magnitudedev/sdk"
+import { ModelReleaseDateSchema, ModelVariantLabelSchema, type LocalModel } from "@magnitudedev/sdk"
 import {
   formatLocalModelDisplayName,
   formatModelDisplayName,
@@ -21,13 +21,10 @@ describe("model presentation", () => {
     expect(formatModelDisplayName("Cloud Model", Option.none())).toBe("Cloud Model")
   })
 
-  it("formats local presentation without inspecting artifact metadata", () => {
-    expect(formatLocalModelDisplayName({
-      presentation: {
-        displayName: "Gemma 4 12B",
-        variantLabel: ModelVariantLabelSchema.make("Q4 QAT"),
-      },
-    })).toBe("Gemma 4 12B (Q4 QAT)")
+  it("names a recommended model's quant in full, and any other model's by its variant label", () => {
+    const presentation = { displayName: "LFM3 1.7B", variantLabel: ModelVariantLabelSchema.make("Q4 QAT") }
+    expect(formatLocalModelDisplayName({ _tag: "Catalog", presentation, catalogData: { quant: { name: "QAD-Q4_0" } } } as unknown as LocalModel)).toBe("LFM3 1.7B (QAD-Q4_0)")
+    expect(formatLocalModelDisplayName({ _tag: "Custom", presentation } as unknown as LocalModel)).toBe("LFM3 1.7B (Q4 QAT)")
   })
 
   it("formats speculative methods consistently", () => {

@@ -282,7 +282,7 @@ describe("recommendations, families, and assessment progress", () => {
     const model = makeCatalogModel()
     const lines = renderRecommendations({ catalog: catalogState([model]), models: [model], hardware: makeHardware(), developerCountry: Option.none(), recommended: [model].map(recommendedModel) }).split("\n")
     expect(lines.slice(3, 9)).toEqual([
-      "1. Qwen Test (Q4) - Alibaba (CN) - Intelligence 75%",
+      "1. Qwen Test (UD-Q4_K_XL) - Alibaba (CN) - Intelligence 75%",
       "   4-bit unsloth UD-Q4_K_XL - 17.2 GB - ~24 tok/s - 32K context - Fits in GPU",
       "   Model ID: qwen-test:gguf:q4",
       "   Acceleration DFlash - tools, structured output",
@@ -808,7 +808,7 @@ describe("models list and show", () => {
     const command = `magnitude models pull ${lacking.modelId} --only projector`
     const list = renderModelsList(statusView({ models: [lacking] }))
     expect(list).not.toContain("Update available")
-    expect(list).toContain(`Image input for Qwen Test (Q4) isn't downloaded (1.03 GB): ${command}`)
+    expect(list).toContain(`Image input for Qwen Test (UD-Q4_K_XL) isn't downloaded (1.03 GB): ${command}`)
     const detail = renderModelDetail({ model: lacking, models: [lacking], hardware: makeHardware(), drafters: { _tag:"NotApplicable" }, hidden: false })
     expect(detail).toMatch(new RegExp(`Image input\\s+Not downloaded \\(1\\.03 GB\\) - ${command}`))
     expect(detail).toMatch(/Installation\s+Installed/)
