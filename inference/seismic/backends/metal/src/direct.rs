@@ -364,6 +364,44 @@ impl LaunchTimestamps {
     }
 }
 
+/// The dispatch types of the compute encoders a command buffer holds so
+/// far. An indirect dispatch is encoded only in a command buffer whose
+/// encoders are all of its own encoder's type ([`Held::admits`]): the AGX
+/// driver (M4 Pro, `AGXMetalG16X`, macOS 15.7) keeps an indirect dispatch's
+/// threadgroup-optimization state in the command buffer's compute context
+/// across encoders, by dispatch type, and an indirect dispatch in an
+/// encoder of one type after an encoder of the other writes or reads
+/// address 0 (`insertIndirectTGOptKernel` in a serial encoder after a
+/// concurrent one, `executeIndirectKernelWithThreadgroupOptimization` in a
+/// concurrent one after a serial one) and kills the process. Encoders of
+/// one type throughout a command buffer, at any length or order of direct
+/// and indirect dispatches, and a new command buffer, never did
+/// (2026-11-17).
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum Held {
+    #[default]
+    Nothing,
+    Only(MTLDispatchType),
+    Both,
+}
+
+impl Held {
+    /// What the command buffer holds once it opens an encoder of `kind`.
+    fn with(self, kind: MTLDispatchType) -> Self {
+        match self {
+            Self::Nothing => Self::Only(kind),
+            Self::Only(held) if held == kind => self,
+            Self::Only(_) | Self::Both => Self::Both,
+        }
+    }
+
+    /// Whether an indirect dispatch may be encoded in an encoder of `kind`
+    /// of this command buffer.
+    fn admits(self, kind: MTLDispatchType) -> bool {
+        self == Self::Nothing || self == Self::Only(kind)
+    }
+}
+
 /// How a batch places its launches in compute encoders.
 enum Encoding {
     /// The production form: each group of launches ([`DirectBatch::group`])
@@ -371,13 +409,16 @@ enum Encoding {
     /// one launch share a serial encoder, which runs them in order. Each
     /// encoder runs after the one before ([`ordered`]). `open` is `None`
     /// after an event command or a group boundary, until the next launch
-    /// opens an encoder of the `next` dispatch type.
+    /// opens an encoder of the `next` dispatch type. An indirect launch the
+    /// current command buffer does not admit ([`Held`]) begins the next.
     Grouped {
         open: Option<(
             Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
             MTLDispatchType,
         )>,
         next: MTLDispatchType,
+        /// The current command buffer's encoders' types.
+        held: Held,
         /// Whether each command's device interval is observed
         /// ([`DirectBatch::observed`]).
         observed: bool,
@@ -425,7 +466,10 @@ impl Encoding {
     /// an observed one's envelope starts immediately before the commit.
     fn commit(&mut self, command: Retained<ProtocolObject<dyn MTLCommandBuffer>>) -> CommittedCommand {
         let observed = match self {
-            Self::Grouped { observed, .. } => *observed,
+            Self::Grouped { observed, held, .. } => {
+                *held = Held::Nothing;
+                *observed
+            }
             Self::Timed { timing, lease, .. } => {
                 if let Some(lease) = lease.take() {
                     timing.parts.push(timing.timestamps.commit(lease, &command));
@@ -587,6 +631,7 @@ impl DirectBatch {
                 open: None,
                 // The first group sets it.
                 next: MTLDispatchType::Serial,
+                held: Held::Nothing,
                 observed,
             },
         })
@@ -755,14 +800,25 @@ impl DirectBatch {
                 self.cut()?;
             }
         }
+        // An indirect launch in a command buffer that holds an encoder of
+        // the other type than its own begins the next command buffer.
+        if let Encoding::Grouped { next, held, .. } = &self.encoding {
+            if launch.grid.is_some() && !held.admits(*next) {
+                self.end_open();
+                self.cut()?;
+            }
+        }
         self.used = true;
         let command = &self.command;
         let device = &self.device;
         match &mut self.encoding {
-            Encoding::Grouped { open, next, .. } => {
+            Encoding::Grouped { open, next, held, .. } => {
                 let (encoder, _) = match open {
                     Some(open) => open,
-                    None => open.insert((grouped_encoder(device, command, *next)?, *next)),
+                    None => {
+                        *held = held.with(*next);
+                        open.insert((grouped_encoder(device, command, *next)?, *next))
+                    }
                 };
                 crate::pooled(|| encode_launch(encoder, launch))
             }
