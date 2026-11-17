@@ -185,12 +185,22 @@ bool shape_survives(shape_survivor survivor, uint token, out float value, out ui
     return key >= survivor.top_k_key && !(survivor.min_p > 0.0 && exp(value - survivor.maximum) < survivor.min_p);
 }
 
+// The mass of a survivor: its weight exp(v - max) (at most 1) in 2^-32 fixed
+// point, truncated, as CUDA's (u64)(w * 2^32). It is decoded from the
+// weight's bits, weight = significand * 2^(exponent - 150), so the mass is
+// floor(significand * 2^(exponent - 118)): integer shifts only, with no
+// float -> integer conversion and no case for the maximum's 2^32. NVIDIA's
+// Vulkan compiler (580.x, GB10) got both of those wrong: a direct
+// float -> u64 conversion gave 2^33 - 1 for 2^32, and a branch to the
+// constant 2^32 gave 0xffffffff_00000000, which counted every maximum's mass
+// as -2^32 and so cut top-p at the first maximum.
 uint64_t shape_mass(shape_survivor survivor, float value) {
-    // A mass is at most 2^32. Keep that endpoint in integer arithmetic:
-    // on the tested NVIDIA Vulkan path, direct float -> u64 conversion
-    // contributed (high=1, low=0xffffffff) to the histogram instead.
-    const float weight = exp(value - survivor.maximum);
-    return weight >= 1.0 ? (1ul << 32) : uint64_t(uint(weight * 4294967296.0));
+    const uint bits = floatBitsToUint(min(exp(value - survivor.maximum), 1.0));
+    const uint biased = bits >> 23;
+    const uint significand = biased == 0u ? bits & 0x7fffffu : (bits & 0x7fffffu) | 0x800000u;
+    // A subnormal's exponent is 1; any shift past 32 leaves nothing of the
+    // 33-bit product.
+    return (uint64_t(significand) << 9) >> min(127u - max(biased, 1u), 63u);
 }
 
 // Descending digit of a weighted histogram at which the running weight

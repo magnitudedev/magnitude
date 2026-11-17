@@ -553,9 +553,11 @@ fn shaping_reference(logits: &[f32], p: &[f32], history: &[i32]) -> (Vec<f32>, V
 fn native_shaping_preserves_unit_mass_when_top_k_precedes_top_p() {
     // The maximum has mass exactly 2^32. Its low word is zero, not u32::MAX;
     // the histogram and total must agree for both tied and unequal peaks.
+    // Every case runs, and every mismatch is reported.
+    let mut mismatches = Vec::new();
     for device in devices() {
         eprintln!("unit probability mass: {:?}", device.backend());
-        for vocabulary in [6usize, 513, 248_320] {
+        for vocabulary in [6usize, 513, 248_320, 262_144] {
             for (second, top_p, keep_second) in [
                 (4.0, 0.5, false),
                 (4.0, 0.95, true),
@@ -573,15 +575,20 @@ fn native_shaping_preserves_unit_mass_when_top_k_precedes_top_p() {
                     if keep_second {
                         expected[vocabulary - 1] = second;
                     }
-                    assert_eq!(
-                        actual, expected,
-                        "{:?}, V={vocabulary}, second={second}, top_p={top_p}, PARTS={parts:?}",
-                        device.backend()
-                    );
+                    if actual != expected {
+                        let kept = |row: &[f32]| row.iter().enumerate().filter(|(_, value)| value.is_finite()).map(|(token, _)| token).collect::<Vec<_>>();
+                        mismatches.push(format!(
+                            "{:?}, V={vocabulary}, second={second}, top_p={top_p}, PARTS={parts:?}: kept {:?}, expected {:?}",
+                            device.backend(),
+                            kept(&actual),
+                            kept(&expected)
+                        ));
+                    }
                 }
             }
         }
     }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
 #[test]
