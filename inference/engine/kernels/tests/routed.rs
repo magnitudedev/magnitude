@@ -4305,6 +4305,22 @@ fn positioned(values: &[f32], positions: &[i32], h: usize) -> Vec<f64> {
     positions.iter().flat_map(|&position| actual_positions(values, position as usize, h)).collect()
 }
 
+/// Grid-coded experts in Vulkan's grouped (prefill) expert GEMMs, which stage
+/// their weights' tables in shared memory: every expert and shared weight
+/// IQ2_XXS (Nemotron 3.5 Bolt), and IQ2_XS beside IQ3_XXS (two tables staged
+/// side by side).
+#[test]
+fn vulkan_grouped_prefill_matches_reference_with_grid_experts() {
+    for device in seismic_native_tests::every_device()
+        .into_iter()
+        .filter(|device| device.backend() == seismic::BackendName::Vulkan)
+    {
+        for experts in [Experts::Iq2Xxs, Experts::Grid] {
+            native_grouped_prefill_matches_reference_on(&device, PackedBlock::new(&device, experts), 0);
+        }
+    }
+}
+
 /// Dense bf16 experts in the grouped (prefill) expert GEMMs.
 #[test]
 fn native_grouped_prefill_matches_reference_with_bf16_experts() {

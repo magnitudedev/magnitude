@@ -61,6 +61,15 @@ enum Spelling {
     Cuda,
 }
 
+/// How a conversion lookup table is read ([`Spelling::table`]).
+enum TableRead {
+    /// The entry itself, read where the device holds the tables.
+    #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
+    Entry(String),
+    /// The declaration of a constant array of the table's words.
+    Array(String),
+}
+
 impl Spelling {
     /// `expression` as a 32-bit unsigned integer.
     fn word(self, expression: &str) -> String {
@@ -121,14 +130,18 @@ impl Spelling {
         }
     }
 
-    /// A constant array of `values`, named `name`.
-    fn constant_array(self, name: &str, values: &[String]) -> String {
-        let values = values.join(", ");
+    /// How conversion lookup table `table` is read: Vulkan reads entry
+    /// `index`, the word of its value, from the device's tables buffer
+    /// (`seismic_lang::source::VULKAN_TABLES_LAYOUT`), where a constant array
+    /// would be copied into each invocation's own storage; CUDA and Metal
+    /// declare a constant array of the table's `words`, named `name`.
+    fn table(self, table: registry::RepackTable, index: &str, name: &str, words: &[u32]) -> TableRead {
+        let values = || words.iter().map(|word| format!("{word:#x}u")).collect::<Vec<_>>().join(", ");
         match self {
             #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
-            Self::Glsl => format!("const uint {name}[] = uint[]({values});\n"),
-            Self::Msl => format!("constant uint {name}[] = {{{values}}};\n"),
-            Self::Cuda => format!("static __device__ const unsigned {name}[] = {{{values}}};\n"),
+            Self::Glsl => TableRead::Entry(format!("SEISMIC_REPACK_TABLE_{}[{index}]", table.index())),
+            Self::Msl => TableRead::Array(format!("constant uint {name}[] = {{{}}};\n", values())),
+            Self::Cuda => TableRead::Array(format!("static __device__ const unsigned {name}[] = {{{}}};\n", values())),
         }
     }
 
@@ -136,7 +149,7 @@ impl Spelling {
     fn array_entry(self, name: &str, index: &str) -> String {
         match self {
             Self::Cuda => format!("__ldg(&{name}[{index}])"),
-            // GLSL and MSL alike.
+            // MSL (GLSL holds no constant array, `table`).
             _ => format!("{name}[{index}]"),
         }
     }
@@ -688,13 +701,15 @@ __device__ __forceinline__ unsigned {name}_staged_bytes(const unsigned *row, uns
 fn render_lookups(out: &mut String, name: &str, words: &WordTable, spelling: Spelling) -> Vec<(WordLookup, u32)> {
     let word = spelling.word_type();
     let mut widths = Vec::new();
-    for (lookup, entries, table) in words.lookups() {
+    for (lookup, source, table) in words.lookups() {
+        let entries = source.values();
         let WordLookup { first, shift } = lookup;
         let bytes = 1usize << shift;
         // The index where at most two entries differ from theirs, those
         // selected; else the entries in the fewest bits each (unsigned when
         // none is negative): held in one 64-bit constant when they fit,
-        // read with a shift; else in a constant array of the table's words.
+        // read with a shift; else read where the device holds the tables;
+        // else in a constant array of the table's words.
         let signed = entries.iter().any(|entry| *entry < 0);
         let width = entries
             .iter()
@@ -741,28 +756,28 @@ fn render_lookups(out: &mut String, name: &str, words: &WordTable, spelling: Spe
             }
         } else {
             let array = format!("{name}_entries_{first}");
-            out.push_str(&spelling.constant_array(
-                &array,
-                &table
-                    .iter()
-                    .map(|word| format!("{word:#x}u"))
-                    .collect::<Vec<_>>(),
-            ));
-            let high = 32 - 8 * bytes as u32;
-            let word = spelling.array_entry(&array, &format!("index >> {}u", 2 - shift));
-            let entry = match shift {
-                2 => word,
-                _ => format!(
-                    "({word} >> ((index & {}u) * {}u))",
-                    (4 / bytes) - 1,
-                    8 * bytes
-                ),
-            };
-            // An entry sign-extended where one is negative, else masked.
-            match (high, signed) {
-                (0, _) => entry,
-                (_, true) => spelling.sign_extended(&entry, high),
-                (_, false) => format!("{entry} & {:#x}u", u32::MAX >> high),
+            match spelling.table(source, "index", &array, table) {
+                #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
+                TableRead::Entry(entry) => entry,
+                TableRead::Array(declaration) => {
+                    out.push_str(&declaration);
+                    let high = 32 - 8 * bytes as u32;
+                    let word = spelling.array_entry(&array, &format!("index >> {}u", 2 - shift));
+                    let entry = match shift {
+                        2 => word,
+                        _ => format!(
+                            "({word} >> ((index & {}u) * {}u))",
+                            (4 / bytes) - 1,
+                            8 * bytes
+                        ),
+                    };
+                    // An entry sign-extended where one is negative, else masked.
+                    match (high, signed) {
+                        (0, _) => entry,
+                        (_, true) => spelling.sign_extended(&entry, high),
+                        (_, false) => format!("{entry} & {:#x}u", u32::MAX >> high),
+                    }
+                }
             }
         };
         out.push_str(&format!(

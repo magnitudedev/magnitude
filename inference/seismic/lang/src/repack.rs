@@ -1575,13 +1575,13 @@ impl WordTable {
     }
 
     /// Each lookup table the values read, in table order: where it lies,
-    /// its entries, and its words.
-    pub fn lookups(&self) -> impl Iterator<Item = (WordLookup, &'static [i32], &[u32])> {
+    /// the table, and its words.
+    pub fn lookups(&self) -> impl Iterator<Item = (WordLookup, RepackTable, &[u32])> {
         self.lookups.iter().map(|(lookup, table)| {
             let words = (table.values().len() << lookup.shift).div_ceil(4);
             (
                 *lookup,
-                table.values(),
+                *table,
                 &self.table[lookup.first as usize..][..words],
             )
         })

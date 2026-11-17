@@ -85,11 +85,18 @@ pub const NATIVE_LIBRARY: &[(&str, &str)] = &[
         "producers.glsl",
         include_str!(concat!(env!("OUT_DIR"), "/producers.glsl")),
     ),
-    (
-        "tables.glsl",
-        include_str!(concat!(env!("OUT_DIR"), "/tables.glsl")),
-    ),
 ];
+
+/// The layout of the Vulkan tables buffer (`seismic_tables_t`), the
+/// bindings of its tables and each grid's and codebook's words: every Vulkan
+/// program's prefix holds it, after the push constant `seismic_tables` its
+/// arrays are read at.
+pub const VULKAN_TABLES_LAYOUT: &str = include_str!(concat!(env!("OUT_DIR"), "/tables.glsl"));
+
+/// The bytes of the Vulkan tables buffer, whose layout
+/// [`VULKAN_TABLES_LAYOUT`] declares: a Vulkan device holds them read-only
+/// at the push constant `seismic_tables`.
+pub const VULKAN_TABLES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tables.bin"));
 
 #[derive(Debug)]
 pub enum LoadError {

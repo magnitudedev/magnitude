@@ -495,7 +495,9 @@ projection routed for cuda:
 # (`routed_output`'s scratch, which its own launch joins;
 # `routed_output_project`'s result). grouped: the
 # Metal form on the projection library's GEMM (TILE_M x TILE_N tiles of
-# SUB_M x SUB_N subgroup tiles). Every record is read with plain loads: a
+# SUB_M x SUB_N subgroup tiles), whose expand and down launches hold and
+# stage their weights' tables at their regions' ends as `dense`'s GEMM does
+# (`dense.seismic`). Every record is read with plain loads: a
 # Vulkan device reads a host write across a submission boundary.
 projection routed for vulkan:
     let CHOICE_GROUPS = ceil_div(most(W, N), SIMDGROUPS * ROWS) for choice
@@ -504,7 +506,10 @@ projection routed for vulkan:
     let SUMMED_SHARED = 256 + 32 * most(W, operands(W)) + min(ceil_div(most(W, WIDTH), 32), 288) * 72 for summed
     let ROW_TILES = STACKED * B * ceil_div(T, TILE_M) + (1 - STACKED) * ceil_div(M, TILE_M) for grouped
     let GEMM_THREADS = TILE_M * TILE_N * 32 / (SUB_M * SUB_N) for grouped
-    let GEMM_SHARED = (TILE_M + TILE_N) * 80 for grouped
+    let GEMM_REGION = (TILE_M + TILE_N) * 80 for grouped
+    let TABLE_SUM = sum(W, form(W, TABLE)) for grouped
+    let TABLE_REGION = min(1, TABLE_SUM) * (8 * ceil_div(TABLE_SUM, 8) + 4) for grouped
+    let GEMM_HELD = GEMM_REGION + TABLE_REGION * (1 - min(1, 16 * ceil_div(GEMM_REGION + TABLE_REGION, 16) / (FLOOR_SHARED_BYTES + 1))) for grouped
     params (SIMDGROUPS in [2, 4, 8] default 2 for choice | summed, ROWS in [1, 2, 4] default 1 for choice | summed,
         form GATHERED in [0, 1] default 0 for choice, arithmetic LANES in [32, 16, 8] default 32 for summed,
         TILE_M in [32, 64, 128] default 32 for grouped, TILE_N in [128, 64] default 128 for grouped,
@@ -580,7 +585,7 @@ projection routed for vulkan:
         threadgroups (ceil_div(N * SERVED, TILE_N), ROW_TILES, 1)
         grid (expand_grid)
         threads_per_threadgroup (GEMM_THREADS, 1, 1)
-        shared_bytes (GEMM_SHARED)
+        shared_bytes (GEMM_HELD)
     launch quantize for grouped when STACKED == 1 and any(W, FIRST == 0 and operands(W) == 1):
         threadgroups (B * T, 1, 1)
         grid (quantize_grid)
@@ -590,7 +595,7 @@ projection routed for vulkan:
         threadgroups (ceil_div(WIDTH, TILE_N), ROW_TILES, 1)
         grid (down_grid)
         threads_per_threadgroup (GEMM_THREADS, 1, 1)
-        shared_bytes (GEMM_SHARED)
+        shared_bytes (GEMM_HELD)
 
 fn routed_route[M, H, PT, NM, E, K, ES](residual: &tensor[M, PT * H] f32, norm: &tensor[NM] NW,
     router: &tensor[E, H] RW, shared_router: &tensor[H] SRW,

@@ -150,18 +150,13 @@
 #define PACKETS_BIASED(AXES) (AXES(SEISMIC_AXIS_COEFF_BIAS) != 0 || AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_OFFSET)
 #define PACKETS_ANY_BIASED PACKETS_SOME(PACKETS_BIASED)
 
-// The tables the bound slots read, which alone <seismic/tables.glsl>
-// declares: a grid by grid codes, a codebook by table codes.
-#define SEISMIC_TABLES_READ_GRID(ID) PACKETS_ANY(SEISMIC_AXIS_CODES_GRID, ID)
-#define SEISMIC_TABLES_READ_CODEBOOK(ID) PACKETS_ANY(SEISMIC_AXIS_CODES_TABLE, ID)
-#include <seismic/tables.glsl>
-
 // Staged tables. A grid code's points and a codebook code's values are read
-// at an index each lane forms from its own codes. From a constant array the
-// subgroup's distinct indices are read one after another; from shared memory
-// in parallel, banks apart. An includer whose decoding launches' shared
-// regions may end with the bound slots' tables (the declaration's
-// `form(W, TABLE)` bytes, `dense.seismic`) defines PACKETS_STAGED_TABLES 1
+// at an index each lane forms from its own codes: from the device's tables
+// buffer (`VULKAN_TABLES_LAYOUT`, in every program's prefix) a load from
+// device memory, from shared memory in parallel, banks apart. An includer
+// whose decoding launches' shared regions may end with the bound slots'
+// tables (the declaration's `form(W, TABLE)` bytes, `dense.seismic`) defines
+// PACKETS_STAGED_TABLES 1
 // before including this file, and each such launch calls
 // `packets_stage_tables()` (workgroup-collective) before it decodes. The
 // declaration holds the tables where every device holds the region with them
@@ -173,7 +168,7 @@
 // low word first) and a codebook's values as `f32`s, and the readers of that
 // launch read it there (`packets_staged`). Every other read (a launch that
 // stages nothing, a gathering kernel's few reads, a region the floor cannot
-// hold with the tables) reads the constant arrays.
+// hold with the tables) reads the tables buffer, as staging does.
 
 // A slot's table, as a key equal for slots that read the same one (0: none),
 // and its words (`GRIDS_WORDS_<ID>`, `CODEBOOKS_WORDS_<ID>`; the id of the
@@ -564,7 +559,7 @@ vec4 packets_interpret(const int kind, uint bytes, const bool centred, const boo
 
 // ---------------------------------------------------------------------------
 // Grid codes (`registry::GridCodes`). An entry codes eight values: grid
-// indices name their points (<seismic/tables.glsl>), magnitudes signed by
+// indices name their points (`VULKAN_TABLES_LAYOUT`), magnitudes signed by
 // the entry's sign bits (seven completed by an eighth of even parity, or
 // eight), or two's complement values where it has none; with a delta, a
 // value v codes 2^DELTA_EXPONENT v + 1, or - 1 where the entry's delta bit

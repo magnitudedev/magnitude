@@ -13,6 +13,8 @@
 #if SEISMIC_STATIC_US != 0
 #define PROJECTION_SCALED
 #endif
+// The grouped projection's GEMMs stage their weights' tables (`packets.glsl`).
+#define PACKETS_STAGED_TABLES 1
 #define KERNEL_W0 SEISMIC_EXPERT_UP
 #define KERNEL_W1 SEISMIC_EXPERT_DOWN
 #include "lib/core/activation.glsl"
@@ -77,6 +79,7 @@ void routed_experts_up_quantize() {
 }
 
 void routed_experts_up_expand() {
+    packets_stage_tables();
     const uint64_t tile_rows = SEISMIC_DIM_T;
     uint64_t block, subtile;
     seismic_split(gl_WorkGroupID.y, (uint(tile_rows) + EXPERTS_TM - 1u) / EXPERTS_TM, block, subtile);
@@ -108,6 +111,7 @@ void routed_experts_up_expand() {
 }
 
 void routed_experts_up_down() {
+    packets_stage_tables();
     const uint64_t tile_rows = SEISMIC_DIM_T;
     uint64_t block, subtile;
     seismic_split(gl_WorkGroupID.y, (uint(tile_rows) + EXPERTS_TM - 1u) / EXPERTS_TM, block, subtile);

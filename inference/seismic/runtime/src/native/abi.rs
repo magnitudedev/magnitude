@@ -6,7 +6,8 @@
 //! (`setBytes` on Metal, one by-value struct parameter on CUDA), and the
 //! scalar-result slots come last. On Vulkan one argument block in device
 //! memory holds every buffer address, then the scalar-result address, then
-//! the words; the single push constant is the block's address.
+//! the words; the push constants are the block's address and the device's
+//! tables buffer's (`seismic_lang::source::VULKAN_TABLES_LAYOUT`).
 
 use super::plan::ParameterAddress;
 use seismic_lang::checked::{

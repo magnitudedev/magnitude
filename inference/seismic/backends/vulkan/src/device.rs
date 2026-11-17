@@ -43,6 +43,15 @@ pub enum OpenError {
 }
 
 impl OpenError {
+    /// An open's own allocation or submission that failed: for want of
+    /// memory, [`Self::Busy`].
+    fn of(error: ExecutionError) -> Self {
+        match error.capacity_refusal() {
+            Some(_) => Self::Busy(error.to_string()),
+            None => Self::Creation(error.to_string()),
+        }
+    }
+
     /// Why the device does not meet the floor, when that is the error: the
     /// reason discovery reports as the device's unavailability.
     pub fn floor_reason(&self) -> Option<String> {
@@ -116,6 +125,34 @@ impl Recording {
     /// Return an unused primary command buffer.
     pub(crate) fn free_command(&mut self, command: vk::CommandBuffer) {
         self.free_commands.push(command);
+    }
+}
+
+/// A pooled primary command buffer the device's own work records, retired
+/// for reuse when it drops, on every path: at once while nothing was
+/// submitted, else once the timeline reaches the submission's value.
+struct Primary<'a> {
+    device: &'a Device,
+    command: vk::CommandBuffer,
+    /// The submission's timeline value; 0 until it is submitted.
+    value: u64,
+}
+
+impl<'a> Primary<'a> {
+    fn take(device: &'a Device) -> Result<Self, ExecutionError> {
+        let command = device.command(&mut *device.recording()?, vk::CommandBufferLevel::PRIMARY)?;
+        Ok(Self { device, command, value: 0 })
+    }
+}
+
+impl Drop for Primary<'_> {
+    fn drop(&mut self) {
+        self.device.retire(Retired {
+            value: self.value,
+            command: RetiredCommand::Primary(self.command),
+            queries: None,
+            arguments: Vec::new(),
+        });
     }
 }
 
@@ -376,6 +413,17 @@ pub(crate) struct Inner {
     /// the others recorded beside it (`DirectGraphBuilder`). The driver's
     /// memory, which `Memory`'s reconciliation charges, holds it.
     pub(crate) graphs: std::sync::atomic::AtomicU64,
+    /// The tables buffer (`seismic_lang::source::VULKAN_TABLES`) in the
+    /// device placement, every launch's second push constant: the logical
+    /// device's own memory, like the device object and its pipelines, a
+    /// block the driver's memory holds ([`Memory::driver_block`]), which
+    /// each reconciliation charges to every live open's own entry and no
+    /// ledger admits. Small: the tables' bytes (about 38 KiB of ggml grids,
+    /// codebooks and conversion tables), rounded up to the device's least
+    /// memory object (its heaps over `maxMemoryAllocationCount`). Written
+    /// before any open of the device is returned ([`Device::open`]) and
+    /// released as the device is destroyed (`Inner::drop`).
+    pub(crate) tables: Range,
     /// Dropped after the logical device is destroyed (`Inner::drop`).
     instance: Arc<Instance>,
     /// Ends the destruction once every other field has dropped, last as it
@@ -384,10 +432,10 @@ pub(crate) struct Inner {
 }
 
 /// Per-open state of a [`Device`]: its stores, pools, transfer staging,
-/// reusable argument chunks, and reconciled driver-memory charge. Dropping the
-/// last clone of an open releases its staging, argument chunks, and driver
-/// charge from its [`MemoryStores`] without disturbing other opens sharing the
-/// logical device.
+/// reusable argument chunks, and reconciled driver-memory charge. Dropping
+/// the last clone of an open releases its staging, argument chunks, and
+/// driver charge from its [`MemoryStores`] without disturbing other opens
+/// sharing the logical device.
 pub(crate) struct Opened {
     inner: Arc<Inner>,
     pub(crate) stores: MemoryStores,
@@ -395,20 +443,6 @@ pub(crate) struct Opened {
     staging: Mutex<Option<Staging>>,
     free_chunks: Mutex<Vec<Range>>,
     driver_charge: Mutex<Option<Charge>>,
-}
-
-impl Opened {
-    fn new(inner: Arc<Inner>, stores: MemoryStores) -> Result<Arc<Self>, OpenError> {
-        let pools = DevicePools::new(&inner.memory).map_err(OpenError::Creation)?;
-        Ok(Arc::new(Self {
-            inner,
-            stores,
-            pools,
-            staging: Mutex::new(None),
-            free_chunks: Mutex::new(Vec::new()),
-            driver_charge: Mutex::new(None),
-        }))
-    }
 }
 
 impl Drop for Opened {
@@ -576,8 +610,7 @@ impl Device {
             };
             if let Some(inner) = registry.opened[index].1.upgrade() {
                 drop(registry);
-                let opened = Opened::new(inner.clone(), stores)?;
-                return Ok(Self { inner, opened });
+                return Self::opening(inner, stores);
             }
             let destroyed = registry.opened[index].2.clone();
             if destroyed.ended() {
@@ -598,10 +631,81 @@ impl Device {
         let properties = description.properties(probed).map_err(OpenError::Floor)?;
         let Description { handle, facts, .. } = description;
         let inner = Arc::new(Inner::create(instance, handle.physical, facts, properties)?);
-        registry.opened.push((uuid, Arc::downgrade(&inner), inner.destroyed.0.clone()));
+        // The logical device's tables are written once, before it is
+        // registered: no other open finds it until they are.
+        let device = Self::opening(inner, stores)?;
+        device.write_tables().map_err(OpenError::of)?;
+        registry.opened.push((uuid, Arc::downgrade(&device.inner), device.inner.destroyed.0.clone()));
         drop(registry);
-        let opened = Opened::new(inner.clone(), stores)?;
+        Ok(device)
+    }
+
+    /// A new open of `inner` charging `stores`: the one place an [`Opened`]
+    /// is made.
+    fn opening(inner: Arc<Inner>, stores: MemoryStores) -> Result<Self, OpenError> {
+        let pools = DevicePools::new(&inner.memory).map_err(OpenError::Creation)?;
+        let opened = Arc::new(Opened {
+            inner: inner.clone(),
+            stores,
+            pools,
+            staging: Mutex::new(None),
+            free_chunks: Mutex::new(Vec::new()),
+            driver_charge: Mutex::new(None),
+        });
         Ok(Self { inner, opened })
+    }
+
+    /// The address of the logical device's tables buffer, every launch's
+    /// second push constant.
+    pub(crate) fn tables(&self) -> u64 {
+        self.inner.tables.address()
+    }
+
+    /// Write the tables buffer's bytes, once, as the logical device is
+    /// created ([`Device::open`]): through its mapping where the storage is
+    /// host-visible, else by `vkCmdUpdateBuffer` on the queue, waited on,
+    /// which takes no staging.
+    fn write_tables(&self) -> Result<(), ExecutionError> {
+        /// What one `vkCmdUpdateBuffer` writes at most.
+        const UPDATE_BYTES: usize = 65536;
+        let tables = &self.inner.tables;
+        let bytes = seismic_lang::source::VULKAN_TABLES;
+        if tables.mapped().is_some() {
+            tables.write_mapped(0, bytes);
+            return Ok(());
+        }
+        let device = &self.inner.device;
+        let mut command = Primary::take(self)?;
+        let raw = command.command;
+        unsafe {
+            call(
+                device.begin_command_buffer(
+                    raw,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                ),
+                "vkBeginCommandBuffer",
+            )?;
+            for (index, chunk) in bytes.chunks(UPDATE_BYTES).enumerate() {
+                device.cmd_update_buffer(
+                    raw,
+                    tables.raw(),
+                    tables.offset() + (index * UPDATE_BYTES) as u64,
+                    chunk,
+                );
+            }
+            barrier(
+                device,
+                raw,
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_WRITE,
+                vk::PipelineStageFlags2::ALL_COMMANDS,
+                vk::AccessFlags2::MEMORY_READ,
+            );
+            call(device.end_command_buffer(raw), "vkEndCommandBuffer")?;
+        }
+        command.value = self.submit(raw)?;
+        self.wait(command.value)
     }
 
     pub fn facts(&self) -> &Facts {
@@ -1328,12 +1432,22 @@ impl Inner {
         let executables = facts
             .pipeline_statistics
             .then(|| ash::khr::pipeline_executable_properties::Device::new(raw, &device));
-        let memory = match Memory::new(&facts, instance.clone(), physical, usage_before) {
-            Ok(memory) => memory,
-            Err(reason) => {
+        // The tables: the device's own block on the device placement's
+        // first kind, held as the driver's memory (`Inner::tables`).
+        let formed = Memory::new(&facts, instance.clone(), physical, usage_before)
+            .map_err(|reason| OpenError::Creation(reason.into()))
+            .and_then(|memory| {
+                let tables = memory
+                    .driver_block(&device, memory.device_kind(), seismic_lang::source::VULKAN_TABLES.len() as u64)
+                    .map_err(OpenError::of)?;
+                Ok((memory, tables))
+            });
+        let (memory, tables) = match formed {
+            Ok(formed) => formed,
+            Err(error) => {
                 let _destroying = PIPELINES.write().unwrap_or_else(PoisonError::into_inner);
                 unsafe { device.destroy_device(None) };
-                return Err(OpenError::Creation(reason.into()));
+                return Err(error);
             }
         };
         let mut inner = Self {
@@ -1360,6 +1474,7 @@ impl Inner {
                 retired: Vec::new(),
             }),
             graphs: std::sync::atomic::AtomicU64::new(0),
+            tables,
             instance,
             destroyed: Ends(Arc::default()),
         };
@@ -1367,7 +1482,7 @@ impl Inner {
         let ranges = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .offset(0)
-            .size(8)];
+            .size(16)];
         inner.layout = creation(
             unsafe {
                 device.create_pipeline_layout(
@@ -1614,6 +1729,7 @@ impl Drop for Inner {
                 device.destroy_fence(side.fence, None);
                 device.destroy_command_pool(side.pool, None);
             }
+            self.memory.release(device, &self.tables);
             self.memory.destroy(device);
             device.destroy_semaphore(self.timeline, None);
             device.destroy_pipeline_layout(self.layout, None);
