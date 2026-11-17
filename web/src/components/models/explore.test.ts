@@ -3,7 +3,8 @@ import { Atom, Registry, Result } from "@effect-atom/atom-react"
 import { Option } from "effect"
 import type { AgentClient } from "@magnitudedev/client-common"
 import type { HuggingFaceRepositoryCheck, HuggingFaceSearchResult } from "@magnitudedev/sdk"
-import { searchSchedule } from "./explore"
+import { exploreFirst, listedFirst, searchSchedule } from "./explore"
+import type { OfferedModel } from "./expanding-model"
 
 type CheckState = { readonly result: Result.Result<HuggingFaceRepositoryCheck, unknown>; readonly isStale: boolean }
 
@@ -55,5 +56,29 @@ describe("Explore's search schedule", () => {
     const before = registry.get(schedule)
     registry.set(checks.get("owner/a")!, { result: Result.success(unsupported()), isStale: false })
     expect(registry.get(schedule)).not.toBe(before)
+  })
+})
+
+describe("a search for a model's other quants", () => {
+  it("lists the repository the model came from first, and the rest in the order found", () => {
+    expect(listedFirst(listed, listed[2]).map(result => result.repository)).toEqual(["owner/c", "owner/a", "owner/b"])
+    expect(listedFirst(listed, undefined)).toBe(listed)
+  })
+
+  it("leads with the model's own repository even when the search didn't find it, as for LiquidAI/LFM3-1.7B-GGUF", () => {
+    const own = { ...listed[0]!, repository: "LiquidAI/LFM3-1.7B-GGUF" } as HuggingFaceSearchResult
+    expect(listedFirst(listed, own).map(result => result.repository)).toEqual(["LiquidAI/LFM3-1.7B-GGUF", "owner/a", "owner/b", "owner/c"])
+  })
+})
+
+describe("what leads a search for a model's other quants", () => {
+  const lfm3 = { key: "lfm3-1.7b", catalog: true, quants: [{ repository: "LiquidAI/LFM3-1.7B-GGUF" }] } as unknown as OfferedModel
+
+  it("is the recommended model published in its repository, which Hugging Face search leaves out, as it is recommended here", () => {
+    expect(exploreFirst("LiquidAI/LFM3-1.7B-GGUF", [{ model: lfm3 }])).toEqual({ _tag: "Offered", model: lfm3 })
+  })
+
+  it("is any other repository looked up by name", () => {
+    expect(exploreFirst("bartowski/LFM3-1.7B-GGUF", [{ model: lfm3 }])).toEqual({ _tag: "Repository", repository: "bartowski/LFM3-1.7B-GGUF" })
   })
 })

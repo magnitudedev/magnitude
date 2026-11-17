@@ -120,12 +120,13 @@ function UncheckedCard({ name, lab, gated, retry }: { name: string; lab: ModelLa
 }
 
 /** A search result whose check is still running, laid out as the card it becomes: its name, and what is being checked. */
-function CheckingCard({ name, lab }: { name: string; lab: ModelLab | undefined }) {
+/** A result still being checked: its name and, since many quantizers' repositories share one name, who uploaded it. */
+function CheckingCard({ name, repository, lab }: { name: string; repository: string; lab: ModelLab | undefined }) {
   return <div className={cn(cardClass, "grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-4 px-4 py-3")}>
     <LabMark lab={lab} className="size-10" />
     <span className="min-w-0">
       <span className="block truncate text-[14px] font-medium">{name}</span>
-      <span role="status" className="mt-0.5 flex items-center gap-1.5 text-xs text-slate-500"><CircleNotchIcon aria-hidden="true" className="size-3.5 shrink-0 motion-safe:animate-spin" />Checking how it runs here…</span>
+      <span role="status" className="mt-0.5 flex items-center gap-1.5 text-xs text-slate-500"><span className="truncate">{repository.split("/")[0]}</span>·<CircleNotchIcon aria-hidden="true" className="size-3.5 shrink-0 motion-safe:animate-spin" />Checking how it runs here…</span>
     </span>
     <span className="grid grid-cols-[84px_64px] gap-4 pr-9">
       <span><SkeletonLine className="ml-auto h-5 text-[15px]" width="3.5rem" /><SkeletonLine className="ml-auto h-4 text-[11px]" width="4rem" /></span>
@@ -168,7 +169,7 @@ export function ExploreView({ query, setQuery, results, families, owned, downloa
             ? <div className="space-y-2">{results.rows.map(row => {
               const key = row._tag === "Offered" ? row.model.key : row.key
               return <Seen key={key} id={key} onSeen={onSeen}>
-                {row._tag === "Checking" ? <CheckingCard name={row.name} lab={row.lab} />
+                {row._tag === "Checking" ? <CheckingCard name={row.name} repository={row.key} lab={row.lab} />
                   : row._tag === "Unchecked" ? <UncheckedCard name={row.name} lab={row.lab} gated={row.gated} retry={row.retry} />
                   : card(row.model, undefined, row.prefetched)}
               </Seen>

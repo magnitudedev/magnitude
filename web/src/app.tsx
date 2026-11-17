@@ -72,7 +72,7 @@ import { ModelsScreen } from "./components/models/models-screen"
 import { NoModelsYet } from "./components/models/no-models"
 import { MachineCard } from "./components/models/parts"
 import { machineView } from "./components/models/machine"
-import { Explore } from "./components/models/explore"
+import { Explore, exploreFirst } from "./components/models/explore"
 import { WhatRuns } from "./components/models/explore-view"
 import { ExploreModelsButton } from "./components/models/your-models"
 import { OnboardingScreen } from "./components/models/onboarding-screen"
@@ -111,13 +111,18 @@ function ModelsPage({ observation }: { observation: ServiceObservation }) {
   const models = useLocalModels()
   const [exploring, setExploring] = useState(false)
   const [typed, setTyped] = useState("")
+  const [first, setFirst] = useState<{ readonly query: string; readonly repository: string } | null>(null)
   const memory = Result.isSuccess(hardware) ? deriveHardwareRoles(hardware.value).servingMemory : "Device"
   const recommendations = useRecommendations(false, memory)
   const service = Result.isSuccess(observation.service) ? observation.service.value : null
   const ready = service?._tag === "Ready"
   const linkedQuery = Option.map(linked, request => request._tag === "HuggingFace" ? request.repository : request.query)
   const back = () => { if (Option.isSome(linked)) clearLinked(); setExploring(false) }
-  const explore = (query: string) => { setTyped(query); setExploring(true) }
+  const explore = ({ query, first }: { readonly query: string; readonly first: string | null }) => {
+    setTyped(query)
+    setFirst(first === null ? null : { query, repository: first })
+    setExploring(true)
+  }
   if ((ready && Option.isSome(linkedQuery)) || exploring) return <>
     <div className="mb-5 flex min-w-0 items-center gap-2">
       <Button variant="ghost" size="icon-lg" aria-label="Back" className="-ml-2.5 shrink-0" onClick={back}><ArrowLeftIcon className="size-5" /></Button>
@@ -125,13 +130,14 @@ function ModelsPage({ observation }: { observation: ServiceObservation }) {
       <div className="shrink-0"><WhatRuns families={recommendations.families} /></div>
     </div>
     <Explore query={Option.getOrElse(linkedQuery, () => typed)} memory={memory} families={recommendations.families}
+      first={Option.isNone(linkedQuery) && first !== null && first.query === typed ? exploreFirst(first.repository, recommendations.offered) : null}
       owned={new Set(Result.isSuccess(models) ? models.value.models.filter(onThisComputer).map(model => String(model.modelId)) : [])}
       setQuery={next => { if (Option.isSome(linked)) clearLinked(); setTyped(next) }} />
   </>
   return <>
     <div className="mb-5 flex items-center justify-between gap-3">
       <h1 className={pageLayout.pageTitle}>Models</h1>
-      {ready ? <ExploreModelsButton onClick={() => explore("")} /> : <Skeleton aria-hidden="true" className="h-8 w-40" />}
+      {ready ? <ExploreModelsButton onClick={() => explore({ query: "", first: null })} /> : <Skeleton aria-hidden="true" className="h-8 w-40" />}
     </div>
     <div>
       {ready ? <ModelsScreen onExplore={explore} empty={<NoModelsYet memory={memory} />} />

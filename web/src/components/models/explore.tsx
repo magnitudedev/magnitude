@@ -2,7 +2,7 @@ import { useContext, useEffect, useMemo, useState } from "react"
 import { Equal, Option } from "effect"
 import { Atom, RegistryContext, Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { CheckIcon, CircleNotchIcon, DownloadSimpleIcon, LightningIcon } from "@phosphor-icons/react"
-import { HUGGING_FACE_SEARCH_QUERY_MAXIMUM_BYTES, repositoryDisplayName, type CatalogFormModelId, type CustomFormModelId, type DrafterChoice, type HuggingFaceRepositoryCheck, type HuggingFaceRepositoryId, type HuggingFaceSearchResult, type LocalModel } from "@magnitudedev/sdk"
+import { HUGGING_FACE_SEARCH_QUERY_MAXIMUM_BYTES, repositoryDisplayName, type CatalogFormModelId, type CustomFormModelId, type DrafterChoice, type HuggingFaceRepositoryCheck, type HuggingFaceRepositoryId, type HuggingFaceSearchResponse, type HuggingFaceSearchResult, type LocalModel } from "@magnitudedev/sdk"
 import { drafterCandidateDownloadBytes, formatStorageSize, readSearchChecks, useAgentClient, useLocalModelMutations, useLocalModels, type AgentClient, type QuickSearchCheck, type ServingMemory } from "@magnitudedev/client-common"
 import { Button } from "../ui/button"
 import { labForDeveloper } from "../model-logo"
@@ -157,8 +157,22 @@ const useRepositoryQuants = (memory: ServingMemory) => function useOpened(model:
   }
 }
 
+/** What leads Explore's results: a recommended model, offered from its ladder, or a repository looked up by name. */
+export type ExploreFirst = { readonly _tag: "Offered"; readonly model: OfferedModel } | { readonly _tag: "Repository"; readonly repository: string }
+
+/**
+ * What a search for a model's quants leads with: the recommended model published in `repository`, offered from its
+ * ladder as it is recommended, since Hugging Face search leaves recommended models' repositories out; else the
+ * repository, looked up by name.
+ */
+export const exploreFirst = (repository: string, offered: readonly { readonly model: OfferedModel }[]): ExploreFirst => {
+  const model = offered.find(entry => entry.model.quants.some(quant => quant.repository === repository))?.model
+  return model ? { _tag: "Offered", model } : { _tag: "Repository", repository }
+}
+
 interface ExploreProps {
   readonly query: string
+  readonly first: ExploreFirst | null
   readonly setQuery: (value: string) => void
   readonly memory: ServingMemory
   readonly families: readonly RunnableFamily[]
@@ -237,6 +251,26 @@ const drafterFor = (selections: Readonly<Record<string, DrafterSelection>>, sele
       ? <DrafterSection key={quant.key} target={quant.drafterTarget} selection={selections[quant.key] ?? AUTO_DRAFTER} onSelect={selection => select(quant.key, selection)} />
       : <span role="status" className="flex items-center gap-1.5 text-xs text-slate-500"><CircleNotchIcon aria-hidden="true" className="size-3.5 motion-safe:animate-spin" />Finding a drafter…</span>
 
+/**
+ * Search results under `first`, a repository looked up on its own, so it leads whether or not the search found it;
+ * the rest follow in their order, without it again.
+ */
+export const listedFirst = (results: readonly HuggingFaceSearchResult[], first: HuggingFaceSearchResult | undefined): readonly HuggingFaceSearchResult[] =>
+  first === undefined ? results : [first, ...results.filter(result => result.repository !== first.repository)]
+
+/**
+ * A repository looked up by its own name: a search for exactly it, which Hugging Face answers with it, so a model's
+ * own repository can lead a search for its other quants even where that search would rank it out of reach.
+ */
+const useRepositoryResult = (repository: string | null, settled: string): HuggingFaceSearchResult | undefined => {
+  const client = useAgentClient()
+  const found = useAtomValue(useMemo(() => Atom.make((get) => repository === null || settled === ""
+    ? Result.initial<HuggingFaceSearchResponse>()
+    : get(client.Models.SearchHuggingFaceModels({ query: repository, limit: Option.some(5), cursor: Option.none() })).result),
+  [client, repository, settled]))
+  return Result.isSuccess(found) ? found.value.results.find(result => result.repository === repository) : undefined
+}
+
 /** No results yet: one list, so what is derived from a search's results doesn't change before they do. */
 const NO_RESULTS: readonly HuggingFaceSearchResult[] = []
 
@@ -245,7 +279,7 @@ const NO_RESULTS: readonly HuggingFaceSearchResult[] = []
  * reaching the end of the list asks for it. An empty query asks for nothing. Its repositories are checked in the order
  * `readSearchChecks` runs them, `visible` being those on screen.
  */
-function useSearchResults(settled: string, query: string, memory: ServingMemory, visible: Atom.Writable<ReadonlySet<string>>): ExploreResults {
+function useSearchResults(settled: string, query: string, first: ExploreFirst | null, memory: ServingMemory, visible: Atom.Writable<ReadonlySet<string>>): ExploreResults {
   const client = useAgentClient()
   const [pages, setPages] = useState<{ readonly query: string; readonly cursor: Option.Option<string>; readonly shown: readonly HuggingFaceSearchResult[] }>(
     { query: settled, cursor: Option.none(), shown: [] })
@@ -261,18 +295,19 @@ function useSearchResults(settled: string, query: string, memory: ServingMemory,
     if (!listed || Option.isNone(next)) return
     setPages({ query: settled, cursor: next, shown: [...current.shown, ...listed.results] })
   }
-  const listedResults = useMemo(() => [...current.shown, ...(listed?.results ?? [])], [current.shown, listed])
+  const pinned = useRepositoryResult(first?._tag === "Repository" ? first.repository : null, settled)
+  const listedResults = useMemo(() => listedFirst([...current.shown, ...(listed?.results ?? [])], pinned), [current.shown, listed, pinned])
   const schedule = useAtomValue(useMemo(() => searchSchedule(client, listedResults, visible), [client, listedResults, visible]))
   const registry = useContext(RegistryContext)
   return query !== settled || (loading && current.shown.length === 0) ? { _tag: "Searching" }
     : Result.isFailure(page) && current.shown.length === 0 ? { _tag: "Failed", message: "Hugging Face search failed. Check your connection and try again." }
     : {
         _tag: "Results",
-        rows: listedResults.flatMap((result) => {
+        rows: [...(first?._tag === "Offered" ? [{ _tag: "Offered" as const, model: first.model, prefetched: false }] : []), ...listedResults.flatMap((result) => {
           const retry = () => registry.refresh(client.Models.CheckHuggingFaceRepository(checkInput(result)))
           const row = searchRow(result, schedule.checks.get(result.repository) ?? Result.initial(), schedule.full.has(result.repository), retry, memory)
           return row ? [row] : []
-        }),
+        })],
         more: loading ? "Loading" : Option.isSome(next) ? more : null,
       }
 }
@@ -283,7 +318,7 @@ export function Explore(props: ExploreProps) {
   const tooLong = new TextEncoder().encode(settled).length > HUGGING_FACE_SEARCH_QUERY_MAXIMUM_BYTES
   const visible = useMemo(() => Atom.make<ReadonlySet<string>>(new Set<string>()), [])
   const setVisible = useAtomSet(visible)
-  const searched = useSearchResults(tooLong ? "" : settled, props.query.trim(), props.memory, visible)
+  const searched = useSearchResults(tooLong ? "" : settled, props.query.trim(), props.first, props.memory, visible)
   const [selections, setSelections] = useState<Readonly<Record<string, DrafterSelection>>>({})
   const download = useDownload(selections)
   const drafters = drafterFor(selections, (key, selection) => setSelections(current => ({ ...current, [key]: selection })))

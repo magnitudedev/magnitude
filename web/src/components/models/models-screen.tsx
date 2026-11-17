@@ -23,10 +23,13 @@ function Status({ tone = "muted", busy = false, title, children }: { tone?: "mut
   </span>
 }
 
-/** What finds a model's other quants on Hugging Face: its repository's name without owner or `-GGUF`, else its name. */
-const quantSearch = (view: OwnedModel) => {
+/**
+ * What finds a model's other quants on Hugging Face: its repository's name without owner or `-GGUF`, else its name,
+ * led by the repository it came from.
+ */
+const quantSearch = (view: OwnedModel): { readonly query: string; readonly first: string | null } => {
   const repository = view.quant.repository?.split("/").pop()?.replace(/[-_.]?gguf$/i, "")
-  return repository && repository.length > 0 ? repository : view.name
+  return { query: repository && repository.length > 0 ? repository : view.name, first: view.quant.repository }
 }
 
 /**
@@ -44,7 +47,7 @@ export function OwnedModels({ list, empty, hidden, unrunnable, onUnhide }: {
 }
 
 /** Models: the user's models, or `empty` while none is visible. */
-export function ModelsScreen({ onExplore, empty }: { onExplore: (query: string) => void; empty: ReactNode }) {
+export function ModelsScreen({ onExplore, empty }: { onExplore: (search: { readonly query: string; readonly first: string | null }) => void; empty: ReactNode }) {
   const models = useLocalModels()
   const hardware = useLocalInferenceHardware()
   const mutations = useLocalModelMutations()
