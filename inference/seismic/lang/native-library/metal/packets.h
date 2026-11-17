@@ -220,16 +220,55 @@ struct Planes {
     template <uint MASK, uint AT = 0u>
     static void floats(thread const words &w, uint step, half offset, thread float4 &even, thread float4 &odd) {
         static_assert(LOW + HIGH + AT <= 8u, "a shifted code fills at most its byte");
-        uint e, o;
-        split_fields<LOW, AT>(low_plane::step(w.low, step), e, o);
-        if constexpr (HIGH != 0u) {
-            uint he, ho;
-            split_fields<HIGH, LOW + AT>(high_plane::step(w.high, step), he, ho);
-            e |= he;
-            o |= ho;
+        if constexpr (HIGH == 0u && MASK == 0u) {
+            in_place<AT>(w.low, step, float(offset) - 1024.0f, even, odd);
+        } else {
+            uint e, o;
+            split_fields<LOW, AT>(low_plane::step(w.low, step), e, o);
+            if constexpr (HIGH != 0u) {
+                uint he, ho;
+                split_fields<HIGH, LOW + AT>(high_plane::step(w.high, step), he, ho);
+                e |= he;
+                o |= ho;
+            }
+            even = byte_floats(e ^ MASK, offset);
+            odd = byte_floats(o ^ MASK, offset);
         }
-        even = byte_floats(e ^ MASK, offset);
-        odd = byte_floats(o ^ MASK, offset);
+    }
+    // A plane's step of codes c as the floats (c << AT) - moved, read where
+    // they are stored rather than shuffled into bytes (`split_fields`): right
+    // shifts issue at about a third of the rate of masks, selects and FMAs
+    // (M4 Pro). A 1-bit code selects its value; a 2-bit code masked in place
+    // below bit 10 of its half is the mantissa of 1024 + c 2^b, which one FMA
+    // scales and moves, exactly (`code_at`): the codes of bits 10.. of a half
+    // take one shift a word.
+    template <uint AT>
+    static void in_place(typename low_plane::words w, uint step, float moved, thread float4 &even, thread float4 &odd) {
+        if constexpr (LOW == 1u) {
+            const float zero = -moved, one = float(1u << AT) - moved;
+            for (uint j = 0; j < 4; ++j) {
+                even[j] = metal::select(zero, one, (w & (1u << (8u * step + 2u * j))) != 0u);
+                odd[j] = metal::select(zero, one, (w & (2u << (8u * step + 2u * j))) != 0u);
+            }
+        } else {
+            const uint word = w[step >> 1], high = word >> 6;
+            const uint lane = step & 1u;
+            even = float4(code_at<AT, 0>(word, lane, moved), code_at<AT, 4>(word, lane, moved),
+                code_at<AT, 8>(word, lane, moved), code_at<AT, 6>(high, lane, moved));
+            odd = float4(code_at<AT, 2>(word, lane, moved), code_at<AT, 6>(word, lane, moved),
+                code_at<AT, 4>(high, lane, moved), code_at<AT, 8>(high, lane, moved));
+        }
+    }
+    // The 2-bit code at bit B of half `lane` of `word` as (c << AT) - moved:
+    // 1024 + c 2^B is exact in a half (B <= 8), its conversion is an operand
+    // of the FMA, and the FMA's result, an integer below 2^11 in magnitude,
+    // is exact.
+    template <uint AT, uint B>
+    static float code_at(uint word, uint lane, float moved) {
+        static_assert(B <= 8u, "1024 + 3 2^B is an exact half");
+        const half2 h = as_type<half2>((word & (0x00030003u << B)) | 0x64006400u);
+        constexpr float scale = power2<int(AT) - int(B)>();
+        return metal::fma(float(h[lane]), scale, -1024.0f * scale - moved);
     }
     template <uint MASK>
     static uint pair(thread const words &w, uint step, uint j) {
