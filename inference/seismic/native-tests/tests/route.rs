@@ -3365,8 +3365,9 @@ fn a_defaults_measurement_the_memory_limit_refuses_prices_its_point_and_is_offer
     use seismic::{PointInputs, PointSource, PointSpec};
 
     /// Points whose inputs are allocated on the device as they are built;
-    /// building `clamp` sets the device's limit to what is then charged, so
-    /// that only the measurement's own allocations are refused.
+    /// building `clamp` sets the device's limit to what is then charged and
+    /// leaves no room in it, so that only the measurement's own allocations
+    /// are refused.
     struct Clamping<'d> {
         charges: &'d seismic::Charges,
         tally: &'d seismic::memory::Tally,
@@ -3393,11 +3394,19 @@ fn a_defaults_measurement_the_memory_limit_refuses_prices_its_point_and_is_offer
             let x = f32_tensor(self.charges, &[self.n], &exact_values(self.n as usize));
             self.kept[point] = vec![x.clone()];
             if self.clamp == Some(point) {
-                // Fill the entry's active 1 MiB (`CARVED_LIMIT`) `Carver` block
-                // whole so the defaults measurement cannot carve from block slack.
-                let pad = Tensor::zeros(self.charges, Element::f32(), &[(1 << 20) / 4])?;
-                self.kept[point].push(pad);
+                // Bytes already charged hold room no limit refuses: the CPU
+                // carves small buffers from the block its entry fills
+                // (`Carver`), charged whole. The least buffers fill that
+                // room until one is refused, so nothing fits beside them and
+                // every allocation the measurement makes is a refused charge.
                 self.tally.bound(self.tally.held());
+                loop {
+                    match Tensor::zeros(self.charges, Element::f32(), &[1]) {
+                        Ok(least) => self.kept[point].push(least),
+                        Err(seismic::TensorError::Execution(error)) if error.capacity_refusal().is_some() => break,
+                        Err(error) => panic!("filling the charged room failed: {error}"),
+                    }
+                }
             }
             Ok(seismic::point_inputs::<split_sum::Entry>(
                 vec![split_sum::Args { x: &x }],
