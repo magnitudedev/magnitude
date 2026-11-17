@@ -107,7 +107,7 @@ function ModelMenu({ model, onExploreQuants, onRemove }: { model: OwnedModel; on
   const [confirming, setConfirming] = useState(false)
   const ref = useDismiss(open, () => setOpen(false))
   const item = "flex w-full items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-slate-100 dark:hover:bg-slate-800"
-  return <span ref={ref} className="relative" onClick={event => event.stopPropagation()}>
+  return <span ref={ref} className="relative">
     <Button size="icon-sm" variant="ghost" aria-label="More" onClick={() => setOpen(value => !value)}><DotsThreeIcon className="size-4" /></Button>
     {open && <div className="absolute right-0 top-8 z-20 w-48 rounded-lg border border-slate-200 bg-white p-1 text-[13px] text-slate-800 shadow-lg dark:border-slate-750 dark:bg-slate-850 dark:text-slate-200">
       <button type="button" onClick={() => { setOpen(false); onExploreQuants() }} className={item}><MagnifyingGlassIcon className="size-3.5" />Explore other quants</button>
@@ -211,13 +211,16 @@ export function YourModels({ models, action, onExploreQuants, onRemove, onDrafte
       {shown.map(model => {
         const isOpen = open === model.modelId
         return <div key={model.modelId} className={cn("first:rounded-t-xl last:rounded-b-xl", isOpen && "bg-slate-50 dark:bg-slate-800/40")}>
-          <div role="button" tabIndex={0} aria-expanded={isOpen} onClick={() => setOpen(isOpen ? null : model.modelId)} onKeyDown={event => { if (event.key === "Enter") setOpen(isOpen ? null : model.modelId) }}
-            className="grid cursor-pointer grid-cols-[28px_minmax(0,1fr)_64px_72px_auto_28px] items-center gap-4 rounded-[inherit] px-4 py-3 hover:bg-slate-50 dark:hover:bg-slate-800/40 max-lg:grid-cols-[28px_minmax(0,1fr)_64px_auto_28px]">
-            <LabMark lab={model.lab} className="size-7" />
-            <span className="min-w-0"><span className="block truncate text-[13px] font-medium">{model.name}</span><QuantLine model={model} />{model.downloadFailure && <span role="alert" className="mt-0.5 block text-xs text-red-600 dark:text-red-400">{model.downloadFailure}</span>}</span>
-            <span className="text-right text-[13px] tabular-nums text-slate-700 dark:text-slate-300">{formatStorageSize(model.quant.sizeBytes)}</span>
-            <span className="text-right max-lg:hidden">{model.quant.fits && <Speed quant={model.quant} />}</span>
-            <span className="flex justify-end" onClick={event => event.stopPropagation()}>{action(model)}</span>
+          {/* The row's opener spans its first columns, so its actions sit beside it rather than inside it. */}
+          <div className="grid grid-cols-[28px_minmax(0,1fr)_64px_72px_auto_28px] items-center gap-4 rounded-[inherit] px-4 py-3 hover:bg-slate-50 dark:hover:bg-slate-800/40 max-lg:grid-cols-[28px_minmax(0,1fr)_64px_auto_28px]">
+            <button type="button" aria-expanded={isOpen} onClick={() => setOpen(isOpen ? null : model.modelId)}
+              className="col-span-4 grid cursor-pointer grid-cols-subgrid items-center rounded-md text-left focus-visible:outline-2 focus-visible:outline-blue-500 max-lg:col-span-3">
+              <LabMark lab={model.lab} className="size-7" />
+              <span className="min-w-0"><span className="block truncate text-[13px] font-medium">{model.name}</span><QuantLine model={model} />{model.downloadFailure && <span role="alert" className="mt-0.5 block text-xs text-red-600 dark:text-red-400">{model.downloadFailure}</span>}</span>
+              <span className="text-right text-[13px] tabular-nums text-slate-700 dark:text-slate-300">{formatStorageSize(model.quant.sizeBytes)}</span>
+              <span className="text-right max-lg:hidden">{model.quant.fits && <Speed quant={model.quant} />}</span>
+            </button>
+            <span className="flex justify-end">{action(model)}</span>
             <ModelMenu model={model} onExploreQuants={() => onExploreQuants(model)} onRemove={() => onRemove(model)} />
           </div>
           {isOpen && <div className="px-4 pb-5 pl-[60px] pr-16"><Details model={model} onDrafter={() => onDrafter(model)} /></div>}

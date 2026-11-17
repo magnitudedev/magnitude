@@ -23,6 +23,9 @@ function Shown({ measuring }: { measuring: RecommendationsView["measuring"] }) {
     usOnly={false} setUsOnly={() => {}} owned={new Set()} selection={selection} />
 }
 
+/** Whether any button or link sits inside a button or an element acting as one. */
+const nestsControls = (html: string) => /role="button"/.test(html) || /<button\b(?:(?!<\/button>).)*<(?:button|a)\b/s.test(html)
+
 const STATUS = /<span role="status"[^>]*>.*?<\/span><\/span>/
 
 describe("Recommended for your machine", () => {
@@ -34,5 +37,11 @@ describe("Recommended for your machine", () => {
     expect(measuring.indexOf("Measuring 7 more quants")).toBeLessThan(measuring.indexOf("Only models from US developers"))
     expect(measuring.indexOf("Measuring 7 more quants")).toBeLessThan(measuring.indexOf("Qwen3.8 Flash Next"))
     expect(measuring.replace(STATUS, "")).toBe(settled)
+  })
+
+  it("opens a card from its own button, with the repository link beside it rather than inside it", () => {
+    const html = renderToStaticMarkup(<Shown measuring={null} />)
+    expect(html).toContain('aria-expanded="true"')
+    expect(nestsControls(html)).toBe(false)
   })
 })
