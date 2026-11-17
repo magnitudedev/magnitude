@@ -13,8 +13,12 @@
 #include "lib/projection/projection.h"
 #include "lib/projection/packing.h"
 #include "lib/projection/operator.h"
-#if defined(SEISMIC_FORMING_READOUT_PROJECT_ROWS_GEMV) || defined(SEISMIC_FORMING_READOUT_PROJECT_ROWS_GEMV_ROWS) || defined(SEISMIC_FORMING_READOUT_PROJECT_ROWS_GEMV_PAIR) || defined(SEISMIC_FORMING_READOUT_PROJECT_ROWS_GATHER_CHOICE)
+#if defined(SEISMIC_FORMING_READOUT_PROJECT_ROWS_GEMV) || defined(SEISMIC_FORMING_READOUT_PROJECT_ROWS_GEMV_ROWS) || defined(SEISMIC_FORMING_READOUT_PROJECT_ROWS_GEMV_PAIR) || defined(SEISMIC_FORMING_READOUT_PROJECT_ROWS_GATHER_CHOICE) || \
+    defined(SEISMIC_FORMING_READOUT_PROJECT_ROWS_GEMV_PACKED)
 #include "lib/projection/gemv.h"
+#endif
+#ifdef SEISMIC_FORMING_READOUT_PROJECT_ROWS_GEMV_PACKED
+#include "lib/projection/gemv_packed.h"
 #endif
 
 typedef element::Act activation;
@@ -131,15 +135,21 @@ kernel void readout_project_rows_gemv(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUM
 }
 #endif
 #ifdef SEISMIC_FORMING_READOUT_PROJECT_ROWS_GEMV_PAIR
-template <uint LANES, uint TILED, uint STAGE, uint ROWS>
+template <uint LANES, uint TILED, uint STAGE, uint PACKED_ROWS, uint ROWS>
 kernel void readout_project_rows_gemv_pair(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(PAIR, TILED);
 }
 #endif
 #ifdef SEISMIC_FORMING_READOUT_PROJECT_ROWS_GEMV_ROWS
-template <uint LANES, uint TILED, uint STAGE, uint ROWS>
+template <uint LANES, uint TILED, uint STAGE, uint PACKED_ROWS, uint ROWS>
 kernel void readout_project_rows_gemv_rows(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(SEVERAL, TILED);
+}
+#endif
+#ifdef SEISMIC_FORMING_READOUT_PROJECT_ROWS_GEMV_PACKED
+template <uint LANES, uint PACKED_ROWS, uint ROWS>
+kernel void readout_project_rows_gemv_packed(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
+    PROJECTION_SINGLE_GEMV_PACKED;
 }
 #endif
 #ifdef SEISMIC_FORMING_READOUT_PROJECT_ROWS_BATCH

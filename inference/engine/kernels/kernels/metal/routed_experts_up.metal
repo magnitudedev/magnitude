@@ -266,7 +266,7 @@ kernel void routed_experts_up_pack(EXPERTS_UP_ARGUMENTS, PROJECTION_THREADGROUP_
         return;
     EXPERTS_UP_BLOCK(index / (uint(SEISMIC_DIM_T) / 4u));
     (void)source;
-    threadgroup float4 peaks[8];
+    threadgroup float peaks[projection::packing_peaks()];
     const routed::Grouped in = EXPERTS_UP_ROWS(0);
     const projection::packing_bounds<0> bounds{};
     typedef projection::packing_codes<packets::W0> coded;
@@ -439,7 +439,7 @@ kernel void routed_experts_up_down_pack(EXPERTS_UP_ARGUMENTS, PROJECTION_THREADG
         return;
     EXPERTS_UP_BLOCK(index / (uint(SEISMIC_DIM_T) / 4u));
     (void)source;
-    threadgroup float4 peaks[8];
+    threadgroup float peaks[projection::packing_peaks()];
     const routed::GroupedProducts in = EXPERTS_UP_PRODUCT_ROWS;
     const projection::packing_bounds<0> bounds{};
     typedef projection::packing_codes<packets::W1> coded;

@@ -347,8 +347,9 @@ inline device uchar *weight_table(device uchar *tables, uint blocks, int ordinal
 // The INT8 and PACK forms' scratch of a weight whose table is `table` (the
 // operand's own passes take no table: `rows` 0); PACK's a
 // `projection::packing_scratch`, of `packing.h`, which its entries include,
-// whose tokens' entries and weights' factors are twice as wide where each
-// run has its code sums (`sums`).
+// whose tokens' entries and weights' factors are twice as wide where each run
+// has its code sums (`sums`). `packing_table` is the weight's table alone,
+// which the coefficient pass reads (its operand pointers none).
 inline projection::int8_scratch int8_forms(device uchar *operand, ulong operand_rows, device uchar *table,
     uint rows, uint columns) {
     device uchar *row_scales = operand + operand_rows * columns;
@@ -358,14 +359,20 @@ inline projection::int8_scratch int8_forms(device uchar *operand, ulong operand_
         reinterpret_cast<device half *>(table + ulong(rows) * (columns / 32u) * 4u)};
 }
 template <typename Packing>
+inline Packing packing_table(device uchar *table, uint rows, uint columns, bool sums) {
+    return Packing{nullptr, nullptr, nullptr, reinterpret_cast<device half *>(table),
+        reinterpret_cast<device float *>(table + ulong(rows) * (columns / 32u) * (sums ? 8u : 4u))};
+}
+template <typename Packing>
 inline Packing packing_forms(device uchar *operand, ulong operand_rows, device uchar *table, uint rows,
     uint columns, bool sums) {
-    const uint entry = sums ? 8u : 4u;
+    Packing forms = packing_table<Packing>(table, rows, columns, sums);
     device uchar *token_factors = operand + operand_rows * columns * 2u + 1024u;
-    device uchar *token_scales = token_factors + operand_rows * (columns / 32u) * entry;
-    return Packing{reinterpret_cast<device float *>(operand), reinterpret_cast<device half *>(token_factors),
-        reinterpret_cast<device float *>(token_scales), reinterpret_cast<device half *>(table),
-        reinterpret_cast<device float *>(table + ulong(rows) * (columns / 32u) * entry)};
+    forms.operand = reinterpret_cast<device float *>(operand);
+    forms.tokens = reinterpret_cast<device half *>(token_factors);
+    forms.token_scales =
+        reinterpret_cast<device float *>(token_factors + operand_rows * (columns / 32u) * (sums ? 8u : 4u));
+    return forms;
 }
 
 // An epilogue of one block's rows reached at the grouped rows' positions:

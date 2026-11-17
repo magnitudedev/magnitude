@@ -204,6 +204,11 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "the projection family's GEMV row classes, apart from `projection.h` so a library that runs no GEMV (a GEMM's, a batched GEMV's) compiles none of them: Metal compiles a launch's library whole",
     ),
     (
+        "lib/projection/gemv_packed",
+        &[BackendName::Metal],
+        "the packed-rows GEMV of a single projection's PACKED_ROWS form, over the token-packing GEMM's operand, apart from `gemv.h` so only its own launch's library compiles it",
+    ),
+    (
         "lib/core/head",
         &[BackendName::Metal, BackendName::Cuda, BackendName::Vulkan],
         "a lane-held head row's RMS norm (Metal's simdgroup, CUDA's warp, Vulkan's logical subgroup), shared by attention, pooled rows and the indexers; the CPU's natives norm a row in their own work item",

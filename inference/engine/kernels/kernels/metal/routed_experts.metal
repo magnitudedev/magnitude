@@ -290,7 +290,7 @@ kernel void routed_experts_pack(EXPERTS_ARGUMENTS, PROJECTION_THREADGROUP_ARGUME
         return;
     EXPERTS_BLOCK(index / (uint(SEISMIC_DIM_T) / 4u));
     (void)source;
-    threadgroup float4 peaks[8];
+    threadgroup float peaks[projection::packing_peaks()];
     const routed::Grouped in = EXPERTS_ROWS(0);
     const projection::packing_bounds<0> bounds{};
     typedef projection::packing_shared<1, packets::W0, 1, packets::W1, 1> coded;
@@ -328,7 +328,7 @@ kernel void routed_experts_packed(EXPERTS_ARGUMENTS, PROJECTION_TILE_ARGUMENTS) 
     PROJECTION_PAIRED_PACKING_ADMITTED;
     if constexpr (!PROJECTION_PAIRED_PACKING_PATH)
         return;
-    threadgroup float4 exchange[projection::packing_simdgroups / 2 * projection::packing_exchange];
+    threadgroup float exchange[projection::packing_simdgroups / 2 * projection::packing_exchange()];
     const uint block = tile.y / BLOCK_TILES, first_row = block * uint(SEISMIC_DIM_T);
     const uint f = uint(SEISMIC_DIM_F), h = uint(SEISMIC_DIM_H), pair = sg / 2u;
     EXPERTS_BLOCK(block);
@@ -471,7 +471,7 @@ kernel void routed_experts_down_pack(EXPERTS_ARGUMENTS, PROJECTION_THREADGROUP_A
         return;
     EXPERTS_BLOCK(index / (uint(SEISMIC_DIM_T) / 4u));
     (void)source;
-    threadgroup float4 peaks[8];
+    threadgroup float peaks[projection::packing_peaks()];
     const routed::GroupedProducts in = EXPERTS_PRODUCT_ROWS;
     const projection::packing_bounds<0> bounds{};
     typedef projection::packing_codes<packets::W2> coded;

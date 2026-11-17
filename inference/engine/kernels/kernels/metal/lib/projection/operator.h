@@ -124,6 +124,26 @@
     const auto x = Operands::rows(input, m, k, globals, simdgroups, sg, lane);                                  \
     PROJECTION_GEMV(packets::W0, packets::W0, false, ROWS, LANES, TILED, COUNT, x, out, w, w, m, n, k)
 
+// The packed-rows GEMV (PACKED_ROWS rows an operand, `gemv_packed`), on a
+// device that runs the packed forms (`packing_forms`); elsewhere the GEMV's
+// row mapping in its place, as the PACK form's `unpacked` launch.
+#define PROJECTION_SINGLE_GEMV_PACKED                                                                           \
+    const uint tile = position.x;                                                                               \
+    PROJECTION_OPERANDS(PROJECTION_GROUP(position.z));                                                          \
+    PROJECTION_GEMV_INPUT(input);                                                                               \
+    PROJECTION_OPERANDS_SHARED(globals, NVFP4);                                                                 \
+    const auto x = Operands::rows(input, m, k, globals, simdgroups, sg, lane);                                  \
+    if constexpr (projection::packing_forms) {                                                                  \
+        PROJECTION_BOUNDS;                                                                                      \
+        PROJECTION_FOR_PACKED_ROWS(m,                                                                           \
+            projection::gemv_packed<packets::W0, PACKED_ROWS, ROWS, MAXM, LANES, BOUNDS>(x, out, w, bounds, m,   \
+                n, k, tile, shared, simdgroups, sg, lane));                                                     \
+    } else {                                                                                                    \
+        PROJECTION_FOR_PACKED_ROWS(m,                                                                           \
+            projection::gemv_form<packets::W0, packets::W0, false, ROWS, MAXM, LANES, false, false>(x, out, w, w, \
+                m, n, k, tile, shared, simdgroups, sg, lane));                                                  \
+    }
+
 #define PROJECTION_SINGLE_BATCH                                                                                 \
     const uint tile = position.x;                                                                               \
     PROJECTION_OPERANDS(PROJECTION_GROUP(position.z));                                                          \
@@ -225,15 +245,15 @@
     projection::gemm_int8<packets::W0, INT8_TILE, PATH>(in, out, w, scratch, m, n, k, tile.x, tile.y, shared,   \
         sg, lane)
 
-// The PACK form past 64 rows: the rows as integer codes, two rows packed per
-// operand element (RESIDUE: the operand's residue width for weights with
-// residue bits), the weight's block scales and biases, then the packed
-// tiles; on a device without the packed path, the staged tiles of the
-// default form, with its results.
+// The PACK form past 64 rows: the rows as integer codes, two rows
+// packed per operand element (RESIDUE: the operand's residue width for
+// weights with residue bits), the weight's block scales and biases, then the
+// packed tiles over the rows padded to two operand tiles; on a device without
+// the packed path, the staged tiles of the default form, with its results.
 #define PROJECTION_SINGLE_PACK                                                                                  \
     if constexpr (!projection::packing_path<packets::W0>())                                                     \
         return;                                                                                                 \
-    threadgroup float4 peaks[8];                                                                                \
+    threadgroup float peaks[projection::packing_peaks()];                                                       \
     PROJECTION_OPERANDS(0u);                                                                                    \
     PROJECTION_PACKING_SCRATCH;                                                                                 \
     PROJECTION_BOUNDS;                                                                                          \
@@ -255,7 +275,7 @@
     PROJECTION_OPERANDS(0u);                                                                                    \
     PROJECTION_PACKING_SCRATCH;                                                                                 \
     projection::gemm_packed<packets::W0, RESIDUE, PACK_TOKENS, WEIGHTS_AHEAD>(out, w, scratch, m,               \
-        (m + 127u) / 128u * 128u, n, k, index * projection::packing_simdgroups + sg, lane)
+        projection::packing_padded(m, 2u), n, k, index * projection::packing_simdgroups + sg, lane)
 
 #define PROJECTION_SINGLE_UNPACKED                                                                              \
     if constexpr (projection::packing_path<packets::W0>())                                                      \
@@ -354,8 +374,8 @@
     projection::gemm_int8_paired<packets::W0, packets::W1, PATH, 64>(in, out, w0, w1, scratch0, scratch1, m, n, k, \
         tile.y, tile.x, shared, exchange, sg, lane)
 
-// The PACK form past 64 rows: the staged rows as integer codes, two rows
-// packed per operand element, once for both weights (RESIDUE: the operand's
+// The PACK form past 64 rows: the staged rows as integer codes, two
+// rows packed per operand element, once for both weights (RESIDUE: the operand's
 // residue width for weights with residue bits), both weights' block scales
 // and biases, then the paired packed tiles; on a device without the packed
 // path, the staged tiles of the default form, with its results. PACK = 1
@@ -375,14 +395,14 @@
     PROJECTION_PAIRED_PACKING_ADMITTED;                                                                         \
     if constexpr (!PROJECTION_PAIRED_PACKING_PATH)                                                              \
         return;                                                                                                 \
-    threadgroup float4 peaks[8];                                                                                \
+    threadgroup float peaks[projection::packing_peaks()];                                                       \
     PROJECTION_OPERANDS;                                                                                        \
     PROJECTION_PACKING_SCRATCH;                                                                                 \
     typedef projection::packing_shared<RESIDUE, packets::W0, 1, packets::W1, 1> coded;                          \
     constexpr uint BOUNDS = projection::packing_bounded<3u, PROJECTION_BOUNDED>::value;                         \
     const projection::packing_bounds<BOUNDS> bounds{PROJECTION_BOUND_TABLES};                                   \
-    projection::packing_operand<coded::centre, coded::folds, coded::sums, coded::residue, BOUNDS>(in, scratch0,  \
-        bounds, m, k, index, peaks, thread_index, sg, lane)
+    projection::packing_operand<coded::centre, coded::folds, coded::sums, coded::residue, BOUNDS>(              \
+        in, scratch0, bounds, m, k, index, peaks, thread_index, sg, lane)
 
 #define PROJECTION_PAIRED_PACK_COEFFICIENTS                                                                     \
     PROJECTION_PAIRED_PACKING_ADMITTED;                                                                         \
@@ -395,17 +415,17 @@
     projection::packing_tile_coefficients(w0, scratch0, k, index, peaks0, thread_index, sg, lane);              \
     projection::packing_tile_coefficients(w1, scratch1, k, index, peaks1, thread_index, sg, lane)
 
-// The operand's rows padded to the paired tile's 64.
+// The operand's rows padded to the paired tile's one operand tile.
 #define PROJECTION_PAIRED_PACKED                                                                                \
     PROJECTION_PAIRED_PACKING_ADMITTED;                                                                         \
     if constexpr (!PROJECTION_PAIRED_PACKING_PATH)                                                              \
         return;                                                                                                 \
-    threadgroup float4 exchange[projection::packing_simdgroups / 2 * projection::packing_exchange];            \
+    threadgroup float exchange[projection::packing_simdgroups / 2 * projection::packing_exchange()];            \
     PROJECTION_OPERANDS;                                                                                        \
     PROJECTION_PACKING_SCRATCH;                                                                                 \
-    projection::gemm_packed_paired<packets::W0, packets::W1, RESIDUE, PACK_TOKENS, WEIGHTS_AHEAD>(out, w0, w1,  \
-        scratch0, scratch1, m, (m + 63u) / 64u * 64u, n, k, index, projection::packing_simdgroups, exchange, sg, \
-        lane)
+    projection::gemm_packed_paired<packets::W0, packets::W1, RESIDUE, PACK_TOKENS, WEIGHTS_AHEAD>(              \
+        out, w0, w1, scratch0, scratch1, m, projection::packing_padded(m, 1u), n, k, index,                     \
+        projection::packing_simdgroups, exchange, sg, lane)
 
 #define PROJECTION_PAIRED_UNPACKED                                                                              \
     PROJECTION_PAIRED_PACKING_ADMITTED;                                                                         \
@@ -795,14 +815,14 @@ inline void segment_tall(thread const In &in, thread const Out &out, thread cons
     PROJECTION_PACKING_ADMITTED;                                                                                \
     if constexpr (!projection::packing_forms)                                                                   \
         return;                                                                                                 \
-    threadgroup float4 peaks[8];                                                                                \
+    threadgroup float peaks[projection::packing_peaks()];                                                       \
     PROJECTION_OPERANDS;                                                                                        \
     constexpr uint SERVED = PROJECTION_EACH_SEGMENT(PROJECTION_SERVED_BIT, ) 0u;                                \
     constexpr uint BOUNDS = projection::packing_bounded<SERVED, PROJECTION_BOUNDED>::value;                     \
     const projection::packing_bounds<BOUNDS> bounds{PROJECTION_BOUND_TABLES};                                   \
     projection::packing_operand<PROJECTION_PACKING::centre, PROJECTION_PACKING::folds, PROJECTION_PACKING::sums, \
-        PROJECTION_PACKING_OF(RESIDUE)::residue, BOUNDS>(in, PROJECTION_SEGMENT_SCRATCH(0), bounds, m, k, index, \
-        peaks, thread_index, sg, lane)
+        PROJECTION_PACKING_OF(RESIDUE)::residue, BOUNDS>(in, PROJECTION_SEGMENT_SCRATCH(0), bounds, m,          \
+        k, index, peaks, thread_index, sg, lane)
 
 #define PROJECTION_SEGMENT_COEFFICIENTS(s, ...)                                                                 \
     if (row < uint(PROJECTION_N##s)) {                                                                          \
@@ -821,15 +841,15 @@ inline void segment_tall(thread const In &in, thread const Out &out, thread cons
     PROJECTION_EACH_SEGMENT(PROJECTION_SEGMENT_COEFFICIENTS, )
 
 #define PROJECTION_SEGMENT_PACKED(s, ...)                                                                       \
-    if (projection::gemm_packed_segment<PROJECTION_PACKET(s), PROJECTION_SERVED(s), CODED, PACK_TOKENS,               \
-            WEIGHTS_AHEAD>(out##s, w##s, PROJECTION_SEGMENT_SCRATCH(s), PROJECTION_ZEROED(s) ? 0u : m, padded,  \
+    if (projection::gemm_packed_segment<PROJECTION_PACKET(s), PROJECTION_SERVED(s), CODED,                      \
+            PACK_TOKENS, WEIGHTS_AHEAD>(out##s, w##s, PROJECTION_SEGMENT_SCRATCH(s), PROJECTION_ZEROED(s) ? 0u : m, padded,  \
             uint(PROJECTION_N##s), k, group, projection::packing_simdgroups, sg, lane))                         \
         return;
 
 #define PROJECTION_SEGMENTED_PACKED                                                                             \
     PROJECTION_PACKING_ADMITTED;                                                                                \
     PROJECTION_OPERANDS;                                                                                        \
-    const uint padded = (m + 127u) / 128u * 128u;                                                               \
+    const uint padded = projection::packing_padded(m, 2u);                                                      \
     constexpr uint CODED = PROJECTION_PACKING_OF(RESIDUE)::residue;                                             \
     uint group = index;                                                                                         \
     PROJECTION_EACH_SEGMENT(PROJECTION_SEGMENT_PACKED, )

@@ -871,7 +871,8 @@ fn scoped_projection_specialization_on<E: seismic::Entry>(
 
 /// `mapping`'s GEMV threadgroup on the Metal launches for three rows up to
 /// VERIFY_ROWS and for two rows of an entry that launches its GEMV per row
-/// count.
+/// count, and on a single projection's packed-rows launch, whose form
+/// (PACKED_ROWS) is off.
 fn with_gemv_rows<E: seismic::Entry>(
     device: &Device,
     specialization: NativeSpecialization,
@@ -880,6 +881,13 @@ fn with_gemv_rows<E: seismic::Entry>(
     if device.backend() != BackendName::Metal {
         return specialization;
     }
+    let specialization = match common::metal_launch_of::<E>("gemv_packed") {
+        Some(packed) => specialization
+            .with_param("PACKED_ROWS", 0)
+            .with_launch_param(packed, "SIMDGROUPS", mapping.simdgroups)
+            .with_launch_param(packed, "ROWS", mapping.rows),
+        None => specialization,
+    };
     ["gemv_rows", "gemv_pair"].into_iter().fold(specialization, |specialization, launch| {
         let launch = common::metal_launch::<E>(launch);
         specialization
@@ -1268,9 +1276,10 @@ const PAIRED_LAUNCHES: [&str; 14] = [
     "gemv", "batch", "gemm_small", "gemm", "tall", "quantize", "coefficients", "int8", "gemv_rows", "gemv_pair",
     "pack", "pack_coefficients", "packed", "unpacked",
 ];
-const SINGLE_LAUNCHES: [&str; 17] = [
+const SINGLE_LAUNCHES: [&str; 18] = [
     "gemv", "batch", "gemm_small", "reduce_small", "gemm", "reduce", "relayout", "tall", "quantize",
-    "coefficients", "int8", "gemv_rows", "gemv_pair", "pack", "pack_coefficients", "packed", "unpacked",
+    "coefficients", "int8", "gemv_rows", "gemv_packed", "gemv_pair", "pack", "pack_coefficients", "packed",
+    "unpacked",
 ];
 const SEGMENTED_LAUNCHES: [&str; 11] = [
     "gemv", "batch", "gemm_small", "gemm", "tall", "gemv_rows", "gemv_pair", "pack", "pack_coefficients", "packed",
@@ -2423,13 +2432,29 @@ fn dense_output_native_arithmetic(
         specialization,
         &[("A", act.element()), ("DW", down.repr.resident(&device))],
     );
+    dense_output_call(device, act, down, residual, rows, product, out_rows, &specialization, &absent_bound(device))
+}
+
+/// `dense_output` under `specialization`, its bound port `bound`.
+fn dense_output_call(
+    device: &Device,
+    act: Act,
+    down: &Weight,
+    residual: &[f32],
+    rows: usize,
+    product: &[f32],
+    out_rows: &[i32],
+    specialization: &NativeSpecialization,
+    bound: &Tensor,
+) -> Vec<f32> {
+    let (h, f) = (down.rows, down.k);
     let kernel = declared::prepared(
         device,
         &dense_output::native_entry_with(dense_output::Elements {
             A: act.element(),
-            DW: down.repr.resident(&device),
+            DW: down.repr.resident(device),
         }),
-        &specialization,
+        specialization,
     )
     .unwrap();
     let out = kernel
@@ -2439,7 +2464,7 @@ fn dense_output_native_arithmetic(
             down_weight: &down.tensor(device),
             out_rows: &i32_tensor(device, &[out_rows.len()], out_rows),
             down_scale: &f32_tensor(device, &[0], &[]),
-            down_bound: &absent_bound(device),
+            down_bound: bound,
         })
         .unwrap()
         .value;
@@ -2820,27 +2845,7 @@ fn dense_output_packed(
         specialization,
         &[("A", act.element()), ("DW", down.repr.resident(device))],
     );
-    let kernel = declared::prepared(
-        device,
-        &dense_output::native_entry_with(dense_output::Elements {
-            A: act.element(),
-            DW: down.repr.resident(device),
-        }),
-        &specialization,
-    )
-    .unwrap();
-    let out = kernel
-        .call(dense_output::Args {
-            residual: &f32_tensor(device, &[rows, h], residual),
-            product: &act_tensor(device, act, &[out_rows.len(), f], product),
-            down_weight: &down.tensor(device),
-            out_rows: &i32_tensor(device, &[out_rows.len()], out_rows),
-            down_scale: &f32_tensor(device, &[0], &[]),
-            down_bound: &bound,
-        })
-        .unwrap()
-        .value;
-    read_f32(&out)
+    dense_output_call(device, act, down, residual, rows, product, out_rows, &specialization, &bound)
 }
 
 /// Metal's PACK form of the down projection: integer activation codes per
@@ -2927,6 +2932,175 @@ fn metal_packed_dense_output_agrees_with_the_staged_form(format: Format) {
                     relative <= 0.8 * narrow && worst <= 0.1,
                     "packed dense_output {repr:?} rows {rows} RESIDUE 2: relative RMS error {relative:.2e} against {narrow:.2e} with one"
                 );
+            }
+        }
+    }
+}
+
+/// The packing lanes' constants of `packing_lanes<N>` (`packing.h`), two or
+/// three lanes: each lane's largest code and the largest |S_l| of a run of
+/// `n` columns, and the accumulator's exponent.
+struct PackingLanes {
+    codes: Vec<f64>,
+    limits: Vec<f64>,
+    exponent: i32,
+}
+
+impl PackingLanes {
+    fn new(lanes: usize, n: f64) -> Self {
+        let width = if lanes == 2 { 16 } else { 10 };
+        let top_shift = width * (lanes as i32 - 1);
+        let exponent = (18 + width).min(31);
+        let field = f64::from((1u32 << (width - 1)) - 1);
+        let codes = (0..lanes)
+            .map(|l| if l == lanes - 1 { f64::from((1u32 << (24 - top_shift)) - 1) } else { f64::from((1u32 << width) - 1) })
+            .collect();
+        let limits = (0..lanes)
+            .map(|l| match l {
+                _ if l == lanes - 1 => f64::from((1u32 << (exponent - top_shift)) - 1),
+                0 => field - n * 2f64.powi(exponent - 25),
+                _ => field,
+            })
+            .collect();
+        Self { codes, limits, exponent }
+    }
+}
+
+/// An upper bound on a run's factor, what one unit of its integer codes is
+/// worth: its values are factor x integer + one constant, so any two that
+/// differ, differ by a multiple of it.
+fn run_factor(values: &[f32]) -> f64 {
+    let mut sorted = values.iter().map(|&v| f64::from(v)).collect::<Vec<_>>();
+    sorted.sort_by(f64::total_cmp);
+    let step = sorted
+        .windows(2)
+        .map(|pair| pair[1] - pair[0])
+        .filter(|&d| d > 1e-7 * sorted[sorted.len() - 1].abs().max(sorted[0].abs()))
+        .fold(f64::INFINITY, f64::min);
+    if step.is_finite() { step } else { sorted[0].abs().max(sorted[sorted.len() - 1].abs()) }
+}
+
+/// Metal's packed-rows GEMV of the down projection (`PACKED_ROWS` = N, each
+/// N its weight's PACK_LANES offers): N activation rows packed per operand
+/// element against the codes of a format the packed form admits without
+/// residue bits, at the decode and verification row counts (a generated
+/// test a format), under the weight's packing bound. It checks structure,
+/// not error, which admission judges: a sum is its packed rows' and weight
+/// row's alone, the same bits under every mapping of one LANES; and each
+/// output is the GEMV's within the form's certified budget, half a code
+/// step a column (the held scale `packing.h` certifies, over its rows'
+/// norms and the bound) and, for a group's bottom row, the accumulator's n
+/// roundings of a run (`packing_lanes::exponent`), with F32 rounding beside.
+fn metal_packed_rows_dense_output_agrees_with_the_gemv(format: Format) {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let repr = Repr::of(format);
+    let Some(packing) = repr.resident(&device).metal_packing() else {
+        return;
+    };
+    if packing.residue {
+        return;
+    }
+    let act = Act::Bf16;
+    let (outputs, k) = (192, 1024);
+    let down = weight(repr, outputs, k, 93, 1.0);
+    let (bound, bound_extent) = down.bound(&device);
+    let squares = if bound_extent > 0 { read_f32(&bound) } else { Vec::new() };
+    let run = 32 / packing.folds as usize;
+    let n = run as f64;
+    let centre = f64::from(packing.centre);
+    let root = n.sqrt();
+    for lanes in 2..=(packing.lanes as usize).min(3) {
+        let constants = PackingLanes::new(lanes, n);
+        for rows in [2usize, 3, 5, 8] {
+            let mut rng = Rng::new(rows as u64 + 94);
+            let residual = (0..rows * outputs).map(|_| rng.symmetric()).collect::<Vec<_>>();
+            let product = (0..rows * k).map(|_| rng.symmetric()).collect::<Vec<_>>();
+            let out_rows = (0..rows as i32).collect::<Vec<_>>();
+            let projected = |values: &[f32]| {
+                values
+                    .iter()
+                    .zip(&residual)
+                    .map(|(value, residual)| f64::from(value - residual))
+                    .collect::<Vec<_>>()
+            };
+            let exact = projected(&dense_output_native_arithmetic(
+                &device, act, &down, &residual, rows, &product, &out_rows, MAPPINGS[0], false,
+            ));
+            // An upper bound on a row's code step a run (its held scale
+            // times its code step, over 64), as `packing_lane_scales`
+            // certifies it: its lane's sum limit at code step s against |x|_1
+            // and, under the bound, |x|_2, capped by its codes against
+            // |x|_inf; the bottom lane may take even codes (s = 2). Its F32
+            // norms and the held rounding are covered by a 2^-7 margin.
+            let step = |m: usize, r: usize| {
+                let x = (0..run).map(|c| f64::from(act.round(product[m * k + r * run + c]))).collect::<Vec<_>>();
+                let l1 = x.iter().map(|v| v.abs()).sum::<f64>();
+                let peak = x.iter().fold(0.0f64, |a, v| a.max(v.abs()));
+                let l2 = x.iter().map(|v| v * v).sum::<f64>().sqrt();
+                let lane = m % lanes;
+                let limit = constants.limits[lane];
+                let certified = |s: f64| {
+                    let mut scale = (64.0 / 0.9990234375) / (limit / centre - 0.5 * n * s) * l1;
+                    if let Some(&b2) = squares.get(r) {
+                        let room = if b2 > 0.0 { limit / f64::from(b2).sqrt() - 0.5 * root * s } else { f64::INFINITY };
+                        scale = scale.min((64.0 / 0.9990234375) * l2 / room);
+                    }
+                    scale.max(peak * 64.0 / constants.codes[lane])
+                };
+                let held = if lane == 0 { certified(1.0).max(2.0 * certified(2.0)) } else { certified(1.0) };
+                held * (1.0 + 2f64.powi(-7)) / 64.0
+            };
+            let mut first: Option<Vec<f32>> = None;
+            for mapping in MAPPINGS {
+                let specialization = with_matrix::<dense_output::Entry>(
+                    &device,
+                    dense_output_specialization_on(&device, &[("H", outputs), ("F", k)], mapping),
+                    &[("A", act.element()), ("DW", repr.resident(&device))],
+                )
+                .with_param("PACKED_ROWS", lanes as u64)
+                .with_param("TILED", 0)
+                .with_param("STAGE", 0)
+                .with_static("DB", bound_extent as u64);
+                let values = dense_output_call(
+                    &device, act, &down, &residual, rows, &product, &out_rows, &specialization, &bound,
+                );
+                if mapping.lanes == MAPPINGS[0].lanes {
+                    let first = first.get_or_insert_with(|| values.clone());
+                    assert!(
+                        first.iter().zip(&values).all(|(a, b)| a.to_bits() == b.to_bits()),
+                        "packed rows dense_output {repr:?} rows {rows} N {lanes} {mapping:?} differs across mappings"
+                    );
+                }
+                let packed = projected(&values);
+                for m in 0..rows {
+                    for j in 0..outputs {
+                        let w = &down.values[j * k..(j + 1) * k];
+                        let mut budget = 0.0;
+                        let mut magnitude = 0.0;
+                        for r in 0..k / run {
+                            let w = &w[r * run..(r + 1) * run];
+                            let step = step(m, r);
+                            let absolute = w.iter().map(|v| f64::from(v.abs())).sum::<f64>();
+                            budget += step * 0.5 * absolute;
+                            if m % lanes == 0 {
+                                budget += step * n * 2f64.powi(constants.exponent - 25) * run_factor(w);
+                            }
+                            magnitude += (0..run)
+                                .map(|c| f64::from(w[c].abs()) * f64::from(product[m * k + r * run + c].abs()))
+                                .sum::<f64>();
+                        }
+                        let difference = (packed[m * outputs + j] - exact[m * outputs + j]).abs();
+                        assert!(
+                            difference <= budget + 1e-5 * magnitude,
+                            "packed rows dense_output {repr:?} rows {rows} N {lanes} {mapping:?}: output ({m}, {j}) differs from the GEMV by {difference:.3e}, beyond its certified {budget:.3e}"
+                        );
+                    }
+                }
             }
         }
     }
@@ -7062,6 +7236,7 @@ gguf_format_tests! {
         embedding_rows_decode_exactly_as_the_portable_body
         metal_tall_and_packed_project_rows_agree_with_the_staged_form
         metal_packed_dense_output_agrees_with_the_staged_form
+        metal_packed_rows_dense_output_agrees_with_the_gemv
         packing_bound_matches_its_portable_body
     ];
 }
