@@ -62,12 +62,14 @@ export function ChatSettingsFields({
   patch,
   context,
   contextLimit,
+  maxOutput,
   changed: differs,
 }: {
   settings: ChatRequestSettings
   patch: (change: Partial<ChatRequestSettings>) => void
   context?: number
   contextLimit?: number
+  maxOutput?: number
   changed: ReadonlySet<ChatDefaultsKey>
 }) {
   const [advanced, setAdvanced] = useState(false)
@@ -81,7 +83,7 @@ export function ChatSettingsFields({
   // Unset temperature uses the inference service's sampling default.
   const temperature = value(s.temperature) ?? 1
   const defaults = {
-    maxOutputTokens: context,
+    maxOutputTokens: maxOutput,
     topK: 20,
     minP: 0,
     repetitionPenalty: 1,
@@ -111,7 +113,7 @@ export function ChatSettingsFields({
         max={max}
         step={step}
         placeholder={key === "seed" ? "Random" : "—"}
-        disabled={key === "maxOutputTokens" && context === undefined && Option.isNone(s.maxOutputTokens)}
+        disabled={key === "maxOutputTokens" && maxOutput === undefined && Option.isNone(s.maxOutputTokens)}
         value={value(s[key]) ?? defaults[key] ?? ""}
         onChange={(e) =>
           patch({

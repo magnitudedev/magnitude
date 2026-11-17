@@ -82,7 +82,8 @@ function ModelSettings({ model, saved, context, contextLimit }: { model: Inferen
       </div>} />}
     <div className="px-4 pb-5">
       {!valid(shown) && <p role="alert" className="mt-3 text-xs text-red-600 dark:text-red-400">Some values are out of range, so they haven't been saved.</p>}
-      <ChatSettingsFields settings={shown} patch={patch} context={context || undefined} contextLimit={contextLimit} changed={standard} />
+      <ChatSettingsFields settings={shown} patch={patch} context={context || undefined} contextLimit={contextLimit}
+        maxOutput={model.top_provider.max_completion_tokens || undefined} changed={standard} />
     </div>
   </SettingsGroup>
 }
