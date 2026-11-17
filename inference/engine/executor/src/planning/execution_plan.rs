@@ -1750,14 +1750,18 @@ fn refusal(no: NoBank, capacity: u64) -> PlanError {
 /// load prepares); every slot count, context and verdict is arithmetic over
 /// it (`assessment::assess_execution_fit`). `T` is what else a form's
 /// outline gives (a drafted plan's target alone).
+///
+/// Each form is boxed: a form carries a whole execution plan draft, and a
+/// load passes its forms by value through deep frames, whose stacks hold
+/// every by-value copy (`seismic_threads::STACK_BYTES`).
 pub enum FloorForms<T = ()> {
     /// The experts streamed through a bank of every expert at the floor
     /// pass, at the most slots the load's own bound holds, and held whole
     /// as their own allocations at groups of one launch where that bound
     /// holds them so.
-    Banked { bank: BankForm<T>, resident: Option<HeldForm<T>> },
+    Banked { bank: Box<BankForm<T>>, resident: Option<Box<HeldForm<T>>> },
     /// Experts that cannot stream, held whole as their own allocations.
-    Resident(HeldForm<T>),
+    Resident(Box<HeldForm<T>>),
 }
 
 /// One way of holding a draft's experts and its charge's structure.
@@ -1842,10 +1846,14 @@ impl<T> FloorForms<T> {
     pub fn structures(self) -> FloorForms {
         let form = |HeldForm { draft, structure, .. }: HeldForm<T>| HeldForm { draft, structure, more: () };
         match self {
-            Self::Banked { bank: BankForm { form: held, experts, points, windowed }, resident } => {
-                FloorForms::Banked { bank: BankForm { form: form(held), experts, points, windowed }, resident: resident.map(form) }
+            Self::Banked { bank, resident } => {
+                let BankForm { form: held, experts, points, windowed } = *bank;
+                FloorForms::Banked {
+                    bank: Box::new(BankForm { form: form(held), experts, points, windowed }),
+                    resident: resident.map(|resident| Box::new(form(*resident))),
+                }
             }
-            Self::Resident(resident) => FloorForms::Resident(form(resident)),
+            Self::Resident(resident) => FloorForms::Resident(Box::new(form(*resident))),
         }
     }
 
@@ -1854,14 +1862,14 @@ impl<T> FloorForms<T> {
     pub fn primary(&self) -> &HeldForm<T> {
         match self {
             Self::Banked { bank, .. } => &bank.form,
-            Self::Resident(resident) => resident,
+            Self::Resident(resident) => &**resident,
         }
     }
 
     /// The bank form, where the experts stream.
     pub fn bank(&self) -> Option<&BankForm<T>> {
         match self {
-            Self::Banked { bank, .. } => Some(bank),
+            Self::Banked { bank, .. } => Some(&**bank),
             Self::Resident(_) => None,
         }
     }
@@ -1870,8 +1878,8 @@ impl<T> FloorForms<T> {
     /// own bound holds them so.
     pub fn resident(&self) -> Option<&HeldForm<T>> {
         match self {
-            Self::Banked { resident, .. } => resident.as_ref(),
-            Self::Resident(resident) => Some(resident),
+            Self::Banked { resident, .. } => resident.as_deref(),
+            Self::Resident(resident) => Some(&**resident),
         }
     }
 }
@@ -1932,8 +1940,8 @@ impl ExecutionPlanDraft {
             None => None,
         };
         match (bank, resident) {
-            (Ok(bank), resident) => Ok(FloorForms::Banked { bank, resident }),
-            (Err(_), Some(resident)) => Ok(FloorForms::Resident(resident)),
+            (Ok(bank), resident) => Ok(FloorForms::Banked { bank: Box::new(bank), resident: resident.map(Box::new) }),
+            (Err(_), Some(resident)) => Ok(FloorForms::Resident(Box::new(resident))),
             (Err(reason), None) => Err(PlanError::Unstreamed(reason).into()),
         }
     }

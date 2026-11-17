@@ -263,7 +263,8 @@ fn serve(
     // Host messages that arrive during the load wait in the session inbox.
     let _reader = session::spawn_reader(receiver, signal.clone());
     match load(manifest, unprepared, &outbound) {
-        Ok(LoadAttempt::Loaded((loaded, ready))) => {
+        Ok(LoadAttempt::Loaded(attempt)) => {
+            let (loaded, ready) = *attempt;
             if let Err(error) = outbound.lock().unwrap().send(WorkerMessage::Ready { ready }) {
                 return WorkerExit::TransportFailed(error.to_string()).into();
             }
@@ -365,7 +366,7 @@ fn load(
                     .send(WorkerMessage::LoadProgress { progress });
             }),
         )? {
-            LoadAttempt::Loaded(built) => built,
+            LoadAttempt::Loaded(built) => *built,
             LoadAttempt::Unprepared => return Err(Stopped::Unprepared),
         };
         let model = manifest.model.clone();
@@ -464,7 +465,7 @@ fn load(
         backend: execution_ready.backend,
         census: execution_ready.census,
     };
-    Ok(LoadAttempt::Loaded((
+    Ok(LoadAttempt::Loaded(Box::new((
         Loaded {
             execution,
             binding,
@@ -472,5 +473,5 @@ fn load(
             census,
         },
         ready,
-    )))
+    ))))
 }

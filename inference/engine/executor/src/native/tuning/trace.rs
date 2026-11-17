@@ -172,16 +172,14 @@ impl TuningTrace {
             TracedWork::Search => Writer::Calling(sink),
             TracedWork::Load => {
                 let (lines, taken) = std::sync::mpsc::channel();
-                let thread = std::thread::Builder::new()
-                    .name("tuning-trace".into())
-                    .spawn(move || {
-                        let mut sink = sink;
-                        for line in taken {
-                            sink.take(line);
-                        }
-                        sink
-                    })
-                    .map_err(|error| format!("tuning trace {}: {error}", path.display()))?;
+                let thread = seismic::threads::spawn("tuning-trace", move || {
+                    let mut sink = sink;
+                    for line in taken {
+                        sink.take(line);
+                    }
+                    sink
+                })
+                .map_err(|error| format!("tuning trace {}: {error}", path.display()))?;
                 Writer::Own(lines, thread)
             }
         };

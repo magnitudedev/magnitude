@@ -749,7 +749,9 @@ enum Provisioned {
 
 /// Everything the owner holds except its pipeline.
 struct Service<F: ProgramFamily> {
-    domain: ExecutorDomain<F>,
+    /// Boxed: a domain is tens of kilobytes, which every owner, and every
+    /// frame that builds or moves one, would otherwise hold by value.
+    domain: Box<ExecutorDomain<F>>,
     scheduler: Scheduler,
     /// Requests outside the pipeline.
     requests: BTreeMap<RequestId, Request>,
@@ -886,7 +888,7 @@ impl<F: ProgramFamily> Owner<F> {
         domain.watch_pressure(wakes.pressure());
         Ok(Self {
             service: Service {
-                domain,
+                domain: Box::new(domain),
                 scheduler: Scheduler::new(limits)?,
                 requests: BTreeMap::new(),
                 epoch: AvailabilityEpoch::default(),

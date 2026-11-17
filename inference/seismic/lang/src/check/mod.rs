@@ -16,6 +16,8 @@ mod initialization;
 #[cfg(test)]
 mod initialization_tests;
 pub(crate) mod ir;
+#[cfg(test)]
+mod nesting_tests;
 mod ownership;
 #[cfg(test)]
 mod ownership_tests;
@@ -700,7 +702,19 @@ fn check_definition(env: &Env, def: usize) -> CheckedOutcome {
     let (mut root, mut result) = c.function_body(declared.body, declared.name_span);
     let initialization =
         initialization::check(&mut c, &mut root, &mut result, initialization_facts);
-    let parts = c.finish(root, result);
+    let mut parts = c.finish(root, result);
+    let nesting = parts.body.nesting();
+    if nesting > ir::MAX_NESTING {
+        parts.diagnostics.push(Diagnostic::with_rule(
+            DiagnosticRule::Nesting,
+            declared.name_span,
+            format!(
+                "`{}` nests {nesting} statements and expressions deep, past the {} that bound a checked program's decode stack",
+                declared.sig.name,
+                ir::MAX_NESTING
+            ),
+        ));
+    }
     CheckedOutcome {
         body: parts.body,
         diagnostics: parts.diagnostics,
@@ -758,26 +772,35 @@ pub(crate) fn check_program(
             checked: &outcomes,
         };
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let checked = std::thread::scope(|scope| {
-            let threads = (0..workers.min(level.len()))
-                .map(|_| {
-                    scope.spawn(|| {
-                        let mut checked = Vec::new();
-                        loop {
-                            let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let Some(&def) = level.get(index) else {
-                                return checked;
-                            };
-                            checked.push((def, check_definition(&env, def)));
-                        }
+        let check_level = || {
+            let mut checked = Vec::new();
+            loop {
+                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(&def) = level.get(index) else {
+                    return checked;
+                };
+                checked.push((def, check_definition(&env, def)));
+            }
+        };
+        // A level of one definition is checked on the calling thread, which
+        // a thread of its own would only wait for.
+        let threads = workers.min(level.len());
+        let checked = if threads == 1 {
+            check_level()
+        } else {
+            std::thread::scope(|scope| {
+                let threads = (0..threads)
+                    .map(|_| {
+                        seismic_threads::spawn_scoped(scope, "seismic-check", &check_level)
+                            .expect("invariant violated: the host starts a thread")
                     })
-                })
-                .collect::<Vec<_>>();
-            threads
-                .into_iter()
-                .flat_map(|thread| thread.join().expect("definition check thread panicked"))
-                .collect::<Vec<_>>()
-        });
+                    .collect::<Vec<_>>();
+                threads
+                    .into_iter()
+                    .flat_map(|thread| thread.join().expect("definition check thread panicked"))
+                    .collect::<Vec<_>>()
+            })
+        };
         for (def, outcome) in checked {
             outcomes[def] = Some(outcome);
         }

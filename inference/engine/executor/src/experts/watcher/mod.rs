@@ -703,20 +703,16 @@ impl Watcher {
             liveness::watch(&held.core, &shared, residency.clone(), requests.service(), copies.clone(), answers, crate::experts::exchange::abort())?
         });
         watcher.requests = Some(
-            std::thread::Builder::new()
-                .name("expert-requests".into())
-                .spawn(move || {
-                    seismic_io::waited_on();
-                    requests.serve();
-                })
-                .map_err(|error| format!("expert request service: {error}"))?,
+            seismic::threads::spawn("expert-requests", move || {
+                seismic_io::waited_on();
+                requests.serve();
+            })
+            .map_err(|error| format!("expert request service: {error}"))?,
         );
         let kept = shared.clone();
         watcher.residency = Some(
-            std::thread::Builder::new()
-                .name("expert-residency".into())
-                .spawn(move || Residency::keep(residency, kept, copier))
-                .map_err(|error| format!("expert residency: {error}"))?,
+            seismic::threads::spawn("expert-residency", move || Residency::keep(residency, kept, copier))
+            .map_err(|error| format!("expert residency: {error}"))?,
         );
         if let Some(copies) = copies {
             let watched = shared.clone();

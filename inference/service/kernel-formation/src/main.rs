@@ -56,7 +56,12 @@ impl From<Backend> for BackendName {
     }
 }
 
+/// The process's work runs on the owner's stack, never on the platform's main thread.
 fn main() -> ExitCode {
+    seismic::threads::run("magnitude-main", start)
+}
+
+fn start() -> ExitCode {
     let arguments = Arguments::parse();
     match form(
         arguments.backend.into(),
@@ -172,7 +177,7 @@ fn reporting<T>(
 ) -> T {
     std::thread::scope(|scope| {
         let (finished, waiting) = std::sync::mpsc::channel::<()>();
-        scope.spawn(move || {
+        seismic::threads::spawn_scoped(scope, "kernel-formation", move || {
             while let Err(RecvTimeoutError::Timeout) = waiting.recv_timeout(PROGRESS_INTERVAL) {
                 // glibc keeps memory freed by the search's short-lived worker
                 // threads in their arenas; on a long run that grows into
@@ -191,7 +196,7 @@ fn reporting<T>(
                     forming.activity()
                 );
             }
-        });
+        }).expect("invariant violated: the host starts a thread");
         let result = work();
         drop(finished);
         result

@@ -416,7 +416,7 @@ pub fn inspect_components(
             },
         },
         head: None,
-        vision,
+        vision: vision.map(Box::new),
         draft: None,
     };
     if stores_prediction_blocks(directory, layer_count, predictions) {

@@ -65,7 +65,7 @@ pub fn load_native_domain(
     Ok(
         match build(catalog, manifest, package, unprepared, Rc::new(|_| {}))? {
             LoadAttempt::Loaded(built) => {
-                LoadAttempt::Loaded((built.domain, built.bindings, built.plan))
+                LoadAttempt::Loaded(Box::new((built.domain, built.bindings, built.plan)))
             }
             LoadAttempt::Unprepared => LoadAttempt::Unprepared,
         },
@@ -79,7 +79,7 @@ pub fn build_native_domain(
     package: Arc<Package>,
 ) -> Result<(ExecutorDomain, StateBindings, ResourcePlan), LoadError> {
     match load_native_domain(manifest, package, UnpreparedUnits::ServeDefaults)? {
-        LoadAttempt::Loaded(built) => Ok(built),
+        LoadAttempt::Loaded(built) => Ok(*built),
         LoadAttempt::Unprepared => Err(internal(
             "a load serving canonical defaults stopped unprepared",
         )),
@@ -450,10 +450,13 @@ fn prepared_key(manifest: &ExecutionManifest) -> Result<TuningCacheKey, LoadErro
     )))
 }
 
-/// How an attempt to load ended, short of failing.
+/// How an attempt to load ended, short of failing. What loaded is boxed:
+/// a load's results (its domain, its prepared programs) are tens of
+/// kilobytes, which every frame that passes an attempt on would otherwise
+/// hold again, and an unoptimized build in each of its temporaries.
 #[derive(Debug)]
 pub enum LoadAttempt<L> {
-    Loaded(L),
+    Loaded(Box<L>),
     /// A load asked to report tuning units without a stored record
     /// ([`UnpreparedUnits::Report`]) met one. Nothing of the model was
     /// placed, and nothing of the attempt remains: the host has the model's
@@ -567,7 +570,7 @@ fn prepare(
         formed.load_misses,
     );
     report_load_memory("programs prepared", opened.device());
-    Ok(LoadAttempt::Loaded(PreparedPrograms {
+    Ok(LoadAttempt::Loaded(Box::new(PreparedPrograms {
         startup,
         draft,
         resident,
@@ -578,7 +581,7 @@ fn prepare(
         state,
         held_pass,
         workers,
-    }))
+    })))
 }
 
 /// A load: one code path whose `unprepared` decides only what happens at a
@@ -649,7 +652,7 @@ fn build_held(
         held_pass,
         workers,
     } = match prepare(catalog, manifest, &package, unprepared, progress.clone(), holding)? {
-        LoadAttempt::Loaded(prepared) => prepared,
+        LoadAttempt::Loaded(prepared) => *prepared,
         LoadAttempt::Unprepared => return Ok(Built::Attempt(LoadAttempt::Unprepared)),
     };
     let limits = draft.policy().limits();
@@ -1068,13 +1071,13 @@ fn build_held(
         .measure_load(load_measures(&pricing).map_err(internal)?, &mut bindings)
         .map_err(|error| internal(error.to_string()))?;
     phase.enter("serving");
-    Ok(Built::Attempt(LoadAttempt::Loaded(NativeDomain {
+    Ok(Built::Attempt(LoadAttempt::Loaded(Box::new(NativeDomain {
         domain,
         bindings,
         plan,
         device: device_selector,
         pricing,
-    })))
+    }))))
 }
 
 /// What a load unpriced without a kernel cache lacks: where the executor's
@@ -1085,13 +1088,17 @@ const UNPRICED: &str = "the load keeps no kernel cache, where the executor's cos
 /// which prices it once its warm-up ends and again each time the service's
 /// measurement job stores new records. No load measures: what is not stored
 /// yet a streamed load requests of the job ([`BankPricing::new`]).
+///
+/// Its definition and plans are boxed: a pricing is moved by value through
+/// a load's deep frames, whose stacks hold every by-value copy
+/// (`seismic_threads::STACK_BYTES`).
 pub(crate) struct LoadPricing {
     kernel_cache: Option<std::path::PathBuf>,
-    definition: magnitude_family_contracts::ModelDefinition,
+    definition: Box<magnitude_family_contracts::ModelDefinition>,
     /// The plan before the weight cap: every expert resident.
-    resident: ExecutionPlanDraft,
+    resident: Box<ExecutionPlanDraft>,
     /// The plan the load runs.
-    planned: ExecutionPlanDraft,
+    planned: Box<ExecutionPlanDraft>,
     /// The load's executor's identity.
     executor: seismic::Identity,
     device: seismic::Device,
@@ -1146,9 +1153,9 @@ impl LoadPricing {
         }
         Ok(Self {
             kernel_cache: manifest.kernel_cache.clone(),
-            definition: manifest.definition.clone(),
-            resident,
-            planned,
+            definition: Box::new(manifest.definition.clone()),
+            resident: Box::new(resident),
+            planned: Box::new(planned),
             executor,
             device,
             bank,
@@ -1214,7 +1221,15 @@ impl LoadPricing {
             readers: 1,
             requests: Vec::new(),
         });
-        let pricing = Self { kernel_cache, definition, resident, planned, executor, device: device.clone(), bank };
+        let pricing = Self {
+            kernel_cache,
+            definition: Box::new(definition),
+            resident: Box::new(resident),
+            planned: Box::new(planned),
+            executor,
+            device: device.clone(),
+            bank,
+        };
         (pricing, device)
     }
 }

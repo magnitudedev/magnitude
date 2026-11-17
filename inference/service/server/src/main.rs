@@ -108,14 +108,19 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
-    // The measurement job's device probes run in processes of this executable.
-    seismic::serve_probe_if_asked();
     // SAFETY: no other thread has started yet.
     unsafe { magnitude_service_server::isolate_hub_credentials() };
+    // The process's work, the engine's in it, runs on the owner's stack, never on the platform's
+    // main thread.
+    seismic_threads::run("magnitude-main", serve)
+}
+
+fn serve() -> anyhow::Result<()> {
+    // The measurement job's device probes run in processes of this executable.
+    seismic::serve_probe_if_asked();
     magnitude_executor::diagnostics::install();
     magnitude_executor::platform::relax_gpu_watchdog();
-    let cli = Cli::parse();
-    match cli.command {
+    match Cli::parse().command {
         // The engine worker owns standard output for its protocol: it exports no telemetry and
         // runs no async runtime of the service's. Its events go to standard error, which the
         // service records in its log, at the level the launcher sets (`RUST_LOG`).
@@ -131,9 +136,7 @@ fn main() -> anyhow::Result<()> {
                 // auxiliary pools it opens) are background work beside a serving worker.
                 seismic::threads::set_share(MachineBudget::host().share(Duty::Background).get());
             }
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
+            seismic_threads::runtime()
                 .context("failed to start the service runtime")?
                 .block_on(run(command))
         }

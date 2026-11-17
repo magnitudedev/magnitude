@@ -87,22 +87,20 @@ pub(crate) fn spawn_reader(
     mut receiver: impl MessageReceiver<HostMessage>,
     signal: Arc<Signal>,
 ) -> std::thread::JoinHandle<()> {
-    std::thread::Builder::new()
-        .name("magnitude-worker-reader".into())
-        .spawn(move || loop {
-            match receiver.receive() {
-                Ok(Some(message)) => signal.push(Inbound::Message(message)),
-                Ok(None) => {
-                    signal.push(Inbound::Disconnected(None));
-                    return;
-                }
-                Err(error) => {
-                    signal.push(Inbound::Disconnected(Some(error)));
-                    return;
-                }
+    seismic::threads::spawn("magnitude-worker-reader", move || loop {
+        match receiver.receive() {
+            Ok(Some(message)) => signal.push(Inbound::Message(message)),
+            Ok(None) => {
+                signal.push(Inbound::Disconnected(None));
+                return;
             }
-        })
-        .expect("spawn the worker reader thread")
+            Err(error) => {
+                signal.push(Inbound::Disconnected(Some(error)));
+                return;
+            }
+        }
+    })
+    .expect("spawn the worker reader thread")
 }
 
 struct PendingAdmission {

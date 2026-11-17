@@ -368,7 +368,7 @@ impl HostCompute {
         let (placed, placements) = std::sync::mpsc::channel();
         for (worker, cpu) in threads.nodes.iter().flatten().copied().enumerate() {
             let (shared, placed) = (compute.inner.clone(), placed.clone());
-            let spawned = std::thread::Builder::new().name(format!("expert-compute-{cpu}")).spawn(move || {
+            let spawned = seismic::threads::spawn(format!("expert-compute-{cpu}"), move || {
                 seismic_io::waited_on();
                 let placement = seismic::pin(&[cpu]);
                 let serves = placement.is_ok();

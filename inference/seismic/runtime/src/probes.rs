@@ -326,10 +326,11 @@ fn crash(status: ExitStatus) -> Option<&'static str> {
 /// Read all of `source` on a thread of its own, so neither of a process's
 /// pipes fills while the other is read.
 fn drain(mut source: impl Read + Send + 'static) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>> {
-    std::thread::spawn(move || {
+    seismic_threads::spawn("probe-drain", move || {
         let mut bytes = Vec::new();
         source.read_to_end(&mut bytes).map(|_| bytes)
     })
+    .expect("invariant violated: the host starts a thread")
 }
 
 /// Serve one probe and exit, where this process was started as a probe

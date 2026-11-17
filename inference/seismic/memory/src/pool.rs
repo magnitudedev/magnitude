@@ -67,15 +67,13 @@ pub trait Fence: Send + Sync + 'static {
 /// pool owing the OS bytes its released granules hold runs at their
 /// flights' end ([`GranulePool::awaited`]).
 pub fn after<F: Fence>(fences: Vec<Arc<F>>, settle: impl FnOnce() + Send + 'static) -> std::thread::JoinHandle<()> {
-    std::thread::Builder::new()
-        .name("pool-return".into())
-        .spawn(move || {
-            for fence in &fences {
-                fence.wait();
-            }
-            settle();
-        })
-        .expect("a pool's return thread starts")
+    seismic_threads::spawn("pool-return", move || {
+        for fence in &fences {
+            fence.wait();
+        }
+        settle();
+    })
+    .expect("a pool's return thread starts")
 }
 
 /// A block of one pool, named for its life: never reused after it returns.

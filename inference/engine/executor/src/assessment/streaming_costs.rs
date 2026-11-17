@@ -900,14 +900,15 @@ impl<'s> Copying<'s> {
     fn start(transfer: &seismic::Transfer, copied: &Tensor, into: &Tensor, store: &'s dyn RecordStore<PointKey>) -> Self {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (transfer, copied, into, stopping) = (transfer.clone(), copied.clone(), into.clone(), stop.clone());
-        let thread = std::thread::spawn(move || {
+        let thread = seismic::threads::spawn("measurement-copies", move || {
             while !stopping.load(std::sync::atomic::Ordering::Relaxed) {
                 let run = seismic::TransferRun { source: &copied, source_offset: 0, destination: &into, destination_offset: 0, bytes: copied.byte_len() };
                 let value = transfer.copy(&[seismic::TransferItem::Run(run)]).map_err(|error| error.to_string())?;
                 while !transfer.wait(value, std::time::Duration::from_secs(1)).map_err(|error| error.to_string())? {}
             }
             Ok(())
-        });
+        })
+        .expect("invariant violated: the host starts a thread");
         Self { stop, thread: std::sync::Mutex::new(Some(thread)), store }
     }
 
@@ -1599,7 +1600,8 @@ impl Sweeps<'_> {
                 let range = Self::share(length, readers, reader);
                 let (share, after) = rest.split_at_mut(range.len());
                 rest = after;
-                scope.spawn(move || share.iter_mut().zip(range).for_each(|(word, index)| *word = index as u64));
+                seismic::threads::spawn_scoped(scope, "measurement-writer", move || share.iter_mut().zip(range).for_each(|(word, index)| *word = index as u64))
+                    .expect("invariant violated: the host starts a thread");
             }
         });
         words
@@ -1610,7 +1612,8 @@ impl Sweeps<'_> {
         std::thread::scope(|scope| {
             for reader in 0..self.readers {
                 let share = &self.words[Self::share(length, self.readers, reader)];
-                scope.spawn(move || std::hint::black_box(share.iter().fold(0u64, |sum, &word| sum.wrapping_add(word))));
+                seismic::threads::spawn_scoped(scope, "measurement-reader", move || std::hint::black_box(share.iter().fold(0u64, |sum, &word| sum.wrapping_add(word))))
+                    .expect("invariant violated: the host starts a thread");
             }
         });
     }

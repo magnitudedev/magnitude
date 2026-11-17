@@ -217,15 +217,13 @@ impl Engine {
         drop(pool);
         for (index, name) in names.clone().enumerate() {
             let flight = InFlight::default();
-            let started = std::thread::Builder::new()
-                .name(format!("seismic-read-{name}"))
-                .spawn({
-                    let flight = flight.clone();
-                    move || {
-                        crate::waited_on();
-                        work(self, &flight)
-                    }
-                });
+            let started = seismic_threads::spawn(format!("seismic-read-{name}"), {
+                let flight = flight.clone();
+                move || {
+                    crate::waited_on();
+                    work(self, &flight)
+                }
+            });
             if let Err(error) = started {
                 self.pool.lock().expect("read pool").started -= names.len() - index;
                 return Err(Error::ThreadStart(error));

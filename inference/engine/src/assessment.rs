@@ -521,11 +521,16 @@ pub enum PreparedModelAssessment {
     /// (`definition` and `execution`, its drafter in `facts`): every served
     /// tier's fit and its drafter's memory are arithmetic over it
     /// ([`finish_model_assessment`]).
+    ///
+    /// Its facts, definition and execution are boxed: each carries whole
+    /// definitions and plan drafts, and a preparation is returned by value
+    /// through deep frames, whose stacks hold every by-value copy
+    /// (`seismic_threads::STACK_BYTES`).
     Planned {
-        facts: ModelFacts<PreparedDrafter>,
+        facts: Box<ModelFacts<PreparedDrafter>>,
         /// The definition `execution` plans, at the largest served tier.
-        definition: ModelDefinition,
-        execution: PreparedExecutionAssessment,
+        definition: Box<ModelDefinition>,
+        execution: Box<PreparedExecutionAssessment>,
         /// The package's served tiers, largest first: every one of
         /// [`served_contexts`], or the one
         /// [`AssessmentStructure::served_context`] fixes.
@@ -582,7 +587,7 @@ pub fn finish_model_assessment(
                 fingerprint: fingerprint.clone(),
             });
         }
-        PreparedModelAssessment::Planned { facts, definition, execution, tiers } => (facts, definition, execution, tiers),
+        PreparedModelAssessment::Planned { facts, definition, execution, tiers } => (&**facts, &**definition, &**execution, tiers),
     };
     let structure = &setup.structure;
     let pricing = structure.selected.graph_cost;
@@ -814,9 +819,9 @@ pub fn prepare_model_assessment_from(
         }
     };
     Ok(PreparedModelAssessment::Planned {
-        facts: admitted.facts(drafter),
-        definition,
-        execution,
+        facts: Box::new(admitted.facts(drafter)),
+        definition: Box::new(definition),
+        execution: Box::new(execution),
         tiers: match structure.served_context {
             Some(_) => vec![admitted.context_limit],
             None => served_contexts(admitted.context_limit),

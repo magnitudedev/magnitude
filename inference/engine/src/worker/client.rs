@@ -348,33 +348,31 @@ pub fn connect_worker(
         ready: ready.clone(),
     });
     let reading = state;
-    std::thread::Builder::new()
-        .name("magnitude-host-reader".into())
-        .spawn(move || loop {
-            let failure = match receiver.receive() {
-                Ok(Some(message)) => {
-                    let mut state = reading.lock().unwrap();
-                    match state.deliver(message) {
-                        Ok(()) if state.closed.is_none() => continue,
-                        Ok(()) => return,
-                        Err(reason) => reason,
-                    }
+    seismic::threads::spawn("magnitude-host-reader", move || loop {
+        let failure = match receiver.receive() {
+            Ok(Some(message)) => {
+                let mut state = reading.lock().unwrap();
+                match state.deliver(message) {
+                    Ok(()) if state.closed.is_none() => continue,
+                    Ok(()) => return,
+                    Err(reason) => reason,
                 }
-                Ok(None) => "the worker ended".to_owned(),
-                Err(error) => error.to_string(),
-            };
-            let mut state = reading.lock().unwrap();
-            let lost = state.lost(failure);
-            state.close(lost);
-            return;
-        })
-        .map_err(|error| LoadError::Internal {
-            reason: error.to_string(),
-        })?;
-    Ok(LoadAttempt::Loaded(WorkerConnection {
+            }
+            Ok(None) => "the worker ended".to_owned(),
+            Err(error) => error.to_string(),
+        };
+        let mut state = reading.lock().unwrap();
+        let lost = state.lost(failure);
+        state.close(lost);
+        return;
+    })
+    .map_err(|error| LoadError::Internal {
+        reason: error.to_string(),
+    })?;
+    Ok(LoadAttempt::Loaded(Box::new(WorkerConnection {
         client: EngineClient { connection },
         ready,
-    }))
+    })))
 }
 
 /// Ask a worker process for a Prepare of `manifest` and wait for its

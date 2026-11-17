@@ -2,6 +2,7 @@
 use super::ast::*;
 use super::lexer::lex;
 use super::token::{Kw, Op, Tok, Token};
+use crate::check::ir::MAX_NESTING;
 use crate::checked::{DiagnosticRule, Encoded};
 use crate::span::{Diagnostic, Span};
 use std::collections::BTreeMap;
@@ -11,7 +12,7 @@ use std::collections::BTreeMap;
 /// its integer literal, and a binding may not take one's name.
 pub(crate) fn parse(text: &str, constants: &BTreeMap<String, u64>) -> Result<File, Diagnostic> {
     let tokens = lex(text)?;
-    Parser { tokens, pos: 0, constants: constants.clone() }.file()
+    Parser { tokens, pos: 0, constants: constants.clone(), open: 0 }.file()
 }
 
 /// Binding powers, shared with the printer. Binary operators use twice their `precedence()`
@@ -27,6 +28,41 @@ struct Parser {
     tokens: Vec<Token>,
     pos: usize,
     constants: BTreeMap<String, u64>,
+    /// The statements, expressions, patterns and types open on the parse's
+    /// path ([`Parser::nested`]).
+    open: usize,
+}
+
+/// How deep `expr` nests: its levels on its deepest path, each expression
+/// one, as a checked body counts them. Measured without recursion, so a
+/// tree of any depth is measured on the parser's stack.
+fn nesting(expr: &Expr) -> usize {
+    let mut deepest = 0;
+    let mut open: Vec<(&Expr, usize)> = vec![(expr, 1)];
+    while let Some((expr, level)) = open.pop() {
+        deepest = deepest.max(level);
+        let below: Vec<&Expr> = match &expr.kind {
+            ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Inf | ExprKind::Bool(_) | ExprKind::Name(_) => Vec::new(),
+            ExprKind::Tuple(items) => items.iter().collect(),
+            ExprKind::Range { lo, hi } => vec![&**lo, &**hi],
+            ExprKind::Tensor { shape, .. } => shape.iter().collect(),
+            ExprKind::Call { callee, bindings, args } => std::iter::once(&**callee)
+                .chain(bindings.iter().map(|(_, value)| value))
+                .chain(args.iter().map(|arg| &arg.value))
+                .collect(),
+            ExprKind::Index { base, indices } => std::iter::once(&**base)
+                .chain(indices.iter().flat_map(|index| match index {
+                    Index::Expr(value) => vec![value],
+                    Index::Slice { start, end } => start.iter().chain(end).collect(),
+                }))
+                .collect(),
+            ExprKind::Attr { base, .. } => vec![&**base],
+            ExprKind::Unary { expr, .. } => vec![&**expr],
+            ExprKind::Binary { lhs, rhs, .. } => vec![&**lhs, &**rhs],
+        };
+        open.extend(below.into_iter().map(|child| (child, level + 1)));
+    }
+    deepest
 }
 
 type PResult<T> = Result<T, Diagnostic>;
@@ -190,6 +226,31 @@ impl Parser {
 
     fn error(&self, message: String) -> Diagnostic {
         Diagnostic::with_rule(DiagnosticRule::Syntax, self.span(), message)
+    }
+
+    /// `parse` with one more statement, expression, pattern or type open on
+    /// the parse's path: refused past [`MAX_NESTING`], which bounds every
+    /// walk of a body (this parse, the checker's, monomorphization's, the
+    /// encode's and the decode's) by construction. Every recursion of the
+    /// parser opens one; a chain that nests without it recursing (binary
+    /// operators, postfix accesses) is measured where its expression ends
+    /// ([`Parser::expr`]).
+    fn nested<T>(&mut self, parse: impl FnOnce(&mut Self) -> PResult<T>) -> PResult<T> {
+        if self.open == MAX_NESTING {
+            return Err(self.too_deep(self.span()));
+        }
+        self.open += 1;
+        let parsed = parse(self);
+        self.open -= 1;
+        parsed
+    }
+
+    fn too_deep(&self, span: Span) -> Diagnostic {
+        Diagnostic::with_rule(
+            DiagnosticRule::Nesting,
+            span,
+            format!("nested past the {MAX_NESTING} statements and expressions that bound a program's stack"),
+        )
     }
 
     /// `item ("," item)*`
@@ -1422,7 +1483,7 @@ impl Parser {
             }
             Tok::Op(Op::LParen) => {
                 self.bump();
-                let mut items = self.comma_list(Self::type_expr)?;
+                let mut items = self.comma_list(|parser| parser.nested(Self::type_expr))?;
                 self.expect_op(Op::RParen)?;
                 if items.len() == 1 {
                     return Ok(items.remove(0));
@@ -1548,14 +1609,14 @@ impl Parser {
         let kind = match self.peek() {
             Tok::Kw(Kw::For) => {
                 self.bump();
-                self.logical_for(false)?
+                self.nested(|parser| parser.logical_for(false))?
             }
             Tok::Kw(Kw::Parallel) if self.peek_at(1) == &Tok::Kw(Kw::For) => {
                 self.bump();
                 self.bump();
-                self.logical_for(true)?
+                self.nested(|parser| parser.logical_for(true))?
             }
-            Tok::Kw(Kw::If) => self.if_stmt()?,
+            Tok::Kw(Kw::If) => self.nested(Self::if_stmt)?,
             Tok::Kw(Kw::Else) => return Err(self.error("`else` without a matching `if`".into())),
             Tok::Indent => return Err(self.error("unexpected indentation".into())),
             _ => return self.simple_statements(out),
@@ -1591,7 +1652,7 @@ impl Parser {
         if self.eat_kw(Kw::Else) {
             els = Some(if self.at_kw(Kw::If) {
                 let start = self.span();
-                let kind = self.if_stmt()?;
+                let kind = self.nested(Self::if_stmt)?;
                 let span = start.to(self.prev_span());
                 Block {
                     stmts: vec![Stmt { kind, span }],
@@ -1617,7 +1678,7 @@ impl Parser {
 
     fn pattern_atom(&mut self) -> PResult<Pattern> {
         if self.eat_op(Op::LParen) {
-            let inner = self.pattern()?;
+            let inner = self.nested(Self::pattern)?;
             self.expect_op(Op::RParen)?;
             return Ok(inner);
         }
@@ -1641,6 +1702,11 @@ impl Parser {
 
     /// The statement and whether a region value already consumed the end of its line.
     fn simple_statement(&mut self) -> PResult<(Stmt, bool)> {
+        self.nested(Self::open_simple_statement)
+    }
+
+    /// [`Parser::simple_statement`], open on the parse's path.
+    fn open_simple_statement(&mut self) -> PResult<(Stmt, bool)> {
         let start = self.span();
         let mut ended = false;
         let kind = match self.peek() {
@@ -1711,8 +1777,14 @@ impl Parser {
 
     // ---- expressions ----
 
+    /// An expression, refused where it nests, under what is open above it,
+    /// past [`MAX_NESTING`].
     fn expr(&mut self) -> PResult<Expr> {
-        self.expr_bp(0)
+        let expr = self.nested(|parser| parser.expr_bp(0))?;
+        if self.open + nesting(&expr) > MAX_NESTING {
+            return Err(self.too_deep(expr.span));
+        }
+        Ok(expr)
     }
 
     fn expr_bp(&mut self, min_bp: u8) -> PResult<Expr> {
@@ -1759,7 +1831,7 @@ impl Parser {
             _ => return self.postfix(),
         };
         let start = self.bump().span;
-        let expr = self.expr_bp(bp - 1)?;
+        let expr = self.nested(|parser| parser.expr_bp(bp - 1))?;
         let span = start.to(expr.span);
         Ok(Expr {
             kind: ExprKind::Unary {

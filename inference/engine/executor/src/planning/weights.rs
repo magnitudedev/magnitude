@@ -2257,7 +2257,7 @@ impl ModelLoadPlan {
 
         let vision = selection
             .vision
-            .then_some(definition.vision.as_ref())
+            .then_some(definition.vision.as_deref())
             .flatten()
             .map(|vision| {
                 let (projector_identity, projector_tensors) =

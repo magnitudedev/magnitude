@@ -148,13 +148,13 @@ fn every_admitted_catalog_target_derives_complete_terms_on(backend: BackendName)
     let derived = std::thread::scope(|scope| {
         let workers = (0..threads.min(targets.len()))
             .map(|_| {
-                scope.spawn(|| {
+                seismic::threads::spawn_scoped(scope, "catalog-derive", || {
                     let mut derived = Vec::new();
                     while let Some(component) = targets.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
                         derived.push((component.model.as_str(), derive_target(component, backend, required(component.model.as_str()))));
                     }
                     derived
-                })
+                }).expect("invariant violated: the host starts a thread")
             })
             .collect::<Vec<_>>();
         workers.into_iter().flat_map(|worker| worker.join().unwrap()).collect::<BTreeMap<_, _>>()

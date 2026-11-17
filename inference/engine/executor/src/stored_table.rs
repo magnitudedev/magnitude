@@ -680,18 +680,16 @@ impl StoredTable {
         }
         let filler = {
             let shared = shared.clone();
-            std::thread::Builder::new()
-                .name("stored-table-filler".into())
-                .spawn(move || {
-                    // A filler that panics fails every step whose gate it
-                    // had not opened and opens them, so none waits on it,
-                    // then ends with the panic (`Drop` joins it).
-                    if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| shared.fill())) {
-                        shared.died(panic.as_ref());
-                        std::panic::resume_unwind(panic);
-                    }
-                })
-                .map_err(|error| failed(&error))?
+            seismic::threads::spawn("stored-table-filler", move || {
+                // A filler that panics fails every step whose gate it
+                // had not opened and opens them, so none waits on it,
+                // then ends with the panic (`Drop` joins it).
+                if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| shared.fill())) {
+                    shared.died(panic.as_ref());
+                    std::panic::resume_unwind(panic);
+                }
+            })
+            .map_err(|error| failed(&error))?
         };
         Ok(Self {
             shared,

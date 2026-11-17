@@ -188,7 +188,7 @@ impl Hot {
         let words = Arc::new(words);
         let stop = Arc::new(AtomicBool::new(false));
         let (classed, class) = std::sync::mpsc::sync_channel(1);
-        let reader = std::thread::spawn({
+        let reader = seismic::threads::spawn("store-reader", {
             let (words, stop) = (words.clone(), stop.clone());
             move || {
                 let yields = yielding();
@@ -207,7 +207,8 @@ impl Hot {
                     }
                 }
             }
-        });
+        })
+        .expect("invariant violated: the host starts a thread");
         let held = Self { words, stop, reader: Some(reader) };
         class.recv().map_err(|_| "the reading thread ended before taking its class".to_owned())??;
         Ok(held)

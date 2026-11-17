@@ -21,7 +21,7 @@ use std::{
     pin::Pin,
     sync::{Arc, Condvar, Mutex},
     task::{Context, Poll, Waker},
-    thread::{self, JoinHandle},
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
@@ -420,28 +420,26 @@ impl<C: Clone + Send + From<Panicked> + 'static> Worker<C> {
         });
         let queue = mailbox.clone();
         let (ready, receive) = std::sync::mpsc::sync_channel(1);
-        let thread = thread::Builder::new()
-            .name("magnitude-execution".into())
-            .spawn(move || {
-                let wakes = WorkerWakeHandle {
-                    mailbox: queue.clone(),
-                };
-                let made = catch_unwind(AssertUnwindSafe(|| factory(wakes)))
-                    .map_err(|_| SpawnError::Panicked)
-                    .and_then(|made| made.map_err(SpawnError::Factory));
-                match made {
-                    Ok((mut owner, readiness)) => {
-                        let _ = ready.send(Ok(readiness));
-                        let cause = catch_unwind(AssertUnwindSafe(|| run(owner.as_mut(), &queue)))
-                            .unwrap_or_else(|_| C::from(Panicked));
-                        queue.stop(cause);
-                    }
-                    Err(error) => {
-                        let _ = ready.send(Err(error));
-                    }
+        let thread = seismic_threads::spawn("magnitude-execution", move || {
+            let wakes = WorkerWakeHandle {
+                mailbox: queue.clone(),
+            };
+            let made = catch_unwind(AssertUnwindSafe(|| factory(wakes)))
+                .map_err(|_| SpawnError::Panicked)
+                .and_then(|made| made.map_err(SpawnError::Factory));
+            match made {
+                Ok((mut owner, readiness)) => {
+                    let _ = ready.send(Ok(readiness));
+                    let cause = catch_unwind(AssertUnwindSafe(|| run(owner.as_mut(), &queue)))
+                        .unwrap_or_else(|_| C::from(Panicked));
+                    queue.stop(cause);
                 }
-            })
-            .map_err(SpawnError::Thread)?;
+                Err(error) => {
+                    let _ = ready.send(Err(error));
+                }
+            }
+        })
+        .map_err(SpawnError::Thread)?;
         let worker = Self {
             mailbox,
             thread: Some(thread),
@@ -882,7 +880,7 @@ mod tests {
         let deadline = Instant::now() + TIMEOUT;
         while client.stopped().is_none() {
             assert!(Instant::now() < deadline);
-            thread::yield_now();
+            std::thread::yield_now();
         }
         assert_eq!(client.stopped(), Some("device lost".into()));
         assert!(matches!(

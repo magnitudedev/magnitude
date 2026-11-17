@@ -316,7 +316,12 @@ async fn memory(State(identity): State<Identity>) -> Response {
 /// starts itself as for a model's Prepare.
 const WORKER_ARGUMENT: &str = "--worker";
 
+/// The process's work runs on the owner's stack, never on the platform's main thread.
 fn main() {
+    seismic_threads::run("magnitude-main", start)
+}
+
+fn start() {
     magnitude_executor::diagnostics::install();
     magnitude_executor::platform::relax_gpu_watchdog();
     if std::env::args().nth(1).as_deref() == Some(WORKER_ARGUMENT) {
@@ -436,10 +441,7 @@ fn run() -> Result<(), String> {
                 .with_state(serving.clone()),
         )
         .merge(magnitude_serving::router(serving));
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| error.to_string())?;
+    let runtime = seismic_threads::runtime().map_err(|error| error.to_string())?;
     runtime.block_on(async move {
         let address = format!("{}:{}", options.host, options.port);
         let listener = tokio::net::TcpListener::bind(&address)

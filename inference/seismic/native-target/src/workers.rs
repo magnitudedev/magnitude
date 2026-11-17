@@ -128,10 +128,8 @@ impl Workers {
         if state.jobs.len() > state.idle && state.threads.len() < self.width {
             let shared = self.shared.clone();
             state.threads.push(
-                std::thread::Builder::new()
-                    .name("seismic-worker".into())
-                    .spawn(move || shared.work())
-                    .expect("the host starts a worker thread"),
+                seismic_threads::spawn("seismic-worker", move || shared.work())
+                .expect("the host starts a worker thread"),
             );
         }
         drop(state);

@@ -311,17 +311,15 @@ pub fn install_parent_watchdog() -> anyhow::Result<()> {
         unsafe { libc::getppid() } == parent,
         "owning ICN exited during worker startup"
     );
-    std::thread::Builder::new()
-        .name("icn-worker-parent-watchdog".to_owned())
-        .spawn(move || {
-            loop {
-                if unsafe { libc::getppid() } != parent {
-                    unsafe { libc::_exit(91) };
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
+    seismic::threads::spawn("icn-worker-parent-watchdog", move || {
+        loop {
+            if unsafe { libc::getppid() } != parent {
+                unsafe { libc::_exit(91) };
             }
-        })
-        .context("cannot start native worker parent watchdog")?;
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    })
+    .context("cannot start native worker parent watchdog")?;
     Ok(())
 }
 
@@ -365,18 +363,16 @@ pub fn install_parent_watchdog() -> anyhow::Result<()> {
         initial == WAIT_TIMEOUT,
         "owning ICN is not alive during worker startup"
     );
-    std::thread::Builder::new()
-        .name("icn-worker-parent-watchdog".to_owned())
-        .spawn(move || {
-            // SAFETY: the native thread owns the handle for its entire blocking wait.
-            let result = unsafe { WaitForSingleObject(owner.as_raw_handle(), INFINITE) };
-            if result != WAIT_OBJECT_0 {
-                eprintln!("ICN parent observation failed");
-            }
-            // Both parent loss and observation failure terminate before further worker work.
-            std::process::exit(91);
-        })
-        .context("cannot start native worker parent watchdog")?;
+    seismic::threads::spawn("icn-worker-parent-watchdog", move || {
+        // SAFETY: the native thread owns the handle for its entire blocking wait.
+        let result = unsafe { WaitForSingleObject(owner.as_raw_handle(), INFINITE) };
+        if result != WAIT_OBJECT_0 {
+            eprintln!("ICN parent observation failed");
+        }
+        // Both parent loss and observation failure terminate before further worker work.
+        std::process::exit(91);
+    })
+    .context("cannot start native worker parent watchdog")?;
     Ok(())
 }
 

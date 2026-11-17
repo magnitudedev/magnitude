@@ -273,7 +273,7 @@ pub fn inspect_components(
             },
         },
         head,
-        vision,
+        vision: vision.map(Box::new),
         draft: None,
     };
     definition

@@ -1485,14 +1485,14 @@ fn scan(
                 .iter()
                 .map(|root| {
                     let declared = &declared;
-                    scope.spawn(move || {
+                    seismic_threads::spawn_scoped(scope, "inventory-scan", move || {
                         crate::local_roots::scan_root(
                             root,
                             declared,
                             cache,
                             &config.architectures,
                         )
-                    })
+                    }).expect("invariant violated: the host starts a thread")
                 })
                 .collect::<Vec<_>>()
                 .into_iter()
@@ -1602,7 +1602,7 @@ fn scan(
         let enriched = std::thread::scope(|scope| {
             candidates
                 .iter()
-                .map(|candidate| scope.spawn(move || enrich_candidate(candidate, cache)))
+                .map(|candidate| seismic_threads::spawn_scoped(scope, "inventory-enrich", move || enrich_candidate(candidate, cache)).expect("invariant violated: the host starts a thread"))
                 .collect::<Vec<_>>()
                 .into_iter()
                 .map(|handle| {

@@ -559,13 +559,11 @@ impl Parks {
     /// ([`Self::settle_held`]), so a keeper with nothing to act on wakes no
     /// host job.
     pub(super) fn keep(parks: Arc<Self>) -> Result<JoinHandle<()>, String> {
-        std::thread::Builder::new()
-            .name("expert-parks".into())
-            .spawn(move || {
-                seismic_io::waited_on();
-                while parks.look() {}
-            })
-            .map_err(|error| format!("expert parks' keeper: {error}"))
+        seismic::threads::spawn("expert-parks", move || {
+            seismic_io::waited_on();
+            while parks.look() {}
+        })
+        .map_err(|error| format!("expert parks' keeper: {error}"))
     }
 }
 

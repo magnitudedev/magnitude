@@ -190,9 +190,7 @@ impl DirectoryStore {
         }
         self.written.store(0, Ordering::Relaxed);
         let (root, capacity, layout) = (self.root.clone(), self.capacity, self.layout);
-        match std::thread::Builder::new()
-            .name("seismic-evict".into())
-            .spawn(move || evict(&root, capacity, layout))
+        match seismic_threads::spawn("seismic-evict", move || evict(&root, capacity, layout))
         {
             Ok(under_way) => *eviction = Some(under_way),
             Err(error) => tracing::warn!("artifact store: the eviction of {} does not start: {error}", self.root.display()),

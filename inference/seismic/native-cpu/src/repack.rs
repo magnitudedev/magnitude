@@ -304,12 +304,12 @@ impl RowConversion {
         let per_thread = work.len().div_ceil(threads);
         std::thread::scope(|scope| {
             for pieces in work.chunks_mut(per_thread) {
-                scope.spawn(move || {
+                seismic_threads::spawn_scoped(scope, "repack", move || {
                     for (record, rows, stored) in pieces {
                         self.piece(k, n, rows.clone(), record, stored)
                             .expect("a tensor's pieces are whole rows and their tiles");
                     }
-                });
+                }).expect("invariant violated: the host starts a thread");
             }
         });
         Some(output)

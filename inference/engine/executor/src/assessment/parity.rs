@@ -433,7 +433,7 @@ fn every_target_is_placed_whole_wherever_the_resident_planner_fits_it(backend: B
     let mut rows: Vec<Row> = std::thread::scope(|scope| {
         let workers = (0..threads)
             .map(|_| {
-                scope.spawn(|| {
+                seismic::threads::spawn_scoped(scope, "parity-rows", || {
                     let mut rows = Vec::new();
                     while let Some(&(target, machine)) = jobs.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
                         let (name, definition, manifest) = (&target.0, &target.1, &target.2);
@@ -475,7 +475,7 @@ fn every_target_is_placed_whole_wherever_the_resident_planner_fits_it(backend: B
                         }
                     }
                     rows
-                })
+                }).expect("invariant violated: the host starts a thread")
             })
             .collect::<Vec<_>>();
         workers.into_iter().flat_map(|worker| worker.join().unwrap()).collect::<Vec<_>>()

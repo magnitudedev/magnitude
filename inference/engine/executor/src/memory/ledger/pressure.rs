@@ -153,17 +153,15 @@ impl Pressure {
         let (waker, stopped) = (events.waker(), Arc::new(AtomicBool::new(false)));
         let wake = Box::new(move || waker.wake());
         let (stopping, pressure) = (stopped.clone(), self.clone());
-        let thread = std::thread::Builder::new()
-            .name("magnitude-memory-pressure".into())
-            .spawn(move || loop {
-                match events.wait() {
-                    _ if stopping.load(Ordering::Acquire) => return,
-                    seismic::Wake::Pressure => pressure.event(watch),
-                    seismic::Wake::Lost => pressure.lose(),
-                    seismic::Wake::Asked => {}
-                }
-            })
-            .expect("invariant violated: the memory pressure thread could not start");
+        let thread = seismic::threads::spawn("magnitude-memory-pressure", move || loop {
+            match events.wait() {
+                _ if stopping.load(Ordering::Acquire) => return,
+                seismic::Wake::Pressure => pressure.event(watch),
+                seismic::Wake::Lost => pressure.lose(),
+                seismic::Wake::Asked => {}
+            }
+        })
+        .expect("invariant violated: the memory pressure thread could not start");
         Thread { watch, wake, stopped, thread: Some(thread) }
     }
 }

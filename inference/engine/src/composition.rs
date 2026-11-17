@@ -335,15 +335,13 @@ pub fn start_in_process(
     let attempt = |unprepared| -> Result<LoadAttempt<ReadyEngine>, LoadError> {
         let (host_end, worker_end) = channel_pair();
         let worker_manifest = manifest.clone();
-        let worker = std::thread::Builder::new()
-            .name("magnitude-worker".into())
-            .spawn(move || {
-                let exit = run_worker(worker_manifest, unprepared, worker_end);
-                tracing::info!("in-process worker exited: {exit:?}");
-            })
-            .map_err(|error| LoadError::Internal {
-                reason: error.to_string(),
-            })?;
+        let worker = seismic::threads::spawn("magnitude-worker", move || {
+            let exit = run_worker(worker_manifest, unprepared, worker_end);
+            tracing::info!("in-process worker exited: {exit:?}");
+        })
+        .map_err(|error| LoadError::Internal {
+            reason: error.to_string(),
+        })?;
         // An attempt that did not load has released everything it opened
         // once its thread ends, which it does as its transport closes: its
         // device among them, so the jobs that settle its pending prices
@@ -355,8 +353,8 @@ pub fn start_in_process(
             outcome
         };
         match connect_worker(host_end, None, |update| (progress.borrow_mut())(update)) {
-            Ok(LoadAttempt::Loaded(connection)) => ReadyEngine::new(Arc::clone(&host), connection)
-                .map(LoadAttempt::Loaded)
+            Ok(LoadAttempt::Loaded(connection)) => ReadyEngine::new(Arc::clone(&host), *connection)
+                .map(|ready| LoadAttempt::Loaded(Box::new(ready)))
                 .map_err(|mismatch| LoadError::Internal {
                     reason: mismatch.to_string(),
                 }),

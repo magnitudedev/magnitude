@@ -1492,7 +1492,7 @@ fn vision_definition() -> ModelDefinition {
     };
     let stored = |name: &str, shape: &[u64]| WeightDescriptor::stored(name, shape);
     let mut definition = tiny_definition();
-    definition.vision = Some(VisionDescription {
+    definition.vision = Some(Box::new(VisionDescription {
         activation_dtype: ActivationDType::BF16,
         hidden: 128,
         output_hidden: definition.decoder.hidden,
@@ -1532,7 +1532,7 @@ fn vision_definition() -> ModelDefinition {
             feed_forward: None,
             output_norm: None,
         },
-    });
+    }));
     definition
 }
 
@@ -1604,7 +1604,7 @@ fn an_image_encodes_its_declared_cells_and_one_launch_when_bidirectional() {
     assert_eq!(crate::image_cell_limit(&tiny_definition(), 2, any).unwrap(), 0);
     let mut definition = vision_definition();
     assert_eq!(crate::image_cell_limit(&definition, 2, any).unwrap(), 4);
-    let vision = definition.vision.as_mut().unwrap();
+    let vision = definition.vision.as_deref_mut().unwrap();
     vision.preprocessing.resize = VisionResize::PixelBounds {
         min_pixels: 16,
         max_pixels: 1 << 30,
@@ -1632,7 +1632,7 @@ fn a_cpu_encodes_fewer_image_cells_than_a_gpu() {
     use seismic::BackendName;
     assert!(crate::CPU_IMAGE_CELLS < crate::MAX_IMAGE_CELLS);
     let mut definition = vision_definition();
-    definition.vision.as_mut().unwrap().preprocessing.resize = VisionResize::PixelBounds {
+    definition.vision.as_deref_mut().unwrap().preprocessing.resize = VisionResize::PixelBounds {
         min_pixels: 16,
         max_pixels: 1 << 30,
     };

@@ -560,7 +560,7 @@ impl AttestedPrograms {
             )));
         }
         if let (Some(handles), Some(vision), Some(_)) =
-            (&self.vision, definition.vision.as_ref(), vision_plan)
+            (&self.vision, definition.vision.as_deref(), vision_plan)
         {
             let patch_rows = crate::programs::native_vision::image_patch_classes(
                 limits.max_image_cells,
@@ -1412,7 +1412,7 @@ impl AttestedPrograms {
             &attested,
             topology,
             &definition.decoder,
-            definition.vision.as_ref(),
+            definition.vision.as_deref(),
             load,
             tuning.numerical_profile,
             tuning.cache,

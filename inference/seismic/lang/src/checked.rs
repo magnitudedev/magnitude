@@ -119,6 +119,9 @@ pub enum DiagnosticRule {
     Placement,
     Atomic,
     Recursion,
+    /// A body nested deeper than a checked program may be, which bounds the
+    /// stack its decode needs.
+    Nesting,
     NativeDeclaration,
 }
 
@@ -137,6 +140,7 @@ impl DiagnosticRule {
             Self::Placement => "Placement",
             Self::Atomic => "Atomic",
             Self::Recursion => "Recursion",
+            Self::Nesting => "Nesting",
             Self::NativeDeclaration => "NativeDeclaration",
         }
     }

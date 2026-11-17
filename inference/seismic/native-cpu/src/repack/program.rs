@@ -1598,7 +1598,7 @@ impl StreamProgram {
         };
         std::thread::scope(|scope| {
             for (index, output) in output.chunks_mut(chunk * units * per_unit).enumerate() {
-                scope.spawn(move || run(index * chunk, output));
+                seismic_threads::spawn_scoped(scope, "repack-program", move || run(index * chunk, output)).expect("invariant violated: the host starts a thread");
             }
         });
         output
@@ -1686,7 +1686,7 @@ impl PacketForms {
         let per_thread = rows.div_ceil(threads(source.len()));
         std::thread::scope(|scope| {
             for (index, output) in output.chunks_mut(per_thread * row_packets * form).enumerate() {
-                scope.spawn(move || {
+                seismic_threads::spawn_scoped(scope, "repack-program", move || {
                     let mut executor = program.executor();
                     let mut sources = Vec::with_capacity(program.row_segments());
                     for (row, out) in output.chunks_mut(row_packets * form).enumerate() {
@@ -1716,7 +1716,7 @@ impl PacketForms {
                             out.copy_from_slice(&executor.run()[..out.len()]);
                         }
                     }
-                });
+                }).expect("invariant violated: the host starts a thread");
             }
         });
         output

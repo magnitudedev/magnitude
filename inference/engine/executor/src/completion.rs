@@ -1,9 +1,6 @@
 use crate::error::DeviceError;
 use seismic::NativeGraphCompletion;
-use std::{
-    sync::{Arc, Condvar, Mutex, mpsc},
-    thread,
-};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 
 /// Exactly one wake for an outstanding executor completion, independent of the
 /// bounded control queue. Completion owners may move it across threads.
@@ -72,14 +69,12 @@ pub(crate) struct CompletionWaiter {
 impl CompletionWaiter {
     pub(crate) fn spawn() -> Result<Self, String> {
         let (jobs, receiver) = mpsc::channel::<WaitJob>();
-        thread::Builder::new()
-            .name("magnitude-device-wait".into())
-            .spawn(move || {
-                while let Ok(job) = receiver.recv() {
-                    job();
-                }
-            })
-            .map_err(|error| format!("device completion waiter did not start: {error}"))?;
+        seismic::threads::spawn("magnitude-device-wait", move || {
+            while let Ok(job) = receiver.recv() {
+                job();
+            }
+        })
+        .map_err(|error| format!("device completion waiter did not start: {error}"))?;
         Ok(Self { jobs })
     }
 
@@ -261,7 +256,7 @@ mod tests {
         };
         let (started, entered) = mpsc::sync_channel(0);
         let (finished, dropped) = mpsc::channel();
-        let owner = thread::spawn(move || {
+        let owner = std::thread::spawn(move || {
             started.send(()).unwrap();
             drop(completion);
             finished.send(()).unwrap();

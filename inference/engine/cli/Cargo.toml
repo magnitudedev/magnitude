@@ -18,5 +18,6 @@ magnitude-executor = { path = "../executor" }
 magnitude-serving = { path = "../serving" }
 magnitude-state = { path = "../state" }
 seismic.workspace = true
+seismic-threads = { workspace = true, features = ["tokio"] }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal"] }

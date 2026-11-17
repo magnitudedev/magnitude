@@ -92,10 +92,9 @@ fn main() -> anyhow::Result<()> {
     let process_started = Instant::now();
     magnitude_engine::telemetry::log_to_stderr().map_err(anyhow::Error::msg)?;
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(assess_catalog(arguments, process_started))
+    seismic_threads::run("magnitude-main", move || {
+        seismic_threads::runtime()?.block_on(assess_catalog(arguments, process_started))
+    })
 }
 
 async fn assess_catalog(arguments: Vec<String>, process_started: Instant) -> anyhow::Result<()> {

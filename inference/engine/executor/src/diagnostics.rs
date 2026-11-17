@@ -127,7 +127,7 @@ pub fn install() {
         }
         WAKE.store(fds[1] as u64, Ordering::Relaxed);
         let reader = fds[0];
-        std::thread::Builder::new().name("diagnostics".into()).spawn(move || {
+        seismic::threads::spawn("diagnostics", move || {
             let mut byte = 0u8;
             // SAFETY: reading one byte into a local from the pipe's read end.
             while unsafe { libc::read(reader, (&mut byte as *mut u8).cast(), 1) } == 1 {

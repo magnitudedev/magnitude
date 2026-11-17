@@ -540,10 +540,8 @@ impl DeviceTable {
         let (reads, taken) = mpsc::channel();
         let filler = {
             let shared = shared.clone();
-            std::thread::Builder::new()
-                .name("device-table-filler".into())
-                .spawn(move || shared.fill_reads(taken))
-                .map_err(|error| failed(&error))?
+            seismic::threads::spawn("device-table-filler", move || shared.fill_reads(taken))
+            .map_err(|error| failed(&error))?
         };
         let table = Self {
             settled: Default::default(),

@@ -263,6 +263,97 @@ pub(crate) enum Stmt {
     Evaluate(Expr),
 }
 
+/// The deepest a body nests: the most statements and expressions on one
+/// path from its root ([`Body::nesting`]). The parser refuses source nested
+/// deeper as it parses it (`DiagnosticRule::Nesting`), so no walk of the
+/// source (the parser's, the checker's) recurses deeper; the checker refuses
+/// a checked body nested deeper, so neither does monomorphization nor the
+/// encode; and a bundle decodes only the checksummed bytes encoded from a
+/// checked module, so no decode recurses deeper either.
+///
+/// The bound is what makes every walk of a program a bounded stack need
+/// ([`WALK_STACK_BYTES`], within `seismic_threads::PROGRAM_BYTES`) rather
+/// than one that follows whatever a program nests. On the 2026-11-17 LFM3
+/// load's stack, the path being
+/// decoded nested 9 statements and 3 expressions; 128 leaves programs an
+/// order of magnitude past that.
+pub(crate) const MAX_NESTING: usize = 128;
+
+/// The most stack one level of [`MAX_NESTING`] takes in any walk of a
+/// program (parsing, checking, monomorphizing, encoding, decoding) in an
+/// unoptimized build, from the stack walks of programs nested 60 and 120
+/// levels deep need (aarch64 macOS, 2026-11-17): a statement level's
+/// monomorphization 12.8 KiB, its check 9.6 KiB and its decode about
+/// 11 KiB; an expression level's or a call's 8 to 10.4 KiB. Optimized
+/// levels take at most 4.3 KiB.
+const WALK_LEVEL_BYTES: usize = 13 << 10;
+
+/// The stack of a walk beside its levels: the frames above the outermost
+/// level and below the innermost, which measured 48 KiB. Tuple-shaped parts
+/// (patterns, places, value tuples) nest only as deep as a tuple type, a few
+/// levels, within it.
+const WALK_FRAME_BYTES: usize = 64 << 10;
+
+/// The most stack any walk of a checked program needs (1.69 MiB):
+/// [`MAX_NESTING`] levels and the frames around them.
+const WALK_STACK_BYTES: usize = MAX_NESTING * WALK_LEVEL_BYTES + WALK_FRAME_BYTES;
+
+// The process's threads are sized for every walk's whole need.
+const _: () = assert!(WALK_STACK_BYTES <= seismic_threads::PROGRAM_BYTES);
+
+impl Body {
+    /// The most statements and expressions on one path from the body's
+    /// root, each statement and each expression a level.
+    pub(crate) fn nesting(&self) -> usize {
+        self.result.iter().map(Expr::nesting).fold(self.root.nesting(), usize::max)
+    }
+}
+
+impl Block {
+    fn nesting(&self) -> usize {
+        self.statements.iter().map(Stmt::nesting).max().unwrap_or(0)
+    }
+}
+
+impl Stmt {
+    fn nesting(&self) -> usize {
+        1 + match self {
+            Stmt::Let { value, .. } | Stmt::Evaluate(value) => value.nesting(),
+            Stmt::Assign { place, value, .. } => place.nesting().max(value.nesting()),
+            Stmt::Loop { start, end, body, .. } => start.nesting().max(end.nesting()).max(body.nesting()),
+            Stmt::If { condition, then_body, else_body, .. } => {
+                condition.nesting().max(then_body.nesting()).max(else_body.nesting())
+            }
+        }
+    }
+}
+
+impl Place {
+    fn nesting(&self) -> usize {
+        match self {
+            Place::Local(_) => 0,
+            Place::Element { indices, .. } => indices_nesting(indices),
+            Place::Tuple(places) => places.iter().map(Place::nesting).max().unwrap_or(0),
+        }
+    }
+}
+
+fn indices_nesting(indices: &[Index]) -> usize {
+    indices
+        .iter()
+        .map(|index| match index {
+            Index::Point { value, .. } => value.nesting(),
+            Index::Range { start, end, .. } => start.iter().chain(end).map(Expr::nesting).max().unwrap_or(0),
+            Index::Full => 0,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn deepest(exprs: &[Expr]) -> usize {
+    exprs.iter().map(Expr::nesting).max().unwrap_or(0)
+}
+
 /// Source-level loop semantics, independent of any physical execution width.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) enum LoopKind {
@@ -509,6 +600,20 @@ pub(crate) struct Expr {
     pub span: Span,
 }
 impl Expr {
+    fn nesting(&self) -> usize {
+        1 + match &self.kind {
+            ExprKind::Literal(_) | ExprKind::Dimension(_) | ExprKind::Local(_) => 0,
+            ExprKind::Primitive { operands, .. } => deepest(operands),
+            ExprKind::Intrinsic { args, .. } => deepest(args),
+            ExprKind::Call { call, args } => {
+                call.seeds.iter().map(|(_, seed)| seed.nesting()).fold(deepest(args), usize::max)
+            }
+            ExprKind::Atomic { indices, value, .. } => indices_nesting(indices).max(value.nesting()),
+            ExprKind::PlaneView { base, .. } => base.nesting(),
+            ExprKind::IndexPosition(word) => word.nesting(),
+        }
+    }
+
     pub(crate) fn new(kind: ExprKind, ty: ValueType, meaning: Option<IntExpr>, span: Span) -> Expr {
         Expr { kind, ty, value: meaning.map_or(SourceValue::Untracked, |meaning| SourceValue::Scalar(SourceScalar::Quantity { meaning, binding: None })), span }
     }

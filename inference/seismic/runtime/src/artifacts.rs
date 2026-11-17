@@ -196,9 +196,7 @@ impl ProgramStore {
     fn run(&self, store: Store) {
         let worker = self.worker.get_or_init(|| {
             let (sender, stores) = std::sync::mpsc::channel::<Store>();
-            match std::thread::Builder::new()
-                .name("seismic-store".into())
-                .spawn(move || stores.into_iter().for_each(|store| store()))
+            match seismic_threads::spawn("seismic-store", move || stores.into_iter().for_each(|store| store()))
             {
                 Ok(_) => Some(sender),
                 Err(error) => {

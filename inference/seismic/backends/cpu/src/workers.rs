@@ -733,9 +733,7 @@ impl Workers {
         let mut threads = Vec::with_capacity(count - 1);
         for ordinal in 1..count {
             let shared = shared.clone();
-            let thread = std::thread::Builder::new()
-                .name(format!("seismic-cpu-{ordinal}"))
-                .spawn(move || work(&shared, ordinal))?;
+            let thread = seismic_threads::spawn(format!("seismic-cpu-{ordinal}"), move || work(&shared, ordinal))?;
             threads.push(thread);
         }
         shared

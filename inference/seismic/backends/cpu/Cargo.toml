@@ -12,6 +12,7 @@ seismic-lang.workspace = true
 seismic-native-target.workspace = true
 seismic-compiler.workspace = true
 seismic-memory.workspace = true
+seismic-threads.workspace = true
 sha2 = "=0.11.0"
 libc = "0.2"
 cranelift-codegen = "=0.125.4"

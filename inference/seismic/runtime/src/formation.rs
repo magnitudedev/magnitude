@@ -89,39 +89,16 @@ pub(crate) enum FormationClass {
     Compiled,
 }
 
-/// The stack of each thread a toolchain call runs on. A call hands its
-/// program to the platform's compiler (NVRTC, or a Vulkan or Metal driver's
-/// shader compiler), whose recursion depth follows the program and the
-/// driver, neither of which the caller chose, so no toolchain call runs on
-/// its caller's stack ([`on_compiler_stack`]).
-///
-/// Measured on an RTX 3090, driver 570.211.01, with its pipeline cache off
-/// (2026-11-07): forming `attention_decode_k8v4` (kv 1, g 16, s 512) drove
-/// NVIDIA's SPIR-V compiler (`libnvidia-glvkspirv`) through two functions
-/// recursing in turn, 640 B and about 390 B a frame. On a 2 MiB libtest
-/// thread it overflowed about 4,050 frames in; on a compiler thread it
-/// touched 2,260,992 B of stack at its peak, of which Seismic's frames
-/// above the driver were at most 9,136 B. The stack is 16 MiB: seven
-/// times that peak, so a program several times deeper than the deepest
-/// measured still forms. It is address space reserved for the thread's
-/// life; only the pages a compile touches are committed.
-const COMPILER_STACK_BYTES: usize = 16 << 20;
-
-/// `call` on a thread of the former's, with [`COMPILER_STACK_BYTES`] of
-/// stack, while the caller waits: what a platform compiler needs of its
-/// stack is never what the calling thread happens to have. A thread is
-/// started for each call, which costs microseconds beside a compile or a
-/// platform load, and the callers that wait bound how many run at once.
+/// `call` on a thread of the former's ([`seismic_threads::run`]) while the
+/// caller waits. A call hands its program to the platform's compiler (NVRTC,
+/// or a Vulkan or Metal driver's shader compiler), whose recursion depth
+/// follows the program and the driver, neither of which the caller chose,
+/// so no toolchain call runs on its caller's stack, whoever started that
+/// thread. A thread is started for each call, which costs microseconds
+/// beside a compile or a platform load, and the callers that wait bound how
+/// many run at once.
 fn on_compiler_stack<R: Send>(call: impl FnOnce() -> R + Send) -> R {
-    std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .name(COMPILER_THREAD.into())
-            .stack_size(COMPILER_STACK_BYTES)
-            .spawn_scoped(scope, call)
-            .expect("the host starts a compiler thread")
-            .join()
-            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-    })
+    seismic_threads::run(COMPILER_THREAD, call)
 }
 
 /// The name of every thread a toolchain call runs on.
@@ -740,9 +717,9 @@ mod tests {
         ) -> Result<(Names, Vec<String>), NativeCompilationError> {
             self.ran();
             if source.text == "deep" {
-                // 8 MiB of stack: four times a libtest thread's.
+                // Half the owner's stack: more than twice a libtest thread's.
                 let start = std::hint::black_box(0u8);
-                std::hint::black_box(deep(&start as *const u8 as usize, 8 << 20));
+                std::hint::black_box(deep(&start as *const u8 as usize, seismic_threads::STACK_BYTES / 2));
             }
             self.compiles.fetch_add(1, Ordering::SeqCst);
             self.entries.fetch_add(source.entries.len(), Ordering::SeqCst);
@@ -867,7 +844,7 @@ mod tests {
     fn every_toolchain_call_runs_on_a_compiler_thread_whatever_its_caller_holds() {
         let store = Arc::new(Held::default());
         let first = former(Some(store.clone()));
-        // A caller with 1 MiB of stack forms a compile that takes 8.
+        // A caller with 1 MiB of stack forms a compile that takes several.
         std::thread::Builder::new()
             .stack_size(1 << 20)
             .spawn(move || {

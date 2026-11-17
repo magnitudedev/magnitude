@@ -42,17 +42,15 @@ impl StorageThread {
         let every = seismic::Processors::discover().map_err(|error| format!("the host's processors: {error}"))?.allowed().iter().copied().collect::<Vec<_>>();
         let (work, received) = std::sync::mpsc::channel::<Work>();
         let (placed, placement) = std::sync::mpsc::sync_channel(1);
-        let thread = std::thread::Builder::new()
-            .name(name.into())
-            .spawn(move || {
-                let pinned = seismic::pin(&every);
-                let serves = pinned.is_ok();
-                placed.send(pinned).expect("a storage thread's start waits for its placement");
-                if serves {
-                    received.iter().for_each(|work| work());
-                }
-            })
-            .map_err(|error| format!("the {name} thread: {error}"))?;
+        let thread = seismic::threads::spawn(name, move || {
+            let pinned = seismic::pin(&every);
+            let serves = pinned.is_ok();
+            placed.send(pinned).expect("a storage thread's start waits for its placement");
+            if serves {
+                received.iter().for_each(|work| work());
+            }
+        })
+        .map_err(|error| format!("the {name} thread: {error}"))?;
         placement.recv().map_err(|error| format!("the {name} thread: {error}"))?.map_err(|error| format!("the {name} thread's placement: {error}"))?;
         Ok(Self {
             work: Some(work),

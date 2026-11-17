@@ -2303,6 +2303,7 @@ dependencies = [
  "magnitude-serving",
  "magnitude-state",
  "seismic",
+ "seismic-threads",
  "serde_json",
  "tokio",
 ]
@@ -2578,6 +2579,7 @@ dependencies = [
  "magnitude-family-contracts",
  "magnitude-generation",
  "magnitude-state",
+ "seismic-threads",
  "serde",
  "serde_json",
  "tracing",
@@ -2655,6 +2657,7 @@ dependencies = [
  "reqwest",
  "same-file",
  "seismic-lang",
+ "seismic-threads",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2694,6 +2697,7 @@ dependencies = [
  "opentelemetry_sdk 0.32.1",
  "reqwest",
  "seismic",
+ "seismic-threads",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -4232,6 +4236,7 @@ dependencies = [
  "seismic-lang",
  "seismic-memory",
  "seismic-native-target",
+ "seismic-threads",
  "seismic-topology",
  "sha2 0.11.0",
  "windows-sys 0.61.2",
@@ -4301,6 +4306,7 @@ name = "seismic-io"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "seismic-threads",
  "serde_json",
 ]
 
@@ -4322,6 +4328,7 @@ dependencies = [
  "num-traits",
  "postcard",
  "seismic-cpu-tiers",
+ "seismic-threads",
  "serde",
  "sha2 0.11.0",
 ]
@@ -4449,6 +4456,9 @@ dependencies = [
 [[package]]
 name = "seismic-threads"
 version = "0.1.0"
+dependencies = [
+ "tokio",
+]
 
 [[package]]
 name = "seismic-topology"

@@ -213,7 +213,7 @@ fn remove_former_artifacts(former: PathBuf) {
             Err(error) => tracing::warn!("kernel cache: cannot remove {}: {error}; its next opening removes it", former.display()),
         }
     };
-    if let Err(error) = std::thread::Builder::new().name("magnitude-cache-migrate".into()).spawn(removing) {
+    if let Err(error) = seismic::threads::spawn("magnitude-cache-migrate", removing) {
         tracing::warn!("kernel cache: the removal of what an earlier build kept does not start: {error}; its next opening removes it");
     }
 }

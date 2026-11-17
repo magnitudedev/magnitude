@@ -2437,7 +2437,7 @@ fn in_parallel<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> 
     std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(workers);
         for _ in 0..workers {
-            handles.push(scope.spawn(|| {
+            handles.push(seismic_threads::spawn_scoped(scope, "coverage", || {
                 loop {
                     let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(item) = items.get(index) else {
@@ -2449,7 +2449,7 @@ fn in_parallel<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> 
                         .expect("no worker panics holding the lock")
                         .push((index, result));
                 }
-            }));
+            }).expect("invariant violated: the host starts a thread"));
         }
         for handle in handles {
             if let Err(payload) = handle.join() {

@@ -244,19 +244,17 @@ impl MeasuredMachine for ServiceMachine {
         };
         let (worker, transport) = JobWorker::spawn(&self.launcher)?;
         let (frames, receiver) = mpsc::channel(64);
-        let reader = std::thread::Builder::new()
-            .name(format!("measurement-job-{}", worker.pid()))
-            .spawn(move || {
-                // A driver past its deadline has stopped reading: what is left is dropped.
-                let outcome = measure_worker(transport, request, |event| {
-                    let _ = frames.blocking_send(match event {
-                        MeasureEvent::Attempting(key) => JobFrame::Attempting(key),
-                        MeasureEvent::Opened => JobFrame::Opened,
-                        MeasureEvent::Recorded(key, record) => JobFrame::Recorded(key, record),
-                    });
+        let reader = seismic::threads::spawn(format!("measurement-job-{}", worker.pid()), move || {
+            // A driver past its deadline has stopped reading: what is left is dropped.
+            let outcome = measure_worker(transport, request, |event| {
+                let _ = frames.blocking_send(match event {
+                    MeasureEvent::Attempting(key) => JobFrame::Attempting(key),
+                    MeasureEvent::Opened => JobFrame::Opened,
+                    MeasureEvent::Recorded(key, record) => JobFrame::Recorded(key, record),
                 });
-                let _ = frames.blocking_send(JobFrame::Finished(outcome));
             });
+            let _ = frames.blocking_send(JobFrame::Finished(outcome));
+        });
         if let Err(error) = reader {
             worker.retire(false).map_err(|(_, error)| error)?;
             return Err(error.into());

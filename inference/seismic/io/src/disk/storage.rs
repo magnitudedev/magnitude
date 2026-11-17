@@ -97,7 +97,7 @@ impl StorageProbe {
             let readers = offsets
                 .iter()
                 .map(|offsets| {
-                    std::thread::Builder::new().spawn_scoped(scope, move || {
+                    seismic_threads::spawn_scoped(scope, "seismic-storage", move || {
                         let mut buffer = Buffer::new(FULL_READ as usize);
                         offsets.iter().try_for_each(|&at| self.file.read_block(at, buffer.bytes_mut()))
                     })

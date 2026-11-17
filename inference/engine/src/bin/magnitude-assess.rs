@@ -301,7 +301,12 @@ fn bounded_job(time: Duration, executor: ExecutorSelector, scope: Job) -> Result
     Ok((seconds, measured))
 }
 
+/// The process's work runs on the owner's stack, never on the platform's main thread.
 fn main() {
+    seismic::threads::run("magnitude-main", start)
+}
+
+fn start() {
     // The measurement job's device probes run in processes of this executable.
     seismic::serve_probe_if_asked();
     magnitude_executor::diagnostics::install();

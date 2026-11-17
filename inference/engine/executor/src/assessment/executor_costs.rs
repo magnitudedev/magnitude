@@ -1261,58 +1261,56 @@ impl ProgramSet {
             formation: Arc::default(),
         };
         let (set, device, forming) = (self.clone(), device.clone(), programs.clone());
-        let thread = std::thread::Builder::new()
-            .name("measurement-formation".into())
-            .spawn(move || {
-                let index = |format: Element| {
-                    set.expands
-                        .iter()
-                        .position(|(measured, _, _)| *measured == format)
-                        .expect("every measured format has a program")
-                };
-                let (activation, chain) = (index(Element::bf16()), index(set.chain));
-                let others = (0..set.expands.len()).filter(|&other| other != activation);
-                let decodes = others
-                    .clone()
-                    .filter(|&other| other != chain)
-                    .map(|other| Job::Expand(other, Rows::Decode));
-                let matrices = others.map(|other| Job::Expand(other, Rows::Matrix));
-                // The probe's program comes first, so the probe waits on no
-                // other compile however few the host's threads; then the
-                // programs of the plan's early points ([`plan`]), so those
-                // wait on no other format's. The attention programs are one
-                // long compile each (the affine one's 1.2 s alone on an RTX
-                // 3090's Vulkan, against 0.7 s for a decode projection):
-                // they start next, beside the short ones the weight rates
-                // read, so each has formed by its history's points.
-                let mut jobs = vec![
-                    Job::Expand(activation, Rows::Decode),
-                    Job::Affine,
-                    Job::Dense,
-                    Job::Expand(chain, Rows::Decode),
-                    Job::Copy,
-                    Job::Output,
-                    Job::Expand(activation, Rows::Matrix),
-                ];
-                // The chain's format is a backend's resident form of Q4_K,
-                // which may be the activation dtype's.
-                jobs.dedup();
-                jobs.extend(decodes.chain(matrices));
-                let formed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    seismic::Workers::of_the_host().each(&jobs, |job| match *job {
-                        _ if !forming.formation.begin(deadline) => {}
-                        job => {
-                            forming.form(&set, &device, job);
-                            forming.formation.end();
-                        }
-                    })
-                }));
-                match formed {
-                    Ok(_) => {}
-                    Err(_) => forming.abandon(),
-                }
-            })
-            .expect("the host starts the formation thread");
+        let thread = seismic::threads::spawn("measurement-formation", move || {
+            let index = |format: Element| {
+                set.expands
+                    .iter()
+                    .position(|(measured, _, _)| *measured == format)
+                    .expect("every measured format has a program")
+            };
+            let (activation, chain) = (index(Element::bf16()), index(set.chain));
+            let others = (0..set.expands.len()).filter(|&other| other != activation);
+            let decodes = others
+                .clone()
+                .filter(|&other| other != chain)
+                .map(|other| Job::Expand(other, Rows::Decode));
+            let matrices = others.map(|other| Job::Expand(other, Rows::Matrix));
+            // The probe's program comes first, so the probe waits on no
+            // other compile however few the host's threads; then the
+            // programs of the plan's early points ([`plan`]), so those
+            // wait on no other format's. The attention programs are one
+            // long compile each (the affine one's 1.2 s alone on an RTX
+            // 3090's Vulkan, against 0.7 s for a decode projection):
+            // they start next, beside the short ones the weight rates
+            // read, so each has formed by its history's points.
+            let mut jobs = vec![
+                Job::Expand(activation, Rows::Decode),
+                Job::Affine,
+                Job::Dense,
+                Job::Expand(chain, Rows::Decode),
+                Job::Copy,
+                Job::Output,
+                Job::Expand(activation, Rows::Matrix),
+            ];
+            // The chain's format is a backend's resident form of Q4_K,
+            // which may be the activation dtype's.
+            jobs.dedup();
+            jobs.extend(decodes.chain(matrices));
+            let formed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                seismic::Workers::of_the_host().each(&jobs, |job| match *job {
+                    _ if !forming.formation.begin(deadline) => {}
+                    job => {
+                        forming.form(&set, &device, job);
+                        forming.formation.end();
+                    }
+                })
+            }));
+            match formed {
+                Ok(_) => {}
+                Err(_) => forming.abandon(),
+            }
+        })
+        .expect("the host starts the formation thread");
         Formed { programs, thread: Some(thread) }
     }
 }
@@ -2409,10 +2407,8 @@ struct Releaser(Vec<std::thread::JoinHandle<()>>);
 
 impl Releaser {
     fn release(&mut self, allocations: Vec<Tensor>) {
-        let thread = std::thread::Builder::new()
-            .name("measurement-release".into())
-            .spawn(move || drop(allocations))
-            .expect("the host starts a release thread");
+        let thread = seismic::threads::spawn("measurement-release", move || drop(allocations))
+        .expect("the host starts a release thread");
         self.0.push(thread);
     }
 
