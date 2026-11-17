@@ -2,7 +2,7 @@ import { chmod, lstat, mkdir } from "node:fs/promises"
 import { dirname, join } from "node:path"
 import { Effect, Option, Schema } from "effect"
 import { NativeHost } from "./index"
-import { requestApplication } from "./application-control"
+import { DataFolderUnusable, requestApplication } from "./application-control"
 import { ApplicationOpenUrl } from "@magnitudedev/sdk/desktop-host"
 import { isUpdateInstallationActive } from "./update-installation-lease"
 import { occupiedMessage } from "./service-port"
@@ -35,6 +35,8 @@ export type ApplicationOwnerRequest = typeof ApplicationOwnerRequest.Type
  */
 const ownershipDirectoryMode = (sharedControl: boolean) => sharedControl ? 0o711 : 0o700
 
+const USABLE_FOLDER = "Check that the folder is on a local drive you can write to."
+
 const prepareOwnershipDirectory = (directory: string, sharedControl = false) => Effect.tryPromise({ try: async () => {
     // Windows creates the final directory with its private ACL inside native acquisition.
     await mkdir(process.platform === "win32" ? dirname(directory) : directory, { recursive: true, mode: ownershipDirectoryMode(sharedControl) })
@@ -43,14 +45,28 @@ const prepareOwnershipDirectory = (directory: string, sharedControl = false) => 
       if (!info.isDirectory() || info.isSymbolicLink() || info.uid !== process.getuid!()) throw new Error("Application directory must belong to the current user")
       await chmod(directory, ownershipDirectoryMode(sharedControl))
     }
-  }, catch: error => new ApplicationOwnershipFailed({ message: String(error) }) })
+  }, catch: error => new DataFolderUnusable({
+    reason: `Magnitude couldn’t prepare its data folder ${directory}. ${USABLE_FOLDER}`,
+    message: `Magnitude couldn’t prepare its data folder ${directory}: ${error instanceof Error ? error.message : String(error)}`,
+  }) })
+
+/**
+ * The kernel ownership lock in `directory`. Failing to open it names the folder, so the person can see which folder
+ * it is (on a network drive, unwritable, or a path Windows can't open) rather than being told to reinstall.
+ */
+const ownershipLock = (native: NativeHost, directory: string) => native.acquireOwnership(join(directory, "application.lock")).pipe(
+  Effect.mapError(error => new DataFolderUnusable({
+    reason: `Magnitude couldn’t take ownership of its data folder ${directory}. ${USABLE_FOLDER}`,
+    message: `Magnitude couldn’t take ownership of its data folder ${directory}: ${error.message.replace(/^Error: /, "")}`,
+  })),
+)
 
 /** A handoff requests cooperation; only acquisition of the retained kernel lock admits a new owner. */
 export const acquireApplicationOwner = (directory: string, request: ApplicationOwnerRequest, sharedControl = false) => Effect.gen(function* () {
   const native = yield* NativeHost
   yield* prepareOwnershipDirectory(directory, sharedControl)
   for (;;) {
-    const lock = yield* native.acquireOwnership(join(directory, "application.lock"))
+    const lock = yield* ownershipLock(native, directory)
     if (Option.isSome(lock)) return { _tag: "Owner" as const, socketPath: yield* native.ownedEndpoint(lock.value, directory), lock: lock.value }
     if (request._tag === "Headless") return yield* applicationAlreadyRunning(directory)
     const endpoint = yield* native.inspectEndpoint(directory)
@@ -85,7 +101,7 @@ export const acquireApplicationOwner = (directory: string, request: ApplicationO
 export const acquireApplicationMaintenance = (directory: string, sharedControl = false) => Effect.gen(function* () {
   const native = yield* NativeHost
   yield* prepareOwnershipDirectory(directory, sharedControl)
-  const lock = yield* native.acquireOwnership(join(directory, "application.lock"))
+  const lock = yield* ownershipLock(native, directory)
   if (Option.isNone(lock)) return yield* applicationAlreadyRunning(directory)
   if (yield* isUpdateInstallationActive(directory)) return yield* new ApplicationOwnershipFailed({
     message: "A Magnitude update is being installed. Retry the command when it finishes.",

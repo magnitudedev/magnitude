@@ -2,6 +2,7 @@
 #include <aclapi.h>
 #include <sddl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <wchar.h>
 
 static void require(BOOL condition, const char *message) {
@@ -20,10 +21,46 @@ static void rejects(const WCHAR *path, const char *message) {
   DWORD error = magnitude_open_private_lock(path, &file, &directory);
   require(error != ERROR_SUCCESS && file == INVALID_HANDLE_VALUE && directory == INVALID_HANDLE_VALUE, message);
 }
+static void extends(const WCHAR *full, const WCHAR *expected, const char *message) {
+  WCHAR *extended = NULL;
+  require(magnitude_extended_from_full(full, &extended) == ERROR_SUCCESS && !wcscmp(extended, expected), message);
+  free(extended);
+}
+/* A profile deeper than MAX_PATH (the tester's 302 and 339 characters) owns its lock and private files without
+ * LongPathsEnabled, which is off by default. */
+static void long_profile(const WCHAR *cwd) {
+  WCHAR deep[4096], lock[4096], updates[4096], key[4096];
+  require(swprintf(deep, 4096, L"%ls\\long-profile", cwd) > 0, "long profile root");
+  while (wcslen(deep) < 340) require(wcscat_s(deep, 4096, L"\\a-directory-name-to-pass-max-path") == 0, "deepen profile path");
+  require(swprintf(lock, 4096, L"%ls\\application.lock", deep) > 0, "long lock path");
+  require(swprintf(updates, 4096, L"%ls\\updates", deep) > 0, "long updates path");
+  require(swprintf(key, 4096, L"%ls\\key.pem", updates) > 0, "long key path");
+  WCHAR *extended = NULL; WCHAR full[4096];
+  require(swprintf(full, 4096, L"\\\\?\\%ls", cwd) > 0 && magnitude_extended_from_full(full, &extended) == ERROR_SUCCESS, "extended cwd");
+  WCHAR walk[4096]; wcscpy_s(walk, 4096, extended); free(extended);
+  for (const WCHAR *rest = deep + wcslen(cwd); *rest; ) {
+    const WCHAR *next = wcschr(rest + 1, L'\\');
+    size_t segment = next ? (size_t)(next - rest) : wcslen(rest);
+    wcsncat_s(walk, 4096, rest, segment);
+    if (next) require(CreateDirectoryW(walk, NULL) || GetLastError() == ERROR_ALREADY_EXISTS, "create long profile parents");
+    rest += segment;
+  }
+  HANDLE file, directory; WCHAR endpoint[128]; BOOL missing;
+  require(magnitude_open_private_lock(lock, &file, &directory) == ERROR_SUCCESS, "own a lock past MAX_PATH");
+  require(magnitude_inspect_application_endpoint(deep, endpoint, &missing) == ERROR_SUCCESS && !missing, "find the endpoint past MAX_PATH");
+  CloseHandle(file); CloseHandle(directory);
+  require(magnitude_prepare_private_directory(updates) == ERROR_SUCCESS, "private updates directory past MAX_PATH");
+  require(magnitude_create_private_content(key) == ERROR_SUCCESS && magnitude_validate_private_content(key) == ERROR_SUCCESS, "private file past MAX_PATH");
+}
 int wmain(void) {
   WCHAR cwd[32768], directory_path[32768], lock_path[32768], moved[32768];
   DWORD length = GetCurrentDirectoryW(32768, cwd);
   require(length > 0 && length < 32000, "bounded fixture directory");
+  extends(L"C:\\Users\\me\\AppData\\Local\\Magnitude", L"\\\\?\\C:\\Users\\me\\AppData\\Local\\Magnitude", "drive path gets the extended prefix");
+  extends(L"\\\\server\\share\\Magnitude", L"\\\\?\\UNC\\server\\share\\Magnitude", "share path gets the extended UNC prefix");
+  extends(L"\\\\?\\C:\\Magnitude", L"\\\\?\\C:\\Magnitude", "an extended path is kept");
+  extends(L"\\\\.\\pipe\\magnitude", L"\\\\.\\pipe\\magnitude", "a device path is kept");
+  long_profile(cwd);
   require(swprintf(directory_path, 32768, L"%ls\\private-state", cwd) > 0, "directory path");
   require(swprintf(lock_path, 32768, L"%ls\\application.lock", directory_path) > 0, "lock path");
   require(swprintf(moved, 32768, L"%ls\\renamed-state", cwd) > 0, "rename path");

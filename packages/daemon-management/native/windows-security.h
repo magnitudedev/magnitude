@@ -1,6 +1,10 @@
 #ifndef MAGNITUDE_WINDOWS_SECURITY_H
 #define MAGNITUDE_WINDOWS_SECURITY_H
 #include <windows.h>
+/* An absolute path in extended-length form: \\?\C:\... for a drive, \\?\UNC\server\share\... for a share, and a path
+ * already in \\?\ or \\.\ form kept as it is. Every function below opens its path in this form, so a profile deeper
+ * than MAX_PATH works without LongPathsEnabled. Caller frees `extended`. */
+DWORD magnitude_extended_from_full(const WCHAR *full, WCHAR **extended);
 /* Caller releases descriptors with LocalFree. */
 DWORD magnitude_private_descriptor(BOOL directory, PSECURITY_DESCRIPTOR *descriptor);
 /* Returns retained non-inheritable handles; the directory cannot be deleted while owned. */
