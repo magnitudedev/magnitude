@@ -34,7 +34,7 @@ pub use conveyor::{ConveyorCarrier, Lender, StagingPool};
 pub use counts::BankCounts;
 pub use layout::{BankAllocation, BankLayout, BankPart, BankSubstrate, BankTier, HostTier, Parking, PlacedAllocations, Placer};
 pub use records::{PoolSlab, RecordForm, RecordTensor, RecordTensors, RoutedTensor, routed_experts};
-pub(crate) use records::layer_homes;
+pub(crate) use records::{decode_set, layer_homes};
 pub use sizing::growth_target;
 pub(crate) use sizing::releasing;
 pub use table::BankTable;
@@ -789,11 +789,11 @@ impl ExpertBankPlan {
     /// device's DONE is the host's only once the launch's submission ends,
     /// past its park, which waits for every entry: a request's misses there
     /// hold their staging all at once, so the reserve holds the widest
-    /// request's distinct misses (its choices, at most the widest layer's
-    /// experts), and no miss waits on its own request's landings.
+    /// request's distinct misses (its decode set, [`decode_set`]), and no
+    /// miss waits on its own request's landings.
     pub fn demand_records(&self) -> u64 {
         match self.host() {
-            HostTier::Unified(Parking::AtBoundaries) => self.choices().min(self.widest().get()),
+            HostTier::Unified(Parking::AtBoundaries) => decode_set(self.selected(), self.widest().get()),
             HostTier::Unified(Parking::InKernels) | HostTier::Linked => self.selected(),
         }
     }
@@ -826,8 +826,10 @@ impl ExpertBankPlan {
         self.hint_records()
     }
 
-    /// Records a scratch round converts: half a request's choices, so a
-    /// round's reads land while the device converts the round before.
+    /// Records a scratch round converts: half the decode set (the most
+    /// distinct experts a request reads at a layer, `decode_set`), so a
+    /// round's reads land while the device converts the round before. A
+    /// round so never holds more than the widest layer's experts.
     pub fn round_records(&self) -> u64 {
         self.structure().round_records()
     }

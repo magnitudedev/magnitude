@@ -113,7 +113,7 @@ impl WorkingSet {
     /// fewer: a prompt converts a layer in as many rounds as its scratch
     /// takes, and the floor holds at least what a decode step needs.
     pub fn new(selected: u64, widest: u64, lent: u64, staging_forms: u64) -> Self {
-        let decode = (magnitude_kernels::constants::VERIFY_ROWS * selected).min(widest);
+        let decode = crate::planning::decode_set(selected, widest);
         Self { selected, decode, lent: lent.max(decode), staging_forms }
     }
 

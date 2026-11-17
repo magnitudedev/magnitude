@@ -1,4 +1,4 @@
-use super::{BankTier, ExpertBankPlan, Placer};
+use super::{decode_set, BankTier, ExpertBankPlan, Placer};
 use crate::memory::ClaimDemand;
 use std::num::NonZeroU64;
 
@@ -135,9 +135,10 @@ impl ExpertBankPlan {
     }
 
     /// One decode request's distinct experts at most, at any of group
-    /// `group`'s layers: `R` of [`Self::decode_records`].
+    /// `group`'s layers: `R` of [`Self::decode_records`], the decode set
+    /// ([`decode_set`]) of the group's widest member.
     fn request_records(&self, group: usize) -> u64 {
-        self.choices().min(self.widest_member(group))
+        decode_set(self.selected(), self.widest_member(group))
     }
 
     /// The most host slots a host tier holds: the widest layer's experts, a

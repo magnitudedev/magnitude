@@ -58,6 +58,14 @@ pub(crate) fn decode_choices(selected: u64) -> u64 {
     VERIFY_ROWS * selected
 }
 
+/// The decode set of a model whose rows each select `selected` of at most
+/// `widest` experts a layer: the most distinct experts a decode request
+/// reads at a layer, its choices ([`decode_choices`]) where the layer has
+/// that many, else every expert of the layer.
+pub(crate) fn decode_set(selected: u64, widest: u64) -> u64 {
+    decode_choices(selected).min(widest)
+}
+
 /// A routed tensor of an expert record, in the order the fill converts them
 /// ([`Self::ALL`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

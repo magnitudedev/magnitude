@@ -33,7 +33,7 @@ pub use bank::{
     ExpertBankPlan, RecordTensor, RecordTensors, RoutedTensor, StagingPool, StoredPart, StoredStack,
     growth_target, BankSubstrate, BankTier, HostTier, LayerSite, Parking, Placer, PoolSlab,
 };
-pub(crate) use bank::{layer_homes, releasing};
+pub(crate) use bank::{decode_set, layer_homes, releasing};
 #[cfg(test)]
 pub(crate) use bank::routed_experts;
 pub use capabilities::{
