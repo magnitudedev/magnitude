@@ -30,6 +30,7 @@ export interface QuantView {
   readonly placement: readonly PlacementTier[]
   readonly servedContext: number | null
   readonly quality: string | null
+  readonly missingDiskBytes: number
 }
 
 export interface MachineGpu {

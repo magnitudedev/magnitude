@@ -123,7 +123,7 @@ export function Onboarding({ machine, preparation, discovered, unrunnable, recom
         {picked && pickedQuant
           ? <>
             {downloadContents(picked, pickedQuant) && <span className="mr-1 text-xs text-slate-500">{downloadContents(picked, pickedQuant)}</span>}
-            <Button disabled={!pickedQuant.fits} onClick={() => { onDownload(picked, pickedQuant); onFinish() }}><DownloadSimpleIcon />Download {formatStorageSize(pickedQuant.downloadBytes)}</Button>
+            <Button disabled={!pickedQuant.fits || pickedQuant.missingDiskBytes > 0} onClick={() => { onDownload(picked, pickedQuant); onFinish() }}><DownloadSimpleIcon />Download {formatStorageSize(pickedQuant.downloadBytes)}</Button>
           </>
           : <Button onClick={onFinish}>Continue</Button>}
       </>}

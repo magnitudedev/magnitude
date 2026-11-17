@@ -209,7 +209,7 @@ export function useDownload(selections: Readonly<Record<string, DrafterSelection
       return <Button disabled><CircleNotchIcon className="motion-safe:animate-spin" />Downloading {percent}%</Button>
     }
     if (existing && onThisComputer(existing)) return <Button disabled variant="outline"><CheckIcon />Downloaded</Button>
-    if (model.catalog) return <DownloadButton key={quant.key} size={quant.downloadBytes} contents={downloadContents({ drafter: null }, quant)} disabled={!quant.fits} start={() => install(quant.key as CatalogFormModelId)} />
+    if (model.catalog) return <DownloadButton key={quant.key} size={quant.downloadBytes} contents={downloadContents({ drafter: null }, quant)} disabled={!quant.fits || quant.missingDiskBytes > 0} start={() => install(quant.key as CatalogFormModelId)} />
     if (quant.repository === null) return null
     const repository = quant.repository as HuggingFaceRepositoryId
     return <HuggingFaceDownload key={quant.key} quant={quant} repository={repository} selection={selections[quant.key] ?? AUTO_DRAFTER}

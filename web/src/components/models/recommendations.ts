@@ -2,7 +2,7 @@ import { useMemo } from "react"
 import { Option } from "effect"
 import { Result, useAtomValue } from "@effect-atom/atom-react"
 import { CountryCodeSchema, type LocalModel, type RecommendedModel, type RoomShortfall } from "@magnitudedev/sdk"
-import { useAgentClient, useLocalModels, type ServingMemory } from "@magnitudedev/client-common"
+import { useAgentClient, useLocalInferenceHardware, useLocalModels, type ServingMemory } from "@magnitudedev/client-common"
 import { offeredFromRecommendation, runnableFamily } from "./data"
 import type { OfferedModel } from "./expanding-model"
 import type { RunnableFamily } from "./explore-view"
@@ -87,6 +87,8 @@ export function useRecommendations(usOnly: boolean, memory: ServingMemory): Reco
   const client = useAgentClient()
   const developerCountry = usOnly ? Option.some(CountryCodeSchema.make("US")) : Option.none()
   const recommendations = useAtomValue(client.Models.GetRecommendations({ developerCountry })).result
+  const hardware = useLocalInferenceHardware()
+  const freeDiskBytes = Result.isSuccess(hardware) ? Option.getOrNull(Option.map(hardware.value.modelStorage, storage => storage.freeBytes)) : null
   const models = useLocalModels()
   return useMemo(() => {
     if (!Result.isSuccess(recommendations) || !Result.isSuccess(models)) return { ready: false, measuring: null, offered: [], roomShortfall: null, families: [] }
@@ -96,11 +98,11 @@ export function useRecommendations(usOnly: boolean, memory: ServingMemory): Reco
       ready: true,
       measuring: complete ? null : { settled: measured, total: rungs },
       offered: recommendations.value.models.flatMap(recommendation => {
-        const model = offeredFromRecommendation(recommendation, byId, memory)
+        const model = offeredFromRecommendation(recommendation, byId, memory, freeDiskBytes)
         return model ? [{ recommendation, model }] : []
       }),
       roomShortfall: Option.getOrNull(recommendations.value.roomShortfall),
       families: recommendations.value.families.map(runnableFamily),
     }
-  }, [recommendations, models, memory])
+  }, [recommendations, models, memory, freeDiskBytes])
 }

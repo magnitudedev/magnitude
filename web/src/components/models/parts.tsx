@@ -97,14 +97,15 @@ export function QuantLadder({ quants, selected, recommended, owned, limit, onSel
   return <div className="grid gap-2" style={{ gridTemplateColumns: `repeat(${quants.length}, minmax(0, 1fr))` }}>
     {quants.map(quant => {
       const active = selected === quant.key
-      return <button key={quant.key} type="button" disabled={!quant.fits || quant.measuring} onClick={() => onSelect(quant.key)} title={quant.quality ?? undefined}
-        className={cn("flex flex-col items-start rounded-lg border px-3 py-2.5 text-left", !quant.fits && !quant.measuring && "opacity-40", active ? "border-blue-600 bg-blue-50/60 ring-1 ring-blue-600/30 dark:border-blue-400 dark:bg-slate-800" : "border-slate-200 bg-white hover:border-slate-300 dark:border-slate-750 dark:bg-slate-850")}>
+      const noRoom = quant.missingDiskBytes > 0
+      return <button key={quant.key} type="button" disabled={!quant.fits || quant.measuring || noRoom} onClick={() => onSelect(quant.key)} title={quant.quality ?? undefined}
+        className={cn("flex flex-col items-start rounded-lg border px-3 py-2.5 text-left", ((!quant.fits && !quant.measuring) || noRoom) && "opacity-40", active ? "border-blue-600 bg-blue-50/60 ring-1 ring-blue-600/30 dark:border-blue-400 dark:bg-slate-800" : "border-slate-200 bg-white hover:border-slate-300 dark:border-slate-750 dark:bg-slate-850")}>
         <span className="flex w-full items-center justify-between gap-1 text-[13px] font-medium">{quant.bits}-bit
           {owned.has(quant.key) ? <Badge>Downloaded</Badge> : recommended === quant.key && <Badge tone="blue">Best</Badge>}</span>
         <span className="w-full truncate text-[11px] text-slate-500">{quantSource(quant)}</span>
         {quant.fits && quant.servedContext !== null && limit !== null && quant.servedContext < limit && <span className="text-[11px] text-orange-700 dark:text-orange-300">{formatContext(quant.servedContext)} context</span>}
         <span className="mt-2.5 flex w-full items-baseline justify-between gap-2 tabular-nums">
-          <span className={cn("text-[13px] font-medium", quant.measuring && "font-normal text-slate-500")}>{quant.fits && quant.speed !== null ? `~${formatSpeed(quant.speed)}` : fitLabel(quant)}</span>
+          <span className={cn("text-[13px] font-medium", (quant.measuring || noRoom) && "font-normal text-slate-500")}>{noRoom ? `Needs ${formatStorageSize(quant.missingDiskBytes)} more disk` : quant.fits && quant.speed !== null ? `~${formatSpeed(quant.speed)}` : fitLabel(quant)}</span>
           <span className="text-xs text-slate-500">{formatStorageSize(quant.sizeBytes)}</span>
         </span>
       </button>

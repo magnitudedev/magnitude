@@ -1,6 +1,6 @@
 import { Option } from "effect"
 import { localModelResidency, type CustomLocalModel, type DrafterTarget, type LocalModel, type LocalModelAssessment, type LocalModelDeveloper, type LocalModelFamily, type RecommendedModel, type SpeculativeMethod, type UnsupportedLocalModel } from "@magnitudedev/sdk"
-import { describeModelLoadFailure, fitPlacementPhrase, modelFailureLabel, formatStorageSize, ladderBitWidths, localModelSizeBytes, quantBitWidth, type ServingMemory } from "@magnitudedev/client-common"
+import { describeModelLoadFailure, fitPlacementPhrase, modelDownloadFailureMessage, modelFailureLabel, formatStorageSize, ladderBitWidths, localModelSizeBytes, quantBitWidth, type ServingMemory } from "@magnitudedev/client-common"
 import { labForDeveloper } from "../model-logo"
 import type { DiscoveredModel } from "./onboarding"
 import type { OfferedModel } from "./expanding-model"
@@ -68,6 +68,7 @@ export const quantView = (quant: { readonly key: string; readonly name: string; 
     placement: fits ? tiersOf(fits, memory) : [],
     servedContext: fits?.served.contextLength ?? null,
     quality: null,
+    missingDiskBytes: 0,
   }
 }
 
@@ -148,6 +149,7 @@ export const ownedModel = (model: LocalModel, memory: ServingMemory): OwnedModel
     drafterChoosable: model._tag === "Custom",
     searchText: `${model.presentation.displayName} ${quant.repository ?? ""} ${quant.name}`,
     failure: failureOf(model),
+    downloadFailure: model.acquisitionState._tag === "InstallFailed" || model.acquisitionState._tag === "UpdateFailed" ? modelDownloadFailureMessage(model.acquisitionState.failure) : null,
   }
 }
 
@@ -178,7 +180,16 @@ export const unrunnableFile = (model: UnsupportedLocalModel): UnrunnableFile => 
 }
 
 /** A recommended tested model as an offered model: its ladder's rungs as this machine would run them, the chosen one marked. */
-export const offeredFromRecommendation = (recommendation: RecommendedModel, models: ReadonlyMap<string, LocalModel>, memory: ServingMemory): OfferedModel | null => {
+/**
+ * The free disk a catalog rung still lacks to download, as the service counts room when it chooses a rung: its stored
+ * bytes, unless it is here already. None when free disk is unknown.
+ */
+const missingDiskBytes = (model: LocalModel, freeDiskBytes: number | null): number => {
+  const remaining = model.acquisitionState._tag === "NotInstalled" || model.acquisitionState._tag === "InstallFailed" ? model.storageBytes : 0
+  return freeDiskBytes === null ? 0 : Math.max(0, remaining - freeDiskBytes)
+}
+
+export const offeredFromRecommendation = (recommendation: RecommendedModel, models: ReadonlyMap<string, LocalModel>, memory: ServingMemory, freeDiskBytes: number | null = null): OfferedModel | null => {
   const rungs = recommendation.rungs.flatMap(id => { const model = models.get(id); return model ? [model] : [] })
   const first = rungs[0]
   if (!first || first._tag !== "Catalog") return null
@@ -193,7 +204,7 @@ export const offeredFromRecommendation = (recommendation: RecommendedModel, mode
     fineTuneOf: null,
     drafter: drafter ? { method: methodName[drafter.method._tag], sizeBytes: drafter.sizeBytes } : null,
     contextLimit: assessment?._tag === "Fits" ? assessment.profile.contextLength : null,
-    quants: ladderOf(rungs.map(model => ({ ...quantOf(model, memory), drafterBytes: model._tag === "Catalog" && !model.drafterWithheld ? drafter?.sizeBytes ?? 0 : 0 }))),
+    quants: ladderOf(rungs.map(model => ({ ...quantOf(model, memory), drafterBytes: model._tag === "Catalog" && !model.drafterWithheld ? drafter?.sizeBytes ?? 0 : 0, missingDiskBytes: missingDiskBytes(model, freeDiskBytes) }))),
     recommended: Option.getOrNull(recommendation.chosen),
     checking: false,
   }

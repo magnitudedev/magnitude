@@ -26,6 +26,7 @@ export interface OwnedModel {
   readonly drafterChoosable: boolean
   readonly searchText: string
   readonly failure: { readonly label: string; readonly summary: string; readonly detail: string } | null
+  readonly downloadFailure: string | null
 }
 
 export interface UnrunnableFile {
@@ -206,7 +207,7 @@ export function YourModels({ models, hidden, unrunnable, action, onExploreQuants
           <div role="button" tabIndex={0} aria-expanded={isOpen} onClick={() => setOpen(isOpen ? null : model.modelId)} onKeyDown={event => { if (event.key === "Enter") setOpen(isOpen ? null : model.modelId) }}
             className="grid cursor-pointer grid-cols-[28px_minmax(0,1fr)_64px_72px_auto_28px] items-center gap-4 rounded-[inherit] px-4 py-3 hover:bg-slate-50 dark:hover:bg-slate-800/40 max-lg:grid-cols-[28px_minmax(0,1fr)_64px_auto_28px]">
             <LabMark lab={model.lab} className="size-7" />
-            <span className="min-w-0"><span className="block truncate text-[13px] font-medium">{model.name}</span><QuantLine model={model} /></span>
+            <span className="min-w-0"><span className="block truncate text-[13px] font-medium">{model.name}</span><QuantLine model={model} />{model.downloadFailure && <span role="alert" className="mt-0.5 block text-xs text-red-600 dark:text-red-400">{model.downloadFailure}</span>}</span>
             <span className="text-right text-[13px] tabular-nums text-slate-700 dark:text-slate-300">{formatStorageSize(model.quant.sizeBytes)}</span>
             <span className="text-right max-lg:hidden">{model.quant.fits && <Speed quant={model.quant} />}</span>
             <span className="flex justify-end" onClick={event => event.stopPropagation()}>{action(model)}</span>
