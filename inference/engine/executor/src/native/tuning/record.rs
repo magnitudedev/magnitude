@@ -220,8 +220,8 @@ impl StoredChoice {
 }
 
 /// The evidence of a unit's choice: every candidate and measurement of its
-/// search. A search holds its own; a stored unit's stays in the store,
-/// named and unread, until something states it.
+/// search. A search holds its own; a stored unit's is the bytes taken with
+/// its choice, undecoded until something states it.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Receipt {
     Held(Arc<TuningResult>),

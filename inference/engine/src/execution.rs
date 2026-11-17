@@ -397,7 +397,7 @@ pub(crate) fn search(
     );
     report_load_memory("searched", opened.device());
     if let Some(cache) = &kernel_cache {
-        cache.store_prepared(&prepared_key(manifest)?);
+        cache.store_prepared(&prepared_key(manifest)?).map_err(internal)?;
     }
     Ok(())
 }
@@ -485,7 +485,7 @@ fn prepare(
         if let Some(root) = &manifest.kernel_cache {
             let cache = KernelCache::open(root.clone(), DEFAULT_KERNEL_CACHE_BYTES)
                 .map_err(|error| internal(error.to_string()))?;
-            if manifest.tuning.fresh || !cache.prepared(&prepared_key(manifest)?) {
+            if manifest.tuning.fresh || !cache.prepared(&prepared_key(manifest)?).map_err(internal)? {
                 return Ok(LoadAttempt::Unprepared);
             }
         }
@@ -2351,6 +2351,6 @@ mod tests {
         store_fixed_costs(&catalog.topology(), &selected.info, cache.path());
         search(catalog, &manifest, &package, Rc::new(|_| ())).unwrap();
         let kernel_cache = KernelCache::open(cache.path().to_owned(), DEFAULT_KERNEL_CACHE_BYTES).unwrap();
-        assert!(kernel_cache.prepared(&prepared_key(&manifest).unwrap()));
+        assert!(kernel_cache.prepared(&prepared_key(&manifest).unwrap()).unwrap());
     }
 }

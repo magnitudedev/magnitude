@@ -1914,6 +1914,7 @@ fn a_record_made_without_demand_is_read_without_demand_and_searched_with_it() {
     let stored = |slot: &TuningCacheKey| {
         cache
             .tuning::<super::record::StoredChoice>(slot)
+            .expect("the unit's record reads")
             .expect("the unit's record is stored")
             .0
     };
@@ -3253,9 +3254,9 @@ fn stored_attention_choice_must_admit_every_served_span_class() {
         coverage: None,
         default_launches: Vec::new(),
     };
-    cache.store_tuning(&key, &StoredChoice::of(&record, Duration::ZERO), &record);
+    cache.store_tuning(&key, &StoredChoice::of(&record, Duration::ZERO), &record).unwrap();
     assert!(
-        cache.tuning::<StoredChoice>(&key).is_some(),
+        cache.tuning::<StoredChoice>(&key).unwrap().is_some(),
         "the stored choice parses"
     );
     assert!(
@@ -3267,7 +3268,7 @@ fn stored_attention_choice_must_admit_every_served_span_class() {
         "an invalid terminal choice must fail without another tuning allowance"
     );
     record.overall = configuration(&defaults);
-    cache.store_tuning(&key, &StoredChoice::of(&record, Duration::ZERO), &record);
+    cache.store_tuning(&key, &StoredChoice::of(&record, Duration::ZERO), &record).unwrap();
     assert!(
         tuner
             .stored(&case, &statics, &points)
@@ -3296,7 +3297,7 @@ fn stored_attention_choice_must_admit_every_served_span_class() {
     );
     // A record whose search stopped for want of room is the machine's
     // moment, not the unit's: a search searches the unit again.
-    cache.store_tuning(&key, &StoredChoice::of(&record, Duration::ZERO).without_room(), &record);
+    cache.store_tuning(&key, &StoredChoice::of(&record, Duration::ZERO).without_room(), &record).unwrap();
     assert!(
         tuner.stored(&case, &statics, &inactive_points).unwrap().unwrap().2.is_none(),
         "a record stopped for want of room is no cache hit"

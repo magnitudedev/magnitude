@@ -1990,7 +1990,7 @@ pub struct TunedEntry {
     pub bindings: String,
     /// The original receipt, shared with observers without copying candidate
     /// measurements. Cached loads retain the same evidence as the first load:
-    /// a stored unit's is named where the store keeps it and read by the
+    /// a stored unit's is the bytes taken with its choice, decoded by the
     /// observer that states it, not by the load.
     pub receipt: Receipt,
     pub overall: Configuration,
@@ -4005,14 +4005,15 @@ impl<'a> Tuner<'a> {
     /// published before the unit's optional work stopped is stored
     /// provisional: a search abandoned then leaves nothing a later search
     /// takes for the unit's choice, so that search searches the unit again.
+    /// What fails the record or its storing fails the unit, as its reason.
     fn publish(
         &mut self,
         key: &TuningKey,
         settled: bool,
         record: impl FnOnce() -> Result<TuningResult, TuneError>,
-    ) -> Result<TuningResult, TuneError> {
+    ) -> Result<TuningResult, String> {
         let began = Instant::now();
-        let result = record()?;
+        let result = record().map_err(|error| error.to_string())?;
         if let (Some(cache), Some(slot)) = (self.context.cache, self.slots.get(key)) {
             let choice = StoredChoice::of(&result, self.budget());
             let choice = if self.without_room.contains(key) {
@@ -4021,7 +4022,7 @@ impl<'a> Tuner<'a> {
                 choice
             };
             let choice = if settled { choice } else { choice.provisional() };
-            cache.store_tuning(slot, &choice, &result);
+            cache.store_tuning(slot, &choice, &result)?;
         }
         self.chosen
             .insert(key.clone(), result.overall.specialization());
@@ -4895,7 +4896,7 @@ impl<'a> Tuner<'a> {
         // so evidence that cannot be read is a broken store, not a miss.
         let stored = match self.context.settings.fresh {
             true => None,
-            false => cache.tuning::<StoredChoice>(&key),
+            false => cache.tuning::<StoredChoice>(&key)?,
         };
         // A provisional record is what a search abandoned before its optional
         // work stopped left: the unit has no choice yet, and is searched

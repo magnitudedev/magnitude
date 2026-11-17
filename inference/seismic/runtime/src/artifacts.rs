@@ -28,7 +28,7 @@
 
 mod directory;
 
-pub use directory::{DirectoryStore, Eviction, Layout, DEFAULT_CAPACITY};
+pub use directory::{DirectoryStore, Eviction, Examining, Layout, DEFAULT_CAPACITY};
 
 pub use seismic_native_target::{ArtifactKey, ArtifactStore, MemoryStore};
 use std::sync::Arc;

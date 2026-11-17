@@ -1011,8 +1011,8 @@ mod tests {
     /// matches, and a later process loads the entry and compiles nothing.
     #[test]
     fn processes_compiling_at_once_leave_every_pointer_whole() {
-        use crate::artifacts::{DirectoryStore, Eviction, DEFAULT_CAPACITY};
-        fn alone(_: &std::path::Path) -> Eviction {
+        use crate::artifacts::{DirectoryStore, Eviction, Examining, DEFAULT_CAPACITY};
+        fn alone(_: &std::path::Path, _: &Examining<'_>) -> Eviction {
             Eviction::Alone
         }
         let root = std::env::temp_dir().join(format!("seismic-formation-race-{}", std::process::id()));

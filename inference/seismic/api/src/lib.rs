@@ -152,7 +152,7 @@ pub mod testing {
 }
 pub use seismic_runtime::memory::process_footprint;
 pub use seismic_runtime::artifacts::{
-    ArtifactKey, ArtifactStore, DeviceOptions, DirectoryStore, Eviction, MemoryStore, ProgramStore,
+    ArtifactKey, ArtifactStore, DeviceOptions, DirectoryStore, Eviction, Examining, MemoryStore, ProgramStore,
     DEFAULT_CAPACITY as DEFAULT_STORE_CAPACITY,
 };
 /// The embedder's ledger as Seismic charges it: every byte a device takes is
