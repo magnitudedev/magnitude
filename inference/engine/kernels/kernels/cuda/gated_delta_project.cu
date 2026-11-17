@@ -62,14 +62,14 @@ __global__ void gated_delta_project_stage(SEISMIC_KERNEL_PARAMS) {
 #endif
 
 #ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_GEMV
-template <unsigned STAGING, unsigned KSPLIT>
+template <unsigned INT8, unsigned STAGING, unsigned KSPLIT>
 __global__ void gated_delta_project_gemv(SEISMIC_KERNEL_PARAMS) {
     PROJECTION_SEGMENTED_GEMV(1, KSPLIT, STAGING);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_GEMV16
-template <unsigned STAGING, unsigned KSPLIT>
+template <unsigned INT8, unsigned STAGING, unsigned KSPLIT>
 __global__ void gated_delta_project_gemv16(SEISMIC_KERNEL_PARAMS) {
     PROJECTION_SEGMENTED_GEMV(2, KSPLIT, STAGING);
 }

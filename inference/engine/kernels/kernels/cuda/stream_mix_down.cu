@@ -103,16 +103,18 @@ __global__ void stream_mix_down_stage(SEISMIC_KERNEL_PARAMS) {
 #endif
 
 #ifdef SEISMIC_FORMING_STREAM_MIX_DOWN_GEMV
-template <unsigned STAGING, unsigned KSPLIT>
+template <unsigned INT8, unsigned STAGING, unsigned KSPLIT>
 __global__ void stream_mix_down_gemv(SEISMIC_KERNEL_PARAMS) {
+    static_assert(INT8 == 0, "a parts projection's GEMV takes no int8_rule rows (`where`: PARTED == 0)");
     mix_gemv<1, KSPLIT>(STREAM, STAGED_ROWS, INVERSE, SEISMIC_RESULT_2_STRIDE_1, PARTIALS, ARRIVALS,
                         (unsigned)SEISMIC_DIM_M, SEGMENTS);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_STREAM_MIX_DOWN_GEMV16
-template <unsigned STAGING, unsigned KSPLIT>
+template <unsigned INT8, unsigned STAGING, unsigned KSPLIT>
 __global__ void stream_mix_down_gemv16(SEISMIC_KERNEL_PARAMS) {
+    static_assert(INT8 == 0, "a parts projection's GEMV takes no int8_rule rows (`where`: PARTED == 0)");
     mix_gemv<2, KSPLIT>(STREAM, STAGED_ROWS, INVERSE, SEISMIC_RESULT_2_STRIDE_1, PARTIALS, ARRIVALS,
                         (unsigned)SEISMIC_DIM_M, SEGMENTS);
 }

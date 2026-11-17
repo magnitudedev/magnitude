@@ -49,14 +49,14 @@ __global__ void attention_output_stage(SEISMIC_KERNEL_PARAMS) {
 #endif
 
 #ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_GEMV
-template <unsigned STAGING, unsigned KSPLIT, unsigned RESIDENCY>
+template <unsigned INT8, unsigned STAGING, unsigned KSPLIT, unsigned RESIDENCY>
 __launch_bounds__(256, PROJECTION_GEMV_BLOCKS(KSPLIT, RESIDENCY)) __global__ void attention_output_gemv(SEISMIC_KERNEL_PARAMS) {
     PROJECTION_GEMV(1, KSPLIT, STAGING, PROJECTION_GEMV_GRID(KSPLIT, RESIDENCY), RESIDENCY);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_GEMV16
-template <unsigned STAGING, unsigned KSPLIT>
+template <unsigned INT8, unsigned STAGING, unsigned KSPLIT>
 __global__ void attention_output_gemv16(SEISMIC_KERNEL_PARAMS) {
     PROJECTION_GEMV(2, KSPLIT, STAGING, 0, 1);
 }

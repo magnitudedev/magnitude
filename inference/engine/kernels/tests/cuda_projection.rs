@@ -305,7 +305,7 @@ fn cuda_int8_activations_follow_the_cpu_rule() {
     );
     // INT8 on the small-band GEMM (17 to 64 rows).
     let mapping = GEMM_MAPPINGS[1];
-    assert!(mapping.quantizes(SMALL_GEMM_ROWS) && projection.admits(&device, mapping));
+    assert!(mapping.quantizes() && projection.admits(&device, mapping));
     for (at, groups) in int8_rule::blocks().chunks(SMALL_GEMM_ROWS).enumerate() {
         let rows = groups.len().max(GEMV_ROWS + 1);
         let mut source = vec![0.0f32; rows * k];

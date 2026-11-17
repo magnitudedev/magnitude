@@ -73,24 +73,41 @@ template <int KSPLIT, int RESIDENCY, u64 N, class WA, class WB> __host__ __devic
     return gemv_min_blocks<Shape, WA, WB, gemv_stated_grid<KSPLIT, RESIDENCY, N>(), RESIDENCY>();
 }
 
+// The GEMV's rows once the previous launch is done: at M = 1 the block's
+// (block-collective, `shared_row`, or with S8 (INT8 = 1) `shared_s8_row`),
+// else the prologue's or stage launch's (with S8 `staged` codes and `groups`).
+template <bool S8, u64 K, class Pro> __device__ __forceinline__ auto gemv_one_row_after_dependency(const Pro &pro) {
+    if constexpr (S8)
+        return shared_s8_row_after_dependency(pro, K);
+    else
+        return shared_row_after_dependency(pro, K);
+}
+template <bool S8, u64 K, class Pro>
+__device__ __forceinline__ auto gemv_rows_after_dependency(const Pro &pro, const u8 *staged, const void *groups) {
+    if constexpr (S8)
+        return s8_rows_after_dependency(staged, groups, K);
+    else
+        return source_after_dependency(pro, K, staged);
+}
+
 // The GEMV over NB column blocks of 8 rows, a launch of GRID blocks (0: not
 // stated, `GemvResidency`). Every warp runs it, a group past the rows
 // included: once the warps' first weight loads are in flight it waits for the
-// previous launch, and at M = 1 the block forms its row whatever its
-// prologue (block-collective, `shared_row`).
-template <int NB, int KSPLIT, int STAGING, u64 GRID, int RESIDENCY, u64 K, class Pro, class WA, class WB, class Epi>
-__device__ __forceinline__ void gemv(const Pro &pro, const u8 *staged, u32 M, u64 N, const WA &wa, const WB &wb,
-                                     const Epi &epi) {
+// previous launch, and reads its rows (`gemv_rows_after_dependency`).
+template <int NB, int KSPLIT, int STAGING, u64 GRID, int RESIDENCY, u64 K, bool S8, class Pro, class WA, class WB,
+          class Epi>
+__device__ __forceinline__ void gemv(const Pro &pro, const u8 *staged, const void *groups, u32 M, u64 N,
+                                     const WA &wa, const WB &wb, const Epi &epi) {
     using Shape = GemvShape<8, 1, KSPLIT, NB>;
     __shared__ GemvShared<Shape, typename GemvSource<Pro>::type, gemv_staged_bytes<STAGING, Shape, K, WA, WB>()> shared;
     if constexpr (NB == 1)
         if (M == 1) {
-            gemv_segment_ready<Shape, GRID, RESIDENCY>(shared, shared_row_after_dependency(pro, K), 1u, K / 64,
+            gemv_segment_ready<Shape, GRID, RESIDENCY>(shared, gemv_one_row_after_dependency<S8, K>(pro), 1u, K / 64,
                                                        Shape::tile_group(), N, wa, wb, epi);
             return;
         }
-    gemv_segment_ready<Shape, GRID, RESIDENCY>(shared, source_after_dependency(pro, K, staged), M, K / 64,
-                                               Shape::tile_group(), N, wa, wb, epi);
+    gemv_segment_ready<Shape, GRID, RESIDENCY>(shared, gemv_rows_after_dependency<S8, K>(pro, staged, groups), M,
+                                               K / 64, Shape::tile_group(), N, wa, wb, epi);
 }
 
 // The stage launch's row: the prologue's rows for the GEMV above (M <= 16),
@@ -316,11 +333,10 @@ __device__ __forceinline__ void gemv_segmented_from(Shared &shared, const Ready 
 
 // The segmented GEMV over NB column blocks of 8 rows. With `zero` != 0 the
 // results of segments 0 and 1 are zeros: their groups store them and are
-// otherwise past the last segment. A one-row block reads its `shared_row`,
-// any other the rows `GemvSource` reads.
-template <int NB, int KSPLIT, int STAGING, u64 K, class Weights, class Pro, class Segments>
-__device__ __forceinline__ void gemv_segmented(const Pro &pro, const u8 *staged, u32 M, const Segments &s,
-                                               unsigned zero) {
+// otherwise past the last segment. It reads its rows as `gemv` does.
+template <int NB, int KSPLIT, int STAGING, u64 K, bool S8, class Weights, class Pro, class Segments>
+__device__ __forceinline__ void gemv_segmented(const Pro &pro, const u8 *staged, const void *rows, u32 M,
+                                               const Segments &s, unsigned zero) {
     using Shape = GemvShape<8, 1, KSPLIT, NB>;
     __shared__ GemvShared<Shape, typename GemvSource<Pro>::type, StagingOf<STAGING, Shape, K, Weights>::bytes()> shared;
     const u64 kblocks = K / 64;
@@ -332,11 +348,12 @@ __device__ __forceinline__ void gemv_segmented(const Pro &pro, const u8 *staged,
     const int segment = locate_segment(group, groups);
     if constexpr (NB == 1)
         if (M == 1) {
-            gemv_segmented_from<Shape>(shared, shared_row_after_dependency(pro, K), 1u, kblocks, group, segment, s,
-                                       zero);
+            gemv_segmented_from<Shape>(shared, gemv_one_row_after_dependency<S8, K>(pro), 1u, kblocks, group, segment,
+                                       s, zero);
             return;
         }
-    gemv_segmented_from<Shape>(shared, source_after_dependency(pro, K, staged), M, kblocks, group, segment, s, zero);
+    gemv_segmented_from<Shape>(shared, gemv_rows_after_dependency<S8, K>(pro, staged, rows), M, kblocks, group,
+                               segment, s, zero);
 }
 
 // One segment's GEMM block, over its weight or served pair.
@@ -545,8 +562,8 @@ __device__ __forceinline__ void gemv_parts(const Row &row, const Rows &rows, flo
 #define PROJECTION_GEMV(NB, KSPLIT, STAGING, GRID, RESIDENCY)                                                      \
     do {                                                                                                           \
         const unsigned group_ = PROJECTION_GROUP(blockIdx.z);                                                      \
-        projection::op::gemv<NB, KSPLIT, STAGING, GRID, RESIDENCY, PROJECTION_K>(                                  \
-            PROJECTION_ROWS(group_), PROJECTION_STAGING, (unsigned)PROJECTION_M, PROJECTION_N,                     \
+        projection::op::gemv<NB, KSPLIT, STAGING, GRID, RESIDENCY, PROJECTION_K, PROJECTION_S8>(                   \
+            PROJECTION_ROWS(group_), PROJECTION_STAGING, PROJECTION_GROUPS, (unsigned)PROJECTION_M, PROJECTION_N,  \
             PROJECTION_WEIGHTS(group_), PROJECTION_EPILOGUE(group_));                                              \
     } while (0)
 #define PROJECTION_GEMV_GRID(KSPLIT, RESIDENCY)                                                                    \
@@ -588,8 +605,8 @@ __device__ __forceinline__ void gemv_parts(const Row &row, const Rows &rows, flo
 // A segmented projection's launches (`PROJECTION_SEGMENTS`: its `Segments`;
 // `PROJECTION_ZERO`: nonzero where segments 0 and 1 are zeros for the call).
 #define PROJECTION_SEGMENTED_GEMV(NB, KSPLIT, STAGING)                                                             \
-    projection::op::gemv_segmented<NB, KSPLIT, STAGING, PROJECTION_K, PROJECTION_WEIGHT_TYPES>(                    \
-        PROJECTION_ROWS(0u), PROJECTION_STAGING, (unsigned)PROJECTION_M, PROJECTION_SEGMENTS,                      \
+    projection::op::gemv_segmented<NB, KSPLIT, STAGING, PROJECTION_K, PROJECTION_S8, PROJECTION_WEIGHT_TYPES>(     \
+        PROJECTION_ROWS(0u), PROJECTION_STAGING, PROJECTION_GROUPS, (unsigned)PROJECTION_M, PROJECTION_SEGMENTS,   \
         (unsigned)PROJECTION_ZERO)
 #define PROJECTION_SEGMENTED_GEMM(SHAPE, OPERANDS_)                                                                \
     do {                                                                                                           \

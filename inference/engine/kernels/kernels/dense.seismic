@@ -367,9 +367,12 @@ projection dense for metal:
 # CUDA: the K1 projection library (`cuda/common/projection.cuh`). Every K1
 # CUDA entry runs the GEMV to 16 rows and the GEMM beyond, in two row bands.
 # The GEMV is the 16-bit path (the A-rounded activation in bf16/f16 MMAs
-# against exact codes, rows independent of the row count): `gemv` to 8 rows,
-# `gemv16` (two 8-row column blocks) from 9 to 16; 8 warps per block in groups
-# of KSPLIT that split K and reduce in part order. The small-band GEMM
+# against exact codes, rows independent of the row count), or with INT8 = 1
+# the INT8 path the GEMMs take (int8_rule activations, the weights' s8 codes,
+# one s8 MMA per 32 codes folded per group in k order, rows likewise
+# independent of the row count): `gemv` to 8 rows, `gemv16` (two 8-row
+# column blocks) from 9 to 16; 8 warps per block in groups of KSPLIT that
+# split K and reduce in part order. The small-band GEMM
 # (`gemm_small`, 17 to 64 rows: 64-row block tiles, 3 cp.async stages) has
 # two operand paths: the 16-bit path (weights dequantized to A) and the INT8
 # candidate (arithmetic INT8 = 1: activations quantized per 32 codes as q8_1
@@ -399,13 +402,14 @@ projection dense for metal:
 # split up to 128 rows. Staging launches form the rows a launch does not
 # read in place: `stage` a normalized input's A rows (at one row the GEMV
 # block forms its row in its shared memory instead), the shared operand
-# stage the INT8 candidate's q8_1 rows plus (d, d * sum q) groups. At one
-# row every GEMV block (an unordered segment's of an ordered entry and a
-# part's included) forms its row in its shared memory, whatever its kind,
-# with the operand sums its biased weights fold (`shared_row`,
-# K * SHARED_ROW_PAIR_BYTES / 2 bytes of K / P: the B fragments are
-# unconditional shared reads, and the sums are formed once a block, not once
-# a k-block in every warp).
+# stage the INT8 path's q8_1 rows plus (d, d * sum q) groups, for both bands
+# past one row. At one row every GEMV block (an unordered segment's of an
+# ordered entry and a part's included) forms its row in its shared memory,
+# whatever its kind, with the operand sums its biased weights fold
+# (`shared_row`, K * SHARED_ROW_PAIR_BYTES / 2 bytes of K / P: the B
+# fragments are unconditional shared reads, and the sums are formed once a
+# block, not once a k-block in every warp), or with INT8 = 1 its q8_1 row and
+# groups (`shared_s8_row`, K * 5 / 4 bytes of the same region).
 
 # The dynamic shared memory of a one-row CUDA GEMV block's row
 # (`shared_row`), a byte count per two of its K columns: their two A
@@ -424,9 +428,9 @@ const SHARED_ROW_PAIR_BYTES = 5
 # materializes them only for more than one row; `staged` rows are formed by
 # the stage launch alone, at every row count; `plain` rows are read in place
 # unless a weight takes NVFP4 operands (`operands(W)`) or a matrix band takes
-# the INT8 or OPERAND operands. The one-row GEMV block reads every kind from
-# the row it forms in its shared memory (above). KSPLIT splits K in
-# each GEMV launch, a setting of each, defaulting to 4; an entry whose rows
+# the INT8 or OPERAND operands (INT8 in the GEMV band too). The one-row GEMV
+# block reads every kind from the row it forms in its shared memory (above).
+# KSPLIT splits K in each GEMV launch, a setting of each, defaulting to 4; an entry whose rows
 # of the band all keep their one-row bits shares one KSPLIT between the two
 # launches by restating it entry-wide (dense_up, dense_output). SPLIT (single) is the GEMM's split over
 # K into shares up to 128 rows (grid z = 1 + min(1, 128 / M)), summed by
@@ -491,8 +495,8 @@ projection dense for cuda:
     scratch staged bytes (M * K * 2) when ORDERED_ANY == 1 and ORDERED_ALL == 0 and M > 1 for rms
     scratch staged bytes (M * K * 2) when ORDERED_ANY == 0 and PUBLISHED == 0 and (M > 1 or PLANES == 1) for rms
     scratch staged bytes (M * K * 2) when ORDERED_ANY == 0 and PUBLISHED == 0 for staged
-    scratch staged bytes (M * K * max(1 + OPERAND, 2 * OPERANDS)) when ORDERED_ANY == 0 and ((M > 1 and OPERANDS == 1) or (M > 16 and (INT8 == 1 or OPERAND == 1))) for plain
-    scratch groups bytes (M * K / 4) when ORDERED_ANY == 0 and INT8 == 1 and M > 16 and PLANES == 0
+    scratch staged bytes (M * K * max(1 + OPERAND, 2 * OPERANDS)) when ORDERED_ANY == 0 and ((M > 1 and (OPERANDS == 1 or INT8 == 1)) or (M > 16 and OPERAND == 1)) for plain
+    scratch groups bytes (M * K / 4) when ORDERED_ANY == 0 and INT8 == 1 and M > 1 and PLANES == 0
     scratch partials bytes (SPLIT * G * M * N * 4) when ORDERED_ANY == 0 and M > 16 and M <= 128 and SPLIT > 1 and PLANES == 0 for single
     scratch partials bytes (M * P * sum(W, N) * 4) when ORDERED_ANY == 0 and M <= 16 and PARTED == 1 for segmented
     scratch arrivals bytes (4) sync when ORDERED_ANY == 0 and M <= 16 and PARTED == 1 for segmented
@@ -529,19 +533,19 @@ projection dense for cuda:
         staging
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch stage for plain when ORDERED_ANY == 0 and ((M > 1 and OPERANDS == 1) or (M > 16 and (INT8 == 1 or OPERAND == 1))):
+    launch stage for plain when ORDERED_ANY == 0 and ((M > 1 and (OPERANDS == 1 or INT8 == 1)) or (M > 16 and OPERAND == 1)):
         reads (INT8, OPERAND)
         staging
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch gemv when ORDERED_ANY == 0 and M <= 8 and PLANES == 0:
         params (RESIDENCY in [0, 1, 2] default 0 for paired | single)
-        reads (STAGING)
+        reads (INT8, STAGING)
         threadgroups (P * tiles(W, ceil_div(ceil_div(N, 16), 8 / KSPLIT)), 1, G)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes ((1 - min(1, M - 1)) * (K / P) * SHARED_ROW_PAIR_BYTES / 2)
     launch gemv16 when ORDERED_ANY == 0 and M > 8 and M <= 16 and PLANES == 0:
-        reads (STAGING)
+        reads (INT8, STAGING)
         alike (gemv)
         threadgroups (P * tiles(W, ceil_div(ceil_div(N, 16), 8 / KSPLIT)), 1, G)
         threads_per_threadgroup (256, 1, 1)
