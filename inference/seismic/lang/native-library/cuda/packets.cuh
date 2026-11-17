@@ -117,11 +117,17 @@ struct OpBF16 {
             : "r"(biased), "r"(0x3F803F80u), "r"(negative | (negative << 16)));
         return value;
     }
-    // Signed bytes `i` of `slots_low` and `slots_high`.
+    // Signed bytes `i` of `slots_low` and `slots_high`. A byte b is
+    // (b & 127) - 128 (b >> 7): each half is 128 + (b & 127), exact in the
+    // binade [128, 256), minus 128 or 256, the powers whose exponents differ
+    // in their low bit, which is b's sign bit where the byte sits.
     __device__ static __forceinline__ u32 bytes(u32 slots_low, u32 slots_high, int i) {
-        const int low = ((int)(slots_low << (24 - 8 * i))) >> 24;
-        const int high = ((int)(slots_high << (24 - 8 * i))) >> 24;
-        return pack((float)low, (float)high);
+        const u32 pair = prmt(slots_low, slots_high, (u32)i | ((u32)(4 + i) << 8));
+        const u32 biased = (pair & 0x007F007Fu) | 0x43004300u;   // 128 + (b & 127)
+        const u32 negative = (pair & 0x00800080u) | 0xC300C300u; // -128, or -256 where b < 0
+        u32 value;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(value) : "r"(biased), "r"(0x3F803F80u), "r"(negative));
+        return value;
     }
     __device__ static __forceinline__ void mma(float (&c)[4], const u32 (&a)[4], const u32 (&b)[2]) {
         seismic_mma_m16n8k16_bf16(c, a, b);
