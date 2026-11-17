@@ -1,7 +1,7 @@
 import { Atom, Registry, Result } from "@effect-atom/atom-react"
 import { Context, Effect, Layer, Option, Stream } from "effect"
 import { Mutation } from "@magnitudedev/effect-query"
-import { localModelResidency, ModelLoadStageSchema, type LocalModelsState, type ModelResidency } from "@magnitudedev/sdk"
+import { localModelResidency, ModelLoadStageSchema, type LocalModelsState, type ModelId, type ModelResidency } from "@magnitudedev/sdk"
 import type { AppearancePreference } from "@magnitudedev/sdk/desktop-host"
 import { LocalModels } from "../local-models/service"
 import { ClientEffectQuery } from "../state/client-effect-query"
@@ -9,7 +9,7 @@ import { formatLocalModelDisplayName } from "../utils/model-presentation"
 import { formatModelLoadPercentage, formatModelLoadStage, formatModelMemory, isMeasuredModelLoadStage } from "../utils/model-load"
 import { ApplicationHost, ApplicationHostFailed } from "./host"
 import { ApplicationRouter } from "./router"
-import { landingPage } from "./landing"
+import { landingPage, readyToChat } from "./landing"
 import type { AddModelRequest, ApplicationPage, HostNotice, QuitFailureDecision } from "./contracts"
 import { ModelTrayPresentation, ModelTrayStatus } from "./contracts"
 
@@ -91,10 +91,30 @@ const makeApplicationSession = Effect.gen(function* () {
     Stream.runForEach(router.land),
     Effect.forkScoped,
   )
-  const completeOnboarding = Atom.fn((_: void) => Mutation.execute(effectQuery.Configuration.CompleteOnboarding, {}).pipe(
+  // The model onboarding's download fetches: once it is ready it is loaded and Chat opens, so onboarding ends in a chat.
+  const onboardingDownload = Atom.keepAlive(Atom.make(Option.none<ModelId>()))
+  const completeOnboarding = Atom.fn((download: Option.Option<ModelId>) => Mutation.execute(effectQuery.Configuration.CompleteOnboarding, {}).pipe(
     provideRegistry,
+    Effect.zipRight(Effect.sync(() => registry.set(onboardingDownload, download))),
     Effect.zipRight(Effect.suspend(() => navigate(Option.getOrElse(landing(registry.get(models.state)), (): ApplicationPage => "chat")))),
   ))
+  yield* Registry.toStream(registry, onboardingDownload).pipe(
+    Stream.filterMap((download) => download),
+    Stream.flatMap((modelId) => Registry.toStream(registry, models.state).pipe(
+      Stream.filterMap((result): Option.Option<boolean> => {
+        if (!Result.isSuccess(result)) return Option.none()
+        const model = result.value.models.find((candidate) => candidate.modelId === modelId)
+        // Ready, it is loaded; gone (cancelled) or failed, onboarding has nothing more to do.
+        return model === undefined || model.acquisitionState._tag === "InstallFailed" ? Option.some(false)
+          : readyToChat(model) ? Option.some(true) : Option.none()
+      }),
+      Stream.take(1),
+      Stream.mapEffect((ready) => Effect.sync(() => registry.set(onboardingDownload, Option.none())).pipe(
+        Effect.zipRight(ready ? models.load(modelId).pipe(Effect.zipRight(navigate("chat")), Effect.catchAll(Effect.logError)) : Effect.void))),
+    ), { switch: true }),
+    Stream.runDrain,
+    Effect.forkScoped,
+  )
   const notices = Atom.keepAlive(Atom.make<ReadonlyArray<HostNotice>>([]))
   const dismissNotice = (notice: HostNotice) => Effect.sync(() => registry.set(notices, registry.get(notices).filter(entry => entry !== notice)))
   const quitFailed = Atom.keepAlive(Atom.make(false))

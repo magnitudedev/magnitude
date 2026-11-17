@@ -64,6 +64,7 @@ describe("host actions", () => {
     use: (session: ApplicationSession, registry: Registry.Registry) => Effect.Effect<A, E>,
     onboarding: { current: "Pending" | "Completed" } = { current: "Completed" },
     localModels: Atom.Writable<Result.Result<LocalModelsState>> = Atom.make<Result.Result<LocalModelsState>>(Result.initial()),
+    loads: string[] = [],
   ) => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
     const delivered = yield* Deferred.make<void>()
     const effectQuery = EffectQueryClient.make(AcnQueries, fakeAcnImplementationsLayer((tag) => {
@@ -85,7 +86,7 @@ describe("host actions", () => {
           application: Stream.never,
         }),
       })),
-      Layer.provide(Layer.succeed(LocalModels, { state: localModels, stop: Effect.void } as unknown as LocalModels)),
+      Layer.provide(Layer.succeed(LocalModels, { state: localModels, stop: Effect.void, load: (modelId: string) => Effect.sync(() => { loads.push(modelId) }) } as unknown as LocalModels)),
       Layer.provide(Layer.succeed(ClientEffectQuery, effectQuery)),
       Layer.provideMerge(Registry.layer),
     ))
@@ -109,17 +110,48 @@ describe("host actions", () => {
   it("opens Models once onboarding is completed while its download is still running", () => {
     const models = Atom.make<Result.Result<LocalModelsState>>(Result.success(downloading))
     return withSession([{ _tag: "Navigate", page: "chat" }], (session, registry) => Effect.gen(function* () {
-      registry.set(session.completeOnboarding, undefined)
+      registry.set(session.completeOnboarding, Option.none())
       yield* Registry.getResult(registry, session.completeOnboarding, { suspendOnWaiting: true })
       expect(registry.get(session.onboardingPending)).toEqual(Option.some(false))
       expect(registry.get(session.page)).toBe("models")
     }), { current: "Pending" }, models)
   })
 
+  it("loads the model onboarding downloaded and opens Chat once its download finishes", () => {
+    const models = Atom.make<Result.Result<LocalModelsState>>(Result.success(downloading))
+    const loads: string[] = []
+    const modelId = downloading.models[0]!.modelId
+    return withSession([], (session, registry) => Effect.gen(function* () {
+      registry.set(session.completeOnboarding, Option.some(modelId))
+      yield* Registry.getResult(registry, session.completeOnboarding, { suspendOnWaiting: true })
+      expect(registry.get(session.page)).toBe("models")
+      expect(loads).toEqual([])
+      registry.set(models, Result.success(ready))
+      yield* Effect.sleep("20 millis")
+      expect(loads).toEqual([modelId])
+      expect(registry.get(session.page)).toBe("chat")
+    }), { current: "Pending" }, models, loads)
+  })
+
+  it("does nothing more once onboarding's download is cancelled", () => {
+    const models = Atom.make<Result.Result<LocalModelsState>>(Result.success(downloading))
+    const loads: string[] = []
+    return withSession([], (session, registry) => Effect.gen(function* () {
+      registry.set(session.completeOnboarding, Option.some(downloading.models[0]!.modelId))
+      yield* Registry.getResult(registry, session.completeOnboarding, { suspendOnWaiting: true })
+      registry.set(models, Result.success({ ...downloading, models: [] }))
+      yield* Effect.sleep("20 millis")
+      registry.set(models, Result.success(ready))
+      yield* Effect.sleep("20 millis")
+      expect(loads).toEqual([])
+      expect(registry.get(session.page)).toBe("models")
+    }), { current: "Pending" }, models, loads)
+  })
+
   it("opens Chat once onboarding is completed with a model ready", () => {
     const models = Atom.make<Result.Result<LocalModelsState>>(Result.success(ready))
     return withSession([{ _tag: "Navigate", page: "models" }], (session, registry) => Effect.gen(function* () {
-      registry.set(session.completeOnboarding, undefined)
+      registry.set(session.completeOnboarding, Option.none())
       yield* Registry.getResult(registry, session.completeOnboarding, { suspendOnWaiting: true })
       expect(registry.get(session.page)).toBe("chat")
     }), { current: "Pending" }, models)

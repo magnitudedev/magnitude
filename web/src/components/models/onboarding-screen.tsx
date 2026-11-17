@@ -1,4 +1,5 @@
 import { useState } from "react"
+import { Option } from "effect"
 import { Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import type { CatalogFormModelId, CustomLocalModel } from "@magnitudedev/sdk"
 import { deriveHardwareRoles, formatStorageSize, useAgentClient, useLocalInferenceHardware, useLocalModelMutations, useLocalModels } from "@magnitudedev/client-common"
@@ -55,6 +56,6 @@ export function OnboardingScreen() {
     usOnly={usOnly}
     setUsOnly={setUsOnly}
     owned={owned}
-    onDownload={(_, quant) => install(quant.key as CatalogFormModelId)}
-    onFinish={() => { recordOnboardingCompleted(true); complete() }} />
+    onDownload={(_, quant) => { install(quant.key as CatalogFormModelId); recordOnboardingCompleted(true); complete(Option.some(quant.key as CatalogFormModelId)) }}
+    onFinish={() => { recordOnboardingCompleted(true); complete(Option.none()) }} />
 }

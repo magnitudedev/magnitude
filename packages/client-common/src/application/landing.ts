@@ -9,7 +9,7 @@ import {
 import type { ApplicationPage } from "./contracts"
 
 /** A model on this computer that chats can use: installed and readable, not being removed, and not known not to fit. */
-const readyToChat = (model: LocalModel) =>
+export const readyToChat = (model: LocalModel) =>
   localModelIsInstalled(model)
   && localModelIsAvailable(model)
   && model.acquisitionState._tag !== "Unavailable"
