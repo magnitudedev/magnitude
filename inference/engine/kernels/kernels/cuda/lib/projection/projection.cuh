@@ -1363,59 +1363,96 @@ template <int CHUNK> __device__ __forceinline__ void cp_async_chunk(u8 *shared, 
         cp_async_8_zfill(shared, global, valid ? 8u : 0u);
 }
 
-// One stream's part of a stage: the code chunks (TILE bytes per tile) of tiles
-// [tile0, tile0 + 8) (zero past `tiles`), by threads `first`, `first + STRIDE`, ...
-template <class W, int STRIDE, int TILE>
-__device__ __forceinline__ void gemm_load_codes(const W &w, u64 tile0, u64 tiles, u64 kblock, u8 *codes, u32 first) {
-    constexpr int CHUNK = ChunkBytes<W>::value;
-    for (int c = first; c < 8 * W::CHUNKS; c += STRIDE) {
-        const u64 j = c / W::CHUNKS;
-        const u32 q = c % W::CHUNKS;
-        const bool valid = tile0 + j < tiles;
-        cp_async_chunk<CHUNK>(codes + j * TILE + q * CHUNK, w.chunk_source(valid ? tile0 + j : tile0, kblock, q),
-                              valid);
-    }
+// Weights `w` with their tiles renumbered from `tile`: the layout's own
+// start of tile `tile` (`tile_base`: `packets::Rows`, `packets::Records`)
+// becomes its start of tile 0, so a code chunk or record word of tile 0 of
+// the result, at any row within it, is that of tile `tile` of `w`. A row
+// within a tile stays the layout's to place (`chunk_source`, `super_word`):
+// a records layout does not place it at a multiple of the row stride.
+template <class W> __device__ __forceinline__ W gemm_tile_at(const W &w, u64 tile) {
+    W at = w;
+    at.base = w.tile_base(tile);
+    return at;
 }
 
-// One stream's codes of k-blocks [kblock, kblock + count) (count <= SPAN)
-// into the stages at codes, codes + STAGE, ...: chunk c of the span copies
-// k-block c % SPAN, so the SPAN copies of one chunk position (a row's
-// consecutive codes in the row-major packed layouts) are issued by adjacent
-// lanes of one warp copy. Measured on GB10: one warp copy's 32 contiguous
-// bytes per row (a q4 k-block) stream from memory at 108 GB/s, 64 bytes at
-// 205 GB/s, 128 bytes at 231 GB/s, whatever the number of copies in flight.
-template <class W, int STRIDE, int TILE, int SPAN, int STAGE>
-__device__ __forceinline__ void gemm_load_codes_span(const W &w, u64 tile0, u64 tiles, u64 kblock, u64 count,
-                                                     u8 *codes, u32 first) {
-    for (int c = first; c < SPAN * 8 * W::CHUNKS; c += STRIDE) {
-        const u64 d = c % SPAN;
-        if (d >= count)
-            continue;
-        const int position = c / SPAN;
-        const u64 j = position / W::CHUNKS;
-        const u32 q = position % W::CHUNKS;
-        const bool valid = tile0 + j < tiles;
-        cp_async_chunk<ChunkBytes<W>::value>(codes + d * STAGE + j * TILE + q * ChunkBytes<W>::value,
-                                             w.chunk_source(valid ? tile0 + j : tile0, kblock + d, q), valid);
-    }
-}
+// One loader thread's copies of one weight stream into a GEMM's stages and
+// record buffers: the code chunks of SPAN consecutive k-blocks of tiles
+// [tile0, tile0 + 8) (STAGE bytes apart, TILE bytes a tile) and the records
+// (RECORD bytes a row) of a superblock of their 128 rows, chunk and word
+// c = first, first + STRIDE, ... Which chunks and words a thread copies, and
+// their tiles, are fixed for a segment, so their tiles' addresses are formed
+// once (`gemm_tile_at`) and a k-block's copy adds its k-block's offset alone.
+// Code chunks past `tiles` and words past it, or of k-blocks at or past
+// `kblocks` (a partial last superblock), read zeros.
+template <class W, int STRIDE, int SPAN, int TILE, int RECORD, int STAGE> struct GemmStreamLoader {
+    static constexpr int CHUNK = ChunkBytes<W>::value;
+    static constexpr int CODES = SPAN * 8 * W::CHUNKS;
+    static constexpr int WORDS = 128 * W::SUPER_WORDS;
+    static constexpr int NC = (CODES + STRIDE - 1) / STRIDE;
+    static constexpr int NW = (WORDS + STRIDE - 1) / STRIDE;
+    W code_tiles[NC > 0 ? NC : 1];
+    W word_tiles[NW > 0 ? NW : 1];
+    bool code_valid[NC > 0 ? NC : 1];
+    bool word_valid[NW > 0 ? NW : 1];
+    u32 first;
+    u64 kblocks;
 
-// One stream's part of a record buffer: the coefficient records (RECORD bytes
-// per row) of superblock `superblock` of the rows of tiles [tile0, tile0 + 8),
-// zero past `tiles` and for words of k-blocks at or past `kblocks` (a partial
-// last superblock), by threads `first`, `first + STRIDE`, ...
-template <class W, int STRIDE, int RECORD>
-__device__ __forceinline__ void gemm_load_records(const W &w, u64 tile0, u64 tiles, u64 superblock, u64 kblocks,
-                                                  u8 *records, u32 first) {
-    for (int c = first; c < 128 * W::SUPER_WORDS; c += STRIDE) {
-        const u32 row = c / W::SUPER_WORDS;
-        const int word = c % W::SUPER_WORDS;
-        const bool valid = tile0 + row / 16 < tiles && 4 * superblock + W::word_kblock(word) < kblocks;
-        cp_async_4_zfill(records + row * RECORD + word * 4,
-                         w.super_word(tile0 * 16 + (valid ? row : 0), valid ? superblock : 0, valid ? word : 0),
-                         valid ? 4u : 0u);
+    __device__ __forceinline__ GemmStreamLoader(const W &w, u64 tile0, u64 tiles, u64 kblocks_, u32 first_)
+        : first(first_), kblocks(kblocks_) {
+        if constexpr (CODES > 0)
+#pragma unroll
+            for (int i = 0; i < NC; ++i) {
+                const u32 c = first + i * STRIDE;
+                const u64 tile = tile0 + c / SPAN / W::CHUNKS;
+                code_valid[i] = c < (u32)CODES && tile < tiles;
+                code_tiles[i] = gemm_tile_at(w, code_valid[i] ? tile : tile0);
+            }
+        if constexpr (WORDS > 0)
+#pragma unroll
+            for (int i = 0; i < NW; ++i) {
+                const u32 c = first + i * STRIDE;
+                const u32 row = c / W::SUPER_WORDS;
+                word_valid[i] = c < (u32)WORDS && tile0 + row / 16 < tiles;
+                word_tiles[i] = gemm_tile_at(w, tile0 + (word_valid[i] ? row / 16 : 0));
+            }
     }
-}
+    // The code chunks of k-blocks [kblock, kblock + count) (count <= SPAN):
+    // chunk c copies k-block c % SPAN, so the SPAN copies of one chunk
+    // position (a row's consecutive codes in the row-major packed layouts)
+    // are issued by adjacent lanes of one warp copy. Measured on GB10: one
+    // warp copy's 32 contiguous bytes per row (a q4 k-block) stream from
+    // memory at 108 GB/s, 64 bytes at 205 GB/s, 128 bytes at 231 GB/s,
+    // whatever the number of copies in flight.
+    __device__ __forceinline__ void codes(u8 *stages, u64 kblock, u64 count) const {
+#pragma unroll
+        for (int i = 0; i < NC; ++i) {
+            const u32 c = first + i * STRIDE;
+            const u32 d = c % SPAN;
+            if (c >= (u32)CODES || d >= count)
+                continue;
+            const u32 position = c / SPAN;
+            const u32 j = position / W::CHUNKS;
+            const u32 q = position % W::CHUNKS;
+            cp_async_chunk<CHUNK>(stages + d * STAGE + j * TILE + q * CHUNK,
+                                  code_tiles[i].chunk_source(0, kblock + d, q), code_valid[i]);
+        }
+    }
+    // The records of superblock `superblock` into `records`.
+    __device__ __forceinline__ void records(u8 *records, u64 superblock) const {
+#pragma unroll
+        for (int i = 0; i < NW; ++i) {
+            const u32 c = first + i * STRIDE;
+            if (c >= (u32)WORDS)
+                continue;
+            const u32 row = c / W::SUPER_WORDS;
+            const int word = c % W::SUPER_WORDS;
+            const bool valid = word_valid[i] && 4 * superblock + W::word_kblock(word) < kblocks;
+            cp_async_4_zfill(records + row * RECORD + word * 4,
+                             word_tiles[i].super_word(valid ? row % 16 : 0, valid ? superblock : 0, valid ? word : 0),
+                             valid ? 4u : 0u);
+        }
+    }
+};
 
 // The warp's decoded coefficients of k-block `kblock`: its NJ tiles' rows
 // (block-tile rows first..first + NJ * 16) from their records (the record
@@ -1699,37 +1736,32 @@ template <class Shape, class WA, class WB, bool S8> struct GemmWeights {
         return reinterpret_cast<float *>(shared + AREAS +
                                          (warp * STREAMS + stream) * Shape::template COEF_AREA<WA, WB, S8>);
     }
-    // Superblock `superblock`'s records of both weights into `buffer`.
-    template <int STRIDE> __device__ __forceinline__ void load_records(u8 *buffer, u64 superblock, u32 first) const {
-        gemm_load_records<WA, STRIDE, RECORD_A>(wa, tile0, tiles, superblock, ktotal, buffer, first);
-        if constexpr (PAIR)
-            gemm_load_records<WB, STRIDE, RECORD_B>(wb, tile0, tiles, superblock, ktotal, buffer + 128 * RECORD_A,
-                                                    first);
-    }
-    template <int STRIDE> __device__ __forceinline__ void load(int s, u64 index, u32 first) const {
-        const u64 kb = kbegin + index;
-        gemm_load_codes<WA, STRIDE, TILE_A>(wa, tile0, tiles, kb, stage(s) + ROWS, first);
-        if constexpr (PAIR)
-            gemm_load_codes<WB, STRIDE, TILE_B>(wb, tile0, tiles, kb, stage(s) + ROWS + 8 * TILE_A, first);
-        if (index == 0 || kb % 4 == 0) {
-            load_records<STRIDE>(shared + RECORDS + (kb / 4) % 2 * BUFFER, kb / 4, first);
+    // A loader thread's copies of both weights (`GemmStreamLoader`), copy
+    // c = first, first + STRIDE, ... of each stage and record buffer, the
+    // stages SPAN k-blocks at a time.
+    template <int STRIDE, int SPAN> struct Loader {
+        GemmStreamLoader<WA, STRIDE, SPAN, TILE_A, RECORD_A, STAGE> a;
+        GemmStreamLoader<WB, STRIDE, SPAN, TILE_B, RECORD_B, STAGE> b;
+        // The weights of the share's k-blocks [index, index + count) into
+        // stages s, s + 1, ..., and the records of each superblock that
+        // starts among them (or of the share's first).
+        __device__ __forceinline__ void load(const GemmWeights &weights, int s, u64 index, u64 count = 1) const {
+            const u64 kb = weights.kbegin + index;
+            a.codes(weights.stage(s) + ROWS, kb, count);
+            if constexpr (PAIR)
+                b.codes(weights.stage(s) + ROWS + 8 * TILE_A, kb, count);
+            for (u64 d = 0; d < count; ++d) {
+                if (index + d != 0 && (kb + d) % 4 != 0)
+                    continue;
+                u8 *buffer = weights.shared + RECORDS + (kb + d) / 4 % 2 * BUFFER;
+                a.records(buffer, (kb + d) / 4);
+                if constexpr (PAIR)
+                    b.records(buffer + 128 * RECORD_A, (kb + d) / 4);
+            }
         }
-    }
-    // The weights of the share's k-blocks [index, index + count) into stages
-    // s, s + 1, ... (`gemm_load_codes_span`), and the records of each
-    // superblock that starts among them (or of the share's first).
-    template <int STRIDE, int SPAN> __device__ __forceinline__ void load_span(int s, u64 index, u64 count,
-                                                                             u32 first) const {
-        const u64 kb = kbegin + index;
-        gemm_load_codes_span<WA, STRIDE, TILE_A, SPAN, STAGE>(wa, tile0, tiles, kb, count, stage(s) + ROWS, first);
-        if constexpr (PAIR)
-            gemm_load_codes_span<WB, STRIDE, TILE_B, SPAN, STAGE>(wb, tile0, tiles, kb, count,
-                                                                  stage(s) + ROWS + 8 * TILE_A, first);
-        for (u64 d = 0; d < count; ++d) {
-            if (index + d != 0 && (kb + d) % 4 != 0)
-                continue;
-            load_records<STRIDE>(shared + RECORDS + (kb + d) / 4 % 2 * BUFFER, (kb + d) / 4, first);
-        }
+    };
+    template <int STRIDE, int SPAN = 1> __device__ __forceinline__ Loader<STRIDE, SPAN> loader(u32 first) const {
+        return Loader<STRIDE, SPAN>{{wa, tile0, tiles, ktotal, first}, {wb, tile0, tiles, ktotal, first}};
     }
     __device__ __forceinline__ void decode(int s, u64 index, u32 warp, u32 first) const {
         const u64 kb = kbegin + index;
@@ -2000,11 +2032,12 @@ __device__ __forceinline__ void gemm_segment(u8 *shared, const Rows &source, u32
             gemm_multiply<Shape, Operands>(acc, weights, stage, index, warp, lane);
     };
     // `index` counts k-blocks of this share.
+    const auto copies = weights.template loader<LOADERS, Shape::SPAN>(loader);
     auto load = [&](int stage, u64 index) {
         if (threadIdx.x / LOADERS != index % Shape::ROTATE)
             return;
         load_rows(weights.stage(stage), kbegin + index);
-        weights.template load<LOADERS>(stage, index, loader);
+        copies.load(weights, stage, index);
     };
 
     float acc[2][NJ][MI][2][4];
@@ -2048,7 +2081,7 @@ __device__ __forceinline__ void gemm_segment(u8 *shared, const Rows &source, u32
             const u64 count = min((u64)SPAN, kblocks - index);
             for (u64 d = 0; d < count; ++d)
                 load_rows(weights.stage(slot * SPAN + (int)d), kbegin + index + d);
-            weights.template load_span<LOADERS, SPAN>(slot * SPAN, index, count, loader);
+            copies.load(weights, slot * SPAN, index, count);
         };
 #pragma unroll
         for (int s = 0; s < SLOTS - 1; ++s) {
@@ -2259,6 +2292,7 @@ __device__ __forceinline__ void gemm_segment_s8(u8 *shared, const Rows &source, 
         grouped[i] = r < Shape::BM && row < M;
         group_row[i] = source.groups_of(grouped[i] ? row : 0);
     }
+    const auto copies = weights.template loader<THREADS>(threadIdx.x);
     auto load = [&](int stage, u64 index) {
         const u64 kb = kbegin + index;
         u8 *base = weights.stage(stage);
@@ -2276,7 +2310,7 @@ __device__ __forceinline__ void gemm_segment_s8(u8 *shared, const Rows &source, 
             if (r < Shape::BM)
                 seismic_cp_async_16_zfill(staged_groups + r * 16, group_row[i] + kb * 2, grouped[i] ? 16u : 0u);
         }
-        weights.template load<THREADS>(stage, index, threadIdx.x);
+        copies.load(weights, stage, index);
     };
 
     float acc[2][NJ][MI][2][4];

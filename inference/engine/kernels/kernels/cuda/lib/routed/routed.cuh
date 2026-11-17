@@ -166,7 +166,7 @@ struct GatheredRows {
 // once per block: measured on GB10 with iq2xxs experts, 1.7x the rate of two
 // warp rows of four tiles). Weights whose rows hold fewer than 64 code bytes
 // per k-block (the 4- to 6-bit codes) stage k-blocks in spans of two, so each
-// warp copy reads 64 contiguous bytes of a row (`gemm_load_codes_span`).
+// warp copy reads 64 contiguous bytes of a row (`GemmStreamLoader::codes`).
 // The spanned layout must fit the declared shared bytes (`DECLARED`), else
 // the 3-stage single k-block pipeline runs, as the int8 GEMM (S8) always
 // does: it stages one k-block a stage (`gemm_segment_s8`).

@@ -247,6 +247,9 @@ struct Rows {
     u64 scales;
     u64 supers;
     u64 supers_bytes; // payload bytes of a row's supers plane
+    // Where tile `tile`'s rows begin: row 16 tile, every plane of a row at
+    // its offset from the row (`CodePlane::chunk`, the decoders' `super_word`).
+    __device__ __forceinline__ const u8 *tile_base(u64 tile) const { return base + 16 * tile * stride; }
 };
 
 // Coefficients of one k-block for the fragment rows g and g+8, per group.
@@ -2140,11 +2143,14 @@ template <class G, class K> struct Records {
     static constexpr u64 ENTRIES = 1024;
     static constexpr u64 FACTORS = 32;
 
+    // Where tile `tile`'s records begin: every group's entries, then its
+    // factors (`factors`), each row's at its place within the tile.
+    __device__ __forceinline__ const u8 *tile_base(u64 tile) const { return base + tile * 16 * stride; }
     __device__ __forceinline__ const u8 *entries_at(u64 tile, u64 superblock) const {
-        return base + tile * 16 * stride + superblock * ENTRIES;
+        return tile_base(tile) + superblock * ENTRIES;
     }
     __device__ __forceinline__ const u8 *factors_at(u64 tile, u64 superblock) const {
-        return base + tile * 16 * stride + factors + superblock * FACTORS;
+        return tile_base(tile) + factors + superblock * FACTORS;
     }
 
     // ---- GEMV in records (`gemv_records_group`).
