@@ -183,7 +183,8 @@ pub enum CachePoint {
     Branch,
     /// The prompt one row before its end.
     PromptBoundary,
-    /// A finished request's whole path.
+    /// A finished request's whole path, or a cancelled one's as far as its
+    /// state was computed: the conversation's latest state.
     Terminal,
 }
 

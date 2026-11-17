@@ -604,6 +604,29 @@ fn a_chain_is_released_by_its_holder_never_orphaned() {
     assert!(domain.queue.is_empty());
 }
 
+/// A holder that ended mid-chain and keeps what it computed concludes its
+/// chain: its queued chunks are joined as they finish and the chain
+/// publishes whole, its holder resident at the chain's end, every row of
+/// the group its own.
+#[test]
+fn a_concluded_chain_keeps_its_holder_at_its_end() {
+    let (mut domain, mut bindings) = chain_fixture();
+    let request = RequestId(81);
+    open(&mut domain, &mut bindings, request);
+    domain.plan_successors(vec![prefill(request, 1), prefill(request, 2)]);
+    let flight = submit_reserved_target(&mut domain, bindings, vec![prefill(request, 0)]);
+    let (pending, mut bindings) = finish_one(&mut domain, flight);
+    domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }).unwrap();
+    assert_eq!((domain.queue.len(), domain.chain_holder()), (2, Some(request)));
+    assert!(!domain.target.contains_key(&request), "the chain holds its holder's state");
+    domain.conclude_chain(request).unwrap();
+    assert!(domain.queue.is_empty());
+    assert_eq!(domain.chain_holder(), None);
+    assert_eq!(domain.target.get(&request).map(SequenceState::position), Some(3), "resident through the chain's last chunk");
+    domain.close(request).unwrap();
+    super::fixtures::shrink_settled(&mut domain, &mut bindings);
+}
+
 /// Spare state slabs owed to the ledger wait while a held chain is under way
 /// between its chunks (releasing them orphans queued steps), then release once
 /// the chain ends. The slabs a closed request's long history backed are spare

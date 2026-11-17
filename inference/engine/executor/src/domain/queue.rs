@@ -497,6 +497,35 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         drained.and(released).and_then(|()| self.close_group())
     }
 
+    /// Conclude the chain of `request`, a holder that ended mid-chain and
+    /// keeps what it computed: its queued chunks run on the device whatever
+    /// happens, so each is waited for and joined as a claimed chunk is, and
+    /// the chain publishes whole, its holder's state at the chain's end. A
+    /// chunk that returns no rows (interrupted, or its weights unread)
+    /// releases the chain as such a chunk always does, its holder's state
+    /// with it.
+    pub fn conclude_chain(&mut self, request: RequestId) -> Result<(), DomainError> {
+        while self.chain_holder() == Some(request) {
+            let Some(QueuedStep { mut flight, .. }) = self.queue.pop_front() else {
+                return Err(DomainError::invariant("a chain under way has its last chunk in flight"));
+            };
+            flight.continuation = Some((0..flight.requests.len()).map(|_| None).collect());
+            if let Some(priming) = &mut flight.priming {
+                priming.continuation = Some(self.head.remove(&priming.request).map(InFlightState::new));
+            }
+            for pending in self.finish_target_work(flight)? {
+                match pending.outcome {
+                    Outcome::Forward { .. } => {
+                        let accepted_rows = pending.committed_rows;
+                        self.reconcile(pending, PhysicalDecision { accepted_rows })?;
+                    }
+                    _ => self.abort(pending)?,
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Join `request`'s finished chained chunk to its chain: held while the
     /// rest of it is queued, published whole with the last chunk.
     pub(super) fn join_chain(

@@ -1,4 +1,4 @@
-use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
+use image::{DynamicImage, ImageFormat, Rgb, RgbImage, Rgba, RgbaImage};
 use magnitude_artifacts::{ImageProcessor, ImageProcessorConfig, ImageResize, Resampling};
 use std::io::Cursor;
 
@@ -234,6 +234,37 @@ fn decode_normalize_and_patchify_follow_merged_block_order() {
             .collect::<Vec<_>>(),
         vec![1, 4, 4]
     );
+}
+
+#[test]
+fn transparency_is_composited_over_white() {
+    let mut source = RgbaImage::new(4, 4);
+    for (x, _, pixel) in source.enumerate_pixels_mut() {
+        *pixel = if x < 2 { Rgba([0, 0, 0, 0]) } else { Rgba([0, 0, 0, 255]) };
+    }
+    let mut encoded = Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(source)
+        .write_to(&mut encoded, ImageFormat::Png)
+        .unwrap();
+
+    let prepared = processor(1, 2, 16, 16)
+        .prepare(&[encoded.into_inner()])
+        .unwrap();
+    let values = prepared
+        .tensors()
+        .iter()
+        .find(|tensor| tensor.name() == "pixel_values")
+        .unwrap();
+    let mut first_channel = values
+        .data()
+        .chunks_exact(4)
+        .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+        .collect::<Vec<_>>()
+        .chunks_exact(6)
+        .map(|row| row[0])
+        .collect::<Vec<_>>();
+    first_channel.sort_by(f32::total_cmp);
+    assert_eq!(first_channel, [[0.0; 8], [1.0; 8]].concat());
 }
 
 #[test]

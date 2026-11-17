@@ -3379,6 +3379,48 @@ impl<F: ProgramFamily> Service<F> {
         Ok(())
     }
 
+    /// Cache a cancelled request's path where its computed state ends,
+    /// mid-prompt or mid-reply: a client that stops a request keeps what it
+    /// saw and sends the conversation again, which resumes there instead of
+    /// computing it anew. A prompt group's chain under way runs on the
+    /// device whatever happens, so it is concluded and kept whole first. A
+    /// stop lands anywhere in a round, so the state is cached only where it
+    /// is settled and the method's checkpoint accounts for the same rows.
+    fn retain_cancelled(&mut self, id: RequestId) -> Result<(), RequestError> {
+        let Some((record, generation)) = self.between(id) else {
+            return Ok(());
+        };
+        if record.terminal_retained
+            || !record.prefix_cache
+            || !generation.is_resident()
+            || generation.finish_reason() != Some(FinishReason::Cancelled)
+        {
+            return Ok(());
+        }
+        if self.domain.chain_holder() == Some(id) {
+            self.domain.conclude_chain(id).map_err(classify_domain_error)?;
+        }
+        let Ok(state) = self.domain.resume_state(id) else {
+            return Ok(());
+        };
+        let position = state.position();
+        drop(state);
+        let Some((_, generation)) = self.between(id) else {
+            return Ok(());
+        };
+        if position < MIN_PREFIX_HIT
+            || !PrefixPath::of(generation).exact_boundary(position)
+            || !generation
+                .method_checkpoint()
+                .is_ok_and(|method| method.accounts_for(position))
+        {
+            return Ok(());
+        }
+        self.cache_prefix(id, position, CachePoint::Terminal)?;
+        self.requests.get_mut(&id).unwrap().record.terminal_retained = true;
+        Ok(())
+    }
+
     /// Drain round members' accepted output into their reserved permits, so
     /// publication overlaps the next submission.
     fn publish_members(&mut self, round: &mut Round) {
@@ -3476,6 +3518,7 @@ impl<F: ProgramFamily> Service<F> {
                 continue;
             }
             self.retain_terminal(id)?;
+            self.retain_cancelled(id)?;
             let request = self.requests.get_mut(&id).expect("listed request");
             let State::Between(generation, _) = &request.state else {
                 continue;

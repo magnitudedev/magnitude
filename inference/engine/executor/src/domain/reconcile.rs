@@ -154,7 +154,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// Cancellation while completion is already available makes no physical
-    /// successor visible and returns the original accepted sequence.
+    /// successor visible. A step returns the original accepted sequence; a
+    /// whole chain whose last chunk finished returns the state its chunks
+    /// computed (`Advance::abort`).
     pub fn abort(&mut self, pending: PendingOperationOutcome) -> Result<(), DomainError> {
         let conflicting_owner = match &pending.outcome {
             Outcome::Head { .. } => self.head.contains_key(&pending.request),
@@ -193,12 +195,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 }
 
 impl Advance {
-    /// The accepted state an aborted outcome returns, when it holds one.
+    /// The accepted state an aborted outcome returns, when it holds one. A
+    /// whole chain's last chunk finished: every chunk's rows were computed
+    /// and the earlier chunks' already reconciled, so its holder keeps them
+    /// all rather than the state the chain started from.
     fn abort(self) -> Option<SequenceState> {
         match self {
             Self::Step(advance) => Some(advance.abort()),
             Self::Chained => None,
-            Self::Chain(chain) => Some(chain.abort()),
+            Self::Chain(chain) => Some(chain.commit()),
         }
     }
 }
