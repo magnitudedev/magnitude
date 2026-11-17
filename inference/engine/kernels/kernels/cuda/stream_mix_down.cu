@@ -125,8 +125,8 @@ __global__ void stream_mix_down_gemm_small(SEISMIC_KERNEL_PARAMS) {
 #endif
 
 #ifdef SEISMIC_FORMING_STREAM_MIX_DOWN_GEMM
-template <unsigned INT8, unsigned OPERAND, unsigned ROTATE>
-__global__ void stream_mix_down_gemm(SEISMIC_KERNEL_PARAMS) {
+template <unsigned INT8, unsigned OPERAND, unsigned ROTATE, unsigned BLOCKS>
+__launch_bounds__(256, BLOCKS) __global__ void stream_mix_down_gemm(SEISMIC_KERNEL_PARAMS) {
     mix_gemm<projection::LargeGemm<ROTATE>>(STAGED_ROWS, (unsigned)SEISMIC_DIM_M, SEGMENTS);
 }
 #endif

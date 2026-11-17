@@ -144,6 +144,16 @@ template <int GROUPS_, int RESIDENCY> struct GroupBarrier {
     }
 };
 
+// Trap unless the launch declared at least `bytes` of dynamic shared memory:
+// a launch that omits what a block lays out there fails at that launch, not
+// by writing past the block's memory.
+__device__ __forceinline__ void require_dynamic_shared(u64 bytes) {
+    u32 declared;
+    asm("mov.u32 %0, %%dynamic_smem_size;" : "=r"(declared));
+    if (bytes > declared)
+        __trap();
+}
+
 // The segment of a segmented projection holding work item `index`, given the
 // items (GEMV tile groups or GEMM block columns) of each segment in order;
 // `index` becomes segment-local. Returns N past the last segment.
@@ -2472,6 +2482,10 @@ __device__ __forceinline__ void gemm_rows(u8 *shared, const Rows &source, u32 M,
                                           const WA &wa, const WB &wb, const Epi &epi, u64 part = 0, u64 parts = 1) {
     static_assert(!S8 || Same<Operands, SemanticGemmOperands>::value,
                   "quantized activation GEMM requires the semantic operand policy");
+    // The launch declares at least this layout's bytes: the 16-bit bound, or
+    // with two blocks an SM the weight's int8 layout bound
+    // (`form(W, INT8_SHARED)`, `dense.seismic`'s BLOCKS).
+    require_dynamic_shared(Shape::template LAYOUT_BYTES<WA, WB, S8>);
     if constexpr (S8)
         gemm_segment_s8<Shape>(shared, source, M, K, nblock, rows, wa, wb, epi, part, parts);
     else

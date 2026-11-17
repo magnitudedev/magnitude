@@ -380,7 +380,18 @@ projection dense for metal:
 # of ROTATE rotating warp sets (the launch parameter ROTATE, tuned: its best
 # value depends on the weight representation, and the arithmetic does not,
 # so every value gives the same bits; likewise in the `gemm` launches of
-# `attention`, `recurrent`, `readout` and `draft`). Entries with few output
+# `attention`, `recurrent`, `readout` and `draft`). BLOCKS (the launch
+# parameter, tuned; same bits at every value) is the large band's blocks an
+# SM: 2 halves its registers (128 a thread) and declares the int8 GEMM's own
+# layout bound (`form(W, INT8_SHARED)`) as its shared bytes, admitted for the
+# int8 GEMM of single or segmented weights whose bound fits half an SM's
+# shared memory (HALF_SM_SHARED: 100 KB an SM on sm_86 and sm_89, less 1 KB
+# reserved a block). Its loop stalls with 8 warps an SM: on an RTX 3090 at
+# 512 rows a third stage was no faster, and 2 blocks cut the int8 GEMM of
+# q4g32s 13%, q8g32s and q3k 1% (runs 30053d, a8dd9f), while weights
+# whose GEMM spills at 128 registers (q4k, q6k, q2k, the iq formats: 200 to
+# 380 stack bytes) run 1.1 to 3.6x slower at 2; 1 is first, the smaller
+# worst-case gap. Entries with few output
 # columns split either band over K up to 128 rows (grid z: 2 shares of
 # partials that `finalize` sums in part order). Measured on GB10 (17 to 512
 # rows, both paths, split 1/2/4, tiles 32/64/128): up to 64 rows want the
@@ -442,6 +453,7 @@ projection dense for cuda:
     let FORMS = 1 for rms
     let FORMS = 0 for staged
     let FORMS = OPERANDS for plain
+    let HALF_SM_SHARED = 49152
     params (arithmetic INT8 in [0, 1] default 0, arithmetic OPERAND in [0, 1] default 0,
         arithmetic SPLIT in [2, 1] default 2 for single,
         TPW in [1, 2] default 1 for ordered,
@@ -457,6 +469,8 @@ projection dense for cuda:
     where (OPERAND == 0 or (INT8 == 0 and PARTED == 0))
     where (INT8 == 0 or each(W, form(W, INT8) == 1)) for paired | single
     where (INT8 == 0 or (PARTED == 0 and each(W, N == 0 or form(W, INT8) == 1))) for segmented
+    where (BLOCKS == 1 or (INT8 == 1 and each(W, N == 0 or form(W, INT8_SHARED) <= HALF_SM_SHARED))) for single | segmented
+    where BLOCKS == 1 for paired
     where (STAGING == 0 or PARTED == 0)
     where (RESIDENCY != 2 or each(W, form(W, GEMV_RECORDS) == 0)) for paired | single
     where (G == 1 or (N % 16 == 0 and INT8 == 0 and OPERAND == 0 and each(W, operands(W) == 0))) for single
@@ -524,11 +538,11 @@ projection dense for cuda:
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (3 * (64 * 144 + SERVED * 10240) + SERVED * 2048)
     launch gemm when ORDERED_ANY == 0 and M > 64 and PLANES == 0:
-        params (ROTATE in [2, 1, 4] default 2)
+        params (ROTATE in [2, 1, 4] default 2, BLOCKS in [1, 2] default 1)
         reads (INT8, OPERAND)
         threadgroups (tiles(W, ceil_div(ceil_div(N, 16), 8)), ceil_div(M, 128), ZSPLIT * G)
         threads_per_threadgroup (256, 1, 1)
-        shared_bytes (2 * (128 * 144 + SERVED * 10240) + SERVED * 2048)
+        shared_bytes ((2 - BLOCKS) * (2 * (128 * 144 + SERVED * 10240) + SERVED * 2048) + (BLOCKS - 1) * most(W, form(W, INT8_SHARED)))
     launch finalize for single when ORDERED_ANY == 0 and M > 16 and M <= 128 and SPLIT > 1 and PLANES == 0:
         reads (SPLIT)
         threadgroups (ceil_div(M * N, 256), 1, G)

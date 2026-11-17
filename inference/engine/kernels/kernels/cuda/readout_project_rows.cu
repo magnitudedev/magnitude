@@ -72,8 +72,8 @@ __global__ void readout_project_rows_gemm_small(SEISMIC_KERNEL_PARAMS) {
 #endif
 
 #ifdef SEISMIC_FORMING_READOUT_PROJECT_ROWS_GEMM
-template <unsigned INT8, unsigned OPERAND, unsigned SPLIT, unsigned ROTATE>
-__global__ void readout_project_rows_gemm(SEISMIC_KERNEL_PARAMS) {
+template <unsigned INT8, unsigned OPERAND, unsigned SPLIT, unsigned ROTATE, unsigned BLOCKS>
+__launch_bounds__(256, BLOCKS) __global__ void readout_project_rows_gemm(SEISMIC_KERNEL_PARAMS) {
     PROJECTION_GEMM(projection::LargeGemm<ROTATE>, PROJECTION_OPERANDS);
 }
 #endif

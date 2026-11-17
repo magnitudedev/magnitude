@@ -1857,6 +1857,17 @@ fn dense_output_timing_at_shape() {
                     eprintln!("timing Cuda dense_output {format:?} M {rows} INT8 {int8}: best {}", report(time));
                 }
             }
+            // The int8 GEMM's fastest at each of its blocks an SM, where the
+            // declaration admits more than one (`BLOCKS`).
+            for blocks in [1, 2] {
+                let at = |configuration: &seismic::Configuration| {
+                    configuration.params.get("INT8").is_some_and(|value| *value == 1)
+                        && configuration.launches.iter().any(|launch| launch.get("BLOCKS") == Some(&blocks))
+                };
+                if let Some((time, _)) = fastest(&at) {
+                    eprintln!("timing Cuda dense_output {format:?} M {rows} INT8 1 BLOCKS {blocks}: best {}", report(time));
+                }
+            }
         }
     }
 }

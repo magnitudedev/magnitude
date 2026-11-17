@@ -40,8 +40,10 @@ use crate::types::DType;
 /// CUDA's forms, in emission order: the folded GEMM recipe (`GEMM_FOLD`),
 /// the int8 GEMM (`INT8`), the records GEMV (`GEMV_RECORDS`) and the int8
 /// GEMM's local scale codes multiplied into the codes (`INT8_LOCAL`), negated
-/// (`INT8_LOCAL_NEGATED`). [`cuda_forms`] values them in this order.
-const CUDA_FORMS: [&str; 5] = ["GEMM_FOLD", "INT8", "GEMV_RECORDS", "INT8_LOCAL", "INT8_LOCAL_NEGATED"];
+/// (`INT8_LOCAL_NEGATED`), and the shared bytes that bound the int8 GEMM's
+/// 128-row layout of the weight (`INT8_SHARED`, [`cuda_int8_shared`]).
+/// [`cuda_forms`] values them in this order.
+const CUDA_FORMS: [&str; 6] = ["GEMM_FOLD", "INT8", "GEMV_RECORDS", "INT8_LOCAL", "INT8_LOCAL_NEGATED", "INT8_SHARED"];
 
 /// Vulkan's forms: whether its packet decoder reads the weight (`DECODED`),
 /// and the bytes of the table its decoder stages in shared memory for it
@@ -317,7 +319,59 @@ fn cuda_forms(rows: &registry::PackedRowLayout, weight: &Weight, operands: Opera
         u32::from(rows.records()),
         u32::from(local.is_some()),
         u32::from(local == Some(true)),
+        cuda_int8_shared(rows, &weight.axes, operands),
     ]
+}
+
+/// The shared bytes that bound the int8 GEMM's layout of one weight
+/// (`projection::GemmShape::LAYOUT_BYTES` of the 128-row band:
+/// `projection::LargeGemm`, 2 stages, 8 warps of one weight tile each), 0
+/// where the int8 GEMM does not take the weight (`cuda_int8`). A
+/// declaration admits two blocks an SM to the int8 GEMM of weights whose
+/// bound fits half an SM's shared memory (`dense.seismic`, `BLOCKS`), and
+/// declares it as the launch's shared bytes; the GEMM traps where its layout
+/// exceeds what its launch declares. Per stage: the activation rows (128
+/// rows of 64 codes at a pitch of 80 bytes, then each row's two 16-byte
+/// groups) and 8 tiles' codes of one k-block (16 rows of every code plane's
+/// bytes of 64 values); per record buffer (two): 128 rows' coefficient
+/// records of a 256-code superblock (each coefficient plane's bytes of it in
+/// whole words, the record in whole 16 bytes); per warp: its 16 rows'
+/// coefficients of a k-block (`GemmShape::COEF_ROW`: a scale, with a bias
+/// or local code where the weight has either, for each group of the
+/// k-block, in whole 16 bytes). Each term is the GEMM's own or more.
+fn cuda_int8_shared(rows: &registry::PackedRowLayout, axes: &registry::DecodeAxes, operands: OperandRecipe) -> u32 {
+    if !cuda_int8(axes, operands) {
+        return 0;
+    }
+    const STAGES: u64 = 2;
+    const ROWS: u64 = 128;
+    const WARPS: u64 = 8;
+    let group = u64::from(rows.packet.group);
+    let per = |plane: &registry::RowPlaneInfo, values: u64| (u64::from(plane.bytes_per_group) * values).div_ceil(group);
+    let mut codes = 0;
+    let mut words = 0;
+    for plane in &rows.planes {
+        match plane.content {
+            registry::RowPlaneContent::Codes { .. }
+            | registry::RowPlaneContent::Grids { .. }
+            | registry::RowPlaneContent::GridHigh { .. } => codes += per(plane, 64),
+            registry::RowPlaneContent::Groups { .. } => words += per(plane, 256).div_ceil(4),
+            // A records plane holds a group's entries and its factors
+            // together: bounded as codes and as coefficients both.
+            registry::RowPlaneContent::Records { .. } => {
+                codes += per(plane, 64);
+                words += per(plane, 256).div_ceil(4);
+            }
+        }
+    }
+    let profile = axes.profile();
+    let groups = 64 / u64::from(profile.local.group.min(64));
+    let single = profile.local.bias == Bias::None && matches!(profile.local.scale, LocalScale::Stored(_));
+    let coefficient_row = (groups * if single { 1 } else { 2 } * 4).next_multiple_of(16);
+    let stage = ROWS * 96 + 8 * 16 * codes;
+    let records = ROWS * (4 * words).next_multiple_of(16);
+    let bytes = STAGES * stage + 2 * records + WARPS * 16 * coefficient_row;
+    u32::try_from(bytes).expect("a layout of under 4 GiB")
 }
 
 /// Whether CUDA's GEMM multiplies the weight's exact codes and applies each

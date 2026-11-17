@@ -76,8 +76,8 @@ __global__ void short_conv_project_gemm_small(SEISMIC_KERNEL_PARAMS) {
 #endif
 
 #ifdef SEISMIC_FORMING_SHORT_CONV_PROJECT_GEMM
-template <unsigned INT8, unsigned OPERAND, unsigned ROTATE>
-__global__ void short_conv_project_gemm(SEISMIC_KERNEL_PARAMS) {
+template <unsigned INT8, unsigned OPERAND, unsigned ROTATE, unsigned BLOCKS>
+__launch_bounds__(256, BLOCKS) __global__ void short_conv_project_gemm(SEISMIC_KERNEL_PARAMS) {
     PROJECTION_SEGMENTED_GEMM(projection::LargeGemm<ROTATE>, PROJECTION_OPERANDS);
 }
 #endif
