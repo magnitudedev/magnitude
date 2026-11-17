@@ -52,6 +52,7 @@ import { ChatTitle } from "./chat/chat-title"
 import { ModelPicker, type PickerModel } from "./chat/model-picker"
 import { useChatModels } from "./chat/served-models"
 import { submitBlocked } from "./chat/submit-blocked"
+import { MESSAGE_CHARS, PASTE_TOO_LONG, noticeAfterEdit, pasteTooLong } from "./chat/paste"
 import { useNavigate } from "../session"
 
 export function ChatPage() {
@@ -373,13 +374,22 @@ function ChatView({
                 // A chat's view mounts whenever a chat is opened or started, so its composer starts focused.
                 autoFocus
                 rows={2}
-                maxLength={1_048_576}
+                maxLength={MESSAGE_CHARS}
                 aria-label="Message"
                 placeholder="Message…"
                 value={composerText}
-                onChange={(e) =>
+                onChange={(e) => {
                   setDraft({ ...draft, text: e.target.value, submitted: null })
-                }
+                  setNotice(noticeAfterEdit)
+                }}
+                onPaste={(e) => {
+                  // Pasting past the limit would keep only what fits, so the sent message would lose its end unnoticed.
+                  const field = e.currentTarget
+                  if (pasteTooLong(field.value, field.selectionStart, field.selectionEnd, e.clipboardData.getData("text/plain"))) {
+                    e.preventDefault()
+                    setNotice(PASTE_TOO_LONG)
+                  }
+                }}
                 onKeyDown={(e) => {
                   if (
                     submitsChatMessage(
