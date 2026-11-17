@@ -1,7 +1,7 @@
 //! CPU backend composition over one exact production worker pool.
 
 use crate::executor::{Device, Executor};
-use crate::workers::Workers;
+use crate::workers::{SharedWorkers, Workers};
 use crate::Cpu;
 use seismic_compiler::errors::TargetError;
 use seismic_memory::entry::Store;
@@ -16,7 +16,7 @@ pub struct OpenedCpu {
 /// The host pool while any opened CPU device holds it. The pool has one
 /// participant per performance core, so every CPU device of the process
 /// shares it: two pools would place two participants on each core.
-static HOST: Mutex<Weak<Mutex<Workers>>> = Mutex::new(Weak::new());
+static HOST: Mutex<Weak<SharedWorkers>> = Mutex::new(Weak::new());
 
 /// The host CPU over its pool of one participant per core of `cores`, the
 /// performance cores the process may keep busy
@@ -32,7 +32,7 @@ pub fn open_host(cores: std::num::NonZeroUsize, store: Arc<dyn Store>) -> Result
             Some(workers) => workers,
             None => {
                 let workers =
-                    Arc::new(Mutex::new(Workers::new(cores.get()).map_err(|error| {
+                    Arc::new(SharedWorkers::new(Workers::new(cores.get()).map_err(|error| {
                         TargetError::DeviceUnavailable(error.to_string())
                     })?));
                 *host = Arc::downgrade(&workers);
@@ -55,10 +55,8 @@ pub(crate) fn open_quota() -> Result<OpenedCpu, TargetError> {
 
 /// Opens execution over the production worker pool. Profiling is acquired
 /// separately from this same executor only by an analytical evaluator.
-pub(crate) fn open_workers(workers: Arc<Mutex<Workers>>, store: Arc<dyn Store>) -> Result<OpenedCpu, TargetError> {
-    let device = crate::profile::device_for_workers(
-        &workers.lock().expect("CPU worker-pool lock poisoned"),
-    )?;
+pub(crate) fn open_workers(workers: Arc<SharedWorkers>, store: Arc<dyn Store>) -> Result<OpenedCpu, TargetError> {
+    let device = crate::profile::device_for_workers(&workers.lock())?;
     Ok(OpenedCpu {
         service: Device,
         executor: Executor::from_workers(workers, store.own()),

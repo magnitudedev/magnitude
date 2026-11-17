@@ -1,7 +1,7 @@
 //! Synchronous execution of the core-owned executable command vocabulary.
 
 use crate::buffer::{Buffer, WritableBuffer};
-use crate::workers::{LaunchFailure, LaunchFrame, NativeSteps, Workers};
+use crate::workers::{LaunchFailure, LaunchFrame, NativeSteps, SharedWorkers};
 use crate::Cpu;
 use seismic_compiler::errors::ExecutionError;
 use seismic_compiler::executable::{
@@ -12,7 +12,7 @@ use seismic_ir::schedule::FillValue;
 use seismic_lang::expr::compiled::InvocationValues;
 use seismic_lang::expr::SymbolValue;
 use seismic_memory::entry::Entry;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Device;
@@ -60,7 +60,7 @@ impl DeviceService<Cpu> for Device {
 
 pub struct Executor {
     /// Shared by every CPU device of the process (`open_host`).
-    workers: Arc<Mutex<Workers>>,
+    workers: Arc<SharedWorkers>,
     /// The device's own entry of the host store, which the pool's scratch
     /// this device's launches grow is charged to.
     own: Arc<dyn Entry>,
@@ -88,7 +88,7 @@ impl Executor {
         seismic_compiler::evaluation::AnalyticalEvaluationContext<Cpu>,
         seismic_compiler::errors::TargetError,
     > {
-        let mut workers = self.workers.lock().expect("CPU worker pool lock poisoned");
+        let mut workers = self.workers.lock();
         crate::profile::profile_for_workers(&mut workers, &self.own, device)
     }
 
@@ -112,17 +112,14 @@ impl Executor {
         steps: &dyn NativeSteps,
         clock: fn() -> f64,
     ) -> (Result<(), ExecutionError>, (f64, f64)) {
-        let mut workers = self.workers.lock().expect("CPU worker-pool lock poisoned");
+        let mut workers = self.workers.lock();
         let started = clock();
         let outcome = workers.run_native(&self.own, steps).map_err(launch_error);
         (outcome, (started, clock()))
     }
 
-    pub(crate) fn from_workers(workers: Arc<Mutex<Workers>>, own: Arc<dyn Entry>) -> Self {
-        let participants = workers
-            .lock()
-            .expect("CPU worker-pool lock poisoned")
-            .count();
+    pub(crate) fn from_workers(workers: Arc<SharedWorkers>, own: Arc<dyn Entry>) -> Self {
+        let participants = workers.lock().count();
         Self {
             workers,
             own,
@@ -146,7 +143,7 @@ impl NativeExecutor<Cpu> for Executor {
 }
 
 pub struct Submission {
-    workers: Arc<Mutex<Workers>>,
+    workers: Arc<SharedWorkers>,
     /// The [`Executor`]'s own entry, which its scratch is charged to.
     own: Arc<dyn Entry>,
 }
@@ -375,7 +372,6 @@ impl Submission {
         };
         self.workers
             .lock()
-            .expect("CPU worker-pool lock poisoned")
             .run(
                 &self.own,
                 kernel.entry,

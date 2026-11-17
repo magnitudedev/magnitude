@@ -9,12 +9,20 @@ use seismic_topology::{
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
-/// The executors this process has open, shared by every [`Devices`].
-fn opened() -> &'static Mutex<HashMap<ExecutorId, Weak<DeviceInner>>> {
+/// The executors this process has open, shared by every [`Devices`], held
+/// across an open so that an executor opens once. An open that panics has
+/// changed nothing (an executor is entered only once it opened, and the
+/// entries of dropped ones are only ever removed), so the panic is that
+/// open's alone: the lock does not pass it on to every later open of the
+/// process as poison.
+fn opened() -> MutexGuard<'static, HashMap<ExecutorId, Weak<DeviceInner>>> {
     static OPENED: OnceLock<Mutex<HashMap<ExecutorId, Weak<DeviceInner>>>> = OnceLock::new();
-    OPENED.get_or_init(Mutex::default)
+    OPENED
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Runtime resources over an inventory. Machine discovery and sampling
@@ -90,7 +98,7 @@ impl Devices {
     ) -> Result<Arc<DeviceInner>, OpenError> {
         let topology = self.topology();
         let info = topology.executor(id).ok_or(OpenError::Stale(id))?.clone();
-        let mut opened = opened().lock().expect("opened executors lock poisoned");
+        let mut opened = opened();
         opened.retain(|_, device| device.strong_count() != 0);
         if let Some(device) = opened.get(&id).and_then(Weak::upgrade) {
             if options.artifacts.as_ref().is_some_and(|requested| !Arc::ptr_eq(&device.artifacts, requested)) {
@@ -215,8 +223,6 @@ impl Devices {
     pub fn status(&self, topology: &DeviceTopology, executor: ExecutorId) -> Status {
         // Read outside the lock: a driver query must not hold up an open.
         let devices = opened()
-            .lock()
-            .expect("opened executors lock poisoned")
             .values()
             .filter_map(Weak::upgrade)
             .collect::<Vec<_>>();
@@ -304,5 +310,23 @@ mod tests {
                 diagnostics: vec!["this build has no Vulkan runtime".into()],
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod opened_tests {
+    use super::*;
+
+    /// An open that panics while it holds the opened executors leaves
+    /// every later open of the process working.
+    #[test]
+    fn a_panicked_open_leaves_later_opens_working() {
+        let panicked = std::thread::spawn(|| {
+            let _held = opened();
+            panic!("the open failed");
+        })
+        .join();
+        assert!(panicked.is_err());
+        Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
     }
 }

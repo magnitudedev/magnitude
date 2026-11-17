@@ -678,6 +678,25 @@ pub struct Workers {
 // driven through `&mut self` by one submitter at a time.
 unsafe impl Send for Workers {}
 
+/// A pool the process's CPU devices share, one job at a time
+/// ([`crate::open_host`]). A job that panics is resumed on its submitter
+/// only after every participant has left it, and every job sets up the
+/// state it runs from, so the pool is as ready for the next job as after
+/// one that returned: the panic is that job's alone, and the lock does not
+/// pass it on to every later user of the pool as poison.
+pub struct SharedWorkers(Mutex<Workers>);
+
+impl SharedWorkers {
+    pub fn new(workers: Workers) -> Self {
+        Self(Mutex::new(workers))
+    }
+
+    /// The pool, once no other job holds it.
+    pub fn lock(&self) -> MutexGuard<'_, Workers> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 /// Why a launch could not be submitted to the pool.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LaunchFailure {
@@ -1095,12 +1114,15 @@ mod tests {
                 }
             }
         }
-        let mut workers = Workers::new(3).expect("pool");
+        // Held as the process's devices hold it: the panic unwinds through
+        // the lock, and the next job still takes the pool.
+        let workers = SharedWorkers::new(Workers::new(3).expect("pool"));
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            workers.run_native(&charged(), &Panicking).expect("run")
+            workers.lock().run_native(&charged(), &Panicking).expect("run")
         }));
         let payload = caught.expect_err("the panic reaches the submitter");
         assert_eq!(payload.downcast_ref::<&str>(), Some(&"item failed"));
+        let mut workers = workers.lock();
         let job = counting(&workers, &[9, 9, 9]);
         workers.run_native(&charged(), &job).expect("run");
         assert!(job
