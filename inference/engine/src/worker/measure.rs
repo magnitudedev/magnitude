@@ -1057,25 +1057,21 @@ mod tests {
         }
     }
 
-    /// A job whose time ends before its first point reads a sample prices
-    /// assessment's points rather than leaving them to a later job, but for
-    /// the required figures, which nothing prices: it stores the others'
-    /// records, so the next is given the first time, its time, not the
-    /// machine, cut it off, so it reports no failure of its own, and the
-    /// required figures stay outstanding until the next job measures them.
+    /// A job given no time stores nothing: everything it reaches first is a
+    /// figure nothing prices (the probe, which the walk reads before any
+    /// other point, and the figures outside the walk), which its time
+    /// ending leaves unrecorded for the next job rather than priced. Its
+    /// time, not the machine, cut it off, so it reports no failure of its
+    /// own: the next job is given longer (the first time, the least any job
+    /// is given) and measures.
     #[test]
-    fn a_job_given_no_time_prices_assessments_points_but_the_required() {
-        use magnitude_executor::assessment::{CostWalk, Outstanding, PointRequest};
-        let required = |outstanding: &Outstanding| outstanding.standing.contains(&PointRequest::Costs(CostWalk::Required));
+    fn a_job_given_no_time_leaves_what_nothing_prices_to_a_longer_one() {
         let root = tempfile::tempdir().unwrap();
         let mut jobs = cut_off_jobs(root.path());
         let run = jobs.run().unwrap();
-        assert_eq!(jobs.request.job, MeasureJob(1), "the cut-off job stored records");
-        assert_eq!(jobs.time.given(), JobTime::first(), "a job that stored gives the next the first time");
-        assert!(required(&run.outstanding), "the required figures are left to the next job: {:?}", run.outstanding);
+        assert_eq!(jobs.request.job, MeasureJob(2), "the cut-off job stored nothing, and the next measured");
+        assert_eq!(jobs.request.time, JobTime::first(), "the next job was given longer: the first time");
         assert!(run.failures.iter().all(|failure| !failure.fails_job()), "{:?}", run.failures);
-        let next = jobs.run().unwrap();
-        assert!(!required(&next.outstanding), "the next job measures them: {:?}", next.outstanding);
     }
 
     /// A job that measured nothing and reported no failure of its own gives
