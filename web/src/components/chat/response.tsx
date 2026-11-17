@@ -39,7 +39,11 @@ export function ChatResponse({
   // Every measurement the engine reported, condensed onto one line; a bare number gets a word only where it'd be ambiguous.
   const at = (speed: Option.Option<number>) => Option.match(speed, { onNone: () => "", onSome: (n) => ` at ${Math.round(n).toLocaleString()} tok/s` })
   const metrics = [
-    Option.map(m.inputTokens, (n) => `Prefill ${tokens(n)}${Option.match(Option.filter(m.cachedTokens, (cached) => cached > 0), { onNone: () => "", onSome: (cached) => ` (${number(cached)} cached)` })}${at(m.prefillTokensPerSecond)}`),
+    // Prefill counts the tokens it computed, the ones its speed covers; those the cache already held follow.
+    Option.map(m.inputTokens, (n) => {
+      const cached = Option.getOrElse(m.cachedTokens, () => 0)
+      return `Prefill ${tokens(n - cached)}${at(m.prefillTokensPerSecond)}${cached > 0 ? ` (${number(cached)} cached)` : ""}`
+    }),
     Option.map(m.outputTokens, (n) => `Decode ${tokens(n)}${at(m.tokensPerSecond)}`),
     Option.map(m.ttftMs, (n) => `TTFT ${seconds(n)}`),
     Option.map(m.totalMs, (n) => `${seconds(n)} total`),

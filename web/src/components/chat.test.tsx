@@ -63,7 +63,7 @@ describe("Chat presentation", () => {
 
   it("shows every measurement on one line under a finished response, with nothing to expand", () => {
     const html = renderToStaticMarkup(<ChatResponse response={response()} retry={() => {}} notify={() => {}} />)
-    expect(html).toContain(">Prefill 60 tokens (40 cached) at 400 tok/s · Decode 20 tokens at 38 tok/s · TTFT 0.25s · 1.0s total</p>")
+    expect(html).toContain(">Prefill 20 tokens at 400 tok/s (40 cached) · Decode 20 tokens at 38 tok/s · TTFT 0.25s · 1.0s total</p>")
     expect(html).not.toContain("Response metrics")
     expect(html).not.toContain('aria-expanded="')
     expect(html).not.toContain("<dl")
@@ -290,7 +290,7 @@ it("shows no speed for a failed reply of one token, and counts it as one token",
   )
   // No decode speed; the prompt's prefill speed is its own figure.
   expect(html).toContain("Decode 1 token ·")
-  expect(html).toContain("Prefill 60 tokens (40 cached) at 400 tok/s")
+  expect(html).toContain("Prefill 20 tokens at 400 tok/s (40 cached)")
   expect(html).not.toContain("1 tokens")
 })
 
