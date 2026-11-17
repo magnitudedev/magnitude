@@ -258,6 +258,14 @@ impl DriverError {
             4 | 46 | 214 | 700 | 702 | 710 | 714 | 715 | 716 | 717 | 718 | 719
         )
     }
+
+    /// CUDA result codes that mean the device cannot be had now but may be
+    /// later: the driver is out of memory (`CUDA_ERROR_OUT_OF_MEMORY`), or
+    /// another process holds the device (`CUDA_ERROR_DEVICE_UNAVAILABLE`,
+    /// as an exclusive-process device is).
+    pub fn is_busy(&self) -> bool {
+        matches!(self.code, 2 | 46)
+    }
 }
 
 impl fmt::Display for DriverError {

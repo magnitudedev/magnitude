@@ -35,6 +35,11 @@ pub enum OpenError {
     Floor(String),
     /// Creating the device or one of its objects failed.
     Creation(String),
+    /// Creating the device or one of its objects failed for want of memory
+    /// (`VK_ERROR_OUT_OF_DEVICE_MEMORY`, `VK_ERROR_OUT_OF_HOST_MEMORY`), or
+    /// as another holds what it needs (`VK_ERROR_TOO_MANY_OBJECTS`): opening
+    /// it later may succeed.
+    Busy(String),
 }
 
 impl OpenError {
@@ -43,7 +48,7 @@ impl OpenError {
     pub fn floor_reason(&self) -> Option<String> {
         match self {
             Self::Floor(reason) => Some(reason.clone()),
-            Self::Loader(_) | Self::Missing | Self::Creation(_) => None,
+            Self::Loader(_) | Self::Missing | Self::Creation(_) | Self::Busy(_) => None,
         }
     }
 }
@@ -53,7 +58,7 @@ impl fmt::Display for OpenError {
         match self {
             Self::Loader(error) => write!(f, "{error}"),
             Self::Missing => f.write_str("the Vulkan device is no longer present"),
-            Self::Creation(reason) => write!(f, "opening the Vulkan device failed: {reason}"),
+            Self::Creation(reason) | Self::Busy(reason) => write!(f, "opening the Vulkan device failed: {reason}"),
             Self::Floor(reason) => write!(f, "the Vulkan device does not meet the floor: {reason}"),
         }
     }
@@ -1186,7 +1191,15 @@ pub(crate) unsafe fn barrier(
 }
 
 fn creation<T>(result: Result<T, vk::Result>, what: &str) -> Result<T, OpenError> {
-    result.map_err(|error| OpenError::Creation(format!("{what} failed: {error}")))
+    result.map_err(|error| {
+        let reason = format!("{what} failed: {error}");
+        match error {
+            vk::Result::ERROR_OUT_OF_DEVICE_MEMORY | vk::Result::ERROR_OUT_OF_HOST_MEMORY | vk::Result::ERROR_TOO_MANY_OBJECTS => {
+                OpenError::Busy(reason)
+            }
+            _ => OpenError::Creation(reason),
+        }
+    })
 }
 
 impl Inner {

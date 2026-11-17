@@ -10,9 +10,16 @@
 //! ended by then has hung, whatever it is doing; the
 //! device is released once its process is proven gone. A load wanting the device, or a
 //! request for the idle model it runs beside, preempts it, killing it at once. A killed job's records stand, as each is stored as it is
-//! made; its attempts are released rather than counted, but for its opening of the device when
-//! its time ended (a device that hangs on opening hangs every job), and the next job resumes from what is
-//! stored. Its state moves `Unmeasured → Measuring → Measured | Failed { retry_at }` (a
+//! made; its attempts are released rather than counted, unless its time ended with the longest
+//! time the schedule gives ([`JobTime::is_longest`]): what it was doing then hung rather than ran
+//! slow, and counts. The next job resumes from what is stored. A job that ends without opening
+//! the device, but for one it refused as busy (out of memory, or held by another process), or is
+//! killed inside the opening given the longest time, could not open it: once
+//! [`UNOPENED_JOBS`] in a row could not, what is stored is published unavailable where it gives
+//! assessment no costs, so onboarding finishes, and the jobs go on at the failures' backoff until
+//! one opens it, whose records are published again. The account is this service's run's, as the
+//! device's present state is no point's property: a new run opens it anew. Its state moves
+//! `Unmeasured → Measuring → Measured | Failed { retry_at }` (a
 //! preempted job to what is stored, as the records it stored price the model it ran beside); it
 //! is `Measured` once what is stored gives assessment its costs, and the jobs that measure the
 //! rest leave it so. What each job stores reaches the
@@ -43,6 +50,11 @@ use crate::worker_process::WorkerLauncher;
 const FIRST_RETRY: Duration = Duration::from_secs(40);
 /// The longest retry delay: a failure is retried at least hourly while the service runs.
 const LAST_RETRY: Duration = Duration::from_secs(60 * 60);
+
+/// The jobs in a row that could not open the device before what is stored, where it gives
+/// assessment no costs, is published unavailable: the second confirms the first was no
+/// transient, as a point's ended jobs do.
+const UNOPENED_JOBS: u32 = 2;
 
 /// What the measurement job reports: its state, and what is stored of the machine for
 /// assessment.
@@ -81,6 +93,9 @@ pub enum Stage {
 /// What is stored of the machine, as far as the job reads it.
 pub trait StoredRecords: Clone + Send + Sync + 'static {
     fn stage(&self) -> Stage;
+    /// What is stored, its costs unavailable for `reason`: settled, so every model counts as
+    /// measured, its speed unavailable.
+    fn unavailable(&self, reason: String) -> Self;
 }
 
 impl StoredRecords for AssessmentSetup {
@@ -91,13 +106,38 @@ impl StoredRecords for AssessmentSetup {
             Measurements::Measured { pending: false, .. } | Measurements::Unavailable { .. } => Stage::Settled,
         }
     }
+
+    fn unavailable(&self, reason: String) -> Self {
+        Self {
+            structure: Arc::clone(&self.structure),
+            measurements: Measurements::Unavailable { reason },
+        }
+    }
 }
 
-/// What a job's reader passes on, in order: each point the job attempts, the point it opens the
-/// device as the attempt of, and each record it stores, then the outcome.
+/// The jobs in a row, of this service's run, that could not open the device, and why the last
+/// could not.
+struct Unopened {
+    jobs: u32,
+    reason: String,
+}
+
+/// What is published of `stored`: unavailable where it gives assessment no costs and
+/// [`UNOPENED_JOBS`] jobs in a row could not open the device, as it is otherwise.
+fn published<S: StoredRecords>(stored: S, unopened: Option<&Unopened>) -> S {
+    match unopened {
+        Some(Unopened { jobs, reason }) if *jobs >= UNOPENED_JOBS && stored.stage() == Stage::Unmeasured => {
+            stored.unavailable(format!("the measurement job could not open the device in {jobs} jobs in a row: {reason}"))
+        }
+        _ => stored,
+    }
+}
+
+/// What a job's reader passes on, in order: its opening of the device, then each point it
+/// attempts and each record it stores, then the outcome.
 pub enum JobFrame {
+    Opened,
     Attempting(PointKey),
-    Opening(PointKey),
     Recorded(PointKey, Record),
     Finished(Result<Vec<MeasureFailure>, JobLost>),
 }
@@ -211,7 +251,7 @@ impl MeasuredMachine for ServiceMachine {
                 let outcome = measure_worker(transport, request, |event| {
                     let _ = frames.blocking_send(match event {
                         MeasureEvent::Attempting(key) => JobFrame::Attempting(key),
-                        MeasureEvent::Opening(key) => JobFrame::Opening(key),
+                        MeasureEvent::Opened => JobFrame::Opened,
                         MeasureEvent::Recorded(key, record) => JobFrame::Recorded(key, record),
                     });
                 });
@@ -294,7 +334,10 @@ async fn read_stored<M: MeasuredMachine>(machine: &Arc<M>) -> M::Stored {
 /// stays priced, so it is no job's failure. A job that stored nothing and reported no failure of
 /// its own gives the next longer, which follows after twice what it ran ([`JobTime`]), and
 /// at the longest time failed, retried at that cadence; one that stored nothing otherwise
-/// failed. The hardware and driver identities are the inventory's revision, fixed for the
+/// failed. A job killed at its time's end given the longest time leaves the attempt it was
+/// inside counted. Jobs that cannot open the device are kept account of, and once
+/// [`UNOPENED_JOBS`] in a row could not, what is stored is published unavailable while the jobs
+/// go on ([`published`]). The hardware and driver identities are the inventory's revision, fixed for the
 /// service's life, so the backoff is this process's and a changed identity is the next process's discovery, starting anew.
 async fn run<M: MeasuredMachine>(
     machine: Arc<M>,
@@ -309,7 +352,12 @@ async fn run<M: MeasuredMachine>(
     let mut backoff = FIRST_RETRY;
     let mut time = JobTime::default();
     loop {
-        while status.borrow().measurements.stage() != Stage::Settled {
+        // What is stored, as the jobs read it: what is published may be unavailable instead
+        // (`published`).
+        let mut stage = status.borrow().measurements.stage();
+        // The jobs in a row that could not open the device, since one last did.
+        let mut unopened: Option<Unopened> = None;
+        while stage != Stage::Settled {
             // A pool that is gone has no work left on the device.
             let _ = settled.wait_for(|settled| *settled).await;
             let mut held = device.measurement().await;
@@ -343,7 +391,8 @@ async fn run<M: MeasuredMachine>(
                 status.send_modify(|status| status.state = MeasurementState::Measuring);
             }
             let started = tokio::time::Instant::now();
-            let (end, killed) = run_job(&machine, held, time.given()).await;
+            let (given, longest) = (time.given(), time.is_longest());
+            let (end, killed) = run_job(&machine, held, given, longest).await;
             // A killed job's attempts are released before what is stored is read, and before
             // the next job starts: a counted attempt would read as its point's failure. A
             // release that fails is retried on the failure's backoff until it succeeds, and the
@@ -356,20 +405,43 @@ async fn run<M: MeasuredMachine>(
             }
             // The room was the model's again as the hold ended, and what the job stored prices its
             // experts, read from what is stored, measuring nothing.
-            if let (Some(resident), true) = (&beside, end.recorded() > 0) {
+            let JobEnd { outcome, recorded, opened } = end;
+            if let (Some(resident), true) = (&beside, recorded > 0) {
                 resident.reprice();
             }
-            let (outcome, recorded) = match end {
-                JobEnd::Ended(outcome, recorded) => (Some(outcome), recorded),
-                JobEnd::Expired(recorded) => (None, recorded),
+            // Whether the job could not open the device: it ended without, or was killed inside
+            // the opening given the longest time. One killed there with longer to give ran
+            // slow, one the device refused as busy may open it later, and one never started
+            // says nothing of the device: each is retried on the failures' backoff alone.
+            let (outcome, unopened_job) = match outcome {
+                JobOutcome::Unstarted(reason) => (Some(Err(JobLost(format!("starting the job: {reason}")))), false),
+                JobOutcome::Ended(outcome) => {
+                    let busy = matches!(&outcome, Ok(failures) if failures.iter().any(|failure| matches!(failure, MeasureFailure::Busy { .. })));
+                    (Some(outcome), !opened && !busy)
+                }
+                JobOutcome::Expired => (None, !opened && longest),
                 // No failure and no progress: the state is what is stored, the records the job
                 // stored before it was killed among it, as they already price the model it ran
                 // beside.
-                JobEnd::Preempted(_) => {
-                    status.send_replace(MeasurementStatus::stored(read_stored(&machine).await));
+                JobOutcome::Preempted => {
+                    let stored = read_stored(&machine).await;
+                    stage = stored.stage();
+                    status.send_replace(MeasurementStatus::stored(published(stored, unopened.as_ref())));
                     continue;
                 }
             };
+            if opened {
+                unopened = None;
+            } else if unopened_job {
+                let reason = match &outcome {
+                    Some(Ok(failures)) => failures.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "),
+                    Some(Err(lost)) => lost.to_string(),
+                    None => format!("opening it did not end within {:?}", given * 2),
+                };
+                let jobs = unopened.as_ref().map_or(0, |unopened| unopened.jobs) + 1;
+                tracing::warn!(jobs, %reason, "the measurement job could not open the device");
+                unopened = Some(Unopened { jobs, reason });
+            }
             let failed = match &outcome {
                 Some(Ok(failures)) => {
                     for failure in failures {
@@ -391,8 +463,9 @@ async fn run<M: MeasuredMachine>(
                 _ => JobProgress::Measured,
             });
             let measurements = read_stored(&machine).await;
-            let stage = measurements.stage();
-            let state = match stage {
+            stage = measurements.stage();
+            let measurements = published(measurements, unopened.as_ref());
+            let state = match measurements.stage() {
                 Stage::Unmeasured => MeasurementState::Measuring,
                 Stage::Refining | Stage::Settled => MeasurementState::Measured,
             };
@@ -457,25 +530,25 @@ fn retrying<S: StoredRecords>(status: &watch::Sender<MeasurementStatus<S>>, dela
     });
 }
 
-/// How one job ended.
-enum JobEnd {
-    /// It reported its outcome, or was lost, having stored this many records.
-    Ended(Result<Vec<MeasureFailure>, JobLost>, usize),
-    /// Its time ended first: it was killed having stored this many records, and its attempts
-    /// were released, but for its opening of the device, which stays counted.
-    Expired(usize),
-    /// Residency wanted the device, or a request the idle model the job ran beside: the job was
-    /// killed having stored this many records, and its attempts released.
-    Preempted(usize),
+/// How one job ended: its outcome, the records it stored, and whether it opened the device.
+struct JobEnd {
+    outcome: JobOutcome,
+    recorded: usize,
+    opened: bool,
 }
 
-impl JobEnd {
-    /// The records the job stored.
-    fn recorded(&self) -> usize {
-        match self {
-            Self::Ended(_, recorded) | Self::Expired(recorded) | Self::Preempted(recorded) => *recorded,
-        }
-    }
+/// What ended a job.
+enum JobOutcome {
+    /// Its worker could not be started, and why.
+    Unstarted(String),
+    /// It reported its outcome, or was lost.
+    Ended(Result<Vec<MeasureFailure>, JobLost>),
+    /// Its time ended first: it was killed, and its attempts released unless it was given the
+    /// longest time.
+    Expired,
+    /// Residency wanted the device, or a request the idle model the job ran beside: the job was
+    /// killed, and its attempts released.
+    Preempted,
 }
 
 /// How making a measurement job's room beside an idle resident model ended.
@@ -549,12 +622,14 @@ async fn release_killed_attempts<M: MeasuredMachine>(
 /// reports its outcome, twice `time` has passed or residency wants the device, either of which
 /// kills it at once; its process is then
 /// proven retired, and only then the device released. A killed job's attempts are returned, its
-/// process gone and every one it reported read, for its owner to release, so a kill never counts
-/// against a point.
+/// process gone and every one it reported read, for its owner to release, so the kill does not
+/// count against a point; but for one whose time ended when `time` is the `longest` the schedule
+/// gives, as what it was inside then hung.
 async fn run_job<M: MeasuredMachine>(
     machine: &Arc<M>,
     mut exclusive: DeviceJob,
     time: Duration,
+    longest: bool,
 ) -> (JobEnd, Option<(MeasureJob, Vec<PointKey>)>) {
     let begun = tokio::time::Instant::now();
     let (ends, limit) = (begun + time, begun + time * 2);
@@ -572,7 +647,8 @@ async fn run_job<M: MeasuredMachine>(
     } = match started {
         Ok(started) => started,
         Err(error) => {
-            return (JobEnd::Ended(Err(JobLost(format!("starting the job: {error:#}"))), 0), None);
+            let outcome = JobOutcome::Unstarted(format!("{error:#}"));
+            return (JobEnd { outcome, recorded: 0, opened: false }, None);
         }
     };
     // Beside an idle resident model, the room it made is credited by the job's footprint.
@@ -582,8 +658,8 @@ async fn run_job<M: MeasuredMachine>(
     let started = tokio::time::Instant::now();
     // Every point the job reported attempting: those a killed job's markers may count.
     let mut attempted = Vec::new();
-    // The point whose attempt the job's opening of the device is.
-    let mut opening = None;
+    // Whether the job reported opening the device.
+    let mut opened = false;
     // The records the job reported storing.
     let mut recorded = 0;
     let outcome = loop {
@@ -600,9 +676,12 @@ async fn run_job<M: MeasuredMachine>(
                         );
                         attempted.push(key);
                     }
-                    Some(JobFrame::Opening(key)) => {
-                        tracing::info!(point = ?key.point, "measurement opening the device");
-                        opening = Some(key);
+                    Some(JobFrame::Opened) => {
+                        tracing::info!(
+                            elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                            "measurement opened the device"
+                        );
+                        opened = true;
                     }
                     Some(JobFrame::Recorded(key, record)) => {
                         recorded += 1;
@@ -671,7 +750,7 @@ async fn run_job<M: MeasuredMachine>(
         retiring = (process, exclusive);
     }
     let killed = match outcome {
-        Ok(outcome) => return (JobEnd::Ended(outcome, recorded), None),
+        Ok(outcome) => return (JobEnd { outcome: JobOutcome::Ended(outcome), recorded, opened }, None),
         Err(killed) => killed,
     };
     // The process is gone, so its stream has ended: every attempt it reported, one its markers may
@@ -679,7 +758,7 @@ async fn run_job<M: MeasuredMachine>(
     while let Some(frame) = frames.recv().await {
         match frame {
             JobFrame::Attempting(key) => attempted.push(key),
-            JobFrame::Opening(key) => opening = Some(key),
+            JobFrame::Opened => opened = true,
             JobFrame::Recorded(key, record) => {
                 recorded += 1;
                 log_record(&key, &record);
@@ -687,17 +766,14 @@ async fn run_job<M: MeasuredMachine>(
             JobFrame::Finished(_) => {}
         }
     }
-    // A device that hangs on opening hangs every job alike: a job killed at its deadline leaves
-    // the open's attempt counted, so two such jobs make its point unobtainable, as a failed open
-    // does. A preempted job says nothing of the device, and releases it too.
-    let end = match killed {
-        Killed::Expired => JobEnd::Expired(recorded),
-        Killed::Preempted => {
-            attempted.extend(opening);
-            JobEnd::Preempted(recorded)
-        }
+    // A job killed at its deadline with longer to give ran slow, and one preempted says nothing
+    // of its points: their attempts are released. One given the longest time hung in the point
+    // it was inside, whose attempt stays counted, as one that ended the job.
+    let (outcome, released) = match killed {
+        Killed::Expired => (JobOutcome::Expired, !longest),
+        Killed::Preempted => (JobOutcome::Preempted, true),
     };
-    (end, Some((job, attempted)))
+    (JobEnd { outcome, recorded, opened }, released.then_some((job, attempted)))
 }
 
 fn log_record(key: &PointKey, record: &Record) {
@@ -724,24 +800,38 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// What the scripted jobs left stored: its stage alone.
-    impl StoredRecords for Stage {
+    /// What the scripted jobs left stored, its stage alone, or that stage published unavailable.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Scripted {
+        Stored(Stage),
+        Unavailable,
+    }
+
+    impl StoredRecords for Scripted {
         fn stage(&self) -> Stage {
-            *self
+            match self {
+                Self::Stored(stage) => *stage,
+                Self::Unavailable => Stage::Settled,
+            }
+        }
+
+        fn unavailable(&self, _: String) -> Self {
+            Self::Unavailable
         }
     }
 
-    const PENDING: Stage = Stage::Unmeasured;
-    const REFINING: Stage = Stage::Refining;
-    const COMPLETE: Stage = Stage::Settled;
+    const PENDING: Scripted = Scripted::Stored(Stage::Unmeasured);
+    const REFINING: Scripted = Scripted::Stored(Stage::Refining);
+    const COMPLETE: Scripted = Scripted::Stored(Stage::Settled);
+    const UNAVAILABLE: Scripted = Scripted::Unavailable;
 
     /// A machine whose jobs are scripted: each start hands out the next job's frames, and
     /// `stored` reads what the jobs left.
     struct ScriptedMachine {
         jobs: Mutex<Vec<StartedJob>>,
-        stored: Mutex<Stage>,
+        stored: Mutex<Scripted>,
         /// What the reads find, one each, in order; the last stands after them.
-        reads: Mutex<std::collections::VecDeque<Stage>>,
+        reads: Mutex<std::collections::VecDeque<Scripted>>,
         started: AtomicUsize,
         /// The time each job was given.
         given: Mutex<Vec<Duration>>,
@@ -754,7 +844,7 @@ mod tests {
     }
 
     impl ScriptedMachine {
-        fn new(jobs: Vec<StartedJob>, reads: Vec<Stage>) -> Arc<Self> {
+        fn new(jobs: Vec<StartedJob>, reads: Vec<Scripted>) -> Arc<Self> {
             Arc::new(Self {
                 jobs: Mutex::new(jobs),
                 stored: Mutex::new(PENDING),
@@ -809,9 +899,9 @@ mod tests {
     }
 
     impl MeasuredMachine for ScriptedMachine {
-        type Stored = Stage;
+        type Stored = Scripted;
 
-        fn stored(&self) -> Stage {
+        fn stored(&self) -> Scripted {
             if let Some(read) = self.reads.lock().unwrap().pop_front() {
                 *self.stored.lock().unwrap() = read;
             }
@@ -858,9 +948,15 @@ mod tests {
         }
     }
 
-    /// A job that reports `frames` and keeps its stream open until its process retires, with how
-    /// it was retired, and what sends it more frames while it runs.
-    fn job(
+    /// A job that opens the device, then reports `frames` and keeps its stream open until its
+    /// process retires, with how it was retired, and what sends it more frames while it runs.
+    fn job(frames: Vec<JobFrame>) -> (StartedJob, Arc<Mutex<Option<bool>>>, mpsc::WeakSender<JobFrame>) {
+        unopened(std::iter::once(JobFrame::Opened).chain(frames).collect())
+    }
+
+    /// A job as [`job`]'s that does not open the device first: one still opening it, or that
+    /// could not.
+    fn unopened(
         frames: Vec<JobFrame>,
     ) -> (StartedJob, Arc<Mutex<Option<bool>>>, mpsc::WeakSender<JobFrame>) {
         let (sender, receiver) = mpsc::channel(8);
@@ -1304,7 +1400,6 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_load_during_a_job_preempts_it() {
         let (running, retired, _open) = job(vec![
-            JobFrame::Opening(key("probe")),
             JobFrame::Attempting(key("launch")),
             JobFrame::Attempting(key("history")),
         ]);
@@ -1331,8 +1426,8 @@ mod tests {
         settle().await;
         assert_eq!(
             *machine.released.lock().unwrap(),
-            [(MeasureJob(7), vec![key("launch"), key("history"), key("probe")])],
-            "every attempt the job reported is released, its opening of the device among them"
+            [(MeasureJob(7), vec![key("launch"), key("history")])],
+            "every attempt the job reported is released"
         );
         assert_eq!(machine.started.load(Ordering::SeqCst), 1);
         drop(share);
@@ -1414,34 +1509,109 @@ mod tests {
         assert_eq!(machine.started.load(Ordering::SeqCst), 2);
     }
 
-    /// Jobs that cannot open the device each end on the probe, their open its attempt: one whose
-    /// open fails, and one whose open hangs until it is killed at its deadline, its attempt left
-    /// counted rather than released. Once two have, the next records the probe unobtainable
-    /// without opening the device, which settles what is stored (the costs unavailable, so every
-    /// model's speed is), and no job runs after it.
+    /// States `status` publishes until what it publishes is `last`, as a collector of them.
+    fn states_until(
+        status: &watch::Receiver<MeasurementStatus<Scripted>>,
+        last: Scripted,
+    ) -> tokio::task::JoinHandle<Vec<MeasurementStatus<Scripted>>> {
+        let mut seen = status.clone();
+        tokio::spawn(async move {
+            let mut states = Vec::new();
+            while seen.changed().await.is_ok() {
+                let status = seen.borrow_and_update().clone();
+                let ended = status.measurements == last;
+                states.push(status);
+                if ended {
+                    break;
+                }
+            }
+            states
+        })
+    }
+
+    /// A slow first opening (a cold compile, a slow disk) that outlasts the jobs given less than
+    /// the longest time is released each time, not counted: the next job is given longer, and
+    /// once one opens the device its records are published. Nothing is ever published
+    /// unavailable.
     #[tokio::test(start_paused = true)]
-    async fn a_device_that_cannot_be_opened_settles_unavailable_after_two_jobs() {
-        let (failed, _, _a) = job(vec![
-            JobFrame::Opening(key("probe")),
-            JobFrame::Finished(Ok(vec![MeasureFailure::Machine { reason: "no device".into() }])),
-        ]);
-        let (hung, hung_retired, _b) = job(vec![JobFrame::Opening(key("probe"))]);
-        let unobtainable = Record::Unobtainable { reason: seismic::measure::Reason::new("measuring it ended 2 measurement jobs") };
-        let (third, _, _c) = job(vec![JobFrame::Recorded(key("probe"), unobtainable), JobFrame::Finished(Ok(Vec::new()))]);
-        let machine = ScriptedMachine::new(vec![failed, hung, third], vec![PENDING, PENDING, COMPLETE]);
+    async fn a_slow_opening_is_given_longer_and_never_published_unavailable() {
+        let record = Record::Measured(seismic::measure::Timing { median: 1e-3, interval: None, samples: 1 });
+        let ((first, _, _a), (second, _, _b), (third, _, _c)) = (unopened(Vec::new()), unopened(Vec::new()), unopened(Vec::new()));
+        let (fourth, _, _d) = job(vec![JobFrame::Recorded(key("probe"), record), JobFrame::Finished(Ok(Vec::new()))]);
+        let machine = ScriptedMachine::new(vec![first, second, third, fourth], vec![PENDING, PENDING, PENDING, COMPLETE]);
+        let status = start(machine.clone(), PENDING, DeviceLock::default(), settled());
+        let states = states_until(&status, COMPLETE).await.unwrap();
+        assert!(states.iter().all(|status| status.measurements != UNAVAILABLE), "{:?}", states.iter().map(|status| status.measurements).collect::<Vec<_>>());
+        assert_eq!(states.last().unwrap().state, MeasurementState::Measured);
+        let given = machine.given.lock().unwrap().clone();
+        assert!(given.len() == 4 && given[3] > time() * 4, "the last is given the longest time: {given:?}");
+        assert_eq!(machine.released.lock().unwrap().len(), 3, "each slow job is released");
+    }
+
+    /// An opening that hangs however long it is given: the jobs given less than the longest time
+    /// are released, and the two given the longest, killed inside it, could not open the device.
+    /// What is stored is then published unavailable, so every model counts as measured, while
+    /// the jobs go on.
+    #[tokio::test(start_paused = true)]
+    async fn an_opening_that_hangs_at_the_longest_time_is_published_unavailable() {
+        let hung: Vec<_> = (0..5).map(|_| unopened(Vec::new())).collect();
+        let retired: Vec<_> = hung.iter().map(|(_, retired, _)| Arc::clone(retired)).collect();
+        let (jobs, _streams): (Vec<_>, Vec<_>) = hung.into_iter().map(|(job, _, stream)| (job, stream)).unzip();
+        let machine = ScriptedMachine::new(jobs, vec![PENDING]);
         let mut status = start(machine.clone(), PENDING, DeviceLock::default(), settled());
+        let ended = status.wait_for(|status| status.measurements == UNAVAILABLE).await.unwrap().clone();
+        assert_eq!(ended.state, MeasurementState::Measured, "onboarding counts every model measured");
+        assert_eq!(machine.started.load(Ordering::SeqCst), 5);
+        assert!(retired.iter().all(|retired| retirement(retired) == Some(false)), "each hung job is killed");
+        let given = machine.given.lock().unwrap().clone();
+        assert!(given[3..5].iter().all(|given| *given > time() * 4), "the last two are given the longest time: {given:?}");
+        assert_eq!(machine.released.lock().unwrap().len(), 3, "only the jobs given less than the longest time are released");
+    }
+
+    /// Two jobs that fail to open the device publish what is stored unavailable; the jobs go on
+    /// at the failures' backoff, and the first that opens the device publishes its records.
+    #[tokio::test(start_paused = true)]
+    async fn a_device_that_could_not_be_opened_is_measured_once_it_opens() {
+        let failure = || unopened(vec![JobFrame::Finished(Ok(vec![MeasureFailure::Machine { reason: "no device".into() }]))]);
+        let ((first, _, _a), (second, _, _b)) = (failure(), failure());
+        let record = Record::Measured(seismic::measure::Timing { median: 1e-3, interval: None, samples: 1 });
+        let (third, _, _c) = job(vec![JobFrame::Recorded(key("probe"), record), JobFrame::Finished(Ok(Vec::new()))]);
+        let machine = ScriptedMachine::new(vec![first, second, third], vec![PENDING, PENDING, COMPLETE]);
+        let mut status = start(machine.clone(), PENDING, DeviceLock::default(), settled());
+        let states = states_until(&status, COMPLETE);
         status.wait_for(|status| matches!(status.state, MeasurementState::Failed { .. })).await.unwrap();
-        let ended = status.wait_for(|status| status.measurements == COMPLETE).await.unwrap().clone();
-        assert_eq!(ended.state, MeasurementState::Measured);
-        assert_eq!(retirement(&hung_retired), Some(false), "the hung open is killed");
-        assert_eq!(
-            *machine.released.lock().unwrap(),
-            [(MeasureJob(7), Vec::new())],
-            "neither the failed open's attempt nor the one killed at its deadline is released"
+        let unavailable = status.wait_for(|status| status.measurements == UNAVAILABLE).await.unwrap().clone();
+        assert_eq!(unavailable.state, MeasurementState::Measured);
+        assert_eq!(machine.started.load(Ordering::SeqCst), 2);
+        let states = states.await.unwrap();
+        let last = states.last().unwrap();
+        assert_eq!((&last.state, last.measurements), (&MeasurementState::Measured, COMPLETE));
+        assert!(
+            states.iter().skip_while(|status| status.measurements != UNAVAILABLE).all(|status| status.state == MeasurementState::Measured),
+            "the retry after it leaves every model measured"
         );
-        tokio::time::sleep(LAST_RETRY * 2).await;
-        settle().await;
-        assert_eq!(machine.started.load(Ordering::SeqCst), 3, "no job runs once the probe is unobtainable");
+        assert_eq!(machine.started.load(Ordering::SeqCst), 3);
+    }
+
+    /// A device out of memory, as another process holds it, refuses two openings as busy: they
+    /// are retried on the failures' backoff and never counted, so nothing is published
+    /// unavailable, and the job that opens it once the memory is free measures.
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_device_is_retried_and_never_published_unavailable() {
+        let busy = || unopened(vec![JobFrame::Finished(Ok(vec![MeasureFailure::Busy { reason: "out of memory".into() }]))]);
+        let ((first, _, _a), (second, _, _b)) = (busy(), busy());
+        let record = Record::Measured(seismic::measure::Timing { median: 1e-3, interval: None, samples: 1 });
+        let (third, _, _c) = job(vec![JobFrame::Recorded(key("probe"), record), JobFrame::Finished(Ok(Vec::new()))]);
+        let machine = ScriptedMachine::new(vec![first, second, third], vec![PENDING, PENDING, COMPLETE]);
+        let began = tokio::time::Instant::now();
+        let status = start(machine.clone(), PENDING, DeviceLock::default(), settled());
+        let states = states_until(&status, COMPLETE).await.unwrap();
+        assert!(states.iter().all(|status| status.measurements != UNAVAILABLE), "{:?}", states.iter().map(|status| status.measurements).collect::<Vec<_>>());
+        assert!(states.iter().any(|status| matches!(status.state, MeasurementState::Failed { .. })), "each busy job shows failed");
+        assert_eq!(states.last().unwrap().state, MeasurementState::Measured);
+        assert_eq!(machine.started.load(Ordering::SeqCst), 3);
+        let elapsed = began.elapsed();
+        assert!(elapsed >= FIRST_RETRY * 3 && elapsed < LAST_RETRY, "retried on the failures' backoff: {elapsed:?}");
     }
 
     /// Measurements stored at start leave nothing to measure.

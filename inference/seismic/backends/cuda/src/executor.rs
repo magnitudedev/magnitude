@@ -5,7 +5,7 @@ use crate::buffer::Buffer;
 use crate::command::{CompiledKernel, LaunchFrame};
 use crate::driver::{Context, Driver, DriverError, HostMapped, PinnedUpload, Stream};
 use crate::{Cuda, CudaLaunchMode};
-use seismic_compiler::errors::{ExecutionError, RefusalReading};
+use seismic_compiler::errors::{ExecutionError, RefusalReading, TargetError};
 use seismic_compiler::executable::{
     CompiledBufferView, CompiledLocalClassTotals, CompiledLocalLayout, DeviceService,
     ExecutableAllocationId, ExecutableCommand, ExecutableKernelId, ExecutionEnvironment,
@@ -89,22 +89,23 @@ pub(crate) fn memory_info(context: &Context) -> Result<MemoryInfo, ExecutionErro
 impl Device {
     /// Device `ordinal`, what it holds that no caller names charged to its
     /// stores' own entries.
-    pub fn open(ordinal: u32, stores: CudaStores) -> Result<Self, ExecutionError> {
-        let driver = Driver::load().map_err(ExecutionError::SubmissionFailed)?;
+    pub fn open(ordinal: u32, stores: CudaStores) -> Result<Self, TargetError> {
+        let unavailable = |error: ExecutionError| TargetError::DeviceUnavailable(error.to_string());
+        let driver = Driver::load().map_err(|error| unavailable(ExecutionError::SubmissionFailed(error)))?;
         let ordinal = i32::try_from(ordinal).map_err(|_| {
-            ExecutionError::SubmissionFailed("CUDA device ordinal exceeds driver ABI".into())
+            unavailable(ExecutionError::SubmissionFailed("CUDA device ordinal exceeds driver ABI".into()))
         })?;
-        let context = Context::retain(driver, ordinal).map_err(submission_error)?;
-        let stream = Stream::new(&context).map_err(submission_error)?;
-        let fill = Stream::new(&context).map_err(submission_error)?;
-        let blocks = Arc::new(Blocks::new(context.clone(), stores.device.own()).map_err(submission_error)?);
-        if let Some(memory) = counted_driver_memory(context.ordinal() as u32)? {
+        let context = Context::retain(driver, ordinal).map_err(opening_error)?;
+        let stream = Stream::new(&context).map_err(opening_error)?;
+        let fill = Stream::new(&context).map_err(opening_error)?;
+        let blocks = Arc::new(Blocks::new(context.clone(), stores.device.own()).map_err(opening_error)?);
+        if let Some(memory) = counted_driver_memory(context.ordinal() as u32).map_err(unavailable)? {
             assert!(
                 context.driver_memory.set(memory).is_ok(),
                 "a context's driver memory is counted once, at its opening"
             );
         }
-        let placeholder = Arc::new(crate::direct::HostWord::on(&context, &stores.host.own())?);
+        let placeholder = Arc::new(crate::direct::HostWord::on(&context, &stores.host.own()).map_err(unavailable)?);
         let graphs = Arc::new(crate::graph_cost::GraphPool::new(stores.device.own(), context.clone()));
         context.charge_own_to(stores.device.own());
         Ok(Self {
@@ -883,6 +884,18 @@ fn counted_driver_memory(
     _ordinal: u32,
 ) -> Result<Option<Arc<seismic_native_target::process::DriverMemory>>, ExecutionError> {
     Ok(None)
+}
+
+/// Opening the device failed on `error`: busy where the driver is out of
+/// memory or another process holds the device ([`DriverError::is_busy`]),
+/// stated as the submission's failure.
+fn opening_error(error: DriverError) -> TargetError {
+    let busy = error.is_busy();
+    let reason = submission_error(error).to_string();
+    match busy {
+        true => TargetError::DeviceBusy(reason),
+        false => TargetError::DeviceUnavailable(reason),
+    }
 }
 
 fn submission_error(error: DriverError) -> ExecutionError {

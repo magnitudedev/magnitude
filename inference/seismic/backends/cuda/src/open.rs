@@ -11,10 +11,11 @@ pub struct OpenedCuda {
 
 /// Device `ordinal`, what it holds that no caller names charged to its
 /// `stores`' own entries.
-pub fn open(ordinal: u32, stores: CudaStores) -> Result<OpenedCuda, ExecutionError> {
+pub fn open(ordinal: u32, stores: CudaStores) -> Result<OpenedCuda, TargetError> {
     let service = Device::open(ordinal, stores)?;
-    let device = crate::profile::device_for_opened(ordinal)
-        .map_err(|error| ExecutionError::SubmissionFailed(error.to_string()))?;
+    let device = crate::profile::device_for_opened(ordinal).map_err(|error| {
+        TargetError::DeviceUnavailable(ExecutionError::SubmissionFailed(error.to_string()).to_string())
+    })?;
     Ok(OpenedCuda { service, device })
 }
 

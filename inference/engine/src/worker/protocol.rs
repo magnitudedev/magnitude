@@ -246,10 +246,8 @@ pub enum WorkerMessage {
     Attempting {
         key: PointKey,
     },
-    /// A `Measure` is about to open its device as its attempt of `key`.
-    Opening {
-        key: PointKey,
-    },
+    /// A `Measure` opened its device.
+    Opened,
     /// A `Measure` stored `record` of `key`.
     Recorded {
         key: PointKey,

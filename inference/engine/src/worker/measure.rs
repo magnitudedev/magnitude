@@ -15,11 +15,10 @@
 //! confirms the first was no transient) is recorded unobtainable with its
 //! reason and not measured again while the hardware and driver it names are
 //! the machine's; the costs complete without it, and only estimates that
-//! need it are unavailable. Opening the device is the attempt of the
-//! required point the stored costs miss first (the probe, until it is
-//! stored), so a device that cannot be opened makes the costs unavailable
-//! by the same rule rather than leaving them pending. A point whose timing
-//! fails is left unrecorded
+//! need it are unavailable. Opening the device is no point's attempt: it is
+//! the machine's present state, not a property of a point, so the job
+//! reports that it opened ([`MeasureEvent::Opened`]) and its host keeps
+//! account of the jobs that could not. A point whose timing fails is left unrecorded
 //! and counts as one ended job, so only this rule makes a timing failure
 //! permanent, as does a point whose operands could not be made now; a
 //! kernel that cannot be formed is recorded unobtainable at once, as
@@ -125,6 +124,13 @@ impl JobTime {
         self.given
     }
 
+    /// Whether the next job is given the longest time: a job killed at its
+    /// deadline then had all the time the schedule gives, so what it was
+    /// doing hung rather than ran slow.
+    pub fn is_longest(self) -> bool {
+        self.given >= Self::longest()
+    }
+
     /// The pause a host that keeps the device's jobs going takes after an
     /// empty job that ran for `ran` and reported no failure of its own,
     /// whether it gave a longer next job or was given the longest time
@@ -144,7 +150,7 @@ impl JobTime {
             self.given = Self::first();
             return Ok(NextJob::Resumes);
         };
-        let exhausted = self.given >= Self::longest();
+        let exhausted = self.is_longest();
         self.given = (self.given * 2).clamp(Self::first(), Self::longest());
         match (failed, exhausted) {
             (true, _) => Err(JobStall::Failed),
@@ -188,12 +194,11 @@ pub struct MeasureJob(pub u64);
 pub enum MeasureEvent {
     /// It is about to record its attempt of the point and time it.
     Attempting(PointKey),
-    /// It is about to record its attempt of the point and open its device
-    /// as it ([`open_as_attempt`]): a host that kills the job at its
-    /// deadline leaves this attempt counted, as a device that hangs on
-    /// opening ends every job alike, and releases it only when the job was
-    /// preempted.
-    Opening(PointKey),
+    /// It opened its device, before any attempt: a job that ends, or is
+    /// killed, before reporting this could not open the machine, which no
+    /// point's attempt counts, as it is the machine's present state rather
+    /// than a point's; its host keeps account of it.
+    Opened,
     /// It stored the point's record.
     Recorded(PointKey, Record),
 }
@@ -203,6 +208,10 @@ pub enum MeasureEvent {
 pub enum MeasureFailure {
     /// The machine could not be discovered, or the selected executor opened.
     Machine { reason: String },
+    /// The selected executor could not be opened now: it is out of memory,
+    /// or another process holds it (`seismic::TargetError::DeviceBusy`).
+    /// Opening it later may succeed.
+    Busy { reason: String },
     /// One cost point: its kernel could not be formed (it is recorded
     /// unobtainable with the failure), its timing failed (it is left
     /// unrecorded, for the next job), or its record could not be read or
@@ -222,7 +231,7 @@ pub enum MeasureFailure {
 impl fmt::Display for MeasureFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Machine { reason } => write!(formatter, "the machine: {reason}"),
+            Self::Machine { reason } | Self::Busy { reason } => write!(formatter, "the machine: {reason}"),
             Self::Point { key, reason } => {
                 write!(formatter, "the point")?;
                 for (name, value) in key.configuration.iter().chain(&key.point) {
@@ -355,8 +364,9 @@ impl AttemptMarkers {
 }
 
 /// Release `job`'s attempt of `key` in the kernel cache at `kernels`: its
-/// host killed the job while timing it (for a load, or as its time ended),
-/// so the point is attempted again uncounted. Only `job`'s own attempt is
+/// host killed the job while timing it (for a load, or as its time ended
+/// short of the longest, [`JobTime::is_longest`]), so the point is
+/// attempted again uncounted. Only `job`'s own attempt is
 /// undone; a key it never marked is left as it is.
 pub fn release_killed(
     kernels: &Path,
@@ -384,7 +394,7 @@ pub(super) fn measure_only(
         if lost.is_none() {
             let message = match event {
                 MeasureEvent::Attempting(key) => WorkerMessage::Attempting { key },
-                MeasureEvent::Opening(key) => WorkerMessage::Opening { key },
+                MeasureEvent::Opened => WorkerMessage::Opened,
                 MeasureEvent::Recorded(key, record) => WorkerMessage::Recorded { key, record },
             };
             lost = sender.send(message).err().map(|error| error.to_string());
@@ -634,38 +644,13 @@ fn measure_job(request: &MeasureRequest, report: &mut dyn FnMut(MeasureEvent), r
     // The job's time runs from its start: discovering the machine, probing
     // and opening the executor are part of it.
     let deadlines = requests::JobDeadlines::new(std::time::Instant::now(), request.time);
-    // The job ended on the machine, with the attempts it could not record.
-    let machine = |unrecorded: Vec<StoreError>, reason: String| {
-        let mut failures = attempt_failures(unrecorded);
-        failures.push(MeasureFailure::Machine { reason });
-        MeasureEnd { failures, held: None }
+    let machine = |reason: String| MeasureEnd {
+        failures: vec![MeasureFailure::Machine { reason }],
+        held: None,
     };
     let catalog = match Devices::discover(&request.paths) {
         Ok(catalog) => catalog,
-        Err(error) => return machine(Vec::new(), error.to_string()),
-    };
-    let executor = match catalog.resolve(request.executor) {
-        Ok(executor) => executor,
-        Err(error) => return machine(Vec::new(), error.to_string()),
-    };
-    let records = KernelCache::measurement_records(&request.kernels);
-    let markers = AttemptMarkers::new(&request.kernels);
-    let mut unrecorded = Vec::new();
-    // Opening the device is the attempt of the required point the stored
-    // costs miss first (the probe, until it is stored): a device that
-    // cannot be opened ends the job on that point, as a point whose timing
-    // ends the job does, so two such jobs record it unobtainable and the
-    // costs are unavailable rather than pending for as long as the
-    // hardware and driver its key names are the machine's.
-    let missing = {
-        let topology = catalog.topology();
-        let info = topology
-            .executor(executor)
-            .expect("a resolved executor is of the catalog's topology");
-        match ExecutorCosts::stored(&topology, info, &records) {
-            Ok(StoredCosts::Missing(key)) => Some(key),
-            Ok(StoredCosts::Complete { .. }) | Err(_) => None,
-        }
+        Err(error) => return machine(error.to_string()),
     };
     // The device forms through the process's one store, as a load's does: a
     // program this job or a load compiled is loaded, not compiled again. It
@@ -675,42 +660,48 @@ fn measure_job(request: &MeasureRequest, report: &mut dyn FnMut(MeasureEvent), r
     // every later load does; a probe that keeps nothing is reported, its
     // property at its safe value.
     let mut probing = Vec::new();
-    let opened = open_as_attempt(missing.as_ref(), &markers, &records, request.job, &mut *report, &mut unrecorded, || {
-        let probes = catalog
-            .probe(executor, &*seismic::ProgramStore::user(), deadlines.standing())
-            .map_err(|error| error.to_string())?;
-        for kept in &probes.kept {
-            tracing::info!(probe = kept.probe, result = %kept.result.line(), report = %kept.report, "probed the device");
-        }
-        probing.extend(probes.failures.iter().map(|failure| MeasureFailure::Probe { reason: failure.to_string() }));
-        catalog
-            .open_with(
-                executor,
-                seismic::DeviceOptions {
-                    artifacts: None,
-                    // The job's point of it (`PointRequest::GraphCost`).
-                    graph_cost: None,
-                },
-            )
-            .map_err(|error| error.to_string())
-    });
-    let device = match opened {
-        Opened::Device(device) => device,
-        Opened::Failed(reason) => return machine(unrecorded, reason),
-        Opened::Unobtainable(failure) => {
-            let mut failures = attempt_failures(unrecorded);
-            failures.extend(failure);
-            return MeasureEnd { failures, held: None };
-        }
+    // An opening the device refused as busy (out of memory, or held by
+    // another process) is the device's for now, not the machine's.
+    let opening = |error: seismic::OpenError| match error {
+        seismic::OpenError::Backend(seismic::TargetError::DeviceBusy(_)) => MeasureFailure::Busy { reason: error.to_string() },
+        error => MeasureFailure::Machine { reason: error.to_string() },
     };
+    let device = match catalog
+        .resolve(request.executor)
+        .map_err(|error| MeasureFailure::Machine { reason: error.to_string() })
+        .and_then(|executor| {
+            let probes = catalog
+                .probe(executor, &*seismic::ProgramStore::user(), deadlines.standing())
+                .map_err(opening)?;
+            for kept in &probes.kept {
+                tracing::info!(probe = kept.probe, result = %kept.result.line(), report = %kept.report, "probed the device");
+            }
+            probing.extend(probes.failures.iter().map(|failure| MeasureFailure::Probe { reason: failure.to_string() }));
+            catalog
+                .open_with(
+                    executor,
+                    seismic::DeviceOptions {
+                        artifacts: None,
+                        // The job's point of it (`PointRequest::GraphCost`).
+                        graph_cost: None,
+                    },
+                )
+                .map_err(opening)
+        }) {
+        Ok(device) => device,
+        Err(failure) => return MeasureEnd { failures: vec![failure], held: None },
+    };
+    report(MeasureEvent::Opened);
+    let records = KernelCache::measurement_records(&request.kernels);
     let (topology, executor) = (device.topology(), device.info());
     let costs = StoredCosts::outstanding_of(&ExecutorCosts::stored(topology, executor, &records));
     let outstanding = requests(topology, executor, &records, costs);
     let outstanding = match outstanding {
         Ok(outstanding) => outstanding,
-        Err(reason) => return machine(unrecorded, format!("the point requests: {reason}")),
+        Err(reason) => return machine(format!("the point requests: {reason}")),
     };
-    let unrecorded = RefCell::new(unrecorded);
+    let markers = AttemptMarkers::new(&request.kernels);
+    let unrecorded = RefCell::new(Vec::new());
     let mut measurer = Measurer::new(
         magnitude_executor::SEARCH_SETTINGS.error_rate,
         magnitude_executor::MIN_SAMPLE_SECONDS,
@@ -804,7 +795,7 @@ fn measure_job(request: &MeasureRequest, report: &mut dyn FnMut(MeasureEvent), r
     );
     let measurement = match measured {
         Ok(measurement) => measurement,
-        Err(error) => return machine(unrecorded.into_inner(), error.to_string()),
+        Err(error) => return machine(error.to_string()),
     };
     failures.extend(measurement.ended.into_iter().map(|error| MeasureFailure::Machine {
         reason: error.to_string(),
@@ -817,87 +808,17 @@ fn measure_job(request: &MeasureRequest, report: &mut dyn FnMut(MeasureEvent), r
                 reason: error.to_string(),
             }),
     );
-    failures.extend(attempt_failures(unrecorded.into_inner()));
+    failures.extend(
+        unrecorded
+            .into_inner()
+            .into_iter()
+            .map(|error| MeasureFailure::Attempt {
+                reason: error.to_string(),
+            }),
+    );
     MeasureEnd {
         failures,
         held: Some(measurement.held),
-    }
-}
-
-/// The failures of attempts that could not be recorded.
-fn attempt_failures(unrecorded: Vec<StoreError>) -> Vec<MeasureFailure> {
-    unrecorded
-        .into_iter()
-        .map(|error| MeasureFailure::Attempt {
-            reason: error.to_string(),
-        })
-        .collect()
-}
-
-/// How opening the device as a point's attempt ended.
-enum Opened<D> {
-    Device(D),
-    /// It could not be opened, and why: the attempt stays counted.
-    Failed(String),
-    /// The point it is the attempt of ended two jobs, so the device was not
-    /// opened: the point is recorded unobtainable, unless storing its
-    /// record failed, as this says.
-    Unobtainable(Option<MeasureFailure>),
-}
-
-/// Open the device (`open`) as the attempt of `missing`, the required
-/// point the stored costs miss first, when they miss one: the attempt is
-/// reported and counted before the open, as a timed point's is, and
-/// released once the device opens, so the walk counts its own attempt of
-/// the point. A point that ended two jobs is recorded unobtainable in
-/// `records`, and reported, without opening the device. Without a missing
-/// point the device opens uncounted. Attempts that could not be recorded
-/// are added to `unrecorded`.
-fn open_as_attempt<D>(
-    missing: Option<&PointKey>,
-    markers: &AttemptMarkers,
-    records: &dyn RecordStore<PointKey>,
-    job: MeasureJob,
-    report: &mut dyn FnMut(MeasureEvent),
-    unrecorded: &mut Vec<StoreError>,
-    open: impl FnOnce() -> Result<D, String>,
-) -> Opened<D> {
-    let Some(key) = missing else {
-        return open().map_or_else(Opened::Failed, Opened::Device);
-    };
-    match markers.unobtainable(key) {
-        Ok(Some(reason)) => {
-            let record = Record::Unobtainable {
-                reason: Reason::new(reason),
-            };
-            return match records.store(key, &record) {
-                Ok(()) => {
-                    report(MeasureEvent::Recorded(key.clone(), record));
-                    Opened::Unobtainable(None)
-                }
-                Err(error) => Opened::Unobtainable(Some(MeasureFailure::Point {
-                    key: key.clone(),
-                    reason: error.to_string(),
-                })),
-            };
-        }
-        Ok(None) => {}
-        Err(error) => unrecorded.push(error),
-    }
-    // Reported before it is recorded, so a host that kills the job knows
-    // every attempt the job may have counted, and this one as the open's.
-    report(MeasureEvent::Opening(key.clone()));
-    if let Err(error) = markers.attempting(key, job) {
-        unrecorded.push(error);
-    }
-    match open() {
-        Ok(device) => {
-            if let Err(error) = markers.release(key, job) {
-                unrecorded.push(error);
-            }
-            Opened::Device(device)
-        }
-        Err(reason) => Opened::Failed(reason),
     }
 }
 
@@ -916,11 +837,20 @@ pub fn measure_worker(
     let measure = HostMessage::Measure { request };
     let lost = |lost: Lost| JobLost(lost.reason);
     handshake(&mut sender, &mut receiver, Some(measure), ended, lost)?;
+    // The device opens once, before any point: a host reads a job that
+    // reported no opening as one that could not open the machine.
+    let mut opened = false;
     loop {
         match receive(&mut receiver, ended, lost)? {
-            WorkerMessage::Attempting { key } => report(MeasureEvent::Attempting(key)),
-            WorkerMessage::Opening { key } => report(MeasureEvent::Opening(key)),
-            WorkerMessage::Recorded { key, record } => report(MeasureEvent::Recorded(key, record)),
+            WorkerMessage::Opened if !opened => {
+                opened = true;
+                report(MeasureEvent::Opened);
+            }
+            WorkerMessage::Attempting { key } if opened => report(MeasureEvent::Attempting(key)),
+            WorkerMessage::Recorded { key, record } if opened => report(MeasureEvent::Recorded(key, record)),
+            WorkerMessage::Attempting { .. } | WorkerMessage::Recorded { .. } => {
+                return Err(JobLost("a point was reported before the device opened".into()))
+            }
             WorkerMessage::MeasureFinished { failures } => return Ok(failures),
             _ => return Err(JobLost("unexpected message during measurement".into())),
         }
@@ -975,64 +905,6 @@ mod tests {
         markers.release(&key, MeasureJob(3)).unwrap();
         assert_eq!(markers.record(&key).unwrap().ended_jobs, 1);
         assert_eq!(markers.unobtainable(&key).unwrap(), None);
-    }
-
-    /// A device that cannot be opened ends each job on the point the costs
-    /// miss first, as a point whose timing ends the job does: the second
-    /// such job leaves it to the next, which records it unobtainable without
-    /// opening the device, so the costs are unavailable rather than pending.
-    /// An open that succeeds leaves the walk its own attempt, and another
-    /// hardware or driver's key is its own. An open killed at the job's
-    /// deadline stays counted, as its attempt is stored before it.
-    #[test]
-    fn a_device_that_cannot_be_opened_records_the_missing_point_unobtainable() {
-        let topology = Devices::discover(&[]).unwrap().topology();
-        let executor = topology.executors().iter().find(|executor| executor.backend() == seismic::BackendName::Cpu).unwrap().clone();
-        let kernels = tempfile::tempdir().unwrap();
-        let (markers, records) = (AttemptMarkers::new(kernels.path()), KernelCache::measurement_records(kernels.path()));
-        let Ok(StoredCosts::Missing(probe)) = ExecutorCosts::stored(&topology, &executor, &records) else {
-            panic!("nothing is stored, so the probe is missing")
-        };
-        let mut events = Vec::new();
-        let mut unrecorded = Vec::new();
-        let mut opens = 0;
-        let mut open = |job, opening: Result<(), String>| {
-            open_as_attempt(Some(&probe), &markers, &records, MeasureJob(job), &mut |event| events.push(event), &mut unrecorded, || {
-                opens += 1;
-                opening
-            })
-        };
-        // An open that succeeds counts nothing.
-        assert!(matches!(open(1, Ok(())), Opened::Device(())));
-        assert_eq!(markers.record(&probe).unwrap().ended_jobs, 0);
-        for job in [2, 3] {
-            assert!(matches!(open(job, Err("no device".into())), Opened::Failed(reason) if reason == "no device"));
-        }
-        assert!(matches!(open(4, Ok(())), Opened::Unobtainable(None)));
-        assert_eq!(opens, 3, "the point that ended two jobs does not open the device");
-        assert!(unrecorded.is_empty(), "{unrecorded:?}");
-        let opening = MeasureEvent::Opening(probe.clone());
-        assert_eq!(events[..3], [opening.clone(), opening.clone(), opening]);
-        assert!(matches!(&events[3], MeasureEvent::Recorded(key, Record::Unobtainable { .. }) if *key == probe));
-        assert!(matches!(RecordStore::load(&records, &probe).unwrap(), Some(Record::Unobtainable { .. })));
-        assert!(ExecutorCosts::stored(&topology, &executor, &records).is_err(), "the costs are unavailable");
-        // Another driver's probe is a key of its own, and is attempted.
-        let mut other = probe.clone();
-        other.executor.driver = "another driver".into();
-        let opened = open_as_attempt(Some(&other), &markers, &records, MeasureJob(5), &mut |_| {}, &mut unrecorded, || Ok(()));
-        assert!(matches!(opened, Opened::Device(())));
-        // The attempt is stored before the open, so a job its host kills
-        // inside a hung open at its deadline leaves it counted; only a
-        // preempted job's is released.
-        let mut inside = None;
-        open_as_attempt(Some(&other), &markers, &records, MeasureJob(6), &mut |_| {}, &mut unrecorded, || {
-            inside = Some(markers.record(&other).unwrap().ended_jobs);
-            Err::<(), _>("killed at its deadline".into())
-        });
-        assert_eq!(inside, Some(1), "counted while the device opens");
-        assert_eq!(markers.unobtainable(&other).unwrap(), None);
-        release_killed(kernels.path(), MeasureJob(6), &other).unwrap();
-        assert_eq!(markers.record(&other).unwrap().ended_jobs, 0, "a preempted open is released");
     }
 
     /// In-process jobs on the host's CPU executor, their records and their

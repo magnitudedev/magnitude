@@ -338,7 +338,7 @@ pub(crate) fn open(
                 host: memory.host_store(),
             };
             let seismic_cuda::OpenedCuda { service, device } =
-                seismic_cuda::open(ordinal, stores).map_err(open_error)?;
+                seismic_cuda::open(ordinal, stores).map_err(OpenError::Backend)?;
             let capability = device.facts().compute_capability;
             let architecture = u32::from(capability.major) * 10 + u32::from(capability.minor);
             let cuda = DeviceFormer::new(seismic_cuda::toolchain::CudaToolchain::new(service.clone(), architecture), &store);

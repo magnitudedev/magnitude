@@ -18,6 +18,9 @@ pub enum TargetError {
     UnsupportedDriver(String),
     UnsupportedToolchain(String),
     DeviceUnavailable(String),
+    /// The device could not be opened now: the driver is out of memory, or
+    /// the device is held by another process. Opening it later may succeed.
+    DeviceBusy(String),
     /// Device/profile evidence was acquired, but could not certify the
     /// analytical contract. The immutable device description remains valid.
     InvalidExecutionProfile(String),
@@ -290,7 +293,7 @@ impl fmt::Display for TargetError {
             Self::UnsupportedDevice(s) => write!(f, "unsupported device: {s}"),
             Self::UnsupportedDriver(s) => write!(f, "unsupported driver: {s}"),
             Self::UnsupportedToolchain(s) => write!(f, "unsupported toolchain: {s}"),
-            Self::DeviceUnavailable(s) => write!(f, "device unavailable: {s}"),
+            Self::DeviceUnavailable(s) | Self::DeviceBusy(s) => write!(f, "device unavailable: {s}"),
             Self::InvalidExecutionProfile(s) => write!(f, "invalid execution profile: {s}"),
         }
     }

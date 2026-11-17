@@ -384,7 +384,10 @@ mod attr {
 }
 
 fn unavailable(error: DriverError) -> TargetError {
-    TargetError::DeviceUnavailable(error.to_string())
+    match error.is_busy() {
+        true => TargetError::DeviceBusy(error.to_string()),
+        false => TargetError::DeviceUnavailable(error.to_string()),
+    }
 }
 
 /// The single-allocation limit of a CUDA device: one `cuMemAlloc` can at

@@ -38,6 +38,7 @@ impl VulkanOpened {
         };
         let service = seismic_vulkan::Device::open(uuid, stores, probed).map_err(|error| match error {
             seismic_vulkan::OpenError::Missing => OpenError::IdentityChanged(info.selector()),
+            busy @ seismic_vulkan::OpenError::Busy(_) => OpenError::Backend(TargetError::DeviceBusy(busy.to_string())),
             other => OpenError::Backend(TargetError::DeviceUnavailable(other.to_string())),
         })?;
         Ok(Self {

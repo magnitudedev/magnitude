@@ -228,10 +228,11 @@ pub enum Measurements {
     /// The job has not stored the probe or a figure no other prices yet:
     /// fit is assessed and speed is pending.
     Pending,
-    /// The stored records give no costs, and why: a required figure is
-    /// recorded unobtainable (the executor cannot stream its own weights,
-    /// or its device could not be opened in two jobs), or the records
-    /// cannot be read, and every fitting model's speed is unavailable.
+    /// The stored records give no costs, and why: the probe is recorded
+    /// unobtainable (the executor cannot stream its own weights), the
+    /// records cannot be read, or the measurement job could not open the
+    /// device in two jobs in a row this service's run (it keeps retrying),
+    /// and every fitting model's speed is unavailable.
     Unavailable { reason: String },
     /// The selected executor's costs and the streamed figures, and the
     /// stored records they were derived from, which identify them. Every
