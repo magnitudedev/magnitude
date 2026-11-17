@@ -366,7 +366,7 @@
 .chat-prose { overflow-wrap: anywhere; }
 .chat-prose > * + * { margin-top: 12px; }
 .chat-prose ul { list-style: disc; padding-left: 20px; }
-.chat-prose ol { list-style: decimal; padding-left: 20px; }
+.chat-prose ol { list-style: decimal; }
 .chat-prose li + li { margin-top: 8px; }
 .chat-prose strong { font-weight: 600; }
 .chat-prose :where(h1, h2, h3, h4, h5, h6) { font-family: var(--font-sans); font-weight: 600; margin-top: 24px; margin-bottom: 10px; }

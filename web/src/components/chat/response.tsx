@@ -133,6 +133,12 @@ const ChatMarkdown = memo(function ChatMarkdown({
           : ""
         return <ChatCodeBlock code={text} language={language} notify={notify} />
       },
+      // A list's numbers sit in its own padding, so it is as wide as its widest number ("138.") and never cut off.
+      ol: ({ node, children, start }) => {
+        const items = node?.children.filter((child) => child.type === "element" && child.tagName === "li").length ?? 0
+        const digits = String(Math.max(1, (start ?? 1) + items - 1)).length
+        return <ol start={start} style={{ paddingLeft: `calc(${digits}ch + 1em)` }}>{children}</ol>
+      },
       a: ({ children, href }) => (
         <a href={href} target="_blank" rel="noreferrer noopener">
           {children}

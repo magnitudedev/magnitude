@@ -234,6 +234,13 @@ describe("Chat presentation", () => {
 })
 
 import { submitsChatMessage } from "./chat/keyboard"
+it("makes room in a numbered list for its widest number, so 138 isn't cut to 38", () => {
+  const list = (markdown: string) => renderToStaticMarkup(<ChatResponse response={response({ content: [{ type: "text", text: markdown, time: { started: 350, ended: 1_000 } }] })} notify={() => {}} />)
+  expect(list("137. One\n138. Two")).toContain('<ol start="137" style="padding-left:calc(3ch + 1em)">')
+  expect(list("1. One\n2. Two")).toContain('style="padding-left:calc(1ch + 1em)"')
+  expect(list("9. One\n10. Two")).toContain('style="padding-left:calc(2ch + 1em)"')
+})
+
 it("keeps IME composition and Shift-Enter out of message submission", () => {
   expect(submitsChatMessage("Enter", false, false, 13)).toBe(true)
   expect(submitsChatMessage("Enter", true, false, 13)).toBe(false)
