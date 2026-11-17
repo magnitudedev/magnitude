@@ -1,4 +1,4 @@
-import type { ReactNode } from "react"
+import { Fragment, type ReactNode } from "react"
 import { CircleNotchIcon } from "@phosphor-icons/react"
 import type { ModelLab } from "../model-logo"
 import { ContextText, ModelCardShell, PlacementBar, QuantLadder, QuantList, RepositoryLink, quantSource } from "./parts"
@@ -42,9 +42,10 @@ export function ExpandingModel({ model, note, expanded, onToggle, quantChoice, o
         : <QuantList quants={model.quants} selected={current.key} recommended={model.recommended} owned={owned} onSelect={onQuantChoice} />}
       {model.checking && <p role="status" className="mt-2 flex items-center gap-1.5 text-xs text-slate-500"><CircleNotchIcon aria-hidden="true" className="size-3.5 motion-safe:animate-spin" />Checking this repository's other quants…</p>}
       {current.fits && <div className="mt-4"><PlacementBar quant={current} /></div>}
+      {/* Each slot under its own key: a drafter and a download both keyed by their quant would otherwise collide. */}
       {(drafter || footer) && <div className="mt-4 flex flex-wrap items-center justify-between gap-x-4 gap-y-3">
-        {drafter?.(current) ?? <span />}
-        {footer?.(current)}
+        <Fragment key="drafter">{drafter?.(current) ?? <span />}</Fragment>
+        <Fragment key="footer">{footer?.(current)}</Fragment>
       </div>}
     </div>}
   </ModelCardShell>
