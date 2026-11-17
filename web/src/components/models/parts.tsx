@@ -39,6 +39,14 @@ export function ContextText({ quant, limit, modelName }: { quant: QuantView; lim
   return <span className="whitespace-nowrap">{formatContext(quant.servedContext)} context</span>
 }
 
+/** A repository's page on Hugging Face as an icon alone, beside a name that does something else when clicked. */
+export function RepositoryIconLink({ repository }: { repository: string }) {
+  return <a href={`https://huggingface.co/${repository}`} target="_blank" rel="noreferrer" title={repository} aria-label={`Open ${repository} on Hugging Face`}
+    className="relative z-10 inline-flex shrink-0 items-center rounded p-0.5 hover:text-blue-700 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:text-blue-400">
+    <ArrowSquareOutIcon className="size-3" />
+  </a>
+}
+
 export function RepositoryLink({ repository, children }: { repository: string; children?: ReactNode }) {
   return <a href={`https://huggingface.co/${repository}`} target="_blank" rel="noreferrer" title={repository} onClick={event => event.stopPropagation()}
     className="inline-flex min-w-0 items-center gap-0.5 hover:text-blue-700 hover:underline dark:hover:text-blue-400">
@@ -120,14 +128,16 @@ export function QuantList({ quants, selected, recommended, owned, onSelect }: {
   return <div className="divide-y divide-slate-200 overflow-hidden rounded-lg border border-slate-200 bg-white dark:divide-slate-750 dark:border-slate-750 dark:bg-slate-850">
     {quants.map(quant => {
       const active = selected === quant.key
-      return <button key={quant.key} type="button" disabled={!quant.fits || quant.measuring} onClick={() => onSelect(quant.key)}
-        className={cn("grid w-full grid-cols-[52px_minmax(0,1fr)_auto_72px_64px] items-center gap-3 px-3 py-2 text-left text-[13px]", active ? "bg-blue-50/60 dark:bg-slate-800" : "hover:bg-slate-50 dark:hover:bg-slate-800/50", !quant.fits && !quant.measuring && "opacity-40")}>
+      // The whole row chooses the size, from a button laid over it; only the icon beside the name opens Hugging Face.
+      return <div key={quant.key} className={cn("relative grid w-full grid-cols-[52px_minmax(0,1fr)_auto_72px_64px] items-center gap-3 px-3 py-2 text-left text-[13px]", active ? "bg-blue-50/60 dark:bg-slate-800" : "hover:bg-slate-50 dark:hover:bg-slate-800/50", !quant.fits && !quant.measuring && "opacity-40")}>
+        <button type="button" aria-label={`${quant.bits}-bit ${quantSource(quant)}`} aria-pressed={active} disabled={!quant.fits || quant.measuring} onClick={() => onSelect(quant.key)}
+          className="absolute inset-0 cursor-pointer focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-blue-500 disabled:cursor-default" />
         <span className={cn("font-medium", active && "text-blue-700 dark:text-blue-400")}>{quant.bits}-bit</span>
-        <span className="min-w-0 truncate text-xs text-slate-500">{quant.repository ? <RepositoryLink repository={quant.repository}>{quantSource(quant)}</RepositoryLink> : quantSource(quant)}</span>
+        <span className="flex min-w-0 items-center gap-1 text-xs text-slate-500"><span className="truncate">{quantSource(quant)}</span>{quant.repository && <RepositoryIconLink repository={quant.repository} />}</span>
         <span>{owned.has(quant.key) ? <Badge>Downloaded</Badge> : recommended === quant.key && <Badge tone="blue">Best</Badge>}</span>
         <span className="text-right text-xs tabular-nums text-slate-700 dark:text-slate-300">{quant.fits && quant.speed !== null ? `~${formatSpeed(quant.speed)}` : fitLabel(quant)}</span>
         <span className="text-right text-xs tabular-nums text-slate-500">{formatStorageSize(quant.sizeBytes)}</span>
-      </button>
+      </div>
     })}
   </div>
 }
