@@ -711,8 +711,8 @@ __device__ __forceinline__ float gemm_s8_product(int biased) { return __int_as_f
 // so a row's bits do not depend on the rows beside it. A one-row block (ONE)
 // folds only column 2t's places, column 0 on lanes t = 0 (no other column
 // is stored).
-template <int NB, bool ONE, class Src, class W>
-__device__ __forceinline__ void gemv_accumulate_s8(float (&acc)[NB][4], const typename W::Raw &raw, const W &w,
+template <int NB, bool ONE, class Src, class W, class R>
+__device__ __forceinline__ void gemv_accumulate_s8(float (&acc)[NB][4], const R &raw, const W &w,
                                                    const Coefficients<W::GROUPS> &c, int h, const u32 (&b)[NB][2],
                                                    const float2 (&x)[NB][2]) {
     static_assert(W::GROUP == 16 || W::GROUP >= 32, "groups of 16 codes, or of 32 or more");
@@ -813,6 +813,27 @@ template <class G, class K> struct GemvRecords<packets::Records<G, K>> {
 // A gathered view's (below) of its weight's.
 template <class W> struct Gathered;
 template <class W> struct GemvRecords<Gathered<W>> : GemvRecords<W> {};
+// The INT8 GEMV's superblocks of weights W (`W::S8Super`, `fetch_s8_superblock`:
+// a packed weight's lanes hold only the codes they multiply), else its whole
+// superblocks.
+template <class W, class = void> struct S8Superblock {
+    typedef typename W::Super type;
+    __device__ static __forceinline__ type fetch(const W &w, u64 tile, u64 superblock, u64 kblocks, u32 lane) {
+        return w.fetch_superblock(tile, superblock, kblocks, lane);
+    }
+    __device__ static __forceinline__ auto raw(const W &w, const type &super, int q, u32 lane) {
+        return w.raw(super, q, lane);
+    }
+};
+template <class W> struct S8Superblock<W, decltype(void(sizeof(typename W::S8Super)))> {
+    typedef typename W::S8Super type;
+    __device__ static __forceinline__ type fetch(const W &w, u64 tile, u64 superblock, u64 kblocks, u32 lane) {
+        return w.fetch_s8_superblock(tile, superblock, kblocks, lane);
+    }
+    __device__ static __forceinline__ auto raw(const W &w, const type &super, int q, u32 lane) {
+        return w.s8_raw(super, q, lane);
+    }
+};
 // The weights of a GEMV whose decoders read grid points from the block's
 // source (`GemvShared::points`): none where the pair runs `gemv_records_group`
 // (16-bit rows of records weights, which read the records' own table), else
@@ -917,10 +938,16 @@ __device__ __forceinline__ void gemv_mma_group(const Ready &ready, u32 M, u64 kb
     const u64 superblocks = (kblocks + 3) / 4;
     const u64 begin = superblocks * part / KSPLIT;
     const u64 end = tile0 < tiles ? superblocks * (part + 1) / KSPLIT : begin;
-    // Codes and packed coefficients of one superblock of the group's tiles.
+    // The INT8 GEMV's int8_rule rows (`S8Rows`), a one-row block's own (S8_ONE).
+    constexpr bool S8 = IsS8Rows<decltype(ready())>::value;
+    constexpr bool S8_ONE = IsS8Rows<decltype(ready())>::ONE;
+    // Codes and packed coefficients of one superblock of the group's tiles:
+    // under S8 only what each lane multiplies (`S8Superblock`).
+    typedef typename packets::Select<S8, typename S8Superblock<WA>::type, typename WA::Super>::type SuperA;
+    typedef typename packets::Select<S8, typename S8Superblock<WB>::type, typename WB::Super>::type SuperB;
     struct Stage {
-        typename WA::Super ra[TPW];
-        typename WB::Super rb[TPW];
+        SuperA ra[TPW];
+        SuperB rb[TPW];
         typename WA::Block ba[TPW];
         typename WB::Block bb[TPW];
     };
@@ -929,7 +956,11 @@ __device__ __forceinline__ void gemv_mma_group(const Ready &ready, u32 M, u64 kb
         for (int i = 0; i < TPW; ++i) {
             if (tile0 + i >= tiles)
                 continue;
-            if constexpr (PERMUTED) {
+            if constexpr (S8) {
+                stage.ra[i] = S8Superblock<WA>::fetch(wa, tile0 + i, sb, kblocks, lane);
+                if constexpr (PAIR)
+                    stage.rb[i] = S8Superblock<WB>::fetch(wb, tile0 + i, sb, kblocks, lane);
+            } else if constexpr (PERMUTED) {
                 stage.ra[i] = wa.fetch_superblock_permuted(tile0 + i, sb, kblocks, lane);
                 if constexpr (PAIR)
                     stage.rb[i] = wb.fetch_superblock_permuted(tile0 + i, sb, kblocks, lane);
@@ -963,9 +994,6 @@ __device__ __forceinline__ void gemv_mma_group(const Ready &ready, u32 M, u64 kb
     // every warp of the block runs the GEMV, as `ready()` requires).
     constexpr bool ROW = is_shared_row<decltype(ready())>;
     static_assert(!ROW || NB == 1, "a shared row is one activation row");
-    // The INT8 GEMV's int8_rule rows (`S8Rows`), a one-row block's own (S8_ONE).
-    constexpr bool S8 = IsS8Rows<decltype(ready())>::value;
-    constexpr bool S8_ONE = IsS8Rows<decltype(ready())>::ONE;
     static_assert(!S8_ONE || NB == 1, "a shared s8 row is one activation row");
     static_assert(!S8 || !PERMUTED, "the INT8 GEMV multiplies packed weights");
     static_assert(!PERMUTED || (SUMS_A == 0 && SUMS_B == 0), "permuted weights take no operand sums");
@@ -1015,7 +1043,7 @@ __device__ __forceinline__ void gemv_mma_group(const Ready &ready, u32 M, u64 kb
                 for (int i = 0; i < TPW; ++i) {
                     if (tile0 + i >= tiles)
                         continue;
-                    const typename WA::Raw ra = wa.raw(stage.ra[i], q, lane);
+                    const auto ra = S8Superblock<WA>::raw(wa, stage.ra[i], q, lane);
                     Coefficients<WA::GROUPS> ca;
                     if constexpr (STAGED)
                         wa.coefficients(wa.staged_block(staging + i * staged_tile, kblocks, sb, lane), q, ca);
@@ -1025,7 +1053,7 @@ __device__ __forceinline__ void gemv_mma_group(const Ready &ready, u32 M, u64 kb
                     for (int h = 0; h < 2; ++h)
                         gemv_accumulate_s8<NB, S8_ONE, Src>(acc[0][i], ra, wa, ca, h, b[h], x[h]);
                     if constexpr (PAIR) {
-                        const typename WB::Raw rb = wb.raw(stage.rb[i], q, lane);
+                        const auto rb = S8Superblock<WB>::raw(wb, stage.rb[i], q, lane);
                         Coefficients<WB::GROUPS> cb;
                         wb.coefficients(stage.bb[i], q, cb);
 #pragma unroll
