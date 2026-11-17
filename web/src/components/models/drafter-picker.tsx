@@ -169,7 +169,7 @@ export function DrafterSection({ target, selection, onSelect }: { target: Drafte
   const download = Option.match(chosen, { onNone: () => 0, onSome: drafterCandidateDownloadBytes })
   return <>
     <button type="button" aria-expanded={open} onClick={() => setOpen(value => !value)}
-      title="A drafter is a small model that guesses ahead, so this one writes several tokens per step"
+      title="A drafter is a small model that drafts tokens ahead to speed up replies."
       className="group inline-flex items-center gap-1.5 text-xs text-slate-600 dark:text-slate-400">
       <LightningIcon weight="fill" className={cn("size-3.5", Option.isNone(chosen) ? "text-slate-400" : "text-amber-500")} />
       <span>{Option.isSome(chosen) && "Using "}<span className="font-medium text-slate-800 underline decoration-slate-300 decoration-dotted underline-offset-2 group-hover:text-blue-700 group-hover:decoration-blue-700 dark:text-slate-200 dark:decoration-slate-600 dark:group-hover:text-blue-400">{Option.match(chosen, { onNone: () => "No drafter", onSome: drafterTitle })}</span></span>
@@ -204,7 +204,7 @@ export function DrafterDialog({ model, bits, onClose, onChoose }: {
   return <Dialog open onOpenChange={open => { if (!open) onClose() }}>
     <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-xl">
       <DialogTitle className="font-heading text-base font-semibold">Drafter for {model.presentation.displayName}{bits > 0 && <span className="font-normal text-slate-500"> · {bits}-bit</span>}</DialogTitle>
-      <p className="-mt-2 text-[13px] text-slate-600 dark:text-slate-400">A small model that guesses ahead, so this one writes several tokens per step.</p>
+      <p className="-mt-2 text-[13px] text-slate-600 dark:text-slate-400">A small model that drafts tokens ahead to speed up replies.</p>
       <DrafterPicker target={target} selection={selection} onSelect={setSelection} />
       <div className="flex justify-end gap-2">
         <Button variant="ghost" onClick={onClose}>Cancel</Button>

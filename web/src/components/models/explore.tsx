@@ -219,7 +219,7 @@ export function useDownload(selections: Readonly<Record<string, DrafterSelection
 
 /** A catalog model's drafter, which comes with it: named beside its download, with the bytes it adds. */
 function CatalogDrafter({ drafter }: { drafter: NonNullable<OfferedModel["drafter"]> }) {
-  return <span className="inline-flex items-center gap-1.5 text-xs text-slate-600 dark:text-slate-400" title="A drafter is a small model that guesses ahead, so this one writes several tokens per step">
+  return <span className="inline-flex items-center gap-1.5 text-xs text-slate-600 dark:text-slate-400" title="A drafter is a small model that drafts tokens ahead to speed up replies.">
     <LightningIcon weight="fill" className="size-3.5 text-amber-500" />
     <span>Using <span className="font-medium text-slate-800 dark:text-slate-200">{drafter.method} drafter</span></span>
     {drafter.sizeBytes > 0 && <span className="text-slate-500">· {formatStorageSize(drafter.sizeBytes)}</span>}
