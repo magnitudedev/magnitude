@@ -4,6 +4,7 @@ import { raiseWindow } from "./window-raise"
 import { makeMacCliRegistration } from "@magnitudedev/daemon-management/desktop-native"
 import { ApplicationUpdateControlFailed } from "@magnitudedev/sdk/desktop-host"
 import { makeRendererRecovery } from "./renderer-recovery"
+import { makeHostActions } from "./host-actions"
 import { startupFailureDetail } from "./startup-failure"
 import { nativeQuitFailureDecision, resolveQuitFailure } from "./quit-failure"
 import { buildApplicationMenu } from "./application-menu"
@@ -29,7 +30,7 @@ import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, po
 import { join, resolve, dirname } from "node:path"
 import { homedir } from "node:os"
 import { fileURLToPath } from "node:url"
-import { Cause, Context, Deferred, Duration, Effect, Either, Exit, Fiber, FiberId, Layer, Option, PubSub, Queue, Ref, Runtime, Schema, Schedule, Scope, Stream } from "effect"
+import { Cause, Context, Deferred, Duration, Effect, Either, Exit, Fiber, FiberId, Layer, Option, Queue, Ref, Runtime, Schema, Schedule, Scope, Stream } from "effect"
 import { RpcServer } from "@effect/rpc"
 import {
   acquireApplicationOwner, applicationStateDirectory, isUpdateInstallationActive, NativeHost, nativeHostLayer,
@@ -45,7 +46,7 @@ import { ProcessGroupController } from "@magnitudedev/utils/process-groups"
 import { ProcessGroupControllerLive } from "@magnitudedev/utils/process-groups/native"
 import { nativeWindowsPrivatePipesLayer, WindowsPipeName } from "@magnitudedev/utils/windows-native"
 import { type ApplicationSnapshot, type OwnedServiceState } from "@magnitudedev/sdk/desktop-host"
-import { HostError, ApplicationAction, InferenceHostRpcs, ModelTrayPresentation, type HostNotice, type Page } from "./desktop-rpc"
+import { HostError, InferenceHostRpcs, ModelTrayPresentation, type HostNotice, type Page } from "./desktop-rpc"
 import type { QuitFailureDecision } from "@magnitudedev/client-common/application/contracts"
 import { makeElectronRpcServerLayer } from "./electron-rpc"
 import { chooseOpenPath } from "./open-dialog"
@@ -157,9 +158,7 @@ const program = Effect.scoped(Effect.gen(function* () {
   const loginStartup = yield* makeLoginStartup(isolatedProfile)
   yield* initializeLoginStartup(loginStartup, stateDir, isolatedProfile).pipe(Effect.provide(NodeContext.layer), Effect.catchAll(error => Effect.logWarning(error.message)))
   const rendererRecovery = yield* makeRendererRecovery
-  const actions = yield* PubSub.unbounded<typeof ApplicationAction.Type>()
-  // The latest opened link, held until a renderer receives it, so a cold start or reload never loses it.
-  const pendingAddModel = yield* Ref.make(Option.none<typeof ApplicationAction.Type>())
+  const hostActions = yield* makeHostActions
   const quit = yield* Queue.sliding<"Quit" | "RestartUpdate" | "Relaunch">(1)
   const state = yield* Ref.make<OwnedServiceState | null>(null)
   const unavailableModel = (label: string): typeof ModelTrayPresentation.Type => ({ label, status: Option.none(), canStop: false })
@@ -293,18 +292,17 @@ const program = Effect.scoped(Effect.gen(function* () {
   const windowShown = () => window !== undefined && !window.isDestroyed() && window.isVisible()
   /** Errors raised while the window is shown appear in the app; native dialogs only when there is no window. */
   const showNotice = (notice: HostNotice) => windowShown()
-    ? PubSub.publish(actions, { _tag: "ShowNotice", notice }).pipe(Effect.asVoid)
+    ? hostActions.publish({ _tag: "ShowNotice", notice })
     : Effect.sync(() => dialog.showErrorBox(notice.title, notice.description))
   const pendingQuitDecision = yield* Ref.make(Option.none<Deferred.Deferred<QuitFailureDecision>>())
   const decideQuitFailure: Effect.Effect<QuitFailureDecision, unknown> = Effect.suspend(() => windowShown()
     ? Effect.gen(function* () {
       const decision = yield* Deferred.make<QuitFailureDecision>()
       yield* Ref.set(pendingQuitDecision, Option.some(decision))
-      yield* PubSub.publish(actions, { _tag: "QuitFailed" })
+      yield* hostActions.publish({ _tag: "QuitFailed" })
       return yield* Deferred.await(decision)
     })
     : nativeQuitFailureDecision(options => dialog.showMessageBox(options)))
-  let pendingPage: Page = "models"
   let wantsWindow = !background
   const loadRenderer = () => Effect.tryPromise(() => process.env.ELECTRON_RENDERER_URL
     ? window.loadURL(process.env.ELECTRON_RENDERER_URL)
@@ -312,14 +310,14 @@ const program = Effect.scoped(Effect.gen(function* () {
       Effect.catchAll(error => rendererRecovery.loadFailed.pipe(Effect.zipRight(Effect.logError(error)))),
     )
   const show = (page?: Page) => Ref.get(state).pipe(Effect.flatMap(current => current?._tag === "Stopping" || current?._tag === "Stopped" ? Effect.void : Effect.gen(function* () {
-    if (page !== undefined) pendingPage = page
+    if (page !== undefined) yield* hostActions.request(page)
     wantsWindow = true
     if (!window) return
     const reload = yield* rendererRecovery.open
     yield* Effect.sync(() => raiseWindow(window, app, process.platform))
     if (reload) yield* loadRenderer()
     // Raising the retained window must preserve the renderer's current page.
-    if (page !== undefined) yield* PubSub.publish(actions, { _tag: "Navigate", page })
+    if (page !== undefined) yield* hostActions.navigate(page)
   })))
   /** Links are validated again here: a forwarded one comes from another process. */
   const openLink = (url: string) => Either.match(parseDeepLink(url), {
@@ -329,8 +327,7 @@ const program = Effect.scoped(Effect.gen(function* () {
     onRight: link => Effect.gen(function* () {
       const action = { _tag: "OpenHuggingFaceModel" as const, repository: link.repository, file: link.file }
       yield* show("models")
-      yield* Ref.set(pendingAddModel, Option.some(action))
-      yield* PubSub.publish(actions, action)
+      yield* hostActions.openModel(action)
     }),
   })
   const tray = Context.get(yield* Layer.build(TrayOwnerLive.pipe(Layer.provide(nativeTray))), TrayOwner)
@@ -340,7 +337,7 @@ const program = Effect.scoped(Effect.gen(function* () {
     const update = yield* updates.state
     yield* tray.setMenu(buildTrayMenu({ service: current?._tag ?? "Unknown", model: presentation, updateReady: (update.transfer._tag === "Ready" || update.transfer._tag === "InstallationFailed") }, {
       open: page => run(show(page)),
-      stopModel: () => run(PubSub.publish(actions, { _tag: "StopModel" })),
+      stopModel: () => run(hostActions.publish({ _tag: "StopModel" })),
       quit: requestQuit,
       restartUpdate: () => run(updates.requireReady.pipe(Effect.zipRight(Queue.offer(quit, "RestartUpdate")), Effect.catchAll(() => Effect.void))),
     }))
@@ -401,12 +398,7 @@ const program = Effect.scoped(Effect.gen(function* () {
   const connectionError = (error: { readonly message: string }) => new HostError({ message: error.message })
   const handlers = InferenceHostRpcs.toLayer({
     Observe: () => snapshots,
-    Actions: () => Stream.unwrapScoped(Effect.gen(function* () {
-      const subscription = yield* PubSub.subscribe(actions)
-      const pending = yield* Ref.getAndSet(pendingAddModel, Option.none())
-      return Stream.concat(Stream.fromIterable([{ _tag: "Navigate" as const, page: pendingPage }, ...Option.toArray(pending)]),
-        Stream.fromQueue(subscription).pipe(Stream.tap(action => action._tag === "OpenHuggingFaceModel" ? Ref.set(pendingAddModel, Option.none()) : Effect.void)))
-    })),
+    Actions: () => hostActions.subscribe,
     PresentModel: value => Ref.set(model, value).pipe(Effect.zipRight(refreshTray), Effect.as({})),
     GetAppearance: () => appearance.read.pipe(Effect.tapError(() => Effect.sync(() => { nativeTheme.themeSource = "system" })),
       Effect.mapError(connectionError), Effect.tap(preference =>
