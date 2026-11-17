@@ -149,7 +149,7 @@ describe("inference argument validation", () => {
     [() => showRecommendations("USA", "10"), "Country must be a two-letter ISO 3166-1 code, such as US"],
     [() => showRecommendations(undefined, "0"), "Limit must be a positive integer"],
     [() => showModel(""), "Expected a model ID, a Hugging Face link, or owner/repo[:QUANT]: "],
-    [() => showModel("not a model"), "Expected a model ID, a Hugging Face link, or owner/repo[:QUANT]: not a model"],
+    [() => showModel("not:a model"), "Expected a model ID, a Hugging Face link, or owner/repo[:QUANT]: not:a model"],
     [() => pullModel(""), "Expected a model ID, a Hugging Face link, or owner/repo[:QUANT]: "],
     [() => pullModel("not a model"), "Expected a model ID, a Hugging Face link, or owner/repo[:QUANT]: not a model"],
     [() => pullModel("https://example.com/owner/repo"), "Expected a model ID, a Hugging Face link, or owner/repo[:QUANT]: https://example.com/owner/repo"],
@@ -1107,7 +1107,7 @@ describe("--json output", () => {
   })
 
   it.each([
-    [() => showModel("bad", { json: true }), "Expected a model ID, a Hugging Face link, or owner/repo[:QUANT]: bad"],
+    [() => showModel("bad:name:x:y", { json: true }), "Expected a model ID, a Hugging Face link, or owner/repo[:QUANT]: bad:name:x:y"],
     [() => removeModel("nonsense", { json: true }), "Invalid model ID: nonsense"],
     [() => loadInstance("local:not-a-digest", { json: true }), "Invalid model ID: local:not-a-digest"],
     [() => searchHuggingFace("  ", { json: true }), "Search query must not be empty"],
