@@ -1218,30 +1218,25 @@ fn readout_head_specialization_on(
     )
 }
 
-fn prepared_projection_specialization_on(
+/// The parameters `readout_project_rows` exercises reading every row of a
+/// `[v, d]` head in order (no token rows, no weight scale) on `device`: on
+/// the GPUs the readout projection's launches at `mapping`, on the CPU its
+/// exact F32 path (`INT8` 0). Every parameter it leaves unset takes its
+/// declared default where it is prepared ([`declared::prepared`]).
+fn readout_project_specialization_on(
     device: &Device,
-    statics: &[(&str, usize)],
+    (v, d): (usize, usize),
     mapping: Mapping,
 ) -> NativeSpecialization {
-    let v = statics.iter().find(|(key, _)| *key == "V").unwrap().1;
-    let mut spec = NativeSpecialization::new()
-        .with_static("S", v as u64)
-        .with_static("I", 0)
-        .with_static("WS", 0);
-    for (key, value) in statics {
-        spec = spec.with_static(*key, *value as u64);
+    let statics = [("V", v), ("D", d), ("S", v), ("I", 0), ("WS", 0)];
+    if is_cpu(device) {
+        return statics
+            .iter()
+            .filter(|(name, _)| matches!(*name, "I" | "WS"))
+            .fold(NativeSpecialization::new(), |spec, (name, value)| spec.with_static(*name, *value as u64))
+            .with_param("INT8", 0);
     }
-    match device.backend() {
-        BackendName::Metal => spec
-            .with_param("LANES", mapping.lanes)
-            .with_launch_param(0, "SIMDGROUPS", mapping.simdgroups)
-            .with_launch_param(0, "ROWS", mapping.rows),
-        BackendName::Vulkan => spec
-            .with_param("SIMDGROUPS", mapping.simdgroups)
-            .with_param("ROWS", mapping.rows)
-            .with_param("LANES", mapping.lanes),
-        _ => spec,
-    }
+    scoped_projection_specialization_on::<readout_project_rows::Entry>(device, &statics, mapping, false)
 }
 
 const ROW_CLASSES: [usize; 9] = [1, 2, 3, VERIFY_ROWS as usize, VERIFY_ROWS as usize + 1, 16, 17, 64, 128];
@@ -6462,12 +6457,12 @@ fn head_logits_match_the_host(
                 A: act.element(),
                 OW: repr.resident(device),
             });
-            let specialization = if is_cpu(device) {
-                declared::declared(device, &entry, |_| 0, &[("INT8", 0)]).unwrap()
-            } else {
-                prepared_projection_specialization_on(device, &[("V", v), ("D", d)], mapping)
-            };
-            let kernel = entry.prepare(device, &specialization).unwrap();
+            let kernel = declared::prepared(
+                device,
+                &entry,
+                &readout_project_specialization_on(device, (v, d), mapping),
+            )
+            .unwrap();
             let logits = kernel
                 .call(readout_project_rows::Args {
                     features: &act_tensor(device, act, &[rows, d], &features),
