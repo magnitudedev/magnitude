@@ -732,7 +732,7 @@ pub fn shrink_settled<F: ProgramFamily>(domain: &mut ExecutorDomain<F>, bindings
     let shrunk = domain.shrink_state(bindings, crate::CompletionWake::new(|| {})).unwrap();
     let slots = match shrunk.slots {
         super::state::SlotRelease::Began => loop {
-            if let Some(released) = domain.advance_slot_release().unwrap() {
+            if let Some(released) = domain.advance_slot_release() {
                 break released.bytes;
             }
             std::thread::sleep(std::time::Duration::from_millis(1));

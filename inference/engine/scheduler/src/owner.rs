@@ -1662,7 +1662,7 @@ trait MemoryStep: MemoryHost + Sized {
                 completed = true;
             }
             completed |= self.advance_expert_bank()?;
-            completed |= self.advance_slot_release()?;
+            completed |= self.advance_slot_release();
             let prefix = self.prefix_value();
             self.domain().value_cache(prefix).map_err(classify_domain_error)?;
             self.domain().value_state().map_err(classify_domain_error)?;
@@ -1821,9 +1821,9 @@ trait MemoryStep: MemoryHost + Sized {
     /// submitting thread (`ExecutorDomain::advance_slot_release`), recorded
     /// with the slots and how long the release thread took. It freed
     /// memory, so what waited on memory may retry. Whether one finished.
-    fn advance_slot_release(&mut self) -> Result<bool, RequestError> {
-        let Some(released) = self.domain().advance_slot_release().map_err(classify_domain_error)? else {
-            return Ok(false);
+    fn advance_slot_release(&mut self) -> bool {
+        let Some(released) = self.domain().advance_slot_release() else {
+            return false;
         };
         tracing::info!(
             slots = released.slots,
@@ -1833,7 +1833,7 @@ trait MemoryStep: MemoryHost + Sized {
             "graph slots released"
         );
         self.advance_epoch();
-        Ok(true)
+        true
     }
 
     /// At a flight boundary, advance the expert bank's resize

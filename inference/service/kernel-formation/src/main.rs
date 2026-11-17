@@ -58,7 +58,7 @@ impl From<Backend> for BackendName {
 
 /// The process's work runs on the owner's stack, never on the platform's main thread.
 fn main() -> ExitCode {
-    seismic::threads::run("magnitude-main", start)
+    seismic::threads::main("magnitude-main", start)
 }
 
 fn start() -> ExitCode {

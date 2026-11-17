@@ -141,7 +141,7 @@ fn idle_slots_a_claim_takes_are_released_with_what_yielded() {
             crate::domain::Yielded::Pending,
             "{backend:?}: the slots' release begins"
         );
-        while domain.advance_slot_release().unwrap().is_none() {
+        while domain.advance_slot_release().is_none() {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         assert_eq!(idle_cache(&domain), 0, "{backend:?}: the released slots' cache is gone");
@@ -169,7 +169,7 @@ fn a_taken_idle_cache_with_no_slot_left_goes_in_a_change() {
         assert!(domain.idle_class.taken(), "{backend:?}: the claim took the idle slots' cache");
         // The slots are released apart from their cache, which stays taken.
         assert!(domain.resources.release_idle_slots(Vec::new(), crate::CompletionWake::new(|| {})), "{backend:?}");
-        while domain.advance_slot_release().unwrap().is_none() {
+        while domain.advance_slot_release().is_none() {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         let lent = domain.idle_class.taken();
@@ -219,7 +219,7 @@ fn a_group_opening_during_a_slot_release_claims_its_whole_class() {
         let (places, claims) = opened(&mut domain, 2);
         assert_eq!(places, 3, "{backend:?}");
         assert_eq!(claims, first, "{backend:?}: the class claims every slot it grows again");
-        while domain.advance_slot_release().unwrap().is_none() {
+        while domain.advance_slot_release().is_none() {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         assert_eq!(graph_slots(&domain), 0, "{backend:?}: freed with the release");

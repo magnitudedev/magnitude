@@ -84,10 +84,7 @@ pub(crate) fn admit_site(charges: &seismic::Charges, request: &SiteRequest) -> R
     // A request is answered: every taken one ends in its answer.
     let ready = loop {
         match layer.ready(slot) {
-            0 => match handle.panicked() {
-                Some(reason) => return Err(failed(&reason)),
-                None => std::hint::spin_loop(),
-            },
+            0 => std::hint::spin_loop(),
             ready => break ready,
         }
     };

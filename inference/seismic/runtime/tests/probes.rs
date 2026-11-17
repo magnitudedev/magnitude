@@ -8,9 +8,11 @@
 //! measurement job, this one serves the probe processes it starts.
 
 fn main() {
-    seismic_runtime::probes::serve_probe_if_asked();
-    #[cfg(not(target_os = "macos"))]
-    every_probe_answers_in_its_process();
+    seismic_threads::main("probes", || {
+        seismic_runtime::probes::serve_probe_if_asked();
+        #[cfg(not(target_os = "macos"))]
+        every_probe_answers_in_its_process();
+    })
 }
 
 #[cfg(not(target_os = "macos"))]

@@ -917,7 +917,7 @@ impl<'s> Copying<'s> {
     fn stop(&self) -> Result<(), String> {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         match self.thread.lock().expect("the copier").take() {
-            Some(thread) => thread.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            Some(thread) => thread.join().expect("the copier's panic ends the process"),
             None => Ok(()),
         }
     }

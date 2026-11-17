@@ -210,36 +210,9 @@ pub enum Ended {
     Panicked(Panic),
 }
 
-/// A read worker's panic, carried to its request's observers. Its payload
-/// unwinds on the first to resume it.
-#[derive(Clone)]
-pub struct Panic(Arc<std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>>>);
-
-impl Panic {
-    pub(crate) fn new(payload: Box<dyn std::any::Any + Send>) -> Self {
-        Self(Arc::new(std::sync::Mutex::new(Some(payload))))
-    }
-
-    /// Unwind with the worker's panic: its payload, or, where another
-    /// observer of the request resumed that, a panic naming it.
-    pub fn resume(&self) -> ! {
-        let payload = self.0.lock().expect("a read worker's panic").take();
-        match payload {
-            Some(payload) => std::panic::resume_unwind(payload),
-            None => panic!("a read worker panicked; another observer of its request resumed the panic"),
-        }
-    }
-}
-
-impl std::fmt::Debug for Panic {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let payload = self.0.lock().expect("a read worker's panic");
-        let message = payload.as_deref().and_then(|payload| {
-            payload.downcast_ref::<&str>().copied().or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-        });
-        formatter.debug_tuple("Panic").field(&message).finish()
-    }
-}
+/// A read worker's panic, carried to its request's observers: the first to
+/// resume it unwinds with it ([`Panic::resume`]).
+pub use seismic_threads::Panic;
 
 /// Queue `ranges` of `file` on its volume's link for `want`, cut as
 /// `volume` says, under `need`'s claim on the pool's workers, counted in

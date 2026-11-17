@@ -119,12 +119,19 @@ impl Workers {
             .expect("no worker panics holding the set")
     }
 
-    /// Run `job` on a thread of the set, when one is free. A job that
-    /// panics is caught where it reports ([`Workers::each`] resumes it in
-    /// its caller); the thread goes on.
-    pub fn spawn(&self, job: impl FnOnce() + Send + 'static) {
+    /// Run `job` on a thread of the set, when one is free, for the calling
+    /// thread ([`seismic_threads::Submitter`]), then `ended` with what it
+    /// returned or, where the caller's panics unwind, its panic, which
+    /// `ended` hands the caller to resume ([`Workers::each`] resumes it in
+    /// its caller). The thread goes on.
+    pub fn spawn<R: 'static>(
+        &self,
+        job: impl FnOnce() -> R + Send + 'static,
+        ended: impl FnOnce(Result<R, seismic_threads::Panic>) + Send + 'static,
+    ) {
+        let submitter = seismic_threads::Submitter::here();
         let mut state = self.state();
-        state.jobs.push_back(Box::new(job));
+        state.jobs.push_back(Box::new(move || ended(submitter.run(job))));
         if state.jobs.len() > state.idle && state.threads.len() < self.width {
             let shared = self.shared.clone();
             state.threads.push(
@@ -195,25 +202,32 @@ impl Workers {
         // The caller is one of the threads the set is allowed.
         let helpers = self.state().allowed - 1;
         for _ in 0..(work.len() - 1).min(helpers) {
-            let gate = gate.clone();
-            self.spawn(move || {
-                let erased = erased;
-                if !gate.enter() {
-                    return;
-                }
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (entering, leaving) = (gate.clone(), gate.clone());
+            self.spawn(
+                move || {
+                    let erased = erased;
+                    if !entering.enter() {
+                        return false;
+                    }
                     // SAFETY: counted in through the gate, so the caller
                     // is still inside `each` and the batch, of the types
                     // `run` was named with, is alive.
                     unsafe { run(erased.0) };
-                }));
-                gate.leave(outcome.err());
-            });
+                    true
+                },
+                // Counted out once the helper has left the batch, by its
+                // end or by a panic.
+                move |entered| match entered {
+                    Ok(false) => {}
+                    Ok(true) => leaving.leave(None),
+                    Err(panic) => leaving.leave(Some(panic)),
+                },
+            );
         }
         batch.run();
         drop(shut);
         if let Some(panic) = gate.state.lock().expect("gate lock").panic.take() {
-            std::panic::resume_unwind(panic);
+            panic.resume();
         }
         batch
             .formed
@@ -277,7 +291,7 @@ struct Gate {
 struct GateState {
     shut: bool,
     inside: usize,
-    panic: Option<Box<dyn std::any::Any + Send>>,
+    panic: Option<seismic_threads::Panic>,
 }
 
 impl Gate {
@@ -290,7 +304,7 @@ impl Gate {
         true
     }
 
-    fn leave(&self, panic: Option<Box<dyn std::any::Any + Send>>) {
+    fn leave(&self, panic: Option<seismic_threads::Panic>) {
         let mut state = self.state.lock().expect("gate lock");
         state.inside -= 1;
         if state.panic.is_none() {
@@ -341,8 +355,10 @@ impl Shared {
                     state.idle -= 1;
                 }
             };
-            // A job reports its own panic to whoever waits for it.
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+            // A job hands its own panic to whoever waits for it
+            // ([`Workers::spawn`]); one whose submitter's panics end the
+            // process never returns here.
+            job();
             // With no job waiting, this thread's burst of work is over. A
             // compile frees nearly all it took but leaves what it formed
             // at the far end of its thread's arena, so the allocator cannot
@@ -383,7 +399,7 @@ impl Drop for Workers {
         };
         self.shared.wake.notify_all();
         for thread in threads {
-            thread.join().expect("a worker thread catches its jobs' panics");
+            thread.join().expect("a worker thread's jobs hand their panics to their submitters");
         }
     }
 }
@@ -402,10 +418,13 @@ mod tests {
         let workers = Workers::new(3);
         for _ in 0..200 {
             let (threads, ran) = (threads.clone(), ran.clone());
-            workers.spawn(move || {
-                threads.lock().unwrap().insert(std::thread::current().id());
-                ran.fetch_add(1, Ordering::SeqCst);
-            });
+            workers.spawn(
+                move || {
+                    threads.lock().unwrap().insert(std::thread::current().id());
+                    ran.fetch_add(1, Ordering::SeqCst);
+                },
+                |ran| ran.expect("a job of the test runs to its end"),
+            );
         }
         drop(workers);
         assert_eq!(ran.load(Ordering::SeqCst), 200);
@@ -562,7 +581,7 @@ mod tests {
                 assert!(std::hint::black_box(&blocks).iter().all(|block| block[0] > 0));
                 drop(blocks);
                 std::mem::forget(kept);
-            });
+            }, |ran| ran.expect("a job of the test runs to its end"));
         }
         // Joined: each thread has run its last job and what follows it.
         drop(workers);

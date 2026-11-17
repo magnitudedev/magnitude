@@ -24,29 +24,6 @@ fn a_failed_read_answers_no_record_and_fails_only_the_rows_that_named_it() {
     next.complete().unwrap();
 }
 
-/// A panic while serving fails the request it served and every later
-/// one, and every step completes with it: the load fails instead of
-/// hanging. (A request of more choices than the decode form's, which the
-/// route never publishes, makes one.)
-#[test]
-fn a_watcher_panic_fails_every_request_and_step() {
-    let harness = harness("panic", EXPERTS, 4);
-    let file = &harness.layer.1;
-    let first = harness.step();
-    let choices = harness.route_at(&first, 0, &[0, 1, 2, 3]);
-    for (choice, &word) in choices.iter().enumerate() {
-        file.store(first.sequence(), 0, choice_word(choice as u64), word);
-    }
-    // More choices than the decode form's.
-    file.store(first.sequence(), 0, constants::FILE_COUNT, WORDS.choices as i32 + 1);
-    file.request(first.sequence(), 0);
-    assert_eq!(until_answered(file, first.sequence(), 0), Answer::Failed);
-    assert!(matches!(first.complete(), Err(StepFailure::Watcher(_))));
-    let next = harness.request(&[4]);
-    assert_eq!(harness.verdict(0, next.sequence()), Some(Answer::Failed));
-    assert!(matches!(next.complete(), Err(StepFailure::Watcher(_))));
-}
-
 /// A kernel that found a state the protocol never reaches (SLOT_VIOLATED)
 /// is no wait that outlasted a pulse: the host panics where the step ends,
 /// and does not re-run it.

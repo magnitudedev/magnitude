@@ -110,16 +110,10 @@ enum Command {
 fn main() -> anyhow::Result<()> {
     // SAFETY: no other thread has started yet.
     unsafe { magnitude_service_server::isolate_hub_credentials() };
-    // The process's work, the engine's in it, runs on the owner's stack, never on the platform's
-    // main thread.
-    seismic_threads::run("magnitude-main", serve)
+    magnitude_executor::main("magnitude-main", serve)
 }
 
 fn serve() -> anyhow::Result<()> {
-    // The measurement job's device probes run in processes of this executable.
-    seismic::serve_probe_if_asked();
-    magnitude_executor::diagnostics::install();
-    magnitude_executor::platform::relax_gpu_watchdog();
     match Cli::parse().command {
         // The engine worker owns standard output for its protocol: it exports no telemetry and
         // runs no async runtime of the service's. Its events go to standard error, which the

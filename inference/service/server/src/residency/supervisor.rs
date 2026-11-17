@@ -117,12 +117,12 @@ impl Inner {
     /// Wait for the engine of `instance_id` to stop serving, and answer its end.
     async fn watch(self: Arc<Self>, instance_id: ModelInstanceId, engine: Arc<dyn SupervisedEngine>) {
         let error = engine.closed().await;
-        self.ended(&instance_id, error);
+        self.ended(&instance_id, error).await;
     }
 
     /// The engine of `instance_id` stopped serving with `error`: release the instance as one
     /// unloaded under memory pressure, or fail it. An instance no longer supervised is past it.
-    fn ended(&self, instance_id: &ModelInstanceId, error: RequestError) {
+    async fn ended(&self, instance_id: &ModelInstanceId, error: RequestError) {
         let Some(supervised) = self.lock().take_if(|supervised| supervised.instance_id == *instance_id) else {
             return;
         };
@@ -140,13 +140,21 @@ impl Inner {
             });
             return;
         }
+        let code = request_failure_code(&error);
+        // A worker lost is reported as a load's loss is (`ResidencyWorker::loss`): its exit
+        // status and what it said of its end, a panic's message and place among it.
+        let reason = match error {
+            RequestError::WorkerLost { .. } => {
+                let worker = Arc::clone(&supervised.worker);
+                tokio::task::spawn_blocking(move || worker.loss(&error))
+                    .await
+                    .expect("a worker's loss is composed without a panic")
+            }
+            error => error.to_string(),
+        };
         self.notifier.send(ResidencyNotification::WorkerFailed {
             instance_id: supervised.instance_id,
-            failure: ModelOperationFailure::new(
-                request_failure_code(&error),
-                format!("inference worker stopped serving: {error}"),
-                true,
-            ),
+            failure: ModelOperationFailure::new(code, format!("inference worker stopped serving: {reason}"), true),
         });
     }
 
@@ -268,6 +276,9 @@ mod tests {
         fn answered_shutdown(&self) -> bool {
             false
         }
+        fn loss(&self, error: &dyn std::fmt::Display) -> String {
+            format!("{error}; worker exited")
+        }
     }
 
     struct Fixture {
@@ -304,16 +315,19 @@ mod tests {
 
     /// An engine unload for memory pressure releases the instance as such, without terminating
     /// its worker; nothing reloads, and the instance is supervised no more.
-    #[test]
-    fn engine_unload_for_memory_pressure_releases_the_instance() {
+    #[tokio::test]
+    async fn engine_unload_for_memory_pressure_releases_the_instance() {
         let mut fixture = fixture();
         let worker = supervise(&fixture);
-        fixture.inner.ended(
-            &instance(),
-            RequestError::ModelUnloaded {
-                cause: UnloadCause::MemoryPressure,
-            },
-        );
+        fixture
+            .inner
+            .ended(
+                &instance(),
+                RequestError::ModelUnloaded {
+                    cause: UnloadCause::MemoryPressure,
+                },
+            )
+            .await;
         assert!(!worker.terminated.load(Ordering::Acquire));
         assert!(matches!(
             fixture.notifications.try_recv().unwrap(),
@@ -326,21 +340,22 @@ mod tests {
         assert!(fixture.notifications.try_recv().is_err(), "nothing reloads");
     }
 
-    /// A worker lost fails the instance; the end of an instance no longer supervised reports
-    /// nothing.
-    #[test]
-    fn worker_loss_fails_the_instance_once() {
+    /// A worker lost fails the instance, reported as its loss ([`ResidencyWorker::loss`]): its
+    /// exit and what it said of it. The end of an instance no longer supervised reports nothing.
+    #[tokio::test]
+    async fn worker_loss_fails_the_instance_once() {
         let mut fixture = fixture();
         supervise(&fixture);
         let lost = || RequestError::WorkerLost {
             reason: "gone".to_owned(),
         };
-        fixture.inner.ended(&instance(), lost());
+        fixture.inner.ended(&instance(), lost()).await;
         assert!(matches!(
             fixture.notifications.try_recv().unwrap(),
-            ResidencyNotification::WorkerFailed { failure, .. } if failure.code() == "worker_exited"
+            ResidencyNotification::WorkerFailed { failure, .. }
+                if failure.code() == "worker_exited" && failure.message().ends_with("gone; worker exited")
         ));
-        fixture.inner.ended(&instance(), lost());
+        fixture.inner.ended(&instance(), lost()).await;
         assert!(fixture.notifications.try_recv().is_err());
     }
 }

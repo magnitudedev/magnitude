@@ -950,8 +950,6 @@ struct Work {
     /// block of an expert's rows by its join unit.
     quantized: Box<[UnsafeCell<Q8Block>]>,
     workers: usize,
-    /// Why a unit failed, where one did: the request fails.
-    why: Mutex<Option<String>>,
     shape: SiteShape,
 }
 
@@ -1014,7 +1012,6 @@ impl Work {
             quantized: (0..rows * blocks).map(|_| UnsafeCell::new(Q8Block::ZERO)).collect(),
             workers,
             experts,
-            why: Mutex::new(None),
             shape,
         }
     }
@@ -1575,11 +1572,7 @@ impl Site {
             let output = self.layers[cell.layer].output.as_ptr();
             // SAFETY: a stage's units are claimed only once the stages
             // before it are finished (`Cell::stage`).
-            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { work.run(stage, lens(share).start + at, output) }));
-            if let Err(payload) = ran {
-                let message = super::watcher::panic_message(payload.as_ref());
-                work.why.lock().expect("a request's failure").get_or_insert(format!("a site worker panicked: {message}"));
-            }
+            unsafe { work.run(stage, lens(share).start + at, output) };
             cell.shares[share].complete(issue, stage);
             return Some(WorkerTurn::Ran);
         }
@@ -1608,7 +1601,6 @@ impl Site {
         // buffers, the workers' partials among them, cost the answer
         // nothing), the cell left empty for the next issue to fill.
         let work = unsafe { (*cell.work.get()).take() }.expect("an issued cell holds its request");
-        let why = work.why.lock().expect("a request's failure").take();
         let layer = &self.layers[cell.layer];
         // Its path's terms, read before the answer lets the slot be
         // requested again (which rewrites the marks), counted as the answer
@@ -1616,24 +1608,16 @@ impl Site {
         let marks = cell.marks.each_ref().map(|mark| mark.load(Ordering::Relaxed));
         // The experts it served, which its step's completion counts: the
         // slot is not requested again before then.
-        if why.is_none() {
-            cell.served.store(work.experts.len() as u64, Ordering::Relaxed);
-            cell.rows.store(work.experts.iter().map(|expert| expert.rows.len() as u64).sum(), Ordering::Relaxed);
-            cell.took.store((self.began.elapsed().as_nanos() as u64).saturating_sub(marks[NOTICED]), Ordering::Relaxed);
-        }
+        cell.served.store(work.experts.len() as u64, Ordering::Relaxed);
+        cell.rows.store(work.experts.iter().map(|expert| expert.rows.len() as u64).sum(), Ordering::Relaxed);
+        cell.took.store((self.began.elapsed().as_nanos() as u64).saturating_sub(marks[NOTICED]), Ordering::Relaxed);
         // Nothing of the request is read once it is answered: the device may
         // then request the slot again, which rewrites the cell.
-        let failed = why.is_some();
         // Out of the cell, the request frees it for the slot's next, which
         // the device makes only after the answer below.
         cell.answered.store(work.step, Ordering::Release);
-        match why {
-            None => self.answer(layer, work.step, false),
-            Some(why) => self.fail(cell.layer, work.step, work.rows_named(), why),
-        }
-        if !failed {
-            self.count(marks);
-        }
+        self.answer(layer, work.step, false);
+        self.count(marks);
         self.open.fetch_sub(1, Ordering::AcqRel);
         drop(work);
     }
@@ -1751,10 +1735,7 @@ pub(crate) fn measure(
                         ready if ready == step | FAILED => {
                             return Err(format!("the site failed its measurement of {experts} experts by {rows} rows"));
                         }
-                        _ => match handle.panicked() {
-                            Some(reason) => return Err(reason),
-                            None => std::hint::spin_loop(),
-                        },
+                        _ => std::hint::spin_loop(),
                     }
                 }
                 times.push(began.elapsed().as_secs_f64());

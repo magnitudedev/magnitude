@@ -30,6 +30,10 @@ pub(crate) fn open_tallied(
     catalog: &seismic::Devices,
     id: seismic::ExecutorId,
 ) -> Result<(seismic::Device, seismic::memory::Tally), seismic::OpenError> {
+    // The test's process reports as an engine process does: a panic that
+    // ends it (`seismic::threads`) with every thread's stack, and
+    // a hung test with them on SIGUSR1.
+    crate::diagnostics::install();
     seismic::testing::open_tallied(catalog, id, Default::default())
 }
 
@@ -45,6 +49,7 @@ pub(crate) fn open_backend_tallied(
     catalog: &seismic::Devices,
     backend: seismic::BackendName,
 ) -> Result<(seismic::Device, seismic::memory::Tally), seismic::OpenError> {
+    crate::diagnostics::install();
     seismic::testing::open_backend_tallied(catalog, backend, Default::default())
 }
 

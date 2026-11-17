@@ -347,9 +347,7 @@ pub fn start_in_process(
         // device among them, so the jobs that settle its pending prices
         // open the device anew ([`settle_prices`]).
         let unloaded = |outcome: Result<LoadAttempt<ReadyEngine>, LoadError>| {
-            worker.join().map_err(|_| LoadError::Internal {
-                reason: "the in-process worker panicked".into(),
-            })?;
+            worker.join().expect("the in-process worker's panic ends the process");
             outcome
         };
         match connect_worker(host_end, None, |update| (progress.borrow_mut())(update)) {

@@ -58,6 +58,10 @@ fn flag(arguments: &[String], name: &str) -> String {
 }
 
 fn main() -> anyhow::Result<()> {
+    magnitude_executor::main("magnitude-main", start)
+}
+
+fn start() -> anyhow::Result<()> {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     if arguments.first().map(String::as_str) == Some("inference-worker") {
         install_parent_watchdog()?;
@@ -67,10 +71,7 @@ fn main() -> anyhow::Result<()> {
         println!("residency_lifecycle: not run (it needs a device host's models: --bundle and the rest)");
         return Ok(());
     }
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(lifecycle(arguments))
+    seismic_threads::runtime()?.block_on(lifecycle(arguments))
 }
 
 struct Harness {

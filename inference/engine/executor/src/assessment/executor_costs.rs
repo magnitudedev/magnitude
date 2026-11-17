@@ -1261,6 +1261,10 @@ impl ProgramSet {
             formation: Arc::default(),
         };
         let (set, device, forming) = (self.clone(), device.clone(), programs.clone());
+        // The formation works for the measurement, which waits for its
+        // programs: a panic forming one ends as one on the measuring thread
+        // would, and reaches every wait for a program with its cause.
+        let measuring = seismic::threads::Submitter::here();
         let thread = seismic::threads::spawn("measurement-formation", move || {
             let index = |format: Element| {
                 set.expands
@@ -1296,7 +1300,7 @@ impl ProgramSet {
             // which may be the activation dtype's.
             jobs.dedup();
             jobs.extend(decodes.chain(matrices));
-            let formed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let formed = measuring.run(|| {
                 seismic::Workers::of_the_host().each(&jobs, |job| match *job {
                     _ if !forming.formation.begin(deadline) => {}
                     job => {
@@ -1304,10 +1308,9 @@ impl ProgramSet {
                         forming.formation.end();
                     }
                 })
-            }));
-            match formed {
-                Ok(_) => {}
-                Err(_) => forming.abandon(),
+            });
+            if let Err(panic) = formed {
+                forming.abandon(&panic);
             }
         })
         .expect("the host starts the formation thread");
@@ -1397,8 +1400,8 @@ type Forming<E> = Arc<Pending<Result<NativeKernel<E>, ExecutorCostsError>>>;
 /// A value one thread sets once and others wait for.
 struct Pending<T> {
     value: std::sync::OnceLock<T>,
-    /// The thread setting it panicked first.
-    abandoned: std::sync::atomic::AtomicBool,
+    /// The panic of the thread setting it, which panicked first.
+    abandoned: std::sync::OnceLock<seismic::threads::Panic>,
     lock: std::sync::Mutex<()>,
     ready: std::sync::Condvar,
 }
@@ -1407,7 +1410,7 @@ impl<T> Pending<T> {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             value: std::sync::OnceLock::new(),
-            abandoned: std::sync::atomic::AtomicBool::new(false),
+            abandoned: std::sync::OnceLock::new(),
             lock: std::sync::Mutex::new(()),
             ready: std::sync::Condvar::new(),
         })
@@ -1419,9 +1422,8 @@ impl<T> Pending<T> {
         self.ready.notify_all();
     }
 
-    fn abandon(&self) {
-        self.abandoned
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+    fn abandon(&self, panic: &seismic::threads::Panic) {
+        let _ = self.abandoned.set(panic.clone());
         let _held = self.lock.lock().expect("pending lock poisoned");
         self.ready.notify_all();
     }
@@ -1434,8 +1436,9 @@ impl<T> Pending<T> {
             if let Some(value) = self.value.get() {
                 return Some(value);
             }
-            if self.abandoned.load(std::sync::atomic::Ordering::SeqCst) {
-                panic!("the formation thread panicked");
+            if let Some(panic) = self.abandoned.get() {
+                drop(held);
+                panic.resume();
             }
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
@@ -1462,8 +1465,8 @@ struct Compiles {
 struct CompilesState {
     compiling: usize,
     held: usize,
-    /// The thread forming panicked.
-    abandoned: bool,
+    /// The panic of the thread forming, which panicked.
+    abandoned: Option<seismic::threads::Panic>,
 }
 
 impl Compiles {
@@ -1480,8 +1483,9 @@ impl Compiles {
         done: impl Fn(&CompilesState) -> bool,
     ) -> (std::sync::MutexGuard<'s, CompilesState>, bool) {
         loop {
-            if held.abandoned {
-                panic!("the formation thread panicked");
+            if let Some(panic) = held.abandoned.clone() {
+                drop(held);
+                panic.resume();
             }
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
@@ -1524,8 +1528,8 @@ impl Compiles {
         Some(Quiet(self.clone()))
     }
 
-    fn abandon(&self) {
-        self.state().abandoned = true;
+    fn abandon(&self, panic: &seismic::threads::Panic) {
+        self.state().abandoned = Some(panic.clone());
         self.changed.notify_all();
     }
 }
@@ -1594,17 +1598,17 @@ impl Programs {
     }
 
     /// Every program not formed yet is never formed: the formation thread
-    /// panicked.
-    fn abandon(&self) {
+    /// panicked, with `panic`, which every wait for one resumes.
+    fn abandon(&self, panic: &seismic::threads::Panic) {
         for (_, decode, matrix) in &self.expands {
-            decode.abandon();
-            matrix.abandon();
+            decode.abandon(panic);
+            matrix.abandon(panic);
         }
-        self.output.abandon();
-        self.dense.abandon();
-        self.affine.abandon();
-        self.copy.abandon();
-        self.formation.abandon();
+        self.output.abandon(panic);
+        self.dense.abandon(panic);
+        self.affine.abandon(panic);
+        self.copy.abandon(panic);
+        self.formation.abandon(panic);
     }
 }
 

@@ -140,8 +140,7 @@ struct Accounted {
 
 /// Account request `naming`'s demand reads `postings` as the last of them
 /// ends, once: a point of the read line over `timed` bytes where they read
-/// all the request's misses, submitted together at its instant; and a read
-/// worker's panic, which ends serving.
+/// all the request's misses, submitted together at its instant.
 pub(super) fn account(postings: &[&Posting], naming: Naming, timed: Option<(u64, Instant)>, shared: &Arc<Shared>) {
     // When the volume began reading the jobs: from their submission, which
     // the request times where they read all its misses, else now, just
@@ -156,7 +155,7 @@ pub(super) fn account(postings: &[&Posting], naming: Naming, timed: Option<(u64,
     for posting in postings {
         let (shared, accounted) = (shared.clone(), accounted.clone());
         posting.join.claimed(move |outcome, _, _| {
-            panicked(&shared, &outcome);
+            unpanicked(&outcome);
             let mut left = accounted.left.lock().expect("a request's reads' account");
             left.0 -= 1;
             left.1 &= matches!(outcome, Outcome::Read);
@@ -242,12 +241,12 @@ fn read_named(shared: &Shared, naming: Naming, (rows, answer): (&BTreeSet<usize>
     false
 }
 
-/// A panic that ended the reads `outcome` reports: a defect of the read
-/// engine's, which ends serving (the stopped watcher fails every request
-/// the device waits on).
-fn panicked(shared: &Shared, outcome: &Outcome) {
+/// No read of experts ends in a panic: the watcher's threads post them,
+/// so a read's panic ends the process (`seismic::threads`) before
+/// any outcome reports it.
+fn unpanicked(outcome: &Outcome) {
     if let Outcome::Panicked(panic) = outcome {
-        shared.end_serving(format!("a read worker panicked reading experts: {panic:?}"));
+        unreachable!("invariant violated: a read of experts the watcher posted ended in a panic: {panic:?}");
     }
 }
 
@@ -902,7 +901,7 @@ impl Prefetch {
                 // end maps its tier record; failed, it fails nothing (a step
                 // waiting for it reads its expert anew).
                 join.claimed(move |outcome, failed, _| {
-                    panicked(&serving, &outcome);
+                    unpanicked(&outcome);
                     let read = failed.is_empty() && matches!(outcome, Outcome::Read);
                     seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("ahead_read"), 0, (target as i64, expert as i64, read as i64));
                     if read {

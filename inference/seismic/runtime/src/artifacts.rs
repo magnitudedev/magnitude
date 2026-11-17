@@ -281,16 +281,13 @@ impl Claim {
         // in flight until the store ends.
         drop(self);
         let mut stored = Stored { store: program_store.clone(), keys: storing, former: former.clone(), panicked: None };
+        // A store's panic ends as one on the former that compiled it would.
+        let former_thread = seismic_threads::Submitter::here();
         program_store.run(Box::new(move || {
-            // A store's panic ends the store, not the thread: it is carried
-            // to every wait for it ([`Stores::settle`]).
-            if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(store)) {
-                let message = panic
-                    .downcast_ref::<String>()
-                    .cloned()
-                    .or_else(|| panic.downcast_ref::<&str>().map(|message| (*message).to_owned()))
-                    .unwrap_or_else(|| "a panic without a message".into());
-                stored.panicked = Some(message);
+            // A store's panic it unwinds from ends the store, not the
+            // thread: it is carried to every wait for it ([`Stores::settle`]).
+            if let Err(panic) = former_thread.run(store) {
+                stored.panicked = Some(panic.message().to_owned());
             }
         }));
     }

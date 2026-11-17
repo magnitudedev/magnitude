@@ -404,6 +404,14 @@ impl ResidencyWorker for EngineWorker {
         }
     }
 
+    fn loss(&self, error: &dyn std::fmt::Display) -> String {
+        let exit = self.ended_status().map_or_else(String::new, |status| format!("; worker {status}"));
+        match self.diagnostics() {
+            diagnostics if diagnostics.is_empty() => format!("{error}{exit}"),
+            diagnostics => format!("{error}{exit}; worker diagnostics: {diagnostics}"),
+        }
+    }
+
     fn terminate(&self, code: &str, reason: &str) -> std::io::Result<()> {
         tracing::info!(worker.pid = self.pid(), code, reason, "terminating inference worker");
         let mut state = self.process.lock().expect("worker process lock");

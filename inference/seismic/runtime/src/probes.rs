@@ -336,7 +336,8 @@ fn drain(mut source: impl Read + Send + 'static) -> std::thread::JoinHandle<std:
 /// Serve one probe and exit, where this process was started as a probe
 /// process (its first argument is [`PROBE_COMMAND`]); return at once
 /// otherwise. Every executable that runs the measurement job calls it first
-/// thing in `main`. An executable that does not starts again as itself,
+/// thing in its program (the engine's process entry does, for every engine
+/// binary). An executable that does not starts again as itself,
 /// never writes [`PROBING`], and so keeps nothing ([`run`]).
 pub fn serve_probe_if_asked() {
     let mut arguments = std::env::args_os().skip(1);
@@ -359,12 +360,9 @@ pub fn serve_probe_if_asked() {
 /// its reason on standard error. A probe that crashes the driver ends the
 /// process otherwise, which its spawner keeps as the probe's finding.
 fn serve(arguments: &[String]) -> i32 {
-    // A panic is this program's failure, not the device's: it keeps nothing.
-    std::panic::set_hook(Box::new(|info| {
-        eprintln!("{info}");
-        std::process::exit(1);
-    }));
-    let outcome = (|| -> Result<ProbeResult<u64>, String> {
+    // A panic is this program's failure, not the device's: it keeps
+    // nothing, so it ends as the probe's failure.
+    let outcome = seismic_threads::recoverable(|| -> Result<ProbeResult<u64>, String> {
         let [backend, device, probe] = arguments else {
             return Err(format!("usage: EXECUTABLE {PROBE_COMMAND} BACKEND DEVICE PROBE"));
         };
@@ -382,7 +380,8 @@ fn serve(arguments: &[String]) -> i32 {
                 Err(format!("this build has no probes of backend `{other}`"))
             }
         }
-    })();
+    })
+    .unwrap_or_else(|panic| Err(format!("the probe panicked: {panic}")));
     match outcome {
         Ok(result) => {
             println!("{}", result.line());

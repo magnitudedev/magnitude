@@ -54,6 +54,8 @@ pub use programs::{
     SealedGraphsHeap, StateProgram, TargetOutput, TargetProgram, VisionProgram,
 };
 pub mod platform;
+mod process;
+pub use process::main;
 mod residency;
 pub mod settle;
 mod resident_weights;

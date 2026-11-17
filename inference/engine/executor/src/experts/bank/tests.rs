@@ -3,36 +3,9 @@ use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use crate::experts::watcher::Join;
 use super::resize::{Cut, Joining, RecordsAt, Stores, grow_by_slots};
-use crate::storage_thread::{Done, StorageThread};
+use crate::storage_thread::StorageThread;
 
 use super::*;
-
-/// A resize step that panics is reported to its holding, its wake
-/// completed, and the resize thread runs the next step: a panic never
-/// leaves a resize running forever nor the bank's thread gone.
-#[test]
-fn a_resize_step_that_panics_is_reported_and_the_thread_runs_on() {
-    let resize_thread = StorageThread::start("bank-test").unwrap();
-    let waited = |done: &Done<u32>| loop {
-        if let Some((outcome, _)) = done.lock().unwrap().take() {
-            return outcome;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    };
-    let woken = Arc::new(AtomicBool::new(false));
-    let wake = { let woken = woken.clone(); CompletionWake::new(move || woken.store(true, Ordering::Release)) };
-    let panicked = resize_thread.run(wake, || -> u32 { panic!("a step's fault") });
-    assert!(waited(&panicked).is_err_and(|why| why.contains("a step's fault")));
-    // The outcome lands before the wake completes, so the owner it wakes
-    // finds it.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !woken.load(Ordering::Acquire) {
-        assert!(Instant::now() < deadline, "the holding's owner is woken to learn it");
-        std::thread::yield_now();
-    }
-    let next = resize_thread.run(CompletionWake::new(|| {}), || 7);
-    assert_eq!(waited(&next), Ok(7));
-}
 
 /// A growth joins slot by slot, each only once every group holds its
 /// records, its pool's blocks charged to the store's pool entry within the
@@ -267,8 +240,7 @@ fn a_long_growth_beside_settled_samples_never_starves_or_panics_them() {
             std::thread::sleep(Duration::from_micros(50));
         }
     }
-    let (outcome, _) = done.lock().unwrap().take().expect("the growth ended");
-    let grown = outcome.expect("the growth did not panic");
+    let (grown, _) = done.lock().unwrap().take().expect("the growth ended");
     assert!(samples >= 3 && seen.len() >= 3, "samples were taken while slots were joining: {samples} samples saw {seen:?}");
     assert!(matches!(grown.cut, Cut::None) && grown.joined.is_some());
     assert_eq!(joined.load(Ordering::Acquire), SLOTS - 1, "every slot after the first joined");
@@ -302,12 +274,12 @@ fn growing_ended_reads_reached_slots_and_charge_after_done_is_taken() {
     );
     let now = Instant::now();
     *done.lock().unwrap() = Some((
-        Ok(Grown {
+        Grown {
             at: 40,
             joined: Some((now, now)),
             cut: Cut::None,
             spent: Spent::default(),
-        }),
+        },
         now,
     ));
     let (resized, _) = growing

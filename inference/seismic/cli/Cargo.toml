@@ -11,3 +11,4 @@ path = "src/main.rs"
 [dependencies]
 seismic-lang.workspace = true
 seismic-std.workspace = true
+seismic-threads.workspace = true

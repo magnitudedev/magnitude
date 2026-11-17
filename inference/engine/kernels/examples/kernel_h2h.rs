@@ -220,6 +220,10 @@ fn quantiles(mut ms: Vec<f64>) -> [f64; 3] {
 }
 
 fn main() {
+    seismic::threads::main("kernel-h2h", start)
+}
+
+fn start() {
     let options = arguments();
     let selected = |name: &str, all: Vec<String>| match options.get(name) {
         Some(list) => list.split(',').map(str::to_owned).collect::<Vec<_>>(),

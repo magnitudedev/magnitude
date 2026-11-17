@@ -115,7 +115,7 @@ impl Changes {
     }
 
     fn meet(&self) -> MutexGuard<'_, Meet> {
-        self.meet.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.meet.lock().expect("the changes' meet is never left by a panic")
     }
 
     /// Whether this is a test's scope in which a record outside a change is
@@ -136,7 +136,7 @@ impl Changes {
         }
         if owner {
             let here = std::thread::current().id();
-            let owned = self.owners.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&here);
+            let owned = self.owners.lock().expect("the changes' owners are never left by a panic").contains(&here);
             assert!(owned || self.alone(), "invariant violated: an owner's change begun off its owner's thread");
             self.meet().owner += 1;
         }
@@ -179,7 +179,7 @@ impl Changes {
     /// returned [`Owner`] drops: a load's or a domain's thread.
     pub fn own(self: &Arc<Self>) -> Owner {
         let thread = std::thread::current().id();
-        self.owners.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(thread);
+        self.owners.lock().expect("the changes' owners are never left by a panic").push(thread);
         Owner { changes: self.clone(), thread }
     }
 
@@ -194,7 +194,7 @@ impl Changes {
         if self.open_here().is_none() {
             let meet = self.meet();
             let waiting = |meet: &mut Meet| meet.wanted > 0 && meet.owner == 0;
-            drop(self.moved.wait_while(meet, waiting).unwrap_or_else(std::sync::PoisonError::into_inner));
+            drop(self.moved.wait_while(meet, waiting).expect("the changes' meet is never left by a panic"));
         }
         step(&self.begin(false))
     }
@@ -210,7 +210,7 @@ pub struct Owner {
 
 impl Drop for Owner {
     fn drop(&mut self) {
-        let mut owners = self.changes.owners.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut owners = self.changes.owners.lock().expect("the changes' owners are never left by a panic");
         let at = owners.iter().position(|thread| *thread == self.thread).expect("an owner is listed until it drops");
         owners.swap_remove(at);
     }
@@ -366,7 +366,7 @@ impl Sampled {
                 return (at, grant, figures);
             }
             let meet = changes.meet();
-            drop(changes.moved.wait_while(meet, |meet| meet.ended == ended).unwrap_or_else(std::sync::PoisonError::into_inner));
+            drop(changes.moved.wait_while(meet, |meet| meet.ended == ended).expect("the changes' meet is never left by a panic"));
         }
     }
 

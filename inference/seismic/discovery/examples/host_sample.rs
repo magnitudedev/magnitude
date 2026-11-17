@@ -2,6 +2,10 @@
 //! (`seismic_discovery::fixtures`) is built from.
 
 fn main() {
+    seismic_threads::main("host-sample", start)
+}
+
+fn start() {
     let sample = seismic_discovery::host_sample();
     let wired = sample.wired.map(|wired| {
         serde_json::json!({

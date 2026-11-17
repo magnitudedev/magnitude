@@ -2718,6 +2718,7 @@ version = "0.1.0"
 dependencies = [
  "fs2",
  "libc",
+ "seismic-threads",
  "serde",
  "serde_json",
  "tempfile",
@@ -4193,6 +4194,7 @@ version = "0.1.0"
 dependencies = [
  "seismic-lang",
  "seismic-std",
+ "seismic-threads",
 ]
 
 [[package]]

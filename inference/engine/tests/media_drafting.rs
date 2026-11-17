@@ -251,6 +251,10 @@ fn check(holds: bool, claim: &str) -> Result<(), String> {
 }
 
 fn main() {
+    magnitude_executor::main("magnitude-main", start)
+}
+
+fn start() {
     if std::env::args().nth(1).as_deref() == Some("--worker") {
         let served = serve_worker(stdio_worker_transport());
         let code = match served.exit {

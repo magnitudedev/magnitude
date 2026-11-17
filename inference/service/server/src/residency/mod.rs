@@ -109,6 +109,11 @@ pub trait ResidencyWorker: Send + Sync {
     /// Whether the worker has answered its shutdown: it serves nothing more, every request it
     /// held answered, and what is left of it is its release.
     fn answered_shutdown(&self) -> bool;
+    /// The loss of the worker, `error`, as the service reports it, whether the worker was loading
+    /// or serving: with its exit status and the tail of its standard error, where a panic or a
+    /// fault reported itself. Blocking: the status is observed for up to a second, as the
+    /// protocol stream closes just before the process is reaped.
+    fn loss(&self, error: &dyn std::fmt::Display) -> String;
 }
 
 fn verify_worker_retirement(worker: &dyn ResidencyWorker) -> Result<(), ModelOperationFailure> {
@@ -1950,6 +1955,10 @@ mod tests {
                 .retired
                 .load(Ordering::Acquire)
                 .then(|| std::process::ExitStatus::from_raw(0)))
+        }
+
+        fn loss(&self, error: &dyn std::fmt::Display) -> String {
+            error.to_string()
         }
 
         fn terminate(&self, _code: &str, _reason: &str) -> std::io::Result<()> {

@@ -424,7 +424,7 @@ impl Drop for DeviceTable {
     fn drop(&mut self) {
         drop(self.reads.lock().expect("device table reads lock").take());
         if let Some(filler) = self.filler.take() {
-            let _ = filler.join();
+            filler.join().expect("the filler's panic ends the process");
         }
         crate::settle::Owed::settle(self);
     }

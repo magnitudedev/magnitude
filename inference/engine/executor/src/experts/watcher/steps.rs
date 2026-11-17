@@ -1577,8 +1577,8 @@ mod slot_tests {
             std::thread::spawn(move || prompt(&shared, true))
         };
         spin("the group never waited", || shared.lent.lock().reserved());
-        shared.end_serving("the request service panicked".into());
-        assert_eq!(waiting.join().unwrap(), Err("the request service panicked".to_owned()));
+        shared.end_serving("serving ended".into());
+        assert_eq!(waiting.join().unwrap(), Err("serving ended".to_owned()));
         assert!(!shared.lent.lock().reserved(), "an ended wait holds nothing");
         assert_eq!(shared.steps.in_flight(), 0, "no step began");
     }

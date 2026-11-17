@@ -90,9 +90,9 @@ fn required(arguments: &[String], name: &str) -> PathBuf {
 
 fn main() -> anyhow::Result<()> {
     let process_started = Instant::now();
-    magnitude_engine::telemetry::log_to_stderr().map_err(anyhow::Error::msg)?;
-    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
-    seismic_threads::run("magnitude-main", move || {
+    magnitude_executor::main("magnitude-main", move || {
+        magnitude_engine::telemetry::log_to_stderr().map_err(anyhow::Error::msg)?;
+        let arguments = std::env::args().skip(1).collect::<Vec<_>>();
         seismic_threads::runtime()?.block_on(assess_catalog(arguments, process_started))
     })
 }

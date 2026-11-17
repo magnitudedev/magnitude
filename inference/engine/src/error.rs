@@ -546,15 +546,6 @@ impl From<&magnitude_scheduler::publication::RequestError> for UnloadCause {
     }
 }
 
-/// An execution owner that panicked stopped without a classified cause.
-impl From<magnitude_scheduler::worker::Panicked> for UnloadCause {
-    fn from(_: magnitude_scheduler::worker::Panicked) -> Self {
-        Self::Internal {
-            reason: "execution owner panicked".into(),
-        }
-    }
-}
-
 /// Planner rejections of a recognized, validated definition are properties
 /// of the material on this execution path: a form, operator, scale or
 /// layout the backend's planner does not execute. The others are arithmetic

@@ -316,14 +316,11 @@ async fn memory(State(identity): State<Identity>) -> Response {
 /// starts itself as for a model's Prepare.
 const WORKER_ARGUMENT: &str = "--worker";
 
-/// The process's work runs on the owner's stack, never on the platform's main thread.
 fn main() {
-    seismic_threads::run("magnitude-main", start)
+    magnitude_executor::main("magnitude-main", start)
 }
 
 fn start() {
-    magnitude_executor::diagnostics::install();
-    magnitude_executor::platform::relax_gpu_watchdog();
     if std::env::args().nth(1).as_deref() == Some(WORKER_ARGUMENT) {
         if let Err(error) = log_to_stderr() {
             eprintln!("magnitude-engine: {error}");

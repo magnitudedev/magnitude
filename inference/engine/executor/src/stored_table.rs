@@ -60,7 +60,7 @@ use seismic::Element;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::mpsc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -680,15 +680,7 @@ impl StoredTable {
         }
         let filler = {
             let shared = shared.clone();
-            seismic::threads::spawn("stored-table-filler", move || {
-                // A filler that panics fails every step whose gate it
-                // had not opened and opens them, so none waits on it,
-                // then ends with the panic (`Drop` joins it).
-                if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| shared.fill())) {
-                    shared.died(panic.as_ref());
-                    std::panic::resume_unwind(panic);
-                }
-            })
+            seismic::threads::spawn("stored-table-filler", move || shared.fill())
             .map_err(|error| failed(&error))?
         };
         Ok(Self {
@@ -896,7 +888,7 @@ impl Drop for StoredTable {
         self.shared.jobs.lock().expect("stored table jobs lock").closed = true;
         self.shared.arrived.notify_one();
         if let Some(filler) = self.filler.take() {
-            let _ = filler.join();
+            filler.join().expect("the filler's panic ends the process");
         }
         crate::settle::Owed::settle(self);
     }
@@ -1014,34 +1006,6 @@ impl Shared {
                 .insert(step, StepFailure::every(error.to_string()));
         }
         self.opened.store(step, Ordering::SeqCst);
-    }
-
-    /// The filler panicked with `panic`: no step is queued from now, and
-    /// every step taken or queued whose gate it had not opened fails every
-    /// slot, its gate opened. Locks the panic poisoned are taken as they are.
-    fn died(&self, panic: &(dyn std::any::Any + Send)) {
-        let reason = panic
-            .downcast_ref::<&str>()
-            .map(|reason| reason.to_string())
-            .or_else(|| panic.downcast_ref::<String>().cloned())
-            .unwrap_or_else(|| "a panic".into());
-        let error = format!("the stored table's filler died: {reason}");
-        let queued = {
-            let mut jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
-            jobs.closed = true;
-            jobs.background.clear();
-            jobs.steps.drain(..).map(|job| job.step).max()
-        };
-        let opened = self.opened.load(Ordering::SeqCst);
-        let last = queued.unwrap_or(0).max(self.taken.load(Ordering::SeqCst));
-        let mut failures = self.failures.lock().unwrap_or_else(PoisonError::into_inner);
-        for step in opened + 1..=last {
-            failures.insert(step, StepFailure::every(error.clone()));
-        }
-        drop(failures);
-        // A gate the device cannot be told of fails its steps as above all
-        // the same.
-        let _ = self.gate.signal(last);
     }
 
     /// Hold `rows` for `holder` in slots free now ([`StoredTable::prefetch`]):
@@ -1997,32 +1961,6 @@ mod tests {
         assert_eq!(table.failure(2), None);
         assert_eq!(table.failure(3), None);
         read_done(&later);
-        drop(table);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    /// A filler that panics fails every step whose gate it had not opened,
-    /// the one it took and the ones queued behind it, and opens their gates:
-    /// no step waits on a dead filler, and none is queued after it.
-    #[test]
-    fn a_filler_that_panics_fails_and_opens_every_gate_behind_it() {
-        let (path, table) = table("panic", 8, DirectoryForm::Dense);
-        let (go, wait) = mpsc::channel::<()>();
-        let first = table
-            .queue(StepRows::Selected(Box::new(move || -> Result<Vec<Vec<u64>>, String> {
-                wait.recv().unwrap();
-                panic!("an injected panic")
-            })))
-            .unwrap();
-        let second = table.queue(StepRows::Known(vec![vec![1]])).unwrap();
-        go.send(()).unwrap();
-        for step in [&first, &second] {
-            assert!(step.gate.wait_signalled(step.value, Duration::from_secs(10)).unwrap());
-            let failure = table.failure(step.value).unwrap();
-            assert_eq!(failure.slots, FailedSlots::Every);
-            assert!(failure.error.contains("an injected panic"), "{}", failure.error);
-        }
-        assert!(table.queue(StepRows::Known(vec![vec![2]])).is_err());
         drop(table);
         std::fs::remove_file(path).unwrap();
     }

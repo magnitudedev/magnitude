@@ -848,11 +848,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// At a flight boundary: the idle graph slots' release, once the load's
     /// release thread has ended it (`AllocatedResources::released_slots`);
     /// none while it runs.
-    pub fn advance_slot_release(&mut self) -> Result<Option<crate::resources::SlotsReleased>, DomainError> {
-        let Some(released) = self.resources.released_slots().map_err(DomainError::invariant)? else {
-            return Ok(None);
-        };
-        Ok(Some(released))
+    pub fn advance_slot_release(&mut self) -> Option<crate::resources::SlotsReleased> {
+        self.resources.released_slots()
     }
 
     /// Claim the prompt-group class of the group opening with `operations`:

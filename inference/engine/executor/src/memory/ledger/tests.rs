@@ -676,24 +676,6 @@ fn an_invariant_broken_under_the_lock_panics_as_itself() {
     let _ = ledger.claim_units(CommittedKind::Request(RequestId(5)), NonZeroU64::new(1).unwrap(), 1);
 }
 
-/// A panic outside the lock releases what its unwind drops: a domain whose
-/// step panics (a worker's Internal unload) leaves none of its bytes
-/// committed or allocated in the process's ledger, which a reload is
-/// admitted by.
-#[test]
-fn an_unwind_releases_what_it_drops() {
-    let (_scope, ledger, _pool) = host();
-    read(&ledger, &mut Clock::new(), 64 * GB, 64 * GB, None);
-    let figures = |ledger: &Ledger| (ledger.estimate().committed(), seismic::memory::Store::allocated(ledger));
-    let before = figures(&ledger);
-    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _claim = commit(&ledger, GB);
-        panic!("a domain's step panics");
-    }));
-    assert!(unwound.is_err());
-    assert_eq!(figures(&ledger), before, "the unwind released the claim");
-}
-
 /// A claim shrinks by bytes its holder freed and claims no more: its bytes
 /// and what it allocated fall together, the store's free room rising by
 /// them.

@@ -445,17 +445,11 @@ impl AllocatedResources {
     }
 
     /// The idle slots' release, once the release thread has ended it; none
-    /// while it runs or where none was begun. Its panic is the device's
-    /// invariant violation, reported as one.
-    pub(crate) fn released_slots(&mut self) -> Result<Option<SlotsReleased>, String> {
-        let Some(release) = self.releasing.as_ref() else {
-            return Ok(None);
-        };
-        let Some((outcome, released)) = release.done.lock().expect("graph slot release outcome").take() else {
-            return Ok(None);
-        };
+    /// while it runs or where none was begun.
+    pub(crate) fn released_slots(&mut self) -> Option<SlotsReleased> {
+        let (bytes, released) = self.releasing.as_ref()?.done.lock().expect("graph slot release outcome").take()?;
         let SlotsReleasing { slots, began, .. } = self.releasing.take().expect("a release in hand");
-        outcome.map(|bytes| Some(SlotsReleased { slots, bytes, began, released }))
+        Some(SlotsReleased { slots, bytes, began, released })
     }
 
     /// The load's release thread (`Releases`), which the expert bank

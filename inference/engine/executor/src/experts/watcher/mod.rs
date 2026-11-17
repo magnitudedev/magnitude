@@ -125,7 +125,6 @@ use super::directory::{Directory, HostTier};
 use super::source::ExpertSource;
 use crate::assessment::ExpertLines;
 use liveness::Life;
-pub(crate) use liveness::panic_message;
 use prefetch::Prefetch;
 use promotions::Promotions;
 use requests::Requests;
@@ -772,7 +771,7 @@ impl Drop for Watcher {
         self.shared.lent.wake();
         self.shared.events().notify();
         for thread in [self.requests.take(), self.residency.take()].into_iter().flatten().chain(self.copies.drain(..)) {
-            thread.join().expect("serving's threads catch their panics");
+            thread.join().expect("a serving thread's panic ends the process");
         }
         self.shared.parks.stop();
         if let Some(keeper) = self.keeper.take() {

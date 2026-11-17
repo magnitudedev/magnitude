@@ -3,7 +3,7 @@ use magnitude_generation::{OutputToken, TokenId};
 use magnitude_scheduler::{
     protocol::{WorkerCommand, WorkerReply},
     publication::{Publication, PublicationQueue, PublicationWakeKind},
-    worker::{DispatchError, Driven, Event, Owner, Panicked, Reread, Worker, WorkerWakeHandle},
+    worker::{DispatchError, Driven, Event, Owner, Reread, Worker, WorkerWakeHandle},
 };
 use std::sync::mpsc;
 use std::task::{Context, Poll, Waker};
@@ -14,12 +14,6 @@ const TIMEOUT: Duration = Duration::from_secs(3);
 /// Why a test owner stopped.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Stopped(&'static str);
-
-impl From<Panicked> for Stopped {
-    fn from(_: Panicked) -> Self {
-        Self("panicked")
-    }
-}
 
 /// Answers every command with `reply` and stops once closed.
 struct Replying {

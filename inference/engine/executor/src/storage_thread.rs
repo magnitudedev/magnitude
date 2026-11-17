@@ -4,9 +4,8 @@ use crate::CompletionWake;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-/// A step's outcome once it ends on a [`StorageThread`], or why it panicked
-/// (which leaves its owner without what the step took), and when.
-pub(crate) type Done<T> = Arc<Mutex<Option<(Result<T, String>, Instant)>>>;
+/// A step's outcome once it ends on a [`StorageThread`], and when.
+pub(crate) type Done<T> = Arc<Mutex<Option<(T, Instant)>>>;
 
 /// A thread storage work runs on, started with its owner and joined when it
 /// drops: the expert bank's records' resizes and its host tier's (each
@@ -25,7 +24,8 @@ pub(crate) struct StorageThread {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-/// A step of storage work, run on the thread, which catches its panic.
+/// A step of storage work, run on the thread: its panic ends the process
+/// (`seismic::threads`).
 type Work = Box<dyn FnOnce() + Send>;
 
 impl StorageThread {
@@ -58,11 +58,10 @@ impl StorageThread {
         })
     }
 
-    /// Run `work` on the thread: its outcome lands in the returned slot, or
-    /// why it panicked (a panic is caught, so the thread, and all later work
-    /// of its owner, outlives it), then `wake` completes. It cannot fail:
-    /// the thread takes work until its owner drops it, so the work, and
-    /// everything it owns, always reaches it.
+    /// Run `work` on the thread: its outcome lands in the returned slot,
+    /// then `wake` completes. It cannot fail: the thread takes work until
+    /// its owner drops it, so the work, and everything it owns, always
+    /// reaches it.
     pub(crate) fn run<T: Send + 'static>(&self, wake: CompletionWake, work: impl FnOnce() -> T + Send + 'static) -> Done<T> {
         let done = Arc::new(Mutex::new(None));
         let slot = done.clone();
@@ -70,12 +69,11 @@ impl StorageThread {
             .as_ref()
             .expect("a storage thread takes work until its owner drops it")
             .send(Box::new(move || {
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
-                    .map_err(|payload| format!("storage work panicked: {}", crate::experts::panic_message(payload.as_ref())));
+                let outcome = work();
                 *slot.lock().expect("storage work outcome") = Some((outcome, Instant::now()));
                 wake.complete();
             }))
-            .expect("a storage thread catches every panic, so it takes work until its owner drops it");
+            .expect("a storage thread takes work until its owner drops it, since its panic ends the process");
         done
     }
 }
@@ -84,7 +82,7 @@ impl Drop for StorageThread {
     fn drop(&mut self) {
         drop(self.work.take());
         if let Some(thread) = self.thread.take() {
-            thread.join().expect("a storage thread panicked");
+            thread.join().expect("a storage thread's panic ends the process");
         }
     }
 }

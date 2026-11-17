@@ -25,9 +25,8 @@ use super::decode::{Began, Decode, Look, Posted};
 use super::liveness;
 use super::residency::{Residency, lock, lock_counted};
 use super::scratch::{self, Pending};
-use super::{Shared, panic_message};
+use super::Shared;
 use crate::experts::yielding::Yielding;
-use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -127,13 +126,7 @@ impl Requests {
                         let gave_up = posted.into_iter().fold(false, |gave_up, request| request.give_up(&mut held.core, &held.prefetch, &self.shared) | gave_up);
                         liveness::refuse(&held.core, &self.shared) | gave_up
                     }
-                    None => match std::panic::catch_unwind(AssertUnwindSafe(|| self.pass(&mut service, &mut held, posted))) {
-                        Ok(progressed) => progressed,
-                        Err(payload) => {
-                            self.shared.end_serving(format!("it panicked: {}", panic_message(payload.as_ref())));
-                            true
-                        }
-                    },
+                    None => self.pass(&mut service, &mut held, posted),
                 };
                 (progressed, self.polls(&held))
             };
@@ -151,19 +144,13 @@ impl Requests {
 
     /// The decode requests the device posted since the last look, each
     /// absent expert's read submitted (`Look::look`): none once serving
-    /// ended. A panic ends serving, as the pass's does.
+    /// ended.
     fn look(&self, began: Began) -> Vec<Posted> {
         if self.shared.life.ended().is_some() {
             return Vec::new();
         }
         let mut service = self.service.lock().expect("the request service is never left by a panic");
-        match std::panic::catch_unwind(AssertUnwindSafe(|| service.look.look(&self.shared, began))) {
-            Ok(posted) => posted,
-            Err(payload) => {
-                self.shared.end_serving(format!("its look panicked: {}", panic_message(payload.as_ref())));
-                Vec::new()
-            }
-        }
+        service.look.look(&self.shared, began)
     }
 
     /// Whether the device's words are looked at by time: where kernels wait

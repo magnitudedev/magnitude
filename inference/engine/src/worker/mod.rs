@@ -449,7 +449,7 @@ fn load(
         Err(
             SpawnError::Factory(Stopped::Failed(error)) | SpawnError::Host(Stopped::Failed(error)),
         ) => return Err(error),
-        Err(error @ (SpawnError::Capacity | SpawnError::Thread(_) | SpawnError::Panicked)) => {
+        Err(error @ (SpawnError::Capacity | SpawnError::Thread(_))) => {
             return Err(internal(error.to_string()))
         }
     };
