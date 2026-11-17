@@ -342,7 +342,7 @@ async fn update_lock(
         .context("failed to validate candidate model catalog lock")?;
     ensure_catalog_resolved(&generated)?;
     let encoded = serde_json::to_vec_pretty(&lock)?;
-    publish(&output, &[encoded.as_slice(), b"\n"].concat(), "json.tmp").await?;
+    publish(&output, [encoded.as_slice(), b"\n"].concat()).await?;
     println!("updated {}", output.display());
     Ok(())
 }
@@ -401,7 +401,7 @@ async fn build_bundle(output: PathBuf, store: &StoreArgs) -> anyhow::Result<()> 
     let bytes = generated.encode_planner_bundle(|completed, total| {
         report_progress("Encoded planner inputs", completed, total);
     })?;
-    publish(&output, &bytes, "bundle.tmp").await?;
+    publish(&output, bytes).await?;
     eprintln!("Validating published planner input bundle...");
     let published = load_release_catalog(&output)
         .context("built planner inputs do not satisfy the runtime contract")?;
@@ -431,14 +431,13 @@ async fn headers(output: PathBuf, store: &StoreArgs) -> anyhow::Result<PathBuf> 
     if current {
         eprintln!("Catalog headers are already current.");
     } else {
-        let staging = output.join("headers.tmp");
-        if staging.exists() {
-            tokio::fs::remove_dir_all(&staging).await?;
-        }
-        let components = load_release_catalog(&bundle)?.export_headers(&staging)?;
+        // Staged under a name of its own and published whole (`seismic_io::StagedDirectory`): a
+        // run exporting at once with this one, or reading the export, never finds it part written.
+        let staging = seismic_io::StagedDirectory::new(&exported)?;
+        let components = load_release_catalog(&bundle)?.export_headers(staging.path())?;
         let models = store.open().await?;
         for artifact in &artifacts {
-            models.export_artifact_header(artifact, &staging).await?;
+            models.export_artifact_header(artifact, staging.path()).await?;
         }
         let index = HeaderIndex {
             lock: catalog_lock_digest(),
@@ -446,11 +445,8 @@ async fn headers(output: PathBuf, store: &StoreArgs) -> anyhow::Result<PathBuf> 
             artifacts,
         };
         let encoded = serde_json::to_vec_pretty(&index)?;
-        tokio::fs::write(staging.join(catalog_headers::INDEX), encoded).await?;
-        if exported.exists() {
-            tokio::fs::remove_dir_all(&exported).await?;
-        }
-        tokio::fs::rename(&staging, &exported).await?;
+        tokio::fs::write(staging.path().join(catalog_headers::INDEX), encoded).await?;
+        staging.publish()?;
     }
     Ok(exported)
 }
@@ -534,14 +530,18 @@ fn report_progress(stage: &str, completed: usize, total: usize) {
     }
 }
 
-async fn publish(output: &Path, bytes: &[u8], temporary_extension: &str) -> anyhow::Result<()> {
+/// Write `bytes` at `output` whole ([`seismic_io::publish`]): a reader, or another run writing
+/// it at once, finds it as it was or as one run wrote it, never part written.
+async fn publish(output: &Path, bytes: Vec<u8>) -> anyhow::Result<()> {
     let parent = output
         .parent()
         .context("catalog output must have a parent directory")?;
     tokio::fs::create_dir_all(parent).await?;
-    let temporary = output.with_extension(temporary_extension);
-    tokio::fs::write(&temporary, bytes).await?;
-    tokio::fs::rename(&temporary, output).await?;
+    let output = output.to_owned();
+    tokio::task::spawn_blocking(move || {
+        seismic_io::publish(&output, seismic_io::Durability::Volatile, |file| std::io::Write::write_all(file, &bytes))
+    })
+    .await??;
     Ok(())
 }
 

@@ -1208,6 +1208,11 @@ async fn publish_package_snapshot(
         Err(error) => return Err(download_io(error)),
     }
 
+    // One fixed stage per commit is safe: every writer of this repository's snapshots, its
+    // stage and its blobs holds the repository lock (`inventory::repository_lock_path`,
+    // `<root>/locks/<repository>.lock`) exclusively across processes, a download from
+    // `run_download_locked` and a removal from the service alike. A stage a dead writer left is
+    // quarantined before it is used again.
     let staged_snapshot = incomplete.join(format!("snapshot-{commit}"));
     quarantine(&staged_snapshot).await?;
     ensure_owned_directory(&staged_snapshot).await?;
@@ -1750,6 +1755,10 @@ async fn persist_integrity_checkpoint(
     Ok(())
 }
 
+/// Rename the verified partial blob onto the blob. The repository lock
+/// (`inventory::repository_lock_path`, `<root>/locks/<repository>.lock`), which
+/// `run_download_locked` holds exclusively across processes for the whole download, makes this
+/// download the only writer of both paths; the rename shows a reader the blob whole or absent.
 async fn publish_verified_blob(paths: &DownloadComponentPaths) -> Result<(), DownloadError> {
     tokio::fs::rename(&paths.partial, &paths.blob)
         .await
@@ -1924,23 +1933,12 @@ async fn atomic_json(path: &Path, value: &impl serde::Serialize) -> Result<(), D
         retryable: false,
         resumable: true,
     })?;
-    let temporary = path.with_extension(format!(
-        "tmp-{}",
-        random_id("write").map_err(inventory_download_error)?
-    ));
-    let mut file = tokio::fs::File::create(&temporary)
-        .await
-        .map_err(download_io)?;
-    file.write_all(&bytes).await.map_err(download_io)?;
-    file.flush().await.map_err(download_io)?;
-    file.sync_all().await.map_err(download_io)?;
-    drop(file);
-    tokio::fs::rename(&temporary, path)
-        .await
-        .map_err(download_io)?;
-    // Unix additionally flushes the renamed directory entry. File contents are
-    // already flushed above; Windows has no equivalent directory fsync.
-    sync_parent(path).await
+    let path = path.to_owned();
+    magnitude_service_utils::blocking::run(move || {
+        magnitude_service_utils::file_cache::publish_private(&path, &bytes)
+    })
+    .await
+    .map_err(download_io)
 }
 
 async fn sync_parent(path: &Path) -> Result<(), DownloadError> {

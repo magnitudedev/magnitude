@@ -2554,6 +2554,7 @@ dependencies = [
  "magnitude-service-server",
  "magnitude-source-identity",
  "seismic",
+ "seismic-io",
  "sha2 0.10.9",
 ]
 
@@ -2618,6 +2619,7 @@ dependencies = [
  "magnitude-executor",
  "magnitude-service-contracts",
  "magnitude-service-models",
+ "seismic-io",
  "serde_json",
  "sha2 0.10.9",
  "tokio",
@@ -2718,6 +2720,7 @@ version = "0.1.0"
 dependencies = [
  "fs2",
  "libc",
+ "seismic-io",
  "seismic-threads",
  "serde",
  "serde_json",
@@ -4339,6 +4342,7 @@ dependencies = [
 name = "seismic-measure"
 version = "0.1.0"
 dependencies = [
+ "seismic-io",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -4430,6 +4434,7 @@ dependencies = [
  "seismic-cpu",
  "seismic-cuda",
  "seismic-discovery",
+ "seismic-io",
  "seismic-ir",
  "seismic-lang",
  "seismic-measure",

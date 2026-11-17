@@ -110,11 +110,8 @@ impl JsonFileStore {
                 bytes.len()
             )));
         }
-        let mut temporary = tempfile::NamedTempFile::new_in(self.schema::<V>()).map_err(error)?;
-        temporary.write_all(&bytes).map_err(error)?;
-        temporary.as_file().sync_all().map_err(error)?;
-        temporary.persist(path).map_err(error)?;
-        Ok(())
+        seismic_io::publish(path, seismic_io::Durability::Durable, |file| file.write_all(&bytes))
+            .map_err(|cause| error(format!("{}: {cause}", path.display())))
     }
 
     /// Every value stored, each read bounded by `largest` as [`Self::load`]

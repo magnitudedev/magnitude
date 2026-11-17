@@ -60,62 +60,74 @@ struct Records {
 }
 
 /// The verdicts and completions of one ledger file.
+///
+/// Every process with the ledger open appends to the same file, and any of
+/// them may compact it. Appending and compacting hold one lock beside the
+/// file (`<ledger>.lock`) exclusively, across processes: an append writes
+/// to the file the path names when it holds the lock, never to one a
+/// compaction has since replaced, and a compaction reads every record
+/// appended before it, by any process, into the file it publishes. So no
+/// record is lost to a compaction. A record enters the ledger's memory and
+/// its file under the one lock hold ([`Ledger::establish`]), so no
+/// compaction falls between them to fold an older record of its key over
+/// it: what the ledger holds is what its file says.
 pub struct Ledger {
     path: PathBuf,
+    lock: PathBuf,
     records: Mutex<Records>,
-    appending: Mutex<std::fs::File>,
 }
 
 impl Ledger {
-    /// The ledger at `path`, empty if there is none, opened for appending.
+    /// The ledger at `path`, empty if there is none.
     pub fn open(path: &Path) -> std::io::Result<Self> {
-        let records = match std::fs::read_to_string(path) {
-            Ok(text) => parse(&text),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Records::default(),
-            Err(error) => return Err(error),
-        };
+        let records = read(path)?;
         if let Some(directory) = path.parent() {
             std::fs::create_dir_all(directory)?;
         }
-        let appending = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let name = path.file_name().expect("a ledger is a file").to_string_lossy();
         Ok(Self {
             path: path.to_owned(),
+            lock: path.with_file_name(format!("{name}.lock")),
             records: Mutex::new(records),
-            appending: Mutex::new(appending),
         })
     }
 
     pub fn verdict(&self, key: &Key) -> Option<Established> {
-        self.lock().verdicts.get(&key.0).copied()
+        self.records().verdicts.get(&key.0).copied()
     }
 
     pub fn record(&self, key: &Key, verdict: Established) {
-        self.lock().verdicts.insert(key.0.clone(), verdict);
-        self.append(&verdict_line(&key.0, verdict));
+        self.establish(&verdict_line(&key.0, verdict), |records| {
+            records.verdicts.insert(key.0.clone(), verdict);
+        });
     }
 
     /// The summary of the completed run keyed `run`, if there is one.
     pub fn completion(&self, run: &Key) -> Option<String> {
-        self.lock().completions.get(&run.0).cloned()
+        self.records().completions.get(&run.0).cloned()
     }
 
     /// Record that the run keyed `run` established everything, with its
     /// `summary` kept on one line.
     pub fn complete(&self, run: &Key, summary: &str) {
         let summary = summary.trim().replace('\n', "; ");
-        self.lock()
-            .completions
-            .insert(run.0.clone(), summary.clone());
-        self.append(&format!("c {run} {summary}\n"));
+        self.establish(&format!("c {run} {summary}\n"), move |records| {
+            records.completions.insert(run.0.clone(), summary);
+        });
     }
 
-    /// Rewrite the file as its records, sorted, each once.
+    /// Rewrite the file as its records, sorted, each once, the ledger's lock
+    /// held: this ledger's and every one any process appended to the file,
+    /// which this ledger then holds too. The file is replaced in one atomic
+    /// step ([`seismic_io::publish`]), so a reader finds it as it was or as
+    /// this compaction wrote it, never part written.
     pub fn compact(&self) -> std::io::Result<()> {
+        let _held = self.held()?;
+        let appended = read(&self.path)?;
         let text = {
-            let records = self.lock();
+            let mut records = self.records();
+            records.verdicts.extend(appended.verdicts);
+            records.completions.extend(appended.completions);
             let mut text = String::new();
             for (key, verdict) in &records.verdicts {
                 text.push_str(&verdict_line(key, *verdict));
@@ -125,33 +137,55 @@ impl Ledger {
             }
             text
         };
-        let mut appending = self
-            .appending
-            .lock()
-            .expect("no thread panics holding the ledger file");
-        let staged = self.path.with_extension("compacting");
-        std::fs::write(&staged, text)?;
-        std::fs::rename(&staged, &self.path)?;
-        *appending = std::fs::OpenOptions::new().append(true).open(&self.path)?;
-        Ok(())
+        seismic_io::publish(&self.path, seismic_io::Durability::Volatile, |file| file.write_all(text.as_bytes()))
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Records> {
+    fn records(&self) -> std::sync::MutexGuard<'_, Records> {
         self.records
             .lock()
             .expect("no thread panics holding the ledger")
     }
 
-    /// Append one line. A failed write loses only that record: a later run
-    /// establishes it again.
-    fn append(&self, line: &str) {
-        let mut file = self
-            .appending
-            .lock()
-            .expect("no thread panics holding the ledger file");
-        if let Err(error) = file.write_all(line.as_bytes()) {
-            eprintln!("formation ledger {}: {error}", self.path.display());
+    /// Hold the ledger's lock exclusively, of every thread and process,
+    /// until the returned file is dropped.
+    fn held(&self) -> std::io::Result<std::fs::File> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&self.lock)?;
+        file.lock()?;
+        Ok(file)
+    }
+
+    /// Establish a record: append its `line` to the file and, once it is
+    /// there, `insert` it into memory, both under one hold of the ledger's
+    /// lock, so memory never holds a record the file lacks (which a
+    /// compaction, folding the file over memory, would replace with an
+    /// older line). A failed write is reported and the record is not
+    /// established: a later formation records it again.
+    fn establish(&self, line: &str, insert: impl FnOnce(&mut Records)) {
+        let appended = self.held().and_then(|held| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)?
+                .write_all(line.as_bytes())?;
+            Ok(held)
+        });
+        match appended {
+            Ok(_held) => insert(&mut self.records()),
+            Err(error) => eprintln!("formation ledger {}: {error}", self.path.display()),
         }
+    }
+}
+
+/// The records of the ledger file at `path`, none if there is no file.
+fn read(path: &Path) -> std::io::Result<Records> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(parse(&text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Records::default()),
+        Err(error) => Err(error),
     }
 }
 
@@ -226,6 +260,68 @@ mod tests {
             Ledger::open(&path).unwrap().verdict(&c),
             Some(Established::Formed)
         );
+    }
+
+    /// Two processes' ledgers on one file, one appending while the other
+    /// compacts again and again: every line of the file parses, and holds
+    /// every record either appended, none lost to a compaction.
+    #[test]
+    fn appends_and_compactions_at_once_lose_no_record() {
+        let path = path("compacting");
+        let [appending, compacting] = ["a", "b"].map(|name| {
+            let ledger = Ledger::open(&path).unwrap();
+            ledger.record(&Key::of(&[name.as_bytes()]), Established::Formed);
+            ledger
+        });
+        std::thread::scope(|scope| {
+            let appending = &appending;
+            seismic::threads::spawn_scoped(scope, "appending", move || {
+                for record in 0..200u8 {
+                    appending.record(&Key::of(&[b"appended", &[record]]), Established::Rejected);
+                }
+            })
+            .unwrap();
+            for _ in 0..50 {
+                compacting.compact().unwrap();
+            }
+        });
+        compacting.compact().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let found = parse(&text);
+        assert_eq!(found.verdicts.len(), text.lines().count(), "every line parses, each record once");
+        assert!(found.verdicts.contains_key(&Key::of(&[b"a"]).0) && found.verdicts.contains_key(&Key::of(&[b"b"]).0));
+        for record in 0..200u8 {
+            let key = Key::of(&[b"appended", &[record]]);
+            assert_eq!(found.verdicts.get(&key.0), Some(&Established::Rejected), "no append is lost");
+        }
+    }
+
+    /// One ledger re-recording a key on one thread while another thread
+    /// compacts it again and again: no compaction folds an older record of
+    /// the key over a newer one between its memory and its file, so once
+    /// the recording ends the ledger and its file both hold the last.
+    #[test]
+    fn a_record_and_a_compaction_at_once_leave_memory_as_the_file() {
+        let path = path("recompacting");
+        let ledger = Ledger::open(&path).unwrap();
+        let key = Key::of(&[b"rerecorded"]);
+        let verdict = |record: u16| if record % 2 == 0 { Established::Formed } else { Established::Rejected };
+        const RECORDS: u16 = 401;
+        std::thread::scope(|scope| {
+            let (ledger, key) = (&ledger, &key);
+            seismic::threads::spawn_scoped(scope, "recording", move || {
+                for record in 0..RECORDS {
+                    ledger.record(key, verdict(record));
+                }
+            })
+            .unwrap();
+            for _ in 0..100 {
+                ledger.compact().unwrap();
+            }
+        });
+        let last = verdict(RECORDS - 1);
+        assert_eq!(ledger.verdict(&key), Some(last), "the ledger holds the last record");
+        assert_eq!(Ledger::open(&path).unwrap().verdict(&key), Some(last), "its file says the last record");
     }
 
     #[test]

@@ -7,10 +7,14 @@ license.workspace = true
 # Measuring work on a device, generically: the timing session, held
 # sustained clocks, the sampling statistics and the one stopping rule,
 # deadlines, and records with their store trait
-# (specs/26-10-18/device-topology.md §2.6). It depends on no device or other
-# Seismic crate: what it times is a `Work`.
+# (specs/26-10-18/device-topology.md §2.6). It depends on no device crate,
+# and of Seismic only on its I/O layer, whose publication its store writes
+# through: what it times is a `Work`.
 [dependencies]
+seismic-io.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+
+[dev-dependencies]
 tempfile = "3.24.0"

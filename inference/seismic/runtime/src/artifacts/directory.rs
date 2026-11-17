@@ -14,10 +14,11 @@
 //! <directory>/<name>            an embedder's own entries ([`DirectoryStore::write`])
 //! ```
 //!
-//! Writes go to a temporary file in the same directory and are renamed into
-//! place, so concurrent processes never see a partial file; a temporary file
-//! older than [`ABANDONED_WRITE`] belongs to a writer that died and is
-//! removed. Reading a file refreshes its modification time, its use time.
+//! Every write is published ([`seismic_io::publish`]), so no reader, of this
+//! store, another over the same directory, or another process, ever sees a
+//! partial file; a temporary file older than [`ABANDONED_WRITE`] belongs to
+//! a writer that died and is removed. Reading a file refreshes its
+//! modification time, its use time.
 //!
 //! Opening the store, and every quarter of its capacity written after,
 //! removes the least recently used entries beyond its capacity, on a thread
@@ -34,6 +35,7 @@
 //! invalidated; any file that cannot be read is a miss.
 
 use super::{ArtifactKey, ArtifactStore};
+use seismic_io::Durability;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -84,8 +86,6 @@ pub struct DirectoryStore {
     root: PathBuf,
     capacity: u64,
     layout: Layout,
-    /// Distinguishes this process's concurrent temporary files.
-    writes: AtomicU64,
     /// Bytes written since eviction last began.
     written: AtomicU64,
     /// The eviction under way, if one is.
@@ -102,7 +102,6 @@ impl DirectoryStore {
             root,
             capacity,
             layout,
-            writes: AtomicU64::new(0),
             written: AtomicU64::new(0),
             eviction: std::sync::Mutex::new(None),
         };
@@ -128,34 +127,23 @@ impl DirectoryStore {
         self.root.join(path).is_file()
     }
 
-    /// Write `bytes` to `path` under the root through a temporary file in
-    /// the same directory, synced before it is renamed into place. A
-    /// failure is reported as a warning event, which the embedder's
-    /// subscriber carries to its telemetry, and leaves no partial file.
-    /// Returns whether the file was written.
+    /// Publish `bytes` at `path` under the root, durably. A failure is
+    /// reported as a warning event, which the embedder's subscriber carries
+    /// to its telemetry, and leaves no partial file. Returns whether the
+    /// file was written.
     pub fn write(&self, path: &Path, bytes: &[u8]) -> bool {
-        self.written(path, bytes, true)
+        self.written(path, bytes, Durability::Durable)
     }
 
-    /// [`DirectoryStore::write`], the file synced first where `synced`.
-    fn written(&self, path: &Path, bytes: &[u8], synced: bool) -> bool {
+    /// [`DirectoryStore::write`], published to `durability`.
+    fn written(&self, path: &Path, bytes: &[u8], durability: Durability) -> bool {
         let path = self.root.join(path);
         let directory = path.parent().expect("a stored file lives in a directory");
         if let Err(error) = fs::create_dir_all(directory) {
             tracing::warn!("artifact store: cannot create {}: {error}", directory.display());
             return false;
         }
-        let temporary = directory.join(format!(
-            ".{}.{}.{}.tmp",
-            path.file_name().expect("a stored file has a name").to_string_lossy(),
-            std::process::id(),
-            self.writes.fetch_add(1, Ordering::Relaxed)
-        ));
-        let written = fs::File::create(&temporary)
-            .and_then(|mut file| file.write_all(bytes).and_then(|()| if synced { file.sync_all() } else { Ok(()) }))
-            .and_then(|()| fs::rename(&temporary, &path));
-        if let Err(error) = &written {
-            let _ = fs::remove_file(&temporary);
+        if let Err(error) = seismic_io::publish(&path, durability, |file| file.write_all(bytes)) {
             tracing::warn!("artifact store: cannot write {}: {error}", path.display());
             return false;
         }
@@ -174,7 +162,7 @@ impl DirectoryStore {
     /// Write `bytes` under `key` of `namespace`, synced, as [`ArtifactStore::put`]
     /// does; whether they were written, which a put only reports.
     pub(crate) fn put_synced(&self, namespace: &str, key: &ArtifactKey, bytes: &[u8]) -> bool {
-        self.written(&Self::artifact(namespace, key), bytes, true)
+        self.written(&Self::artifact(namespace, key), bytes, Durability::Durable)
     }
 
     fn artifact(namespace: &str, key: &ArtifactKey) -> PathBuf {
@@ -249,7 +237,7 @@ fn evict(root: &Path, capacity: u64, layout: Layout) {
                 continue;
             }
             let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-            if item.file_name().to_string_lossy().starts_with('.') {
+            if seismic_io::unpublished(&item.file_name()) {
                 if now.duration_since(modified).unwrap_or_default() > ABANDONED_WRITE {
                     let _ = fs::remove_file(&path);
                 }
@@ -303,7 +291,8 @@ impl ArtifactStore for DirectoryStore {
     /// is synced: it is kept from eviction, rare to write, and costly to
     /// form again.
     fn put(&self, namespace: &str, key: &ArtifactKey, bytes: &[u8]) {
-        self.written(&Self::artifact(namespace, key), bytes, namespace == crate::probes::NAMESPACE);
+        let durability = if namespace == crate::probes::NAMESPACE { Durability::Durable } else { Durability::Volatile };
+        self.written(&Self::artifact(namespace, key), bytes, durability);
     }
 }
 
@@ -341,7 +330,7 @@ mod tests {
         let leftovers = fs::read_dir(root.join(ARTIFACTS).join("metal"))
             .unwrap()
             .flatten()
-            .filter(|item| item.file_name().to_string_lossy().starts_with('.'))
+            .filter(|item| seismic_io::unpublished(&item.file_name()))
             .count();
         assert_eq!(leftovers, 0, "no temporary file remains");
         fs::remove_dir_all(root).unwrap();

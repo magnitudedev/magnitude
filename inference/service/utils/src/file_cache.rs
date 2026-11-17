@@ -3,15 +3,13 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 
 use fs2::FileExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use seismic_io::Durability;
 use serde_json::{Map, Value};
-
-static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Reads a bounded regular file. Every filesystem and size failure is a cache miss.
 pub fn read_bytes(path: &Path, maximum_bytes: usize) -> Option<Vec<u8>> {
@@ -97,7 +95,7 @@ pub fn write_json_atomic<T: Serialize>(
 /// Publishes bounded bytes as a complete replacement, skipped while another writer holds the lock.
 /// Failure is intentionally invisible.
 pub fn write_bytes_atomic(path: &Path, lock_path: &Path, bytes: &[u8], maximum_bytes: usize) {
-    publish(path, lock_path, bytes, maximum_bytes, false);
+    replace(path, lock_path, bytes, maximum_bytes, false);
 }
 
 /// Publishes bounded bytes as a complete replacement, waiting for another writer to finish: for
@@ -108,10 +106,10 @@ pub fn write_bytes_atomic_waiting(
     bytes: &[u8],
     maximum_bytes: usize,
 ) {
-    publish(path, lock_path, bytes, maximum_bytes, true);
+    replace(path, lock_path, bytes, maximum_bytes, true);
 }
 
-fn publish(path: &Path, lock_path: &Path, bytes: &[u8], maximum_bytes: usize, wait: bool) {
+fn replace(path: &Path, lock_path: &Path, bytes: &[u8], maximum_bytes: usize, wait: bool) {
     if bytes.len() > maximum_bytes {
         return;
     }
@@ -155,21 +153,8 @@ fn publish(path: &Path, lock_path: &Path, bytes: &[u8], maximum_bytes: usize, wa
     if locked.is_err() {
         return;
     }
-    let sequence = TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let temporary = temporary_path(parent, path, sequence);
-    let persisted = write_private_file(&temporary, bytes) && fs::rename(&temporary, path).is_ok();
-    if !persisted {
-        let _ = fs::remove_file(&temporary);
-    }
+    let _ = publish_private(path, bytes);
     let _ = lock.unlock();
-}
-
-fn temporary_path(parent: &Path, path: &Path, sequence: u64) -> PathBuf {
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("cache");
-    parent.join(format!(".{name}.tmp-{}-{sequence}", std::process::id()))
 }
 
 fn create_private_directories(path: &Path) -> std::io::Result<()> {
@@ -182,18 +167,19 @@ fn create_private_directories(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn write_private_file(path: &Path, bytes: &[u8]) -> bool {
-    let mut options = fs::OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let Ok(mut file) = options.open(path) else {
-        return false;
-    };
-    file.write_all(bytes).is_ok() && file.sync_all().is_ok()
+/// Publish `bytes` at `path` as a file only its owner reads, synced, in one
+/// atomic step ([`seismic_io::publish`]): every reader, in this process or
+/// another, finds the file as it was or as it now is, never part written.
+/// A failure leaves `path` as it was.
+pub fn publish_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    seismic_io::publish(path, Durability::Durable, |file| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(bytes)
+    })
 }
 
 #[cfg(test)]
