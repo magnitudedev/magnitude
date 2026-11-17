@@ -8,7 +8,7 @@ import {
   type LocalModelFamily,
 } from "@magnitudedev/acn-protocol"
 import type { CatalogModelSource } from "./local-model-sources"
-import { projectRecommendations } from "./recommendations"
+import { projectRecommendations, recommendationViews, sameRecommendationViews } from "./recommendations"
 
 const GB = 1_000_000_000
 
@@ -201,5 +201,26 @@ describe("recommendations", () => {
       rung({ id: "chatonly:gguf:q4", storageBytes: 1 * GB, tokensPerSecond: 50, intelligence: 90, tools: false }),
     ])
     expect(models.map(({ base }) => base)).toEqual(["agentic"])
+  })
+})
+
+describe("republishing recommendations", () => {
+  const ladder = [
+    rung({ id: "big:gguf:q2", storageBytes: 10 * GB, tokensPerSecond: 40 }),
+    rung({ id: "big:gguf:q4", storageBytes: 20 * GB, tokensPerSecond: 25, country: "US" }),
+  ]
+  const views = (freeBytes: number) => recommendationViews({
+    models: ladder,
+    catalog: ladder.map((model) => source(model.modelId, "qwen35")),
+    families,
+    hardware: hardware(freeBytes),
+  })
+
+  it("doesn't happen when free disk moves by a few KiB without changing any offer", () => {
+    expect(sameRecommendationViews(views(109_362_847_744), views(109_362_839_552))).toBe(true)
+  })
+
+  it("happens when free disk changes which size has room to download", () => {
+    expect(sameRecommendationViews(views(25 * GB), views(15 * GB))).toBe(false)
   })
 })

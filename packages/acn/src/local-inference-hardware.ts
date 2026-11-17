@@ -1,7 +1,8 @@
-import { Context, Effect, Layer, Scope, Stream } from "effect"
+import { Context, Effect, Layer, Option, Schema, Scope, Stream } from "effect"
 import {
   Models,
   inferenceAcceleratorDisplayName,
+  LocalInferenceHardwareSchema,
   projectInferenceHardware,
   type LocalInferenceHardware as LocalInferenceHardwareState,
 } from "@magnitudedev/acn-protocol"
@@ -10,6 +11,17 @@ import { AcnChanges } from "./changes"
 
 export const acceleratorDisplayName = inferenceAcceleratorDisplayName
 export const projectLocalInferenceHardware = projectInferenceHardware
+
+const sameHardware = Schema.equivalence(LocalInferenceHardwareSchema)
+const withoutFreeMemory = (state: LocalInferenceHardwareState): LocalInferenceHardwareState =>
+  ({ ...state, memoryDomains: state.memoryDomains.map((domain) => ({ ...domain, availableBytes: Option.none() })) })
+
+/**
+ * Whether a client would see a different environment: free memory moves with every snapshot and no client follows it
+ * live (a status read asks for it), so a change in it alone is no change to tell clients about.
+ */
+export const sameEnvironmentForClients = (previous: LocalInferenceHardwareState, next: LocalInferenceHardwareState): boolean =>
+  sameHardware(withoutFreeMemory(previous), withoutFreeMemory(next))
 
 export interface LocalInferenceHardwareApi {
   readonly state: Effect.Effect<LocalInferenceHardwareState>
@@ -46,6 +58,7 @@ export const LocalInferenceHardwareLive: Layer.Layer<
     Stream.filterMap((state) => state),
   )
   yield* Effect.forkIn(projectedChanges.pipe(
+    Stream.changesWith(sameEnvironmentForClients),
     Stream.runForEach(() => changes.publish({ operation: Models.getLocalEnvironment._tag })),
   ), scope)
   // Instance changes can immediately alter available memory. The hardware

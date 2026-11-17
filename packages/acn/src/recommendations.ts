@@ -1,6 +1,7 @@
 import { Array, Context, Effect, Layer, Option, Order, Schema, Stream } from "effect"
 import {
   LocalModelFamilySchema,
+  RecommendationsSchema,
   Models,
   comparisonTokensPerSecond,
   localModelCapabilities,
@@ -180,6 +181,19 @@ export const projectRecommendations = (inputs: RecommendationInputs): Recommenda
   return { complete: measured === rungs, measured, rungs, models, roomShortfall, families: inputs.families }
 }
 
+/**
+ * Every view of the recommendations a client can ask for: all developers', then each developer country's among the
+ * catalog's models. Recommendations are republished only when one of these changes, whatever input moved: free disk
+ * shifting by a log write's few KiB changes no offer.
+ */
+export const recommendationViews = (inputs: Omit<RecommendationInputs, "developerCountry">): readonly RecommendationsState[] => {
+  const countries = [...new Set(inputs.models.flatMap((model) => model._tag === "Catalog" ? [model.catalogData.developer.country] : []))].sort()
+  return [Option.none<CountryCode>(), ...countries.map((country) => Option.some(country))]
+    .map((developerCountry) => projectRecommendations({ ...inputs, developerCountry }))
+}
+
+export const sameRecommendationViews = Schema.equivalence(Schema.Array(RecommendationsSchema))
+
 export interface RecommendationsApi {
   readonly get: (developerCountry: Option.Option<CountryCode>) => Effect.Effect<RecommendationsState>
 }
@@ -195,19 +209,21 @@ export const RecommendationsLive: Layer.Layer<
   const sources = yield* LocalModelSources
   const hardware = yield* LocalInferenceHardware
   const changes = yield* AcnChanges
-  yield* Stream.merge(local.changes, hardware.changes.pipe(Stream.map(() => undefined))).pipe(
+  const inputs = Effect.all({ local: local.state, source: sources.state, hardware: hardware.state }).pipe(
+    Effect.map(({ local, source, hardware }) => ({
+      models: local.models,
+      catalog: source.catalogModels,
+      families: projectModelFamilies(source.families),
+      hardware,
+    })),
+  )
+  yield* Stream.merge(local.changes, hardware.changes.pipe(Stream.as(undefined))).pipe(
+    Stream.mapEffect(() => Effect.map(inputs, recommendationViews)),
+    Stream.changesWith(sameRecommendationViews),
     Stream.runForEach(() => changes.publish({ operation: Models.getRecommendations._tag })),
     Effect.forkScoped,
   )
   return Recommendations.of({
-    get: (developerCountry) => Effect.all({ local: local.state, source: sources.state, hardware: hardware.state }).pipe(
-      Effect.map(({ local, source, hardware }) => projectRecommendations({
-        models: local.models,
-        catalog: source.catalogModels,
-        families: projectModelFamilies(source.families),
-        hardware,
-        developerCountry,
-      })),
-    ),
+    get: (developerCountry) => Effect.map(inputs, (current) => projectRecommendations({ ...current, developerCountry })),
   })
 }))
