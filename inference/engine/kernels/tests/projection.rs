@@ -633,9 +633,12 @@ struct Mapping {
     batch_parts: u64,
     /// `dense_output`'s INT8 tile rows on Metal (INT8_TILE).
     int8_tile: u64,
-    /// The Metal GEMV launches' activation staging (STAGE), under TILED 0
-    /// and LANES below 32.
+    /// The GEMV launches' activation staging (STAGE) on Metal and Vulkan:
+    /// Metal takes it under TILED 0 and LANES below 32, Vulkan at LANES
+    /// below 32.
     stage: u64,
+    /// The Vulkan dense GEMV's codes decoded by logic and adds (DECODE).
+    decode: u64,
 }
 
 /// A tall GEMM threadgroup: TALL_M rows, TALL_K columns per stage, STAGERS
@@ -672,6 +675,7 @@ const fn gemm_mapping(tile_m: u64, tile_n: u64, split: u64) -> Mapping {
         batch_parts: 2,
         int8_tile: 128,
         stage: 0,
+        decode: 0,
     }
 }
 
@@ -692,6 +696,7 @@ const MAPPINGS: [Mapping; 4] = [
         batch_parts: 2,
         int8_tile: 128,
         stage: 0,
+        decode: 1,
     },
     Mapping {
         simdgroups: 2,
@@ -708,7 +713,8 @@ const MAPPINGS: [Mapping; 4] = [
         tiled: 1,
         batch_parts: 1,
         int8_tile: 128,
-        stage: 0,
+        stage: 1,
+        decode: 0,
     },
     Mapping {
         simdgroups: 32,
@@ -726,6 +732,7 @@ const MAPPINGS: [Mapping; 4] = [
         batch_parts: 4,
         int8_tile: 128,
         stage: 0,
+        decode: 0,
     },
     Mapping {
         simdgroups: 16,
@@ -743,6 +750,7 @@ const MAPPINGS: [Mapping; 4] = [
         batch_parts: 2,
         int8_tile: 128,
         stage: 1,
+        decode: 1,
     },
 ];
 
@@ -818,6 +826,12 @@ fn specialization_on(
         specialization
             .with_param("BATCH_SIMDGROUPS", mapping.batch_simdgroups)
             .with_param("BATCH_ROWS", mapping.batch_rows)
+    } else if device.backend() == BackendName::Vulkan {
+        specialization
+            .with_param("SUB_M", mapping.sub_m)
+            .with_param("SUB_N", mapping.sub_n)
+            .with_param("STAGE", mapping.stage)
+            .with_param("DECODE", mapping.decode)
     } else {
         specialization
             .with_param("SUB_M", mapping.sub_m)
@@ -949,7 +963,8 @@ fn with_projection_forms<E: seismic::Entry>(
         .with_param("TILED", mapping.tiled)
         .with_param("SMALL", 1)
         .with_param("PACK", 0)
-        .with_param("STAGE", mapping.stage)
+        // Metal stages F32 activations only in its row-mapping GEMV (TILED 0).
+        .with_param("STAGE", if mapping.tiled == 0 { mapping.stage } else { 0 })
         .with_launch_param(common::metal_launch::<E>("batch"), "BATCH_PARTS", mapping.batch_parts)
 }
 
@@ -4232,6 +4247,53 @@ fn dense_output_matches_its_portable_body_and_the_host_reference_on(device: &Dev
                 &expected,
                 &bound,
             );
+        }
+    }
+}
+
+/// The Vulkan dense GEMV's F32 staging (STAGE) and its decode by logic and
+/// adds (DECODE) keep every value: `dense_output` at one and three rows, over
+/// sign, offset, two's complement, k-quant and grid codes, is bit for bit
+/// the same under each as under neither.
+#[test]
+fn vulkan_gemv_stage_and_decode_keep_every_bit() {
+    let encodings = [
+        Encoding::Q1_0,
+        Encoding::Tq2_0,
+        Encoding::Q4_0,
+        Encoding::Q8_0,
+        Encoding::Q2K,
+        Encoding::Q3K,
+        Encoding::Iq2Xxs,
+        Encoding::Iq3S,
+        Encoding::Iq1S,
+    ];
+    let act = Act::Bf16;
+    let (h, f) = (300, 1024);
+    for device in devices().into_iter().filter(|device| device.backend() == BackendName::Vulkan) {
+        for encoding in encodings {
+            let down = weight(Repr::gguf(encoding), h, f, 35, 1.0);
+            for rows in [1usize, 3] {
+                let mut rng = Rng::new(rows as u64 + 200);
+                let residual = (0..rows * h).map(|_| rng.symmetric()).collect::<Vec<_>>();
+                let out_rows = (0..rows as i32).collect::<Vec<_>>();
+                let product = (0..rows * f).map(|_| act.round(rng.symmetric())).collect::<Vec<_>>();
+                let run = |stage, decode| {
+                    let mapping = Mapping { stage, decode, ..MAPPINGS[3] };
+                    dense_output_native(&device, act, &down, &residual, rows, &product, &out_rows, mapping)
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>()
+                };
+                let neither = run(0, 0);
+                for (stage, decode) in [(1, 0), (0, 1), (1, 1)] {
+                    assert_eq!(
+                        run(stage, decode),
+                        neither,
+                        "{encoding:?} M {rows} STAGE {stage} DECODE {decode}"
+                    );
+                }
+            }
         }
     }
 }

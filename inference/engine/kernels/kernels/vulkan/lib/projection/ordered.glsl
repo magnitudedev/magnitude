@@ -88,7 +88,8 @@ void projection_segmented_ordered_gemv_all() {
                     gl_WorkGroupID.x == 0u, m, uint(PROJECTION_N##s), PROJECTION_K, tile);              \
             } else {                                                                                    \
                 projection_gemv(PROJECTION_KIND##s, PROJECTION_PARTNER_KIND##s, PROJECTION_PAIRED##s,   \
-                    rows, lanes, maxm, PROJECTION_NORM,                                                 \
+                    rows, lanes, maxm, SEISMIC_TUNE_STAGE == 1, SEISMIC_TUNE_DECODE == 1,               \
+                    PROJECTION_NORM,                                                                    \
                     PROJECTION_SEGMENT_INPUT(s), PROJECTION_OUTPUT##s, PROJECTION_WEIGHT##s,            \
                     PROJECTION_PARTNER##s, m, uint(PROJECTION_N##s), PROJECTION_K, tile);               \
             }                                                                                           \

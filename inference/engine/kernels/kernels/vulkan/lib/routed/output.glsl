@@ -67,8 +67,8 @@ void routed_output_projection() {
                 0ul, SEISMIC_EXPERT_PRODUCT_STRIDE_2, uint(SEISMIC_DIM_F), 0ul), EXPERT_OPERANDS);
             const projection_weights down = routed_expert_matrix(slab_experts(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_DOWN),
                 SEISMIC_PTR(SEISMIC_BUFFER_TIER_DOWN)), source, PACKETS_W0_STACKED_ROWS, uint(SEISMIC_DIM_F));
-            projection_gemv_sums(PACKETS_W0, PACKETS_W0, false, OUTPUT_R, OUTPUT_LANES, 1u, PROJECTION_NORM_NONE, x, down, down,
-                1u, hidden, uint(SEISMIC_DIM_F), tile, totals, unused);
+            projection_gemv_sums(PACKETS_W0, PACKETS_W0, false, OUTPUT_R, OUTPUT_LANES, 1u, false, false,
+                PROJECTION_NORM_NONE, x, down, down, 1u, hidden, uint(SEISMIC_DIM_F), tile, totals, unused);
         }
     } else {
         const projection_prologue x = projection_operands(projection_plain(ROUTED_ACT,
@@ -76,8 +76,8 @@ void routed_output_projection() {
             0ul, SEISMIC_SHARED_PRODUCT_STRIDE_1, uint(SEISMIC_DIM_S), 0ul), SHARED_OPERANDS);
         const projection_weights down = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_DOWN), PACKETS_W1_ROWS, 0ul,
             uint(SEISMIC_DIM_S));
-        projection_gemv_sums(PACKETS_W1, PACKETS_W1, false, OUTPUT_R, OUTPUT_LANES, 1u, PROJECTION_NORM_NONE, x, down, down, 1u,
-            hidden, uint(SEISMIC_DIM_S), tile, totals, unused);
+        projection_gemv_sums(PACKETS_W1, PACKETS_W1, false, OUTPUT_R, OUTPUT_LANES, 1u, false, false,
+            PROJECTION_NORM_NONE, x, down, down, 1u, hidden, uint(SEISMIC_DIM_S), tile, totals, unused);
     }
     [[unroll]] for (uint r = 0u; r < PROJECTION_GEMV_MAX_R; ++r) {
         const uint n = first + r;

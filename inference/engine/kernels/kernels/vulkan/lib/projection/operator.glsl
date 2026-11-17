@@ -66,8 +66,9 @@ void projection_single_gemv(const uint maxm) {
     packets_stage_tables();
     const uint g = PROJECTION_GROUP(gl_WorkGroupID.z);
     const projection_weights w = projected_weight(g);
-    projection_gemv(PACKETS_W0, PACKETS_W0, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, maxm, PROJECTION_NORM,
-        projected_input(g), projected_output(g), w, w, PROJECTION_M, PROJECTION_N, PROJECTION_K, gl_WorkGroupID.x);
+    projection_gemv(PACKETS_W0, PACKETS_W0, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, maxm,
+        SEISMIC_TUNE_STAGE == 1, SEISMIC_TUNE_DECODE == 1, PROJECTION_NORM, projected_input(g), projected_output(g), w,
+        w, PROJECTION_M, PROJECTION_N, PROJECTION_K, gl_WorkGroupID.x);
 }
 
 // Group g's share of the split partials: SPLIT parts of M x N each.
@@ -104,9 +105,9 @@ void projection_single_finalize() {
 #ifdef PROJECTION_PAIR
 void projection_paired_gemv(const uint maxm) {
     packets_stage_tables();
-    projection_gemv(PACKETS_W0, PACKETS_W1, true, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, maxm, PROJECTION_NORM,
-        projected_input(0u), projected_output(0u), projected_weight(0u), projected_partner(0u), PROJECTION_M,
-        PROJECTION_N, PROJECTION_K, gl_WorkGroupID.x);
+    projection_gemv(PACKETS_W0, PACKETS_W1, true, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, maxm,
+        SEISMIC_TUNE_STAGE == 1, SEISMIC_TUNE_DECODE == 1, PROJECTION_NORM, projected_input(0u), projected_output(0u),
+        projected_weight(0u), projected_partner(0u), PROJECTION_M, PROJECTION_N, PROJECTION_K, gl_WorkGroupID.x);
 }
 
 // A pair's tile takes TILE_N / 2 features of each weight.
@@ -153,7 +154,8 @@ void projection_paired_gemm() {
                 projection_zero_tile(PROJECTION_OUTPUT##s, m, uint(PROJECTION_N##s), 0u, m, tile * per, per); \
             else                                                                                        \
                 projection_gemv(PROJECTION_KIND##s, PROJECTION_PARTNER_KIND##s, PROJECTION_PAIRED##s,   \
-                    SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, maxm, PROJECTION_NORM, x, PROJECTION_OUTPUT##s, \
+                    SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, maxm, SEISMIC_TUNE_STAGE == 1,               \
+                    SEISMIC_TUNE_DECODE == 1, PROJECTION_NORM, x, PROJECTION_OUTPUT##s,                 \
                     PROJECTION_WEIGHT##s, PROJECTION_PARTNER##s, m, uint(PROJECTION_N##s), PROJECTION_K, tile); \
             return;                                                                                     \
         }                                                                                               \
@@ -237,7 +239,8 @@ void projection_segmented_gemm() {
             projection_weights w = PROJECTION_WEIGHT##s;                                                \
             w.packet_first = part * (width / 32u);                                                      \
             projection_gemv(PROJECTION_KIND##s, PROJECTION_KIND##s, false, SEISMIC_TUNE_ROWS,           \
-                SEISMIC_TUNE_LANES, maxm, PROJECTION_NORM, x,                                           \
+                SEISMIC_TUNE_LANES, maxm, SEISMIC_TUNE_STAGE == 1, SEISMIC_TUNE_DECODE == 1,            \
+                PROJECTION_NORM, x,                                                                     \
                 projection_store(out_over_scratch(ELEMENT_F32, PROJECTION_PARTIALS), row, 1ul, column + first), w, w,  \
                 m, uint(PROJECTION_N##s), width, tile);                                                 \
             found = true;                                                                               \

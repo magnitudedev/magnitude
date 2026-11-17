@@ -593,7 +593,16 @@ projection dense for cuda:
 # weight takes NVFP4 operands (`operands(W)`), which the GEMV forms while
 # staging and the stage launch past 8 rows. The GEMV's shared region holds the
 # rows' squares, the NVFP4 operands' global scales and the staged packets
-# (`projection.glsl`). Every launch that decodes the weights holds its own
+# (`projection.glsl`), 72 bytes a packet row in A storage, or, under STAGE,
+# 136 as F32 (the values rounded to A: the same values, read without
+# splitting A), half as many at once; a chunk at LANES 32 would then hold no
+# packet a lane of 8 rows (LANES < 32). DECODE has the GEMV decode codes in
+# logic and adds rather than the conversion unit (exactly: a byte in the
+# mantissa of 2^23, less 2^23) and sign codes by the activations' sign bits.
+# Both keep every value and result: STAGE pays where decode bounds the GEMV
+# and costs where memory does, and DECODE pays where conversions run at a
+# fraction of the rate of adds (NVIDIA) and costs where they don't, so both
+# are tuned. Every launch that decodes the weights holds its own
 # region rounded to 8 bytes and, where every device holds that region with
 # them (its footprint, the 16-byte views' largest, within the backend's
 # floor, FLOOR_SHARED_BYTES), their grids' and codebooks' tables (their
@@ -621,14 +630,15 @@ projection dense for vulkan:
     let ORDERED_ALL = sum(W, ORDERED) / WEIGHTS
     let OPERANDS = min(1, sum(W, operands(W)))
     let GEMV_HEAD = 256 + 32 * OPERANDS
-    let GEMV_STAGING = min(8 * ceil_div(K / P, 32), 288) * 72
+    let GEMV_PACKET = 72 + 64 * STAGE
+    let GEMV_STAGING = min(8 * ceil_div(K / P, 32), 288 / (1 + STAGE)) * GEMV_PACKET
     let GEMV_SHARED = GEMV_HEAD + GEMV_STAGING
     let TABLE_SUM = sum(W, form(W, TABLE))
     let TABLE_REGION = min(1, TABLE_SUM) * (8 * ceil_div(TABLE_SUM, 8) + 4)
     let GEMV_REGION = 8 * ceil_div(GEMV_SHARED, 8)
     let GEMV_ROOM = max(FLOOR_SHARED_BYTES, GEMV_HEAD + TABLE_REGION + 16) - GEMV_HEAD - TABLE_REGION - 16
-    let GEMV_FIT = min(GEMV_STAGING, 72 * (GEMV_ROOM / 72))
-    let GEMV_FITS = min(1, TABLE_SUM) * min(1, GEMV_FIT / min(GEMV_STAGING, 8 * LANES * 72))
+    let GEMV_FIT = min(GEMV_STAGING, GEMV_PACKET * (GEMV_ROOM / GEMV_PACKET))
+    let GEMV_FITS = min(1, TABLE_SUM) * min(1, GEMV_FIT / min(GEMV_STAGING, 8 * LANES * GEMV_PACKET))
     let GEMV_HELD = GEMV_FITS * (8 * ceil_div(GEMV_HEAD + GEMV_FIT, 8) + TABLE_REGION) + (1 - GEMV_FITS) * GEMV_REGION
     let GEMM_REGION = (TILE_M + TILE_N) * 80
     let GEMM_HELD = GEMM_REGION + TABLE_REGION * (1 - min(1, 16 * ceil_div(GEMM_REGION + TABLE_REGION, 16) / (FLOOR_SHARED_BYTES + 1)))
@@ -646,8 +656,10 @@ projection dense for vulkan:
     let SPLITS = SPLIT for single
     params (SIMDGROUPS in [16, 8, 4, 2, 32] default (16 - 8 * ORDERED_ANY), ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default (16 + 16 * ORDERED_ANY * (1 - ORDERED_ALL)),
         TILE_M in [128, 64, 32] default 64, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32,
+        form STAGE in [0, 1] default 0, form DECODE in [0, 1] default 0,
         arithmetic SPLIT in [1, 2, 4] default 1 for single)
     where dense_bytes(A) == 2
+    where (STAGE == 0 or LANES < 32)
     where (ORDERED_ANY == 0 or SIMDGROUPS <= 16)
     where (ORDERED_ANY == 0 or (TILE_M == 64 and TILE_N == 128 and SUB_M == 32 and SUB_N == 32))
     where (ORDERED_ANY == 0 or SPLIT == 1) for single

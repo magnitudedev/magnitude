@@ -458,7 +458,24 @@ void packets_split_low1(uint field, out uint even, out uint odd) {
 }
 #endif
 
-vec4 packets_unsigned_bytes(uint word) { return vec4(unpack8(word)); }
+// Four bytes as exact values, unsigned or two's complement: through the
+// conversion unit, or by `arithmetic` alone (the byte in the mantissa of
+// 2^23, which 0x4b000000 | b is exactly 2^23 + b, less 2^23; a signed byte
+// with its top bit flipped is it plus 128, less 2^23 + 128): the same
+// values, the latter in logic and adds at their full rate where conversions
+// take a quarter (NVIDIA).
+vec4 packets_unsigned_bytes(uint word, const bool arithmetic) {
+    if (!arithmetic)
+        return vec4(unpack8(word));
+    return uintBitsToFloat(((uvec4(word) >> uvec4(0u, 8u, 16u, 24u)) & 0xffu) | 0x4b000000u) - 8388608.0;
+}
+
+vec4 packets_signed_bytes(uint word, const bool arithmetic) {
+    if (!arithmetic)
+        return vec4(unpack8(int(word)));
+    return uintBitsToFloat(((uvec4(word ^ 0x80808080u) >> uvec4(0u, 8u, 16u, 24u)) & 0xffu) | 0x4b000000u)
+        - 8388736.0;
+}
 
 // ---------------------------------------------------------------------------
 // Interpretations of codes (`registry::CodeInterpretation`): four codes, a
@@ -514,13 +531,15 @@ vec4 packets_e4m3(uint bytes) {
 
 // Four codes, a byte each, as exact values, offset codes less their offset
 // where `centred` (per byte: 128 + code - offset, without borrows, with its
-// top bit flipped: code - offset as a signed byte).
-vec4 packets_interpret(const int kind, uint bytes, const bool centred) {
+// top bit flipped: code - offset as a signed byte); `arithmetic` as
+// `packets_unsigned_bytes`.
+vec4 packets_interpret(const int kind, uint bytes, const bool centred, const bool arithmetic) {
     const int interpretation = PACKETS_AXIS(kind, SEISMIC_AXIS_CODES);
 #if PACKETS_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_OFFSET)
     if (centred && interpretation == SEISMIC_CODES_OFFSET)
-        return vec4(unpack8(int(((bytes | 0x80808080u) - uint(PACKETS_AXIS(kind, SEISMIC_AXIS_CODES_OFFSET)) * 0x01010101u)
-            ^ 0x80808080u)));
+        return packets_signed_bytes(
+            ((bytes | 0x80808080u) - uint(PACKETS_AXIS(kind, SEISMIC_AXIS_CODES_OFFSET)) * 0x01010101u) ^ 0x80808080u,
+            arithmetic);
 #endif
 #if PACKETS_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_TABLE)
     if (interpretation == SEISMIC_CODES_TABLE)
@@ -529,17 +548,18 @@ vec4 packets_interpret(const int kind, uint bytes, const bool centred) {
 #endif
 #if PACKETS_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_TWOS)
     if (interpretation == SEISMIC_CODES_TWOS)
-        return vec4(unpack8(int(bytes)));
+        return packets_signed_bytes(bytes, arithmetic);
 #endif
 #if PACKETS_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_ODD)
     if (interpretation == SEISMIC_CODES_ODD)
-        return 2.0 * packets_unsigned_bytes(bytes) + float(1 - 2 * PACKETS_AXIS(kind, SEISMIC_AXIS_CODES_OFFSET));
+        return 2.0 * packets_unsigned_bytes(bytes, arithmetic)
+            + float(1 - 2 * PACKETS_AXIS(kind, SEISMIC_AXIS_CODES_OFFSET));
 #endif
 #if PACKETS_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_E4M3)
     if (interpretation == SEISMIC_CODES_E4M3)
         return packets_e4m3(bytes);
 #endif
-    return packets_unsigned_bytes(bytes);
+    return packets_unsigned_bytes(bytes, arithmetic);
 }
 
 // ---------------------------------------------------------------------------
@@ -656,22 +676,25 @@ uint packets_grid_whole_entry(const int kind, packets_packet packet, uint step) 
 
 // The eight codes of `point` under sign bits `signs` (seven completed by an
 // eighth of even parity unless the slot's `form` is another), as
-// (0,2,4,6), (1,3,5,7); a slot of signed points has no signs.
+// (0,2,4,6), (1,3,5,7); a slot of signed points has no signs; `arithmetic`
+// as `packets_unsigned_bytes`.
 void packets_grid_codes(uvec2 point, uint signs,
 #if PACKETS_SOME(PACKETS_GRID_UNPARITIED)
     const int form,
 #endif
-    out vec4 even, out vec4 odd) {
+    const bool arithmetic, out vec4 even, out vec4 odd) {
 #if PACKETS_SOME(PACKETS_GRID_UNPARITIED)
     if (form == SEISMIC_GRID_SIGNS_PARITY_PLUS7)
 #endif
     signs |= (uint(bitCount(signs)) & 1u) << 7;
 #if PACKETS_SOME(PACKETS_GRID_SIGNED_POINTS)
     const bool magnitudes = form != SEISMIC_GRID_SIGNS_NONE;
-    const vec4 low = magnitudes ? packets_unsigned_bytes(point.x) : vec4(unpack8(int(point.x)));
-    const vec4 high = magnitudes ? packets_unsigned_bytes(point.y) : vec4(unpack8(int(point.y)));
+    const vec4 low =
+        magnitudes ? packets_unsigned_bytes(point.x, arithmetic) : packets_signed_bytes(point.x, arithmetic);
+    const vec4 high =
+        magnitudes ? packets_unsigned_bytes(point.y, arithmetic) : packets_signed_bytes(point.y, arithmetic);
 #else
-    const vec4 low = packets_unsigned_bytes(point.x), high = packets_unsigned_bytes(point.y);
+    const vec4 low = packets_unsigned_bytes(point.x, arithmetic), high = packets_unsigned_bytes(point.y, arithmetic);
 #endif
     even = uintBitsToFloat(floatBitsToUint(vec4(low.x, low.z, high.x, high.z)) ^
                            (((uvec4(signs) >> uvec4(0u, 2u, 4u, 6u)) & 1u) << 31));
@@ -1025,9 +1048,9 @@ void packets_high_codes(const int kind, packets_packet packet, uint step, uint l
 
 // The codes of sub-step `step` (elements 8 step ..) as (0,2,4,6), (1,3,5,7),
 // offset codes less their offset where `centred` (a dense packet's are its
-// values).
-void packets_decode(const int kind, packets_packet packet, uint step, const bool centred, out vec4 even,
-    out vec4 odd) {
+// values); `arithmetic` as `packets_unsigned_bytes`.
+void packets_decode(const int kind, packets_packet packet, uint step, const bool centred, const bool arithmetic,
+    out vec4 even, out vec4 odd) {
 #if PACKETS_ANY_DENSE
     if (packets_dense(kind)) {
         const uint first = 8u * step;
@@ -1056,7 +1079,7 @@ void packets_decode(const int kind, packets_packet packet, uint step, const bool
 #if PACKETS_SOME(PACKETS_GRID_UNPARITIED)
             PACKETS_AXIS(kind, SEISMIC_AXIS_CODES_GRID_SIGNS),
 #endif
-            even, odd);
+            arithmetic, even, odd);
 #if PACKETS_SOME(PACKETS_GRID_DELTA)
         if (PACKETS_AXIS(kind, SEISMIC_AXIS_CODES_GRID_DELTA) != 0) {
             // The delta bit, past the signs: 2^DELTA_EXPONENT v + 1, or - 1.
@@ -1073,8 +1096,8 @@ void packets_decode(const int kind, packets_packet packet, uint step, const bool
     if (PACKETS_AXIS(kind, SEISMIC_AXIS_CODE_LOW_BITS) == 8) {
         const uvec4 words = step < 2u ? packet.low : packet.second;
         const uint base = (step & 1u) * 2u;
-        const vec4 a = packets_interpret(kind, words[base], centred);
-        const vec4 b = packets_interpret(kind, words[base + 1u], centred);
+        const vec4 a = packets_interpret(kind, words[base], centred, arithmetic);
+        const vec4 b = packets_interpret(kind, words[base + 1u], centred, arithmetic);
         even = vec4(a.x, a.z, b.x, b.z);
         odd = vec4(a.y, a.w, b.y, b.w);
         return;
@@ -1086,8 +1109,8 @@ void packets_decode(const int kind, packets_packet packet, uint step, const bool
         uint e, o;
         packets_split_low2((packet.low[step >> 1] >> (16u * (step & 1u))) & 0xffffu, e, o);
         packets_high_codes(kind, packet, step, 2u, e, o);
-        even = packets_interpret(kind, e, centred);
-        odd = packets_interpret(kind, o, centred);
+        even = packets_interpret(kind, e, centred, arithmetic);
+        odd = packets_interpret(kind, o, centred, arithmetic);
         return;
     }
 #endif
@@ -1097,8 +1120,8 @@ void packets_decode(const int kind, packets_packet packet, uint step, const bool
         uint e, o;
         packets_split_low1((packet.low.x >> (8u * step)) & 0xffu, e, o);
         packets_high_codes(kind, packet, step, 1u, e, o);
-        even = packets_interpret(kind, e, centred);
-        odd = packets_interpret(kind, o, centred);
+        even = packets_interpret(kind, e, centred, arithmetic);
+        odd = packets_interpret(kind, o, centred, arithmetic);
         return;
     }
 #endif
@@ -1113,14 +1136,38 @@ void packets_decode(const int kind, packets_packet packet, uint step, const bool
     if (PACKETS_AXIS(kind, SEISMIC_AXIS_CODE_HIGH_BITS) == 2)
         packets_split_high2((packet.high[step >> 1] >> (16u * (step & 1u))) & 0xffffu, he, ho);
 #endif
-    even = packets_interpret(kind, (word & 0x0f0f0f0fu) | he, centred);
-    odd = packets_interpret(kind, ((word >> 4) & 0x0f0f0f0fu) | ho, centred);
+    even = packets_interpret(kind, (word & 0x0f0f0f0fu) | he, centred, arithmetic);
+    odd = packets_interpret(kind, ((word >> 4) & 0x0f0f0f0fu) | ho, centred, arithmetic);
 #endif
 }
 
-// The codes of sub-step `step`, for factored dot products (`packets_bias`).
-void packets_codes(const int kind, packets_packet packet, uint step, out vec4 even, out vec4 odd) {
-    packets_decode(kind, packet, step, false, even, odd);
+// The codes of sub-step `step`, for factored dot products (`packets_bias`);
+// `arithmetic` as `packets_unsigned_bytes`.
+void packets_codes(const int kind, packets_packet packet, uint step, const bool arithmetic, out vec4 even,
+    out vec4 odd) {
+    packets_decode(kind, packet, step, false, arithmetic, even, odd);
+}
+
+// Whether `kind`'s codes are signs: one bit each, odd codes 2 (c - 1) + 1,
+// -1 or +1.
+bool packets_signs(const int kind) {
+#if PACKETS_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 1) && PACKETS_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_ODD)
+    return PACKETS_AXIS(kind, SEISMIC_AXIS_FORM) == SEISMIC_FORM_ROWS
+        && PACKETS_AXIS(kind, SEISMIC_AXIS_CODE_LOW_BITS) == 1 && PACKETS_AXIS(kind, SEISMIC_AXIS_CODE_HIGH_BITS) == 0
+        && PACKETS_AXIS(kind, SEISMIC_AXIS_CODES) == SEISMIC_CODES_ODD
+        && PACKETS_AXIS(kind, SEISMIC_AXIS_CODES_OFFSET) == 1;
+#else
+    return false;
+#endif
+}
+
+// A signs kind's codes of sub-step `step` as float sign bits, (0,2,4,6),
+// (1,3,5,7): bit 31 where the code is -1, so that a value XORed with it is
+// the value times the code, exactly (element i is the sub-step's bit i).
+void packets_sign_masks(packets_packet packet, uint step, out uvec4 even, out uvec4 odd) {
+    const uint negative = ~(packet.low.x >> (8u * step));
+    even = (uvec4(negative) << uvec4(31u, 29u, 27u, 25u)) & 0x80000000u;
+    odd = (uvec4(negative) << uvec4(30u, 28u, 26u, 24u)) & 0x80000000u;
 }
 
 float packets_scale(const int kind, packets_packet packet, uint step) {
@@ -1156,7 +1203,7 @@ float packets_value(const int kind, packets_packet packet, uint step, float code
 // bias or an offset code's exact bias (`packets_bias`), so a value of zero
 // is +0. Codes are not centred: the offset costs nothing past the fma.
 void packets_values(const int kind, packets_packet packet, uint step, out vec4 even, out vec4 odd) {
-    packets_decode(kind, packet, step, false, even, odd);
+    packets_decode(kind, packet, step, false, false, even, odd);
     if (packets_dense(kind))
         return;
     const float scale = packets_scale(kind, packet, step);
@@ -1176,7 +1223,7 @@ void packets_values(const int kind, packets_packet packet, uint step, out vec4 e
 // The logical values of sub-step `step` exactly, as a gather publishes
 // them (`packets_value`): a zero keeps the sign of scale * 0.
 void packets_exact_values(const int kind, packets_packet packet, uint step, out vec4 even, out vec4 odd) {
-    packets_decode(kind, packet, step, true, even, odd);
+    packets_decode(kind, packet, step, true, false, even, odd);
     [[unroll]] for (uint i = 0u; i < 4u; ++i) {
         even[i] = packets_value(kind, packet, step, even[i]);
         odd[i] = packets_value(kind, packet, step, odd[i]);
@@ -1187,7 +1234,7 @@ void packets_exact_values(const int kind, packets_packet packet, uint step, out 
 // its centred code, then its value.
 float packets_value_at(const int kind, packets_packet packet, uint i) {
     vec4 even, odd;
-    packets_decode(kind, packet, i >> 3, true, even, odd);
+    packets_decode(kind, packet, i >> 3, true, false, even, odd);
     const uint lane = (i & 7u) >> 1;
     return packets_value(kind, packet, i >> 3, (i & 1u) != 0u ? odd[lane] : even[lane]);
 }

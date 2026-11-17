@@ -57,8 +57,8 @@ void routed_down_choice(const uint64_t m, const uint64_t k, const uint tile, out
         0ul, SEISMIC_PRODUCT_STRIDE_2, uint(SEISMIC_DIM_F), 0ul), DOWN_OPERANDS);
     const projection_weights down = routed_expert_matrix(slab_experts(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_DOWN),
         SEISMIC_PTR(SEISMIC_BUFFER_TIER_DOWN)), source, PACKETS_W0_STACKED_ROWS, uint(SEISMIC_DIM_F));
-    projection_gemv_sums(PACKETS_W0, PACKETS_W0, false, DOWN_R, DOWN_LANES, 1u, PROJECTION_NORM_NONE, x, down, down, 1u,
-        hidden, uint(SEISMIC_DIM_F), tile, totals, unused);
+    projection_gemv_sums(PACKETS_W0, PACKETS_W0, false, DOWN_R, DOWN_LANES, 1u, false, false, PROJECTION_NORM_NONE, x,
+        down, down, 1u, hidden, uint(SEISMIC_DIM_F), tile, totals, unused);
 }
 
 #ifdef ROUTED_PROJECTED_PUT

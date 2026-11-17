@@ -59,7 +59,8 @@
 //   GEMV   PROJECTION_GEMV_SQUARES_BYTES (row-norm partial squares), the
 //          NVFP4 operand rows' global scales (PROJECTION_GEMV_GLOBALS_BYTES,
 //          only when the weights take NVFP4 operands), then the staging:
-//          min(8 * ceil_div(K, 32), 288) * 72
+//          min(8 * ceil_div(K, 32), 288) * 72, or, staged as F32,
+//          min(8 * ceil_div(K, 32), 144) * 136
 //   GEMM   (TM + TN) * 80 (the f16 A and B tiles, rows padded to 40)
 //   stage pre-pass: 128 (one partial per subgroup)
 //
@@ -512,17 +513,47 @@ uint projection_gemv_stage_word(projection_prologue in_) {
                + (in_.operands == PROJECTION_OPERANDS_NVFP4 ? PROJECTION_GEMV_GLOBALS_BYTES : 0)) / 16u;
 }
 
-// The packets of every activation row the GEMV stages at once, 72 bytes
-// each (their values and two 16-column sums a row): PROJECTION_GEMV_STAGE_PACKETS,
-// or, where the launch holds its weights' tables at its region's end
-// (`packets_held`), what the region holds before them, which its declaration
-// sizes to at least 8 * LANES (`dense.seismic`).
-uint projection_gemv_stage_packets(projection_prologue in_) {
+// A staged packet's bytes a row: its values in A storage, or as F32 where
+// `f32`, and its two 16-column sums.
+uint projection_gemv_packet_bytes(const bool f32) {
+    return f32 ? 136u : 72u;
+}
+
+// The packets of every activation row the GEMV stages at once:
+// PROJECTION_GEMV_STAGE_PACKETS (half of them where `f32`), or, where the
+// launch holds its weights' tables at its region's end (`packets_held`),
+// what the region holds before them, which its declaration sizes to at
+// least 8 * LANES (`dense.seismic`).
+uint projection_gemv_stage_packets(projection_prologue in_, const bool f32) {
+    const uint most = f32 ? PROJECTION_GEMV_STAGE_PACKETS / 2u : PROJECTION_GEMV_STAGE_PACKETS;
 #if defined(PACKETS_STAGING)
     if (packets_held)
-        return min(PROJECTION_GEMV_STAGE_PACKETS, (4u * PACKETS_TABLES_AT - 16u * projection_gemv_stage_word(in_)) / 72u);
+        return min(most,
+            (4u * PACKETS_TABLES_AT - 16u * projection_gemv_stage_word(in_)) / projection_gemv_packet_bytes(f32));
 #endif
-    return PROJECTION_GEMV_STAGE_PACKETS;
+    return most;
+}
+
+// The staging's uvec4 of activation row m's eight values at step `step` of
+// chunk-local packet `local`: in A storage, or, where `f32`, the even values
+// as F32 there and the odd ones `chunk` on.
+uint projection_gemv_x_word(const bool f32, uint word, uint m, uint step, uint chunk, uint local) {
+    return word + (f32 ? 2u : 1u) * (m * 4u + step) * chunk + local;
+}
+
+// The staging's float of the first of the packets' 16-column sums.
+uint projection_gemv_sums_float(const bool f32, uint word, const uint maxm, uint chunk) {
+    return 4u * (word + (f32 ? 8u : 4u) * maxm * chunk);
+}
+
+// The eight staged values at `at` (`projection_gemv_x_word`).
+void projection_gemv_x8(const int act, const bool f32, uint at, uint chunk, out vec4 xe, out vec4 xo) {
+    if (f32) {
+        xe = uintBitsToFloat(seismic_shared_uvec4[at]);
+        xo = uintBitsToFloat(seismic_shared_uvec4[at + chunk]);
+    } else {
+        element_split8(act, seismic_shared_uvec4[at], xe, xo);
+    }
 }
 // The register arrays are sized for the largest R and bound; every loop over
 // weight rows runs to `r_rows` and every loop over activation rows to `maxm`,
@@ -611,11 +642,12 @@ void projection_gemv_prologue8(projection_prologue in_, const int norm, uint m, 
 // Stage packets first .. first + count of every activation row: one
 // invocation per eight columns (row m, packet, step); the four steps of a
 // packet sit on adjacent lanes, which add their sums pairwise into the
-// packet's two 16-column sums.
-void projection_gemv_stage(projection_prologue in_, const int norm, const uint maxm, uint m_rows, uint first,
-    uint count, uint chunk) {
+// packet's two 16-column sums. Where `f32`, the values are rounded to A and
+// stored as F32, the same values a reader takes without splitting A.
+void projection_gemv_stage(projection_prologue in_, const int norm, const uint maxm, const bool f32, uint m_rows,
+    uint first, uint count, uint chunk) {
     const uint word = projection_gemv_stage_word(in_);
-    const uint sums = 4u * (word + 4u * maxm * chunk);
+    const uint sums = projection_gemv_sums_float(f32, word, maxm, chunk);
     for (uint item = gl_LocalInvocationIndex; item < 4u * m_rows * count; item += gl_WorkGroupSize.x) {
         const uint step = item & 3u, packet = item >> 2;
         // Under the bound 1 every packet is of row 0, without a division.
@@ -623,7 +655,15 @@ void projection_gemv_stage(projection_prologue in_, const int norm, const uint m
         const uint local = maxm == 1u ? packet : packet - m * count;
         vec4 even, odd;
         projection_gemv_prologue8(in_, norm, m, 32u * (first + local) + 8u * step, even, odd);
-        seismic_shared_uvec4[word + (m * 4u + step) * chunk + local] = element_pack8(in_.act, even, odd);
+        const uint at = projection_gemv_x_word(f32, word, m, step, chunk, local);
+        if (f32) {
+            vec4 e, o;
+            element_split8(in_.act, element_pack8(in_.act, even, odd), e, o);
+            seismic_shared_uvec4[at] = floatBitsToUint(e);
+            seismic_shared_uvec4[at + chunk] = floatBitsToUint(o);
+        } else {
+            seismic_shared_uvec4[at] = element_pack8(in_.act, even, odd);
+        }
         const vec4 pair = even + odd;
         float sum = (pair.x + pair.y) + (pair.z + pair.w);
         sum += subgroupShuffleXor(sum, 1u);
@@ -658,42 +698,60 @@ float projection_dot8(vec4 ce, vec4 co, vec4 xe, vec4 xo) {
     return seismic_fma_rn(co.w, xo.w, sum);
 }
 
+// The dot product of sub-step `step` of `packet`'s codes with eight
+// activations: the codes decoded (`arithmetic` as `packets_unsigned_bytes`)
+// into projection_dot8, or, for codes that are signs decoded by
+// `arithmetic`, the activations with their signs flipped where a code is -1
+// and added in the same order: a sign's product is exact, so the roundings
+// are projection_dot8's.
+float projection_code_dot8(const int kind, packets_packet packet, uint step, const bool arithmetic, vec4 xe, vec4 xo) {
+    if (arithmetic && packets_signs(kind)) {
+        uvec4 me, mo;
+        packets_sign_masks(packet, step, me, mo);
+        const vec4 e = uintBitsToFloat(floatBitsToUint(xe) ^ me), o = uintBitsToFloat(floatBitsToUint(xo) ^ mo);
+        return ((((((e.x + o.x) + e.y) + o.y) + e.z) + o.z) + e.w) + o.w;
+    }
+    vec4 ce, co;
+    packets_codes(kind, packet, step, arithmetic, ce, co);
+    return projection_dot8(ce, co, xe, xo);
+}
+
 // Accumulate one loaded packet (chunk-local `local`) for every activation row
-// of the staging from uvec4 `word`.
+// of the staging from uvec4 `word` (as F32 where `f32`), its codes decoded by
+// `arithmetic` where asked (`packets_unsigned_bytes`).
 void projection_gemv_accumulate(const int wk, const int uk, const bool paired, const uint r_rows, const uint maxm,
-    const int act, inout float acc[PROJECTION_GEMV_SUMS], inout float acc2[PROJECTION_GEMV_SUMS],
-    packets_packet a[PROJECTION_GEMV_MAX_R], packets_packet b[PROJECTION_GEMV_MAX_R], uint local, uint m_rows,
-    uint chunk, uint word) {
-    const uint sums = 4u * (word + 4u * maxm * chunk);
+    const bool f32, const bool arithmetic, const int act, inout float acc[PROJECTION_GEMV_SUMS],
+    inout float acc2[PROJECTION_GEMV_SUMS], packets_packet a[PROJECTION_GEMV_MAX_R],
+    packets_packet b[PROJECTION_GEMV_MAX_R], uint local, uint m_rows, uint chunk, uint word) {
+    const uint sums = projection_gemv_sums_float(f32, word, maxm, chunk);
     [[unroll]] for (uint step = 0u; step < 4u; ++step) {
         if (maxm == 1u) {
             // One activation row: each weight row's codes are decoded where
             // they are used, never held for all R rows at once.
             if (m_rows > 0u) {
                 vec4 xe, xo;
-                element_split8(act, seismic_shared_uvec4[word + step * chunk + local], xe, xo);
+                projection_gemv_x8(act, f32, projection_gemv_x_word(f32, word, 0u, step, chunk, local), chunk, xe, xo);
                 [[unroll]] for (uint r = 0u; r < r_rows; ++r) {
                     const uint at = r * PROJECTION_GEMV_MAX_M;
-                    vec4 ce, co;
-                    packets_codes(wk, a[r], step, ce, co);
-                    acc[at] = seismic_fma_rn(packets_scale(wk, a[r], step), projection_dot8(ce, co, xe, xo), acc[at]);
-                    if (paired) {
-                        packets_codes(uk, b[r], step, ce, co);
-                        acc2[at] = seismic_fma_rn(packets_scale(uk, b[r], step), projection_dot8(ce, co, xe, xo), acc2[at]);
-                    }
+                    acc[at] = seismic_fma_rn(packets_scale(wk, a[r], step),
+                        projection_code_dot8(wk, a[r], step, arithmetic, xe, xo), acc[at]);
+                    if (paired)
+                        acc2[at] = seismic_fma_rn(packets_scale(uk, b[r], step),
+                            projection_code_dot8(uk, b[r], step, arithmetic, xe, xo), acc2[at]);
                 }
             }
         } else {
             vec4 ae[PROJECTION_GEMV_MAX_R], ao[PROJECTION_GEMV_MAX_R], be[PROJECTION_GEMV_MAX_R], bo[PROJECTION_GEMV_MAX_R];
             [[unroll]] for (uint r = 0u; r < r_rows; ++r) {
-                packets_codes(wk, a[r], step, ae[r], ao[r]);
+                packets_codes(wk, a[r], step, arithmetic, ae[r], ao[r]);
                 if (paired)
-                    packets_codes(uk, b[r], step, be[r], bo[r]);
+                    packets_codes(uk, b[r], step, arithmetic, be[r], bo[r]);
             }
             [[unroll]] for (uint m = 0u; m < maxm; ++m) {
                 if (m < m_rows) {
                     vec4 xe, xo;
-                    element_split8(act, seismic_shared_uvec4[word + (m * 4u + step) * chunk + local], xe, xo);
+                    projection_gemv_x8(act, f32, projection_gemv_x_word(f32, word, m, step, chunk, local), chunk, xe,
+                        xo);
                     [[unroll]] for (uint r = 0u; r < r_rows; ++r) {
                         const uint at = r * PROJECTION_GEMV_MAX_M + m;
                         acc[at] = seismic_fma_rn(packets_scale(wk, a[r], step), projection_dot8(ae[r], ao[r], xe, xo), acc[at]);
@@ -740,13 +798,14 @@ void projection_gemv_accumulate(const int wk, const int uk, const bool paired, c
 // weight rows (from projection_gemv_first_row) and every activation row, at
 // totals[r * PROJECTION_GEMV_MAX_M + m] (totals2: the paired weight).
 void projection_gemv_sums(const int wk, const int uk, const bool paired, const uint r_rows, const uint lanes,
-    const uint maxm, const int norm, projection_prologue in_, projection_weights w, projection_weights u, uint m_rows,
-    uint rows, uint k, uint tile, out float totals[PROJECTION_GEMV_SUMS], out float totals2[PROJECTION_GEMV_SUMS]) {
+    const uint maxm, const bool f32, const bool arithmetic, const int norm, projection_prologue in_,
+    projection_weights w, projection_weights u, uint m_rows, uint rows, uint k, uint tile,
+    out float totals[PROJECTION_GEMV_SUMS], out float totals2[PROJECTION_GEMV_SUMS]) {
     const uint sub = SEISMIC_LANE % lanes;
     const uint packets = (k + 31u) / 32u;
     // Every packet at once where the staging holds them, else a multiple of
     // LANES of them.
-    const uint staged = projection_gemv_stage_packets(in_) / maxm;
+    const uint staged = projection_gemv_stage_packets(in_, f32) / maxm;
     const uint chunk = staged >= packets ? packets : staged / lanes * lanes;
     const bool double_buffer = !paired || maxm == 1u;
     packets_packet current_a[PROJECTION_GEMV_MAX_R], current_b[PROJECTION_GEMV_MAX_R];
@@ -767,7 +826,7 @@ void projection_gemv_sums(const int wk, const int uk, const bool paired, const u
         // The previous chunk's or call's reads of the staging finish before
         // this one writes it (and the row-norm squares become visible).
         barrier();
-        projection_gemv_stage(in_, norm, maxm, m_rows, first, count, chunk);
+        projection_gemv_stage(in_, norm, maxm, f32, m_rows, first, count, chunk);
         barrier();
         // Recomputed from builtins rather than held across the chunk loop.
         const uint first_row = projection_gemv_first_row(r_rows, lanes, tile);
@@ -790,8 +849,8 @@ void projection_gemv_sums(const int wk, const int uk, const bool paired, const u
                         if (more)
                             projection_gemv_load(wk, uk, paired, r_rows, w, u, first_row, rows, first + local + lanes,
                                 next_a, next_b);
-                        projection_gemv_accumulate(wk, uk, paired, r_rows, maxm, in_.act, acc, acc2, current_a,
-                            current_b, local, m_rows, chunk, projection_gemv_stage_word(in_));
+                        projection_gemv_accumulate(wk, uk, paired, r_rows, maxm, f32, arithmetic, in_.act, acc, acc2,
+                            current_a, current_b, local, m_rows, chunk, projection_gemv_stage_word(in_));
                         if (more) {
                             current_a = next_a;
                             current_b = next_b;
@@ -799,8 +858,8 @@ void projection_gemv_sums(const int wk, const int uk, const bool paired, const u
                     } else {
                         packets_packet a[PROJECTION_GEMV_MAX_R], b[PROJECTION_GEMV_MAX_R];
                         projection_gemv_load(wk, uk, paired, r_rows, w, u, first_row, rows, first + local, a, b);
-                        projection_gemv_accumulate(wk, uk, paired, r_rows, maxm, in_.act, acc, acc2, a, b, local,
-                            m_rows, chunk, projection_gemv_stage_word(in_));
+                        projection_gemv_accumulate(wk, uk, paired, r_rows, maxm, f32, arithmetic, in_.act, acc, acc2,
+                            a, b, local, m_rows, chunk, projection_gemv_stage_word(in_));
                     }
                 }
             }
@@ -824,9 +883,12 @@ void projection_gemv_sums(const int wk, const int uk, const bool paired, const u
 
 // The GEMV of one segment: weight kinds `wk` (and `uk` of the up weights when
 // paired), R rows per lane group, LANES lanes per group, and the
-// activation-row bound `maxm` (1, 2, 4 or 8; m_rows <= maxm): the sums, then
-// the epilogue of each (weight row, activation row) from one lane of its
-// group. Rms prologues first reduce their rows' squares (norm SHARED). Every
+// activation-row bound `maxm` (1, 2, 4 or 8; m_rows <= maxm), activations
+// staged as F32 where `f32` (`projection_gemv_stage`) and codes decoded by
+// `arithmetic` where asked (`packets_unsigned_bytes`, and signs by the
+// activations' sign bits, `projection_code_dot8`): the sums, then the
+// epilogue of each (weight row, activation row) from one lane of its group.
+// Rms prologues first reduce their rows' squares (norm SHARED). Every
 // invocation of the workgroup must call it (it contains barriers).
 //
 // One bound per pipeline: every call passes `maxm` as a literal, and an entry
@@ -837,12 +899,13 @@ void projection_gemv_sums(const int wk, const int uk, const bool paired, const u
 // create (dense_expand, rtx3090), against about 1 s for one bound, while a
 // single bound of 8 for every row count lost 16% of one-row decode bandwidth.
 void projection_gemv(const int wk, const int uk, const bool paired, const uint r_rows, const uint lanes,
-    const uint maxm, const int norm, projection_prologue in_, projection_epilogue out_, projection_weights w,
-    projection_weights u, uint m_rows, uint rows, uint k, uint tile) {
+    const uint maxm, const bool f32, const bool arithmetic, const int norm, projection_prologue in_,
+    projection_epilogue out_, projection_weights w, projection_weights u, uint m_rows, uint rows, uint k, uint tile) {
     if (norm == PROJECTION_NORM_SHARED)
         projection_gemv_squares(in_, m_rows);
     float totals[PROJECTION_GEMV_SUMS], totals2[PROJECTION_GEMV_SUMS];
-    projection_gemv_sums(wk, uk, paired, r_rows, lanes, maxm, norm, in_, w, u, m_rows, rows, k, tile, totals, totals2);
+    projection_gemv_sums(wk, uk, paired, r_rows, lanes, maxm, f32, arithmetic, norm, in_, w, u, m_rows, rows, k, tile,
+        totals, totals2);
     const uint sub = SEISMIC_LANE % lanes;
     const uint first_row = projection_gemv_first_row(r_rows, lanes, tile);
     [[unroll]] for (uint r = 0u; r < r_rows; ++r) {
