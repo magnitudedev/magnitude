@@ -46,6 +46,12 @@ const quickState = (check: Result.Result<HuggingFaceRepositoryCheck, unknown>): 
  * repository offering the quant it recommends for this machine until it is opened, fully checked in the background
  * when `prefetched`.
  */
+/** What a search's schedule has read: each listed repository's quick check it has read, and those it fully checked. */
+interface SearchSchedule {
+  readonly checks: ReadonlyMap<string, Result.Result<HuggingFaceRepositoryCheck, unknown>>
+  readonly full: ReadonlySet<string>
+}
+
 const searchRow = (result: HuggingFaceSearchResult, check: Result.Result<HuggingFaceRepositoryCheck, unknown>, prefetched: boolean, retry: () => void, memory: ServingMemory): ExploreRow | null => {
   const developer = Option.getOrNull(result.developer)
   const named = { key: result.repository, name: result.displayName, lab: developer ? labForDeveloper(developer.lab) : undefined }
@@ -216,13 +222,14 @@ function useSearchResults(settled: string, query: string, memory: ServingMemory,
     setPages({ query: settled, cursor: next, shown: [...current.shown, ...listed.results] })
   }
   const listedResults = useMemo(() => [...current.shown, ...(listed?.results ?? [])], [current.shown, listed])
-  const schedule = useAtomValue(useMemo(() => Atom.make((get) => {
+  const schedule = useAtomValue(useMemo(() => Atom.make((get): SearchSchedule => {
     const byKey = new Map<string, HuggingFaceSearchResult>(listedResults.map(result => [result.repository, result]))
     const checks = new Map<string, Result.Result<HuggingFaceRepositoryCheck, unknown>>()
     const full = new Set<string>()
     readSearchChecks({
       listed: listedResults.map(result => result.repository),
       visible: get(visible),
+      read: new Set(Option.match(get.self<SearchSchedule>(), { onNone: () => [], onSome: previous => [...previous.checks.keys()] })),
       quick: (key) => {
         const check = get(client.Models.CheckHuggingFaceRepository(checkInput(byKey.get(key)!))).result
         checks.set(key, check)

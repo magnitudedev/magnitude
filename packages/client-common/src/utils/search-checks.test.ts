@@ -8,12 +8,14 @@ const reads = (input: {
   readonly visible: readonly string[]
   readonly quick?: Readonly<Record<string, QuickSearchCheck>>
   readonly full?: ReadonlySet<string>
+  readonly read?: readonly string[]
 }) => {
   const quick: string[] = []
   const full: string[] = []
   readSearchChecks({
     listed,
     visible: new Set(input.visible),
+    read: new Set(input.read ?? []),
     quick: key => { quick.push(key); return input.quick?.[key] ?? "Running" },
     full: key => { full.push(key); return input.full?.has(key) ?? false },
   })
@@ -59,5 +61,22 @@ describe("readSearchChecks", () => {
     const { quick, full } = reads({ visible: range(20, 27), quick: settled(range(0, 15), "Runnable") })
     expect(quick).toEqual(range(20, 20 + QUICK_SEARCH_CHECKS))
     expect(full).toEqual([])
+  })
+
+  it("keeps reading a check read before once its row leaves the screen, so what it found stays known", () => {
+    // repo-2 settled as not running here: its row is hidden, so it leaves `visible` and falls out of the order.
+    const { quick } = reads({ visible: [...range(0, 2), ...range(3, 7)], quick: settled(range(0, 15), "Settled"), read: ["repo-2"] })
+    expect(quick).toContain("repo-2")
+  })
+
+  it("starts no check only because it is in no order, unless it was read before", () => {
+    const { quick } = reads({ visible: range(0, 7), read: ["repo-40"] })
+    expect(quick).toEqual(["repo-40", ...range(0, QUICK_SEARCH_CHECKS - 1)])
+  })
+
+  it("counts the running checks of rows that left the screen toward the quick checks run at once", () => {
+    const hidden = range(40, 40 + QUICK_SEARCH_CHECKS)
+    const { quick } = reads({ visible: range(0, 7), read: hidden })
+    expect(quick.filter(key => !hidden.includes(key))).toEqual([])
   })
 })

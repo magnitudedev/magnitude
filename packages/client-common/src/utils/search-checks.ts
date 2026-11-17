@@ -29,21 +29,33 @@ export const searchCheckOrder = (listed: readonly string[], visible: ReadonlySet
  * what should run is read. Quick checks come first: in `searchCheckOrder`, every settled one, and the unsettled up to
  * `QUICK_SEARCH_CHECKS`. Once every repository in that order has its quick check running or settled, the ones that run
  * here have their full checks read, in the same order, up to `FULL_SEARCH_CHECKS` unsettled. Scrolling changes the
- * order, so the repositories newly on screen take the quick checks' turns again.
+ * order, so the repositories newly on screen take the quick checks' turns again. A quick check `read` before is read
+ * again first, wherever the order now stands: it has started already, so reading it runs nothing new, what it found
+ * stays known whether or not its row is on screen, and while it runs it holds one of the quick checks' turns.
  */
 export const readSearchChecks = (input: {
   readonly listed: readonly string[]
   readonly visible: ReadonlySet<string>
+  readonly read: ReadonlySet<string>
   readonly quick: (key: string) => QuickSearchCheck
   readonly full: (key: string) => boolean
 }): void => {
-  const order = searchCheckOrder(input.listed, input.visible)
-  const runnable: string[] = []
+  const checks = new Map<string, QuickSearchCheck>()
   let running = 0
-  for (const key of order) {
-    if (running === QUICK_SEARCH_CHECKS) return
+  for (const key of input.listed) {
+    if (!input.read.has(key)) continue
     const check = input.quick(key)
+    checks.set(key, check)
     if (check === "Running") running += 1
+  }
+  const runnable: string[] = []
+  for (const key of searchCheckOrder(input.listed, input.visible)) {
+    let check = checks.get(key)
+    if (check === undefined) {
+      if (running >= QUICK_SEARCH_CHECKS) return
+      check = input.quick(key)
+      if (check === "Running") running += 1
+    }
     if (check === "Runnable") runnable.push(key)
   }
   let fullRunning = 0
