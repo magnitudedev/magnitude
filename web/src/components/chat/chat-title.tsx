@@ -5,7 +5,7 @@ import { useAgentClient } from "@magnitudedev/client-common"
 import type { SessionId } from "@magnitudedev/sdk"
 import { CHAT_TITLE_MAX_LENGTH, renameOf } from "./rename"
 
-const TITLE_CLASS = "min-w-0 font-heading text-[24px] font-semibold tracking-tight md:text-[28px]"
+const TITLE_CLASS = "min-w-0 font-heading text-[17px] font-semibold leading-7 tracking-tight"
 
 /** The open chat's title above its transcript; double-clicking it renames the chat in place. */
 export function ChatTitle({ chat }: { chat: { readonly id: SessionId; readonly title: string } | null }) {

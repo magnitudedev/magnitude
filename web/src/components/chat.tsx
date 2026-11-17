@@ -270,7 +270,7 @@ function ChatView({
   }))
   return (
     <section aria-label="Chat" className="flex min-h-0 flex-1 flex-col">
-      <div className="mb-5 flex min-h-9 shrink-0 items-center justify-between gap-3">
+      <div className="mb-4 flex shrink-0 items-center justify-between gap-3">
         <ChatTitle chat={chat?.chat ?? null} />
         <Button variant="ghost" className="shrink-0" disabled={pending} onClick={() => startNewChat()}>
           <PlusIcon />
