@@ -53,7 +53,7 @@ describe("Chat presentation", () => {
     expect(html).toContain('aria-label="JavaScript code"')
     expect(html).toContain('aria-label="Copy code"')
     expect(html).toContain('class="hljs-keyword"')
-    expect(html).toContain("40 tok/s")
+    expect(html).toContain("38 tok/s")
     expect(html).toContain("TTFT 0.25s")
     expect(html).toContain("20 tokens")
     expect(html).toContain("Retry response")
@@ -246,6 +246,21 @@ it("labels a response a shutdown ended as interrupted, and one the user ended as
   const stopped = render("user")
   expect(stopped).toContain("Stopped")
   expect(stopped).not.toContain("Retry to continue")
+})
+
+it("shows no speed for a failed reply of one token, and counts it as one token", () => {
+  const html = renderToStaticMarkup(
+    <ChatResponse
+      response={ended({ type: "failed", error: { type: "inference", code: "worker_exited", message: "x" } }, {
+        end: { time: 1_100, outcome: { type: "failed", error: { type: "inference", code: "worker_exited", message: "x" } },
+          usage: { ...encoded.end.usage, completionTokens: 1 }, timings: { ...encoded.end.timings, predictedMs: 0.02 } },
+      })}
+      notify={() => {}}
+    />
+  )
+  expect(html).not.toContain("tok/s")
+  expect(html).toContain("1 token<")
+  expect(html).not.toContain("1 tokens")
 })
 
 it("shows a stopped response's token count from the engine's report", () => {

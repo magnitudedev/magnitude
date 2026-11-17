@@ -245,9 +245,14 @@ export interface EngineReport {
   readonly timings: Option.Option<ResponseTimings>
 }
 
-/** Output tokens a second, from the engine's report: final, or the latest while a response runs. */
+/**
+ * Output tokens a second, from the engine's report: final, or the latest while a response runs. The engine's
+ * `predicted_ms` is its decode work after the first token, which the prompt's processing produces, so it spans the
+ * tokens after the first; a response of one token decoded nothing and has no speed.
+ */
 export const tokensPerSecond = ({ usage, timings }: EngineReport) =>
-  Option.flatMap(Option.all([usage, timings]), ([u, t]) => rate(u.completionTokens, t.predictedMs))
+  Option.flatMap(Option.all([usage, timings]), ([u, t]) =>
+    u.completionTokens >= 2 ? rate(u.completionTokens - 1, t.predictedMs) : Option.none())
 
 /** What the engine measured of a response, read from its report. */
 export const engineMetrics = (report: EngineReport): EngineMetrics => {

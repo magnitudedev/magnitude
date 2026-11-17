@@ -51,13 +51,20 @@ describe("Response metrics", () => {
       thoughtForMs: Option.some(500),
       totalMs: Option.some(1_100),
       generationMs: Option.some(500),
-      tokensPerSecond: Option.some(40),
+      tokensPerSecond: Option.some(38),
       // The 20 prompt tokens not found in the cache, over 50 ms.
       prefillTokensPerSecond: Option.some(400),
       inputTokens: Option.some(60),
       cachedTokens: Option.some(40),
       outputTokens: Option.some(20),
     })
+  })
+
+  it("gives no speed for a response of one token, which decoded nothing after the prompt", () => {
+    const one = responseMetrics(ended({ type: "failed", error: { type: "inference", code: "worker_exited", message: "x" } },
+      { usage: { ...usage, completionTokens: 1 }, timings: { ...timings, predictedMs: 0.02 } }))
+    expect(one.tokensPerSecond).toEqual(Option.none())
+    expect(one.outputTokens).toEqual(Option.some(1))
   })
 
   it("counts a stopped response's tokens from its report, and none for one stopped before any", () => {

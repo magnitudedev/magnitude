@@ -14,7 +14,7 @@ import {
 } from "@phosphor-icons/react"
 import Markdown, { type Components } from "react-markdown"
 import remarkGfm from "remark-gfm"
-import { CopyText, IconButton, SentAt, ThinkingFor, number, seconds } from "./shared"
+import { CopyText, IconButton, SentAt, ThinkingFor, number, seconds, tokens } from "./shared"
 import { ChatCodeBlock } from "./code-block"
 import { rehypeLongTokens } from "./long-tokens"
 import { FailureDetails } from "../failure-details"
@@ -45,11 +45,11 @@ export function ChatResponse({
   const metrics = [
     Option.map(m.tokensPerSecond, (n) => `${number(n)} tok/s`),
     Option.map(m.ttftMs, (n) => `TTFT ${seconds(n)}`),
-    Option.map(m.outputTokens, (n) => `${number(n)} tokens`),
+    Option.map(m.outputTokens, tokens),
   ].flatMap(Option.toArray)
   const labels: [string, Option.Option<string>][] = [
-    ["Input", Option.map(m.inputTokens, (n) => `${number(n)} tokens`)],
-    ["Cached", Option.map(m.cachedTokens, (n) => `${number(n)} tokens`)],
+    ["Input", Option.map(m.inputTokens, tokens)],
+    ["Cached", Option.map(m.cachedTokens, tokens)],
     [
       "Prefill",
       Option.map(m.prefillTokensPerSecond, (n) => `${number(n)} tok/s`),

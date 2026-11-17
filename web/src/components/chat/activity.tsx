@@ -109,7 +109,7 @@ export function ChatActivityStatus({
     measures.push(count(reported.cachedTokens) + " cached")
   } else if (activity === "thinking") {
     const usage = Option.flatMap(live, (r) => r.usage)
-    if (Option.isSome(usage)) measures.push(count(usage.value.completionTokens) + " tokens")
+    if (Option.isSome(usage)) measures.push(count(usage.value.completionTokens) + (usage.value.completionTokens === 1 ? " token" : " tokens"))
     const speed = Option.flatMap(live, tokensPerSecond)
     if (Option.isSome(speed)) measures.push(rate(speed.value) + " tok/s")
   }

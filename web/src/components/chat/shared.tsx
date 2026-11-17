@@ -9,6 +9,8 @@ export const value = <A,>(option: Option.Option<A>) =>
   Option.getOrUndefined(option)
 export const number = (n: number) =>
   n.toLocaleString(undefined, { maximumFractionDigits: 1 })
+/** A count of tokens: "1 token", "20 tokens". */
+export const tokens = (n: number) => `${number(n)} ${n === 1 ? "token" : "tokens"}`
 export const seconds = (ms: number) =>
   `${(ms / 1000).toFixed(ms < 1000 ? 2 : 1)}s`
 
