@@ -29,6 +29,7 @@ use seismic_lang::checked::{
     NativeCondition, NativeEvalError, NativeImplementation, NativeParameter, NativeSpecialization,
     NativeSpecializationError,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// What admits configurations of a planned domain, asked one configuration
@@ -137,7 +138,7 @@ pub struct PointShape {
 }
 
 /// The lexical address of one tuning parameter.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ParameterAddress {
     Entry(String),
     Launch { ordinal: usize, name: String },
@@ -313,7 +314,7 @@ impl Iterator for Subsets {
 /// it has ([`Group::steps`], [`Group::form_starts`],
 /// [`Group::neighbours`]), and its domain says which of them the
 /// declaration admits ([`Domain`]).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Group {
     pub launches: Vec<usize>,
     pub parameters: Vec<ParameterAddress>,
@@ -426,7 +427,7 @@ impl Group {
 /// The partition of a declared domain: its independent groups, the
 /// parameters that only choose which launch serves which rows, and the
 /// launches each point can run.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TuningPartition {
     pub groups: Vec<Group>,
     /// Entry parameters used solely to choose a launch's active row band,
@@ -679,7 +680,7 @@ pub fn whole(
 
 /// One point as planned: the launches that can run there, each under some
 /// assignment of the parameters its condition reads.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlannedPoint {
     pub label: String,
     pub active: Vec<usize>,

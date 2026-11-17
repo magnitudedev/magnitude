@@ -1,12 +1,15 @@
 """`kernel`: how fast is this kernel entry, in each configuration, at the shapes this model runs
 it at, and how well does the tuner's search choose? The tuner's own survey in the model's
-Prepare alone, from its headers alone: the catalog's header export opens as the model with zero
-weights, so nothing of it is downloaded or imported. Every admissible configuration of the
-named entry (each launch's own choices included, for an entry whose launches are formed
-separately) is formed, validated and timed at each of the entry's tuning points for this model
-and context, with the tuner's own cache-defeating rotations; the rest of the model is searched
-in a token budget. It reports per point the declared default, the configuration the tuner
-chose, and the fastest, each the median of its samples with its deviation; then the production
+Prepare alone, over the model's own files: tuning imports its weights as a load does, in their
+stored format, so validation compares every configuration's output with the default's over real
+codes and scales (over the header export's zero weights every output is zero and every
+configuration is admitted alike). The work every admissible configuration of
+the named entry runs at each of the entry's tuning points for this model and context (each
+launch's own choices included, for an entry whose launches are formed separately) is formed,
+validated and timed there once, with the tuner's own cache-defeating rotations; a configuration's
+time at a point is that of the work it runs there. The rest of the model is searched in a token
+budget. It reports per point the declared default, the configuration the tuner chose, and the
+fastest work there, each the median of its samples with its deviation; then the production
 search replayed against the survey: how often it lands within 1/2/5% of the true best at the
 evaluations this load allows it, and the per-point gap of one configuration for all points.
 
@@ -18,11 +21,12 @@ load's tuning.
 import argparse
 import json
 
-from ..engine import Headers, Step
+from ..engine import Step, Weights
 from . import Answer, Instrument, JobResult, Measure, Plan, harness, lacking
 
 # What a survey answer reads, which every build's survey must hold (`lacking`).
-SURVEYED = ("entry", "bindings", "result.configurations", "result.served", "result.overall", "result.points")
+SURVEYED = ("entry", "bindings", "result.configurations", "result.served", "result.overall", "result.points",
+            "result.method.Survey.record")
 
 OTHERS_TUNING_SECONDS = "1"  # the rest of the model is not what this measures
 
@@ -43,7 +47,7 @@ def plan(arguments, source, host) -> Plan:
         "--tuning-survey-samples", str(arguments.samples),
     ))  # fmt: skip
     return Plan(builds=(harness.BUILD,), jobs=(("kernel", job),), device="timed",
-                acquires=Headers(arguments.model), files=(arguments.fixture,))
+                acquires=Weights(arguments.model), files=(arguments.fixture,))
 
 
 def _parameters(configuration: dict) -> str:
@@ -63,7 +67,8 @@ def _difference(configuration: str, default: str) -> str:
 
 
 def _times(record: dict) -> dict[str, dict[str, tuple[float, float]]]:
-    """Per configuration (as text), per point: (median, deviation) seconds."""
+    """Per configuration the survey records (its defaults and its choice, as text), per point:
+    (median, deviation) seconds."""
     found: dict[str, dict[str, tuple[float, float]]] = {}
     for configuration in record["configurations"]:
         outcome = configuration["outcome"]
@@ -74,6 +79,17 @@ def _times(record: dict) -> dict[str, dict[str, tuple[float, float]]]:
             for point in outcome["Measured"]["points"]
         }
     return found
+
+
+def _fastest(point: dict) -> tuple[str, tuple[float, float]] | None:
+    """A surveyed point's fastest measured work: the configuration it was measured in (as text)
+    and its (median, deviation) seconds; None when no work there was measured."""
+    measured = [(work["configuration"], work["outcome"]["Measured"]) for work in point["work"]
+                if "Measured" in work["outcome"]]
+    if not measured:
+        return None
+    configuration, fastest = min(measured, key=lambda found: found[1]["median_seconds"])
+    return _parameters(configuration), (fastest["median_seconds"], fastest["deviation_seconds"])
 
 
 def _shown(at: dict[str, tuple[float, float]], name: str) -> str:
@@ -117,24 +133,29 @@ def answer(arguments, results: dict[str, JobResult]) -> Answer:
             lines.append(f"{path.stem}: this build's harness records no {', '.join(missing)}")
             continue
         record = survey["result"]
+        surveyed = record["method"]["Survey"]["record"]
         times = _times(record)
         default = _parameters(record["served"][0])
         chosen = _parameters(record["overall"])
         bindings = survey["bindings"] if len(survey["bindings"]) <= 60 else survey["bindings"][:57] + "..."
-        lines.append(f"{survey['entry']} [{bindings}] · {len(times)} configurations measured")
+        works = sum(len(point["work"]) for point in surveyed["points"])
+        lines.append(f"{survey['entry']} [{bindings}] · {surveyed['formed']} configurations formed,"
+                     f" {works} works measured")
         lines.append(f"  default {default}")
         lines.append(f"  tuner's choice: {_difference(chosen, default)}")
         lines.append(f"  {'point':<20}{'default µs':>13}{'choice µs':>13}{'best µs':>13}  best, as changed from the default")
-        for point in record["points"]:
+        for point, at in zip(record["points"], surveyed["points"]):
             label = point["label"]
-            at = {name: by_point[label] for name, by_point in times.items() if label in by_point}
-            if not at:
+            fastest = _fastest(at)
+            if fastest is None:
                 continue
-            best = min(at, key=lambda name: at[name][0])
-            shown = "".join(_shown(at, name) for name in (default, chosen, best))
+            best, best_time = fastest
+            here = {name: by_point[label] for name, by_point in times.items() if label in by_point}
+            here[best] = best_time
+            shown = "".join(_shown(here, name) for name in (default, chosen, best))
             lines.append(f"  {label[:19]:<20}{shown}  {_difference(best, default)}")
-            if chosen in at:
-                median, deviation = at[chosen]
+            if chosen in times and label in times[chosen]:
+                median, deviation = times[chosen][label]
                 measures[f"{survey['entry']} {survey['bindings']} {label}"] = Measure(
                     1e6 * median, "µs", 1e6 * deviation, lower_is_better=True
                 )

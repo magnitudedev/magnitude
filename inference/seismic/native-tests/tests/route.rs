@@ -7,8 +7,9 @@ use seismic::measure::{measure, Measure, Stop};
 use seismic::{
     AllocationLimit, BackendName, CallError, Device, Devices, Element, Exclusion, ExecutionError,
     InvocationError, NativeGraphFamily, NativeSpecialization, NumericalRequirement, Outcome,
-    SearchPlan, SearchSettings, Stage, Strategy, SurveyPlan, Tensor,
-    TraceDetail, TuneError, TuningInitializer, TuningMethod, TuningPoint, UnitPlan,
+    SearchPlan, SearchSettings, Stage, Strategy, SurveyPlan, SurveyRecord, Tensor,
+    TraceDetail, TuneError, TuningInitializer, TuningMethod, TuningPoint, TuningResult, UnitPlan,
+    WorkOutcome,
 };
 use seismic_native_tests::{
     accumulate, gated_sum, marked_groups, scale_records, scale_rows, scoped_scale, split_sum,
@@ -826,8 +827,10 @@ fn tuning_searches_from_the_defaults_and_validates_its_choice() {
             [exact_values(n as usize).iter().sum::<f32>()]
         );
 
-        // A survey measures and validates every configuration with every
-        // sample recorded.
+        // A survey measures and validates the work of every configuration
+        // at every point with every sample recorded. Every parameter of a
+        // program formed whole decides the work at each point: each point
+        // holds every configuration of the domain.
         let survey = split_sum::native_tune(
             &device,
             &statics(n),
@@ -840,23 +843,36 @@ fn tuning_searches_from_the_defaults_and_validates_its_choice() {
             }),
         )
         .unwrap_or_else(|error| panic!("{:?}: {error}", device.backend()));
-        assert_eq!(survey.configurations.len(), domain);
-        for record in &survey.configurations {
-            match &record.outcome {
-                Outcome::Measured { points, .. } => {
-                    assert_eq!(survey.admitted(record), Ok(()));
-                    assert!(
-                        points
-                            .iter()
-                            .all(|point| (1..=5).contains(&point.samples.len()))
-                    );
-                }
-                Outcome::Excluded(exclusion) => {
-                    panic!("{:?}: {exclusion:?}", device.backend())
-                }
+        let record = surveyed(&survey);
+        for point in &record.points {
+            assert_eq!(point.rows.len(), domain);
+            for work in &point.work {
+                let WorkOutcome::Measured(measurement) = &work.outcome else {
+                    panic!("{:?}: {:?}", device.backend(), work.outcome)
+                };
+                assert!(work
+                    .observation
+                    .is_none_or(|observation| seismic::admit(&survey.observations[observation], &survey.requirement).is_ok()));
+                assert!((1..=5).contains(&measurement.samples.len()));
             }
         }
+        // The configurations it records are the defaults and its choice,
+        // each measured and admitted at every point.
+        assert_eq!(survey.served.first(), survey.configurations.first().map(|record| &record.configuration));
+        assert_eq!(survey.served.last(), Some(&survey.overall));
+        for record in &survey.configurations {
+            assert!(matches!(record.outcome, Outcome::Measured { .. }));
+            assert_eq!(survey.admitted(record), Ok(()));
+        }
     }
+}
+
+/// A survey's record ([`seismic::SurveyRecord`]).
+fn surveyed(survey: &TuningResult) -> &SurveyRecord {
+    let TuningMethod::Survey { record, .. } = &survey.method else {
+        panic!("{:?}", survey.method)
+    };
+    record
 }
 
 #[test]
@@ -1070,9 +1086,9 @@ fn expiry_during_reset_preserves_the_choice_without_rejecting_the_candidate() {
 /// there. Configurations that differ only in a parameter no launch working
 /// at the point reads share a key there: the device runs one of them for
 /// observation, once per witness, and the others take that observation. A
-/// survey records such configurations only where another point tells them
-/// apart: one whose moved parameter no launch it runs at any point reads
-/// runs the default's work everywhere and is not recorded.
+/// survey records the work at each point once: one configuration whose
+/// moved parameter no launch it runs at any point reads runs the default's
+/// work everywhere and is not surveyed.
 #[test]
 fn a_numerical_observation_is_made_once_per_point_and_key() {
     use std::cell::Cell;
@@ -1127,58 +1143,86 @@ fn a_numerical_observation_is_made_once_per_point_and_key() {
         }),
     )
     .unwrap();
-    let default = &survey.served[0];
-    let default_workers = |record: &seismic::ConfigurationRecord| {
-        record.configuration.params["cpu.workers.1"] == default.params["cpu.workers.1"]
-    };
+    let record = surveyed(&survey);
+    let default = &record.defaults;
     // Where the mirrored launch never works (`SMALL` past both sizes), its
-    // participant count is recorded at its default alone.
-    assert!(
-        survey
-            .configurations
+    // participant count is surveyed at its default alone.
+    let position = |name: &str| {
+        record
+            .parameters
             .iter()
-            .filter(|record| record.configuration.params["SMALL"] != 64)
-            .all(default_workers)
-    );
-    let mut keys = sizes.map(|_| std::collections::BTreeSet::new());
-    for record in &survey.configurations {
-        let Outcome::Measured { points, .. } = &record.outcome else {
-            panic!("{:?}", record.outcome)
+            .position(|parameter| parameter.launch.is_none() && parameter.name == name)
+            .unwrap()
+    };
+    let (small, workers) = (position("SMALL"), position("cpu.workers.1"));
+    for point in &record.points {
+        let at = |row: &seismic::SurveyedRow, position: usize| {
+            row.values[point.leading.iter().position(|&leading| leading == position).unwrap()]
         };
-        assert_eq!(survey.admitted(record), Ok(()));
-        if record.configuration == *default {
-            // The reference is measured against nothing.
-            assert!(record.observations.is_empty());
-            continue;
-        }
-        // Every candidate holds the observation made under its own key at
-        // each point.
-        assert_eq!(record.observations.len(), sizes.len(), "{:?}", record.observations);
-        for (point, (measured, keys)) in points.iter().zip(&mut keys).enumerate() {
-            let observation = record
-                .observations
-                .iter()
-                .map(|&index| &survey.observations[index])
-                .find(|observation| observation.point == format!("n{}", sizes[point]))
-                .unwrap();
+        assert!(point
+            .rows
+            .iter()
+            .filter(|row| at(row, small) != 64)
+            .all(|row| at(row, workers) == default.params["cpu.workers.1"]));
+    }
+    // Every work a candidate measured holds the observation made under its
+    // own key at its point; the defaults' own work is the reference,
+    // observed against nothing.
+    let mut distinct = 0;
+    for (point, surveyed) in record.points.iter().enumerate() {
+        for work in &surveyed.work {
+            let WorkOutcome::Measured(measured) = &work.outcome else {
+                panic!("{:?}", work.outcome)
+            };
+            let Some(observation) = work.observation else {
+                assert_eq!(work.configuration, *default);
+                continue;
+            };
+            let observation = &survey.observations[observation];
+            assert_eq!(observation.point, format!("n{}", sizes[point]));
             assert_eq!(observation.key, measured.key);
             assert_eq!(observation.rotations.len(), witnesses[point].len());
-            keys.insert(measured.key.clone());
+            assert_eq!(seismic::admit(observation, &survey.requirement), Ok(()));
+            distinct += 1;
         }
     }
-    let candidates = survey.configurations.len() - 1;
+    let candidates = record.formed - 1;
     assert!(
-        keys[0].len() < candidates,
-        "{candidates} candidates must share some of their {} keys at 32 for this to test reuse",
-        keys[0].len()
+        record.points[0].work.len() < record.points[0].rows.len(),
+        "{} assignments at 32 must share some of their {} works for this to test reuse",
+        record.points[0].rows.len(),
+        record.points[0].work.len()
     );
-    let distinct = keys.iter().map(|keys| keys.len()).sum::<usize>();
-    assert_eq!(survey.observations.len(), distinct);
+    // Every other observation is of the defaults' own work, by a candidate
+    // that runs it there: the reference stands for that work.
+    let reference = |point: usize| {
+        record.points[point]
+            .work
+            .iter()
+            .find(|work| work.observation.is_none())
+            .map(|work| match &work.outcome {
+                WorkOutcome::Measured(measured) => measured.key.clone(),
+                WorkOutcome::Excluded(exclusion) => panic!("{exclusion:?}"),
+            })
+            .unwrap()
+    };
+    let unreferenced = survey.observations.len() - distinct;
+    assert_eq!(
+        survey
+            .observations
+            .iter()
+            .filter(|observation| {
+                let point = sizes.iter().position(|n| observation.point == format!("n{n}")).unwrap();
+                observation.key == reference(point)
+            })
+            .count(),
+        unreferenced
+    );
     // The device ran each witness once for the default and once per
     // distinct key at each point, not once per candidate.
     assert_eq!(
         resets.get(),
-        sizes.len() * survey.configurations.len() + 2 * (sizes.len() + distinct)
+        sizes.len() * (candidates + 1) + 2 * (sizes.len() + survey.observations.len())
     );
 }
 
@@ -3447,12 +3491,13 @@ fn a_ranged_kernel_forms_and_serves_only_its_range() {
 }
 
 /// A survey of a unit whose launches are formed separately forms them as its
-/// search does, from held launch programs, and measures and validates every
-/// admissible configuration: each launch's own choices, at a point where each
-/// launch works. It reports how many configurations it forms before it forms
-/// any, and its progress through them as it goes.
+/// search does, from held launch programs, and measures and validates the
+/// work of every admissible configuration: each launch's own choices, at the
+/// point where each launch works, and not their product. It reports how many
+/// configurations it forms before it forms any, and its progress through
+/// them as it goes.
 #[test]
-fn a_survey_times_every_configuration_of_launches_formed_separately() {
+fn a_survey_times_every_launchs_choices_where_it_works() {
     /// The survey's points, and the progress it reported.
     struct Reporting<'p> {
         points: Vec<TuningPoint<'p, scoped_scale::Entry>>,
@@ -3507,28 +3552,37 @@ fn a_survey_times_every_configuration_of_launches_formed_separately() {
         }),
     )
     .unwrap();
-    // Two widths by two row counts for each of the two launches.
-    assert_eq!(survey.configurations.len(), 16);
+    // Two widths by two row counts for each of the two launches, each
+    // launch's at the one point where it works: the defaults, and three
+    // more for each point.
+    let record = surveyed(&survey);
+    assert_eq!(record.formed, 7);
     let progress = |formed, measured| seismic::SurveyProgress {
-        configurations: 16,
+        configurations: 7,
         formed,
         measured,
     };
     assert_eq!(points.reports.first(), Some(&progress(0, 0)));
-    assert_eq!(points.reports.last(), Some(&progress(16, 16)));
+    assert_eq!(points.reports.last(), Some(&progress(7, 7)));
     assert!(points.reports.windows(2).all(|pair| {
         pair[0].configurations == pair[1].configurations
             && pair[0].formed <= pair[1].formed
             && pair[0].measured <= pair[1].measured
             && pair[1].measured <= pair[1].formed
     }));
-    for record in &survey.configurations {
-        let Outcome::Measured { points, .. } = &record.outcome else {
-            panic!("{:?}", record.outcome)
-        };
-        assert_eq!(survey.admitted(record), Ok(()));
-        assert_eq!(points.len(), 2);
-        assert!(points.iter().all(|point| (1..=3).contains(&point.samples.len())));
+    for point in &record.points {
+        assert_eq!(point.rows.len(), 4);
+        assert_eq!(point.work.len(), 4);
+        for work in &point.work {
+            let WorkOutcome::Measured(measurement) = &work.outcome else {
+                panic!("{:?}", work.outcome)
+            };
+            assert!((1..=3).contains(&measurement.samples.len()));
+        }
     }
-    assert!(matches!(survey.method, TuningMethod::Survey { samples: 3 }));
+    for record in &survey.configurations {
+        assert!(matches!(record.outcome, Outcome::Measured { .. }));
+        assert_eq!(survey.admitted(record), Ok(()));
+    }
+    assert!(matches!(survey.method, TuningMethod::Survey { samples: 3, .. }));
 }

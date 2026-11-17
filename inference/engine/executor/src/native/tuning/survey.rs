@@ -2,15 +2,16 @@
 //! `tuning-survey`), never part of a served engine.
 //!
 //! A process that installs a [`TuningSurvey`] replaces the search of every
-//! tuned entry instance (or of the named entries) by a survey: every
-//! admissible configuration that runs work of its own at the surveyed
-//! points (one moving only parameters no launch it runs there reads runs
-//! its default's work) is formed, measured with
-//! [`TuningSurvey::samples`] samples per point, and validated, and the whole
-//! Seismic `TuningResult` (every raw sample of every configuration) is
-//! written to one JSON file per entry instance: the true cost of every
-//! configuration in the declared space, against which a search's choice is
-//! judged. Points are measured once per key, as the search measures them.
+//! tuned entry instance (or of the named entries) by a survey: the work
+//! every admissible configuration that runs work of its own (one moving
+//! only parameters no launch it runs reads runs its default's work) runs
+//! at each surveyed point is formed, measured with
+//! [`TuningSurvey::samples`] samples, and validated, once per point and
+//! key, and the whole Seismic `TuningResult` (its `SurveyRecord`: every
+//! raw sample of every work) is written to one JSON file per entry
+//! instance: the true cost of every configuration in the declared space,
+//! composed from the work it runs at each point, against which a search's
+//! choice is judged.
 //! [`replay_report`] runs the production search (`seismic::replay`) against
 //! these files (tuning spec §E2) and reports, per entry instance, the choice
 //! quality at the evaluations the survey's load would have allowed its
@@ -26,7 +27,7 @@
 //! survey is process-global so that no production API carries it.
 
 use super::TuningKey;
-use seismic::{SurveyPlan, TuningResult};
+use seismic::{SurveyPlan, TuningMethod, TuningResult};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -121,8 +122,10 @@ pub const NO_DEMAND: &str = "No point has demand at this load: every configurati
 /// ([`REPLAY_RUNS`] runs each, §E2) and report, as Markdown: per entry
 /// instance, the chosen configuration's true cost relative to the true best
 /// at the evaluations the survey's allowance covers (at the survey's mean
-/// time per configuration), at twice and four times them and with the whole
-/// space, for the production objective and the previous one, with the search
+/// time per configuration) and at twice and four times them, none beyond the
+/// configurations the record's domain holds (a launch-scoped entry's is the
+/// product of its launches' domains, which no replay exhausts), for the
+/// production objective and the previous one, with the search
 /// settings of the survey's backend; the
 /// configurations needed for 95% of runs to reach 2% of the best (`n95`);
 /// and per point, the time of the overall best configuration against the
@@ -169,15 +172,20 @@ pub fn replay_report(directory: &std::path::Path) -> Result<String, String> {
             .expect("writing to a string");
             continue;
         }
+        let TuningMethod::Survey { record: surveyed, .. } = &result.method else {
+            return Err(format!("{}: the result is not a survey's", path.display()));
+        };
+        // A search evaluates a configuration as the survey formed and
+        // measured each of its own.
         let time = &result.time;
         let per_configuration =
             (time.forming_seconds + time.measuring_seconds + time.validating_seconds)
-                / result.configurations.len().max(1) as f64;
+                / surveyed.formed.max(1) as f64;
         let budget =
             ((allowance / per_configuration.max(f64::MIN_POSITIVE)).floor() as usize).max(1);
         let recording =
             Recording::new(&result).map_err(|error| format!("{}: {error}", path.display()))?;
-        let space = recording.len();
+        let space = usize::try_from(recording.len()).unwrap_or(usize::MAX);
         // The settings the recorded entry's search runs with.
         let settings = super::SEARCH_SETTINGS;
         writeln!(
@@ -186,9 +194,9 @@ pub fn replay_report(directory: &std::path::Path) -> Result<String, String> {
             result.entry,
             field("bindings")?.as_str().unwrap_or_default(),
             field("statics")?,
-            space,
+            recording.len(),
             recording.measured(),
-            recording.values(recording.best()),
+            recording.best(),
         )
         .expect("writing to a string");
         writeln!(
@@ -203,7 +211,6 @@ pub fn replay_report(directory: &std::path::Path) -> Result<String, String> {
             let mut budgets = [1, 2, 4]
                 .map(|multiple| (multiple * budget).min(space))
                 .to_vec();
-            budgets.push(space);
             budgets.dedup();
             for budget in budgets {
                 let replayed = replay(&recording, budget, &settings, objective, REPLAY_RUNS);

@@ -52,6 +52,7 @@ pub(crate) mod point;
 pub mod replay;
 pub mod sampling;
 pub mod search;
+pub mod survey;
 pub mod spans;
 pub mod timeline;
 mod timing;

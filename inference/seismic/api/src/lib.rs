@@ -259,6 +259,9 @@ pub mod coverage {
 }
 /// Replay of the tuning search against recorded surveys (development).
 pub use seismic_runtime::native::replay;
+pub use seismic_runtime::native::survey::{
+    SurveyIndex, SurveyRecord, SurveyedPoint, SurveyedRow, SurveyedWork, WorkOutcome,
+};
 pub use seismic_runtime::native::search::{
     Cost, LaunchKey, ParameterValues, SearchSettings, SearchStop,
 };

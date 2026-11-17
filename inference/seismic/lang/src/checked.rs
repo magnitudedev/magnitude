@@ -3808,7 +3808,30 @@ impl NativeImplementation {
         keep_going: impl FnMut() -> bool,
         visit: impl FnMut(&NativeSpecialization) -> bool,
     ) -> Result<(), NativeSpecializationError> {
-        self.walk(statics, &[], false, &entry_held(statics), None, keep_going, visit)
+        self.walk(statics, &[], false, &entry_held(statics), None, None, keep_going, visit)
+    }
+
+    /// Visit, until `visit` returns false, the first admissible
+    /// configuration at `statics` every prefix of which `within` holds of,
+    /// for each assignment of the `leading` parameters (each an entry
+    /// parameter, `None`, or a launch's, `Some(ordinal)`, with its name)
+    /// that one such configuration takes. A prefix is the statics with the
+    /// parameters walked so far, those of one value known throughout, so
+    /// the last is the whole configuration; one `within` refuses is not
+    /// extended. The assignments come in the order of the walk of
+    /// [`Self::walk_admissible`] with the `leading` parameters moved first,
+    /// in the order given. What a caller that tells configurations apart by
+    /// the leading parameters alone needs, its condition false at every
+    /// configuration extending a prefix it is false at: the walk follows
+    /// the leading assignments, never the product of the other domains.
+    pub fn walk_admitted_within(
+        &self,
+        statics: &NativeSpecialization,
+        leading: &[(Option<usize>, &str)],
+        mut within: impl FnMut(&NativeSpecialization) -> bool,
+        visit: impl FnMut(&NativeSpecialization) -> bool,
+    ) -> Result<(), NativeSpecializationError> {
+        self.walk(statics, leading, true, &entry_held(statics), None, Some(&mut within), || true, visit)
     }
 
     /// Visit, until `visit` returns false, the first admissible
@@ -3831,7 +3854,7 @@ impl NativeImplementation {
             .filter(|parameter| leading.contains(&parameter.name))
             .map(|parameter| (None, parameter.name.as_str()))
             .collect::<Vec<_>>();
-        self.walk(statics, &first, true, &entry_held(statics), None, || true, visit)
+        self.walk(statics, &first, true, &entry_held(statics), None, None, || true, visit)
     }
 
     /// Visit, until `visit` returns false, the admissible specializations
@@ -3872,7 +3895,7 @@ impl NativeImplementation {
             }
             held_at(parameter, at)
         };
-        self.walk(base, moved, false, &walked, after, keep_going, visit)
+        self.walk(base, moved, false, &walked, after, None, keep_going, visit)
     }
 
     /// The walk of [`Self::walk_admissible_while`], or, with `first` the
@@ -3882,11 +3905,12 @@ impl NativeImplementation {
     /// leaving nothing to walk; the `first` parameters walk first, in that
     /// order, and with `led` each admitted configuration ends the walk over
     /// the parameters after them; with `after`, an assignment of the first
-    /// parameters, what sorts at or before it is passed over. A prefix
+    /// parameters, what sorts at or before it is passed over; with
+    /// `within`, that of [`Self::walk_admitted_within`]. A prefix
     /// is not extended once the `where` condition, read with the parameters
-    /// not yet walked unknown, is false ([`NativeCondition::decided`]): the
-    /// work follows what the condition leaves open, not the product of the
-    /// domains.
+    /// not yet walked unknown, is false ([`NativeCondition::decided`]), or
+    /// `within` refuses it: the work follows what the conditions leave
+    /// open, not the product of the domains.
     fn walk(
         &self,
         statics: &NativeSpecialization,
@@ -3894,6 +3918,7 @@ impl NativeImplementation {
         led: bool,
         walked: &dyn Fn(Option<usize>, &NativeParameter) -> Result<Vec<u64>, NativeSpecializationError>,
         after: Option<&[u64]>,
+        within: Option<&mut dyn FnMut(&NativeSpecialization) -> bool>,
         keep_going: impl FnMut() -> bool,
         visit: impl FnMut(&NativeSpecialization) -> bool,
     ) -> Result<(), NativeSpecializationError> {
@@ -3956,15 +3981,24 @@ impl NativeImplementation {
                 })
                 .collect::<Vec<_>>()
         });
-        let mut configuration = base;
-        for ((launch, parameter), values) in domains.iter().zip(&values) {
-            configuration = match launch {
-                None => configuration.with_param(parameter.name.clone(), values[0]),
-                Some(launch) => {
-                    configuration.with_launch_param(*launch, parameter.name.clone(), values[0])
-                }
-            };
-        }
+        let valued = |specialization: NativeSpecialization, (launch, parameter): &(Option<usize>, &NativeParameter), value| match launch {
+            None => specialization.with_param(parameter.name.clone(), value),
+            Some(launch) => specialization.with_launch_param(*launch, parameter.name.clone(), value),
+        };
+        // The prefix `within` reads holds the parameters of one value from
+        // the start, and each other one while the walk assigns it.
+        let within = within.map(|condition| Within {
+            prefix: domains
+                .iter()
+                .zip(&values)
+                .filter(|(_, values)| values.len() == 1)
+                .fold(base.clone(), |prefix, (parameter, values)| valued(prefix, parameter, values[0])),
+            condition,
+        });
+        let configuration = domains
+            .iter()
+            .zip(&values)
+            .fold(base, |configuration, (parameter, values)| valued(configuration, parameter, values[0]));
         // The position a name in `where` is walked at; none when two
         // parameters share it, which the condition then reads as unknown.
         let mut owners = std::collections::BTreeMap::<&str, Option<usize>>::new();
@@ -3988,11 +4022,12 @@ impl NativeImplementation {
             launch_keys,
             lead,
             after: after.unwrap_or_default(),
+            within,
             keep_going,
             visit,
         };
         let verdict = walk.verdict(0);
-        if verdict == Some(false) {
+        if verdict == Some(false) || !walk.within() {
             return Ok(());
         }
         walk.descend(0, verdict, resuming).map(|_| ())
@@ -4048,8 +4083,16 @@ struct Walk<'w, K, V> {
     /// The position in `values` of each of the first parameters of the
     /// assignment the walk resumes after; empty when it does not.
     after: Vec<usize>,
+    within: Option<Within<'w>>,
     keep_going: K,
     visit: V,
+}
+
+/// The condition of [`NativeImplementation::walk_admitted_within`] and the
+/// prefix it reads: the statics and the parameters assigned so far.
+struct Within<'w> {
+    condition: &'w mut dyn FnMut(&NativeSpecialization) -> bool,
+    prefix: NativeSpecialization,
 }
 
 impl<K: FnMut() -> bool, V: FnMut(&NativeSpecialization) -> bool> Walk<'_, K, V> {
@@ -4071,6 +4114,11 @@ impl<K: FnMut() -> bool, V: FnMut(&NativeSpecialization) -> bool> Walk<'_, K, V>
             }
         };
         constraint.decided(&|name| self.configuration.static_value(name), &parameter)
+    }
+
+    /// Whether the walk's `within` condition, if any, holds of its prefix.
+    fn within(&mut self) -> bool {
+        self.within.as_mut().is_none_or(|within| (within.condition)(&within.prefix))
     }
 
     /// Walk the parameters from `depth` on, `verdict` being the condition's
@@ -4104,6 +4152,25 @@ impl<K: FnMut() -> bool, V: FnMut(&NativeSpecialization) -> bool> Walk<'_, K, V>
                 None => Flow::Continue,
             });
         }
+        let flow = self.extend(depth, verdict, edge);
+        // A parameter of one value stays in the prefix throughout.
+        if let Some(within) = self.within.as_mut().filter(|_| self.values[depth].len() > 1) {
+            match &self.launch_keys[depth] {
+                None => within.prefix.params.remove(&self.domains[depth].1.name),
+                Some(key) => within.prefix.launch_params.remove(key),
+            };
+        }
+        flow
+    }
+
+    /// Walk the parameter at `depth` over its values, and from each the
+    /// parameters after it ([`Self::descend`]).
+    fn extend(
+        &mut self,
+        depth: usize,
+        verdict: Option<bool>,
+        edge: bool,
+    ) -> Result<Flow, NativeSpecializationError> {
         let first = if edge { self.after[depth] } else { 0 };
         for step in first..self.values[depth].len() {
             if !(self.keep_going)() {
@@ -4112,11 +4179,16 @@ impl<K: FnMut() -> bool, V: FnMut(&NativeSpecialization) -> bool> Walk<'_, K, V>
             let value = self.values[depth][step];
             match &self.launch_keys[depth] {
                 None => {
-                    *self
-                        .configuration
-                        .params
-                        .get_mut(&self.domains[depth].1.name)
-                        .expect("every parameter was valued") = value;
+                    let name = &self.domains[depth].1.name;
+                    *self.configuration.params.get_mut(name).expect("every parameter was valued") = value;
+                    if let Some(within) = &mut self.within {
+                        match within.prefix.params.get_mut(name) {
+                            Some(held) => *held = value,
+                            None => {
+                                within.prefix.params.insert(name.clone(), value);
+                            }
+                        }
+                    }
                 }
                 Some(key) => {
                     *self
@@ -4124,10 +4196,18 @@ impl<K: FnMut() -> bool, V: FnMut(&NativeSpecialization) -> bool> Walk<'_, K, V>
                         .launch_params
                         .get_mut(key)
                         .expect("every launch parameter was valued") = value;
+                    if let Some(within) = &mut self.within {
+                        match within.prefix.launch_params.get_mut(key) {
+                            Some(held) => *held = value,
+                            None => {
+                                within.prefix.launch_params.insert(key.clone(), value);
+                            }
+                        }
+                    }
                 }
             }
             let verdict = if verdict == Some(true) { verdict } else { self.verdict(depth + 1) };
-            if verdict == Some(false) {
+            if verdict == Some(false) || !self.within() {
                 continue;
             }
             match self.descend(depth + 1, verdict, edge && step == first)? {
@@ -4811,6 +4891,49 @@ mod native_tests {
         for configuration in &configurations {
             native.validate(configuration).unwrap();
         }
+    }
+
+    /// A walk led by some parameters within a condition visits, for each
+    /// leading assignment some configuration the condition holds of takes,
+    /// the first such configuration, in the walk's order, and extends no
+    /// prefix the condition refuses nor any once that one is visited.
+    #[test]
+    fn a_led_walk_within_a_condition_visits_one_configuration_per_leading_assignment() {
+        let text = "native scale for metal from \"scale.metal\":\n    params (form WIDE in [0, 1] default 0)\n    where (WIDE == 1 or TILE == 4) and (WIDE == 0 or ROWS == 1)\n    launch small when WIDE == 0:\n        params (ROWS in [1, 2, 4] default 1)\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch large when WIDE == 1:\n        params (TILE in [4, 8] default 4)\n        threadgroups (ceil_div(N, TILE), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n";
+        let module = crate::native_source::check_fixture(source(text), &[]).unwrap();
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .unwrap();
+        let values = |configuration: &NativeSpecialization| {
+            (
+                configuration.param("WIDE"),
+                configuration.launch_param(0, "ROWS"),
+                configuration.launch_param(1, "TILE"),
+            )
+        };
+        let (mut visited, mut prefixes) = (Vec::new(), Vec::new());
+        native
+            .walk_admitted_within(
+                &NativeSpecialization::new(),
+                &[(None, "WIDE"), (Some(0), "ROWS")],
+                |prefix| {
+                    prefixes.push(values(prefix));
+                    prefix.launch_param(0, "ROWS").is_none_or(|rows| rows < 4)
+                },
+                |configuration| {
+                    visited.push(values(configuration));
+                    true
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            visited,
+            [(Some(0), Some(1), Some(4)), (Some(0), Some(2), Some(4)), (Some(1), Some(1), Some(4))]
+        );
+        assert!(
+            !prefixes.iter().any(|prefix| matches!(prefix, (_, Some(4), Some(_)) | (Some(1), Some(1), Some(8)))),
+            "a refused or visited leading assignment is not extended: {prefixes:?}"
+        );
     }
 
     /// A walk moving some parameters changes exactly those, in the order
