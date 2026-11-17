@@ -4632,6 +4632,10 @@ impl NativeGraphPlan {
     pub fn workspace_bytes(&self) -> u64 {
         self.inner.workspace_bytes()
     }
+    /// The bytes of a slot's own sync region a run of the plan uses.
+    pub fn sync_bytes(&self) -> u64 {
+        self.inner.sync_bytes()
+    }
     pub fn output_bytes(&self) -> u64 {
         self.inner.output_bytes()
     }
@@ -4802,6 +4806,10 @@ impl NativeGraphFamily {
     }
     pub fn workspace_bytes(&self) -> u64 {
         self.inner.workspace_bytes()
+    }
+    /// The bytes of each slot's own sync region.
+    pub fn sync_bytes(&self) -> u64 {
+        self.inner.sync_bytes()
     }
     /// The workspace no placement of the family's plans fits in less than.
     pub fn workspace_floor_bytes(&self) -> u64 {
@@ -5226,8 +5234,8 @@ impl<E: Entry> NativeKernel<E> {
         self.inner.scalar_result_bytes()
     }
 
-    /// The unrounded byte span placed in a standalone call's scratch arena
-    /// for `args` (`SYNC_RESERVE` plus placed scratch buffers).
+    /// The unrounded bytes placed in a standalone call's scratch
+    /// regions for `args`: its sync region and its body together.
     pub fn standalone_scratch_bytes(&self, args: E::Args<'_>) -> Result<u64, CallError> {
         self.inner.standalone_scratch_bytes(E::encode(args))
     }

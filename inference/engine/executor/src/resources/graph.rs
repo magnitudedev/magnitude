@@ -269,9 +269,9 @@ impl VisionGraphClass {
         crate::planning::serial_upload_regions(self.family.upload_bytes())
     }
 
-    /// One activation's own workspace and its upload regions.
+    /// One activation's own workspace, sync region and upload regions.
     fn activation_bytes(&self) -> u64 {
-        self.family.workspace_bytes() + self.upload_regions().iter().sum::<u64>()
+        self.family.workspace_bytes() + self.family.sync_bytes() + self.upload_regions().iter().sum::<u64>()
     }
 }
 

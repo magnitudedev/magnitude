@@ -57,16 +57,15 @@
 //   argument is trivial.
 // Correctness never depends on how many threadgroups are co-resident.
 //
-// The launch's `sync` scratch `counters` (LAND_SLOTS slices indexed by
-// `q mod LAND_SLOTS` so a step and its in-flight successor never alias on a
-// shared graph slot, each zero when it starts and restored to zero by it):
-// the claims (LAND_CLAIMS), the arrivals (LAND_ARRIVALS), the poll
-// (LAND_LEAD: 1 while a threadgroup polls the host, its every holder clearing
-// it as it stops waiting), what the poller heard (LAND_HEARD: 2 x the head's
-// count, plus 1 once that count is final, published and read under
-// system-scope fences so a waiter's head load follows the poller's), and from
-// LAND_ITEMS each entry's items placed. The last threadgroup to arrive
-// restores every word of its step's slice.
+// The launch's `sync` scratch `counters` (its graph slot's own, zero when
+// it starts, restored to zero by it; runs of one slot never overlap: a
+// device runs its compute submissions in order): the claims
+// (LAND_CLAIMS), the arrivals (LAND_ARRIVALS), the poll (LAND_LEAD: 1 while
+// a threadgroup polls the host, its every holder clearing it as it stops
+// waiting), what the poller heard (LAND_HEARD: 2 x the head's count, plus 1
+// once that count is final, published and read under system-scope fences so
+// a waiter's head load follows the poller's), and from LAND_ITEMS each
+// entry's items placed. The last threadgroup to arrive restores every word.
 //
 // The includer's conversion, every thread calling each hook:
 // - `STREAMING_LAND_PARAM` and `STREAMING_LAND_ARG`: its conversion
@@ -242,11 +241,8 @@ STREAMING_FN void streaming_land_entry(STREAMING_SYSTEM_WORDS landing, u64 landi
 // arrived. A launch that lands nothing (no record converts: where the host
 // tier places) does not call it: an entry of no items has no claims.
 STREAMING_FN void streaming_land(STREAMING_LAND_PARAM, STREAMING_SYSTEM_WORDS landing, u64 landing_stride,
-    STREAMING_SYSTEM_WORDS slot, u64 slot_stride, u64 q, STREAMING_DEVICE_WORDS counters_base, u32 capacity, u32 groups,
+    STREAMING_SYSTEM_WORDS slot, u64 slot_stride, u64 q, STREAMING_DEVICE_WORDS counters, u32 capacity, u32 groups,
     STREAMING_GROUP_PARAM, u32 tid) {
-    STREAMING_DEVICE_WORDS counters = STREAMING_AT(
-        counters_base,
-        streaming_modulo(q, u64(SEISMIC_CONST_LAND_SLOTS)) * u64(STREAMING_LAND_ITEMS + int(capacity)));
     const u32 gate = streaming_land_items(STREAMING_LAND_ARG, STREAMING_LAND_GATE);
     const u32 up = streaming_land_items(STREAMING_LAND_ARG, STREAMING_LAND_UP);
     const u32 per_entry = gate + up + streaming_land_items(STREAMING_LAND_ARG, STREAMING_LAND_DOWN);

@@ -546,6 +546,7 @@ impl ResourceAllocator {
         // The admitted charge was derived from a serial family's footprint.
         let admitted = |family: &seismic::NativeGraphFamily, charge: &crate::NativeGraphCharge| {
             family.workspace_bytes() == charge.workspace_bytes
+                && family.sync_bytes() == charge.sync_bytes
                 && family.output_bytes() == charge.output_bytes
                 && crate::planning::serial_upload_regions(family.upload_bytes())
                     == charge.upload_regions

@@ -7420,11 +7420,11 @@ fn streaming_a_landing_stops_once_its_slot_is_answered_or_failed() {
 
 /// Two consecutive steps in flight (`q` and `q + 1`), queued as a load
 /// queues a step and its lookahead successor: each on a family slot of its
-/// own over one shared execution arena (so one `sync` scratch), every
-/// flight's decode graph recorded ahead (`record_decode`). They keep
-/// disjoint counter slices (`LAND_SLOTS`) and system-ordered `HEARD`
-/// publications: even when both steps are submitted before either completes
-/// and their entries land in rapid zero-sleep bursts across all `LAND_GROUPS`
+/// own over one shared execution arena, every flight's decode graph
+/// recorded ahead (`record_decode`). Each slot holds its own `sync` region,
+/// so their counters are disjoint, and `HEARD` is published system-ordered:
+/// even when both steps are submitted before either completes and their
+/// entries land in rapid zero-sleep bursts across all `LAND_GROUPS`
 /// threadgroups, neither raises `SLOT_VIOLATED` and both place every record.
 #[test]
 fn streaming_overlapping_land_steps_isolate_counters_and_order_heads() {

@@ -513,20 +513,13 @@ impl Drop for GraphHold {
 
 /// Bytes charged to a scratch buffer that is empty or inactive: it keeps
 /// its ABI slot.
-const MINIMUM_SCRATCH_BYTES: u64 = 1;
-
-/// Bytes at the start of every non-empty scratch arena (a standalone call's
-/// and every graph workspace that places anything) reserved for `sync`
-/// scratch; a graph that places nothing needs no workspace. Nothing else is ever placed
-/// there, arenas are zeroed when allocated, and every call restores its sync
-/// buffers to zero before it ends, so the range is zero whenever a launch
-/// starts, whichever call or graph used it last.
-pub(crate) const SYNC_SCRATCH_BYTES: u64 = 64 * 1024;
+pub(crate) const MINIMUM_SCRATCH_BYTES: u64 = 1;
 
 /// One call-private scratch buffer: its bytes, whether it holds arrival
-/// counters (`sync`), which live in the reserved range of their arena, the
-/// operand it holds, if any (`ScratchOperand`), and the result whose
-/// emission it serves, if any (`NativeScratch::emission`).
+/// counters (`sync`), which live in their execution's sync region
+/// ([`ScratchRegions`]), the operand it holds, if any (`ScratchOperand`),
+/// and the result whose emission it serves, if any
+/// (`NativeScratch::emission`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScratchNeed {
     pub bytes: u64,
@@ -612,26 +605,36 @@ impl ScratchOperand {
     }
 }
 
-/// Place one standalone call's scratch buffers: `sync` buffers in the
-/// reserved range, the rest after it. Returns the offsets in declaration
-/// order and the end of the placed range.
-fn place_scratch(needs: &[ScratchNeed]) -> (Vec<u64>, u64) {
-    let mut sync_end = 0u64;
-    let mut end = SYNC_SCRATCH_BYTES;
+/// The two regions an execution's scratch is placed in. `sync` scratch
+/// (arrival counters) lies in a region of its own, zeroed when allocated and
+/// zero whenever a launch starts: each launch restores its counters to zero
+/// before it ends, and the executions that share a sync region run one after
+/// another (a device runs its compute submissions in submission order).
+/// Every other buffer lies in the body, whose bytes a launch finds as the
+/// last execution left them. Each region is sized by what its execution
+/// places there, so no placement exceeds it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ScratchRegions {
+    pub(crate) sync: u64,
+    pub(crate) body: u64,
+}
+
+/// Place one standalone call's scratch buffers: `sync` buffers in the sync
+/// region, the rest in the body. Returns the offsets in declaration order,
+/// each in its buffer's region, and the regions' bytes: a region a buffer
+/// lies in holds at least its minimum, so it exists.
+fn place_scratch(needs: &[ScratchNeed]) -> (Vec<u64>, ScratchRegions) {
+    let mut regions = ScratchRegions::default();
     let offsets = needs
         .iter()
         .map(|need| {
-            let cursor = if need.sync { &mut sync_end } else { &mut end };
+            let cursor = if need.sync { &mut regions.sync } else { &mut regions.body };
             let offset = cursor.next_multiple_of(BUFFER_ALIGNMENT);
-            *cursor = offset + need.bytes;
+            *cursor = offset + need.bytes.max(MINIMUM_SCRATCH_BYTES);
             offset
         })
         .collect();
-    assert!(
-        sync_end <= SYNC_SCRATCH_BYTES,
-        "sync scratch of one call exceeds the reserved {SYNC_SCRATCH_BYTES} bytes"
-    );
-    (offsets, end)
+    (offsets, regions)
 }
 
 #[derive(Clone)]
@@ -2801,7 +2804,8 @@ impl NativePrepared {
 
     pub(crate) fn standalone_scratch_bytes(&self, args: EncodedArgs) -> Result<u64, CallError> {
         let shape = self.shape(&args.values())?;
-        Ok(if shape.scratch.is_empty() { 0 } else { place_scratch(&shape.scratch).1 })
+        let regions = place_scratch(&shape.scratch).1;
+        Ok(regions.sync + regions.body)
     }
 
     /// Validate a standalone call, place its results and its scratch (in
@@ -2866,12 +2870,8 @@ impl NativePrepared {
             };
             results.push(tensor);
         }
-        let (scratch, scratch_end) = if shape.scratch.is_empty() {
-            (Vec::new(), 0)
-        } else {
-            place_scratch(&shape.scratch)
-        };
-        let arena = arena.holding(&self.public_device, scratch_end)?;
+        let (scratch, regions) = place_scratch(&shape.scratch);
+        let (sync, body) = arena.holding(&self.public_device, regions)?;
 
         let schema = self.schema();
         let mut buffers = Vec::new();
@@ -2961,13 +2961,13 @@ impl NativePrepared {
         for tensor in &results {
             access.extend(tensor.bound_allocations().map(|allocation| (allocation, true)));
         }
-        if let Some(arena) = arena {
-            for (offset, need) in scratch.into_iter().zip(&shape.scratch) {
-                buffers.push((arena.clone(), offset, need.bytes));
-                representations.push("bytes");
-            }
-            access.push((arena, true));
+        for (offset, need) in scratch.into_iter().zip(&shape.scratch) {
+            let region = if need.sync { &sync } else { &body };
+            let region = region.as_ref().expect("a region a buffer is placed in is held");
+            buffers.push((region.clone(), offset, need.bytes));
+            representations.push("bytes");
         }
+        access.extend([sync, body].into_iter().flatten().map(|region| (region, true)));
         access.extend(self.scalar_slots().map(|slots| (slots.clone(), true)));
         // The kernel's arguments: its bound buffers'.
         let mut bound = Vec::with_capacity(representations.len());
@@ -3071,34 +3071,40 @@ impl NativePrepared {
 }
 
 /// The scratch of standalone calls placed together (one call, a batch, a
-/// tuning point): one arena, grown to the largest call's scratch and reused
-/// by every later one (the device queue orders its users). Each placed call
-/// keeps the arena it was placed in, so the storage lives as long as the
-/// calls do, never as long as their kernel.
+/// tuning point): a sync region and a body ([`ScratchRegions`]), each grown
+/// to the largest call's and reused by every later one (the device queue
+/// orders its users). Each placed call keeps the regions it was placed in,
+/// so the storage lives as long as the calls do, never as long as their
+/// kernel. A grown region is a new zeroed allocation, so the sync region is
+/// zero whenever a call starts.
 #[derive(Default)]
 pub(crate) struct ScratchArena {
-    scratch: Option<Arc<Allocation>>,
+    sync: Option<Arc<Allocation>>,
+    body: Option<Arc<Allocation>>,
 }
 
 impl ScratchArena {
-    /// The arena, holding at least `bytes`; `None` when the call has no
-    /// scratch.
+    /// The sync region and the body, holding at least `regions`' bytes
+    /// each; `None` for a region the call places nothing in.
     fn holding(
         &mut self,
         device: &Arc<DeviceInner>,
-        bytes: u64,
-    ) -> Result<Option<Arc<Allocation>>, CallError> {
-        if bytes == 0 {
-            return Ok(None);
-        }
-        if let Some(arena) = self.scratch.as_ref().filter(|arena| arena.bytes() >= bytes) {
-            return Ok(Some(arena.clone()));
-        }
-        let arena = device
-            .allocate_zeroed(bytes, BUFFER_ALIGNMENT)
-            .map_err(CallError::Execution)?;
-        self.scratch = Some(arena.clone());
-        Ok(Some(arena))
+        regions: ScratchRegions,
+    ) -> Result<(Option<Arc<Allocation>>, Option<Arc<Allocation>>), CallError> {
+        let hold = |held: &mut Option<Arc<Allocation>>, bytes: u64| -> Result<Option<Arc<Allocation>>, CallError> {
+            if bytes == 0 {
+                return Ok(None);
+            }
+            if let Some(region) = held.as_ref().filter(|region| region.bytes() >= bytes) {
+                return Ok(Some(region.clone()));
+            }
+            let region = device
+                .allocate_zeroed(bytes, BUFFER_ALIGNMENT)
+                .map_err(CallError::Execution)?;
+            *held = Some(region.clone());
+            Ok(Some(region))
+        };
+        Ok((hold(&mut self.sync, regions.sync)?, hold(&mut self.body, regions.body)?))
     }
 }
 

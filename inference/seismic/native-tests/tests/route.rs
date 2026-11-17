@@ -17,10 +17,6 @@ use seismic_native_tests::{
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
-/// The range every non-empty scratch arena reserves at its start for `sync`
-/// scratch (the runtime's `SYNC_SCRATCH_BYTES`).
-const SYNC_RESERVE: u64 = 64 * 1024;
-
 /// A search whose time outlasts its convergence on the test entries.
 fn search() -> Strategy {
     Strategy::Search(SearchPlan {
@@ -2034,10 +2030,10 @@ fn standalone_scratch_is_the_calls_own() {
             read_f32(&call().unwrap()),
             [exact_values(64).iter().sum::<f32>()]
         );
-        // The reserved sync range, then four f32 partials.
+        // Four f32 partials, and no sync region: the call places none.
         assert_eq!(
             assert_standalone_scratch_released(&device, placed, call),
-            SYNC_RESERVE + 16,
+            16,
             "{:?}",
             device.backend()
         );
@@ -2528,8 +2524,8 @@ fn inactive_scratch_is_charged_the_minimum() {
             );
             assert_standalone_scratch_released(&device, placed, call)
         };
-        assert_eq!(scratch(10), SYNC_RESERVE + 1, "{:?}", device.backend());
-        assert_eq!(scratch(200), SYNC_RESERVE + 800, "{:?}", device.backend());
+        assert_eq!(scratch(10), 1, "{:?}", device.backend());
+        assert_eq!(scratch(200), 800, "{:?}", device.backend());
 
         let workspace = |n: u64| {
             let mut graph = device.native_graph();
@@ -2546,9 +2542,9 @@ fn inactive_scratch_is_charged_the_minimum() {
             graph.export(&sum).unwrap();
             graph.seal().unwrap().workspace_bytes()
         };
-        assert!(workspace(10) < SYNC_RESERVE + 800, "{:?}", device.backend());
+        assert!(workspace(10) < 800, "{:?}", device.backend());
         assert!(
-            workspace(200) >= SYNC_RESERVE + 800,
+            workspace(200) >= 800,
             "{:?}",
             device.backend()
         );

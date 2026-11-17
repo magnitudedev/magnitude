@@ -7,7 +7,8 @@
 //! Sealing validates every node against its entry contract once and fixes
 //! its executable form: argument words, launch geometry, and for every
 //! buffer the storage region and offset it lives at. A run supplies only the
-//! regions (the slot's workspace, the run's upload region and output arena)
+//! regions (the slot's workspace and sync region, the run's upload region
+//! and output arena)
 //! and the tensors bound to external ports; attaching checks those bindings
 //! alone, so per-run host work does not revalidate nodes.
 
@@ -22,7 +23,7 @@ use super::timeline::{
 use super::{
     charge_emissions, merge_access, submit, CallLaunches, Dispatch, DispatchList, FormedAt, LaunchGeometry,
     NativeOperandNorm, NativePrepared, NativeQueue, NativeRoute, NativeSubmission, NativeTensorSpec, ScratchNeed,
-    ScratchOperand, BUFFER_ALIGNMENT, SYNC_SCRATCH_BYTES,
+    ScratchOperand, BUFFER_ALIGNMENT, MINIMUM_SCRATCH_BYTES,
 };
 use crate::api::device::DeviceInner;
 use crate::api::kernel::{
@@ -1034,6 +1035,7 @@ impl NativeGraphDraft {
             placements: storage.placements,
             scratch_bytes: storage.scratch_bytes,
             scratch_floor_bytes: storage.scratch_floor_bytes,
+            sync_bytes: storage.sync_bytes,
             output_bytes: storage.output_bytes,
             upload_bytes: storage.upload_bytes,
             recorded,
@@ -1107,6 +1109,7 @@ impl NativeGraphLayout {
     pub fn storage_bytes(&self) -> NativeGraphStorageBytes {
         NativeGraphStorageBytes {
             workspace: self.storage.scratch_bytes,
+            sync: self.storage.sync_bytes,
             output: self.storage.output_bytes,
             upload: self.storage.upload_bytes,
             recorded: self.recorded,
@@ -1260,11 +1263,14 @@ fn storage_signature(
 }
 
 /// What a graph holds while it runs and once it is recorded: its storage
-/// (workspace, output arena, upload region) and what recording one run of
-/// it may take ([`GraphCensus`]).
+/// (workspace, sync region, output arena, upload region) and what recording
+/// one run of it may take ([`GraphCensus`]). The sync region is each
+/// execution slot's own; the workspace may be shared by slots whose runs
+/// never overlap.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NativeGraphStorageBytes {
     pub workspace: u64,
+    pub sync: u64,
     pub output: u64,
     pub upload: u64,
     pub recorded: GraphCensus,
@@ -1275,6 +1281,7 @@ impl NativeGraphStorageBytes {
     pub fn most(self, other: Self) -> Self {
         Self {
             workspace: self.workspace.max(other.workspace),
+            sync: self.sync.max(other.sync),
             output: self.output.max(other.output),
             upload: self.upload.max(other.upload),
             recorded: self.recorded.most(other.recorded),
@@ -1593,6 +1600,7 @@ impl NativeGraphMetadataDraft {
         );
         Ok(NativeGraphStorageBytes {
             workspace: storage.scratch_bytes,
+            sync: storage.sync_bytes,
             output: storage.output_bytes,
             upload: storage.upload_bytes,
             recorded: self.recorded(),
@@ -1622,6 +1630,7 @@ impl NativeGraphMetadataDraft {
         )?;
         Ok(NativeGraphStorageBytes {
             workspace: storage.scratch_bytes,
+            sync: storage.sync_bytes,
             output: storage.output_bytes,
             upload: storage.upload_bytes,
             recorded: self.recorded(),
@@ -1787,6 +1796,7 @@ impl ValidatedMetadataDraft {
         let storage = plan_storage(&ports, &nodes, &self.links, &results, &self.draft.exports, &self.draft.stores);
         Ok(NativeGraphStorageBytes {
             workspace: storage.scratch_bytes,
+            sync: storage.sync_bytes,
             output: storage.output_bytes,
             upload: storage.upload_bytes,
             recorded: self.census,
@@ -2635,6 +2645,9 @@ enum Region {
     External(u32),
     /// The slot's workspace arena: results, graph locals and node scratch.
     Workspace,
+    /// The slot's own sync region: node `sync` scratch, zero whenever a
+    /// launch starts.
+    Sync,
     /// The run's upload region: host-written inputs.
     Upload,
     /// The run's output arena: exports.
@@ -2833,7 +2846,7 @@ impl Executable {
                 }
                 // Graph storage is never a slab view: a slab port takes it
                 // only where it holds no elements.
-                Region::Upload | Region::Workspace | Region::Outputs
+                Region::Upload | Region::Workspace | Region::Sync | Region::Outputs
                     if kernel.addresses_slab(ordinal) && descriptor.byte_len > 0 =>
                 {
                     return Err(WorkflowError::PlainSlabBinding {
@@ -2841,7 +2854,7 @@ impl Executable {
                     });
                 }
                 Region::Upload => self.upload_written |= write,
-                Region::Workspace | Region::Outputs => {}
+                Region::Workspace | Region::Sync | Region::Outputs => {}
             }
             let mut site = Site {
                 region,
@@ -2935,7 +2948,7 @@ impl Executable {
         let host_word = |(region, offset): (Region, u64)| match region {
             Region::External(port) => Some((HostWord::Port(port), offset)),
             Region::Upload => Some((HostWord::Upload, offset)),
-            Region::Workspace | Region::Outputs => None,
+            Region::Workspace | Region::Sync | Region::Outputs => None,
         };
         let own = planned
             .condition
@@ -3044,6 +3057,8 @@ impl Executable {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Placement {
     Scratch(u64),
+    /// Arrival counters in the slot's sync region.
+    Sync(u64),
     Export(u64),
     /// A host-written input in the per-submission upload region.
     Upload(u64),
@@ -3057,6 +3072,7 @@ impl Placement {
     fn site(self) -> (Region, u64) {
         match self {
             Self::Scratch(offset) => (Region::Workspace, offset),
+            Self::Sync(offset) => (Region::Sync, offset),
             Self::Export(offset) => (Region::Outputs, offset),
             Self::Upload(offset) => (Region::Upload, offset),
             Self::Port(port) => (Region::External(port), 0),
@@ -3082,6 +3098,9 @@ struct StoragePlan {
     scratch_bytes: u64,
     /// The most workspace bytes live at one step: no placement fits in less.
     scratch_floor_bytes: u64,
+    /// The sync region's bytes: every node's `sync` scratch, each disjoint
+    /// from every other's.
+    sync_bytes: u64,
     output_bytes: u64,
     upload_bytes: u64,
 }
@@ -3430,8 +3449,10 @@ fn aligned_floor_end(intervals: &[&Interval], steps: &[usize]) -> u64 {
 
 /// Place graph storage. Results, graph locals and node scratch share one
 /// arena by lifetime (a node's scratch is live across its inputs and
-/// results, so it never aliases them), placed by [`place`];
-/// exports get their own arena; inputs the host writes go to a
+/// results, so it never aliases them), placed by [`place`]; node `sync`
+/// scratch, which must be zero when a launch starts, gets the slot's own
+/// sync region, each buffer disjoint from every other; exports get their
+/// own arena; inputs the host writes go to a
 /// per-submission upload region so a later host write cannot race an
 /// earlier submission still reading them. Every buffer starts at a
 /// [`BUFFER_ALIGNMENT`] offset of its region.
@@ -3533,12 +3554,10 @@ fn plan_storage(
             });
         }
     }
-    // Sync scratch lives in the reserved range at the workspace's start,
-    // each node's buffers disjoint from every other node's; the rest of the
-    // workspace begins after the range (`cursor` below). Graphs of one
-    // family share an arena, so every graph that places anything reserves
-    // the range; a graph that places nothing needs no workspace at all.
-    let mut sync_cursor = 0u64;
+    // Sync scratch lives in the slot's sync region, each node's buffers
+    // disjoint from every other node's, so the region is as large as they
+    // need together.
+    let mut sync_bytes = 0u64;
     let mut node_scratch = nodes
         .iter()
         .map(|node| vec![None; node.scratch.len()])
@@ -3567,13 +3586,10 @@ fn plan_storage(
                 continue;
             }
             if need.sync {
-                let offset = sync_cursor.next_multiple_of(BUFFER_ALIGNMENT);
-                sync_cursor = offset + need.bytes;
-                assert!(
-                    sync_cursor <= SYNC_SCRATCH_BYTES,
-                    "sync scratch of one graph exceeds the reserved {SYNC_SCRATCH_BYTES} bytes"
-                );
-                node_scratch[node][ordinal] = Some(Placement::Scratch(offset));
+                // At least the minimum, so a region a buffer lies in exists.
+                let offset = sync_bytes.next_multiple_of(BUFFER_ALIGNMENT);
+                sync_bytes = offset + need.bytes.max(MINIMUM_SCRATCH_BYTES);
+                node_scratch[node][ordinal] = Some(Placement::Sync(offset));
                 continue;
             }
             intervals.push(Interval {
@@ -3590,17 +3606,9 @@ fn plan_storage(
         .iter()
         .filter(|interval| !interval.exported)
         .collect::<Vec<_>>();
-    let Placed { offsets: scratch_offsets, bytes: placed_bytes, .. } = place(&scratch);
-    // The placed buffers follow the reserved sync range, which a graph
-    // reserves whenever it places anything.
-    let reserved = if sync_cursor == 0 && placed_bytes == 0 {
-        0
-    } else {
-        SYNC_SCRATCH_BYTES
-    };
-    let scratch_bytes = reserved + placed_bytes;
-    let scratch_floor_bytes = reserved + liveness_floor(&scratch);
-    let mut scratch_offsets = scratch_offsets.into_iter().map(|offset| reserved + offset);
+    let Placed { offsets: scratch_offsets, bytes: scratch_bytes, .. } = place(&scratch);
+    let scratch_floor_bytes = liveness_floor(&scratch);
+    let mut scratch_offsets = scratch_offsets.into_iter();
     let mut output_bytes = 0u64;
     let mut placements = results
         .iter()
@@ -3651,6 +3659,7 @@ fn plan_storage(
         node_scratch,
         scratch_bytes,
         scratch_floor_bytes,
+        sync_bytes,
         output_bytes,
         upload_bytes,
     }
@@ -3667,6 +3676,7 @@ pub struct NativeGraphPlan {
     placements: Vec<Vec<Placement>>,
     scratch_bytes: u64,
     scratch_floor_bytes: u64,
+    sync_bytes: u64,
     output_bytes: u64,
     upload_bytes: u64,
     /// What recording one of its runs takes ([`recorded_census`]).
@@ -3738,11 +3748,15 @@ impl NativeGraphPlan {
     pub fn workspace_floor_bytes(&self) -> u64 {
         self.scratch_floor_bytes
     }
+    /// The bytes of a slot's own sync region a run of the plan uses.
+    pub fn sync_bytes(&self) -> u64 {
+        self.sync_bytes
+    }
     pub fn output_bytes(&self) -> u64 {
         self.output_bytes
     }
     pub fn slot_storage_bytes(&self) -> u64 {
-        self.scratch_bytes + self.output_bytes
+        self.scratch_bytes + self.sync_bytes + self.output_bytes
     }
     /// Bytes of one submission's host-written inputs.
     pub fn upload_bytes(&self) -> u64 {
@@ -3970,11 +3984,8 @@ impl NativeGraphPlan {
     /// family slot instead takes the smallest of its idle upload regions
     /// that holds a run's input ([`idle_upload`]).
     pub fn new_slot(self: &Arc<Self>) -> Result<NativeGraphSlot, TensorError> {
-        let workspace = if self.scratch_bytes == 0 {
-            None
-        } else {
-            Some(self.device.allocate_zeroed(self.scratch_bytes, BUFFER_ALIGNMENT)?)
-        };
+        let workspace = zeroed_region(&self.device, self.scratch_bytes)?;
+        let sync = zeroed_region(&self.device, self.sync_bytes)?;
         let upload = if self.upload_bytes == 0 {
             None
         } else {
@@ -3991,6 +4002,7 @@ impl NativeGraphPlan {
                 .transpose()?
                 .flatten(),
             workspace,
+            sync,
             upload,
             hold: self.slot_hold()?,
         })
@@ -4163,6 +4175,8 @@ pub struct NativeGraphFamily {
     plans: Vec<Arc<NativeGraphPlan>>,
     device: Arc<DeviceInner>,
     workspace_bytes: u64,
+    /// The largest sync region of its plans: each slot's own.
+    sync_bytes: u64,
     output_bytes: u64,
     upload_bytes: u64,
     /// Its layouts' graphs and its share of its device's graph budget,
@@ -4313,6 +4327,7 @@ impl NativeGraphFamily {
                 .map(|plan| plan.scratch_bytes)
                 .max()
                 .unwrap_or(0),
+            sync_bytes: plans.iter().map(|plan| plan.sync_bytes).max().unwrap_or(0),
             output_bytes: plans
                 .iter()
                 .map(|plan| plan.output_bytes)
@@ -4334,6 +4349,12 @@ impl NativeGraphFamily {
 
     pub fn workspace_bytes(&self) -> u64 {
         self.workspace_bytes
+    }
+
+    /// The bytes of each slot's own sync region, which every run of the
+    /// slot uses and no other slot's does.
+    pub fn sync_bytes(&self) -> u64 {
+        self.sync_bytes
     }
 
     /// The largest liveness floor of the family's plans: the workspace no
@@ -4469,30 +4490,24 @@ impl NativeGraphFamily {
         self: &Arc<Self>,
         regions: &[u64],
     ) -> Result<NativeGraphFamilySlot, TensorError> {
-        let scratch = if self.workspace_bytes == 0 {
-            None
-        } else {
-            Some(
-                self.device
-                    .allocate_zeroed(self.workspace_bytes, BUFFER_ALIGNMENT)?,
-            )
-        };
+        let scratch = zeroed_region(&self.device, self.workspace_bytes)?;
         Ok(NativeGraphFamilySlot {
             family: self.clone(),
             workspace_records: self.workspace_record_tables(scratch.as_ref())?,
             scratch,
+            sync: zeroed_region(&self.device, self.sync_bytes)?,
             uploads: self.upload_regions(regions)?,
             lent_locals: Vec::new(),
             hold: self.slot_hold()?,
         })
     }
 
-    /// A slot whose workspace is the shared `arena`, with upload regions of
-    /// `regions` bytes each of its own ([`Self::new_slot`]). The arena must
-    /// hold this family's workspace, and no plan of the family may keep a
-    /// value in workspace between runs: a prewritten port is refused, since
-    /// another family's graph rewrites the arena before this family's next
-    /// run.
+    /// A slot whose workspace is the shared `arena`, with a sync region and
+    /// upload regions of `regions` bytes each of its own ([`Self::new_slot`]).
+    /// The arena must hold this family's workspace, and no plan of the
+    /// family may keep a value in workspace between runs: a prewritten port
+    /// is refused, since another family's graph rewrites the arena before
+    /// this family's next run.
     pub fn new_slot_in(
         self: &Arc<Self>,
         arena: &NativeExecutionArena,
@@ -4523,6 +4538,7 @@ impl NativeGraphFamily {
                 .workspace_record_tables(scratch.as_ref())
                 .map_err(WorkflowError::TensorView)?,
             scratch,
+            sync: zeroed_region(&self.device, self.sync_bytes).map_err(WorkflowError::TensorView)?,
             uploads: self
                 .upload_regions(regions)
                 .map_err(WorkflowError::TensorView)?,
@@ -4563,7 +4579,8 @@ impl NativeGraphFamily {
 /// graph's workspace holds only the values of its own run, so graphs bound
 /// to one arena never use it at once: the device needs one workspace the
 /// size of its largest family's, whatever the families and launches in
-/// flight.
+/// flight. Sync scratch, which must be zero when a launch starts, is never
+/// in it: each slot holds its own sync region.
 #[derive(Clone)]
 pub struct NativeExecutionArena {
     device: Arc<DeviceInner>,
@@ -4595,6 +4612,14 @@ impl NativeExecutionArena {
     pub fn charged_bytes(&self) -> u64 {
         self.allocation.as_ref().map_or(0, |allocation| allocation.charged_bytes())
     }
+}
+
+/// A zeroed region of `bytes` on `device`; none where it holds nothing.
+fn zeroed_region(device: &Arc<DeviceInner>, bytes: u64) -> Result<Option<Arc<Allocation>>, TensorError> {
+    Ok(match bytes {
+        0 => None,
+        bytes => Some(device.allocate_zeroed(bytes, BUFFER_ALIGNMENT)?),
+    })
 }
 
 /// Release `allocation` where its holder alone held it: the bytes it was
@@ -4635,6 +4660,8 @@ impl NativeGraphFamilyOutputSlot {
 pub struct NativeGraphFamilySlot {
     family: Arc<NativeGraphFamily>,
     scratch: Option<Arc<Allocation>>,
+    /// Its own sync region ([`NativeGraphFamily::sync_bytes`]).
+    sync: Option<Arc<Allocation>>,
     /// Each family plan's workspace record table over `scratch`, in plan
     /// order ([`NativeGraphPlan::workspace_record_table`]).
     workspace_records: Vec<Option<Arc<Allocation>>>,
@@ -4655,8 +4682,9 @@ impl NativeGraphFamilySlot {
     /// ([`released`]) and what its family's graph hold shrank by
     /// ([`super::SlotGraphs::release`]).
     pub fn release(self) -> u64 {
-        let Self { scratch, workspace_records, uploads, hold, .. } = self;
-        let charged: u64 = workspace_records.into_iter().flatten().chain(uploads).chain(scratch).map(released).sum();
+        let Self { scratch, sync, workspace_records, uploads, hold, .. } = self;
+        let charged: u64 =
+            workspace_records.into_iter().flatten().chain(uploads).chain(scratch).chain(sync).map(released).sum();
         charged + super::SlotGraphs::release(hold)
     }
 
@@ -4689,6 +4717,7 @@ impl NativeGraphFamilySlot {
             plan: plan.clone(),
             workspace: self.scratch.clone(),
             workspace_records: self.workspace_records[member].clone(),
+            sync: self.sync.clone(),
             upload,
             hold: self.hold.clone(),
         };
@@ -4796,6 +4825,8 @@ pub struct NativeGraphSlot {
     /// The plan's workspace record table over `workspace`
     /// ([`NativeGraphPlan::workspace_record_table`]), formed with it.
     workspace_records: Option<Arc<Allocation>>,
+    /// Node `sync` scratch: the slot's own, zero whenever a launch starts.
+    sync: Option<Arc<Allocation>>,
     /// Host-written inputs of the next run.
     upload: Option<Arc<Allocation>>,
     /// Its runs' graphs in the device's graph budget (its family slot's).
@@ -4870,7 +4901,7 @@ impl NativeGraphSlot {
                 WorkflowError::NativeOutputLeaseConsumed,
             ));
         }
-        let owned = [&self.workspace, &self.upload, &exports.arena]
+        let owned = [&self.workspace, &self.sync, &self.upload, &exports.arena]
             .into_iter()
             .flatten()
             .map(|allocation| allocation.identity())
@@ -5329,6 +5360,14 @@ impl ReadyNativeGraphRun<'_> {
                         .filter(|_| plan.scratch_bytes > 0)
                         .map(|allocation| (allocation.clone(), false)),
                 )
+                // The slot's own sync region, where the plan places in it.
+                .chain(
+                    self.slot
+                        .sync
+                        .iter()
+                        .filter(|_| plan.sync_bytes > 0)
+                        .map(|allocation| (allocation.clone(), true)),
+                )
                 .chain(
                     self.slot
                         .upload
@@ -5373,6 +5412,7 @@ impl ReadyNativeGraphRun<'_> {
             slabs,
             workspace: self.slot.workspace.clone(),
             workspace_records: self.slot.workspace_records.clone(),
+            sync: self.slot.sync.clone(),
             upload: self.slot.upload.clone(),
             outputs: self.exports.arena.clone(),
             timelines: self.timelines,
@@ -5552,6 +5592,7 @@ struct QueuedRun {
     workspace: Option<Arc<Allocation>>,
     /// The slot's workspace record table (`NativeGraphSlot::workspace_records`).
     workspace_records: Option<Arc<Allocation>>,
+    sync: Option<Arc<Allocation>>,
     upload: Option<Arc<Allocation>>,
     outputs: Option<Arc<Allocation>>,
     /// Its timeline operations, each with the node it precedes; a park's
@@ -5628,6 +5669,7 @@ impl QueuedRun {
                 (&*external.allocation, external.offset + site.offset)
             }
             (Region::Workspace, SiteRecords::None) => (region(&run.workspace), site.offset),
+            (Region::Sync, SiteRecords::None) => (region(&run.sync), site.offset),
             (Region::Upload, SiteRecords::None) => (region(&run.upload), site.offset),
             (Region::Outputs, SiteRecords::None) => (region(&run.outputs), site.offset),
             (region, records) => unreachable!("a {records:?} record site in {region:?}"),
@@ -5833,6 +5875,7 @@ impl DispatchList for SequenceList<'_> {
                     (allocation.identity(), start + site.offset, site.bytes)
                 }
                 (Region::Workspace, SiteRecords::None) => (region(&run.workspace), site.offset, site.bytes),
+                (Region::Sync, SiteRecords::None) => (region(&run.sync), site.offset, site.bytes),
                 (Region::Upload, SiteRecords::None) => (region(&run.upload), site.offset, site.bytes),
                 (Region::Outputs, SiteRecords::None) => (region(&run.outputs), site.offset, site.bytes),
                 (region, records) => unreachable!("a {records:?} record site in {region:?}"),
@@ -6092,6 +6135,58 @@ mod operand_pairing_tests {
         carry(CarrySide::Out { result: WorkflowResultRef { workflow: WORKFLOW, node: 0, result: 0 } }, rows)
     }
 
+    /// The storage of a chain of nodes, each with the `sync` buffers of
+    /// `bytes`.
+    fn sync_chain(layers: &[Vec<u64>]) -> StoragePlan {
+        let nodes = layers
+            .iter()
+            .enumerate()
+            .map(|(at, buffers)| {
+                let source = if at == 0 { (INPUT_NODE, 0) } else { (at as u32 - 1, 0) };
+                let needs = buffers.iter().map(|&bytes| ScratchNeed { bytes, sync: true, operand: None, emission: None });
+                node(source, needs.collect())
+            })
+            .collect::<Vec<_>>();
+        let links = operand_links::<()>(&nodes, &[]).unwrap();
+        let ports = [port("f32", &[64], true)];
+        let results = vec![vec![Some(spec(1024))]; nodes.len()];
+        plan_storage(&ports, &nodes, &links, &results, &[], &[])
+    }
+
+    /// A graph of more `sync` buffers than any fixed reservation held forms,
+    /// its sync region sized by what its nodes place, every buffer at its
+    /// own aligned offset: 300 one-counter nodes (beyond the 256 aligned
+    /// buffers 64 KiB once held), and a deep, wide MoE decode graph (61
+    /// layers at H = 7168, each a routed output's per-row arrivals of
+    /// H * 4 bytes, a landing launch's counters of a 64-entry list and two
+    /// one-word arrivals: about 1.8 MiB).
+    #[test]
+    fn a_graphs_sync_region_holds_every_nodes_counters() {
+        let counters = sync_chain(&vec![vec![4]; 300]);
+        assert_eq!(counters.sync_bytes, 299 * BUFFER_ALIGNMENT + 4);
+        for (node, row) in counters.node_scratch.iter().enumerate() {
+            assert_eq!(row[0], Placement::Sync(node as u64 * BUFFER_ALIGNMENT), "node {node}");
+        }
+
+        let layer = vec![7168 * 4, 4 * (4 + 64), 4, 4];
+        let moe = sync_chain(&vec![layer.clone(); 61]);
+        let per_layer = layer.iter().map(|bytes| bytes.next_multiple_of(BUFFER_ALIGNMENT)).sum::<u64>();
+        assert_eq!(moe.sync_bytes, 61 * per_layer - (BUFFER_ALIGNMENT - 4));
+        let mut placed = moe
+            .node_scratch
+            .iter()
+            .flatten()
+            .zip(std::iter::repeat(&layer).flatten())
+            .map(|(placement, &bytes)| match *placement {
+                Placement::Sync(offset) => offset..offset + bytes,
+                other => panic!("a sync buffer lies at {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        placed.sort_by_key(|range| range.start);
+        assert!(placed.windows(2).all(|pair| pair[0].end <= pair[1].start), "sync buffers are disjoint");
+        assert_eq!(placed.last().unwrap().end, moe.sync_bytes);
+    }
+
     /// A producer that emits its result's operand, a node between, and two
     /// consumers of that result's operand: the first consumer's buffer is
     /// the producer's, live across the node between, and its formation is
@@ -6127,10 +6222,12 @@ mod operand_pairing_tests {
         // The second consumer's larger buffer is placed only across its own
         // step, never widening the paired buffer live across node 1.
         assert!(
-            storage.scratch_bytes - SYNC_SCRATCH_BYTES < 8192 + 4096 + 1024,
+            storage.scratch_bytes < 8192 + 4096 + 1024,
             "the paired buffer is sized to its paired consumer alone: {}",
-            storage.scratch_bytes - SYNC_SCRATCH_BYTES,
+            storage.scratch_bytes,
         );
+        assert_eq!(storage.node_scratch[0][1], Placement::Sync(0), "sync scratch lies in the sync region");
+        assert_eq!(storage.sync_bytes, 4, "the sync region is what its nodes place");
         // The paired operand, as large as the consumer's, lives across the
         // node between: nothing else live then aliases it.
         let between = scratch(1, 0);

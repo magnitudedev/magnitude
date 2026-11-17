@@ -278,11 +278,6 @@ impl FlightDepth {
     pub(crate) const PIPELINED: Self = Self { groups: NonZeroUsize::new(2).unwrap() };
 }
 
-// A landing launch's counters hold a slice per step in flight on one graph
-// slot (`LAND_SLOTS`, indexed by the step's sequence): no deeper flight may
-// share them.
-const _: () = assert!(FlightDepth::PIPELINED.groups.get() as u64 <= magnitude_kernels::constants::LAND_SLOTS);
-
 impl ResourceLimits {
     /// The most rows a decode step's launch takes: a row for each of its
     /// requests, at most a launch's slots, in the row class covering them.
@@ -519,9 +514,10 @@ pub struct ResourceBytes {
 
 /// A Seismic-derived physical family charge at startup. The engine chooses
 /// the slot counts; Seismic supplies every byte and every tensor layout
-/// within each slot. Each activation holds the upload regions of
-/// `upload_regions` bytes each, allocated with it: one per graph run its
-/// lease keeps in flight at once, holding what that run writes. Output
+/// within each slot. Each activation holds its own sync region of
+/// `sync_bytes` and the upload regions of `upload_regions` bytes each,
+/// allocated with it: one per graph run its lease keeps in flight at once,
+/// holding what that run writes. Output
 /// slots beyond `output_slots` are elastic run-time claims of
 /// `output_bytes` each. `workspace_bytes` is not part of `committed_bytes`:
 /// every family binds the device's one workspace arena, which the plan
@@ -531,6 +527,7 @@ pub struct ResourceBytes {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeGraphCharge {
     pub workspace_bytes: u64,
+    pub sync_bytes: u64,
     pub output_bytes: u64,
     pub upload_regions: Vec<u64>,
     pub activations: usize,
@@ -539,12 +536,13 @@ pub struct NativeGraphCharge {
     pub graphs: seismic::LaunchGraphs,
 }
 
-/// A family's per-slot storage: scratch and output arena bytes, the bytes
-/// of each upload region of an activation, and what its launches' graphs
-/// hold.
+/// A family's per-slot storage: scratch, sync region and output arena
+/// bytes, the bytes of each upload region of an activation, and what its
+/// launches' graphs hold.
 #[derive(Clone, Debug)]
 struct FamilyFootprint {
     workspace_bytes: u64,
+    sync_bytes: u64,
     output_bytes: u64,
     upload_regions: Vec<u64>,
     graphs: seismic::LaunchGraphs,
@@ -561,6 +559,7 @@ impl FamilyFootprint {
     fn serial(family: &seismic::NativeGraphFamily) -> Self {
         Self {
             workspace_bytes: family.workspace_bytes(),
+            sync_bytes: family.sync_bytes(),
             output_bytes: family.output_bytes(),
             upload_regions: serial_upload_regions(family.upload_bytes()),
             graphs: family.graphs(),
@@ -591,6 +590,7 @@ impl NativeGraphCharge {
         Self::from_footprint(
             FamilyFootprint {
                 workspace_bytes: storage.workspace,
+                sync_bytes: storage.sync,
                 output_bytes: storage.output,
                 upload_regions,
                 graphs,
@@ -603,6 +603,7 @@ impl NativeGraphCharge {
         Self::from_footprint(
             FamilyFootprint {
                 workspace_bytes: graphs.workspace_bytes(),
+                sync_bytes: graphs.family().sync_bytes(),
                 output_bytes: graphs.output_bytes(),
                 upload_regions: graphs.upload_regions().to_vec(),
                 graphs: graphs.family().graphs(),
@@ -611,9 +612,9 @@ impl NativeGraphCharge {
         )
     }
 
-    /// Bytes of one activation's upload regions.
+    /// Bytes of one activation's sync region and upload regions.
     pub fn activation_bytes(&self) -> u64 {
-        self.upload_regions.iter().sum()
+        self.sync_bytes + self.upload_regions.iter().sum::<u64>()
     }
 
     fn from_footprint(footprint: FamilyFootprint, slots: GraphSlots) -> Result<Self, String> {
@@ -625,7 +626,7 @@ impl NativeGraphCharge {
         let per_activation = footprint
             .upload_regions
             .iter()
-            .try_fold(0u64, |bytes, region| bytes.checked_add(*region))
+            .try_fold(footprint.sync_bytes, |bytes, region| bytes.checked_add(*region))
             .ok_or("graph activation byte count overflows")?;
         let committed_bytes = per_activation
             .checked_mul(count(activations)?)
@@ -638,6 +639,7 @@ impl NativeGraphCharge {
             .ok_or("graph charge overflows")?;
         Ok(Self {
             workspace_bytes: footprint.workspace_bytes,
+            sync_bytes: footprint.sync_bytes,
             output_bytes: footprint.output_bytes,
             upload_regions: footprint.upload_regions,
             activations,

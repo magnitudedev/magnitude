@@ -108,7 +108,7 @@ native routed_scratch_request for vulkan from "vulkan/routed_scratch_request.com
 # `routed_land`'s.
 native routed_round for vulkan from "vulkan/routed_round.comp":
     records (conveyor_gate, conveyor_up, conveyor_down, gate, up, down)
-    scratch counters bytes (4 * LAND_SLOTS * (LAND_ITEMS + L)) sync
+    scratch counters bytes (4 * (LAND_ITEMS + L)) sync
     launch routed_round:
         threadgroups (LAND_GROUPS, 1, 1)
         grid (grid)
@@ -136,7 +136,7 @@ native routed_scratch_grids for vulkan from "vulkan/routed_scratch_grids.comp":
 native routed_land for vulkan from "vulkan/routed_land.comp":
     static (K)
     records (staging_gate, staging_up, staging_down, gate, up, down)
-    scratch counters bytes (4 * LAND_SLOTS * (LAND_ITEMS + L)) sync
+    scratch counters bytes (4 * (LAND_ITEMS + L)) sync
     launch routed_land:
         threadgroups (1 + min(V, 1) * (LAND_GROUPS - 1), 1, 1)
         unless (policy[POLICY_RESOLVED])

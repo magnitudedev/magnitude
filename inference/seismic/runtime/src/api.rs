@@ -2974,8 +2974,8 @@ pub mod kernel {
         ) -> Result<crate::native::KernelPoint, super::CallError> {
             crate::native::KernelPoint::place(&self.inner, rotation, Vec::new(), None)
         }
-        /// The unrounded byte span placed in a standalone call's scratch
-        /// arena for `args` (`SYNC_RESERVE` plus placed scratch buffers).
+        /// The unrounded bytes placed in a standalone call's scratch
+        /// regions for `args`: its sync region and its body together.
         pub fn standalone_scratch_bytes(
             &self,
             args: EncodedArgs,
