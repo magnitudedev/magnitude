@@ -1400,3 +1400,31 @@ def test_a_stopped_caller_hung_past_its_stop_is_ended_and_its_runner_stopped(rig
     assert cli._stop(argparse.Namespace(run="bbbbbb")) == 0
     assert not state.alive(follower.pid)  # `alive` reaps it, so its own wait reads no signal
     assert stopped == ["20261105T000000Z-step-bbbbbb"]
+
+
+def test_served_keeps_a_tool_conversation_whole(tmp_path):
+    """A tools fixture's calls keep their ids and its tools are offered, so the service accepts it."""
+    import json
+    from magnitude_rig.host.served import opening, request_body
+    tool = {"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}
+    fixture = {"id": "t", "tools": [tool], "messages": [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "q", "tools": [tool]},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c0", "type": "function", "function": {"name": "f", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c0", "content": "{}"},
+        {"role": "user", "content": "again"},
+        {"role": "assistant", "content": "x", "scored": True},
+    ]}
+    path = tmp_path / "f.jsonl"
+    path.write_text(json.dumps(fixture) + "\n")
+    body = request_body(opening(path, 0))
+    messages = body["messages"]
+    assert [m["role"] for m in messages] == ["system", "user", "assistant", "tool", "user"]
+    assert messages[3]["tool_call_id"] == "c0" and messages[2]["tool_calls"][0]["id"] == "c0"
+    assert all("tools" not in m and "scored" not in m for m in messages)
+    assert body["tools"] == [tool]
+    # Opened past its start, the conversation begins on a whole turn: the skip lands on the
+    # tool result, whose call is behind it, so the opening moves on to the next user message.
+    skipped = request_body(opening(path, 0, 2))["messages"]
+    assert [m["role"] for m in skipped] == ["system", "user"]
+    assert skipped[1]["content"] == "again"

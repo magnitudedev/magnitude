@@ -173,7 +173,8 @@ class Service:
         """One answer: its text, how it ended, and its first token's time and each later one's."""
         started = time.monotonic()
         request = urllib.request.Request(self.origin + "/v1/chat/completions", method="POST", headers={"content-type": "application/json"}, data=json.dumps({
-            "model": model, "messages": messages, "max_tokens": ANSWER_TOKENS, "temperature": 0, "seed": 1,
+            "model": model, **request_body(messages),
+            "max_tokens": ANSWER_TOKENS, "temperature": 0, "seed": 1,
             "stream": True, "stream_options": {"include_usage": True}, **OPTIONS,
         }).encode())
         pieces, content, reasoning, times, finish, usage = [], [], [], [], None, None
@@ -204,7 +205,8 @@ class Service:
     def stream(self, model: str, messages: list[dict], started: threading.Event) -> dict:
         """An answer token by token, `started` set at its first; how far it got and how it ended."""
         request = urllib.request.Request(self.origin + "/v1/chat/completions", method="POST", headers={"content-type": "application/json"}, data=json.dumps({
-            "model": model, "messages": messages, "max_tokens": ANSWER_TOKENS * 4, "temperature": 0, "seed": 1, "stream": True,
+            "model": model, **request_body(messages),
+            "max_tokens": ANSWER_TOKENS * 4, "temperature": 0, "seed": 1, "stream": True,
             **OPTIONS,
         }).encode())
         pieces, ended = [], None
@@ -318,18 +320,40 @@ class Run:
 
 
 def opening(path: Path, index: int, skip: int = 0) -> list[dict]:
-    """Fixture `index`'s messages from `skip` on, its system message first, within a prompt's
-    characters and ending on a user message."""
+    """Fixture `index`'s messages from the first user message at or past `skip`, its system
+    message first, within a prompt's characters and ending on a user message: whole turns
+    only, so a tool result never loses the assistant call it completes, each message whole (a
+    tool call and its result keep their ids), the fixture's own tools offered on its first
+    user message, as the fixture format places a unit's tools (`harness/src/render.rs`)."""
     fixture = json.loads(path.read_text().splitlines()[index])
+    messages = fixture["messages"]
+    start = next(at for at in range(1 + skip, len(messages)) if messages[at]["role"] == "user")
     kept, characters = [], 0
-    for message in fixture["messages"][:1] + fixture["messages"][1 + skip:]:
+    for message in messages[:1] + messages[start:]:
         characters += len(str(message["content"]))
         if characters > PROMPT_CHARACTERS:
             break
-        kept.append({"role": message["role"], "content": message["content"]})
+        kept.append({key: value for key, value in message.items() if key != "scored"})
     while kept[-1]["role"] != "user":
         kept.pop()
+    if fixture.get("tools"):
+        first = next(message for message in kept if message["role"] == "user")
+        first["tools"] = [*fixture["tools"], *first.get("tools", [])]
     return kept
+
+
+def request_body(messages: list[dict]) -> dict:
+    """`messages` as a chat request carries them: each unit's tools lifted off its message into
+    the request's offered tools, deduplicated by function name, first kept."""
+    sent, offered, names = [], [], set()
+    for message in messages:
+        message = dict(message)
+        for tool in message.pop("tools", []):
+            if tool["function"]["name"] not in names:
+                names.add(tool["function"]["name"])
+                offered.append(tool)
+        sent.append(message)
+    return {"messages": sent, **({"tools": offered} if offered else {})}
 
 
 def fields(line: str) -> dict[str, str]:
