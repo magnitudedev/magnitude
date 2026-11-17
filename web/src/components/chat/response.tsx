@@ -1,4 +1,4 @@
-import { memo, useMemo, useState } from "react"
+import { memo, useMemo } from "react"
 import { DateTime, Option } from "effect"
 import {
   type ChatAssistantMessage,
@@ -6,15 +6,10 @@ import {
   responseMetrics,
   responseStatusText,
 } from "@magnitudedev/sdk"
-import {
-  ArrowCounterClockwiseIcon,
-  CaretDownIcon,
-  PlusIcon,
-  CaretRightIcon,
-} from "@phosphor-icons/react"
+import { ArrowCounterClockwiseIcon, PlusIcon } from "@phosphor-icons/react"
 import Markdown, { type Components } from "react-markdown"
 import remarkGfm from "remark-gfm"
-import { CopyText, IconButton, SentAt, ThinkingFor, number, seconds, tokens } from "./shared"
+import { CopyText, SentAt, ThinkingFor, number, seconds, tokens } from "./shared"
 import { ChatCodeBlock } from "./code-block"
 import { rehypeLongTokens } from "./long-tokens"
 import { FailureDetails } from "../failure-details"
@@ -33,7 +28,6 @@ export function ChatResponse({
   newChat?: () => void
   notify: (text: string) => void
 }) {
-  const [details, setDetails] = useState(false)
   const m = responseMetrics(g)
   const content = partsText(g, "text")
   const reasoning = partsText(g, "reasoning")
@@ -42,21 +36,15 @@ export function ChatResponse({
     ? g.content.find((part) => part._tag === "reasoning")?.time.started
     : undefined
   const { label, problem: failure, detail } = responseStatusText(g)
+  // Every measurement the engine reported, condensed onto one line; a bare number gets a word only where it'd be ambiguous.
+  const at = (speed: Option.Option<number>) => Option.match(speed, { onNone: () => "", onSome: (n) => ` at ${Math.round(n).toLocaleString()} tok/s` })
   const metrics = [
-    Option.map(m.tokensPerSecond, (n) => `${number(n)} tok/s`),
+    Option.map(m.inputTokens, (n) => `Prefill ${tokens(n)}${Option.match(Option.filter(m.cachedTokens, (cached) => cached > 0), { onNone: () => "", onSome: (cached) => ` (${number(cached)} cached)` })}${at(m.prefillTokensPerSecond)}`),
+    Option.map(m.outputTokens, (n) => `Decode ${tokens(n)}${at(m.tokensPerSecond)}`),
     Option.map(m.ttftMs, (n) => `TTFT ${seconds(n)}`),
-    Option.map(m.outputTokens, tokens),
+    Option.map(m.totalMs, (n) => `${seconds(n)} total`),
+    label,
   ].flatMap(Option.toArray)
-  const labels: [string, Option.Option<string>][] = [
-    ["Input", Option.map(m.inputTokens, tokens)],
-    ["Cached", Option.map(m.cachedTokens, tokens)],
-    [
-      "Prefill",
-      Option.map(m.prefillTokensPerSecond, (n) => `${number(n)} tok/s`),
-    ],
-    ["First answer", Option.map(m.firstAnswerMs, seconds)],
-    ["Total", Option.map(m.totalMs, seconds)],
-  ]
   return (
     <article aria-label="Assistant response" className="chat-hover-group">
       {reasoning && (
@@ -90,66 +78,26 @@ export function ChatResponse({
           {Option.isSome(detail) && (
             <FailureDetails text={detail.value} notify={notify} />
           )}
-          <div className="mt-4 flex flex-wrap items-center justify-between gap-2">
-            <button
-              type="button"
-              aria-label="Response metrics"
-              aria-expanded={details}
-              onClick={() => setDetails(!details)}
-              className="flex flex-wrap items-center gap-2 rounded py-1 text-xs tabular-nums text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200"
-            >
-              {[
-                ...metrics,
-                ...Option.toArray(label),
-              ].map((metric, i) => (
-                <span key={metric} className="inline-flex items-center gap-2">
-                  {i > 0 && (
-                    <span className="text-slate-300 dark:text-slate-700">
-                      ·
-                    </span>
-                  )}
-                  {metric}
-                </span>
-              ))}
-              {details ? <CaretDownIcon /> : <CaretRightIcon />}
-            </button>
-            <div className="flex items-center gap-1">
-              <span className="chat-message-actions">
-                {Option.match(g.end, { onNone: () => null, onSome: (end) => <SentAt time={DateTime.toEpochMillis(end.time)} /> })}
-                {content && <CopyText text={content} label="Copy response" notify={notify} />}
-              </span>
+          {metrics.length > 0 && (
+            <p className="mt-4 text-xs tabular-nums text-slate-500 dark:text-slate-400">{metrics.join(" · ")}</p>
+          )}
+          <div className="mt-1 flex items-center">
+            <span className="chat-message-actions">
+              {Option.match(g.end, { onNone: () => null, onSome: (end) => <SentAt time={DateTime.toEpochMillis(end.time)} /> })}
+              {content && <CopyText text={content} label="Copy response" notify={notify} />}
               {retry && responseExceedsContext(g) && newChat ? (
-                <IconButton label="New chat" onClick={newChat}>
+                <button type="button" className="chat-message-action" aria-label="New chat" title="New chat" onClick={newChat}>
                   <PlusIcon />
-                </IconButton>
+                </button>
               ) : (
                 retry && (
-                  <IconButton label="Retry response" onClick={retry}>
+                  <button type="button" className="chat-message-action" aria-label="Retry response" title="Retry response" onClick={retry}>
                     <ArrowCounterClockwiseIcon />
-                  </IconButton>
+                  </button>
                 )
               )}
-            </div>
+            </span>
           </div>
-          {details && (
-            <dl className="mt-1 flex flex-wrap gap-x-5 gap-y-2 pb-1 text-xs leading-5 tabular-nums text-slate-500 dark:text-slate-400">
-              {labels.flatMap(([label, item]) =>
-                Option.isSome(item)
-                  ? [
-                      <div
-                        key={label}
-                        className="inline-flex items-baseline gap-1.5"
-                      >
-                        <dt>{label}</dt>
-                        <dd className="text-slate-700 dark:text-slate-300">
-                          {item.value}
-                        </dd>
-                      </div>,
-                    ]
-                  : []
-              )}
-            </dl>
-          )}
         </>
       )}
     </article>

@@ -1,8 +1,7 @@
-import { useMemo, useRef, useState, type ReactNode } from "react"
+import { useMemo, useRef, useState } from "react"
 import { Atom, Result, useAtomMount, useAtomValue } from "@effect-atom/atom-react"
 import { Cause, Effect, Fiber, Option, Stream } from "effect"
 import { CheckIcon, CopyIcon } from "@phosphor-icons/react"
-import { Button } from "../ui/button"
 import { writeClipboardText } from "../../lib/clipboard"
 export const none = Option.none
 export const value = <A,>(option: Option.Option<A>) =>
@@ -95,31 +94,3 @@ export const errorText = (result: Result.Result<unknown, unknown>) =>
             : unspecified,
       })
     : null
-export function IconButton({
-  label,
-  children,
-  onClick,
-  pressed,
-  disabled,
-}: {
-  label: string
-  children: ReactNode
-  onClick: () => void
-  pressed?: boolean
-  disabled?: boolean
-}) {
-  return (
-    <Button
-      type="button"
-      variant="ghost"
-      size="icon"
-      aria-label={label}
-      title={label}
-      aria-pressed={pressed}
-      disabled={disabled}
-      onClick={onClick}
-    >
-      {children}
-    </Button>
-  )
-}

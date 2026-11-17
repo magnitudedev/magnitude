@@ -60,6 +60,29 @@ describe("Chat presentation", () => {
     expect(html).not.toContain("model logo")
     expect(html).not.toContain("Response details")
   })
+
+  it("shows every measurement on one line under a finished response, with nothing to expand", () => {
+    const html = renderToStaticMarkup(<ChatResponse response={response()} retry={() => {}} notify={() => {}} />)
+    expect(html).toContain(">Prefill 60 tokens (40 cached) at 400 tok/s · Decode 20 tokens at 38 tok/s · TTFT 0.25s · 1.0s total</p>")
+    expect(html).not.toContain("Response metrics")
+    expect(html).not.toContain('aria-expanded="')
+    expect(html).not.toContain("<dl")
+    expect(html).not.toContain("First answer")
+  })
+
+  it("rounds speeds to whole numbers, separates thousands, and leaves out a cached count of none", () => {
+    const html = renderToStaticMarkup(<ChatResponse response={response({ content: [{ type: "text", text: answer, time: { started: 4_100, ended: 62_000 } }], end: {
+      time: 62_700, outcome: { type: "finished", finishReason: "stop" },
+      usage: { promptTokens: 54, cachedTokens: 0, completionTokens: 11_435 },
+      timings: { promptMs: 30.6, predictedMs: 46_030, samplerMs: 1, parserMs: 1, timeToFirstTokenMs: 4_000 },
+    } })} notify={() => {}} />)
+    expect(html).toContain(">Prefill 54 tokens at 1,765 tok/s · Decode 11,435 tokens at 248 tok/s · TTFT 4.0s · 62.6s total</p>")
+  })
+
+  it("puts Retry after the time and copy button, revealed on hover with them", () => {
+    const html = renderToStaticMarkup(<ChatResponse response={response()} retry={() => {}} notify={() => {}} />)
+    expect(html).toMatch(/<span class="chat-message-actions"><time[^>]*>[^<]*<\/time><button[^>]*aria-label="Copy response"[^>]*>.*?<\/button><button type="button" class="chat-message-action" aria-label="Retry response"/)
+  })
   it("does not execute model HTML, unsafe links or remote images", () => {
     const html = renderToStaticMarkup(
       <ChatResponse
@@ -258,8 +281,9 @@ it("shows no speed for a failed reply of one token, and counts it as one token",
       notify={() => {}}
     />
   )
-  expect(html).not.toContain("tok/s")
-  expect(html).toContain("1 token<")
+  // No decode speed; the prompt's prefill speed is its own figure.
+  expect(html).toContain("Decode 1 token ·")
+  expect(html).toContain("Prefill 60 tokens (40 cached) at 400 tok/s")
   expect(html).not.toContain("1 tokens")
 })
 
