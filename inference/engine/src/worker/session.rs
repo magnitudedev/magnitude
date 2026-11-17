@@ -345,6 +345,7 @@ impl Session {
                     })?,
                 }
             }
+            HostMessage::AttachMeasurementProcess { process } => self.unanswer(WorkerCommand::AttachMeasurementProcess { process }),
             HostMessage::ReleaseMeasurementRoom => {
                 // A claim not yet answered is withdrawn with it.
                 self.room = None;

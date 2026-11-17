@@ -123,7 +123,7 @@ fn image_features_match_the_reference_encoder() {
         build_native_domain(&resolved.manifest, host.shared_package()).unwrap();
     let request = RequestId(1);
     domain.install_input(request, input).unwrap();
-    let encodes = domain.open_state(&mut bindings, request, None, 0).unwrap();
+    let encodes = domain.open_served(&mut bindings, request, None).unwrap();
     let [operation] = encodes.as_slice() else {
         panic!("one encode")
     };

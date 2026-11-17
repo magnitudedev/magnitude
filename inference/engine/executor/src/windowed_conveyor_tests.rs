@@ -344,7 +344,6 @@ fn open_domain(
         .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
     recorded.record(weights);
     recorded.record(host_tables);
-    let held_pass = programs.target_graphs().unwrap().held_pass().get();
     let plan = execution.resources().clone();
     let target_state = plan.allocate_target_state(device.clone(), pools.state.clone()).unwrap();
     let constants = crate::memory::ClaimDemand {
@@ -352,17 +351,13 @@ fn open_domain(
         ..Default::default()
     };
     let constants = resources.ledgers().claim(&device, crate::memory::ledger::CommittedKind::Load, constants).unwrap();
+    let request_slot = crate::domain::fixtures::request_slot(resources.ledgers(), &device, &execution, 0);
     let reader = crate::DeviceReader::open(
         Rc::new(seismic::Devices::discover(&[]).unwrap()),
         release,
         device,
     )
     .unwrap();
-    let in_process = resources.ledgers().device().in_process(crate::experts::derived::in_process_bytes(
-        &crate::memory::ledger::LoadShape::of(&execution),
-        execution.policy().limits().max_launch_rows,
-        held_pass,
-    ));
     let (mut domain, mut bindings) = ExecutorDomain::new(
         execution,
         definition.clone(),
@@ -376,7 +371,7 @@ fn open_domain(
         None,
         recorded,
         constants,
-        in_process,
+        request_slot,
     )
     .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
     let costs = crate::assessment::synthetic::costs();
@@ -520,7 +515,7 @@ fn run_workload(
     let requests = [RequestId(1), RequestId(2)];
     for request in requests {
         domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
-        domain.open_state(&mut bindings, request, None, 0).unwrap();
+        domain.open_served(&mut bindings, request, None).unwrap();
     }
     let mut steps = Vec::new();
     let mut selected_tokens = Vec::new();

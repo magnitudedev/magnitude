@@ -259,6 +259,10 @@ pub struct Engine {
     /// The loaded generation method: which drafter, if any, and its width.
     pub method: ResolvedMethod,
     next_request: u64,
+    /// The rows a sequence may reach, the served context's: what each
+    /// reserves as it opens, so no prefill or decode it runs writes past
+    /// its reservation.
+    context_rows: u64,
     /// Under cross-step pipelining a step's submissions are traced during
     /// the previous step, so traces are collected per window.
     pub lookahead: bool,
@@ -315,12 +319,14 @@ impl<F: ProgramFamily> MemoryHost for Unrequested<'_, F> {
         None
     }
 
-    /// A shortage the harness would answer by preempting ends the run, as
-    /// an unload does: its sequences are the run's own.
-    fn preempt(&mut self, _: &[RequestId]) -> Result<(), magnitude_scheduler::publication::RequestError> {
-        Err(magnitude_scheduler::publication::RequestError::ModelUnloaded {
-            cause: magnitude_scheduler::publication::ModelUnloadCause::MemoryPressure,
-        })
+    /// The run's sequences are its own: none is evicted, so no relief
+    /// names one.
+    fn evictable(&self) -> std::collections::BTreeSet<RequestId> {
+        std::collections::BTreeSet::new()
+    }
+
+    fn preempt(&mut self, sequences: &[RequestId]) -> Result<(), magnitude_scheduler::publication::RequestError> {
+        panic!("invariant violated: a relief names the harness's sequences {sequences:?}, none of which is evictable")
     }
 }
 
@@ -390,6 +396,7 @@ impl Engine {
         let vocabulary = usize::try_from(resolved.manifest.definition.decoder.vocabulary)
             .map_err(|_| "vocabulary exceeds the host domain")?;
         let method = resolved.manifest.model.method;
+        let context_rows = resolved.manifest.definition.decoder.context_limit;
         let (domain, bindings, _) = load_in_process(
             &resolved.manifest,
             |unprepared| {
@@ -412,6 +419,7 @@ impl Engine {
             vocabulary,
             method,
             next_request: 1,
+            context_rows,
             lookahead: load.lookahead,
             expert_ranges,
             memory: BetweenFlights::new(),
@@ -457,7 +465,9 @@ impl Engine {
             .bindings
             .as_mut()
             .expect("no flight holds the state bindings");
-        self.domain.open_state(bindings, request, from, 0).map_err(text)?;
+        // The harness runs no chain between its steps.
+        let unchained = self.domain.unchained(bindings).expect("no chain is under way between the harness's steps");
+        self.domain.open_state(unchained, request, from, self.context_rows).map_err(text)?;
         Ok(request)
     }
 

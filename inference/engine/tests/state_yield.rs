@@ -154,7 +154,7 @@ fn open(domain: &mut ExecutorDomain, bindings: &mut StateBindings, request: Requ
     domain
         .install_input(request, PreparedModelInput::continuation_only())
         .unwrap();
-    domain.open_state(bindings, request, None, 0).unwrap();
+    domain.open_served(bindings, request, None).unwrap();
 }
 
 fn prefill(

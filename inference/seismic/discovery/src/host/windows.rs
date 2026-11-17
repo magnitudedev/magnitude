@@ -369,10 +369,10 @@ pub(super) fn sample() -> HostSample {
     // What the lists hold, within the commit this process can still make:
     // a page taken is committed first.
     let room = (counters.free_zero + counters.standby).min(status.ullAvailPageFile);
-    let free_above_target = counters.free_zero.min(room);
+    let free = counters.free_zero.min(room);
     let host = super::Scope {
         total: status.ullTotalPhys,
-        supply: Supply { free_above_target, clean_cache: room - free_above_target, cold_reclaimable: 0 },
+        supply: Supply { free_beyond_target: super::beyond(free, 0), clean_cache: room - free, cold_reclaimable: 0 },
     };
     let limits = job_limits().unwrap_or_else(|error| panic!("invariant violated: this process's job limits: {error}"));
     // A job's commit counts a growth in the call, whichever scope binds.

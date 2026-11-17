@@ -179,7 +179,7 @@ fn open(
     domain
         .install_input(request, PreparedModelInput::continuation_only())
         .unwrap();
-    domain.open_state(bindings, request, from, 0).unwrap();
+    domain.open_served(bindings, request, from).unwrap();
 }
 
 /// One draft transaction at draft position `position` entering `tokens`
@@ -327,7 +327,7 @@ fn draft_state_copies_and_restores_reproduce_its_proposals() {
     // Evicting the source and resuming it from that state drafts them too.
     domain.release_state(&[source]).unwrap();
     domain
-        .open_state(&mut bindings, source, Some(&before_draft), 0)
+        .open_served(&mut bindings, source, Some(&before_draft))
         .unwrap();
     let (resumed, mut bindings) =
         draft(&mut domain, bindings, source, &tokens, &conditioning, width);

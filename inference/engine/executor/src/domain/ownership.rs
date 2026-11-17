@@ -52,31 +52,22 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// with a span straddling that position are adopted; every image placed
     /// after it that still lacks features is returned as an encode. Opening
     /// into free banks changes no bindings; growing one orphans the queued
-    /// steps first. Admission is new work's: refused, changing nothing,
-    /// where the device's ledger cannot hold the rows the residency
-    /// restores (`replay`, the position a preempted sequence held when it
-    /// was evicted; none for a fresh one), at least one, past where it
-    /// resumes, beside the guarantee (`Ledger::admit`): a preempted sequence
-    /// comes back only once its rows fit, so the growth that preempted it
-    /// does not evict it again at its next page. Opened, the sequence holds
-    /// its state claim, and the idle optional components are committed
-    /// again for it to draft and encode with.
+    /// steps first, by `unchained`'s proof that no chain holds them: an open
+    /// during another request's chain waits for its end. Admission is new
+    /// work's: refused, changing nothing, where the device's ledger cannot
+    /// reserve the request's whole state, every row of its `rows` (its
+    /// prompt and the most it may generate, within the context) and the
+    /// drafter's speculative rows past them (`Ledger::reserve`), so no row
+    /// of it ever waits on memory. Opened, the request holds its
+    /// reservation, and the idle optional components are committed again
+    /// for it to draft and encode with.
     pub fn open_state(
         &mut self,
-        bindings: &mut StateBindings,
+        mut unchained: Unchained<'_>,
         request: RequestId,
         from: Option<&ResumeState>,
-        replay: u64,
+        rows: u64,
     ) -> Result<Vec<Operation>, DomainError> {
-        use crate::memory::ledger::Need;
-        let resumes = from.map_or(0, ResumeState::position) as u64;
-        let ledgers = self.resources.ledgers();
-        ledgers
-            .device()
-            .admit(&Need::StateRows { sequence: request, from: resumes, to: replay.max(resumes + 1) })
-            .map_err(|short| DomainError::short(short, ledgers))?;
-        self.activate_components();
-        self.orphan_queue(bindings)?;
         let installed = self
             .input
             .get(&request)
@@ -90,16 +81,37 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 request.0
             )));
         }
+        let resumes = from.map_or(0, ResumeState::position) as u64;
+        if resumes > rows {
+            return Err(DomainError::invariant(format!(
+                "request {} resumes at row {resumes}, past the {rows} rows it opens with",
+                request.0
+            )));
+        }
+        let ledgers = self.resources.ledgers();
+        let reserved = crate::memory::ledger::LoadShape::request_rows(rows, self.execution.policy().method());
+        let mut reservation = ledgers
+            .device()
+            .reserve(&self.request_slot, request, reserved)
+            .map_err(|short| DomainError::short(short, ledgers))?;
+        self.activate_components();
+        self.orphan_queue(&mut unchained)?;
         let (target, head) = match from {
             Some(from) => self.fork_resume_state(from)?,
-            None => self.fresh_state(bindings)?,
+            None => self.fresh_state(&mut unchained)?,
         };
         let position = target.position();
-        let claim = ledger_claim(self.resources.ledgers().device(), request)?;
-        self.state_claims.insert(request, super::state::StateClaim { claim, through: position as u64 });
+        reservation.grow(position as u64);
+        self.change_state(|this| this.state_claims.insert(request, reservation));
         self.target.insert(request, target);
         if let Some(head) = head {
             self.head.insert(request, head);
+        }
+        if let Err(error) = self.back_reservation(unchained.bindings(), request) {
+            self.target.remove(&request);
+            self.head.remove(&request);
+            self.change_state(|this| this.drop_state_claim(request));
+            return Err(error);
         }
         let installed = self.input.get_mut(&request).expect("input checked above");
         installed.resident = true;
@@ -132,11 +144,26 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(encodes)
     }
 
-    fn fresh_state(
+    /// A test's open of `request` at the load's served context: its whole
+    /// context reserved ([`Self::open_state`]); refused as invariant while a
+    /// chain is under way, which a test opens beside only to see deferred.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn open_served(
         &mut self,
         bindings: &mut StateBindings,
+        request: RequestId,
+        from: Option<&ResumeState>,
+    ) -> Result<Vec<Operation>, DomainError> {
+        let rows = self.execution.resources().target_state().context_rows as u64;
+        let unchained = self.unchained(bindings).ok_or_else(|| DomainError::invariant("a test opens a request beside a chain"))?;
+        self.open_state(unchained, request, from, rows)
+    }
+
+    fn fresh_state(
+        &mut self,
+        unchained: &mut Unchained<'_>,
     ) -> Result<(SequenceState, Option<SequenceState>), DomainError> {
-        self.provision_open(bindings)?;
+        self.provision_open(unchained)?;
         let requirements = self.open_requirements();
         self.can_open(requirements).map_err(DomainError::Capacity)?;
         let target = self.target_store.create().map_err(|error| {
@@ -282,12 +309,4 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.change_state(|this| requests.iter().for_each(|request| this.drop_state_claim(*request)));
         Ok(())
     }
-}
-
-/// A sequence's state claim as it opens: none of its rows yet, which every
-/// ledger holds (no take, no preemption), grown as it advances.
-fn ledger_claim(ledger: &crate::memory::ledger::Ledger, sequence: RequestId) -> Result<crate::memory::ledger::Claim, DomainError> {
-    ledger
-        .claim(crate::memory::ledger::Need::StateRows { sequence, from: 0, to: 0 })
-        .map_err(|refused| DomainError::invariant(format!("a sequence's empty state claim was refused: {refused:?}")))
 }

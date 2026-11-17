@@ -24,6 +24,9 @@ pub(super) struct Store {
     pub(super) changes: Arc<Changes>,
     /// The OS's pressure events in the store ([`Ledger::watch_pressure`]).
     pub(super) pressure: Arc<pressure::Pressure>,
+    /// Where the footprints of grants' processes are read
+    /// ([`super::Footprints`]).
+    pub(super) footprints: Arc<dyn super::Footprints>,
 }
 
 /// Which entry of a store.
@@ -52,19 +55,15 @@ pub(super) struct State {
     pub(super) releasing: u64,
     /// Cache by kind ([`CacheKind::ALL`]'s order).
     pub(super) cache_of: [u64; CacheKind::ALL.len()],
-    /// Each sequence's committed state, by admission.
+    /// Each request's reservation, by admission.
     pub(super) state_of: BTreeMap<RequestId, u64>,
-    /// What the sequences' state holds in all: the sum of `state_of`.
-    pub(super) state_total: u64,
-    /// What [`CommittedKind::StateFloor`] claims hold: committed state up to
-    /// it is held once, by the floor ([`Self::raise`]).
-    pub(super) floor: u64,
-    /// Sequences' state entries a preemption reserved, and the entry of the
-    /// preemption each one's bytes go to as its sequence is evicted.
-    pub(super) reserved: HashMap<EntryId, EntryId>,
-    /// The entries of preemptions not yet completed: never preempted
-    /// themselves.
-    pub(super) pending: std::collections::HashSet<EntryId>,
+    /// The reservations drawn from a request slot, each with the slot's
+    /// entry ([`Ledger::reserve`]): one request at a time draws on a slot,
+    /// and its bytes go back to it as it drops.
+    pub(super) lent: HashMap<EntryId, EntryId>,
+    /// The grants, and the process each one's growth is credited from
+    /// ([`Grant`]).
+    pub(super) grants: BTreeMap<EntryId, super::grant::Granted>,
     /// The process's own changes no sample shows yet.
     pub(super) journal: Journal,
     /// The latest reading, as the ledger estimated it; none before the
@@ -77,16 +76,14 @@ pub(super) struct State {
     pub(super) boundary: Boundary,
     /// The store's shortage across readings.
     pub(super) persistence: Persistence,
-    /// The loads' in-process figures, summed ([`Ledger::in_process`]).
-    pub(super) in_process: u64,
     /// The store's granule pools, each once it opens, by class
     /// ([`PoolClass::index`], [`Ledger::pool_block`]).
     pub(super) pools: [Option<Pool>; 2],
     /// What pooled holdings of each class hold ([`Holding::pool_class`]),
     /// summed.
     pooled: [u64; 2],
-    /// Moves on every change of the entries, a value or the in-process
-    /// figure ([`Ledger::holdings_generation`]).
+    /// Moves on every change of the entries or a value
+    /// ([`Ledger::holdings_generation`]).
     pub(super) holdings: u64,
     /// The readings folded in ([`Ledger::generation`]).
     pub(super) readings: u64,
@@ -101,10 +98,6 @@ pub(super) struct State {
     /// The latest reading a shortage was answered at
     /// ([`Ledger::shortage`]): each reading is answered once.
     pub(super) answered: Option<Sampled>,
-    /// Cache bytes shed to a shortage since the latest reading
-    /// ([`Ledger::yield_cache`]): what Step 1 has yielded toward that
-    /// reading's cause.
-    pub(super) shed_at_reading: u64,
     /// The shortest interval between two readings across which others'
     /// memory moved ([`Ledger::others_interval`]).
     pub(super) others_interval: Option<Duration>,
@@ -228,15 +221,10 @@ impl State {
         }
     }
 
-    /// What pooled holdings of `class` hold, the state's net of what the
-    /// floor already holds: the granules the class's pool's allocation
-    /// serves.
+    /// What pooled holdings of `class` hold: the granules the class's
+    /// pool's allocation serves.
     fn pooled_held(&self, class: PoolClass) -> u64 {
-        let pooled = self.pooled[class.index()];
-        match class {
-            PoolClass::State => pooled - self.floor.min(self.state_total),
-            PoolClass::Records => pooled,
-        }
+        self.pooled[class.index()]
     }
 
     /// The spare granules `class`'s pool allocating `allocated` holds: what
@@ -293,12 +281,12 @@ impl State {
         self.taken -= bytes.min(self.taken);
     }
 
-    /// What `sequence`'s state is worth per byte: the least of its entries'
-    /// ([`Claim::value`]), none where its holder never valued it.
+    /// What `sequence`'s state is worth per byte: its reservation's
+    /// ([`Reservation::value`]), none where its holder never valued it.
     pub(super) fn value_of(&self, sequence: RequestId) -> Value {
         self.held
             .values()
-            .filter(|entry| entry.holding == Holding::Committed(CommittedKind::State(sequence)))
+            .filter(|entry| entry.holding == Holding::Committed(CommittedKind::Request(sequence)))
             .map(|entry| entry.value)
             .min()
             .unwrap_or(Value::NONE)
@@ -317,11 +305,7 @@ impl State {
         match holding {
             Holding::Committed(kind) => {
                 apply(&mut self.committed);
-                if kind == CommittedKind::StateFloor {
-                    apply(&mut self.floor);
-                }
-                if let CommittedKind::State(sequence) = kind {
-                    apply(&mut self.state_total);
+                if let CommittedKind::Request(sequence) = kind {
                     let held = self.state_of.entry(sequence).or_default();
                     apply(held);
                     if *held == 0 {
@@ -464,8 +448,7 @@ impl State {
         self.entry(id).holding = holding;
     }
 
-    /// Entry `id` was let go: a preempted sequence's bytes go to the
-    /// preemption that reserved them; any other's are free.
+    /// Entry `id` was let go: its bytes are free.
     pub(super) fn release(&mut self, id: EntryId) {
         for pool in &mut self.pools {
             if pool.is_some_and(|pool| pool.entry == id) {
@@ -476,15 +459,13 @@ impl State {
         self.allocated -= entry.allocated + entry.releasing;
         self.wired -= entry.wired;
         self.released(entry.releasing);
-        match self.reserved.remove(&id) {
-            // The preempted sequence's bytes become the preemption's.
-            Some(to) => {
-                self.count(entry.holding, entry.bytes, false);
-                let holding = self.entry(to).holding;
-                self.count(holding, entry.bytes, true);
-                self.entry(to).bytes += entry.bytes;
-            }
-            None => self.count(entry.holding, entry.bytes, false),
+        self.grants.remove(&id);
+        self.count(entry.holding, entry.bytes, false);
+        // A reservation drawn from a request slot gives its bytes back to
+        // it; the granules stay the pool's, so nothing allocated moves.
+        if let Some(slot) = self.lent.remove(&id).filter(|slot| self.held.contains_key(slot)) {
+            let has = self.held[&slot].bytes;
+            self.resize(slot, has + entry.bytes);
         }
     }
 

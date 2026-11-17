@@ -134,7 +134,7 @@ fn idle_slots_a_claim_takes_are_released_with_what_yielded() {
         // A claim takes every byte that yields, the idle slots' cache among
         // it (it yields before the bank's).
         let ledger = domain.resources.ledgers().device().clone();
-        let (_all, _) = ledger.claim_units(CommittedKind::Measurement, std::num::NonZeroU64::new(1).unwrap(), u64::MAX);
+        let (_all, _) = ledger.claim_units(CommittedKind::Scratch, std::num::NonZeroU64::new(1).unwrap(), u64::MAX);
         assert!(domain.idle_slots_taken(), "{backend:?}: the claim took the idle slots' cache");
         assert_eq!(
             domain.release_yielded(&mut bindings, crate::CompletionWake::new(|| {})).unwrap(),
@@ -165,7 +165,7 @@ fn a_taken_idle_cache_with_no_slot_left_goes_in_a_change() {
         assert_eq!(places, 3, "{backend:?}");
         domain.close_group().unwrap();
         let ledger = domain.resources.ledgers().device().clone();
-        let (all, _) = ledger.claim_units(CommittedKind::Measurement, std::num::NonZeroU64::new(1).unwrap(), u64::MAX);
+        let (all, _) = ledger.claim_units(CommittedKind::Scratch, std::num::NonZeroU64::new(1).unwrap(), u64::MAX);
         assert!(domain.idle_slots_taken(), "{backend:?}: the claim took the idle slots' cache");
         // The slots are released apart from their cache, which stays taken.
         assert!(domain.resources.release_idle_slots(Vec::new(), crate::CompletionWake::new(|| {})), "{backend:?}");
@@ -208,7 +208,7 @@ fn a_group_opening_during_a_slot_release_claims_its_whole_class() {
         let idle = idle_cache(&domain);
         assert!(idle > 0, "{backend:?}");
         let ledger = domain.resources.ledgers().device().clone();
-        let (all, _) = ledger.claim_units(CommittedKind::Measurement, std::num::NonZeroU64::new(1).unwrap(), u64::MAX);
+        let (all, _) = ledger.claim_units(CommittedKind::Scratch, std::num::NonZeroU64::new(1).unwrap(), u64::MAX);
         assert_eq!(
             domain.release_yielded(&mut bindings, crate::CompletionWake::new(|| {})).unwrap(),
             crate::domain::Yielded::Pending,
@@ -235,7 +235,7 @@ fn a_group_opens_with_one_place_where_nothing_yields() {
         let (mut domain, _bindings) = banked_chain(backend, 4, 3);
         let ledger = domain.resources.ledgers().device().clone();
         // Another holding takes every byte that yields at once.
-        let (_all, _) = ledger.claim_units(CommittedKind::Measurement, std::num::NonZeroU64::new(1).unwrap(), u64::MAX);
+        let (_all, _) = ledger.claim_units(CommittedKind::Scratch, std::num::NonZeroU64::new(1).unwrap(), u64::MAX);
         let (held, claims) = opened(&mut domain, 2);
         assert_eq!(held, 1, "{backend:?}: no room, one place");
         assert!(claims.is_empty(), "{backend:?}: {claims:?}");
@@ -269,7 +269,7 @@ fn a_drafted_domains_provision_claims_through_its_draft_depth_in_both_stores() {
         fixture_over(definition, manifest, limits(2, 1, false), method, None, false, crate::platform::DeviceRequest::Automatic);
     let request = crate::RequestId(7);
     domain.install_input(request, magnitude_family_contracts::PreparedModelInput::continuation_only()).unwrap();
-    assert!(domain.open_state(&mut bindings, request, None, 0).unwrap().is_empty());
+    assert!(domain.open_served(&mut bindings, request, None).unwrap().is_empty());
     let rows = 2;
     let prefill = crate::Operation::Forward {
         request,
@@ -285,107 +285,79 @@ fn a_drafted_domains_provision_claims_through_its_draft_depth_in_both_stores() {
     domain.provision(&mut bindings, &[prefill], None).unwrap();
     let through = (rows + method.draft_rows()) as u64;
     let state = &domain.state_claims[&request];
-    assert_eq!(state.through, through, "the claim reaches the rows and the draft depth");
+    assert_eq!(state.through(), through, "the claim reaches the rows and the draft depth");
     let shape = LoadShape::of(&domain.execution);
     let resources = domain.execution.resources();
     let head = resources.head_state().expect("an MTP head keeps its own history");
     let domains = shape.stores.iter().map(|store| store.domains.len()).collect::<Vec<_>>();
     assert_eq!(domains, [resources.target_state().history.len(), head.history.len()], "both stores' domains");
-    assert_eq!(state.claim.bytes(), shape.state_bytes(through), "the claim holds both stores' pages through the draft depth");
+    let context = resources.target_state().context_rows as u64;
+    assert_eq!(state.rows(), LoadShape::request_rows(context, method), "the open reserved the whole request, draft depth and all");
+    assert_eq!(state.bytes(), shape.state_bytes(state.rows()), "the reservation holds both stores' pages through its rows");
 }
 
-/// A preempted sequence comes back only when the whole replay its
-/// residency restores fits: with room for one page left and another
-/// sequence holding the load's floor and more, a residency restoring two
-/// pages is refused, changing nothing, while a fresh one opens. So an
-/// older sequence's next page cannot evict it again mid-replay unless
-/// memory freed elsewhere let it back in.
+/// The request slot is the first request's reservation: it moves into the
+/// request as it opens and back as it closes; a second request beside it
+/// takes free room, never the slot twice.
 #[test]
-fn a_preempted_sequence_comes_back_only_when_its_whole_replay_fits() {
+fn a_reservation_draws_the_slot_first_and_gives_it_back() {
     use super::super::fixtures::{fixture_over, limits, tiny_definition, tiny_manifest};
-    use crate::memory::ledger::Need;
-    let mut definition = tiny_definition();
-    definition.decoder.context_limit = 1024;
-    let manifest = tiny_manifest(&definition);
+    use crate::memory::ledger::CommittedKind;
     let (mut domain, mut bindings) = fixture_over(
-        definition,
-        manifest,
+        tiny_definition(),
+        tiny_manifest(&tiny_definition()),
         limits(2, 1, false),
         crate::PlannedMethod::Plain,
         None,
         false,
         crate::platform::DeviceRequest::Automatic,
     );
-    let ledger = domain.resources.ledgers().device().clone();
-    let (holder, back) = (crate::RequestId(1), crate::RequestId(2));
-    let bytes = |rows: u64| ledger.bytes(&Need::StateRows { sequence: back, from: 0, to: rows });
-    let page = bytes(1);
-    let two_pages = (2..=1024).find(|rows| bytes(*rows) > page).expect("the context spans two pages");
-    for request in [holder, back] {
+    let (first, second) = (crate::RequestId(1), crate::RequestId(2));
+    let [slot] = committed_of(&domain, CommittedKind::RequestSlot)[..] else { panic!("one request slot") };
+    for request in [first, second] {
         domain.install_input(request, magnitude_family_contracts::PreparedModelInput::continuation_only()).unwrap();
+        assert!(domain.open_served(&mut bindings, request, None).unwrap().is_empty());
     }
-    assert!(domain.open_state(&mut bindings, holder, None, 0).unwrap().is_empty());
-    domain.claim_state_rows(holder, two_pages).unwrap();
-    let snapshot = ledger.estimate();
-    let _room = ledger
-        .claim(Need::Measurement { bytes: snapshot.free() + snapshot.cache() - page })
-        .expect("the room fits");
-    assert!(
-        matches!(
-            domain.open_state(&mut bindings, back, None, two_pages),
-            Err(crate::domain::DomainError::Capacity(_))
-        ),
-        "a replay of two pages does not fit one page's room"
-    );
-    assert!(!domain.state_claims.contains_key(&back), "a refused residency holds nothing");
-    assert!(domain.open_state(&mut bindings, back, None, 0).unwrap().is_empty(), "a fresh residency fits");
+    let reserved = domain.state_claims[&first].bytes();
+    assert_eq!(committed_of(&domain, CommittedKind::RequestSlot), [slot - reserved], "the first request drew the slot");
+    assert_eq!(domain.state_claims[&second].bytes(), reserved, "the second reserved as much beside it");
+    domain.close(second).unwrap();
+    assert_eq!(committed_of(&domain, CommittedKind::RequestSlot), [slot - reserved], "the second never held the slot");
+    domain.close(first).unwrap();
+    assert_eq!(committed_of(&domain, CommittedKind::RequestSlot), [slot], "the first gave the slot back");
 }
 
-/// A sequence that closes while its growth waits on a preemption lets the
-/// preemption go with it: it holds nothing past the close, and the
-/// sequence it named, no longer reserved to it, frees its state to the
-/// store as it closes in turn.
+/// An open refused for room holds nothing and yields nothing: the retained
+/// prefixes' cache is the same after it, and it opens once room frees.
 #[test]
-fn a_closed_sequences_preemption_is_let_go() {
+fn an_open_refused_short_keeps_the_prefix_cache() {
     use super::super::fixtures::{fixture_over, limits, tiny_definition, tiny_manifest};
-    use crate::memory::ledger::{CommittedKind, Need};
-    let mut definition = tiny_definition();
-    definition.decoder.context_limit = 1024;
-    let manifest = tiny_manifest(&definition);
+    use crate::memory::ledger::{CacheKind, CommittedKind};
     let (mut domain, mut bindings) = fixture_over(
-        definition,
-        manifest,
-        limits(3, 1, false),
+        tiny_definition(),
+        tiny_manifest(&tiny_definition()),
+        limits(2, 1, false),
         crate::PlannedMethod::Plain,
         None,
         false,
         crate::platform::DeviceRequest::Automatic,
     );
-    let (holder, first, later) = (crate::RequestId(1), crate::RequestId(2), crate::RequestId(3));
-    for request in [holder, first, later] {
+    let (holder, refused) = (crate::RequestId(1), crate::RequestId(2));
+    for request in [holder, refused] {
         domain.install_input(request, magnitude_family_contracts::PreparedModelInput::continuation_only()).unwrap();
-        assert!(domain.open_state(&mut bindings, request, None, 0).unwrap().is_empty());
     }
-    // Fill both 64 KiB `StateFloor` slabs (`1024` 128-byte rows at a
-    // `1024`-row context) so `later` and `first` claim committed state bytes
-    // above the floor.
-    domain.claim_state_rows(holder, 1024).unwrap();
-    let rows = 4;
-    domain.claim_state_rows(later, rows).unwrap();
-    // Everything else is taken: the first sequence's growth of as many rows
-    // is covered by the later one's state alone.
+    assert!(domain.open_served(&mut bindings, holder, None).unwrap().is_empty());
     let ledger = domain.resources.ledgers().device().clone();
-    let snapshot = ledger.estimate();
-    let _room = ledger.claim(Need::Measurement { bytes: snapshot.free() + snapshot.cache() }).expect("the room fits");
-    assert!(matches!(
-        domain.claim_state_rows(first, rows),
-        Err(crate::domain::DomainError::Preempt(named)) if named == [later]
-    ));
-    domain.close(first).unwrap();
-    assert!(committed_of(&domain, CommittedKind::State(first)).is_empty(), "the preemption is let go with its sequence");
-    let (committed, held) = (ledger.estimate().committed(), domain.state_claims[&later].claim.bytes());
-    domain.close(later).unwrap();
-    assert_eq!(ledger.estimate().committed(), committed - held, "the named sequence's state frees to the store");
+    let _prefix = ledger.cache(CacheKind::Prefix, 4096).expect("the prefix fits");
+    let (room, _) = ledger.claim_units(CommittedKind::Scratch, std::num::NonZeroU64::new(1).unwrap(), u64::MAX);
+    assert!(
+        matches!(domain.open_served(&mut bindings, refused, None), Err(crate::domain::DomainError::Capacity(_))),
+        "nothing is left for a second request"
+    );
+    assert!(!domain.state_claims.contains_key(&refused), "a refused open holds nothing");
+    assert_eq!(ledger.estimate().cache_of(CacheKind::Prefix), 4096, "a refused open yields no prefix");
+    drop(room);
+    assert!(domain.open_served(&mut bindings, refused, None).unwrap().is_empty(), "it opens once room frees");
 }
 
 /// A component's import, made under its claim and marked allocated, is the
@@ -421,7 +393,7 @@ fn an_imports_bytes_are_never_others_memory() {
         assert_eq!(after.others(), others, "{backend:?}: the import read as others' memory");
         assert!(after.free() < GB, "{backend:?}: free room is under the import");
         assert_eq!(after.guarantee(), guarantee, "{backend:?}: the import raised the guarantee");
-        assert!(ledger.shortage().is_none_or(|shortage| !shortage.response.unload), "{backend:?}: the import unloads the model");
+        assert!(ledger.shortage(&std::collections::BTreeSet::new()).is_none_or(|shortage| !shortage.response.unload), "{backend:?}: the import unloads the model");
         drop(import);
     }
 }
@@ -437,14 +409,15 @@ fn read_at(ledger: &crate::memory::ledger::Ledger, epoch: std::time::Instant, av
 }
 
 /// A load's ledger with 1 GiB free beside the bank at its floor, a
-/// sequence's rows claimed past 800 MiB, and the stores' slabs as the load
-/// started: the rows' claim, the floor's with the records pool's entry that
-/// allocates its granules and the state pool's entry, and the slabs.
+/// request of more than 800 MiB reserved from its slot, and the stores'
+/// slabs as the load started: the slot and the reservation, the floor's
+/// claim with the records pool's entry that allocates its granules and
+/// the state pool's entry, and the slabs.
 fn grown_rows() -> (
     crate::memory::ledger::Ledgers,
     crate::memory::ledger::Ledger,
     (crate::memory::ledger::Claim, std::sync::Arc<dyn seismic::memory::Entry>, std::sync::Arc<dyn seismic::memory::Entry>),
-    crate::memory::ledger::Claim,
+    (crate::memory::ledger::Claim, crate::memory::ledger::Reservation),
     super::StateSlabs,
     std::time::Instant,
 ) {
@@ -468,46 +441,49 @@ fn grown_rows() -> (
     read_at(&ledger, epoch, GIB, 1);
     assert_eq!(ledger.estimate().free(), GIB, "1 GiB free beside the bank at its floor");
     let sequence = crate::RequestId(1);
-    let to = (1..).map(|pages: u64| pages * 1024).find(|rows| ledger.bytes(&Need::StateRows { sequence, from: 0, to: *rows }) >= 800 * MIB).expect("a history past 800 MiB");
-    let rows = ledger.claim(Need::StateRows { sequence, from: 0, to }).expect("the rows fit");
-    (scope, ledger, (floor, records, pool), rows, super::StateSlabs::new(64 * MIB), epoch)
+    let rows = (1..).map(|pages: u64| pages * 1024).find(|rows| ledger.bytes(&Need::Request { sequence, rows: *rows }) >= 800 * MIB).expect("a history past 800 MiB");
+    let slot = ledger.claim(Need::RequestSlot { bytes: ledger.bytes(&Need::Request { sequence, rows }) }).expect("the slot fits");
+    let reservation = ledger.reserve(&slot, sequence, rows).expect("the request draws its slot");
+    (scope, ledger, (floor, records, pool), (slot, reservation), super::StateSlabs::default(), epoch)
 }
 
-/// A state growth's slabs are the rows its sequence claimed: with 1 GiB
-/// free and the bank at its floor, an 800 MiB growth past rows claimed is
-/// held whole, its rows held by their claim and only the slab's rounding
-/// past them held anew, as spare, never the rows' bytes twice.
+/// A state growth's slabs are the request's reservation: with 1 GiB free
+/// and the bank at its floor, an 800 MiB growth past its rows is held
+/// whole, its rows by their reservation and only the slab's rounding past
+/// them anew, as spare, never the rows' bytes twice.
 #[test]
 fn a_state_growth_is_not_admitted_beside_its_own_rows() {
     use crate::memory::ledger::CacheKind;
-    let (_scope, ledger, (_floor, _records, pool), rows, mut slabs, _epoch) = grown_rows();
+    let (_scope, ledger, (_floor, _records, pool), (slot, rows), mut slabs, _epoch) = grown_rows();
+    let committed = slot.bytes() + rows.bytes();
+    ledger.change(|_| slabs.settle(&ledger, 0, 0, 0, committed));
     let growth = rows.bytes() + 16 * MIB;
-    let held = rows.bytes();
-    slabs.reserve(&ledger, growth, std::iter::once(&rows)).expect("the growth past the rows fits free room");
+    slabs.reserve(&ledger, growth).expect("the growth past the rows fits free room");
     ledger.change(|_| { let entry = &pool; entry.take(&entry.change(), growth, seismic::memory::Wiring::Pageable) }).expect("the pool backs the growth");
-    ledger.change(|_| slabs.settle(&ledger, 64 * MIB + growth, rows.bytes(), std::iter::once(&rows)));
-    assert_eq!(rows.bytes(), held, "the slabs back the claimed rows, which hold them");
+    ledger.change(|_| slabs.settle(&ledger, growth, rows.bytes(), rows.bytes(), committed));
     assert_eq!(ledger.estimate().cache_of(CacheKind::Spare), 16 * MIB, "only the slab's excess is held anew");
     // A second growth past rows already backed is all spare, and refused
     // past free room.
-    assert!(slabs.reserve(&ledger, GIB, std::iter::once(&rows)).is_err());
+    assert!(slabs.reserve(&ledger, GIB).is_err());
 }
 
-/// After a reading, a sequence's state bytes are the process's own, never
+/// After a reading, a request's state bytes are the process's own, never
 /// other programs' memory: allocating them moves others nothing.
 #[test]
 fn a_sequences_state_is_never_read_as_others_memory() {
-    let (_scope, ledger, (_floor, _records, pool), rows, mut slabs, epoch) = grown_rows();
+    let (_scope, ledger, (_floor, _records, pool), (slot, rows), mut slabs, epoch) = grown_rows();
     let others = ledger.estimate().others();
+    let committed = slot.bytes() + rows.bytes();
+    ledger.change(|_| slabs.settle(&ledger, 0, 0, 0, committed));
     let growth = rows.bytes() + 16 * MIB;
-    slabs.reserve(&ledger, growth, std::iter::once(&rows)).expect("the growth fits");
+    slabs.reserve(&ledger, growth).expect("the growth fits");
     ledger.change(|_| { let entry = &pool; entry.take(&entry.change(), growth, seismic::memory::Wiring::Pageable) }).expect("the pool backs the growth");
-    ledger.change(|_| slabs.settle(&ledger, 64 * MIB + growth, rows.bytes(), std::iter::once(&rows)));
+    ledger.change(|_| slabs.settle(&ledger, growth, rows.bytes(), rows.bytes(), committed));
     read_at(&ledger, epoch, GIB - growth, 2);
     assert_eq!(ledger.estimate().others(), others, "the state's bytes read as the process's own");
-    // Evicted, its rows' slab bytes stay the process's, as spare.
+    // Closed, its rows' slab bytes stay the process's: the slot's room.
     drop(rows);
-    ledger.change(|_| slabs.settle(&ledger, 64 * MIB + growth, 0, std::iter::empty()));
+    ledger.change(|_| slabs.settle(&ledger, growth, 0, 0, slot.bytes()));
     read_at(&ledger, epoch, GIB - growth, 3);
-    assert_eq!(ledger.estimate().others(), others, "an evicted sequence's slabs read as the process's own");
+    assert_eq!(ledger.estimate().others(), others, "a closed request's slabs read as the process's own");
 }

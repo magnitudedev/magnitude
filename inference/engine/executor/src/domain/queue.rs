@@ -25,7 +25,10 @@
 //! behind its own step, chained on the entry before. Queued steps live in the
 //! domain's one queue (`Queue`), with the chain they continue: they are the
 //! only work that holds bindings between flights, so every binding change
-//! resolves them first (`orphan_queue`). The owner never sees them. When
+//! resolves them first (`orphan_queue`), which takes the proof that no chain
+//! holds the queue (`Unchained`): a binding change during a chain has no
+//! representation, so the owner defers it to the chain's end. The owner
+//! never sees them. When
 //! the operations it next submits equal the front step's prediction (token
 //! included, known once its predecessor finished) and the accepted states are
 //! the ones the successors follow, the group claims the queued step: nothing
@@ -207,19 +210,10 @@ impl<F: ProgramFamily> Queue<F> {
     }
 
     /// Wait for the queued steps nobody will claim and drop them, in queue
-    /// order: their successors release their rows and banks, their leases
-    /// return to their pools. A chain under way is not among them: its
-    /// holder claims it to its end or releases it, and the owner changes no
-    /// bindings until then (`chain_holder`). The binding right proves no
-    /// flight is on the device: every queued step waited for is behind none.
-    pub(super) fn orphan(
-        &mut self,
-        experts: Option<&ExpertMeasures>,
-        _between_flights: &mut StateBindings,
-    ) -> Result<(), DomainError> {
-        if self.holder().is_some() {
-            return Err(DomainError::invariant("a chain under way is orphaned"));
-        }
+    /// order ([`ExecutorDomain::orphan_queue`]), by the proof that no chain
+    /// is among them.
+    pub(super) fn orphan(&mut self, experts: Option<&ExpertMeasures>, _unchained: &mut Unchained<'_>) -> Result<(), DomainError> {
+        assert!(self.holder().is_none(), "invariant violated: a chain opened while its queue was proven unchained");
         self.drain(experts)
     }
 
@@ -233,6 +227,23 @@ impl<F: ProgramFamily> Queue<F> {
             Self::Opening(steps) | Self::Chain(HeldChain { steps, .. }) => steps,
         };
         drain_steps(steps, experts)
+    }
+}
+
+/// Proof that no chain holds the queue: the binding right, borrowed only
+/// while the queue is empty or holds steps nobody will claim (a pipelined
+/// successor, or a chain not yet opened), never a chain under way
+/// ([`ExecutorDomain::unchained`]). While it holds the bindings no step is
+/// submitted, so no chain can open: every binding change takes one, and
+/// orphaning the queue through it never meets a chain.
+pub struct Unchained<'b> {
+    bindings: &'b mut StateBindings,
+}
+
+impl Unchained<'_> {
+    /// The binding right it holds.
+    pub(super) fn bindings(&mut self) -> &mut StateBindings {
+        self.bindings
     }
 }
 
@@ -983,10 +994,21 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(flight)
     }
 
-    /// Wait for the queued steps nobody will claim and drop them
-    /// (`Queue::orphan`): every binding change does so first.
-    pub(super) fn orphan_queue(&mut self, bindings: &mut StateBindings) -> Result<(), DomainError> {
-        self.queue.orphan(self.measures.as_ref().and_then(|measures| measures.experts.as_ref()), bindings)
+    /// The binding right, as proof that no chain holds the queue
+    /// ([`Unchained`]); none while a chain is under way, whose holder claims
+    /// it to its end or releases it: what changes bindings waits for that.
+    pub fn unchained<'b>(&self, bindings: &'b mut StateBindings) -> Option<Unchained<'b>> {
+        self.queue.holder().is_none().then_some(Unchained { bindings })
+    }
+
+    /// Wait for the queued steps nobody will claim and drop them, in queue
+    /// order: their successors release their rows and banks, their leases
+    /// return to their pools. Every binding change does so first, by the
+    /// proof that no chain is among them. The binding right proves no
+    /// flight is on the device: every queued step waited for is behind
+    /// none. Only the drained steps' own failures are reported.
+    pub(super) fn orphan_queue(&mut self, unchained: &mut Unchained<'_>) -> Result<(), DomainError> {
+        self.queue.orphan(self.measures.as_ref().and_then(|measures| measures.experts.as_ref()), unchained)
     }
 
     /// Wait for every queued step and drop it, a chain under way with them

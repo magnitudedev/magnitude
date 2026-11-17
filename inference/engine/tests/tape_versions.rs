@@ -207,7 +207,7 @@ fn tape_versions_continue_exactly_like_runs_that_stopped_there() {
         domain
             .install_input(request, PreparedModelInput::continuation_only())
             .unwrap();
-        domain.open_state(bindings, request, None, 0).unwrap();
+        domain.open_served(bindings, request, None).unwrap();
         Sequence {
             request,
             position: 0,

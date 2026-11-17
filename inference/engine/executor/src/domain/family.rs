@@ -269,7 +269,7 @@ pub enum BankResize {
 /// What a chain's encoding finds memory short of between its submissions
 /// (`ExecutorDomain::submit_chain`'s probe): the bytes of the bank's cache
 /// the ledger took for a real shortage an OS pressure event showed
-/// (`memory::ledger::Ledger::yield_cache`), which the bank cuts beside the
+/// (`memory::ledger::Ledger::execute`), which the bank cuts beside the
 /// running chain.
 #[derive(Clone, Copy, Debug)]
 pub struct RunningPressure {

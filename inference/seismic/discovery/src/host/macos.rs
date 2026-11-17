@@ -406,11 +406,12 @@ pub(super) fn sample() -> HostSample {
     let pressure = pressure_level();
     let (served, task) = snapshot(at, page, free_target);
     let Snapshot { statistics, counted, own, file_floor } = &served.as_ref().expect("a sample was just served").snapshot;
-    // Free and volatile purgeable pages (purged at no one's cost) above the
+    // Free and volatile purgeable pages (purged at no one's cost) less the
     // free-page target, which the pageout daemon refills by compressing,
     // swapping and evicting other pages: pages taken below it are never free
-    // without displacing someone.
-    let free_above_target = pages((free + purgeable).saturating_sub(free_target));
+    // without displacing someone, and a fall below it is a fall all the
+    // same.
+    let free_beyond_target = super::beyond(pages(free + purgeable), pages(free_target));
     // The inactive queue is not split by kind: at least its pages that no
     // file backs, both counts of the one snapshot.
     let cold = pages(u64::from(statistics.inactive_count).saturating_sub(u64::from(statistics.external_page_count)));
@@ -424,7 +425,7 @@ pub(super) fn sample() -> HostSample {
         page_bytes: page,
         total,
         supply: Supply {
-            free_above_target,
+            free_beyond_target,
             clean_cache,
             cold_reclaimable: cold.min(compressed_saving(cold, stored, logical).saturating_add(swap)),
         },
@@ -501,7 +502,7 @@ mod memory_tests {
     #[test]
     fn the_host_sample_reads_within_the_machine() {
         let sample = sample();
-        assert!(sample.supply.free_above_target + sample.supply.clean_cache <= sample.total);
+        assert!(sample.supply.total() <= sample.total);
         assert!(sample.supply.cold_reclaimable <= sample.cold && sample.cold <= sample.total);
         let wired = sample.wired.expect("macOS reads its wired figures");
         assert!(wired.wire_count > 0 && wired.wire_count < sample.total);

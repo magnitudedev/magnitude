@@ -65,13 +65,13 @@
 //!   one [`Estimate`]: the entries and the reading at one instant, so no
 //!   decision mixes readings. The budget is `min(grant, in_use + supply)`,
 //!   `in_use` the process's `allocated_visible` the store's use holds; the
-//!   guarantee `in_process + others' rise`; the bank's target
+//!   guarantee others' rise; the bank's target
 //!   what the budget leaves beside them, within the boundary
 //!   (`memory::supply::Boundary`).
 //!
 //! Sizes are never computed here. A [`Need`] names what is needed and with
 //! what inputs; the page rule ([`magnitude_state::state_bytes`]) sizes state inside
-//! [`Ledger::claim`] and [`Ledger::admit`] through the one private `size`,
+//! [`Ledger::reserve`] through the one private `size`,
 //! the same functions plan and assessment predict with.
 //!
 //! No OS is queried here: readings are handed in.
@@ -81,6 +81,9 @@ mod changes;
 mod charges;
 mod claims;
 mod estimate;
+mod grant;
+mod relief;
+mod reservation;
 mod state;
 mod view;
 mod vocabulary;
@@ -91,15 +94,17 @@ pub use store::*;
 
 pub use admission::{Admit, Over, Short};
 pub use changes::{Changes, Changing, OpenChange, Owner, Sample, Sampled};
-pub use claims::{ArenaClaim, Cached, Claim, InProcess, Preemption, Refused};
+pub use claims::{ArenaClaim, Cached, Claim};
 pub use estimate::Estimate;
+pub use grant::{Footprints, Grant, SystemFootprints};
+pub use relief::{Owed, Relief, ReliefPlan};
+pub use reservation::Reservation;
 pub use view::{ChargeClasses, Ledger, Standing};
-pub use vocabulary::{CacheKind, CommittedKind, Entry, Holding, LoadShape, Need, PoolClass, StoreShape, Value};
+pub use vocabulary::{CacheKind, CommittedKind, Entry, GrantRole, Holding, LoadShape, Need, PoolClass, StoreShape, Value};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
 
 use crate::planning::BankTier;
 #[cfg(test)] use crate::operation::RequestId;

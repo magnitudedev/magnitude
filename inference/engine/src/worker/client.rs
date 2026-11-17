@@ -607,6 +607,17 @@ impl EngineClient {
         Self::wait(reply).await
     }
 
+    /// The measurement job holding the room was started as `process`: the
+    /// worker credits its footprint against the room from now.
+    pub fn attach_measurement_process(&self, process: magnitude_executor::ProcessId) -> Result<(), RequestError> {
+        let state = self.connection.state.lock().unwrap();
+        if let Some(error) = &state.closed {
+            return Err(error.clone());
+        }
+        // Sent under the state lock, so it follows the claim it names.
+        self.connection.send(HostMessage::AttachMeasurementProcess { process })
+    }
+
     /// The measurement job ended: the bank may grow into its room again. A
     /// claim still pending is withdrawn.
     pub fn release_measurement_room(&self) -> Result<(), RequestError> {

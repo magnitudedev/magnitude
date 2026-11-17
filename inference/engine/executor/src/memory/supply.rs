@@ -2,7 +2,7 @@
 //! (design §4.2, §4.3).
 //!
 //! - **One reading per store** ([`Reading`]): the store's total, its supply
-//!   (`free_above_target + clean_cache + cold_reclaimable`: bytes the OS
+//!   (`free_beyond_target + clean_cache + cold_reclaimable`: bytes the OS
 //!   gives without writing anyone's dirty data), on unified Metal its wired
 //!   ceiling, on host RAM its paging signals, and the store's lag. Built
 //!   from one host sample ([`seismic::HostSample`], which panics naming any
@@ -189,7 +189,7 @@ impl Reading {
     /// Where the grant leaves more than the store's capacity.
     pub fn device(capacity: u64, free: u64, lag: seismic::Lag) -> Self {
         assert!(free <= capacity, "invariant violated: a device's grant leaves {free} of its {capacity} bytes");
-        let supply = seismic::Supply { free_above_target: free, clean_cache: 0, cold_reclaimable: 0 };
+        let supply = seismic::Supply { free_beyond_target: i64::try_from(free).expect("a store's bytes fit i64"), clean_cache: 0, cold_reclaimable: 0 };
         Self { total: capacity, supply, grant: None, paging: None, own_reclaimed: None, lag }
     }
 
@@ -290,6 +290,10 @@ pub(crate) struct Boundary {
     /// The OS counts no share of the process's in the machine's harm: harm
     /// and others' cold pages cannot be judged.
     unjudged: bool,
+    /// What the process has committed at the latest reading: B never falls
+    /// below it, so a boundary sheds cache alone and never the floor the
+    /// load serves with.
+    committed: u64,
 }
 
 /// What one reading gives the boundary.
@@ -312,6 +316,8 @@ pub(crate) struct Observed {
     /// that no reading of the store has taken yet
     /// (`memory::ledger::Ledger::watch_pressure`).
     pub(crate) events: u64,
+    /// What the process has committed: the least B may be.
+    pub(crate) committed: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -366,7 +372,8 @@ fn judge(unexplained: f64, harmed: u64, spread: f64, span: f64) -> (f64, u64) {
 impl Boundary {
     /// Fold in one reading.
     pub(crate) fn observe(&mut self, now: Observed) {
-        let Observed { paging, held, live, room, unit, events } = now;
+        let Observed { paging, held, live, room, unit, events, committed } = now;
+        self.committed = committed;
         let seismic::Counted { at, lag } = paging.counted;
         let cold = paging.cold;
         self.harmed = None;
@@ -378,10 +385,11 @@ impl Boundary {
             // evidence a regrowth needs.
             let blocks = unit.saturating_mul(events);
             let bytes = live.saturating_sub(blocks);
-            self.cap = Some(match self.cap {
+            let cap = match self.cap {
                 Some(cap) => Cap { bytes: cap.bytes.min(bytes), step: cap.step.saturating_add(blocks), ..cap },
                 None => Cap { bytes, step: blocks, room, cold },
-            });
+            };
+            self.cap = Some(cap);
         }
         let lifted = |cap: &Cap| room >= cap.room.saturating_add(cap.step) || cold >= cap.cold.saturating_add(cap.step);
         let Some(harm) = paging.harm else {
@@ -471,9 +479,11 @@ impl Boundary {
         self.baseline.is_some()
     }
 
-    /// The most the process may hold in the store, where B stands.
+    /// The most the process may hold in the store, where B stands: never
+    /// below what is committed at the latest reading, so B bounds the
+    /// cache and the floor the load serves with is never shed to it.
     pub(crate) fn cap(&self) -> Option<u64> {
-        self.cap.map(|cap| cap.bytes)
+        self.cap.map(|cap| cap.bytes.max(self.committed))
     }
 
     /// Whether growth is admissible: a baseline judges harm, and no
@@ -537,7 +547,7 @@ mod tests {
             pressure: Some(seismic::PressureLevel::Normal),
             counted: seismic::Counted { at, lag: LAG },
         };
-        Observed { paging, held: GB, live: GB, room: 2 * GB, unit: 0, events: 0 }
+        Observed { paging, held: GB, live: GB, room: 2 * GB, unit: 0, events: 0, committed: 0 }
     }
 
     /// Whether harm sets B within one second of readings `cadence` apart,

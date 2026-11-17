@@ -96,7 +96,7 @@ pub(crate) fn selected_with_room(catalog: &seismic::Devices, host_bytes: u64) ->
         .expect("the host has a device");
     let mut status = real.reading.status.clone();
     status.sample.host.total = host_bytes;
-    status.sample.host.supply = seismic::Supply { free_above_target: host_bytes, clean_cache: 0, cold_reclaimable: 0 };
+    status.sample.host.supply = seismic::Supply { free_beyond_target: i64::try_from(host_bytes).expect("bytes fit i64"), clean_cache: 0, cold_reclaimable: 0 };
     status.sample.grants.clear();
     crate::platform::selected(&real.reading.topology, &status, &release, real.info, real.graph_cost)
 }

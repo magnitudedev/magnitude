@@ -465,7 +465,11 @@ impl Sample {
 #[cfg(any(test, feature = "fixtures"))]
 impl Ledgers {
     pub(crate) fn scripted(clock: impl Fn() -> Instant + Send + Sync + 'static) -> Self {
-        Self { stores: Mutex::default(), changes: Arc::new(Changes { alone: std::sync::atomic::AtomicBool::new(true), clock: Box::new(clock), ..Changes::default() }) }
+        Self {
+            stores: Mutex::default(),
+            changes: Arc::new(Changes { alone: std::sync::atomic::AtomicBool::new(true), clock: Box::new(clock), ..Changes::default() }),
+            footprints: Arc::new(super::store::Unobserved),
+        }
     }
 }
 

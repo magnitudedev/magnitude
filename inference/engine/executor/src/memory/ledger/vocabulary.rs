@@ -9,10 +9,16 @@ use crate::planning::BankTier;
 /// What committed memory is held for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CommittedKind {
-    /// A sequence's state (KV), as it grows. The only committed kind a
-    /// claim may take ([`Ledger::claim`]): an earlier sequence's growth
-    /// preempts a later one's.
-    State(RequestId),
+    /// A request's whole state, reserved as it opens
+    /// ([`Ledger::reserve`]): every row it may write, so its rows draw
+    /// within it and never wait on memory.
+    Request(RequestId),
+    /// The served context's whole request, held for the domain's life: the
+    /// state the load's fit counted at its served context
+    /// (`AssessmentMemoryCharge::state_bytes`). One request at a time
+    /// draws its reservation from it ([`Ledger::reserve`]), and the load's
+    /// first state slabs are granules within it.
+    RequestSlot,
     /// A streamed tier's landing rows.
     Landing,
     /// An optional component's memory (a draft head, a vision encoder):
@@ -32,8 +38,11 @@ pub enum CommittedKind {
     Arena,
     /// The expert bank's floor: one step's routed experts per layer.
     BankFloor,
-    /// A measurement job's room, in another process.
-    Measurement,
+    /// Room a process's own growth draws on beside the load: a measurement
+    /// job's, in another process, or a search's heap in this one. Its
+    /// process's footprint is credited against it at each reading, so its
+    /// growth is never read as others' ([`GrantRole`]).
+    Grant(GrantRole),
     /// A prompt group's scratch beyond the decode set the floor holds, from
     /// its open to its close: optional, taken only from what yields at once
     /// ([`Ledger::claim_units`]).
@@ -55,12 +64,6 @@ pub enum CommittedKind {
     /// ([`super::Ledger::pool_block`]): never a spare granule, as no claim
     /// can take it.
     Absent(PoolClass),
-    /// One request's minimum state: what a load needs to serve beside its
-    /// weights and its bank's floor. Held for the domain's life; each
-    /// sequence's state is credited against it ([`State::raise`]), so a
-    /// request's first rows draw from room the load already holds and no
-    /// window opens in which it is lost.
-    StateFloor,
     /// The state stores' address tables, which the pool's granules are
     /// bound through: allocated as the stores are made, outside the pool,
     /// and held for the domain's life.
@@ -70,9 +73,20 @@ pub enum CommittedKind {
     Device,
 }
 
+/// Whose growth a [`CommittedKind::Grant`] holds room for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GrantRole {
+    /// The service's measurement job, in a process of its own: its whole
+    /// footprint is credited.
+    Measurement,
+    /// A search in this process: its footprint's growth since the grant's
+    /// process was named is credited.
+    Tuning,
+}
+
 /// What cache memory is held for. Cache fills all room no committed claim
 /// holds, and yields to one, and to a real shortage
-/// ([`Ledger::yield_cache`]), the entry worth least per byte first
+/// ([`Ledger::execute`]), the entry worth least per byte first
 /// ([`Value`]); of equal worth, in this order, then the oldest first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CacheKind {
@@ -175,15 +189,15 @@ impl PoolClass {
 }
 
 impl Holding {
-    /// The pool whose granules the holding lies in: KV slabs (a sequence's
-    /// state, the state floor, retained prefixes, spare state slabs) in the
+    /// The pool whose granules the holding lies in: KV slabs (a request's
+    /// reservation, the request slot, retained prefixes, spare state slabs) in the
     /// state's, bank slots (the floor, landing rows, a growth's backing,
     /// slots above the floor) in the records'; a pool's own entry in
     /// itself. The pool's entry allocates them; moving one between
     /// holdings of one class moves only what is held.
     pub(super) fn pool_class(self) -> Option<PoolClass> {
         match self {
-            Self::Committed(CommittedKind::State(_) | CommittedKind::StateFloor) => Some(PoolClass::State),
+            Self::Committed(CommittedKind::Request(_) | CommittedKind::RequestSlot) => Some(PoolClass::State),
             Self::Committed(CommittedKind::BankFloor | CommittedKind::Landing) => Some(PoolClass::Records),
             Self::Committed(CommittedKind::Backing(class)) => Some(class),
             Self::Committed(_) => None,
@@ -208,8 +222,8 @@ impl Holding {
 /// none of its own ([`Holding::Pool`] of its class). `releasing` is memory a cache
 /// holding yielded that Seismic has not freed yet: allocated still, held
 /// no more (for pooled cache, the pool's). A cache entry's `value` ranks
-/// it ([`Value`]); a sequence's state is valued by its holder
-/// ([`Claim::value`]); any other committed entry's is none.
+/// it ([`Value`]); a request's reservation is valued by its holder
+/// ([`Reservation::value`]); any other committed entry's is none.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Entry {
     pub holding: Holding,
@@ -233,37 +247,37 @@ pub struct Entry {
 
 /// What committed memory is needed for, with the inputs its formula sizes
 /// it from, or its bytes where its caller holds them. The one input to
-/// [`Ledger::claim`] and [`Ledger::admit`]: there are no kind-specific
-/// claims. The arena is carved from what the load recorded allocating
+/// [`Ledger::claim`], [`Ledger::reserve`] and [`Ledger::grant`]. The arena
+/// is carved from what the load recorded allocating
 /// ([`Recorded::claim_arena`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Need {
-    /// The state `sequence`'s history takes as it grows from `from` rows
-    /// to `to`: the pages `to` rows occupy beyond those `from` rows occupy
-    /// ([`LoadShape::state_bytes`]), so its claim holds what its stores
-    /// allocate for it.
-    StateRows { sequence: RequestId, from: u64, to: u64 },
+    /// The whole state `sequence`'s history of `rows` rows takes
+    /// ([`LoadShape::state_bytes`]): reserved as it opens, every row it may
+    /// write within it.
+    Request { sequence: RequestId, rows: u64 },
     /// A streamed tier's landing rows, at load, of `slot_bytes` each.
     LandingRows { tier: BankTier, rows: u64, slot_bytes: u64 },
     /// A bank holding's floor, at load: the bank plan's charge at it, which
     /// plan and assessment size the bank by too.
     BankFloor { bytes: u64 },
-    /// A measurement job's room, as the job declares it.
-    Measurement { bytes: u64 },
-    /// One request's minimum state, at load: the state `rows` rows take, held
-    /// for the domain's life ([`CommittedKind::StateFloor`]).
-    StateFloor { rows: u64 },
+    /// The served context's request, at load, of the bytes the load's fit
+    /// counted for it ([`CommittedKind::RequestSlot`]).
+    RequestSlot { bytes: u64 },
+    /// Room for a process's growth beside the load, as its holder declares it
+    /// ([`CommittedKind::Grant`]).
+    Grant { role: GrantRole, bytes: u64 },
 }
 
 impl Need {
     /// The kind a claim for this need holds.
     pub fn kind(&self) -> CommittedKind {
         match self {
-            Self::StateRows { sequence, .. } => CommittedKind::State(*sequence),
+            Self::Request { sequence, .. } => CommittedKind::Request(*sequence),
             Self::LandingRows { .. } => CommittedKind::Landing,
             Self::BankFloor { .. } => CommittedKind::BankFloor,
-            Self::Measurement { .. } => CommittedKind::Measurement,
-            Self::StateFloor { .. } => CommittedKind::StateFloor,
+            Self::RequestSlot { .. } => CommittedKind::RequestSlot,
+            Self::Grant { role, .. } => CommittedKind::Grant(*role),
         }
     }
 }
@@ -315,12 +329,11 @@ impl LoadShape {
         Self::of_states(plan.resources().target_state(), plan.resources().head_state())
     }
 
-    /// One request's minimum state in the load `plan` places: what its first
-    /// step claims, its one row and the most speculative rows its drafter adds
-    /// past it ([`crate::domain::claimed_through`]), so a load that holds it
-    /// serves a request whatever the method.
-    pub fn minimum_state(plan: &crate::planning::ExecutionPlan) -> u64 {
-        Self::of(plan).state_bytes(crate::domain::claimed_through(0, 1, plan.policy().method()))
+    /// The rows a request of `rows` rows writes at most under `method`: its
+    /// own and the most speculative rows its drafter adds past its last
+    /// ([`crate::domain::claimed_through`]). What its reservation holds.
+    pub fn request_rows(rows: u64, method: crate::PlannedMethod) -> u64 {
+        crate::domain::claimed_through(0, usize::try_from(rows).expect("a request's rows fit usize"), method)
     }
 
     /// The history domains of every state store a load holds: the
@@ -357,13 +370,9 @@ impl LoadShape {
 /// their callers hold them.
 pub(super) fn size(shape: &LoadShape, need: &Need) -> u64 {
     match need {
-        Need::StateRows { from, to, .. } => {
-            assert!(from <= to, "a sequence's state need grows its history, never shrinks it");
-            shape.state_bytes(*to) - shape.state_bytes(*from)
-        }
+        Need::Request { rows, .. } => shape.state_bytes(*rows),
         Need::LandingRows { rows, slot_bytes, .. } => rows.checked_mul(*slot_bytes).expect("landing rows' bytes fit u64"),
-        Need::Measurement { bytes } | Need::BankFloor { bytes } => *bytes,
-        Need::StateFloor { rows } => shape.state_bytes(*rows),
+        Need::BankFloor { bytes } | Need::RequestSlot { bytes } | Need::Grant { bytes, .. } => *bytes,
     }
 }
 

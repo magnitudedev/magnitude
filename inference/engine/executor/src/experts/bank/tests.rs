@@ -205,13 +205,13 @@ fn a_long_growth_beside_settled_samples_never_starves_or_panics_them() {
     const TOTAL: u64 = 1 << 40;
     const SUPPLY: u64 = 1 << 30;
     let host = |clean: u64| seismic::HostSample {
-        supply: seismic::Supply { free_above_target: SUPPLY - clean, clean_cache: clean, cold_reclaimable: 0 },
+        supply: seismic::Supply { free_beyond_target: i64::try_from(SUPPLY - clean).expect("bytes fit i64"), clean_cache: clean, cold_reclaimable: 0 },
         ..crate::memory::ledger::tests::host_sample(TOTAL, SUPPLY)
     };
     let first = host(0);
     let start = ledger.read(ledger.sampled(Instant::now()), crate::memory::supply::Reading::host(&first));
     let (others, supply) = (start.others(), start.supply());
-    assert_eq!(supply, SUPPLY);
+    assert_eq!(supply, SUPPLY as i64);
     let changes = scope.changes().clone();
     let entries = ledger.pool_block(crate::memory::ledger::PoolClass::Records, std::num::NonZeroU64::new(2 * granule).expect("a slot's block"));
     let pool = device.pool(seismic::Contract::Shared, granule, 2 * granule, entries).unwrap();

@@ -10,7 +10,7 @@
 use super::*;
 use seismic::memory::Wiring;
 use std::sync::Mutex as Lock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const GB: u64 = 1 << 30;
 const MB: u64 = 1 << 20;
@@ -47,7 +47,8 @@ struct Snapshot {
 /// which counts them (none of the process's pages is cold in the script).
 struct Os {
     total: u64,
-    /// Free pages the OS keeps free by reclaiming.
+    /// Free pages the OS keeps free by reclaiming, of which its hard
+    /// reserve ([`Self::hard_reserve`]) no allocation takes.
     target: u64,
     /// Other programs' working set, which they touch.
     hot: u64,
@@ -143,8 +144,18 @@ impl Os {
         self.ours - self.swapped + self.own_stored + self.releasing.iter().map(|(_, bytes)| bytes).sum::<u64>() + self.hot + self.cold + self.compressed + self.cache
     }
 
+    /// The free pages within the target no allocation takes: Linux's min
+    /// watermark, two thirds of the high one kswapd reclaims to, as macOS's
+    /// `vm_page_free_min` is within its `vm_page_free_target`.
+    fn hard_reserve(&self) -> u64 {
+        self.target * 2 / 3
+    }
+
     /// Keep free at the target: drop clean cache, then compress cold pages
-    /// (a compressed page stores half of itself).
+    /// (a compressed page stores half of itself); what neither gives comes
+    /// out of the free pages below the target down to the hard reserve, the
+    /// soft reserve a growth within one reading dips into. Out of memory
+    /// past it.
     fn reclaim(&mut self) {
         let mut need = (self.used() + self.target).saturating_sub(self.total);
         let dropped = need.min(self.cache);
@@ -153,8 +164,7 @@ impl Os {
         let compressed = (2 * need).min(self.cold);
         self.cold -= compressed;
         self.compressed += compressed / 2;
-        need -= compressed / 2;
-        assert_eq!(need, 0, "the scripted OS ran out of memory");
+        assert!(self.used() + self.hard_reserve() <= self.total, "the scripted OS ran out of memory: an allocation took its hard reserve");
     }
 
     /// The process allocated `bytes` of `wiring` at `at`: shown after the
@@ -212,7 +222,7 @@ impl Os {
             page_bytes: PAGE,
             total: self.total,
             supply: seismic::Supply {
-                free_above_target: free.saturating_sub(self.target),
+                free_beyond_target: i64::try_from(free).expect("bytes fit i64") - i64::try_from(self.target).expect("bytes fit i64"),
                 clean_cache: self.cache + growing,
                 cold_reclaimable: self.cold / 2,
             },
@@ -256,31 +266,31 @@ struct Machine {
     /// the weights and every pool block lie in the residency set; pageable
     /// host memory otherwise.
     wiring: Wiring,
-    _load: (Claim, InProcess),
-    /// One request's minimum state, held where the in-process figure is
-    /// any.
-    _floor: Option<Claim>,
-    /// The load's one sequence and its pages, where it serves: its claim,
-    /// drawn from the floor, which decode grows a page at a time.
-    serving: Option<(Claim, u64)>,
+    _load: Claim,
+    /// The load's request slot: the served context's request, which its
+    /// first request draws its reservation from.
+    slot: Claim,
+    /// The load's one request and the pages it wrote, where it serves: its
+    /// reservation, drawn from the slot, which decode writes a page at a
+    /// time.
+    serving: Option<(Reservation, u64)>,
     bank: Vec<Cached>,
     /// Readings at which the bank resized.
     resizes: u32,
 }
 
 impl Machine {
-    /// A load of `weights` bytes and an in-process figure of `in_process`
-    /// in `os` ([`Self::start`]), serving one sequence where the figure is
-    /// any, as nothing grows in process otherwise.
-    fn load(os: Os, weights: u64, in_process: u64) -> Self {
-        Self::start(os, weights, in_process, in_process > 0)
+    /// A load of `weights` bytes and a request slot of `request` bytes in
+    /// `os` ([`Self::start`]), serving one request where the slot holds
+    /// any.
+    fn load(os: Os, weights: u64, request: u64) -> Self {
+        Self::start(os, weights, request, request > 0)
     }
 
-    /// A load of `weights` bytes and an in-process figure of `in_process`
-    /// in `os`, read once before and once after it: its state floor held
-    /// where the figure is any, and one sequence admitted on it where
-    /// `serving`.
-    fn start(mut os: Os, weights: u64, in_process: u64, serving: bool) -> Self {
+    /// A load of `weights` bytes and a request slot of `request` bytes in
+    /// `os`, read once before and once after it, one request reserving the
+    /// slot's whole pages where `serving`.
+    fn start(mut os: Os, weights: u64, request: u64, serving: bool) -> Self {
         let now = Arc::new(Lock::new(Instant::now()));
         let clock = now.clone();
         let scope = Ledgers::scripted(move || *clock.lock().expect("the clock"));
@@ -293,17 +303,22 @@ impl Machine {
         };
         let at = *now.lock().expect("the clock");
         read(&ledger, &mut os, at);
-        let claim = ledger.claim(Need::Measurement { bytes: weights }).expect("the weights fit");
+        let claim = ledger.claim_at(None, CommittedKind::Load, weights).expect("the weights fit");
         ledger.change(|_| { let entry = claim.entry(); entry.take(&entry.change(), weights, wiring) }).expect("the weights' own bytes");
         os.grow(at, weights, wiring);
-        let launch = ledger.in_process(in_process);
-        let floor = (in_process > 0).then(|| {
-            let Need::StateRows { to: rows, .. } = super::tests::pages(1, 0, 1) else { unreachable!("a sequence's pages are its rows") };
-            ledger.claim(Need::StateFloor { rows }).expect("the floor fits")
+        let slot = ledger.claim(Need::RequestSlot { bytes: request }).expect("the slot fits");
+        let serving = serving.then(|| {
+            let rows = request / page_bytes(&ledger) * super::tests::page_rows();
+            (ledger.reserve(&slot, RequestId(1), rows).expect("the request draws the slot"), 0)
         });
-        let serving = serving.then(|| (ledger.claim(super::tests::pages(1, 0, 1)).expect("the first page draws from the floor"), 1));
-        let mut machine =
-            Self { os, now, _scope: scope, ledger, pool, state, wiring, _load: (claim, launch), _floor: floor, serving, bank: Vec::new(), resizes: 0 };
+        if let Some((request, _)) = &serving {
+            // Its slabs are allocated as it opens: the OS holds its whole
+            // state from then (`ExecutorDomain::back_reservation`).
+            let bytes = request.bytes();
+            ledger.change(|_| state.take(&state.change(), bytes, wiring)).expect("the reservation holds the slabs' granules");
+            os.grow(at, bytes, wiring);
+        }
+        let mut machine = Self { os, now, _scope: scope, ledger, pool, state, wiring, _load: claim, slot, serving, bank: Vec::new(), resizes: 0 };
         machine.tick(100);
         machine.read();
         machine
@@ -357,17 +372,12 @@ impl Machine {
         }
     }
 
-    /// The decode's next page of the sequence's state, claimed as it grows
-    /// and allocated from the pool.
-    fn decode_page(&mut self) {
-        let at = self.at();
-        let (sequence, pages) = self.serving.as_mut().expect("the load serves a sequence");
-        let before = sequence.bytes();
-        sequence.grow(super::tests::pages(1, *pages, *pages + 1)).expect("the page fits");
-        *pages += 1;
-        let page = sequence.bytes() - before;
-        self.ledger.change(|_| self.state.take(&self.state.change(), page, self.wiring)).expect("the sequence holds the block's granules");
-        self.os.grow(at, page, self.wiring);
+    /// The decode's next `pages` pages of the request's state, written
+    /// into slabs its open allocated: nothing allocates.
+    fn decode(&mut self, pages: u64) {
+        let (request, written) = self.serving.as_mut().expect("the load serves a request");
+        *written += pages;
+        request.grow(*written * super::tests::page_rows());
     }
 
     /// A reading `ms` after the last, then the bank following it.
@@ -376,6 +386,11 @@ impl Machine {
         self.read();
         self.follow();
     }
+}
+
+/// The bytes of one page of a request's state.
+fn page_bytes(ledger: &Ledger) -> u64 {
+    ledger.bytes(&Need::Request { sequence: RequestId(1), rows: super::tests::page_rows() })
 }
 
 /// `ledger` reads `os` at `at`, as the store's kind reads it.
@@ -394,8 +409,8 @@ const SNAPSHOT_MS: u64 = SNAPSHOT.as_millis() as u64;
 /// Load 20 GB, and let the bank fill: the load's step closes, a baseline
 /// is learned, and the bank grows, at the reading that returns: the next
 /// reading a snapshot later judges the bank's growth step.
-fn filled(os: Os, in_process: u64) -> Machine {
-    let mut machine = Machine::load(os, 20 * GB, in_process);
+fn filled(os: Os, request: u64) -> Machine {
+    let mut machine = Machine::load(os, 20 * GB, request);
     for _ in 0..20 {
         if machine.bank_bytes() > 0 {
             break;
@@ -412,9 +427,9 @@ fn filled(os: Os, in_process: u64) -> Machine {
 /// once that growth's step closes, two readings on, and by them alone: the
 /// 4 GB the compressor frees of the cold pages ([`Os::new`]). Nothing
 /// resizes at the reading between, and nothing stands at the reading after.
-fn settled(os: Os, in_process: u64) -> Machine {
+fn settled(os: Os, request: u64) -> Machine {
     const COLD: u64 = 4 * GB;
-    let mut machine = filled(os, in_process);
+    let mut machine = filled(os, request);
     let (first, resizes) = (machine.bank_bytes(), machine.resizes);
     machine.step(SNAPSHOT_MS);
     assert_eq!((machine.bank_bytes(), machine.resizes), (first, resizes), "the first growth's step is open: nothing resizes");
@@ -430,27 +445,50 @@ fn settled(os: Os, in_process: u64) -> Machine {
     machine
 }
 
-/// Steady decode makes no resize: once the bank has settled, the sequence
-/// claims its state a page a reading, which draws down the in-process
-/// figure it is the growth of, and others take a third of a granule at
-/// every other reading and give it back, which moves the target by less
-/// than a block.
+/// Steady decode makes no resize: once the bank has settled, the request
+/// writes its state a page a reading, within the reservation it holds from
+/// its open, and others take a third of a granule at every other reading
+/// and give it back, which moves the target by less than a block.
 #[test]
 fn steady_decode_makes_zero_resizes() {
     let mut machine = settled(Os::new(), GB);
     let settled = machine.resizes;
-    let (_, first) = *machine.serving.as_ref().expect("the load serves a sequence");
+    let (_, first) = *machine.serving.as_ref().expect("the load serves a request");
     for reading in 0..200 {
-        machine.decode_page();
+        machine.decode(1);
         match reading % 2 {
             0 => machine.os.hot += GRANULE / 3,
             _ => machine.os.hot -= GRANULE / 3,
         }
         machine.step(100);
     }
-    let (sequence, pages) = machine.serving.as_ref().expect("the load serves a sequence");
-    assert!(*pages - first == 200 && sequence.bytes() < GB, "the decode's pages, within the in-process figure");
+    let page = page_bytes(&machine.ledger);
+    let (request, pages) = machine.serving.as_ref().expect("the load serves a request");
+    assert!(*pages - first == 200 && *pages * page <= request.bytes(), "the decode's pages, within the reservation");
     assert_eq!(machine.resizes, settled, "steady decode resizes nothing");
+}
+
+/// A request reserved at its open writes every row of its context while
+/// others rise inside the guarantee at every reading: its slabs were
+/// allocated as it opened, so nothing it writes allocates or waits on
+/// memory, no relief preempts it, and nothing unloads.
+#[test]
+fn a_context_length_request_completes_beside_rising_others() {
+    let mut machine = settled(Os::new(), GB);
+    let pages = machine.serving.as_ref().expect("the load serves a request").0.rows() / super::tests::page_rows();
+    let per_reading = pages.div_ceil(40);
+    while machine.serving.as_ref().expect("the load serves a request").1 < pages {
+        let written = machine.serving.as_ref().expect("the load serves a request").1;
+        machine.decode(per_reading.min(pages - written));
+        machine.os.hot += GRANULE / 16;
+        machine.step(100);
+        if let Some(shortage) = machine.ledger.shortage(&std::collections::BTreeSet::from([RequestId(1)])) {
+            assert!(!shortage.response.unload, "others' rise inside the guarantee unloads nothing");
+            assert!(shortage.response.relief.is_none_or(|plan| plan.preempt().is_empty()), "the request is never preempted");
+        }
+    }
+    let (request, written) = machine.serving.as_ref().expect("the load serves a request");
+    assert_eq!(*written * super::tests::page_rows(), request.rows(), "every row of its context written");
 }
 
 /// A shrink never raises others' memory: a release the store does not show
@@ -488,7 +526,7 @@ fn growth_into_a_compressing_os_stops_at_supply() {
     let supply = 15 * GB;
     let held = machine.bank_bytes();
     assert!(held <= supply && supply - held < GRANULE, "the bank takes the supply, {held} of {supply}, and no more");
-    assert!(machine.ledger.estimate().supply() < GRANULE, "what it took left the supply");
+    assert!(machine.ledger.estimate().supply() < GRANULE as i64, "what it took left the supply");
     assert!(machine.os.compressed > 0, "the OS compressed others' cold pages under it");
     let room = machine.ledger.estimate().budget();
     for _ in 0..20 {
@@ -534,43 +572,6 @@ fn regrowth_needs_exogenous_evidence() {
     assert!(machine.bank_bytes() > 0, "the bank grows again");
 }
 
-/// Others' spike is a real shortage: the cache yields once, and the load
-/// unloads only where the shortage persists past the store's λ with nothing
-/// left to yield or pending.
-#[test]
-fn an_exogenous_spike_yields_once_and_unloads_only_past_lambda() {
-    let mut machine = filled(Os::new(), 10 * GB);
-    let bank = machine.bank_bytes();
-    // Others take 9 GB in one reading.
-    machine.os.hot += 9 * GB;
-    machine.tick(100);
-    machine.read();
-    let shortage = machine.ledger.shortage().expect("a real shortage");
-    assert!(matches!(shortage.cause, shortage::Cause::Room { .. }));
-    assert_eq!(shortage.response.yields, bank, "the cache yields at once");
-    assert!(shortage.response.preempt.is_empty() && !shortage.response.unload);
-    assert_eq!(machine.ledger.yield_cache(shortage.response.yields), bank);
-    let at = machine.at();
-    for granule in machine.bank.drain(..) {
-        machine.ledger.change(|_| {
-            drop(granule);
-            machine.pool.freed(&machine.pool.change(), GRANULE, machine.wiring);
-        });
-        machine.os.release(at, GRANULE, machine.wiring);
-    }
-    // Within λ of the first reading short (30 ms of its 50): the release is
-    // pending.
-    machine.tick(30);
-    machine.read();
-    let again = machine.ledger.shortage().expect("still short");
-    assert_eq!(again.response.yields, 0, "the cache yielded once");
-    assert!(!again.response.unload, "within the store's λ");
-    // Past λ, nothing pending and nothing left: unload.
-    machine.tick(200);
-    machine.read();
-    assert!(machine.ledger.shortage().expect("still short").response.unload);
-}
-
 /// Pressure names no bytes: B falls one block per pressure event the OS
 /// delivers, never per reading; a level that stands with no new event
 /// drains nothing more; each reading is answered once, yielding what the
@@ -583,7 +584,7 @@ fn pressure_yields_a_block_per_event_and_regrows_only_on_evidence() {
     machine.os.pressure = seismic::PressureLevel::Warn;
     for _ in 0..3 {
         machine.step(100);
-        assert!(machine.ledger.shortage().is_none(), "a level with no event drains nothing");
+        assert!(machine.ledger.shortage(&std::collections::BTreeSet::new()).is_none(), "a level with no event drains nothing");
         assert!(machine.ledger.estimate().cap().is_none(), "nor sets B");
     }
     let bank = machine.bank_bytes();
@@ -595,13 +596,13 @@ fn pressure_yields_a_block_per_event_and_regrows_only_on_evidence() {
         for reading in 0..3 {
             machine.tick(100);
             machine.read();
-            let shortage = machine.ledger.shortage();
+            let shortage = machine.ledger.shortage(&std::collections::BTreeSet::new());
             if reading == 0 {
                 let shortage = shortage.expect("a pressure event is a real shortage");
                 assert!(matches!(shortage.cause, shortage::Cause::Pressure(seismic::PressureLevel::Warn)));
-                assert_eq!(shortage.response.yields, GRANULE, "event {event}: one block");
+                assert_eq!(shortage.response.relief.as_ref().map(ReliefPlan::covers), Some(GRANULE), "event {event}: one block");
                 assert!(!shortage.response.unload);
-                assert!(machine.ledger.shortage().is_none(), "the reading was answered");
+                assert!(machine.ledger.shortage(&std::collections::BTreeSet::new()).is_none(), "the reading was answered");
                 yielded += GRANULE;
             } else {
                 assert!(shortage.is_none(), "event {event}: the standing level drains nothing more");
@@ -700,7 +701,7 @@ fn a_device_store_shows_the_process_after_its_own_lag() {
     };
     read_both(&mut os, &mut driver);
     let charged = |ledger: &Ledger, bytes: u64| {
-        let claim = ledger.claim(Need::Measurement { bytes }).expect("room");
+        let claim = ledger.claim_at(None, CommittedKind::Load, bytes).expect("room");
         ledger.change(|_| { let entry = claim.entry(); entry.take(&entry.change(), bytes, Wiring::Pageable) }).expect("the claim's own bytes");
         claim
     };
@@ -784,7 +785,7 @@ fn without_harm_growth_is_bounded_by_the_supply_alone() {
     os.counts_own = false;
     let mut machine = Machine::load(os, 20 * GB, 0);
     machine.step(100);
-    assert_eq!(machine.ledger.estimate().supply(), 11 * GB, "free above the target and clean cache, no cold pages");
+    assert_eq!(machine.ledger.estimate().supply(), 11 * GB as i64, "free above the target and clean cache, no cold pages");
     assert_eq!(machine.bank_bytes(), 11 * GB, "the bank takes the supply at once");
     let grown = machine.resizes;
     for _ in 0..10 {
@@ -797,7 +798,7 @@ fn without_harm_growth_is_bounded_by_the_supply_alone() {
     let estimate = machine.ledger.estimate();
     assert_eq!((machine.bank_bytes(), machine.resizes), (11 * GB, grown), "the bank holds");
     assert_eq!((machine.os.compressed, estimate.cap()), (0, None), "no cold page compressed, no boundary");
-    assert!(machine.ledger.shortage().is_none() && machine.ledger.standing().is_none(), "nothing stands");
+    assert!(machine.ledger.shortage(&std::collections::BTreeSet::new()).is_none() && machine.ledger.standing().is_none(), "nothing stands");
 }
 
 /// Where the host gives no feedback of any kind (no harm and no pressure
@@ -811,7 +812,7 @@ fn without_harm_and_pressure_clean_cache_is_no_supply() {
     (os.counts_own, os.reports_pressure) = (false, false);
     let mut machine = Machine::load(os, 20 * GB, 0);
     machine.step(100);
-    assert_eq!(machine.ledger.estimate().supply(), 7 * GB, "free above the target alone");
+    assert_eq!(machine.ledger.estimate().supply(), 7 * GB as i64, "free above the target alone");
     assert_eq!(machine.bank_bytes(), 7 * GB, "the bank takes the supply at once");
     let grown = machine.resizes;
     for _ in 0..10 {
@@ -844,7 +845,7 @@ fn only_wired_memory_is_the_processs_in_the_wire_count() {
     let mut machine = Machine::load(os, 20 * GB, 0);
     assert_eq!(wired(&machine), (Some(6 * GB), Some(34 * GB)));
     machine.tick(100);
-    let anonymous = machine.ledger.claim(Need::Measurement { bytes: 4 * GB }).expect("room");
+    let anonymous = machine.ledger.claim_at(None, CommittedKind::Load, 4 * GB).expect("room");
     machine.ledger.change(|_| { let entry = anonymous.entry(); entry.take(&entry.change(), 4 * GB, Wiring::Pageable) }).expect("the claim's own bytes");
     let at = machine.at();
     machine.os.grow(at, 4 * GB, Wiring::Pageable);
@@ -995,9 +996,8 @@ fn an_idle_span_past_the_residency_lapse_moves_nothing() {
     assert_eq!((machine.bank_bytes(), machine.resizes), (bank, resizes), "the bank never moves");
 }
 
-/// An idle load: 20 GB of weights, an in-process figure of 1 GB and the
-/// state floor of one request held, no sequence admitted and no bank above
-/// its floor, so nothing to yield or preempt.
+/// An idle load: 20 GB of weights and a request slot of 1 GB, no request
+/// admitted and no bank above its floor, so nothing to yield or preempt.
 fn idle(os: Os) -> Machine {
     Machine::start(os, 20 * GB, GB, false)
 }
@@ -1005,47 +1005,46 @@ fn idle(os: Os) -> Machine {
 /// `reading` (a reading of the scripted OS with its cause standing) four
 /// times: each answered with the shortage standing, nothing to yield or
 /// preempt and no change of the process's pending, until it spans more than
-/// the store's λ; the idle load never unloads (§4.5). Its first new
-/// sequence is refused while the cause stands: two pages, one beyond the
-/// floor, refused by that page and the 1 GB in-process figure its
-/// admission makes live. The cause at the last reading.
+/// the store's λ; a load short by anything but its floor never unloads
+/// (§4.5). The cause at the last reading.
 fn stands_idle(machine: &mut Machine, mut reading: impl FnMut(&mut Machine)) -> shortage::Cause {
     let mut first = None;
     let mut cause = None;
     for _ in 0..4 {
         reading(machine);
-        let shortage = machine.ledger.shortage().expect("the cause stands");
+        let shortage = machine.ledger.shortage(&std::collections::BTreeSet::new()).expect("the cause stands");
         let estimate = machine.ledger.estimate();
-        assert_eq!((shortage.response.yields, shortage.response.preempt.len(), estimate.pending()), (0, 0, false), "nothing to give, nothing pending");
-        assert!(!shortage.response.unload, "an idle load never unloads");
+        let covers = shortage.response.relief.as_ref().map_or(0, ReliefPlan::covers);
+        assert_eq!((covers, estimate.pending()), (0, false), "nothing to give, nothing pending");
+        assert!(!shortage.response.unload, "an idle load short of no floor never unloads");
         first = first.or(Some(estimate.at().at()));
         cause = Some(shortage.cause);
     }
     let first = first.expect("four readings");
     assert!(machine.at().duration_since(first) > machine.ledger.estimate().lag(), "the shortage spans more than λ");
-    let page = machine.ledger.bytes(&super::tests::pages(1, 0, 1));
-    match machine.ledger.claim(super::tests::pages(1, 0, 2)) {
-        Err(Refused::Short(short)) => assert_eq!(short.over, page + GB, "the page past the floor and the in-process figure"),
-        Err(Refused::Preempt(_)) | Ok(_) => panic!("the first sequence is refused while the cause stands"),
-    }
     cause.expect("four readings")
 }
 
-/// An idle load whose committed memory, its weights and state floor, lies
+/// An idle load whose committed memory, its weights and request slot, lies
 /// over a budget others squeezed: others take 15 GB, the OS drops its 4 GB
 /// of clean cache and compresses every cold page, and the budget is the
-/// load's own 20 GB, short of the floor's page at every reading after the
-/// first. It never unloads, and its first new sequence is refused.
+/// load's own 20 GB, the slot's 1 GB short of it at every reading after the
+/// first. What is committed cannot be held: past λ, it unloads.
 #[test]
-fn an_idle_load_over_its_budget_never_unloads() {
+fn an_idle_load_over_its_floor_unloads_past_lambda() {
     let mut machine = idle(Os::new());
     machine.os.hot += 15 * GB;
-    let cause = stands_idle(&mut machine, |machine| {
+    let mut unloads = Vec::new();
+    for _ in 0..4 {
         machine.tick(100);
         machine.read();
-    });
-    let page = machine.ledger.bytes(&super::tests::pages(1, 0, 1));
-    assert_eq!(cause, shortage::Cause::Room { over: page });
+        if let Some(shortage) = machine.ledger.shortage(&std::collections::BTreeSet::new()) {
+            assert_eq!(shortage.cause, shortage::Cause::FloorShort { over: GB });
+            unloads.push(shortage.response.unload);
+        }
+    }
+    assert_eq!(unloads.first(), Some(&false), "one reading decides nothing");
+    assert_eq!(unloads.last(), Some(&true), "past λ, the floor short: unload");
 }
 
 /// An idle load while others' working set grows of itself, harm past the
@@ -1070,9 +1069,10 @@ fn an_idle_load_under_harm_never_unloads() {
     assert!(matches!(cause, shortage::Cause::Harm { .. }));
 }
 
-/// An idle load under the OS's pressure, a new event at every reading: short
-/// by the pressure for more than λ, it never unloads, and its first new
-/// sequence is refused.
+/// An idle load under the OS's pressure, a new event at every reading and
+/// no cache to shed: B never falls below what is committed, so it is short
+/// by the pressure for more than λ, never unloads, and its request slot
+/// stands; a request past the slot is refused under B.
 #[test]
 fn an_idle_load_under_pressure_never_unloads() {
     let mut machine = idle(Os::new());
@@ -1083,11 +1083,16 @@ fn an_idle_load_under_pressure_never_unloads() {
         machine.read();
     });
     assert_eq!(cause, shortage::Cause::Pressure(seismic::PressureLevel::Warn));
+    let estimate = machine.ledger.estimate();
+    assert!(estimate.cap().is_some_and(|cap| cap >= estimate.committed()), "B never falls below what is committed");
+    let rows = super::tests::page_rows();
+    let _first = machine.ledger.reserve(&machine.slot, RequestId(1), rows).expect("the slot holds the first request");
+    assert!(machine.ledger.reserve(&machine.slot, RequestId(2), rows).is_err(), "a request past the slot is refused under B");
 }
 
 /// An idle load whose bank holds cache above its floor yields just the harm's
-/// bytes at Step 1 (`admission_waits == false`) and admits its first sequence
-/// from the remaining room and cache instead of refusing it as if at floor.
+/// bytes at Step 1 (`admission_waits == false`) and admits its first request
+/// instead of refusing it as if at floor.
 #[test]
 fn an_idle_load_with_cache_above_its_floor_admits_new_work_when_cache_meets_harm() {
     let mut machine = idle(Os::new());
@@ -1104,11 +1109,11 @@ fn an_idle_load_with_cache_above_its_floor_admits_new_work_when_cache_meets_harm
     machine.os.harm += 8;
     machine.tick(SNAPSHOT_MS);
     machine.read();
-    let shortage = machine.ledger.shortage().expect("harm past the baseline");
+    let shortage = machine.ledger.shortage(&std::collections::BTreeSet::new()).expect("harm past the baseline");
     assert_eq!(shortage.cause, shortage::Cause::Harm { bytes: 8 * PAGE });
-    assert_eq!(shortage.response.yields, 8 * PAGE);
     assert!(!shortage.response.admission_waits, "cache meets the harm above its floor");
-    assert_eq!(machine.ledger.yield_cache(shortage.response.yields), 8 * PAGE);
-    let admitted = machine.ledger.claim(super::tests::pages(1, 0, 2));
-    assert!(admitted.is_ok(), "the first sequence is admitted once cache meets the shortage: {:?}", admitted.err());
+    let plan = shortage.response.relief.expect("the bank covers the harm");
+    assert_eq!(machine.ledger.execute(plan).yielded, 8 * PAGE);
+    let admitted = machine.ledger.reserve(&machine.slot, RequestId(1), 2 * super::tests::page_rows());
+    assert!(admitted.is_ok(), "the first request is admitted once cache meets the shortage: {:?}", admitted.err());
 }

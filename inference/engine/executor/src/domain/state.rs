@@ -109,25 +109,24 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.target.is_empty() && self.head.is_empty() && self.input.is_empty()
     }
 
-    /// Value each resident sequence's state claim by what its replay costs
-    /// per byte it holds (`Claim::value`): the seconds one launch of its
-    /// claimed rows takes resident from an empty history, on the load's
-    /// measured step (`LoadCosts::step`), over the claim's bytes. A
-    /// shortage preempts the sequence worth least first, and a growth
-    /// preempts among those admitted after it by the same order. None is
-    /// valued before the load's step is measured; one that holds no rows
+    /// Value each resident request's reservation by what its replay costs
+    /// per byte it holds (`Reservation::value`): the seconds one launch of
+    /// its written rows takes resident from an empty history, on the load's
+    /// measured step (`LoadCosts::step`), over the reservation's bytes. A
+    /// shortage's relief preempts the request worth least first. None is
+    /// valued before the load's step is measured; one that wrote no rows
     /// replays nothing and keeps no value.
     pub fn value_state(&self) -> Result<(), DomainError> {
         let Some(step) = self.load_costs().map(|costs| &costs.step) else {
             return Ok(());
         };
         for (sequence, state) in &self.state_claims {
-            let Some(bytes) = std::num::NonZeroU64::new(state.claim.bytes()).filter(|_| state.through > 0) else {
+            let Some(bytes) = std::num::NonZeroU64::new(state.bytes()).filter(|_| state.through() > 0) else {
                 continue;
             };
-            let rows = u32::try_from(state.through).map_err(|_| DomainError::invariant(format!("{sequence:?} claims rows past a launch's count")))?;
+            let rows = u32::try_from(state.through()).map_err(|_| DomainError::invariant(format!("{sequence:?} writes rows past a launch's count")))?;
             let replay = step(rows, 0).map_err(|error| DomainError::invariant(format!("the replay of {sequence:?}: {error}")))?.resident;
-            state.claim.value(crate::memory::ledger::Value::per_byte(replay, bytes));
+            state.value(crate::memory::ledger::Value::per_byte(replay, bytes));
         }
         Ok(())
     }
@@ -270,8 +269,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// keep growing in place. A refused minimum grant returns a byte deficit.
     /// Histories at the segment limit are repacked first. With a `ceiling`,
     /// growth that would take the stores' committed state past it grows
-    /// nothing and returns [`DomainError::StateCeiling`]. A sequence's rows
-    /// may preempt the sequences admitted after it ([`DomainError::Preempt`]).
+    /// nothing and returns [`DomainError::StateCeiling`]. A request's rows
+    /// draw within its reservation and never wait on memory. Every other
+    /// allocation the group needs is made here too, where a refusal parks
+    /// or refuses its requests alone: the optional components it binds,
+    /// after the state's backing, and its priming boundary, kept for its
+    /// reservation ([`Self::reserve`]), which then allocates nothing.
     pub fn provision(
         &mut self,
         bindings: &mut StateBindings,
@@ -293,7 +296,20 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if self.claim_slots(operations).is_some() {
             return Ok(());
         }
-        self.orphan_queue(bindings)?;
+        // Only the chain holder's groups are admitted while its chain is
+        // under way (`claims`). One that is not the queued chunk (lowered at
+        // other rows than the chain planned) releases the chain, its state
+        // with it, and the holder replays; any other group is an invariant
+        // violation.
+        if let Some(holder) = self.chain_holder() {
+            if !operations.iter().any(|operation| operation.request() == holder) {
+                return Err(DomainError::invariant("a group other than the chain holder's provisions while its chain is under way"));
+            }
+            self.release_chain()?;
+            return Err(DomainError::ChainReleased(holder));
+        }
+        let mut unchained = self.unchained(bindings).expect("invariant violated: no chain is under way, so the queue is unchained");
+        self.orphan_queue(&mut unchained)?;
         self.close_group()?;
         self.open_group(operations)?;
         for operation in operations {
@@ -310,9 +326,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // successor its own, a chain's chunks the two they alternate
         // (`OwnedChainedAdvance`).
         let behind = self.behind(operations);
-        // The rows each sequence reaches through this group
-        // (`claimed_through`), committed on the ledger before any store
-        // grows.
+        // The rows each request reaches through this group
+        // (`claimed_through`), within its reservation.
         let method = self.execution.policy().method();
         let mut state_rows = Vec::new();
         let mut target_banks = 0usize;
@@ -382,7 +397,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
         }
         for (sequence, through) in state_rows {
-            self.claim_state_rows(sequence, through)?;
+            self.state_claims
+                .get_mut(&sequence)
+                .ok_or_else(|| DomainError::invariant("a resident request holds no reservation"))?
+                .grow(through);
         }
         // Stores without history domains still grow banks.
         if target_banks != 0 {
@@ -392,18 +410,29 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             self.grant_state_growth(bindings, true, &head, &head_queued, head_banks)?;
         }
         self.change_state(|_| ());
-        let lane = match operations.first() {
-            Some(Operation::Forward { .. }) => ReservationLane::Target,
-            Some(Operation::Head { .. }) => ReservationLane::Head,
+        let Some(lane) = operations.first().map(ReservationLane::of) else {
+            return Ok(());
+        };
+        self.bind_component(lane)?;
+        // A primed chunk's drafter entry runs on the head.
+        if operations.iter().any(|operation| matches!(operation, Operation::Forward { prime: Some(prime), .. } if !prime.tokens.is_empty())) {
+            self.bind_component(ReservationLane::Head)?;
+        }
+        let bounded = operations.iter().any(|operation| matches!(operation, Operation::Forward { prime: Some(Priming { boundary: true, .. }), .. }));
+        match (bounded, self.boundary.is_some()) {
+            (false, _) => self.boundary = None,
+            (true, false) => self.boundary = Some(self.allocate_boundary()?),
+            (true, true) => {}
+        }
+        match operations.first() {
             Some(Operation::Encode { image, .. }) => {
                 let class = self
                     .image_class(image.patches())
                     .map_err(DomainError::Input)?;
-                return self.provision_vision(class as u64);
+                self.provision_vision(class as u64)
             }
-            None => return Ok(()),
-        };
-        self.provision_output(lane, super::projected_rows(operations))
+            _ => self.provision_output(lane, super::projected_rows(operations)),
+        }
     }
 
     /// The state the stores' holders reference: the rows and banks some
@@ -505,73 +534,41 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .map_err(|error| growth_failure(error, bytes, "graph output growth"))
     }
 
-    /// Commit `sequence`'s state rows through row `through` on the device's
-    /// ledger (`Need::StateRows`), growing its claim by the pages its rows
-    /// past those it holds occupy: a provision repeated, or one whose rows its sequence
-    /// rewinds below, takes nothing again. Where the ledger names sequences
-    /// of this load to preempt, their bytes are reserved to it and this
-    /// returns [`DomainError::Preempt`]; once the owner has evicted them
-    /// (each dropping its claim), the next provision completes the growth it
-    /// waited for. A preemption whose sequences still stand is let go.
-    /// Refused past the budget, nothing is taken.
-    fn claim_state_rows(&mut self, sequence: RequestId, through: u64) -> Result<(), DomainError> {
-        use crate::memory::ledger::{Need, Refused};
-        if let Some((waiting, waited, preemption)) = self.preempting.take() {
-            let evicted = preemption.sequences().iter().all(|named| !self.state_claims.contains_key(named));
-            match self.state_claims.get_mut(&waiting) {
-                Some(state) if evicted => {
-                    state.claim.complete(preemption);
-                    state.through = state.through.max(waited);
-                }
-                // Its sequences stand, or its own closed: let go.
-                _ => drop(preemption),
-            }
+    /// Let go of `sequence`'s reservation, as it closes or is evicted.
+    /// Back every row `request`'s reservation holds past its position with
+    /// slabs now, in both stores: rows backed and admitted by no step, as
+    /// queued rows are. So the OS holds the request's whole state as it
+    /// opens, within the room its reservation committed, and no row it
+    /// writes later allocates.
+    pub(super) fn back_reservation(&mut self, bindings: &mut StateBindings, request: RequestId) -> Result<(), DomainError> {
+        let unwritten = self.unwritten_rows(request)?;
+        let target = self.target.get(&request).ok_or_else(|| DomainError::invariant("a reserved request holds no target state"))?.queued_demands(0, unwritten);
+        self.grant_state_growth(bindings, false, &[], &target, 0)?;
+        if let (Some(head), true) = (self.head.get(&request), self.head_store.is_some()) {
+            let head = head.queued_demands(0, unwritten);
+            self.grant_state_growth(bindings, true, &[], &head, 0)?;
         }
-        let state = self
-            .state_claims
-            .get_mut(&sequence)
-            .ok_or_else(|| DomainError::invariant("a resident sequence holds no state claim"))?;
-        if through <= state.through {
-            return Ok(());
-        }
-        match state.claim.grow(Need::StateRows { sequence, from: state.through, to: through }) {
-            Ok(()) => {
-                state.through = through;
-                Ok(())
-            }
-            Err(Refused::Short(short)) => Err(DomainError::short(short, self.resources.ledgers())),
-            Err(Refused::Preempt(preemption)) => {
-                let sequences = preemption.sequences().to_vec();
-                if !sequences.iter().all(|named| self.state_claims.contains_key(named)) {
-                    return Err(DomainError::invariant(format!(
-                        "the ledger named {sequences:?} for preemption, not all of them this load's sequences"
-                    )));
-                }
-                self.preempting = Some((sequence, through, preemption));
-                Err(DomainError::Preempt(sequences))
-            }
-        }
+        Ok(())
     }
 
-    /// Let go of `sequence`'s state claim, as it closes or is evicted, with
-    /// the preemption its growth waits on: kept, that preemption would hold
-    /// what it took and the bytes of every sequence it named as each left,
-    /// for a growth no provision completes.
+    /// The rows `request`'s reservation holds past its target position.
+    fn unwritten_rows(&self, request: RequestId) -> Result<usize, DomainError> {
+        let reservation = self.state_claims.get(&request).ok_or_else(|| DomainError::invariant("a resident request holds no reservation"))?;
+        let position = self.target.get(&request).map_or(0, SequenceState::position) as u64;
+        usize::try_from(reservation.rows().saturating_sub(position)).map_err(|_| DomainError::invariant("a reservation's rows fit the host"))
+    }
+
     pub(super) fn drop_state_claim(&mut self, sequence: RequestId) {
         self.state_claims.remove(&sequence);
-        if self.preempting.as_ref().is_some_and(|(waiting, ..)| *waiting == sequence) {
-            self.preempting = None;
-        }
     }
 
     /// Grant elastic state growth of the target or `head` store from a fresh
     /// domain observation. Growth changes bindings, so the queued steps are
     /// orphaned first; its release may itself free what the growth needed.
     /// Seismic's charge ledger remains authoritative: its limit enforces the
-    /// grant on each added slab allocation. The slabs' bytes are the rows
-    /// the sequences claimed ([`Self::claim_state_rows`]), allocated on
-    /// their claims, and only what they add past those is held anew
-    /// ([`StateSlabs`]). `queued` are the rows of the
+    /// grant on each added slab allocation. The slabs draw on the committed
+    /// room the request slot and the reservations hold, and only what they
+    /// add past it is held anew ([`StateSlabs`]). `queued` are the rows of the
     /// steps queued behind the group's, backed now and admitted by their own
     /// steps.
     pub(super) fn grant_state_growth(
@@ -602,8 +599,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             // the preferred growth falls back to the minimum where it is
             // not.
             let ledger = self.resources.ledgers().device();
-            let claims = self.state_claims.values().map(|state| &state.claim);
-            if let Err(short) = self.state_slabs.reserve(ledger, required, claims) {
+            if let Err(short) = self.state_slabs.reserve(ledger, required) {
                 if choice == GrowthChoice::Preferred {
                     continue;
                 }
@@ -762,12 +758,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
     /// Commit the successor banks a newly opened request needs. Free banks
     /// change no bindings and leave the queued steps running.
-    pub fn provision_open(&mut self, bindings: &mut StateBindings) -> Result<(), DomainError> {
-        self.orphan_queue(bindings)?;
+    pub fn provision_open(&mut self, unchained: &mut Unchained<'_>) -> Result<(), DomainError> {
+        self.orphan_queue(unchained)?;
         let requirements = self.open_requirements();
-        self.grant_state_growth(bindings, false, &[], &[], requirements.target_banks())?;
+        self.grant_state_growth(unchained.bindings(), false, &[], &[], requirements.target_banks())?;
         if self.head_store.is_some() {
-            self.grant_state_growth(bindings, true, &[], &[], requirements.head_banks())?;
+            self.grant_state_growth(unchained.bindings(), true, &[], &[], requirements.head_banks())?;
         }
         Ok(())
     }
@@ -786,7 +782,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         bindings: &mut StateBindings,
         wake: crate::CompletionWake,
     ) -> Result<StateShrink, DomainError> {
-        let state = self.yield_state(bindings)?;
+        let mut unchained = self.unchained(bindings).ok_or_else(|| DomainError::invariant("a test shrinks the state beside a chain"))?;
+        let state = self.yield_state(&mut unchained)?;
         let slots = self.release_idle_graph_slots(wake);
         Ok(StateShrink { state, slots })
     }
@@ -797,8 +794,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// emptiest blocks where whole blocks fall short of it
     /// (`seismic::Pool::return_freed`): the one copy. The queued steps are
     /// orphaned first: their launch bindings pin slab placement.
-    pub(super) fn yield_state(&mut self, bindings: &mut StateBindings) -> Result<StateYield, DomainError> {
-        self.orphan_queue(bindings)?;
+    pub(super) fn yield_state(&mut self, unchained: &mut Unchained<'_>) -> Result<StateYield, DomainError> {
+        self.orphan_queue(unchained)?;
+        let bindings = unchained.bindings();
         let pool = bindings.target.pool().clone();
         self.change_state(|this| {
             let mut released = this.shrink_store(bindings, false)?;
@@ -992,33 +990,63 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         })
     }
 
-    /// Claim `bytes` of device memory for the service's measurement job
-    /// beside the model, in place of any claim before, which is dropped
-    /// first: a committed claim on the device's ledger
-    /// (`memory::ledger::Need::Measurement`), which the bank's cache yields
-    /// to; and the bank's own traffic is held (`ElasticBank::hold_traffic`),
-    /// so the job measures beside none of the load's copies or reads. A
-    /// growth or the host tier's backing running ends at its next slot
-    /// (`ElasticBank::stop_growths`): held, its slots would wait for the
-    /// claim's release, which waits for the job's end. Refused, as the
-    /// device's store is blind or by what committed memory it may not take
-    /// exceeds the budget by (`memory::ledger::Short`), nothing is held.
-    pub fn claim_measurement_room(&mut self, bytes: u64) -> Result<(), crate::memory::ledger::Short> {
-        use crate::memory::ledger::{Need, Refused};
-        self.measurement_claim = None;
-        let claim = match self.resources.ledgers().device().claim(Need::Measurement { bytes }) {
-            Ok(claim) => claim,
-            Err(Refused::Short(short)) => return Err(short),
-            Err(Refused::Preempt(preemption)) => {
-                panic!("invariant violated: a measurement's claim waits on preempting {:?}; only state preempts", preemption.sequences())
-            }
+    /// The relief that covers `lacks` bytes of `resource`, the memory of
+    /// the store a claim was refused in, taking what `allow` admits
+    /// (`memory::ledger::Ledger::plan_relief`); none where nothing covers it
+    /// or the resource is no store's.
+    pub fn plan_relief(&self, resource: ResourceKind, lacks: u64, allow: crate::memory::ledger::Relief) -> Option<crate::memory::ledger::ReliefPlan> {
+        let ledgers = self.resources.ledgers();
+        let ledger = match resource {
+            ResourceKind::DeviceMemory => ledgers.device(),
+            ResourceKind::HostStaging => ledgers.host(),
+            _ => return None,
         };
+        ledger.plan_relief(lacks, allow)
+    }
+
+    /// Carry out `plan` whole in its store (`memory::ledger::Ledger::execute`):
+    /// its cache yields now, each holder freeing it at its next release; its
+    /// requests are the owner's to evict.
+    pub fn execute_relief(&self, plan: crate::memory::ledger::ReliefPlan) -> crate::memory::ledger::Owed {
+        let ledgers = self.resources.ledgers();
+        match ledgers.keeping(&plan.store()) {
+            Some(ledger) => ledger.execute(plan),
+            None => panic!("invariant violated: a relief plan of a store the load does not reach"),
+        }
+    }
+
+    /// Hold `bytes` of device memory for the service's measurement job
+    /// beside the model, in place of any grant before, which is dropped
+    /// first: a grant on the device's ledger
+    /// (`memory::ledger::GrantRole::Measurement`), taken of free room and
+    /// the cache worth nothing, never the bank's or the retained prefixes';
+    /// the job's footprint is credited against it once its process is named
+    /// ([`Self::attach_measurement_process`]), so the job's growth is never
+    /// read as others'. The bank's own traffic is held
+    /// (`ElasticBank::hold_traffic`), so the job measures beside none of the
+    /// load's copies or reads. A growth or the host tier's backing running
+    /// ends at its next slot (`ElasticBank::stop_growths`): held, its slots
+    /// would wait for the grant's release, which waits for the job's end.
+    /// Short (`memory::ledger::Short`), nothing is held, and the job waits
+    /// for the next quiet period.
+    pub fn claim_measurement_room(&mut self, bytes: u64) -> Result<(), crate::memory::ledger::Short> {
+        self.measurement_claim = None;
+        let grant = self.resources.ledgers().device().grant(crate::memory::ledger::GrantRole::Measurement, bytes)?;
         if let Some(bank) = self.family.expert_bank() {
             bank.stop_growths();
         }
         let traffic = self.hold_expert_traffic();
-        self.measurement_claim = Some(MeasurementClaim { _claim: claim, _traffic: traffic });
+        self.measurement_claim = Some(MeasurementClaim { grant, _traffic: traffic });
         Ok(())
+    }
+
+    /// The measurement job holding the room runs as `process`: its
+    /// footprint is credited against its grant from now until the room is
+    /// released. Nothing where no grant is held (it was released first).
+    pub fn attach_measurement_process(&mut self, process: seismic::ProcessId) {
+        if let Some(claim) = &self.measurement_claim {
+            claim.grant.attach(process);
+        }
     }
 
     /// Hold the expert bank's own traffic until the returned hold drops
@@ -1135,19 +1163,23 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
     }
 
-    /// Release one store's slabs beyond the room its live requests' next
-    /// steps claim (`magnitude_state::StoreBindings::shrink`), moving no
-    /// row or bank: the bytes of the granules released.
+    /// Release one store's slabs beyond the room its live requests'
+    /// reservations and next steps claim
+    /// (`magnitude_state::StoreBindings::shrink`), moving no row or bank:
+    /// the bytes of the granules released.
     fn shrink_store(&mut self, bindings: &mut StateBindings, head: bool) -> Result<u64, DomainError> {
         // A live request's steps in flight (its next, and the one queued
         // behind it where the load pipelines or chains) each append a row
-        // and take a successor bank: room the shrink keeps, as no surplus.
+        // and take a successor bank, and every row its reservation holds is
+        // backed from its open ([`Self::back_reservation`]): room the
+        // shrink keeps, as no surplus.
         let steps = self.execution.policy().limits().target_successor_banks();
         let live = if head { &self.head } else { &self.target };
-        let next = magnitude_state::NextSteps {
-            rows: live.values().flat_map(|state| state.demands(steps)).collect(),
-            banks: steps * live.len(),
-        };
+        let mut rows = Vec::new();
+        for (request, state) in live {
+            rows.extend(state.demands(self.unwritten_rows(*request)?.max(steps)));
+        }
+        let next = magnitude_state::NextSteps { rows, banks: steps * live.len() };
         Ok(bindings.store(head)?.shrink(&next)?)
     }
 
@@ -1208,9 +1240,9 @@ pub(super) struct GroupClass {
 }
 
 impl<F: ProgramFamily> ExecutorDomain<F> {
-    /// `change`, a change to the state slabs or to the sequences' row
-    /// claims, and the device's ledger settled with the slabs the stores
-    /// hold after it ([`StateSlabs::settle`]), as one change
+    /// `change`, a change to the state slabs or to the requests'
+    /// reservations, and the device's ledger settled with the slabs the
+    /// stores hold after it ([`StateSlabs::settle`]), as one change
     /// (`memory::ledger::Changes::change`).
     pub(super) fn change_state<R>(&mut self, change: impl FnOnce(&mut Self) -> R) -> R {
         let changes = self.resources.ledgers().changes().clone();
@@ -1219,36 +1251,37 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             let backed = self.committed_state_bytes();
             let referenced = self.referenced_state_bytes();
             let ledger = self.resources.ledgers().device();
-            let claims = self.state_claims.values().map(|state| &state.claim);
-            self.state_slabs.settle(ledger, backed, referenced, claims);
+            let written = self
+                .state_claims
+                .iter()
+                .map(|(sequence, state)| ledger.bytes(&crate::memory::ledger::Need::Request { sequence: *sequence, rows: state.through() }))
+                .sum::<u64>();
+            let committed = self.state_claims.values().map(crate::memory::ledger::Reservation::bytes).sum::<u64>() + self.request_slot.bytes();
+            self.state_slabs.settle(ledger, backed, referenced, written, committed);
             changed
         })
     }
 }
 
-/// The state slabs the stores grew past those the load allocated as it
-/// started, which the load's record holds, on the device's ledger. A
-/// slab's bytes are the rows the sequences claimed by pages
-/// ([`ExecutorDomain::claim_state_rows`]), held by those claims. The pool's
-/// entry allocates every slab once (`memory::ledger::Ledger::pool_block`);
-/// the holdings over its granules move only what is held. What the slabs
-/// hold past the rows is cache: what holders still reference (retained
-/// prefixes) as
-/// [`CacheKind::Prefix`](crate::memory::ledger::CacheKind::Prefix), the
-/// rest as spare granules. No slab byte is admitted beside the rows that
-/// claimed it, and none reads as other programs' memory.
+/// The state slabs the stores hold, against the committed room the load's
+/// request slot and its requests' reservations hold on the device's ledger.
+/// The pool's entry allocates every slab once
+/// (`memory::ledger::Ledger::pool_block`); the holdings over its granules
+/// move only what is held. Slabs the requests' written rows occupy, and
+/// spare slabs within the committed room, are that room's; what holders
+/// still reference beyond the written rows (retained prefixes) is
+/// [`CacheKind::Prefix`](crate::memory::ledger::CacheKind::Prefix), and the
+/// spare slabs past the committed room are spare granules. No slab byte is
+/// held twice, and none reads as other programs' memory.
 pub(super) struct StateSlabs {
-    /// The stores' slab bytes as the load started.
-    floor: u64,
-    /// What the rows claimed held of the grown slabs at the last settle:
-    /// the slabs that back them.
-    rows: u64,
-    /// The grown slabs' bytes no sequence's rows claim and no holder
-    /// references.
+    /// The committed room no slab backed at the last settle: what a growth
+    /// draws on before anything is held anew.
+    unbacked: u64,
+    /// The spare slabs past the committed room.
     spare: SlabCache,
-    /// The grown slabs' bytes retained prefixes alone reference.
+    /// The slabs retained prefixes alone reference.
     prefix: SlabCache,
-    /// What a growth adds past the rows claimed, held before the stores
+    /// What a growth adds past the committed room, held before the stores
     /// allocate it in the pool: spare once settled ([`Self::settle`]).
     pending: Option<crate::memory::ledger::Claim>,
 }
@@ -1299,8 +1332,7 @@ impl SlabCache {
             }
             held -= cut;
         }
-        // Refused where the room is held already (a preemption the evicted
-        // rows went to), so not held twice.
+        // Refused where the room is held already, so not held twice.
         if bytes > held {
             self.held.extend(ledger.cache(self.kind, bytes - held).ok());
         }
@@ -1309,25 +1341,21 @@ impl SlabCache {
     }
 }
 
-impl StateSlabs {
-    /// The stores' slabs as the load started, `floor` bytes.
-    pub(super) fn new(floor: u64) -> Self {
+impl Default for StateSlabs {
+    fn default() -> Self {
         use crate::memory::ledger::CacheKind;
-        Self { floor, rows: 0, spare: SlabCache::new(CacheKind::Spare), prefix: SlabCache::new(CacheKind::Prefix), pending: None }
+        Self { unbacked: 0, spare: SlabCache::new(CacheKind::Spare), prefix: SlabCache::new(CacheKind::Prefix), pending: None }
     }
+}
 
+impl StateSlabs {
     /// Hold, before the stores allocate a growth of `bytes`, what it adds
-    /// past the rows `claims` hold that no slab backs yet, as a pooled
-    /// claim ([`Self::settle`] makes it spare). Refused, as its store
-    /// refuses it, where free room lacks it; nothing is held then.
-    pub(super) fn reserve<'a>(
-        &mut self,
-        ledger: &crate::memory::ledger::Ledger,
-        bytes: u64,
-        claims: impl Iterator<Item = &'a crate::memory::ledger::Claim>,
-    ) -> Result<(), crate::memory::ledger::Short> {
-        let unbacked = claims.map(crate::memory::ledger::Claim::bytes).sum::<u64>().saturating_sub(self.rows);
-        let required = bytes.saturating_sub(unbacked);
+    /// past the committed room no slab backs yet, as a pooled claim
+    /// ([`Self::settle`] makes it spare). Refused, as its store refuses it,
+    /// where free room lacks it; nothing is held then. A request's rows
+    /// within its reservation add nothing.
+    pub(super) fn reserve(&mut self, ledger: &crate::memory::ledger::Ledger, bytes: u64) -> Result<(), crate::memory::ledger::Short> {
+        let required = bytes.saturating_sub(self.unbacked);
         if required == 0 {
             return Ok(());
         }
@@ -1355,45 +1383,27 @@ impl StateSlabs {
     }
 
     /// Settle with `backed`, the slab bytes the stores hold now in the
-    /// pool, of which holders reference `referenced`. Of what they grew
-    /// past the floor, each claim in `claims` (the earliest sequence first)
-    /// holds its rows: a claim's growth took the pool's granules in place
-    /// (the ledger's yield within the pool), so its rows need no move here.
-    /// What holders reference beyond those rows is the retained prefixes',
-    /// and the rest is spare: the reserved growth turns spare, and each
-    /// cache settles ([`SlabCache::settle`]).
-    pub(super) fn settle<'a>(
-        &mut self,
-        ledger: &crate::memory::ledger::Ledger,
-        backed: u64,
-        referenced: u64,
-        claims: impl Iterator<Item = &'a crate::memory::ledger::Claim>,
-    ) {
-        let mut grown = backed.saturating_sub(self.floor);
-        let rows = claims
-            .map(|claim| {
-                let rows = claim.bytes().min(grown);
-                grown -= rows;
-                rows
-            })
-            .sum::<u64>();
-        self.rows = rows;
-        let prefix = referenced.saturating_sub(rows).min(grown);
-        let spare = grown - prefix;
+    /// pool, of which holders reference `referenced`, the requests' written
+    /// rows `written` by the page rule, and `committed`, the room the
+    /// request slot and the reservations hold. The written rows' slabs are
+    /// the committed room's; what holders reference beyond them is the
+    /// retained prefixes'; the spare slabs fill the committed room first,
+    /// and the rest is spare granules. The reserved growth turns spare, and
+    /// each cache settles ([`SlabCache::settle`]).
+    pub(super) fn settle(&mut self, ledger: &crate::memory::ledger::Ledger, backed: u64, referenced: u64, written: u64, committed: u64) {
+        let written = written.min(backed);
+        let prefix = referenced.saturating_sub(written).min(backed - written);
+        let spare = backed - written - prefix;
+        let room = committed.saturating_sub(written);
+        let within = spare.min(room);
+        self.unbacked = room - within;
         if let Some(pending) = self.pending.take() {
             let cached = pending.into_backed_cache(crate::memory::ledger::CacheKind::Spare);
             self.spare.held.push(cached);
         }
         self.prefix.settle(ledger, prefix);
-        self.spare.settle(ledger, spare);
+        self.spare.settle(ledger, spare - within);
     }
-}
-
-/// A resident sequence's committed state rows ([`ExecutorDomain::claim_state_rows`]):
-/// its claim on the device's ledger, and the row it holds them through.
-pub(super) struct StateClaim {
-    pub(super) claim: crate::memory::ledger::Claim,
-    pub(super) through: u64,
 }
 
 /// What growing the prompt-group class from the floor's one place to
@@ -1439,11 +1449,10 @@ fn growth_failure(error: seismic::TensorError, bytes: u64, growth: &str) -> Doma
     }
 }
 
-/// The measurement job's committed claim on the device's ledger, and its
-/// hold of the bank's own traffic, which stands while the claim does and
-/// drops with it.
+/// The measurement job's grant on the device's ledger, and its hold of the
+/// bank's own traffic, which stands while the grant does and drops with it.
 pub(super) struct MeasurementClaim {
-    _claim: crate::memory::ledger::Claim,
+    grant: crate::memory::ledger::Grant,
     _traffic: Option<TrafficHold>,
 }
 

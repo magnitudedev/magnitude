@@ -31,6 +31,13 @@ pub trait ResidentRoom: Send + Sync {
     /// floor: answered once made, with why it cannot be, or released by [`Self::release`] first;
     /// failing once the model is gone. The model grows nothing until [`Self::release`].
     fn claim(&self, bytes: u64) -> BoxFuture<'static, Result<RoomAnswer, RequestError>>;
+    /// The measurement holding the room runs as `process`: its footprint is credited against the
+    /// room, so its growth is never read as another program's, until [`Self::release`], which
+    /// comes only once it is shown gone, so a reused pid is never credited. A model that credits
+    /// nothing ignores it.
+    fn attach(&self, process: seismic::ProcessId) {
+        let _ = process;
+    }
     /// The measurement ended: the model may grow into the room again.
     fn release(&self);
     /// The measurement stored new records: the model prices its experts again from them.
@@ -148,6 +155,15 @@ impl DeviceJob {
     /// The job's preemption apart from its hold, for a hold its worker keeps until retired.
     pub fn preemption(&self) -> Preemption {
         self.preemption.clone()
+    }
+
+    /// The job's process runs as `process`: beside an idle resident model, the room that model
+    /// made is credited by its footprint until the hold, and with it the room, is released
+    /// ([`ResidentRoom::attach`]).
+    pub fn credit(&self, process: seismic::ProcessId) {
+        if let Some(resident) = self.beside() {
+            resident.attach(process);
+        }
     }
 
     /// The idle resident model the job runs beside; none when it has the device to itself.

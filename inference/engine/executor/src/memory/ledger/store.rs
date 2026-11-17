@@ -14,25 +14,35 @@ use std::num::NonZeroU64;
 pub struct Ledgers {
     pub(super) stores: Mutex<HashMap<seismic::StoreIdentity, Weak<Store>>>,
     pub(super) changes: Arc<Changes>,
+    /// Where its stores read the footprints of grants' processes.
+    pub(super) footprints: Arc<dyn Footprints>,
 }
 
 impl Ledgers {
-    fn of(changes: Changes) -> Self {
-        Self { stores: Mutex::default(), changes: Arc::new(changes) }
+    fn of(changes: Changes, footprints: Arc<dyn Footprints>) -> Self {
+        Self { stores: Mutex::default(), changes: Arc::new(changes), footprints }
     }
 
     /// A test's scope of its own, no OS behind its stores: a record its
-    /// test makes outside a change is a change of its own.
+    /// test makes outside a change is a change of its own. Every process's
+    /// footprint is unobserved.
     #[cfg(any(test, feature = "fixtures"))]
     pub fn new() -> Self {
-        Self::of(Changes { alone: std::sync::atomic::AtomicBool::new(true), ..Changes::default() })
+        Self::footprinted(Arc::new(Unobserved))
+    }
+
+    /// [`Self::new`], its grants' processes' footprints read from
+    /// `footprints`: a test's script.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn footprinted(footprints: Arc<dyn Footprints>) -> Self {
+        Self::of(Changes { alone: std::sync::atomic::AtomicBool::new(true), ..Changes::default() }, footprints)
     }
 
     /// A test's scope of its own under the process's rule: a record
     /// outside a change panics.
     #[cfg(test)]
     pub(crate) fn strict() -> Self {
-        Self::of(Changes::default())
+        Self::of(Changes::default(), Arc::new(Unobserved))
     }
 
     /// The changes of this scope's stores ([`Changes`]).
@@ -43,7 +53,7 @@ impl Ledgers {
     /// The process's scope.
     pub fn process() -> &'static Self {
         static PROCESS: OnceLock<Ledgers> = OnceLock::new();
-        PROCESS.get_or_init(|| Ledgers::of(Changes::default()))
+        PROCESS.get_or_init(|| Ledgers::of(Changes::default(), Arc::new(SystemFootprints)))
     }
 
     /// The ledger in this scope of each of `stores`, as Seismic charges
@@ -73,11 +83,28 @@ impl Ledgers {
         let mut stores = self.stores.lock().expect("ledger scope lock poisoned");
         let found = stores.get(&store).and_then(Weak::upgrade);
         let store = found.unwrap_or_else(|| {
-            let made = Arc::new(Store { identity: store.clone(), state: Mutex::new(State::default()), changes: self.changes.clone(), pressure: Arc::default() });
+            let made = Arc::new(Store {
+                identity: store.clone(),
+                state: Mutex::new(State::default()),
+                changes: self.changes.clone(),
+                pressure: Arc::default(),
+                footprints: self.footprints.clone(),
+            });
             stores.insert(store, Arc::downgrade(&made));
             made
         });
         Ledger { store, shape }
+    }
+}
+
+/// A test scope's footprints: none observed.
+#[cfg(any(test, feature = "fixtures"))]
+pub(super) struct Unobserved;
+
+#[cfg(any(test, feature = "fixtures"))]
+impl Footprints for Unobserved {
+    fn footprint(&self, _: seismic::ProcessId, _: &seismic::StoreIdentity) -> seismic::ProcessFootprint {
+        seismic::ProcessFootprint::Unobserved
     }
 }
 
@@ -117,7 +144,7 @@ impl UnreadLedgers {
     /// figures ([`Ledger::read`]), and the reading.
     #[cfg(test)]
     pub(crate) fn read_scripted(self, reading: Reading) -> (DeviceLedgers, DeviceReading) {
-        let at = self.0.device.sampled(Instant::now());
+        let at = self.0.device.sampled(std::time::Instant::now());
         let device = self.0.device.read(at, reading);
         let host = (!Arc::ptr_eq(&self.0.device.store, &self.0.host.store)).then(|| self.0.host.read(at, reading));
         (self.0, DeviceReading { device, host })
@@ -210,7 +237,7 @@ impl DeviceLedgers {
     }
 
     fn claim_judged(&self, reading: Option<&DeviceReading>, device: &seismic::Device, kind: CommittedKind, demand: crate::memory::ClaimDemand) -> Result<Held, Short> {
-        assert!(!matches!(kind, CommittedKind::State(_)), "a sequence's state is claimed by its rows");
+        assert!(!matches!(kind, CommittedKind::Request(_) | CommittedKind::Grant(_)), "a {kind:?} claim is taken by its own path");
         let (on_device, on_host) = self.placed(device, demand);
         let unified = Arc::ptr_eq(&self.device.store, &self.host.store);
         let mut claims = Vec::new();
@@ -553,19 +580,16 @@ impl DeviceReading {
         Self { device, host }
     }
 
-    /// The estimates a load whose in-process figure is `in_process`, not
-    /// yet held in its store, prices at this reading once `ledgers` hold
+    /// The estimates a load prices at this reading once `ledgers` hold
     /// what they hold now ([`Ledger::room_after`] in each store): the
     /// reading's OS figures fixed, and every holding since it, the load's
-    /// own claims and other loads' alike, counted; the figure in the
-    /// device's own store, where the load's state lies. With nothing held
-    /// since, each [`Estimate::room`] is the reading's own less the figure:
-    /// the room the load's plan settles into (`PlanningRoom`), its search
-    /// and its claims read, the one authority on room (design §5). Reads no
-    /// OS figure.
-    pub fn room_after(&self, ledgers: &DeviceLedgers, in_process: u64) -> LoadEstimate {
-        let device = ledgers.device.room_after(&self.device, in_process);
-        let host = self.host.as_ref().map(|host| ledgers.host.room_after(host, 0));
+    /// own claims and other loads' alike, counted. With nothing held
+    /// since, each [`Estimate::room`] is the reading's own: the room the
+    /// load's plan settles into (`PlanningRoom`), its search and its claims
+    /// read, the one authority on room (design §5). Reads no OS figure.
+    pub fn room_after(&self, ledgers: &DeviceLedgers) -> LoadEstimate {
+        let device = ledgers.device.room_after(&self.device);
+        let host = self.host.as_ref().map(|host| ledgers.host.room_after(host));
         LoadEstimate { device, host }
     }
 }
@@ -719,20 +743,24 @@ pub fn free<R>(claims: Vec<Claim>, free: impl FnOnce() -> R) -> R {
 #[derive(Default)]
 pub struct Recorded {
     claims: Vec<Claim>,
-    /// The load's minimum request state, in each store that holds state
-    /// ([`Self::record_state_floor`]): held for the domain's life.
-    state_floors: Vec<Claim>,
+}
+
+impl Held {
+    /// The load's request slot ([`CommittedKind::RequestSlot`]), held in
+    /// the one store the load's state lies in.
+    ///
+    /// # Panics
+    /// Where it holds other than one request slot's claim.
+    pub fn into_request_slot(self) -> Claim {
+        let [claim]: [Claim; 1] = self.claims.try_into().unwrap_or_else(|claims: Vec<Claim>| {
+            panic!("invariant violated: a request slot is claimed in {} stores", claims.len())
+        });
+        assert_eq!(claim.kind(), CommittedKind::RequestSlot, "invariant violated: a request slot of another kind");
+        claim
+    }
 }
 
 impl Recorded {
-    /// `floor`, the load's minimum request state claimed as
-    /// [`CommittedKind::StateFloor`], kept for the domain's life.
-    pub fn record_state_floor(&mut self, floor: Held) {
-        for claim in floor.claims {
-            assert_eq!(claim.kind(), CommittedKind::StateFloor, "invariant violated: a state floor recorded of another kind");
-            self.state_floors.push(claim);
-        }
-    }
 
     /// `held`, an allocation the load made as it started, joins the record.
     ///
@@ -771,7 +799,6 @@ impl Recorded {
         let mut ledger = self
             .claims
             .iter()
-            .chain(&self.state_floors)
             .find(|claim| claim.ledger().store.identity == *store)
             .map(|claim| claim.ledger().clone());
         for source in [CommittedKind::Backing(PoolClass::Records), CommittedKind::Load] {
@@ -813,7 +840,7 @@ impl Recorded {
 
     /// The record's claims, held for the domain's life.
     pub fn into_claims(self) -> Vec<Claim> {
-        self.claims.into_iter().chain(self.state_floors).collect()
+        self.claims
     }
 }
 

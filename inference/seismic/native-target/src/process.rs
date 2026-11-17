@@ -411,21 +411,32 @@ mod macos {
     /// accounting reports. The task ledger's own peak is of an interval the
     /// system restarts, and read below the footprint of the same instant.
     pub(super) fn lifetime_peak_footprint() -> Option<u64> {
-        const RUSAGE_INFO_V4: c_int = 4;
-        /// The structure in 64-bit words: a 16-byte UUID, then 35 counters.
-        const WORDS: usize = 2 + 35;
         /// `ri_lifetime_max_phys_footprint`: the 29th counter.
         const LIFETIME_MAX_PHYS_FOOTPRINT: usize = 2 + 28;
+        rusage(std::process::id()).map(|usage| usage[LIFETIME_MAX_PHYS_FOOTPRINT])
+    }
+
+    /// `ri_phys_footprint` of `pid`'s `rusage_info_v4`: its physical
+    /// footprint now.
+    pub(super) fn phys_footprint(pid: u32) -> Option<u64> {
+        /// `ri_phys_footprint`: the 8th counter.
+        const PHYS_FOOTPRINT: usize = 2 + 7;
+        rusage(pid).map(|usage| usage[PHYS_FOOTPRINT])
+    }
+
+    /// `pid`'s `rusage_info_v4` (`<sys/resource.h>`), in 64-bit words: a
+    /// 16-byte UUID, then 35 counters; none where the process is gone.
+    fn rusage(pid: u32) -> Option<[u64; 2 + 35]> {
+        const RUSAGE_INFO_V4: c_int = 4;
         unsafe extern "C" {
-            fn getpid() -> c_int;
             fn proc_pid_rusage(pid: c_int, flavor: c_int, buffer: *mut c_void) -> c_int;
         }
-        let mut usage = [0u64; WORDS];
+        let pid = c_int::try_from(pid).ok()?;
+        let mut usage = [0u64; 2 + 35];
         // SAFETY: `proc_pid_rusage` writes a whole `rusage_info_v4`, which
         // `usage` is the size and alignment of, when it returns zero.
-        let result =
-            unsafe { proc_pid_rusage(getpid(), RUSAGE_INFO_V4, usage.as_mut_ptr().cast()) };
-        (result == 0).then_some(usage[LIFETIME_MAX_PHYS_FOOTPRINT])
+        let result = unsafe { proc_pid_rusage(pid, RUSAGE_INFO_V4, usage.as_mut_ptr().cast()) };
+        (result == 0).then_some(usage)
     }
 
     pub(super) fn malloc_live_bytes() -> u64 {
@@ -441,6 +452,57 @@ mod macos {
         // for everything that can be returned; it frees nothing in use.
         unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
     }
+}
+
+/// A process of the machine, by its operating system's identifier: one the
+/// service owns (a measurement job), or this one ([`Self::current`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub struct ProcessId(u32);
+
+impl ProcessId {
+    /// The process of the operating system's identifier `raw`.
+    pub const fn of(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    /// This process.
+    pub fn current() -> Self {
+        Self(std::process::id())
+    }
+
+    /// The operating system's identifier.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// What a process holds in host RAM at one reading ([`process_footprint`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessFootprint {
+    Observed(u64),
+    /// The system reports none for it: it ended, or reads no such figure.
+    Unobserved,
+}
+
+/// The host RAM footprint of `process` now: macOS's physical footprint
+/// (`proc_pid_rusage`, `ri_phys_footprint`), Linux's resident anonymous
+/// and shared memory (`/proc/<pid>/status` `RssAnon` and `RssShmem`, the
+/// footprint's own terms, file-backed pages left out); unobserved
+/// elsewhere, or where the process is gone. A device's own memory is in
+/// neither.
+pub fn process_footprint(process: ProcessId) -> ProcessFootprint {
+    #[cfg(target_os = "macos")]
+    let bytes = macos::phys_footprint(process.0);
+    #[cfg(target_os = "linux")]
+    let bytes = std::fs::read_to_string(format!("/proc/{}/status", process.0))
+        .ok()
+        .and_then(|status| linux::footprint_of(&status, 0));
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let bytes: Option<u64> = {
+        let _ = process;
+        None
+    };
+    bytes.map_or(ProcessFootprint::Unobserved, ProcessFootprint::Observed)
 }
 
 /// Return to the system the pages the allocator keeps of memory this

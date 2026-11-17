@@ -54,7 +54,7 @@ impl PromptScratch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::ledger::{CacheKind, Ledgers, LoadShape, Need};
+    use crate::memory::ledger::{CacheKind, Ledgers, LoadShape};
     use crate::memory::supply::Reading;
     use std::sync::Arc;
     use std::time::Instant;
@@ -90,7 +90,7 @@ mod tests {
     #[test]
     fn a_group_takes_only_what_yields_at_once() {
         let (_scope, ledger) = ledger(64 * RECORD);
-        let committed = ledger.claim(Need::Measurement { bytes: 50 * RECORD }).expect("room");
+        let committed = ledger.claim_at(None, crate::memory::ledger::CommittedKind::Load, 50 * RECORD).expect("room");
         // The bank's slots are granules of the store's pool.
         let _pool = ledger.pool_block(crate::memory::ledger::PoolClass::Records, NonZeroU64::new(RECORD).unwrap()).blocks;
         let bank = ledger.cached(CacheKind::Bank, 10 * RECORD + RECORD / 2).expect("room");

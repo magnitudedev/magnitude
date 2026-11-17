@@ -167,7 +167,7 @@ fn a_stores_holdings_share_its_room_in_order() {
 /// grows in process until a sequence is admitted.
 #[test]
 fn a_load_imports_what_its_first_reading_keeps() {
-    use crate::memory::ledger::{CacheKind, Ledgers, LoadShape, Need};
+    use crate::memory::ledger::{CacheKind, Ledgers, LoadShape};
     use crate::memory::supply::Reading;
     use std::time::{Duration, Instant};
     const GB: u64 = 1_000_000_000;
@@ -184,10 +184,9 @@ fn a_load_imports_what_its_first_reading_keeps() {
         ledger.read(at, Reading::device(TOTAL, TOTAL - others - allocated, now));
     };
     read(1, 0);
-    let _launch = ledger.in_process(GB / 2);
     let imported = import_target(&ledger.estimate(), beside, &shape(), &charge);
     assert!(shape().floor_slots() < imported && imported < shape().saturation_slots(), "{imported} slots");
-    let held = ledger.claim(Need::Measurement { bytes: beside }).expect("the import's claims fit");
+    let held = ledger.claim_at(None, crate::memory::ledger::CommittedKind::Load, beside).expect("the import's claims fit");
     ledger.change(|_| { let entry = held.entry(); entry.take(&entry.change(), beside, seismic::memory::Wiring::Pageable) }).expect("the import's own bytes");
     let cache = charge(imported) - charge(shape().floor_slots());
     let _cache = ledger.cached(CacheKind::Bank, cache).expect("the import's room holds its cache");

@@ -21,6 +21,8 @@ use magnitude_state::KvCodec;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
+pub mod loaded;
+
 /// The machine as a test's reader reads it: the device's status and host
 /// RAM's sample as first read, moved only by what the fixture's own ledgers
 /// allocated since (the process's one count of its memory) and by what
@@ -144,10 +146,10 @@ impl StillHost {
         // fixture tests never inherit transient live-machine swap/pressure or
         // unmonitored-Linux withheld clean_cache splitting usable supply.
         let monitored = first.sample.host.harm.is_some() || first.sample.host.pressure.is_some();
-        let usable = first.sample.host.supply.free_above_target
+        let usable = first.sample.host.supply.free_beyond_target.max(0).unsigned_abs()
             + if monitored { first.sample.host.supply.clean_cache } else { 0 };
         first.sample.host.supply = seismic::Supply {
-            free_above_target: usable,
+            free_beyond_target: i64::try_from(usable).expect("host RAM's bytes fit i64"),
             clean_cache: 0,
             cold_reclaimable: 0,
         };
@@ -208,17 +210,11 @@ impl StatusReading for StillHost {
         sample.host.at = stamp;
         sample.host.counted.at = stamp;
         let host_ram = self.topology.host_ram().id();
-        // Host RAM as first read, its usable supply less what the fixture took.
-        let mut left = self.taken(host_ram);
-        for term in [
-            &mut sample.host.supply.free_above_target,
-            &mut sample.host.supply.clean_cache,
-            &mut sample.host.supply.cold_reclaimable,
-        ] {
-            let drain = (*term).min(left);
-            *term -= drain;
-            left -= drain;
-        }
+        // Host RAM as first read (free memory alone, [`Self::of`]), its
+        // free memory less what the fixture took: below the OS's target
+        // where it took more.
+        let taken = i64::try_from(self.taken(host_ram)).expect("host RAM's bytes fit i64");
+        sample.host.supply.free_beyond_target -= taken;
         if let Some(wired) = &mut sample.host.wired {
             wired.wire_count = wired.wire_count.saturating_add(self.taken_wired(host_ram));
         }
@@ -497,13 +493,10 @@ pub fn fixture_over(
     // no plan, and its initial slab and tables are charged as they are made.
     let head_plan = execution.resources().head_state().filter(|_| method.drafts());
     let spare_slab = if head && head_plan.is_none() { target_state.granule } else { 0 };
-    // As a load makes its state: its first slabs held as the state floor,
-    // pooled, and its address tables charged to a claim of their own.
-    let slabs = crate::memory::ClaimDemand {
-        device: target_state.initial_slab_bytes().unwrap() + spare_slab,
-        ..Default::default()
-    };
-    recorded.record_state_floor(ledgers.claim(&device, crate::memory::ledger::CommittedKind::StateFloor, slabs).expect("the fixture's ledgers hold its state"));
+    // As a load makes its state: the served context's request slot, its
+    // first slabs granules within it, and its address tables charged to a
+    // claim of their own.
+    let request_slot = request_slot(&ledgers, &device, &execution, spare_slab);
     let head_tables = head_plan.map_or(0, |state| state.table_bytes().unwrap());
     let tables = crate::memory::ClaimDemand { device: target_state.table_bytes().unwrap() + head_tables, ..Default::default() };
     let kind = crate::memory::ledger::CommittedKind::StateTables;
@@ -516,11 +509,6 @@ pub fn fixture_over(
         (store, head)
     });
     let store = store.unwrap();
-    let in_process = resources.ledgers().device().in_process(crate::experts::derived::in_process_bytes(
-        &crate::memory::ledger::LoadShape::of(&execution),
-        execution.policy().limits().max_launch_rows,
-        1,
-    ));
     let (domain, bindings) = ExecutorDomain::with_family(
         execution,
         definition,
@@ -541,11 +529,27 @@ pub fn fixture_over(
             reading,
         },
         recorded,
-        in_process,
+        request_slot,
     )
     .expect("the fixture holds its arena");
     settle_ledgers(domain.domain.device(), domain.resources.ledgers(), &*domain.family.reading);
     (domain, bindings)
+}
+
+/// The request slot a load of `execution` claims on `ledgers` as it starts
+/// (`CommittedKind::RequestSlot`): a request of its served context by the
+/// page rule, and at least the state stores' first slabs and `spare`, which
+/// lie within it.
+pub fn request_slot(ledgers: &crate::memory::ledger::DeviceLedgers, device: &seismic::Device, execution: &ExecutionPlan, spare: u64) -> crate::memory::ledger::Claim {
+    let target = execution.resources().target_state();
+    let request = crate::memory::ledger::LoadShape::of(execution)
+        .state_bytes(crate::memory::ledger::LoadShape::request_rows(target.context_rows as u64, execution.policy().method()));
+    let initial = target.initial_slab_bytes().unwrap() + execution.resources().head_state().map_or(0, |state| state.initial_slab_bytes().unwrap()) + spare;
+    let slot = crate::memory::ClaimDemand { device: request.max(initial), ..Default::default() };
+    ledgers
+        .claim(device, crate::memory::ledger::CommittedKind::RequestSlot, slot)
+        .expect("the fixture's ledgers hold its request slot")
+        .into_request_slot()
 }
 
 /// `make`, an allocation a load makes as it starts, under its claim of
@@ -627,7 +631,6 @@ fn fixture_ledgers_at(
     fixture_ledgers_in(&scope, device, execution, reading)
 }
 
-#[cfg(test)]
 pub(crate) fn fixture_ledgers(device: &seismic::Device, execution: &crate::ExecutionPlan, reading: &dyn StatusReading) -> crate::memory::ledger::DeviceLedgers {
     fixture_ledgers_in(&crate::memory::ledger::Ledgers::new(), device, execution, reading)
 }
@@ -738,7 +741,7 @@ pub fn take_all_cache<F: ProgramFamily>(domain: &ExecutorDomain<F>) -> crate::me
         .ledgers()
         .device()
         .clone()
-        .claim_units(crate::memory::ledger::CommittedKind::Measurement, std::num::NonZeroU64::MIN, u64::MAX)
+        .claim_units(crate::memory::ledger::CommittedKind::Scratch, std::num::NonZeroU64::MIN, u64::MAX)
         .0
 }
 
@@ -809,7 +812,7 @@ pub fn group_opening<F: ProgramFamily>(domain: &mut ExecutorDomain<F>, bindings:
         prime: None,
     };
     domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
-    assert!(domain.open_state(bindings, request, None, 0).unwrap().is_empty());
+    assert!(domain.open_served(bindings, request, None).unwrap().is_empty());
     domain.plan_successors((1..4).map(chunk).collect());
     vec![chunk(0)]
 }

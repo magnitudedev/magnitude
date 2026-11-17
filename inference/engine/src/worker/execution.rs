@@ -175,6 +175,12 @@ impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
                 // An ending model holds no claim; its end answers the host.
                 Execution::Draining(..) | Execution::Stopped(_) => RoomGrant::released(),
             })),
+            WorkerCommand::AttachMeasurementProcess { process } => {
+                if let Execution::Serving(owner) | Execution::Draining(owner, _) = &mut self.execution {
+                    owner.attach_measurement_process(process);
+                }
+                Ok(WorkerReply::Acknowledged)
+            }
             WorkerCommand::ReleaseMeasurementRoom => {
                 if let Execution::Serving(owner) | Execution::Draining(owner, _) = &mut self.execution {
                     owner.release_measurement_room();

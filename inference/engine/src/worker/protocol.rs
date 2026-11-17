@@ -126,6 +126,10 @@ pub enum HostMessage {
     /// `MeasurementRoom` naming `claim` and held until
     /// `ReleaseMeasurementRoom`.
     ClaimMeasurementRoom { claim: RoomClaimId, bytes: u64 },
+    /// The measurement job holding the room was started as `process`: its
+    /// footprint is credited against the room from now, so its growth is
+    /// never read as others'.
+    AttachMeasurementProcess { process: magnitude_executor::ProcessId },
     /// The measurement job ended: its room is free again.
     ReleaseMeasurementRoom,
     /// The measurement job stored new records: price the experts again

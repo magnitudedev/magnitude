@@ -4,7 +4,7 @@
 use super::*;
 use seismic::memory::Wiring::Pageable;
 use std::num::NonZeroU64;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const GB: u64 = 1 << 30;
 
@@ -21,13 +21,23 @@ pub(crate) fn shape() -> Arc<LoadShape> {
     Arc::new(LoadShape { stores: vec![StoreShape { domains, context: 1024, max_advance: 16 }] })
 }
 
-/// `sequence`'s state growing from `from` whole pages of [`shape`]'s
-/// history to `to`: a sequence's state grows a page at a time.
-pub(crate) fn pages(sequence: u64, from: u64, to: u64) -> Need {
+/// The rows of one page of [`shape`]'s history: a request's state is laid
+/// out a page at a time.
+pub(crate) fn page_rows() -> u64 {
     let shape = shape();
     let store = &shape.stores[0];
-    let page = store.domains[0].pages(&store.domains, store.context, store.max_advance).expect("its pages").page_rows as u64;
-    Need::StateRows { sequence: RequestId(sequence), from: from * page, to: to * page }
+    store.domains[0].pages(&store.domains, store.context, store.max_advance).expect("its pages").page_rows as u64
+}
+
+/// A load's request slot of `bytes`.
+fn slot(ledger: &Ledger, bytes: u64) -> Claim {
+    ledger.claim(Need::RequestSlot { bytes }).expect("the slot fits")
+}
+
+/// `sequence`'s whole request of `pages` pages, reserved from `slot` or
+/// beside it.
+fn request(ledger: &Ledger, slot: &Claim, sequence: u64, pages: u64) -> Result<Reservation, Short> {
+    ledger.reserve(slot, RequestId(sequence), pages * page_rows())
 }
 
 /// A store's two pools' entries, each open while held: the records pool's,
@@ -87,7 +97,7 @@ pub(crate) fn host_sample(total: u64, available: u64) -> seismic::HostSample {
         at,
         page_bytes: 4096,
         total,
-        supply: seismic::Supply { free_above_target: available, clean_cache: 0, cold_reclaimable: 0 },
+        supply: seismic::Supply { free_beyond_target: i64::try_from(available).expect("bytes fit i64"), clean_cache: 0, cold_reclaimable: 0 },
         counted: seismic::Counted { at, lag: Duration::ZERO },
         cold: 0,
         own_cold: seismic::OwnCold::Unobserved,
@@ -117,22 +127,15 @@ fn read(ledger: &Ledger, clock: &mut Clock, total: u64, available: u64, grant: O
 /// A committed claim of exactly `bytes`, sized without any formula, and
 /// allocated: memory the process made.
 fn commit(ledger: &Ledger, bytes: u64) -> Claim {
-    let claim = ledger.claim(Need::Measurement { bytes }).expect("the claim fits");
+    let claim = held(ledger, bytes).expect("the claim fits");
     ledger.change(|_| claim.entry().take(&claim.entry().change(), bytes, Pageable)).expect("the claim's own bytes");
     claim
 }
 
-/// A load serving one sequence whose state lies within the state floor:
-/// the floor's claim of one page and the sequence's first page, drawn from
-/// it. A sequence admitted makes the in-process term live
-/// (`State::in_process_left`), its state beyond the floor drawing it down.
-/// The claims, and the page's bytes.
-fn serving(ledger: &Ledger) -> ((Claim, Claim), u64) {
-    let Need::StateRows { to: rows, .. } = pages(1, 0, 1) else { unreachable!("a sequence's pages are its rows") };
-    let floor = ledger.claim(Need::StateFloor { rows }).expect("the floor fits");
-    let sequence = ledger.claim(pages(1, 0, 1)).expect("the first page draws from the floor");
-    let page = floor.bytes();
-    ((floor, sequence), page)
+/// A committed claim of exactly `bytes`, sized without any formula, none
+/// of it allocated yet.
+fn held(ledger: &Ledger, bytes: u64) -> Result<Claim, Short> {
+    ledger.claim_at(None, CommittedKind::Load, bytes)
 }
 
 /// The OS file cache is supply, never others' memory: the same 48 GB
@@ -146,7 +149,7 @@ fn file_cache_is_supply_whatever_it_holds() {
         let (_scope, ledger, _pool) = host();
         let (total, others) = (48 * GB, 8 * GB);
         let sample = seismic::HostSample {
-            supply: seismic::Supply { free_above_target: total - others - cache, clean_cache: cache, cold_reclaimable: 0 },
+            supply: seismic::Supply { free_beyond_target: i64::try_from(total - others - cache).expect("bytes fit i64"), clean_cache: cache, cold_reclaimable: 0 },
             wired: Some(seismic::WiredFigures { limit: seismic::WiredLimit::Set(36 * GB), wire_count: GB }),
             ..host_sample(total, 0)
         };
@@ -180,7 +183,7 @@ fn an_own_free_is_never_others_memory() {
     });
     let freed = ledger.estimate();
     assert_eq!((freed.others(), freed.budget(), freed.guarantee()), (0, before.budget(), 0));
-    assert!(ledger.shortage().is_none());
+    assert!(ledger.shortage(&std::collections::BTreeSet::new()).is_none());
     read(&ledger, &mut clock, 64 * GB, 24 * GB, None);
     let shown = ledger.estimate();
     assert_eq!((shown.others(), shown.budget(), shown.guarantee()), (0, before.budget(), 0));
@@ -242,13 +245,13 @@ fn a_free_the_driver_shows_late_stays_the_drivers_until_it_shows() {
         assert_eq!(lagging.cap(), before.cap(), "no settle or harm step");
         assert_eq!(lagging.room(), before.room(), "the driver still counts them");
         assert_eq!(charged.as_ref().map(seismic::memory::Charge::bytes), Some(FREED), "the driver's entry holds them");
-        assert!(ledger.shortage().is_none(), "no shortage, so nothing yields, preempts or unloads");
+        assert!(ledger.shortage(&std::collections::BTreeSet::new()).is_none(), "no shortage, so nothing yields, preempts or unloads");
     }
     let shown_free = reading(shown[3], 6 * GB, &mut charged);
     assert!(charged.is_none(), "the driver's entry drops by them");
     assert_eq!(shown_free.others(), before.others());
     assert_eq!(shown_free.room(), before.room() + FREED, "room grows by them");
-    assert!(ledger.shortage().is_none());
+    assert!(ledger.shortage(&std::collections::BTreeSet::new()).is_none());
     assert_eq!(ledger.allocated(), 6 * GB);
     drop(weights);
 }
@@ -295,16 +298,15 @@ fn own_claims_are_never_others_taking_memory() {
     }
 }
 
-/// Item 23: the guarantee is the load's one in-process figure and others'
-/// rise between the last two readings, never a forecast scaled by our own
-/// release latency.
+/// Item 23: the guarantee is others' rise between the last two readings
+/// alone: never a forecast scaled by our own release latency, and nothing
+/// of the process's own (a request's whole state is committed as it
+/// opens).
 #[test]
-fn the_guarantee_is_others_rise_and_the_in_process_figure_only() {
+fn the_guarantee_is_others_rise_only() {
     let (_scope, ledger, pool) = host();
     let mut clock = Clock::new();
     read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
-    let launch = ledger.in_process(3 * GB);
-    let (_serving, _) = serving(&ledger);
     let _weights = commit(&ledger, 30 * GB);
     let bank = ledger.cached(CacheKind::Bank, 20 * GB).expect("free room");
     read(&ledger, &mut clock, 64 * GB, 14 * GB, None);
@@ -314,12 +316,9 @@ fn the_guarantee_is_others_rise_and_the_in_process_figure_only() {
     });
     // Our free, shown: no term of it.
     read(&ledger, &mut clock, 64 * GB, 34 * GB, None);
-    assert_eq!(ledger.estimate().guarantee(), 3 * GB);
+    assert_eq!(ledger.estimate().guarantee(), 0);
     // Another program takes 2 GB in one interval.
     read(&ledger, &mut clock, 64 * GB, 32 * GB, None);
-    assert_eq!(ledger.estimate().guarantee(), 5 * GB);
-    // The load unloads: its figure leaves the store's guarantee.
-    drop(launch);
     assert_eq!(ledger.estimate().guarantee(), 2 * GB);
 }
 
@@ -331,14 +330,12 @@ fn our_own_change_out_of_step_keeps_others_rise() {
     let (_scope, ledger, pool) = host();
     let mut clock = Clock::new();
     read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
-    let _launch = ledger.in_process(3 * GB);
-    let (_serving, _) = serving(&ledger);
     let _weights = commit(&ledger, 30 * GB);
     let bank = ledger.cached(CacheKind::Bank, 20 * GB).expect("free room");
     read(&ledger, &mut clock, 64 * GB, 14 * GB, None);
     // Another program takes 2 GB in one interval.
     read(&ledger, &mut clock, 64 * GB, 12 * GB, None);
-    assert_eq!(ledger.estimate().guarantee(), 5 * GB);
+    assert_eq!(ledger.estimate().guarantee(), 2 * GB);
     // The bank's cache yields; a reading whose figures show it a second
     // late judges no rise of others', and keeps the one it had.
     ledger.change(|_| {
@@ -348,7 +345,7 @@ fn our_own_change_out_of_step_keeps_others_rise() {
     let late = seismic::Lag { release: Duration::from_secs(1), growth: Duration::from_secs(1) };
     ledger.read(ledger.sampled(clock.next()), Reading::device(64 * GB, 12 * GB, late));
     assert!(ledger.estimate().pending(), "the free is not yet shown");
-    assert_eq!(ledger.estimate().guarantee(), 5 * GB, "others' rise stands across our own change");
+    assert_eq!(ledger.estimate().guarantee(), 2 * GB, "others' rise stands across our own change");
 }
 
 /// A growth freed before the figures show it, where a release shows at
@@ -473,8 +470,8 @@ fn a_full_store_refuses_and_never_unloads() {
     read(&ledger, &mut clock, 64 * GB, 34 * GB, Some(30 * GB));
     let full = ledger.estimate();
     assert_eq!(full.budget(), 30 * GB);
-    assert!(ledger.shortage().is_none());
-    assert!(matches!(ledger.claim(Need::Measurement { bytes: 1 }), Err(Refused::Short(Short { over: 1, .. }))));
+    assert!(ledger.shortage(&std::collections::BTreeSet::new()).is_none());
+    assert!(matches!(held(&ledger, 1), Err(Short { over: 1, .. })));
 }
 
 /// Item 46: others squeezing the load at one reading is a real shortage,
@@ -487,64 +484,106 @@ fn a_squeeze_at_one_reading_never_unloads() {
     read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
     let _weights = commit(&ledger, 50 * GB);
     read(&ledger, &mut clock, 64 * GB, 14 * GB, None);
-    assert!(ledger.shortage().is_none());
+    assert!(ledger.shortage(&std::collections::BTreeSet::new()).is_none());
     // Others take 12 GB in one interval: 2 GB stay free.
     read(&ledger, &mut clock, 64 * GB, 2 * GB, None);
     let squeezed = ledger.estimate();
     assert_eq!(squeezed.guarantee(), 12 * GB);
-    let shortage = ledger.shortage().expect("the guarantee cannot be kept");
-    assert!(matches!(shortage.cause, shortage::Cause::Room { over } if over == 10 * GB));
+    let shortage = ledger.shortage(&std::collections::BTreeSet::new()).expect("the guarantee cannot be kept");
+    assert!(matches!(shortage.cause, shortage::Cause::RiseShort { over } if over == 10 * GB));
     assert!(!shortage.response.unload, "one reading decides nothing");
     // Others stop rising: the guarantee falls to zero, and the load stays.
     read(&ledger, &mut clock, 64 * GB, 2 * GB, None);
-    assert!(ledger.shortage().is_none());
+    assert!(ledger.shortage(&std::collections::BTreeSet::new()).is_none());
 }
 
-/// An idle load squeezed below its in-process figure is no shortage:
-/// nothing is admitted, so nothing can grow in process. It never unloads;
-/// new work is refused instead, as its first sequence would make the
-/// figure live.
+/// Others rising past what the budget holds beside committed memory is a
+/// rise shortfall: relieved where it can be, new work waiting, never an
+/// unload, however many readings it spans. A request refused for room
+/// waits for the next reading.
 #[test]
-fn an_idle_squeeze_refuses_new_work_and_never_unloads() {
+fn a_rise_shortfall_never_unloads() {
     let (_scope, ledger, _pool) = host();
     let mut clock = Clock::new();
     read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
     let _weights = commit(&ledger, 50 * GB);
-    let _launch = ledger.in_process(4 * GB);
+    let slot = slot(&ledger, 0);
     read(&ledger, &mut clock, 64 * GB, 14 * GB, None);
-    read(&ledger, &mut clock, 64 * GB, 2 * GB, None);
-    let risen = ledger.shortage().expect("others' rise is a real shortage");
-    assert!(!risen.response.unload, "one reading decides nothing");
-    for _ in 0..3 {
-        read(&ledger, &mut clock, 64 * GB, 2 * GB, None);
-        assert!(ledger.shortage().is_none(), "idle: no growth to guarantee");
-        assert_eq!(ledger.estimate().guarantee(), 0);
+    for available in [4, 1, 0] {
+        read(&ledger, &mut clock, 64 * GB, available * GB, None);
+        let shortage = ledger.shortage(&std::collections::BTreeSet::new()).expect("others' rise is a real shortage");
+        assert!(matches!(shortage.cause, shortage::Cause::RiseShort { .. }), "{:?}", shortage.cause);
+        assert!(shortage.response.admission_waits && !shortage.response.unload, "a rise shortfall never unloads");
     }
-    assert!(matches!(ledger.claim(pages(1, 0, 1)), Err(Refused::Short(_))), "the first sequence would make the figure live");
-    assert_eq!(ledger.standing(), Some(Standing::Wait), "the refused claim waits for a reading");
-    read(&ledger, &mut clock, 64 * GB, 2 * GB, None);
+    read(&ledger, &mut clock, 64 * GB, 0, None);
+    assert!(ledger.shortage(&std::collections::BTreeSet::new()).is_none(), "others stopped rising");
+    assert!(request(&ledger, &slot, 1, 1).is_err(), "no room for a request");
+    assert_eq!(ledger.standing(), Some(Standing::Wait), "the refused request waits for a reading");
+    read(&ledger, &mut clock, 64 * GB, 0, None);
     assert_eq!(ledger.standing(), None, "a reading answers the wait");
 }
 
-/// A shortage that holds on a later reading while a sequence is served,
-/// nothing left to yield or preempt and no change of the process's
-/// pending, unloads.
+/// Free memory below the OS's target reads whole: others' growth into the
+/// OS's reserve is their rise, and a budget it takes below what is
+/// committed is a floor shortfall.
 #[test]
-fn a_squeeze_that_persists_while_serving_unloads() {
+fn free_below_the_target_reads_as_others_rise_and_a_shortfall() {
+    let (_scope, ledger, _pool) = host();
+    let mut clock = Clock::new();
+    let read_free = |ledger: &Ledger, clock: &mut Clock, free: i64| {
+        let sample = seismic::HostSample { supply: seismic::Supply { free_beyond_target: free, clean_cache: 0, cold_reclaimable: 0 }, ..host_sample(64 * GB, 0) };
+        ledger.read(ledger.sampled(clock.next()), Reading::host(&sample));
+    };
+    read_free(&ledger, &mut clock, 64 * GB as i64);
+    let _weights = commit(&ledger, 50 * GB);
+    read_free(&ledger, &mut clock, 14 * GB as i64);
+    read_free(&ledger, &mut clock, 0);
+    read_free(&ledger, &mut clock, -2 * GB as i64);
+    let below = ledger.estimate();
+    assert_eq!((below.supply(), below.guarantee(), below.budget()), (-2 * GB as i64, 2 * GB, 48 * GB), "the dip is others' rise, the budget below what is committed");
+    let shortage = ledger.shortage(&std::collections::BTreeSet::new()).expect("committed past the budget");
+    assert_eq!(shortage.cause, shortage::Cause::FloorShort { over: 2 * GB });
+}
+
+/// A floor shortfall following a rise shortfall that stood past λ is
+/// judged from its own first reading: one reading of it decides nothing.
+#[test]
+fn a_floor_shortfall_after_a_standing_rise_waits_its_own_lambda() {
     let (_scope, ledger, _pool) = host();
     let mut clock = Clock::new();
     read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
-    let _weights = commit(&ledger, 50 * GB);
-    let _launch = ledger.in_process(4 * GB);
-    let ((_floor, _sequence), page) = serving(&ledger);
-    read(&ledger, &mut clock, 64 * GB, 14 * GB, None);
-    assert!(ledger.shortage().is_none());
-    read(&ledger, &mut clock, 64 * GB, 2 * GB, None);
-    assert!(!ledger.shortage().expect("short").response.unload, "the first reading short");
-    read(&ledger, &mut clock, 64 * GB, 2 * GB, None);
-    let shortage = ledger.shortage().expect("still short of the in-process figure");
-    assert!(matches!(shortage.cause, shortage::Cause::Room { over } if over == 2 * GB + page));
-    assert!(shortage.response.unload, "the one sequence is the earliest, never preempted");
+    let _weights = held(&ledger, 50 * GB).expect("room");
+    read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
+    for available in [55, 52] {
+        read(&ledger, &mut clock, 64 * GB, available * GB, None);
+        let shortage = ledger.shortage(&std::collections::BTreeSet::new()).expect("others' rise is a real shortage");
+        assert!(matches!(shortage.cause, shortage::Cause::RiseShort { .. }), "{:?}", shortage.cause);
+    }
+    read(&ledger, &mut clock, 64 * GB, 45 * GB, None);
+    let floor = ledger.shortage(&std::collections::BTreeSet::new()).expect("the budget is short of what is committed");
+    assert!(matches!(floor.cause, shortage::Cause::FloorShort { .. }), "{:?}", floor.cause);
+    assert!(!floor.response.unload, "the rise's span is no part of the floor's");
+    read(&ledger, &mut clock, 64 * GB, 45 * GB, None);
+    assert!(ledger.shortage(&std::collections::BTreeSet::new()).expect("still short").response.unload, "past its own λ: unload");
+}
+
+/// A floor shortfall (the budget short of what is committed) that holds
+/// on readings spanning the store's λ, with nothing to relieve it and no
+/// change of the process's pending, unloads; one reading decides nothing.
+#[test]
+fn a_floor_shortfall_past_lambda_unloads() {
+    let (_scope, ledger, _pool) = host();
+    let mut clock = Clock::new();
+    read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
+    let _weights = held(&ledger, 50 * GB).expect("room");
+    read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
+    assert!(ledger.shortage(&std::collections::BTreeSet::new()).is_none());
+    read(&ledger, &mut clock, 64 * GB, 40 * GB, None);
+    let first = ledger.shortage(&std::collections::BTreeSet::new()).expect("the budget is short of what is committed");
+    assert!(matches!(first.cause, shortage::Cause::FloorShort { over } if over == 10 * GB), "{:?}", first.cause);
+    assert!(!first.response.unload, "one reading decides nothing");
+    read(&ledger, &mut clock, 64 * GB, 40 * GB, None);
+    assert!(ledger.shortage(&std::collections::BTreeSet::new()).expect("still short").response.unload, "past λ, nothing to give: unload");
 }
 
 /// Each reading is answered once: asking again at a later event with no
@@ -558,89 +597,83 @@ fn a_shortage_is_answered_once_per_reading() {
     let _weights = commit(&ledger, 56 * GB);
     let _bank = ledger.cached(CacheKind::Bank, 2 * GB).expect("free room");
     read(&ledger, &mut clock, 64 * GB, 6 * GB, None);
-    read(&ledger, &mut clock, 64 * GB, 0, None);
-    let shortage = ledger.shortage().expect("others rose by 6 GB: the budget holds 58, the weights and the rise 62");
-    assert_eq!(shortage.response.yields, 2 * GB, "the whole cache");
-    assert!(ledger.shortage().is_none(), "the reading was answered");
+    read(&ledger, &mut clock, 64 * GB, GB, None);
+    let shortage = ledger.shortage(&std::collections::BTreeSet::new()).expect("others rose by 5 GB: the budget holds 59, the weights and the rise 61");
+    assert_eq!(shortage.response.relief.as_ref().map(ReliefPlan::covers), Some(2 * GB), "the whole cache");
+    assert!(ledger.shortage(&std::collections::BTreeSet::new()).is_none(), "the reading was answered");
     assert!(matches!(ledger.standing(), Some(Standing::Shortage(_))), "and still stands");
-    read(&ledger, &mut clock, 64 * GB, 0, None);
-    assert!(ledger.shortage().is_none(), "others stopped rising: the next reading clears it");
+    read(&ledger, &mut clock, 64 * GB, GB, None);
+    assert!(ledger.shortage(&std::collections::BTreeSet::new()).is_none(), "others stopped rising: the next reading clears it");
     assert_eq!(ledger.standing(), None);
 }
 
-/// The same squeeze beside a later sequence: preemption has something to
-/// take, so a claim preempts it and nothing unloads.
+/// The same squeeze beside a later request: relief has its reservation to
+/// take, so the plan preempts it and nothing unloads.
 #[test]
-fn a_squeeze_with_preemptible_state_preempts_instead() {
+fn a_squeeze_with_a_later_request_preempts_it_instead() {
     let (_scope, ledger, _pool) = host();
     let mut clock = Clock::new();
     read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
     let _weights = commit(&ledger, 40 * GB);
-    let mut first = ledger.claim(pages(1, 0, 1)).expect("room");
-    let page = first.bytes();
-    let _second = ledger.claim(pages(2, 0, (8 * GB).div_ceil(page))).expect("room");
+    let page = ledger.bytes(&Need::Request { sequence: RequestId(1), rows: page_rows() });
+    let slot = slot(&ledger, page);
+    let _first = request(&ledger, &slot, 1, 1).expect("the slot");
+    let _second = request(&ledger, &slot, 2, (8 * GB).div_ceil(page)).expect("room");
     let held = ledger.estimate().committed();
     read(&ledger, &mut clock, 64 * GB, 64 * GB - held, None);
     read(&ledger, &mut clock, 64 * GB, 1 * GB, None);
-    let squeezed = ledger.estimate();
-    assert!(squeezed.guarantee() > 1 * GB);
-    let shortage = ledger.shortage().expect("the guarantee cannot be kept");
-    assert_eq!(shortage.response.preempt, [RequestId(2)]);
-    assert!(!shortage.response.unload, "the second sequence is preemptible");
-    let Err(Refused::Preempt(preemption)) = first.grow(pages(1, 1, 1 + (2 * GB).div_ceil(page))) else {
-        panic!("the growth preempts the second sequence");
-    };
-    assert_eq!(preemption.sequences(), [RequestId(2)]);
+    let shortage = ledger.shortage(&[1, 2].map(RequestId).into()).expect("the guarantee cannot be kept");
+    assert_eq!(shortage.response.relief.as_ref().map(ReliefPlan::preempt), Some(&[RequestId(2)][..]));
+    assert!(!shortage.response.unload, "the second request is preemptible");
 }
 
-/// Four sequences of one page each beside a bank filling the rest of a
-/// 40 GB grant, and the page's bytes.
-fn four_sequences(ledger: &Ledger) -> ([Claim; 4], Cached, u64) {
+/// Four requests of one page each, the first drawn from the slot, beside a
+/// retained prefix of a page and a bank filling the rest of a 40 GB grant;
+/// the slot and the page's bytes.
+fn four_requests(ledger: &Ledger) -> ([Reservation; 4], (Cached, Cached), Claim, u64) {
     let mut clock = Clock::new();
     read(ledger, &mut clock, 64 * GB, 64 * GB, Some(40 * GB));
-    let claims = [1, 2, 3, 4].map(|sequence| ledger.claim(pages(sequence, 0, 1)).expect("room"));
-    let page = claims[0].bytes();
-    let bank = ledger.cached(CacheKind::Bank, ledger.estimate().budget() - 4 * page).expect("the rest");
-    (claims, bank, page)
+    let page = ledger.bytes(&Need::Request { sequence: RequestId(1), rows: page_rows() });
+    let slot = slot(ledger, page);
+    let requests = [1, 2, 3, 4].map(|sequence| request(ledger, &slot, sequence, 1).expect("room"));
+    let prefix = ledger.cached(CacheKind::Prefix, page).expect("room");
+    let bank = ledger.cached(CacheKind::Bank, ledger.estimate().budget() - 5 * page).expect("the rest");
+    (requests, (bank, prefix), slot, page)
 }
 
-/// A sequence's growth takes free room, then cache, then the state of the
-/// sequences admitted after it, the latest first and just enough, once
-/// they are evicted; never an earlier sequence's.
+/// A relief plan takes cache, then the requests admitted after the first,
+/// the latest first and just enough, never the first nor one its holder
+/// cannot evict now; it exists whole or not at all, and none takes
+/// nothing: a need past what yields leaves the bank as it was.
 #[test]
-fn a_claim_preempts_only_later_sequences_after_the_cache() {
+fn a_relief_plan_covers_its_need_whole_or_takes_nothing() {
     let (_scope, ledger, _pool) = host();
-    let ([mut first, second, third, fourth], _bank, page) = four_sequences(&ledger);
-    let bank = ledger.estimate().cache();
-    let grown = bank / page + 2;
-    let Err(Refused::Preempt(preemption)) = first.grow(pages(1, 1, 1 + grown)) else {
-        panic!("the growth needs preemption");
-    };
-    assert_eq!(preemption.sequences(), [RequestId(4), RequestId(3)]);
-    assert_eq!(ledger.estimate().cache(), 0, "the cache went to the growth");
-    drop((fourth, third));
-    first.complete(preemption);
-    assert_eq!(first.bytes(), (1 + grown) * page);
-    assert_eq!(ledger.estimate().cache_of(CacheKind::Spare), bank + 2 * page - grown * page);
-    assert_eq!(second.bytes(), page, "an earlier sequence is kept");
-    // The second sequence can never take the first's.
-    assert!(ledger.admit(&pages(2, 1, 1 + grown + 8)).is_err());
+    let (_requests, (bank, prefix), _slot, page) = four_requests(&ledger);
+    let cached = bank.bytes() + prefix.bytes();
+    let every = [1, 2, 3, 4].map(RequestId).into();
+    let plan = ledger.plan_relief(cached + 2 * page, Relief::CacheAndRequests(&every)).expect("the cache and two requests cover it");
+    assert_eq!(plan.preempt(), [RequestId(4), RequestId(3)]);
+    let held = [1, 2, 3].map(RequestId).into();
+    let around = ledger.plan_relief(cached + 2 * page, Relief::CacheAndRequests(&held)).expect("the cache and two evictable requests cover it");
+    assert_eq!(around.preempt(), [RequestId(3), RequestId(2)], "the request its holder cannot evict is never named");
+    assert_eq!(ledger.plan_relief(cached + 4 * page, Relief::CacheAndRequests(&every)), None, "the first request is never preempted");
+    assert_eq!(ledger.plan_relief(cached + 1, Relief::CacheOnly), None, "cache alone cannot cover it");
+    let after = ledger.estimate();
+    assert_eq!((after.cache_of(CacheKind::Bank), after.cache_of(CacheKind::Prefix)), (cached - page, page), "no plan took the bank or the prefix");
+    let owed = ledger.execute(plan);
+    assert_eq!((owed.yielded, owed.preempt), (cached, vec![RequestId(4), RequestId(3)]));
+    assert_eq!((bank.bytes(), prefix.bytes()), (0, 0), "the plan carried out whole");
 }
 
 /// An invariant broken under the ledger's lock panics as itself: the
 /// handles dropped while unwinding never touch the ledger it poisoned, so
 /// the test binary goes on.
 #[test]
-#[should_panic(expected = "a preemption completes only once every sequence it named is evicted")]
+#[should_panic(expected = "a request's state is reserved whole, never in units")]
 fn an_invariant_broken_under_the_lock_panics_as_itself() {
     let (_scope, ledger, _pool) = host();
-    let ([mut first, _second, _third, _fourth], _bank, page) = four_sequences(&ledger);
-    let grown = ledger.estimate().cache() / page + 1;
-    let Err(Refused::Preempt(preemption)) = first.grow(pages(1, 1, 1 + grown)) else {
-        panic!("the growth needs preemption");
-    };
-    // The fourth sequence is still held.
-    first.complete(preemption);
+    let (_requests, _cache, _slot, _page) = four_requests(&ledger);
+    let _ = ledger.claim_units(CommittedKind::Request(RequestId(5)), NonZeroU64::new(1).unwrap(), 1);
 }
 
 /// A panic outside the lock releases what its unwind drops: a domain whose
@@ -659,31 +692,6 @@ fn an_unwind_releases_what_it_drops() {
     }));
     assert!(unwound.is_err());
     assert_eq!(figures(&ledger), before, "the unwind released the claim");
-}
-
-/// Two claims race for one eviction's bytes: the preempting claim holds
-/// them from the moment it names the sequence, so it wins with exactly one
-/// eviction, and the other claim never takes them.
-#[test]
-fn a_preemption_holds_its_evictions_bytes_against_a_racing_claim() {
-    let (_scope, ledger, _pool) = host();
-    let ([mut first, mut second, third, fourth], _bank, page) = four_sequences(&ledger);
-    let grown = ledger.estimate().cache() / page + 1;
-    let Err(Refused::Preempt(preemption)) = first.grow(pages(1, 1, 1 + grown)) else {
-        panic!("the growth needs preemption");
-    };
-    assert_eq!(preemption.sequences(), [RequestId(4)]);
-    // The second sequence races for the fourth's bytes: they are reserved,
-    // so it can only name the third.
-    let Err(Refused::Preempt(racing)) = second.grow(pages(2, 1, 2)) else {
-        panic!("the race finds no free room");
-    };
-    assert_eq!(racing.sequences(), [RequestId(3)]);
-    drop(racing);
-    drop(fourth);
-    first.complete(preemption);
-    assert_eq!(first.bytes(), (1 + grown) * page);
-    assert_eq!(third.bytes(), page, "one eviction only");
 }
 
 /// A claim shrinks by bytes its holder freed and claims no more: its bytes
@@ -716,18 +724,16 @@ fn a_claim_takes_cache_and_is_refused_only_past_the_budget() {
     let _bank = ledger.cached(CacheKind::Bank, 20 * GB).expect("free room");
     // Another program holds 20 GB: 4 GB are free.
     read(&ledger, &mut clock, 64 * GB, 4 * GB, None);
-    let need = Need::Measurement { bytes: 10 * GB };
-    assert_eq!(ledger.admit(&need), Ok(()));
-    let _taken = ledger.claim(need).expect("cache yields to it");
+    assert_eq!(ledger.covers(None, 10 * GB), Ok(()));
+    let _taken = held(&ledger, 10 * GB).expect("cache yields to it");
     let snapshot = ledger.estimate();
     assert_eq!(snapshot.committed(), 30 * GB);
     // The free 4 GB lie in the guarantee: 10 GB of the bank's.
     assert!(snapshot.guarantee() >= 4 * GB, "others' rise holds the free room: {}", snapshot.guarantee());
     assert_eq!(snapshot.cache(), 10 * GB);
-    let past = Need::Measurement { bytes: 15 * GB };
     let short = Short { store: ledger.store(), required: 15 * GB, over: GB };
-    assert_eq!(ledger.admit(&past), Err(short.clone()));
-    assert!(matches!(ledger.claim(past), Err(Refused::Short(refused)) if refused == short));
+    assert_eq!(ledger.covers(None, 15 * GB), Err(short.clone()));
+    assert!(matches!(held(&ledger, 15 * GB), Err(refused) if refused == short));
 }
 
 /// Every claim counts the store's supply: free memory above the OS's
@@ -746,7 +752,7 @@ fn every_claim_counts_the_supply() {
     ledger.read(ledger.sampled(clock.next()), Reading::host(&sample));
     // No baseline judges harm yet: cold pages are not room.
     assert_eq!(ledger.estimate().free(), 10 * GB);
-    let floor = ledger.claim(Need::Measurement { bytes: 10 * GB }).expect("the supply covers it");
+    let floor = held(&ledger, 10 * GB).expect("the supply covers it");
     assert!(ledger.covers(None, 1).is_err(), "what it took is held");
     drop(floor);
     // A reading whose counters show the machine later learns a baseline;
@@ -801,7 +807,7 @@ fn a_shrink_never_raises_others_or_the_guarantee() {
         read(&ledger, &mut clock, 64 * GB, 64 * GB - 4 * GB - ledger.estimate().allocated(), None);
         let shown = ledger.estimate();
         assert_eq!((shown.others(), shown.guarantee(), shown.budget()), (4 * GB, 0, before.budget()));
-        assert!(ledger.shortage().is_none());
+        assert!(ledger.shortage(&std::collections::BTreeSet::new()).is_none());
     }
 }
 
@@ -993,7 +999,7 @@ fn a_record_outside_a_change_panics() {
     let ledger = scope.ledger(seismic::StoreIdentity::HostRam, shape());
     read(&ledger, &mut Clock::new(), 64 * GB, 64 * GB, None);
     let claim = ledger.change(|_| {
-        let claim = ledger.claim(Need::Measurement { bytes: GB }).expect("the claim fits");
+        let claim = held(&ledger, GB).expect("the claim fits");
         claim.entry().take(&claim.entry().change(), GB, Pageable).expect("the claim's own bytes");
         claim
     });
@@ -1011,7 +1017,8 @@ fn a_unit_claim_takes_whole_units_from_free_spare_and_bank_alone() {
     let mut clock = Clock::new();
     read(&ledger, &mut clock, 64 * GB, 64 * GB, Some(40 * GB));
     let unit = NonZeroU64::new(GB).unwrap();
-    let state = ledger.claim(pages(2, 0, 1)).expect("room");
+    let slot = slot(&ledger, 0);
+    let state = request(&ledger, &slot, 2, 1).expect("room");
     let page = state.bytes();
     let held = |claim: &Claim| claim.bytes();
     // Free room alone, capped by `most`.
@@ -1031,7 +1038,7 @@ fn a_unit_claim_takes_whole_units_from_free_spare_and_bank_alone() {
     assert_eq!(spare.bytes(), 0, "spare yields first");
     assert_eq!(bank.bytes(), bank_bytes + 3 * GB + GB / 2 - taken * GB, "the bank yields the rest");
     assert_eq!(prefix.bytes(), 10 * GB, "a prefix never yields to it");
-    assert_eq!(held(&state), page, "no sequence is preempted");
+    assert_eq!(state.bytes(), page, "no request is preempted");
     // Nothing left to take: it holds none.
     let (none, units) = ledger.claim_units(CommittedKind::Scratch, unit, 5);
     assert_eq!((units, held(&none)), (0, 0));
@@ -1063,7 +1070,7 @@ fn a_loads_allocation_is_admitted_or_short_by_its_figures() {
 #[should_panic(expected = "admits before its first reading")]
 fn a_claim_in_a_store_never_read_panics() {
     let (_scope, ledger, _pool) = host();
-    let _ = ledger.claim(Need::Measurement { bytes: GB });
+    let _ = held(&ledger, GB);
 }
 
 /// A device's own memory is charged as it opens, before its store's first
@@ -1158,7 +1165,7 @@ fn a_claim_not_yet_allocated_stays_out_of_free_room_across_a_reading() {
     let (_scope, ledger, _pool) = host();
     let mut clock = Clock::new();
     read(&ledger, &mut clock, 64 * GB, 24 * GB, None);
-    let room = ledger.claim(Need::Measurement { bytes: 4 * GB }).expect("room");
+    let room = held(&ledger, 4 * GB).expect("room");
     assert_eq!(ledger.estimate().free(), 20 * GB);
     read(&ledger, &mut clock, 64 * GB, 24 * GB, None);
     let after = ledger.estimate();
@@ -1185,7 +1192,7 @@ fn a_claim_turns_cache_in_place_and_yields_before_the_bank() {
     assert_eq!(ledger.entries().len(), entries, "the same entry");
     assert_eq!((after.allocated(), after.free(), after.others()), (before.allocated(), before.free(), before.others()));
     assert_eq!((after.committed(), after.cache_of(CacheKind::GraphSlots)), (before.committed() - 4 * GB, 4 * GB));
-    let _taken = ledger.claim(Need::Measurement { bytes: 5 * GB }).expect("cache yields to it");
+    let _taken = held(&ledger, 5 * GB).expect("cache yields to it");
     assert_eq!((slots.bytes(), bank.bytes()), (0, 59 * GB), "the idle slots yield first, then the bank");
 }
 
@@ -1201,7 +1208,7 @@ fn a_claim_allocates_taken_cache_only_as_its_holder_frees_it() {
     let _weights = commit(&ledger, 20 * GB);
     let bank = ledger.cached(CacheKind::Bank, 40 * GB).expect("free room");
     read(&ledger, &mut clock, 64 * GB, 4 * GB, None);
-    let taken = ledger.claim(Need::Measurement { bytes: 10 * GB }).expect("cache yields to it");
+    let taken = held(&ledger, 10 * GB).expect("cache yields to it");
     assert_eq!((bank.bytes(), bank.releasing()), (34 * GB, 0), "the bank yields 6 GB, the pool's still");
     assert!(ledger.change(|_| taken.entry().take(&taken.entry().change(), 10 * GB, Pageable)).is_err(), "the taken bytes are allocated only once freed");
     let held = ledger.estimate();
@@ -1228,7 +1235,8 @@ fn a_shortages_yield_is_free_only_once_freed() {
     let _weights = commit(&ledger, 40 * GB);
     let bank = ledger.cached(CacheKind::Bank, 20 * GB).expect("free room");
     assert_eq!(ledger.estimate().free(), 4 * GB);
-    assert_eq!(ledger.yield_cache(8 * GB), 8 * GB);
+    let plan = ledger.plan_relief(8 * GB, Relief::CacheOnly).expect("the bank covers it");
+    assert_eq!(ledger.execute(plan).yielded, 8 * GB);
     assert_eq!((bank.bytes(), ledger.estimate().free()), (12 * GB, 4 * GB), "shed, still allocated: not free");
     assert!(ledger.cached(CacheKind::Prefix, 5 * GB).is_err());
     ledger.change(|_| pool.freed(&pool.change(), 8 * GB, Pageable));
@@ -1241,16 +1249,20 @@ fn a_shortages_yield_is_free_only_once_freed() {
 #[test]
 fn a_shortage_preempts_the_lowest_value_first() {
     let (_scope, ledger, _pool) = host();
-    let ([first, second, third, fourth], _bank, page) = four_sequences(&ledger);
+    read(&ledger, &mut Clock::new(), 64 * GB, 64 * GB, Some(40 * GB));
+    let page = ledger.bytes(&Need::Request { sequence: RequestId(1), rows: page_rows() });
+    let slot = slot(&ledger, page);
+    // No cache: the shortage's relief is the requests'.
+    let [first, second, third, fourth] = [1, 2, 3, 4].map(|sequence| request(&ledger, &slot, sequence, 1).expect("room"));
     let per_page = NonZeroU64::new(page).unwrap();
-    for (claim, seconds) in [(&first, 0.0), (&second, 0.1), (&third, 0.9), (&fourth, 0.5)] {
-        claim.value(Value::per_byte(seconds, per_page));
+    for (request, seconds) in [(&first, 0.0), (&second, 0.1), (&third, 0.9), (&fourth, 0.5)] {
+        request.value(Value::per_byte(seconds, per_page));
     }
     // The grant falls to two and a half pages: the four pages are a page
     // and a half over it.
     read(&ledger, &mut Clock::new(), 64 * GB, 64 * GB, Some(2 * page + page / 2));
-    let shortage = ledger.shortage().expect("committed past the budget");
-    assert_eq!(shortage.response.preempt, [RequestId(2), RequestId(4)]);
+    let shortage = ledger.shortage(&[1, 2, 3, 4].map(RequestId).into()).expect("committed past the budget");
+    assert_eq!(shortage.response.relief.as_ref().map(ReliefPlan::preempt), Some(&[RequestId(2), RequestId(4)][..]));
 }
 
 /// A bank holding dropped leaves its granules spare in the pool, still
@@ -1262,7 +1274,7 @@ fn a_dropped_bank_leaves_spare_granules_until_the_pool_frees_them() {
     let mut clock = Clock::new();
     read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
     let bank = ledger.cached(CacheKind::Bank, 64 * GB).expect("free room");
-    let _taken = ledger.claim(Need::Measurement { bytes: 8 * GB }).expect("cache yields to it");
+    let _taken = held(&ledger, 8 * GB).expect("cache yields to it");
     drop(bank);
     let dropped = ledger.estimate();
     assert_eq!((dropped.allocated(), dropped.releasing(), dropped.cache_of(CacheKind::Spare)), (64 * GB, 8 * GB, 56 * GB));
@@ -1290,24 +1302,62 @@ fn a_backing_holds_its_bytes_and_the_pool_allocates_them() {
     assert_eq!((cache.bytes(), snapshot.allocated(), snapshot.cache_of(CacheKind::Bank), snapshot.free()), (8 * GB, 5 * GB, 8 * GB, 56 * GB));
 }
 
-/// A sequence's first rows draw from the state floor the load holds, with
-/// no room beside it and no window in which the floor is lost: with every
-/// byte of the budget held, a sequence claims what the floor holds and
-/// holds nothing more than the floor did; its next page is refused.
+/// The request slot is the first request's: it reserves what the slot
+/// holds, holding nothing more than the slot did, and a second request
+/// beside it draws free room. With every byte of the budget held, a third
+/// has no room; the first's close gives the slot back, and the third
+/// draws it then.
 #[test]
-fn a_sequences_first_rows_draw_from_the_state_floor() {
+fn a_reservation_draws_the_slot_and_gives_it_back() {
     let (_scope, ledger, _pool) = host();
     let mut clock = Clock::new();
     read(&ledger, &mut clock, 64 * GB, 8 * GB, None);
-    let Need::StateRows { to: page, .. } = pages(1, 0, 1) else { unreachable!() };
-    let _floor = ledger.claim(Need::StateFloor { rows: page }).expect("the floor fits");
-    let room = ledger.estimate().free();
-    let _rest = commit(&ledger, room);
-    assert_eq!(ledger.estimate().free(), 0, "the floor and the rest hold the whole budget");
-    let held = ledger.estimate().committed();
-    let mut state = ledger.claim(pages(1, 0, 1)).expect("the first page draws from the floor");
-    assert_eq!(ledger.estimate().committed(), held, "the floor's bytes are held once");
-    assert!(state.grow(pages(1, 1, 2)).is_err(), "the page past the floor has no room");
+    let page = ledger.bytes(&Need::Request { sequence: RequestId(1), rows: page_rows() });
+    let slot = slot(&ledger, page);
+    let committed = ledger.estimate().committed();
+    let first = request(&ledger, &slot, 1, 1).expect("the first request draws the slot");
+    assert_eq!((ledger.estimate().committed(), slot.bytes()), (committed, 0), "the slot's bytes are held once");
+    let free = ledger.estimate().free();
+    let _second = request(&ledger, &slot, 2, 1).expect("the second draws free room beside the slot in use");
+    assert_eq!((ledger.estimate().committed(), ledger.estimate().free()), (committed + page, free - page), "the second's page is free room's");
+    let _rest = commit(&ledger, ledger.estimate().free());
+    assert!(request(&ledger, &slot, 3, 1).is_err(), "a third request has no room");
+    drop(first);
+    assert_eq!(slot.bytes(), page, "the close gives the slot back");
+    let _third = request(&ledger, &slot, 3, 1).expect("the third draws it now");
+}
+
+/// A grant's process's footprint is the process's own, within the grant:
+/// a measurement job that grows by exactly its grant leaves others, their
+/// rise and the guarantee as they were, and causes nothing; one byte past
+/// it is others'.
+#[test]
+fn a_grants_footprint_is_never_others_memory() {
+    struct Scripted(std::sync::Mutex<u64>);
+    impl Footprints for Scripted {
+        fn footprint(&self, _: seismic::ProcessId, _: &seismic::StoreIdentity) -> seismic::ProcessFootprint {
+            seismic::ProcessFootprint::Observed(*self.0.lock().unwrap())
+        }
+    }
+    let footprint = Arc::new(Scripted(std::sync::Mutex::new(0)));
+    let scope = Ledgers::footprinted(footprint.clone());
+    let ledger = scope.ledger(seismic::StoreIdentity::HostRam, shape());
+    let mut clock = Clock::new();
+    read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
+    let _weights = commit(&ledger, 30 * GB);
+    read(&ledger, &mut clock, 64 * GB, 34 * GB, None);
+    let grant = ledger.grant(GrantRole::Measurement, 4 * GB).expect("room");
+    grant.attach(seismic::ProcessId::of(1));
+    let before = ledger.estimate();
+    *footprint.0.lock().unwrap() = 4 * GB;
+    read(&ledger, &mut clock, 64 * GB, 30 * GB, None);
+    let grown = ledger.estimate();
+    let figures = |estimate: &Estimate| (estimate.others(), estimate.guarantee(), estimate.budget(), estimate.free());
+    assert_eq!(figures(&grown), figures(&before), "the job's growth is its grant's");
+    assert!(ledger.shortage(&std::collections::BTreeSet::new()).is_none(), "and causes nothing");
+    *footprint.0.lock().unwrap() = 4 * GB + 1;
+    read(&ledger, &mut clock, 64 * GB, 30 * GB - 1, None);
+    assert_eq!(ledger.estimate().others(), before.others() + 1, "a byte past the grant is others'");
 }
 
 /// The bank's target as the catalog's failures met it (taken over from the
@@ -1335,8 +1385,8 @@ mod target {
     /// blocks of one slot, a load serving one sequence; others take a third
     /// of a slot for a reading and give it back, while the sequence's
     /// decode claims its state a page at a time: the bank resizes at no
-    /// reading. The pages draw down the in-process figure they are the
-    /// growth of, so the target never moves with them; others' jitter
+    /// reading. The pages are written within the request's reservation,
+    /// so the target never moves with them; others' jitter
     /// moves it by less than a block, which the bank keeps: a rise lowers
     /// the budget by its bytes and raises the guarantee by them.
     #[test]
@@ -1345,13 +1395,18 @@ mod target {
         let (_scope, ledger, _pool) = host();
         let mut clock = Clock::new();
         let committed = 10 * GB;
-        let in_process = 2 * SLOT;
-        let page = ledger.bytes(&pages(1, 0, 1));
-        let base = TOTAL - committed - page - in_process - SLOTS * SLOT;
+        let pages = 41;
+        let page = ledger.bytes(&Need::Request { sequence: RequestId(1), rows: page_rows() });
+        let whole = ledger.bytes(&Need::Request { sequence: RequestId(1), rows: pages * page_rows() });
+        // A measurement job's room beside the load, none of it allocated
+        // yet: what others' jitter takes of the store's free memory.
+        let job = SLOT;
+        let base = TOTAL - committed - whole - job - SLOTS * SLOT;
         read(&ledger, &mut clock, base);
         let _weights = commit(&ledger, committed);
-        let _launch = ledger.in_process(in_process);
-        let ((_floor, mut sequence), _) = serving(&ledger);
+        let _job = ledger.grant(GrantRole::Measurement, job).expect("the job's room");
+        let slot = slot(&ledger, whole);
+        let mut sequence = request(&ledger, &slot, 1, pages).expect("the slot");
         let _bank = ledger.cached(CacheKind::Bank, SLOTS * SLOT).expect("the bank's room");
         read(&ledger, &mut clock, base);
         assert_eq!(ledger.estimate().target(), SLOTS * SLOT, "the bank as it stood");
@@ -1361,7 +1416,7 @@ mod target {
         let mut held = 1;
         for reading in 0..40 {
             // The decode's next page, claimed as it grows.
-            sequence.grow(pages(1, held, held + 1)).expect("the page fits within the in-process figure");
+            sequence.grow((held + 1) * page_rows());
             held += 1;
             let jitter = if reading % 2 == 0 { SLOT / 3 } else { 0 };
             read(&ledger, &mut clock, base + jitter);
@@ -1369,7 +1424,7 @@ mod target {
             assert_eq!(target, SLOTS * SLOT - 2 * jitter, "reading {reading}: only others' jitter moves the target, in the budget and the guarantee");
             assert_eq!(resizes(target), None, "reading {reading}: no resize");
         }
-        assert!(held * page < in_process, "the decode stayed within the figure");
+        assert!(held * page <= sequence.bytes(), "the decode stayed within its reservation");
     }
 
     /// Items 4, 5, 12, 13, 15, 44: growth is never dropped. As another
@@ -1412,9 +1467,9 @@ mod target {
         assert_eq!(ledger.estimate().target(), SLOTS * SLOT, "given back");
     }
 
-    /// The guarantee is the only margin: the in-process figure lowers the
-    /// target by its bytes, and committed memory filling the budget leaves
-    /// none.
+    /// The guarantee is the only margin: a request's reservation lowers the
+    /// target by its bytes as it opens, and committed memory filling the
+    /// budget leaves none.
     #[test]
     fn the_guarantee_is_the_only_margin() {
         let (_scope, ledger, _pool) = host();
@@ -1423,11 +1478,11 @@ mod target {
         read(&ledger, &mut clock, base);
         let _weights = commit(&ledger, 10 * GB);
         read(&ledger, &mut clock, base);
-        let launch = ledger.in_process(3 * SLOT);
-        assert_eq!(ledger.estimate().target(), SLOTS * SLOT, "idle: nothing grows in process");
-        let (serving, page) = serving(&ledger);
-        assert_eq!(ledger.estimate().target(), (SLOTS - 3) * SLOT - page, "serving: the figure and the floor's page");
-        drop((launch, serving));
+        assert_eq!(ledger.estimate().target(), SLOTS * SLOT, "idle: nothing reserved");
+        let slot = slot(&ledger, 0);
+        let serving = request(&ledger, &slot, 1, 3).expect("room");
+        assert_eq!(ledger.estimate().target(), SLOTS * SLOT - serving.bytes(), "serving: the request's reservation");
+        drop((serving, slot));
         let _rest = commit(&ledger, SLOTS * SLOT);
         read(&ledger, &mut clock, base);
         assert_eq!(ledger.estimate().target(), 0, "committed fills the budget");
@@ -1442,12 +1497,8 @@ mod target {
         let mut clock = Clock::new();
         let others = 40 * GB;
         read(&ledger, &mut clock, others);
-        let page = ledger.bytes(&pages(1, 0, 1));
-        let beside = 7 * GB + page;
-        let planned = ledger.room_after(&ledger.estimate(), GB / 2).room() - beside;
+        let planned = ledger.room_after(&ledger.estimate()).room() - 7 * GB;
         let _held = commit(&ledger, 7 * GB);
-        let (_serving, _) = serving(&ledger);
-        let _launch = ledger.in_process(GB / 2);
         let _cache = ledger.cached(CacheKind::Bank, planned).expect("the plan's room holds its cache");
         read(&ledger, &mut clock, others);
         assert_eq!(ledger.estimate().target(), planned);
@@ -1468,7 +1519,8 @@ fn cache_yields_by_value_per_byte() {
     let gb = NonZeroU64::new(8 * GB).unwrap();
     bank.value(Value::per_byte(1.0, gb));
     prefix.value(Value::recompute(0.5, 4, gb));
-    assert_eq!(ledger.yield_cache(12 * GB), 12 * GB);
+    let plan = ledger.plan_relief(12 * GB, Relief::CacheOnly).expect("the cache covers it");
+    assert_eq!(ledger.execute(plan).yielded, 12 * GB);
     assert_eq!((spare.bytes(), bank.bytes(), prefix.bytes()), (0, 4 * GB, 8 * GB), "spare, then the bank worth less");
 }
 
@@ -1506,7 +1558,7 @@ fn cache_turns_committed_in_place_unless_taken() {
     let drafter = active.into_cache(CacheKind::Drafter);
     let rest = ledger.cached(CacheKind::Bank, 60 * GB).expect("room");
     rest.value(Value::per_byte(1.0, NonZeroU64::new(60 * GB).unwrap()));
-    let _taken = ledger.claim(Need::Measurement { bytes: GB }).expect("cache yields");
+    let _taken = held(&ledger, GB).expect("cache yields");
     assert!(drafter.into_claim(CommittedKind::Component).is_err(), "taken in part");
 }
 
@@ -1519,7 +1571,7 @@ fn one_charged_allocation_counts_once() {
     let mut clock = Clock::new();
     read(&ledger, &mut clock, 64 * GB, 64 * GB, None);
     let _bank = ledger.cache(CacheKind::Bank, 4 * GB).expect("room");
-    let claim = ledger.claim(Need::Measurement { bytes: 2 * GB }).expect("room");
+    let claim = held(&ledger, 2 * GB).expect("room");
     let recorded = ledger.estimate();
     assert_eq!((recorded.allocated(), recorded.cache() + recorded.committed()), (0, 6 * GB), "recorded, held, none allocated");
     ledger.change(|_| {
@@ -1572,8 +1624,8 @@ fn two_loads_share_one_pressure_watch_and_count_each_event_once() {
 /// read by), then less exactly what they took (`Ledger::claim_at`, the one
 /// each store's claim is taken by). A later reading of the store, others
 /// taking 36 GB of the 40 GB the load priced, moves neither: 64 GB, 40 GB
-/// available, an in-process figure of 2 GB, so the search's room is 38 GB, 32 GB after a
-/// 6 GB claim, and a 30 GB claim still fits at the held reading. It does
+/// available, so the search's room is 40 GB, 34 GB after a 6 GB claim,
+/// and a 30 GB claim still fits at the held reading. It does
 /// not prove the plan's size is that room: `plan_load` sizes the plan from
 /// the assessment capacity, not from the reading.
 #[test]
@@ -1581,14 +1633,13 @@ fn a_loads_claims_find_the_room_its_search_priced() {
     let (_scope, ledger, _pool) = host();
     let mut clock = Clock::new();
     let held = ledger.read(ledger.sampled(clock.next()), device(64 * GB, 40 * GB));
-    let in_process = 2 * GB;
-    let searched = ledger.room_after(&held, in_process).room();
-    assert_eq!(searched, 38 * GB, "the supply less the in-process figure");
+    let searched = ledger.room_after(&held).room();
+    assert_eq!(searched, 40 * GB, "the supply");
     let _claim = ledger.claim_at(Some(&held), CommittedKind::Load, 6 * GB).expect("the search's room holds it");
-    assert_eq!(ledger.room_after(&held, in_process).room(), searched - 6 * GB, "less exactly the claim");
+    assert_eq!(ledger.room_after(&held).room(), searched - 6 * GB, "less exactly the claim");
     read(&ledger, &mut clock, 64 * GB, 4 * GB, None);
     assert_eq!(ledger.estimate().others(), 60 * GB, "the store's latest reading moved");
-    assert_eq!(ledger.room_after(&held, in_process).room(), searched - 6 * GB, "the load's reading stands");
+    assert_eq!(ledger.room_after(&held).room(), searched - 6 * GB, "the load's reading stands");
     assert!(ledger.claim_at(Some(&held), CommittedKind::Load, 30 * GB).is_ok(), "claims at the held reading");
 }
 
@@ -1597,19 +1648,16 @@ fn a_loads_claims_find_the_room_its_search_priced() {
 /// fold of `Reading::unified` into the store's ledger), prices a load's
 /// room at the wired ceiling's grant: the 38,654,705,664-byte working set
 /// less the 1,795,801,088 bytes others wire, 36,858,904,576 bytes, beside
-/// 47,779,758,080 of supply in the 51,539,607,552-byte store. A load whose
-/// in-process figure is 1 GB claims the room it prices, the grant less
-/// that figure; the figure is then exactly what stays free beside the
-/// claim, and one byte past it is refused.
+/// 47,779,758,080 of supply in the 51,539,607,552-byte store. A load
+/// claims the whole room it prices, and one byte past it is refused.
 ///
 /// It proves the room the ledgers grant from a recorded sample: the one
 /// room a load's plan settles into (`PlanningRoom`) and its claims read, so
 /// a plan that fits the store is granted by it.
 #[test]
-fn the_m4_pros_recorded_sample_prices_the_wired_grant_less_the_in_process_figure() {
+fn the_m4_pros_recorded_sample_prices_the_wired_grant() {
     const STORE: u64 = 51_539_607_552;
     const GRANT: u64 = 36_858_904_576;
-    let in_process = GB;
     let scope = Ledgers::new();
     let recorded = seismic::host_samples::m4_pro();
     assert_eq!(recorded.total, STORE);
@@ -1619,12 +1667,11 @@ fn the_m4_pros_recorded_sample_prices_the_wired_grant_less_the_in_process_figure
     let held = &reading.device;
     assert_eq!((held.supply(), held.others()), (47_779_758_080, 3_759_849_472), "free above the target and clean cache; others' the rest");
     assert_eq!(held.budget(), GRANT, "the working set less others' wired bytes");
-    let room = reading.room_after(&ledgers, in_process).device.room();
-    assert_eq!(room, GRANT - in_process, "the grant less the in-process figure");
+    let room = reading.room_after(&ledgers).device.room();
+    assert_eq!(room, GRANT, "the grant");
     let _plan = ledger.claim_at(Some(held), CommittedKind::Load, room).expect("the room the load prices is admitted");
-    assert_eq!(reading.room_after(&ledgers, in_process).device.room(), 0, "the claim takes the whole room");
-    assert_eq!(ledger.room_after(held, 0).free(), in_process, "the in-process figure stays free beside it");
-    let past = in_process + 1;
+    assert_eq!(reading.room_after(&ledgers).device.room(), 0, "the claim takes the whole room");
+    let past = 1;
     assert_eq!(
         ledger.claim_at(Some(held), CommittedKind::Load, past).err(),
         Some(Short { store: ledger.store(), required: past, over: 1 }),
@@ -1644,7 +1691,7 @@ fn linux_unified_host_prices_cuda_and_vulkan_grants_without_wired_figures() {
         page_bytes: 4_096,
         total: seismic::fixtures::GB10_HOST,
         supply: seismic::Supply {
-            free_above_target: 112 * GB,
+            free_beyond_target: i64::try_from(112 * GB).expect("bytes fit i64"),
             clean_cache: 8 * GB,
             cold_reclaimable: 0,
         },
@@ -1721,7 +1768,7 @@ fn an_effect_and_its_record_are_one_change_no_reading_stands_across() {
     let _owner = scope.changes().own();
     let ledger = scope.ledger(seismic::StoreIdentity::HostRam, shape());
     read(&ledger, &mut Clock::new(), 64 * GB, 64 * GB, None);
-    let claim = ledger.change(|_| ledger.claim(Need::Measurement { bytes: GB }).expect("the claim fits"));
+    let claim = ledger.change(|_| held(&ledger, GB).expect("the claim fits"));
     let changes = scope.changes().clone();
     let reading = |changes: &Changes| Sampled::attempt(changes, &std::time::Instant::now, &|| (), 0).is_some();
     assert!(reading(&changes), "no change is under way");
@@ -1745,7 +1792,7 @@ fn a_holder_dropping_closes_its_entry() {
     use std::sync::atomic::{AtomicBool, Ordering};
     let (_scope, ledger, _pool) = host();
     read(&ledger, &mut Clock::new(), 64 * GB, 64 * GB, None);
-    let claim = ledger.claim(Need::Measurement { bytes: GB }).expect("the claim fits");
+    let claim = held(&ledger, GB).expect("the claim fits");
     let entry = claim.entry();
     let ran = Arc::new(AtomicBool::new(false));
     entry.on_close(Box::new({
@@ -1798,7 +1845,7 @@ fn a_settled_idle_sleep_opens_a_fresh_baseline_at_the_next_reading() {
     assert_eq!(woken.budget(), 18 * GB, "wired ceiling takes the new wired baseline without a wake wired_rise");
     assert_eq!(woken.room(), 18 * GB);
     assert_eq!(woken.cap(), None, "paging while asleep sets no active boundary");
-    assert!(ledger.shortage().is_none(), "paging while asleep raises no active harm shortage");
+    assert!(ledger.shortage(&std::collections::BTreeSet::new()).is_none(), "paging while asleep raises no active harm shortage");
     assert_eq!(ledger.standing(), None, "waking into ample free supply raises no false standing");
     assert_eq!(ledger.others_interval(), None, "an unmonitored idle gap is not an active-serving others interval");
 

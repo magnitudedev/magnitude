@@ -385,6 +385,11 @@ impl Generation {
     pub fn resident_position(&self) -> usize {
         self.resident_position
     }
+    /// The most rows the request's history ever holds: its prompt and
+    /// every token it may generate, within the context.
+    pub fn request_rows(&self) -> usize {
+        self.prompt.len().saturating_add(self.options.max_tokens).min(self.options.context_limit)
+    }
     pub fn accepted_position(&self) -> usize {
         self.accepted_position
     }

@@ -52,7 +52,7 @@ use seismic_measure::{
     median, median_of, sample, warm, Clock, Counted, Deadline, Raise, Rounds, Shuffle, Slotted,
     Tally, Verdict, WorkError,
 };
-pub use seismic_native_target::process::{return_freed_pages, ProcessMemory};
+pub use seismic_native_target::process::{process_footprint, return_freed_pages, ProcessFootprint, ProcessId, ProcessMemory};
 pub use seismic_native_target::workers::{Narrowed, Workers};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

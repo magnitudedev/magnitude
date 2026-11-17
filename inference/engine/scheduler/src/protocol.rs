@@ -38,6 +38,9 @@ pub enum WorkerCommand {
     /// device's ledger, which cache yields to at once, and held until
     /// released.
     ClaimMeasurementRoom { bytes: u64 },
+    /// The measurement job holding the room was started as `process`: its
+    /// footprint is credited against the room from now.
+    AttachMeasurementProcess { process: magnitude_executor::ProcessId },
     /// The measurement job ended: its room is free again.
     ReleaseMeasurementRoom,
     /// The measurement job stored new records: price the experts again

@@ -1,12 +1,10 @@
-//! The holders of entries ([`Claim`], [`Cached`], [`ArenaClaim`],
-//! [`Preemption`], [`InProcess`]) and the way a view takes them.
+//! The holders of entries ([`Claim`], [`Cached`], [`ArenaClaim`]) and the
+//! way a view takes them.
 
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use crate::operation::RequestId;
-
-use super::admission::{Over, Short, Taken};
+use super::admission::{Over, Short};
 use super::charges::Holder;
 use super::estimate::Estimate;
 use super::state::EntryId;
@@ -62,103 +60,7 @@ pub struct Cached {
     kind: CacheKind,
 }
 
-/// Why a claim was not taken whole.
-#[derive(Debug)]
-pub enum Refused {
-    /// Committed memory it may not preempt, with the need, exceeds the
-    /// budget. Nothing was taken.
-    Short(Short),
-    /// Free room and cache cannot cover it: the preemption holds what they
-    /// gave, and the bytes of the sequences it names are reserved to it.
-    Preempt(Preemption),
-}
-
-/// A claim waiting on preemption: what free room and cache gave its need,
-/// and the sequences, the lowest value first and just enough, whose
-/// state is reserved to it. Their holders evict them (fenced) and drop
-/// their claims; each one's bytes join the preemption as it drops, and no
-/// other claim can take them. Then [`Ledger::complete`] (or
-/// [`Claim::complete`] for a growth) holds the need, which cannot fail.
-/// Dropped before that, it lets go of what it holds and the sequences
-/// stand.
-#[must_use]
-pub struct Preemption {
-    ledger: Ledger,
-    entry: EntryId,
-    kind: CommittedKind,
-    bytes: u64,
-    sequences: Vec<RequestId>,
-}
-
-impl Preemption {
-    /// The sequences to evict, the lowest value first.
-    pub fn sequences(&self) -> &[RequestId] {
-        &self.sequences
-    }
-
-    /// The refusal it comes to where its holder cannot evict the sequences
-    /// it names: its need, over by what their state would give.
-    pub fn short(&self) -> Short {
-        let held = self.ledger.state().held[&self.entry].bytes;
-        Over { bytes: self.bytes - held }.of(&self.ledger.store.identity, self.bytes)
-    }
-
-    /// Its parts, without letting go of what it holds.
-    fn into_parts(self) -> (Ledger, EntryId, CommittedKind, u64) {
-        let this = std::mem::ManuallyDrop::new(self);
-        // SAFETY: `this` is never dropped, so its ledger moves out once.
-        let ledger = unsafe { std::ptr::read(&this.ledger) };
-        // SAFETY: as the ledger; the sequences' allocation is let go here.
-        drop(unsafe { std::ptr::read(&this.sequences) });
-        (ledger, this.entry, this.kind, this.bytes)
-    }
-}
-
-impl std::fmt::Debug for Preemption {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Preemption").field("kind", &self.kind).field("bytes", &self.bytes).field("sequences", &self.sequences).finish()
-    }
-}
-
-impl Drop for Preemption {
-    /// Recorded as every release is ([`Ledger::unpoisoned`]).
-    fn drop(&mut self) {
-        if let Some(mut state) = self.ledger.unpoisoned() {
-            state.abandoned(self.entry);
-        }
-    }
-}
-
-/// A load's in-process figure in its store (§3.2): the state growth of the
-/// largest launch its arena admits, held from load to unload. Dropped, the
-/// store's guarantee no longer counts it.
-#[must_use]
-pub struct InProcess {
-    ledger: Ledger,
-    bytes: u64,
-}
-
-impl Drop for InProcess {
-    /// Recorded as every release is ([`Ledger::unpoisoned`]).
-    fn drop(&mut self) {
-        if let Some(mut state) = self.ledger.unpoisoned() {
-            state.in_process -= self.bytes;
-            state.holdings += 1;
-        }
-    }
-}
-
 impl Ledger {
-    /// Hold `bytes`, a load's in-process figure (§3.2), in the store's
-    /// guarantee until the returned figure drops. Set once at load, on the
-    /// store its state lies in.
-    pub fn in_process(&self, bytes: u64) -> InProcess {
-        let mut state = self.state();
-        state.in_process = state.in_process.checked_add(bytes).expect("a store's in-process bytes fit u64");
-        state.holdings += 1;
-        InProcess { ledger: self.clone(), bytes }
-    }
-
     /// Hold `bytes` of committed memory of `kind`, an allocation about to
     /// be made, admitted at `held`, a reading of the store a load holds,
     /// or else at the latest (a domain's claim as it serves): the one way
@@ -168,34 +70,25 @@ impl Ledger {
     /// is held.
     ///
     /// # Panics
-    /// For a sequence's state, which is claimed by its rows alone.
+    /// For a request's state, which is reserved whole ([`Self::reserve`]),
+    /// or a grant ([`Self::grant`]).
     pub fn claim_at(&self, held: Option<&Estimate>, kind: CommittedKind, bytes: u64) -> Result<Claim, Short> {
-        assert!(!matches!(kind, CommittedKind::State(_)), "a sequence's state is claimed by its rows");
-        let taken = self.state().take_in(&self.store.identity, held.map(|held| held.read), kind, bytes)?;
-        match taken {
-            Taken::Held(id) => Ok(Claim::held(self.clone(), id, kind)),
-            Taken::Preempting { .. } => unreachable!("only a sequence's growth preempts"),
-        }
+        assert!(!matches!(kind, CommittedKind::Request(_) | CommittedKind::Grant(_)), "a {kind:?} claim is taken by its own path");
+        let id = self.state().take_in(&self.store.identity, held.map(|held| held.read), kind, bytes)?;
+        Ok(Claim::held(self.clone(), id, kind))
     }
 
-    /// The one way committed memory is taken: `need` sized by the
-    /// formulas, synchronously, in the one order the holding kinds give:
-    /// free room, then cache in rank order (worth least per byte first,
-    /// [`Value`]). Each cache holder reads what it still holds from its
-    /// handle's `bytes`. Where these cannot cover it, the state of
-    /// sequences admitted after the claimant's covers the rest
-    /// ([`Refused::Preempt`]); refused outright only where committed memory
-    /// it may not preempt, with the need, exceeds the budget.
-    pub fn claim(&self, need: Need) -> Result<Claim, Refused> {
+    /// Committed memory for `need`, sized by the formulas, synchronously,
+    /// in the one order the holding kinds give: free room, then cache in
+    /// rank order (worth least per byte first, [`Value`]). Each cache
+    /// holder reads what it still holds from its handle's `bytes`. Refused
+    /// where committed memory with the need exceeds the budget.
+    ///
+    /// # Panics
+    /// For a request's state or a grant, as [`Self::claim_at`].
+    pub fn claim(&self, need: Need) -> Result<Claim, Short> {
         let bytes = size(&self.shape, &need);
-        let kind = need.kind();
-        let taken = self.state().take_in(&self.store.identity, None, kind, bytes).map_err(Refused::Short)?;
-        match taken {
-            Taken::Held(id) => Ok(Claim::held(self.clone(), id, kind)),
-            Taken::Preempting { entry, sequences } => {
-                Err(Refused::Preempt(Preemption { ledger: self.clone(), entry, kind, bytes, sequences }))
-            }
-        }
+        self.claim_at(None, need.kind(), bytes)
     }
 
     /// Committed memory of `kind` in whole `unit`s, at most `most` of them:
@@ -206,20 +99,10 @@ impl Ledger {
     /// (0 bytes). Its holder reads the units it got from the second value.
     ///
     /// # Panics
-    /// For a sequence's state, which is claimed by its rows alone.
+    /// For a request's state, which is reserved whole.
     pub fn claim_units(&self, kind: CommittedKind, unit: NonZeroU64, most: u64) -> (Claim, u64) {
         let (id, units) = self.state().take_units(&self.store.identity, kind, unit, most);
         (Claim::held(self.clone(), id, kind), units)
-    }
-
-    /// The claim `preemption` waited for, every sequence it named evicted.
-    /// A sequence not yet evicted, or a preemption for a growth, is a
-    /// broken invariant.
-    pub fn complete(&self, preemption: Preemption) -> Claim {
-        let (ledger, entry, kind, bytes) = preemption.into_parts();
-        assert!(Arc::ptr_eq(&ledger.store, &self.store), "a preemption completes in its own ledger");
-        ledger.state().completed(entry, bytes);
-        Claim::held(ledger, entry, kind)
     }
 
     /// Hold `bytes` of free room as cache of `kind`, none of it allocated:
@@ -327,20 +210,6 @@ impl Claim {
         self.record.entry()
     }
 
-    /// What the sequence's state is worth per byte, as its holder measures
-    /// it (the seconds its replay costs per byte held): a shortage preempts
-    /// the lowest first ([`Shortage`]), as does a growth among the
-    /// sequences admitted after its own.
-    ///
-    /// # Panics
-    /// For a claim that is not a sequence's state.
-    pub fn value(&self, value: Value) {
-        assert!(matches!(self.kind, CommittedKind::State(_)), "invariant violated: a {:?} claim is valued; only a sequence's state is", self.kind);
-        let mut state = self.ledger().state();
-        state.entry(self.id()).value = value;
-        state.holdings += 1;
-    }
-
     /// The backing ended: the claim's bytes, the granules the pool backed
     /// for it, are cache of `kind` ([`Self::into_cache`]).
     pub fn into_backed_cache(self, kind: CacheKind) -> Cached {
@@ -366,39 +235,9 @@ impl Claim {
         Claim::held(self.ledger().clone(), id, kind)
     }
 
-    /// Grow by `need`, of this claim's kind (a sequence's rows), as
-    /// [`Ledger::claim`] takes.
-    pub fn grow(&mut self, need: Need) -> Result<(), Refused> {
-        assert_eq!(need.kind(), self.kind, "a claim grows by a need of its own kind");
-        let ledger = self.ledger();
-        let bytes = size(&ledger.shape, &need);
-        let mut state = ledger.state();
-        match state.take_in(&ledger.store.identity, None, self.kind, bytes).map_err(Refused::Short)? {
-            Taken::Held(entry) => {
-                state.merge(entry, self.id());
-                Ok(())
-            }
-            Taken::Preempting { entry, sequences } => {
-                drop(state);
-                Err(Refused::Preempt(Preemption { ledger: ledger.clone(), entry, kind: self.kind, bytes, sequences }))
-            }
-        }
-    }
-
-    /// Grow by the need `preemption` waited for, every sequence it named
-    /// evicted ([`Ledger::complete`]).
-    pub fn complete(&mut self, preemption: Preemption) {
-        let (ledger, entry, kind, bytes) = preemption.into_parts();
-        assert!(Arc::ptr_eq(&ledger.store, &self.ledger().store) && kind == self.kind, "a growth completes into its own claim");
-        let mut state = ledger.state();
-        state.completed(entry, bytes);
-        state.merge(entry, self.id());
-    }
-
     /// Turn the claim into cache of `kind` in place, in its own entry, its
     /// bytes and their allocation kept throughout (a closed group's class,
-    /// an active drafter going idle, a sequence's slabs retained as a
-    /// prefix): claims in process take it as any cache. Its entry stays the
+    /// an active drafter going idle): claims in process take it as any cache. Its entry stays the
     /// one Seismic charges.
     ///
     /// # Panics
@@ -407,7 +246,6 @@ impl Claim {
     pub fn into_cache(self, kind: CacheKind) -> Cached {
         let Claim { record, .. } = self;
         let mut state = record.ledger.state();
-        assert!(!state.reserved.contains_key(&record.id), "a preempted sequence's state is dropped, its bytes the preemption's");
         let entry = *state.entry(record.id);
         assert!(
             entry.holding.pooled() || entry.allocated == entry.bytes,
@@ -493,7 +331,7 @@ impl Cached {
     /// last asked, read once: pooled cache's granules stay its holder's
     /// until it frees them, and those claims allocate the bytes only then,
     /// so its holder owes them. None of what a shortage took
-    /// (`Ledger::yield_cache`), which the holder frees by its own rule.
+    /// (`Ledger::execute`), which the holder frees by its own rule.
     pub fn take_claimed(&self) -> u64 {
         let mut state = self.ledger().state();
         std::mem::take(&mut state.entry(self.id()).claimed)

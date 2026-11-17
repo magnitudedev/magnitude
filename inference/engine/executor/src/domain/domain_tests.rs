@@ -39,7 +39,7 @@ fn open<F: ProgramFamily>(
         .unwrap();
     assert!(
         domain
-            .open_state(bindings, request, None, 0)
+            .open_served(bindings, request, None)
             .unwrap()
             .is_empty()
     );
@@ -281,7 +281,7 @@ fn growth_orphans_a_queued_lookahead_then_grows() {
         domain: history,
         rows: head.free_rows(history) + 1,
     }];
-    domain.provision_open(&mut bindings).unwrap();
+    { let mut unchained = domain.unchained(&mut bindings).unwrap(); domain.provision_open(&mut unchained).unwrap(); }
     assert!(
         domain.queue.is_empty(),
         "the growing entry orphaned the lookahead"
@@ -409,6 +409,38 @@ fn a_prompt_chunk_opens_a_chain_its_holder_claims() {
     // Once the chain ends, its group's class is freed.
     assert_eq!(domain.group_places().get(), 1, "the chain's close frees its places");
     super::fixtures::shrink_settled(&mut domain, &mut bindings);
+}
+
+/// An open while another request's prompt chain is under way, between its
+/// chunks (the scheduler's `make_resident` of a second agent request,
+/// whose open provisions the target and orphans the queue), finds the
+/// queue chained: it gets no [`Unchained`] token and waits, holding
+/// nothing, and the chain runs on. Once the chain's last chunk lands, the
+/// same open succeeds.
+#[test]
+fn an_open_during_a_chain_waits_for_its_end() {
+    let (mut domain, mut bindings) = chain_fixture();
+    let (holder, waiting) = (RequestId(80), RequestId(82));
+    open(&mut domain, &mut bindings, holder);
+    domain.install_input(waiting, PreparedModelInput::continuation_only()).unwrap();
+    domain.plan_successors((1..3).map(|position| prefill(holder, position)).collect());
+    let flight = submit_reserved_target(&mut domain, bindings, vec![prefill(holder, 0)]);
+    let (pending, mut bindings) = finish_one(&mut domain, flight);
+    domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }).unwrap();
+    for position in 1..3 {
+        assert_eq!(domain.chain_holder(), Some(holder));
+        assert!(domain.unchained(&mut bindings).is_none(), "the open waits while the chain is under way");
+        assert!(!domain.state_claims.contains_key(&waiting), "a waiting open holds nothing");
+        let flight = submit_claimed(&mut domain, bindings, vec![prefill(holder, position)]);
+        let (pending, returned) = finish_one(&mut domain, flight);
+        bindings = returned;
+        domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }).unwrap();
+    }
+    assert_eq!(domain.chain_holder(), None);
+    let unchained = domain.unchained(&mut bindings).expect("the chain ended: the queue is free");
+    let rows = domain.execution.resources().target_state().context_rows as u64;
+    assert!(domain.open_state(unchained, waiting, None, rows).unwrap().is_empty(), "the open succeeds once the chain ends");
+    assert!(domain.state_claims.contains_key(&waiting));
 }
 
 /// A prompt group's places are the plan's: where the plan holds its
@@ -548,17 +580,23 @@ fn a_chain_is_released_by_its_holder_never_orphaned() {
         bindings
     };
     let mut bindings = held(&mut domain, bindings);
-    // A replay row is not the queued prompt chunk.
+    // Another request's group while the chain is under way is an invariant
+    // violation; the holder's own group that is not the queued prompt chunk
+    // (a replay row) releases the chain, its state with it, and the holder
+    // replays.
     assert!(matches!(
-        domain.provision(&mut bindings, &[forward(request, 1)], None),
+        domain.provision(&mut bindings, &[forward(RequestId(99), 1)], None),
         Err(DomainError::Invariant(_))
     ));
-    domain.release_chain().unwrap();
+    assert!(matches!(
+        domain.provision(&mut bindings, &[forward(request, 1)], None),
+        Err(DomainError::ChainReleased(holder)) if holder == request
+    ));
     assert!(domain.queue.is_empty());
     assert_eq!(domain.chain_holder(), None);
     assert!(domain.resume_state(request).is_err(), "the holder was evicted");
 
-    domain.open_state(&mut bindings, request, None, 0).unwrap();
+    domain.open_served(&mut bindings, request, None).unwrap();
     let mut bindings = held(&mut domain, bindings);
     domain.close(request).unwrap();
     assert_eq!(domain.chain_holder(), None);
@@ -726,7 +764,7 @@ fn reservation_recomputes_row_demand_after_shared_tail_relocation() {
         .install_input(copy, PreparedModelInput::continuation_only())
         .unwrap();
     domain
-        .open_state(&mut bindings, copy, Some(&checkpoint), 0)
+        .open_served(&mut bindings, copy, Some(&checkpoint))
         .unwrap();
     assert!(!domain.target[&copy].blocked_tails().is_empty());
     let operations = [forward(copy, 1)];
@@ -764,7 +802,7 @@ fn one_launch_advances_two_continuations_of_a_shared_tail() {
             .install_input(copy, PreparedModelInput::continuation_only())
             .unwrap();
         domain
-            .open_state(&mut bindings, copy, Some(&checkpoint), 0)
+            .open_served(&mut bindings, copy, Some(&checkpoint))
             .unwrap();
     }
     for copy in copies {
@@ -1616,7 +1654,7 @@ fn a_repeated_image_is_encoded_once_and_placed_at_every_occurrence() {
         .unwrap();
     assert_eq!(domain.input[&request].images.len(), 2);
 
-    let images = encoded_images(&domain.open_state(&mut bindings, request, None, 0).unwrap());
+    let images = encoded_images(&domain.open_served(&mut bindings, request, None).unwrap());
     let [first, second] = images.as_slice() else {
         panic!("two distinct images form two encodes, not three")
     };
@@ -1653,7 +1691,7 @@ fn an_image_repeated_across_turns_resumes_and_encodes_its_remaining_placement() 
     domain
         .install_input(first, vision_input(&[(1, "shared")], 3))
         .unwrap();
-    let [encode] = encoded_images(&domain.open_state(&mut bindings, first, None, 0).unwrap())
+    let [encode] = encoded_images(&domain.open_served(&mut bindings, first, None).unwrap())
         .try_into()
         .unwrap_or_else(|_| panic!("one image forms one encode"));
     reconcile_encode(&mut domain, first, encode);
@@ -1693,7 +1731,7 @@ fn an_image_repeated_across_turns_resumes_and_encodes_its_remaining_placement() 
         .unwrap();
     let [encode] = encoded_images(
         &domain
-            .open_state(&mut bindings, second, Some(&resume), 0)
+            .open_served(&mut bindings, second, Some(&resume))
             .unwrap(),
     )
     .try_into()
@@ -1893,7 +1931,7 @@ fn deferred_priming_commits_after_target_publication_and_releases_leases() {
         held_outputs + 1
     );
     // The returned binding right is usable only after the second flight ends.
-    domain.provision_open(&mut bindings).unwrap();
+    { let mut unchained = domain.unchained(&mut bindings).unwrap(); domain.provision_open(&mut unchained).unwrap(); }
     domain.close(request).unwrap();
 }
 
@@ -1940,7 +1978,7 @@ fn a_deferred_entry_commits_with_the_chain_its_chunk_opens() {
     let checkpoint = domain.resume_state(request).unwrap();
     assert_eq!(checkpoint.target.position(), 3);
     assert_eq!(checkpoint.head.as_ref().unwrap().position(), 1);
-    domain.provision_open(&mut bindings).unwrap();
+    { let mut unchained = domain.unchained(&mut bindings).unwrap(); domain.provision_open(&mut unchained).unwrap(); }
     domain.close(request).unwrap();
 }
 
@@ -2035,7 +2073,7 @@ fn boundary_features_commit_fork_and_abort_with_numerical_state() {
         .install_input(fork, PreparedModelInput::continuation_only())
         .unwrap();
     domain
-        .open_state(&mut bindings, fork, Some(&checkpoint), 0)
+        .open_served(&mut bindings, fork, Some(&checkpoint))
         .unwrap();
     domain.release_state(&[request]).unwrap();
     assert!(domain.input[&request].boundary.is_none());
@@ -2155,7 +2193,7 @@ fn token_history_follows_rollback_and_fork() {
         .install_input(copy, PreparedModelInput::continuation_only())
         .unwrap();
     domain
-        .open_state(&mut bindings, copy, Some(&checkpoint), 0)
+        .open_served(&mut bindings, copy, Some(&checkpoint))
         .unwrap();
     assert_eq!(
         token_values(domain.preceding_tokens(copy, 4, 8).unwrap()),

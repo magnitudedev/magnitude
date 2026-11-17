@@ -1111,6 +1111,13 @@ impl ResidentRoom for EngineClient {
         Box::pin(async move { client.claim_measurement_room(bytes).await })
     }
 
+    fn attach(&self, process: seismic::ProcessId) {
+        // A worker that is gone holds no room to credit.
+        if let Err(error) = self.attach_measurement_process(process) {
+            tracing::debug!(%error, "the measurement process reached no worker");
+        }
+    }
+
     fn release(&self) {
         // A worker that is gone holds no room.
         if let Err(error) = self.release_measurement_room() {

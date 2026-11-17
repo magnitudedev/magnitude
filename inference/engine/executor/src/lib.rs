@@ -60,14 +60,16 @@ mod resident_weights;
 mod resources;
 
 pub use completion::{Completed, Completion, CompletionWake};
-pub use experts::derived::{import_slots, in_process_bytes};
+pub use experts::derived::import_slots;
+/// A process whose footprint a grant is credited by (`memory::ledger::Grant`).
+pub use seismic::ProcessId;
 pub use stored_table::{Prefetched, TableWaits};
 pub use device_resources::{
     ConditioningRange, ConditioningRef, FeatureRef, ImageRef, LogitsRef, ResourceDomain,
     ResourceError, WeakFeatureRef,
 };
 pub use domain::{
-    MEMORY_TRACE, BankHolding, BankResize, BankResized, BankStep, Followed, Yielded, TableResidency, DeviceReader, LoadRoom, MachineReading, PlanningRoom, DomainError, DomainRequirements, DomainReservation, ExecutorDomain,
+    MEMORY_TRACE, BankHolding, BankResize, BankResized, BankStep, Followed, Yielded, TableResidency, DeviceReader, LoadRoom, MachineReading, PlanningRoom, DomainError, DomainRequirements, DomainReservation, ExecutorDomain, Unchained,
     ExpertMeasures, LoadCosts, LoadMeasures, ExpertCover, ExpertResidency, ExpertResizes, HeldBy, HostResidency, ThreadHeld, OptionalComponent, DecodeStep,
     ExpertTargets, HeadFlight, LaunchDuration, MemoryChargeReconciliation, MemoryRead, MemoryReading, MemoryResponse, NativeFamily, OpenRequirements,
     PendingOperationOutcome, PhysicalDecision, PrimingCompletionFlight, ProgramFamily,

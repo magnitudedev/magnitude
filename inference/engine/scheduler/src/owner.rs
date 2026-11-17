@@ -36,6 +36,7 @@ use magnitude_executor::{
     ProgramFamily, RequestId, ResourcePlan, StateBindings, SubmitError,
     SubmitFailure, WorkKind, Yielded,
 };
+use magnitude_executor::memory::ledger::Relief;
 use magnitude_family_contracts::PreparedModelInput;
 use magnitude_generation::{
     FinishReason, Generation, OutputToken, RoundStart, StartedRound, TimedLaunch,
@@ -368,6 +369,16 @@ impl Work {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Wait {
     at: AvailabilityEpoch,
+    on: WaitsOn,
+}
+
+/// What a wait is for: memory, or the end of another request's prompt
+/// chain, whose queued chunks an open would orphan (a flight boundary,
+/// which advances the epoch).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaitsOn {
+    Memory,
+    Chain,
 }
 
 enum Stage {
@@ -543,12 +554,8 @@ fn classify_domain_error(error: DomainError) -> RequestError {
             RequestError::Invariant(error)
         }
         DomainError::WeightRead(error) => RequestError::WeightRead(error),
-        error @ DomainError::StateCeiling { .. } => RequestError::Invariant(InvariantError {
+        error @ (DomainError::StateCeiling { .. } | DomainError::ChainReleased(_)) => RequestError::Invariant(InvariantError {
             context: "state ceiling",
-            detail: error.to_string(),
-        }),
-        error @ DomainError::Preempt(_) => RequestError::Invariant(InvariantError {
-            context: "state preemption",
             detail: error.to_string(),
         }),
     }
@@ -709,6 +716,10 @@ enum Provisioned {
     /// Over budget once every release was tried and it holds one operation:
     /// its requests fail at once with the typed capacity error.
     Refused(OperationGroup, RequestError),
+    /// Its chain's holder's group was not the chain's queued chunk: the
+    /// chain was released with the holder's state, which replays
+    /// (`DomainError::ChainReleased`).
+    Replay(OperationGroup, RequestId),
 }
 
 /// Everything the owner holds except its pipeline.
@@ -810,9 +821,11 @@ pub trait MemoryHost {
     /// hits since it was retained, which value the prefixes' cache
     /// (`ExecutorDomain::value_cache`); none without one.
     fn prefix_value(&self) -> Option<(u64, u64)>;
-    /// Preempt those of `sequences` (a real shortage's, the lowest value
-    /// first) the host can evict now; one in flight is named again at a
-    /// later reading if the shortage holds.
+    /// The requests the host can evict now: the only ones a real
+    /// shortage's relief names ([`Self::preempt`]).
+    fn evictable(&self) -> BTreeSet<RequestId>;
+    /// Evict `sequences`, the requests a real shortage's relief named, each
+    /// of them evictable since the reading that named them.
     fn preempt(&mut self, sequences: &[RequestId]) -> Result<(), RequestError>;
 }
 
@@ -1003,6 +1016,12 @@ impl<F: ProgramFamily> Owner<F> {
         let claimed = self.service.domain.claim_measurement_room(bytes);
         granter.answer(claimed.map_err(|short| RoomRefusal::Short { bytes: short.over }));
         grant
+    }
+
+    /// The measurement job holding the room was started as `process`
+    /// (`ExecutorDomain::attach_measurement_process`).
+    pub fn attach_measurement_process(&mut self, process: magnitude_executor::ProcessId) {
+        self.service.domain.attach_measurement_process(process);
     }
 
     /// The measurement job ended: its claim is released.
@@ -1318,6 +1337,9 @@ impl<F: ProgramFamily> Service<F> {
         }
         match request.state.wait() {
             Some(_) if self.waits_on_memory(request) => return Status::MemoryBlocked,
+            // Behind another request's chain it waits on no memory: it runs
+            // once the chain ends.
+            Some(Wait { on: WaitsOn::Chain, .. }) => {}
             Some(_) => return Status::Preempted,
             None => {}
         }
@@ -1623,7 +1645,10 @@ trait MemoryStep: MemoryHost + Sized {
         let after_idle = settled == Some(self.domain().readings_generation());
         let read = match boundary || completed || owed || pressured {
             false => None,
-            true => match self.domain().read_memory(after_idle).map_err(classify_domain_error)? {
+            true => match {
+                let evictable = self.evictable();
+                self.domain().read_memory(after_idle, &evictable).map_err(classify_domain_error)?
+            } {
                 MemoryReading::Read(read) => {
                     self.memory().settled = None;
                     Some(read)
@@ -1647,9 +1672,17 @@ trait MemoryStep: MemoryHost + Sized {
             self.unload();
             return Ok(Observed { unload: true, reread: Reread::Settled });
         }
-        if !response.preempt.is_empty() {
-            tracing::info!(requests = ?response.preempt, "a real memory shortage with no cache left preempts the requests worth least");
-            self.preempt(&response.preempt)?;
+        // Each store's plan is carried out whole; a request two stores'
+        // plans name is evicted once.
+        let mut preempt = BTreeSet::new();
+        for plan in response.relief.iter().cloned() {
+            preempt.extend(self.domain().execute_relief(plan).preempt);
+        }
+        let preempted = !preempt.is_empty();
+        if preempted {
+            let preempt = preempt.into_iter().collect::<Vec<_>>();
+            tracing::info!(requests = ?preempt, "a real memory shortage preempts the requests worth least");
+            self.preempt(&preempt)?;
         }
         // New work waits while a shortage holds the bank at its floor; the
         // reading that finds none lets it retry.
@@ -1660,7 +1693,7 @@ trait MemoryStep: MemoryHost + Sized {
         // The reading changed something where its response moved what we
         // hold (the ledgers' generation past the reading's own), or
         // preempted, or let new work in or held it back.
-        let changed = !response.preempt.is_empty()
+        let changed = preempted
             || waited != response.admission_waits
             || self.domain().memory_generation() != read.generation;
         let reread = match self.domain().memory_stands().map_err(classify_domain_error)? {
@@ -1929,7 +1962,7 @@ impl<F: ProgramFamily> Service<F> {
     /// make room for it.
     fn waits_on_memory(&self, request: &Request) -> bool {
         request.record.preemption_debt == 0
-            && matches!(&request.state, State::Between(_, Stage::NonResident(Some(_))))
+            && matches!(&request.state, State::Between(_, Stage::NonResident(Some(Wait { on: WaitsOn::Memory, .. }))))
     }
 
     /// End the waits that have ended, then take the requests selection can
@@ -2387,16 +2420,22 @@ impl<F: ProgramFamily> Service<F> {
         // A real shortage holds new work back while the bank sits at its
         // floor (`MemoryResponse::admission_waits`).
         if self.memory.admission_waits {
-            return Ok(Residency::Waiting(generation, Wait { at: self.epoch }));
+            return Ok(Residency::Waiting(generation, Wait { at: self.epoch, on: WaitsOn::Memory }));
         }
-        // The rows it restores: where a preempted request was evicted, none
-        // for a fresh one; it opens only once they all fit beside the
-        // guarantee (`ExecutorDomain::open_state`).
-        let replay = generation.resident_position() as u64;
+        // Its whole state is reserved as it opens: every row its prompt and
+        // its generation may take (`ExecutorDomain::open_state`), so none of
+        // its rows ever waits on memory.
+        let rows = generation.request_rows() as u64;
         // Short of memory, it is relieved as any claim is ([`Self::relieve`]),
-        // its prefix looked up afresh at each try, as an eviction may drop it.
+        // taking cache alone, its prefix looked up afresh at each try, as an
+        // eviction may drop it. While another request's chain is under way
+        // the open changes no bindings: it waits for the chain's end, a
+        // flight boundary.
         let prefix = record.prefix_cache;
         let open = |this: &mut Self, bindings: &mut StateBindings| {
+                let Some(unchained) = this.domain.unchained(bindings) else {
+                    return Ok(Ok(None));
+                };
                 let hit = match prefix {
                     true => this
                         .prefix_cache
@@ -2408,17 +2447,18 @@ impl<F: ProgramFamily> Service<F> {
                     Some(hit) => Some(this.prefix_cache.entry(hit).map_err(invariant("prefix cache"))?.state()),
                     None => None,
                 };
-                Ok(this.domain.open_state(bindings, id, from, replay).map(|encodes| (hit, encodes)))
+                Ok(this.domain.open_state(unchained, id, from, rows).map(|encodes| Some((hit, encodes))))
             };
         let first = open(self, bindings).map_err(fatal)?;
-        let relieved = self.relieve(bindings, first, open).map_err(fatal)?;
+        let relieved = self.relieve(bindings, first, false, open).map_err(fatal)?;
         let (hit, encodes) = match relieved.current {
-            Ok(opened) => opened,
+            Ok(Some(opened)) => opened,
+            Ok(None) => return Ok(Residency::Waiting(generation, Wait { at: self.epoch, on: WaitsOn::Chain })),
             // New work waits for memory a change of ours will free.
-            Err(DomainError::Capacity(_) | DomainError::Preempt(_))
+            Err(DomainError::Capacity(_))
                 if relieved.pending || self.requests.values().any(|request| request.state.generation().is_resident()) =>
             {
-                return Ok(Residency::Waiting(generation, Wait { at: self.epoch }));
+                return Ok(Residency::Waiting(generation, Wait { at: self.epoch, on: WaitsOn::Memory }));
             }
             Err(error) if is_fatal(&error) => return Err(fatal(classify_domain_error(error))),
             // Nothing of ours can make room: it fails at once.
@@ -2526,6 +2566,10 @@ impl<F: ProgramFamily> Service<F> {
                     self.refuse(&mut round, &group_, error);
                     continue;
                 }
+                Ok(Provisioned::Replay(group_, holder)) => {
+                    self.replay(&mut round, &group_, holder).map_err(|error| (None, classify_domain_error(error)))?;
+                    continue;
+                }
                 Err(error) => return Err((Some(round.members), error)),
             };
             match submit_group(&mut self.domain, bindings, &group_, self.wakes.completion()) {
@@ -2603,7 +2647,7 @@ impl<F: ProgramFamily> Service<F> {
             self.prefix_cache.release_unspared(&held);
             current = self.fits(bindings, round, &group_);
         }
-        let Relieved { current, pending } = self.relieve(bindings, current, |this, bindings| Ok(this.fits(bindings, round, &group_)))?;
+        let Relieved { current, pending } = self.relieve(bindings, current, true, |this, bindings| Ok(this.fits(bindings, round, &group_)))?;
         if short(&current) {
             group_ = match group_.split_last() {
                 Ok((leading, trailing)) => return Ok(Provisioned::Split(leading, trailing)),
@@ -2612,9 +2656,9 @@ impl<F: ProgramFamily> Service<F> {
         }
         match current {
             Ok(()) => Ok(Provisioned::Fits(group_)),
-            Err(DomainError::Preempt(_)) => Ok(Provisioned::Short(group_, Wait { at: self.epoch })),
-            Err(DomainError::Capacity(_)) if pending || self.others_stand(round, &group_) => Ok(Provisioned::Short(group_, Wait { at: self.epoch })),
-            Err(error @ DomainError::Capacity(_)) => Ok(Provisioned::Refused(group_, classify_domain_error(error))),
+            Err(DomainError::Capacity(_)) if pending || self.others_stand(round, &group_) => Ok(Provisioned::Short(group_, Wait { at: self.epoch, on: WaitsOn::Memory })),
+            Err(error @ (DomainError::Capacity(_) | DomainError::Input(_))) => Ok(Provisioned::Refused(group_, classify_domain_error(error))),
+            Err(DomainError::ChainReleased(holder)) => Ok(Provisioned::Replay(group_, holder)),
             Err(error) => Err(classify_domain_error(error)),
         }
     }
@@ -2653,6 +2697,30 @@ impl<F: ProgramFamily> Service<F> {
 
     /// Move a group that cannot proceed out of the round: each of its
     /// requests takes all of its remaining work with it and waits alone.
+    /// `group_`'s requests leave the round between rounds, and `holder`,
+    /// whose state its chain's release took, replays from its committed
+    /// history, as an evicted request does.
+    fn replay(&mut self, round: &mut Round, group_: &OperationGroup, holder: RequestId) -> Result<(), DomainError> {
+        tracing::info!(?holder, "a chain holder's group is not its queued chunk: the chain is released and the holder replays");
+        let requests = group_.operations().iter().map(Operation::request).collect::<BTreeSet<_>>();
+        // Their work queued in the round's later groups leaves with them.
+        let kept = std::mem::take(&mut round.groups)
+            .into_iter()
+            .flat_map(OperationGroup::into_operations)
+            .filter(|operation| !requests.contains(&operation.request()))
+            .collect();
+        round.groups = group(&self.domain, kept).into_iter().collect();
+        for request in requests {
+            let Some(Member { record, state }) = round.members.remove(&request) else { continue };
+            let generation = match state {
+                Membership::Started(started) => started.abandon(),
+                Membership::Generation(generation) => generation,
+            };
+            self.requests.insert(request, Request { record, state: State::Between(generation, Stage::Ready) });
+        }
+        self.evicted(&[holder])
+    }
+
     fn park(&mut self, round: &mut Round, group_: OperationGroup, wait: Wait) {
         let requests = group_
             .operations()
@@ -3323,41 +3391,55 @@ impl<F: ProgramFamily> Service<F> {
     }
 
     /// The one path a claim short of memory takes, from its `first` try,
-    /// trying again by `attempt`: where
-    /// the device's ledger names sequences to preempt for it
-    /// (`DomainError::Preempt`), evict them, all or none ([`Self::evict`]):
-    /// the ledger alone names whom a claim preempts, so no two preempt each
-    /// other, and where one of them cannot be evicted now (its work is in a
-    /// round) none is and the claim waits for that round's end; where the
-    /// device would not give the memory yet, free the cache the ledger took
-    /// ([`MemoryStep::follow_yields`]). Each that freed anything tries
-    /// again; one that frees memory only later (a round's end, slots
-    /// releasing off this thread, the expert bank's shrink) leaves the
-    /// claim pending, and the caller
-    /// decides from there whether it waits or fails.
+    /// trying again by `attempt`: first free the cache the ledger took for
+    /// claims already admitted ([`MemoryStep::follow_yields`]); where that
+    /// frees nothing, ask the device's ledger for relief that covers what
+    /// the claim lacks, taking cache, and where `preempting`, the requests
+    /// that can be evicted now (`Ledger::plan_relief`), and carry it out
+    /// whole: its cache yields and its requests are evicted
+    /// ([`Self::evict`]). Where no relief covers it, nothing yields. Each
+    /// that freed anything tries again; one that
+    /// frees memory only later (a round's end, slots releasing off this
+    /// thread, the expert bank's shrink) leaves the claim pending, and the
+    /// caller decides from there whether it waits or fails.
     fn relieve<T>(
         &mut self,
         bindings: &mut StateBindings,
         first: Result<T, DomainError>,
+        preempting: bool,
         mut attempt: impl FnMut(&mut Self, &mut StateBindings) -> Result<Result<T, DomainError>, RequestError>,
     ) -> Result<Relieved<T>, RequestError> {
         let mut current = first;
         loop {
             let pending = match &current {
-                Err(DomainError::Preempt(named)) => {
-                    let named = named.clone();
-                    match self.evictable(&named).len() == named.len() {
-                        true => {
-                            self.evict(&named).map_err(classify_domain_error)?;
-                            None
-                        }
-                        false => Some(true),
-                    }
-                }
-                Err(DomainError::Capacity(_)) => match self.follow_yields(bindings)? {
+                Err(DomainError::Capacity(capacity)) => match self.follow_yields(bindings)? {
                     Yielded::Released { .. } => None,
                     Yielded::Pending => Some(true),
-                    Yielded::Nothing => Some(false),
+                    Yielded::Nothing => {
+                        let lacks = capacity.required.saturating_sub(capacity.available);
+                        let evictable = self.evictable();
+                        let allow = match preempting {
+                            true => Relief::CacheAndRequests(&evictable),
+                            false => Relief::CacheOnly,
+                        };
+                        match self.domain.plan_relief(capacity.resource, lacks, allow) {
+                            None => Some(false),
+                            Some(plan) => {
+                                let owed = self.domain.execute_relief(plan);
+                                if !owed.preempt.is_empty() {
+                                    self.evict(&owed.preempt).map_err(classify_domain_error)?;
+                                }
+                                match self.follow_yields(bindings)? {
+                                    Yielded::Released { .. } => None,
+                                    Yielded::Pending => Some(true),
+                                    Yielded::Nothing => match owed.preempt.is_empty() {
+                                        true => Some(owed.yielded > 0),
+                                        false => None,
+                                    },
+                                }
+                            }
+                        }
+                    }
                 },
                 _ => Some(false),
             };
@@ -3366,11 +3448,6 @@ impl<F: ProgramFamily> Service<F> {
                 None => current = attempt(self, bindings)?,
             }
         }
-    }
-
-    /// Those of `sequences` that can be evicted now ([`Self::can_evict`]).
-    fn evictable(&self, sequences: &[RequestId]) -> Vec<RequestId> {
-        sequences.iter().copied().filter(|id| self.requests.get(id).is_some_and(Self::can_evict)).collect()
     }
 
     /// The one eviction: `sequences`, each evictable now, have their state
@@ -3461,12 +3538,18 @@ impl<F: ProgramFamily> MemoryHost for Service<F> {
         self.prefix_cache.least_value()
     }
 
+    /// Those that can be evicted now ([`Self::can_evict`]); a chain's
+    /// holder between its chunks is resident and ready, but its state is
+    /// the chain's until the chain ends: never evicted.
+    fn evictable(&self) -> BTreeSet<RequestId> {
+        let holder = self.domain.chain_holder();
+        self.requests.iter().filter(|(id, request)| Some(**id) != holder && Self::can_evict(request)).map(|(id, _)| *id).collect()
+    }
+
     fn preempt(&mut self, sequences: &[RequestId]) -> Result<(), RequestError> {
-        let evictable = self.evictable(sequences);
-        if evictable.is_empty() {
-            return Ok(());
-        }
-        self.evict(&evictable).map_err(classify_domain_error)
+        let evictable = self.evictable();
+        assert!(sequences.iter().all(|id| evictable.contains(id)), "invariant violated: a relief names a request that cannot be evicted: {sequences:?}");
+        self.evict(sequences).map_err(classify_domain_error)
     }
 }
 
@@ -3855,7 +3938,7 @@ mod pending_retention_tests {
         assert_eq!(generation.finish_reason(), Some(FinishReason::Length));
         let round = generation.start_reconciliation(4).unwrap_or_else(|(_, e)| panic!("{e}"));
         let work = lower_round(&round, RequestId(1), round.generation().resident_position(), None).unwrap();
-        let parked = State::Parked(round, Work::new(vec![work]).unwrap(), Some(Wait { at: AvailabilityEpoch::default() }));
+        let parked = State::Parked(round, Work::new(vec![work]).unwrap(), Some(Wait { at: AvailabilityEpoch::default(), on: WaitsOn::Memory }));
         assert!(parked.settled().is_none());
         let State::Parked(round, _, _) = parked else { unreachable!() };
         let transition = round.prepare_round_transition(RequestId(1), &[], None, &mut NoFeatures).unwrap();
@@ -3866,7 +3949,7 @@ mod pending_retention_tests {
         assert_eq!(generation.output_len(), 0);
         assert!(generation.pending_reconciliation().is_none());
         assert_eq!(generation.resident_position(), generation.accepted_position());
-        let pending = State::Between(generation, Stage::Pending(priming(), Some(Wait { at: AvailabilityEpoch::default() })));
+        let pending = State::Between(generation, Stage::Pending(priming(), Some(Wait { at: AvailabilityEpoch::default(), on: WaitsOn::Memory })));
         assert!(pending.settled().is_none(), "pending priming must block retention and terminal publication");
         let State::Between(generation, _) = pending else { unreachable!() };
         // finish_round returns completed method work as Ready.
@@ -3879,7 +3962,7 @@ mod pending_retention_tests {
         for (cancel, expected) in [(true, FinishReason::Cancelled), (false, FinishReason::Failed)] {
             let pending = State::Between(
                 super::termination_tests::generation(),
-                Stage::Pending(priming(), Some(Wait { at: AvailabilityEpoch::default() })),
+                Stage::Pending(priming(), Some(Wait { at: AvailabilityEpoch::default(), on: WaitsOn::Memory })),
             );
             assert!(pending.settled().is_none());
             // terminate_request discards composed work
@@ -3895,7 +3978,7 @@ mod pending_retention_tests {
         generation.evicted().unwrap();
         assert!(!generation.is_resident());
         assert_eq!(generation.finish_reason(), Some(FinishReason::Length));
-        let state = State::Between(generation, Stage::NonResident(Some(Wait { at: AvailabilityEpoch::default() })));
+        let state = State::Between(generation, Stage::NonResident(Some(Wait { at: AvailabilityEpoch::default(), on: WaitsOn::Memory })));
         assert!(state.settled().is_some());
         let State::Between(generation, _) = state else { unreachable!() };
         let state = State::Between(generation, Stage::AwaitingPrefix { through: 1 });
@@ -3903,16 +3986,14 @@ mod pending_retention_tests {
     }
 }
 
-/// The owner's one claim path over the controlled domain
-/// (`magnitude_executor::fixtures`): a group's claim the device's ledger
-/// refuses for preemption evicts exactly the sequences it names, and one
-/// it refuses over budget fails its request at once with the typed
-/// capacity error, holding no wait.
+/// The owner over the controlled domain (`magnitude_executor::fixtures`):
+/// opens refused for memory, relief's evictions, and request identities
+/// across loads.
 #[cfg(test)]
 mod claim_tests {
     use super::*;
     use crate::publication::Publication;
-    use magnitude_executor::{ResourceKind, fixtures};
+    use magnitude_executor::fixtures;
     use magnitude_generation::{EndOfGeneration, InputLayout, MethodChoice, Options, Sampling, Shaping, TokenId};
 
     struct NoWakes;
@@ -3942,7 +4023,17 @@ mod claim_tests {
     /// A fresh generation of four prompt tokens within the fixture's
     /// eight-token context.
     fn fresh(vocabulary: usize) -> Generation {
-        Generation::new(
+        fresh_by(vocabulary, MethodChoice::Plain)
+    }
+
+    /// [`fresh`], generating by `method`: plain, or MTP by its own method.
+    fn fresh_by(vocabulary: usize, method: MethodChoice) -> Generation {
+        let factory: Arc<dyn magnitude_generation::Method> = match method {
+            MethodChoice::Plain => Arc::new(magnitude_generation::Plain),
+            MethodChoice::Mtp { proposals } => Arc::new(magnitude_generation::Mtp::new("fixture", proposals.into()).unwrap()),
+            other => unreachable!("the owner's tests generate by no {other:?}"),
+        };
+        Generation::new_with_method(
             vec![TokenId(1), TokenId(2), TokenId(3), TokenId(4)],
             InputLayout::new(4, vec![]).unwrap(),
             Options {
@@ -3956,68 +4047,34 @@ mod claim_tests {
                 shaping: Shaping { temperature: 0.0, ..Default::default() },
                 seed: 0,
                 forced_quantum: 0,
-                method: MethodChoice::Plain,
+                method,
                 end_of_generation: EndOfGeneration::Stop,
                 reasoning_budget: None,
             },
             None,
+            factory,
         )
         .unwrap()
     }
 
-    /// Make `id` resident between rounds, as selection does.
-    fn resident(service: &mut Service<fixtures::TestFamily>, bindings: &mut StateBindings, id: RequestId) {
+    /// Make `id` resident between rounds, as selection does: whether it is
+    /// (`Some(true)`) or waits (`Some(false)`); none where it failed.
+    fn residency(service: &mut Service<fixtures::TestFamily>, bindings: &mut StateBindings, id: RequestId) -> Option<bool> {
         let Request { mut record, state } = service.requests.remove(&id).expect("an admitted request");
         let State::Between(generation, Stage::NonResident(None)) = state else { panic!("{id:?} is not waiting to be resident") };
-        match service.make_resident(id, &mut record, generation, bindings) {
-            Ok(Residency::Resident(generation, encodes)) if encodes.is_empty() && generation.finish_reason().is_none() => {
-                service.requests.insert(id, Request { record, state: State::Between(generation, Stage::Ready) });
-            }
-            _ => panic!("{id:?} becomes resident"),
-        }
-    }
-
-    /// `id`'s next prefill round of [`ROWS`] rows, out of the map as
-    /// selection takes it, and its one group.
-    fn round_of(service: &mut Service<fixtures::TestFamily>, id: RequestId) -> (Round, OperationGroup) {
-        let Request { record, state } = service.requests.remove(&id).expect("a resident request");
-        let State::Between(generation, Stage::Ready) = state else { panic!("{id:?} is not ready") };
-        let Ok(RoundStart::Target(started)) = generation.start_round(id, ROWS) else { panic!("{id:?} starts a prefill round") };
-        let operation = lower_round(&started, id, started.generation().resident_position(), None).unwrap();
-        let candidate = ScheduledOperation {
-            identity: id,
-            phase: Phase::Prefill,
-            active: false,
-            resident: true,
-            waiting_since_ns: 0,
-            service_ns: 0,
-            preemption_debt: 0,
-            holds_chain: false,
+let Ok(residency) = service.make_resident(id, &mut record, generation, bindings) else { panic!("{id:?}'s open is fatal") };
+        let (state, resident) = match residency {
+            Residency::Resident(generation, _) => (State::Between(generation, Stage::Ready), Some(true)),
+            Residency::Waiting(generation, _) => (State::Between(generation, Stage::NonResident(None)), Some(false)),
+            Residency::Failed(generation) => (State::Between(generation, Stage::NonResident(None)), None),
         };
-        let selection = service.scheduler.select(&[candidate], 0).unwrap().expect("a selection");
-        let mut groups = group(&service.domain, vec![operation]);
-        assert_eq!(groups.len(), 1, "one operation is one group");
-        let round = Round {
-            selection,
-            started: 0,
-            members: BTreeMap::from([(id, Member { record, state: Membership::Started(started) })]),
-            groups: VecDeque::new(),
-        };
-        (round, groups.remove(0))
+        service.requests.insert(id, Request { record, state });
+        resident
     }
 
-    /// Put a round's one member back between rounds, its state as the
-    /// round's provisioning left it.
-    fn back(service: &mut Service<fixtures::TestFamily>, mut round: Round, id: RequestId) {
-        let Member { record, state } = round.members.remove(&id).expect("the round's member");
-        let Membership::Started(started) = state else { panic!("a started round") };
-        service.requests.insert(id, Request { record, state: State::Between(started.abandon(), Stage::Ready) });
-    }
-
-    /// Take every byte the device's ledger would give a claim now (its free
-    /// room and its cache) as a measurement's room: what is left to any
-    /// later claim is the state it may preempt.
-    fn take_room(service: &mut Service<fixtures::TestFamily>) {
+    /// Take every byte the device's ledger would give new work now (its
+    /// free room and the cache worth nothing) as a measurement's room.
+    fn take_room<F: ProgramFamily>(service: &mut Service<F>) {
         const PAST: u64 = u64::MAX / 4;
         service.domain.release_measurement_room();
         let room = match service.domain.claim_measurement_room(PAST) {
@@ -4027,82 +4084,115 @@ mod claim_tests {
         service.domain.claim_measurement_room(room).expect("the room the ledger gives is held");
     }
 
-    /// Three requests admitted in turn, each resident; the second's rows
-    /// claimed; then the room taken. The first's rows preempt exactly the
-    /// sequence the ledger names (the second: the latest admitted after it
-    /// that holds state), which waits non-resident with a preemption owed,
-    /// while the third, holding none, stands, and the first is never
-    /// preempted. The third's rows, which may preempt nothing, wait short
-    /// while the first still holds memory, and once the first retires and
-    /// its freed room is taken, are refused over budget: its request fails
-    /// at once with the typed capacity error, and no request waits.
-    #[test]
-    fn a_group_refused_for_memory_evicts_exactly_the_named_sequences_and_a_short_one_fails_at_once() {
+    /// Admit `count` fresh requests in turn.
+    fn admit(owner: &mut Owner<fixtures::TestFamily>, count: usize) -> Vec<RequestId> {
         let vocabulary = fixtures::tiny_definition().decoder.vocabulary as usize;
+        (0..count)
+            .map(|_| owner.admit(fresh(vocabulary), PreparedModelInput::continuation_only(), PrefixRetention::Transient, 4, 0).unwrap().0)
+            .collect()
+    }
+
+    /// The first request draws the load's request slot; with the room
+    /// beside it taken, a second request's open is refused for memory and
+    /// waits while the first holds the slot: it holds no state, and no
+    /// prefix entry is touched.
+    #[test]
+    fn an_open_refused_while_the_slot_is_lent_waits_and_touches_no_prefix() {
         let (domain, bindings) = fixtures::fixture(None);
         let mut owner = Owner::new(domain, bindings, limits(), Arc::new(NoWakes)).unwrap();
-        let mut admitted = Vec::new();
-        for _ in 0..3 {
-            let (id, receiver) = owner
-                .admit(fresh(vocabulary), PreparedModelInput::continuation_only(), PrefixRetention::Transient, 4, 0)
-                .unwrap();
-            admitted.push((id, receiver));
-        }
-        let [first, later, third] = [admitted[0].0, admitted[1].0, admitted[2].0];
+        let [first, second] = admit(&mut owner, 2)[..] else { unreachable!() };
         let Pipeline::Idle(bindings) = &mut owner.pipeline else { panic!("an idle owner") };
         let service = &mut owner.service;
-        for id in [first, later, third] {
-            resident(service, bindings, id);
-        }
-        let (round, group_) = round_of(service, later);
-        assert!(matches!(service.provision(bindings, &round, group_), Ok(Provisioned::Fits(_))), "the room holds the second's rows");
-        back(service, round, later);
+        assert_eq!(residency(service, bindings, first), Some(true), "the first draws the slot");
         take_room(service);
+        let entries = service.prefix_cache.len();
+        assert_eq!(residency(service, bindings, second), Some(false), "the second waits while the slot is lent");
+        assert!(matches!(service.requests[&second].state, State::Between(_, Stage::NonResident(None))), "it holds no state");
+        assert_eq!(service.prefix_cache.len(), entries, "no prefix entry is touched");
+    }
 
-        let (round, group_) = round_of(service, first);
-        let provisioned = service.provision(bindings, &round, group_);
-        assert!(matches!(provisioned, Ok(Provisioned::Fits(_))), "the first's rows fit once the named sequence is evicted");
+    /// Relief carried out for a claim short of memory evicts exactly the
+    /// requests its plan names, the latest admitted first and just enough,
+    /// never the first.
+    #[test]
+    fn relief_evicts_exactly_the_requests_its_plan_names() {
+        let (domain, bindings) = fixtures::fixture(None);
+        let mut owner = Owner::new(domain, bindings, limits(), Arc::new(NoWakes)).unwrap();
+        let ids = admit(&mut owner, 3);
+        let Pipeline::Idle(bindings) = &mut owner.pipeline else { panic!("an idle owner") };
+        let service = &mut owner.service;
+        for id in &ids {
+            assert_eq!(residency(service, bindings, *id), Some(true), "{id:?} opens");
+        }
+        take_room(service);
+        let resource = magnitude_executor::ResourceKind::DeviceMemory;
+        let evictable = MemoryHost::evictable(service);
+        let lacks = std::iter::successors(Some(1u64), |bytes| bytes.checked_mul(2))
+            .find(|bytes| service.domain.plan_relief(resource, *bytes, Relief::CacheAndRequests(&evictable)).is_some_and(|plan| !plan.preempt().is_empty()))
+            .expect("a need some request covers");
+        let named = service.domain.plan_relief(resource, lacks, Relief::CacheAndRequests(&evictable)).expect("the plan").preempt().to_vec();
+        assert_eq!(named, [ids[2]], "the latest admitted, just enough");
+        let short = Err(DomainError::Capacity(magnitude_executor::CapacityError { resource, required: lacks, available: 0 }));
+        let relieved = service.relieve(bindings, short, true, |_, _| Ok(Ok(()))).unwrap();
+        assert!(relieved.current.is_ok(), "the claim fits once relieved");
         let evicted = |service: &Service<fixtures::TestFamily>, id: RequestId| {
             let request = &service.requests[&id];
             matches!(request.state, State::Between(_, Stage::NonResident(None))) && request.record.preemption_debt == 1
         };
-        assert!(evicted(service, later), "the second, which the ledger named, is evicted");
-        assert!(
-            matches!(&service.requests[&third].state, State::Between(generation, Stage::Ready) if generation.is_resident()),
-            "the third, which the ledger did not name, stands"
-        );
-        assert_eq!(service.requests[&third].record.preemption_debt, 0);
-        back(service, round, first);
-        assert_eq!(service.requests[&first].record.preemption_debt, 0, "the first is never preempted");
-        take_room(service);
-
-        let (round, group_) = round_of(service, third);
-        assert!(
-            matches!(service.provision(bindings, &round, group_), Ok(Provisioned::Short(..))),
-            "the third's rows wait while the first still holds resident state"
-        );
-        back(service, round, third);
-        service.retire(first).unwrap();
-        take_room(service);
-
-        let (mut round, group_) = round_of(service, third);
-        match service.provision(bindings, &round, group_) {
-            Ok(Provisioned::Refused(refused, error)) => {
-                assert!(
-                    matches!(&error, RequestError::Capacity(ServiceCapacityError { resource: CapacityResource::Execution(ResourceKind::DeviceMemory), .. })),
-                    "refused over the device's budget, not {error:?}"
-                );
-                service.refuse(&mut round, &refused, error);
-            }
-            _ => panic!("the third's rows, which preempt nothing, are refused over budget"),
+        assert!(evicted(service, ids[2]), "the named request is evicted");
+        for id in &ids[..2] {
+            assert!(!evicted(service, *id) && service.requests[id].record.preemption_debt == 0, "{id:?} stands");
         }
-        let Member { record, state } = &round.members[&third];
-        assert_eq!(state.generation().finish_reason(), Some(FinishReason::Failed), "the third fails at once");
-        assert!(matches!(record.error, Some(RequestError::Capacity(_))));
+    }
+
+    /// A drafting load whose drafter was released with nothing resident
+    /// serves a drafting request with every byte of room taken: the
+    /// drafter's reload is refused for memory while that request's group
+    /// provisions, so the request fails on its own, and the owner, never
+    /// stopping, serves the next request once the room is free again. Each
+    /// request draws the load's request slot in turn, so none of them needs
+    /// room to open.
+    #[test]
+    fn a_drafter_reload_refused_for_memory_fails_its_request_alone() {
+        use std::task::{Context, Poll, Waker};
+        let (directory, definition, domain, bindings) = fixtures::loaded::drafted("refused-drafter-reload");
+        let vocabulary = definition.decoder.vocabulary as usize;
+        let mut owner = Some(Owner::new(domain, bindings, limits(), Arc::new(NoWakes)).unwrap());
+        // The service clock, a millisecond a run.
+        let now = std::cell::Cell::new(0u64);
+        // Run the owner until `receiver` ends: its terminal publication.
+        let serve = |owner: &mut Option<Owner<magnitude_executor::NativeFamily>>, receiver: &mut PublicationReceiver| loop {
+            let (ran, _) = owner.take().expect("the owner is between runs").run(now.get()).unwrap_or_else(|error| panic!("the owner stopped: {error}"));
+            *owner = Some(ran);
+            now.set(now.get() + 1_000_000);
+            while let Poll::Ready(publication) = receiver.poll_next(&mut Context::from_waker(Waker::noop())) {
+                match publication.expect("a request ends with a terminal publication") {
+                    Publication::Output(_) => {}
+                    terminal => return terminal,
+                }
+            }
+        };
+        let admit = |owner: &mut Option<Owner<magnitude_executor::NativeFamily>>, method| {
+            owner.as_mut().unwrap().admit(fresh_by(vocabulary, method), PreparedModelInput::continuation_only(), PrefixRetention::Transient, 4, now.get()).unwrap().1
+        };
+        let mut plain = admit(&mut owner, MethodChoice::Plain);
+        assert!(matches!(serve(&mut owner, &mut plain), Publication::Completed { .. }), "the first request is served");
+        {
+            let Owner { service, pipeline: Pipeline::Idle(bindings) } = owner.as_mut().unwrap() else { panic!("an idle owner") };
+            // With nothing resident, the drafter is released, as the ledger takes it.
+            service.domain.release_idle_optional_components(bindings, &[magnitude_executor::OptionalComponent::Drafter]).unwrap();
+            take_room(service);
+        }
+        let mut drafting = admit(&mut owner, MethodChoice::Mtp { proposals: 2 });
         assert!(
-            service.requests.values().all(|request| request.state.wait().is_none()),
-            "no request waits"
+            matches!(serve(&mut owner, &mut drafting), Publication::Failed(RequestError::Capacity(_))),
+            "the drafting request fails for memory on its own"
         );
+        owner.as_mut().unwrap().service.domain.release_measurement_room();
+        let mut next = admit(&mut owner, MethodChoice::Plain);
+        assert!(matches!(serve(&mut owner, &mut next), Publication::Completed { .. }), "the owner serves the next request");
+        drop(owner);
+        std::fs::remove_dir_all(&directory).expect("the fixture's directory is removed");
     }
 
     /// Two loads in one process, each with its own owner, admit in turn:
@@ -4123,30 +4213,5 @@ mod claim_tests {
         }
         let ids = admitted.iter().map(|(id, _)| *id).collect::<Vec<_>>();
         assert!(ids.windows(2).all(|pair| pair[0] < pair[1]), "unique and in admission order across loads: {ids:?}");
-    }
-
-    /// A non-resident request whose state opening is refused over budget with
-    /// nothing of ours left to free fails at once with the typed capacity
-    /// error, never starting a round on the finished generation.
-    #[test]
-    fn a_non_resident_request_refused_over_budget_fails_with_capacity() {
-        let vocabulary = fixtures::tiny_definition().decoder.vocabulary as usize;
-        let (domain, bindings) = fixtures::fixture(None);
-        let mut owner = Owner::new(domain, bindings, limits(), Arc::new(NoWakes)).unwrap();
-        take_room(&mut owner.service);
-        let (_id, mut receiver) = owner
-            .admit(fresh(vocabulary), PreparedModelInput::continuation_only(), PrefixRetention::Transient, 4, 0)
-            .unwrap();
-        let (owner, _) = owner.run(0).expect("a non-resident capacity refusal is not fatal");
-        assert!(owner.service.requests.is_empty(), "the refused request retired");
-        assert!(!receiver.began(), "the refused request never became resident");
-        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-        match receiver.poll_next(&mut cx) {
-            std::task::Poll::Ready(Some(Publication::Failed(RequestError::Capacity(ServiceCapacityError {
-                resource: CapacityResource::Execution(ResourceKind::DeviceMemory),
-                ..
-            })))) => {}
-            other => panic!("expected device-memory capacity error, got {other:?}"),
-        }
     }
 }

@@ -138,9 +138,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let Some(bank) = self.family.expert_bank() else {
             return Ok(BankStep::AtLimit);
         };
-        let step = match self.chain_holder() {
-            Some(_) => BankStep::Deferred,
-            None => bank.shrink(holding, to, &mut || self.queue.orphan(self.measures.as_ref().and_then(|measures| measures.experts.as_ref()), bindings), wake)?,
+        let step = match self.unchained(bindings) {
+            None => BankStep::Deferred,
+            Some(mut unchained) => {
+                bank.shrink(holding, to, &mut || self.queue.orphan(self.measures.as_ref().and_then(|measures| measures.experts.as_ref()), &mut unchained), wake)?
+            }
         };
         match step {
             BankStep::Begun(tier) => {
@@ -246,10 +248,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             freed = true;
         }
         let (mut released, mut returned) = (0, 0);
-        if self.state_slabs.spare_owed() > 0 && self.chain_holder().is_none() {
+        if let Some(mut unchained) = self.unchained(bindings).filter(|_| self.state_slabs.spare_owed() > 0) {
             // The stores release the slabs beyond the live requests' next
             // steps, moving no row, and the pool returns what they freed.
-            let state = self.yield_state(bindings)?;
+            let state = self.yield_state(&mut unchained)?;
             (released, returned) = (state.released, state.returned);
             freed |= released + returned > 0;
         }

@@ -145,7 +145,6 @@ pub(crate) fn fixture_definition_of(hidden: u64) -> ModelDefinition {
 /// component: its first block (attention, dense) under head names, between
 /// the head's own norms and combine, reading out through the target's
 /// vocabulary projection and chaining its output.
-#[cfg(test)]
 pub(crate) fn with_mtp_head(mut definition: ModelDefinition) -> ModelDefinition {
     use magnitude_family_contracts::{
         Head, HeadBlock, HeadChain, HeadComponent, HeadHistory, HeadInput, HeadReadout,

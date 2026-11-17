@@ -21,7 +21,7 @@ fn main() {
         "page_bytes": sample.page_bytes,
         "total": sample.total,
         "supply": {
-            "free_above_target": sample.supply.free_above_target,
+            "free_beyond_target": sample.supply.free_beyond_target,
             "clean_cache": sample.supply.clean_cache,
             "cold_reclaimable": sample.supply.cold_reclaimable,
         },

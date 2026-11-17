@@ -105,6 +105,8 @@ pub(crate) struct PreparedPrograms {
     /// The pass the load's in-process figure was priced at
     /// (`LoadPlans::held_pass`), which its target graphs are prepared for.
     pub held_pass: magnitude_executor::PassLaunches,
+    /// The load's request slot (`LoadPlans::slot`).
+    pub slot: u64,
     /// The load's one set of worker threads: everything its preparation
     /// does off the calling thread runs on these and no others. It is lent
     /// to the opened device for the programs the load forms, and seals the
@@ -127,6 +129,8 @@ struct PlannedModel {
     backend: BackendName,
     state: StateResourcePlan,
     held_pass: magnitude_executor::PassLaunches,
+    /// The load's request slot (`LoadPlans::slot`).
+    pub slot: u64,
     kernel_cache: Option<Arc<KernelCache>>,
     numerical_profile: magnitude_executor::ResolvedNumericalProfile,
 }
@@ -194,16 +198,16 @@ struct LoadPlans {
     resident: ExecutionPlanDraft,
     /// The plan the load runs.
     draft: ExecutionPlanDraft,
-    /// The pass its certified family holds (`AssessmentMemoryCharge::held_pass`):
-    /// the places its in-process figure is sized by.
+    /// The pass its certified family holds (`AssessmentMemoryCharge::held_pass`).
     held_pass: magnitude_executor::PassLaunches,
     /// The state `draft` plans, its domain bounded by the room the load's
     /// claims read (`PlanningRoom::net`): planned once, here, for the load.
     state: StateResourcePlan,
-    /// The load's in-process figure (design §3.2): the state its largest
-    /// launch grows by at `held_pass`, the guarantee its room is priced
-    /// beside, which its domain holds once it serves.
-    in_process: u64,
+    /// The load's request slot: the state of one request at its served
+    /// context, as its fit counted it (`AssessmentMemoryCharge::state_bytes`),
+    /// which the load commits beside its weights so the bank never imports
+    /// into it.
+    pub slot: u64,
 }
 
 /// Plan `manifest`'s load on `device`: the same derivation metadata-only
@@ -212,11 +216,11 @@ struct LoadPlans {
 /// reading the load holds, not from the assessment's stable fit: its plan
 /// settles into the room its search and claims read
 /// ([`magnitude_executor::PlanningRoom`], `DeviceReading::room_after`), so a
-/// plan that fits is granted at the reading. The pass the plan's placement
-/// settled (`AssessmentMemoryCharge::held_pass`) is the one authority for
-/// the load's in-process figure, priced there by the draft's own page rule:
-/// the state plan is bounded by what is left of that room once the figure is
-/// held.
+/// plan that fits is granted at the reading. What the fit counted for the
+/// served context's request (`AssessmentMemoryCharge::state_bytes`) is the
+/// load's request slot, the one figure fit and commitment share: a request
+/// of the whole served context fits it by the page rule, or the charge
+/// under-counts its own state, which is an invariant violation.
 fn plan_load(manifest: &ExecutionManifest, selected: &platform::SelectedDevice, holding: Holding, device: &ReadDevice) -> Result<LoadPlans, LoadError> {
     let backend = selected.info.backend();
     let planned = |error: crate::planning::ExecutionPlanningError| -> LoadError {
@@ -226,14 +230,12 @@ fn plan_load(manifest: &ExecutionManifest, selected: &platform::SelectedDevice, 
         }
     };
     let tensor_operations = magnitude_executor::TensorOperations::of(selected.info.forms_tensor_operations());
-    let room = magnitude_executor::PlanningRoom::new(&device.reading, &device.ledgers, &manifest.definition, manifest.model.kv_codec, tensor_operations, selected.info.limits().allocations());
+    let room = magnitude_executor::PlanningRoom::new(&device.reading, &device.ledgers);
     let resident = crate::planning::plan_resident(manifest, selected).map_err(planned)?;
     let charged = crate::planning::plan_banked::<magnitude_executor::AssessmentMemoryCharge>(manifest, selected, resident.clone(), holding, &room)
         .map_err(planned)?;
     let held_pass = charged.charge().held_pass;
-    let in_process = room
-        .in_process(charged.draft(), charged.charge())
-        .map_err(|error| LoadError::from(classify_plan(error, backend)))?;
+    let slot = charged.charge().state_bytes;
     let draft = charged.into_draft();
     let state = ResourcePlanner::state_plan(
         &manifest.definition,
@@ -241,10 +243,17 @@ fn plan_load(manifest: &ExecutionManifest, selected: &platform::SelectedDevice, 
         draft.policy().method(),
         manifest.model.kv_codec,
         draft.policy().limits(),
-        ResourceCapacity { domain_bytes: room.net(in_process), tensor_operations, allocations: selected.info.limits().allocations() },
+        ResourceCapacity { domain_bytes: room.net(), tensor_operations, allocations: selected.info.limits().allocations() },
     )
     .map_err(internal)?;
-    Ok(LoadPlans { resident, draft, held_pass, state, in_process })
+    let context = manifest.definition.decoder.context_limit;
+    let request = LoadShape::of_states(state.target_state(), state.head_state())
+        .state_bytes(LoadShape::request_rows(context, draft.policy().method()));
+    assert!(
+        request <= slot,
+        "invariant violated: a request of the served context's {context} rows takes {request} bytes of state, past the {slot} the load's fit counted"
+    );
+    Ok(LoadPlans { resident, draft, held_pass, state, slot })
 }
 
 /// Select and open the manifest's device and plan the model on it.
@@ -273,7 +282,7 @@ fn plan_on_device(
     let read = read_device(catalog, manifest, &selected)?;
     report_load_phase("device open", &mut phase_started);
     report_load_memory("device opened", read.opened.device());
-    let LoadPlans { resident, draft, held_pass, state, in_process } = plan_load(manifest, &selected, holding, &read)?;
+    let LoadPlans { resident, draft, held_pass, state, slot } = plan_load(manifest, &selected, holding, &read)?;
     let ReadDevice { opened, ledgers, reader, reading } = read;
     if let Some(bank) = draft.load().expert_bank() {
         let weights = draft.load().weight_bytes().map_err(internal)?;
@@ -292,7 +301,7 @@ fn plan_on_device(
     );
     report_load_phase("planning", &mut phase_started);
     let numerical_profile = numerical_profile(manifest)?;
-    let startup = Startup { reader, reading, in_process, recorded: Recorded::default(), ledgers };
+    let startup = Startup { reader, reading, recorded: Recorded::default(), ledgers };
     // Preparation holds the programs' device storage and runs qualification
     // fixtures beside it before any model weights are imported: the first
     // allocations the load's ledgers claim.
@@ -313,6 +322,7 @@ fn plan_on_device(
         backend,
         state,
         held_pass,
+        slot,
         kernel_cache,
         numerical_profile,
     })
@@ -509,6 +519,7 @@ fn prepare(
         backend,
         state,
         held_pass,
+        slot,
         kernel_cache,
         numerical_profile,
     } = plan_on_device(catalog, manifest, package, progress.as_ref(), holding)?;
@@ -551,15 +562,8 @@ fn prepare(
     // Qualification ran, its fixtures freed; the programs' storage stays.
     drop(qualification_claim);
     startup.recorded.record(programs_claim);
-    let room = magnitude_executor::PlanningRoom::new(
-        &startup.reading,
-        &startup.ledgers,
-        &manifest.definition,
-        manifest.model.kv_codec,
-        magnitude_executor::TensorOperations::of(draft.device().tensor_operations()),
-        draft.device().allocations(),
-    )
-    .holding(AttestedPrograms::DEVICE_BYTES);
+    let room = magnitude_executor::PlanningRoom::new(&startup.reading, &startup.ledgers)
+        .holding(AttestedPrograms::DEVICE_BYTES);
     let draft = draft
         .finalize_readout(&manifest.definition, programs.readout_choices(), &room)
         .and_then(|draft| draft.finalize_sites(|bank| programs.sited_layers(bank)))
@@ -596,6 +600,7 @@ fn prepare(
         backend,
         state,
         held_pass,
+        slot,
         workers,
     }))
 }
@@ -666,6 +671,7 @@ fn build_held(
         backend,
         state,
         held_pass,
+        slot,
         workers,
     } = match prepare(catalog, manifest, &package, unprepared, progress.clone(), holding)? {
         LoadAttempt::Loaded(prepared) => prepared,
@@ -880,15 +886,17 @@ fn build_held(
     let host_tables = startup.claim("host tables", ClaimDemand { host: host_tables, ..ClaimDemand::default() })?;
     // The allocations after the target import are claimed before it, so the
     // import's bank holds what they leave.
-    // The state stores' first slabs are granules of the store's pool, whose
-    // entry allocates them: their claims hold them, pooled, for the
-    // domain's life.
-    let state_claim = |purpose, bytes| startup.claim_as(purpose, CommittedKind::StateFloor, ClaimDemand { device: bytes, ..ClaimDemand::default() });
-    let target_state_claim = state_claim("initial target state", plan.target_state().initial_slab_bytes().map_err(internal)?)?;
-    let head_state_claim = plan
+    // What the load needs to serve beside its weights and its bank's floor
+    // is the served context's whole request, the state its fit counted:
+    // committed with them, before the import, so the bank never imports
+    // into it, and held for the domain's life, one request at a time
+    // reserving from it. The state stores' first slabs are granules of the
+    // store's pool within it ([`CommittedKind::RequestSlot`]).
+    let initial = plan
         .head_state()
-        .map(|state| Ok::<_, LoadError>((state, state_claim("initial head state", state.initial_slab_bytes().map_err(internal)?)?)))
-        .transpose()?;
+        .map_or(Ok(0), |state| state.initial_slab_bytes())
+        .and_then(|head| plan.target_state().initial_slab_bytes().map(|target| target + head))
+        .map_err(internal)?;
     // Their address tables lie outside the pool: a claim of their own,
     // charged as the stores are made and held for the domain's life.
     let table_bytes = plan
@@ -901,21 +909,18 @@ fn build_held(
         })
         .map_err(internal)?;
     let mut state_tables = startup.claim_as("state tables", CommittedKind::StateTables, ClaimDemand { device: table_bytes, ..ClaimDemand::default() })?;
+    // The fit's state counts the tables too: the slot holds the rest, so
+    // each byte is committed once, the tables by their own claim.
+    let slot = slot.checked_sub(table_bytes).unwrap_or_else(|| panic!("invariant violated: the state tables' {table_bytes} bytes exceed the {slot}-byte state the load's fit counted"));
+    assert!(initial <= slot, "invariant violated: the state stores' first {initial} bytes of slabs exceed the {slot}-byte request slot");
+    let request_slot = startup
+        .claim_as("the served context's request", CommittedKind::RequestSlot, ClaimDemand { device: slot, ..ClaimDemand::default() })?
+        .into_request_slot();
     let constants_claim = startup.claim_as(
         "target binding constants",
         CommittedKind::Arena,
         ClaimDemand { device: target_binding_constants, ..ClaimDemand::default() },
     )?;
-    // What the load needs to serve beside its weights and its bank's floor is
-    // one request's minimum state: claimed with them, under the load's
-    // policy, and held for the domain's life, the first request's state
-    // drawing from it ([`CommittedKind::StateFloor`]).
-    let state_floor = startup.claim_as(
-        "minimum request state",
-        CommittedKind::StateFloor,
-        ClaimDemand { device: LoadShape::minimum_state(&execution_plan), ..ClaimDemand::default() },
-    )?;
-    startup.recorded.record_state_floor(state_floor);
     let upload_window = startup.claim_as(
         "target import",
         CommittedKind::Upload,
@@ -934,14 +939,7 @@ fn build_held(
         // A plan holding its experts whole that the memory free now does
         // not hold streams them, where they can stream.
         Imported::Unheld(refused) => {
-            let room = magnitude_executor::PlanningRoom::new(
-                &startup.reading,
-                &startup.ledgers,
-                &manifest.definition,
-                manifest.model.kv_codec,
-                magnitude_executor::TensorOperations::of(planned.device().tensor_operations()),
-                planned.device().allocations(),
-            );
+            let room = magnitude_executor::PlanningRoom::new(&startup.reading, &startup.ledgers);
             return match planned.streaming::<magnitude_executor::AssessmentMemoryCharge>(
                 &manifest.definition,
                 manifest.model.weight_bound,
@@ -1047,20 +1045,11 @@ fn build_held(
         .transpose()
         .map_err(|error| internal(error.to_string()))?;
     let target_state = state_tables.allocate(|| plan.allocate_target_state(device.clone(), pools.state.clone())).map_err(internal)?;
-    startup.recorded.record_state_floor(target_state_claim);
-    let head_state = head_state_claim
-        .map(|(state, claim)| {
-            let allocated = state_tables.allocate(|| state.allocate(device.clone(), pools.state.clone())).map_err(internal)?;
-            startup.recorded.record_state_floor(claim);
-            Ok::<_, LoadError>(allocated)
-        })
+    let head_state = plan
+        .head_state()
+        .map(|state| state_tables.allocate(|| state.allocate(device.clone(), pools.state.clone())).map_err(internal))
         .transpose()?;
     startup.recorded.record(state_tables);
-    // The load's one in-process figure, priced from its plan before
-    // anything was searched or claimed (`plan_on_device`), held in its store
-    // from here for the domain's life: the figure every claim before priced
-    // its room beside.
-    let in_process = startup.ledgers.device().in_process(startup.in_process);
     let (mut domain, bindings) = ExecutorDomain::new(
         Rc::new(execution_plan),
         definition,
@@ -1074,7 +1063,7 @@ fn build_held(
         head_state,
         startup.recorded,
         constants_claim,
-        in_process,
+        request_slot,
     )
     .map_err(|error| domain_refused(error, &startup.ledgers))?;
     report_load_phase("state and domain allocation", &mut phase_started);
@@ -1705,7 +1694,7 @@ fn load_memory_record(moment: &str, device: &seismic::Device) -> serde_json::Val
     let host = serde_json::json!({
         "total_bytes": host.total,
         "supply_bytes": host.supply.total(),
-        "free_above_target_bytes": host.supply.free_above_target,
+        "free_beyond_target_bytes": host.supply.free_beyond_target,
         "clean_cache_bytes": host.supply.clean_cache,
         "cold_reclaimable_bytes": host.supply.cold_reclaimable,
     });
@@ -1751,9 +1740,7 @@ enum Imported {
 /// taken at its start and once more right before its target import, the
 /// one large decision ([`Self::claim_target_import`]), which it plans,
 /// searches and claims at, its OS figures fixed and every holding since
-/// counted; its
-/// in-process figure, which that room is priced beside until its domain
-/// holds it; the device's store ledgers, which claim each allocation the
+/// counted; the device's store ledgers, which claim each allocation the
 /// load makes before it is made
 /// ([`magnitude_executor::memory::ledger::DeviceLedgers::claim_at`]); and
 /// the record of what it allocated ([`Recorded`]), which the domain's
@@ -1762,7 +1749,6 @@ enum Imported {
 struct Startup {
     reader: DeviceReader,
     reading: DeviceReading,
-    in_process: u64,
     ledgers: DeviceLedgers,
     recorded: Recorded,
 }
@@ -1771,12 +1757,7 @@ impl Startup {
     /// The room a search is held to: the load's own
     /// ([`magnitude_executor::LoadRoom`]).
     fn room(&self) -> magnitude_executor::LoadRoom<'_> {
-        magnitude_executor::LoadRoom {
-            reading: &self.reading,
-            ledgers: &self.ledgers,
-            in_process: self.in_process,
-            release: self.reader.release_rate(),
-        }
+        magnitude_executor::LoadRoom::new(&self.reading, &self.ledgers, self.reader.release_rate())
     }
 
     /// Claim `demand`, an allocation the load makes and keeps, at the
@@ -1802,7 +1783,7 @@ impl Startup {
     /// storage it lies in, beside the upload window and every allocation
     /// claimed before it. A streamed load's bank imports at its derived
     /// target at the load's reading ([`magnitude_executor::import_slots`],
-    /// beside the speed guarantee, the load's in-process figure in it), the
+    /// beside the speed guarantee and the load's request slot), the
     /// most of those slots, down to its floor, every store holds: what its
     /// first reading keeps. Experts held whole that do not fit are handed
     /// back ([`Imported::Unheld`]).
@@ -1830,7 +1811,7 @@ impl Startup {
             None => (0, 0, 0),
             Some(bank) => {
                 let device = self.reader.device();
-                let at_load = self.reading.room_after(&self.ledgers, self.in_process);
+                let at_load = self.reading.room_after(&self.ledgers);
                 let most = magnitude_executor::import_slots(&at_load, &self.ledgers, device, bank, demand(bank.floor())?);
                 (bank.floor(), bank.slots, most)
             }
@@ -1936,8 +1917,10 @@ fn warm_up(
     )
     .map_err(|error| failed(error.to_string()))?;
     domain.install_input(request, input).map_err(failed)?;
+    // Its one row: no chain is under way before the load's first step.
+    let unchained = domain.unchained(&mut bindings).ok_or_else(|| failed("a chain is under way before the load's first step".into()))?;
     domain
-        .open_state(&mut bindings, request, None, 0)
+        .open_state(unchained, request, None, 1)
         .map_err(|error| failed(error.to_string()))?;
     // Its token is host-known, as an admitted prompt's are: its table rows
     // are prefetched before its step is queued, so it waits on none.

@@ -681,7 +681,7 @@ fn vision_claims_its_slots_on_an_image_and_releases_them_at_idle() {
     let mut cycles = Vec::new();
     for request in [RequestId(1), RequestId(2)] {
         domain.install_input(request, input.clone()).unwrap();
-        let encodes = domain.open_state(&mut bindings, request, None, 0).unwrap();
+        let encodes = domain.open_served(&mut bindings, request, None).unwrap();
         assert_eq!(encodes.len(), 1);
         let opened = charged(&domain);
         bindings = encode(&mut domain, bindings, encodes);
@@ -737,7 +737,7 @@ fn image_conditioning_survives_eviction_and_cached_resumption() {
     // Uninterrupted: encode, the image chunk, then the rest.
     let reference = RequestId(1);
     domain.install_input(reference, input.clone()).unwrap();
-    let encodes = domain.open_state(&mut bindings, reference, None, 0).unwrap();
+    let encodes = domain.open_served(&mut bindings, reference, None).unwrap();
     assert_eq!(encodes.len(), 1);
     bindings = encode(&mut domain, bindings, encodes);
     domain.reconcile_memory_charge(&[]).unwrap();
@@ -751,11 +751,11 @@ fn image_conditioning_survives_eviction_and_cached_resumption() {
     // Becoming resident again re-encodes the image for the replay.
     let evicted = RequestId(2);
     domain.install_input(evicted, input.clone()).unwrap();
-    let encodes = domain.open_state(&mut bindings, evicted, None, 0).unwrap();
+    let encodes = domain.open_served(&mut bindings, evicted, None).unwrap();
     bindings = encode(&mut domain, bindings, encodes);
     bindings = forward(&mut domain, bindings, evicted, &input, 0..split).1;
     domain.release_state(&[evicted]).unwrap();
-    let encodes = domain.open_state(&mut bindings, evicted, None, 0).unwrap();
+    let encodes = domain.open_served(&mut bindings, evicted, None).unwrap();
     assert_eq!(encodes.len(), 1, "replay re-encodes the released image");
     bindings = encode(&mut domain, bindings, encodes);
     bindings = forward(&mut domain, bindings, evicted, &input, 0..split).1;
@@ -768,7 +768,7 @@ fn image_conditioning_survives_eviction_and_cached_resumption() {
     let resumed = RequestId(3);
     domain.install_input(resumed, input.clone()).unwrap();
     let encodes = domain
-        .open_state(&mut bindings, resumed, Some(&after_image), 0)
+        .open_served(&mut bindings, resumed, Some(&after_image))
         .unwrap();
     assert!(encodes.is_empty(), "an image before the resume position is not re-encoded");
     let (continued, _) = forward(&mut domain, bindings, resumed, &input, split..end);

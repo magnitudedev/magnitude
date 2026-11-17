@@ -256,7 +256,7 @@ fn finishing(
     )
     .unwrap();
     domain.install_input(request, input).unwrap();
-    domain.open_state(bindings, request, None, 0).unwrap();
+    domain.open_served(bindings, request, None).unwrap();
     executor::Operation::Forward {
         request,
         kind: executor::WorkKind::Prefill,

@@ -111,6 +111,10 @@ pub trait JobProcess: Send + 'static {
     fn retire(self: Box<Self>, reported: bool) -> Result<(), (Box<dyn JobProcess>, std::io::Error)>;
     /// The process's recent standard error, for a lost job's report.
     fn diagnostics(&self) -> String;
+    /// The process, where it is one of the system's.
+    fn process(&self) -> Option<seismic::ProcessId> {
+        None
+    }
 }
 
 /// A running job: its identity, its reader's frames and its process.
@@ -245,6 +249,10 @@ impl JobProcess for JobWorker {
 
     fn diagnostics(&self) -> String {
         JobWorker::diagnostics(self)
+    }
+
+    fn process(&self) -> Option<seismic::ProcessId> {
+        Some(seismic::ProcessId::of(self.pid()))
     }
 }
 
@@ -567,6 +575,10 @@ async fn run_job<M: MeasuredMachine>(
             return (JobEnd::Ended(Err(JobLost(format!("starting the job: {error:#}"))), 0), None);
         }
     };
+    // Beside an idle resident model, the room it made is credited by the job's footprint.
+    if let Some(process) = process.process() {
+        exclusive.credit(process);
+    }
     let started = tokio::time::Instant::now();
     // Every point the job reported attempting: those a killed job's markers may count.
     let mut attempted = Vec::new();
@@ -634,7 +646,8 @@ async fn run_job<M: MeasuredMachine>(
             let retired = process.retire(reported);
             match retired {
                 Ok(()) => {
-                    // The device is released: a waiting share proceeds.
+                    // The device is released, and with the room its footprint's credit, only now
+                    // that no reused pid can be credited: a waiting share proceeds.
                     drop(exclusive);
                     Ok(())
                 }

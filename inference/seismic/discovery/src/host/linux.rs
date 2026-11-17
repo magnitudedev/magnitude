@@ -212,7 +212,7 @@ pub(super) fn sample() -> HostSample {
     let host = super::Scope {
         total: field("MemTotal:"),
         supply: Supply {
-            free_above_target: field("MemFree:").saturating_sub(low_watermarks(page)),
+            free_beyond_target: super::beyond(field("MemFree:"), low_watermarks(page)),
             clean_cache: (field("Active(file):") + field("Inactive(file):"))
                 .saturating_sub(field("Dirty:") + field("Writeback:")),
             cold_reclaimable: cold.min(field("SwapFree:")),
@@ -1115,7 +1115,7 @@ mod tests {
                 790
             )]
         );
-        assert_eq!(limits[0].remaining_bytes(), 10);
+        assert_eq!(limits[0].scope(u64::MAX).supply.balance(), 10);
         let cgroups = fixture.cgroups().unwrap().unwrap();
         let own = fixture.0.join("sys/fs/cgroup/user.slice/app.scope");
         assert_eq!(cgroups.limits().unwrap()[0].0, own);
@@ -1255,7 +1255,7 @@ mod tests {
             let limits = fixture.limits().unwrap();
             assert_eq!(limits[0].used_bytes, 900);
             assert_eq!(limits[0].reclaimable_bytes, reclaimable);
-            assert_eq!(limits[0].remaining_bytes(), remaining);
+            assert_eq!(limits[0].scope(u64::MAX).supply.balance(), remaining);
         }
     }
 
@@ -1279,7 +1279,7 @@ mod tests {
         );
         let limits = fixture.limits().unwrap();
         assert_eq!(limits[0].reclaimable_bytes, 450);
-        assert_eq!(limits[0].remaining_bytes(), 550);
+        assert_eq!(limits[0].scope(u64::MAX).supply.balance(), 550);
     }
 
     #[test]

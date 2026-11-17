@@ -164,34 +164,13 @@ pub fn target_slots(room: u64, shape: &BankShape, charge: &dyn Fn(u64) -> u64) -
         .unwrap_or_else(|never| match never {})
 }
 
-/// The one in-process figure (design §3.2) of a load whose state stores
-/// are `shape`: the state the largest launch the arena admits grows by at
-/// once, `launch_rows` rows in each of its `places` prompt-group places,
-/// sized by the ledger's page rule
-/// (`memory::ledger::LoadShape::state_bytes`). A load prices its room
-/// beside it from its plan on, before it searches or claims
-/// (`memory::ledger::DeviceReading::room_after`).
-///
-/// This is the only derivation: the load computes it once at plan time and
-/// carries the value to its domain, which holds it for its life
-/// (`memory::ledger::Ledger::in_process`). Every input is fixed before any
-/// search or claim, so none can change under it: `shape` is the draft's
-/// state plan, `launch_rows` the service's `max_launch_rows` (set when the
-/// execution is planned and never rewritten), `places` the pass the
-/// assessment holds (`PassLaunches`), which the prepared graphs certify to
-/// be the pass they hold.
-pub fn in_process_bytes(shape: &crate::memory::ledger::LoadShape, launch_rows: usize, places: usize) -> u64 {
-    let rows = (launch_rows as u64).checked_mul(places as u64).expect("a launch's rows fit u64");
-    shape.state_bytes(rows)
-}
-
 /// The experts' slots a load imports its bank `plan` at, `floor` the
 /// import's weights with the bank at its floor: [`import_target`] in the
 /// bank's store at the load's estimate `at_load`
 /// (`memory::ledger::DeviceReading::room_after`), of what those weights
 /// place there beside every claim the store's ledger holds (the
-/// allocations after the import claimed before it), held at most at the
-/// plan's slots.
+/// allocations after the import claimed before it, the load's request slot
+/// among them), held at most at the plan's slots.
 pub fn import_slots(
     at_load: &crate::memory::ledger::LoadEstimate,
     ledgers: &DeviceLedgers,

@@ -17,7 +17,7 @@ pub fn m4_pro() -> HostSample {
         at,
         page_bytes: 16_384,
         total: 51_539_607_552,
-        supply: Supply { free_above_target: 18_506_711_040, clean_cache: 29_273_047_040, cold_reclaimable: 0 },
+        supply: Supply { free_beyond_target: 18_506_711_040, clean_cache: 29_273_047_040, cold_reclaimable: 0 },
         counted: Counted { at, lag: Duration::from_secs(1) },
         cold: 0,
         own_cold: OwnCold::Unobserved,

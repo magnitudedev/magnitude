@@ -97,9 +97,10 @@ impl Ledger {
     /// after an unmonitored idle sleep so what moved while asleep opens a
     /// fresh baseline rather than counting as one active step's rise.
     pub fn read_after(&self, at: Sampled, reading: Reading, after_idle: bool) -> Estimate {
+        let footprints = self.footprints();
         let mut state = self.state();
         if !state.read.is_some_and(|latest| !latest.at.precedes(&at)) {
-            state.read(at, reading, self.store.pressure.take(), after_idle);
+            state.read(&self.store.identity, at, reading, self.store.pressure.take(), after_idle, &footprints);
         }
         state.judged(&self.store.identity)
     }
@@ -155,7 +156,7 @@ impl Ledger {
 
     /// The generation of what the process holds in the store: it moves on
     /// every change of an entry (a claim, a cache holding, an allocation, a
-    /// free, a hand-over), of a value, or of the in-process figure, and
+    /// free, a hand-over) or of a value, and
     /// never on a reading. Equal holdings generations hold the same entries,
     /// so a census of them recomputed only when it moves misses nothing, and
     /// steady decode's readings never recompute it.
@@ -229,8 +230,9 @@ impl Ledger {
     /// none, was never read, or this reading was answered already. Every
     /// response is to new evidence, so asking at every event never repeats
     /// one; whether a shortage still stands between readings is
-    /// [`Self::standing`]'s.
-    pub fn shortage(&self) -> Option<Shortage> {
+    /// [`Self::standing`]'s. Its relief preempts none but `evictable`, the
+    /// requests the owner can evict now.
+    pub fn shortage(&self, evictable: &std::collections::BTreeSet<crate::operation::RequestId>) -> Option<Shortage> {
         let mut state = self.state();
         let estimate = state.estimate()?;
         if state.answered == Some(estimate.at()) {
@@ -238,19 +240,8 @@ impl Ledger {
         }
         state.answered = Some(estimate.at());
         let cause = shortage::cause(&estimate, state.boundary.harmed(), state.boundary.pressed())?;
-        let admitted = !state.state_of.is_empty();
-        Some(shortage::respond(&estimate, cause, &state.preemptible_by_value(), admitted, &state.persistence))
-    }
-
-    /// Yield up to `bytes` of the store's cache now, worth least per byte
-    /// first: the first response to a real shortage. Each holder reads what
-    /// it still holds from its handle's `bytes` and frees the rest, Seismic
-    /// freeing it through the entry. The bytes yielded.
-    pub fn yield_cache(&self, bytes: u64) -> u64 {
-        let mut state = self.state();
-        let yielded = bytes - state.give(bytes, |_| true, None);
-        state.shed_at_reading = state.shed_at_reading.saturating_add(yielded);
-        yielded
+        let relief = state.plan_relief(&self.store.identity, shortage::lacks(&estimate, cause), shortage::allows(cause, evictable));
+        Some(shortage::respond(&estimate, cause, relief, &state.persistence))
     }
 
     /// The bytes `need` takes, by the formulas a claim of it is sized by.
@@ -258,42 +249,26 @@ impl Ledger {
         size(&self.shape, need)
     }
 
-    /// Whether `need` could be held beside every committed claim: refused
-    /// as [`Self::claim`] refuses it.
-    pub fn admit(&self, need: &Need) -> Result<(), Short> {
-        let bytes = size(&self.shape, need);
-        let mut state = self.state();
-        match state.admit(state.reading(&self.store.identity, None), need.kind(), bytes) {
-            Admit::Admit => Ok(()),
-            Admit::Refuse(over) => {
-                state.waiting = true;
-                Err(over.of(&self.store.identity, bytes))
-            }
-        }
-    }
-
-    /// Whether `bytes` more, preempting no sequence, could be held beside
+    /// Whether `bytes` more could be held beside
     /// every committed claim at `held`, a reading of the store a load
     /// holds, or else at the latest: refused as [`Self::claim_at`] refuses
     /// them.
     pub fn covers(&self, held: Option<&Estimate>, bytes: u64) -> Result<(), Short> {
         let state = self.state();
-        match state.covers(state.reading(&self.store.identity, held.map(|held| held.read)), bytes, 0) {
+        match state.covers(state.reading(&self.store.identity, held.map(|held| held.read)), bytes) {
             Admit::Admit => Ok(()),
             Admit::Refuse(over) => Err(over.of(&self.store.identity, bytes)),
         }
     }
 
     /// The store's estimate a load prices at `held`, a reading of the
-    /// store it holds from its start, its in-process figure `in_process`
-    /// not yet held in the store: the reading's OS figures fixed, and every
-    /// holding since it counted, the load's own claims and other loads'
-    /// alike (design §5). Reads no OS figure. The one room a load's plan,
-    /// search and claims read in a store: with nothing held since,
-    /// [`Estimate::room`] of it is the reading's own room less the figure,
-    /// and each claim at the reading ([`Self::claim_at`]) lowers it by
-    /// exactly what it took.
-    pub fn room_after(&self, held: &Estimate, in_process: u64) -> Estimate {
-        self.state().estimate_at(held.read).at_load(in_process)
+    /// store it holds from its start: the reading's OS figures fixed, and
+    /// every holding since it counted, the load's own claims and other
+    /// loads' alike (design §5). Reads no OS figure. The one room a load's
+    /// plan, search and claims read in a store: with nothing held since,
+    /// [`Estimate::room`] of it is the reading's own room, and each claim at
+    /// the reading ([`Self::claim_at`]) lowers it by exactly what it took.
+    pub fn room_after(&self, held: &Estimate) -> Estimate {
+        self.state().estimate_at(held.read)
     }
 }

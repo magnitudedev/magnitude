@@ -4,7 +4,6 @@
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use super::admission::{Admit, Taken};
 use super::state::{EntryId, Pool, State};
 use super::view::Ledger;
 use super::vocabulary::{CommittedKind, Holding, PoolClass};
@@ -195,13 +194,8 @@ impl State {
                 }
             }
             Holding::Committed(kind) => {
-                if let Admit::Refuse(_) = self.covers(at, self.raise(kind, lacks), 0) {
-                    return Err(refused(self));
-                }
-                match self.take(at, kind, lacks).map_err(|_| refused(self))? {
-                    Taken::Held(taken) => self.merge(taken, id),
-                    Taken::Preempting { .. } => unreachable!("an admission without preemptible state preempts none"),
-                }
+                let taken = self.take(at, kind, lacks).map_err(|_| refused(self))?;
+                self.merge(taken, id);
             }
             Holding::Cache(_) => {
                 if self.free_for(at, entry.holding, lacks) < lacks {
@@ -239,7 +233,7 @@ impl State {
         }
         self.allocate(id, allocated);
         self.wire(id, bytes, wiring);
-        self.keep_guarantee(entry.holding, allocated.saturating_sub(entry.bytes));
+        self.keep_guarantee(entry.holding, allocated.saturating_sub(entry.bytes), |_| true);
     }
 
     /// Entry `id`'s holder freed `bytes`: they are neither allocated nor

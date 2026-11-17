@@ -37,6 +37,7 @@ mod in_flight;
 mod input;
 mod ownership;
 mod queue;
+pub use queue::Unchained;
 mod reconcile;
 mod state;
 pub(crate) use state::claimed_through;
@@ -102,12 +103,12 @@ pub enum DomainError {
         growth: u64,
         ceiling: u64,
     },
-    /// A sequence's state rows wait on preempting these sequences, admitted
-    /// after it, the latest first, as the device's ledger names them
-    /// (`Claim::grow`): their bytes are reserved to it. The owner evicts
-    /// them (`release_state`) and provisions again, which completes the
-    /// claim; nothing grew.
-    Preempt(Vec<RequestId>),
+    /// A group of a chain's holder that is not the chain's queued chunk
+    /// (its round was lowered at other rows than the chain planned): the
+    /// chain was released, the holder's state with it, as an eviction's
+    /// (`ExecutorDomain::release_chain`). The holder replays from its
+    /// committed history; nothing else changed.
+    ChainReleased(RequestId),
 }
 
 impl DomainError {
@@ -151,7 +152,7 @@ impl std::fmt::Display for DomainError {
                 f,
                 "state growth of {growth} bytes beside {committed} committed exceeds the {ceiling}-byte state ceiling"
             ),
-            Self::Preempt(sequences) => write!(f, "a claim waits on preempting requests {sequences:?}"),
+            Self::ChainReleased(holder) => write!(f, "request {}'s group is not its chain's queued chunk: the chain was released", holder.0),
         }
     }
 }
@@ -403,6 +404,17 @@ pub enum ReservationLane {
     Vision,
 }
 
+impl ReservationLane {
+    /// The lane `operation` runs on.
+    fn of(operation: &Operation) -> Self {
+        match operation {
+            Operation::Forward { .. } => Self::Target,
+            Operation::Head { .. } => Self::Head,
+            Operation::Encode { .. } => Self::Vision,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DomainRequirements {
     lane: ReservationLane,
@@ -596,15 +608,18 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// What the load allocated as it started that no holding names (its
     /// weights, tables, state and programs' storage): held for the load.
     _recorded: Vec<crate::memory::ledger::Claim>,
-    /// Each resident sequence's committed state rows on the device's
-    /// ledger, taken as it opens, grown as it advances ([`Self::provision`])
-    /// and dropped as it closes or is evicted.
-    state_claims: BTreeMap<RequestId, state::StateClaim>,
-    /// A sequence's state rows, through a row, waiting on the preemption
-    /// the ledger named ([`DomainError::Preempt`]), completed as it
-    /// provisions again and let go with the sequence's state claim.
-    preempting: Option<(RequestId, u64, crate::memory::ledger::Preemption)>,
-    /// The state slabs grown past the load's, on the device's ledger.
+    /// Each resident request's whole state on the device's ledger, reserved
+    /// as it opens ([`Self::open_state`]), its rows drawn within it as it
+    /// advances ([`Self::provision`]) and dropped as it closes or is evicted.
+    state_claims: BTreeMap<RequestId, crate::memory::ledger::Reservation>,
+    /// The priming boundary of the group provisioned last
+    /// ([`Self::provision`]), which reserving it takes ([`Self::reserve`]).
+    boundary: Option<FeatureRef>,
+    /// The load's request slot: the served context's whole request, which
+    /// its fit counted, held for the domain's life. One request at a time
+    /// reserves from it (`memory::ledger::Ledger::reserve`).
+    request_slot: crate::memory::ledger::Claim,
+    /// The state slabs and the holdings over them on the device's ledger.
     state_slabs: state::StateSlabs,
     domain: ResourceDomain,
     /// The device's memory reading, carried over from the load's startup.
@@ -701,9 +716,6 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// owner takes it ([`Self::take_running_release`]): the storage it
     /// resizes.
     running_release: Option<crate::planning::BankTier>,
-    /// The load's one in-process figure, held on the store its state lies
-    /// in for the domain's life (`memory::ledger::Ledger::in_process`).
-    _in_process: crate::memory::ledger::InProcess,
     /// The thread it is made on owns its memory for its life: an owner's
     /// change of the scope begun on another panics.
     _owner: crate::memory::ledger::Owner,
@@ -1195,7 +1207,9 @@ struct StoreAnswer<'d> {
     ledger: &'d crate::memory::ledger::Ledger,
     generation: u64,
     shortage: Option<crate::memory::shortage::Shortage>,
-    yielded: u64,
+    /// What its shortage's relief left the owner: the cache it shed, which
+    /// each holder frees at the next boundary, and the requests to preempt.
+    owed: crate::memory::ledger::Owed,
 }
 
 impl<'d> MemoryProbe<'d> {
@@ -1206,46 +1220,50 @@ impl<'d> MemoryProbe<'d> {
 
     /// The one answer to a reading (design §3.3): each store's real
     /// shortage at it judged once (`memory::ledger::Ledger::shortage`), its
-    /// first step taken at once (its cache yields in rank order,
-    /// `Ledger::yield_cache`, which each holder frees at the next boundary),
-    /// and the rest of every store's response merged into what the owner
+    /// relief plan carried out whole at once (`Ledger::execute`: its cache
+    /// yields, each holder freeing it at the next boundary), and the rest
+    /// of every store's response, its preemptions among it, merged into
+    /// what the owner
     /// owes, which it carries out in order at its next reading
     /// ([`ExecutorDomain::read_memory`]). Each store's generation at the
     /// reading is kept for the resizes begun on it. Whichever event read,
     /// a flight boundary or a pressure event beside a running chain, this
-    /// is the one consumer of the shortage's answer.
-    fn answer(&self) -> Vec<StoreAnswer<'d>> {
+    /// is the one consumer of the shortage's answer. Its plans preempt none
+    /// but `evictable`, the requests the owner can evict now, so the owner
+    /// carries out every plan it is owed.
+    fn answer(&self, evictable: &std::collections::BTreeSet<RequestId>) -> Vec<StoreAnswer<'d>> {
         let answers = stores(self.ledgers)
             .map(|ledger| {
                 // The reading's generation, before its response moves the
                 // ledger: what a resize that follows its target names.
                 let generation = ledger.generation();
-                let shortage = ledger.shortage();
-                let yielded = shortage.as_ref().map_or(0, |shortage| ledger.yield_cache(shortage.response.yields));
-                StoreAnswer { ledger, generation, shortage, yielded }
+                let mut shortage = ledger.shortage(evictable);
+                // A plan of cache alone is carried out at once; one naming
+                // requests, each evictable now, is the owner's.
+                let owed = match shortage.as_mut().and_then(|shortage| shortage.response.relief.take_if(|plan| plan.preempt().is_empty())) {
+                    Some(plan) => ledger.execute(plan),
+                    None => crate::memory::ledger::Owed::default(),
+                };
+                StoreAnswer { ledger, generation, shortage, owed }
             })
             .collect::<Vec<_>>();
         let mut answered = self.answered.borrow_mut();
         answered.generations = answers.iter().map(|answer| (answer.ledger.store(), answer.generation)).collect();
-        for StoreAnswer { ledger, generation, shortage, yielded } in &answers {
+        for StoreAnswer { ledger, generation, shortage, owed: relieved } in &answers {
             let Some(shortage) = shortage else { continue };
             tracing::info!(
                 store = ?ledger.store(),
                 generation,
                 cause = ?shortage.cause,
-                yielded,
+                yielded = relieved.yielded,
                 admission_waits = shortage.response.admission_waits,
-                preempt = shortage.response.preempt.len(),
+                preempt = shortage.response.relief.as_ref().map_or(0, |plan| plan.preempt().len()),
                 unload = shortage.response.unload,
                 "a real memory shortage"
             );
             let owed = answered.owed.get_or_insert_with(MemoryResponse::default);
             owed.admission_waits |= shortage.response.admission_waits;
-            for &sequence in &shortage.response.preempt {
-                if !owed.preempt.contains(&sequence) {
-                    owed.preempt.push(sequence);
-                }
-            }
+            owed.relief.extend(shortage.response.relief.clone());
             owed.unload |= shortage.response.unload;
         }
         answers
@@ -1300,7 +1318,9 @@ impl<'d> MemoryProbe<'d> {
         let ledger = self.ledgers.of(tier);
         let bank_cache = || ledger.estimate().cache_of(crate::memory::ledger::CacheKind::Bank);
         let before = bank_cache();
-        drop(self.answer());
+        // Beside a running chain the owner evicts nothing: the answer's
+        // relief preempts no request.
+        drop(self.answer(&std::collections::BTreeSet::new()));
         match before - bank_cache() {
             0 => None,
             bytes => Some(RunningPressure { bytes }),
@@ -1349,11 +1369,10 @@ pub struct SizingTerms {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SizingFigures {
     pub budget: u64,
-    pub supply: u64,
+    pub supply: i64,
     pub others: u64,
     pub committed: u64,
     pub other_cache: u64,
-    pub in_process: u64,
     pub guarantee: u64,
     pub cap: Option<u64>,
 }
@@ -1364,11 +1383,10 @@ pub struct SizingFigures {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SizingTerm {
     Budget { from: u64, to: u64 },
-    Supply { from: u64, to: u64 },
+    Supply { from: i64, to: i64 },
     Others { from: u64, to: u64 },
     Committed { from: u64, to: u64 },
     OtherCache { from: u64, to: u64 },
-    InProcess { from: u64, to: u64 },
     Guarantee { from: u64, to: u64 },
     Cap { from: Option<u64>, to: Option<u64> },
 }
@@ -1382,7 +1400,6 @@ impl SizingTerm {
             Self::Others { .. } => "others",
             Self::Committed { .. } => "committed",
             Self::OtherCache { .. } => "other_cache",
-            Self::InProcess { .. } => "in_process",
             Self::Guarantee { .. } => "guarantee",
             Self::Cap { .. } => "cap",
         }
@@ -1394,7 +1411,7 @@ impl SizingTerms {
     /// (`floor + (budget − committed − other cache − guarantee) / slot`,
     /// within the boundary): of the target's own terms, the one that
     /// moved most, named by what moved it, supply or others within the
-    /// budget and the in-process figure within the guarantee; the boundary
+    /// budget; the boundary
     /// where only it moved. None where no term moved: the target moved
     /// with the bank's own price, not with memory.
     pub fn term(&self, before: &Self) -> Option<&'static str> {
@@ -1415,7 +1432,6 @@ impl SizingTerms {
         Some(match largest {
             Some("budget") if has("supply") => "supply",
             Some("budget") if has("others") => "others",
-            Some("guarantee") if has("in_process") => "in_process",
             Some(field) => field,
             None if has("cap") => "cap",
             None => return None,
@@ -1426,16 +1442,15 @@ impl SizingTerms {
     /// begun on these to the event that moved them.
     pub fn moved(&self, before: &Self) -> Vec<SizingTerm> {
         let (from, to) = (before.figures, self.figures);
+        let budget = (from.budget != to.budget).then_some(SizingTerm::Budget { from: from.budget, to: to.budget });
+        let supply = (from.supply != to.supply).then_some(SizingTerm::Supply { from: from.supply, to: to.supply });
         let terms = [
-            (from.budget, to.budget, SizingTerm::Budget { from: from.budget, to: to.budget }),
-            (from.supply, to.supply, SizingTerm::Supply { from: from.supply, to: to.supply }),
             (from.others, to.others, SizingTerm::Others { from: from.others, to: to.others }),
             (from.committed, to.committed, SizingTerm::Committed { from: from.committed, to: to.committed }),
             (from.other_cache, to.other_cache, SizingTerm::OtherCache { from: from.other_cache, to: to.other_cache }),
-            (from.in_process, to.in_process, SizingTerm::InProcess { from: from.in_process, to: to.in_process }),
             (from.guarantee, to.guarantee, SizingTerm::Guarantee { from: from.guarantee, to: to.guarantee }),
         ];
-        let mut moved = terms.into_iter().filter(|(from, to, _)| from != to).map(|(.., term)| term).collect::<Vec<_>>();
+        let mut moved = budget.into_iter().chain(supply).chain(terms.into_iter().filter(|(from, to, _)| from != to).map(|(.., term)| term)).collect::<Vec<_>>();
         if from.cap != to.cap {
             moved.push(SizingTerm::Cap { from: from.cap, to: to.cap });
         }
@@ -1449,12 +1464,16 @@ impl SizingTerms {
 /// the rest, in order.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MemoryResponse {
-    /// New work waits: the bank sits at its floor.
+    /// New work waits: committed memory or others' rise is short, or no
+    /// relief covers the shortage.
     pub admission_waits: bool,
-    /// The sequences to preempt, the lowest value first.
-    pub preempt: Vec<RequestId>,
-    /// The shortage is real and persists with nothing of ours pending: the
-    /// model unloads.
+    /// Relief naming requests to preempt, the lowest value first: the
+    /// owner carries each out whole, its cache shed and its requests
+    /// evicted, only where it can evict every one of them now
+    /// (`ExecutorDomain::execute_relief`); otherwise none of it.
+    pub relief: Vec<crate::memory::ledger::ReliefPlan>,
+    /// A floor shortfall persists with nothing to give and nothing of ours
+    /// pending: the model unloads.
     pub unload: bool,
 }
 
@@ -1616,7 +1635,7 @@ impl ExecutorDomain<NativeFamily> {
         head_state: Option<StoreBindings>,
         mut recorded: crate::memory::ledger::Recorded,
         mut constants: crate::memory::ledger::Held,
-        in_process: crate::memory::ledger::InProcess,
+        request_slot: crate::memory::ledger::Claim,
     ) -> Result<(Self, StateBindings), DomainError> {
         // A model's drafter (its draft head or separate draft) is enabled
         // only when its method drafts.
@@ -1649,7 +1668,7 @@ impl ExecutorDomain<NativeFamily> {
             vision_loader,
             family,
             recorded,
-            in_process,
+            request_slot,
         )
     }
 }
@@ -1707,16 +1726,18 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// (`memory::ledger::Ledger::shortage`), once per reading: a shortage
     /// already answered is not answered again. The first step of each
     /// store's response is taken at once: its cache yields in rank order
-    /// (`Ledger::yield_cache`), which each holder frees at this boundary.
+    /// (`Ledger::execute`, the relief plan carried out whole), which each holder frees at this boundary.
     /// What is left of the response, every store's in one, is returned for
     /// the owner to carry out in order; none where no store is short anew.
     /// Where a change off the owner's thread stood beside the sample,
     /// nothing is read and nothing answered ([`MemoryReading::Beside`]).
+    /// The response preempts none but `evictable`, the requests the owner
+    /// can evict now.
     /// Each store's reading is traced as one `memory read` event at
     /// [`MEMORY_TRACE`], of the one estimate the judgment reads, and each
     /// bank holding in the store with what it holds and its derived target
     /// (`experts::derived::derive`, as the bank follows it).
-    pub fn read_memory(&self, after_idle: bool) -> Result<MemoryReading, DomainError> {
+    pub fn read_memory(&self, after_idle: bool, evictable: &std::collections::BTreeSet<RequestId>) -> Result<MemoryReading, DomainError> {
         let began = Instant::now();
         let probe = self.memory_probe();
         if !probe.read(self.family.expert_bank(), after_idle) {
@@ -1730,7 +1751,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             (true, Some(bank)) => self.derived_targets(bank)?,
             _ => Vec::new(),
         };
-        for StoreAnswer { ledger, generation, shortage, yielded } in probe.answer() {
+        for StoreAnswer { ledger, generation, shortage, owed } in probe.answer(evictable) {
             if !traced {
                 continue;
             }
@@ -1762,11 +1783,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 wired_limit = estimate.wired_limit().unwrap_or(0),
                 wire_count = estimate.wire_count().unwrap_or(0),
                 allocated = estimate.allocated(),
-                in_process = estimate.in_process(),
                 guarantee = estimate.guarantee(),
                 pending = estimate.pending(),
                 short = shortage.is_some(),
-                yielded,
+                yielded = owed.yielded,
                 bank_slots = experts.map_or(0, |target| target.held),
                 bank_target = experts.map_or(0, |target| target.target),
                 // The least the bank shrinks by; zero where no bank holds
@@ -1864,7 +1884,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 others: estimate.others(),
                 committed: estimate.committed(),
                 other_cache: estimate.cache() - bank,
-                in_process: estimate.in_process(),
                 guarantee: estimate.guarantee(),
                 cap: estimate.cap(),
             },
@@ -2042,11 +2061,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let first = operations
             .first()
             .ok_or_else(|| DomainError::invariant("empty reservation"))?;
-        let lane = match first {
-            Operation::Forward { .. } => ReservationLane::Target,
-            Operation::Head { .. } => ReservationLane::Head,
-            Operation::Encode { .. } => ReservationLane::Vision,
-        };
+        let lane = ReservationLane::of(first);
         if operations.iter().any(|operation| {
             !matches!(
                 (lane, operation),
@@ -2495,8 +2510,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// the group claims it, otherwise its provisioned state, advances and
     /// launch leases.
     ///
-    /// Each allocation it makes is claimed first by the device's ledgers
-    /// as they read last (`ExecutorDomain::claim_growth`).
+    /// It allocates nothing of its own: every allocation the group needs is
+    /// provisioning's ([`Self::provision`]), so after the group was
+    /// provisioned, provisioning it again here grows nothing and no memory
+    /// refusal reaches a reservation.
     pub fn reserve(
         &mut self,
         bindings: &mut StateBindings,
@@ -2512,18 +2529,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 resources: ReservedResources::Target(TargetGraphReservation::Claim(slots)),
             });
         }
-        // Commit the selected group's numerical backing before a lazy
-        // component import. Provisioning admits the physical growth peak
-        // by the device's ledgers before any backing allocation. The owner applied
-        // any state ceiling when it selected the group.
+        // The owner applied any state ceiling when it provisioned the group.
         self.provision(bindings, operations, None)?;
         // Provisioning may relocate a shared tail into a fresh page. Recompute
         // row demand against that layout: the next append can now fit in place.
         let requirements = self.requirements(operations)?;
-        self.bind_component(requirements.lane)?;
-        if requirements.priming_banks != 0 {
-            self.bind_component(ReservationLane::Head)?;
-        }
         self.can_reserve(&requirements)
             .map_err(DomainError::Capacity)?;
         let reads_target = requirements.lane == ReservationLane::Head && self.head_reads_target();
@@ -2532,19 +2542,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 "{detail} changed after availability check: {error}"
             ))
         };
-        let boundary = if operations.iter().any(|op| {
-            matches!(
-                op,
-                Operation::Forward {
-                    prime: Some(Priming { boundary: true, .. }),
-                    ..
-                }
-            )
-        }) {
-            Some(self.allocate_boundary()?)
-        } else {
-            None
-        };
+        let boundary = self.boundary.take();
         let resources = match requirements.lane {
             ReservationLane::Target => {
                 let graph = self.resources.target_graph();
@@ -2729,8 +2727,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         vision_loader: Option<ComponentLoader<ResidentVision>>,
         family: F,
         mut recorded: crate::memory::ledger::Recorded,
-        in_process: crate::memory::ledger::InProcess,
+        request_slot: crate::memory::ledger::Claim,
     ) -> Result<(Self, StateBindings), DomainError> {
+        assert_eq!(
+            request_slot.kind(),
+            crate::memory::ledger::CommittedKind::RequestSlot,
+            "invariant violated: a domain's request slot is a {:?} claim",
+            request_slot.kind()
+        );
         let owner = resources.ledgers().changes().own();
         // The load's last allocation is behind it, and the OS has since
         // refilled the free pages its allocations took from the file cache:
@@ -2761,10 +2765,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             arena,
             _recorded: recorded.into_claims(),
             state_claims: BTreeMap::new(),
-            preempting: None,
-            state_slabs: state::StateSlabs::new(
-                target_state.committed_bytes() + head_state.as_ref().map_or(0, |state| state.committed_bytes()),
-            ),
+            boundary: None,
+            request_slot,
+            state_slabs: state::StateSlabs::default(),
             domain: ResourceDomain::new(id, memory.device().clone()),
             memory: RefCell::new(memory),
             target_store: Rc::clone(&target_state),
@@ -2798,7 +2801,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             resize_held: ResizeHeld::default(),
             shrink_step: false,
             running_release: None,
-            _in_process: in_process,
             _owner: owner,
             teardown: Default::default(),
         };

@@ -179,12 +179,16 @@ pub struct HostSample {
 /// bytes, in its three parts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Supply {
-    /// Free pages above the floor the OS keeps free by reclaiming: macOS
-    /// `vm.page_free_count + vm.page_purgeable_count` above
-    /// `vm.vm_page_free_target`; Linux `MemFree` above the zones' low
-    /// watermarks (`/proc/zoneinfo`); Windows the free and zero lists. In a
-    /// binding limit, the limit less its usage.
-    pub free_above_target: u64,
+    /// Free pages less the floor the OS keeps free by reclaiming, negative
+    /// where the OS has fallen below that floor (pages taken of its reserve
+    /// that its reclaim has not yet refilled), so a fall of free memory
+    /// shows whole, above the floor or below it: macOS
+    /// `vm.page_free_count + vm.page_purgeable_count` less
+    /// `vm.vm_page_free_target`; Linux `MemFree` less the zones' low
+    /// watermarks (`/proc/zoneinfo`); Windows the free and zero lists, the
+    /// OS keeping no floor of them. In a binding limit, the limit less its
+    /// usage.
+    pub free_beyond_target: i64,
     /// File pages no one has dirtied, which the OS drops without writing:
     /// macOS file-backed pages (`external_page_count` of a
     /// `host_statistics64` snapshot; macOS counts no dirty file page) above
@@ -206,10 +210,23 @@ pub struct Supply {
 }
 
 impl Supply {
-    /// The three parts together.
-    pub fn total(&self) -> u64 {
-        self.free_above_target.saturating_add(self.clean_cache).saturating_add(self.cold_reclaimable)
+    /// The three parts together, signed: below zero where the OS is short
+    /// of its own floor by more than its cache and cold pages give.
+    pub fn balance(&self) -> i64 {
+        let rest = i64::try_from(self.clean_cache.saturating_add(self.cold_reclaimable)).expect("a store's bytes fit i64");
+        self.free_beyond_target.saturating_add(rest)
     }
+
+    /// What a taker can have now: the balance, none where it is short.
+    pub fn total(&self) -> u64 {
+        self.balance().max(0).unsigned_abs()
+    }
+}
+
+/// `free` less `floor`, signed: what [`Supply::free_beyond_target`] holds.
+pub(crate) fn beyond(free: u64, floor: u64) -> i64 {
+    let signed = |bytes: u64| i64::try_from(bytes).expect("a store's bytes fit i64");
+    signed(free) - signed(floor)
 }
 
 /// When a sample's counters show the machine, by the OS's mechanism that
@@ -417,7 +434,7 @@ pub(crate) fn binding(host: Scope, limits: &[ProcessMemoryLimit]) -> Binding {
     limits.iter().map(|limit| limit.scope(host.total)).enumerate().fold(
         Binding { scope: host, supplier: None },
         |least, (index, bound)| {
-            let (supply, supplier) = match bound.supply.total() < least.scope.supply.total() {
+            let (supply, supplier) = match bound.supply.balance() < least.scope.supply.balance() {
                 true => (bound.supply, Some(index)),
                 false => (least.scope.supply, least.supplier),
             };
@@ -465,21 +482,17 @@ pub(crate) struct ProcessMemoryLimit {
 
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 impl ProcessMemoryLimit {
-    /// What the limit has left: the limit less the usage the OS cannot
-    /// reclaim within it.
-    pub(crate) fn remaining_bytes(&self) -> u64 {
-        self.limit_bytes.saturating_sub(self.used_bytes.saturating_sub(self.reclaimable_bytes))
-    }
-
-    /// The limit as a scope of host RAM of `capacity` bytes: its free room
-    /// and the clean file cache within it, no more than it has left.
+    /// The limit as a scope of host RAM of `capacity` bytes: its room
+    /// beyond its usage, negative where the usage overran it (cgroup v2's
+    /// `memory.high` lets it, reclaiming and throttling past it), and the
+    /// clean file cache within it, never more than its usage (the counters
+    /// are read apart), so its supply never exceeds the limit.
     fn scope(&self, capacity: u64) -> Scope {
-        let free_above_target = self.limit_bytes.saturating_sub(self.used_bytes);
         Scope {
             total: self.limit_bytes.min(capacity),
             supply: Supply {
-                free_above_target,
-                clean_cache: self.remaining_bytes() - free_above_target,
+                free_beyond_target: beyond(self.limit_bytes, self.used_bytes),
+                clean_cache: self.reclaimable_bytes.min(self.used_bytes),
                 cold_reclaimable: 0,
             },
         }
@@ -519,7 +532,7 @@ mod tests {
     }
 
     fn host(total: u64, free: u64, clean: u64, cold: u64) -> Scope {
-        Scope { total, supply: Supply { free_above_target: free, clean_cache: clean, cold_reclaimable: cold } }
+        Scope { total, supply: Supply { free_beyond_target: beyond(free, 0), clean_cache: clean, cold_reclaimable: cold } }
     }
 
     /// A cgroup's file cache is supply within it, all of it the kernel can
@@ -558,6 +571,17 @@ mod tests {
             [Some(0), Some(0), None, None, None],
             "the scope whose supply binds is named with it"
         );
+    }
+
+    /// A cgroup v2 usage past its `memory.high` is an overrun its supply
+    /// shows, less its clean cache, not saturated to none: it binds below
+    /// a host with room.
+    #[test]
+    fn a_cgroups_overrun_is_negative_supply() {
+        let overrun = binding(host(64 * GB, 40 * GB, 0, 0), &[cgroup(32 * GB, 35 * GB, GB)]);
+        let supply = Supply { free_beyond_target: -3 * GB as i64, clean_cache: GB, cold_reclaimable: 0 };
+        assert_eq!(overrun, Binding { scope: Scope { total: 32 * GB, supply }, supplier: Some(0) });
+        assert_eq!(supply.balance(), -2 * GB as i64);
     }
 
     /// A 32-bit count read across its wrap keeps rising.

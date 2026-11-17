@@ -337,7 +337,7 @@ fn mtp_head_charge_releases_and_reloads_after_idle() {
         domain
             .install_input(request, PreparedModelInput::continuation_only())
             .unwrap();
-        domain.open_state(&mut bindings, request, None, 0).unwrap();
+        domain.open_served(&mut bindings, request, None).unwrap();
         let head = Operation::Head {
             request,
             phase: magnitude_executor::HeadPhase::Priming { draft_from: 1 },

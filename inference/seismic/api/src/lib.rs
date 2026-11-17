@@ -266,7 +266,7 @@ pub use seismic_runtime::native::trace::{
     TracedLaunchGeometry, TracedQueueSubmission, TracedSubmission,
 };
 pub use seismic_runtime::native::tune::{
-    admit, governing_ratio, reselect, return_freed_pages, BuildError, Configuration,
+    admit, governing_ratio, process_footprint, reselect, return_freed_pages, BuildError, Configuration, ProcessFootprint, ProcessId,
     ConfigurationRecord, Constraint, CoverageCheck, CoverageOutcome, DeclaredParameter, Difference,
     Exclusion, FormationRecord, Formed, GoverningStep, Grounded, Narrowed, NumericalObservation,
     NumericalRequirement, Outcome, Performed, PieceMemory, PointInputs, PointMeasurement,

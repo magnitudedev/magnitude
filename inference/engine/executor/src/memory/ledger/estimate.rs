@@ -16,7 +16,7 @@ pub(super) struct Read {
     pub(super) at: Sampled,
     /// The store's supply, others' cold pages in it only once harm is
     /// judged ([`Boundary::judges`]).
-    supply: u64,
+    supply: i64,
     /// What the process had allocated as the sample shows it.
     visible: u64,
     /// Of `visible`, the pageable bytes the OS reports holding outside RAM,
@@ -26,6 +26,10 @@ pub(super) struct Read {
     /// Of `visible` beyond `nonresident`, what the store's use does not hold
     /// and the OS did not report: [`Estimate::unobserved_resident`].
     unobserved: u64,
+    /// What the grants' processes hold of their grants
+    /// (`State::credited`): the process's own in the store's use, held by
+    /// the grants' committed bytes, never allocatable by this process.
+    credited: u64,
     /// Others' memory: what the store uses beyond the supply and the
     /// process's own bytes in it as the sample shows them.
     others: u64,
@@ -54,9 +58,10 @@ pub(super) struct Read {
 
 impl Read {
     /// What the store's use held of the process's bytes at the reading:
-    /// those the sample shows, less those out of RAM, reported or not.
+    /// those the sample shows, less those out of RAM, reported or not, and
+    /// what its grants' processes hold of their grants.
     fn in_use(&self) -> u64 {
-        self.visible - self.nonresident - self.unobserved
+        self.visible - self.nonresident - self.unobserved + self.credited
     }
 }
 
@@ -79,7 +84,6 @@ pub struct Estimate {
     /// the bank's slots grow into, each pool holding its own class
     /// (`PoolClass`).
     bank_spare: u64,
-    in_process: u64,
     /// A change of the process's no reading shows yet.
     pending: bool,
     /// The store's readings so far with some of the process's bytes
@@ -96,13 +100,6 @@ pub struct Estimate {
 }
 
 impl Estimate {
-    /// This estimate as a load whose in-process figure is `in_process` will
-    /// find it once loaded and serving: its figure in the guarantee.
-    pub(super) fn at_load(mut self, in_process: u64) -> Self {
-        self.in_process = self.in_process.checked_add(in_process).expect("a store's in-process bytes fit u64");
-        self
-    }
-
     /// The instant of the reading it estimates.
     pub fn at(&self) -> Sampled {
         self.read.at
@@ -136,6 +133,12 @@ impl Estimate {
         self.committed + self.cache
     }
 
+    /// What the process holds now in the store's room: its entries, and
+    /// what cache shed to a shortage still releases.
+    pub(super) fn held_now(&self) -> u64 {
+        self.held().saturating_add(self.shed)
+    }
+
     /// Bytes the process allocated: of what it holds, and what cache
     /// yielded that its holders have not freed yet.
     pub fn allocated(&self) -> u64 {
@@ -148,9 +151,11 @@ impl Estimate {
         self.releasing
     }
 
-    /// The store's supply at the reading (§4.2): free above the OS's
-    /// target, clean cache and, once harm is judged, cold reclaimable pages.
-    pub fn supply(&self) -> u64 {
+    /// The store's supply at the reading (§4.2): free memory less the OS's
+    /// target, clean cache and, once harm is judged, cold reclaimable pages;
+    /// below zero where the OS has fallen below its target by more than the
+    /// rest gives.
+    pub fn supply(&self) -> i64 {
         self.read.supply
     }
 
@@ -226,7 +231,7 @@ impl Estimate {
     /// back only into the supply), the grant the wired ceiling's where one
     /// bounds the store (§4.3).
     pub fn budget(&self) -> u64 {
-        let room = self.read.in_use().saturating_add(self.read.supply);
+        let room = u64::try_from((i128::from(self.read.in_use()) + i128::from(self.read.supply)).max(0)).expect("a store's bytes fit u64");
         self.read.grant.map_or(room, |grant| grant.min(room))
     }
 
@@ -242,19 +247,16 @@ impl Estimate {
     /// releasing bytes included. A claim that took cache in process
     /// allocates those bytes only once their holder freed them.
     pub fn allocatable(&self) -> u64 {
-        self.budget().saturating_sub(self.allocated)
-    }
-
-    /// The loads' in-process figures in the store (§3.2).
-    pub fn in_process(&self) -> u64 {
-        self.in_process
+        self.budget().saturating_sub(self.allocated.saturating_add(self.read.credited))
     }
 
     /// The speed guarantee: free room the bank's target leaves for growth
-    /// that arrives within one reading: `in_process` and others' rise since
-    /// the reading before.
+    /// that arrives within one reading, others' rise since the reading
+    /// before. Nothing of the process's own grows unreserved: a request's
+    /// rows draw within its reservation ([`Reservation`]), and a grant's
+    /// process's growth is credited against the grant.
     pub fn guarantee(&self) -> u64 {
-        self.in_process.saturating_add(self.read.rise)
+        self.read.rise
     }
 
     /// What the process holds past the budget less the guarantee: the
@@ -285,9 +287,9 @@ impl Estimate {
     /// memory, every other cache and the guarantee; within B where it
     /// stands; and no more than it holds where growth is not admissible
     /// (a step's window open, or no baseline yet to judge harm by). Steady
-    /// decode moves none of it: its state growth is held once, by the
-    /// in-process term it draws down (`State::in_process_left`), and
-    /// others' rise counts only where attributed to them. What moves it
+    /// decode moves none of it: its state growth draws within its request's
+    /// reservation, and others' rise counts only where attributed to them.
+    /// What moves it
     /// within a block (others' jitter) the bank keeps
     /// (`experts::derived::held_target`).
     /// The room the store leaves the bank and its records pool's spare
@@ -326,34 +328,17 @@ impl State {
     pub(super) fn estimate_at(&self, read: Read) -> Estimate {
         Estimate {
             read,
-            committed: self.committed - self.floor.min(self.state_total),
+            committed: self.committed,
             cache: self.cache,
             allocated: self.allocated,
             releasing: self.releasing,
             shed: self.releasing - self.taken,
             cache_of: self.cache_of,
             bank_spare: self.spare_of(super::vocabulary::PoolClass::Records),
-            in_process: self.in_process_left(),
             pending: self.journal.pending(),
             unobserved_readings: self.unobserved_readings,
             accounting_violations: self.accounting_violations,
             unwired_readings: self.unwired_readings,
-        }
-    }
-
-    /// The in-process term of the guarantee (§3.2): none with no sequence
-    /// admitted, as nothing can grow in process then (a load idle under a
-    /// squeeze refuses new work, [`Self::admit`], and never unloads for
-    /// growth that cannot come); while sequences are admitted, the loads'
-    /// figures less the state they hold beyond the state floor. Decode's
-    /// state growth is the growth the figure guarantees room for, so it is
-    /// held once: as it is claimed, page by page, the committed state rises
-    /// by what the term falls, and neither the target nor a shortage moves
-    /// until the state passes the figure.
-    fn in_process_left(&self) -> u64 {
-        match self.state_of.is_empty() {
-            true => 0,
-            false => self.in_process.saturating_sub(self.state_total.saturating_sub(self.floor)),
         }
     }
 
@@ -378,11 +363,11 @@ impl State {
 
     /// Fold in `reading`, sampled at `at` (§4.1-4.3), `events`, the OS's
     /// pressure events in the store no reading took yet, and `after_idle`,
-    /// whether the store had no readings across an unmonitored idle sleep.
-    pub(super) fn read(&mut self, at: Sampled, reading: Reading, events: u64, after_idle: bool) {
+    /// whether the store had no readings across an unmonitored idle sleep;
+    /// each grant's process's footprint read from `footprints`.
+    pub(super) fn read(&mut self, store: &seismic::StoreIdentity, at: Sampled, reading: Reading, events: u64, after_idle: bool, footprints: &super::grant::Footprinted) {
         self.readings += 1;
         self.waiting = false;
-        self.shed_at_reading = 0;
         let settled = after_idle && events == 0;
         let lag = reading.lag();
         // The live figures show the machine at the sample's instant; the
@@ -413,7 +398,8 @@ impl State {
         // Others' cold pages are supply by the judgment of the readings
         // before this one: the boundary folds this reading below, with the
         // room the process's bytes in use leave, which the supply sets.
-        let supply = figures.free_above_target + reading.clean_cache_supply() + self.cold_supply(&reading, figures);
+        let rest = i64::try_from(reading.clean_cache_supply() + self.cold_supply(&reading, figures)).expect("a store's bytes fit i64");
+        let supply = figures.free_beyond_target + rest;
         // What the store uses beyond its supply is others' and the
         // process's own bytes in RAM. What its use does not hold of
         // `resident` is the process's bytes out of RAM that the OS did not
@@ -428,7 +414,9 @@ impl State {
         // logged. It stays a count, never a panic: a driver's charge or a
         // page the OS has not yet faulted in may produce it, and a budget
         // lowered by it is the safe side.
-        let used = reading.total() - supply;
+        // A supply below zero is the OS below its target: others' (or the
+        // process's) growth it has not yet reclaimed for, used all the same.
+        let used = u64::try_from(i128::from(reading.total()) - i128::from(supply)).expect("a store's use is no less than none");
         let unobserved = resident.saturating_sub(used);
         if unobserved > 0 {
             match reclaimed.is_some_and(|own| own.exact) {
@@ -445,7 +433,11 @@ impl State {
                 false => self.unobserved_readings += 1,
             }
         }
-        let in_use = resident - unobserved;
+        // A grant's process's memory is the grant's, within its bytes: its
+        // growth is the process's own in the store's use, never others'
+        // (none where its footprint is unobserved).
+        let credited = self.credited(store, footprints).min(used.saturating_sub(resident - unobserved));
+        let in_use = resident - unobserved + credited;
         // The OS's compressed store holds the process's compressed pages in
         // RAM, in what the store uses and in no byte of `in_use`: its
         // figure is an estimate at the compressor's machine-wide ratio, so
@@ -457,7 +449,7 @@ impl State {
         }
         if let Some(paging) = reading.paging() {
             let room = in_use.saturating_add(figures.total());
-            self.boundary.observe(Observed { paging, held: counted.allocated, live: visible.allocated, room, unit: self.unit(), events });
+            self.boundary.observe(Observed { paging, held: counted.allocated, live: visible.allocated, room, unit: self.unit(), events, committed: self.committed });
         }
         // Others' rise counts only where it is attributed to them, between
         // readings that show every change of the process's: their harm, or a
@@ -523,10 +515,13 @@ impl State {
         }
         let paged = reading.paging().is_some();
         let (cap, grows) = (self.boundary.cap(), !paged || self.boundary.admits_growth());
-        self.read = Some(Read { at, supply, visible: visible.allocated, nonresident, unobserved, others, rise, grant, ceiling: reading.ceiling(), unwired, lag, shown, cap, grows });
+        self.read = Some(Read { at, supply, visible: visible.allocated, nonresident, unobserved, credited, others, rise, grant, ceiling: reading.ceiling(), unwired, lag, shown, cap, grows });
         let estimate = self.estimate().expect("a store just read is estimated");
         let cause = shortage::cause(&estimate, self.boundary.harmed(), self.boundary.pressed());
-        self.persistence.observe(at, cause);
+        // Only a floor shortfall unloads: its persistence alone is kept,
+        // so a rise, harm or pressure that stood before it never makes it
+        // unload at once.
+        self.persistence.observe(at, cause.filter(|cause| matches!(cause, shortage::Cause::FloorShort { .. })));
     }
 
     /// The cold pages of `reading` that are supply (§4.2): none on host RAM
