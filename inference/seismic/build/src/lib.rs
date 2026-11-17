@@ -2024,15 +2024,18 @@ mod internals {
         let refuse = |reason: String| BuildError::CpuNative { path: cpu.path.clone(), reason };
         let nat = |expression: &seismic_lang::checked::NativeNatExpr| cpu_nat(expression).ok_or_else(|| refuse(format!("a formation of `{}` reads an element or the device in its shape", entry.name)));
         let kernel = &definition.launches[formation.launch as usize].kernel;
-        let mut rows = Vec::new();
+        // Each operand's source rows and groups: it forms `groups` runs of
+        // each source row, so `sources * groups` rows (group-major), which
+        // the launch's grid and the operand's buffers hold.
+        let mut shapes = Vec::new();
         for operand in &formation.operands {
-            rows.push(format!("({} as usize)", nat(&operand.rows)?));
+            shapes.push((format!("({} as usize)", nat(&operand.rows)?), format!("({} as usize)", nat(&operand.groups)?)));
         }
         out.push_str(&format!(
             "    #[inline(always)]\n    fn {kernel}<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {{\n      use lib::projection::projection as operator;\n      let total = {};\n      let mut first = 0usize;\n",
-            rows.join(" + ")
+            shapes.iter().map(|(sources, groups)| format!("{sources} * {groups}")).collect::<Vec<_>>().join(" + ")
         ));
-        for (operand, rows) in formation.operands.iter().zip(&rows) {
+        for (operand, (sources, groups)) in formation.operands.iter().zip(&shapes) {
             let formed = cpu_condition(&operand.formed).ok_or_else(|| refuse(format!("a formation of `{}` reads an element or the device in `formed`", entry.name)))?;
             let tiles = cpu_condition(&operand.tiles).ok_or_else(|| refuse(format!("a formation of `{}` reads an element or the device in `tiles`", entry.name)))?;
             let weight_binds = operand
@@ -2048,9 +2051,8 @@ mod internals {
                 .join(", ");
             let scratch = |ordinal: u32| ident(&definition.scratch[ordinal as usize].name).to_lowercase();
             out.push_str(&format!(
-                "      {{\n        let (rows, width, groups) = ({rows}, {} as usize, {} as usize);\n        {weight_binds}\n        let weights: [&dyn operator::Recipe; {}] = [{weight_refs}];\n",
+                "      {{\n        let (sources, width, groups) = ({sources}, {} as usize, {groups});\n        let rows = sources * groups;\n        {weight_binds}\n        let weights: [&dyn operator::Recipe; {}] = [{weight_refs}];\n",
                 nat(&operand.width)?,
-                nat(&operand.groups)?,
                 operand.weights.len(),
             ));
             // The rows formed (all, or the window's), whether each is formed
@@ -2081,8 +2083,12 @@ mod internals {
                             out.push_str(&format!("        let at = cx.{}();\n", cpu_argument(entry, *at as usize)));
                             "at.get([row]) as usize".to_owned()
                         }
-                        // Group-major operand rows of the source's rows.
-                        None => "row % (rows / groups) * groups + row / (rows / groups)".to_owned(),
+                        // Formed row `row` is run `row / sources` of source
+                        // row `row % sources`: row `row % sources * groups +
+                        // row / sources` of the source's runs. Only a formed
+                        // row reads it (`row < sources * groups`), so
+                        // `sources` is not zero.
+                        None => "row % sources * groups + row / sources".to_owned(),
                     };
                     let window = match within {
                         Some([first, count]) => {
@@ -2122,7 +2128,7 @@ mod internals {
             };
             let columns = if whole { "_columns" } else { "columns" };
             out.push_str(&format!(
-                "        let formed = operator::Formed {{ rows, width, groups, window: {window}, whole: {whole}, staged: cx.scratch_{}(), quantized: {formed}.then(|| cx.scratch_{}()), tiles: {tiles} && operator::tiled(rows / groups, &weights), weights: &weights }};\n        // SAFETY: the declaration's buffers; every item of the launch forms the same operands, each column of a row once.\n        unsafe {{ operator::form(formed, first, total, group, shared, |row, {columns}, out, {shared}| {values}) }};\n        first += rows;\n      }}\n",
+                "        let formed = operator::Formed {{ rows, width, groups, window: {window}, whole: {whole}, staged: cx.scratch_{}(), quantized: {formed}.then(|| cx.scratch_{}()), tiles: {tiles} && operator::tiled(sources, &weights), weights: &weights }};\n        // SAFETY: the declaration's buffers; every item of the launch forms the same operands, each column of a row once.\n        unsafe {{ operator::form(formed, first, total, group, shared, |row, {columns}, out, {shared}| {values}) }};\n        first += rows;\n      }}\n",
                 scratch(operand.staged),
                 scratch(operand.quantized),
             ));
