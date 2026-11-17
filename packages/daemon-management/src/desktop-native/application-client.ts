@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process"
 import { Deferred, Effect, Option, Schedule, Schema } from "effect"
-import { ApplicationControlClosed, ApplicationControlFailed, ApplicationControlUnavailable } from "./application-control"
+import { ApplicationControlClosed, ApplicationControlFailed, ApplicationControlUnavailable, type DataFolderUnusable } from "./application-control"
 import { type ApplicationIntent, type ApplicationSnapshot } from "@magnitudedev/sdk/desktop-host"
 
 export class ApplicationLaunchFailed extends Schema.TaggedError<ApplicationLaunchFailed>()("ApplicationLaunchFailed", { message: Schema.String }) {}
@@ -50,8 +50,8 @@ export const launchApplicationProcess = <A, E, R>(command: ApplicationLaunchComm
 }))
 
 export interface ApplicationClientOptions {
-  readonly launch: (intent: "EnsureRunning" | "ShowWindow", observe: Effect.Effect<ApplicationSnapshot, ApplicationControlClosed | ApplicationControlFailed | ApplicationControlUnavailable | ApplicationLaunchFailed>) => Effect.Effect<ApplicationSnapshot, ApplicationControlClosed | ApplicationControlFailed | ApplicationControlUnavailable | ApplicationLaunchFailed>
-  readonly request: (intent: ApplicationIntent) => Effect.Effect<ApplicationSnapshot, ApplicationControlClosed | ApplicationControlFailed | ApplicationControlUnavailable>
+  readonly launch: (intent: "EnsureRunning" | "ShowWindow", observe: Effect.Effect<ApplicationSnapshot, ApplicationControlClosed | ApplicationControlFailed | ApplicationControlUnavailable | DataFolderUnusable | ApplicationLaunchFailed>) => Effect.Effect<ApplicationSnapshot, ApplicationControlClosed | ApplicationControlFailed | ApplicationControlUnavailable | DataFolderUnusable | ApplicationLaunchFailed>
+  readonly request: (intent: ApplicationIntent) => Effect.Effect<ApplicationSnapshot, ApplicationControlClosed | ApplicationControlFailed | ApplicationControlUnavailable | DataFolderUnusable>
 }
 
 /** A request may launch once. Waiting and recovery only observe that owner; they never relaunch it. */

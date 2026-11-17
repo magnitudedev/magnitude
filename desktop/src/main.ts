@@ -4,6 +4,7 @@ import { raiseWindow } from "./window-raise"
 import { makeMacCliRegistration } from "@magnitudedev/daemon-management/desktop-native"
 import { ApplicationUpdateControlFailed } from "@magnitudedev/sdk/desktop-host"
 import { makeRendererRecovery } from "./renderer-recovery"
+import { startupFailureDetail } from "./startup-failure"
 import { nativeQuitFailureDecision, resolveQuitFailure } from "./quit-failure"
 import { buildApplicationMenu } from "./application-menu"
 import { buildTrayMenu, MODEL_STATUS_ITEM } from "./tray-menu"
@@ -553,8 +554,9 @@ Effect.runPromiseExit(program.pipe(
     const message = Cause.pretty(cause)
     console.error(message)
     if (!canPresentErrors) { exiting = true; app.exit(1); return }
+    const detail = startupFailureDetail(cause)
     void app.whenReady().then(() => {
-      if (!background && !systemShutdownRequested) dialog.showErrorBox("Magnitude couldn’t continue", "Quit Magnitude and open it again. If it still won’t start, reinstall the application. Your downloaded models and configuration are stored separately.")
+      if (!background && !systemShutdownRequested) dialog.showErrorBox("Magnitude couldn’t continue", detail)
       exiting = true
       app.exit(1)
     })

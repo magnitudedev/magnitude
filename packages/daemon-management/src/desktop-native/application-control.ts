@@ -11,14 +11,19 @@ export class ApplicationControlFailed extends Schema.TaggedError<ApplicationCont
 export class ApplicationControlClosed extends Schema.TaggedError<ApplicationControlClosed>()("ApplicationControlClosed", {}) {
   override get message() { return "Application closed without a response" }
 }
+/**
+ * Magnitude's data folder can't be used (too deep for a Unix socket, or one it can't prepare or lock), which
+ * reinstalling can't fix. `reason` says so to people, naming the folder; `message` adds the system's error for logs.
+ */
+export class DataFolderUnusable extends Schema.TaggedError<DataFolderUnusable>()("DataFolderUnusable", { reason: Schema.String, message: Schema.String }) {}
 export class ApplicationControlUnavailable extends Schema.TaggedError<ApplicationControlUnavailable>()("ApplicationControlUnavailable", { message: Schema.String }) {}
 const failure = (error: unknown) => new ApplicationControlFailed({ message: String(error) })
 
 const validateUnixControlPath = (path: string) => Effect.gen(function* () {
   const maximumBytes = process.platform === "darwin" ? 103 : 107
-  if (path.includes("\0") || Buffer.byteLength(path, "utf8") > maximumBytes) return yield* new ApplicationControlFailed({
-    message: `The application control path is invalid or exceeds ${maximumBytes} UTF-8 bytes. Use a shorter application state directory.`,
-  })
+  if (!path.includes("\0") && Buffer.byteLength(path, "utf8") <= maximumBytes) return
+  const reason = `The application control path ${path} is invalid or exceeds ${maximumBytes} UTF-8 bytes. Use a shorter application state directory.`
+  return yield* new DataFolderUnusable({ reason, message: reason })
 })
 
 /** Call only while holding the native lifetime lock, in a private current-user directory.
