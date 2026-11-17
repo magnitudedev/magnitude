@@ -221,8 +221,8 @@ pub fn prepare(artifacts: &Artifacts, options: &EngineOptions, load: &Load) -> R
 /// load is once its job has run. The load's points come of its plan, which
 /// prices its holdings on the standing figures, so those settle first, as
 /// every load in its own process settles them (`composition::settle_prices`).
-/// The rest stops early only where the jobs' time gives no next job before
-/// one measures (`worker::measure::JobTime`), reporting why, and the load
+/// The rest stops early only where a job measures nothing
+/// (`worker::measure::JobsStopped`), reporting why, and the load
 /// then serves what is pending as any load does. Nothing to do without a
 /// kernel cache.
 fn settle_measurements(artifacts: &Artifacts, resolved: &magnitude_engine::composition::ResolvedEngineConfiguration) -> Result<(), String> {

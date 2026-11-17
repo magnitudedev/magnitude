@@ -145,8 +145,8 @@ pub enum ProbeFailure {
     /// or panicked, or ended before it began probing), or its process wrote
     /// no result.
     Failed { probe: &'static str, reason: String },
-    /// The probe had not ended within its limit ([`PROBE_LIMIT`], or the
-    /// job's deadline where that came first) and was stopped.
+    /// The probe had not ended within its limit ([`PROBE_LIMIT`]) and was
+    /// stopped.
     Stopped { probe: &'static str, after: Duration },
     /// The job's deadline had passed before the probe was started.
     Unstarted { probe: &'static str },
@@ -190,7 +190,8 @@ pub struct ProbeRun {
 /// nothing of the device, and a kill (the system's, out of memory, or ours at
 /// the probe's limit) or termination says nothing of the probe. Each runs at
 /// most [`PROBE_LIMIT`]; none is started at or past `deadline`, and one
-/// running at it is stopped.
+/// started runs to its end: how busy its host was decides whether a probe
+/// runs in this job, never what it keeps.
 pub(crate) fn run<P: Probes>(
     store: &dyn ArtifactStore,
     identity: &Identity,
@@ -207,7 +208,7 @@ pub(crate) fn run<P: Probes>(
             continue;
         }
         JOB_PROBES_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (result, report) = match process(program, device, probe, deadline) {
+        let (result, report) = match process(program, device, probe) {
             Ok(kept) => kept,
             Err(failure) => {
                 run.failures.push(failure);
@@ -229,7 +230,6 @@ fn process(
     program: &Path,
     device: &[&str],
     probe: &'static str,
-    deadline: Instant,
 ) -> Result<(ProbeResult<u64>, String), ProbeFailure> {
     let failed = |reason: String| ProbeFailure::Failed { probe, reason };
     let mut child = Command::new(program)
@@ -244,7 +244,7 @@ fn process(
     let output = drain(child.stdout.take().expect("stdout is piped"));
     let report = drain(child.stderr.take().expect("stderr is piped"));
     let started = Instant::now();
-    let limit = deadline.min(started + PROBE_LIMIT);
+    let limit = started + PROBE_LIMIT;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,

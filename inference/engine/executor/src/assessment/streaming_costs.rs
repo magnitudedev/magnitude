@@ -2031,7 +2031,7 @@ mod tests {
             let records = std::env::temp_dir().join(format!("convert-line-{}-{backend:?}", std::process::id()));
             let store = seismic::measure::JsonFileStore::new(&records);
             let mut measurer = Measurer::new(crate::SEARCH_SETTINGS.error_rate, crate::MIN_SAMPLE_SECONDS);
-            let deadline = super::super::requests::JobDeadlines::within(std::time::Duration::from_secs(300));
+            let deadline = super::super::requests::JobDeadlines::new(std::time::Instant::now(), std::time::Duration::from_secs(300));
             let requests = super::super::Outstanding { standing: vec![super::super::PointRequest::Convert(form)], loads: Vec::new() };
             let mut visited = Vec::new();
             let ended = super::super::requests::measure(&mut measurer, &seismic::Charges::tally(&device), &store, &requests, deadline, &mut |_| Attempt::Proceed, &mut |key, outcome| {

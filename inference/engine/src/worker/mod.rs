@@ -156,7 +156,7 @@ pub struct Served {
 enum Held {
     Load { _load: Loaded },
     /// The points' storage and programs, and the thread forming them,
-    /// whose drop waits for the compiles it began before the job's deadline.
+    /// whose drop waits for the compiles it began.
     Measurement { _points: magnitude_executor::assessment::Held },
 }
 

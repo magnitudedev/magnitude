@@ -164,7 +164,7 @@ pub mod memory {
         Store, Tally, Wiring,
     };
 }
-pub use seismic_runtime::probes::{carry as carry_probe_results, probe_misses, probe_runs, serve_probe_if_asked, KeptProbe, ProbeFailure, ProbeRun, NAMESPACE as PROBE_NAMESPACE};
+pub use seismic_runtime::probes::{carry as carry_probe_results, probe_misses, probe_runs, serve_probe_if_asked, KeptProbe, ProbeFailure, ProbeRun, NAMESPACE as PROBE_NAMESPACE, PROBE_LIMIT};
 /// What a native declaration reads of the device it runs on, `device.NAME`,
 /// and how each backend establishes it.
 pub use seismic_lang::device;

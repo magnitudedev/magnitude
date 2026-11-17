@@ -451,23 +451,23 @@ impl Ceilings {
 
 /// Measure `requests` (a load's) on the device of `charges`, which its
 /// points allocate through, in this process, as the measurement job
-/// measures them (`assessment::requests::measure`), each walk given its job
-/// time (`worker::measure::JobTime`), into `store`, until no point is left
-/// expired: the harness is a tool, which may measure in its own process.
-/// Why the walks could not run, or stopped before measuring the rest.
+/// measures them (`assessment::requests::measure`), each job given its
+/// time (`worker::measure::job_time`), into `store`, until no point is
+/// left unbegun: the harness is a tool, which may measure in its own
+/// process. Each job begins a point at least, formed and timed to its
+/// end, so the jobs go on only while each measures something.
+/// Why the walks could not run, or a job measured nothing.
 fn measure_requested(
     charges: &seismic::Charges,
     store: &dyn seismic::measure::RecordStore<seismic::PointKey>,
     requests: &[magnitude_executor::assessment::PointRequest],
 ) -> Result<(), String> {
-    use magnitude_engine::worker::measure::{JobProgress, JobTime};
     use magnitude_executor::assessment::requests;
     use seismic::measure::Outcome;
-    let mut time = JobTime::default();
     loop {
         let mut measurer = seismic::Measurer::new(magnitude_executor::SEARCH_SETTINGS.error_rate, magnitude_executor::MIN_SAMPLE_SECONDS);
-        let deadline = requests::JobDeadlines::new(std::time::Instant::now(), time.given());
-        let (mut measured, mut failed, mut expired) = (false, false, false);
+        let deadline = requests::JobDeadlines::new(std::time::Instant::now(), magnitude_engine::worker::measure::job_time());
+        let (mut measured, mut expired) = (false, false);
         let walked = requests::measure(
             &mut measurer,
             charges,
@@ -476,10 +476,9 @@ fn measure_requested(
             deadline,
             &mut |_| seismic::measure::Attempt::Proceed,
             &mut |_, outcome| match outcome {
-                Outcome::Loaded(_) => {}
                 Outcome::Measured(_) | Outcome::Skipped(_) | Outcome::Unformed(_) => measured = true,
-                Outcome::Unmade(_) | Outcome::Failed(_) | Outcome::Store(_) => failed = true,
                 Outcome::Expired => expired = true,
+                Outcome::Loaded(_) | Outcome::Unmade(_) | Outcome::Failed(_) | Outcome::Store(_) => {}
             },
         )
         .map_err(|error| error.to_string())?;
@@ -491,11 +490,9 @@ fn measure_requested(
         if !expired {
             return Ok(());
         }
-        let progress = match measured {
-            true => JobProgress::Measured,
-            false => JobProgress::Empty { failed },
-        };
-        time.after(progress).map_err(|stall| format!("the measurement walk stopped: {stall}"))?;
+        if !measured {
+            return Err("a measurement job measured nothing: every point it began failed".into());
+        }
     }
 }
 

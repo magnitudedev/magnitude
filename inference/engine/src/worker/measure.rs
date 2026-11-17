@@ -5,10 +5,11 @@
 //! The job discovers the machine, opens the selected executor and measures
 //! the point requests outstanding on it
 //! ([`magnitude_executor::assessment::requests`]: assessment's standing
-//! requests first, within `MEASUREMENT_SECONDS` of the job's start whatever
-//! time it is given, those the budget cannot hold priced unless they read
-//! a required figure, which the next job measures; then the loads',
-//! the load that waited latest first, within the job's time), through
+//! requests first, their samples sharing `MEASUREMENT_SECONDS` of sampling
+//! whatever time the job is given; then the loads', the load that waited
+//! latest first; each point begun while the job's time lasts, from its
+//! device's opening ([`job_time`]), formed and timed to its end, what it
+//! does not reach the next job's), through
 //! `seismic-measure`, each record stored in the kernel cache as it is
 //! taken, and ends with the points it could not measure. Before each point it records the key it is
 //! attempting ([`AttemptMarkers`]): a point that ends two jobs (the second
@@ -42,121 +43,57 @@ use std::sync::Arc;
 /// the first was not a transient.
 const ENDED_JOBS: u32 = 2;
 
-/// The most times [`JobTime::first`] a job is given, when the jobs before it
-/// measured nothing.
-const LONGEST_JOB: u32 = 8;
-
-/// The time each measurement job is given from its start, whichever host
-/// runs the jobs: in its own process ([`InProcessJobs`]) or in a worker
-/// beside it. Assessment's standing points take `MEASUREMENT_SECONDS` of it
-/// at most, whatever it is (`requests::JobDeadlines`), and each ends in the
-/// job, measured or priced, except a required figure's, which nothing
-/// prices: the budget ending before it leaves it unrecorded, and the next
-/// job resumes it from the records stored. A load's point whose first
-/// sample is not read when a job's time ends is released uncounted, and the
-/// next job starts at the same point, so a job that measured nothing and
-/// reported no failure of its own gives the next twice its time, up to
-/// [`LONGEST_JOB`] times the first, and one that measured gives the next the
-/// first again.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct JobTime {
-    given: std::time::Duration,
+/// The time each measurement job is given to begin points in, whichever
+/// host runs the jobs: in its own process ([`InProcessJobs`]) or in a worker
+/// beside it, from the moment the job's device is open
+/// ([`MeasureEvent::Opened`]; `requests::JobDeadlines`), so discovering the
+/// machine, probing the device and opening it take none of it. It is the
+/// standing points' budget for their samples (`MEASUREMENT_SECONDS`), so a
+/// job on an idle host reaches all of them that sampling alone allows. It
+/// decides only when the job begins no more points: each begun is formed
+/// and timed to its end, and one not begun is left unrecorded, the next job
+/// resuming from the records stored. So a busy host stretches each sample,
+/// and fewer points begin in a job, but no point begun expires and none is
+/// priced for want of time: how busy the host is decides which job reads a
+/// figure, never what is recorded of it.
+pub fn job_time() -> std::time::Duration {
+    std::time::Duration::from_secs_f64(magnitude_executor::assessment::MEASUREMENT_SECONDS)
 }
 
-/// What a job's end says of the next job's time.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum JobProgress {
-    /// It measured something: stored a record, or left fewer requests
-    /// outstanding.
-    Measured,
-    /// It measured nothing; `failed` when it reported a failure of its own
-    /// ([`MeasureFailure::fails_job`]) or ended without reporting.
-    Empty { failed: bool },
-}
+/// How long a running job may be silent before it has hung: the hang
+/// guard every host of a job keeps ([`hang_silence`]), its silence counted
+/// from the job's last event ([`MeasureEvent`]), or its start. A job reports
+/// a point's attempt as it begins it and its record as it stores it, so
+/// once it is open its longest silence is one point's forming and sampling,
+/// the two things it does between those events: the worst cold formation
+/// of a point's kernels measured, 23 s (`routed_land` for the convert point
+/// on CUDA, an RTX 3090, 2026-11-17, against 0.18 s once stored), plus a
+/// point's most sampling, a standing point's whole `MEASUREMENT_SECONDS`;
+/// and, as [`seismic::PROBE_LIMIT`] is over the longest probes seen, 7.5x
+/// their sum, for slower compilers and hosts no rig has shown. A compile and
+/// a sample are each one native call, which reports nothing until it ends,
+/// so no finer event bounds them. A job silent past it has hung (as in a
+/// driver), and the point it was inside counts as one its job ended.
+pub const POINT_LIMIT: std::time::Duration = std::time::Duration::from_secs(250);
 
-/// The next job, after one that did not stall.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NextJob {
-    /// The job measured: the next takes the rest in the first time.
-    Resumes,
-    /// The job's time ended before its point read a sample: the next, given
-    /// twice as long, takes the point again.
-    Longer,
-}
+/// How long a job may be silent before it opens its device
+/// ([`MeasureEvent::Opened`]), its first event: its probes begin within
+/// [`seismic::PROBE_LIMIT`] of its start (`measure_machine`), the last begun
+/// runs at most another, and opening the device is what a probe's process
+/// does before it probes (a start and a device open, which that limit
+/// covers), so a third covers it. A job not open by then has hung in its
+/// opening, and could not open the machine.
+pub const OPENING_LIMIT: std::time::Duration = std::time::Duration::from_secs(3 * seismic::PROBE_LIMIT.as_secs());
 
-/// Why a job that measured nothing gives no next job.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum JobStall {
-    /// It reported a failure of its own.
-    Failed,
-    /// It was given the longest time already.
-    Exhausted,
-}
-
-impl fmt::Display for JobStall {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Failed => formatter.write_str("it failed"),
-            Self::Exhausted => write!(formatter, "its time ended inside a point given the longest job time, {:?}", JobTime::longest()),
-        }
-    }
-}
-
-impl Default for JobTime {
-    fn default() -> Self {
-        Self { given: Self::first() }
-    }
-}
-
-impl JobTime {
-    /// The first job's time.
-    pub fn first() -> std::time::Duration {
-        std::time::Duration::from_secs_f64(magnitude_executor::assessment::MEASUREMENT_SECONDS)
-    }
-
-    /// The longest time a job is given.
-    pub fn longest() -> std::time::Duration {
-        Self::first() * LONGEST_JOB
-    }
-
-    /// The next job's time.
-    pub fn given(self) -> std::time::Duration {
-        self.given
-    }
-
-    /// Whether the next job is given the longest time: a job killed at its
-    /// deadline then had all the time the schedule gives, so what it was
-    /// doing hung rather than ran slow.
-    pub fn is_longest(self) -> bool {
-        self.given >= Self::longest()
-    }
-
-    /// The pause a host that keeps the device's jobs going takes after an
-    /// empty job that ran for `ran` and reported no failure of its own,
-    /// whether it gave a longer next job or was given the longest time
-    /// already: twice what it ran, so jobs whose time keeps ending inside a
-    /// point occupy the device at most a third of the time, at that cadence
-    /// however long they stall.
-    pub fn pause(ran: std::time::Duration) -> std::time::Duration {
-        ran * 2
-    }
-
-    /// Take the end of the job given [`JobTime::given`]: the next job, or
-    /// why there is none. An empty job gives the next twice its time, never
-    /// less than the first nor more than the longest, whether or not it
-    /// stalls, so a host that retries a stalled job retries it at that time.
-    pub fn after(&mut self, end: JobProgress) -> Result<NextJob, JobStall> {
-        let JobProgress::Empty { failed } = end else {
-            self.given = Self::first();
-            return Ok(NextJob::Resumes);
-        };
-        let exhausted = self.is_longest();
-        self.given = (self.given * 2).clamp(Self::first(), Self::longest());
-        match (failed, exhausted) {
-            (true, _) => Err(JobStall::Failed),
-            (false, true) => Err(JobStall::Exhausted),
-            (false, false) => Ok(NextJob::Longer),
-        }
+/// How long a job, `opened` its device or not, may be silent from its last
+/// event (or its start) before it has hung, and its host kills it: the one
+/// hang policy of every host of a job, which reads its events as they come
+/// ([`observe_measurement`], [`measure_worker`]).
+pub fn hang_silence(opened: bool) -> std::time::Duration {
+    if opened {
+        POINT_LIMIT
+    } else {
+        OPENING_LIMIT
     }
 }
 
@@ -175,12 +112,10 @@ pub struct MeasureRequest {
     /// selects.
     pub executor: seismic::ExecutorSelector,
     /// This job, as its attempt markers name it, so the attempt of a job
-    /// its host kills is released rather than counted ([`release_killed`]).
+    /// its host preempts is released rather than counted ([`release_killed`]).
     pub job: MeasureJob,
-    /// The time the job has from its start: what its host's time for it
-    /// ([`JobTime::given`]) has left, the bound however many points are
-    /// requested, of which assessment's standing points take
-    /// `MEASUREMENT_SECONDS` at most (`requests::JobDeadlines`).
+    /// The time the job has to begin points in from its device's opening
+    /// ([`job_time`]), however many are requested (`requests::JobDeadlines`).
     pub time: std::time::Duration,
 }
 
@@ -337,8 +272,7 @@ impl AttemptMarkers {
     }
 
     /// Undo `job`'s attempt of `key`, where it is the attempt counted last:
-    /// the job was killed, or its time ended, which says nothing of the
-    /// point.
+    /// its host preempted the job, which says nothing of the point.
     fn release(&self, key: &impl Serialize, job: MeasureJob) -> Result<(), StoreError> {
         let record = self.record(key)?;
         if record.job != Some(job) {
@@ -364,9 +298,8 @@ impl AttemptMarkers {
 }
 
 /// Release `job`'s attempt of `key` in the kernel cache at `kernels`: its
-/// host killed the job while timing it (for a load, or as its time ended
-/// short of the longest, [`JobTime::is_longest`]), so the point is
-/// attempted again uncounted. Only `job`'s own attempt is
+/// host preempted the job while timing it (for a load), which says nothing
+/// of the point, so it is attempted again uncounted. Only `job`'s own attempt is
 /// undone; a key it never marked is left as it is.
 pub fn release_killed(
     kernels: &Path,
@@ -379,9 +312,19 @@ pub fn release_killed(
 /// A Measure: run the job of `request` and report each attempt and each
 /// record it stores, then what could not be measured. The process ends
 /// after the outcome, with what the job's points still hold.
-pub(super) fn measure_only(
-    request: MeasureRequest,
+pub(super) fn measure_only(request: MeasureRequest, sender: impl MessageSender<WorkerMessage>) -> Served {
+    report_measurement(&request, sender, measure_machine)
+}
+
+/// The job of `request` run by `job` ([`measure_machine`], or a tool's
+/// other job), its events and outcome reported to its host over `sender` as
+/// a worker reports a Measure, greeting it first: what a host reads to keep
+/// the job's hang guard ([`observe_measurement`]). The process ends after
+/// the outcome, with what the job's points still hold.
+pub fn report_measurement(
+    request: &MeasureRequest,
     mut sender: impl MessageSender<WorkerMessage>,
+    job: fn(&MeasureRequest, &mut dyn FnMut(MeasureEvent)) -> MeasureEnd,
 ) -> Served {
     let hello = WorkerMessage::Hello {
         build: EngineBuild::current(),
@@ -390,7 +333,7 @@ pub(super) fn measure_only(
         return WorkerExit::TransportFailed(error.to_string()).into();
     }
     let mut lost = None;
-    let MeasureEnd { failures, held } = measure_machine(&request, &mut |event| {
+    let MeasureEnd { failures, held } = job(request, &mut |event| {
         if lost.is_none() {
             let message = match event {
                 MeasureEvent::Attempting(key) => WorkerMessage::Attempting { key },
@@ -436,14 +379,13 @@ pub struct MeasureEnd {
 }
 
 /// Measurement jobs run in this process ([`measure_machine`]), one after
-/// another, on the executor a load of a manifest selects, each given its
-/// [`JobTime`]: how a host that runs no job beside it (a tool, a load in its
+/// another, on the executor a load of a manifest selects, each given the
+/// [`job_time`]: how a host that runs no job beside it (a tool, a load in its
 /// own process) has what a load waits on measured.
 pub struct InProcessJobs {
     request: MeasureRequest,
     topology: Arc<seismic::DeviceTopology>,
     executor: seismic::Executor,
-    time: JobTime,
     /// Whether the jobs take the machine's line alone ([`Self::of_line`]).
     #[cfg(feature = "machine-line")]
     line: bool,
@@ -462,9 +404,9 @@ pub struct JobRun {
 pub enum JobsStopped {
     /// The outstanding requests could not be read.
     Requests(String),
-    /// A job measured nothing, and its time gives no next one.
+    /// A job measured nothing: every point it began failed, or it was
+    /// given no time to begin one.
     Stalled {
-        stall: JobStall,
         outstanding: magnitude_executor::assessment::Outstanding,
         failures: Vec<MeasureFailure>,
     },
@@ -474,8 +416,8 @@ impl fmt::Display for JobsStopped {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Requests(reason) => write!(formatter, "the outstanding point requests: {reason}"),
-            Self::Stalled { stall, outstanding, failures } => {
-                write!(formatter, "a measurement job measured nothing of {outstanding:?}, as {stall}")?;
+            Self::Stalled { outstanding, failures } => {
+                write!(formatter, "a measurement job measured nothing of {outstanding:?}")?;
                 for failure in failures {
                     write!(formatter, "; {failure}")?;
                 }
@@ -494,7 +436,6 @@ impl InProcessJobs {
     pub fn of_load(catalog: &Devices, paths: Vec<PathBuf>, manifest: &crate::options::ExecutionManifest) -> Result<Option<Self>, String> {
         let Some(kernels) = manifest.kernel_cache.clone() else { return Ok(None) };
         let selected = crate::planning::select_load_device(catalog, manifest).map_err(|error| error.to_string())?;
-        let time = JobTime::default();
         Ok(Some(Self {
             request: MeasureRequest {
                 paths,
@@ -502,11 +443,10 @@ impl InProcessJobs {
                 storage: manifest.store().to_path_buf(),
                 executor: selected.info.selector(),
                 job: MeasureJob(0),
-                time: time.given(),
+                time: job_time(),
             },
             topology: catalog.topology(),
             executor: selected.info,
-            time,
             #[cfg(feature = "machine-line")]
             line: false,
         }))
@@ -518,7 +458,6 @@ impl InProcessJobs {
     /// asks for it and no other figure.
     #[cfg(feature = "machine-line")]
     pub fn of_line(catalog: &Devices, kernels: PathBuf, storage: PathBuf, executor: seismic::Executor) -> Self {
-        let time = JobTime::default();
         Self {
             request: MeasureRequest {
                 paths: Vec::new(),
@@ -526,11 +465,10 @@ impl InProcessJobs {
                 storage,
                 executor: executor.selector(),
                 job: MeasureJob(0),
-                time: time.given(),
+                time: job_time(),
             },
             topology: catalog.topology(),
             executor,
-            time,
             line: true,
         }
     }
@@ -548,35 +486,25 @@ impl InProcessJobs {
         PointRequests::new(&self.request.kernels).outstanding(&self.topology, &self.executor, &self.request.storage, &records, costs)
     }
 
-    /// Run jobs, each to its end and releasing what it held, until one
-    /// measures something or a job's [`JobTime`] gives no next one.
+    /// Run a job to its end, releasing what it held: what it left
+    /// outstanding, or that it measured nothing.
     pub fn run(&mut self) -> Result<JobRun, JobsStopped> {
         let before = self.outstanding().map_err(JobsStopped::Requests)?;
-        loop {
-            self.request.job = MeasureJob(self.request.job.0 + 1);
-            self.request.time = self.time.given();
-            let mut recorded = false;
-            let mut report = |event: MeasureEvent| recorded |= matches!(event, MeasureEvent::Recorded(..));
-            #[cfg(feature = "machine-line")]
-            let end = match self.line {
-                true => measure_line(&self.request, &mut report),
-                false => measure_machine(&self.request, &mut report),
-            };
-            #[cfg(not(feature = "machine-line"))]
-            let end = measure_machine(&self.request, &mut report);
-            drop(end.held);
-            let outstanding = self.outstanding().map_err(JobsStopped::Requests)?;
-            let job = match recorded || outstanding != before {
-                true => JobProgress::Measured,
-                false => JobProgress::Empty { failed: end.failures.iter().any(MeasureFailure::fails_job) },
-            };
-            match self.time.after(job) {
-                Ok(NextJob::Resumes) => return Ok(JobRun { outstanding, failures: end.failures }),
-                Ok(NextJob::Longer) => {
-                    tracing::info!(given = ?self.request.time, next = ?self.time.given(), "a measurement job's time ended inside a point; the next is given longer");
-                }
-                Err(stall) => return Err(JobsStopped::Stalled { stall, outstanding, failures: end.failures }),
-            }
+        self.request.job = MeasureJob(self.request.job.0 + 1);
+        let mut recorded = false;
+        let mut report = |event: MeasureEvent| recorded |= matches!(event, MeasureEvent::Recorded(..));
+        #[cfg(feature = "machine-line")]
+        let end = match self.line {
+            true => measure_line(&self.request, &mut report),
+            false => measure_machine(&self.request, &mut report),
+        };
+        #[cfg(not(feature = "machine-line"))]
+        let end = measure_machine(&self.request, &mut report);
+        drop(end.held);
+        let outstanding = self.outstanding().map_err(JobsStopped::Requests)?;
+        match recorded || outstanding != before {
+            true => Ok(JobRun { outstanding, failures: end.failures }),
+            false => Err(JobsStopped::Stalled { outstanding, failures: end.failures }),
         }
     }
 }
@@ -601,11 +529,10 @@ pub fn probe_machine(
 
 /// Measure the outstanding point requests of the request's executor, in
 /// the order of who waits on them ([`PointRequests::outstanding`]), by
-/// their deadlines from the job's start (`requests::JobDeadlines`):
-/// assessment's within `MEASUREMENT_SECONDS`, the points its time cannot
-/// hold priced, but for a required figure's; the loads' within the
-/// request's time, what it does not reach (and a required figure's) left
-/// for the next job, its attempts released. A point that ended two jobs is not timed: it
+/// the job's time from its device's opening (`requests::JobDeadlines`):
+/// assessment's first, then the loads', each begun while the request's time
+/// lasts formed and timed to its end, what it does not reach left for the
+/// next job, its attempts released. A point that ended two jobs is not timed: it
 /// is recorded unobtainable, so the executor's costs complete without it. Each attempt reaches `report`
 /// before it is recorded, and each record as soon as the job stores it.
 /// Returns what could not be measured, and what the job's points were made
@@ -641,9 +568,9 @@ type Requests<'a> = &'a dyn Fn(
 
 /// A measurement job of `requests` ([`measure_machine`]).
 fn measure_job(request: &MeasureRequest, report: &mut dyn FnMut(MeasureEvent), requests: Requests<'_>) -> MeasureEnd {
-    // The job's time runs from its start: discovering the machine, probing
-    // and opening the executor are part of it.
-    let deadlines = requests::JobDeadlines::new(std::time::Instant::now(), request.time);
+    // Probes begin within a probe's limit of the job's start, so the job
+    // opens within its host's `OPENING_LIMIT`.
+    let probes_begin_until = std::time::Instant::now() + seismic::PROBE_LIMIT;
     let machine = |reason: String| MeasureEnd {
         failures: vec![MeasureFailure::Machine { reason }],
         held: None,
@@ -658,7 +585,9 @@ fn measure_job(request: &MeasureRequest, report: &mut dyn FnMut(MeasureEvent), r
     // property probes run first, each in a process of its own, and keep
     // their results in the same store, so the device opens with them, as
     // every later load does; a probe that keeps nothing is reported, its
-    // property at its safe value.
+    // property at its safe value. A probe begins only within a probe's limit
+    // of the job's start, and one begun runs to its own end; one not begun
+    // leaves its property for the next job. None of it is the job's time.
     let mut probing = Vec::new();
     // An opening the device refused as busy (out of memory, or held by
     // another process) is the device's for now, not the machine's.
@@ -671,7 +600,7 @@ fn measure_job(request: &MeasureRequest, report: &mut dyn FnMut(MeasureEvent), r
         .map_err(|error| MeasureFailure::Machine { reason: error.to_string() })
         .and_then(|executor| {
             let probes = catalog
-                .probe(executor, &*seismic::ProgramStore::user(), deadlines.standing())
+                .probe(executor, &*seismic::ProgramStore::user(), probes_begin_until)
                 .map_err(opening)?;
             for kept in &probes.kept {
                 tracing::info!(probe = kept.probe, result = %kept.result.line(), report = %kept.report, "probed the device");
@@ -692,6 +621,9 @@ fn measure_job(request: &MeasureRequest, report: &mut dyn FnMut(MeasureEvent), r
         Err(failure) => return MeasureEnd { failures: vec![failure], held: None },
     };
     report(MeasureEvent::Opened);
+    // The job's time runs from its device's opening, as its host's does:
+    // discovering the machine, probing and opening it take none of it.
+    let deadlines = requests::JobDeadlines::new(std::time::Instant::now(), request.time);
     let records = KernelCache::measurement_records(&request.kernels);
     let (topology, executor) = (device.topology(), device.info());
     let costs = StoredCosts::outstanding_of(&ExecutorCosts::stored(topology, executor, &records));
@@ -769,16 +701,9 @@ fn measure_job(request: &MeasureRequest, report: &mut dyn FnMut(MeasureEvent), r
                     });
                     return;
                 }
-                // The job's time ended before a load's point, or a required
-                // figure's, read a sample (any other standing point's is
-                // priced, `Skipped`): no failure of it, so its attempt is
-                // released, as a killed job's is, and the next job takes it.
-                Outcome::Expired => {
-                    if let Err(error) = markers.release(&key, request.job) {
-                        unrecorded.borrow_mut().push(error);
-                    }
-                    return;
-                }
+                // The job's time ended before the point was begun: it was
+                // never attempted, and the next job takes it.
+                Outcome::Expired => return,
                 Outcome::Store(error) => {
                     failures.push(MeasureFailure::Point {
                         key: key.clone(),
@@ -828,17 +753,38 @@ fn measure_job(request: &MeasureRequest, report: &mut dyn FnMut(MeasureEvent), r
 /// `transport`, passing each attempt and each record it stores to `report`
 /// as the worker reports it. Returns what the job could not measure, or how
 /// it was lost. Blocking until the worker reports its outcome or its stream
-/// ends: the caller owns the deadline and ends the process.
+/// ends: the caller keeps the job's hang guard ([`hang_silence`]) over the
+/// events and ends the process.
 pub fn measure_worker(
     transport: impl HostTransport,
     request: MeasureRequest,
+    report: impl FnMut(MeasureEvent),
+) -> Result<Vec<MeasureFailure>, JobLost> {
+    observed(transport, Some(HostMessage::Measure { request }), report)
+}
+
+/// [`measure_worker`] for a job its process was given directly, which
+/// reports over `transport` ([`report_measurement`]): a tool's own job
+/// process.
+pub fn observe_measurement(
+    transport: impl HostTransport,
+    report: impl FnMut(MeasureEvent),
+) -> Result<Vec<MeasureFailure>, JobLost> {
+    observed(transport, None, report)
+}
+
+/// A job's events read off `transport`, once its worker greeted this build
+/// (and was sent `first`, where it takes its job from its host), each
+/// reported as it comes, until its outcome.
+fn observed(
+    transport: impl HostTransport,
+    first: Option<HostMessage>,
     mut report: impl FnMut(MeasureEvent),
 ) -> Result<Vec<MeasureFailure>, JobLost> {
     let (mut receiver, mut sender) = transport.split();
     let ended = "it reported its outcome";
-    let measure = HostMessage::Measure { request };
     let lost = |lost: Lost| JobLost(lost.reason);
-    handshake(&mut sender, &mut receiver, Some(measure), ended, lost)?;
+    handshake(&mut sender, &mut receiver, first, ended, lost)?;
     // The device opens once, before any point: a host reads a job that
     // reported no opening as one that could not open the machine.
     let mut opened = false;
@@ -925,54 +871,29 @@ mod tests {
             },
             topology,
             executor,
-            time: JobTime { given: std::time::Duration::ZERO },
             #[cfg(feature = "machine-line")]
             line: false,
         }
     }
 
-    /// A job given no time stores nothing: everything it reaches first is a
-    /// figure nothing prices (the probe, which the walk reads before any
-    /// other point, and the figures outside the walk), which its time
-    /// ending leaves unrecorded for the next job rather than priced. Its
-    /// time, not the machine, cut it off, so it reports no failure of its
-    /// own: the next job is given longer (the first time, the least any job
-    /// is given) and measures.
+    /// A job given no time stores nothing: it begins no point, leaving every
+    /// one unrecorded, and reports it measured nothing, with no failure of
+    /// its own. The next, given a job's time, begins its points and measures.
     #[test]
-    fn a_job_given_no_time_leaves_what_nothing_prices_to_a_longer_one() {
+    fn a_job_given_no_time_leaves_every_point_to_the_next() {
         let root = tempfile::tempdir().unwrap();
         let mut jobs = cut_off_jobs(root.path());
+        match jobs.run() {
+            Err(JobsStopped::Stalled { failures, .. }) => {
+                assert!(failures.iter().all(|failure| !failure.fails_job()), "{failures:?}")
+            }
+            Err(stopped) => panic!("{stopped}"),
+            Ok(_) => panic!("a job given no time measured"),
+        }
+        jobs.request.time = job_time();
         let run = jobs.run().unwrap();
         assert_eq!(jobs.request.job, MeasureJob(2), "the cut-off job stored nothing, and the next measured");
-        assert_eq!(jobs.request.time, JobTime::first(), "the next job was given longer: the first time");
         assert!(run.failures.iter().all(|failure| !failure.fails_job()), "{:?}", run.failures);
-    }
-
-    /// A job that measured nothing and reported no failure of its own gives
-    /// the next twice its time, up to the longest, past which it stalls; one
-    /// that reported a failure stalls at once, still doubling the time a
-    /// retry is given; one that measured gives the next the first time.
-    #[test]
-    fn an_empty_job_doubles_the_next_jobs_time_up_to_the_longest() {
-        let empty = JobProgress::Empty { failed: false };
-        let mut time = JobTime::default();
-        assert_eq!(time.given(), JobTime::first());
-        for doubled in [2, 4, 8] {
-            assert_eq!(time.after(empty), Ok(NextJob::Longer));
-            assert_eq!(time.given(), JobTime::first() * doubled);
-        }
-        assert_eq!(time.given(), JobTime::longest());
-        assert_eq!(time.after(empty), Err(JobStall::Exhausted));
-        assert_eq!(time.given(), JobTime::longest());
-        assert_eq!(time.after(JobProgress::Measured), Ok(NextJob::Resumes));
-        assert_eq!(time.given(), JobTime::first());
-        assert_eq!(time.after(JobProgress::Empty { failed: true }), Err(JobStall::Failed));
-        assert_eq!(time.given(), JobTime::first() * 2);
-        let mut longest = JobTime { given: JobTime::longest() };
-        assert_eq!(longest.after(JobProgress::Empty { failed: true }), Err(JobStall::Failed));
-        // A job at the longest time is retried at the same cadence as the
-        // jobs before it, twice what it ran, however often it stalls.
-        assert_eq!(JobTime::pause(JobTime::longest()), JobTime::longest() * 2);
     }
 
     /// Requests and outcomes cross the process encoding.

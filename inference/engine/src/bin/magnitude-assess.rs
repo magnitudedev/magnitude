@@ -25,7 +25,9 @@ use magnitude_engine::{
     },
     error::UnsupportedModel,
     options::{standard_service_limits, ModelMethod, ModelPolicy, PROFILE_SEQUENCES},
-    worker::measure::{end_measured, measure_machine, MeasureEnd, MeasureEvent, MeasureJob, MeasureRequest},
+    worker::measure::{hang_silence, measure_machine, observe_measurement, report_measurement, MeasureEvent, MeasureJob, MeasureRequest},
+    worker::transport::{stdio_worker_transport, Transport},
+    worker::{start_worker_process, WorkerExit, WorkerProcess, WorkerReport},
 };
 #[cfg(feature = "machine-line")]
 use magnitude_engine::worker::measure::measure_line;
@@ -245,57 +247,77 @@ fn parse() -> Result<Options, String> {
     })
 }
 
-/// How many times its own time the measurement job is waited for: it ends by
-/// its own deadline, counted from inside its process, so its kill comes well
-/// after that deadline and a job that ends by it is never killed.
-const JOB_KILLED_AT: u32 = 2;
-
-/// Run the measurement job in a process of its own and wait for it at most
-/// [`JOB_KILLED_AT`] times its time: a native submission, a driver call or a
-/// compile cannot be cancelled, so only the kill bounds it, whatever the
+/// Run the measurement job in a process of its own, reading its events as
+/// it reports them ([`report_measurement`]), until it reports its outcome
+/// or hangs: silent past [`hang_silence`], the one hang policy every host
+/// of a job keeps, when it is killed. A native submission, a driver call or
+/// a compile cannot be cancelled, so only the kill bounds it, whatever the
 /// kernel cache holds. What it stored stands; a point it was attempting
 /// counts as ended this job, and one that ends two is recorded unobtainable,
 /// so a point that hangs does not hang every job. The seconds it took, and
-/// whether it ended on its own with nothing unmeasured.
+/// whether it reported its outcome with nothing unmeasured.
 fn bounded_job(time: Duration, executor: ExecutorSelector, scope: Job) -> Result<(f64, bool), String> {
-    let limit = time * JOB_KILLED_AT;
-    eprintln!(
-        "magnitude-assess: measuring this machine, {:.0} s, killed at {:.0} s",
-        time.as_secs_f64(),
-        limit.as_secs_f64()
-    );
+    eprintln!("magnitude-assess: measuring this machine, {:.0} s", time.as_secs_f64());
     let started = Instant::now();
-    let measured;
-    let mut job = std::process::Command::new(std::env::current_exe().map_err(|error| error.to_string())?)
+    let mut command = std::process::Command::new(std::env::current_exe().map_err(|error| error.to_string())?);
+    command
         .args(std::env::args_os().skip(1))
         .arg(match scope {
             Job::Machine => JOB_ONLY,
             #[cfg(feature = "machine-line")]
             Job::Line => LINE_JOB_ONLY,
         })
-        .arg(executor.to_string())
-        .stdout(std::process::Stdio::null())
-        .spawn()
-        .map_err(|error| format!("the measurement job: {error}"))?;
-    loop {
-        match job.try_wait().map_err(|error| format!("the measurement job: {error}"))? {
-            Some(status) => {
-                if !status.success() {
-                    eprintln!("magnitude-assess: the measurement job ended {status}");
-                }
-                measured = status.success();
-                break;
+        .arg(executor.to_string());
+    let WorkerProcess { transport, retire } =
+        start_worker_process(command).map_err(|error| format!("the measurement job: {error}"))?;
+    let (events, heard) = std::sync::mpsc::channel();
+    let reader = seismic::threads::spawn("measurement-job-reader", move || {
+        observe_measurement(transport, |event| {
+            let _ = events.send(event);
+        })
+    })
+    .map_err(|error| format!("the measurement job's reader: {error}"))?;
+    let mut opened = false;
+    let hung = loop {
+        match heard.recv_timeout(hang_silence(opened)) {
+            Ok(MeasureEvent::Opened) => opened = true,
+            Ok(MeasureEvent::Recorded(key, record)) => {
+                eprintln!("magnitude-assess: {:.3} s: {key:?}: {record:?}", started.elapsed().as_secs_f64())
             }
-            None if started.elapsed() >= limit => {
-                job.kill().map_err(|error| format!("the measurement job: {error}"))?;
-                job.wait().map_err(|error| format!("the measurement job: {error}"))?;
-                eprintln!("magnitude-assess: the measurement job was killed at its limit; what it stored stands");
-                measured = false;
-                break;
-            }
-            None => std::thread::sleep(Duration::from_millis(50)),
+            Ok(MeasureEvent::Attempting(_)) => {}
+            // The reader ended: the job reported its outcome, or its stream ended.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break false,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break true,
         }
-    }
+    };
+    let retire = |report| retire(report).map_err(|error| format!("the measurement job: {error}"));
+    let joined = |reader: std::thread::JoinHandle<_>| reader.join().map_err(|_| "the measurement job's reader panicked".to_string());
+    let measured = if hung {
+        // Killing it ends its stream, and so its reader.
+        let ended = retire(WorkerReport::Unreported)?;
+        let _ = joined(reader)?;
+        eprintln!("magnitude-assess: the measurement job hung and was killed ({ended}); what it stored stands");
+        false
+    } else {
+        // Its stream ended, its outcome reported or not: it is waited for.
+        let outcome = joined(reader)?;
+        let ended = retire(match outcome {
+            Ok(_) => WorkerReport::Reported,
+            Err(_) => WorkerReport::Ended,
+        })?;
+        match outcome {
+            Ok(failures) => {
+                for failure in &failures {
+                    eprintln!("magnitude-assess: not measured: {failure}");
+                }
+                failures.is_empty()
+            }
+            Err(lost) => {
+                eprintln!("magnitude-assess: the measurement job was lost: {lost}; it {ended}");
+                false
+            }
+        }
+    };
     let seconds = started.elapsed().as_secs_f64();
     eprintln!("magnitude-assess: measured in {seconds:.3} s");
     Ok((seconds, measured))
@@ -338,39 +360,31 @@ fn run() -> Result<bool, String> {
         }
     }
     if let Some((executor, scope)) = options.job {
-        // Measured as the job measures: what is stored is kept, and each
-        // record stored now is printed.
-        let started = Instant::now();
-        let measure = match scope {
+        // Measured as the job measures, its events reported to the process
+        // that started it ([`bounded_job`]), which keeps its hang guard.
+        let job = match scope {
             Job::Machine => measure_machine,
             #[cfg(feature = "machine-line")]
             Job::Line => measure_line,
         };
-        let MeasureEnd { failures, held } = measure(
-            &MeasureRequest {
-                paths: served,
-                kernels: options.kernels.clone(),
-                storage: options.storage.clone(),
-                executor,
-                // Nothing preempts the tool's job; its process names it.
-                job: MeasureJob(u64::from(std::process::id())),
-                time: options.time,
-            },
-            &mut |event| {
-                if let MeasureEvent::Recorded(key, record) = event {
-                    eprintln!(
-                        "magnitude-assess: {:.3} s: {key:?}: {record:?}",
-                        started.elapsed().as_secs_f64()
-                    )
-                }
-            },
-        );
-        for failure in &failures {
-            eprintln!("magnitude-assess: not measured: {failure}");
-        }
+        let request = MeasureRequest {
+            paths: served,
+            kernels: options.kernels.clone(),
+            storage: options.storage.clone(),
+            executor,
+            // Nothing preempts the tool's job; its process names it.
+            job: MeasureJob(u64::from(std::process::id())),
+            time: options.time,
+        };
+        let (_, sender) = stdio_worker_transport().split();
+        let served = report_measurement(&request, sender, job);
         // Every record is stored: the job's process ends as the service's
         // measurement worker's does.
-        end_measured(held, if failures.is_empty() { 0 } else { 1 });
+        let code = match &served.exit {
+            WorkerExit::Measured => 0,
+            _ => 1,
+        };
+        served.end_process(code);
     }
     let catalog = Devices::discover(&served).map_err(|error| error.to_string())?;
     let mut structure = AssessmentStructure::discover(

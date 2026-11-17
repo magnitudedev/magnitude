@@ -19,7 +19,9 @@
 //!   through measured points and refined by observations of real work,
 //!   with its state ([`LineState`]).
 //! - **Records** ([`measure_all`], [`Record`], [`RecordStore`]): measured
-//!   points kept under the caller's keys, through a store the host
+//!   points kept under the caller's keys, each begun before its host's
+//!   cutoff and timed to its end, so what is recorded never follows from
+//!   how long the host took to reach it, through a store the host
 //!   implements, read bounded and written atomically ([`JsonFileStore`]),
 //!   or held for a host that keeps none ([`HeldStore`]).
 

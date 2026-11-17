@@ -209,9 +209,8 @@ impl ReadyEngine {
 /// process before it loads or prepares (`preview::priced`): no job runs
 /// beside a host that loads in its own process, so while they are pending
 /// its own jobs measure them ([`InProcessJobs`]), and the plan is taken
-/// again. Jobs whose time gives no next one before they measure anything
-/// of what is pending ([`crate::worker::measure::JobTime`]) fail the load
-/// with why. A preview that fails otherwise is the load's to report, as it
+/// again. A job that measures nothing of what is pending
+/// ([`crate::worker::measure::JobsStopped`]) fails the load with why. A preview that fails otherwise is the load's to report, as it
 /// plans the same. Returns how often its jobs measured; never without a
 /// kernel cache, which holds the figures. A load in its own process
 /// settles them once an attempt finds them pending ([`load_in_process`]),
