@@ -419,7 +419,7 @@ mod tests {
         .expect("a component");
         let domains = vec![magnitude_state::HistoryDomainLayout::Token { components: vec![component] }];
         let page_rows = domains[0].pages(&domains, 1024, 16).expect("the pages").page_rows as u64;
-        (std::sync::Arc::new(LoadShape { stores: vec![StoreShape { domains, context: 1024, max_advance: 16 }] }), page_rows)
+        (std::sync::Arc::new(LoadShape { stores: vec![StoreShape::paged(domains, 1024, 16)] }), page_rows)
     }
 
     /// Two readers of the process's one open device read its store's one

@@ -105,8 +105,6 @@ pub(crate) struct PreparedPrograms {
     /// The pass the load's in-process figure was priced at
     /// (`LoadPlans::held_pass`), which its target graphs are prepared for.
     pub held_pass: magnitude_executor::PassLaunches,
-    /// The load's request slot (`LoadPlans::slot`).
-    pub slot: u64,
     /// The load's one set of worker threads: everything its preparation
     /// does off the calling thread runs on these and no others. It is lent
     /// to the opened device for the programs the load forms, and seals the
@@ -129,8 +127,6 @@ struct PlannedModel {
     backend: BackendName,
     state: StateResourcePlan,
     held_pass: magnitude_executor::PassLaunches,
-    /// The load's request slot (`LoadPlans::slot`).
-    pub slot: u64,
     kernel_cache: Option<Arc<KernelCache>>,
     numerical_profile: magnitude_executor::ResolvedNumericalProfile,
 }
@@ -203,11 +199,6 @@ struct LoadPlans {
     /// The state `draft` plans, its domain bounded by the room the load's
     /// claims read (`PlanningRoom::net`): planned once, here, for the load.
     state: StateResourcePlan,
-    /// The load's request slot: the state of one request at its served
-    /// context, as its fit counted it (`AssessmentMemoryCharge::state_bytes`),
-    /// which the load commits beside its weights so the bank never imports
-    /// into it.
-    pub slot: u64,
 }
 
 /// Plan `manifest`'s load on `device`: the same derivation metadata-only
@@ -216,11 +207,7 @@ struct LoadPlans {
 /// reading the load holds, not from the assessment's stable fit: its plan
 /// settles into the room its search and claims read
 /// ([`magnitude_executor::PlanningRoom`], `DeviceReading::room_after`), so a
-/// plan that fits is granted at the reading. What the fit counted for the
-/// served context's request (`AssessmentMemoryCharge::state_bytes`) is the
-/// load's request slot, the one figure fit and commitment share: a request
-/// of the whole served context fits it by the page rule, or the charge
-/// under-counts its own state, which is an invariant violation.
+/// plan that fits is granted at the reading.
 fn plan_load(manifest: &ExecutionManifest, selected: &platform::SelectedDevice, holding: Holding, device: &ReadDevice) -> Result<LoadPlans, LoadError> {
     let backend = selected.info.backend();
     let planned = |error: crate::planning::ExecutionPlanningError| -> LoadError {
@@ -235,7 +222,6 @@ fn plan_load(manifest: &ExecutionManifest, selected: &platform::SelectedDevice, 
     let charged = crate::planning::plan_banked::<magnitude_executor::AssessmentMemoryCharge>(manifest, selected, resident.clone(), holding, &room)
         .map_err(planned)?;
     let held_pass = charged.charge().held_pass;
-    let slot = charged.charge().state_bytes;
     let draft = charged.into_draft();
     let state = ResourcePlanner::state_plan(
         &manifest.definition,
@@ -246,14 +232,7 @@ fn plan_load(manifest: &ExecutionManifest, selected: &platform::SelectedDevice, 
         ResourceCapacity { domain_bytes: room.net(), tensor_operations, allocations: selected.info.limits().allocations() },
     )
     .map_err(internal)?;
-    let context = manifest.definition.decoder.context_limit;
-    let request = LoadShape::of_states(state.target_state(), state.head_state())
-        .state_bytes(LoadShape::request_rows(context, draft.policy().method()));
-    assert!(
-        request <= slot,
-        "invariant violated: a request of the served context's {context} rows takes {request} bytes of state, past the {slot} the load's fit counted"
-    );
-    Ok(LoadPlans { resident, draft, held_pass, state, slot })
+    Ok(LoadPlans { resident, draft, held_pass, state })
 }
 
 /// Select and open the manifest's device and plan the model on it.
@@ -282,7 +261,7 @@ fn plan_on_device(
     let read = read_device(catalog, manifest, &selected)?;
     report_load_phase("device open", &mut phase_started);
     report_load_memory("device opened", read.opened.device());
-    let LoadPlans { resident, draft, held_pass, state, slot } = plan_load(manifest, &selected, holding, &read)?;
+    let LoadPlans { resident, draft, held_pass, state } = plan_load(manifest, &selected, holding, &read)?;
     let ReadDevice { opened, ledgers, reader, reading } = read;
     if let Some(bank) = draft.load().expert_bank() {
         let weights = draft.load().weight_bytes().map_err(internal)?;
@@ -322,7 +301,6 @@ fn plan_on_device(
         backend,
         state,
         held_pass,
-        slot,
         kernel_cache,
         numerical_profile,
     })
@@ -519,7 +497,6 @@ fn prepare(
         backend,
         state,
         held_pass,
-        slot,
         kernel_cache,
         numerical_profile,
     } = plan_on_device(catalog, manifest, package, progress.as_ref(), holding)?;
@@ -600,7 +577,6 @@ fn prepare(
         backend,
         state,
         held_pass,
-        slot,
         workers,
     }))
 }
@@ -671,7 +647,6 @@ fn build_held(
         backend,
         state,
         held_pass,
-        slot,
         workers,
     } = match prepare(catalog, manifest, &package, unprepared, progress.clone(), holding)? {
         LoadAttempt::Loaded(prepared) => prepared,
@@ -886,19 +861,9 @@ fn build_held(
     let host_tables = startup.claim("host tables", ClaimDemand { host: host_tables, ..ClaimDemand::default() })?;
     // The allocations after the target import are claimed before it, so the
     // import's bank holds what they leave.
-    // What the load needs to serve beside its weights and its bank's floor
-    // is the served context's whole request, the state its fit counted:
-    // committed with them, before the import, so the bank never imports
-    // into it, and held for the domain's life, one request at a time
-    // reserving from it. The state stores' first slabs are granules of the
-    // store's pool within it ([`CommittedKind::RequestSlot`]).
-    let initial = plan
-        .head_state()
-        .map_or(Ok(0), |state| state.initial_slab_bytes())
-        .and_then(|head| plan.target_state().initial_slab_bytes().map(|target| target + head))
-        .map_err(internal)?;
-    // Their address tables lie outside the pool: a claim of their own,
-    // charged as the stores are made and held for the domain's life.
+    // The state stores' address tables lie outside the pool: a claim of
+    // their own, charged as the stores are made and held for the domain's
+    // life.
     let table_bytes = plan
         .target_state()
         .table_bytes()
@@ -909,12 +874,15 @@ fn build_held(
         })
         .map_err(internal)?;
     let mut state_tables = startup.claim_as("state tables", CommittedKind::StateTables, ClaimDemand { device: table_bytes, ..ClaimDemand::default() })?;
-    // The fit's state counts the tables too: the slot holds the rest, so
-    // each byte is committed once, the tables by their own claim.
-    let slot = slot.checked_sub(table_bytes).unwrap_or_else(|| panic!("invariant violated: the state tables' {table_bytes} bytes exceed the {slot}-byte state the load's fit counted"));
-    assert!(initial <= slot, "invariant violated: the state stores' first {initial} bytes of slabs exceed the {slot}-byte request slot");
+    // What admission needs for one request to make progress is its opening
+    // reservation, the request slot: committed beside the weights and the
+    // bank's floor, before the import, so the bank never imports into it,
+    // and held for the domain's life. The state stores' first slabs are
+    // granules within it. Every request's rows past it are reserved as it
+    // opens and grows, the bank yielding them by relief.
+    let slot = magnitude_executor::request_slot_bytes(&execution_plan).map_err(internal)?;
     let request_slot = startup
-        .claim_as("the served context's request", CommittedKind::RequestSlot, ClaimDemand { device: slot, ..ClaimDemand::default() })?
+        .claim_as("one request's opening", CommittedKind::RequestSlot, ClaimDemand { device: slot, ..ClaimDemand::default() })?
         .into_request_slot();
     let constants_claim = startup.claim_as(
         "target binding constants",

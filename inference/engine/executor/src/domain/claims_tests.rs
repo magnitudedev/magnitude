@@ -292,15 +292,15 @@ fn a_drafted_domains_provision_claims_through_its_draft_depth_in_both_stores() {
     let domains = shape.stores.iter().map(|store| store.domains.len()).collect::<Vec<_>>();
     assert_eq!(domains, [resources.target_state().history.len(), head.history.len()], "both stores' domains");
     let context = resources.target_state().context_rows as u64;
-    assert_eq!(state.rows(), LoadShape::request_rows(context, method), "the open reserved the whole request, draft depth and all");
+    assert_eq!(state.rows(), context + method.draft_rows() as u64, "the served open reserved the whole context, draft depth and all");
     assert_eq!(state.bytes(), shape.state_bytes(state.rows()), "the reservation holds both stores' pages through its rows");
 }
 
-/// The request slot is the first request's reservation: it moves into the
-/// request as it opens and back as it closes; a second request beside it
-/// takes free room, never the slot twice.
+/// A reservation draws on what the request slot holds first and gives
+/// back exactly what it drew as it closes; one opened beside it draws what
+/// is left, and the rest from free room.
 #[test]
-fn a_reservation_draws_the_slot_first_and_gives_it_back() {
+fn a_reservation_draws_the_slot_first_and_gives_back_what_it_drew() {
     use super::super::fixtures::{fixture_over, limits, tiny_definition, tiny_manifest};
     use crate::memory::ledger::CommittedKind;
     let (mut domain, mut bindings) = fixture_over(
@@ -319,12 +319,14 @@ fn a_reservation_draws_the_slot_first_and_gives_it_back() {
         assert!(domain.open_served(&mut bindings, request, None).unwrap().is_empty());
     }
     let reserved = domain.state_claims[&first].bytes();
-    assert_eq!(committed_of(&domain, CommittedKind::RequestSlot), [slot - reserved], "the first request drew the slot");
-    assert_eq!(domain.state_claims[&second].bytes(), reserved, "the second reserved as much beside it");
+    assert_eq!(domain.state_claims[&second].bytes(), reserved, "both reserved their whole requests");
+    let drawn = slot.min(reserved);
+    let left = slot - drawn;
+    assert_eq!(committed_of(&domain, CommittedKind::RequestSlot), [left - left.min(reserved)], "each drew what the slot held, the first first");
     domain.close(second).unwrap();
-    assert_eq!(committed_of(&domain, CommittedKind::RequestSlot), [slot - reserved], "the second never held the slot");
+    assert_eq!(committed_of(&domain, CommittedKind::RequestSlot), [left], "the second gave back what it drew");
     domain.close(first).unwrap();
-    assert_eq!(committed_of(&domain, CommittedKind::RequestSlot), [slot], "the first gave the slot back");
+    assert_eq!(committed_of(&domain, CommittedKind::RequestSlot), [slot], "the first gave back the rest");
 }
 
 /// An open refused for room holds nothing and yields nothing: the retained
@@ -429,10 +431,14 @@ fn grown_rows() -> (
     )
     .expect("a component");
     let domains = vec![magnitude_state::HistoryDomainLayout::Token { components: vec![component] }];
-    let shape = std::sync::Arc::new(LoadShape { stores: vec![crate::memory::ledger::StoreShape { domains, context: 1 << 20, max_advance: 16 }] });
-    let scope = crate::memory::ledger::Ledgers::new();
-    let ledger = scope.ledger(seismic::StoreIdentity::HostRam, shape);
+    let shape = std::sync::Arc::new(LoadShape { stores: vec![crate::memory::ledger::StoreShape::paged(domains, 1 << 20, 16)] });
+    // Its changes are stamped at the epoch, before every scripted reading
+    // after the first: on the process's clock, a change made more than a
+    // reading's offset after the epoch (a loaded host) postdates that
+    // reading, which then counts the change's bytes as not yet read.
     let epoch = std::time::Instant::now();
+    let scope = crate::memory::ledger::Ledgers::scripted(move || epoch);
+    let ledger = scope.ledger(seismic::StoreIdentity::HostRam, shape);
     read_at(&ledger, epoch, 2 * GIB, 0);
     let records = ledger.pool_block(crate::memory::ledger::PoolClass::Records, std::num::NonZeroU64::new(GIB).expect("a block")).blocks;
     let pool = ledger.pool_block(crate::memory::ledger::PoolClass::State, std::num::NonZeroU64::new(GIB).expect("a block")).blocks;

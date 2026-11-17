@@ -71,7 +71,7 @@
 //!
 //! Sizes are never computed here. A [`Need`] names what is needed and with
 //! what inputs; the page rule ([`magnitude_state::state_bytes`]) sizes state inside
-//! [`Ledger::reserve`] through the one private `size`,
+//! [`Ledger::reserve`] and [`Ledger::extend`] through the one private `size`,
 //! the same functions plan and assessment predict with.
 //!
 //! No OS is queried here: readings are handed in.
@@ -92,7 +92,7 @@ pub use pressure::PressureWatch;
 mod store;
 pub use store::*;
 
-pub use admission::{Admit, Over, Short};
+pub use admission::{Admit, Frees, Over, Short};
 pub use changes::{Changes, Changing, OpenChange, Owner, Sample, Sampled};
 pub use claims::{ArenaClaim, Cached, Claim};
 pub use estimate::Estimate;
@@ -100,7 +100,7 @@ pub use grant::{Footprints, Grant, SystemFootprints};
 pub use relief::{Owed, Relief, ReliefPlan};
 pub use reservation::Reservation;
 pub use view::{ChargeClasses, Ledger, Standing};
-pub use vocabulary::{CacheKind, CommittedKind, Entry, GrantRole, Holding, LoadShape, Need, PoolClass, StoreShape, Value};
+pub use vocabulary::{CacheKind, CommittedKind, Entry, GrantRole, Holding, LoadShape, Need, PoolClass, RequestRows, StoreShape, Value};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};

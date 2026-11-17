@@ -18,7 +18,7 @@ pub(crate) fn shape() -> Arc<LoadShape> {
     )
     .expect("a component");
     let domains = vec![magnitude_state::HistoryDomainLayout::Token { components: vec![component] }];
-    Arc::new(LoadShape { stores: vec![StoreShape { domains, context: 1024, max_advance: 16 }] })
+    Arc::new(LoadShape { stores: vec![StoreShape::paged(domains, 1024, 16)] })
 }
 
 /// The rows of one page of [`shape`]'s history: a request's state is laid
@@ -34,8 +34,8 @@ fn slot(ledger: &Ledger, bytes: u64) -> Claim {
     ledger.claim(Need::RequestSlot { bytes }).expect("the slot fits")
 }
 
-/// `sequence`'s whole request of `pages` pages, reserved from `slot` or
-/// beside it.
+/// `sequence`'s reservation of `pages` pages, drawn from `slot` first and
+/// the rest beside it.
 fn request(ledger: &Ledger, slot: &Claim, sequence: u64, pages: u64) -> Result<Reservation, Short> {
     ledger.reserve(slot, RequestId(sequence), pages * page_rows())
 }
@@ -300,8 +300,8 @@ fn own_claims_are_never_others_taking_memory() {
 
 /// Item 23: the guarantee is others' rise between the last two readings
 /// alone: never a forecast scaled by our own release latency, and nothing
-/// of the process's own (a request's whole state is committed as it
-/// opens).
+/// of the process's own (a request's state is committed ahead of the
+/// rows it writes).
 #[test]
 fn the_guarantee_is_others_rise_only() {
     let (_scope, ledger, pool) = host();
@@ -651,13 +651,13 @@ fn a_relief_plan_covers_its_need_whole_or_takes_nothing() {
     let (_requests, (bank, prefix), _slot, page) = four_requests(&ledger);
     let cached = bank.bytes() + prefix.bytes();
     let every = [1, 2, 3, 4].map(RequestId).into();
-    let plan = ledger.plan_relief(cached + 2 * page, Relief::CacheAndRequests(&every)).expect("the cache and two requests cover it");
+    let plan = ledger.plan_relief(cached + 2 * page, Relief::CacheAndRequests(&every), crate::memory::ledger::Frees::Room).expect("the cache and two requests cover it");
     assert_eq!(plan.preempt(), [RequestId(4), RequestId(3)]);
     let held = [1, 2, 3].map(RequestId).into();
-    let around = ledger.plan_relief(cached + 2 * page, Relief::CacheAndRequests(&held)).expect("the cache and two evictable requests cover it");
+    let around = ledger.plan_relief(cached + 2 * page, Relief::CacheAndRequests(&held), crate::memory::ledger::Frees::Room).expect("the cache and two evictable requests cover it");
     assert_eq!(around.preempt(), [RequestId(3), RequestId(2)], "the request its holder cannot evict is never named");
-    assert_eq!(ledger.plan_relief(cached + 4 * page, Relief::CacheAndRequests(&every)), None, "the first request is never preempted");
-    assert_eq!(ledger.plan_relief(cached + 1, Relief::CacheOnly), None, "cache alone cannot cover it");
+    assert_eq!(ledger.plan_relief(cached + 4 * page, Relief::CacheAndRequests(&every), crate::memory::ledger::Frees::Room), None, "the first request is never preempted");
+    assert_eq!(ledger.plan_relief(cached + 1, Relief::CacheOnly, crate::memory::ledger::Frees::Room), None, "cache alone cannot cover it");
     let after = ledger.estimate();
     assert_eq!((after.cache_of(CacheKind::Bank), after.cache_of(CacheKind::Prefix)), (cached - page, page), "no plan took the bank or the prefix");
     let owed = ledger.execute(plan);
@@ -669,7 +669,7 @@ fn a_relief_plan_covers_its_need_whole_or_takes_nothing() {
 /// handles dropped while unwinding never touch the ledger it poisoned, so
 /// the test binary goes on.
 #[test]
-#[should_panic(expected = "a request's state is reserved whole, never in units")]
+#[should_panic(expected = "a request's state is reserved by its own path, never in units")]
 fn an_invariant_broken_under_the_lock_panics_as_itself() {
     let (_scope, ledger, _pool) = host();
     let (_requests, _cache, _slot, _page) = four_requests(&ledger);
@@ -1235,7 +1235,7 @@ fn a_shortages_yield_is_free_only_once_freed() {
     let _weights = commit(&ledger, 40 * GB);
     let bank = ledger.cached(CacheKind::Bank, 20 * GB).expect("free room");
     assert_eq!(ledger.estimate().free(), 4 * GB);
-    let plan = ledger.plan_relief(8 * GB, Relief::CacheOnly).expect("the bank covers it");
+    let plan = ledger.plan_relief(8 * GB, Relief::CacheOnly, crate::memory::ledger::Frees::Room).expect("the bank covers it");
     assert_eq!(ledger.execute(plan).yielded, 8 * GB);
     assert_eq!((bank.bytes(), ledger.estimate().free()), (12 * GB, 4 * GB), "shed, still allocated: not free");
     assert!(ledger.cached(CacheKind::Prefix, 5 * GB).is_err());
@@ -1519,7 +1519,7 @@ fn cache_yields_by_value_per_byte() {
     let gb = NonZeroU64::new(8 * GB).unwrap();
     bank.value(Value::per_byte(1.0, gb));
     prefix.value(Value::recompute(0.5, 4, gb));
-    let plan = ledger.plan_relief(12 * GB, Relief::CacheOnly).expect("the cache covers it");
+    let plan = ledger.plan_relief(12 * GB, Relief::CacheOnly, crate::memory::ledger::Frees::Room).expect("the cache covers it");
     assert_eq!(ledger.execute(plan).yielded, 12 * GB);
     assert_eq!((spare.bytes(), bank.bytes(), prefix.bytes()), (0, 4 * GB, 8 * GB), "spare, then the bank worth less");
 }
@@ -1875,4 +1875,49 @@ fn a_settled_idle_sleep_opens_a_fresh_baseline_at_the_next_reading() {
     };
     let pressured = ledger.read_after(ledger.sampled(pressured_wake), Reading::unified(&pressured_sample, u64::MAX), true);
     assert_eq!(pressured.guarantee(), 3 * GB, "a pressured wake preserves supply rise");
+}
+
+/// A reservation extends ahead of its rows from what the request slot
+/// holds first, then from free room beside it; short, it holds what it
+/// held and the extension waits; dropped, it gives the slot back exactly
+/// what it drew of it, never the bytes it took beside it.
+#[test]
+fn a_reservation_extends_from_the_slot_then_free_room_and_gives_back_what_it_drew() {
+    let (_scope, ledger, _pools) = host();
+    let mut clock = Clock::new();
+    let page = ledger.bytes(&Need::Request { sequence: RequestId(1), rows: page_rows() });
+    read(&ledger, &mut clock, 64 * GB, 4 * page, Some(64 * GB));
+    let slot = slot(&ledger, 2 * page);
+    let mut sequence = request(&ledger, &slot, 1, 1).expect("a page of the slot");
+    assert_eq!((sequence.bytes(), slot.bytes()), (page, page), "it drew its page of the slot");
+    ledger.extend(&slot, &mut sequence, 3 * page_rows()).expect("the slot's page, then a page of free room");
+    assert_eq!((sequence.rows(), sequence.bytes(), slot.bytes()), (3 * page_rows(), 3 * page, 0), "the slot first, the rest beside it");
+    let free = ledger.estimate().free();
+    assert!(ledger.extend(&slot, &mut sequence, 64 * page_rows()).is_err(), "an extension past free room is short");
+    assert_eq!((sequence.rows(), sequence.bytes(), ledger.estimate().free()), (3 * page_rows(), 3 * page, free), "short, it holds what it held");
+    drop(sequence);
+    assert_eq!(slot.bytes(), 2 * page, "dropped, the slot has back the two pages drawn of it");
+}
+
+/// A growth's relief counts all a preempted request holds, since a
+/// request's state draws on the slot first; any other claim's counts only
+/// what it holds beside the slot, and a request that drew only the slot
+/// frees nothing for it.
+#[test]
+fn a_preempted_request_frees_its_whole_reservation_for_state_and_beside_the_slot_for_room() {
+    let (_scope, ledger, _pools) = host();
+    let mut clock = Clock::new();
+    let page = ledger.bytes(&Need::Request { sequence: RequestId(1), rows: page_rows() });
+    read(&ledger, &mut clock, 64 * GB, 4 * page, Some(64 * GB));
+    let slot = slot(&ledger, page);
+    // The second drew beside the slot the first held; the first gone, the
+    // third drew the slot, and the second is now the earliest admitted.
+    let first = request(&ledger, &slot, 1, 1).expect("the slot's page");
+    let _second = request(&ledger, &slot, 2, 1).expect("a page beside the slot");
+    drop(first);
+    let _third = request(&ledger, &slot, 3, 1).expect("the slot's page again");
+    let every = [2, 3].map(RequestId).into();
+    let state = ledger.plan_relief(page, Relief::CacheAndRequests(&every), Frees::RequestState).expect("the third's page covers a growth");
+    assert_eq!(state.preempt(), [RequestId(3)], "the slot's page it frees is a growth's");
+    assert_eq!(ledger.plan_relief(page, Relief::CacheAndRequests(&every), Frees::Room), None, "it frees nothing beside the slot");
 }

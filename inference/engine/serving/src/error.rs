@@ -275,6 +275,9 @@ fn request_class(error: &RequestError) -> Class {
             (StatusCode::BAD_REQUEST, INVALID, "context_length_exceeded", false)
         }
         RequestError::InsufficientMemory(_) => (unavailable, SERVER, "insufficient_memory", true),
+        RequestError::ContextExceedsMemory(_) => {
+            (StatusCode::BAD_REQUEST, INVALID, "context_exceeds_memory", false)
+        }
         RequestError::MemoryObservationUnavailable { .. } => {
             (unavailable, SERVER, "memory_observation_unavailable", true)
         }

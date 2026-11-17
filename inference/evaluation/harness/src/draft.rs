@@ -135,6 +135,7 @@ struct Drafted {
 fn head(engine: &mut Engine, operation: Operation, accepted: usize) -> Result<Outcome, String> {
     let operations = [operation];
     let mut bindings = engine.bindings();
+    engine.provision(&mut bindings, &operations)?;
     let ReservedResources::Head(workspace, output, advances) = engine
         .domain
         .reserve(&mut bindings, &operations)
@@ -319,6 +320,7 @@ fn draft_at(
     }];
     let verify_start = host_seconds();
     let mut bindings = engine.bindings();
+    engine.provision(&mut bindings, &operations)?;
     let ReservedResources::Target(reservation) = engine
         .domain
         .reserve(&mut bindings, &operations)

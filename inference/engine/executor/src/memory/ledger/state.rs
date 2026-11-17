@@ -57,10 +57,10 @@ pub(super) struct State {
     pub(super) cache_of: [u64; CacheKind::ALL.len()],
     /// Each request's reservation, by admission.
     pub(super) state_of: BTreeMap<RequestId, u64>,
-    /// The reservations drawn from a request slot, each with the slot's
-    /// entry ([`Ledger::reserve`]): one request at a time draws on a slot,
-    /// and its bytes go back to it as it drops.
-    pub(super) lent: HashMap<EntryId, EntryId>,
+    /// The reservations that drew on a request slot, each with the slot's
+    /// entry and the bytes it drew ([`Ledger::reserve`], [`Ledger::extend`]),
+    /// which go back to the slot as it drops.
+    pub(super) lent: HashMap<EntryId, (EntryId, u64)>,
     /// The grants, and the process each one's growth is credited from
     /// ([`Grant`]).
     pub(super) grants: BTreeMap<EntryId, super::grant::Granted>,
@@ -461,11 +461,11 @@ impl State {
         self.released(entry.releasing);
         self.grants.remove(&id);
         self.count(entry.holding, entry.bytes, false);
-        // A reservation drawn from a request slot gives its bytes back to
-        // it; the granules stay the pool's, so nothing allocated moves.
-        if let Some(slot) = self.lent.remove(&id).filter(|slot| self.held.contains_key(slot)) {
+        // A reservation gives what it drew of a request slot back to it;
+        // the granules stay the pool's, so nothing allocated moves.
+        if let Some((slot, drawn)) = self.lent.remove(&id).filter(|(slot, _)| self.held.contains_key(slot)) {
             let has = self.held[&slot].bytes;
-            self.resize(slot, has + entry.bytes);
+            self.resize(slot, has + drawn);
         }
     }
 

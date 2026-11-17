@@ -9,15 +9,17 @@ use crate::planning::BankTier;
 /// What committed memory is held for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CommittedKind {
-    /// A request's whole state, reserved as it opens
-    /// ([`Ledger::reserve`]): every row it may write, so its rows draw
-    /// within it and never wait on memory.
+    /// A request's state ([`Ledger::reserve`]): the rows it is about to
+    /// write, reserved as it opens and extended ahead of its steps
+    /// ([`Ledger::extend`]), so its rows draw within it and never wait on
+    /// memory mid-launch.
     Request(RequestId),
-    /// The served context's whole request, held for the domain's life: the
-    /// state the load's fit counted at its served context
-    /// (`AssessmentMemoryCharge::state_bytes`). One request at a time
-    /// draws its reservation from it ([`Ledger::reserve`]), and the load's
-    /// first state slabs are granules within it.
+    /// One request's opening reservation, held for the domain's life
+    /// (`domain::request_slot_bytes`): what admission needs for one request
+    /// to make progress, committed beside the weights so the bank never
+    /// imports into it. Reservations draw on what it holds first and give
+    /// it back as they drop; the load's first state slabs are granules
+    /// within it.
     RequestSlot,
     /// A streamed tier's landing rows.
     Landing,
@@ -252,17 +254,17 @@ pub struct Entry {
 /// ([`Recorded::claim_arena`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Need {
-    /// The whole state `sequence`'s history of `rows` rows takes
-    /// ([`LoadShape::state_bytes`]): reserved as it opens, every row it may
-    /// write within it.
+    /// The state `sequence`'s history of `rows` rows takes
+    /// ([`LoadShape::state_bytes`]): what its reservation holds
+    /// ([`RequestRows`]).
     Request { sequence: RequestId, rows: u64 },
     /// A streamed tier's landing rows, at load, of `slot_bytes` each.
     LandingRows { tier: BankTier, rows: u64, slot_bytes: u64 },
     /// A bank holding's floor, at load: the bank plan's charge at it, which
     /// plan and assessment size the bank by too.
     BankFloor { bytes: u64 },
-    /// The served context's request, at load, of the bytes the load's fit
-    /// counted for it ([`CommittedKind::RequestSlot`]).
+    /// One request's opening reservation, at load
+    /// ([`CommittedKind::RequestSlot`]).
     RequestSlot { bytes: u64 },
     /// Room for a process's growth beside the load, as its holder declares it
     /// ([`CommittedKind::Grant`]).
@@ -289,14 +291,15 @@ pub struct LoadShape {
     pub stores: Vec<StoreShape>,
 }
 
-/// One state store's history domains, and the context and largest advance
-/// the store lays their pages out at
-/// ([`magnitude_state::HistoryDomainLayout::geometry`]).
+/// One state store's history domains, the context and largest advance the
+/// store lays their pages out at, and the granule it backs them in, a slab
+/// a granule ([`magnitude_state::HistoryDomainLayout::geometry`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoreShape {
     pub domains: Vec<magnitude_state::HistoryDomainLayout>,
     pub context: usize,
     pub max_advance: usize,
+    pub granule: u64,
 }
 
 impl StoreShape {
@@ -307,18 +310,23 @@ impl StoreShape {
             domains: state.history.iter().map(|domain| domain.layout.clone()).collect(),
             context: state.context_rows,
             max_advance: state.max_advance,
+            granule: state.granule,
         }
     }
 
+    /// A test's store of `domains` backed a page a granule, so its slabs
+    /// are its pages.
+    #[cfg(test)]
+    pub(crate) fn paged(domains: Vec<magnitude_state::HistoryDomainLayout>, context: usize, max_advance: usize) -> Self {
+        let pages = domains[0].pages(&domains, context, max_advance).expect("the pages");
+        let granule = (pages.page_rows as u64) * domains[0].row_bytes().expect("a row's bytes");
+        Self { domains, context, max_advance, granule }
+    }
+
     /// The state `sequences` histories of `depth` rows take in this store,
-    /// in `unit` ([`magnitude_state::state_bytes`]).
-    pub fn state_bytes(
-        &self,
-        unit: magnitude_state::StateUnit,
-        sequences: u64,
-        depth: u64,
-    ) -> Result<u64, magnitude_state::Error> {
-        magnitude_state::state_bytes(&self.domains, self.context, self.max_advance, unit, sequences, depth)
+    /// in its slabs ([`magnitude_state::state_bytes`]).
+    pub fn state_bytes(&self, sequences: u64, depth: u64) -> Result<u64, magnitude_state::Error> {
+        magnitude_state::state_bytes(&self.domains, self.context, self.max_advance, self.granule, sequences, depth)
     }
 }
 
@@ -327,13 +335,6 @@ impl LoadShape {
     /// way a load's shape is built.
     pub fn of(plan: &crate::planning::ExecutionPlan) -> Self {
         Self::of_states(plan.resources().target_state(), plan.resources().head_state())
-    }
-
-    /// The rows a request of `rows` rows writes at most under `method`: its
-    /// own and the most speculative rows its drafter adds past its last
-    /// ([`crate::domain::claimed_through`]). What its reservation holds.
-    pub fn request_rows(rows: u64, method: crate::PlannedMethod) -> u64 {
-        crate::domain::claimed_through(0, usize::try_from(rows).expect("a request's rows fit usize"), method)
     }
 
     /// The history domains of every state store a load holds: the
@@ -346,8 +347,11 @@ impl LoadShape {
     }
 
     /// The state one history of `rows` rows occupies across the load's
-    /// stores, by the page rule ([`magnitude_state::state_bytes`]): the
-    /// target's, and its drafter's own where it keeps one.
+    /// stores, in the slabs each store backs it in
+    /// ([`magnitude_state::state_bytes`]):
+    /// the target's, and its drafter's own where it keeps one. What a
+    /// request's reservation holds is then what backing its rows allocates,
+    /// never less: one count of one quantity, as the load's fit counts it.
     ///
     /// # Panics
     /// Where a store's history domains do not size it: a load's domains
@@ -357,7 +361,7 @@ impl LoadShape {
             .iter()
             .try_fold(0u64, |total, store| {
                 let bytes = store
-                    .state_bytes(magnitude_state::StateUnit::Pages, 1, rows)
+                    .state_bytes(1, rows)
                     .expect("a load's history domains size every history it admits");
                 total.checked_add(bytes)
             })
@@ -365,8 +369,50 @@ impl LoadShape {
     }
 }
 
+/// The rows a request's reservation holds, the one rule for them: a
+/// launch's rows ahead of what it writes (`window`, the plan's
+/// `max_launch_rows`), within its served context and the most speculative
+/// rows its drafter adds past it (`limit`). Their bytes are
+/// [`LoadShape::state_bytes`]'s.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RequestRows {
+    window: u64,
+    method: crate::PlannedMethod,
+    limit: u64,
+}
+
+impl RequestRows {
+    /// The rule of the load `plan` places.
+    pub fn of(plan: &crate::planning::ExecutionPlan) -> Self {
+        let method = plan.policy().method();
+        Self {
+            window: plan.policy().limits().max_launch_rows as u64,
+            method,
+            limit: crate::domain::claimed_through(0, plan.resources().target_state().context_rows, method),
+        }
+    }
+
+    /// What a request about to write `rows` rows opens holding: those, its
+    /// drafter's rows past them ([`crate::domain::claimed_through`]) and a
+    /// launch's rows ahead.
+    pub fn opening(self, rows: u64) -> u64 {
+        self.reach(crate::domain::claimed_through(0, usize::try_from(rows).expect("a request's rows fit usize"), self.method))
+    }
+
+    /// What a request whose step reaches row `through`
+    /// ([`crate::domain::claimed_through`]) holds once it is extended: a
+    /// launch's rows ahead, within its limit.
+    ///
+    /// # Panics
+    /// Where `through` is past the limit: no step writes past the context.
+    pub fn reach(self, through: u64) -> u64 {
+        assert!(through <= self.limit, "invariant violated: a step reaches row {through}, past a request's {} rows", self.limit);
+        through.saturating_add(self.window).min(self.limit)
+    }
+}
+
 /// The bytes `need` takes: the one place any need's bytes come from. State
-/// rows by the pages they occupy ([`LoadShape::state_bytes`]); the rest as
+/// rows by the slabs they are backed in ([`LoadShape::state_bytes`]); the rest as
 /// their callers hold them.
 pub(super) fn size(shape: &LoadShape, need: &Need) -> u64 {
     match need {

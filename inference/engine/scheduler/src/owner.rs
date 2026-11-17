@@ -33,7 +33,7 @@ use magnitude_executor::{
     BankResize, BankResized, BankStep, BankTier, DomainError, Followed, LoadMeasures, InvariantError,
     MemoryChargeReconciliation, MemoryReading, NativeFamily, SizingTerm, SizingTerms,
     Operation, Outcome, PendingOperationOutcome, PhysicalDecision,
-    ProgramFamily, RequestId, ResourcePlan, StateBindings, SubmitError,
+    ProgramFamily, RequestId, ResourceKind, ResourcePlan, StateBindings, SubmitError,
     SubmitFailure, WorkKind, Yielded,
 };
 use magnitude_executor::memory::ledger::Relief;
@@ -558,6 +558,19 @@ fn classify_domain_error(error: DomainError) -> RequestError {
             context: "state ceiling",
             detail: error.to_string(),
         }),
+    }
+}
+
+/// A request's refusal where nothing of ours is left to free for it: its
+/// state short (as it opens, or grows ahead of a step), it alone needs
+/// more than the load can ever give it
+/// ([`RequestError::ContextExceedsMemory`]).
+fn refused_alone(error: DomainError) -> RequestError {
+    match error {
+        DomainError::Capacity(magnitude_executor::CapacityError { resource: ResourceKind::RequestState, required, available }) => {
+            RequestError::ContextExceedsMemory { required, available }
+        }
+        error => classify_domain_error(error),
     }
 }
 
@@ -1095,7 +1108,12 @@ impl<F: ProgramFamily> Owner<F> {
             pipeline,
         } = self;
         match service.drive(pipeline, now) {
-            Ok((pipeline, ran)) => Ok((Owner { service, pipeline }, ran)),
+            Ok((pipeline, ran)) => {
+                if let Pipeline::Idle(_) = &pipeline {
+                    service.check_no_unwakeable_wait();
+                }
+                Ok((Owner { service, pipeline }, ran))
+            }
             Err((mut members, error)) => {
                 // Members are dropped with the owner; terminating them first
                 // delivers their outcome.
@@ -1937,6 +1955,71 @@ trait MemoryStep: MemoryHost + Sized {
         Ok(true)
     }
 
+    /// The one path a claim short of memory takes, from its `first` try,
+    /// trying again by `attempt`: first free the cache the ledger took for
+    /// claims already admitted ([`MemoryStep::follow_yields`]); where that
+    /// frees nothing, ask the device's ledger for relief that covers what
+    /// the claim lacks, taking cache, and where `preempting`, the requests
+    /// that can be evicted now (`Ledger::plan_relief`), and carry it out
+    /// whole: its cache yields and its requests are evicted
+    /// ([`MemoryHost::preempt`]). Where no relief covers it, nothing yields. Each
+    /// that freed anything tries again; one that
+    /// frees memory only later (a round's end, slots releasing off this
+    /// thread, the expert bank's shrink) leaves the claim pending, and the
+    /// caller decides from there whether it waits or fails. Pending is
+    /// only ever a change under way, whose end advances the epoch.
+    fn relieve<T>(
+        &mut self,
+        bindings: &mut StateBindings,
+        first: Result<T, DomainError>,
+        preempting: bool,
+        mut attempt: impl FnMut(&mut Self, &mut StateBindings) -> Result<Result<T, DomainError>, RequestError>,
+    ) -> Result<Relieved<T>, RequestError> {
+        let mut current = first;
+        loop {
+            let pending = match &current {
+                Err(DomainError::Capacity(capacity)) => match self.follow_yields(bindings)? {
+                    Yielded::Released { .. } => None,
+                    Yielded::Pending => Some(true),
+                    Yielded::Nothing => {
+                        let lacks = capacity.required.saturating_sub(capacity.available);
+                        let evictable = self.evictable();
+                        let allow = match preempting {
+                            true => Relief::CacheAndRequests(&evictable),
+                            false => Relief::CacheOnly,
+                        };
+                        match self.domain().plan_relief(capacity.resource, lacks, allow) {
+                            None => Some(false),
+                            Some(plan) => {
+                                let owed = self.domain().execute_relief(plan);
+                                if !owed.preempt.is_empty() {
+                                    self.preempt(&owed.preempt)?;
+                                }
+                                // Pending only on a change under way (a
+                                // shrink begun, slots releasing): cache the
+                                // plan took that its holders freed none of
+                                // frees nothing later, and a wait on it is
+                                // one nothing wakes.
+                                match self.follow_yields(bindings)? {
+                                    Yielded::Released { .. } => None,
+                                    Yielded::Pending => Some(true),
+                                    Yielded::Nothing => match owed.preempt.is_empty() {
+                                        true => Some(false),
+                                        false => None,
+                                    },
+                                }
+                            }
+                        }
+                    }
+                },
+                _ => Some(false),
+            };
+            match pending {
+                Some(pending) => return Ok(Relieved { current, pending }),
+                None => current = attempt(self, bindings)?,
+            }
+        }
+    }
 }
 
 impl<H: MemoryHost> MemoryStep for H {}
@@ -1950,6 +2033,20 @@ impl<H: MemoryHost> MemoryStep for H {}
 /// which is a flight's boundary.
 pub fn between_flights<H: MemoryHost>(host: &mut H, bindings: Option<&mut StateBindings>) -> Result<bool, RequestError> {
     host.observe(bindings, true).map(|observed| observed.unload)
+}
+
+/// The one relief of a claim short of memory, for every host: from its
+/// `first` try, retried by `attempt` after each release
+/// ([`MemoryStep::relieve`]); where `preempting`, the host's evictable
+/// requests may be preempted for it.
+pub fn relieve<H: MemoryHost, T>(
+    host: &mut H,
+    bindings: &mut StateBindings,
+    first: Result<T, DomainError>,
+    preempting: bool,
+    attempt: impl FnMut(&mut H, &mut StateBindings) -> Result<Result<T, DomainError>, RequestError>,
+) -> Result<Relieved<T>, RequestError> {
+    host.relieve(bindings, first, preempting, attempt)
 }
 
 impl<F: ProgramFamily> Service<F> {
@@ -2422,11 +2519,13 @@ impl<F: ProgramFamily> Service<F> {
         if self.memory.admission_waits {
             return Ok(Residency::Waiting(generation, Wait { at: self.epoch, on: WaitsOn::Memory }));
         }
-        // Its whole state is reserved as it opens: every row its prompt and
-        // its generation may take (`ExecutorDomain::open_state`), so none of
-        // its rows ever waits on memory.
-        let rows = generation.request_rows() as u64;
-        // Short of memory, it is relieved as any claim is ([`Self::relieve`]),
+        // It reserves the rows it is about to write as it opens: its prompt,
+        // or the history it replays, and a launch's rows ahead
+        // (`ExecutorDomain::open_state`), so no prompt row waits on memory.
+        // Later rows are reserved ahead at its steps' boundaries
+        // (`ExecutorDomain::provision`).
+        let rows = generation.resume_bound() as u64;
+        // Short of memory, it is relieved as any claim is ([`relieve`]),
         // taking cache alone, its prefix looked up afresh at each try, as an
         // eviction may drop it. While another request's chain is under way
         // the open changes no bindings: it waits for the chain's end, a
@@ -2456,14 +2555,14 @@ impl<F: ProgramFamily> Service<F> {
             Ok(None) => return Ok(Residency::Waiting(generation, Wait { at: self.epoch, on: WaitsOn::Chain })),
             // New work waits for memory a change of ours will free.
             Err(DomainError::Capacity(_))
-                if relieved.pending || self.requests.values().any(|request| request.state.generation().is_resident()) =>
+                if relieved.pending || self.domain.holds_state_beside(&BTreeSet::from([id])) =>
             {
                 return Ok(Residency::Waiting(generation, Wait { at: self.epoch, on: WaitsOn::Memory }));
             }
             Err(error) if is_fatal(&error) => return Err(fatal(classify_domain_error(error))),
             // Nothing of ours can make room: it fails at once.
             Err(error) => {
-                Self::fail_generation(record, &mut generation, classify_domain_error(error));
+                Self::fail_generation(record, &mut generation, refused_alone(error));
                 return Ok(Residency::Failed(generation));
             }
         };
@@ -2551,7 +2650,7 @@ impl<F: ProgramFamily> Service<F> {
             if let Err(error) = planned {
                 return Err((Some(round.members), error));
             }
-            let group_ = match self.provision(&mut bindings, &round, group_) {
+            let group_ = match self.provision(&mut bindings, &mut round, group_) {
                 Ok(Provisioned::Fits(group_)) => group_,
                 Ok(Provisioned::Split(leading, trailing)) => {
                     round.groups.push_front(trailing);
@@ -2625,14 +2724,18 @@ impl<F: ProgramFamily> Service<F> {
     /// rows are evicted (the ledger took every cheaper byte, cache worth
     /// least first, before it named them), the cache it took is freed where
     /// the device would not give the memory yet, then the group sheds its
-    /// trailing operations, which loses no work. What is still short waits
-    /// for a change of ours that frees memory (a request standing beside it
-    /// ending, a named sequence leaving its round, the cache taken freeing
-    /// off this thread); where none can come, its requests fail.
+    /// trailing operations, which loses no work. A request's state growing
+    /// short takes the round's other members out of the round first, so
+    /// they may be preempted for it rather than stand beside it. What is
+    /// still short waits for a change of ours that frees memory (a request
+    /// standing beside it ending, a named sequence leaving its round, the
+    /// cache taken freeing off this thread); where none can come, its
+    /// requests fail, a request's state alone past what the load can give
+    /// it with [`RequestError::ContextExceedsMemory`].
     fn provision(
         &mut self,
         bindings: &mut StateBindings,
-        round: &Round,
+        round: &mut Round,
         group_: OperationGroup,
     ) -> Result<Provisioned, RequestError> {
         let short = |current: &Result<(), DomainError>| matches!(current, Err(DomainError::Capacity(_)));
@@ -2647,7 +2750,21 @@ impl<F: ProgramFamily> Service<F> {
             self.prefix_cache.release_unspared(&held);
             current = self.fits(bindings, round, &group_);
         }
-        let Relieved { current, pending } = self.relieve(bindings, current, true, |this, bindings| Ok(this.fits(bindings, round, &group_)))?;
+        let Relieved { mut current, mut pending } = self.relieve(bindings, current, true, |this, bindings| Ok(this.fits(bindings, round, &group_)))?;
+        // A request's state growing short with nothing else to free: the
+        // round's other members stand beside it only until they leave the
+        // round. They leave it now, ready, so the relief may preempt them,
+        // the lowest value first, and a growth never waits on requests that
+        // may themselves be waiting on it.
+        let growth = |current: &Result<(), DomainError>| {
+            matches!(current, Err(DomainError::Capacity(capacity)) if capacity.resource == ResourceKind::RequestState)
+        };
+        let own = group_.operations().iter().map(Operation::request).collect::<BTreeSet<_>>();
+        let others = round.members.keys().copied().filter(|id| !own.contains(id)).collect::<BTreeSet<_>>();
+        if growth(&current) && !pending && !others.is_empty() {
+            self.withdraw(round, &others);
+            Relieved { current, pending } = self.relieve(bindings, current, true, |this, bindings| Ok(this.fits(bindings, round, &group_)))?;
+        }
         if short(&current) {
             group_ = match group_.split_last() {
                 Ok((leading, trailing)) => return Ok(Provisioned::Split(leading, trailing)),
@@ -2656,8 +2773,8 @@ impl<F: ProgramFamily> Service<F> {
         }
         match current {
             Ok(()) => Ok(Provisioned::Fits(group_)),
-            Err(DomainError::Capacity(_)) if pending || self.others_stand(round, &group_) => Ok(Provisioned::Short(group_, Wait { at: self.epoch, on: WaitsOn::Memory })),
-            Err(error @ (DomainError::Capacity(_) | DomainError::Input(_))) => Ok(Provisioned::Refused(group_, classify_domain_error(error))),
+            Err(DomainError::Capacity(_)) if pending || self.others_stand(&group_) => Ok(Provisioned::Short(group_, Wait { at: self.epoch, on: WaitsOn::Memory })),
+            Err(error @ (DomainError::Capacity(_) | DomainError::Input(_))) => Ok(Provisioned::Refused(group_, refused_alone(error))),
             Err(DomainError::ChainReleased(holder)) => Ok(Provisioned::Replay(group_, holder)),
             Err(error) => Err(classify_domain_error(error)),
         }
@@ -2703,6 +2820,15 @@ impl<F: ProgramFamily> Service<F> {
     fn replay(&mut self, round: &mut Round, group_: &OperationGroup, holder: RequestId) -> Result<(), DomainError> {
         tracing::info!(?holder, "a chain holder's group is not its queued chunk: the chain is released and the holder replays");
         let requests = group_.operations().iter().map(Operation::request).collect::<BTreeSet<_>>();
+        self.withdraw(round, &requests);
+        self.evicted(&[holder])
+    }
+
+    /// Take `requests` out of `round`, their work in its later groups with
+    /// them, each between rounds and ready, its started round abandoned to
+    /// run again: so a request that stands beside a claim only as a round
+    /// member can be evicted for it.
+    fn withdraw(&mut self, round: &mut Round, requests: &BTreeSet<RequestId>) {
         // Their work queued in the round's later groups leaves with them.
         let kept = std::mem::take(&mut round.groups)
             .into_iter()
@@ -2710,15 +2836,18 @@ impl<F: ProgramFamily> Service<F> {
             .filter(|operation| !requests.contains(&operation.request()))
             .collect();
         round.groups = group(&self.domain, kept).into_iter().collect();
-        for request in requests {
+        for &request in requests {
             let Some(Member { record, state }) = round.members.remove(&request) else { continue };
             let generation = match state {
                 Membership::Started(started) => started.abandon(),
                 Membership::Generation(generation) => generation,
             };
-            self.requests.insert(request, Request { record, state: State::Between(generation, Stage::Ready) });
+            let stage = match generation.is_resident() {
+                true => Stage::Ready,
+                false => Stage::NonResident(None),
+            };
+            self.requests.insert(request, Request { record, state: State::Between(generation, stage) });
         }
-        self.evicted(&[holder])
     }
 
     fn park(&mut self, round: &mut Round, group_: OperationGroup, wait: Wait) {
@@ -3381,72 +3510,21 @@ impl<F: ProgramFamily> Service<F> {
         Ok(())
     }
 
-    /// Whether `request` can be evicted now: live and resident between
-    /// rounds (`Stage::Ready` or `Stage::AwaitingCredit`). A round's
-    /// members are out of the map, pending or parked work is mid-operation,
-    /// and a finished request keeps its state until it retires.
+    /// Whether `request` can be evicted now: live and resident outside a
+    /// round, its state no flight's: between rounds, its pending work
+    /// unsubmitted, or its round parked on memory, which eviction discards
+    /// for it to replay (`StartedRound::evicted`). A round's members are
+    /// out of the map, and a finished request keeps its state until it
+    /// retires. Without the parked, two requests each parked on the
+    /// other's memory would wait on each other.
     fn can_evict(request: &Request) -> bool {
-        matches!(&request.state, State::Between(generation, Stage::Ready | Stage::AwaitingCredit)
-            if generation.is_resident() && generation.finish_reason().is_none())
-    }
-
-    /// The one path a claim short of memory takes, from its `first` try,
-    /// trying again by `attempt`: first free the cache the ledger took for
-    /// claims already admitted ([`MemoryStep::follow_yields`]); where that
-    /// frees nothing, ask the device's ledger for relief that covers what
-    /// the claim lacks, taking cache, and where `preempting`, the requests
-    /// that can be evicted now (`Ledger::plan_relief`), and carry it out
-    /// whole: its cache yields and its requests are evicted
-    /// ([`Self::evict`]). Where no relief covers it, nothing yields. Each
-    /// that freed anything tries again; one that
-    /// frees memory only later (a round's end, slots releasing off this
-    /// thread, the expert bank's shrink) leaves the claim pending, and the
-    /// caller decides from there whether it waits or fails.
-    fn relieve<T>(
-        &mut self,
-        bindings: &mut StateBindings,
-        first: Result<T, DomainError>,
-        preempting: bool,
-        mut attempt: impl FnMut(&mut Self, &mut StateBindings) -> Result<Result<T, DomainError>, RequestError>,
-    ) -> Result<Relieved<T>, RequestError> {
-        let mut current = first;
-        loop {
-            let pending = match &current {
-                Err(DomainError::Capacity(capacity)) => match self.follow_yields(bindings)? {
-                    Yielded::Released { .. } => None,
-                    Yielded::Pending => Some(true),
-                    Yielded::Nothing => {
-                        let lacks = capacity.required.saturating_sub(capacity.available);
-                        let evictable = self.evictable();
-                        let allow = match preempting {
-                            true => Relief::CacheAndRequests(&evictable),
-                            false => Relief::CacheOnly,
-                        };
-                        match self.domain.plan_relief(capacity.resource, lacks, allow) {
-                            None => Some(false),
-                            Some(plan) => {
-                                let owed = self.domain.execute_relief(plan);
-                                if !owed.preempt.is_empty() {
-                                    self.evict(&owed.preempt).map_err(classify_domain_error)?;
-                                }
-                                match self.follow_yields(bindings)? {
-                                    Yielded::Released { .. } => None,
-                                    Yielded::Pending => Some(true),
-                                    Yielded::Nothing => match owed.preempt.is_empty() {
-                                        true => Some(owed.yielded > 0),
-                                        false => None,
-                                    },
-                                }
-                            }
-                        }
-                    }
-                },
-                _ => Some(false),
-            };
-            match pending {
-                Some(pending) => return Ok(Relieved { current, pending }),
-                None => current = attempt(self, bindings)?,
-            }
+        let live = |generation: &Generation| generation.is_resident() && generation.finish_reason().is_none();
+        match &request.state {
+            State::Between(generation, Stage::Ready | Stage::AwaitingCredit | Stage::Pending(..)) => live(generation),
+            // Parked on memory: its round's next operation is unsubmitted,
+            // so its state is no flight's.
+            State::Parked(started, ..) => live(started.generation()),
+            State::Between(_, Stage::AwaitingPrefix { .. } | Stage::NonResident(_)) => false,
         }
     }
 
@@ -3457,14 +3535,37 @@ impl<F: ProgramFamily> Service<F> {
         self.evicted(sequences)
     }
 
+    /// An idle owner never holds a request waiting on memory nothing can
+    /// free: with no other request holding state, no reading owed and no
+    /// change under way (a bank resize begun, graph slots releasing), no
+    /// epoch advance can come, so a wait on memory standing then is an
+    /// invariant violation, never a silent park.
+    fn check_no_unwakeable_wait(&self) {
+        let under_way = self.memory.admission_waits
+            || self.memory.owed
+            || self.memory.bank_began.iter().any(Option::is_some)
+            || self.domain.releasing_slots();
+        if under_way {
+            return;
+        }
+        for (id, request) in &self.requests {
+            if let Some(Wait { at, on: WaitsOn::Memory }) = request.state.wait() {
+                assert!(
+                    self.epoch.changed_since(at) || self.domain.holds_state_beside(&BTreeSet::from([*id])),
+                    "invariant violated: an idle owner holds {id:?} waiting on memory that nothing under way can free"
+                );
+            }
+        }
+    }
+
     /// Whether a request outside `group_` holds memory whose release would
-    /// let it in: one resident, or in this round. A claim short beside one
-    /// waits for it to end; with none, nothing of ours can free memory for
-    /// it, and it fails.
-    fn others_stand(&self, round: &Round, group_: &OperationGroup) -> bool {
+    /// let it in: one holding state, between rounds, in this round or in a
+    /// flight ([`ExecutorDomain::holds_state_beside`]). A claim short
+    /// beside one waits for it to end; with none, nothing of ours can free
+    /// memory for it, and it fails.
+    fn others_stand(&self, group_: &OperationGroup) -> bool {
         let own = group_.operations().iter().map(Operation::request).collect::<BTreeSet<_>>();
-        round.members.keys().any(|id| !own.contains(id))
-            || self.requests.iter().any(|(id, request)| !own.contains(id) && request.state.generation().is_resident())
+        self.domain.holds_state_beside(&own)
     }
 
     /// Mark `set`, whose state was just released, evicted: each waits
@@ -3472,11 +3573,16 @@ impl<F: ProgramFamily> Service<F> {
     fn evicted(&mut self, set: &[RequestId]) -> Result<(), DomainError> {
         for &id in set {
             let Request { mut record, state } = self.requests.remove(&id).expect("an evicted request");
-            let State::Between(mut generation, _) = state else {
-                unreachable!("an evicted request is between rounds")
-            };
             record.preemption_debt = record.preemption_debt.saturating_add(1);
-            generation.evicted().map_err(release_invariant("preemption"))?;
+            // A round parked on memory is discarded with its state: the
+            // request replays from its committed history.
+            let generation = match state {
+                State::Between(mut generation, _) => {
+                    generation.evicted().map_err(release_invariant("preemption"))?;
+                    generation
+                }
+                State::Parked(started, ..) => started.evicted().map_err(release_invariant("preemption"))?,
+            };
             self.requests.insert(
                 id,
                 Request {
@@ -3566,12 +3672,11 @@ enum Residency {
     Failed(Generation),
 }
 
-/// What relieving a claim short of memory came to ([`Service::relieve`]):
-/// its last try, and whether a change of ours under way will free memory
-/// for it.
-struct Relieved<T> {
-    current: Result<T, DomainError>,
-    pending: bool,
+/// What relieving a claim short of memory came to ([`relieve`]): its last
+/// try, and whether a change of ours under way will free memory for it.
+pub struct Relieved<T> {
+    pub current: Result<T, DomainError>,
+    pub pending: bool,
 }
 
 #[cfg(test)]
@@ -4075,13 +4180,66 @@ let Ok(residency) = service.make_resident(id, &mut record, generation, bindings)
     /// Take every byte the device's ledger would give new work now (its
     /// free room and the cache worth nothing) as a measurement's room.
     fn take_room<F: ProgramFamily>(service: &mut Service<F>) {
+        leave_room(service, 0);
+    }
+
+    /// Leave `keep` bytes of what the device's ledger would give new work
+    /// now, the rest taken as a measurement's room.
+    fn leave_room<F: ProgramFamily>(service: &mut Service<F>, keep: u64) {
         const PAST: u64 = u64::MAX / 4;
         service.domain.release_measurement_room();
         let room = match service.domain.claim_measurement_room(PAST) {
             Err(magnitude_executor::memory::ledger::Short { over, .. }) => PAST - over,
             other => panic!("a claim past the budget is refused over it, not {other:?}"),
         };
-        service.domain.claim_measurement_room(room).expect("the room the ledger gives is held");
+        assert!(room >= keep, "the ledger gives {room} bytes, not {keep}");
+        service.domain.claim_measurement_room(room - keep).expect("the room the ledger gives is held");
+    }
+
+    /// Item 1 of the request-memory redesign: requests with long prompts and
+    /// no `max_tokens` (the chat layer's rest of the context) open holding
+    /// their prompts and a launch's rows ahead, not their whole contexts.
+    /// Three open in room that holds three such openings, where reserving
+    /// each one's whole context would hold no third.
+    #[test]
+    fn long_prompts_without_max_tokens_open_side_by_side() {
+        const CONTEXT: usize = 4096;
+        const PROMPT: usize = 1024;
+        let mut definition = fixtures::tiny_definition();
+        definition.decoder.context_limit = CONTEXT as u64;
+        let vocabulary = definition.decoder.vocabulary as usize;
+        let (domain, bindings) =
+            fixtures::fixture_of(definition, fixtures::limits(2, 1, false), None, false, magnitude_executor::platform::DeviceRequest::Automatic);
+        let opening = fixtures::reserved_bytes(&domain, fixtures::opening_rows(&domain, PROMPT as u64));
+        let whole = fixtures::reserved_bytes(&domain, fixtures::opening_rows(&domain, CONTEXT as u64));
+        assert!(2 * whole > 3 * opening, "two whole contexts take more than three openings: {whole} and {opening} bytes");
+        let mut owner = Owner::new(domain, bindings, limits(), Arc::new(NoWakes)).unwrap();
+        let unbounded = || {
+            let options = Options {
+                max_tokens: CONTEXT - PROMPT + 1,
+                output_capacity: 4,
+                context_limit: CONTEXT,
+                vocabulary,
+                stop_tokens: BTreeSet::new(),
+                suppressed_tokens: BTreeSet::new(),
+                sampling: Sampling::Greedy,
+                shaping: Shaping { temperature: 0.0, ..Default::default() },
+                seed: 0,
+                forced_quantum: 0,
+                method: MethodChoice::Plain,
+                end_of_generation: EndOfGeneration::Stop,
+                reasoning_budget: None,
+            };
+            Generation::new(vec![TokenId(1); PROMPT], InputLayout::new(PROMPT, vec![]).unwrap(), options, None).unwrap()
+        };
+        let ids = (0..3)
+            .map(|_| owner.admit(unbounded(), PreparedModelInput::continuation_only(), PrefixRetention::Transient, 4, 0).unwrap().0)
+            .collect::<Vec<_>>();
+        let Owner { service, pipeline: Pipeline::Idle(bindings) } = &mut owner else { panic!("an idle owner") };
+        leave_room(service, 3 * opening);
+        for id in ids {
+            assert_eq!(residency(service, bindings, id), Some(true), "{id:?} opens beside the others");
+        }
     }
 
     /// Admit `count` fresh requests in turn.

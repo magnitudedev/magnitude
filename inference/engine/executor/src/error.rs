@@ -225,6 +225,10 @@ pub enum ResourceKind {
     DeviceMemory,
     /// Host RAM a dedicated device stages its uploads through.
     HostStaging,
+    /// The device memory a request's state reservation draws on, as it
+    /// opens or grows ahead of a step (`memory::ledger::Ledger::reserve`,
+    /// `memory::ledger::Ledger::extend`).
+    RequestState,
     StateRows,
     RecurrentBanks,
     Workspace,

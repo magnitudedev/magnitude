@@ -270,7 +270,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// Histories at the segment limit are repacked first. With a `ceiling`,
     /// growth that would take the stores' committed state past it grows
     /// nothing and returns [`DomainError::StateCeiling`]. A request's rows
-    /// draw within its reservation and never wait on memory. Every other
+    /// draw within its reservation, extended here, at the group's boundary,
+    /// where the group reaches past it, so none waits on memory mid-launch;
+    /// an extension short of memory is a capacity refusal the owner
+    /// relieves, preempting others, or waits on. Every other
     /// allocation the group needs is made here too, where a refusal parks
     /// or refuses its requests alone: the optional components it binds,
     /// after the state's backing, and its priming boundary, kept for its
@@ -394,6 +397,28 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     growth,
                     ceiling,
                 });
+            }
+        }
+        // A request whose group reaches past its reservation extends it
+        // first, a launch's rows ahead (`RequestRows::reach`), and backs
+        // the rows it added: short, the group is refused for memory here,
+        // at its boundary, before any of its rows is written.
+        // The extension settles the slabs in the same change, so the room it
+        // reserved is committed room the backing draws on, never held anew.
+        let rule = crate::memory::ledger::RequestRows::of(&self.execution);
+        for &(sequence, through) in &state_rows {
+            let held = self
+                .state_claims
+                .get(&sequence)
+                .ok_or_else(|| DomainError::invariant("a resident request holds no reservation"))?
+                .rows();
+            if through > held {
+                self.change_state(|this| {
+                    let reservation = this.state_claims.get_mut(&sequence).expect("a resident request's reservation, read above");
+                    this.resources.ledgers().device().extend(&this.request_slot, reservation, rule.reach(through))
+                })
+                .map_err(DomainError::request_short)?;
+                self.back_reservation(bindings, sequence)?;
             }
         }
         for (sequence, through) in state_rows {
@@ -537,9 +562,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// Let go of `sequence`'s reservation, as it closes or is evicted.
     /// Back every row `request`'s reservation holds past its position with
     /// slabs now, in both stores: rows backed and admitted by no step, as
-    /// queued rows are. So the OS holds the request's whole state as it
-    /// opens, within the room its reservation committed, and no row it
-    /// writes later allocates.
+    /// queued rows are. So the OS holds every row the request has reserved,
+    /// as it opens and as it extends, within the room its reservation
+    /// committed, and no row it writes allocates mid-launch.
     pub(super) fn back_reservation(&mut self, bindings: &mut StateBindings, request: RequestId) -> Result<(), DomainError> {
         let unwritten = self.unwritten_rows(request)?;
         let target = self.target.get(&request).ok_or_else(|| DomainError::invariant("a reserved request holds no target state"))?.queued_demands(0, unwritten);
@@ -549,6 +574,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             self.grant_state_growth(bindings, true, &[], &head, 0)?;
         }
         Ok(())
+    }
+
+    /// Whether a request other than `own` holds state on the device's
+    /// ledger: resident, in a flight or not, so its end or eviction frees
+    /// memory.
+    pub fn holds_state_beside(&self, own: &std::collections::BTreeSet<RequestId>) -> bool {
+        self.state_claims.keys().any(|request| !own.contains(request))
     }
 
     /// The rows `request`'s reservation holds past its target position.
@@ -810,6 +842,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         })
     }
 
+    /// Whether the load's release thread is releasing idle graph slots: a
+    /// change under way whose end frees memory.
+    pub fn releasing_slots(&self) -> bool {
+        self.resources.releasing_slots()
+    }
+
     /// At a flight boundary: the idle graph slots' release, once the load's
     /// release thread has ended it (`AllocatedResources::released_slots`);
     /// none while it runs.
@@ -995,13 +1033,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// (`memory::ledger::Ledger::plan_relief`); none where nothing covers it
     /// or the resource is no store's.
     pub fn plan_relief(&self, resource: ResourceKind, lacks: u64, allow: crate::memory::ledger::Relief) -> Option<crate::memory::ledger::ReliefPlan> {
+        use crate::memory::ledger::Frees;
         let ledgers = self.resources.ledgers();
-        let ledger = match resource {
-            ResourceKind::DeviceMemory => ledgers.device(),
-            ResourceKind::HostStaging => ledgers.host(),
+        let (ledger, frees) = match resource {
+            ResourceKind::RequestState => (ledgers.device(), Frees::RequestState),
+            ResourceKind::DeviceMemory => (ledgers.device(), Frees::Room),
+            ResourceKind::HostStaging => (ledgers.host(), Frees::Room),
             _ => return None,
         };
-        ledger.plan_relief(lacks, allow)
+        ledger.plan_relief(lacks, allow, frees)
     }
 
     /// Carry out `plan` whole in its store (`memory::ledger::Ledger::execute`):
@@ -1218,6 +1258,22 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 }
 
+/// The bytes of the load `execution`'s request slot
+/// (`CommittedKind::RequestSlot`): one request's opening reservation, of a
+/// request about to write no rows (`RequestRows::opening`), by the page
+/// rule its reservations are sized by (`LoadShape::state_bytes`); at least
+/// the state stores' first slabs, which construction backs as granules
+/// within it.
+pub fn request_slot_bytes(execution: &ExecutionPlan) -> Result<u64, String> {
+    let resources = execution.resources();
+    let initial = resources
+        .head_state()
+        .map_or(Ok(0), |state| state.initial_slab_bytes())
+        .and_then(|head| resources.target_state().initial_slab_bytes().map(|target| target + head))?;
+    let opening = crate::memory::ledger::LoadShape::of(execution).state_bytes(crate::memory::ledger::RequestRows::of(execution).opening(0));
+    Ok(opening.max(initial))
+}
+
 /// The row a sequence's state claim reaches through a group that advances
 /// it `rows` (its own and those queued behind it) from `position`: those
 /// rows, and the most speculative rows its drafter adds past them
@@ -1248,7 +1304,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let changes = self.resources.ledgers().changes().clone();
         changes.change(|_| {
             let changed = change(self);
-            let backed = self.committed_state_bytes();
+            // The slabs alone: the stores' address tables are committed by
+            // their own claim, never room the reservations' rows fill.
+            let backed = self.target_store.backed_slab_bytes() + self.head_store.as_ref().map_or(0, |store| store.backed_slab_bytes());
             let referenced = self.referenced_state_bytes();
             let ledger = self.resources.ledgers().device();
             let written = self
@@ -1384,7 +1442,7 @@ impl StateSlabs {
 
     /// Settle with `backed`, the slab bytes the stores hold now in the
     /// pool, of which holders reference `referenced`, the requests' written
-    /// rows `written` by the page rule, and `committed`, the room the
+    /// rows `written` as their reservations count them, and `committed`, the room the
     /// request slot and the reservations hold. The written rows' slabs are
     /// the committed room's; what holders reference beyond them is the
     /// retained prefixes'; the spare slabs fill the committed room first,

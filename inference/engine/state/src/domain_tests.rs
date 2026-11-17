@@ -1061,7 +1061,10 @@ fn a_batch_takes_its_state_bytes_of_pages() {
     ];
     let (context, max_advance) = (64, 16);
     let device = cpu_device();
+    let granule = device.pool.granule();
     for rows in 1..=4 {
+        // Each domain's rows a batch takes, as its store takes them.
+        let mut taken_rows = Vec::new();
         for (index, (layout, at)) in layouts.iter().zip([0, 0, 3]).enumerate() {
             let domain = HistoryDomainId(index);
             let store = indexed_store(device.clone(), context, max_advance);
@@ -1071,53 +1074,41 @@ fn a_batch_takes_its_state_bytes_of_pages() {
             };
             let free = store.free_rows(domain);
             let advance = OwnedStateAdvance::begin(state, rows).ok().unwrap();
-            let taken = (free - store.free_rows(domain)) as u64 * store.history_row_bytes(domain);
+            let taken = (free - store.free_rows(domain)) as u64;
+            let slab_rows = store.history_slab_rows(domain) as u64;
             let single = std::slice::from_ref(layout);
             assert_eq!(
-                taken,
-                state_bytes(single, context, max_advance, StateUnit::Pages, 1, rows as u64).unwrap(),
+                taken.div_ceil(slab_rows) * granule,
+                state_bytes(single, context, max_advance, granule, 1, rows as u64).unwrap(),
                 "{:?} at {rows} rows",
                 layout.kind()
             );
+            taken_rows.push((taken, slab_rows));
             let _ = advance.abort();
         }
-        // The store's every domain at once.
-        let each = layouts
-            .iter()
-            .map(|layout| state_bytes(std::slice::from_ref(layout), context, max_advance, StateUnit::Pages, 1, rows as u64).unwrap())
-            .sum::<u64>();
-        assert_eq!(state_bytes(&layouts, context, max_advance, StateUnit::Pages, 1, rows as u64).unwrap(), each);
         // Three sequences' slabs: each domain's pages of all three in whole
         // slabs of its own, a granule each, as the store commits them, never
         // one rounding of the sum.
-        let granule = device.pool.granule();
-        let slabs = layouts
-            .iter()
-            .enumerate()
-            .map(|(index, layout)| {
-                let domain = HistoryDomainId(index);
-                let store = indexed_store(device.clone(), context, max_advance);
-                let pages = state_bytes(std::slice::from_ref(layout), context, max_advance, StateUnit::Pages, 3, rows as u64).unwrap();
-                let slab_rows = store.history_slab_rows(domain) as u64;
-                (pages / store.history_row_bytes(domain)).div_ceil(slab_rows) * granule
-            })
-            .sum::<u64>();
-        assert_eq!(state_bytes(&layouts, context, max_advance, StateUnit::Slabs { granule }, 3, rows as u64).unwrap(), slabs);
+        let slabs = taken_rows.iter().map(|(taken, slab_rows)| (3 * taken).div_ceil(*slab_rows) * granule).sum::<u64>();
+        assert_eq!(state_bytes(&layouts, context, max_advance, granule, 3, rows as u64).unwrap(), slabs);
     }
 }
 
 /// A window history occupies at most its row limit's pages and the partial
 /// page at its front however long it grows, so `state_bytes` of its
-/// rows from a page boundary caps there: as a sequence advances far past
-/// its window, the pages the store holds for it never exceed that figure,
-/// and reach it once the window straddles a page boundary in flight.
+/// rows from a page boundary caps at those pages' slabs: as a sequence
+/// advances far past its window, the slabs its pages take never exceed
+/// that figure, the pages reaching the cap once the window straddles a
+/// page boundary in flight, wherever the window lies across slabs.
 #[test]
 fn a_window_historys_pages_stay_within_its_capped_state_bytes() {
     let (context, window, max_advance) = (4096, 300, 16);
-    let mut bindings = windowed_store(cpu_device(), context, window, max_advance, 1024, 2);
+    let device = cpu_device();
+    let granule = device.pool.granule();
+    let mut bindings = windowed_store(device, context, window, max_advance, 1024, 2);
     let store = Rc::clone(&bindings);
     let single = [HistoryDomainLayout::Window { rows: window, components: vec![component(1, 2)] }];
-    let row_bytes = store.history_row_bytes(WINDOW);
+    let slab_rows = store.history_slab_rows(WINDOW);
     let page = store.history_page_rows(WINDOW);
     let cap = window_pages(page, window + max_advance) * page;
     let free = store.free_rows(WINDOW);
@@ -1128,8 +1119,8 @@ fn a_window_historys_pages_stay_within_its_capped_state_bytes() {
         let advance = OwnedStateAdvance::begin(state, max_advance).ok().unwrap();
         let through = advance.position() + max_advance;
         let held = free - store.free_rows(WINDOW);
-        let bytes = state_bytes(&single, context, max_advance, StateUnit::Pages, 1, through as u64).unwrap();
-        assert!(held as u64 * row_bytes <= bytes, "{held} rows held through {through}");
+        let bytes = state_bytes(&single, context, max_advance, granule, 1, through as u64).unwrap();
+        assert!(held.div_ceil(slab_rows) as u64 * granule <= bytes, "{held} rows held through {through}");
         most = most.max(held);
         let OwnedAdvanceResolution::Committed(next) = advance.commit_all().ok().unwrap() else {
             panic!("an attention advance commits");
@@ -1137,5 +1128,5 @@ fn a_window_historys_pages_stay_within_its_capped_state_bytes() {
         state = next;
     }
     assert_eq!(most, cap, "a window straddling a page boundary in flight holds the capped pages");
-    assert_eq!(state_bytes(&single, context, max_advance, StateUnit::Pages, 1, context as u64).unwrap(), cap as u64 * row_bytes);
+    assert_eq!(state_bytes(&single, context, max_advance, granule, 1, context as u64).unwrap(), cap.div_ceil(slab_rows) as u64 * granule);
 }

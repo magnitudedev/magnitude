@@ -18,7 +18,7 @@ use magnitude_executor::{
     Shaping, StateBindings, TokenId, TuningSettings, WorkKind,
 };
 use magnitude_family_contracts::PreparedModelInput;
-use magnitude_scheduler::owner::{BetweenFlights, MemoryHost, between_flights};
+use magnitude_scheduler::owner::{BetweenFlights, MemoryHost, between_flights, relieve};
 use magnitude_scheduler::ServiceLimits;
 use magnitude_state::KvCodec;
 use seismic::{SubmissionTrace, TracedSubmission, host_seconds};
@@ -259,10 +259,6 @@ pub struct Engine {
     /// The loaded generation method: which drafter, if any, and its width.
     pub method: ResolvedMethod,
     next_request: u64,
-    /// The rows a sequence may reach, the served context's: what each
-    /// reserves as it opens, so no prefill or decode it runs writes past
-    /// its reservation.
-    context_rows: u64,
     /// Under cross-step pipelining a step's submissions are traced during
     /// the previous step, so traces are collected per window.
     pub lookahead: bool,
@@ -396,7 +392,6 @@ impl Engine {
         let vocabulary = usize::try_from(resolved.manifest.definition.decoder.vocabulary)
             .map_err(|_| "vocabulary exceeds the host domain")?;
         let method = resolved.manifest.model.method;
-        let context_rows = resolved.manifest.definition.decoder.context_limit;
         let (domain, bindings, _) = load_in_process(
             &resolved.manifest,
             |unprepared| {
@@ -419,7 +414,6 @@ impl Engine {
             vocabulary,
             method,
             next_request: 1,
-            context_rows,
             lookahead: load.lookahead,
             expert_ranges,
             memory: BetweenFlights::new(),
@@ -465,9 +459,13 @@ impl Engine {
             .bindings
             .as_mut()
             .expect("no flight holds the state bindings");
-        // The harness runs no chain between its steps.
+        // The harness runs no chain between its steps. A sequence opens
+        // holding the rows it resumes and a launch's rows ahead, as the
+        // service's requests do; its steps reserve ahead as they go
+        // ([`Self::provision`]).
         let unchained = self.domain.unchained(bindings).expect("no chain is under way between the harness's steps");
-        self.domain.open_state(unchained, request, from, self.context_rows).map_err(text)?;
+        let rows = from.map_or(0, ResumeState::position) as u64;
+        self.domain.open_state(unchained, request, from, rows).map_err(text)?;
         Ok(request)
     }
 
@@ -604,6 +602,30 @@ impl Engine {
         }
     }
 
+    /// Provision `operations` as the service's owner does, so the step's
+    /// reservation takes nothing more: a growth of a sequence's reservation
+    /// short of memory is relieved through the scheduler's one relief path,
+    /// taking cache alone (the run's sequences are never preempted), and
+    /// waits at the next boundary for a shrink that relief owes it.
+    pub(crate) fn provision(&mut self, bindings: &mut StateBindings, operations: &[Operation]) -> Result<(), String> {
+        loop {
+            let first = self.domain.provision(bindings, operations, None);
+            let now = u64::try_from(self.opened.elapsed().as_nanos()).map_err(|_| "the run outlasts the clock")?;
+            let mut host = Unrequested { domain: &mut self.domain, memory: &mut self.memory, now };
+            let relieved = relieve(&mut host, bindings, first, false, |host, bindings| {
+                Ok(host.domain().provision(bindings, operations, None))
+            })
+            .map_err(|error| error.to_string())?;
+            match relieved.current {
+                Ok(()) => return Ok(()),
+                Err(magnitude_executor::DomainError::Capacity(_)) if relieved.pending => {
+                    between_steps(&mut self.domain, &mut self.memory, bindings, now)?;
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    }
+
     /// One submission of `step`'s forwards: none where the flight was
     /// interrupted, its outcomes aborted.
     fn attempt(
@@ -614,6 +636,7 @@ impl Engine {
     ) -> Result<Option<(Step, Vec<Outcome>)>, String> {
         let mut bindings = self.bindings();
         let start = host_seconds();
+        self.provision(&mut bindings, &operations)?;
         let ReservedResources::Target(reservation) = self
             .domain
             .reserve(&mut bindings, &operations)

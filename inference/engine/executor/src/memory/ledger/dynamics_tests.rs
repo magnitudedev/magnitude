@@ -267,8 +267,8 @@ struct Machine {
     /// host memory otherwise.
     wiring: Wiring,
     _load: Claim,
-    /// The load's request slot: the served context's request, which its
-    /// first request draws its reservation from.
+    /// The load's request slot, which its first request draws its
+    /// reservation from.
     slot: Claim,
     /// The load's one request and the pages it wrote, where it serves: its
     /// reservation, drawn from the slot, which decode writes a page at a
@@ -1087,7 +1087,10 @@ fn an_idle_load_under_pressure_never_unloads() {
     assert!(estimate.cap().is_some_and(|cap| cap >= estimate.committed()), "B never falls below what is committed");
     let rows = super::tests::page_rows();
     let _first = machine.ledger.reserve(&machine.slot, RequestId(1), rows).expect("the slot holds the first request");
-    assert!(machine.ledger.reserve(&machine.slot, RequestId(2), rows).is_err(), "a request past the slot is refused under B");
+    // The slot's room left, and a request needing more than it.
+    let left = machine.slot.bytes();
+    let past = (1..).map(|pages| pages * rows).find(|rows| machine.ledger.bytes(&Need::Request { sequence: RequestId(2), rows: *rows }) > left).expect("a request past the slot");
+    assert!(machine.ledger.reserve(&machine.slot, RequestId(2), past).is_err(), "a request past the slot is refused under B");
 }
 
 /// An idle load whose bank holds cache above its floor yields just the harm's

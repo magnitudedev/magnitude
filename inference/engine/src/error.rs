@@ -382,6 +382,9 @@ pub enum RequestError {
     ContextLengthExceeded { required: u64, limit: u64 },
     /// A claim could not be satisfied after the release order. Retryable.
     InsufficientMemory(InsufficientMemory),
+    /// The request's context needs more memory than the loaded model can
+    /// ever give it, with nothing else left to free: not retryable as is.
+    ContextExceedsMemory(InsufficientMemory),
     /// A required memory observation failed (Blind). Retryable.
     MemoryObservationUnavailable { reason: String },
     /// The model is no longer loaded.
@@ -434,6 +437,11 @@ impl fmt::Display for RequestError {
                 "the input requires {required} tokens but the loaded context is {limit}"
             ),
             Self::InsufficientMemory(memory) => memory.fmt(formatter),
+            Self::ContextExceedsMemory(memory) => write!(
+                formatter,
+                "the request's context needs {} bytes of memory, past the {} the loaded model can give it",
+                memory.required, memory.available
+            ),
             Self::MemoryObservationUnavailable { reason } => {
                 write!(formatter, "memory observation unavailable: {reason}")
             }
@@ -494,6 +502,9 @@ impl From<magnitude_scheduler::publication::RequestError> for RequestError {
                 | CapacityResource::RetainedMethodFeature
                 | CapacityResource::RetainedMediaFeature => Self::Overloaded,
             },
+            Scheduled::ContextExceedsMemory { required, available } => {
+                Self::ContextExceedsMemory(InsufficientMemory { required, available })
+            }
             Scheduled::Device(DeviceError::Lost(reason)) => Self::DeviceLost { reason },
             Scheduled::Device(error) => Self::DeviceLost {
                 reason: error.to_string(),

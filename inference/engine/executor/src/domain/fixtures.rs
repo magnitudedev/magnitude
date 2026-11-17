@@ -493,7 +493,7 @@ pub fn fixture_over(
     // no plan, and its initial slab and tables are charged as they are made.
     let head_plan = execution.resources().head_state().filter(|_| method.drafts());
     let spare_slab = if head && head_plan.is_none() { target_state.granule } else { 0 };
-    // As a load makes its state: the served context's request slot, its
+    // As a load makes its state: one request's opening as its slot, its
     // first slabs granules within it, and its address tables charged to a
     // claim of their own.
     let request_slot = request_slot(&ledgers, &device, &execution, spare_slab);
@@ -537,19 +537,33 @@ pub fn fixture_over(
 }
 
 /// The request slot a load of `execution` claims on `ledgers` as it starts
-/// (`CommittedKind::RequestSlot`): a request of its served context by the
-/// page rule, and at least the state stores' first slabs and `spare`, which
-/// lie within it.
+/// (`CommittedKind::RequestSlot`): the load's ([`super::request_slot_bytes`]),
+/// and `spare` beside it, a spare head store's first slab, which no plan
+/// counts and which lies within it.
 pub fn request_slot(ledgers: &crate::memory::ledger::DeviceLedgers, device: &seismic::Device, execution: &ExecutionPlan, spare: u64) -> crate::memory::ledger::Claim {
-    let target = execution.resources().target_state();
-    let request = crate::memory::ledger::LoadShape::of(execution)
-        .state_bytes(crate::memory::ledger::LoadShape::request_rows(target.context_rows as u64, execution.policy().method()));
-    let initial = target.initial_slab_bytes().unwrap() + execution.resources().head_state().map_or(0, |state| state.initial_slab_bytes().unwrap()) + spare;
-    let slot = crate::memory::ClaimDemand { device: request.max(initial), ..Default::default() };
+    let slot = crate::memory::ClaimDemand { device: super::request_slot_bytes(execution).unwrap() + spare, ..Default::default() };
     ledgers
         .claim(device, crate::memory::ledger::CommittedKind::RequestSlot, slot)
         .expect("the fixture's ledgers hold its request slot")
         .into_request_slot()
+}
+
+/// The bytes a request of `domain`'s load holds once reserved through
+/// `rows` rows: their slabs in both its stores
+/// (`memory::ledger::LoadShape::state_bytes`).
+pub fn reserved_bytes<F: ProgramFamily>(domain: &ExecutorDomain<F>, rows: u64) -> u64 {
+    domain.resources.ledgers().device().bytes(&crate::memory::ledger::Need::Request { sequence: RequestId(0), rows })
+}
+
+/// The rows a request of `domain`'s load reserves as it opens about to
+/// write `rows` rows (`memory::ledger::RequestRows::opening`).
+pub fn opening_rows<F: ProgramFamily>(domain: &ExecutorDomain<F>, rows: u64) -> u64 {
+    crate::memory::ledger::RequestRows::of(&domain.execution).opening(rows)
+}
+
+/// The rows `request`'s reservation holds, none where it holds none.
+pub fn reservation_rows<F: ProgramFamily>(domain: &ExecutorDomain<F>, request: RequestId) -> Option<u64> {
+    domain.state_claims.get(&request).map(crate::memory::ledger::Reservation::rows)
 }
 
 /// `make`, an allocation a load makes as it starts, under its claim of

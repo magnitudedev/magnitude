@@ -1,7 +1,6 @@
 //! Admission: how a store's state takes and yields. Nothing is preempted
-//! here: a request's state is reserved whole as it opens, so no growth of
-//! it ever needs another's, and preemption is only a shortage's relief
-//! ([`super::relief`]).
+//! here: a claim short of memory, a request's growth included, is relieved
+//! only by a plan ([`super::relief`]).
 
 use std::num::NonZeroU64;
 
@@ -35,6 +34,16 @@ impl Over {
     }
 }
 
+/// What a relief frees room for, which decides what a preempted request
+/// frees for it ([`State::preemptible_by_value`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Frees {
+    /// A request's state, which draws on the load's request slot first.
+    RequestState,
+    /// Anything else: room beside the slot.
+    Room,
+}
+
 /// Admission by the budget's figures alone: the check inside every take,
 /// and the arena's ([`Ledger::admit_arena`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,19 +64,33 @@ impl State {
         })
     }
 
-    /// The requests a shortage may preempt, never the earliest admitted
-    /// (it always progresses), each with the bytes its preemption frees:
-    /// none for one drawn from a request slot, whose bytes return to the
-    /// slot. Lowest value first ([`Reservation::value`]), of equal value
-    /// the latest admitted first.
-    pub(super) fn preemptible_by_value(&self) -> Vec<(RequestId, u64)> {
-        let slotted = |sequence: &RequestId| self.lent.keys().any(|id| self.held[id].holding == Holding::Committed(CommittedKind::Request(*sequence)));
+    /// The requests a relief may preempt, never the earliest admitted (it
+    /// always progresses), each with the bytes its preemption frees for
+    /// `frees`: all it holds for a request's state, which draws on the slot
+    /// first; for anything else, what it holds beyond what it drew of a
+    /// request slot, which returns to the slot. None that frees nothing.
+    /// Lowest value first ([`Reservation::value`]), of equal value the
+    /// latest admitted first.
+    pub(super) fn preemptible_by_value(&self, frees: Frees) -> Vec<(RequestId, u64)> {
+        let drawn = |sequence: RequestId| {
+            self.lent
+                .iter()
+                .filter(|(id, _)| self.held[*id].holding == Holding::Committed(CommittedKind::Request(sequence)))
+                .map(|(_, (_, drawn))| *drawn)
+                .sum::<u64>()
+        };
         let mut sequences: Vec<(Value, RequestId, u64)> = self
             .state_of
             .iter()
             .skip(1)
-            .filter(|(sequence, _)| !slotted(sequence))
-            .map(|(sequence, bytes)| (self.value_of(*sequence), *sequence, *bytes))
+            .map(|(sequence, bytes)| {
+                let frees = match frees {
+                    Frees::RequestState => *bytes,
+                    Frees::Room => bytes - drawn(*sequence),
+                };
+                (self.value_of(*sequence), *sequence, frees)
+            })
+            .filter(|(_, _, frees)| *frees > 0)
             .collect();
         sequences.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
         sequences.into_iter().map(|(_, sequence, bytes)| (sequence, bytes)).collect()
@@ -203,7 +226,7 @@ impl State {
     /// ([`Self::give`]). Never preempts and never refuses. The entry and its
     /// units.
     pub(super) fn take_units(&mut self, store: &seismic::StoreIdentity, kind: CommittedKind, unit: NonZeroU64, most: u64) -> (EntryId, u64) {
-        assert!(!matches!(kind, CommittedKind::Request(_)), "a request's state is reserved whole, never in units");
+        assert!(!matches!(kind, CommittedKind::Request(_)), "a request's state is reserved by its own path, never in units");
         let yielding = |kind: CacheKind| matches!(kind, CacheKind::Spare | CacheKind::GraphSlots | CacheKind::Bank);
         let free = self.free_for(self.reading(store, None), Holding::Committed(kind), most);
         let cover = CacheKind::ALL.into_iter().filter(|kind| yielding(*kind)).fold(free, |cover, kind| cover.saturating_add(self.cache_of[kind.index()]));

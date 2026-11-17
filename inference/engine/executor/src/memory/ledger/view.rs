@@ -240,7 +240,7 @@ impl Ledger {
         }
         state.answered = Some(estimate.at());
         let cause = shortage::cause(&estimate, state.boundary.harmed(), state.boundary.pressed())?;
-        let relief = state.plan_relief(&self.store.identity, shortage::lacks(&estimate, cause), shortage::allows(cause, evictable));
+        let relief = state.plan_relief(&self.store.identity, shortage::lacks(&estimate, cause), shortage::allows(cause, evictable), super::admission::Frees::Room);
         Some(shortage::respond(&estimate, cause, relief, &state.persistence))
     }
 

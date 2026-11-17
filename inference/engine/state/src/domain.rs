@@ -181,19 +181,6 @@ impl HistoryDomainLayout {
     }
 }
 
-/// Which memory [`state_bytes`] counts for a load's histories.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StateUnit {
-    /// The pages the histories take: what their claims hold.
-    Pages,
-    /// The slabs a store of `granule`-byte granules commits for them, a
-    /// granule each. Each stored domain grows in whole slabs of its own
-    /// geometry ([`HistoryDomainLayout::geometry`]), so the domain's pages
-    /// for every sequence are rounded to its slabs before the domains are
-    /// summed.
-    Slabs { granule: u64 },
-}
-
 /// The slab regions of a stored domain's `components`: one per plane, the
 /// layout the store's slabs of the domain take.
 pub fn slab_regions(components: &[ComponentDescriptor]) -> Vec<SlabRegion> {
@@ -209,9 +196,10 @@ pub fn slab_regions(components: &[ComponentDescriptor]) -> Vec<SlabRegion> {
 
 /// The state `sequences` histories of `depth` rows each take in a store of
 /// `domains` at `context` tokens and advances of at most `max_advance` rows,
-/// counted in `unit`: the page rule, the one place state bytes come from.
-/// The load, the assessment, the planner and the runtime ledger all size
-/// state here.
+/// backed in `granule`-byte granules, a slab each: the page rule, the one
+/// place state bytes come from. The load, the assessment, the planner and
+/// the runtime ledger all size state here, a request's reservation
+/// included, so what is reserved is what the store backs.
 ///
 /// One history takes, in each stored domain, the whole pages its rows take
 /// (`page_demand_rows` at the domain's pages, [`HistoryDomainLayout::pages`])
@@ -225,13 +213,19 @@ pub fn slab_regions(components: &[ComponentDescriptor]) -> Vec<SlabRegion> {
 /// ([`HistoryDomainKind::most_advance_rows`]) at a boundary too. A Window
 /// domain's pages are capped at what its history ever occupies
 /// ([`crate::layout::window_pages`] of its row limit), since it releases the
-/// rows before its window as it slides. No recurrent state is counted: a
-/// sequence's bank is its own, whatever its rows (`recurrent_bank_bytes`).
+/// rows before its window as it slides. Each stored domain grows in whole
+/// slabs of its own geometry ([`HistoryDomainLayout::geometry`]), so the
+/// domain's pages for every sequence are rounded to its slabs before the
+/// domains are summed. A store backs pages, not positions: a slab is added
+/// only for pages its backed slabs' free pages lack (`HistoryDomain::admission`),
+/// so a window sliding across a slab boundary takes no slab its pages do
+/// not. No recurrent state is counted: a sequence's bank is its own,
+/// whatever its rows (`recurrent_bank_bytes`).
 pub fn state_bytes(
     domains: &[HistoryDomainLayout],
     context: usize,
     max_advance: usize,
-    unit: StateUnit,
+    granule: u64,
     sequences: u64,
     depth: u64,
 ) -> Result<u64, Error> {
@@ -251,14 +245,9 @@ pub fn state_bytes(
                 HistoryDomainKind::Token | HistoryDomainKind::Shared { .. } | HistoryDomainKind::Block { .. } => taken,
             };
             let taken = u64::try_from(taken).ok().and_then(|taken| taken.checked_mul(sequences)).ok_or_else(overflow)?;
-            let bytes = match unit {
-                StateUnit::Pages => taken.checked_mul(domain.row_bytes()?),
-                StateUnit::Slabs { granule } => {
-                    let slab_rows = domain.geometry(domains, context, max_advance, granule)?.slab_rows;
-                    let slab_rows = u64::try_from(slab_rows).map_err(|_| overflow())?;
-                    taken.div_ceil(slab_rows).checked_mul(granule)
-                }
-            };
+            let slab_rows = domain.geometry(domains, context, max_advance, granule)?.slab_rows;
+            let slab_rows = u64::try_from(slab_rows).map_err(|_| overflow())?;
+            let bytes = taken.div_ceil(slab_rows).checked_mul(granule);
             bytes.and_then(|bytes| total.checked_add(bytes)).ok_or_else(overflow)
         })
 }

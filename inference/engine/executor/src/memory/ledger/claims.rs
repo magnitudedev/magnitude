@@ -70,8 +70,8 @@ impl Ledger {
     /// is held.
     ///
     /// # Panics
-    /// For a request's state, which is reserved whole ([`Self::reserve`]),
-    /// or a grant ([`Self::grant`]).
+    /// For a request's state, which is reserved by its own path
+    /// ([`Self::reserve`]), or a grant ([`Self::grant`]).
     pub fn claim_at(&self, held: Option<&Estimate>, kind: CommittedKind, bytes: u64) -> Result<Claim, Short> {
         assert!(!matches!(kind, CommittedKind::Request(_) | CommittedKind::Grant(_)), "a {kind:?} claim is taken by its own path");
         let id = self.state().take_in(&self.store.identity, held.map(|held| held.read), kind, bytes)?;
@@ -99,7 +99,7 @@ impl Ledger {
     /// (0 bytes). Its holder reads the units it got from the second value.
     ///
     /// # Panics
-    /// For a request's state, which is reserved whole.
+    /// For a request's state, which is reserved by its own path.
     pub fn claim_units(&self, kind: CommittedKind, unit: NonZeroU64, most: u64) -> (Claim, u64) {
         let (id, units) = self.state().take_units(&self.store.identity, kind, unit, most);
         (Claim::held(self.clone(), id, kind), units)

@@ -44,6 +44,10 @@ pub enum RequestError {
     Input(String),
     State(magnitude_state::Error),
     Capacity(ServiceCapacityError),
+    /// The request's state needs `required` bytes of memory where nothing
+    /// else the load holds can be freed for it: alone, it exceeds what the
+    /// loaded model can ever give it, `available`.
+    ContextExceedsMemory { required: u64, available: u64 },
     Device(DeviceError),
     Invariant(InvariantError),
     /// The request's weights (table rows or experts) could not be read from
@@ -62,6 +66,10 @@ impl std::fmt::Display for RequestError {
                 formatter,
                 "{:?} capacity exhausted: {} required, {} available",
                 capacity.resource, capacity.required, capacity.available
+            ),
+            Self::ContextExceedsMemory { required, available } => write!(
+                formatter,
+                "the request's context needs {required} bytes of memory, past the {available} the loaded model can give it"
             ),
             Self::Device(error) => error.fmt(formatter),
             Self::Invariant(error) => error.fmt(formatter),

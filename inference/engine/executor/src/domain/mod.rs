@@ -41,6 +41,7 @@ pub use queue::Unchained;
 mod reconcile;
 mod state;
 pub(crate) use state::claimed_through;
+pub use state::request_slot_bytes;
 mod target;
 mod vision;
 
@@ -117,6 +118,14 @@ impl DomainError {
             context: "executor domain",
             detail: detail.into(),
         })
+    }
+
+    /// A request's reservation on the device's ledger refused as `short`,
+    /// as it opens or grows: a deficit of the memory its state draws on
+    /// ([`ResourceKind::RequestState`]).
+    pub(crate) fn request_short(short: crate::memory::ledger::Short) -> Self {
+        let crate::memory::ledger::Short { required, over, .. } = short;
+        Self::Capacity(CapacityError { resource: ResourceKind::RequestState, required, available: required - over })
     }
 
     /// A claim on `ledgers` refused as `short`: a deficit of that store's
@@ -608,16 +617,17 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// What the load allocated as it started that no holding names (its
     /// weights, tables, state and programs' storage): held for the load.
     _recorded: Vec<crate::memory::ledger::Claim>,
-    /// Each resident request's whole state on the device's ledger, reserved
-    /// as it opens ([`Self::open_state`]), its rows drawn within it as it
-    /// advances ([`Self::provision`]) and dropped as it closes or is evicted.
+    /// Each resident request's state on the device's ledger, reserved as
+    /// it opens ([`Self::open_state`]), extended ahead of its steps and its
+    /// rows drawn within it as it advances ([`Self::provision`]), and
+    /// dropped as it closes or is evicted.
     state_claims: BTreeMap<RequestId, crate::memory::ledger::Reservation>,
     /// The priming boundary of the group provisioned last
     /// ([`Self::provision`]), which reserving it takes ([`Self::reserve`]).
     boundary: Option<FeatureRef>,
-    /// The load's request slot: the served context's whole request, which
-    /// its fit counted, held for the domain's life. One request at a time
-    /// reserves from it (`memory::ledger::Ledger::reserve`).
+    /// The load's request slot: one request's opening reservation
+    /// ([`request_slot_bytes`]), held for the domain's life. Reservations
+    /// draw on it first (`memory::ledger::Ledger::reserve`).
     request_slot: crate::memory::ledger::Claim,
     /// The state slabs and the holdings over them on the device's ledger.
     state_slabs: state::StateSlabs,

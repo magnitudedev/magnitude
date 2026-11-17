@@ -55,12 +55,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// steps first, by `unchained`'s proof that no chain holds them: an open
     /// during another request's chain waits for its end. Admission is new
     /// work's: refused, changing nothing, where the device's ledger cannot
-    /// reserve the request's whole state, every row of its `rows` (its
-    /// prompt and the most it may generate, within the context) and the
-    /// drafter's speculative rows past them (`Ledger::reserve`), so no row
-    /// of it ever waits on memory. Opened, the request holds its
-    /// reservation, and the idle optional components are committed again
-    /// for it to draft and encode with.
+    /// reserve the rows it is about to write, its `rows` (its prompt, or the
+    /// history it replays), with its drafter's rows past them and a launch's
+    /// rows ahead (`RequestRows::opening`, `Ledger::reserve`), so no prompt
+    /// row waits on memory. Its later rows are reserved ahead at its steps'
+    /// boundaries ([`Self::provision`]). Opened, the request holds its
+    /// reservation, backed, and the idle optional components are committed
+    /// again for it to draft and encode with.
     pub fn open_state(
         &mut self,
         mut unchained: Unchained<'_>,
@@ -89,11 +90,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             )));
         }
         let ledgers = self.resources.ledgers();
-        let reserved = crate::memory::ledger::LoadShape::request_rows(rows, self.execution.policy().method());
+        let reserved = crate::memory::ledger::RequestRows::of(&self.execution).opening(rows);
         let mut reservation = ledgers
             .device()
             .reserve(&self.request_slot, request, reserved)
-            .map_err(|short| DomainError::short(short, ledgers))?;
+            .map_err(DomainError::request_short)?;
         self.activate_components();
         self.orphan_queue(&mut unchained)?;
         let (target, head) = match from {
@@ -144,8 +145,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(encodes)
     }
 
-    /// A test's open of `request` at the load's served context: its whole
-    /// context reserved ([`Self::open_state`]); refused as invariant while a
+    /// A test's open of `request` about to write the load's served context:
+    /// its whole context reserved ([`Self::open_state`]); refused as invariant while a
     /// chain is under way, which a test opens beside only to see deferred.
     #[cfg(any(test, feature = "fixtures"))]
     pub fn open_served(

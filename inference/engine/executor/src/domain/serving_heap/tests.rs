@@ -141,7 +141,7 @@ fn a_shortages_yield_under_a_block_keeps_the_bank() {
         // slot of the bank's.
         let bank = || ledger.estimate().cache_of(crate::memory::ledger::CacheKind::Bank);
         let before = bank();
-        let plan = ledger.plan_relief(cheaper_than_the_bank(&ledger) + row / 2, Relief::CacheOnly).expect("the cache covers the shortage");
+        let plan = ledger.plan_relief(cheaper_than_the_bank(&ledger) + row / 2, Relief::CacheOnly, crate::memory::ledger::Frees::Room).expect("the cache covers the shortage");
         ledger.execute(plan);
         let fell = before - bank();
         assert!(fell > 0 && fell < row, "{backend:?}: the shortage took {fell} bytes of the bank's cache, under a block");

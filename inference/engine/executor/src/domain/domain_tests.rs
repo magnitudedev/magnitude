@@ -606,11 +606,14 @@ fn a_chain_is_released_by_its_holder_never_orphaned() {
 
 /// Spare state slabs owed to the ledger wait while a held chain is under way
 /// between its chunks (releasing them orphans queued steps), then release once
-/// the chain ends.
+/// the chain ends. The slabs a closed request's long history backed are spare
+/// beside a request that reserves only its few rows and a launch ahead: a
+/// reservation's slabs are what backs it, so spare is what no reservation
+/// holds.
 #[test]
 fn spare_slabs_owed_wait_for_a_held_chain_and_release_once_it_ends() {
     let mut definition = super::fixtures::tiny_definition();
-    definition.decoder.context_limit = 1024;
+    definition.decoder.context_limit = 2048;
     let (mut domain, mut bindings) = super::fixtures::fixture_of(
         definition,
         super::fixtures::limits(512, 3, false),
@@ -621,7 +624,7 @@ fn spare_slabs_owed_wait_for_a_held_chain_and_release_once_it_ends() {
     super::fixtures::measure_load(&mut domain, &mut bindings);
     let (other, request) = (RequestId(80), RequestId(81));
     open(&mut domain, &mut bindings, other);
-    for chunk in 0..2 {
+    for chunk in 0..4 {
         let step = Operation::Forward {
             request: other,
             kind: WorkKind::Prefill,
@@ -642,7 +645,13 @@ fn spare_slabs_owed_wait_for_a_held_chain_and_release_once_it_ends() {
     }
     domain.close(other).unwrap();
 
-    open(&mut domain, &mut bindings, request);
+    // The request opens about to write its three rows, not its context.
+    domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
+    let unchained = domain.unchained(&mut bindings).expect("no chain is under way");
+    assert!(domain.open_state(unchained, request, None, 3).unwrap().is_empty());
+    let backed = domain.target_store.backed_slab_bytes();
+    let reserved = domain.state_claims[&request].bytes() + domain.request_slot.bytes();
+    assert!(backed > reserved, "the closed history's slabs, {backed} bytes, exceed the {reserved} the request and the slot hold");
     domain.plan_successors(vec![prefill(request, 1), prefill(request, 2)]);
     let flight = submit_reserved_target(&mut domain, bindings, vec![prefill(request, 0)]);
     let (pending, mut bindings) = finish_one(&mut domain, flight);

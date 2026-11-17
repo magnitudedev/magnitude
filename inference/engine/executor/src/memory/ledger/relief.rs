@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 
 use crate::operation::RequestId;
 
+use super::admission::Frees;
 use super::state::{EntryId, State};
 use super::view::Ledger;
 use super::vocabulary::{CacheKind, Holding, Value};
@@ -59,9 +60,9 @@ impl ReliefPlan {
 }
 
 impl State {
-    /// The relief that covers `need` in `store`, taking what `allow` admits;
-    /// none where all of it together does not.
-    pub(super) fn plan_relief(&self, store: &seismic::StoreIdentity, need: u64, allow: Relief) -> Option<ReliefPlan> {
+    /// The relief that covers `need` in `store` for what `frees` names,
+    /// taking what `allow` admits; none where all of it together does not.
+    pub(super) fn plan_relief(&self, store: &seismic::StoreIdentity, need: u64, allow: Relief, frees: Frees) -> Option<ReliefPlan> {
         let mut order: Vec<(Value, CacheKind, EntryId, u64)> = self
             .held
             .iter()
@@ -82,7 +83,7 @@ impl State {
             plan.covers += yields;
         }
         if let Relief::CacheAndRequests(evictable) = allow {
-            for (sequence, bytes) in self.preemptible_by_value().into_iter().filter(|(sequence, _)| evictable.contains(sequence)) {
+            for (sequence, bytes) in self.preemptible_by_value(frees).into_iter().filter(|(sequence, _)| evictable.contains(sequence)) {
                 if plan.covers >= need {
                     break;
                 }
@@ -95,11 +96,11 @@ impl State {
 }
 
 impl Ledger {
-    /// The relief that covers `need` bytes in the store, taking what `allow`
-    /// admits; none where nothing the store holds covers it, and nothing is
-    /// taken then.
-    pub fn plan_relief(&self, need: u64, allow: Relief) -> Option<ReliefPlan> {
-        self.state().plan_relief(&self.store.identity, need, allow)
+    /// The relief that covers `need` bytes in the store for what `frees`
+    /// names, taking what `allow` admits; none where nothing the store holds
+    /// covers it, and nothing is taken then.
+    pub fn plan_relief(&self, need: u64, allow: Relief, frees: Frees) -> Option<ReliefPlan> {
+        self.state().plan_relief(&self.store.identity, need, allow, frees)
     }
 
     /// Carry out `plan` whole: its cache yields now, each holder freeing

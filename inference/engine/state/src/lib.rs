@@ -15,7 +15,7 @@ pub use advance::{
 pub use bank::{BankComponent, recurrent_bank_bytes};
 pub use domain::{
     HistoryDomainId, HistoryDomainKind, HistoryDomainLayout, HistoryDomainPlan, HistoryReads,
-    HistorySource, StateUnit, produced_domain, slab_regions, state_bytes,
+    HistorySource, produced_domain, slab_regions, state_bytes,
 };
 
 pub use codec::{
@@ -1570,12 +1570,21 @@ impl StateStore {
     /// store's pool, which is charged for whole blocks of them.
     pub fn committed_bytes(&self) -> u64 {
         let backing = self.backing.borrow();
+        let tables = backing.history.iter().map(|history| &history.slabs).chain(&backing.recurrent).map(SlabTensor::address_table_bytes).sum::<u64>();
+        tables + self.backed_slab_bytes()
+    }
+
+    /// Bytes of the backed slabs alone, granules of the store's pool: the
+    /// committed backing less its address tables, which their own claim
+    /// commits.
+    pub fn backed_slab_bytes(&self) -> u64 {
+        let backing = self.backing.borrow();
         backing
             .history
             .iter()
             .map(|history| &history.slabs)
             .chain(&backing.recurrent)
-            .map(|slabs| slabs.address_table_bytes() + slabs.backed().len() as u64 * slabs.pool().granule())
+            .map(|slabs| slabs.backed().len() as u64 * slabs.pool().granule())
             .sum()
     }
 

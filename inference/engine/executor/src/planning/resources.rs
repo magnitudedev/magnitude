@@ -1519,7 +1519,7 @@ impl ResourcePlanner {
         let mut workload_slabs = 0u64;
         for store in std::iter::once(&target_state).chain(head_state.as_ref()) {
             let slabs = crate::memory::ledger::StoreShape::of(store)
-                .state_bytes(magnitude_state::StateUnit::Slabs { granule: store.granule }, conversations, fit_depth)
+                .state_bytes(conversations, fit_depth)
                 .map_err(|error| error.to_string())?;
             workload_slabs = workload_slabs.checked_add(slabs).ok_or("state fit charge overflows")?;
         }
@@ -1999,7 +1999,7 @@ mod slab_plan_tests {
         let history_depth = u64::from(plan.domains[0].slab_rows) + 1;
         let slabs = |conversations| {
             crate::memory::ledger::StoreShape::of(&plan)
-                .state_bytes(magnitude_state::StateUnit::Slabs { granule }, conversations, history_depth)
+                .state_bytes(conversations, history_depth)
                 .unwrap()
         };
         assert_eq!(slabs(1), 2 * granule);
