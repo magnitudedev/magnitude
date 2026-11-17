@@ -165,6 +165,14 @@ export const residencyLabel = (model: LocalModel): string => {
   }
 }
 
+/** The engine's own message for a model whose load failed, shown as the reason beside what the failure means. */
+export const residencyFailureReason = (model: LocalModel): Option.Option<string> => {
+  const residency = residencyState(model)
+  return residency?._tag === "Failed" && !("_tag" in residency.failure)
+    ? Option.some(residency.failure.message)
+    : Option.none()
+}
+
 export const percent = (completed: number, total: number): string =>
   `${total === 0 ? 0 : Math.round((completed / total) * 100)}%`
 

@@ -11,6 +11,7 @@ import {
   ResponseUsage,
 } from "./session-event"
 import { ServingModelId } from "./serving-usage"
+import { engineFailureSentence } from "./engine-failure"
 
 // A chat's transcript as folded from its session's log (spec section 4), and its running response's
 // live state. These shapes are derived: a change to them is a change to the fold, never to stored
@@ -153,14 +154,13 @@ const statusLabels: { readonly [Status in ResponseStatus]: Option.Option<string>
 
 /**
  * What a failure tells the reader. Each message but the inference service's is a sentence written
- * where the failure was found; the service's own message is shown as its report.
+ * where the failure was found; the service's is written from its code, since its message is
+ * diagnostic text ([`failureDetail`]).
  */
-const failureText = (error: ResponseFailure): string => {
+export const failureText = (error: ResponseFailure): string => {
   switch (error._tag) {
     case "inference":
-      return error.code === CONTEXT_LENGTH_EXCEEDED
-        ? "This chat is longer than the context this computer serves this model at. Start a new chat to continue."
-        : `The inference service failed: ${error.message}`
+      return engineFailureSentence(error.code)
     case "unreachable":
     case "rejected":
     case "storage":
@@ -168,6 +168,10 @@ const failureText = (error: ResponseFailure): string => {
       return error.message
   }
 }
+
+/** The inference service's own message about a failure, for a bug report: shown collapsed, never as the summary. */
+export const failureDetail = (error: ResponseFailure): Option.Option<string> =>
+  error._tag === "inference" && error.message.trim() !== "" ? Option.some(error.message) : Option.none()
 
 const CONTEXT_LENGTH_EXCEEDED = "context_length_exceeded"
 
@@ -182,13 +186,14 @@ export const responseExceedsContext = (message: ChatAssistantMessage): boolean =
     && outcome.error.code === CONTEXT_LENGTH_EXCEEDED,
 )
 
-/** How a response's status is labelled, and what went wrong with it, if anything. */
+/** How a response's status is labelled, what went wrong with it, if anything, and the service's own report of it. */
 export const responseStatusText = (
   message: ChatAssistantMessage
-): { readonly label: Option.Option<string>; readonly problem: Option.Option<string> } => {
+): { readonly label: Option.Option<string>; readonly problem: Option.Option<string>; readonly detail: Option.Option<string> } => {
   const status = responseStatus(message)
   return {
     label: statusLabels[status],
+    detail: Option.flatMap(message.end, ({ outcome }) => outcome._tag === "failed" ? failureDetail(outcome.error) : Option.none()),
     problem: Option.flatMap(message.end, ({ outcome }) => {
       switch (outcome._tag) {
         case "failed":

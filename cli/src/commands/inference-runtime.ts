@@ -65,6 +65,7 @@ import {
   modelAssessment,
   modelQuant,
   renderQuantLadder,
+  residencyFailureReason,
   residencyLabel,
 } from "./model-format"
 export * from "./hugging-face-runtime"
@@ -384,6 +385,7 @@ export const renderHardware = ({ hardware, models }: HardwareView): string => {
     "Current model",
     ...(current === undefined ? ["  None"] : [
       `  ${formatLocalModelDisplayName(current)} - ${residencyLabel(current)}`,
+      ...Option.match(residencyFailureReason(current), { onNone: () => [], onSome: (reason) => [`  Reason: ${reason}`] }),
       ...Option.match(allocation, {
         onSome: (value) => [`  Context ${formatContext(value.contextWindowTokens)}`],
         onNone: () => Option.match(plan, {

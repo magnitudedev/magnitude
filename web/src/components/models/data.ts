@@ -1,6 +1,6 @@
 import { Option } from "effect"
-import type { CustomLocalModel, DrafterTarget, LocalModel, LocalModelAssessment, LocalModelDeveloper, LocalModelFamily, RecommendedModel, SpeculativeMethod, UnsupportedLocalModel } from "@magnitudedev/sdk"
-import { fitPlacementPhrase, formatStorageSize, ladderBitWidths, localModelSizeBytes, quantBitWidth, type ServingMemory } from "@magnitudedev/client-common"
+import { localModelResidency, type CustomLocalModel, type DrafterTarget, type LocalModel, type LocalModelAssessment, type LocalModelDeveloper, type LocalModelFamily, type RecommendedModel, type SpeculativeMethod, type UnsupportedLocalModel } from "@magnitudedev/sdk"
+import { describeModelLoadFailure, fitPlacementPhrase, formatStorageSize, ladderBitWidths, localModelSizeBytes, quantBitWidth, type ServingMemory } from "@magnitudedev/client-common"
 import { labForDeveloper } from "../model-logo"
 import type { DiscoveredModel } from "./onboarding"
 import type { OfferedModel } from "./expanding-model"
@@ -123,6 +123,12 @@ const drafterOf = (model: LocalModel): OwnedModel["drafter"] => {
 }
 
 /** A model on this computer as the Your models list shows it. */
+/** Why the model last failed to load, in a sentence from its code, with the engine's own report kept for Details. */
+const loadFailureOf = (model: LocalModel): OwnedModel["loadFailure"] => Option.match(localModelResidency(model), {
+  onNone: () => null,
+  onSome: residency => residency._tag === "Failed" ? { summary: describeModelLoadFailure(residency.failure), detail: residency.failure.message } : null,
+})
+
 export const ownedModel = (model: LocalModel, memory: ServingMemory): OwnedModel => {
   const developer = Option.getOrNull(developerOf(model))
   const assessment = assessmentOf(model)
@@ -141,6 +147,7 @@ export const ownedModel = (model: LocalModel, memory: ServingMemory): OwnedModel
     drafter: drafterOf(model),
     drafterChoosable: model._tag === "Custom",
     searchText: `${model.presentation.displayName} ${quant.repository ?? ""} ${quant.name}`,
+    loadFailure: loadFailureOf(model),
   }
 }
 

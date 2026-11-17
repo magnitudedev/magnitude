@@ -231,7 +231,7 @@ it("labels responses with no token measurements instead of showing an empty metr
     renderToStaticMarkup(<ChatResponse response={ended(outcome)} notify={() => {}} />)
   const reported = failed({ type: "failed", error: { type: "inference", code: "server_error", message: "The engine stopped." } })
   expect(reported).toContain("Failed")
-  expect(reported).toContain("The engine stopped.")
+  expect(reported).toContain("The inference engine reported an error (server_error).")
   expect(reported).not.toContain("tok/s")
   const unfinished = failed({ type: "finished", finishReason: "tool_calls" })
   expect(unfinished).toContain("The model ended with tool_calls. This chat has no tools.")
@@ -281,4 +281,16 @@ it("offers a new chat instead of a retry when the chat outgrew the model's serve
     />
   )
   expect(other).toContain('aria-label="Retry response"')
+})
+
+it("says what an engine failure means, and keeps the engine's report collapsed under Details with a copy button", () => {
+  const report = `worker lost during load: the worker ended before it was ready; worker diagnostics: ${"0x5a620e5e9763 - std::sys::backtrace at /home/ubuntu/inference/engine/scheduler/src/worker.rs:429:28 ".repeat(150)}`
+  const html = renderToStaticMarkup(
+    <ChatResponse response={ended({ type: "failed", error: { type: "inference", code: "worker_exited", message: report } })} notify={() => {}} />
+  )
+  const alert = html.match(/<p role="alert"[^>]*>(.*?)<\/p>/)?.[1]
+  expect(alert).toBe("The model’s engine stopped unexpectedly. Try again, or choose another model.")
+  expect(html).toMatch(/<details[^>]*><summary[^>]*>Details<\/summary>/)
+  expect(html.indexOf("worker diagnostics")).toBeGreaterThan(html.indexOf("<details"))
+  expect(html).toContain('aria-label="Copy details"')
 })

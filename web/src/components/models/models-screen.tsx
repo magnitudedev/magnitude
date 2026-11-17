@@ -75,7 +75,7 @@ export function ModelsScreen({ onExplore, empty }: { onExplore: (query: string) 
       case "Loading": return <span className="flex items-center gap-2"><Status busy>Loading {Math.round(residency.fraction * 100)}%</Status>{stop}</span>
       case "Ready": return <span className="flex items-center gap-2"><Status tone="running">Running</Status>{stop}</span>
       case "Stopping": return <Status busy>Stopping…</Status>
-      case "Failed": return <span className="flex items-center gap-2"><Status tone="failed" title={residency.failure.message}>Couldn’t load</Status>{load}</span>
+      case "Failed": return <span className="flex items-center gap-2"><Status tone="failed" title={view.loadFailure?.summary}>Couldn’t load</Status>{load}</span>
       default: return load
     }
   }

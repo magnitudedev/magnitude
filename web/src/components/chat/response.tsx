@@ -17,6 +17,7 @@ import remarkGfm from "remark-gfm"
 import { CopyText, IconButton, SentAt, ThinkingFor, number, seconds } from "./shared"
 import { ChatCodeBlock } from "./code-block"
 import { rehypeLongTokens } from "./long-tokens"
+import { FailureDetails } from "../failure-details"
 /** A response's parts of one kind, joined in order. */
 const partsText = (response: ChatAssistantMessage, part: "text" | "reasoning") =>
   response.content.flatMap((p) => (p._tag === part ? [p.text] : [])).join("")
@@ -40,7 +41,7 @@ export function ChatResponse({
   const thinkingSince = running && g.content.at(-1)?._tag === "reasoning"
     ? g.content.find((part) => part._tag === "reasoning")?.time.started
     : undefined
-  const { label, problem: failure } = responseStatusText(g)
+  const { label, problem: failure, detail } = responseStatusText(g)
   const metrics = [
     Option.map(m.tokensPerSecond, (n) => `${number(n)} tok/s`),
     Option.map(m.ttftMs, (n) => `TTFT ${seconds(n)}`),
@@ -85,6 +86,9 @@ export function ChatResponse({
             >
               {failure.value}
             </p>
+          )}
+          {Option.isSome(detail) && (
+            <FailureDetails text={detail.value} notify={notify} />
           )}
           <div className="mt-4 flex flex-wrap items-center justify-between gap-2">
             <button

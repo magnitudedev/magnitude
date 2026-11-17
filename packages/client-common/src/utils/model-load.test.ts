@@ -53,13 +53,13 @@ describe("memory shortage and stop wording", () => {
     expect(blocked).toBe("This model needs 32.3 GB and 25.8 GB is available. Quit apps you aren’t using, or choose a smaller model.")
   })
 
-  it("describes a shortage in the user's terms and passes any other failure's message through", () => {
+  it("describes a shortage in the user's terms and any other failure by its code, never by the service's message", () => {
     expect(describeModelLoadFailure({
       _tag: "MemoryShortage", code: "memory_shortage", message: "private bytes", retryable: true,
       shortage: { _tag: "Blocked", requiredBytes: 30 * 2 ** 30, availableBytes: 24 * 2 ** 30 },
     })).toBe(`${MEMORY_SHORTAGE_TITLE}. This model needs 32.3 GB and 25.8 GB is available. Quit apps you aren’t using, or choose a smaller model.`)
     expect(describeModelLoadFailure({ code: "worker_exited", message: "the worker exited", retryable: true }))
-      .toBe("the worker exited")
+      .toBe("The model’s engine stopped unexpectedly. Try again, or choose another model.")
   })
 
   it("recognizes only a stop for memory pressure", () => {
