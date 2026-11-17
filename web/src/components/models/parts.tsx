@@ -199,7 +199,7 @@ export function ModelCardShell({ lab, title, note, detail, quant, active, onSele
     <div role="button" tabIndex={0} aria-expanded={active} onClick={onSelect} onKeyDown={event => { if (event.key === "Enter") onSelect() }} className="grid w-full cursor-pointer grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-4 px-4 py-3 text-left">
       <LabMark lab={lab} className="size-10" />
       <span className="min-w-0">
-        <span className="flex items-center gap-2 text-[14px] font-medium"><span className="truncate">{title}</span>{note && <span className="shrink-0 text-xs font-normal text-slate-500">{note}</span>}</span>
+        <span className="flex items-center gap-2 text-[14px] font-medium"><span className="max-w-full shrink-0 truncate">{title}</span>{note && <span className="min-w-0 truncate text-xs font-normal text-slate-500">{note}</span>}</span>
         <span className="mt-0.5 block min-w-0 truncate text-xs text-slate-500">{detail}</span>
       </span>
       <span className="flex items-center gap-4">
