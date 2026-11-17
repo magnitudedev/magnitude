@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from "react"
 import { Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { Option } from "effect"
-import type { ApplicationPage } from "@magnitudedev/client-common"
+import type { ApplicationPage, MainPage } from "@magnitudedev/client-common"
 import { selectedChat, useAgentClient } from "@magnitudedev/client-common"
 import type { ChatSummary } from "@magnitudedev/sdk"
-import { DotsThreeIcon, PencilSimpleIcon, PlusIcon, TrashIcon } from "@phosphor-icons/react"
+import { CircleNotchIcon, DotsThreeIcon, PencilSimpleIcon, TrashIcon } from "@phosphor-icons/react"
 import { ConfirmDialog } from "../confirm-dialog"
 import { CHAT_TITLE_MAX_LENGTH, renameOf } from "./rename"
 
@@ -50,7 +50,8 @@ function Row({ chat, current, open }: { chat: ChatSummary; current: boolean; ope
         />
       ) : (
         <button type="button" className="chat-list-title" title={chat.title} onClick={open} aria-current={current ? "page" : undefined}>
-          <span className="truncate">{chat.title}</span>
+          <span className="min-w-0 flex-1 truncate">{chat.title}</span>
+          <span className="chat-list-status">{chat.running && <ChatInProgress />}</span>
         </button>
       )}
       {editing === null && (
@@ -87,7 +88,31 @@ function Row({ chat, current, open }: { chat: ChatSummary; current: boolean; ope
   )
 }
 
-/** Every chat, newest first, a page at a time, loading the next page as the list's end comes into view; a quiet line until there is one. */
+/** A chat's response in progress, from its start to its end: a spinner, named for assistive technology. */
+function ChatInProgress() {
+  return <CircleNotchIcon role="img" aria-label="In progress" className="size-3 motion-safe:animate-spin" />
+}
+
+/**
+ * The Chat tab's status: while another page shows, and with it no list of chats, a spinner while any recent chat has a
+ * response in progress; on Chat, each chat's row shows its own. It reads the chat list's first page, which ACN tells
+ * of each response's start and end, so it follows them without a timer.
+ */
+export function ChatTabStatus({ page }: { page: MainPage }) {
+  const client = useAgentClient()
+  const listed = useAtomValue(client.Chat.ListChats({ offset: 0, limit: PAGE })).result
+  return page !== "chat" && Result.isSuccess(listed) && listed.value.chats.some((chat) => chat.running) ? <ChatInProgress /> : null
+}
+
+/**
+ * What the sidebar shows under its Chat tab: the recent chats while Chat is the page in the main area, Settings open
+ * over it or not, and nothing while Models or Connections is.
+ */
+export function SidebarChats({ page, navigate, onNavigate }: { page: MainPage; navigate: (page: ApplicationPage) => void; onNavigate?: () => void }) {
+  return page === "chat" ? <ChatList navigate={navigate} onNavigate={onNavigate} /> : null
+}
+
+/** The recent chats, newest first, a page at a time, loading the next page as the list's end comes into view; the open chat is marked. */
 export function ChatList({ navigate, onNavigate }: { navigate: (page: ApplicationPage) => void; onNavigate?: () => void }) {
   const [pages, setPages] = useState(1)
   return (
@@ -120,7 +145,7 @@ function ChatListPage({ offset, last, more, navigate, onNavigate }: {
     return () => observer.disconnect()
   }, [last, hasMore])
   if (!Result.isSuccess(listed)) return null
-  if (offset === 0 && listed.value.chats.length === 0) return <p className="chat-list-empty">No chats yet. Click New chat above to start one.</p>
+  if (offset === 0 && listed.value.chats.length === 0) return <p className="chat-list-empty">No chats yet.</p>
   return <>
     {listed.value.chats.map((chat) => (
       <Row
@@ -136,17 +161,4 @@ function ChatListPage({ offset, last, more, navigate, onNavigate }: {
     ))}
     {last && hasMore && <div ref={end} aria-hidden="true" className="h-px" />}
   </>
-}
-
-/** The top of the sidebar: New chat, and every chat beneath it once the app has reached the service. */
-export function ChatSection({ navigate, onNavigate }: { navigate?: (page: ApplicationPage) => void; onNavigate?: () => void }) {
-  const select = useAtomSet(selectedChat)
-  return (
-    <div className="flex min-h-0 flex-1 flex-col">
-      <button type="button" className="new-chat-button group" disabled={!navigate} onClick={() => { select(null); navigate?.("chat"); onNavigate?.() }}>
-        New chat<PlusIcon weight="bold" className="size-3.5 transition-transform duration-200 group-hover:rotate-90" />
-      </button>
-      {navigate && <ChatList navigate={navigate} onNavigate={onNavigate} />}
-    </div>
-  )
 }

@@ -173,14 +173,16 @@ describe("host actions", () => {
     }), { current: "Completed" }, models)
   })
 
-  it("keeps Chat or Models in the main area while Settings is open over it", () => withSession([], (session, registry) => Effect.gen(function* () {
+  it("keeps the main page in the main area while Settings is open over it", () => withSession([], (session, registry) => Effect.gen(function* () {
     registry.get(session.mainPage)
     yield* session.navigate("models")
     yield* session.navigate("settings")
     expect(registry.get(session.mainPage)).toBe("models")
     yield* session.navigate("chat")
     yield* session.navigate("connections")
-    expect(registry.get(session.mainPage)).toBe("chat")
+    expect(registry.get(session.mainPage)).toBe("connections")
+    yield* session.navigate("usage")
+    expect(registry.get(session.mainPage)).toBe("connections")
   })))
 
   it("starts Models over when Models is chosen while it is shown, but not when Settings closes over it", () => withSession([], (session, registry) => Effect.gen(function* () {

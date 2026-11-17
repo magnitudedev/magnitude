@@ -4,7 +4,7 @@ import { ApplicationPage, type MainPage } from "./contracts"
 
 export interface ApplicationRouter {
   readonly page: Atom.Atom<ApplicationPage>
-  /** Chat or Models, whichever the main area shows; it stays behind Settings while Settings is open over it. */
+  /** The page the main area shows; it stays behind Settings while Settings is open over it. */
   readonly mainPage: Atom.Atom<MainPage>
   /**
    * Counts the times a main page was opened from the main area, not returned to by closing Settings over it. A page
@@ -19,7 +19,7 @@ export const ApplicationRouter = Context.GenericTag<ApplicationRouter>("client/A
 
 const DEFAULT_PAGE: ApplicationPage = "chat"
 const isPage = Schema.is(ApplicationPage)
-const isMainPage = (page: ApplicationPage): page is MainPage => page === "chat" || page === "models"
+const isMainPage = (page: ApplicationPage): page is MainPage => page === "chat" || page === "models" || page === "connections"
 
 export const pagePath = (page: ApplicationPage) => page === DEFAULT_PAGE ? "/" : `/${page}`
 export const pageFromPath = (path: string): Option.Option<ApplicationPage> => {

@@ -6,7 +6,7 @@ import { Skeleton } from "./components/ui/skeleton"
 import { pageLayout } from "./components/page-layout"
 import { ServingUsage } from "./components/serving-usage"
 import { setAppearancePreference, useAppearancePreference } from "./stores/appearance-store"
-import { Button, buttonVariants } from "./components/ui/button"
+import { Button } from "./components/ui/button"
 import { Switch } from "./components/ui/switch"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./components/ui/select"
 import { MagnitudeMark } from "./components/magnitude-mark"
@@ -79,7 +79,7 @@ import { onThisComputer } from "./components/models/data"
 import { onboardingCompletedHere, recordOnboardingCompleted } from "./components/models/onboarding-record"
 import { useRecommendations } from "./components/models/recommendations"
 import { ChatModelSettings } from "./components/chat/model-settings"
-import { ChatSection } from "./components/chat/sidebar-list"
+import { ChatTabStatus, SidebarChats } from "./components/chat/sidebar-list"
 import { SidebarUpdatePill, SidebarUpdateProvider, useApplicationOwner, useApplicationUpdateActions, useApplicationUpdateObservation, useSidebarUpdate, type UpdateTransfer } from "./components/application-update"
 
 const ALL_INTERFACES = "all"
@@ -384,17 +384,16 @@ function SignOutRow() {
     alert={Result.isFailure(signingOut) && !signingOut.waiting ? <ErrorNotice title="Couldn’t sign out" description="Check that this device can still reach Magnitude, then try again." /> : undefined}
     control={<Button size="sm" variant="outline" disabled={signingOut.waiting} onClick={() => run()}>Sign out</Button>} />
 }
-type SettingsTab = "general" | "chat" | "storage" | "network" | "connections" | "usage" | "about"
+type SettingsTab = "general" | "chat" | "storage" | "network" | "usage" | "about"
 const settingsTabs: ReadonlyArray<{ readonly key: SettingsTab; readonly label: string; readonly icon: Icon }> = [
   { key: "general", label: "General", icon: SlidersIcon },
   { key: "chat", label: "Chat", icon: ChatCircleIcon },
   { key: "storage", label: "Storage", icon: HardDrivesIcon },
   { key: "network", label: "Network", icon: WifiHighIcon },
-  { key: "connections", label: "Connections", icon: PlugIcon },
   { key: "usage", label: "Usage", icon: ChartBarIcon },
   { key: "about", label: "About", icon: InfoIcon },
 ]
-const settingsTabFor = (page: ApplicationPage): SettingsTab => page === "connections" || page === "usage" ? page : "general"
+const settingsTabFor = (page: ApplicationPage): SettingsTab => page === "usage" ? page : "general"
 
 /**
  * Settings in its modal: its sections listed on the left, or in a menu above them in a narrow window, and the chosen
@@ -409,7 +408,6 @@ function SettingsModal({ observation, initial, onClose }: { observation: Service
   const [tab, setTab] = useState(initial)
   const [locations, setLocations] = useState(false)
   useAtomMount(useMemo(() => Atom.make(Effect.all([Atom.refresh(client.Configuration.GetModelStorage({})), Atom.refresh(client.Configuration.GetNetworkAccess({})), Atom.refresh(client.Models.ListModelLocations({}))], { discard: true })), [client]))
-  const service = Result.isSuccess(observation.service) ? observation.service.value : null
   const choose = (next: SettingsTab) => { setLocations(false); setTab(next) }
   return <AppModal title="Settings" onClose={onClose}>
     <div className={narrow ? "flex min-h-0 flex-1 flex-col" : "flex min-h-0 flex-1"}>
@@ -439,7 +437,6 @@ function SettingsModal({ observation, initial, onClose }: { observation: Service
           {tab === "chat" && <ChatModelSettings />}
           {tab === "storage" && <SettingsGroup><ModelStorageRow /><ModelLocationsRow onManage={() => setLocations(true)} /></SettingsGroup>}
           {tab === "network" && <SettingsGroup><NetworkAccessRows /></SettingsGroup>}
-          {tab === "connections" && <Connections serviceReady={service?._tag === "Ready"} selectedModel={Option.none()} />}
           {tab === "usage" && <ServingUsage />}
           {tab === "about" && <><SettingsGroup><AboutRow /></SettingsGroup>{remote && <SettingsGroup label="This browser"><SignOutRow /></SettingsGroup>}</>}
           {(storagePending || networkPending) && <div aria-hidden="true" className="h-44" />}
@@ -465,6 +462,7 @@ export function App() {
       : service?._tag === "Reconnecting" ? <ReconnectingToMagnitude />
       : service?._tag === "Failed" || service?._tag === "CleanupFailed" ? <MagnitudeCouldNotStart service={service} canRetry={observation.canRetry} onOpenStatus={() => navigate("settings")} />
       : main === "chat" ? <ChatPage />
+      : main === "connections" ? <><h1 className={`${pageLayout.pageTitle} mb-6`}>Connections</h1><Connections serviceReady={service?._tag === "Ready"} selectedModel={Option.none()} /></>
       : <ModelsPage key={visit} observation={observation} />}
     </AppShell>
     {page !== main && <SettingsModal key={page} observation={observation} initial={settingsTabFor(page)} onClose={() => navigate(main)} />}
@@ -543,45 +541,61 @@ export function AppShell({ page, navigate, platform, children }: { page: MainPag
 /** Models on this computer: the user's own, and catalog models installed or on their way. */
 const modelsOnComputer = (state: LocalModelsState) =>
   state.models.filter(model => model._tag === "Custom" || model.acquisitionState._tag !== "NotInstalled").length
-const rowClass = (current: boolean) => `${buttonVariants({ variant: "ghost" })} h-9 justify-start gap-3 rounded-lg px-3 text-left text-[13px] font-medium ${current ? "bg-blue-50 text-blue-700 dark:bg-slate-800 dark:text-blue-400" : "hover:bg-slate-100 dark:hover:bg-slate-800"}`
-/** Models in the sidebar, with how many are on this computer; before the window reaches the service it shows without a count and can't be opened yet. */
-function ModelsButton({ current, onClick }: { current: boolean; onClick?: () => void }) {
-  return onClick ? <CountedModelsButton current={current} onClick={onClick} /> : <ModelsButtonView current={current} count={Option.none()} />
+/** A page tab at the top of the sidebar, as main's sidebar drew them: icon and name, highlighted while its page shows. */
+function NavTab({ label, name, icon, current, onClick, status }: { label: string; name?: string; icon: ReactNode; current: boolean; onClick?: () => void; status?: ReactNode }) {
+  return <Button variant="ghost" disabled={!onClick} onClick={onClick} aria-label={name} aria-current={current ? "page" : undefined}
+    className={`group h-10 justify-start gap-3 rounded-lg px-3 text-left text-sm font-medium ${current ? "bg-blue-50 text-blue-700 dark:bg-slate-800 dark:text-blue-400" : "hover:bg-slate-100 dark:hover:bg-slate-800"}`}>
+    {icon}{label}
+    {status !== undefined && <span className="ml-auto inline-flex size-4 shrink-0 items-center justify-center text-blue-500">{status}</span>}
+  </Button>
 }
-function CountedModelsButton({ current, onClick }: { current: boolean; onClick: () => void }) {
-  return <ModelsButtonView current={current} count={useLocalModelsSelector(modelsOnComputer, Equivalence.number)} onClick={onClick} />
+/** The Chat tab, with room at its end for its status; before the window reaches the service it shows none. */
+function ChatTab({ page, onClick }: { page: MainPage; onClick?: (() => void) | undefined }) {
+  return <NavTab label="Chat" icon={<ChatCircleIcon className="size-4 shrink-0" />} current={page === "chat"} {...(onClick ? { onClick } : {})}
+    status={onClick ? <ChatTabStatus page={page} /> : null} />
 }
-function ModelsButtonView({ current, count, onClick }: { current: boolean; count: Option.Option<number>; onClick?: () => void }) {
-  return <button type="button" disabled={!onClick} onClick={onClick} aria-current={current ? "page" : undefined}
-    aria-label={Option.match(count, { onNone: () => "Models", onSome: value => value > 0 ? `Models, ${value} on this computer` : "Models" })}
-    className={`group ${rowClass(current)}`}>
+/** The Models tab, with how many models are on this computer; before the window reaches the service it shows without a count and can't be opened yet. */
+function ModelsTab({ current, onClick }: { current: boolean; onClick?: () => void }) {
+  return onClick ? <CountedModelsTab current={current} onClick={onClick} /> : <ModelsTabView current={current} count={Option.none()} />
+}
+function CountedModelsTab({ current, onClick }: { current: boolean; onClick: () => void }) {
+  return <ModelsTabView current={current} count={useLocalModelsSelector(modelsOnComputer, Equivalence.number)} onClick={onClick} />
+}
+function ModelsTabView({ current, count, onClick }: { current: boolean; count: Option.Option<number>; onClick?: () => void }) {
+  return <NavTab label="Models" name={Option.match(count, { onNone: () => "Models", onSome: value => value > 0 ? `Models, ${value} on this computer` : "Models" })} current={current} onClick={onClick} icon={
     <span className="relative inline-flex">
       <CubeIcon className="size-4 shrink-0" />
-      {Option.isSome(count) && count.value > 0 && <span className="absolute -top-1.5 -right-2 min-w-4 rounded-full bg-slate-200 px-1 text-center text-[10px] leading-4 font-semibold tabular-nums text-slate-700 ring-2 ring-slate-50 group-hover:ring-slate-100 dark:bg-slate-700 dark:text-slate-100 dark:ring-slate-925 dark:group-hover:ring-slate-800">{count.value}</span>}
-    </span>
-    Models
-  </button>
+      {Option.isSome(count) && count.value > 0 && <span aria-hidden="true" className={`absolute -top-1.5 -right-2 min-w-4 rounded-full bg-slate-200 px-1 text-center text-[10px] leading-4 font-semibold tabular-nums text-slate-700 ring-2 dark:bg-slate-700 dark:text-slate-100 ${current ? "ring-blue-50 dark:ring-slate-800" : "ring-slate-50 group-hover:ring-slate-100 dark:ring-slate-925 dark:group-hover:ring-slate-800"}`}>{count.value}</span>}
+    </span>} />
 }
 function BarButton({ label, icon: BarIcon, onClick }: { label: string; icon: Icon; onClick?: () => void }) {
   return <ActionTooltip label={label} trigger={
     <button type="button" aria-label={label} disabled={!onClick} onClick={onClick}
-      className="ml-auto inline-flex size-8 shrink-0 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100 hover:text-slate-900 focus-visible:outline-2 focus-visible:outline-blue-500 disabled:opacity-50 dark:hover:bg-slate-800 dark:hover:text-slate-100">
+      className="inline-flex size-8 shrink-0 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100 hover:text-slate-900 focus-visible:outline-2 focus-visible:outline-blue-500 disabled:opacity-50 dark:hover:bg-slate-800 dark:hover:text-slate-100">
       <BarIcon className="size-[18px]" />
     </button>} />
 }
-/** The sidebar: New chat and the chats, then Models and Docs, then a bar with the update and Settings. */
+/** Docs, a plain link in the sidebar's bar: hovering changes its text's colour and underlines it. */
+function DocsLink({ onNavigate }: { onNavigate?: () => void }) {
+  return <a href="https://docs.magnitude.dev" target="_blank" rel="noreferrer" onClick={onNavigate}
+    className="group inline-flex items-center gap-2 rounded-sm px-2 text-[13px] font-medium focus-visible:outline-2 focus-visible:outline-blue-500">
+    <BookOpenIcon className="size-4 shrink-0 text-slate-500 dark:text-slate-400" />
+    <span className="inline-flex items-center gap-1 border-b border-transparent text-slate-600 group-hover:border-current group-hover:text-slate-400 dark:text-slate-300 dark:group-hover:text-slate-100">Docs<ArrowUpRightIcon aria-hidden="true" className="size-3.5" /></span>
+  </a>
+}
+/** The sidebar: the Models, Connections and Chat tabs, the recent chats, the update when there is one, then a bar with Docs and Settings. */
 function Navigation({ page, navigate, onNavigate }: { page: MainPage; navigate?: (page: ApplicationPage) => void; onNavigate?: () => void }) {
   const open = navigate && ((target: ApplicationPage) => () => { navigate(target); onNavigate?.() })
   return <nav id="desktop-navigation" className="flex min-h-0 flex-1 flex-col">
-    <div className="flex min-h-0 flex-1 flex-col px-4"><ChatSection navigate={navigate} onNavigate={onNavigate} /></div>
-    <div className="flex shrink-0 flex-col gap-0.5 px-4 pb-2 pt-2">
-      <ModelsButton current={page === "models"} onClick={open?.("models")} />
-      <a href="https://docs.magnitude.dev" target="_blank" rel="noreferrer" onClick={onNavigate} className={rowClass(false)}>
-        <BookOpenIcon className="size-4 shrink-0" />Docs<ArrowUpRightIcon aria-hidden="true" className="ml-auto size-3.5 shrink-0 text-slate-400" />
-      </a>
+    <div className="flex shrink-0 flex-col gap-2 px-4">
+      <ModelsTab current={page === "models"} onClick={open?.("models")} />
+      <NavTab label="Connections" icon={<PlugIcon className="size-4 shrink-0" />} current={page === "connections"} onClick={open?.("connections")} />
+      <ChatTab page={page} onClick={open?.("chat")} />
     </div>
-    <div className="flex shrink-0 items-center gap-2 border-t border-slate-200 px-3 pt-2.5 dark:border-slate-750">
-      <SidebarUpdatePill navigate={navigate} onNavigate={onNavigate} />
+    <div className="mt-2 flex min-h-0 flex-1 flex-col px-4">{navigate && <SidebarChats page={page} navigate={navigate} onNavigate={onNavigate} />}</div>
+    <div className="shrink-0 px-4 pb-2.5 empty:hidden"><SidebarUpdatePill navigate={navigate} onNavigate={onNavigate} /></div>
+    <div className="flex shrink-0 items-center justify-between gap-1 border-t border-slate-200 px-3 pt-2.5 dark:border-slate-750">
+      <DocsLink onNavigate={onNavigate} />
       <BarButton label="Settings" icon={GearSixIcon} onClick={open?.("settings")} />
     </div>
   </nav>

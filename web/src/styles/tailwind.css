@@ -442,11 +442,6 @@
 .chat-message-action svg { width: 14px; height: 14px; }
 .chat-message-action:hover { background: var(--magnitude-slate-100); color: var(--magnitude-slate-800); }
 [data-theme=dark] .chat-message-action:hover { background: var(--magnitude-slate-800); color: var(--magnitude-slate-300); }
-.new-chat-button { display: flex; height: 38px; width: 100%; flex-shrink: 0; align-items: center; justify-content: center; gap: 7px; margin-bottom: 12px; border-radius: 8px; font-size: 14px; font-weight: 500; color: white; background: linear-gradient(180deg, var(--magnitude-blue-700), var(--magnitude-blue-800)); box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.1), 0 1px 2px rgb(0 0 0 / 0.2), 0 3px 8px -6px var(--magnitude-blue-700); transition: filter 150ms, transform 100ms; }
-.new-chat-button:hover { filter: brightness(1.06); }
-.new-chat-button:active { transform: translateY(1px); }
-.new-chat-button:focus-visible { outline: 2px solid var(--magnitude-blue-400); outline-offset: 2px; }
-.new-chat-button:disabled { opacity: 0.5; }
 .chat-list-empty { padding: 24px 16px 0; font-size: 13px; line-height: 1.5; text-align: center; color: var(--magnitude-slate-500); }
 .chat-list { display: flex; min-height: 0; flex: 1; flex-direction: column; gap: 1px; overflow-y: auto; padding: 2px 0 6px; }
 .chat-list-row { position: relative; display: flex; height: 32px; min-width: 0; align-items: center; border-radius: 6px; }
@@ -454,6 +449,7 @@
 [data-theme=dark] .chat-list-row:hover, [data-theme=dark] .chat-list-row[data-menu=true] { background: var(--magnitude-slate-800); }
 .chat-list-row[data-current=true] { background: var(--magnitude-slate-150); }
 [data-theme=dark] .chat-list-row[data-current=true] { background: var(--magnitude-slate-800); }
+.chat-list-status { display: inline-flex; width: 12px; height: 12px; flex-shrink: 0; align-items: center; justify-content: center; color: var(--magnitude-blue-500); }
 .chat-list-title { display: flex; min-width: 0; flex: 1; align-items: center; gap: 6px; padding: 8px 10px; font-size: 13px; line-height: 16px; text-align: left; color: var(--magnitude-slate-600); }
 .chat-list-row[data-current=true] .chat-list-title { color: var(--magnitude-slate-900); font-weight: 500; }
 [data-theme=dark] .chat-list-title { color: var(--magnitude-slate-300); }

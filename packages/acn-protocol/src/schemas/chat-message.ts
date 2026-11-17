@@ -68,6 +68,13 @@ export type ChatMessage = typeof ChatMessage.Type
 export const latestResponse = (messages: ReadonlyArray<ChatMessage>): Option.Option<ChatAssistantMessage> =>
   Arr.findLast(messages, (message): message is ChatAssistantMessage => message._tag === "assistant")
 
+/**
+ * The chat's running response: its latest, until that ends. It runs from the moment it starts, through waiting, the
+ * model loading and preparing, thinking and streaming, and stopping, until its end is recorded however it ended.
+ */
+export const runningResponse = (messages: ReadonlyArray<ChatMessage>): Option.Option<ChatAssistantMessage> =>
+  Option.filter(latestResponse(messages), (response) => Option.isNone(response.end))
+
 export const ModelLoadingStage = Schema.Literal("queued", "preparing", "optimizing", "loading_weights", "finalizing")
 export type ModelLoadingStage = typeof ModelLoadingStage.Type
 

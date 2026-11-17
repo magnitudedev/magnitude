@@ -9,11 +9,11 @@ import {
 } from "@effect-atom/atom-react"
 import { Cause, DateTime, Effect, Option, Schema } from "effect"
 import {
-  type ChatAssistantMessage,
   chatMessages,
   generateSessionId,
   type InferenceModel,
   liveResponse,
+  runningResponse,
   type MessageId,
   RequestedResponseSettings,
   ServingModelId,
@@ -37,6 +37,7 @@ import {
 } from "@magnitudedev/client-common"
 import {
   ArrowUpIcon,
+  PlusIcon,
   SquareIcon,
   CircleNotchIcon,
 } from "@phosphor-icons/react"
@@ -139,10 +140,7 @@ function ChatView({
   const retryState = useAtomValue(client.Chat.RetryChatResponse)
   const stopState = useAtomValue(client.Chat.StopChatResponse)
   const pending = startState.waiting || sendState.waiting || retryState.waiting
-  const active = messages.find(
-    (m): m is ChatAssistantMessage =>
-      m._tag === "assistant" && Option.isNone(m.end)
-  )
+  const active = Option.getOrUndefined(runningResponse(messages))
   const input = useRef<HTMLTextAreaElement>(null)
   const scroller = useRef<HTMLDivElement>(null)
   const startNewChat = () => {
@@ -265,8 +263,12 @@ function ChatView({
   }))
   return (
     <section aria-label="Chat" className="flex min-h-0 flex-1 flex-col">
-      <div className="mb-5 flex min-h-9 shrink-0 items-center">
+      <div className="mb-5 flex min-h-9 shrink-0 items-center justify-between gap-3">
         <ChatTitle chat={chat?.chat ?? null} />
+        <Button variant="ghost" className="shrink-0" disabled={pending} onClick={startNewChat}>
+          <PlusIcon />
+          New chat
+        </Button>
       </div>
       <div className="relative flex min-h-0 flex-1">
         <div className="flex min-w-0 flex-1 flex-col">

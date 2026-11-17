@@ -4,9 +4,11 @@ import {
   appendOutput,
   ChatAssistantMessage,
   type ChatContentPart,
+  ChatMessage,
   responseMetrics,
   responseStatus,
   responseStatusText,
+  runningResponse,
 } from "./chat-message"
 
 const usage = { promptTokens: 60, cachedTokens: 40, completionTokens: 20 }
@@ -137,5 +139,30 @@ describe("appendOutput", () => {
   it("opens a new part when the part changes", () => {
     expect(appendOutput([part("reasoning", "Hm", 0, 5)], part("text", "Hi", 7, 8)))
       .toEqual([part("reasoning", "Hm", 0, 5), part("text", "Hi", 7, 8)])
+  })
+})
+
+describe("runningResponse", () => {
+  const user = Schema.decodeUnknownSync(ChatMessage)({ type: "user", id: "message", text: "Hi", time: 900 })
+
+  it("is the latest response while it has no end: from its start, through loading, thinking and streaming, until a stop ends it", () => {
+    const started = response({ end: undefined, content: [] })
+    expect(runningResponse([user, started])).toEqual(Option.some(started))
+    const streaming = response({ end: undefined })
+    expect(runningResponse([user, streaming])).toEqual(Option.some(streaming))
+  })
+
+  it("is none once the latest response ended, however it ended, and none before any response", () => {
+    for (const outcome of [
+      { type: "finished", finishReason: "stop" },
+      { type: "failed", error: { type: "inference", code: "worker_exited", message: "x" } },
+      { type: "stopped", by: "user" },
+      { type: "stopped", by: "shutdown" },
+    ]) expect(runningResponse([user, ended(outcome)])).toEqual(Option.none())
+    expect(runningResponse([user])).toEqual(Option.none())
+  })
+
+  it("follows only the latest response, not an earlier one left without an end", () => {
+    expect(runningResponse([response({ end: undefined, id: "earlier" }), user, ended({ type: "finished", finishReason: "stop" })])).toEqual(Option.none())
   })
 })
