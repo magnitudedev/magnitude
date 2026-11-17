@@ -50,6 +50,14 @@ describe("Chat draft lifecycle", () => {
   it("does not erase the next draft when retrying a response", () => {
     expect(completeChatSubmission(draft, "Previous question", id, true).text).toBe(draft.text)
   })
+  it("does not restore the input of a response that outgrew the context, which can't succeed in that chat", () => {
+    const overflowed = Schema.decodeUnknownSync(ChatAssistantMessage)({
+      type: "assistant", id, model: "qwen3-8b", settings: { systemPrompt: "", stop: [] }, started: 0, content: [],
+      end: { time: 1, outcome: { type: "failed", error: { type: "inference", code: "context_length_exceeded", message: "prompt is too long" } } },
+    })
+    const next = completeChatSubmission(draft, draft.text, id, false)
+    expect(chatComposerText(next, overflowed)).toBe("")
+  })
   it("does not restore an unrelated failed response", () => {
     expect(
       chatComposerText({ ...draft, text: "", submitted: { id: MessageId.make("other"), text: "Other" } }, failed)

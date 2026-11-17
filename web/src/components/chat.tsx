@@ -144,12 +144,13 @@ function ChatView({
   const active = Option.getOrUndefined(runningResponse(messages))
   const input = useRef<HTMLTextAreaElement>(null)
   const scroller = useRef<HTMLDivElement>(null)
-  const startNewChat = () => {
+  /** A new chat with this model, its draft `text`: empty, or the message a chat that outgrew its context couldn't answer. */
+  const startNewChat = (text = "") => {
     clearError()
     select(null)
     // The new chat keeps this model and starts from its settings.
     setNewDraft({
-      text: "",
+      text,
       settings: { model: effectiveSettings.model },
       submitted: null,
     })
@@ -270,7 +271,7 @@ function ChatView({
     <section aria-label="Chat" className="flex min-h-0 flex-1 flex-col">
       <div className="mb-5 flex min-h-9 shrink-0 items-center justify-between gap-3">
         <ChatTitle chat={chat?.chat ?? null} />
-        <Button variant="ghost" className="shrink-0" disabled={pending} onClick={startNewChat}>
+        <Button variant="ghost" className="shrink-0" disabled={pending} onClick={() => startNewChat()}>
           <PlusIcon />
           New chat
         </Button>
@@ -327,7 +328,7 @@ function ChatView({
                           ? () => void submit(message.id)
                           : undefined
                       }
-                      newChat={pending ? undefined : startNewChat}
+                      newChat={pending ? undefined : () => { const asked = messages[index - 1]; startNewChat(asked?._tag === "user" ? asked.text : "") }}
                       notify={setNotice}
                     />
                   )
