@@ -21,7 +21,6 @@ import { NativeTrayFactory, NativeTrayFailed, TrayOwner, TrayOwnerLive, type Tra
 import { CommandExecutor, FetchHttpClient } from "@effect/platform"
 import { NodeContext } from "@effect/platform-node"
 import { NodeSqliteDriverLayer } from "@magnitudedev/storage/sqlite/node"
-import { HttpsUrlSchema } from "@magnitudedev/sdk"
 import { slate } from "@magnitudedev/client-common"
 import { DESKTOP_APP_ORIGIN, handleAppProtocol, resolveRendererDir } from "./app-protocol"
 import { developmentRelaunchExitCode, rendererServedByDevServer } from "./development-relaunch"
@@ -450,10 +449,11 @@ const program = Effect.scoped(Effect.gen(function* () {
       "Content-Security-Policy": [`default-src 'self'; script-src 'self'${app.isPackaged ? "" : " 'unsafe-inline'"}; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self' http://127.0.0.1:* ws://127.0.0.1:* http://localhost:* ws://localhost:*`],
     } }))
     value.webContents.on("will-navigate", event => event.preventDefault())
+    // Links open in the browser: web pages (a model source, a page a chat links to, a server on localhost) and
+    // email addresses. Any other scheme could start another program, so it is not opened.
     value.webContents.setWindowOpenHandler(({ url }) => {
-      const source = Schema.decodeUnknownEither(HttpsUrlSchema)(url)
-      if (source._tag === "Right") run(Effect.tryPromise(() => shell.openExternal(source.right)).pipe(
-        Effect.catchAll(() => showNotice({ title: "Could not open model source", description: "Open your browser and try the source link again." })),
+      if (/^(https?:\/\/|mailto:)/i.test(url)) run(Effect.tryPromise(() => shell.openExternal(url)).pipe(
+        Effect.catchAll(() => showNotice({ title: "Could not open the link", description: "Open your browser and try the link again." })),
       ))
       return { action: "deny" }
     })

@@ -408,7 +408,8 @@
 [data-theme=dark] .chat-prose blockquote { border-color: var(--magnitude-slate-600); }
 .chat-prose blockquote { border-left: 2px solid var(--magnitude-slate-300); padding-left: 12px; color: var(--magnitude-slate-500); }
 .chat-prose table { display: block; overflow-x: auto; border-collapse: collapse; }
-.chat-prose th, .chat-prose td { border-bottom: 1px solid var(--magnitude-slate-200); padding: 8px 12px; text-align: left; }
+.chat-prose th, .chat-prose td { border-bottom: 1px solid var(--magnitude-slate-200); padding: 8px 12px; text-align: left; overflow-wrap: break-word; }
+.chat-prose .chat-long-token { overflow-wrap: anywhere; }
 [data-theme=dark] .chat-prose pre, [data-theme=dark] .chat-prose :not(pre) > code { background: var(--magnitude-slate-850); }
 [data-theme=dark] .chat-prose a { color: var(--magnitude-blue-400); }
 [data-theme=dark] .chat-prose th, [data-theme=dark] .chat-prose td { border-color: var(--magnitude-slate-750); }

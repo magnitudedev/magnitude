@@ -18,6 +18,7 @@ import Markdown, { type Components } from "react-markdown"
 import remarkGfm from "remark-gfm"
 import { IconButton, number, seconds } from "./shared"
 import { ChatCodeBlock } from "./code-block"
+import { rehypeLongTokens } from "./long-tokens"
 /** A response's parts of one kind, joined in order. */
 const partsText = (response: ChatAssistantMessage, part: "text" | "reasoning") =>
   response.content.flatMap((p) => (p._tag === part ? [p.text] : [])).join("")
@@ -201,7 +202,7 @@ const ChatMarkdown = memo(function ChatMarkdown({
   )
   return (
     <div className="chat-prose text-sm leading-6">
-      <Markdown remarkPlugins={[remarkGfm]} components={components}>
+      <Markdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeLongTokens]} components={components}>
         {content}
       </Markdown>
     </div>

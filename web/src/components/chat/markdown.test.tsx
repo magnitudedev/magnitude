@@ -128,4 +128,13 @@ describe("Chat Markdown structure", () => {
     expect(html).toContain("<blockquote>\n<p>First</p>\n<p>Second</p>")
     expect(html).toContain("<li>\n<p>First</p>\n<p>Second</p>\n<ul>")
   })
+
+  it("lets only an overlong token in a table cell wrap, keeping ordinary words whole", () => {
+    const token = "a1b2c3d4".repeat(15)
+    const html = render(`| Value | Note |\n| --- | --- |\n| ${token} | short words here |`)
+    expect(html).toContain(`<span class="chat-long-token">${token}</span>`)
+    expect(html).toContain("<th>Value</th>")
+    expect(html).toContain("<td>short words here</td>")
+    expect(render("A paragraph with " + token)).not.toContain("chat-long-token")
+  })
 })
