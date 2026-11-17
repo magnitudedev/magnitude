@@ -9,10 +9,11 @@ import { formatLocalModelDisplayName } from "../utils/model-presentation"
 import { formatModelLoadPercentage, formatModelLoadStage, formatModelMemory, isMeasuredModelLoadStage } from "../utils/model-load"
 import { ApplicationHost, ApplicationHostFailed } from "./host"
 import { ApplicationRouter } from "./router"
+import { landingPage } from "./landing"
 import type { AddModelRequest, ApplicationPage, HostNotice, QuitFailureDecision } from "./contracts"
 import { ModelTrayPresentation, ModelTrayStatus } from "./contracts"
 
-export { AddModelRequest, ApplicationPage, HostAction, HostNotice, QuitFailureDecision, ModelTrayPresentation, ModelTrayStatus } from "./contracts"
+export { AddModelRequest, ApplicationPage, MainPage, HostAction, HostNotice, QuitFailureDecision, ModelTrayPresentation, ModelTrayStatus } from "./contracts"
 
 export const activeLocalModel = (models: LocalModelsState) => {
   for (const model of models.models) {
@@ -82,9 +83,17 @@ const makeApplicationSession = Effect.gen(function* () {
     return Result.isInitial(state) ? Option.none() : Option.some(Result.isSuccess(state) && state.value.onboarding === "Pending")
   }))
   const navigate = router.navigate
+  const landing = (result: Result.Result<LocalModelsState, unknown>) => Result.isSuccess(result) ? landingPage(result.value) : Option.none()
+  // The app opens on the page the first full answer about this computer's models calls for, unless it has moved on.
+  yield* Registry.toStream(registry, models.state).pipe(
+    Stream.filterMap(landing),
+    Stream.take(1),
+    Stream.runForEach(router.land),
+    Effect.forkScoped,
+  )
   const completeOnboarding = Atom.fn((_: void) => Mutation.execute(effectQuery.Configuration.CompleteOnboarding, {}).pipe(
     provideRegistry,
-    Effect.zipRight(router.navigate("models")),
+    Effect.zipRight(Effect.suspend(() => navigate(Option.getOrElse(landing(registry.get(models.state)), (): ApplicationPage => "chat")))),
   ))
   const notices = Atom.keepAlive(Atom.make<ReadonlyArray<HostNotice>>([]))
   const dismissNotice = (notice: HostNotice) => Effect.sync(() => registry.set(notices, registry.get(notices).filter(entry => entry !== notice)))
@@ -126,6 +135,7 @@ const makeApplicationSession = Effect.gen(function* () {
 
   return {
     page: router.page,
+    mainPage: router.mainPage,
     onboardingPending: onboardingPending as Atom.Atom<Option.Option<boolean>>,
     navigate,
     completeOnboarding,

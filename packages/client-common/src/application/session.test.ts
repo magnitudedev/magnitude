@@ -22,6 +22,10 @@ const observed = (residencyState: Extract<CatalogLocalModel["acquisitionState"],
   } }],
 })
 
+const ready = observed({ _tag: "Unloaded" })
+const none: LocalModelsState = { ...ready, models: [makeSetupModel(false)] }
+const downloading: LocalModelsState = { ...ready, models: [{ ...makeSetupModel(false), acquisitionState: { _tag: "Installing" } } as unknown as CatalogLocalModel] }
+
 describe("desktop model retirement controls", () => {
   it("keeps Stop available while native cleanup is incomplete", () => {
     const presentation = modelTrayPresentation(observed({ _tag: "Stopping", reason: "user_stop", allocation: { _tag: "Planned", allocation: Option.none() } }))
@@ -59,6 +63,7 @@ describe("host actions", () => {
     actions: ReadonlyArray<HostAction>,
     use: (session: ApplicationSession, registry: Registry.Registry) => Effect.Effect<A, E>,
     onboarding: { current: "Pending" | "Completed" } = { current: "Completed" },
+    localModels: Atom.Writable<Result.Result<LocalModelsState>> = Atom.make<Result.Result<LocalModelsState>>(Result.initial()),
   ) => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
     const delivered = yield* Deferred.make<void>()
     const effectQuery = EffectQueryClient.make(AcnQueries, fakeAcnImplementationsLayer((tag) => {
@@ -80,7 +85,7 @@ describe("host actions", () => {
           application: Stream.never,
         }),
       })),
-      Layer.provide(Layer.succeed(LocalModels, { state: Atom.make(Result.initial()), stop: Effect.void } as unknown as LocalModels)),
+      Layer.provide(Layer.succeed(LocalModels, { state: localModels, stop: Effect.void } as unknown as LocalModels)),
       Layer.provide(Layer.succeed(ClientEffectQuery, effectQuery)),
       Layer.provideMerge(Registry.layer),
     ))
@@ -101,16 +106,81 @@ describe("host actions", () => {
     expect(registry.get(session.page)).toBe("chat")
   }), { current: "Pending" }))
 
-  it("opens Models once onboarding is completed", () => withSession([{ _tag: "Navigate", page: "chat" }], (session, registry) => Effect.gen(function* () {
-    registry.set(session.completeOnboarding, undefined)
-    yield* Registry.getResult(registry, session.completeOnboarding, { suspendOnWaiting: true })
-    expect(registry.get(session.onboardingPending)).toEqual(Option.some(false))
-    expect(registry.get(session.page)).toBe("models")
-  }), { current: "Pending" }))
+  it("opens Models once onboarding is completed while its download is still running", () => {
+    const models = Atom.make<Result.Result<LocalModelsState>>(Result.success(downloading))
+    return withSession([{ _tag: "Navigate", page: "chat" }], (session, registry) => Effect.gen(function* () {
+      registry.set(session.completeOnboarding, undefined)
+      yield* Registry.getResult(registry, session.completeOnboarding, { suspendOnWaiting: true })
+      expect(registry.get(session.onboardingPending)).toEqual(Option.some(false))
+      expect(registry.get(session.page)).toBe("models")
+    }), { current: "Pending" }, models)
+  })
 
-  it("starts on Models with no onboarding when it was completed before", () => withSession([], (session, registry) => Effect.sync(() => {
+  it("opens Chat once onboarding is completed with a model ready", () => {
+    const models = Atom.make<Result.Result<LocalModelsState>>(Result.success(ready))
+    return withSession([{ _tag: "Navigate", page: "models" }], (session, registry) => Effect.gen(function* () {
+      registry.set(session.completeOnboarding, undefined)
+      yield* Registry.getResult(registry, session.completeOnboarding, { suspendOnWaiting: true })
+      expect(registry.get(session.page)).toBe("chat")
+    }), { current: "Pending" }, models)
+  })
+
+  it("starts on Chat until the service answers, and stays there if it never does", () => withSession([], (session, registry) => Effect.gen(function* () {
     expect(registry.get(session.onboardingPending)).toEqual(Option.some(false))
-    expect(registry.get(session.page)).toBe("models")
+    yield* Effect.sleep("20 millis")
+    expect(registry.get(session.page)).toBe("chat")
+  })))
+
+  it("lands on Chat when a model is ready", () => {
+    const models = Atom.make<Result.Result<LocalModelsState>>(Result.initial())
+    return withSession([], (session, registry) => Effect.gen(function* () {
+      registry.set(models, Result.success(ready))
+      yield* Effect.sleep("20 millis")
+      expect(registry.get(session.page)).toBe("chat")
+    }), { current: "Completed" }, models)
+  })
+
+  it("lands on Models when no model is downloaded, or only a download is running", () => Effect.runPromise(Effect.forEach([none, downloading], (state) => Effect.promise(() => {
+    const models = Atom.make<Result.Result<LocalModelsState>>(Result.initial())
+    return withSession([], (session, registry) => Effect.gen(function* () {
+      registry.set(models, Result.success(state))
+      yield* Effect.sleep("20 millis")
+      expect(registry.get(session.page)).toBe("models")
+    }), { current: "Completed" }, models)
+  }), { discard: true })))
+
+  it("waits for the service to finish finding models, then decides once", () => {
+    const models = Atom.make<Result.Result<LocalModelsState>>(Result.initial())
+    return withSession([], (session, registry) => Effect.gen(function* () {
+      registry.set(models, Result.success({ ...none, preparation: { ...none.preparation, discovery: { complete: false, modelsFound: 0 } } }))
+      yield* Effect.sleep("20 millis")
+      expect(registry.get(session.page)).toBe("chat")
+      registry.set(models, Result.success(none))
+      yield* Effect.sleep("20 millis")
+      expect(registry.get(session.page)).toBe("models")
+      registry.set(models, Result.success(ready))
+      yield* Effect.sleep("20 millis")
+      expect(registry.get(session.page)).toBe("models")
+    }), { current: "Completed" }, models)
+  })
+
+  it("keeps the page someone navigated to before the service answered", () => {
+    const models = Atom.make<Result.Result<LocalModelsState>>(Result.initial())
+    return withSession([{ _tag: "Navigate", page: "usage" }], (session, registry) => Effect.gen(function* () {
+      registry.set(models, Result.success(none))
+      yield* Effect.sleep("20 millis")
+      expect(registry.get(session.page)).toBe("usage")
+    }), { current: "Completed" }, models)
+  })
+
+  it("keeps Chat or Models in the main area while Settings is open over it", () => withSession([], (session, registry) => Effect.gen(function* () {
+    registry.get(session.mainPage)
+    yield* session.navigate("models")
+    yield* session.navigate("settings")
+    expect(registry.get(session.mainPage)).toBe("models")
+    yield* session.navigate("chat")
+    yield* session.navigate("connections")
+    expect(registry.get(session.mainPage)).toBe("chat")
   })))
 
   it("opens a Hugging Face link on Models with the add request set", () => withSession([{ _tag: "OpenHuggingFaceModel", repository, file: Option.some(file) }], (session, registry) => Effect.sync(() => {
