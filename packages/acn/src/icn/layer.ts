@@ -34,6 +34,7 @@ import {
   IcnInstancesLive,
   IcnStorageConfig,
   IcnPreparationReporter,
+  IcnUnexpectedExit,
 } from "@magnitudedev/icn";
 import { ACN_VERSION } from "../version";
 import { hostDiscoveryEnvironment, resolveAutomaticLocations } from "./discovery-roots";
@@ -198,6 +199,14 @@ const makeProcess = (dataDir: string, modelStore: string, localModels: LocalMode
     )))
     : UnixIcnChildSpawner.pipe(Layer.provide(Layer.succeed(ProcessGroupController, ProcessGroupControllerLive)))));
 
+/**
+ * What people are told when the engine stops unexpectedly: its exit status when it exited with one, else nothing, so
+ * the owner says it in its own words. An engine killed by a signal reaches here as the platform's failure to read an
+ * exit code, whose message is the whole command line; that stays in the log.
+ */
+export const icnExitDetail = (error: unknown): string | undefined =>
+  error instanceof IcnUnexpectedExit ? `The inference engine stopped unexpectedly (exit status ${error.code}).` : undefined;
+
 const makeSupervision = () =>
   Layer.scopedDiscard(
     Effect.gen(function* () {
@@ -208,7 +217,7 @@ const makeSupervision = () =>
           Effect.logFatal("ICN exited unexpectedly; stopping ACN").pipe(
             Effect.annotateLogs({ cause: error.message }),
             Effect.zipRight(
-              lifecycle.beginStopping({ reason: "icn-exited", detail: error.message })
+              lifecycle.beginStopping({ reason: "icn-exited", detail: icnExitDetail(error) })
             )
           )
         ),
