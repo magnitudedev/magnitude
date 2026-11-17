@@ -246,8 +246,13 @@ impl AttemptMarkers {
         Ok(self.files.load(key, LARGEST_RECORD)?.unwrap_or_default())
     }
 
-    fn store(&self, key: &impl Serialize, record: &AttemptRecord) -> Result<(), StoreError> {
-        self.files.store(key, record, LARGEST_RECORD)
+    /// Replace `key`'s record by `change` of it, every other change of it,
+    /// from this job, another or the host, waiting
+    /// ([`JsonFileStore::update`]); none leaves it as it is.
+    fn change(&self, key: &impl Serialize, change: impl FnOnce(AttemptRecord) -> Option<AttemptRecord>) -> Result<(), StoreError> {
+        self.files
+            .update(key, LARGEST_RECORD, |record: Option<AttemptRecord>| change(record.unwrap_or_default()).ok_or(()))
+            .map(|_changed_or_left| ())
     }
 
     /// Why `key` cannot be measured on this machine: it ended two jobs.
@@ -261,39 +266,29 @@ impl AttemptMarkers {
 
     /// Record that `job` is about to time `key`.
     fn attempting(&self, key: &impl Serialize, job: MeasureJob) -> Result<(), StoreError> {
-        let record = self.record(key)?;
-        self.store(
-            key,
-            &AttemptRecord {
+        self.change(key, |record| {
+            Some(AttemptRecord {
                 ended_jobs: record.ended_jobs.saturating_add(1),
                 job: Some(job),
-            },
-        )
+            })
+        })
     }
 
     /// Undo `job`'s attempt of `key`, where it is the attempt counted last:
     /// its host preempted the job, which says nothing of the point.
     fn release(&self, key: &impl Serialize, job: MeasureJob) -> Result<(), StoreError> {
-        let record = self.record(key)?;
-        if record.job != Some(job) {
-            return Ok(());
-        }
-        self.store(
-            key,
-            &AttemptRecord {
+        self.change(key, |record| {
+            (record.job == Some(job)).then(|| AttemptRecord {
                 ended_jobs: record.ended_jobs.saturating_sub(1),
                 job: None,
-            },
-        )
+            })
+        })
     }
 
     /// Record that `key`'s point resolved, with a record: the job did not
     /// end on it.
     fn resolved(&self, key: &impl Serialize) -> Result<(), StoreError> {
-        if self.record(key)?.ended_jobs == 0 {
-            return Ok(());
-        }
-        self.store(key, &AttemptRecord::default())
+        self.change(key, |record| (record.ended_jobs != 0).then(AttemptRecord::default))
     }
 }
 
