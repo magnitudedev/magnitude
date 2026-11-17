@@ -3,10 +3,10 @@
 //! The process's auxiliary pools (memory fault-in, native-target workers,
 //! repack, formation) size themselves by [`share`], never by the machine: a
 //! process the service starts is handed its share at startup
-//! ([`set_share`]), the serving worker all of the machine's cores and
-//! background work fewer, so its auxiliary pools leave the serving worker
-//! room. A device's own pools (the CPU device's, the expert-compute pool)
-//! never read the share: their size is part of the device's identity, which
+//! ([`set_share`]), the serving worker its whole [`quota`] and background
+//! work less, so its auxiliary pools leave the serving worker room. A
+//! device's own pools (the CPU device's, the expert-compute pool) never read
+//! the share: their size is part of the device's identity, which
 //! a measurement sizes and serving then opens, so they take the machine as
 //! the process sees it. A process handed none (a tool, a test) takes its
 //! [`quota`].

@@ -115,8 +115,7 @@ impl Processors {
     /// The performance cores the process may keep busy at once: those it
     /// may run on ([`Self::performance_cores`]) under its quota of CPUs
     /// (`seismic_threads::quota`, which follows a cgroup's `cpu.max`). The
-    /// machine's cores as one process sees them: the CPU device's pool, and
-    /// what the service shares among the processes it starts.
+    /// machine's cores as one process sees them: the CPU device's pool.
     pub fn cores(&self) -> Result<std::num::NonZeroUsize, String> {
         std::num::NonZeroUsize::new(self.performance_cores())
             .map(|cores| cores.min(seismic_threads::quota()))
