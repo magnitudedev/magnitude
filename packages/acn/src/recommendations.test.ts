@@ -122,6 +122,32 @@ describe("recommendations", () => {
     expect(project(ladder(true), { freeBytes: 15 * GB }).models[0]?.chosen).toEqual(Option.some("big:gguf:q4"))
   })
 
+  it("chooses no rung without room on disk, even when none reaches 20 tok/s or speeds are still measured", () => {
+    const slow = [
+      rung({ id: "big:gguf:q2", storageBytes: 100 * GB, tokensPerSecond: 12 }),
+      rung({ id: "big:gguf:q4", storageBytes: 173 * GB, tokensPerSecond: 12 }),
+    ]
+    expect(project(slow, { freeBytes: 16 * GB }).models[0]?.chosen).toEqual(Option.none())
+    const unmeasured = [rung({ id: "big:gguf:q2", storageBytes: 100 * GB }), rung({ id: "small:gguf:q4", storageBytes: 1 * GB })]
+    expect(project(unmeasured, { freeBytes: 16 * GB }).models.map(({ base, chosen }) => [base, Option.getOrNull(chosen)]))
+      .toEqual([["small", "small:gguf:q4"], ["big", null]])
+  })
+
+  it("names the model that would lead with more free disk, and how much more it needs", () => {
+    const models = [
+      rung({ id: "big:gguf:q2", storageBytes: 100 * GB, tokensPerSecond: 30, intelligence: 90 }),
+      rung({ id: "big:gguf:q4", storageBytes: 173 * GB, tokensPerSecond: 25, intelligence: 90 }),
+      rung({ id: "small:gguf:q4", storageBytes: 2 * GB, tokensPerSecond: 60, intelligence: 40 }),
+    ]
+    const short = project(models, { freeBytes: 16 * GB })
+    expect(short.models[0]?.base).toBe("small")
+    expect(short.roomShortfall).toEqual(Option.some({ base: "big", name: "big", rung: "big:gguf:q4", missingBytes: 157 * GB }))
+    expect(project(models, { freeBytes: 200 * GB }).roomShortfall).toEqual(Option.none())
+    expect(project(models).roomShortfall).toEqual(Option.none())
+    const larger = project([rung({ id: "big:gguf:q2", storageBytes: 10 * GB, tokensPerSecond: 40 }), ...models.slice(1, 2)], { freeBytes: 16 * GB })
+    expect(larger.roomShortfall).toEqual(Option.none())
+  })
+
   it("falls back to the highest fitting rung near the fastest when none reaches 20 tok/s", () => {
     const { models: [model] } = project([
       rung({ id: "slow:gguf:q2", storageBytes: 10 * GB, tokensPerSecond: 12 }),

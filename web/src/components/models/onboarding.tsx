@@ -1,5 +1,5 @@
 import { useRef, useState } from "react"
-import { CaretDownIcon, CaretRightIcon, CheckIcon, CircleNotchIcon, DownloadSimpleIcon, FolderSimpleIcon, WarningCircleIcon } from "@phosphor-icons/react"
+import { CaretDownIcon, CaretRightIcon, CheckIcon, CircleNotchIcon, DownloadSimpleIcon, FolderSimpleIcon, InfoIcon, WarningCircleIcon } from "@phosphor-icons/react"
 import { formatStorageSize } from "@magnitudedev/client-common"
 import { Button } from "../ui/button"
 import { HuggingFaceLogo, type ModelLab } from "../model-logo"
@@ -68,15 +68,15 @@ function PreparationProgress({ steps }: { steps: readonly PreparationStep[] }) {
 
 /** Onboarding before the app has reached the service: the first step under way, the rest to come. */
 export function OnboardingStarting() {
-  return <Onboarding machine={null} discovered={[]} unrunnable={[]} recommendations={[]} usOnly={false} setUsOnly={() => {}} owned={new Set()}
+  return <Onboarding machine={null} discovered={[]} unrunnable={[]} recommendations={[]} roomNote={null} usOnly={false} setUsOnly={() => {}} owned={new Set()}
     preparation={preparationLabels.map((label, index) => ({ label, detail: null, fraction: null, state: index === 0 ? "active" : "pending" }))}
     onDownload={() => {}} onFinish={() => {}} />
 }
 
 /** First run, in a modal over the app: what's already here, and one recommended model to download. */
-export function Onboarding({ machine, preparation, discovered, unrunnable, recommendations, usOnly, setUsOnly, owned, onDownload, onFinish }: {
+export function Onboarding({ machine, preparation, discovered, unrunnable, recommendations, roomNote, usOnly, setUsOnly, owned, onDownload, onFinish }: {
   machine: MachineView | null; preparation: readonly PreparationStep[] | null; discovered: readonly DiscoveredModel[]; unrunnable: readonly UnrunnableFile[]
-  recommendations: readonly Recommendation[]; usOnly: boolean; setUsOnly: (value: boolean) => void; owned: ReadonlySet<string>
+  recommendations: readonly Recommendation[]; roomNote: string | null; usOnly: boolean; setUsOnly: (value: boolean) => void; owned: ReadonlySet<string>
   onDownload: (model: OfferedModel, quant: QuantView) => void; onFinish: () => void
 }) {
   const measuring = preparation !== null
@@ -95,6 +95,7 @@ export function Onboarding({ machine, preparation, discovered, unrunnable, recom
     </div>
     <div ref={body} tabIndex={-1} className="min-h-0 flex-1 overflow-y-auto bg-slate-50 px-6 pb-6 pt-5 outline-none dark:bg-slate-900/40">
       <div>{machine ? <MachineCard machine={machine} /> : <MachineCardSkeleton />}</div>
+      {roomNote && <p className="mt-3 flex items-center gap-2 px-1 text-sm text-slate-600 dark:text-slate-400"><InfoIcon className="size-4 shrink-0" />{roomNote}</p>}
       {preparation && <PreparationProgress steps={preparation} />}
 
       {discovered.length > 0 && <div className={`${cardClass} mt-4 px-4 py-3`}>
@@ -119,7 +120,7 @@ export function Onboarding({ machine, preparation, discovered, unrunnable, recom
         </div>}
       </div>}
 
-      <Section title="Recommended for your machine" aside={<label className="flex cursor-pointer items-center gap-2 text-xs text-slate-600 dark:text-slate-400"><input type="checkbox" checked={usOnly} onChange={event => { setUsOnly(event.target.checked); setSelection(undefined); setQuantChoice(null) }} className="accent-blue-600" />Only models from US developers</label>}>
+      <Section title="Recommended for your machine" className={roomNote && !preparation && discovered.length === 0 ? "mt-5" : "mt-8"} aside={<label className="flex cursor-pointer items-center gap-2 text-xs text-slate-600 dark:text-slate-400"><input type="checkbox" checked={usOnly} onChange={event => { setUsOnly(event.target.checked); setSelection(undefined); setQuantChoice(null) }} className="accent-blue-600" />Only models from US developers</label>}>
         {measuring ? <OfferedModelsSkeleton firstOpened /> : <div className="space-y-2">
             {recommendations.map(({ model, note }) => <ExpandingModel key={model.key} model={model} note={note} expanded={selected === model.key} owned={owned}
               onToggle={() => { setSelection(selected === model.key ? null : model.key); setQuantChoice(null) }}

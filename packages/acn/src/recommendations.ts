@@ -14,6 +14,7 @@ import {
   type LocalModelFamily,
   type RecommendedModel,
   type Recommendations as RecommendationsState,
+  type RoomShortfall,
 } from "@magnitudedev/acn-protocol"
 import type { ModelFamily as NativeModelFamily } from "@magnitudedev/icn-protocol/schemas"
 import { AcnChanges } from "./changes"
@@ -59,7 +60,7 @@ const remainingDownloadBytes = (model: CatalogLocalModel): number => {
   }
 }
 
-const rung = (model: CatalogLocalModel, hardware: LocalInferenceHardwareState): Rung => {
+const rung = (model: CatalogLocalModel, freeBytes: Option.Option<number>): Rung => {
   const serving = model.servingState
   const fits = serving._tag === "Assessed" && serving.assessment._tag === "Fits" ? serving.assessment : undefined
   return {
@@ -69,9 +70,9 @@ const rung = (model: CatalogLocalModel, hardware: LocalInferenceHardwareState): 
     speed: fits === undefined
       ? Option.none()
       : comparisonTokensPerSecond(fits.residency.performance, fits.served.contextLength),
-    roomOnDisk: Option.match(hardware.modelStorage, {
+    roomOnDisk: Option.match(freeBytes, {
       onNone: () => true,
-      onSome: ({ freeBytes }) => remainingDownloadBytes(model) <= freeBytes,
+      onSome: (free) => remainingDownloadBytes(model) <= free,
     }),
   }
 }
@@ -83,13 +84,13 @@ const reaches = (rung: Rung, tokensPerSecond: number): boolean =>
 const NEAR_FASTEST = 0.9
 
 /**
- * The rung chosen for this machine: the highest that fits, has room on disk and reaches the target speed; else the
- * highest that fits within `NEAR_FASTEST` of the fastest, since a smaller rung a few percent faster is no better
- * choice; else, before any speed is measured, the smallest that fits.
+ * The rung chosen for this machine, among those that fit and have room on disk: the highest that reaches the target
+ * speed; else the highest within `NEAR_FASTEST` of the fastest, since a smaller rung a few percent faster is no
+ * better choice; else, before any speed is measured, the smallest.
  */
 const chooseRung = (ladder: readonly Rung[]): Option.Option<Rung> => {
-  const fitting = ladder.filter((candidate) => candidate.fits)
-  const target = fitting.filter((candidate) => candidate.roomOnDisk && reaches(candidate, TARGET_TOKENS_PER_SECOND))
+  const fitting = ladder.filter((candidate) => candidate.fits && candidate.roomOnDisk)
+  const target = fitting.filter((candidate) => reaches(candidate, TARGET_TOKENS_PER_SECOND))
   if (target.length > 0) return Array.last(target)
   const fastest = Math.max(0, ...fitting.flatMap((candidate) => Option.toArray(candidate.speed)))
   return Array.last(fitting.filter((candidate) => reaches(candidate, fastest * NEAR_FASTEST))).pipe(
@@ -136,30 +137,47 @@ export const projectRecommendations = (inputs: RecommendationInputs): Recommenda
     const parsed = parseModelId(model.modelId)
     return parsed._tag === "Catalog" ? parsed.baseId : model.modelId
   })
-  let measured = 0
-  let rungs = 0
-  const models = Object.entries(ladders).flatMap(([base, variants]): readonly RecommendedModel[] => {
-    const ladder = Array.sort(variants, Order.mapInput(Order.number, (model: CatalogLocalModel) => model.storageBytes))
-      .map((model) => rung(model, inputs.hardware))
-    if (!Array.isNonEmptyReadonlyArray(ladder)) return []
-    const first = ladder[0].model
-    if (!comingSoon(first)) {
-      rungs += ladder.length
-      measured += ladder.filter((candidate) => candidate.measured).length
-    }
-    const chosen = comingSoon(first) ? Option.none() : chooseRung(ladder)
-    return [{
-      base: base as CatalogBaseId,
-      name: first.presentation.displayName,
-      developer: first.catalogData.developer,
-      intelligence: localModelIntelligence(first),
-      chosen: Option.map(chosen, ({ model }) => model.modelId),
-      rungs: Array.map(ladder, ({ model }) => model.modelId),
-      meetsTarget: Option.exists(chosen, (candidate) => reaches(candidate, TARGET_TOKENS_PER_SECOND)),
-      meetsOnboardingFloor: Option.exists(chosen, (candidate) => reaches(candidate, ONBOARDING_FLOOR_TOKENS_PER_SECOND)),
-    }]
-  })
-  return { complete: measured === rungs, measured, rungs, models: Array.sort(models, recommendationOrder), families: inputs.families }
+  const ranked = (freeBytes: Option.Option<number>) => {
+    let measured = 0
+    let rungs = 0
+    const models = Object.entries(ladders).flatMap(([base, variants]): readonly RecommendedModel[] => {
+      const ladder = Array.sort(variants, Order.mapInput(Order.number, (model: CatalogLocalModel) => model.storageBytes))
+        .map((model) => rung(model, freeBytes))
+      if (!Array.isNonEmptyReadonlyArray(ladder)) return []
+      const first = ladder[0].model
+      if (!comingSoon(first)) {
+        rungs += ladder.length
+        measured += ladder.filter((candidate) => candidate.measured).length
+      }
+      const chosen = comingSoon(first) ? Option.none() : chooseRung(ladder)
+      return [{
+        base: base as CatalogBaseId,
+        name: first.presentation.displayName,
+        developer: first.catalogData.developer,
+        intelligence: localModelIntelligence(first),
+        chosen: Option.map(chosen, ({ model }) => model.modelId),
+        rungs: Array.map(ladder, ({ model }) => model.modelId),
+        meetsTarget: Option.exists(chosen, (candidate) => reaches(candidate, TARGET_TOKENS_PER_SECOND)),
+        meetsOnboardingFloor: Option.exists(chosen, (candidate) => reaches(candidate, ONBOARDING_FLOOR_TOKENS_PER_SECOND)),
+      }]
+    })
+    return { measured, rungs, models: Array.sort(models, recommendationOrder) }
+  }
+  const freeBytes = Option.map(inputs.hardware.modelStorage, ({ freeBytes }) => freeBytes)
+  const { measured, rungs, models } = ranked(freeBytes)
+  const byId = new Map(catalogModels.map((model) => [model.modelId as string, model] as const))
+  // The model that would lead with unlimited disk, when it is not the one leading here because its rung lacks room.
+  const leader = (ranking: readonly RecommendedModel[]) => Array.findFirst(ranking, (model) => model.meetsOnboardingFloor)
+  const leading = Option.map(leader(models), ({ base }) => base)
+  const roomShortfall = Option.flatMap(freeBytes, (free) =>
+    leader(ranked(Option.none()).models).pipe(
+      Option.filter((model) => !Option.contains(leading, model.base)),
+      Option.flatMap((model) => Option.flatMap(model.chosen, (rung): Option.Option<RoomShortfall> => {
+        const missingBytes = remainingDownloadBytes(byId.get(rung)!) - free
+        return missingBytes > 0 ? Option.some({ base: model.base, name: model.name, rung, missingBytes }) : Option.none()
+      })),
+    ))
+  return { complete: measured === rungs, measured, rungs, models, roomShortfall, families: inputs.families }
 }
 
 export interface RecommendationsApi {

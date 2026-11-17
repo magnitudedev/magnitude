@@ -1,7 +1,7 @@
 import { useMemo } from "react"
 import { Option } from "effect"
 import { Result, useAtomValue } from "@effect-atom/atom-react"
-import { CountryCodeSchema, type LocalModel, type RecommendedModel } from "@magnitudedev/sdk"
+import { CountryCodeSchema, type LocalModel, type RecommendedModel, type RoomShortfall } from "@magnitudedev/sdk"
 import { useAgentClient, useLocalModels, type ServingMemory } from "@magnitudedev/client-common"
 import { offeredFromRecommendation, runnableFamily } from "./data"
 import type { OfferedModel } from "./expanding-model"
@@ -16,6 +16,7 @@ export interface RecommendationsView {
   readonly ready: boolean
   readonly measuring: { readonly settled: number; readonly total: number } | null
   readonly offered: readonly OfferedRecommendation[]
+  readonly roomShortfall: RoomShortfall | null
   readonly families: readonly RunnableFamily[]
 }
 
@@ -29,7 +30,7 @@ export function useRecommendations(usOnly: boolean, memory: ServingMemory): Reco
   const recommendations = useAtomValue(client.Models.GetRecommendations({ developerCountry })).result
   const models = useLocalModels()
   return useMemo(() => {
-    if (!Result.isSuccess(recommendations) || !Result.isSuccess(models)) return { ready: false, measuring: null, offered: [], families: [] }
+    if (!Result.isSuccess(recommendations) || !Result.isSuccess(models)) return { ready: false, measuring: null, offered: [], roomShortfall: null, families: [] }
     const { complete, measured, rungs } = recommendations.value
     const byId = new Map<string, LocalModel>(models.value.models.map(model => [model.modelId, model]))
     return {
@@ -39,6 +40,7 @@ export function useRecommendations(usOnly: boolean, memory: ServingMemory): Reco
         const model = offeredFromRecommendation(recommendation, byId, memory)
         return model ? [{ recommendation, model }] : []
       }),
+      roomShortfall: Option.getOrNull(recommendations.value.roomShortfall),
       families: recommendations.value.families.map(runnableFamily),
     }
   }, [recommendations, models, memory])

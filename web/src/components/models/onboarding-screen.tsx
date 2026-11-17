@@ -1,7 +1,7 @@
 import { useState } from "react"
 import { Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import type { CatalogFormModelId, CustomLocalModel } from "@magnitudedev/sdk"
-import { deriveHardwareRoles, useAgentClient, useLocalInferenceHardware, useLocalModelMutations, useLocalModels } from "@magnitudedev/client-common"
+import { deriveHardwareRoles, formatStorageSize, useAgentClient, useLocalInferenceHardware, useLocalModelMutations, useLocalModels } from "@magnitudedev/client-common"
 import { useSession } from "../../session"
 import { useServiceObservation } from "../../service-view"
 import { discoveredModel, onThisComputer, unrunnableFile } from "./data"
@@ -56,6 +56,9 @@ export function OnboardingScreen() {
     discovered={found.flatMap(model => { const view = discoveredModel(model); return view ? [view] : [] })}
     unrunnable={(local?.unsupported ?? []).map(unrunnableFile)}
     recommendations={offered}
+    roomNote={recommendations.roomShortfall && !measuring
+      ? `${recommendations.roomShortfall.name} would be the top pick here with ${formatStorageSize(recommendations.roomShortfall.missingBytes)} more free disk space.`
+      : null}
     usOnly={usOnly}
     setUsOnly={setUsOnly}
     owned={owned}
