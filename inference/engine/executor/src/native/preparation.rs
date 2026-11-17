@@ -93,7 +93,9 @@ pub(super) struct NativePreparationCache {
 
 /// Everything program preparation reads.
 pub(super) struct PreparationInputs<'a> {
-    pub device: &'a Device,
+    /// What preparation allocates through, on its device: the programs'
+    /// claim.
+    pub charges: &'a seismic::Charges,
     pub plan: &'a ProgramPlan,
     pub load: &'a ModelLoadPlan,
     pub limits: TuningLimits,
@@ -204,7 +206,7 @@ impl NativePreparationCache {
         unprepared: super::tuning::UnpreparedUnits,
     ) -> Result<Self, CatalogFailure> {
         let PreparationInputs {
-            device,
+            charges,
             plan,
             load,
             limits,
@@ -213,11 +215,12 @@ impl NativePreparationCache {
             selection_limits,
             graph_demand,
         } = inputs;
+        let device = &charges.device();
         let began = std::time::Instant::now();
         let recipe_states = ReadoutRecipeStates::default();
         let mut spec = Specializer::new(device);
         let import = imports(&mut spec, plan)?;
-        let owner = AttestedPrograms::owner(device)?;
+        let owner = AttestedPrograms::owner(charges)?;
         let epsilon = epsilon(tuning.definition)?;
         let invocations = invocation_demand(
             device,
@@ -242,10 +245,10 @@ impl NativePreparationCache {
                 Some(selection_limits),
                 spec,
                 Tuning::Tuner(Tuner::serve(
-                    device,
+                    charges,
                     tuning,
                     limits,
-                    TuningWeights::new(device, load, tuning.weights, &import),
+                    TuningWeights::new(charges, load, tuning.weights, &import),
                     invocations,
                     unprepared,
                 )),
@@ -318,7 +321,7 @@ impl NativePreparationCache {
         inputs: PreparationInputs<'_>,
     ) -> Result<Vec<TunedEntry>, CatalogFailure> {
         let PreparationInputs {
-            device,
+            charges,
             plan,
             load,
             limits,
@@ -327,6 +330,7 @@ impl NativePreparationCache {
             selection_limits,
             graph_demand,
         } = inputs;
+        let device = &charges.device();
         let recipe_states = ReadoutRecipeStates::default();
         // The search imports the weights its units measure through the
         // import kernels.
@@ -344,10 +348,10 @@ impl NativePreparationCache {
             &recipe_states,
         )?;
         let mut tuner = Tuner::count(
-            device,
+            charges,
             tuning,
             limits,
-            TuningWeights::new(device, load, tuning.weights, &import),
+            TuningWeights::new(charges, load, tuning.weights, &import),
             invocations,
         )
         .held_to(room);
@@ -687,6 +691,7 @@ impl<'a> Preparation<'a> {
         let Some(device) = self.tuning.device() else {
             return Ok(None);
         };
+        let device = &device;
         let backend = device.backend();
         if !crate::programs::graph::readout::reads_progressive_heads(backend)
             .map_err(|outcome| CatalogFailure::Preparation {

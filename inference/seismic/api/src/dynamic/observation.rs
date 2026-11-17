@@ -107,6 +107,7 @@ impl Kernel {
             .iter()
             .map(|v| {
                 snapshot(
+                    &self.charges,
                     v,
                     &mut interpreter,
                     &mut oracle_args,
@@ -218,7 +219,10 @@ impl Kernel {
         Ok(report)
     }
 }
+/// `v`, its tensors copied privately through `charges`, the checked
+/// kernel's.
 fn snapshot(
+    charges: &crate::Charges,
     v: &Value,
     interpreter: &mut Interpreter<'_>,
     oracle: &mut Vec<Arg>,
@@ -229,7 +233,7 @@ fn snapshot(
         Value::Unit => Value::Unit,
         Value::Tuple(v) => Value::Tuple(
             v.iter()
-                .map(|v| snapshot(v, interpreter, oracle, inputs, ordinal))
+                .map(|v| snapshot(charges, v, interpreter, oracle, inputs, ordinal))
                 .collect::<Result<_, _>>()?,
         ),
         Value::Tensor(t) | Value::Move(t) => {
@@ -242,7 +246,7 @@ fn snapshot(
             )
             .map_err(|e| Error::new("TensorError", e))?;
             oracle.push(Arg::Tensor(interpreter.add_tensor(data)));
-            let private = Tensor::from_host(&raw.device(), raw.element(), raw.extents(), &bytes)?;
+            let private = Tensor::from_host(charges, raw.element(), raw.extents(), &bytes)?;
             inputs.push((*ordinal, private.raw()?));
             *ordinal += 1;
             if matches!(v, Value::Move(_)) {
@@ -307,6 +311,7 @@ mod tests {
     fn dynamic_check_compares_failed_source_state_without_mutating_callers() {
         let catalog = Devices::discover(&[]).unwrap();
         let device = catalog.open_backend(BackendName::Cpu).unwrap();
+        let charges = crate::Charges::tally(&device);
         let module=Module::source(
             "fn probe(dst: &mut tensor[2] i32, divisor: i32):\n    dst[0] = 7\n    let unused = 42 / divisor\n    dst[1] = 9\n",
             "dynamic-failed-outcome.seismic",false,None,
@@ -315,7 +320,7 @@ mod tests {
             .function("probe")
             .unwrap()
             .prepare(
-                &device,
+                &charges,
                 BTreeMap::new(),
                 PreparationOptions::feedback(
                     PrecisionPolicy::Exact,
@@ -330,7 +335,7 @@ mod tests {
             .into_iter()
             .flat_map(i32::to_le_bytes)
             .collect::<Vec<_>>();
-        let dst = Tensor::from_host(&device, Element::dense(DType::I32), &[2], &original).unwrap();
+        let dst = Tensor::from_host(&charges, Element::dense(DType::I32), &[2], &original).unwrap();
         let report = kernel
             .check(
                 &[Value::Tensor(dst.clone()), Value::Scalar(Scalar::I32(0))],

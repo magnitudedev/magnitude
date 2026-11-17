@@ -69,8 +69,9 @@ fn cases() -> Vec<Case> {
 }
 
 fn i32_tensor(device: &Device, shape: &[u64], values: &[i32]) -> Tensor {
+    let charges = seismic::Charges::tally(device);
     let bytes = values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
-    Tensor::from_host(device, Element::i32(), shape, &bytes).unwrap()
+    Tensor::from_host(&charges, Element::i32(), shape, &bytes).unwrap()
 }
 
 /// A result's values as F32, whatever its element (the gather's wide result is F32, a row of
@@ -180,6 +181,7 @@ fn fixture(case: &Case, layout: Layout) -> Option<Fixture> {
 
 /// The rows gathered by `embedding_rows` in `layout`.
 fn gather(device: &Device, case: &Case, layout: Layout) {
+    let charges = seismic::Charges::tally(device);
     let Some(Fixture { element, rows, shape, resident, reference, tokens }) = fixture(case, layout) else {
         return;
     };
@@ -200,8 +202,8 @@ fn gather(device: &Device, case: &Case, layout: Layout) {
         .unwrap();
     let out = declared::prepared(device, &embedding_rows::native_entry_with(elements()), &specialization)
         .unwrap()
-        .call(embedding_rows::Args {
-            table: &Tensor::from_host(device, element, &shape, &resident).unwrap(),
+        .call(&charges, embedding_rows::Args {
+            table: &Tensor::from_host(&charges, element, &shape, &resident).unwrap(),
             tokens: &i32_tensor(device, &[rows as u64, 2], &tokens),
             directory: &i32_tensor(device, &[0, 1], &[]),
             scale: 1.0,
@@ -215,6 +217,7 @@ fn gather(device: &Device, case: &Case, layout: Layout) {
 /// The rows read by `stored_rows` from resident slots (one record holding every row, in the
 /// rows16 layout every backend's `stored_rows` reads) through a dense directory.
 fn read_stored(device: &Device, case: &Case) {
+    let charges = seismic::Charges::tally(device);
     let Some(Fixture { element, rows, resident, reference, tokens, .. }) = fixture(case, Layout::Rows16) else {
         return;
     };
@@ -229,8 +232,8 @@ fn read_stored(device: &Device, case: &Case) {
     let result = stored
         .prepare(device, &specialization)
         .unwrap()
-        .call(stored_rows::Args {
-            slots: &Tensor::from_host(device, element, &[1, rows as u64, K as u64], &resident).unwrap(),
+        .call(&charges, stored_rows::Args {
+            slots: &Tensor::from_host(&charges, element, &[1, rows as u64, K as u64], &resident).unwrap(),
             tokens: &i32_tensor(device, &[rows as u64, 2], &tokens),
             directory: &i32_tensor(device, &[rows as u64, 1], &slots),
         })

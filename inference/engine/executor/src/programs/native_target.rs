@@ -753,6 +753,19 @@ impl RowState<'_> {
 }
 
 impl NativeTargetProgram {
+    /// What its per-step graph slots and outputs are formed through:
+    /// charges that allocate nothing, as none of those plans needs storage.
+    /// The overlay and boundary-copy plans refuse any slot storage or
+    /// upload when sealed (`overlay`, `boundary_copy`); the per-layer entry
+    /// graph refuses exports when sealed (`PreparedPerLayerEntryGraph`); a
+    /// block's fill and pass graphs (`OnceStage`) export nothing, as only a
+    /// `Stage::Run` graph exports (`SealedBlockGraph::prepare`), and run in
+    /// their launch's planned graph workspace. Every storage a step uses is
+    /// a planned claim's; a plan that asked for more fails its step.
+    fn unallocating(&self) -> seismic::Charges {
+        seismic::Charges::none(&self.device)
+    }
+
     /// What the graphs of the overlay plans sealed so far cost serving:
     /// plans of no graph family (`seismic::NativeGraphPlan::graph_replays`).
     pub(crate) fn overlay_graph_replays(&self) -> seismic::GraphReplays {
@@ -772,8 +785,13 @@ impl NativeTargetProgram {
         self.graphs.group_bytes(places)
     }
 
-    pub(crate) fn hold_group(&self, places: usize) -> Result<(), crate::resources::AllocationError> {
-        self.graphs.hold_group(places)
+    pub(crate) fn hold_group(&self, charges: &seismic::Charges, places: std::num::NonZeroUsize) -> Result<(), crate::resources::AllocationError> {
+        self.graphs.hold_group(charges, places)
+    }
+
+    /// The floor's buffers alone held again ([`Self::hold_group`]).
+    pub(crate) fn release_group(&self) {
+        self.graphs.release_group()
     }
 
     pub(crate) fn new(
@@ -909,13 +927,13 @@ impl NativeTargetProgram {
             .transpose()?;
         let mut bindings = bound.bindings();
         if let Some(port) = &graph.residual {
-            bindings.set(port, residual.ok_or_else(|| invalid("residual conditioning was not exported"))?).map_err(device)?;
+            bindings.set(&self.unallocating(), port, residual.ok_or_else(|| invalid("residual conditioning was not exported"))?).map_err(device)?;
         }
         if let Some(rows) = &graph.final_rows {
-            bindings.set(&rows.hidden, hidden).map_err(device)?;
+            bindings.set(&self.unallocating(), &rows.hidden, hidden).map_err(device)?;
         }
         if let (Some(ports), Some(tap_rows)) = (&graph.taps, &tap_rows) {
-            bindings.set(&ports.taps, tap_rows).map_err(device)?;
+            bindings.set(&self.unallocating(), &ports.taps, tap_rows).map_err(device)?;
         }
         let mut out_rows = vec![0_i32; output_class];
         for (index, &row) in batch.out_rows.iter().enumerate() {
@@ -1015,7 +1033,7 @@ impl NativeTargetProgram {
             )
             .map_err(device)?;
         let plan = graph.seal_launched().map_err(device)?;
-        if plan.workspace_bytes() != 0 || plan.output_bytes() != 0 || plan.upload_bytes() != 0 {
+        if plan.slot_storage_bytes() != 0 || plan.upload_bytes() != 0 {
             return Err(invalid(
                 "boundary capture unexpectedly requires graph storage",
             ));
@@ -1055,7 +1073,7 @@ impl NativeTargetProgram {
             )
             .map_err(device)?;
         let plan = graph.seal_launched().map_err(device)?;
-        if plan.workspace_bytes() != 0 || plan.output_bytes() != 0 || plan.upload_bytes() != 0 {
+        if plan.slot_storage_bytes() != 0 || plan.upload_bytes() != 0 {
             return Err(invalid(
                 "conditioning overlay unexpectedly requires graph storage",
             ));
@@ -1161,10 +1179,10 @@ impl NativeTargetProgram {
             })
             .map_err(|error: HostTableError| invalid(error.to_string()))??;
         let mut bindings = bound.bindings();
-        bindings.set(&graph.ports.hidden, hidden).map_err(device)?;
-        bindings.set(&graph.ports.rows, &inputs).map_err(device)?;
+        bindings.set(&self.unallocating(), &graph.ports.hidden, hidden).map_err(device)?;
+        bindings.set(&self.unallocating(), &graph.ports.rows, &inputs).map_err(device)?;
         let ready = active
-            .attach(bindings, graph.plan.new_outputs().map_err(device)?)
+            .attach(bindings, graph.plan.new_outputs(&self.unallocating()).map_err(device)?)
             .map_err(device)?;
         submitter.queue(ready, |_| {})?;
         if let Some((token, slot)) = written {
@@ -1570,6 +1588,7 @@ impl NativeTargetProgram {
                             .map_err(device)?;
                         bindings
                             .set(
+                                &self.unallocating(),
                                 &kept.rows,
                                 &self.kept_token_rows(&region, batch.tokens.len() as u64)?,
                             )
@@ -1577,7 +1596,7 @@ impl NativeTargetProgram {
                     }
                 }
                 TargetTokens::Selected(selected) => bindings
-                    .set(&entry.tokens, selected.tensor())
+                    .set(&self.unallocating(), &entry.tokens, selected.tensor())
                     .map_err(device)?,
             }
             // Selected tokens are copied for the host, which learns from
@@ -1590,7 +1609,7 @@ impl NativeTargetProgram {
                     .ok_or_else(|| invalid("an entry notice without a selection notice"))?
                     .next(rows)
                     .map_err(invalid)?;
-                bindings.set(&ports.tokens, &step.tokens).map_err(device)?;
+                bindings.set(&self.unallocating(), &ports.tokens, &step.tokens).map_err(device)?;
                 bindings
                     .set_timeline(ports.signal, &step.timeline, step.value)
                     .map_err(device)?;
@@ -1599,7 +1618,7 @@ impl NativeTargetProgram {
             // Selected tokens of a table with landing slots: a landed read.
             if let Some(ports) = &entry.landed {
                 let read = ports
-                    .queue(&self.graphs.embedding, &mut bindings)
+                    .queue(&self.graphs.embedding, &self.unallocating(), &mut bindings)
                     .map_err(invalid)?;
                 submitter.lands(read);
             }
@@ -1633,13 +1652,13 @@ impl NativeTargetProgram {
                 .slice_leading(start as u64, end as u64)
                 .map_err(device)?;
             let mut bindings = overlay.plan.bindings();
-            bindings.set(&overlay.source, &source).map_err(device)?;
+            bindings.set(&self.unallocating(), &overlay.source, &source).map_err(device)?;
             bindings
-                .set(&overlay.destination, &destination)
+                .set(&self.unallocating(), &overlay.destination, &destination)
                 .map_err(device)?;
-            let mut slot = overlay.plan.new_slot().map_err(device)?;
+            let mut slot = overlay.plan.new_slot(&self.unallocating()).map_err(device)?;
             let ready = slot
-                .attach(bindings, overlay.plan.new_outputs().map_err(device)?)
+                .attach(bindings, overlay.plan.new_outputs(&self.unallocating()).map_err(device)?)
                 .map_err(device)?;
             submitter.queue(ready, |_| {})?;
         }
@@ -1930,13 +1949,13 @@ impl NativeTargetProgram {
         let (graph, bound) = self.graphs.fill(index).map_err(invalid)?;
         let mut bindings = bound.bindings();
         if let Some(bank) = &run.bank {
-            bank.bind(graph, index, run.region.place, &mut bindings).map_err(invalid)?;
-            bank.bind_window(graph, index, window, &mut bindings).map_err(invalid)?;
+            bank.bind(graph, index, run.region.place, &self.unallocating(), &mut bindings).map_err(invalid)?;
+            bank.bind_window(graph, index, window, &self.unallocating(), &mut bindings).map_err(invalid)?;
             bank.fill_followed(index, window, followed).map_err(invalid)?;
         }
         let mut active = run.launch.graph_workspace.slot_mut().activate(&graph.plan).map_err(device)?;
         let ready = active
-            .attach(bindings, graph.plan.new_outputs().map_err(device)?)
+            .attach(bindings, graph.plan.new_outputs(&self.unallocating()).map_err(device)?)
             .map_err(device)?;
         let mut registered = Ok(());
         submitter.fill(ready, |outputs| {
@@ -1988,26 +2007,26 @@ impl NativeTargetProgram {
         let rows_of = |buffer: &seismic::Tensor| buffer.slice_leading(view, view + pass_rows).map_err(device);
         let mut bindings = bound.bindings();
         for (port, buffer) in into.crossing.iter().zip(crossing.pass().iter()) {
-            bindings.set(port, &rows_of(buffer)?).map_err(device)?;
+            bindings.set(&self.unallocating(), port, &rows_of(buffer)?).map_err(device)?;
         }
         if let Some(bank) = &run.bank {
-            bank.bind_window(graph, index, window, &mut bindings).map_err(invalid)?;
+            bank.bind_window(graph, index, window, &self.unallocating(), &mut bindings).map_err(invalid)?;
         }
         // A streamed layer's pass writes its set's reads into its group's
         // record at the set's first place (`BankPart::GroupReads`).
         if let Some((bank, record)) = reads {
             let at = bank.group_reads_at(record, set.start);
             for (port, words) in super::native_target_graph::placed_banks(bank, graph, index, at).map_err(invalid)? {
-                bindings.set(port, &words).map_err(device)?;
+                bindings.set(&self.unallocating(), port, &words).map_err(device)?;
             }
         }
         bindings
-            .set(&into.experts, &merged.experts.slice_leading(0, graph.ports.blocks).map_err(device)?)
+            .set(&self.unallocating(), &into.experts, &merged.experts.slice_leading(0, graph.ports.blocks).map_err(device)?)
             .map_err(device)?;
-        bindings.set(&into.inverse, &rows_of(&merged.inverse)?).map_err(device)?;
+        bindings.set(&self.unallocating(), &into.inverse, &rows_of(&merged.inverse)?).map_err(device)?;
         for (port, entry) in [(&into.rows, rows), (&into.first, first)] {
             bindings
-                .set(port, &merged.table.slice_leading(entry, entry + 1).map_err(device)?)
+                .set(&self.unallocating(), port, &merged.table.slice_leading(entry, entry + 1).map_err(device)?)
                 .map_err(device)?;
         }
         let mut active = run
@@ -2017,7 +2036,7 @@ impl NativeTargetProgram {
             .activate(&graph.plan)
             .map_err(device)?;
         let ready = active
-            .attach(bindings, graph.plan.new_outputs().map_err(device)?)
+            .attach(bindings, graph.plan.new_outputs(&self.unallocating()).map_err(device)?)
             .map_err(device)?;
         submitter.queue(ready, |_| {})?;
         Ok(())
@@ -2075,9 +2094,9 @@ impl NativeTargetProgram {
                 .transpose()?;
             let mut bindings = bound.bindings();
             let hidden = graph.hidden.as_ref().ok_or_else(|| invalid("a run's graph reads no rows"))?;
-            bindings.set(&hidden.rows, &run.hidden.rows).map_err(device)?;
+            bindings.set(&self.unallocating(), &hidden.rows, &run.hidden.rows).map_err(device)?;
             match (&hidden.pre, &run.hidden.pre) {
-                (Some(port), Some(pre)) => bindings.set(port, pre).map_err(device)?,
+                (Some(port), Some(pre)) => bindings.set(&self.unallocating(), port, pre).map_err(device)?,
                 (None, None) => {}
                 _ => return Err(invalid("a block graph's pre port disagrees with the carry it reads")),
             }
@@ -2090,8 +2109,8 @@ impl NativeTargetProgram {
                     let carries = run.region.group.operands(run.region.place).map_err(invalid)?;
                     let mut bind = |ports: &CarryPorts, at: usize| {
                         let [rows, quantized] = &carries[at];
-                        bindings.set(&ports.carry.rows, rows).map_err(device)?;
-                        bindings.set(&ports.carry.quantized, quantized).map_err(device)
+                        bindings.set(&self.unallocating(), &ports.carry.rows, rows).map_err(device)?;
+                        bindings.set(&self.unallocating(), &ports.carry.quantized, quantized).map_err(device)
                     };
                     let read = match (operand_in, run.carried) {
                         (None, _) => None,
@@ -2118,23 +2137,23 @@ impl NativeTargetProgram {
             // the group's pass the chain's experts' rows and its rows'
             // positions in them.
             if let Some(bank) = bank {
-                bank.bind(graph, index, run.region.place, &mut bindings).map_err(invalid)?;
+                bank.bind(graph, index, run.region.place, &self.unallocating(), &mut bindings).map_err(invalid)?;
             }
             if let Some(ports) = &graph.ports {
                 let SplitValues { crossing, merged } = run.region.group.split(index).map_err(invalid)?;
                 match ports {
                     SplitPorts::Front(ports) => {
                         for (port, buffer) in ports.iter().zip(crossing.iter()) {
-                            bindings.set(port, &run.region.rows(buffer, rows)?).map_err(device)?;
+                            bindings.set(&self.unallocating(), port, &run.region.rows(buffer, rows)?).map_err(device)?;
                         }
                     }
                     SplitPorts::Back(ports) => {
                         for (port, buffer) in ports.crossing.iter().zip(crossing.back().iter()) {
-                            bindings.set(port, &run.region.rows(buffer, rows)?).map_err(device)?;
+                            bindings.set(&self.unallocating(), port, &run.region.rows(buffer, rows)?).map_err(device)?;
                         }
-                        bindings.set(&ports.experts, &merged.experts).map_err(device)?;
+                        bindings.set(&self.unallocating(), &ports.experts, &merged.experts).map_err(device)?;
                         bindings
-                            .set(&ports.inverse, &run.region.rows(&merged.inverse, rows)?)
+                            .set(&self.unallocating(), &ports.inverse, &run.region.rows(&merged.inverse, rows)?)
                             .map_err(device)?;
                     }
                 }
@@ -2145,7 +2164,7 @@ impl NativeTargetProgram {
             }
             match (&graph.per_layer, &run.per_layer_rows) {
                 (None, _) => {}
-                (Some(port), Some(inputs)) => bindings.set(port, inputs).map_err(device)?,
+                (Some(port), Some(inputs)) => bindings.set(&self.unallocating(), port, inputs).map_err(device)?,
                 (Some(_), None) => {
                     return Err(invalid("a per-layer block graph has no per-layer rows"));
                 }
@@ -2155,10 +2174,10 @@ impl NativeTargetProgram {
             if let Some(ports) = &graph.ngram {
                 match state.tokens() {
                     TargetTokens::Host => bindings
-                        .set(&ports.tokens, &self.kept_token_rows(&run.region, rows)?)
+                        .set(&self.unallocating(), &ports.tokens, &self.kept_token_rows(&run.region, rows)?)
                         .map_err(device)?,
                     TargetTokens::Selected(selected) => bindings
-                        .set(&ports.tokens, selected.tensor())
+                        .set(&self.unallocating(), &ports.tokens, selected.tensor())
                         .map_err(device)?,
                 }
                 // Its table's rows: written by the host before the step's
@@ -2180,7 +2199,7 @@ impl NativeTargetProgram {
             }
             if let (Some(ports), Some(tap_rows)) = (&graph.taps, &tap_rows) {
                 let taps = self.graphs.prepared.block_taps(index);
-                bindings.set(&ports.taps, tap_rows).map_err(device)?;
+                bindings.set(&self.unallocating(), &ports.taps, tap_rows).map_err(device)?;
                 let [entry, middle, output] = stage.taps();
                 for (port, tap) in [
                     (&ports.entry, taps.entry.filter(|_| entry)),
@@ -2228,15 +2247,15 @@ impl NativeTargetProgram {
                         .expect("a block whose graph binds an index-list source keeps its own pooled source");
                     let pooled = state.pooled(source.block, source.part)?;
                     let block_read = pooled.block_read;
-                    bindings.set(&picked.plane, pooled.rows).map_err(device)?;
+                    bindings.set(&self.unallocating(), &picked.plane, pooled.rows).map_err(device)?;
                     bindings
-                        .set(&picked.picks, controls.bound(LaunchControl::Picks { read: block_read })?)
+                        .set(&self.unallocating(), &picked.picks, controls.bound(LaunchControl::Picks { read: block_read })?)
                         .map_err(device)?;
                     if let Some(index) = &picked.index {
                         let index_keys = pooled
                             .index_keys
                             .ok_or_else(|| invalid("an indexed pooled source has no index keys"))?;
-                        bindings.set(&index.index_keys, index_keys).map_err(device)?;
+                        bindings.set(&self.unallocating(), &index.index_keys, index_keys).map_err(device)?;
                         let pool = LaunchControl::Pool { read: block_read };
                         let mut tables = vec![(&index.complete, LaunchControl::Complete { read: block_read })];
                         match &index.lists {
@@ -2253,9 +2272,9 @@ impl NativeTargetProgram {
                             ));
                             match (&own.window, pooled.window) {
                                 (Some(window), Some((window_read, [window_rows, window_coordinates]))) => {
-                                    bindings.set(&window.rows, window_rows).map_err(device)?;
+                                    bindings.set(&self.unallocating(), &window.rows, window_rows).map_err(device)?;
                                     bindings
-                                        .set(&window.coordinates, window_coordinates)
+                                        .set(&self.unallocating(), &window.coordinates, window_coordinates)
                                         .map_err(device)?;
                                     tables.push((&window.visible, LaunchControl::Visible { read: window_read }));
                                     tables.push((
@@ -2268,7 +2287,7 @@ impl NativeTargetProgram {
                             }
                         }
                         for (port, control) in tables {
-                            bindings.set(port, controls.bound(control)?).map_err(device)?;
+                            bindings.set(&self.unallocating(), port, controls.bound(control)?).map_err(device)?;
                         }
                     }
                 }
@@ -2291,7 +2310,7 @@ impl NativeTargetProgram {
                             (&planes.window_coordinates, window_coordinates),
                             (&planes.block_keys, block_keys),
                         ] {
-                            bindings.set(port, plane).map_err(device)?;
+                            bindings.set(&self.unallocating(), port, plane).map_err(device)?;
                         }
                         let read = |read| LaunchControl::Visible { read };
                         let index_tables = tables.index.iter().flat_map(|index| {
@@ -2309,7 +2328,7 @@ impl NativeTargetProgram {
                         .into_iter()
                         .chain(index_tables)
                         {
-                            bindings.set(port, controls.bound(control)?).map_err(device)?;
+                            bindings.set(&self.unallocating(), port, controls.bound(control)?).map_err(device)?;
                         }
                     }
                     (None, None) => {}
@@ -2322,7 +2341,7 @@ impl NativeTargetProgram {
                     ));
                 }
                 for (port, plane) in ports.iter().zip(history) {
-                    bindings.set(port, plane).map_err(device)?;
+                    bindings.set(&self.unallocating(), port, plane).map_err(device)?;
                 }
                 // A listing class sealed for more segments than the
                 // launch has reads its spans padded.
@@ -2336,7 +2355,7 @@ impl NativeTargetProgram {
                     (fresh, LaunchControl::Fresh { read }),
                     (destinations, LaunchControl::Destinations { read }),
                 ] {
-                    bindings.set(port, controls.bound(control)?).map_err(device)?;
+                    bindings.set(&self.unallocating(), port, controls.bound(control)?).map_err(device)?;
                 }
                 match (history_tiles, &listed_tiles) {
                     (Some(tiles), Some((_, bytes))) => {
@@ -2355,6 +2374,7 @@ impl NativeTargetProgram {
                 for (offset, port) in components.iter().enumerate() {
                     bindings
                         .set(
+                            &self.unallocating(),
                             port,
                             arenas
                                 .get(run.recurrent_component + offset)
@@ -2369,7 +2389,7 @@ impl NativeTargetProgram {
                     (&recurrent.previous_tape, LaunchControl::PreviousTape),
                     (&recurrent.following_bank, LaunchControl::FollowingBank),
                 ] {
-                    bindings.set(port, controls.bound(control)?).map_err(device)?;
+                    bindings.set(&self.unallocating(), port, controls.bound(control)?).map_err(device)?;
                 }
             }
             let (next, outputs) = rotation.activate(&graph.plan)?;
@@ -2436,13 +2456,13 @@ impl NativeTargetProgram {
             let destination = boundary.allocation().tensor().map_err(device)?;
             let copy = self.boundary_copy()?;
             let mut bindings = copy.plan.bindings();
-            bindings.set(&copy.source, &source).map_err(device)?;
+            bindings.set(&self.unallocating(), &copy.source, &source).map_err(device)?;
             bindings
-                .set(&copy.destination, destination)
+                .set(&self.unallocating(), &copy.destination, destination)
                 .map_err(device)?;
-            let mut slot = copy.plan.new_slot().map_err(device)?;
+            let mut slot = copy.plan.new_slot(&self.unallocating()).map_err(device)?;
             let ready = slot
-                .attach(bindings, copy.plan.new_outputs().map_err(device)?)
+                .attach(bindings, copy.plan.new_outputs(&self.unallocating()).map_err(device)?)
                 .map_err(device)?;
             submitter.queue(ready, |_| {})?;
         }

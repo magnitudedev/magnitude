@@ -614,7 +614,7 @@ mod tests {
     }
 
     fn slots(device: &seismic::Device, table: SlotTable) -> ExchangeTable {
-        ExchangeTable::new(Tensor::shared(device, Element::i32(), &[table.words()]).unwrap(), table, &crate::experts::exchange::Pulse::new()).unwrap()
+        ExchangeTable::new(Tensor::shared(&seismic::Charges::tally(device), Element::i32(), &[table.words()]).unwrap(), table, &crate::experts::exchange::Pulse::new()).unwrap()
     }
 
     fn parks(device: &seismic::Device) -> Parks {

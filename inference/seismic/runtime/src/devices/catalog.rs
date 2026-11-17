@@ -115,9 +115,9 @@ impl Devices {
                 reason: reason.clone(),
             });
         }
-        let embedded = stores.is_some();
+        let shared_in = stores.is_some();
         let stores = stores.unwrap_or_else(|| tallies(&topology, &info));
-        let memory = DeviceStores::new(&topology, &info, stores, embedded);
+        let memory = DeviceStores::new(&topology, &info, stores, shared_in);
         let device = crate::backends::open(info, topology, memory, options)?;
         opened.insert(id, Arc::downgrade(&device));
         Ok(device)
@@ -141,7 +141,7 @@ impl Devices {
                 reason: reason.clone(),
             });
         }
-        let memory = DeviceStores::new(&topology, &info, stores, true);
+        let memory = DeviceStores::new(&topology, &info, stores, false);
         crate::backends::open(info, topology, memory, options)
     }
 

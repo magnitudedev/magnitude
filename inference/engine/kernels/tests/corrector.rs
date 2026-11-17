@@ -97,7 +97,7 @@ fn tensor(device: &Device, element: Element, shape: &[usize], bytes: &[u8]) -> T
         .iter()
         .map(|extent| *extent as u64)
         .collect::<Vec<_>>();
-    Tensor::from_host(device, element, &shape, bytes).unwrap()
+    Tensor::from_host(&seismic::Charges::tally(device), element, &shape, bytes).unwrap()
 }
 
 fn f32_tensor(device: &Device, shape: &[usize], values: &[f32]) -> Tensor {
@@ -629,6 +629,7 @@ fn host_models_match_the_portable_bodies() {
 // Natives.
 
 fn features_match(device: &Device, case: &Features) {
+    let charges = seismic::Charges::tally(device);
     let entry = corrector_features::native_entry_with(corrector_features::Elements { A: Element::bf16() });
     let implementation = entry
         .offered(device)
@@ -650,7 +651,7 @@ fn features_match(device: &Device, case: &Features) {
         )
         .unwrap();
     let result = kernel
-        .call(corrector_features::Args {
+        .call(&charges, corrector_features::Args {
             logits: &f32_tensor(device, &[case.rows, case.vocabulary], &case.logits),
             unary: &f32_tensor(device, &[case.rows, case.top_k], &case.unary),
             norm_weight: &f32_tensor(device, &[5], &case.norm_weight),
@@ -675,6 +676,7 @@ fn features_match(device: &Device, case: &Features) {
 }
 
 fn rows_match(device: &Device) {
+    let charges = seismic::Charges::tally(device);
     let (rows, width) = (5usize, 1030usize);
     let input = values(rows * width, 12);
     let bias = values(width, 13);
@@ -706,7 +708,7 @@ fn rows_match(device: &Device) {
             )
             .unwrap();
         let result = kernel
-            .call(corrector_rows::Args {
+            .call(&charges, corrector_rows::Args {
                 values: &f32_tensor(device, &[rows, width], &input),
                 bias: &f32_tensor(device, &[width], &bias),
                 residual: &f32_tensor(
@@ -753,6 +755,7 @@ fn rows_match(device: &Device) {
 }
 
 fn nodes_match(device: &Device) {
+    let charges = seismic::Charges::tally(device);
     let (slots, rows, top_k, width) = (2usize, 3usize, 4usize, 70usize);
     let nodes = slots * rows * top_k;
     let token = values(nodes * width, 15);
@@ -785,7 +788,7 @@ fn nodes_match(device: &Device) {
         )
         .unwrap();
         let result = kernel
-            .call(corrector_nodes::Args {
+            .call(&charges, corrector_nodes::Args {
                 token: &f32_tensor(device, &[slots, rows, top_k, width], &token),
                 token_bias: &f32_tensor(
                     device,
@@ -829,6 +832,7 @@ fn nodes_match(device: &Device) {
 }
 
 fn attention_matches(device: &Device, blocks: usize, nodes: usize, heads: usize, width: usize) {
+    let charges = seismic::Charges::tally(device);
     let joined = 3 * heads * width;
     let qkv = values(blocks * nodes * joined, 23)
         .into_iter()
@@ -860,7 +864,7 @@ fn attention_matches(device: &Device, blocks: usize, nodes: usize, heads: usize,
         )
         .unwrap();
     let result = kernel
-        .call(corrector_attention::Args {
+        .call(&charges, corrector_attention::Args {
             qkv: &f32_tensor(device, &[blocks, nodes, 3, heads, width], &qkv),
             input_bias: &f32_tensor(device, &[3, heads, width], &input_bias),
             bias: &f32_tensor(device, &[heads, nodes, nodes], &bias),
@@ -883,6 +887,7 @@ fn attention_matches(device: &Device, blocks: usize, nodes: usize, heads: usize,
 }
 
 fn factors_match(device: &Device) {
+    let charges = seismic::Charges::tally(device);
     let (blocks, nodes, width) = (2usize, 5usize, 90usize);
     let x = values(blocks * nodes * width, 26)
         .into_iter()
@@ -912,7 +917,7 @@ fn factors_match(device: &Device) {
         )
         .unwrap();
     let result = kernel
-        .call(corrector_factors::Args {
+        .call(&charges, corrector_factors::Args {
             nodes: &tensor(
                 device,
                 Element::bf16(),
@@ -947,6 +952,7 @@ fn factors_match(device: &Device) {
 }
 
 fn path_matches(device: &Device, case: &Path) {
+    let charges = seismic::Charges::tally(device);
     let implementation = corrector_path::native_implementation(device)
         .unwrap()
         .expect("corrector_path has a native implementation on every device");
@@ -973,7 +979,7 @@ fn path_matches(device: &Device, case: &Path) {
         &i32_bytes(&vec![-1; case.steps * case.slots * 2]),
     );
     kernel
-        .call(corrector_path::Args {
+        .call(&charges, corrector_path::Args {
             candidates: &tensor(
                 device,
                 Element::i32(),

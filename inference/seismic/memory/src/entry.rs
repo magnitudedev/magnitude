@@ -388,14 +388,15 @@ pub trait Store: Send + Sync + 'static {
     fn restart_high_water(&self);
     /// The device's own entry in the store: what it holds that no caller
     /// names (transfer staging, its contexts and queues, driver objects),
-    /// which its backend charges by name.
+    /// which its backend charges by name. Seismic alone asks for it: a
+    /// device's charges are minted from each store's identity, never the
+    /// store, so no holder's charges name it.
     fn own(&self) -> Arc<dyn Entry>;
-    /// The one entry a store that counts every byte in one holds (a
-    /// [`Tally`]): what an allocation that names no entry is charged to.
-    /// None for a ledger of many entries, where such an allocation has no
-    /// owner.
-    fn sole(&self) -> Option<Arc<dyn Entry>> {
-        None
+    /// Whether the store is a [`Tally`], its one entry counting every byte
+    /// charged to it, rather than an embedder's ledger minting an entry for
+    /// each holder. Only a tally is one.
+    fn tally(&self) -> bool {
+        false
     }
 }
 
@@ -544,9 +545,8 @@ impl Store for Tally {
         self.0.clone()
     }
 
-    /// The tally itself, its store's one entry.
-    fn sole(&self) -> Option<Arc<dyn Entry>> {
-        Some(self.0.clone())
+    fn tally(&self) -> bool {
+        true
     }
 }
 

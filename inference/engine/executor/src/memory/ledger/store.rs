@@ -222,7 +222,9 @@ impl DeviceLedgers {
     /// Refused, nothing is held.
     ///
     /// # Panics
-    /// For a sequence's state, which is claimed by its rows alone.
+    /// For a sequence's state, which is claimed by its rows alone, or a
+    /// pooled kind, whose granules its pool's entry allocates (the request
+    /// slot is claimed by [`Self::claim_request_slot`]).
     pub fn claim(&self, device: &seismic::Device, kind: CommittedKind, demand: crate::memory::ClaimDemand) -> Result<Held, Short> {
         self.claim_judged(None, device, kind, demand)
     }
@@ -236,8 +238,63 @@ impl DeviceLedgers {
         self.claim_judged(Some(reading), device, kind, demand)
     }
 
+    /// `claims`, each of `kind` and taken in a store of these ledgers apart
+    /// ([`Ledger::claim_units`]), as one holding over every store the
+    /// device reaches: a store none of them claims in opened at none as the
+    /// holding allocates ([`Held::allocate`]), kept only where an
+    /// allocation lands there.
+    ///
+    /// # Panics
+    /// For a claim of another kind, a pooled one, one of a store these do
+    /// not reach, or two of one store.
+    pub fn holding(&self, kind: CommittedKind, claims: Vec<Claim>) -> Held {
+        assert!(!Holding::Committed(kind).pooled(), "invariant violated: a pooled {kind:?} holding allocates through its pool's entry");
+        let ledgers = if Arc::ptr_eq(&self.device.store, &self.host.store) { vec![&self.device] } else { vec![&self.device, &self.host] };
+        for claim in &claims {
+            assert_eq!(claim.kind(), kind, "invariant violated: a {:?} claim in a {kind:?} holding", claim.kind());
+            assert!(ledgers.iter().any(|ledger| Arc::ptr_eq(&claim.ledger().store, &ledger.store)), "invariant violated: a holding's claim in a store its device does not reach");
+        }
+        assert!(
+            ledgers.iter().all(|ledger| claims.iter().filter(|claim| Arc::ptr_eq(&claim.ledger().store, &ledger.store)).count() <= 1),
+            "invariant violated: a holding of two claims in one store"
+        );
+        let unclaimed = ledgers
+            .into_iter()
+            .filter(|ledger| !claims.iter().any(|claim| Arc::ptr_eq(&claim.ledger().store, &ledger.store)))
+            .map(|ledger| (ledger.clone(), kind))
+            .collect();
+        Held { claims, unclaimed, changes: self.device.store.changes.clone() }
+    }
+
+    /// The load's request slot ([`CommittedKind::RequestSlot`]) of
+    /// `demand`, claimed in the one store the load's state lies in: a
+    /// pooled holding, whose granules the state pool's entry allocates, so
+    /// never a [`Held`].
+    ///
+    /// # Panics
+    /// Where `demand` places bytes in other than one store.
+    pub fn claim_request_slot(&self, device: &seismic::Device, demand: crate::memory::ClaimDemand) -> Result<Claim, Short> {
+        self.claim_request_slot_judged(None, device, demand)
+    }
+
+    /// [`Self::claim_request_slot`] at `reading`, the load's
+    /// ([`Self::claim_at`]).
+    pub fn claim_request_slot_at(&self, reading: &DeviceReading, device: &seismic::Device, demand: crate::memory::ClaimDemand) -> Result<Claim, Short> {
+        self.claim_request_slot_judged(Some(reading), device, demand)
+    }
+
+    fn claim_request_slot_judged(&self, reading: Option<&DeviceReading>, device: &seismic::Device, demand: crate::memory::ClaimDemand) -> Result<Claim, Short> {
+        let (on_device, on_host) = self.placed(device, demand);
+        let mut placed = self.judged(reading).into_iter().zip([on_device, on_host]).filter(|(_, bytes)| *bytes > 0);
+        let (Some(((ledger, held), bytes)), None) = (placed.next(), placed.next()) else {
+            panic!("invariant violated: a request slot is claimed in other than one store");
+        };
+        ledger.claim_at(held, CommittedKind::RequestSlot, bytes)
+    }
+
     fn claim_judged(&self, reading: Option<&DeviceReading>, device: &seismic::Device, kind: CommittedKind, demand: crate::memory::ClaimDemand) -> Result<Held, Short> {
         assert!(!matches!(kind, CommittedKind::Request(_) | CommittedKind::Grant(_)), "a {kind:?} claim is taken by its own path");
+        assert!(!Holding::Committed(kind).pooled(), "invariant violated: a pooled {kind:?} holding is claimed by its own path; its pool's entry allocates its granules");
         let (on_device, on_host) = self.placed(device, demand);
         let unified = Arc::ptr_eq(&self.device.store, &self.host.store);
         let mut claims = Vec::new();
@@ -245,11 +302,11 @@ impl DeviceLedgers {
         for (index, ((ledger, held), bytes)) in self.judged(reading).into_iter().zip([on_device, on_host]).enumerate() {
             if bytes > 0 {
                 claims.push(ledger.claim_at(held, kind, bytes)?);
-            } else if !(unified && index == 1) && !Holding::Committed(kind).pooled() {
+            } else if !(unified && index == 1) {
                 unclaimed.push((ledger.clone(), kind));
             }
         }
-        Ok(Held { claims, unclaimed })
+        Ok(Held { claims, unclaimed, changes: self.device.store.changes.clone() })
     }
 
     /// The bytes `demand` places in the device's own memory's store and in
@@ -476,7 +533,8 @@ impl DeviceLedgers {
         let sizing = seismic::BlockSizing { granule, allocations: device.native_allocations() };
         let block = seismic::block_bytes(sizing).map_err(|error| format!("the {contract:?} store's {class:?} pool blocks: {error:?}"))?;
         let entries = self.of_contract(device, contract).pool_block(class, NonZeroU64::new(block.held).expect("a block holds a granule"));
-        device.pool(contract, granule, block.bytes, entries).map_err(|error| format!("the {contract:?} store's {class:?} pool: {error}"))
+        seismic::Pool::open(&entries.charges(device, contract), contract, granule, block.bytes)
+            .map_err(|error| format!("the {contract:?} store's {class:?} pool: {error}"))
     }
 
     /// The ledger of the store `device` places `contract`'s fixed storage
@@ -490,6 +548,25 @@ impl DeviceLedgers {
     /// The ledger of `store`, where these keep one.
     pub fn keeping(&self, store: &seismic::StoreIdentity) -> Option<&Ledger> {
         [&self.device, &self.host].into_iter().find(|ledger| ledger.store.identity == *store)
+    }
+
+    /// Charges of a measurement job run on `device` in this process (a
+    /// tool's, a test's): in each store the device reaches, a
+    /// [`CommittedKind::Measurement`] holding opened at none, which grows
+    /// as the job allocates through it, each allocation its own change
+    /// judged by the store's reading as any holding's is, and is released
+    /// as the last of the charges drops.
+    ///
+    /// # Panics
+    /// Where `device` reaches a store these do not keep: only another
+    /// device's would.
+    pub fn measurement(&self, device: &seismic::Device) -> seismic::Charges {
+        device.charges(|store| {
+            let ledger = self
+                .keeping(store)
+                .unwrap_or_else(|| panic!("invariant violated: a measurement job's device reaches {store:?}, a store its ledgers do not keep"));
+            Arc::new(ledger.growing(CommittedKind::Measurement))
+        })
     }
 
     /// The ledger of the store `tier` lies in.
@@ -538,6 +615,28 @@ impl DeviceLedgers {
             weights.claims.push(backing);
         }
         Ok(())
+    }
+}
+
+/// A store's granule pool's two entries of its ledger ([`Ledger::pool_block`]):
+/// its blocks', whose granules its slabs claim and release, and its absent
+/// granule's, which no claim takes.
+pub struct PoolEntries {
+    pub blocks: Arc<dyn seismic::memory::Entry>,
+    pub absent: Arc<dyn seismic::memory::Entry>,
+}
+
+impl PoolEntries {
+    /// The charges a pool of the store `device` places `contract` in is
+    /// made through: its blocks to the blocks' entry, its absent granule
+    /// to the absent granule's ([`seismic::PoolCharges::apart`]), each
+    /// minted for that store alone ([`seismic::Device::charges_in`]).
+    ///
+    /// # Panics
+    /// Where `contract`'s storage lies in another store than these
+    /// entries'.
+    pub fn charges(self, device: &seismic::Device, contract: seismic::Contract) -> seismic::PoolCharges {
+        seismic::PoolCharges::apart(&device.charges_in(contract, self.blocks), &device.charges_in(contract, self.absent))
     }
 }
 
@@ -620,8 +719,10 @@ pub struct LoadEstimate {
 }
 
 /// The committed claims of one allocation across the stores a device
-/// reaches ([`DeviceLedgers::claim`]): at most one per store. Kept for the
-/// life of the allocation; dropped, its bytes are free.
+/// reaches ([`DeviceLedgers::claim`]): every store once, either claimed in
+/// (`claims`) or not yet (`unclaimed`), and never of a pooled kind, whose
+/// granules its pool's entry allocates. Kept for the life of the
+/// allocation; dropped, its bytes are free.
 #[must_use]
 pub struct Held {
     claims: Vec<Claim>,
@@ -630,26 +731,33 @@ pub struct Held {
     /// (such as a discrete GPU's `Contract::Shared` / `Contract::Words` buffer
     /// during program preparation, qualification, or resource allocation).
     unclaimed: Vec<(Ledger, CommittedKind)>,
+    /// The changes of the scope its device's ledgers are in: every
+    /// allocation through it, and its record, is one of them.
+    changes: Arc<Changes>,
 }
 
 impl Held {
     /// `make`, the allocation on the owner's thread, as one change
-    /// ([`Changes::change`]): every allocation it makes in a store the device
-    /// reaches is charged to this holding's non-pooled claim there, at its
-    /// exact bytes, as Seismic makes it ([`seismic::memory::charging`]).
+    /// ([`Changes::change`]): handed the charges `device`'s ledger mints
+    /// from this holding ([`seismic::Device::charges`]), every allocation it
+    /// makes in a store the device reaches is charged to this holding's
+    /// non-pooled claim there, at its exact bytes, as Seismic makes it.
     ///
-    /// This is the only way an allocation is charged to a holding: it names
-    /// every store the device reaches, those this holding placed no bytes in
-    /// included, so no allocation it makes is left outside a charging scope.
-    pub fn allocate<T>(&mut self, make: impl FnOnce() -> T) -> T {
-        let changes = self
-            .claims
-            .first()
-            .map(|claim| claim.ledger().store.changes.clone())
-            .or_else(|| self.unclaimed.first().map(|(ledger, _)| ledger.store.changes.clone()));
-        let Some(changes) = changes else {
-            return make();
-        };
+    /// This is the only way an allocation is charged to a holding: the
+    /// charges name a claim in every store the device reaches, those this
+    /// holding placed no bytes in included (opened at none, kept only
+    /// where an allocation landed), so no allocation it makes goes
+    /// uncharged. `make` is lent them, which are not `Clone`, for the
+    /// change alone: nothing it returns holds them, so nothing allocates
+    /// through them after the change ends (what allocates later is handed
+    /// its charges at that call).
+    ///
+    /// # Panics
+    /// Where `device` reaches a store its ledgers do not keep: a holding
+    /// covers every store of the device its ledgers were opened for
+    /// ([`DeviceLedgers::claim`]), so only another device's would.
+    pub fn allocate<T>(&mut self, device: &seismic::Device, make: impl FnOnce(&seismic::Charges) -> T) -> T {
+        let changes = self.changes.clone();
         changes.change(|_| {
             let mut extra: Vec<Claim> = self
                 .unclaimed
@@ -659,15 +767,16 @@ impl Held {
                     Claim::held(ledger.clone(), id, *kind)
                 })
                 .collect();
-            let entries = self
-                .claims
-                .iter()
-                .filter(|claim| !claim.pooled())
-                .chain(extra.iter())
-                .map(Claim::entry)
-                .collect::<Vec<_>>();
-            let outcome = seismic::memory::charging(&entries, make);
-            drop(entries);
+            let charges = device.charges(|store| {
+                self.claims
+                    .iter()
+                    .chain(extra.iter())
+                    .find(|claim| claim.ledger().store.identity == *store)
+                    .unwrap_or_else(|| panic!("invariant violated: a holding names no claim in {store:?}, a store its device reaches"))
+                    .entry()
+            });
+            let outcome = make(&charges);
+            drop(charges);
             let mut retained = Vec::new();
             for (claim, slot) in extra.drain(..).zip(std::mem::take(&mut self.unclaimed)) {
                 if claim.allocated_bytes() > 0 || claim.bytes() > 0 {
@@ -743,21 +852,6 @@ pub fn free<R>(claims: Vec<Claim>, free: impl FnOnce() -> R) -> R {
 #[derive(Default)]
 pub struct Recorded {
     claims: Vec<Claim>,
-}
-
-impl Held {
-    /// The load's request slot ([`CommittedKind::RequestSlot`]), held in
-    /// the one store the load's state lies in.
-    ///
-    /// # Panics
-    /// Where it holds other than one request slot's claim.
-    pub fn into_request_slot(self) -> Claim {
-        let [claim]: [Claim; 1] = self.claims.try_into().unwrap_or_else(|claims: Vec<Claim>| {
-            panic!("invariant violated: a request slot is claimed in {} stores", claims.len())
-        });
-        assert_eq!(claim.kind(), CommittedKind::RequestSlot, "invariant violated: a request slot of another kind");
-        claim
-    }
 }
 
 impl Recorded {

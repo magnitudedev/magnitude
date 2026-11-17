@@ -282,7 +282,7 @@ pub(crate) mod tests {
         let (_, recorded) = seismic::record_kernel_requests(|| {
             crate::AttestedPrograms::prepare_draft(
                 &draft,
-                &device,
+                &seismic::Charges::tally(&device),
                 crate::TuningContext {
                     definition: &definition,
                     weights: &crate::ZeroTuningWeights,
@@ -395,7 +395,7 @@ pub(crate) mod tests {
         let room = Total(1 << 40);
         crate::AttestedPrograms::search_draft(
             &draft,
-            &device,
+            &seismic::Charges::tally(&device),
             crate::TuningContext {
                 definition: &definition,
                 weights: &crate::ZeroTuningWeights,
@@ -519,7 +519,7 @@ pub(crate) mod tests {
         let room = Taken(&search, &tally, std::cell::OnceCell::new());
         crate::AttestedPrograms::search_draft(
             &draft,
-            &device,
+            &seismic::Charges::tally(&device),
             crate::TuningContext {
                 definition: &definition,
                 weights: &crate::ZeroTuningWeights,
@@ -597,7 +597,7 @@ pub(crate) mod tests {
         .unwrap();
         let mut programs = crate::AttestedPrograms::prepare_draft(
             &draft,
-            &device,
+            &seismic::Charges::tally(&device),
             crate::TuningContext {
                 definition: &definition,
                 weights: &crate::ZeroTuningWeights,
@@ -913,7 +913,7 @@ pub(crate) mod tests {
             .unwrap();
             let programs = crate::AttestedPrograms::prepare_draft(
                 &draft,
-                &device,
+                &seismic::Charges::tally(&device),
                 crate::TuningContext {
                     definition,
                     weights: &crate::ZeroTuningWeights,

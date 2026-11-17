@@ -1781,10 +1781,11 @@ mod causal_cache_tests {
         let granule = 64 << 20;
         let entry: std::sync::Arc<dyn seismic::memory::Entry> =
             std::sync::Arc::new(seismic::memory::Tally::unbounded(seismic::StoreIdentity::HostRam));
-        let pool = device.pool(seismic::Contract::DeviceOnly, granule, granule, seismic::PoolEntries::one(entry)).expect("the CPU opens its pool");
+        let pool = seismic::Pool::open(&seismic::PoolCharges::one(&device.charges_in(seismic::Contract::DeviceOnly, entry)), seismic::Contract::DeviceOnly, granule, granule).expect("the CPU opens its pool");
+        let charges = seismic::Charges::tally(&device);
         for codec in [KvCodec::Dense, KvCodec::AffineK8V4] {
             let (store, mut bindings) = StateStore::new(
-                Rc::clone(&device),
+                &charges,
                 pool.clone(),
                 16,
                 16,

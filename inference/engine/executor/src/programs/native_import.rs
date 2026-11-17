@@ -52,6 +52,7 @@ impl ImportProgram for NativeImportProgram {
 
     fn submit(
         &mut self,
+        charges: &seismic::Charges,
         mut launch: ValidatedImportLaunch,
     ) -> Result<Self::Submission, (SubmitError, ValidatedImportLaunch)> {
         let result = (|| -> Result<(), SubmitError> {
@@ -64,7 +65,7 @@ impl ImportProgram for NativeImportProgram {
             }
             fill_staged_source(core.source().stored(), core.plan(), workspace.upload_mut())?;
             let (resident, bound) = destination.parts_mut();
-            import_into(&self.handle, workspace.source(), resident, bound)
+            import_into(&self.handle, charges, workspace.source(), resident, bound)
         })();
         if let Err(error) = result {
             return Err((error, launch));
@@ -145,6 +146,7 @@ pub(crate) fn stored_source_bytes(stored: &Stored) -> Result<Vec<u8>, SubmitErro
 /// packets.
 pub(crate) fn import_into(
     handle: &AttestedImport,
+    charges: &seismic::Charges,
     source: &Tensor,
     destination: &Tensor,
     bound: Option<&mut Tensor>,
@@ -155,6 +157,7 @@ pub(crate) fn import_into(
     match handle {
         AttestedImport::Dense(handle) => handle
             .call_into(
+                charges,
                 import_dense::Args { source: &source },
                 import_dense::OutputArgs {
                     value: &mut resident,
@@ -163,6 +166,7 @@ pub(crate) fn import_into(
             .map(|_| ()),
         AttestedImport::Repack { repack, .. } => repack
             .call_into(
+                charges,
                 repack_weight::Args { source: &source },
                 repack_weight::OutputArgs {
                     value: &mut resident,
@@ -173,7 +177,7 @@ pub(crate) fn import_into(
     .map_err(execution)?;
     match bound {
         Some(bound) => bound_entry(handle)?
-            .call(packing_bound::Args {
+            .call(charges, packing_bound::Args {
                 weight: destination,
                 bound,
             })
@@ -233,7 +237,7 @@ pub(crate) fn enqueue_into(
 /// (`!AttestedImport::writes_records`).
 pub(crate) fn import_records(
     handle: &AttestedImport,
-    device: &seismic::Device,
+    charges: &seismic::Charges,
     source: &Tensor,
     extents: &[u64],
     record_at: &dyn Fn(u64) -> Result<Tensor, String>,
@@ -241,7 +245,7 @@ pub(crate) fn import_records(
     let transfer = |detail: String| SubmitError::Device(DeviceError::Transfer(detail));
     let view = import_view(extents)?;
     let source = shaped(source, &view, "source")?;
-    let mut batch = NativeTensorBatch::new(device);
+    let mut batch = NativeTensorBatch::new(charges);
     for index in 0..view[0] {
         let matrix = source
             .slice_leading(index, index + 1)
@@ -356,7 +360,7 @@ mod tests {
         };
         // SAFETY: fill_staged_source writes every physical upload byte.
         let mut upload =
-            unsafe { Tensor::uninitialized(&device, Element::f32(), &[rows]) }.unwrap();
+            unsafe { Tensor::uninitialized(&seismic::Charges::tally(&device), Element::f32(), &[rows]) }.unwrap();
         fill_staged_source(&stored, &plan(Vec::new()), &mut upload).unwrap();
         assert_eq!(upload.read_to_host().unwrap(), values);
 
@@ -393,6 +397,7 @@ mod tests {
             return;
         }
         let device = crate::test_support::open_backend(&catalog, BackendName::Metal).expect("an available Metal executor opens");
+        let charges = seismic::Charges::tally(&device);
         let source_element = Element::named("gguf_q5_k").unwrap();
         for layout in [seismic::Layout::Rows16, seismic::Layout::Mma16] {
             let resident_element = Element::stored("q5k", layout).unwrap();
@@ -401,11 +406,11 @@ mod tests {
                 .map(|index: usize| (index as u8).wrapping_mul(29).wrapping_add(7))
                 .collect::<Vec<_>>();
             let source =
-                Tensor::from_host(&device, source_element, &[17 * 512], &source_bytes).unwrap();
+                Tensor::from_host(&charges, source_element, &[17 * 512], &source_bytes).unwrap();
             // SAFETY: this import is a pure result that must write every
             // physical byte, including packed padding.
             let resident =
-                unsafe { Tensor::uninitialized(&device, resident_element, &shape) }.unwrap();
+                unsafe { Tensor::uninitialized(&charges, resident_element, &shape) }.unwrap();
             let kernel = repack_weight::native_for_device_with(
                 &device,
                 repack_weight::Elements {
@@ -419,7 +424,7 @@ mod tests {
                 repack: kernel,
                 bound: None,
             };
-            import_into(&repack, &source, &resident, None).unwrap();
+            import_into(&repack, &charges, &source, &resident, None).unwrap();
             assert_eq!(resident.extents(), shape);
             assert_eq!(
                 resident.read_to_host().unwrap(),
@@ -447,6 +452,7 @@ mod tests {
             return;
         }
         let device = crate::test_support::open_backend(&catalog, BackendName::Metal).expect("an available Metal executor opens");
+        let charges = seismic::Charges::tally(&device);
         let source_element = Element::named("gguf_q5_k").unwrap();
         let resident_element = Element::stored("q5k", seismic::Layout::Rows16).unwrap();
         let shape = [17_u64, 512];
@@ -521,9 +527,9 @@ mod tests {
             bound: 0,
             holding: crate::Holding::Whole,
         };
-        let source = crate::resources::filled_import(&weight, &stored, &device).unwrap();
+        let source = crate::resources::filled_import(&weight, &stored, &charges).unwrap();
         // SAFETY: the packed import writes every resident byte before readback.
-        let resident = unsafe { Tensor::uninitialized(&device, resident_element, &shape) }.unwrap();
+        let resident = unsafe { Tensor::uninitialized(&charges, resident_element, &shape) }.unwrap();
         let kernel = repack_weight::native_for_device_with(
             &device,
             repack_weight::Elements {
@@ -537,7 +543,7 @@ mod tests {
             repack: kernel,
             bound: None,
         };
-        import_into(&repack, &source, &resident, None).unwrap();
+        import_into(&repack, &charges, &source, &resident, None).unwrap();
         assert_eq!(
             resident.read_to_host().unwrap(),
             resident_element
@@ -555,6 +561,7 @@ mod tests {
             return;
         }
         let device = crate::test_support::open_backend(&catalog, BackendName::Metal).expect("an available Metal executor opens");
+        let charges = seismic::Charges::tally(&device);
         let packed_element = Element::named("gguf_q5_k").unwrap();
         let resident_element = Element::stored("q5k", seismic::Layout::Rows16).unwrap();
         let dense_element = Element::f32();
@@ -565,12 +572,12 @@ mod tests {
             .into_iter()
             .flat_map(f32::to_le_bytes)
             .collect::<Vec<_>>();
-        let packed = Tensor::from_host(&device, packed_element, &[17 * 512], &packed_bytes).unwrap();
-        let dense = Tensor::from_host(&device, dense_element, &[4], &dense_bytes).unwrap();
+        let packed = Tensor::from_host(&charges, packed_element, &[17 * 512], &packed_bytes).unwrap();
+        let dense = Tensor::from_host(&charges, dense_element, &[4], &dense_bytes).unwrap();
         // SAFETY: both import entries write their complete physical results.
         let packed_result =
-            unsafe { Tensor::uninitialized(&device, resident_element, &[17, 512]) }.unwrap();
-        let dense_result = unsafe { Tensor::uninitialized(&device, dense_element, &[4]) }.unwrap();
+            unsafe { Tensor::uninitialized(&charges, resident_element, &[17, 512]) }.unwrap();
+        let dense_result = unsafe { Tensor::uninitialized(&charges, dense_element, &[4]) }.unwrap();
         let packed_kernel = repack_weight::native_for_device_with(
             &device,
             repack_weight::Elements {
@@ -589,7 +596,7 @@ mod tests {
             &seismic::NativeSpecialization::new(),
         )
         .unwrap();
-        let mut batch = NativeTensorBatch::new(&device);
+        let mut batch = NativeTensorBatch::new(&charges);
         enqueue_into(
             &AttestedImport::Repack {
                 repack: packed_kernel,

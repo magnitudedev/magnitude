@@ -226,12 +226,13 @@ fn words(tensor: &Tensor) -> Vec<i32> {
 }
 
 fn native(device: &Device, case: &Case) -> Outcome {
+    let charges = seismic::Charges::tally(device);
     let m = case.rows() as u64;
     let (spans, r) = span_table(&case.lists);
     let complete = ints(device, &[m], &case.complete());
-    let host = |shape: &[u64]| Tensor::from_host(device, Element::i32(), shape, &[]).unwrap();
+    let host = |shape: &[u64]| Tensor::from_host(&charges, Element::i32(), shape, &[]).unwrap();
     let blocks = prepared!(device, candidate_blocks::native_entry())
-        .call(candidate_blocks::Args {
+        .call(&charges, candidate_blocks::Args {
             scores: &tensor(device, Element::f32(), &[m, case.n as u64], &case.produce),
             complete: &complete,
             block_slots: &ints(device, &[0, case.nb() as u64], &[]),
@@ -240,7 +241,7 @@ fn native(device: &Device, case: &Case) -> Outcome {
         .unwrap();
     let topk = prepared!(device, rows_topk::native_entry());
     let picked = topk
-        .call(rows_topk::Args {
+        .call(&charges, rows_topk::Args {
             scores: &blocks.r0,
             complete: &complete,
             spans: &blocks.r1,
@@ -248,7 +249,7 @@ fn native(device: &Device, case: &Case) -> Outcome {
         })
         .unwrap();
     let pool = prepared!(device, candidate_rows::native_entry())
-        .call(candidate_rows::Args {
+        .call(&charges, candidate_rows::Args {
             blocks: &picked.value,
             spans: &ints(device, &[m, r as u64, 2], &spans),
             form: &host(&[0, case.bu as u64, case.k as u64]),
@@ -256,7 +257,7 @@ fn native(device: &Device, case: &Case) -> Outcome {
         .unwrap();
     let width = (case.b + r) as u64;
     let picks = topk
-        .call(rows_topk::Args {
+        .call(&charges, rows_topk::Args {
             scores: &tensor(device, Element::f32(), &[m, case.n as u64], &case.listed(&words(&pool.value), width as usize)),
             complete: &complete,
             spans: &pool.value,
@@ -327,13 +328,14 @@ fn candidate_rows_at_deepseek_v41_decode_shape_times() {
     else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let (b, bu, k) = (2048usize, 8usize, 512usize);
     for (units, stride) in [(2048usize, 1usize), (32768, 2)] {
         let picked = (0..b).map(|pick| pick * stride).take_while(|block| block * bu < units);
         let picks = picked.map(|block| block as i32).chain(std::iter::repeat(-1)).take(b).collect::<Vec<_>>();
         let blocks = ints(&device, &[1, b as u64], &picks);
         let spans = ints(&device, &[1, 1, 2], &[0, units as i32]);
-        let form = Tensor::from_host(&device, Element::i32(), &[0, bu as u64, k as u64], &[]).unwrap();
+        let form = Tensor::from_host(&charges, Element::i32(), &[0, bu as u64, k as u64], &[]).unwrap();
         let point = seismic::TuningPoint {
             label: "m1".into(),
             weight: 1.0,
@@ -345,7 +347,7 @@ fn candidate_rows_at_deepseek_v41_decode_shape_times() {
             written: Default::default(),
         };
         let result = candidate_rows::native_tune(
-            &device,
+            &charges,
             &seismic::NativeSpecialization::new(),
             vec![point],
             seismic::NumericalRequirement::BitExact,

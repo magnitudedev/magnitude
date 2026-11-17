@@ -11,7 +11,7 @@ use crate::{
 };
 use magnitude_artifacts::{Package, gguf::GgufArtifact};
 use magnitude_family_contracts::{WeightKind, WeightRole, WeightScope};
-use seismic::{BuildError, Device, Element, Tensor};
+use seismic::{BuildError, Element, Tensor};
 use std::collections::HashMap;
 
 /// Where tuning reads weights from.
@@ -21,14 +21,14 @@ pub trait TuningWeightSource {
     /// [`Self::import_source`]'s.
     fn source_bytes(&self, weight: &WeightPlan, leading: bool) -> Result<Vec<u8>, String>;
 
-    /// The tensor an import entry reads `weight` from on `device`: its
+    /// The tensor an import entry reads `weight` from, through `charges`: its
     /// source in its upload representation, one row of every element.
     /// Tuning reads real values rather than zeros because a tuned entry's
     /// time can depend on them: an NVFP4 operand recipe quantizes the
     /// expert product row (`silu(gate) · up`), and its block scales branch
     /// on the values (`nvfp4::value`'s zero scale, `nvfp4::global_scale`'s
     /// binade corrections, `projection/stage.h`).
-    fn import_source(&self, device: &Device, weight: &WeightPlan, leading: bool) -> Result<Tensor, BuildError>;
+    fn import_source(&self, charges: &seismic::Charges, weight: &WeightPlan, leading: bool) -> Result<Tensor, BuildError>;
 }
 
 impl TuningWeightSource for Package {
@@ -48,10 +48,10 @@ impl TuningWeightSource for Package {
     /// a weight therefore holds on the host what the load's import of it
     /// holds, and no copy of the source besides; `leading`: the plan is of
     /// an expert stack's first experts, a prefix of the stored tensor.
-    fn import_source(&self, device: &Device, weight: &WeightPlan, leading: bool) -> Result<Tensor, BuildError> {
+    fn import_source(&self, charges: &seismic::Charges, weight: &WeightPlan, leading: bool) -> Result<Tensor, BuildError> {
         let artifact = artifact(self, weight.component)?;
         let stored = Stored::of_plan(artifact, weight, leading).map_err(|error| error.to_string())?;
-        Ok(crate::resources::filled_import(weight, &stored, device)?)
+        Ok(crate::resources::filled_import(weight, &stored, charges)?)
     }
 }
 
@@ -90,8 +90,8 @@ impl TuningWeightSource for ZeroTuningWeights {
         ])
     }
 
-    fn import_source(&self, device: &Device, weight: &WeightPlan, _leading: bool) -> Result<Tensor, BuildError> {
-        Ok(Tensor::zeros(device, weight.upload, &[logical_count(&weight.shape)?])?)
+    fn import_source(&self, charges: &seismic::Charges, weight: &WeightPlan, _leading: bool) -> Result<Tensor, BuildError> {
+        Ok(Tensor::zeros(charges, weight.upload, &[logical_count(&weight.shape)?])?)
     }
 
 }
@@ -124,7 +124,8 @@ pub(crate) fn held_elsewhere(tensor: &Tensor) -> bool {
 }
 
 pub(crate) struct TuningWeights<'a> {
-    device: &'a Device,
+    /// What the imported weights are allocated through: the tuning's.
+    charges: &'a seismic::Charges,
     load: &'a ModelLoadPlan,
     source: &'a dyn TuningWeightSource,
     import: &'a ImportKernels,
@@ -187,13 +188,13 @@ pub(crate) fn experts_text(read: u64, layer: u64) -> String {
 
 impl<'a> TuningWeights<'a> {
     pub fn new(
-        device: &'a Device,
+        charges: &'a seismic::Charges,
         load: &'a ModelLoadPlan,
         source: &'a dyn TuningWeightSource,
         import: &'a ImportKernels,
     ) -> Self {
         Self {
-            device,
+            charges,
             load,
             source,
             import,
@@ -264,14 +265,14 @@ impl<'a> TuningWeights<'a> {
         // uploads it.
         if plan.placed_on_host() {
             let bytes = self.source.source_bytes(plan, stack.leading.is_some())?;
-            let tensor = Tensor::from_host(self.device, plan.resident, &plan.shape, &bytes)?;
+            let tensor = Tensor::from_host(self.charges, plan.resident, &plan.shape, &bytes)?;
             self.resident.insert(stack, tensor.clone());
             return Ok(tensor);
         }
-        let source = self.source.import_source(self.device, plan, stack.leading.is_some())?;
-        let destination = Tensor::zeros(self.device, plan.resident, &plan.shape)?;
+        let source = self.source.import_source(self.charges, plan, stack.leading.is_some())?;
+        let destination = Tensor::zeros(self.charges, plan.resident, &plan.shape)?;
         let mut bound = (plan.bound != 0)
-            .then(|| Tensor::zeros(self.device, Element::f32(), &[plan.bound]))
+            .then(|| Tensor::zeros(self.charges, Element::f32(), &[plan.bound]))
             .transpose()?;
         let handle = self
             .import
@@ -283,7 +284,7 @@ impl<'a> TuningWeights<'a> {
                     plan.resident.name()
                 )
             })?;
-        crate::programs::native_import::import_into(&handle, &source, &destination, bound.as_mut())
+        crate::programs::native_import::import_into(&handle, self.charges, &source, &destination, bound.as_mut())
             .map_err(|error| error.to_string())?;
         if let Some(bound) = bound {
             self.bounds.insert(stack, bound);

@@ -159,12 +159,6 @@ impl Claim {
         self.kind
     }
 
-    /// Whether this claim's granules are allocated by a pool entry rather than
-    /// charged directly through [`Self::entry`].
-    pub(crate) fn pooled(&self) -> bool {
-        Holding::Committed(self.kind).pooled()
-    }
-
     pub fn bytes(&self) -> u64 {
         self.ledger().state().entry(self.id()).bytes
     }

@@ -177,10 +177,11 @@ fn every_owner_write_publishes_the_registrys_one_nan() {
     let mut failures = Vec::new();
     for device in devices {
         let backend = device.backend();
+        let charges = seismic::Charges::tally(&device);
         let operations = operations(backend);
         let rows = operations.len();
         let bytes = (0..rows).flat_map(|_| &x).flat_map(|bits| bits.to_le_bytes()).collect::<Vec<_>>();
-        let input = Tensor::from_host(&device, Element::f32(), &[rows as u64, n as u64], &bytes).expect("host tensor");
+        let input = Tensor::from_host(&charges, Element::f32(), &[rows as u64, n as u64], &bytes).expect("host tensor");
         for name in ELEMENTS {
             let kernel = owner_publish::native_for_device_with(
                 &device,
@@ -188,7 +189,7 @@ fn every_owner_write_publishes_the_registrys_one_nan() {
                 &specialization(rows, n),
             )
             .unwrap_or_else(|error| panic!("owner_publish {name} on {backend:?}: {error}"));
-            let result = kernel.call(owner_publish::Args { x: &input }).expect("call");
+            let result = kernel.call(&charges, owner_publish::Args { x: &input }).expect("call");
             let published = result.value.read_to_host().expect("host read");
             let width = if name == "f32" { 4 } else { 2 };
             assert_eq!(published.len(), rows * n * width, "{backend:?} {name}");

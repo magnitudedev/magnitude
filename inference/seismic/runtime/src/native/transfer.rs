@@ -364,7 +364,7 @@ mod tests {
         let transfer = TransferInner::new(&device).unwrap();
         let tensor = |bytes: &[u8]| {
             let representation = seismic_lang::registry::dense(seismic_lang::types::DType::I32);
-            crate::api::tensor::TensorInner::from_host(&device, representation, &[bytes.len() as u64 / 4], bytes).unwrap()
+            crate::api::tensor::TensorInner::from_host(&crate::memory::Charges::tally(&device), representation, &[bytes.len() as u64 / 4], bytes).unwrap()
         };
         let source = tensor(&[1, 2, 3, 4, 5, 6, 7, 8]);
         let destination = tensor(&[0; 8]);

@@ -457,7 +457,7 @@ mod tests {
         let bytes = 48 * MIB;
         let mut held = ledgers.claim(&device, CommittedKind::Load, ClaimDemand { device: bytes, ..Default::default() }).expect("the ledger admits it");
         let _tensor = held
-            .allocate(|| seismic::Tensor::zeros(&device, seismic::Element::bool(), &[bytes]))
+            .allocate(&device, |charges| seismic::Tensor::zeros(charges, seismic::Element::bool(), &[bytes]))
             .expect("Seismic allocates what the ledger admitted");
         let estimate = ledgers.device().estimate();
         assert_eq!(estimate.committed(), bytes);
@@ -483,7 +483,7 @@ mod tests {
         assert!(reader.read_at_event(&ledgers).is_some());
         assert_eq!(ledgers.device().estimate().room(), 16 * MIB, "the reading leaves the claim its room");
         let _tensor = held
-            .allocate(|| seismic::Tensor::zeros(&device, seismic::Element::bool(), &[bytes]))
+            .allocate(&device, |charges| seismic::Tensor::zeros(charges, seismic::Element::bool(), &[bytes]))
             .expect("Seismic allocates what the claim holds");
     }
 
@@ -503,7 +503,7 @@ mod tests {
         let bytes = 48 * MIB;
         let mut held = ledgers.claim(&device, CommittedKind::Load, ClaimDemand { device: bytes, ..Default::default() }).expect("the clean file cache is supply");
         let _tensor = held
-            .allocate(|| seismic::Tensor::zeros(&device, seismic::Element::bool(), &[bytes]))
+            .allocate(&device, |charges| seismic::Tensor::zeros(charges, seismic::Element::bool(), &[bytes]))
             .expect("Seismic allocates what the claim took");
     }
 
@@ -529,21 +529,20 @@ mod tests {
 
         let mut import = ledgers.claim(&device, CommittedKind::Load, ClaimDemand { device: weights, ..Default::default() }).expect("the weights are admitted");
         let _weights = import
-            .allocate(|| seismic::Tensor::zeros(&device, seismic::Element::bool(), &[weights]))
+            .allocate(&device, |charges| seismic::Tensor::zeros(charges, seismic::Element::bool(), &[weights]))
             .expect("Seismic allocates the import");
 
         let ledger = ledgers.device();
         let pool = ledger.pool_block(crate::memory::ledger::PoolClass::State, std::num::NonZeroU64::new(page).unwrap()).blocks;
         let slot = ledgers
-            .claim(&device, CommittedKind::RequestSlot, ClaimDemand { device: page, ..Default::default() })
-            .expect("the request slot fits the free room")
-            .into_request_slot();
+            .claim_request_slot(&device, ClaimDemand { device: page, ..Default::default() })
+            .expect("the request slot fits the free room");
         let mut rows = ledger.reserve(&slot, crate::RequestId(1), page_rows).expect("the first request draws on the slot");
         let mut slabs = crate::domain::state::StateSlabs::default();
         ledger.change(|_| slabs.settle(ledger, 0, 0, 0, page));
         let growth = page + rounding;
         slabs.reserve(ledger, growth).expect("the rounding past the rows fits the free room");
-        let _slab = seismic::memory::charging(&[pool], || seismic::Tensor::zeros(&device, seismic::Element::bool(), &[growth]))
+        let _slab = seismic::Tensor::zeros(&device.charges(|_| pool.clone()), seismic::Element::bool(), &[growth])
             .expect("Seismic allocates the reserved slab");
         rows.grow(page_rows);
         ledger.change(|_| slabs.settle(ledger, growth, 0, page, rows.bytes() + slot.bytes()));
@@ -581,20 +580,19 @@ mod tests {
         // The load claims what it needs to serve, and allocates each claim
         // at once.
         let state_floor = ledgers
-            .claim(&device, CommittedKind::RequestSlot, ClaimDemand { device: floor_bytes, ..Default::default() })
-            .expect("the load's request slot is admitted")
-            .into_request_slot();
+            .claim_request_slot(&device, ClaimDemand { device: floor_bytes, ..Default::default() })
+            .expect("the load's request slot is admitted");
         let mut import = ledgers
             .claim(&device, CommittedKind::Load, ClaimDemand { device: weights, ..Default::default() })
             .expect("the weights, past the free room, take the clean file cache");
         let _weights = import
-            .allocate(|| seismic::Tensor::zeros(&device, seismic::Element::bool(), &[weights]))
+            .allocate(&device, |charges| seismic::Tensor::zeros(charges, seismic::Element::bool(), &[weights]))
             .expect("Seismic allocates the import");
 
         // The first request draws its rows from the slot: nothing more
         // held, and the page it allocates in the pool is admitted.
         let _state = ledger.reserve(&state_floor, crate::RequestId(1), page_rows).expect("the first request draws on the slot");
-        let _page = seismic::memory::charging(&[pool.clone()], || seismic::Tensor::zeros(&device, seismic::Element::bool(), &[page]))
+        let _page = seismic::Tensor::zeros(&device.charges(|_| pool.clone()), seismic::Element::bool(), &[page])
             .expect("Seismic allocates the first page");
         let estimate = ledger.estimate();
         assert_eq!(estimate.committed(), estimate.allocated(), "the charge equals the allocations: the slot is held once");
@@ -615,7 +613,7 @@ mod tests {
         assert!(reader.read_at_event(&ledgers).is_some());
         let (group, units) = ledger.claim_units(CommittedKind::GroupClass, unit, 1);
         assert_eq!(units, 1, "the room that came back holds the staging");
-        let _staging = seismic::memory::charging(&[group.entry()], || seismic::Tensor::zeros(&device, seismic::Element::bool(), &[staging]))
+        let _staging = seismic::Tensor::zeros(&device.charges(|_| group.entry().clone()), seismic::Element::bool(), &[staging])
             .expect("Seismic allocates the staging its claim admitted");
         let estimate = ledger.estimate();
         assert_eq!(estimate.committed(), estimate.allocated(), "the charge equals the allocations with the group's staging");

@@ -89,6 +89,7 @@ fn portable(case: &Case) -> Vec<i32> {
 }
 
 fn native(device: &seismic::Device, case: &Case) -> Vec<i32> {
+    let charges = seismic::Charges::tally(device);
     let m = case.rows() as u64;
     let (spans, r) = span_table(&case.lists);
     let entry = rows_topk::native_entry();
@@ -96,7 +97,7 @@ fn native(device: &seismic::Device, case: &Case) -> Vec<i32> {
         entry.offered(device).unwrap().unwrap().default_specialization(&seismic::NativeSpecialization::new()).unwrap();
     let kernel = entry.prepare(device, &specialization).unwrap();
     let results = kernel
-        .call(rows_topk::Args {
+        .call(&charges, rows_topk::Args {
             scores: &tensor(device, seismic::Element::f32(), &[m, case.n as u64], &case.scores),
             complete: &ints(device, &[m], &case.complete),
             spans: &ints(device, &[m, r as u64, 2], &spans),

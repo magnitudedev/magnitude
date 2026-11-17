@@ -328,14 +328,14 @@ impl SiteLayer {
         })
     }
 
-    /// A layer over `tensors` and `scales` with storage of its own on
-    /// `device`, host-shared: the layer a measurement or an
+    /// A layer over `tensors` and `scales` with storage of its own through
+    /// `charges`, host-shared: the layer a measurement or an
     /// admission serves ([`measure`], `native::qualification::site`), of an
     /// executor of its own whose requests the host writes (no park answers
     /// them), as layer 0 of group 0.
-    pub(crate) fn owned(device: &seismic::Device, tensors: SiteTensors, scales: SiteScales, shape: SiteShape) -> Result<Self, String> {
+    pub(crate) fn owned(charges: &seismic::Charges, tensors: SiteTensors, scales: SiteScales, shape: SiteShape) -> Result<Self, String> {
         let shared = |element: seismic::Element, count: usize| {
-            seismic::Tensor::shared(device, element, &[count as u64]).map_err(|error| format!("site storage: {error}"))
+            seismic::Tensor::shared(charges, element, &[count as u64]).map_err(|error| format!("site storage: {error}"))
         };
         let storage = SiteStorage {
             table: shared(seismic::Element::i32(), shape.table.words() as usize)?,

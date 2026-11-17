@@ -88,11 +88,12 @@ fn specialization(
 }
 
 fn tensor(device: &Device, element: Element, shape: &[usize], bytes: &[u8]) -> Tensor {
+    let charges = seismic::Charges::tally(device);
     let shape = shape
         .iter()
         .map(|extent| *extent as u64)
         .collect::<Vec<_>>();
-    Tensor::from_host(device, element, &shape, bytes).unwrap()
+    Tensor::from_host(&charges, element, &shape, bytes).unwrap()
 }
 
 fn close(actual: &[f32], expected: &[f32], tolerance: f32, what: &str) {
@@ -137,6 +138,7 @@ fn convolve(
 }
 
 fn convolutions_restart_at_every_block(device: &Device) {
+    let charges = seismic::Charges::tally(device);
     let (rows, groups, channels, taps, block) = (10usize, 4usize, 8usize, 3usize, 4u32);
     let width = groups * channels;
     let extents = [
@@ -191,7 +193,7 @@ fn convolutions_restart_at_every_block(device: &Device) {
         &bf16_bytes(&input_values),
     );
     let convolved = kernel
-        .call(draft_convolve_input::Args {
+        .call(&charges, draft_convolve_input::Args {
             input: &input,
             dynamic: &dynamic,
             base: &base,
@@ -246,7 +248,7 @@ fn convolutions_restart_at_every_block(device: &Device) {
         &f32_bytes(&residual_values),
     );
     let finished = kernel
-        .call(draft_convolve_residual::Args {
+        .call(&charges, draft_convolve_residual::Args {
             residual: &residual,
             output: &output,
             dynamic: &dynamic,
@@ -279,6 +281,7 @@ fn convolutions_restart_at_every_block(device: &Device) {
 }
 
 fn gated_rows_are_silu_times_up(device: &Device) {
+    let charges = seismic::Charges::tally(device);
     let (rows, width) = (3usize, 300usize);
     let entry = draft_gated_rows::native_entry_with(draft_gated_rows::Elements { A: Element::bf16() });
     let implementation = entry
@@ -304,7 +307,7 @@ fn gated_rows_are_silu_times_up(device: &Device) {
         .map(bf16_round)
         .collect::<Vec<_>>();
     let gated = kernel
-        .call(draft_gated_rows::Args {
+        .call(&charges, draft_gated_rows::Args {
             gate: &tensor(
                 device,
                 Element::bf16(),
@@ -334,6 +337,7 @@ fn gated_rows_are_silu_times_up(device: &Device) {
 }
 
 fn top_k_orders_by_value_then_token(device: &Device, vocabulary: usize, count: usize) {
+    let charges = seismic::Charges::tally(device);
     let rows = 3usize;
     let mut logits = values(rows * vocabulary, 8);
     // Ties: row 1 holds its maximum at tokens 900 and 7; row 2 at 3 tokens.
@@ -381,7 +385,7 @@ fn top_k_orders_by_value_then_token(device: &Device, vocabulary: usize, count: u
         &f32_bytes(&vec![0.0; rows * count]),
     );
     kernel
-        .call(draft_top_k::Args {
+        .call(&charges, draft_top_k::Args {
             logits: &tensor(
                 device,
                 Element::f32(),
@@ -413,6 +417,7 @@ fn top_k_orders_by_value_then_token(device: &Device, vocabulary: usize, count: u
 }
 
 fn path_step_selects_the_best_joint_score(device: &Device) {
+    let charges = seismic::Charges::tally(device);
     let (slots, count, rank) = (4usize, 6usize, 64usize);
     let hidden_values = values(slots * rank, 9)
         .into_iter()
@@ -482,7 +487,7 @@ fn path_step_selects_the_best_joint_score(device: &Device) {
         &i32_bytes(&vec![-1; slots * 2]),
     );
     kernel
-        .call(draft_path_step::Args {
+        .call(&charges, draft_path_step::Args {
             candidates: &tensor(
                 device,
                 Element::i32(),

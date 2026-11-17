@@ -26,7 +26,8 @@ const QUEUED: u64 = 1 << 14;
 
 /// A `NODES`-kernel graph of `scale_rows` over one row, sealed on the
 /// calling thread, and a launch of it.
-fn busy_graph(device: &seismic::Device) -> impl FnMut() -> seismic::NativeGraphCompletion {
+fn busy_graph(charges: &seismic::Charges) -> impl FnMut() -> seismic::NativeGraphCompletion + '_ {
+    let device = &charges.device();
     let kernel = scale_rows::native_for_device(device, &NativeSpecialization::new().with_param("ROWS", 1)).unwrap();
     let mut graph = device.native_graph();
     let input = graph.port(Element::f32(), &[1, 4]).unwrap();
@@ -37,13 +38,13 @@ fn busy_graph(device: &seismic::Device) -> impl FnMut() -> seismic::NativeGraphC
     graph.export(&value).unwrap();
     let plan = graph.seal().unwrap();
     let family = NativeGraphFamily::new(&[plan.clone()], 1).unwrap();
-    let mut slot = family.new_slot(&[family.upload_bytes()]).unwrap();
-    let mut output_slot = Some(family.new_output_slot().unwrap());
-    let x = Tensor::from_host(device, Element::f32(), &[1, 4], &f32_bytes(&[1.0; 4])).unwrap();
+    let mut slot = family.new_slot(charges, &[family.upload_bytes()]).unwrap();
+    let mut output_slot = Some(family.new_output_slot(charges).unwrap());
+    let x = Tensor::from_host(charges, Element::f32(), &[1, 4], &f32_bytes(&[1.0; 4])).unwrap();
     move || {
         let outputs = output_slot.take().unwrap().activate(&plan).unwrap();
         let mut bindings = plan.bindings();
-        bindings.set(&input, &x).unwrap();
+        bindings.set(charges, &input, &x).unwrap();
         let (outputs, completion) = slot.activate(&plan).unwrap().attach(bindings, outputs).unwrap().submit().unwrap();
         output_slot = Some(outputs.recycle().unwrap());
         completion
@@ -115,6 +116,7 @@ fn a_wait_answered_by_host_words_alone_ends_while_other_threads_are_stuck_in_the
     let _turn = SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
     let n = 1024u64;
     for device in seismic_native_tests::devices(&[BackendName::Metal, BackendName::Cuda, BackendName::Vulkan]) {
+        let charges = seismic::Charges::tally(&device);
         let backend = device.backend();
         let kernel = parked_scale::native_for_device(&device, &NativeSpecialization::new()).unwrap();
         let after_kernel = scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1)).unwrap();
@@ -140,13 +142,13 @@ fn a_wait_answered_by_host_words_alone_ends_while_other_threads_are_stuck_in_the
         graph.export(&value).unwrap();
         let plan = graph.seal().unwrap();
         let family = NativeGraphFamily::new(&[plan.clone()], 1).unwrap();
-        let mut slot = family.new_slot(&[family.upload_bytes()]).unwrap();
+        let mut slot = family.new_slot(&charges, &[family.upload_bytes()]).unwrap();
 
         // The data the call waits for, host-shared as a host tier is, and
         // its words; all written before the busy threads start.
-        let data = Tensor::shared(&device, Element::f32(), &[n]).unwrap();
-        let word = Tensor::shared(&device, Element::i32(), &[1]).unwrap();
-        let skipped = Tensor::shared(&device, Element::i32(), &[1]).unwrap();
+        let data = Tensor::shared(&charges, Element::f32(), &[n]).unwrap();
+        let word = Tensor::shared(&charges, Element::i32(), &[1]).unwrap();
+        let skipped = Tensor::shared(&charges, Element::i32(), &[1]).unwrap();
         // SAFETY: no device work uses them yet.
         unsafe {
             data.write_shared(0, &vec![0; 4 * n as usize]).unwrap();
@@ -158,16 +160,16 @@ fn a_wait_answered_by_host_words_alone_ends_while_other_threads_are_stuck_in_the
             Timeline::<seismic::timeline::Reached>::new(&device).unwrap(),
         );
         let start = Instant::now();
-        let outputs = family.new_output_slot().unwrap().activate(&plan).unwrap();
+        let outputs = family.new_output_slot(&charges).unwrap().activate(&plan).unwrap();
         let mut bindings = plan.bindings();
-        bindings.set(&answer, &word).unwrap();
-        bindings.set(&skip, &skipped).unwrap();
-        bindings.set(&input, &data).unwrap();
+        bindings.set(&charges, &answer, &word).unwrap();
+        bindings.set(&charges, &skip, &skipped).unwrap();
+        bindings.set(&charges, &input, &data).unwrap();
         bindings.set_park(park, &parks).unwrap();
         bindings.set_timeline(after, &done, 1).unwrap();
         // The busy threads' graphs, prepared before the park: a graph slot
         // is created only between flights.
-        let (first, queueing) = (busy_graph(&device), busy_graph(&device));
+        let (first, queueing) = (busy_graph(&charges), busy_graph(&charges));
         let (outputs, completion) = slot.activate(&plan).unwrap().attach(bindings, outputs).unwrap().submit().unwrap();
         let parked = outputs.park(park);
         let answering = Answer { word: &word, parks: &parks, parked, answered: false };
@@ -254,6 +256,7 @@ fn a_wait_for_a_transfer_returns_as_it_lands_beside_a_parked_call() {
     const TIMEOUT: Duration = Duration::from_secs(5);
     let n = 1024u64;
     for device in seismic_native_tests::devices(&[BackendName::Cuda, BackendName::Vulkan]) {
+        let charges = seismic::Charges::tally(&device);
         let backend = device.backend();
         let kernel = parked_scale::native_for_device(&device, &NativeSpecialization::new()).unwrap();
         let mut graph = device.native_graph();
@@ -269,11 +272,11 @@ fn a_wait_for_a_transfer_returns_as_it_lands_beside_a_parked_call() {
         graph.export(&waited).unwrap();
         let plan = graph.seal().unwrap();
         let family = NativeGraphFamily::new(&[plan.clone()], 1).unwrap();
-        let mut slot = family.new_slot(&[family.upload_bytes()]).unwrap();
+        let mut slot = family.new_slot(&charges, &[family.upload_bytes()]).unwrap();
 
-        let data = Tensor::shared(&device, Element::f32(), &[n]).unwrap();
-        let word = Tensor::shared(&device, Element::i32(), &[1]).unwrap();
-        let skipped = Tensor::shared(&device, Element::i32(), &[1]).unwrap();
+        let data = Tensor::shared(&charges, Element::f32(), &[n]).unwrap();
+        let word = Tensor::shared(&charges, Element::i32(), &[1]).unwrap();
+        let skipped = Tensor::shared(&charges, Element::i32(), &[1]).unwrap();
         // SAFETY: no device work uses them yet.
         unsafe {
             data.write_shared(0, &vec![0; 4 * n as usize]).unwrap();
@@ -281,9 +284,9 @@ fn a_wait_for_a_transfer_returns_as_it_lands_beside_a_parked_call() {
             skipped.write_shared(0, &[0; 4]).unwrap();
         }
         let shape = [RECORDS, RECORD];
-        let mut tier = Tensor::shared(&device, Element::bool(), &shape).unwrap();
+        let mut tier = Tensor::shared(&charges, Element::bool(), &shape).unwrap();
         tier.write_from_host(&vec![7u8; (RECORDS * RECORD) as usize]).unwrap();
-        let into = Tensor::zeros(&device, Element::bool(), &shape).unwrap();
+        let into = Tensor::zeros(&charges, Element::bool(), &shape).unwrap();
         let transfer = seismic::Transfer::new(&device).unwrap();
         let runs = (0..RECORDS)
             .map(|record| {
@@ -301,11 +304,11 @@ fn a_wait_for_a_transfer_returns_as_it_lands_beside_a_parked_call() {
             Timeline::<seismic::timeline::Parks>::new(&device).unwrap(),
             Timeline::<seismic::timeline::Reached>::new(&device).unwrap(),
         );
-        let outputs = family.new_output_slot().unwrap().activate(&plan).unwrap();
+        let outputs = family.new_output_slot(&charges).unwrap().activate(&plan).unwrap();
         let mut bindings = plan.bindings();
-        bindings.set(&answer, &word).unwrap();
-        bindings.set(&skip, &skipped).unwrap();
-        bindings.set(&input, &data).unwrap();
+        bindings.set(&charges, &answer, &word).unwrap();
+        bindings.set(&charges, &skip, &skipped).unwrap();
+        bindings.set(&charges, &input, &data).unwrap();
         bindings.set_park(park, &parks).unwrap();
         bindings.set_timeline(after, &done, 1).unwrap();
         let (outputs, completion) = slot.activate(&plan).unwrap().attach(bindings, outputs).unwrap().submit().unwrap();

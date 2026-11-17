@@ -71,25 +71,25 @@ macro_rules! generated_entry {
         #[cfg(feature = "tuning-survey")]
         fn tune(
             &self,
-            device: &seismic::Device,
+            charges: &seismic::Charges,
             statics: &seismic::NativeSpecialization,
             points: &mut dyn seismic::PointSource<'_, Self::Entry>,
             validation: seismic::NumericalRequirement,
             strategy: seismic::Strategy,
         ) -> Result<seismic::TuningResult, seismic::TuneError> {
             let $this = self;
-            $module::native_tune_with(device, $elements, statics, points, validation, strategy)
+            $module::native_tune_with(charges, $elements, statics, points, validation, strategy)
         }
 
         fn open(
             &self,
-            device: &seismic::Device,
+            charges: &seismic::Charges,
             statics: &seismic::NativeSpecialization,
             validation: seismic::NumericalRequirement,
         ) -> Result<Box<dyn super::EntrySearch<Self::Entry>>, seismic::TuneError> {
             let $this = self;
             Ok(Box::new($module::native_search_with(
-                device, $elements, statics, validation,
+                charges, $elements, statics, validation,
             )?))
         }
 
@@ -111,23 +111,23 @@ macro_rules! generated_entry {
         #[cfg(feature = "tuning-survey")]
         fn tune(
             &self,
-            device: &seismic::Device,
+            charges: &seismic::Charges,
             statics: &seismic::NativeSpecialization,
             points: &mut dyn seismic::PointSource<'_, Self::Entry>,
             validation: seismic::NumericalRequirement,
             strategy: seismic::Strategy,
         ) -> Result<seismic::TuningResult, seismic::TuneError> {
-            $module::native_tune(device, statics, points, validation, strategy)
+            $module::native_tune(charges, statics, points, validation, strategy)
         }
 
         fn open(
             &self,
-            device: &seismic::Device,
+            charges: &seismic::Charges,
             statics: &seismic::NativeSpecialization,
             validation: seismic::NumericalRequirement,
         ) -> Result<Box<dyn super::EntrySearch<Self::Entry>>, seismic::TuneError> {
             Ok(Box::new($module::native_search(
-                device, statics, validation,
+                charges, statics, validation,
             )?))
         }
 
@@ -1163,7 +1163,7 @@ pub(crate) trait EntryTuning: Clone + 'static {
     #[cfg(feature = "tuning-survey")]
     fn tune(
         &self,
-        device: &Device,
+        charges: &seismic::Charges,
         statics: &NativeSpecialization,
         points: &mut dyn seismic::PointSource<'_, Self::Entry>,
         validation: seismic::NumericalRequirement,
@@ -1173,7 +1173,7 @@ pub(crate) trait EntryTuning: Clone + 'static {
     /// `native_search[_with]`.
     fn open(
         &self,
-        device: &Device,
+        charges: &seismic::Charges,
         statics: &NativeSpecialization,
         validation: seismic::NumericalRequirement,
     ) -> Result<Box<dyn EntrySearch<Self::Entry>>, TuneError>;
@@ -2318,7 +2318,8 @@ impl ModelInputs<'_> {
 
 pub(crate) struct TuningInputs<'w, 'a> {
     model: ModelInputs<'a>,
-    pub device: &'a Device,
+    /// What the units' inputs are allocated through: the search's.
+    pub charges: &'a seismic::Charges,
     pub weights: &'w mut TuningWeights<'a>,
     noise: &'w Noise,
     /// Tensors shared by the units of one tuning, by a name that identifies
@@ -2438,7 +2439,7 @@ impl TuningInputs<'_, '_> {
             )));
         }
         let bytes = generate(count)?;
-        Ok(Tensor::from_host(self.device, element, extents, &bytes)?)
+        Ok(Tensor::from_host(self.charges, element, extents, &bytes)?)
     }
 
     /// An `i32` tensor of `values`.
@@ -2448,7 +2449,7 @@ impl TuningInputs<'_, '_> {
             .flat_map(|value| value.to_le_bytes())
             .collect::<Vec<_>>();
         Ok(Tensor::from_host(
-            self.device,
+            self.charges,
             Element::i32(),
             extents,
             &bytes,
@@ -2462,7 +2463,7 @@ impl TuningInputs<'_, '_> {
             .flat_map(|value| value.to_le_bytes())
             .collect::<Vec<_>>();
         Ok(Tensor::from_host(
-            self.device,
+            self.charges,
             Element::u32(),
             extents,
             &bytes,
@@ -2476,7 +2477,7 @@ impl TuningInputs<'_, '_> {
             .flat_map(|value| value.to_le_bytes())
             .collect::<Vec<_>>();
         Ok(Tensor::from_host(
-            self.device,
+            self.charges,
             Element::f32(),
             extents,
             &bytes,
@@ -2492,7 +2493,7 @@ impl TuningInputs<'_, '_> {
     /// A zeroed tensor owned by the case: outputs and tables the entry
     /// overwrites.
     pub fn scratch(&self, element: Element, extents: &[u64]) -> Result<Tensor, BuildError> {
-        Ok(Tensor::zeros(self.device, element, extents)?)
+        Ok(Tensor::zeros(self.charges, element, extents)?)
     }
 
     /// `tensor` lent to a `&mut` parameter that writes leading-axis rows
@@ -2559,7 +2560,7 @@ impl TuningInputs<'_, '_> {
             return Err("a tuning slab has invalid row bounds".into());
         }
         let slab = crate::experts::pooled_slabs(
-            self.device,
+            self.charges,
             seismic::Contract::DeviceOnly,
             rows,
             rows,
@@ -2954,7 +2955,7 @@ impl<'a> allocation::Unit for Box<dyn SearchedUnit<'a> + 'a> {
             .next()
             .expect("a unit performs the work it named")
             .stage;
-        let device = tuner.device;
+        let device = &tuner.charges.device();
         let charged_before = allocated(device);
         let resident = <Self as allocation::Unit>::holding(self) > 0;
         let host_before = seismic::ProcessMemory::footprint_now();
@@ -3075,7 +3076,7 @@ impl<'a> allocation::Unit for Box<dyn SearchedUnit<'a> + 'a> {
     fn refused_for_bytes(&mut self, tuner: &mut Tuner<'a>) {
         if tuner.memory.no_room.is_none() {
             if let Some(room) = tuner.room_now() {
-                tuner.memory.read_room(tuner.device, room);
+                tuner.memory.read_room(&tuner.charges.device(), room);
             }
             tuner.memory.no_room = Some(tuner.no_room(self));
         }
@@ -3095,7 +3096,7 @@ impl<'a> allocation::Unit for Box<dyn SearchedUnit<'a> + 'a> {
     }
 
     fn free(tuner: &Tuner<'a>) -> Option<u64> {
-        tuner.memory.free(tuner.device, tuner.room_now())
+        tuner.memory.free(&tuner.charges.device(), tuner.room_now())
     }
 
     fn host_free(tuner: &Tuner<'a>) -> allocation::HostRoom {
@@ -3122,7 +3123,7 @@ impl<'a> allocation::Unit for Box<dyn SearchedUnit<'a> + 'a> {
     }
 
     fn capacity(tuner: &Tuner<'a>) -> Option<u64> {
-        tuner.memory.capacity(tuner.device, tuner.room_now())
+        tuner.memory.capacity(&tuner.charges.device(), tuner.room_now())
     }
 }
 
@@ -3343,7 +3344,7 @@ impl<'a, T: EntryTuning> SearchedUnit<'a> for CaseUnit<'a, T> {
             min_sample_seconds: MIN_SAMPLE_SECONDS,
             start: self
                 .case
-                .search_starts(&ranged::EVERY_ROW, tuner.device, &self.implementation, &self.statics, tuner.limits),
+                .search_starts(&ranged::EVERY_ROW, &tuner.charges.device(), &self.implementation, &self.statics, tuner.limits),
         });
         let cutoff = tuner.started + before;
         let searching = Instant::now();
@@ -3366,7 +3367,7 @@ impl<'a, T: EntryTuning> SearchedUnit<'a> for CaseUnit<'a, T> {
         let room = tuner.room_now();
         tuner
             .memory
-            .observe(tuner.device, performed.memory.ledger_peak_bytes, room);
+            .observe(&tuner.charges.device(), performed.memory.ledger_peak_bytes, room);
         self.resident_footprint = performed.memory.resident_footprint;
         // A promotion is published with the unit's record as it stands,
         // served from that instant. What a piece measures or
@@ -3606,7 +3607,9 @@ type StoredSlot<'c> = (
 /// record when its served choice changes, and stops when nothing that fits
 /// is left, publishing once more each record that changed since.
 pub(crate) struct Tuner<'a> {
-    device: &'a Device,
+    /// What the tuning allocates through, on its device: the claim its
+    /// preparation holds.
+    charges: &'a seismic::Charges,
     context: TuningContext<'a>,
     limits: TuningLimits,
     weights: TuningWeights<'a>,
@@ -3660,7 +3663,7 @@ pub(crate) struct Tuner<'a> {
     /// thread.
     /// None once the search has ended: the walk that follows it compiles
     /// nothing a stored record does not serve, and holds no thread.
-    staff: Option<Staff<'a>>,
+    staff: Option<Staff>,
 }
 
 /// One preparation's worker threads, lent to its device for as long as the
@@ -3669,8 +3672,8 @@ pub(crate) struct Tuner<'a> {
 /// run on these threads and no others. The tuner owns the concurrency of
 /// the load's formation; the device and its toolchain start no thread per
 /// compile. The threads are joined when the tuner is done.
-struct Staff<'a> {
-    device: &'a Device,
+struct Staff {
+    device: Device,
     workers: Arc<seismic::Workers>,
 }
 
@@ -3689,15 +3692,15 @@ enum MandatoryFormed {
     Untuned(Result<Duration, CatalogFailure>),
 }
 
-impl<'a> Staff<'a> {
-    fn of(device: &'a Device) -> Self {
+impl Staff {
+    fn of(device: Device) -> Self {
         let workers = Arc::new(seismic::Workers::of_the_host());
         device.staff(Some(workers.clone()));
         Self { device, workers }
     }
 }
 
-impl Drop for Staff<'_> {
+impl Drop for Staff {
     fn drop(&mut self) {
         self.device.staff(None);
     }
@@ -3782,11 +3785,11 @@ impl<'a> Tuner<'a> {
             canonical: HashMap::new(),
         };
         self.provisional.clear();
-        self.staff = Some(Staff::of(self.device));
+        self.staff = Some(Staff::of(self.charges.device()));
         self
     }
-    pub(super) fn device(&self) -> &'a Device {
-        self.device
+    pub(super) fn device(&self) -> Device {
+        self.charges.device()
     }
     fn budget(&self) -> Duration {
         self.context.settings.budget
@@ -3834,13 +3837,13 @@ impl<'a> Tuner<'a> {
             room(
                 "device",
                 self.memory.ceiling_bytes,
-                Some(self.memory.held(self.device)),
+                Some(self.memory.held(&self.charges.device())),
                 charged,
             ),
             room(
                 "footprint",
                 self.memory.footprint_ceiling_bytes,
-                self.memory.held_whole(self.device),
+                self.memory.held_whole(&self.charges.device()),
                 charged.saturating_add(compile),
             ),
             room(
@@ -3869,14 +3872,14 @@ impl<'a> Tuner<'a> {
     /// A tuner that counts the units of a walk: the first phase of a
     /// search.
     pub fn count(
-        device: &'a Device,
+        charges: &'a seismic::Charges,
         context: TuningContext<'a>,
         limits: TuningLimits,
         weights: TuningWeights<'a>,
         invocations: super::specialization::InvocationDemand,
     ) -> Self {
         Self::in_phase(
-            device,
+            charges,
             context,
             limits,
             weights,
@@ -3896,7 +3899,7 @@ impl<'a> Tuner<'a> {
     /// search its host then runs replaces them all. The load that serves
     /// defaults reads whatever is stored: it comes after that search.
     pub fn serve(
-        device: &'a Device,
+        charges: &'a seismic::Charges,
         context: TuningContext<'a>,
         limits: TuningLimits,
         weights: TuningWeights<'a>,
@@ -3904,7 +3907,7 @@ impl<'a> Tuner<'a> {
         unprepared: UnpreparedUnits,
     ) -> Self {
         Self::in_phase(
-            device,
+            charges,
             TuningContext {
                 settings: TuningSettings {
                     fresh: context.settings.fresh && unprepared == UnpreparedUnits::Report,
@@ -3920,7 +3923,7 @@ impl<'a> Tuner<'a> {
     }
 
     fn in_phase(
-        device: &'a Device,
+        charges: &'a seismic::Charges,
         context: TuningContext<'a>,
         limits: TuningLimits,
         weights: TuningWeights<'a>,
@@ -3928,7 +3931,7 @@ impl<'a> Tuner<'a> {
         phase: Phase<'a>,
     ) -> Self {
         Self {
-            device,
+            charges,
             context,
             limits,
             weights,
@@ -3972,7 +3975,7 @@ impl<'a> Tuner<'a> {
             staff: match phase {
                 Phase::Serve(_) => None,
                 Phase::Count { .. } | Phase::Census { .. } | Phase::Searched => {
-                    Some(Staff::of(device))
+                    Some(Staff::of(charges.device()))
                 }
             },
             phase,
@@ -3993,7 +3996,7 @@ impl<'a> Tuner<'a> {
 
     /// The room the search is held to, read now; none without a room.
     fn room_now(&self) -> Option<RoomNow> {
-        self.room.map(|room| room.now(self.device))
+        self.room.map(|room| room.now(&self.charges.device()))
     }
 
     /// Publish a unit's record as it stands: derive it (`record`), store it
@@ -4046,15 +4049,15 @@ impl<'a> Tuner<'a> {
         else {
             unreachable!("a census follows the count");
         };
-        self.memory.began_bytes = allocated(self.device);
-        self.memory.device_separate = device_separate(self.device);
+        self.memory.began_bytes = allocated(&self.charges.device());
+        self.memory.device_separate = device_separate(&self.charges.device());
         // The search holds no more than the platform lets the engine claim
         // ([`TuningRoom`]). Where the device's memory is the host's, its
         // charges and the process's footprint are one domain under one
         // ceiling; where it is apart, host RAM is a second domain with the
         // platform's own room.
         if let Some(room) = self.room_now() {
-            self.memory.read_room(self.device, room);
+            self.memory.read_room(&self.charges.device(), room);
         }
         // The units' canonical programs and the untuned entries compile
         // together on the load's worker threads: a compile needs nothing of
@@ -4115,7 +4118,7 @@ impl<'a> Tuner<'a> {
             let observed = grounded.len();
             let threads = self
                 .memory
-                .compile_threads(self.device, self.room_now())
+                .compile_threads(&self.charges.device(), self.room_now())
                 .map_or(1, |threads| threads.max(1))
                 .min(observed.max(1))
                 .min(groundings.len() - observed);
@@ -4195,7 +4198,7 @@ impl<'a> Tuner<'a> {
                 (key, count)
             })
             .collect::<HashMap<_, _>>();
-        self.memory.mandatory_bytes = allocated(self.device);
+        self.memory.mandatory_bytes = allocated(&self.charges.device());
         self.memory.peak_bytes = self.memory.mandatory_bytes;
         let searches = !launches.is_empty();
         self.first_load_search = searches;
@@ -4298,10 +4301,10 @@ impl<'a> Tuner<'a> {
                     }),
             );
         drop(threads);
-        self.memory.ended_bytes = allocated(self.device);
+        self.memory.ended_bytes = allocated(&self.charges.device());
         let ended = self.memory.ended_bytes;
         let room = self.room_now();
-        self.memory.observe(self.device, ended, room);
+        self.memory.observe(&self.charges.device(), ended, room);
         self.memory.process_peak_bytes = process_peak_bytes();
         // Every unit reports its record as the allocator left it published,
         // whatever became of the work: each has served a published legal
@@ -4404,7 +4407,7 @@ impl<'a> Tuner<'a> {
     fn inputs(&mut self) -> TuningInputs<'_, 'a> {
         TuningInputs {
             model: self.model(),
-            device: self.device,
+            charges: self.charges,
             weights: &mut self.weights,
             noise: &self.noise,
             shared: &mut self.shared,
@@ -4474,7 +4477,7 @@ impl<'a> Tuner<'a> {
             .map_err(|error| failure(error.to_string()))?;
         // The implementation as the device offers it, bound once for the
         // unit, and its canonical default, as a stored fallback holds it.
-        let offered = offered(case, self.device).map_err(failure)?;
+        let offered = offered(case, &self.charges.device()).map_err(failure)?;
         let defaults = offered
             .default_specialization(statics)
             .map_err(|error| failure(format!("the device offers no default at these statics: {error}")))?;
@@ -4579,7 +4582,7 @@ impl<'a> Tuner<'a> {
             if survey_plan(key.0).is_none() {
                 let requirement = self.context.numerical_profile.requirement(&case.entry());
                 let search = case
-                    .open(self.device, statics, requirement)
+                    .open(self.charges, statics, requirement)
                     .map_err(|error| failure(error.to_string()))?;
                 let cases: UnitCases<T::Case> = UnitCases {
                     points: shapes.iter().map(|_| None).collect(),
@@ -4852,7 +4855,7 @@ impl<'a> Tuner<'a> {
             return Ok(digest.clone());
         }
         let digest = case
-            .digest(self.device, statics)
+            .digest(&self.charges.device(), statics)
             .map_err(|error| error.to_string())?;
         self.digests.borrow_mut().insert(key, digest.clone());
         Ok(digest)
@@ -4874,7 +4877,7 @@ impl<'a> Tuner<'a> {
         let digest = self.implementation_digest(case, statics)?;
         let requirement = self.context.numerical_profile.requirement(&case.entry());
         let key = TuningCacheKey::of(&tuning_key_material(
-            self.device,
+            &self.charges.device(),
             entry,
             &case.bindings(),
             statics,
@@ -4926,7 +4929,7 @@ impl<'a> Tuner<'a> {
             // formed and checked for; the walk that prepares it forms what
             // it serves, once.
             let chosen = choice.overall.specialization();
-            if !case.stored_valid(self.device, &chosen) {
+            if !case.stored_valid(&self.charges.device(), &chosen) {
                 return Err(format!(
                     "terminal tuning choice for {entry} fails its served contract; search cannot reopen"
                 ));
@@ -4964,11 +4967,11 @@ impl<'a> Tuner<'a> {
             points: shapes.iter().map(|_| None).collect(),
             guard: None,
         };
-        let device = self.device;
+        let charges = self.charges;
         let observer = self.context.observer;
         let result = case
             .tune(
-                device,
+                charges,
                 statics,
                 &mut SurveyedPoints {
                     points: UnitPoints {

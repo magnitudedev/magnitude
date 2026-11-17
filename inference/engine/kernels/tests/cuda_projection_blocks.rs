@@ -72,6 +72,7 @@ fn cuda_recurrent_project_iq4_matches_host_model() {
 
 fn recurrent_project_cases(mixes: &[[Option<Format>; 4]], seed: u64) {
     let Some(device) = cuda() else { return };
+    let charges = seismic::Charges::tally(&device);
     let mut rng = Rng(seed);
     let (h, nk, nv, w) = (512usize, 2usize, 4usize, 64usize);
     let (qkv, z) = ((2 * nk + nv) * w, nv * w);
@@ -130,7 +131,7 @@ fn recurrent_project_cases(mixes: &[[Option<Format>; 4]], seed: u64) {
                 }
                 let projected = projection
                     .kernel(&device, mapping)
-                    .call(gated_delta_project::Args {
+                    .call(&charges, gated_delta_project::Args {
                         hidden: &hidden,
                         input_norm: &norm,
                         qkv_weight: &weights[0].tensor,
@@ -179,6 +180,7 @@ fn cuda_attention_project_grids_match_host_model() {
 
 fn attention_project_cases(sets: &[[Format; 3]], seed: u64) {
     let Some(device) = cuda() else { return };
+    let charges = seismic::Charges::tally(&device);
     let mut rng = Rng(seed);
     let (d, kv, g, w) = (512usize, 2usize, 2usize, 64usize);
     let (query, keys) = (kv * g * 2 * w, kv * w);
@@ -237,7 +239,7 @@ fn attention_project_cases(sets: &[[Format; 3]], seed: u64) {
                 let project = |project_mode| {
                     projection
                         .kernel(&device, mapping)
-                        .call(attention_project::Args {
+                        .call(&charges, attention_project::Args {
                             hidden: &hidden,
                             input_norm: &norm,
                             query_weight: &weights[0].tensor,
@@ -313,6 +315,7 @@ fn attention_output_projection(
 
 fn attention_output_matches_host_model(format: Format) {
     let Some(device) = cuda() else { return };
+    let charges = seismic::Charges::tally(&device);
     let mut rng = Rng(59);
     let (d, q, w) = (272usize, 4usize, 128usize);
     let output = weight(&device, format, d, q * w, &mut rng);
@@ -337,7 +340,7 @@ fn attention_output_matches_host_model(format: Format) {
                 .unzip();
             let result = projection
                 .kernel(&device, mapping)
-                .call(attention_output::Args {
+                .call(&charges, attention_output::Args {
                     hidden: &hidden,
                     inject: &no_inject(&device, hidden.extents()[0]),
                     gated: &gated_tensor,
@@ -364,6 +367,7 @@ fn attention_output_matches_host_model(format: Format) {
 #[test]
 fn cuda_scaled_projections_match_host_model() {
     let Some(device) = cuda() else { return };
+    let charges = seismic::Charges::tally(&device);
     /// The segments' second-level scales, query, gate, key, value: none a
     /// power of two, each distinct, so a scale bound to the wrong segment
     /// fails.
@@ -429,7 +433,7 @@ fn cuda_scaled_projections_match_host_model() {
                 let slack = sum_slack(&flips, &operand);
                 let projected = projection
                     .kernel(&device, mapping)
-                    .call(attention_project::Args {
+                    .call(&charges, attention_project::Args {
                         hidden: &hidden,
                         input_norm: &norm,
                         query_weight: &projections[0].tensor,
@@ -495,7 +499,7 @@ fn cuda_scaled_projections_match_host_model() {
                     .unzip();
                 let result = output_projection
                     .kernel(&device, mapping)
-                    .call(attention_output::Args {
+                    .call(&charges, attention_output::Args {
                         hidden: &hidden,
                         inject: &no_inject(&device, hidden.extents()[0]),
                         gated: &gated,
@@ -529,5 +533,5 @@ gguf_format_tests! {
 
 /// The inject port of a single residual stream: no columns.
 fn no_inject(device: &seismic::Device, rows: u64) -> seismic::Tensor {
-    seismic::Tensor::zeros(device, seismic::Element::f32(), &[rows, 0]).unwrap()
+    seismic::Tensor::zeros(&seismic::Charges::tally(device), seismic::Element::f32(), &[rows, 0]).unwrap()
 }

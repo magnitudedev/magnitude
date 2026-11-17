@@ -104,9 +104,9 @@ fn devices_of(backends: &[BackendName], store: &Arc<ProgramStore>) -> Vec<Device
 /// The input of `split_sum` at N = 1000, all ones.
 const N: u64 = 1000;
 
-fn ones(device: &Device) -> Tensor {
+fn ones(charges: &seismic::Charges) -> Tensor {
     let bytes = (0..N).flat_map(|_| 1.0f32.to_le_bytes()).collect::<Vec<_>>();
-    Tensor::from_host(device, Element::f32(), &[N], &bytes).expect("host tensor")
+    Tensor::from_host(charges, Element::f32(), &[N], &bytes).expect("host tensor")
 }
 
 /// The value of `split_sum`'s result `sum`, which sums [`ones`].
@@ -126,8 +126,9 @@ fn form_and_run(device: &Device) {
         .expect("statics");
     let kernel = split_sum::native_for_device(device, &defaults)
         .unwrap_or_else(|error| panic!("{:?}: {error}", device.backend()));
-    let x = ones(device);
-    checked_sum(device, &kernel.call(split_sum::Args { x: &x }).expect("call").value);
+    let charges = seismic::Charges::tally(device);
+    let x = ones(&charges);
+    checked_sum(device, &kernel.call(&charges, split_sum::Args { x: &x }).expect("call").value);
 }
 
 /// What forming `split_sum` on fresh devices of `backend` over `store`
@@ -158,8 +159,9 @@ fn formed(backend: BackendName, store: &Arc<RecordingStore>) -> Option<(u64, u64
 /// mapping to choose and every process forms the same kernel whichever
 /// estimates its analytical context measured.
 fn form_and_run_planned(device: &Device) {
+    let charges = seismic::Charges::tally(device);
     let analytical = seismic::PreparationOptions::analytical(seismic::PrecisionPolicy::Exact);
-    match add_one::for_device(device, analytical) {
+    match add_one::for_device(&charges, analytical) {
         Ok(_) => println!("{CHILD} analytical {:?} prepared", device.backend()),
         Err(error) => println!("{CHILD} analytical {:?} not prepared: {error}", device.backend()),
     }
@@ -167,9 +169,9 @@ fn form_and_run_planned(device: &Device) {
         seismic::PrecisionPolicy::Exact,
         seismic::FeedbackOptions { search_time: std::time::Duration::ZERO, ..Default::default() },
     );
-    let kernel = add_one::for_device(device, options).unwrap_or_else(|error| panic!("{:?}: {error}", device.backend()));
-    let x = Tensor::from_host(device, Element::f32(), &[1], &1.0f32.to_le_bytes()).expect("host tensor");
-    let result = kernel.call(add_one::Args { x: &x }).expect("call").value;
+    let kernel = add_one::for_device(&charges, options).unwrap_or_else(|error| panic!("{:?}: {error}", device.backend()));
+    let x = Tensor::from_host(&charges, Element::f32(), &[1], &1.0f32.to_le_bytes()).expect("host tensor");
+    let result = kernel.call(&charges, add_one::Args { x: &x }).expect("call").value;
     let result = f32::from_le_bytes(result.read_to_host().expect("read")[..4].try_into().unwrap());
     assert_eq!(result, 2.0, "{:?}", device.backend());
 }

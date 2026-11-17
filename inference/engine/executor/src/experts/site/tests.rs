@@ -26,6 +26,7 @@ fn fixture(device: &seismic::Device) -> (SiteLayer, [Vec<f32>; 3]) {
 
 /// [`fixture`]'s layer with its expansion clamped at `limit`.
 fn clamped_fixture(device: &seismic::Device, limit: Option<GluLimit>) -> (SiteLayer, [Vec<f32>; 3]) {
+    let charges = seismic::Charges::tally(device);
     let shape = SiteShape {
         table: magnitude_kernels::SlotTable::site(2, 4),
         rows: 2,
@@ -47,7 +48,7 @@ fn clamped_fixture(device: &seismic::Device, limit: Option<GluLimit>) -> (SiteLa
     let element = seismic::Element::bf16();
     let records = |data: &[f32], rows: usize, columns: usize| {
         let bytes = data.iter().flat_map(|value| Bf16::narrow(*value).to_le_bytes()).collect::<Vec<u8>>();
-        let tensor = Tensor::shared(device, element, &[RECORDS as u64, rows as u64, columns as u64]).unwrap();
+        let tensor = Tensor::shared(&charges, element, &[RECORDS as u64, rows as u64, columns as u64]).unwrap();
         let records = Records::rows(&tensor, (rows * columns * 2) as u64, RECORDS as u64).unwrap();
         for record in 0..RECORDS {
             let at = record * rows * columns * 2;
@@ -57,7 +58,7 @@ fn clamped_fixture(device: &seismic::Device, limit: Option<GluLimit>) -> (SiteLa
         SiteRecords::new(records, rows, columns, element).unwrap()
     };
     let tensors = SiteTensors { gate: Some(records(&values[0], f, h)), up: records(&values[1], f, h), down: records(&values[2], h, f) };
-    (SiteLayer::owned(device, tensors, scales(), shape).unwrap(), values)
+    (SiteLayer::owned(&charges, tensors, scales(), shape).unwrap(), values)
 }
 
 /// The rows of a request: two rows of H.
@@ -378,6 +379,7 @@ fn the_executor_measures_its_answers() {
 /// device's packed `mma16` form (gate and up `q4k`, down `q5k`), each the
 /// conversion of finite pseudo-random stored bytes.
 fn packed(device: &seismic::Device, h: usize, f: usize, count: usize) -> SiteTensors {
+    let charges = seismic::Charges::tally(device);
     let tier = seismic::cpu::Tier::detected().unwrap();
     let element = |name: &str| seismic::Element::named(name).unwrap_or_else(|| panic!("{name}"));
     let tensor = |name: &str, source: &str, rows: usize, columns: usize, seed: u32| {
@@ -385,7 +387,7 @@ fn packed(device: &seismic::Device, h: usize, f: usize, count: usize) -> SiteTen
         assert!(resident.cpu_operand(tier).is_some(), "the CPU reads {name}");
         let record = [1, rows as u64, columns as u64];
         let stored_bytes = source.canonical_byte_len(&record).unwrap() as usize;
-        let tensor = Tensor::shared(device, resident, &[count as u64, rows as u64, columns as u64]).unwrap();
+        let tensor = Tensor::shared(&charges, resident, &[count as u64, rows as u64, columns as u64]).unwrap();
         let records = Records::rows(&tensor, tensor.byte_len() / count as u64, count as u64).unwrap();
         for index in 0..count as u32 {
             let bytes = (0..stored_bytes).map(|at| ((at as u32).wrapping_mul(2_654_435_761).wrapping_add(seed + index) >> 24) as u8).collect();
@@ -431,7 +433,7 @@ fn packed_records_are_served_where_they_lie() {
     let values = [tensors.gate.as_ref().unwrap(), &tensors.up, &tensors.down]
         .map(|records| (0..2).flat_map(|record| records.values(record)).collect::<Vec<_>>());
     let shape = packed_shape(2, 2, 2, h, f);
-    let layer = SiteLayer::owned(&device, tensors, SiteScales { gate: None, up: None }, shape).unwrap();
+    let layer = SiteLayer::owned(&seismic::Charges::tally(&device), tensors, SiteScales { gate: None, up: None }, shape).unwrap();
     let compute = HostCompute::start(vec![layer], &threads(3)).unwrap();
     let handle = compute.handle();
     let _flight = handle.flight().unwrap();
@@ -470,10 +472,11 @@ fn packed_records_are_served_where_they_lie() {
 #[test]
 fn an_expert_of_several_rows_answers_each_as_alone() {
     let device = cpu();
+    let charges = seismic::Charges::tally(&device);
     let (h, f, rows) = (512usize, 256usize, 4usize);
     let x = (0..rows * h).map(|index| ((index * 53 % 211) as f32 / 211.0 - 0.5) * 2.0).collect::<Vec<_>>();
     for workers in [1usize, 3, 5] {
-        let layer = SiteLayer::owned(&device, packed(&device, h, f, 2), SiteScales { gate: None, up: None }, packed_shape(rows, 2, 2, h, f)).unwrap();
+        let layer = SiteLayer::owned(&charges, packed(&device, h, f, 2), SiteScales { gate: None, up: None }, packed_shape(rows, 2, 2, h, f)).unwrap();
         let compute = HostCompute::start(vec![layer], &threads(workers)).unwrap();
         let handle = compute.handle();
         let _flight = handle.flight().unwrap();
@@ -538,7 +541,7 @@ fn the_site_counts_each_answered_requests_experts_and_path() {
 fn the_reference_site_measures() {
     for backend in [seismic::BackendName::Cuda, seismic::BackendName::Vulkan] {
         let form = crate::assessment::CpuForm::reference(backend).unwrap().expect("a discrete backend streams");
-        let (workers, lines) = measure_cpu_site(&cpu(), &form).unwrap_or_else(|error| panic!("{backend:?}: {error}"));
+        let (workers, lines) = measure_cpu_site(&seismic::Charges::tally(&cpu()), &form).unwrap_or_else(|error| panic!("{backend:?}: {error}"));
         assert!(workers > 0 && lines.expert.one.get() > 0., "{backend:?}: {workers} workers, {lines:?}");
     }
 }

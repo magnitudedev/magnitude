@@ -420,6 +420,7 @@ fn statics(case: &Case) -> NativeSpecialization {
 }
 
 fn native(device: &Device, case: &Case) -> Outcome {
+    let charges = seismic::Charges::tally(device);
     let (m, w, gt) = (case.rows as u64, case.w() as u64, case.gt() as u64);
     let entry = pool_rows::native_entry_with(pool_rows::Elements { A: case.element, Y: case.row });
     let specialization = entry.offered(device).unwrap().unwrap().default_specialization(&statics(case)).unwrap();
@@ -446,7 +447,7 @@ fn native(device: &Device, case: &Case) -> Outcome {
         plane(BLOCK_ROWS, BLOCK_SLAB_ROWS, case.row, w, &vec![SENTINEL; BLOCK_ROWS * case.w()]);
     let launch = |values: &[Vec<f32>]| values[case.first - case.start()..].concat();
     let results = kernel
-        .call(pool_rows::Args {
+        .call(&charges, pool_rows::Args {
             u: &tensor(device, Element::f32(), &[m, w], &launch(&case.u)),
             g: &tensor(device, Element::f32(), &[m, gt * w], &launch(&case.g)),
             position: &tensor(device, Element::f32(), &[case.places.len() as u64, w], &case.places.concat()),

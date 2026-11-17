@@ -185,7 +185,7 @@ impl OwnedCodecAdvance {
         destination: &SequenceState,
     ) -> Result<(KvCodec, KvCodec, Vec<Vec<usize>>), Error> {
         if Rc::ptr_eq(&source.store, &destination.store)
-            || !Rc::ptr_eq(&source.store.device, &destination.store.device)
+            || !source.store.device.same_device(&destination.store.device)
             || destination.position != 0
             || destination.claims.iter().any(|claims| !claims.is_empty())
             || destination.history_start != 0
@@ -1555,7 +1555,7 @@ mod tests {
             panic!("source rows must commit");
         };
         let destination = destination_store.create().unwrap();
-        let conversion = OwnedCodecAdvance::begin(source, destination).ok().unwrap();
+        let conversion = OwnedCodecAdvance::begin(source, destination).unwrap_or_else(|(_, _, error)| panic!("the conversion begins: {error}"));
         assert_eq!(conversion.rows(), 2);
         assert_eq!(conversion.source_codec(), KvCodec::Dense);
         assert_eq!(conversion.destination_codec(), KvCodec::AffineK8V4);
@@ -1582,7 +1582,7 @@ mod tests {
         assert_eq!(source.position(), 2);
         assert_eq!(destination.position(), 0);
         assert_eq!(destination_store.occupied_rows(TOKEN), 0);
-        let conversion = OwnedCodecAdvance::begin(source, destination).ok().unwrap();
+        let conversion = OwnedCodecAdvance::begin(source, destination).unwrap_or_else(|(_, _, error)| panic!("the conversion begins: {error}"));
         let destination = conversion.commit();
         assert_eq!(destination.position(), 2);
         assert_eq!(

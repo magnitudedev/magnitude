@@ -1142,6 +1142,7 @@ impl PreparedTargetGraphs {
     /// its own.
     pub(crate) fn bind_weights(
         self: &Arc<Self>,
+        charges: &seismic::Charges,
         resident: &ResidentTarget,
     ) -> Result<BoundTargetGraphs, String> {
         // Only a load whose blocks stream their experts holds graphs of bank
@@ -1152,7 +1153,7 @@ impl PreparedTargetGraphs {
         }
         let embedding = resident.embedding.table().clone();
         let direct = seismic::Tensor::from_host(
-            &resident.embedding.tensor().device(),
+            charges,
             Element::i32(),
             &[0, 1],
             &[],
@@ -1172,11 +1173,11 @@ impl PreparedTargetGraphs {
                 *key,
                 entry
                     .plan
-                    .bind_static(&fixed)
+                    .bind_static(charges, &fixed)
                     .map_err(|error| format!("target embedding graph class {key:?}: {error}"))?,
             );
         }
-        let mut constants = ConstantTensors::new(resident.embedding.tensor().device());
+        let mut constants = ConstantTensors::new(charges);
         let mut bound = Vec::with_capacity(self.blocks_by_class.len());
         if resident.blocks != self.blocks_by_class.len() {
             return Err("resident target blocks disagree with the prepared graphs".into());
@@ -1184,15 +1185,14 @@ impl PreparedTargetGraphs {
         for (index, graphs) in self.blocks_by_class.iter().enumerate() {
             // The block's classes ascend in its vectors, so do its bindings.
             bound.push(BlockBindings {
-                runs: bind_block_graphs(&graphs.runs, index, resident, &mut constants)?,
-                passes: bind_block_graphs(&graphs.passes, index, resident, &mut constants)?,
-                untapped: bind_block_graphs(&graphs.untapped, index, resident, &mut constants)?,
+                runs: bind_block_graphs(&graphs.runs, index, resident, charges, &mut constants)?,
+                passes: bind_block_graphs(&graphs.passes, index, resident, charges, &mut constants)?,
+                untapped: bind_block_graphs(&graphs.untapped, index, resident, charges, &mut constants)?,
             });
         }
         // The pass's merged experts and row table, which every group's passes
         // write and its backs read; the row table holds every first row and
         // row count, entry `i` holding `i`.
-        let device = resident.embedding.tensor().device();
         let pass = match super::SplitLayers::of(&self.served) {
             None => None,
             Some(layers) => {
@@ -1202,14 +1202,14 @@ impl PreparedTargetGraphs {
                     .flat_map(i32::to_le_bytes)
                     .collect::<Vec<_>>();
                 Some(PassBuffers {
-                    experts: zeros(&device, &split.merged.experts).map_err(|error| error.to_string())?,
-                    table: seismic::Tensor::from_host(&device, *element, extents, &counts)
+                    experts: zeros(charges, &split.merged.experts).map_err(|error| error.to_string())?,
+                    table: seismic::Tensor::from_host(charges, *element, extents, &counts)
                         .map_err(|error| format!("merged row table allocation failed: {error}"))?,
                     layers,
                 })
             }
         };
-        let floor = Rc::new(GroupBuffers::new(self, &device, 1, pass.as_ref()).map_err(|error| error.to_string())?);
+        let floor = Rc::new(GroupBuffers::new(self, charges, 1, pass.as_ref()).map_err(|error| error.to_string())?);
         let per_layer = match (&resident.per_layer, self.group.per_layer) {
             (None, None) => None,
             (Some(weights), Some(extents)) => Some(BoundPerLayerEntry {
@@ -1218,7 +1218,7 @@ impl PreparedTargetGraphs {
                     .iter()
                     .map(|(rows, graph)| {
                         let absent = seismic::Tensor::from_host(
-                            &weights.projection.tensor().device(),
+                            charges,
                             Element::f32(),
                             &[0],
                             &[],
@@ -1245,7 +1245,7 @@ impl PreparedTargetGraphs {
                         }
                         graph
                             .plan
-                            .bind_static(&fixed)
+                            .bind_static(charges, &fixed)
                             .map(|bound| (*rows, bound))
                             .map_err(|error| format!("per-layer entry graph rows {rows}: {error}"))
                     })
@@ -1260,7 +1260,7 @@ impl PreparedTargetGraphs {
         let stored = resident.sublayers.stored_blocks()?;
         let notice = self
             .notice_rows
-            .map(|rows| SelectionNotice::new(&resident.embedding.tensor().device(), rows))
+            .map(|rows| SelectionNotice::new(charges, rows))
             .transpose()?;
         let graphs = BoundTargetGraphs {
             prepared: self.clone(),
@@ -1271,7 +1271,6 @@ impl PreparedTargetGraphs {
             pass,
             floor,
             held: RefCell::new(None),
-            device,
             embedding,
             stored,
             notice,

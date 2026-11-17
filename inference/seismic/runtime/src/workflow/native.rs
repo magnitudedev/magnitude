@@ -5,6 +5,7 @@ use crate::driver::workflow::{
     ScalarDescriptor, TensorDescriptor, WorkflowId, WorkflowPlanDraft,
 };
 use crate::driver::AdmittedCommand;
+use crate::memory::Charges;
 use crate::driver::*;
 use crate::execution::{AdmittedNode, AdmittedOutput, AdmittedRun, AdmittedScalarOutput};
 use crate::resources::{
@@ -291,6 +292,8 @@ struct QueuedNode<T: TargetFamily, E: NativeExecutor<T>> {
 pub(crate) struct WorkflowGraphDraft<T: TargetFamily, E: NativeExecutor<T>> {
     identity: WorkflowId,
     device: Arc<Opened<T, E>>,
+    /// What every allocation its run makes is charged to.
+    charges: Charges,
     nodes: Vec<QueuedNode<T, E>>,
     result_counts: Vec<u32>,
 }
@@ -303,6 +306,7 @@ pub(crate) struct BoundWorkflowGraph<T: TargetFamily, E: NativeExecutor<T>> {
     keys: BTreeMap<(u64, usize, usize), Arc<PersistentTable>>,
     allocation_limit: u64,
     device: Arc<Opened<T, E>>,
+    charges: Charges,
 }
 
 pub(crate) struct WorkflowContinuation<T: TargetFamily, E: NativeExecutor<T>> {
@@ -356,8 +360,8 @@ impl<T: TargetFamily, E: NativeExecutor<T>> WorkflowContinuation<T, E> {
     }
     pub(crate) fn next(
         &mut self,
-        device: &Arc<Opened<T, E>>,
         resources: &mut AdmittedResources,
+        charges: &Charges,
     ) -> Result<Option<AdmittedNode<T, E>>, CallError> {
         if self.planner.bound_node(self.next_node).is_none() {
             if !self.bind_next()? {
@@ -369,7 +373,7 @@ impl<T: TargetFamily, E: NativeExecutor<T>> WorkflowContinuation<T, E> {
             .bound_node(self.next_node)
             .expect("node just bound")
             .clone();
-        let admitted = admit_reached_node(node, &mut self.physical, device, resources)?;
+        let admitted = admit_reached_node(node, &mut self.physical, resources, charges)?;
         self.next_node += 1;
         Ok(Some(admitted))
     }
@@ -531,8 +535,8 @@ fn preclaim_resources<T: TargetFamily, E: NativeExecutor<T>>(
 fn admit_reached_node<T: TargetFamily, E: NativeExecutor<T>>(
     node: BoundNode<PlannedNode<T, E>>,
     physical: &mut BTreeMap<ResourceId, Arc<Allocation>>,
-    device: &Arc<Opened<T, E>>,
     resources: &mut AdmittedResources,
+    charges: &Charges,
 ) -> Result<AdmittedNode<T, E>, CallError> {
     let mut demands = Vec::new();
     for requirement in &node.private_resources {
@@ -576,8 +580,8 @@ fn admit_reached_node<T: TargetFamily, E: NativeExecutor<T>>(
     // those made before it, freeing their charges.
     let mut replacements = Vec::new();
     for (requirement, bytes) in demands {
-        let allocation = device
-            .allocate_storage(bytes, requirement.alignment)
+        let allocation = charges
+            .allocate(bytes, requirement.alignment)
             .map_err(CallError::Execution)?;
         if let ResourceId::Persistent {
             owner,
@@ -643,10 +647,21 @@ fn admit_reached_node<T: TargetFamily, E: NativeExecutor<T>>(
 }
 
 impl<T: TargetFamily, E: NativeExecutor<T>> WorkflowGraphDraft<T, E> {
-    pub(crate) fn new(device: Arc<Opened<T, E>>) -> Self {
+    /// A workflow on `device`, every allocation its run makes charged to
+    /// `charges`.
+    ///
+    /// # Panics
+    /// Where `charges` are another device's: what a workflow of `device`
+    /// allocates is charged through `device`'s charges alone.
+    pub(crate) fn new(device: Arc<Opened<T, E>>, charges: Charges) -> Self {
+        assert!(
+            device.identity() == charges.device().kind.identity(),
+            "invariant violated: a workflow of one device charged through another device's charges"
+        );
         Self {
             identity: WorkflowId::fresh(),
             device,
+            charges,
             nodes: Vec::new(),
             result_counts: Vec::new(),
         }
@@ -779,6 +794,7 @@ impl<T: TargetFamily, E: NativeExecutor<T>> WorkflowGraphDraft<T, E> {
             keys,
             allocation_limit: u64::MAX,
             device: self.device,
+            charges: self.charges,
         })
     }
 }
@@ -816,7 +832,7 @@ impl<T: TargetFamily, E: NativeExecutor<T>> BoundWorkflowGraph<T, E> {
             .map_err(CallError::Execution)?;
         let first = self
             .continuation
-            .next(&self.device, &mut resources)?
+            .next(&mut resources, &self.charges)?
             .expect("first node is already bound");
         let identity = self.continuation.planner.identity.raw();
         let mut run = AdmittedRun::new(
@@ -826,6 +842,7 @@ impl<T: TargetFamily, E: NativeExecutor<T>> BoundWorkflowGraph<T, E> {
             vec![first],
             resources,
             submission,
+            self.charges,
         );
         run.set_continuation(self.continuation);
         Ok(run)
@@ -834,9 +851,10 @@ impl<T: TargetFamily, E: NativeExecutor<T>> BoundWorkflowGraph<T, E> {
 
 pub(crate) fn call_one<T: TargetFamily + 'static, E: NativeExecutor<T>>(
     kernel: Arc<PreparedHandle<T, E>>,
+    charges: &Charges,
     args: EncodedArgs,
 ) -> Result<(DecodedResults, u64), CallError> {
-    let mut workflow = WorkflowGraphDraft::new(kernel.prepared.device.clone());
+    let mut workflow = WorkflowGraphDraft::new(kernel.prepared.device.clone(), charges.clone());
     workflow
         .enqueue(kernel, args.into_workflow())
         .map_err(CallError::Workflow)?;
@@ -854,10 +872,10 @@ pub(crate) fn call_one<T: TargetFamily + 'static, E: NativeExecutor<T>>(
 /// planner and resource transaction as an ordinary selected variant.
 pub(crate) fn admit_trial<T: TargetFamily, E: NativeExecutor<T>>(
     device: &Arc<Opened<T, E>>,
-    public_device: &Arc<crate::api::device::DeviceInner>,
     executable: &ExecutableVariant<T, E::Handle>,
     args: EncodedArgs,
     allocation_limit: u64,
+    charges: &Charges,
 ) -> Result<AdmittedRun<T, E>, CallError> {
     let mut physical = BTreeMap::new();
     let mut descriptors = Vec::new();
@@ -879,7 +897,7 @@ pub(crate) fn admit_trial<T: TargetFamily, E: NativeExecutor<T>>(
         owner: NEXT_PREPARED.fetch_add(1, Ordering::Relaxed),
         variant: 0,
         persistent: Arc::new(PersistentTable::new()),
-        output_device: public_device.clone(),
+        output_device: charges.device().clone(),
     });
     let mut planner = WorkflowPlanDraft::new();
     let bindings = descriptors
@@ -903,6 +921,7 @@ pub(crate) fn admit_trial<T: TargetFamily, E: NativeExecutor<T>>(
         keys,
         allocation_limit,
         device: device.clone(),
+        charges: charges.clone(),
     }
     .admit_with_limit(allocation_limit)
 }
@@ -1130,8 +1149,9 @@ mod preclaim_tests {
         let crate::backends::OpenedKind::Cpu(opened) = &device.kind else {
             unreachable!()
         };
-        let first = opened.allocate_storage(16, 4).unwrap();
-        let second = opened.allocate_storage(16, 4).unwrap();
+        let charges = Charges::tally(&device);
+        let first = charges.allocate(16, 4).unwrap();
+        let second = charges.allocate(16, 4).unwrap();
         let table = Arc::new(PersistentTable::new());
         let mut prior = table.claim_growth((0, 0));
         prior.install_reached(PersistentBinding {

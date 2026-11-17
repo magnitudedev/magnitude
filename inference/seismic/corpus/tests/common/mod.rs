@@ -178,9 +178,9 @@ pub fn prepare(
         },
     );
     match selection {
-        Selection::Baseline => Ok((function.prepare(device, elements, options)?, None)),
+        Selection::Baseline => Ok((function.prepare(&seismic::Charges::tally(device), elements, options)?, None)),
         Selection::Ranked => {
-            let (session, kernel) = function.start_feedback(device, elements, options)?;
+            let (session, kernel) = function.start_feedback(&seismic::Charges::tally(device), elements, options)?;
             Ok((kernel, Some(session)))
         }
     }
@@ -266,7 +266,7 @@ fn invalid_invocation(checked: Result<CheckReport, seismic::dynamic::Error>) -> 
 
 /// The public tensor storage size of `element[shape]` (C15-5: never computed by the corpus).
 fn storage_bytes(device: &Device, element: &str, shape: &[u64]) -> Result<u64, String> {
-    seismic::Tensor::zeros(device, element_named(element), shape)
+    seismic::Tensor::zeros(&seismic::Charges::tally(device), element_named(element), shape)
         .map(|tensor| tensor.storage_bytes())
         .map_err(|e| format!("{element}{shape:?}: {e}"))
 }
@@ -326,7 +326,7 @@ fn value(
                 shape,
                 bytes,
             } => {
-                let tensor = Tensor::from_host(device, element_named(&element), &shape, &bytes)
+                let tensor = Tensor::from_host(&seismic::Charges::tally(device), element_named(&element), &shape, &bytes)
                     .map_err(|e| format!("{parameter}: {e}"))?;
                 if matches!(
                     ty,

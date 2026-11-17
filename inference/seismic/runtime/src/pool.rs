@@ -5,7 +5,8 @@
 //! - A load opens one pool per store a contract places in, once
 //!   ([`Pool::open`]); fixtures open their own beside it. Its blocks are the backend's plain allocations
 //!   (`OpenedKind::allocate_block`), each charged to the pool's ledger entry
-//!   by the backend that makes it.
+//!   by the backend that makes it, through the device's charges
+//!   ([`PoolCharges`]) as every allocation is.
 //! - A slab is one granule. A store's address table holds each slot's region
 //!   addresses, in the device's own memory, and each entry is written in
 //!   place as one 8-byte store: by the host as a slab is added or freed
@@ -47,7 +48,7 @@ use crate::api::TensorError;
 use crate::completion::DeviceCompletion;
 use crate::driver::{AccessGroup, Allocation, DeviceUses};
 use crate::native::moves::{self, MoveStep};
-use crate::memory::{Entry, Wiring};
+use crate::memory::{Charges, Entry, Wiring};
 use seismic_compiler::errors::ExecutionError;
 use seismic_lang::ids::RepresentationId;
 use seismic_memory::pool::{BlockId, Blocks, Claimed, Fence, GranuleId, GranulePool, Move};
@@ -160,7 +161,7 @@ impl Blocks for PoolBlocks {
     fn allocate(&self, bytes: u64, entry: &Arc<dyn Entry>) -> Result<PoolBlock, ExecutionError> {
         let charged = Arc::new(BlockEntry { entry: entry.clone(), charged: AtomicU64::new(0) });
         let through: Arc<dyn Entry> = charged.clone();
-        let allocation = self.device.kind.allocate_block(self.device.memory.allocated_from(&self.kinds)?, bytes, &through, self.access.clone())?;
+        let allocation = self.device.kind.allocate_block(&self.kinds, bytes, &through, self.access.clone())?;
         let address = self.device.allocation_address(&allocation, 0);
         assert!(
             address % BLOCK_ALIGNMENT == 0,
@@ -185,23 +186,34 @@ struct Holder {
     slot: usize,
 }
 
-/// The entries a pool's memory is charged to, both of its store: its
-/// blocks, whose granules its slabs claim and release, to `blocks`; its
-/// absent granule, which no slab holds and the pool holds for its life, to
-/// `absent`. A ledger that counts what the blocks' entry holds beyond its
-/// slabs' granules as granules a claim can take holds the absent granule
-/// apart, so it is never counted as one.
+/// The charges a pool's memory is made through, both of one device: its
+/// blocks, whose granules its slabs claim and release, through `blocks`;
+/// its absent granule, which no slab holds and the pool holds for its life,
+/// through `absent`. A ledger that counts what the blocks' entry holds
+/// beyond its slabs' granules as granules a claim can take holds the absent
+/// granule apart, so it is never counted as one.
 #[derive(Clone)]
-pub struct PoolEntries {
-    pub blocks: Arc<dyn Entry>,
-    pub absent: Arc<dyn Entry>,
+pub struct PoolCharges {
+    blocks: Charges,
+    absent: Charges,
 }
 
-impl PoolEntries {
-    /// Every byte of the pool charged to `entry`: a tally's, which counts
-    /// what the pool holds without telling its granules apart.
-    pub fn one(entry: Arc<dyn Entry>) -> Self {
-        Self { blocks: entry.clone(), absent: entry }
+impl PoolCharges {
+    /// Every byte of the pool made through `charges`: a tally's or a
+    /// fixture's, which counts what the pool holds without telling its
+    /// granules apart.
+    pub fn one(charges: &Charges) -> Self {
+        Self { blocks: charges.clone(), absent: charges.clone() }
+    }
+
+    /// The pool's blocks made through `blocks`, its absent granule through
+    /// `absent`.
+    ///
+    /// # Panics
+    /// Where they are charges of two devices.
+    pub fn apart(blocks: Charges, absent: Charges) -> Self {
+        absent.of_device(blocks.device());
+        Self { blocks, absent }
     }
 }
 
@@ -246,33 +258,33 @@ impl PoolShared {
 }
 
 impl Pool {
-    /// A new pool of the store `contract` places in on `device`, of
-    /// `granule`-byte granules in `block_bytes`-byte blocks
-    /// (`seismic_memory::pool::block_bytes`), charged to `entries` (its
-    /// blocks to one, its absent granule, allocated now, to the other),
-    /// holding no block until it grows. Its owner decides who
-    /// shares it, by its clones: a load opens each of its stores' pools once
-    /// and hands it to every store that claims from it, while each load,
-    /// tuning or qualification fixture on the device holds pools of its
-    /// own, at its own granule, beside them. Refused for an entry of another
-    /// store or a block of no whole granules.
-    pub fn open(
-        device: &Arc<DeviceInner>,
-        contract: Contract,
-        granule: u64,
-        block_bytes: u64,
-        entries: PoolEntries,
-    ) -> Result<Self, TensorError> {
+    /// A new pool of the store `contract` places in on `charges`' device,
+    /// of `granule`-byte granules in `block_bytes`-byte blocks
+    /// (`seismic_memory::pool::block_bytes`), made through `charges` (its
+    /// blocks through one, its absent granule, allocated now, through the
+    /// other), each charged to their entry of that store, in the kind they
+    /// are confined to where they are, holding no block until it grows. Its
+    /// owner decides who shares it, by its clones: a load opens each of its
+    /// stores' pools once and hands it to every store that claims from it,
+    /// while each load, tuning or qualification fixture on the device holds
+    /// pools of its own, at its own granule, beside them. Refused for a
+    /// block of no whole granules, or charges confined to a kind of none of
+    /// the store's.
+    ///
+    /// # Panics
+    /// Through charges that allocate nothing in that store
+    /// ([`Charges::none`]): a pool's granules are bytes.
+    pub fn open(charges: &PoolCharges, contract: Contract, granule: u64, block_bytes: u64) -> Result<Self, TensorError> {
         let refused = |why: String| TensorError::SlabLayout(why);
+        let device = charges.blocks.device();
         let topology = device.topology();
         let store = topology
             .first_store(device.info(), contract)
             .ok_or_else(|| refused(format!("{contract:?} places in no store of the device")))?;
-        let identity = topology.store_identity(store).expect("a placement names stores of its revision");
-        let PoolEntries { blocks: entry, absent } = entries;
-        if let Some(other) = [&entry, &absent].into_iter().map(|entry| entry.store()).find(|store| **store != identity) {
-            return Err(refused(format!("a pool of {identity} charged to an entry of {other}")));
-        }
+        let made = charges.blocks.of(contract, granule)?;
+        let absent = charges.absent.of(contract, granule)?;
+        assert_eq!(made.kinds, absent.kinds, "invariant violated: a pool's absent granule made in other kinds than its blocks");
+        let (entry, absent) = (made.entry.clone(), absent.entry.clone());
         if granule == 0
             || granule % BLOCK_ALIGNMENT != 0
             || block_bytes < granule
@@ -296,7 +308,11 @@ impl Pool {
                     .is_some_and(|path| path.store() == store)
             })
             .map(|kind| kind.native().id)
+            .filter(|kind| made.kinds.contains(kind))
             .collect::<Vec<_>>();
+        if kinds.is_empty() {
+            return Err(refused(format!("a pool of {contract:?} made through charges confined to none of its store's kinds {:?}", made.kinds)));
+        }
         let access = Arc::new(AccessGroup::default());
         let blocks = PoolBlocks { device: device.clone(), kinds, access: access.clone() };
         let absent = blocks.allocate(granule, &absent)?;
@@ -650,11 +666,12 @@ impl Slots {
         self.capacity
     }
 
-    /// A table of `regions × capacity` entries in `access`: record-table
-    /// storage, aligned to its entry, as every reader of an entry (a
-    /// native kernel's, [`Self::point`]'s atomic store) reads it whole.
+    /// A table of `regions × capacity` entries in `access`, through
+    /// `charges`: record-table storage, aligned to its entry, as every
+    /// reader of an entry (a native kernel's, [`Self::point`]'s atomic
+    /// store) reads it whole.
     fn allocate_table(
-        device: &Arc<DeviceInner>,
+        charges: &Charges,
         regions: usize,
         capacity: usize,
         access: Option<Arc<AccessGroup>>,
@@ -663,7 +680,7 @@ impl Slots {
             .checked_mul(capacity as u64)
             .and_then(seismic_lang::registry::record_table_bytes)
             .ok_or_else(|| TensorError::SlabLayout("a slab table's bytes overflow".into()))?;
-        Ok(device.kind.allocate_in(bytes, seismic_lang::registry::RECORD_TABLE_ENTRY_BYTES, access)?)
+        Ok(charges.allocate_in(bytes, seismic_lang::registry::RECORD_TABLE_ENTRY_BYTES, access)?)
     }
 
     /// Where entry `(region, slot)` lies in the table, in bytes.
@@ -874,20 +891,21 @@ impl Slots {
     /// slot), in storage of their own: a slab view's copy
     /// (`TensorInner::copy_of`). Its free slots name its first slab.
     pub(crate) fn copy(
-        device: &Arc<DeviceInner>,
+        charges: &Charges,
         representation: RepresentationId,
         extents: &[u64],
         images: &[Option<Vec<u8>>],
     ) -> Result<Arc<Self>, TensorError> {
+        let device = charges.device();
         let capacity = images.len();
-        let table = Self::allocate_table(device, 1, capacity, None)?;
+        let table = Self::allocate_table(charges, 1, capacity, None)?;
         let slabs = images
             .iter()
             .map(|image| {
                 image
                     .as_ref()
                     .map(|bytes| {
-                        let slab = TensorInner::from_host_in(device, representation, extents, bytes, Some(table.access_group().clone()))?;
+                        let slab = TensorInner::from_host_in(charges, representation, extents, bytes, Some(table.access_group().clone()))?;
                         Ok::<_, TensorError>(Slab { regions: vec![(slab.allocation().clone(), 0)], hold: None })
                     })
                     .transpose()
@@ -942,8 +960,11 @@ impl SlabStore {
     /// views for its life and never frees. Every other slot is free. Refused
     /// where a slab is larger than a granule and some slot is not lent, its
     /// alignment is not one every granule has, or the lent tensors do not
-    /// match the regions.
-    pub fn in_pool(pool: &Pool, geometry: SlabGeometry, lent: &[Arc<TensorInner>]) -> Result<Self, TensorError> {
+    /// match the regions. Its address table is allocated through `charges`.
+    ///
+    /// # Panics
+    /// Where `charges` are of another device than the pool's.
+    pub fn in_pool(charges: &Charges, pool: &Pool, geometry: SlabGeometry, lent: &[Arc<TensorInner>]) -> Result<Self, TensorError> {
         let shared = &pool.0;
         let refused = |why: String| TensorError::SlabLayout(why);
         if BLOCK_ALIGNMENT % geometry.slab_alignment != 0 {
@@ -953,6 +974,7 @@ impl SlabStore {
             )));
         }
         let device = &shared.device;
+        charges.of_device(device);
         let capacity = geometry.capacity;
         let mut slabs = (0..capacity).map(|_| None).collect::<Vec<Option<Slab>>>();
         let mut lenders = Vec::<Arc<Allocation>>::new();
@@ -1015,7 +1037,7 @@ impl SlabStore {
                 geometry.slab_bytes, shared.granule
             )));
         }
-        let table = Slots::allocate_table(device, geometry.regions.len(), capacity, Some(shared.absent.allocation.access_group().clone()))?;
+        let table = Slots::allocate_table(charges, geometry.regions.len(), capacity, Some(shared.absent.allocation.access_group().clone()))?;
         let offsets = geometry.regions.iter().map(|(_, _, offset)| *offset).collect::<Vec<_>>();
         let absent = device.allocation_address(&shared.absent.allocation, 0);
         let slots = Arc::new(Slots {
@@ -1253,7 +1275,8 @@ mod tests {
         let store = topology.first_store(topology.executor(id).unwrap(), Contract::DeviceOnly).unwrap();
         let tally = crate::memory::Tally::unbounded(topology.store_identity(store).unwrap());
         let (granule, block) = (1 << 16, 1 << 18);
-        let pool = Pool::open(&device, Contract::DeviceOnly, granule, block, PoolEntries::one(Arc::new(tally.clone()))).unwrap();
+        let charges = PoolCharges::one(&Charges::in_store(&device, Contract::DeviceOnly, Arc::new(tally.clone())));
+        let pool = Pool::open(&charges, Contract::DeviceOnly, granule, block).unwrap();
         let absent = tally.held();
         let i32s = seismic_lang::registry::dense(seismic_lang::types::DType::I32);
         let geometry = SlabGeometry {
@@ -1264,7 +1287,7 @@ mod tests {
             slab_alignment: BLOCK_ALIGNMENT,
             regions: vec![(i32s, vec![2], 0)],
         };
-        let slabs = SlabStore::in_pool(&pool, geometry, &[]).unwrap();
+        let slabs = SlabStore::in_pool(&crate::memory::Charges::tally(&device), &pool, geometry, &[]).unwrap();
         for _ in 0..8 {
             slabs.add_slab(SlabFill::Zeroed).unwrap();
         }

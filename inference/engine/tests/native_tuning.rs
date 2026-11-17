@@ -14,7 +14,7 @@
 use magnitude_artifacts::Package;
 use magnitude_executor::{
     platform::{self, DeviceRequest, ReleaseRate, PlatformConfig},
-    memory::ledger::{DeviceLedgers, LoadShape},
+    memory::{ClaimDemand, ledger::{CommittedKind, DeviceLedgers, LoadShape}},
     AttestedPrograms, ComponentSelection, DeviceReader, ExecutionPath, ExecutionPlanner, KernelCache,
     PlannedMethod, ResourceLimits, TunedEntry, TuningContext, TuningOrigin, UnreportedTuning, MachineReading,
     DEFAULT_KERNEL_CACHE_BYTES,
@@ -99,14 +99,20 @@ fn prepare_every_entry(
     // Its stores are read as a load's are once it opens: every judgment
     // Seismic asks of them (tuning's room) follows that reading.
     let reader = DeviceReader::open(std::rc::Rc::new(MachineReading::new(catalog.clone())), release, std::rc::Rc::new(opened.device().clone())).unwrap();
-    let (_ledgers, _) = reader.read_opened(DeviceLedgers::open(opened.device(), Arc::new(LoadShape { stores: Vec::new() })));
+    let (ledgers, reading) = reader.read_opened(DeviceLedgers::open(opened.device(), Arc::new(LoadShape { stores: Vec::new() })));
+    // This thread prepares as a load's does: its programs' storage is made
+    // under its claim, one change of the ledgers it owns.
+    let _owner = ledgers.changes().own();
     let backend = opened.device().backend();
     let mut tunings = Vec::with_capacity(loads);
     for load in 0..loads {
         let began = std::time::Instant::now();
-        let programs = AttestedPrograms::prepare_draft(
+        let mut programs_claim = ledgers
+            .claim_at(&reading, opened.device(), CommittedKind::Load, ClaimDemand { device: AttestedPrograms::DEVICE_BYTES, ..ClaimDemand::default() })
+            .unwrap_or_else(|short| panic!("the programs' storage is claimed: {short:?}"));
+        let programs = programs_claim.allocate(opened.device(), |charges| AttestedPrograms::prepare_draft(
             &draft,
-            opened.device(),
+            charges,
             TuningContext {
                 definition: &definition,
                 weights: &package,
@@ -116,7 +122,7 @@ fn prepare_every_entry(
                 settings: magnitude_executor::TuningSettings::STANDARD,
             },
             magnitude_executor::UnpreparedUnits::ServeDefaults,
-        )
+        ))
         .unwrap_or_else(|error| panic!("{error}"));
         let seconds = began.elapsed().as_secs_f64();
         let mut cases = HashSet::new();

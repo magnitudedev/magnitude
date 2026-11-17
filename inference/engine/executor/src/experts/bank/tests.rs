@@ -56,8 +56,9 @@ fn a_growth_joins_each_slot_as_every_group_holds_it() {
     let changes = scope.changes().clone();
     // A slot is a block: a granule of each group.
     let entries = ledger.pool_block(crate::memory::ledger::PoolClass::Records, std::num::NonZeroU64::new(2 * granule).expect("a slot's block"));
-    let pool = device.pool(seismic::Contract::Shared, granule, 2 * granule, entries).unwrap();
-    let groups = (0..2).map(|_| (seismic::SlabTensor::in_pool(&pool, 1, 8, &regions).unwrap(), 0, vec![64])).collect();
+    let charges = seismic::Charges::tally(&device);
+    let pool = seismic::Pool::open(&entries.charges(&device, seismic::Contract::Shared), seismic::Contract::Shared, granule, 2 * granule).unwrap();
+    let groups = (0..2).map(|_| (seismic::SlabTensor::in_pool(&charges, &pool, 1, 8, &regions).unwrap(), 0, vec![64])).collect();
     let stores = Stores::new(pool, groups);
     let opened = ledger.estimate().allocated();
     let records: RecordsAt = Arc::new(|_, at| at);
@@ -131,8 +132,9 @@ fn a_pools_absent_granule_is_committed_never_spare() {
     ledger.read(ledger.sampled(Instant::now()), crate::memory::supply::Reading::device(1 << 40, 1 << 40, crate::domain::fixtures::NO_LAG));
     let changes = scope.changes().clone();
     let entries = ledger.pool_block(crate::memory::ledger::PoolClass::Records, std::num::NonZeroU64::new(2 * granule).expect("a block"));
-    let pool = device.pool(seismic::Contract::Shared, granule, 2 * granule, entries).unwrap();
-    let groups = vec![(seismic::SlabTensor::in_pool(&pool, 1, 2, &regions).unwrap(), 0, vec![64])];
+    let charges = seismic::Charges::tally(&device);
+    let pool = seismic::Pool::open(&entries.charges(&device, seismic::Contract::Shared), seismic::Contract::Shared, granule, 2 * granule).unwrap();
+    let groups = vec![(seismic::SlabTensor::in_pool(&charges, &pool, 1, 2, &regions).unwrap(), 0, vec![64])];
     let stores = Stores::new(pool, groups);
     let opened = ledger.estimate();
     assert!(opened.allocated() >= granule, "the pool allocated its absent granule as it opened");
@@ -214,9 +216,10 @@ fn a_long_growth_beside_settled_samples_never_starves_or_panics_them() {
     assert_eq!(supply, SUPPLY as i64);
     let changes = scope.changes().clone();
     let entries = ledger.pool_block(crate::memory::ledger::PoolClass::Records, std::num::NonZeroU64::new(2 * granule).expect("a slot's block"));
-    let pool = device.pool(seismic::Contract::Shared, granule, 2 * granule, entries).unwrap();
+    let charges = seismic::Charges::tally(&device);
+    let pool = seismic::Pool::open(&entries.charges(&device, seismic::Contract::Shared), seismic::Contract::Shared, granule, 2 * granule).unwrap();
     // A store of a slot for each of the ninety.
-    let groups = (0..2).map(|_| (seismic::SlabTensor::in_pool(&pool, 1, SLOTS, &regions).unwrap(), 0, vec![64])).collect();
+    let groups = (0..2).map(|_| (seismic::SlabTensor::in_pool(&charges, &pool, 1, SLOTS, &regions).unwrap(), 0, vec![64])).collect();
     let stores = Arc::new(Stores::new(pool, groups));
     let opened = ledger.estimate().allocated();
     let records: RecordsAt = Arc::new(|_, at| at);

@@ -237,12 +237,12 @@ impl SelectionNotice {
     }
 
     /// A notice for steps of at most `rows` rows on `device`.
-    pub fn new(device: &seismic::Device, rows: u64) -> Result<Self, String> {
+    pub fn new(charges: &seismic::Charges, rows: u64) -> Result<Self, String> {
         let failed = |error: &dyn std::fmt::Display| format!("selection notice: {error}");
         Ok(Self {
-            copies: seismic::Tensor::words(device, seismic::Element::i32(), &Self::extents(rows))
+            copies: seismic::Tensor::words(charges, seismic::Element::i32(), &Self::extents(rows))
                 .map_err(|error| failed(&error))?,
-            timeline: seismic::Timeline::new(device).map_err(|error| failed(&error))?,
+            timeline: seismic::Timeline::new(&charges.device()).map_err(|error| failed(&error))?,
             next: Mutex::new(0),
         })
     }
@@ -376,7 +376,7 @@ enum Backing {
 impl Slots {
     /// `records` records of `record_rows` rows of `width` `resident` values
     /// as `layout` places them, every record held.
-    fn new(device: &seismic::Device, layout: &StoredSlots, resident: seismic::Element, width: u64) -> Result<Self, seismic::TensorError> {
+    fn new(charges: &seismic::Charges, layout: &StoredSlots, resident: seismic::Element, width: u64) -> Result<Self, seismic::TensorError> {
         let (records, record_rows) = layout.shape();
         let rows = usize::try_from(record_rows)
             .map_err(|_| seismic::TensorError::SlabLayout("record rows exceed host domain".into()))?;
@@ -385,12 +385,12 @@ impl Slots {
             StoredSlots::Whole { pool, .. } => {
                 // The store's one region lent whole: every record's rows,
                 // record after record, each record a lent slab.
-                let allocation = seismic::Tensor::shared(device, resident, &[records, record_rows, width])?;
-                let store = seismic::SlabTensor::in_pool_over(pool, 1, records, &regions, vec![allocation.clone()])?;
+                let allocation = seismic::Tensor::shared(charges, resident, &[records, record_rows, width])?;
+                let store = seismic::SlabTensor::in_pool_over(charges, pool, 1, records, &regions, vec![allocation.clone()])?;
                 Ok(Self { store, record_rows: rows, backing: Backing::Whole(allocation) })
             }
             StoredSlots::Banked { pool, .. } => {
-                let store = seismic::SlabTensor::in_pool(pool, 1, records, &regions)?;
+                let store = seismic::SlabTensor::in_pool(charges, pool, 1, records, &regions)?;
                 for _ in 0..records {
                     store.add_slab(seismic::SlabFill::Zeroed)?;
                 }
@@ -575,7 +575,7 @@ impl StoredTable {
     /// empty (`seed`).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        device: &seismic::Device,
+        charges: &seismic::Charges,
         descriptor: &WeightDescriptor,
         stored: seismic::Element,
         resident: seismic::Element,
@@ -634,10 +634,10 @@ impl StoredTable {
         // one as the record goes (`StoredTable::resize`).
         let directory = SlotDirectory::new(rows, slots, 1, form);
         let (entries, fields) = (form.entries(rows, slots), form.fields());
-        let slots_store = Slots::new(device, &layout, resident, width).map_err(|error| failed(&error))?;
+        let slots_store = Slots::new(charges, &layout, resident, width).map_err(|error| failed(&error))?;
         let slots_view = slots_store.store.logical_region(0).map_err(|error| failed(&error))?;
         let directory_tensor =
-            seismic::Tensor::words(device, seismic::Element::i32(), &[entries, fields])
+            seismic::Tensor::words(charges, seismic::Element::i32(), &[entries, fields])
                 .map_err(|error| failed(&error))?;
         let curve_ranges = ranges
             .iter()
@@ -654,8 +654,8 @@ impl StoredTable {
             slot_bytes: slot_bytes as usize,
             ranges,
             rows,
-            gate: seismic::Timeline::new(device).map_err(|error| failed(&error))?,
-            read: seismic::Timeline::new(device).map_err(|error| failed(&error))?,
+            gate: seismic::Timeline::new(&charges.device()).map_err(|error| failed(&error))?,
+            read: seismic::Timeline::new(&charges.device()).map_err(|error| failed(&error))?,
             jobs: Mutex::new(Jobs::default()),
             arrived: Condvar::new(),
             state: Mutex::new(State {
@@ -1464,7 +1464,7 @@ mod tests {
         let path = file(name);
         let device = device();
         let table = StoredTable::new(
-            &device,
+            &seismic::Charges::tally(&device),
             &descriptor(),
             stored(),
             resident(),
@@ -1558,14 +1558,14 @@ mod tests {
         let slab = seismic::SlabLayout::for_regions(1, 1, &regions).unwrap();
         let granule = slab.slab_bytes.next_multiple_of(slab.slab_alignment);
         let entry: Arc<dyn seismic::memory::Entry> = Arc::new(seismic::memory::Tally::unbounded(seismic::StoreIdentity::HostRam));
-        device.pool(seismic::Contract::Shared, granule, 2 * granule, seismic::PoolEntries::one(entry)).unwrap()
+        seismic::Pool::open(&seismic::PoolCharges::one(&device.charges_in(seismic::Contract::Shared, entry)), seismic::Contract::Shared, granule, 2 * granule).unwrap()
     }
 
     /// A banked table of `records` records of `record_rows` slots in
     /// `pool`, over the rows `path` holds.
-    fn banked(device: &seismic::Device, pool: &seismic::Pool, records: u64, record_rows: u64, path: &std::path::Path) -> StoredTable {
+    fn banked(charges: &seismic::Charges, pool: &seismic::Pool, records: u64, record_rows: u64, path: &std::path::Path) -> StoredTable {
         StoredTable::new(
-            device,
+            charges,
             &descriptor(),
             stored(),
             resident(),
@@ -1589,8 +1589,9 @@ mod tests {
     fn a_banked_table_resizes_by_records() {
         let path = file("resize");
         let device = device();
+        let charges = seismic::Charges::tally(&device);
         let pool = pool(&device, resident(), WIDTH, 256);
-        let table = banked(&device, &pool, 4, 256, &path);
+        let table = banked(&charges, &pool, 4, 256, &path);
         let granule = pool.granule();
         assert_eq!(table.charged_bytes(), 4 * granule);
         let rows = |count: u64, from: u64| (from..from + count).map(|row| row * 3 % ROWS).collect::<Vec<_>>();
@@ -1622,9 +1623,9 @@ mod tests {
             .into_iter()
             .flat_map(i32::to_le_bytes)
             .collect::<Vec<_>>();
-        let tokens = seismic::Tensor::from_host(&device, Element::i32(), &[2, 2], &query).unwrap();
+        let tokens = seismic::Tensor::from_host(&charges, Element::i32(), &[2, 2], &query).unwrap();
         let decoded = kernel
-            .call(magnitude_kernels::stored_rows::Args {
+            .call(&charges, magnitude_kernels::stored_rows::Args {
                 slots: table.slots_tensor(),
                 tokens: &tokens,
                 directory: table.directory(),
@@ -1666,7 +1667,7 @@ mod tests {
         let path = file("evict");
         let device = device();
         let pool = pool(&device, resident(), WIDTH, 16);
-        let table = banked(&device, &pool, 4, 16, &path);
+        let table = banked(&seismic::Charges::tally(&device), &pool, 4, 16, &path);
         let run = |rows: Vec<u64>| {
             let step = table.queue(StepRows::Known(vec![rows])).unwrap();
             assert!(step.gate.wait_signalled(step.value, Duration::from_secs(10)).unwrap());
@@ -1823,12 +1824,13 @@ mod tests {
                 continue;
             };
             backends.push(backend);
+            let charges = seismic::Charges::tally(&device);
             let ranges = vec![
                 RowRange { source: Reader::open(&codes, CachePolicy::Uncached).unwrap(), first: 100, bytes: WIDTH as usize },
                 RowRange { source: Reader::open(&scales, CachePolicy::Uncached).unwrap(), first: 37, bytes: (WIDTH / 32) as usize },
             ];
             let table = StoredTable::new(
-                &device,
+                &charges,
                 &descriptor,
                 Element::named("gguf_f8_e4m3_e8m0_1x32").unwrap(),
                 resident,
@@ -1856,9 +1858,9 @@ mod tests {
             )
             .unwrap();
             let selections = (0..ROWS as i32).flat_map(|row| [row, 0]).flat_map(i32::to_le_bytes).collect::<Vec<_>>();
-            let tokens = seismic::Tensor::from_host(&device, Element::i32(), &[ROWS, 2], &selections).unwrap();
+            let tokens = seismic::Tensor::from_host(&charges, Element::i32(), &[ROWS, 2], &selections).unwrap();
             let rows = kernel
-                .call(stored_rows::Args { slots: table.slots_tensor(), tokens: &tokens, directory: table.directory() })
+                .call(&charges, stored_rows::Args { slots: table.slots_tensor(), tokens: &tokens, directory: table.directory() })
                 .unwrap()
                 .value
                 .read_to_host()
@@ -2071,6 +2073,7 @@ mod tests {
     fn a_cold_and_a_warm_table_read_identical_rows() {
         use magnitude_kernels::stored_rows;
         let device = device();
+        let charges = seismic::Charges::tally(&device);
         let kernel = stored_rows::native_for_device_with(
             &device,
             stored_rows::Elements {
@@ -2096,7 +2099,7 @@ mod tests {
             // Each step's outputs, and the row slot 0 held when it read.
             let run = || {
                 let table = StoredTable::new(
-                    &device,
+                    &charges,
                     &descriptor(),
                     stored(),
                     resident(),
@@ -2118,14 +2121,14 @@ mod tests {
                         assert!(step.gate.wait_signalled(step.value, Duration::from_secs(10)).unwrap());
                         let selections = [first as i32, 0, -1, 0, second as i32, 0, -1, 1];
                         let tokens = seismic::Tensor::from_host(
-                            &device,
+                            &charges,
                             Element::i32(),
                             &[4, 2],
                             &selections.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>(),
                         )
                         .unwrap();
                         let rows = kernel
-                            .call(stored_rows::Args {
+                            .call(&charges, stored_rows::Args {
                                 slots: table.slots_tensor(),
                                 tokens: &tokens,
                                 directory: table.directory(),

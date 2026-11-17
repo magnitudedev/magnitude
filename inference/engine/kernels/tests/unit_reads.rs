@@ -160,20 +160,21 @@ macro_rules! prepared {
 
 /// (bitmap, units, segments) on `device`.
 fn native(device: &Device, case: &Case) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
+    let charges = seismic::Charges::tally(device);
     let m = case.rows.len() as u64;
     let (spans, r) = case.spans();
     let reads = prepared!(device, unit_reads::native_entry());
     let read = reads
-        .call(unit_reads::Args {
+        .call(&charges, unit_reads::Args {
             picks: &ints(device, &[m, case.k as u64], &case.picks()),
             complete: &ints(device, &[m], &case.complete()),
-            bitmap_words: &Tensor::from_host(device, Element::u32(), &[0, case.words as u64], &[]).unwrap(),
+            bitmap_words: &Tensor::from_host(&charges, Element::u32(), &[0, case.words as u64], &[]).unwrap(),
         })
         .unwrap();
     let rows = prepared!(device, candidate_rows::native_entry());
-    let host = |shape: &[u64]| Tensor::from_host(device, Element::i32(), shape, &[]).unwrap();
+    let host = |shape: &[u64]| Tensor::from_host(&charges, Element::i32(), shape, &[]).unwrap();
     let segments = rows
-        .call(candidate_rows::Args {
+        .call(&charges, candidate_rows::Args {
             blocks: &read.r1,
             spans: &ints(device, &[m, r as u64, 2], &spans),
             form: &host(&[0, case.rate as u64, 0]),

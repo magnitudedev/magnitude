@@ -137,7 +137,7 @@ pub fn pool(device: &seismic::Device) -> seismic::Pool {
     let store = topology.first_store(device.info(), seismic::Contract::DeviceOnly).expect("the device places DeviceOnly");
     let identity = topology.store_identity(store).expect("a placement names stores of its revision");
     let entry: std::sync::Arc<dyn seismic::memory::Entry> = std::sync::Arc::new(seismic::memory::Tally::unbounded(identity));
-    device.pool(seismic::Contract::DeviceOnly, 1 << 20, 4 << 20, seismic::PoolEntries::one(entry)).expect("the pool opens")
+    seismic::Pool::open(&seismic::PoolCharges::one(&device.charges_in(seismic::Contract::DeviceOnly, entry)), seismic::Contract::DeviceOnly, 1 << 20, 4 << 20).expect("the pool opens")
 }
 
 /// Select test devices with the caller's artifact-store configuration. Each

@@ -32,6 +32,7 @@ fn read_f32(tensor: &Tensor) -> Vec<f32> {
 fn a_gate_holds_the_work_after_it_until_the_host_opens_it() {
     let (m, n) = (1u64, 8u64);
     for device in seismic_native_tests::every_device() {
+        let charges = seismic::Charges::tally(&device);
         let backend = device.backend();
         let kernel =
             scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1))
@@ -65,12 +66,12 @@ fn a_gate_holds_the_work_after_it_until_the_host_opens_it() {
         graph.export(&after).unwrap();
         let plan = graph.seal().unwrap();
         let family = NativeGraphFamily::new(&[plan.clone()], 1).unwrap();
-        let mut slot = family.new_slot(&[family.upload_bytes()]).unwrap();
-        let output_slot = family.new_output_slot().unwrap();
+        let mut slot = family.new_slot(&charges, &[family.upload_bytes()]).unwrap();
+        let output_slot = family.new_output_slot(&charges).unwrap();
 
         let first = (0..n).map(|value| value as f32).collect::<Vec<_>>();
         let second = (0..n).map(|value| 100.0 + value as f32).collect::<Vec<_>>();
-        let shared = Tensor::shared(&device, Element::f32(), &[m, n]).unwrap();
+        let shared = Tensor::shared(&charges, Element::f32(), &[m, n]).unwrap();
         // SAFETY: no device work uses the tensor yet.
         unsafe { shared.write_shared(0, &f32_bytes(&first)).unwrap() };
         let (arrived, opened, done) = (
@@ -80,9 +81,9 @@ fn a_gate_holds_the_work_after_it_until_the_host_opens_it() {
         );
         // Two runs: the second's values are past the first's.
         for step in 1..=2u64 {
-            let outputs = family.new_output_slot().unwrap().activate(&plan).unwrap();
+            let outputs = family.new_output_slot(&charges).unwrap().activate(&plan).unwrap();
             let mut bindings = plan.bindings();
-            bindings.set(&input, &shared).unwrap();
+            bindings.set(&charges, &input, &shared).unwrap();
             bindings.set_timeline(arrival, &arrived, step).unwrap();
             bindings.set_timeline(gate, &opened, step).unwrap();
             bindings.set_timeline(signal, &done, step).unwrap();
@@ -136,6 +137,7 @@ fn a_gate_holds_the_work_after_it_until_the_host_opens_it() {
 fn an_open_gate_lets_the_run_through() {
     let (m, n) = (2u64, 4u64);
     for device in seismic_native_tests::every_device() {
+        let charges = seismic::Charges::tally(&device);
         let kernel =
             scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1))
                 .unwrap();
@@ -155,15 +157,15 @@ fn an_open_gate_lets_the_run_through() {
         graph.export(&value).unwrap();
         let plan = graph.seal().unwrap();
         let family = NativeGraphFamily::new(&[plan.clone()], 1).unwrap();
-        let mut slot = family.new_slot(&[family.upload_bytes()]).unwrap();
+        let mut slot = family.new_slot(&charges, &[family.upload_bytes()]).unwrap();
         let values = (0..m * n).map(|value| value as f32).collect::<Vec<_>>();
-        let tensor = Tensor::from_host(&device, Element::f32(), &[m, n], &f32_bytes(&values))
+        let tensor = Tensor::from_host(&charges, Element::f32(), &[m, n], &f32_bytes(&values))
             .unwrap();
         let opened = Timeline::new(&device).unwrap();
         opened.signal(7).unwrap();
-        let outputs = family.new_output_slot().unwrap().activate(&plan).unwrap();
+        let outputs = family.new_output_slot(&charges).unwrap().activate(&plan).unwrap();
         let mut bindings = plan.bindings();
-        bindings.set(&input, &tensor).unwrap();
+        bindings.set(&charges, &input, &tensor).unwrap();
         bindings.set_timeline(gate, &opened, 5).unwrap();
         let mut active = slot.activate(&plan).unwrap();
         let (outputs, completion) = active.attach(bindings, outputs).unwrap().submit().unwrap();
@@ -181,6 +183,7 @@ fn an_open_gate_lets_the_run_through() {
 #[test]
 fn a_run_binds_every_timeline_node() {
     let Some(device) = seismic_native_tests::fresh_device(BackendName::Cpu) else { return };
+    let charges = seismic::Charges::tally(&device);
     let kernel =
         scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1))
             .unwrap();
@@ -200,11 +203,11 @@ fn a_run_binds_every_timeline_node() {
     graph.export(&value).unwrap();
     let plan = graph.seal().unwrap();
     let family = NativeGraphFamily::new(&[plan.clone()], 1).unwrap();
-    let mut slot = family.new_slot(&[family.upload_bytes()]).unwrap();
-    let tensor = Tensor::zeros(&device, Element::f32(), &[1, 4]).unwrap();
-    let outputs = family.new_output_slot().unwrap().activate(&plan).unwrap();
+    let mut slot = family.new_slot(&charges, &[family.upload_bytes()]).unwrap();
+    let tensor = Tensor::zeros(&charges, Element::f32(), &[1, 4]).unwrap();
+    let outputs = family.new_output_slot(&charges).unwrap().activate(&plan).unwrap();
     let mut bindings = plan.bindings();
-    bindings.set(&input, &tensor).unwrap();
+    bindings.set(&charges, &input, &tensor).unwrap();
     let mut active = slot.activate(&plan).unwrap();
     assert!(active.attach(bindings, outputs).is_err());
     let mut bindings = plan.bindings();

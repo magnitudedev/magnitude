@@ -710,9 +710,11 @@ fn measure_job(request: &MeasureRequest, report: &mut dyn FnMut(MeasureEvent), r
     // attempting and the visiting closures report.
     let report = RefCell::new(report);
     let mut failures = probing;
+    // The job's process opened its device on tallies of its own
+    // (`Devices::open_with`): every byte it allocates is the job's.
     let measured = requests::measure(
         &mut measurer,
-        &device,
+        &seismic::Charges::tally(&device),
         &records,
         &outstanding,
         deadlines,

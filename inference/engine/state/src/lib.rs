@@ -1233,7 +1233,7 @@ impl HistoryDomain {
 /// sealed into graphs. Backing slabs are added as demand grows and released
 /// when empty, only through the store's [`StoreBindings`].
 pub struct StateStore {
-    device: Rc<Device>,
+    device: Device,
     /// The granule pool of the store the slabs lie in, shared with every
     /// other slab store there: each backed slab is one of its granules.
     pool: Pool,
@@ -1415,7 +1415,7 @@ impl StateStore {
     /// below a page or a bank is refused. The store's one [`StoreBindings`]
     /// comes with it.
     pub fn new(
-        device: Rc<Device>,
+        charges: &seismic::Charges,
         pool: Pool,
         context_capacity: usize,
         max_advance: usize,
@@ -1450,6 +1450,7 @@ impl StateStore {
             None
         } else {
             Some(SlabTensor::in_pool(
+                charges,
                 &pool,
                 bank_slab_banks as u64,
                 reserved_banks as u64,
@@ -1468,6 +1469,7 @@ impl StateStore {
         for domain in stored {
             let geometry = domain.pages.in_granule(domain.row_bytes, pool.granule()).map_err(Error::Request)?;
             let slabs = SlabTensor::in_pool(
+                charges,
                 &pool,
                 geometry.slab_rows as u64,
                 domain.logical_rows as u64,
@@ -1492,7 +1494,7 @@ impl StateStore {
             });
         }
         let store = Rc::new(Self {
-            device,
+            device: charges.device(),
             pool,
             context_capacity,
             domains,
@@ -2910,8 +2912,8 @@ impl OwnDevice {
         let (device, tally) =
             seismic::testing::open_backend_tallied(catalog, backend, Default::default())?;
         let entry: std::sync::Arc<dyn seismic::memory::Entry> = std::sync::Arc::new(tally.clone());
-        let pool = device
-            .pool(seismic::Contract::DeviceOnly, granule, granules * granule, seismic::PoolEntries::one(entry))
+        let charges = seismic::PoolCharges::one(&device.charges_in(seismic::Contract::DeviceOnly, entry));
+        let pool = Pool::open(&charges, seismic::Contract::DeviceOnly, granule, granules * granule)
             .expect("a test's own device opens its pool");
         Ok(Self {
             device: Rc::new(device),
@@ -2950,9 +2952,8 @@ impl OwnDevice {
         // one granule, a block's bytes.
         let (tally, entry) = scratch();
         let block = {
-            let opened = self
-                .device
-                .pool(seismic::Contract::DeviceOnly, self.pool.granule(), self.pool.block_bytes(), seismic::PoolEntries::one(entry))
+            let charges = seismic::PoolCharges::one(&self.device.charges_in(seismic::Contract::DeviceOnly, entry));
+            let opened = Pool::open(&charges, seismic::Contract::DeviceOnly, self.pool.granule(), self.pool.block_bytes())
                 .expect("a scratch pool opens beside the fixture's");
             let block = opened.held_bytes();
             assert_eq!(tally.held(), block);
@@ -2967,12 +2968,18 @@ impl OwnDevice {
         // the same pool, so tables of the same bytes, whatever the regions'
         // rows.
         let (tally, entry) = scratch();
-        let tables = seismic::memory::charging(&[entry], || {
+        // The fixture's store charged to the scratch tally; any other store
+        // the device reaches to an unbounded tally of its own.
+        let charges = self.device.charges(|store| match *store == identity {
+            true => entry.clone(),
+            false => std::sync::Arc::new(seismic::memory::Tally::unbounded(store.clone())),
+        });
+        let tables = {
             let made = stores
                 .iter()
                 .map(|slabs| {
                     let region = seismic::SlabRegion { element: seismic::Element::dense(DType::F32), row_shape: vec![1] };
-                    SlabTensor::in_pool(&self.pool, slabs.rows_per_slab(), slabs.logical_rows(), &vec![region; slabs.region_count()])
+                    SlabTensor::in_pool(&charges, &self.pool, slabs.rows_per_slab(), slabs.logical_rows(), &vec![region; slabs.region_count()])
                         .expect("a scratch slab store opens in the fixture's pool")
                 })
                 .collect::<Vec<_>>();
@@ -2980,7 +2987,7 @@ impl OwnDevice {
             let tables = tally.held();
             drop(made);
             tables
-        });
+        };
         assert_eq!(tally.held(), 0, "the scratch tables return their charge as they drop");
         let pooled = self.pool.held_bytes();
         assert_eq!(pooled, (slabs + 1) * block, "a block for each of {slabs} backed slabs and the absent granule");
@@ -2997,7 +3004,7 @@ impl OwnDevice {
         banks: BankCapacity,
     ) -> Result<(Rc<StateStore>, StoreBindings), Error> {
         StateStore::new(
-            self.device.clone(),
+            &seismic::Charges::tally(&self.device),
             self.pool.clone(),
             context_capacity,
             max_advance,

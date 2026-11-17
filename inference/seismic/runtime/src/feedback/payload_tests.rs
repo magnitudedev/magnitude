@@ -96,7 +96,7 @@ fn tensor(x: &tensor[8] {dtype}, y: &tensor[8] {dtype}, choose: bool, times: ran
                     &module,
                     module.entry_named(name).unwrap(),
                     ElementBindings::default(),
-                    &device,
+                    &crate::memory::Charges::tally(&device),
                     PreparationOptions::feedback(
                         PrecisionPolicy::Exact,
                         FeedbackOptions {
@@ -129,10 +129,10 @@ fn tensor(x: &tensor[8] {dtype}, y: &tensor[8] {dtype}, choose: bool, times: ran
         };
         let (held_input, held_alternate) = (held_bytes(&words), held_bytes(&alternate));
         let x = Arc::new(
-            TensorInner::from_host(&device, registry::dense(dtype), &[8], &input_bytes).unwrap(),
+            TensorInner::from_host(&crate::memory::Charges::tally(&device), registry::dense(dtype), &[8], &input_bytes).unwrap(),
         );
         let y = Arc::new(
-            TensorInner::from_host(&device, registry::dense(dtype), &[8], &alternate_bytes)
+            TensorInner::from_host(&crate::memory::Charges::tally(&device), registry::dense(dtype), &[8], &alternate_bytes)
                 .unwrap(),
         );
         for (choose, repetitions) in [(false, 0), (true, 0), (false, 2), (true, 2)] {
@@ -145,7 +145,7 @@ fn tensor(x: &tensor[8] {dtype}, y: &tensor[8] {dtype}, choose: bool, times: ran
                     start: 0_u64.into(),
                     end: u64::try_from(repetitions).unwrap().into(),
                 });
-                let actual = crate::api::kernel::call(&scalar, args)
+                let actual = crate::api::kernel::call(&scalar, &crate::memory::Charges::tally(&device), args)
                     .unwrap()
                     .take_scalar();
                 assert_eq!(
@@ -162,7 +162,7 @@ fn tensor(x: &tensor[8] {dtype}, y: &tensor[8] {dtype}, choose: bool, times: ran
                 start: 0_u64.into(),
                 end: u64::try_from(repetitions).unwrap().into(),
             });
-            let mut result = crate::api::kernel::call(&tensor, args).unwrap();
+            let mut result = crate::api::kernel::call(&tensor, &crate::memory::Charges::tally(&device), args).unwrap();
             assert_eq!(
                 result.take_tensor().read_to_host().unwrap(),
                 if choose { &held_alternate } else { &held_input }.as_slice(),
@@ -229,7 +229,7 @@ fn absolute(a: f16) -> f16:
                 &module,
                 module.entry_named(name).unwrap(),
                 ElementBindings::default(),
-                &device,
+                &crate::memory::Charges::tally(&device),
                 PreparationOptions::feedback(
                     PrecisionPolicy::Exact,
                     FeedbackOptions {
@@ -244,7 +244,7 @@ fn absolute(a: f16) -> f16:
         for bits in arguments {
             args.push_scalar(scalar_argument(dtype, bits));
         }
-        let actual = crate::api::kernel::call(&kernel, args)
+        let actual = crate::api::kernel::call(&kernel, &crate::memory::Charges::tally(&device), args)
             .unwrap()
             .take_scalar();
         assert_eq!(
@@ -300,7 +300,7 @@ fn maximum(a: &tensor[4] f32, b: &tensor[4] f32) -> tensor[4] f32:
                 &module,
                 module.entry_named(name).unwrap(),
                 ElementBindings::default(),
-                &device,
+                &crate::memory::Charges::tally(&device),
                 PreparationOptions::feedback(
                     PrecisionPolicy::Exact,
                     FeedbackOptions {
@@ -323,7 +323,7 @@ fn maximum(a: &tensor[4] f32, b: &tensor[4] f32) -> tensor[4] f32:
             let bytes = encode(&words);
             let input = Arc::new(
                 TensorInner::from_host(
-                    &device,
+                    &crate::memory::Charges::tally(&device),
                     registry::dense(dtype),
                     &[words.len() as u64],
                     &bytes,
@@ -341,7 +341,7 @@ fn maximum(a: &tensor[4] f32, b: &tensor[4] f32) -> tensor[4] f32:
                 ),
             ));
         }
-        let output = crate::api::kernel::call(&kernel, args)
+        let output = crate::api::kernel::call(&kernel, &crate::memory::Charges::tally(&device), args)
             .unwrap()
             .take_tensor();
         assert_eq!(
@@ -380,7 +380,7 @@ fn packed_reference_boundary(backend: registry::BackendName) {
             &module,
             module.entry_named("probe").unwrap(),
             ElementBindings::default(),
-            &device,
+            &crate::memory::Charges::tally(&device),
             PreparationOptions::feedback(
                 PrecisionPolicy::Exact,
                 FeedbackOptions {
@@ -404,11 +404,11 @@ fn packed_reference_boundary(backend: registry::BackendName) {
     weight[68..70].copy_from_slice(&0xbf00u16.to_le_bytes()); // -0.5
     weight[70..72].copy_from_slice(&0x4040u16.to_le_bytes()); // 3
     let a = Arc::new(
-        TensorInner::from_host(&device, registry::dense(DType::BF16), &[128], &activation).unwrap(),
+        TensorInner::from_host(&crate::memory::Charges::tally(&device), registry::dense(DType::BF16), &[128], &activation).unwrap(),
     );
     let w = Arc::new(
         TensorInner::from_host(
-            &device,
+            &crate::memory::Charges::tally(&device),
             registry::representation("q4g64").unwrap(),
             &[128],
             &weight,
@@ -418,7 +418,7 @@ fn packed_reference_boundary(backend: registry::BackendName) {
     let mut arguments = EncodedArgs::new();
     arguments.push_tensor(a.clone());
     arguments.push_tensor(w.clone());
-    let actual = crate::api::kernel::call(&kernel, arguments)
+    let actual = crate::api::kernel::call(&kernel, &crate::memory::Charges::tally(&device), arguments)
         .unwrap()
         .take_scalar();
     // ((9 * 1.5 - 2) * 1.25) + ((5 * -0.5 + 3) * -2)
@@ -490,7 +490,7 @@ fn source_cast_payloads(backend: registry::BackendName, store: bool) {
                 &module,
                 module.entry_named("cast_value").unwrap(),
                 ElementBindings::default(),
-                &device,
+                &crate::memory::Charges::tally(&device),
                 PreparationOptions::feedback(
                     PrecisionPolicy::Exact,
                     FeedbackOptions {
@@ -504,7 +504,7 @@ fn source_cast_payloads(backend: registry::BackendName, store: bool) {
         let recipe = scalar_recipe(ScalarOp::Cast(to), &[from]);
         let destination = Arc::new(
             TensorInner::from_host(
-                &device,
+                &crate::memory::Charges::tally(&device),
                 registry::dense(to),
                 &[1],
                 &vec![0; to.bytes() as usize],
@@ -520,7 +520,7 @@ fn source_cast_payloads(backend: registry::BackendName, store: bool) {
             if store {
                 args.push_tensor(destination.clone());
             }
-            let actual = crate::api::kernel::call(&kernel, args)
+            let actual = crate::api::kernel::call(&kernel, &crate::memory::Charges::tally(&device), args)
                 .unwrap()
                 .take_scalar();
             assert_eq!(

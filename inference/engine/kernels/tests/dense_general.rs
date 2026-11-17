@@ -126,7 +126,7 @@ fn tensor(
         other => panic!("unsupported element {other:?}"),
     };
     let shape = shape.iter().map(|d| *d as u64).collect::<Vec<_>>();
-    seismic::Tensor::from_host(device, element, &shape, &bytes).unwrap()
+    seismic::Tensor::from_host(&seismic::Charges::tally(device), element, &shape, &bytes).unwrap()
 }
 
 fn i32_tensor(device: &seismic::Device, shape: &[usize], values: &[i32]) -> seismic::Tensor {
@@ -135,7 +135,7 @@ fn i32_tensor(device: &seismic::Device, shape: &[usize], values: &[i32]) -> seis
         .flat_map(|v| v.to_le_bytes())
         .collect::<Vec<_>>();
     let shape = shape.iter().map(|d| *d as u64).collect::<Vec<_>>();
-    seismic::Tensor::from_host(device, seismic::Element::i32(), &shape, &bytes).unwrap()
+    seismic::Tensor::from_host(&seismic::Charges::tally(device), seismic::Element::i32(), &shape, &bytes).unwrap()
 }
 
 fn read(tensor: &seismic::Tensor, dtype: DType) -> Vec<f32> {
@@ -960,6 +960,7 @@ fn native_project_rows_matches_host_reference() {
                     },
                 );
                 for device in &devices {
+                    let charges = seismic::Charges::tally(device);
                     let form = Form::projection(
                         device.backend(),
                         rows,
@@ -989,7 +990,7 @@ fn native_project_rows_matches_host_reference() {
                         );
                         let result = projection
                             .kernel(device, &mapping)
-                            .call(project_rows::Args {
+                            .call(&charges, project_rows::Args {
                                 source: &source,
                                 weight: &weight,
                                 weight_scale: &weight_scale,
@@ -1053,6 +1054,7 @@ fn native_dense_up_matches_host_reference() {
                 out_rows(outputs),
             );
             for device in devices.iter() {
+                let charges = seismic::Charges::tally(device);
                 let form = Form::projection(
                     device.backend(),
                     outputs,
@@ -1081,7 +1083,7 @@ fn native_dense_up_matches_host_reference() {
                     );
                     let result = expansion
                         .kernel(device, &mapping)
-                        .call(dense_up::Args {
+                        .call(&charges, dense_up::Args {
                             residual: &residual,
                             norm: &norm_tensor,
                             up_weight: &up_tensor,
@@ -1148,6 +1150,7 @@ fn native_short_conv_project_matches_host_reference() {
         for rows in ROW_CLASSES {
             let x = residual(rows, h, 11 + rows as u32);
             for device in devices.iter() {
+                let charges = seismic::Charges::tally(device);
                 let form = Form::projection(
                     device.backend(),
                     rows,
@@ -1172,7 +1175,7 @@ fn native_short_conv_project_matches_host_reference() {
                     );
                     let result = projection
                         .kernel(device, &mapping)
-                        .call(short_conv_project::Args {
+                        .call(&charges, short_conv_project::Args {
                             residual: &residual,
                             norm: &norm_tensor,
                             b_weight: &b_tensor,
@@ -1236,6 +1239,7 @@ fn native_per_layer_gate_matches_host_reference() {
                 pattern(rows * l * p, 17, 1.0),
             );
             for device in devices.iter() {
+                let charges = seismic::Charges::tally(device);
                 let form = Form::projection(
                     device.backend(),
                     rows,
@@ -1267,7 +1271,7 @@ fn native_per_layer_gate_matches_host_reference() {
                     );
                     let result = gating
                         .kernel(device, &mapping)
-                        .call(per_layer_gate::Args {
+                        .call(&charges, per_layer_gate::Args {
                             hidden: &hidden_tensor,
                             gate_weight: &gate_tensor,
                             inputs: &inputs_tensor,

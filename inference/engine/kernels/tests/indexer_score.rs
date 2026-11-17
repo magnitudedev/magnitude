@@ -190,6 +190,7 @@ fn portable(case: &Case) -> Vec<f32> {
 }
 
 fn native(device: &seismic::Device, case: &Case) -> Vec<f32> {
+    let charges = seismic::Charges::tally(device);
     let m = case.rows as u64;
     let (spans, r) = span_table(&case.lists);
     let statics = [
@@ -207,7 +208,7 @@ fn native(device: &seismic::Device, case: &Case) -> Vec<f32> {
     let kernel = entry.prepare(device, &specialization).unwrap();
     let (_slabs, keys) = plane(device, Element::f32(), case.plane_rows, &case.keys);
     let results = kernel
-        .call(indexer_score::Args {
+        .call(&charges, indexer_score::Args {
             query: &tensor(device, Element::bf16(), &[m, H as u64, W as u64], &case.query),
             query_norm: &tensor(device, Element::f32(), &[case.nq() as u64, W as u64], &case.query_norm[..case.nq() * W]),
             head_weights: &tensor(
@@ -223,7 +224,7 @@ fn native(device: &seismic::Device, case: &Case) -> Vec<f32> {
             keys: &keys,
             spans: &ints(device, &[m, r as u64, 2], &spans),
             score_slots: &ints(device, &[0, case.n as u64], &[]),
-            form: &Tensor::from_host(device, Element::i32(), &[0, case.layout.ra as u64, case.layout.rt as u64], &[]).unwrap(),
+            form: &Tensor::from_host(&charges, Element::i32(), &[0, case.layout.ra as u64, case.layout.rt as u64], &[]).unwrap(),
             scale: case.scale,
             epsilon: EPSILON,
             block: case.rounding.block,
@@ -290,6 +291,7 @@ fn indexer_score_at_deepseek_v41_prefill_shape_times() {
     let Some(device) = devices().into_iter().find(|device| device.backend() == seismic::BackendName::Metal) else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let (m, n, blocks, block) = (2048usize, 16384usize, 2048usize, 8usize);
     let pool = |t: usize| {
         let covered = t / block + 1;
@@ -318,7 +320,7 @@ fn indexer_score_at_deepseek_v41_prefill_shape_times() {
     let amplitudes = tensor(&device, Element::f32(), &[P as u64], &[1.0; P]);
     let coordinates = ints(&device, &[m as u64, 4], &coordinates);
     let score_slots = ints(&device, &[0, n as u64], &[]);
-    let form = Tensor::from_host(&device, Element::i32(), &[0, 1, 1], &[]).unwrap();
+    let form = Tensor::from_host(&charges, Element::i32(), &[0, 1, 1], &[]).unwrap();
     for (name, list) in lists {
         let listed = (0..m).map(list).collect::<Vec<_>>();
         let (spans, r) = span_table(&listed);
@@ -353,7 +355,7 @@ fn indexer_score_at_deepseek_v41_prefill_shape_times() {
             written: Default::default(),
         };
         let result = indexer_score::native_tune_with(
-            &device,
+            &charges,
             indexer_score::Elements { A: Element::bf16() },
             &statics,
             vec![point],

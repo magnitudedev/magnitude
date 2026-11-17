@@ -20,6 +20,7 @@ fn a_sampled_run_reads_the_device_time_between_its_marks() {
     let (first, second) = (8usize, 16usize);
     for device in seismic_native_tests::every_device() {
         let backend = device.backend();
+        let charges = seismic::Charges::tally(&device);
         let kernel = scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1)).unwrap();
         let mut graph = device.native_graph();
         let input = graph.port(Element::f32(), &[rows, width]).unwrap();
@@ -36,12 +37,12 @@ fn a_sampled_run_reads_the_device_time_between_its_marks() {
         let plan = graph.seal().unwrap();
         let family = NativeGraphFamily::new(&[plan.clone()], 1).unwrap();
         assert_eq!(family.graphs().pinned.graphs, 1, "{backend:?}: a mark adds no graph");
-        let mut slot = family.new_slot(&[family.upload_bytes()]).unwrap();
-        let tensor = Tensor::zeros(&device, Element::f32(), &[rows, width]).unwrap();
+        let mut slot = family.new_slot(&charges, &[family.upload_bytes()]).unwrap();
+        let tensor = Tensor::zeros(&charges, Element::f32(), &[rows, width]).unwrap();
         let run = |sampled: bool, slot: &mut seismic::NativeGraphFamilySlot| {
-            let outputs = family.new_output_slot().unwrap().activate(&plan).unwrap();
+            let outputs = family.new_output_slot(&charges).unwrap().activate(&plan).unwrap();
             let mut bindings = plan.bindings();
-            bindings.set(&input, &tensor).unwrap();
+            bindings.set(&charges, &input, &tensor).unwrap();
             let mut active = slot.activate(&plan).unwrap();
             let ready = active.attach(bindings, outputs).unwrap();
             let mut sequence = device.native_sequence(seismic::NativeQueue::Compute);

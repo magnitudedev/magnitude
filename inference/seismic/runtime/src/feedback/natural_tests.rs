@@ -134,7 +134,7 @@ fn source_arithmetic(x: u32, y: i32) -> (u32, i32):
                 &module,
                 module.entry_named(name).unwrap(),
                 ElementBindings::default(),
-                &device,
+                &crate::memory::Charges::tally(&device),
                 PreparationOptions::feedback(
                     PrecisionPolicy::Exact,
                     FeedbackOptions {
@@ -149,7 +149,7 @@ fn source_arithmetic(x: u32, y: i32) -> (u32, i32):
         for argument in arguments {
             args.push_scalar(argument);
         }
-        let mut results = crate::api::kernel::call(&kernel, args)
+        let mut results = crate::api::kernel::call(&kernel, &crate::memory::Charges::tally(&device), args)
             .unwrap_or_else(|error| panic!("{backend:?} {name}: {error:?}"));
         for expected in expected {
             match (results.take_scalar(), expected) {

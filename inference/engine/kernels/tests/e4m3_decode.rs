@@ -247,13 +247,15 @@ fn assert_same(label: &str, actual: &[f32], expected: &[f32], kept: &[bool]) {
 }
 
 fn i32_tensor(device: &Device, shape: &[u64], values: &[i32]) -> Tensor {
+    let charges = seismic::Charges::tally(device);
     let bytes = values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
-    Tensor::from_host(device, Element::i32(), shape, &bytes).unwrap()
+    Tensor::from_host(&charges, Element::i32(), shape, &bytes).unwrap()
 }
 
 fn f32_tensor(device: &Device, shape: &[u64], values: &[f32]) -> Tensor {
+    let charges = seismic::Charges::tally(device);
     let bytes = values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
-    Tensor::from_host(device, Element::f32(), shape, &bytes).unwrap()
+    Tensor::from_host(&charges, Element::f32(), shape, &bytes).unwrap()
 }
 
 fn read_f32(tensor: &Tensor) -> Vec<f32> {
@@ -307,6 +309,7 @@ fn e4m3_gathers_match_the_reference_under_f32_scales() {
 }
 
 fn e4m3_gathers_match_the_reference_on(device: &Device, scales: Vec<Scale>) {
+    let charges = seismic::Charges::tally(device);
     let codes: [u8; K] = std::array::from_fn(|k| k as u8);
     let table = Table::new(
         scales
@@ -344,8 +347,8 @@ fn e4m3_gathers_match_the_reference_on(device: &Device, scales: Vec<Scale>) {
         );
         let out = declared::prepared(device, &embedding_rows::native_entry_with(elements()), &specialization)
             .unwrap()
-            .call(embedding_rows::Args {
-                table: &Tensor::from_host(device, element, &table.shape(), &bytes).unwrap(),
+            .call(&charges, embedding_rows::Args {
+                table: &Tensor::from_host(&charges, element, &table.shape(), &bytes).unwrap(),
                 tokens: &tokens,
                 directory: &directory,
                 scale: 1.0,
@@ -389,6 +392,7 @@ fn e4m3_gemv_products_match_the_reference_under_f32_scales() {
 /// The GEMV of a table of every finite code under each of `scales`, then a
 /// tile of rows of one NaN code of each sign under `one` (a scale of 1).
 fn e4m3_gemv_products_match_the_reference_on(device: &Device, scales: Vec<Scale>, one: Scale) {
+    let charges = seismic::Charges::tally(device);
     let finite = (0..=u8::MAX)
         .filter(|code| code & 0x7f != 0x7f)
         .chain([0x00, 0x80])
@@ -412,7 +416,7 @@ fn e4m3_gemv_products_match_the_reference_on(device: &Device, scales: Vec<Scale>
     let values = table.values();
     let kept = table.kept(device);
     let (element, bytes) = table.resident(device.backend().resident_layout());
-    let weight = Tensor::from_host(device, element, &table.shape(), &bytes).unwrap();
+    let weight = Tensor::from_host(&charges, element, &table.shape(), &bytes).unwrap();
     for act in [Element::bf16(), Element::f16()] {
         let elements = || project_rows::Elements {
             A: act,
@@ -440,8 +444,8 @@ fn e4m3_gemv_products_match_the_reference_on(device: &Device, scales: Vec<Scale>
                 .flat_map(|k| (if k == column { one } else { 0 }).to_le_bytes())
                 .collect::<Vec<_>>();
             let out = kernel
-                .call(project_rows::Args {
-                    source: &Tensor::from_host(device, act, &[1, K as u64], &source).unwrap(),
+                .call(&charges, project_rows::Args {
+                    source: &Tensor::from_host(&charges, act, &[1, K as u64], &source).unwrap(),
                     weight: &weight,
                     weight_scale: &f32_tensor(device, &[0], &[]),
                     weight_bound: &f32_tensor(device, &[0], &[]),

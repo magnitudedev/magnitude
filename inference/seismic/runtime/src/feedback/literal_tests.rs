@@ -17,7 +17,7 @@ fn literal_publications(backend: registry::BackendName) {
             &module,
             module.entry_named("probe").unwrap(),
             ElementBindings::default(),
-            &device,
+            &crate::memory::Charges::tally(&device),
             PreparationOptions::feedback(
                 PrecisionPolicy::Exact,
                 FeedbackOptions {
@@ -28,7 +28,7 @@ fn literal_publications(backend: registry::BackendName) {
         )
         .unwrap(),
     );
-    let mut results = crate::api::kernel::call(&kernel, EncodedArgs::new()).unwrap();
+    let mut results = crate::api::kernel::call(&kernel, &crate::memory::Charges::tally(&device), EncodedArgs::new()).unwrap();
     for expected in [
         ReferenceScalar::F16(0x3c01),
         ReferenceScalar::BF16(0x3f81),

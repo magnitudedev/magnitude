@@ -7,17 +7,16 @@ use super::*;
 /// scratch arena because a launch waits for the earlier launches over the
 /// bytes it reaches.
 pub(crate) struct NativeTensorBatch {
-    device: Arc<DeviceInner>,
     calls: Vec<(Arc<NativePrepared>, NativeBoundCall)>,
     scratch: ScratchArena,
 }
 
 impl NativeTensorBatch {
-    pub(crate) fn new(device: Arc<DeviceInner>) -> Self {
+    /// A batch whose calls' scratch is charged to `charges`.
+    pub(crate) fn new(charges: crate::memory::Charges) -> Self {
         Self {
-            device,
             calls: Vec::new(),
-            scratch: ScratchArena::default(),
+            scratch: ScratchArena::new(charges),
         }
     }
 
@@ -27,11 +26,6 @@ impl NativeTensorBatch {
         args: EncodedArgs,
         outputs: EncodedOutputs,
     ) -> Result<(), CallError> {
-        if !Arc::ptr_eq(&self.device, &kernel.public_device) {
-            return Err(CallError::Execution(ExecutionError::SubmissionFailed(
-                "native batch call belongs to another device".into(),
-            )));
-        }
         if kernel
             .results
             .iter()

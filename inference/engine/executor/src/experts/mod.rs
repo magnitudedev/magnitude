@@ -81,6 +81,7 @@ pub use directory::{LayerCurve, MissCurve, RoutedRead};
 #[cfg(feature = "expert-routing")]
 pub use directory::{Recency, replay};
 pub use bank::LoadPools;
+pub(crate) use bank::Places;
 pub(crate) use bank::{ExpertBank, ExpertStep, HeldTable, PooledRecords, Recording, ServedBank, StepFailure, StepRoute, fixture_pool, pooled_records, pooled_slabs};
 
 use magnitude_kernels::{constants, list_extent};

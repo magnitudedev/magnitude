@@ -19,7 +19,7 @@ use std::sync::mpsc;
 
 fn slots(table: SlotTable) -> ExchangeTable {
     let device = crate::test_support::open_backend(&Devices::discover(&[]).unwrap(), BackendName::Cpu).unwrap();
-    ExchangeTable::new(Tensor::shared(&device, Element::i32(), &[table.words()]).unwrap(), table, &super::super::Pulse::new()).unwrap()
+    ExchangeTable::new(Tensor::shared(&seismic::Charges::tally(&device), Element::i32(), &[table.words()]).unwrap(), table, &super::super::Pulse::new()).unwrap()
 }
 
 /// The reads of a load that reads nothing, of an engine that works on

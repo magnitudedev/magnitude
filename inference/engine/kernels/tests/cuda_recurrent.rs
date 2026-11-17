@@ -238,6 +238,7 @@ fn cuda_chunk_short_slots_get_the_step_bits() {
 #[ignore = "focused CUDA tuning; run explicitly on an idle device"]
 fn cuda_recurrent_scoped_tuning_completes() {
     let Some(device) = cuda() else { return };
+    let charges = seismic::Charges::tally(&device);
     let geometry = Geometry {
         banks: 3,
         ..QWEN_4B
@@ -281,7 +282,7 @@ fn cuda_recurrent_scoped_tuning_completes() {
         written: Default::default(),
     }];
     let result = gated_delta_chunk::native_tune_with(
-        &device,
+        &charges,
         gated_delta_chunk::Elements {
             RN: Element::f32(),
             A: Element::bf16(),

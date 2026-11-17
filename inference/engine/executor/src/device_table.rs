@@ -454,7 +454,7 @@ impl DeviceTable {
     /// slots are empty (`seed`).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        device: &seismic::Device,
+        charges: &seismic::Charges,
         element: seismic::Element,
         stored: seismic::Element,
         rows: u64,
@@ -468,6 +468,7 @@ impl DeviceTable {
         kept: Option<KeptRows>,
     ) -> Result<Self, String> {
         let failed = |error: &dyn std::fmt::Display| format!("device table: {error}");
+        let device = &charges.device();
         let tile = element.tile_rows();
         if rows % tile != 0
             || slots % tile != 0
@@ -488,22 +489,19 @@ impl DeviceTable {
         // The directory addresses every slot; the clock takes regular ones
         // only.
         let mut tiles = SlotDirectory::new(rows, slots + landing, tile, form);
-        let slots_tensor = seismic::Tensor::zeros(device, element, &shape(slots + landing))
-            .map_err(|error| failed(&error))?;
         // Every import into the slots (a run of tiles, a landed read) binds
         // one record of whole tiles from a tile's boundary: the table of the
-        // slots' tiles, held from now, serves every one of them
+        // slots' tiles, formed with them, serves every one of them
         // (`WeightPlan::record_table_entries`).
         let tiled = [(slots + landing) / tile, tile]
             .into_iter()
             .chain(row_shape.iter().copied())
             .collect::<Vec<_>>();
-        slots_tensor
-            .reshape(&tiled)
-            .and_then(|tiles| tiles.hold_record_table())
+        let slots_tensor = seismic::Tensor::zeros_recorded(charges, element, &tiled)
+            .and_then(|tiles| tiles.reshape(&shape(slots + landing)))
             .map_err(|error| failed(&error))?;
         let directory = seismic::Tensor::words(
-            device,
+            charges,
             seismic::Element::i32(),
             &[form.entries(rows, slots + landing), form.fields()],
         )
@@ -513,9 +511,9 @@ impl DeviceTable {
         let shared = Arc::new(Shared {
             directory,
             fields: form.fields(),
-            landing_staging: seismic::Tensor::shared(device, stored, &shape(landing))
+            landing_staging: seismic::Tensor::shared(charges, stored, &shape(landing))
                 .map_err(|error| failed(&error))?,
-            notice: seismic::Tensor::words(device, seismic::Element::i32(), &[landing, 2])
+            notice: seismic::Tensor::words(charges, seismic::Element::i32(), &[landing, 2])
                 .map_err(|error| failed(&error))?,
             noticed: seismic::Timeline::new(device).map_err(|error| failed(&error))?,
             gate: seismic::Timeline::new(device).map_err(|error| failed(&error))?,
@@ -560,17 +558,28 @@ impl DeviceTable {
             reads: Mutex::new(Some(reads)),
             filler: Some(filler),
         };
-        table.hold_places(1)?;
+        table.hold_places(charges, 1)?;
         Ok(table)
     }
 
     /// Hold the stagings a class of `places` places has in flight
     /// (`TableFlights::stagings`): grown for a larger class, the least
     /// recently used released for a smaller once their conversions complete.
-    pub fn hold_places(&self, places: usize) -> Result<(), String> {
+    pub fn hold_places(&self, charges: &seismic::Charges, places: usize) -> Result<(), String> {
         self.staging
             .borrow_mut()
-            .resize(self.flights.stagings(places), || staging(&self.slots, self.stored, self.staging_rows))
+            .resize(self.flights.stagings(places), || staging(charges, &self.slots, self.stored, self.staging_rows))
+    }
+
+    /// The floor's stagings alone held again, a class's released: the
+    /// floor's are held from the table's start, so none is made.
+    pub fn release_places(&self) {
+        self.staging
+            .borrow_mut()
+            .resize(self.flights.stagings(1), || -> Result<seismic::Tensor, String> {
+                panic!("invariant violated: a table's floor stagings made as its class is released")
+            })
+            .expect("a release makes no staging");
     }
 
     /// The bytes of the stagings a class of `places` places holds
@@ -601,10 +610,10 @@ impl DeviceTable {
     /// first: the rows steps named when the table was last served, then the
     /// table's first rows. The clock reaches the last slots first, so the
     /// least valuable rows are the first replaced.
-    pub fn seed(&self) -> Result<(), String> {
+    pub fn seed(&self, charges: &seismic::Charges) -> Result<(), String> {
         let kept = self.kept.as_ref().map_or_else(Vec::new, KeptRows::read);
-        self.hold(kept, true)?;
-        self.hold(0..self.shared.slot_tiles as u64 * self.tile_rows(), false)
+        self.hold(charges, kept, true)?;
+        self.hold(charges, 0..self.shared.slot_tiles as u64 * self.tile_rows(), false)
     }
 
     /// Bring the tiles of `rows` the device does not hold into the slots no
@@ -612,7 +621,7 @@ impl DeviceTable {
     /// table's first step finds the device idle. Rows outside the table name
     /// none. `served`: steps named these rows when the table was last
     /// served.
-    fn hold(&self, rows: impl IntoIterator<Item = u64>, served: bool) -> Result<(), String> {
+    fn hold(&self, charges: &seismic::Charges, rows: impl IntoIterator<Item = u64>, served: bool) -> Result<(), String> {
         let tile = self.tile_rows();
         let (absent, taken) = {
             let mut state = self.state();
@@ -640,7 +649,7 @@ impl DeviceTable {
         let rows = absent.len() as u64 * tile;
         let mut seeding = match rows {
             0 => return Ok(()),
-            rows => staging(&self.slots, self.stored, rows)?,
+            rows => staging(charges, &self.slots, self.stored, rows)?,
         };
         match self.bring(&absent, &taken, served, &mut seeding)? {
             Some(converted) => converted.wait().map_err(|error| format!("device table: {error}")),
@@ -1065,6 +1074,7 @@ impl Shared {
 
 /// A staging tensor of `rows` rows of the table of `slots`, as `stored`.
 fn staging(
+    charges: &seismic::Charges,
     slots: &seismic::Tensor,
     stored: seismic::Element,
     rows: u64,
@@ -1074,7 +1084,7 @@ fn staging(
         .collect::<Vec<_>>();
     // SAFETY: a fill writes every row of its staging before the device
     // reads them.
-    unsafe { seismic::Tensor::uninitialized(&slots.device(), stored, &extents) }
+    unsafe { seismic::Tensor::uninitialized(charges, stored, &extents) }
         .map_err(|error| format!("device table staging: {error}"))
 }
 
@@ -1139,8 +1149,9 @@ mod tests {
     fn device_table(kept: Option<&Path>) -> Rc<DeviceTable> {
         let catalog = seismic::Devices::discover(&[]).unwrap();
         let device = crate::test_support::open_backend(&catalog, seismic::testing::requested_backend().unwrap_or(BackendName::Cpu)).unwrap();
+        let charges = seismic::Charges::tally(&device);
         let table = DeviceTable::new(
-            &device,
+            &charges,
             Element::f32(),
             Element::f32(),
             8,
@@ -1154,7 +1165,7 @@ mod tests {
             kept.map(|directory| KeptRows::of(directory, "table")),
         )
         .unwrap();
-        table.seed().unwrap();
+        table.seed(&charges).unwrap();
         Rc::new(table)
     }
 

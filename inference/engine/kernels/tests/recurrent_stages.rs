@@ -228,6 +228,7 @@ impl Tensors {
         chunk: bool,
         specialization: &NativeSpecialization,
     ) -> Tensor {
+        let charges = seismic::Charges::tally(device);
         macro_rules! call {
             ($module:ident, $args:expr) => {
                 declared::prepared(
@@ -239,7 +240,7 @@ impl Tensors {
                     specialization,
                 )
                 .unwrap()
-                .call($args)
+                .call(&charges, $args)
                 .unwrap()
                 .value
             };
@@ -962,7 +963,7 @@ impl Case {
         let g = self.geometry;
         let from_f32 = |shape: &[u64], values: &[f32]| {
             Tensor::from_host(
-                device,
+                &seismic::Charges::tally(device),
                 Element::f32(),
                 shape,
                 &values
@@ -984,11 +985,11 @@ impl Case {
                     .flat_map(|value| value.to_le_bytes())
                     .collect()
             };
-            Tensor::from_host(device, activation, shape, &bytes).unwrap()
+            Tensor::from_host(&seismic::Charges::tally(device), activation, shape, &bytes).unwrap()
         };
         let ints = |shape: &[u64], values: Vec<i32>| {
             Tensor::from_host(
-                device,
+                &seismic::Charges::tally(device),
                 Element::i32(),
                 shape,
                 &values
@@ -1953,6 +1954,7 @@ fn step_row_block_never_changes_bits_and_stop_equals_a_shorter_run() {
 }
 
 fn step_row_block_never_changes_bits_and_stop_equals_a_shorter_run_on(device: &Device) {
+    let charges = seismic::Charges::tally(device);
     let slot = |rows, stop| slot(rows, stop, 1, 2);
     let full = Case::new(SMALL, 6, vec![slot(6, 3)], false, 11);
     let mut reference = None;
@@ -1960,7 +1962,7 @@ fn step_row_block_never_changes_bits_and_stop_equals_a_shorter_run_on(device: &D
         let mut t = full.tensors(device, Element::f32());
         let gated = full
             .native_step(device, Element::f32(), rows)
-            .call(t.step_args(&full))
+            .call(&charges, t.step_args(&full))
             .unwrap()
             .value;
         let outcome = (read(&gated), read(&t.window), read(&t.delta));
@@ -2200,7 +2202,7 @@ fn bf16_tensor(device: &Device, shape: &[u64], values: &[f32]) -> Tensor {
         .iter()
         .flat_map(|value| ((bf16_round(*value).to_bits() >> 16) as u16).to_le_bytes())
         .collect::<Vec<_>>();
-    Tensor::from_host(device, Element::bf16(), shape, &bytes).unwrap()
+    Tensor::from_host(&seismic::Charges::tally(device), Element::bf16(), shape, &bytes).unwrap()
 }
 
 /// The inputs of the recurrent projection of a case: F32 hidden rows, BF16
@@ -2237,7 +2239,7 @@ impl ProjectionInputs {
         });
         Self {
             hidden: Tensor::from_host(
-                device,
+                &seismic::Charges::tally(device),
                 Element::f32(),
                 &[case.rows as u64, hidden as u64],
                 &values
@@ -2505,6 +2507,7 @@ fn step_form(
     hidden: usize,
     mapping: ProjectionMapping,
 ) -> (Vec<f32>, Outcome) {
+    let charges = seismic::Charges::tally(device);
     use magnitude_kernels::gated_delta_project;
     let g = case.geometry;
     let launch = crate::common::metal_launch::<gated_delta_project::Entry>;
@@ -2545,7 +2548,7 @@ fn step_form(
         &specialization,
     )
     .unwrap()
-    .call(gated_delta_project::Args {
+    .call(&charges, gated_delta_project::Args {
         hidden: &inputs.hidden,
         input_norm: &inputs.norm,
         qkv_weight: &inputs.weights[0],
@@ -2553,8 +2556,8 @@ fn step_form(
         alpha_weight: &inputs.weights[2],
         beta_weight: &inputs.weights[3],
         epsilon: 1e-6,
-        qkv_bound: &Tensor::from_host(device, Element::f32(), &[0], &[]).unwrap(),
-        gate_bound: &Tensor::from_host(device, Element::f32(), &[0], &[]).unwrap(),
+        qkv_bound: &Tensor::from_host(&charges, Element::f32(), &[0], &[]).unwrap(),
+        gate_bound: &Tensor::from_host(&charges, Element::f32(), &[0], &[]).unwrap(),
     })
     .unwrap()
     .value;
@@ -2562,7 +2565,7 @@ fn step_form(
     t.inputs = Inputs::Gated { projection };
     let gated = case
         .native_step(device, Element::bf16(), 32)
-        .call(t.step_args(case))
+        .call(&charges, t.step_args(case))
         .unwrap()
         .value;
     (
@@ -2585,6 +2588,7 @@ fn convolved_form(
     hidden: usize,
     mapping: ProjectionMapping,
 ) -> (Vec<f32>, Outcome) {
+    let charges = seismic::Charges::tally(device);
     use magnitude_kernels::{gated_delta_project_convolved, gated_delta_step_convolved};
     let g = case.geometry;
     let specialization = gemv_mappings(
@@ -2613,7 +2617,7 @@ fn convolved_form(
         &specialization,
     )
     .unwrap()
-    .call(gated_delta_project_convolved::Args {
+    .call(&charges, gated_delta_project_convolved::Args {
         hidden: &inputs.hidden,
         input_norm: &inputs.norm,
         qkv_weight: &inputs.weights[0],
@@ -2645,7 +2649,7 @@ fn convolved_form(
         &step,
     )
     .unwrap()
-    .call(gated_delta_step_convolved::Args {
+    .call(&charges, gated_delta_step_convolved::Args {
         projection: &projected.r0,
         convolved: &projected.r1,
         rate: &t.rate,
@@ -3031,6 +3035,7 @@ fn step_timing_at_decode_shapes() {
     };
     let backends = [BackendName::Metal, BackendName::Cuda, BackendName::Vulkan];
     for device in seismic_native_tests::devices(&backends) {
+        let charges = seismic::Charges::tally(&device);
         let backend = device.backend();
         let mappings: Vec<(String, NativeSpecialization)> = match backend {
             BackendName::Metal => [32u64, 16, 64]
@@ -3060,7 +3065,7 @@ fn step_timing_at_decode_shapes() {
                 )
                 .unwrap();
                 let mut t = case.tensors(&device, Element::bf16());
-                let point = kernel.point(vec![t.step_args(&case)]).unwrap();
+                let point = kernel.point(&charges, vec![t.step_args(&case)]).unwrap();
                 let (median, min) = time_point!(point);
                 eprintln!(
                     "{backend:?} gated_delta_step M={rows} {label}: {:.2} us (min {:.2})",
@@ -3094,7 +3099,7 @@ fn step_timing_at_decode_shapes() {
                 let (projection, beta, gate, decay, lower) =
                     (projection.clone(), beta.clone(), gate.clone(), decay.clone(), *lower);
                 let point = kernel
-                    .point(vec![state_args!(kimi_delta_step, t, case, {
+                    .point(&charges, vec![state_args!(kimi_delta_step, t, case, {
                         projection: &projection, beta: &beta, gate: &gate, decay: &decay, decay_lower: lower,
                     })])
                     .unwrap();

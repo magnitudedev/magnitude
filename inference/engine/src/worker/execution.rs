@@ -320,13 +320,17 @@ mod tests {
     }
 
     /// Store the read line of the volume `cache` lies on as the
-    /// measurement job measures it.
-    fn store_read_line(device: &seismic::Device, cache: &std::path::Path) {
+    /// measurement job measures it: on a device of `backend`'s of its own,
+    /// opened outside any ledger as the job's process opens its own, and
+    /// charged to its tallies.
+    fn store_read_line(backend: seismic::BackendName, cache: &std::path::Path) {
+        let catalog = seismic::Devices::discover(&[]).unwrap();
+        let (device, _) = seismic::testing::open_backend_tallied(&catalog, backend, Default::default()).unwrap();
         let mut measurer =
             seismic::Measurer::new(magnitude_executor::SEARCH_SETTINGS.error_rate, magnitude_executor::MIN_SAMPLE_SECONDS);
         magnitude_executor::assessment::requests::measure(
             &mut measurer,
-            device,
+            &seismic::Charges::tally(&device),
             &KernelCache::measurement_records(cache),
             &magnitude_executor::assessment::Outstanding {
                 standing: vec![magnitude_executor::assessment::PointRequest::Storage { directory: cache.to_owned() }],
@@ -380,7 +384,7 @@ mod tests {
         assert_eq!(grown, 4, "the unpriced bank grew to its ceiling");
         assert!(matches!(resize, Some(BankResize::Grew { from: 2, .. })), "{resize:?}");
         // The measurement job stores the store's read line.
-        store_read_line(&device, cache.path());
+        store_read_line(backend, cache.path());
         assert!(matches!(execution.command(WorkerCommand::Reprice, now), Ok(WorkerReply::Acknowledged)));
         observe(&mut execution, now, 100);
         let (repriced, resize) = slots(&mut execution);

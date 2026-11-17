@@ -223,9 +223,11 @@ impl Function {
                 b.bind(n, e.id())
             }))
     }
+    /// The entry prepared on `charges`' device, its calls allocating
+    /// through `charges`.
     pub fn prepare(
         &self,
-        device: &Device,
+        charges: &super::Charges,
         elements: BTreeMap<String, Element>,
         options: PreparationOptions,
     ) -> Result<Kernel, Error> {
@@ -235,12 +237,12 @@ impl Function {
             &self.module.checked,
             self.info().id,
             self.bindings(&elements)?,
-            device.inner(),
+            charges.inner(),
             options,
         )?;
         Ok(Kernel {
             function: self.clone(),
-            device: device.clone(),
+            charges: charges.share(),
             elements,
             inner: KernelKind::Ordinary(Arc::new(prepared)),
             preparation_seconds: start.elapsed().as_secs_f64(),
@@ -251,7 +253,7 @@ impl Function {
     /// implementations are Rust compiled into a generated-binding build.
     pub fn prepare_native(
         &self,
-        device: &Device,
+        charges: &super::Charges,
         elements: BTreeMap<String, Element>,
         specialization: crate::NativeSpecialization,
     ) -> Result<Kernel, Error> {
@@ -261,13 +263,13 @@ impl Function {
             &self.module.checked,
             self.info().id,
             bindings,
-            device.inner(),
+            charges.device().inner(),
             specialization,
             None,
         )?;
         Ok(Kernel {
             function: self.clone(),
-            device: device.clone(),
+            charges: charges.share(),
             elements,
             inner: KernelKind::Native(Arc::new(prepared)),
             preparation_seconds: start.elapsed().as_secs_f64(),
@@ -298,6 +300,8 @@ impl Drop for TensorHandle {
 }
 /// A dynamic host owner. Cloning aliases validity; views are separately tracked borrows.
 #[derive(Clone)]
+/// A tensor of a host binding: what it allocates is charged to the charges
+/// it is made through.
 pub struct Tensor(Arc<TensorHandle>);
 impl Tensor {
     fn new(value: super::Tensor, view: bool) -> Self {
@@ -326,19 +330,19 @@ impl Tensor {
             .ok_or_else(|| Error::new("TensorError", "tensor was moved"))
     }
     pub fn from_host(
-        device: &Device,
+        charges: &super::Charges,
         element: Element,
         shape: &[u64],
         bytes: &[u8],
     ) -> Result<Self, Error> {
         Ok(Self::new(
-            super::Tensor::from_host(device, element, shape, bytes)?,
+            super::Tensor::from_host(charges, element, shape, bytes)?,
             false,
         ))
     }
-    pub fn zeros(device: &Device, element: Element, shape: &[u64]) -> Result<Self, Error> {
+    pub fn zeros(charges: &super::Charges, element: Element, shape: &[u64]) -> Result<Self, Error> {
         Ok(Self::new(
-            super::Tensor::zeros(device, element, shape)?,
+            super::Tensor::zeros(charges, element, shape)?,
             false,
         ))
     }
@@ -362,10 +366,11 @@ impl Tensor {
         let _g = lock(&self.0.storage.gate);
         Ok(self.raw()?.write_from_host(bytes)?)
     }
-    pub fn copy(&self) -> Result<Self, Error> {
+    /// A copy of it, allocated through `charges`.
+    pub fn copy(&self, charges: &super::Charges) -> Result<Self, Error> {
         let _g = lock(&self.0.storage.gate);
         let t = self.raw()?;
-        Self::from_host(&t.device(), t.element(), t.extents(), &t.read_to_host()?)
+        Self::from_host(charges, t.element(), t.extents(), &t.read_to_host()?)
     }
     pub fn copy_from(&self, source: &Self) -> Result<(), Error> {
         let mut storages = vec![self.0.storage.clone(), source.0.storage.clone()];
@@ -472,7 +477,8 @@ enum KernelKind {
 }
 pub struct Kernel {
     function: Function,
-    device: Device,
+    /// What its calls allocate through.
+    charges: super::Charges,
     elements: BTreeMap<String, Element>,
     inner: KernelKind,
     pub preparation_seconds: f64,
@@ -481,8 +487,8 @@ impl Kernel {
     pub fn function(&self) -> &Function {
         &self.function
     }
-    pub fn device(&self) -> &Device {
-        &self.device
+    pub fn device(&self) -> Device {
+        self.charges.device()
     }
     pub fn is_native(&self) -> bool {
         matches!(self.inner, KernelKind::Native(_))
@@ -524,7 +530,7 @@ impl Kernel {
         }
         let result = match &self.inner {
             KernelKind::Ordinary(kernel) => {
-                let mut draft = runtime::workflow(self.device.inner())
+                let mut draft = runtime::workflow(self.charges.inner())
                     .map_err(|e| Error::from(CallError::Workflow(e)))?;
                 let mut workflow_args = runtime::EncodedWorkflowArgs::new();
                 for v in args {
@@ -553,7 +559,7 @@ impl Kernel {
                 }
             }
             KernelKind::Native(kernel) => seismic_lang::failure::SourceTermination::Returned(
-                runtime::call_native_with_commit(kernel, encoded, || {
+                runtime::call_native_with_commit(kernel, self.charges.inner(), encoded, || {
                     for t in &moves {
                         t.commit();
                     }
@@ -710,12 +716,14 @@ fn decode(
     })
 }
 
-// Own the device before borrowing its preparation context. The generated cell
-// drops the campaign first and never invents a static device lifetime.
+// Own the charges (and their device) before borrowing the preparation
+// context. The generated cell drops the campaign first and never invents a
+// static device lifetime. The campaign's trials, and the kernels it
+// publishes, allocate through the owned charges.
 type Campaign<'a> = runtime::FeedbackPreparation<'a>;
 self_cell::self_cell! {
     struct OwnedCampaign {
-        owner: Device,
+        owner: super::Charges,
         #[not_covariant]
         dependent: Campaign,
     }
@@ -728,7 +736,7 @@ pub struct FeedbackSession {
 impl Function {
     pub fn start_feedback(
         &self,
-        device: &Device,
+        charges: &super::Charges,
         elements: BTreeMap<String, Element>,
         options: PreparationOptions,
     ) -> Result<(FeedbackSession, Kernel), Error> {
@@ -742,7 +750,7 @@ impl Function {
         let bindings = self.bindings(&elements)?;
         let start = Instant::now();
         let mut initial = None;
-        let campaign = OwnedCampaign::try_new(device.clone(), |owner| {
+        let campaign = OwnedCampaign::try_new(charges.share(), |owner| {
             let (session, kernel) = runtime::start_feedback(
                 &self.module.checked,
                 self.info().id,
@@ -756,7 +764,7 @@ impl Function {
         })?;
         let kernel = Kernel {
             function: self.clone(),
-            device: device.clone(),
+            charges: charges.share(),
             elements: elements.clone(),
             inner: KernelKind::Ordinary(Arc::new(
                 initial.expect("successful feedback publishes kernel"),
@@ -781,7 +789,7 @@ impl FeedbackSession {
             .with_dependent_mut(|_, s| s.continue_for(duration))?;
         Ok(Kernel {
             function: self.function.clone(),
-            device: self.campaign.borrow_owner().clone(),
+            charges: self.campaign.borrow_owner().share(),
             elements: self.elements.clone(),
             inner: KernelKind::Ordinary(Arc::new(inner)),
             preparation_seconds: start.elapsed().as_secs_f64(),

@@ -90,7 +90,7 @@ fn unit_effect(x: &mut tensor[4] f32) -> f32:
                 &module,
                 module.entry_named(name).unwrap(),
                 ElementBindings::default(),
-                &device,
+                &crate::memory::Charges::tally(&device),
                 PreparationOptions::feedback(
                     PrecisionPolicy::Exact,
                     FeedbackOptions {
@@ -106,11 +106,11 @@ fn unit_effect(x: &mut tensor[4] f32) -> f32:
             .flat_map(f32::to_le_bytes)
             .collect::<Vec<_>>();
         let input = Arc::new(
-            TensorInner::from_host(&device, registry::dense(DType::F32), &[4], &bytes).unwrap(),
+            TensorInner::from_host(&crate::memory::Charges::tally(&device), registry::dense(DType::F32), &[4], &bytes).unwrap(),
         );
         let mut args = EncodedArgs::new();
         args.push_tensor(input);
-        let mut output = crate::api::kernel::call(&kernel, args)
+        let mut output = crate::api::kernel::call(&kernel, &crate::memory::Charges::tally(&device), args)
             .unwrap_or_else(|error| panic!("{name}: {error:?}"));
         let ArgumentValue::F32(actual) = output.take_scalar() else {
             panic!("{name}: expected scalar")
@@ -165,7 +165,7 @@ fn fresh_partial(x: &tensor[2,2] f32) -> f32:
                 &module,
                 module.entry_named(name).unwrap(),
                 ElementBindings::default(),
-                &device,
+                &crate::memory::Charges::tally(&device),
                 PreparationOptions::feedback(
                     PrecisionPolicy::Exact,
                     FeedbackOptions {
@@ -181,11 +181,11 @@ fn fresh_partial(x: &tensor[2,2] f32) -> f32:
             .flat_map(f32::to_le_bytes)
             .collect::<Vec<_>>();
         let input = Arc::new(
-            TensorInner::from_host(&device, registry::dense(DType::F32), &[2, 2], &bytes).unwrap(),
+            TensorInner::from_host(&crate::memory::Charges::tally(&device), registry::dense(DType::F32), &[2, 2], &bytes).unwrap(),
         );
         let mut args = EncodedArgs::new();
         args.push_tensor(input);
-        let mut output = crate::api::kernel::call(&kernel, args)
+        let mut output = crate::api::kernel::call(&kernel, &crate::memory::Charges::tally(&device), args)
             .unwrap_or_else(|error| panic!("{name}: {error:?}"));
         let ArgumentValue::F32(actual) = output.take_scalar() else {
             panic!("expected scalar")
@@ -249,7 +249,7 @@ fn cpu_repeat_uses_nonzero_offset_and_rectangular_transpose_composition() {
             &module,
             module.entry_named("main").unwrap(),
             ElementBindings::default(),
-            &device,
+            &crate::memory::Charges::tally(&device),
             PreparationOptions::feedback(
                 PrecisionPolicy::Exact,
                 FeedbackOptions {
@@ -264,11 +264,11 @@ fn cpu_repeat_uses_nonzero_offset_and_rectangular_transpose_composition() {
         .flat_map(|value| (value as f32).to_le_bytes())
         .collect::<Vec<_>>();
     let input = Arc::new(
-        TensorInner::from_host(&device, registry::dense(DType::F32), &[3, 4], &bytes).unwrap(),
+        TensorInner::from_host(&crate::memory::Charges::tally(&device), registry::dense(DType::F32), &[3, 4], &bytes).unwrap(),
     );
     let mut args = EncodedArgs::new();
     args.push_tensor(input);
-    let mut output = crate::api::kernel::call(&kernel, args).unwrap();
+    let mut output = crate::api::kernel::call(&kernel, &crate::memory::Charges::tally(&device), args).unwrap();
     let ArgumentValue::F32(actual) = output.take_scalar() else {
         panic!("expected scalar")
     };
@@ -290,7 +290,7 @@ fn cpu_overlapping_store_preserves_rhs_and_root_descriptor() {
             &module,
             module.entry_named("main").unwrap(),
             ElementBindings::default(),
-            &device,
+            &crate::memory::Charges::tally(&device),
             PreparationOptions::feedback(
                 PrecisionPolicy::Exact,
                 FeedbackOptions {
@@ -306,11 +306,11 @@ fn cpu_overlapping_store_preserves_rhs_and_root_descriptor() {
         .flat_map(f32::to_le_bytes)
         .collect::<Vec<_>>();
     let input = Arc::new(
-        TensorInner::from_host(&device, registry::dense(DType::F32), &[3], &bytes).unwrap(),
+        TensorInner::from_host(&crate::memory::Charges::tally(&device), registry::dense(DType::F32), &[3], &bytes).unwrap(),
     );
     let mut args = EncodedArgs::new();
     args.push_tensor(input);
-    let mut output = crate::api::kernel::call(&kernel, args).unwrap();
+    let mut output = crate::api::kernel::call(&kernel, &crate::memory::Charges::tally(&device), args).unwrap();
     let ArgumentValue::F32(actual) = output.take_scalar() else {
         panic!("expected scalar")
     };
@@ -391,7 +391,7 @@ fn captured(x: &tensor[3,4] f32) -> tensor[6] f32:
                 &module,
                 module.entry_named(name).unwrap(),
                 ElementBindings::default(),
-                &device,
+                &crate::memory::Charges::tally(&device),
                 PreparationOptions::feedback(
                     PrecisionPolicy::Exact,
                     FeedbackOptions {
@@ -407,11 +407,11 @@ fn captured(x: &tensor[3,4] f32) -> tensor[6] f32:
             .flat_map(|value| (value as f32).to_le_bytes())
             .collect::<Vec<_>>();
         let input = Arc::new(
-            TensorInner::from_host(&device, registry::dense(DType::F32), &shape, &bytes).unwrap(),
+            TensorInner::from_host(&crate::memory::Charges::tally(&device), registry::dense(DType::F32), &shape, &bytes).unwrap(),
         );
         let mut args = EncodedArgs::new();
         args.push_tensor(input.clone());
-        let mut result = crate::api::kernel::call(&kernel, args)
+        let mut result = crate::api::kernel::call(&kernel, &crate::memory::Charges::tally(&device), args)
             .unwrap_or_else(|error| panic!("{name}: {error:?}"));
         let expected = expected
             .into_iter()
@@ -442,7 +442,7 @@ fn captured(x: &tensor[3,4] f32) -> tensor[6] f32:
             &module,
             module.entry_named("failure_prefix").unwrap(),
             ElementBindings::default(),
-            &device,
+            &crate::memory::Charges::tally(&device),
             PreparationOptions::feedback(
                 PrecisionPolicy::Exact,
                 FeedbackOptions {
@@ -457,13 +457,13 @@ fn captured(x: &tensor[3,4] f32) -> tensor[6] f32:
         .flat_map(|value| (value as f32).to_le_bytes())
         .collect::<Vec<_>>();
     let input = Arc::new(
-        TensorInner::from_host(&device, registry::dense(DType::F32), &[2, 3], &bytes).unwrap(),
+        TensorInner::from_host(&crate::memory::Charges::tally(&device), registry::dense(DType::F32), &[2, 3], &bytes).unwrap(),
     );
     let mut args = EncodedArgs::new();
     args.push_tensor(input.clone());
     args.push_scalar(crate::api::kernel::EncodedScalar::I32(2));
     assert!(
-        crate::api::kernel::call(&kernel, args).is_err(),
+        crate::api::kernel::call(&kernel, &crate::memory::Charges::tally(&device), args).is_err(),
         "failed source prefix must not publish a mapped result"
     );
     let expected = [7_f32, 2., 3., 4., 5., 6.]
@@ -508,7 +508,7 @@ fn partial(x: &tensor[2,3] f32) -> tensor[1] f32:
                 &module,
                 module.entry_named(name).unwrap(),
                 ElementBindings::default(),
-                &device,
+                &crate::memory::Charges::tally(&device),
                 PreparationOptions::feedback(
                     PrecisionPolicy::Exact,
                     FeedbackOptions {
@@ -523,11 +523,11 @@ fn partial(x: &tensor[2,3] f32) -> tensor[1] f32:
             .flat_map(|value| (value as f32).to_le_bytes())
             .collect::<Vec<_>>();
         let input = Arc::new(
-            TensorInner::from_host(&device, registry::dense(DType::F32), &[2, 3], &bytes).unwrap(),
+            TensorInner::from_host(&crate::memory::Charges::tally(&device), registry::dense(DType::F32), &[2, 3], &bytes).unwrap(),
         );
         let mut args = EncodedArgs::new();
         args.push_tensor(input);
-        let mut result = crate::api::kernel::call(&kernel, args).unwrap();
+        let mut result = crate::api::kernel::call(&kernel, &crate::memory::Charges::tally(&device), args).unwrap();
         assert_eq!(
             result.take_tensor().read_to_host().unwrap(),
             expected
@@ -562,7 +562,7 @@ fn cpu_return_boundary_rounds_scalar_and_tensor_elements() {
             &module,
             module.entry_named("scalar").unwrap(),
             ElementBindings::default(),
-            &device,
+            &crate::memory::Charges::tally(&device),
             options(),
         )
         .unwrap(),
@@ -571,7 +571,7 @@ fn cpu_return_boundary_rounds_scalar_and_tensor_elements() {
     args.push_scalar(crate::api::kernel::EncodedScalar::F32Bits(
         1.0006f32.to_bits(),
     ));
-    let mut result = crate::api::kernel::call(&scalar, args).unwrap();
+    let mut result = crate::api::kernel::call(&scalar, &crate::memory::Charges::tally(&device), args).unwrap();
     let ArgumentValue::F16(bits) = result.take_scalar() else {
         panic!("expected f16 scalar")
     };
@@ -587,17 +587,17 @@ fn cpu_return_boundary_rounds_scalar_and_tensor_elements() {
                 &module,
                 module.entry_named(name).unwrap(),
                 ElementBindings::default(),
-                &device,
+                &crate::memory::Charges::tally(&device),
                 options(),
             )
             .unwrap(),
         );
         let input = Arc::new(
-            TensorInner::from_host(&device, registry::dense(DType::F32), &[2], &bytes).unwrap(),
+            TensorInner::from_host(&crate::memory::Charges::tally(&device), registry::dense(DType::F32), &[2], &bytes).unwrap(),
         );
         let mut args = EncodedArgs::new();
         args.push_tensor(input);
-        let mut result = crate::api::kernel::call(&tensor, args).unwrap();
+        let mut result = crate::api::kernel::call(&tensor, &crate::memory::Charges::tally(&device), args).unwrap();
         assert_eq!(
             result.take_tensor().read_to_host().unwrap(),
             [0x3c01u16, 0x4000]

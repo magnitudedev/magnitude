@@ -10,7 +10,7 @@ fn validate_failure<T: TargetFamily, E: NativeExecutor<T>>(
     reference: &LogicalEntry,
     failed: bool,
 ) {
-    let mut observer = Observer::new(prepared.device.clone(), device);
+    let mut observer = Observer::new(prepared.device.clone(), crate::memory::Charges::tally(&device));
     let mut values = seismic_lang::expr::compiled::InvocationValues::new();
     let seismic_lang::entry::ParameterKind::Scalar { symbol, .. } =
         &prepared.kernel.schema().parameters()[1].kind
@@ -116,7 +116,7 @@ fn native_failure(backend: registry::BackendName) {
             &module,
             id,
             ElementBindings::default(),
-            &device,
+            &crate::memory::Charges::tally(&device),
             PreparationOptions::feedback(
                 PrecisionPolicy::Exact,
                 FeedbackOptions {
@@ -164,7 +164,7 @@ fn reached_private_allocation_preserves_prefix(source: &str) {
         &module,
         module.entry_named("main").unwrap(),
         ElementBindings::default(),
-        &device,
+        &crate::memory::Charges::tally(&device),
         PreparationOptions::feedback(
             PrecisionPolicy::Exact,
             FeedbackOptions {
@@ -176,7 +176,7 @@ fn reached_private_allocation_preserves_prefix(source: &str) {
     .unwrap();
     let output = Arc::new(
         TensorInner::from_host(
-            &device,
+            &crate::memory::Charges::tally(&device),
             registry::dense(DType::I32),
             &[1],
             &0i32.to_le_bytes(),
@@ -188,7 +188,7 @@ fn reached_private_allocation_preserves_prefix(source: &str) {
     let mut args = EncodedArgs::new();
     args.push_tensor(output.clone());
     args.push_scalar(crate::api::kernel::EncodedScalar::I32(0));
-    let error = crate::api::kernel::call(&Arc::new(kernel), args)
+    let error = crate::api::kernel::call(&Arc::new(kernel), &crate::memory::Charges::tally(&device), args)
         .err()
         .expect("division fails after the first allocation");
     assert!(
@@ -238,7 +238,7 @@ fn reached_geometry_outcome(source: &str, with_inputs: bool, expected: &[i32]) {
             &module,
             module.entry_named("probe").unwrap(),
             ElementBindings::default(),
-            &device,
+            &crate::memory::Charges::tally(&device),
             PreparationOptions::feedback(
                 PrecisionPolicy::Exact,
                 FeedbackOptions {
@@ -252,7 +252,7 @@ fn reached_geometry_outcome(source: &str, with_inputs: bool, expected: &[i32]) {
     let tensor = |shape: &[u64], data: &[i32]| {
         Arc::new(
             TensorInner::from_host(
-                &device,
+                &crate::memory::Charges::tally(&device),
                 registry::dense(DType::I32),
                 shape,
                 &data
@@ -274,7 +274,7 @@ fn reached_geometry_outcome(source: &str, with_inputs: bool, expected: &[i32]) {
         args.push_tensor(visible.clone());
     }
     args.push_tensor(output.clone());
-    crate::api::kernel::call(&kernel, args).unwrap();
+    crate::api::kernel::call(&kernel, &crate::memory::Charges::tally(&device), args).unwrap();
     let bytes = output.read_to_host().unwrap();
     let actual = bytes
         .chunks_exact(4)

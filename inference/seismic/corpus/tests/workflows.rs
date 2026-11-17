@@ -59,13 +59,13 @@ impl Fixture {
 
     fn f32s(&self, values: &[f32]) -> Tensor {
         let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-        Tensor::from_host(&self.device, Element::f32(), &[values.len() as u64], &bytes)
+        Tensor::from_host(&seismic::Charges::tally(&self.device), Element::f32(), &[values.len() as u64], &bytes)
             .expect("host tensor")
     }
 
     fn i32s(&self, values: &[i32]) -> Tensor {
         let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-        Tensor::from_host(&self.device, Element::i32(), &[values.len() as u64], &bytes)
+        Tensor::from_host(&seismic::Charges::tally(&self.device), Element::i32(), &[values.len() as u64], &bytes)
             .expect("host tensor")
     }
 }
@@ -100,7 +100,7 @@ fn tensor_bytes(value: &Value) -> Vec<u8> {
 fn chain_matches_composed_entry(backend: BackendName) {
     let f = Fixture::new(backend, MODULE);
     let x = f.f32s(&[1.5, -2.0, 3.25, 0.5]);
-    let mut workflow = Workflow::new(&f.device);
+    let mut workflow = Workflow::new(&seismic::Charges::tally(&f.device));
     let doubled = workflow
         .enqueue(f.kernel("twice"), vec![external(&x)])
         .unwrap();
@@ -114,7 +114,7 @@ fn chain_matches_composed_entry(backend: BackendName) {
 fn device_scalar_result_feeds_next_node(backend: BackendName) {
     let f = Fixture::new(backend, MODULE);
     let x = f.f32s(&[1.5, -2.0, 3.25, 0.5]);
-    let mut workflow = Workflow::new(&f.device);
+    let mut workflow = Workflow::new(&seismic::Charges::tally(&f.device));
     let head = workflow
         .enqueue(f.kernel("first"), vec![external(&x)])
         .unwrap();
@@ -136,7 +136,7 @@ fn device_scalar_result_feeds_next_node(backend: BackendName) {
 fn diamond_resolves(backend: BackendName) {
     let f = Fixture::new(backend, MODULE);
     let x = f.f32s(&[1.5, -2.0, 3.25, 0.5]);
-    let mut workflow = Workflow::new(&f.device);
+    let mut workflow = Workflow::new(&seismic::Charges::tally(&f.device));
     let doubled = workflow
         .enqueue(f.kernel("twice"), vec![external(&x)])
         .unwrap();
@@ -174,7 +174,7 @@ fn failed_node_keeps_prefix_and_stops(backend: BackendName) {
     let f = Fixture::new(backend, MODULE);
     let out = f.i32s(&[0, 0]);
     let x = f.f32s(&[1.0, 2.0, 3.0, 4.0]);
-    let mut workflow = Workflow::new(&f.device);
+    let mut workflow = Workflow::new(&seismic::Charges::tally(&f.device));
     workflow
         .enqueue(
             f.kernel("write_then_divide"),
@@ -200,7 +200,7 @@ fn pick_then_read(backend: BackendName, picked: i32) -> Result<Value, seismic::d
     let f = Fixture::new(backend, INDEX_MODULE);
     let x = f.i32s(&[picked, 0, 0, 0, 0, 0, 0, 0]);
     let t = f.f32s(&[10.0, 20.0, 30.0, 40.0]);
-    let mut workflow = Workflow::new(&f.device);
+    let mut workflow = Workflow::new(&seismic::Charges::tally(&f.device));
     let index = workflow
         .enqueue(f.kernel("pick8"), vec![external(&x)])
         .unwrap();
@@ -235,7 +235,7 @@ fn failed_node_skips_at_issue_nodes(backend: BackendName) {
     let f = Fixture::new(backend, MODULE);
     let out = f.i32s(&[0, 0]);
     let out2 = f.i32s(&[0, 0]);
-    let mut workflow = Workflow::new(&f.device);
+    let mut workflow = Workflow::new(&seismic::Charges::tally(&f.device));
     let divide = f.kernel("write_then_divide");
     let host_i32 = |value| WorkflowValue::External(Value::Scalar(Scalar::I32(value)));
     workflow

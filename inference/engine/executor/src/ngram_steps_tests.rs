@@ -2857,7 +2857,7 @@ fn cpu_loads_whole_and_tier_placed_expert_banks() {
     .unwrap();
     let mut programs = AttestedPrograms::prepare_draft(
         &base_draft,
-        &device,
+        &seismic::Charges::tally(&device),
         crate::TuningContext {
             definition: &definition,
             weights: &crate::ZeroTuningWeights,
@@ -2976,7 +2976,7 @@ fn cpu_loads_whole_and_tier_placed_expert_banks() {
         )
         .unwrap();
         let target = weights
-            .allocate(|| residency.load_target(&definition, &package, &host_tables, Box::new(|_, _| ())))
+            .allocate(&device, |charges| residency.load_target(charges, &definition, &package, &host_tables, Box::new(|_, _| ())))
             .unwrap();
         recorded.record(weights);
         recorded.record(host_tables);
@@ -3060,10 +3060,8 @@ fn cpu_loads_whole_and_tier_placed_expert_banks() {
             .unwrap();
         let empty_tier = tier_up.slice_leading(0, 0).unwrap();
         assert_eq!(empty_tier.extents()[0], 0);
-        empty_tier.hold_record_table().unwrap();
         let sub_tier = tier_up.slice_leading(0, 2).unwrap();
         assert_eq!(sub_tier.extents()[0], 2);
-        sub_tier.hold_record_table().unwrap();
         assert_eq!(bank.host_tier(), Some((bank.host_slots(), 8)));
         let _served = crate::experts::ServedBank::new(
             bank.clone(),

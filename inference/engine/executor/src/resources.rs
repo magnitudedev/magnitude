@@ -16,7 +16,7 @@ use crate::{
     WeightPlan,
 };
 use magnitude_batching::LaunchClass;
-use seismic::{Device, Tensor};
+use seismic::Tensor;
 use std::fmt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -43,8 +43,8 @@ pub struct ImportWorkspaceLease {
 /// The caller fills it
 /// ([`crate::programs::native_import::fill_staged_source`]) before binding
 /// it as a kernel source.
-pub(crate) unsafe fn import_upload(weight: &WeightPlan, device: &Device) -> Result<Tensor, AllocationError> {
-    unsafe { Tensor::uninitialized(device, weight.upload, &source_extents(weight)?) }
+pub(crate) unsafe fn import_upload(weight: &WeightPlan, charges: &seismic::Charges) -> Result<Tensor, AllocationError> {
+    unsafe { Tensor::uninitialized(charges, weight.upload, &source_extents(weight)?) }
         .map_err(AllocationError::Tensor)
 }
 
@@ -52,9 +52,9 @@ pub(crate) unsafe fn import_upload(weight: &WeightPlan, device: &Device) -> Resu
 /// ([`crate::programs::native_import::fill_staged_source`]): the source a
 /// weight imported outside a load's batches (an expert bank's stacks, a
 /// tuning unit's weights) is imported from.
-pub(crate) fn filled_import(weight: &WeightPlan, stored: &Stored, device: &Device) -> Result<Tensor, String> {
+pub(crate) fn filled_import(weight: &WeightPlan, stored: &Stored, charges: &seismic::Charges) -> Result<Tensor, String> {
     // SAFETY: filled here, before any entry binds it.
-    let mut upload = unsafe { import_upload(weight, device) }.map_err(|error| error.to_string())?;
+    let mut upload = unsafe { import_upload(weight, charges) }.map_err(|error| error.to_string())?;
     crate::programs::native_import::fill_staged_source(stored, weight, &mut upload)
         .map_err(|error| error.to_string())?;
     Ok(upload)
@@ -162,7 +162,6 @@ enum ReadoutPool {
 /// allocated class is held.
 #[must_use]
 pub(crate) struct GrownClass {
-    places: std::num::NonZeroUsize,
     slots: crate::StartupSlots,
 }
 
@@ -183,9 +182,6 @@ pub struct AllocatedResources {
     head_graph: Option<NativeGraphPool>,
     vision_graph: Option<VisionGraphPool>,
     state_graph: NativeGraphPool,
-    /// The places of the prompt-group class the pools hold: the floor's
-    /// one, or an open group's, within the load's chain capacity.
-    places: std::num::NonZeroUsize,
     /// The ledgers of the stores the device reaches, which the load's
     /// committed claims are taken from: the one handle the load holds.
     ledgers: crate::memory::ledger::DeviceLedgers,
@@ -316,14 +312,6 @@ impl AllocatedResources {
         }
     }
 
-    /// The places of the prompt-group class held ([`Self::hold_class`]): a
-    /// chain runs at most that many launches. The one record of it: the
-    /// family's group buffers are held with it
-    /// (`ExecutorDomain::open_group`).
-    pub fn group_places(&self) -> std::num::NonZeroUsize {
-        self.places
-    }
-
     /// The ledgers of the stores the device reaches
     /// ([`crate::memory::ledger::DeviceLedgers`]).
     pub fn ledgers(&self) -> &crate::memory::ledger::DeviceLedgers {
@@ -350,20 +338,20 @@ impl AllocatedResources {
         })
     }
 
-    /// Allocate the pools' slots of the arena's class of `places` places,
-    /// whose pools hold `slots` (`ResourceLimits::class_slots`), to be held
+    /// Allocate the pools' slots of a prompt-group class whose pools hold
+    /// `slots` (`ResourceLimits::class_slots`), to be held
     /// by [`Self::hold_class`]. The caller holds a heap claim for
     /// [`Self::class_bytes`] across this call. On a failure what was
     /// allocated idles until released.
     pub(crate) fn grow_class(
         &mut self,
-        places: std::num::NonZeroUsize,
+        charges: &seismic::Charges,
         slots: crate::StartupSlots,
     ) -> Result<GrownClass, AllocationError> {
         for (pool, slots) in self.class_pools(slots) {
-            pool.grow(slots)?;
+            pool.grow(charges, slots)?;
         }
-        Ok(GrownClass { places, slots })
+        Ok(GrownClass { slots })
     }
 
     /// Hold the class [`Self::grow_class`] allocated.
@@ -371,7 +359,6 @@ impl AllocatedResources {
         for (pool, slots) in self.class_pools(grown.slots) {
             pool.hold(slots);
         }
-        self.places = grown.places;
     }
 
     /// Hold the floor's class of one place again: the slots beyond it idle
@@ -380,7 +367,6 @@ impl AllocatedResources {
         for pool in [Some(&mut self.target_graph), Some(&mut self.target_readout_chunk_graph), self.head_graph.as_mut()].into_iter().flatten() {
             pool.hold_floor();
         }
-        self.places = std::num::NonZeroUsize::MIN;
     }
 
     /// The pools a prompt group's class sizes, each with its slots of
@@ -487,7 +473,7 @@ impl ResourceAllocator {
     pub(crate) fn import_workspace(
         execution: &ExecutionPlan,
         weight: &WeightPlan,
-        device: &Device,
+        charges: &seismic::Charges,
         domain: ResourceDomainId,
     ) -> Result<ImportWorkspaceLease, AllocationError> {
         let invalid = |detail: &str| {
@@ -502,8 +488,8 @@ impl ResourceAllocator {
         let extents = source_extents(weight).map_err(|error| invalid(&error.to_string()))?;
         // SAFETY: the importer fills it before binding it
         // (`NativeImportProgram::enqueue`, `submit`).
-        let upload = unsafe { import_upload(weight, device) }?;
-        if !upload.belongs_to(device)
+        let upload = unsafe { import_upload(weight, charges) }?;
+        if !upload.belongs_to(&charges.device())
             || upload.element() != weight.upload
             || upload.extents() != extents
             || upload.byte_len() != weight.source_bytes
@@ -525,7 +511,7 @@ impl ResourceAllocator {
 
     pub fn allocate(
         execution: &ExecutionPlan,
-        device: &Device,
+        charges: &seismic::Charges,
         domain: ResourceDomainId,
         target_graphs: &PreparedTargetGraphs,
         target_readout_graphs: &PreparedTargetReadoutGraphs,
@@ -534,6 +520,7 @@ impl ResourceAllocator {
         state_graphs: &PreparedStateCopyGraphs,
         ledgers: &crate::memory::ledger::DeviceLedgers,
     ) -> Result<AllocatedResources, AllocationError> {
+        let device = &charges.device();
         if device.backend() != execution.device().backend()
             || device.info().name() != execution.device().name()
         {
@@ -551,9 +538,7 @@ impl ResourceAllocator {
                 && crate::planning::serial_upload_regions(family.upload_bytes())
                     == charge.upload_regions
         };
-        let arena = device
-            .execution_arena(plan.arena_bytes())
-            .map_err(AllocationError::Tensor)?;
+        let arena = seismic::NativeExecutionArena::new(charges, plan.arena_bytes()).map_err(AllocationError::Tensor)?;
         // The target's charge is the prepared graphs' footprint
         // (`NativeGraphCharge::from_prepared`).
         let target_graph = NativeGraphPool::new(
@@ -561,6 +546,7 @@ impl ResourceAllocator {
             target_graphs.family(),
             plan.target_graph(),
             &arena,
+            charges,
             Outputs::Device,
         )?;
         let readout_charge = plan.target_readout_graph();
@@ -579,6 +565,7 @@ impl ResourceAllocator {
             target_readout_graphs.family(),
             readout_charge,
             &arena,
+            charges,
             Outputs::Host,
         )?;
         let target_readout_chunk_graph = NativeGraphPool::new(
@@ -586,11 +573,12 @@ impl ResourceAllocator {
             target_readout_graphs.chunk_family(),
             chunk_charge,
             &arena,
+            charges,
             Outputs::Host,
         )?;
         let head_graph = match (head_graphs, plan.head_graph()) {
             (Some(graphs), Some(charge)) if admitted(graphs.family(), charge) => Some(
-                NativeGraphPool::new(domain.clone(), graphs.family(), charge, &arena, Outputs::Host)?,
+                NativeGraphPool::new(domain.clone(), graphs.family(), charge, &arena, charges, Outputs::Host)?,
             ),
             (None, None) => None,
             _ => {
@@ -620,7 +608,7 @@ impl ResourceAllocator {
             }));
         }
         let state_graph =
-            NativeGraphPool::new(domain.clone(), state_graphs.family(), state_charge, &arena, Outputs::Device)?;
+            NativeGraphPool::new(domain.clone(), state_graphs.family(), state_charge, &arena, charges, Outputs::Device)?;
         let allocated = AllocatedResources {
             domain: domain.clone(),
             arena,
@@ -630,7 +618,6 @@ impl ResourceAllocator {
             head_graph,
             vision_graph,
             state_graph,
-            places: std::num::NonZeroUsize::MIN,
             ledgers: ledgers.clone(),
             releases: crate::Releases::start().map_err(AllocationError::Thread)?,
             releasing: None,

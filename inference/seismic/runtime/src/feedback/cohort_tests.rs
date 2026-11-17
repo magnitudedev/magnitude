@@ -119,7 +119,7 @@ fn failing(indices: &tensor[4] i32, input: &tensor[4] i32, out: &mut tensor[4] i
                 &module,
                 module.entry_named(name).unwrap(),
                 ElementBindings::default(),
-                &device,
+                &crate::memory::Charges::tally(&device),
                 PreparationOptions::feedback(
                     PrecisionPolicy::Exact,
                     FeedbackOptions {
@@ -132,7 +132,7 @@ fn failing(indices: &tensor[4] i32, input: &tensor[4] i32, out: &mut tensor[4] i
         );
         let zeros = vec![0u8; 16];
         let output = Arc::new(
-            TensorInner::from_host(&device, registry::dense(DType::I32), &[4], &zeros).unwrap(),
+            TensorInner::from_host(&crate::memory::Charges::tally(&device), registry::dense(DType::I32), &[4], &zeros).unwrap(),
         );
         let mut args = EncodedArgs::new();
         if name == "failing" {
@@ -141,15 +141,15 @@ fn failing(indices: &tensor[4] i32, input: &tensor[4] i32, out: &mut tensor[4] i
                 .flat_map(i32::to_le_bytes)
                 .collect::<Vec<_>>();
             args.push_tensor(Arc::new(
-                TensorInner::from_host(&device, registry::dense(DType::I32), &[4], &invalid)
+                TensorInner::from_host(&crate::memory::Charges::tally(&device), registry::dense(DType::I32), &[4], &invalid)
                     .unwrap(),
             ));
             args.push_tensor(Arc::new(
-                TensorInner::from_host(&device, registry::dense(DType::I32), &[4], &zeros).unwrap(),
+                TensorInner::from_host(&crate::memory::Charges::tally(&device), registry::dense(DType::I32), &[4], &zeros).unwrap(),
             ));
         }
         args.push_tensor(output.clone());
-        let result = crate::api::kernel::call(&kernel, args);
+        let result = crate::api::kernel::call(&kernel, &crate::memory::Charges::tally(&device), args);
         assert_eq!(result.is_err(), name == "failing", "{backend:?} {name}");
         let actual = output
             .read_to_host()
@@ -304,7 +304,7 @@ fn ordered_prefix(input: &tensor[4] i32, out: &mut tensor[4] i32):
                 &module,
                 module.entry_named(name).unwrap(),
                 ElementBindings::default(),
-                &device,
+                &crate::memory::Charges::tally(&device),
                 PreparationOptions::feedback(
                     PrecisionPolicy::Exact,
                     FeedbackOptions {
@@ -325,12 +325,12 @@ fn ordered_prefix(input: &tensor[4] i32, out: &mut tensor[4] i32):
                 .flat_map(i32::to_le_bytes)
                 .collect::<Vec<_>>();
             args.push_tensor(Arc::new(
-                TensorInner::from_host(&device, registry::dense(DType::I32), &[4], &bytes).unwrap(),
+                TensorInner::from_host(&crate::memory::Charges::tally(&device), registry::dense(DType::I32), &[4], &bytes).unwrap(),
             ));
         }
         let output = Arc::new(
             TensorInner::from_host(
-                &device,
+                &crate::memory::Charges::tally(&device),
                 registry::dense(DType::I32),
                 &[expected.len() as u64],
                 &vec![0; expected.len() * 4],
@@ -338,7 +338,7 @@ fn ordered_prefix(input: &tensor[4] i32, out: &mut tensor[4] i32):
             .unwrap(),
         );
         args.push_tensor(output.clone());
-        let result = crate::api::kernel::call(&kernel, args);
+        let result = crate::api::kernel::call(&kernel, &crate::memory::Charges::tally(&device), args);
         if let Some(expected) = error {
             let actual = result
                 .err()

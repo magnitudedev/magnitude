@@ -128,6 +128,7 @@ fn native(
     let specialization =
         declared::declared_at(device, &entry, &dense_statics(specialization.clone().with_static("SK", 0))).unwrap();
     let kernel = entry.prepare(device, &specialization).unwrap();
+    let charges = seismic::Charges::tally(device);
     let (selected_rows, selected) = no_picks(device, m, kv, w);
     let plane = |values: &[f32]| {
         let slabs = crate::common::slab_tensor(
@@ -153,14 +154,14 @@ fn native(
         (Some(slabs), plane)
     };
     let selection = Tensor::from_host(
-        device,
+        &charges,
         Element::u32(),
         &[m as u64, words as u64],
         &bits.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>(),
     )
     .unwrap();
     let result = kernel
-        .call(attention_prefill::Args {
+        .call(&charges, attention_prefill::Args {
             query: &bf16_tensor(device, &[m, kv * g, 2 * w], &case.query_gate),
             gate: &bf16_tensor(device, &[m, kv * g, 0], &[]),
             key: &bf16_tensor(device, &[1, m, kv * w], &case.key),
@@ -183,7 +184,7 @@ fn native(
             history_key: &mut history_key,
             history_value: &mut history_value,
             form: &Tensor::from_host(
-                device,
+                &charges,
                 Element::i32(),
                 &[0, 0, 0, 0, u64::from(stored), 0, 0],
                 &[],

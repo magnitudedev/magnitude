@@ -91,6 +91,7 @@ impl ResidentRoles {
     fn import(
         weights: Vec<(WeightRole, &magnitude_family_contracts::WeightDescriptor)>,
         residency: &mut ResidencyStore,
+        charges: &seismic::Charges,
         artifact: &GgufArtifact,
         activation: DType,
     ) -> Result<Self, ResidencyError> {
@@ -104,6 +105,7 @@ impl ResidentRoles {
                 continue;
             }
             let weight = residency.import_gguf(
+                charges,
                 artifact,
                 descriptor,
                 operators::resident_dtype(role.kind, activation),
@@ -126,7 +128,7 @@ impl ResidentRoles {
                     .collect::<Option<Vec<_>>>();
                 if let Some(planes) = planes {
                     for (role, descriptor) in planes {
-                        let weight = residency.import_progressive(artifact, &descriptor)?;
+                        let weight = residency.import_progressive(charges, artifact, &descriptor)?;
                         if roles.insert(role, weight).is_some() {
                             return Err(invalid(format!("weight role {role:?} is bound twice")));
                         }
@@ -299,13 +301,14 @@ pub(crate) fn import_target(
     definition: &ModelDefinition,
     package: &Package,
     residency: &mut ResidencyStore,
+    charges: &seismic::Charges,
     host_tables: &crate::memory::ledger::Held,
 ) -> Result<ResidentTarget, ResidencyError> {
     validate_definition_package(definition, package)?;
     let decoder = &definition.decoder;
     let activation = activation_dtype(decoder.activation_dtype);
     let target = package.target();
-    let embedding = residency.import_gguf(target, &decoder.entry.embedding, activation)?;
+    let embedding = residency.import_gguf(charges, target, &decoder.entry.embedding, activation)?;
     // A low-rank hyper-connection exit site is the last block's mix site:
     // its roles are resident beside the sublayers'. Every exit norm (a
     // previous-site exit's among them) is the readout's.
@@ -315,11 +318,11 @@ pub(crate) fn import_target(
                 .into_iter()
                 .filter(|(role, _)| role.kind != magnitude_family_contracts::WeightKind::OutputNorm)
                 .collect(),
-            exit.norm.as_ref().map(|norm| residency.import_gguf(target, &norm.weight, activation)).transpose()?,
+            exit.norm.as_ref().map(|norm| residency.import_gguf(charges, target, &norm.weight, activation)).transpose()?,
         ),
         ExitNorm::Rms(RmsNorm { weight, .. }) | ExitNorm::Layer(LayerNorm { weight, .. }) => (
             Vec::new(),
-            Some(residency.import_gguf(target, weight, activation)?),
+            Some(residency.import_gguf(charges, target, weight, activation)?),
         ),
     };
     let sublayers = ResidentRoles::import(
@@ -328,6 +331,7 @@ pub(crate) fn import_target(
             .chain(exit_roles)
             .collect(),
         residency,
+        charges,
         target,
         activation,
     )?;
@@ -336,6 +340,7 @@ pub(crate) fn import_target(
         WeightScope::Target,
         target,
         residency,
+        charges,
         activation,
     )?;
     let fusion = definition
@@ -347,6 +352,7 @@ pub(crate) fn import_target(
                 .expect("validated: a bound draft has its component");
             let mut import = |kind, descriptor| {
                 residency.import_gguf(
+                    charges,
                     artifact,
                     descriptor,
                     operators::resident_dtype(kind, activation),
@@ -366,8 +372,9 @@ pub(crate) fn import_target(
             let stored = crate::residency::Stored::from_gguf(target, &entry.table)
                 .map_err(|error| invalid(error.to_string()))?;
             Ok::<_, ResidencyError>(ResidentPerLayer {
-                projection: residency.import_gguf(target, &entry.projection, activation)?,
+                projection: residency.import_gguf(charges, target, &entry.projection, activation)?,
                 norm: residency.import_gguf(
+                    charges,
                     target,
                     &entry.projection_norm.weight,
                     operators::resident_dtype(WeightKind::PerLayerProjectionNorm, activation),
@@ -384,7 +391,7 @@ pub(crate) fn import_target(
         output,
         fusion,
         per_layer,
-        bank: residency.open_expert_bank(target)?,
+        bank: residency.open_expert_bank(charges, target)?,
         imports: residency.imports(),
     })
 }
@@ -430,6 +437,7 @@ fn import_output(
     scope: WeightScope,
     target: &GgufArtifact,
     residency: &mut ResidencyStore,
+    charges: &seismic::Charges,
     activation: DType,
 ) -> Result<ResidentOutput, ResidencyError> {
     let planes = ProgressivePlane::ALL
@@ -447,7 +455,7 @@ fn import_output(
         Some(planes) => {
             let [top, bit3, rest, scales, radius] = planes
                 .iter()
-                .map(|plane| residency.import_progressive(target, plane))
+                .map(|plane| residency.import_progressive(charges, target, plane))
                 .collect::<Result<Vec<_>, _>>()?
                 .try_into()
                 .map_err(|_| invalid("a progressive head has five planes"))?;
@@ -459,7 +467,7 @@ fn import_output(
                 radius,
             })
         }
-        None => ResidentOutput::Packed(residency.import_gguf(target, descriptor, activation)?),
+        None => ResidentOutput::Packed(residency.import_gguf(charges, target, descriptor, activation)?),
     })
 }
 
@@ -467,24 +475,26 @@ pub(crate) fn import_optional_head(
     definition: &ModelDefinition,
     package: &Package,
     residency: &mut ResidencyStore,
+    charges: &seismic::Charges,
 ) -> Result<Option<ResidentHead>, ResidencyError> {
     validate_definition_package(definition, package)?;
     let decoder = &definition.decoder;
     let activation = activation_dtype(decoder.activation_dtype);
     if let Some(draft) = &definition.draft {
-        return import_draft(definition, draft, package, residency).map(Some);
+        return import_draft(definition, draft, package, residency, charges).map(Some);
     }
     definition
         .head
         .as_ref()
         .map(|head| {
             let embedding =
-                residency.import_gguf(package.target(), &decoder.entry.embedding, activation)?;
+                residency.import_gguf(charges, package.target(), &decoder.entry.embedding, activation)?;
             let output = import_output(
                 &decoder.exit.output,
                 WeightScope::Target,
                 package.target(),
                 residency,
+                charges,
                 activation,
             )?;
             let weights =
@@ -500,7 +510,7 @@ pub(crate) fn import_optional_head(
             Ok(ResidentHead {
                 embedding,
                 depth: head.depth(),
-                weights: ResidentRoles::import(weights, residency, artifact, activation)?,
+                weights: ResidentRoles::import(weights, residency, charges, artifact, activation)?,
                 output,
             })
         })
@@ -516,6 +526,7 @@ fn import_draft(
     draft: &magnitude_family_contracts::DraftDefinition,
     package: &Package,
     residency: &mut ResidencyStore,
+    charges: &seismic::Charges,
 ) -> Result<ResidentHead, ResidencyError> {
     let decoder = &definition.decoder;
     let activation = activation_dtype(decoder.activation_dtype);
@@ -525,21 +536,23 @@ fn import_draft(
         .expect("validated: a bound draft has its component");
     let embedding = match &draft.embedding {
         magnitude_family_contracts::DraftEmbedding::Target => {
-            residency.import_gguf(target, &decoder.entry.embedding, activation)?
+            residency.import_gguf(charges, target, &decoder.entry.embedding, activation)?
         }
         magnitude_family_contracts::DraftEmbedding::Own(table) => residency.import_gguf(
+            charges,
             artifact,
             table,
             operators::resident_dtype(WeightKind::Embedding, activation),
         )?,
     };
     let output = match &draft.output {
-        Some(output) => import_output(output, WeightScope::Draft, artifact, residency, activation)?,
+        Some(output) => import_output(output, WeightScope::Draft, artifact, residency, charges, activation)?,
         None => import_output(
             &decoder.exit.output,
             WeightScope::Target,
             target,
             residency,
+            charges,
             activation,
         )?,
     };
@@ -552,7 +565,7 @@ fn import_draft(
     Ok(ResidentHead {
         embedding,
         depth: draft.blocks.len(),
-        weights: ResidentRoles::import(weights, residency, artifact, activation)?,
+        weights: ResidentRoles::import(weights, residency, charges, artifact, activation)?,
         output,
     })
 }
@@ -561,13 +574,14 @@ pub(crate) fn import_optional_vision(
     definition: &ModelDefinition,
     package: &Package,
     residency: &mut ResidencyStore,
+    charges: &seismic::Charges,
 ) -> Result<Option<ResidentVision>, ResidencyError> {
     validate_definition_package(definition, package)?;
     definition
         .vision
         .as_ref()
         .zip(package.projector())
-        .map(|(vision, projector)| materialize_vision(residency, projector, vision))
+        .map(|(vision, projector)| materialize_vision(residency, charges, projector, vision))
         .transpose()
 }
 
@@ -623,12 +637,13 @@ pub(crate) fn activation_dtype(dtype: ActivationDType) -> DType {
 // chose (their stored element).
 fn materialize_vision(
     residency: &mut ResidencyStore,
+    charges: &seismic::Charges,
     artifact: &GgufArtifact,
     vision: &VisionDescription,
 ) -> Result<ResidentVision, ResidencyError> {
     let mut roles = HashMap::new();
     for (role, descriptor) in vision.weights() {
-        let weight = residency.import_gguf_planned(artifact, descriptor)?;
+        let weight = residency.import_gguf_planned(charges, artifact, descriptor)?;
         if roles.insert(role, weight).is_some() {
             return Err(invalid(format!("weight role {role:?} is bound twice")));
         }

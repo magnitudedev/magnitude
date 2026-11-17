@@ -35,6 +35,7 @@ fn a_chains_places_replay_their_shapes_graphs_bit_for_bit() {
     const PLACES: usize = 7;
     let (m, n) = (2u64, 8u64);
     for device in seismic_native_tests::every_device() {
+        let charges = seismic::Charges::tally(&device);
         let backend = device.backend();
         let kernel =
             scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1))
@@ -56,7 +57,7 @@ fn a_chains_places_replay_their_shapes_graphs_bit_for_bit() {
         let family = NativeGraphFamily::new(&[plan.clone()], 1).unwrap();
         let created = device.graph_replays();
         let mut slots = (0..PLACES)
-            .map(|_| family.new_slot(&[family.upload_bytes()]).unwrap())
+            .map(|_| family.new_slot(&charges, &[family.upload_bytes()]).unwrap())
             .collect::<Vec<_>>();
         let created = device.graph_replays().since(created);
         // Each place's input rows, and the rows of one tensor it lands in.
@@ -65,20 +66,20 @@ fn a_chains_places_replay_their_shapes_graphs_bit_for_bit() {
             .collect::<Vec<_>>();
         let sources = inputs
             .iter()
-            .map(|values| Tensor::from_host(&device, Element::f32(), &[m, n], &f32_bytes(values)).unwrap())
+            .map(|values| Tensor::from_host(&charges, Element::f32(), &[m, n], &f32_bytes(values)).unwrap())
             .collect::<Vec<_>>();
         let rows = PLACES as u64 * m;
-        let landed = Tensor::from_host(&device, Element::f32(), &[rows, n], &f32_bytes(&vec![-1.0; (rows * n) as usize]))
+        let landed = Tensor::from_host(&charges, Element::f32(), &[rows, n], &f32_bytes(&vec![-1.0; (rows * n) as usize]))
             .unwrap();
         let chain = |slots: &mut [seismic::NativeGraphFamilySlot]| {
             let mut sequence = device.native_sequence(seismic::NativeQueue::Compute);
             let mut exported = Vec::new();
             for (place, slot) in slots.iter_mut().enumerate() {
-                let outputs = family.new_output_slot().unwrap().activate(&plan).unwrap();
+                let outputs = family.new_output_slot(&charges).unwrap().activate(&plan).unwrap();
                 let mut bindings = plan.bindings();
-                bindings.set(&input, &sources[place]).unwrap();
+                bindings.set(&charges, &input, &sources[place]).unwrap();
                 let at = place as u64 * m;
-                bindings.set(&landing, &landed.slice_leading(at, at + m).unwrap()).unwrap();
+                bindings.set(&charges, &landing, &landed.slice_leading(at, at + m).unwrap()).unwrap();
                 let mut active = slot.activate(&plan).unwrap();
                 let outputs = active.attach(bindings, outputs).unwrap().queue(&mut sequence).unwrap();
                 exported.push(outputs.exported(&after).unwrap());
@@ -154,6 +155,7 @@ fn a_launched_plans_slots_are_made_and_run_while_earlier_steps_are_in_flight() {
     const BUSY_NODES: usize = 16;
     let (busy_rows, n) = (4096u64, 256u64);
     for device in seismic_native_tests::every_device() {
+        let charges = seismic::Charges::tally(&device);
         let backend = device.backend();
         let kernel =
             scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1)).unwrap();
@@ -167,13 +169,13 @@ fn a_launched_plans_slots_are_made_and_run_while_earlier_steps_are_in_flight() {
         let busy = graph.seal().unwrap();
         let family = NativeGraphFamily::new(&[busy.clone()], 1).unwrap();
         // Made before any flight, as a load makes its slots.
-        let mut busy_slot = family.new_slot(&[family.upload_bytes()]).unwrap();
-        let mut busy_outputs = Some(family.new_output_slot().unwrap());
-        let busy_x = Tensor::zeros(&device, Element::f32(), &[busy_rows, n]).unwrap();
+        let mut busy_slot = family.new_slot(&charges, &[family.upload_bytes()]).unwrap();
+        let mut busy_outputs = Some(family.new_output_slot(&charges).unwrap());
+        let busy_x = Tensor::zeros(&charges, Element::f32(), &[busy_rows, n]).unwrap();
         let mut busy_run = |sequence: &mut seismic::NativeGraphSequence| {
             let outputs = busy_outputs.take().unwrap().activate(&busy).unwrap();
             let mut bindings = busy.bindings();
-            bindings.set(&busy_input, &busy_x).unwrap();
+            bindings.set(&charges, &busy_input, &busy_x).unwrap();
             let outputs = busy_slot.activate(&busy).unwrap().attach(bindings, outputs).unwrap().queue(sequence).unwrap();
             busy_outputs = Some(outputs.recycle().unwrap());
         };
@@ -197,16 +199,16 @@ fn a_launched_plans_slots_are_made_and_run_while_earlier_steps_are_in_flight() {
             graph.store(&scaled, &destination).unwrap();
             let plan = graph.seal_launched().unwrap();
             let values = (0..rows * n).map(|value| (step as u64 * 100_000 + value) as f32).collect::<Vec<_>>();
-            let bound = Tensor::from_host(&device, Element::f32(), &[rows, n], &f32_bytes(&values)).unwrap();
-            let landed = Tensor::zeros(&device, Element::f32(), &[rows, n]).unwrap();
+            let bound = Tensor::from_host(&charges, Element::f32(), &[rows, n], &f32_bytes(&values)).unwrap();
+            let landed = Tensor::zeros(&charges, Element::f32(), &[rows, n]).unwrap();
             let mut bindings = plan.bindings();
-            bindings.set(&source, &bound).unwrap();
-            bindings.set(&destination, &landed).unwrap();
+            bindings.set(&charges, &source, &bound).unwrap();
+            bindings.set(&charges, &destination, &landed).unwrap();
             // Made with the steps before this one in flight.
-            let mut slot = plan.new_slot().unwrap();
+            let mut slot = plan.new_slot(&charges).unwrap();
             let mut sequence = device.native_sequence(seismic::NativeQueue::Compute);
             busy_run(&mut sequence);
-            slot.attach(bindings, plan.new_outputs().unwrap()).unwrap().queue(&mut sequence).unwrap();
+            slot.attach(bindings, plan.new_outputs(&charges).unwrap()).unwrap().queue(&mut sequence).unwrap();
             busy_run(&mut sequence);
             completions.push(sequence.submit().unwrap());
             steps.push((values, landed));
@@ -226,6 +228,7 @@ fn interleaved_classes_slots_and_places_record_each_shape_once() {
     let n = 8u64;
     let classes = [1u64, 2, 4];
     for device in seismic_native_tests::every_device() {
+        let charges = seismic::Charges::tally(&device);
         let backend = device.backend();
         let mut template = NativeGraphMetadata::new_template(backend);
         let input = template.port_with_class_extent(Element::f32(), &[4, n], 0, "M").unwrap();
@@ -258,7 +261,7 @@ fn interleaved_classes_slots_and_places_record_each_shape_once() {
             .collect::<Vec<_>>();
         let plans = sealed.iter().map(|(plan, ..)| plan.clone()).collect::<Vec<_>>();
         let family = NativeGraphFamily::new(&plans, 1).unwrap();
-        let mut slots = (0..PLACES).map(|_| family.new_slot(&[family.upload_bytes()]).unwrap()).collect::<Vec<_>>();
+        let mut slots = (0..PLACES).map(|_| family.new_slot(&charges, &[family.upload_bytes()]).unwrap()).collect::<Vec<_>>();
         // A run of class `class` on slot `slot`, its rows the input's
         // doubled into the returned tensor.
         let mut runs = Vec::new();
@@ -266,12 +269,12 @@ fn interleaved_classes_slots_and_places_record_each_shape_once() {
             let (plan, input, landing) = &sealed[class];
             let m = classes[class];
             let values = (0..m * n).map(|value| (seed * 100 + value) as f32).collect::<Vec<_>>();
-            let source = Tensor::from_host(&device, Element::f32(), &[m, n], &f32_bytes(&values)).unwrap();
-            let landed = Tensor::zeros(&device, Element::f32(), &[m, n]).unwrap();
+            let source = Tensor::from_host(&charges, Element::f32(), &[m, n], &f32_bytes(&values)).unwrap();
+            let landed = Tensor::zeros(&charges, Element::f32(), &[m, n]).unwrap();
             let mut bindings = plan.bindings();
-            bindings.set(input, &source).unwrap();
-            bindings.set(landing, &landed).unwrap();
-            let outputs = family.new_output_slot().unwrap().activate(plan).unwrap();
+            bindings.set(&charges, input, &source).unwrap();
+            bindings.set(&charges, landing, &landed).unwrap();
+            let outputs = family.new_output_slot(&charges).unwrap().activate(plan).unwrap();
             let mut active = slots[slot].activate(plan).unwrap();
             active.attach(bindings, outputs).unwrap().queue(sequence).unwrap();
             runs.push((values, landed));
@@ -325,6 +328,7 @@ fn a_layouts_classes_making_different_launches_replay_one_graph() {
     const SLOTS: usize = 3;
     let classes = [32u64, 128];
     for device in seismic_native_tests::every_device() {
+        let charges = seismic::Charges::tally(&device);
         let backend = device.backend();
         let mut template = NativeGraphMetadata::new_template(backend);
         let input = template.port_with_class_extent(Element::f32(), &[128], 0, "N").unwrap();
@@ -352,7 +356,7 @@ fn a_layouts_classes_making_different_launches_replay_one_graph() {
         let plans = sealed.iter().map(|(plan, ..)| plan.clone()).collect::<Vec<_>>();
         let family = NativeGraphFamily::new(&plans, 1).unwrap();
         let created = device.graph_replays();
-        let mut slots = (0..SLOTS).map(|_| family.new_slot(&[family.upload_bytes()]).unwrap()).collect::<Vec<_>>();
+        let mut slots = (0..SLOTS).map(|_| family.new_slot(&charges, &[family.upload_bytes()]).unwrap()).collect::<Vec<_>>();
         let created = device.graph_replays().since(created);
         let served = device.graph_replays();
         for round in 0..4u64 {
@@ -360,10 +364,10 @@ fn a_layouts_classes_making_different_launches_replay_one_graph() {
                 let class = (round as usize + at) % classes.len();
                 let (plan, input, sum) = &sealed[class];
                 let values = (0..classes[class]).map(|value| (round * 7 + at as u64 + value) as f32).collect::<Vec<_>>();
-                let source = Tensor::from_host(&device, Element::f32(), &[classes[class]], &f32_bytes(&values)).unwrap();
+                let source = Tensor::from_host(&charges, Element::f32(), &[classes[class]], &f32_bytes(&values)).unwrap();
                 let mut bindings = plan.bindings();
-                bindings.set(input, &source).unwrap();
-                let outputs = family.new_output_slot().unwrap().activate(plan).unwrap();
+                bindings.set(&charges, input, &source).unwrap();
+                let outputs = family.new_output_slot(&charges).unwrap().activate(plan).unwrap();
                 let mut sequence = device.native_sequence(seismic::NativeQueue::Compute);
                 let outputs = slot.activate(plan).unwrap().attach(bindings, outputs).unwrap().queue(&mut sequence).unwrap();
                 sequence.submit().unwrap().wait().unwrap();

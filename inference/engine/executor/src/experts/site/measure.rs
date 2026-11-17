@@ -1,5 +1,5 @@
 use crate::experts::source::Records;
-use seismic::{Device, Tensor};
+use seismic::Tensor;
 
 /// The samples of a request of the most choices a site's measurement takes,
 /// each over records no sample of it read before (`measure_site`), where the
@@ -14,12 +14,12 @@ const SITE_SAMPLES: u64 = 16;
 /// the handshake; requests of one expert of one row, of a decode row's
 /// choices and of one expert of every decode row), each on a pool of its
 /// own, over a layer of its own.
-pub(crate) fn measure_cpu_site(device: &Device, form: &crate::assessment::CpuForm) -> Result<(usize, crate::assessment::CpuLines), String> {
+pub(crate) fn measure_cpu_site(charges: &seismic::Charges, form: &crate::assessment::CpuForm) -> Result<(usize, crate::assessment::CpuLines), String> {
     use super::{SiteRecords, SiteScales, SiteTensors};
     let count = (form.choices * SITE_SAMPLES).min(form.experts);
     let records = |record: crate::planning::RecordTensor| -> Result<SiteRecords, String> {
         let shape = [count, record.matrix[0], record.matrix[1]];
-        let tensor = Tensor::shared(device, record.resident, &shape).map_err(|error| format!("a site's records: {error}"))?;
+        let tensor = Tensor::shared(charges, record.resident, &shape).map_err(|error| format!("a site's records: {error}"))?;
         // Bytes of no value a format reads as a fast case: real work is a
         // model's words, none of them all zero.
         // SAFETY: nothing reads the tensor yet.
@@ -31,8 +31,8 @@ pub(crate) fn measure_cpu_site(device: &Device, form: &crate::assessment::CpuFor
     let tensors = SiteTensors { gate: form.record.gate.map(records).transpose()?, up: records(form.record.up)?, down: records(form.record.down)? };
     let scales = SiteScales { gate: None, up: None };
     let shape = super::SiteShape::of(form)?;
-    let owned = || super::SiteLayer::owned(device, tensors.clone(), scales.clone(), shape);
-    let machine = super::Machine::discover(device, 0.)?;
+    let owned = || super::SiteLayer::owned(charges, tensors.clone(), scales.clone(), shape);
+    let machine = super::Machine::discover(&charges.device(), 0.)?;
     let request = (shape.choices.min(tensors.up.count()), 1);
     let threads = machine
         .sized(|threads| Ok(super::measure_site(owned()?, threads, &[request])?.remove(0)))

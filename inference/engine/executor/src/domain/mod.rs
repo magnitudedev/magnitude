@@ -676,8 +676,8 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// The service's measurement job's committed claim beside the model
     /// (`ExecutorDomain::claim_measurement_room`).
     measurement_claim: Option<state::MeasurementClaim>,
-    /// The committed claims of the prompt-group class held beyond one
-    /// place (`AllocatedResources::group_places`), from the group's open to
+    /// The places and committed claims of the prompt-group class held
+    /// beyond one place ([`Self::group_places`]), from the group's open to
     /// its close ([`Self::open_group`], [`Self::close_group`]): its
     /// device-side bytes on the device's ledger and its host bytes on host
     /// RAM's. None while groups hold one place.
@@ -1662,7 +1662,10 @@ impl ExecutorDomain<NativeFamily> {
         }
         // The family binds the target's constants, the arena's: one change
         // with their record.
-        let family = constants.allocate(|| NativeFamily::new(programs, resident, definition.decoder.clone(), resources.ledgers(), &mut recorded))?;
+        let device = resident.embedding.tensor().device();
+        let family = constants.allocate(&device, |charges| {
+            NativeFamily::new(charges, programs, resident, definition.decoder.clone(), resources.ledgers(), &mut recorded)
+        })?;
         recorded.record(constants);
         Self::with_family(
             execution,
@@ -2447,7 +2450,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// binding's life.
     fn bind_component(&mut self, lane: ReservationLane) -> Result<(), DomainError> {
         // Its import and binding allocate under the claims below, tables included.
-        let _lifted = self.domain.device().lift_table_seal();
+        let device = self.domain.device().clone();
         match lane {
             ReservationLane::Head if !self.family.head_is_bound() => {
                 let loader = self
@@ -2464,7 +2467,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     crate::memory::ledger::CommittedKind::Component,
                     crate::memory::ClaimDemand { device: constants, ..Default::default() },
                 )?;
-                binding.allocate(|| self.family.bind_head(resident, &self.definition))?;
+                binding.allocate(&device, |charges| self.family.bind_head(charges, resident, &self.definition))?;
                 self.head_binding = binding.into_claims();
                 self.hold_bound_head()?;
                 Ok(())
@@ -2484,7 +2487,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     crate::memory::ledger::CommittedKind::Component,
                     crate::memory::ClaimDemand { device: constants, ..Default::default() },
                 )?;
-                binding.allocate(|| self.family.bind_vision(resident, &self.definition))?;
+                binding.allocate(&device, |charges| self.family.bind_vision(charges, resident, &self.definition))?;
                 self.vision_binding = binding.into_claims();
                 Ok(())
             }
@@ -2497,9 +2500,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// upload `peak` (staged through host RAM where that is a store apart)
     /// claimed only while the import runs.
     fn import_component<T: Clone>(&self, loader: &ComponentLoader<T>, resident: u64, peak: u64) -> Result<T, DomainError> {
-        let imported = match loader.imported() {
-            true => loader.load(),
-            false => {
+        let imported = match loader.resident() {
+            Some(resident) => Ok(resident),
+            None => {
                 use crate::memory::{ClaimDemand, ledger::CommittedKind};
                 let weights = self.claim_growth(CommittedKind::Component, ClaimDemand { device: resident, ..Default::default() })?;
                 let _upload = self.claim_growth(CommittedKind::Upload, ClaimDemand { device: peak, staged: peak, ..Default::default() })?;
@@ -2800,6 +2803,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
     pub fn resources(&self) -> &ResourceDomain {
         &self.domain
+    }
+
+    /// Charges of a measurement job run on this domain's device beside it,
+    /// in its process (a tool's): its ledgers' measurement holding
+    /// ([`crate::memory::ledger::DeviceLedgers::measurement`]).
+    pub fn measurement_charges(&self) -> seismic::Charges {
+        self.resources.ledgers().measurement(self.domain.device())
     }
 
     /// The compatibility key of an operation. Keying does not validate;

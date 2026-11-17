@@ -282,7 +282,7 @@ struct Tensors {
 
 fn tensor(device: &Device, element: Element, shape: &[usize], bytes: Vec<u8>) -> Tensor {
     let shape = shape.iter().map(|x| *x as u64).collect::<Vec<_>>();
-    Tensor::from_host(device, element, &shape, &bytes).unwrap()
+    Tensor::from_host(&seismic::Charges::tally(device), element, &shape, &bytes).unwrap()
 }
 
 fn words(values: &[u32]) -> Vec<u8> {
@@ -450,6 +450,7 @@ fn run_with_softcap(
     (scan, rows, gather): Params,
     softcap: f32,
 ) -> Levels {
+    let charges = seismic::Charges::tally(device);
     let width = width_param(device);
     let top = declared::prepared(
         device,
@@ -460,7 +461,7 @@ fn run_with_softcap(
         &scan_spec::<readout_top_rows::Entry>(device, head, false, scan, rows),
     )
     .unwrap()
-    .call(readout_top_rows::Args {
+    .call(&charges, readout_top_rows::Args {
         softcap,
         hidden: &t.hidden,
         norm: &t.norm,
@@ -483,7 +484,7 @@ fn run_with_softcap(
         &statics(head).with_launch_param(0, width, gather),
     )
     .unwrap()
-    .call(readout_refine_rows::Args {
+    .call(&charges, readout_refine_rows::Args {
         softcap,
         features: &top.r2,
         top: &t.top,
@@ -506,7 +507,7 @@ fn run_with_softcap(
         &statics(head).with_launch_param(0, width, gather),
     )
     .unwrap()
-    .call(readout_exact_rows::Args {
+    .call(&charges, readout_exact_rows::Args {
         softcap,
         features: &top.r2,
         top: &t.top,
@@ -533,7 +534,7 @@ fn run_with_softcap(
         &scan_spec::<readout_planes_rows::Entry>(device, head, true, scan, rows),
     )
     .unwrap()
-    .call(readout_planes_rows::Args {
+    .call(&charges, readout_planes_rows::Args {
         softcap,
         hidden: &t.hidden,
         norm: &t.norm,
@@ -717,6 +718,7 @@ fn progressive_softcap_preserves_full_selection_and_saturated_ties() {
 #[test]
 fn planes_readout_projects_every_row_class() {
     let Some(device) = device() else { return };
+    let charges = seismic::Charges::tally(&device);
     let head = Head::new(301, 1088, 43);
     let mut rng = Rng(11);
     for o in [VERIFY_ROWS as usize + 1, 16, 21] {
@@ -733,7 +735,7 @@ fn planes_readout_projects_every_row_class() {
                 &scan_spec::<readout_planes_rows::Entry>(&device, &head, true, 4, 2),
             )
             .unwrap()
-            .call(readout_planes_rows::Args {
+            .call(&charges, readout_planes_rows::Args {
                 softcap: 0.0,
                 hidden: &t.hidden,
                 norm: &t.norm,
@@ -788,6 +790,7 @@ fn planes_readout_projects_every_row_class() {
 #[test]
 fn planes_batched_full_pass_selects_what_the_scalar_pass_selects() {
     let Some(device) = device() else { return };
+    let charges = seismic::Charges::tally(&device);
     if device.backend() != BackendName::Metal {
         return;
     }
@@ -806,7 +809,7 @@ fn planes_batched_full_pass_selects_what_the_scalar_pass_selects() {
                 &scan_spec::<readout_planes_rows::Entry>(&device, &head, true, 8, 2),
             )
             .unwrap()
-            .call(readout_planes_rows::Args {
+            .call(&charges, readout_planes_rows::Args {
                 softcap: 0.0,
                 hidden: &t.hidden,
                 norm: &t.norm,
@@ -951,6 +954,7 @@ fn assert_covers(label: &str, native: &[f32], portable: &[f32], scale: f32) {
 #[test]
 fn progressive_portable_bodies_match_the_natives() {
     let Some(device) = device() else { return };
+    let charges = seismic::Charges::tally(&device);
     let module = crate::common::kernels();
     let softcap = 30.0;
     // A vocabulary that is no multiple of 32 or of the scan's rows, and a
@@ -1129,7 +1133,7 @@ fn progressive_portable_bodies_match_the_natives() {
             &statics(&head).with_launch_param(0, width, 4),
         )
         .unwrap()
-        .call(readout_refine_rows::Args {
+        .call(&charges, readout_refine_rows::Args {
             softcap,
             features: &features_tensor,
             top: &t.top,
@@ -1164,7 +1168,7 @@ fn progressive_portable_bodies_match_the_natives() {
             &statics(&head).with_launch_param(0, width, 4),
         )
         .unwrap()
-        .call(readout_exact_rows::Args {
+        .call(&charges, readout_exact_rows::Args {
             softcap,
             features: &features_tensor,
             top: &t.top,
@@ -1196,6 +1200,7 @@ fn progressive_portable_bodies_match_the_natives() {
 #[test]
 fn prepared_full_and_indexed_share_projection_and_mask_invalid_ids() {
     let Some(device) = device() else { return };
+    let charges = seismic::Charges::tally(&device);
     let (o, v, d, s) = (2usize, 9usize, 64usize, 5usize);
     let features = (0..o * d)
         .map(|i| bf16_round(((i * 13 % 31) as f32 - 15.0) / 32.0))
@@ -1247,7 +1252,7 @@ fn prepared_full_and_indexed_share_projection_and_mask_invalid_ids() {
         .unwrap();
         read_f32(
             &kernel
-                .call(magnitude_kernels::readout_project_rows::Args {
+                .call(&charges, magnitude_kernels::readout_project_rows::Args {
                     features: &features_tensor,
                     weight: &weight_tensor,
                     token_rows: &tokens,

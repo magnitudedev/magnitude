@@ -216,6 +216,17 @@ impl ReadyEngine {
 /// kernel cache, which holds the figures. A load in its own process
 /// settles them once an attempt finds them pending ([`load_in_process`]),
 /// so a priced machine's load plans nothing more.
+///
+/// No device of this process is open as it runs, so each job opens its
+/// executor on tallies of its own and charges them
+/// (`worker::measure::measure_job`): every caller runs it before its load
+/// opens anything ([`prepare_in_process`], the harness), or after a load
+/// attempt whose prices were pending has ended and released what it opened
+/// ([`load_in_process`]: [`start_in_process`] joins the attempt's worker
+/// thread; an attempt on the caller's thread has returned). A job that
+/// found its executor open in an embedder's ledger would panic
+/// (`seismic::Charges::tally`): measuring beside a live load charges that
+/// load's measurement holding instead (`ExecutorDomain::measurement_charges`).
 pub fn settle_prices(manifest: &ExecutionManifest) -> Result<u64, LoadError> {
     let internal = |reason: String| LoadError::Internal { reason };
     let paths = vec![manifest.store().to_path_buf()];
@@ -333,19 +344,24 @@ pub fn start_in_process(
             .map_err(|error| LoadError::Internal {
                 reason: error.to_string(),
             })?;
-        match connect_worker(host_end, None, |update| (progress.borrow_mut())(update))? {
-            LoadAttempt::Loaded(connection) => ReadyEngine::new(Arc::clone(&host), connection)
+        // An attempt that did not load has released everything it opened
+        // once its thread ends, which it does as its transport closes: its
+        // device among them, so the jobs that settle its pending prices
+        // open the device anew ([`settle_prices`]).
+        let unloaded = |outcome: Result<LoadAttempt<ReadyEngine>, LoadError>| {
+            worker.join().map_err(|_| LoadError::Internal {
+                reason: "the in-process worker panicked".into(),
+            })?;
+            outcome
+        };
+        match connect_worker(host_end, None, |update| (progress.borrow_mut())(update)) {
+            Ok(LoadAttempt::Loaded(connection)) => ReadyEngine::new(Arc::clone(&host), connection)
                 .map(LoadAttempt::Loaded)
                 .map_err(|mismatch| LoadError::Internal {
                     reason: mismatch.to_string(),
                 }),
-            LoadAttempt::Unprepared => {
-                // Everything the attempt opened is gone with its thread.
-                worker.join().map_err(|_| LoadError::Internal {
-                    reason: "the in-process worker panicked".into(),
-                })?;
-                Ok(LoadAttempt::Unprepared)
-            }
+            Ok(LoadAttempt::Unprepared) => unloaded(Ok(LoadAttempt::Unprepared)),
+            Err(error) => unloaded(Err(error)),
         }
     };
     load_in_process(&manifest, attempt, worker, |update| {

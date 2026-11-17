@@ -31,9 +31,8 @@ fn device() -> (Rc<Device>, Pool) {
     let (device, tally) =
         seismic::testing::open_backend_tallied(&catalog, BackendName::Cpu, Default::default()).unwrap();
     let entry: Arc<dyn seismic::memory::Entry> = Arc::new(tally);
-    let pool = device
-        .pool(seismic::Contract::DeviceOnly, GRANULE, GRANULE, seismic::PoolEntries::one(entry))
-        .unwrap();
+    let charges = seismic::PoolCharges::one(&device.charges_in(seismic::Contract::DeviceOnly, entry));
+    let pool = Pool::open(&charges, seismic::Contract::DeviceOnly, GRANULE, GRANULE).unwrap();
     (Rc::new(device), pool)
 }
 fn write(tensor: &Tensor, bytes: &[u8]) -> Result<(), magnitude_state::Error> {
@@ -68,7 +67,7 @@ fn store(history: bool, values: bool) -> StoreBindings {
 fn store_with(history: bool, values: bool, context: usize, pages: usize) -> StoreBindings {
     let (device, pool) = device();
     StateStore::new(
-        device,
+        &seismic::Charges::tally(&device),
         pool,
         context,
         16,
@@ -439,7 +438,7 @@ fn reclamation_counts_selected_handles_once_and_respects_checkpoint_pins() {
     assert_eq!(reclaimable(&[&fork]), 48);
     let (device, pool) = device();
     let other = StateStore::new(
-        device,
+        &seismic::Charges::tally(&device),
         pool,
         16,
         16,

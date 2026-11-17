@@ -173,7 +173,7 @@ impl<'a> Tuning<'a> {
     ) -> Result<NativeSpecialization, CatalogFailure> {
         match self {
             Self::Tuner(tuner) => {
-                let key = unit_of(tuner.device(), &tuner.model(), prerequisite)?;
+                let key = unit_of(&tuner.device(), &tuner.model(), prerequisite)?;
                 tuner
                     .following(&key, implementation, fixed)
                     .map_err(|outcome| failure(entry, bindings, outcome))
@@ -182,10 +182,10 @@ impl<'a> Tuning<'a> {
         }
     }
 
-    pub fn device(&self) -> Option<&'a Device> {
+    pub fn device(&self) -> Option<Device> {
         match self {
             Self::Tuner(tuner) => Some(tuner.device()),
-            Self::Demand { device, .. } => Some(device),
+            Self::Demand { device, .. } => Some((*device).clone()),
             Self::Listing(_) => None,
         }
     }

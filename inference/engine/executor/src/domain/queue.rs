@@ -598,11 +598,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// function of the round's operations, the chunks the scheduler planned
     /// for it and the load. A lone prompt chunk opens a chain of the planned
     /// chunks continuing it, a place each of the class its group holds
-    /// (`AllocatedResources::group_places`, claimed as it opened,
-    /// `open_group`), that the family runs in a chain; otherwise, with
-    /// pipelining, every slot's successor of one kind queues behind it.
+    /// (`group_places`, claimed as it opened, `open_group`), that the family
+    /// runs in a chain; otherwise, with pipelining, every slot's successor
+    /// of one kind queues behind it.
     pub(super) fn behind(&self, operations: &[Operation]) -> Behind {
-        self.behind_within(operations, self.resources.group_places().get())
+        self.behind_within(operations, self.group_places().get())
     }
 
     /// What runs behind `operations` (`behind`) with prompt groups of up to

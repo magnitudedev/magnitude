@@ -27,6 +27,12 @@ fn device(error: impl ToString) -> SubmitError {
 }
 pub struct NativeStateProgram {
     graphs: Rc<PreparedStateCopyGraphs>,
+    /// What its copies' graph outputs are formed and their rows bound
+    /// through as they run: charges that allocate nothing, as a copy graph
+    /// exports nothing and binds the load's planes. It
+    /// moves rows in place within its bound plane (`copy_graph_draft`), and
+    /// runs in the state lane's planned graph workspace.
+    unallocating: seismic::Charges,
 }
 
 /// The map row classes a store copy of a plane holding `plane_rows` rows or
@@ -115,8 +121,8 @@ pub(crate) fn state_copy_classes(
 }
 
 impl NativeStateProgram {
-    pub(crate) fn new(graphs: Rc<PreparedStateCopyGraphs>) -> Self {
-        Self { graphs }
+    pub(crate) fn new(graphs: Rc<PreparedStateCopyGraphs>, device: &Device) -> Self {
+        Self { graphs, unallocating: seismic::Charges::none(device) }
     }
 
     fn execute(
@@ -168,7 +174,7 @@ impl NativeStateProgram {
                         slab_rows,
                     };
                     let plan = self.graphs.plan(&class)?;
-                    let bindings = self.graphs.bindings(&class, &view)?;
+                    let bindings = self.graphs.bindings(&self.unallocating, &class, &view)?;
                     // Native copy bodies skip negative map entries. Padding
                     // must not launch concurrent writes to a real row.
                     let mut from = words(&copy.from)?;
@@ -179,7 +185,7 @@ impl NativeStateProgram {
                         &class,
                         state_graph_workspace.slot_mut(),
                         bindings,
-                        plan.new_outputs().map_err(device)?,
+                        plan.new_outputs(&self.unallocating).map_err(device)?,
                         &bytes(&from),
                         &bytes(&to),
                     )?;
@@ -397,14 +403,17 @@ impl PreparedStateCopyGraphs {
         Ok(&self.variant(class)?.plan)
     }
 
+    /// A run's bindings of `class`'s plan to `rows`, bound through
+    /// `charges` (`seismic::NativeGraphBindings::set`).
     pub(crate) fn bindings(
         &self,
+        charges: &seismic::Charges,
         class: &StateCopyGraphClass,
         rows: &Tensor,
     ) -> Result<NativeGraphBindings, SubmitError> {
         let variant = self.variant(class)?;
         let mut bindings = variant.plan.bindings();
-        bindings.set(&variant.rows, rows).map_err(device)?;
+        bindings.set(charges, &variant.rows, rows).map_err(device)?;
         Ok(bindings)
     }
 
@@ -655,8 +664,9 @@ mod tests {
             PreparedStateCopyGraphs::prepare(&device, &handles, [other, class.clone()]).unwrap();
         assert_eq!(graphs.workspace_bytes_max(), assessment.workspace);
         assert_eq!(graphs.output_bytes_max(), assessment.output);
+        let charges = seismic::Charges::tally(&device);
         let slabs = crate::experts::pooled_slabs(
-            &device,
+            &charges,
             seismic::Contract::DeviceOnly,
             2,
             4,
@@ -680,9 +690,9 @@ mod tests {
             .unwrap();
         let view = slabs.logical_region(0).unwrap();
         let reshaped = view.reshape(&[4, 1, 4]).unwrap();
-        let bindings = graphs.bindings(&class, &reshaped).unwrap();
-        let outputs = graphs.plan(&class).unwrap().new_outputs().unwrap();
-        let mut slot = graphs.family().new_slot(&[graphs.family().upload_bytes()]).unwrap();
+        let bindings = graphs.bindings(&charges, &class, &reshaped).unwrap();
+        let outputs = graphs.plan(&class).unwrap().new_outputs(&charges).unwrap();
+        let mut slot = graphs.family().new_slot(&charges, &[graphs.family().upload_bytes()]).unwrap();
         graphs
             .run(
                 &class,

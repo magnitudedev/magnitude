@@ -196,8 +196,9 @@ impl Case {
     /// The native entry on `device` in `activation`; `reuse` places the banks
     /// with an interior slab freed and reused.
     fn native(&self, device: &Device, activation: Element, reuse: bool) -> Outcome {
+        let charges = seismic::Charges::tally(device);
         let mut bound = self.bind(device, reuse);
-        let gated = kernel(device, activation).call(bound.args(self.slab_banks)).unwrap().value;
+        let gated = kernel(device, activation).call(&charges, bound.args(self.slab_banks)).unwrap().value;
         Outcome {
             gated: read(&gated),
             window: read(&bound.window),

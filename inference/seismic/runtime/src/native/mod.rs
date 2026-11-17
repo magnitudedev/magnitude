@@ -848,12 +848,13 @@ pub(crate) struct ScalarSlots {
 }
 
 impl ScalarSlots {
-    /// The slots of `words` scalar-result words on `device`; none for none.
+    /// The slots of `words` scalar-result words on `device`, its own as
+    /// the kernel's programs are; none for none.
     fn allocate(device: &Arc<DeviceInner>, words: usize) -> Result<Option<Self>, ExecutionError> {
         match words {
             0 => Ok(None),
             words => Ok(Some(Self {
-                slots: device.allocate(Self::bytes_of(words), ResultClass::WORD_BYTES)?,
+                slots: crate::memory::Charges::result_slots(device).allocate(Self::bytes_of(words), ResultClass::WORD_BYTES)?,
                 words,
                 calls: Mutex::new(()),
             })),
@@ -2776,32 +2777,34 @@ impl NativePrepared {
         Ok(())
     }
 
-    pub(crate) fn call(self: &Arc<Self>, args: EncodedArgs) -> Result<DecodedResults, CallError> {
-        self.call_with(args, None, Parking::Unanswered, || {})
+    pub(crate) fn call(self: &Arc<Self>, charges: &crate::memory::Charges, args: EncodedArgs) -> Result<DecodedResults, CallError> {
+        self.call_with(charges, args, None, Parking::Unanswered, || {})
     }
 
     /// A standalone call whose every awaited word already holds its answer
     /// (the host wrote it before the call), as a graph's park bound
     /// answered is (`NativeGraphBindings::set_answered`): it waits for
     /// nothing, so every backend runs it, wherever its parks are realized.
-    pub(crate) fn call_answered(self: &Arc<Self>, args: EncodedArgs) -> Result<DecodedResults, CallError> {
-        self.call_with(args, None, Parking::Answered, || {})
+    pub(crate) fn call_answered(self: &Arc<Self>, charges: &crate::memory::Charges, args: EncodedArgs) -> Result<DecodedResults, CallError> {
+        self.call_with(charges, args, None, Parking::Answered, || {})
     }
 
     pub(crate) fn call_into(
         self: &Arc<Self>,
+        charges: &crate::memory::Charges,
         args: EncodedArgs,
         outputs: EncodedOutputs,
     ) -> Result<DecodedResults, CallError> {
-        self.call_with(args, Some(outputs), Parking::Unanswered, || {})
+        self.call_with(charges, args, Some(outputs), Parking::Unanswered, || {})
     }
 
     pub(crate) fn call_with_commit(
         self: &Arc<Self>,
+        charges: &crate::memory::Charges,
         args: EncodedArgs,
         commit: impl FnOnce(),
     ) -> Result<DecodedResults, CallError> {
-        self.call_with(args, None, Parking::Unanswered, commit)
+        self.call_with(charges, args, None, Parking::Unanswered, commit)
     }
 
     pub(crate) fn standalone_scratch_bytes(&self, args: EncodedArgs) -> Result<u64, CallError> {
@@ -2811,8 +2814,11 @@ impl NativePrepared {
     }
 
     /// Validate a standalone call, place its results and its scratch (in
-    /// `arena`, which the calls placed together share), and fix its
-    /// executable form.
+    /// `arena`, which the calls placed together share, through its
+    /// charges), and fix its executable form.
+    ///
+    /// # Panics
+    /// Where the arena's charges are another device's.
     fn prepare_call(
         &self,
         arena: &mut ScratchArena,
@@ -2820,6 +2826,7 @@ impl NativePrepared {
         outputs: Option<EncodedOutputs>,
         parking: Parking,
     ) -> Result<NativeBoundCall, CallError> {
+        arena.charges.of_device(&self.public_device);
         validate_standalone_parking(self.schema(), self.public_device.info().backend(), parking)?;
         for (parameter, tensor) in self.schema().parameters().iter().zip(args.tensors()) {
             if let (ParameterKind::Tensor { access, .. }, Some(tensor)) = (&parameter.kind, tensor)
@@ -2866,14 +2873,14 @@ impl NativePrepared {
                     tensor
                 }
                 None => Arc::new(
-                    TensorInner::zeros(&self.public_device, spec.representation, &spec.extents)
+                    TensorInner::zeros(&arena.charges, spec.representation, &spec.extents)
                         .map_err(tensor_error)?,
                 ),
             };
             results.push(tensor);
         }
         let (scratch, regions) = place_scratch(&shape.scratch);
-        let (sync, body) = arena.holding(&self.public_device, regions)?;
+        let (sync, body) = arena.holding(regions)?;
 
         let schema = self.schema();
         let mut buffers = Vec::new();
@@ -2923,7 +2930,9 @@ impl NativePrepared {
                 }));
             }
             if record_ports[buffer] {
-                let bound = tensor.records().map_err(tensor_error)?;
+                // A table the view's storage does not hold yet is formed
+                // through the call's charges, as its scratch is.
+                let bound = tensor.forming_records(&arena.charges).map_err(tensor_error)?;
                 buffers.push((
                     bound.table.clone(),
                     bound.table_offset,
@@ -2998,6 +3007,7 @@ impl NativePrepared {
 
     fn call_with(
         self: &Arc<Self>,
+        charges: &crate::memory::Charges,
         args: EncodedArgs,
         outputs: Option<EncodedOutputs>,
         parking: Parking,
@@ -3014,7 +3024,7 @@ impl NativePrepared {
         // 17.1 MB per Qwen3.6 35B load that no plan term counted
         // (`standalone_scratch_is_the_calls_own`), and no hot path makes
         // standalone calls. Batches and tuning points share one arena.
-        let call = self.prepare_call(&mut ScratchArena::default(), args, outputs, parking)?;
+        let call = self.prepare_call(&mut ScratchArena::new(charges.clone()), args, outputs, parking)?;
         self.reset_scalar_results()?;
         commit();
         let calls = [call];
@@ -3079,20 +3089,27 @@ impl NativePrepared {
 /// so the storage lives as long as the calls do, never as long as their
 /// kernel. A grown region is a new zeroed allocation, so the sync region is
 /// zero whenever a call starts.
-#[derive(Default)]
 pub(crate) struct ScratchArena {
+    /// What the calls placed in it allocate through: their scratch and
+    /// results.
+    charges: crate::memory::Charges,
     sync: Option<Arc<Allocation>>,
     body: Option<Arc<Allocation>>,
 }
 
 impl ScratchArena {
+    /// An empty arena of calls whose allocations are charged to `charges`.
+    pub(crate) fn new(charges: crate::memory::Charges) -> Self {
+        Self { charges, sync: None, body: None }
+    }
+
     /// The sync region and the body, holding at least `regions`' bytes
     /// each; `None` for a region the call places nothing in.
     fn holding(
         &mut self,
-        device: &Arc<DeviceInner>,
         regions: ScratchRegions,
     ) -> Result<(Option<Arc<Allocation>>, Option<Arc<Allocation>>), CallError> {
+        let charges = &self.charges;
         let hold = |held: &mut Option<Arc<Allocation>>, bytes: u64| -> Result<Option<Arc<Allocation>>, CallError> {
             if bytes == 0 {
                 return Ok(None);
@@ -3100,7 +3117,7 @@ impl ScratchArena {
             if let Some(region) = held.as_ref().filter(|region| region.bytes() >= bytes) {
                 return Ok(Some(region.clone()));
             }
-            let region = device
+            let region = charges
                 .allocate_zeroed(bytes, BUFFER_ALIGNMENT)
                 .map_err(CallError::Execution)?;
             *held = Some(region.clone());
@@ -4201,7 +4218,7 @@ mod tests {
         )
         .expect("fill prepares");
         // A view of three words past a leading word, so the offset counts.
-        let allocation = device.allocate_mapped_zeroed(seismic_topology::Contract::Words, 16, 16).expect("shared words");
+        let allocation = crate::memory::Charges::tally(&device).allocate_mapped_zeroed(seismic_topology::Contract::Words, 16, 16).expect("shared words");
         let base = allocation.storage().host_address().expect("host-addressed words");
         let store = |word: usize, value: u32| unsafe {
             std::sync::atomic::AtomicU32::from_ptr(base.as_ptr().add(4 + 4 * word).cast())
@@ -4466,11 +4483,11 @@ mod issue_lifecycle_tests {
     fn unwinding_after_issue_retires_the_work_and_releases_submission_locks() {
         let kernel = cpu_noop();
         let device = kernel.public_device.clone();
-        let tensor = Arc::new(TensorInner::zeros(&device, seismic_lang::registry::dense(
+        let tensor = Arc::new(TensorInner::zeros(&crate::memory::Charges::tally(&device), seismic_lang::registry::dense(
             seismic_lang::types::DType::F32), &[1]).unwrap());
         let mut args = EncodedArgs::new();
         args.push_tensor(tensor.clone());
-        let call = kernel.prepare_call(&mut ScratchArena::default(), args, None, Parking::Unanswered).unwrap();
+        let call = kernel.prepare_call(&mut ScratchArena::new(crate::memory::Charges::tally(&device)), args, None, Parking::Unanswered).unwrap();
         let calls = [call];
         FAIL_AFTER_PUBLICATION.set(true);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

@@ -158,8 +158,9 @@ pub use seismic_runtime::artifacts::{
 /// The embedder's ledger as Seismic charges it: every byte a device takes is
 /// charged to one [`memory::Entry`] of the [`memory::Store`] it lies in.
 pub mod memory {
+    pub use crate::Charges;
     pub use seismic_runtime::memory::{
-        charging, AllocationFailure, Backed, Carved, Change, Charge, Charging, DropScope, Entry, Grant, HostBlock, PageSize, Refused,
+        AllocationFailure, Backed, Carved, Change, Charge, Charging, DropScope, Entry, Grant, HostBlock, PageSize, Refused,
         Store, Tally, Wiring,
     };
 }
@@ -404,7 +405,7 @@ pub use seismic_topology::fixtures;
 #[cfg(feature = "fixtures")]
 pub use seismic_discovery::fixtures as host_samples;
 mod pool;
-pub use pool::{block_bytes, BlockSize, BlockSizing, NativeAllocations, Pool, PoolEntries, SizingError, BLOCK_ALIGNMENT};
+pub use pool::{block_bytes, BlockSize, BlockSizing, NativeAllocations, Pool, PoolCharges, SizingError, BLOCK_ALIGNMENT};
 pub use slab::{SlabFill, SlabLayout, SlabRegion, SlabTensor};
 
 use seismic_compiler::prepared::ArgumentValue;
@@ -568,19 +569,102 @@ pub struct Device {
     inner: Arc<seismic_runtime::api::device::DeviceInner>,
 }
 
-impl Device {
-    /// Declare the load's charge final: a record table formed afterwards
-    /// outside a [`TableSealLifted`] scope is an invariant violation (stops
-    /// every build), being device memory no claim covers.
-    pub fn seal_record_tables(&self) {
-        self.inner.seal_record_tables()
+/// What every allocation through a device is charged to: one entry of the
+/// embedder's ledger in each store the device reaches, minted for the
+/// device by that ledger ([`Device::charges`]); each store's own entry, of
+/// a device opened on tallies ([`Charges::tally`]); or none, for work that
+/// allocates nothing ([`Charges::none`]). Every allocating call takes the
+/// charges it allocates through, which carry their device, so no
+/// allocation is made that names no entry. Not `Clone`: a caller cannot
+/// keep lent charges past the lender's change ([`Device::charges`]'s
+/// minter); what allocates later is handed charges at its allocating call.
+/// What seismic forms from charges (a [`Kernel`], a `Workflow`, a
+/// feedback campaign, a `PoolCharges`) keeps a share of them for its own
+/// later allocations, so it is formed within the change it allocates for
+/// and dropped with it.
+pub struct Charges {
+    inner: seismic_runtime::memory::Charges,
+}
+
+impl Charges {
+    /// Each store's one entry of `device`, opened on tallies of its own
+    /// ([`Devices::open_with`], `testing::open_tallied`, or
+    /// [`Devices::open_in`] over [`memory::Tally`] stores): every
+    /// allocation on it. For tests, tools, frontends with no ledger of
+    /// their own.
+    ///
+    /// # Panics
+    /// Where `device` was opened in an embedder's ledger, whose holders
+    /// each have an entry it mints ([`Device::charges`]).
+    pub fn tally(device: &Device) -> Self {
+        Self { inner: seismic_runtime::memory::Charges::tally(&device.inner) }
     }
 
-    /// Lift the seal while the guard lives, for allocations made under a
-    /// claim after the load (a component's import and binding).
-    pub fn lift_table_seal(&self) -> TableSealLifted {
-        self.inner.lift_table_seal();
-        TableSealLifted(self.clone(), std::marker::PhantomData)
+    /// Charges of `device` for work whose plan needs no storage: an
+    /// allocation of any byte through them is an invariant violation, and
+    /// panics.
+    pub fn none(device: &Device) -> Self {
+        Self { inner: seismic_runtime::memory::Charges::none(&device.inner) }
+    }
+
+    /// These charges, every allocation made through them landing in `kind`
+    /// (and lying along its access path) or refused, never moving on to
+    /// its placement's other kinds; an allocation whose contract's
+    /// placement does not name `kind` is refused.
+    ///
+    /// # Panics
+    /// Where `kind` is none of the device's executor's kinds.
+    pub fn confined(&self, kind: NativeKind) -> Self {
+        Self { inner: self.inner.confined(kind) }
+    }
+
+    /// The device allocations through these are made on: the one their
+    /// runtime charges hold, shared.
+    pub fn device(&self) -> Device {
+        Device { inner: self.inner.device().clone() }
+    }
+
+    /// Their entry of the store `contract`'s storage lies in. None where
+    /// they allocate nothing there ([`Self::none`], [`Device::charges_in`]
+    /// of another store).
+    pub fn entry(&self, contract: Contract) -> Option<Arc<dyn memory::Entry>> {
+        self.inner.entry(contract).cloned()
+    }
+
+    pub(crate) fn inner(&self) -> &seismic_runtime::memory::Charges {
+        &self.inner
+    }
+
+    /// The same charges, for what Seismic itself keeps that allocates
+    /// later (a kernel's calls, a workflow's runs, a campaign's): never
+    /// handed out of Seismic but inside what keeps them.
+    pub(crate) fn share(&self) -> Self {
+        Self { inner: self.inner.clone() }
+    }
+}
+
+impl Device {
+    /// Charges of this device, each store's entry the one `entry_in`
+    /// names for it, called once with the identity of each store the device
+    /// reaches: how an embedder's ledger mints what a holding allocates
+    /// through. Handed no store, it cannot name a store's own entry
+    /// ([`memory::Store::own`]).
+    ///
+    /// # Panics
+    /// Where `entry_in` names an entry of another store than it was given.
+    pub fn charges(&self, entry_in: impl FnMut(&StoreIdentity) -> Arc<dyn memory::Entry>) -> Charges {
+        Charges { inner: self.inner.charges(entry_in) }
+    }
+
+    /// Charges of this device in the store `contract`'s storage lies in
+    /// alone, to `entry`, an entry of that store: what a granule pool of it
+    /// is made through ([`PoolCharges`]). An allocation of any byte
+    /// through them in another store panics, as through [`Charges::none`].
+    ///
+    /// # Panics
+    /// Where `entry` is an entry of another store.
+    pub fn charges_in(&self, contract: Contract, entry: Arc<dyn memory::Entry>) -> Charges {
+        Charges { inner: seismic_runtime::memory::Charges::in_store(&self.inner, contract, entry) }
     }
 
     pub fn same_device(&self, other: &Self) -> bool {
@@ -665,12 +749,6 @@ impl Device {
             inner: seismic_runtime::native::graph::NativeGraphDraft::new(&self.inner),
         }
     }
-    /// The device's shared graph workspace of `bytes`: every family slot
-    /// created in it binds the one allocation.
-    pub fn execution_arena(&self, bytes: u64) -> Result<NativeExecutionArena, TensorError> {
-        seismic_runtime::native::graph::NativeExecutionArena::new(&self.inner, bytes)
-            .map(|inner| NativeExecutionArena { inner })
-    }
     /// Begin an exact graph using a certified Seismic placement.
     pub fn native_graph_with_layout(&self, layout: &NativeGraphLayout) -> NativeGraph {
         NativeGraph {
@@ -705,27 +783,6 @@ impl Device {
     pub fn device_store(&self) -> StoreId {
         self.inner.device_store()
     }
-    /// The ledger entry an allocation of `contract` made now on this thread
-    /// is charged to: the one its caller names for the store
-    /// ([`memory::charging`]), else the store's own ([`memory::Store::own`]).
-    /// What a pool a caller opens for its own use is charged to.
-    pub fn entry(&self, contract: Contract) -> Arc<dyn memory::Entry> {
-        self.inner.entry(contract)
-    }
-    /// Run `allocate`, confining every allocation it makes on this thread
-    /// through this device to `kind`, one of the executor's kinds: an
-    /// allocation of a contract whose placement names `kind` lands there
-    /// (and lies along its access path) or is refused, never moving on to
-    /// the placement's other kinds; any other allocation, a contract's
-    /// placement not naming `kind`, is refused. Allocations on other threads
-    /// and of other devices are not confined; scopes nest, the innermost
-    /// one of a device confining it.
-    ///
-    /// # Panics
-    /// Where `kind` is none of the executor's kinds.
-    pub fn in_kind<T>(&self, kind: NativeKind, allocate: impl FnOnce() -> T) -> T {
-        self.inner.in_kind(kind, allocate)
-    }
     /// The bytes the embedder's ledger counts the process holding in the
     /// device store ([`memory::Store::allocated`]).
     pub fn allocated(&self) -> u64 {
@@ -752,10 +809,6 @@ impl Device {
     /// allocation needing more is refused as a capacity shortfall.
     pub fn room(&self, contract: Contract) -> u64 {
         self.inner.room(contract)
-    }
-    /// A planned workflow on this device; refused on a native-only backend.
-    pub fn workflow(&self) -> Result<WorkflowDraft, WorkflowError> {
-        seismic_runtime::api::kernel::workflow(&self.inner).map(|inner| WorkflowDraft { inner })
     }
     pub(crate) fn inner(&self) -> &Arc<seismic_runtime::api::device::DeviceInner> {
         &self.inner
@@ -1611,18 +1664,6 @@ impl Tensor {
         self.inner.record_placement()
     }
 
-    /// Form now the address table a native record port binds this view's
-    /// records through, where its backend binds record tables (Metal,
-    /// Vulkan), so
-    /// binding this view later allocates nothing: for a view first bound
-    /// while its device may refuse an allocation, such as a release under
-    /// memory pressure. A fixed allocation holds the table with its storage,
-    /// and a view of a single record later binds any table it holds with an
-    /// entry at that record's address.
-    pub fn hold_record_table(&self) -> Result<(), TensorError> {
-        self.inner.hold_records()
-    }
-
     #[cfg(test)]
     pub(crate) fn device_address(&self) -> u64 {
         self.inner.device_address()
@@ -1635,14 +1676,14 @@ impl Tensor {
     /// Every byte of the tensor's physical layout, including padding, must
     /// be initialized before the tensor is read or passed as a device input.
     pub unsafe fn uninitialized(
-        device: &Device,
+        charges: &Charges,
         element: Element,
         extents: &[u64],
     ) -> Result<Tensor, TensorError> {
         // SAFETY: the caller upholds the complete-initialization contract.
         unsafe {
             seismic_runtime::api::tensor::TensorInner::uninitialized(
-                device.inner(),
+                charges.inner(),
                 element.id(),
                 extents,
             )
@@ -1661,11 +1702,11 @@ impl Tensor {
     /// notice the device writes for the host. On Metal it is
     /// `MTLStorageModeShared`, as is every Metal tensor.
     pub fn shared(
-        device: &Device,
+        charges: &Charges,
         element: Element,
         extents: &[u64],
     ) -> Result<Tensor, TensorError> {
-        seismic_runtime::api::tensor::TensorInner::shared(device.inner(), element.id(), extents)
+        seismic_runtime::api::tensor::TensorInner::shared(charges.inner(), element.id(), extents)
             .map(|inner| Tensor {
                 inner: Arc::new(inner),
             })
@@ -1676,11 +1717,11 @@ impl Tensor {
     /// [`Tensor::store_release`]): timelines, park and answer words, maps
     /// and directories.
     pub fn words(
-        device: &Device,
+        charges: &Charges,
         element: Element,
         extents: &[u64],
     ) -> Result<Tensor, TensorError> {
-        seismic_runtime::api::tensor::TensorInner::words(device.inner(), element.id(), extents).map(
+        seismic_runtime::api::tensor::TensorInner::words(charges.inner(), element.id(), extents).map(
             |inner| Tensor {
                 inner: Arc::new(inner),
             },
@@ -1694,12 +1735,12 @@ impl Tensor {
     /// queue's work requests and another's waits on, which the host
     /// answers.
     pub fn protocol_words(
-        device: &Device,
+        charges: &Charges,
         element: Element,
         extents: &[u64],
     ) -> Result<Tensor, TensorError> {
         seismic_runtime::api::tensor::TensorInner::protocol_words(
-            device.inner(),
+            charges.inner(),
             element.id(),
             extents,
         )
@@ -1713,11 +1754,11 @@ impl Tensor {
     /// graph run's inputs lie (a large BAR's on Vulkan, whose host reads
     /// are uncached). The host never reads it.
     pub fn upload(
-        device: &Device,
+        charges: &Charges,
         element: Element,
         extents: &[u64],
     ) -> Result<Tensor, TensorError> {
-        seismic_runtime::api::tensor::TensorInner::upload(device.inner(), element.id(), extents)
+        seismic_runtime::api::tensor::TensorInner::upload(charges.inner(), element.id(), extents)
             .map(|inner| Tensor {
                 inner: Arc::new(inner),
             })
@@ -1820,11 +1861,27 @@ impl Tensor {
 
     /// A zero-filled owned tensor.
     pub fn zeros(
-        device: &Device,
+        charges: &Charges,
         element: Element,
         extents: &[u64],
     ) -> Result<Tensor, TensorError> {
-        seismic_runtime::api::tensor::TensorInner::zeros(device.inner(), element.id(), extents).map(
+        seismic_runtime::api::tensor::TensorInner::zeros(charges.inner(), element.id(), extents).map(
+            |inner| Tensor {
+                inner: Arc::new(inner),
+            },
+        )
+    }
+    /// A zero-filled owned tensor whose records' address table, which a
+    /// native record port binds them through, is formed with it through
+    /// `charges` and held with its storage: a view of a run of its records
+    /// (a streamed table's landed slots) binds through that table, and
+    /// binding one allocates nothing.
+    pub fn zeros_recorded(
+        charges: &Charges,
+        element: Element,
+        extents: &[u64],
+    ) -> Result<Tensor, TensorError> {
+        seismic_runtime::api::tensor::TensorInner::zeros_recorded(charges.inner(), element.id(), extents).map(
             |inner| Tensor {
                 inner: Arc::new(inner),
             },
@@ -1833,13 +1890,13 @@ impl Tensor {
     /// An owned tensor initialized from host bytes in the representation's
     /// canonical dense layout.
     pub fn from_host(
-        device: &Device,
+        charges: &Charges,
         element: Element,
         extents: &[u64],
         bytes: &[u8],
     ) -> Result<Tensor, TensorError> {
         seismic_runtime::api::tensor::TensorInner::from_host(
-            device.inner(),
+            charges.inner(),
             element.id(),
             extents,
             bytes,
@@ -2245,8 +2302,10 @@ pub struct FeedbackPreparation<'device, E: Entry> {
 }
 
 impl<'device, E: Entry> FeedbackPreparation<'device, E> {
+    /// Start the search on `charges`' device, its trials allocated through
+    /// `charges`.
     fn start(
-        device: &'device Device,
+        charges: &'device Charges,
         precision: PrecisionPolicy,
         options: FeedbackOptions,
         bindings: seismic_lang::entry::ElementBindings,
@@ -2257,7 +2316,7 @@ impl<'device, E: Entry> FeedbackPreparation<'device, E> {
             module.checked(),
             entry.id(),
             bindings,
-            device.inner(),
+            charges.inner(),
             precision,
             options,
         )
@@ -2311,9 +2370,10 @@ pub struct NativeTensorBatchCompletion {
 }
 
 impl NativeTensorBatch {
-    pub fn new(device: &Device) -> Self {
+    /// A batch whose calls' scratch is charged to `charges`.
+    pub fn new(charges: &Charges) -> Self {
         Self {
-            inner: seismic_runtime::api::kernel::NativeTensorBatchAny::new(device.inner()),
+            inner: seismic_runtime::api::kernel::NativeTensorBatchAny::new(charges.inner()),
         }
     }
 
@@ -4380,12 +4440,12 @@ impl std::fmt::Debug for NativePort {
 impl OperandCarry {
     /// Tensors to bind to its ports, one run's carry: its rows, then its Q8
     /// blocks.
-    pub fn allocate(&self, device: &Device) -> Result<[Tensor; 2], TensorError> {
+    pub fn allocate(&self, charges: &Charges) -> Result<[Tensor; 2], TensorError> {
         let [(rows, rows_extents), (quantized, quantized_extents)] =
             seismic_runtime::native::graph::operand_carry_ports(self.shape[0], self.shape[1]);
         Ok([
-            Tensor::zeros(device, Element(rows), &rows_extents)?,
-            Tensor::zeros(device, Element(quantized), &quantized_extents)?,
+            Tensor::zeros(charges, Element(rows), &rows_extents)?,
+            Tensor::zeros(charges, Element(quantized), &quantized_extents)?,
         ])
     }
 
@@ -4660,22 +4720,25 @@ impl NativeGraphPlan {
     pub fn graph_replays(&self) -> GraphReplays {
         self.inner.graph_replays()
     }
-    pub fn new_slot(&self) -> Result<NativeGraphSlot, TensorError> {
-        self.inner.new_slot().map(|inner| NativeGraphSlot { inner })
+    /// A slot of the plan, its storage allocated through `charges`.
+    pub fn new_slot(&self, charges: &Charges) -> Result<NativeGraphSlot, TensorError> {
+        self.inner.new_slot(charges.inner()).map(|inner| NativeGraphSlot { inner })
     }
-    /// Runs of the plan with `bindings`, on a slot of their own, as
-    /// [`measure`] times them, each pass one run timed as `timing` says. A
-    /// plan with timeline nodes is refused.
+    /// Runs of the plan with `bindings`, on a slot of their own allocated
+    /// through `charges`, as [`measure`] times them, each pass one run
+    /// timed as `timing` says. A plan with timeline nodes is refused.
     pub fn point(
         &self,
+        charges: &Charges,
         bindings: NativeGraphBindings,
         timing: GraphTiming,
     ) -> Result<GraphPoint, CallError> {
-        self.inner.point(bindings.inner, timing)
+        self.inner.point(charges.inner(), bindings.inner, timing)
     }
-    pub fn new_outputs(&self) -> Result<NativeGraphOutputs, TensorError> {
+    /// A run's outputs, allocated through `charges`.
+    pub fn new_outputs(&self, charges: &Charges) -> Result<NativeGraphOutputs, TensorError> {
         self.inner
-            .new_outputs()
+            .new_outputs(charges.inner())
             .map(|inner| NativeGraphOutputs { inner })
     }
     pub fn bindings(&self) -> NativeGraphBindings {
@@ -4683,8 +4746,12 @@ impl NativeGraphPlan {
             inner: self.inner.bindings(),
         }
     }
+    /// Bind the ports that stay fixed across runs, each through
+    /// [`NativeGraphBindings::set`]: a fixed record port's records formed
+    /// through `charges`.
     pub fn bind_static(
         &self,
+        charges: &Charges,
         fixed: &[(&NativePort, &Tensor)],
     ) -> Result<BoundNativeGraphPlan, CallError> {
         let fixed = fixed
@@ -4692,7 +4759,7 @@ impl NativeGraphPlan {
             .map(|(port, tensor)| (port.inner, tensor.inner.clone()))
             .collect::<Vec<_>>();
         self.inner
-            .bind_static(&fixed)
+            .bind_static(charges.inner(), &fixed)
             .map(|inner| BoundNativeGraphPlan { inner })
     }
 }
@@ -4826,35 +4893,37 @@ impl NativeGraphFamily {
     pub fn upload_bytes(&self) -> u64 {
         self.inner.upload_bytes()
     }
-    pub fn new_output_slot(&self) -> Result<NativeGraphFamilyOutputSlot, TensorError> {
+    /// A slot of outputs, allocated through `charges`.
+    pub fn new_output_slot(&self, charges: &Charges) -> Result<NativeGraphFamilyOutputSlot, TensorError> {
         self.inner
-            .new_output_slot()
+            .new_output_slot(charges.inner())
             .map(|inner| NativeGraphFamilyOutputSlot { inner })
     }
     /// [`Self::new_output_slot`] of outputs the host reads as they complete
     /// (`Contract::Shared`), with no copy queued behind later runs.
-    pub fn new_host_output_slot(&self) -> Result<NativeGraphFamilyOutputSlot, TensorError> {
+    pub fn new_host_output_slot(&self, charges: &Charges) -> Result<NativeGraphFamilyOutputSlot, TensorError> {
         self.inner
-            .new_host_output_slot()
+            .new_host_output_slot(charges.inner())
             .map(|inner| NativeGraphFamilyOutputSlot { inner })
     }
     /// A slot whose upload regions, of `regions` bytes each (one per run it
     /// keeps in flight at once, holding that run's input), are allocated
-    /// here; activation never allocates.
-    pub fn new_slot(&self, regions: &[u64]) -> Result<NativeGraphFamilySlot, TensorError> {
+    /// here through `charges`; activation never allocates.
+    pub fn new_slot(&self, charges: &Charges, regions: &[u64]) -> Result<NativeGraphFamilySlot, TensorError> {
         self.inner
-            .new_slot(regions)
+            .new_slot(charges.inner(), regions)
             .map(|inner| NativeGraphFamilySlot { inner })
     }
     /// A slot whose workspace is the shared `arena`, with upload regions of
-    /// `regions` bytes each of its own.
+    /// `regions` bytes each of its own, allocated through `charges`.
     pub fn new_slot_in(
         &self,
+        charges: &Charges,
         arena: &NativeExecutionArena,
         regions: &[u64],
     ) -> Result<NativeGraphFamilySlot, WorkflowError> {
         self.inner
-            .new_slot_in(&arena.inner, regions)
+            .new_slot_in(charges.inner(), &arena.inner, regions)
             .map(|inner| NativeGraphFamilySlot { inner })
     }
 }
@@ -4866,6 +4935,12 @@ pub struct NativeExecutionArena {
 }
 
 impl NativeExecutionArena {
+    /// A device's shared graph workspace of `bytes`, allocated through
+    /// `charges`: every family slot created in it binds the one allocation.
+    pub fn new(charges: &Charges, bytes: u64) -> Result<Self, TensorError> {
+        seismic_runtime::native::graph::NativeExecutionArena::new(charges.inner(), bytes).map(|inner| Self { inner })
+    }
+
     pub fn bytes(&self) -> u64 {
         self.inner.bytes()
     }
@@ -4958,8 +5033,13 @@ pub struct NativeGraphBindings {
 }
 
 impl NativeGraphBindings {
-    pub fn set(&mut self, port: &NativePort, tensor: &Tensor) -> Result<(), WorkflowError> {
-        self.inner.set(port.inner, tensor.inner.clone())
+    /// Bind external port `port` to `tensor`. Where a record port binds it,
+    /// the address table of its records is formed now, through `charges`
+    /// (the binder's), where its storage holds none yet, and held with the
+    /// storage: binding it again finds the table, and a run allocates
+    /// nothing.
+    pub fn set(&mut self, charges: &Charges, port: &NativePort, tensor: &Tensor) -> Result<(), WorkflowError> {
+        self.inner.set(charges.inner(), port.inner, tensor.inner.clone())
     }
 
     /// Bind timeline node `port` to `timeline` at `value` for this run: a
@@ -4996,16 +5076,18 @@ impl NativeGraphBindings {
         self.inner.set_answered(port)
     }
 
-    /// Bind an unsubmitted exported output lease as a graph destination.
-    /// The tensor is only exposed to the checked graph attachment.
+    /// Bind an unsubmitted exported output lease as a graph destination
+    /// ([`Self::set`]). The tensor is only exposed to the checked graph
+    /// attachment.
     pub fn set_reserved_export(
         &mut self,
+        charges: &Charges,
         port: &NativePort,
         outputs: &NativeGraphOutputs,
         result: &WorkflowTensor,
     ) -> Result<(), WorkflowError> {
         self.inner
-            .set_reserved_export(port.inner, &outputs.inner, result.inner)
+            .set_reserved_export(charges.inner(), port.inner, &outputs.inner, result.inner)
     }
 }
 
@@ -5160,6 +5242,12 @@ pub struct WorkflowCompletion {
 }
 
 impl WorkflowDraft {
+    /// A planned workflow on `charges`' device, every allocation its runs
+    /// make charged to them; refused on a native-only backend.
+    pub fn new(charges: &Charges) -> Result<Self, WorkflowError> {
+        seismic_runtime::api::kernel::workflow(charges.inner()).map(|inner| Self { inner })
+    }
+
     pub fn enqueue<E: Entry>(
         &mut self,
         kernel: &Kernel<E>,
@@ -5203,8 +5291,10 @@ impl<E: Entry> Kernel<E> {
         self.inner.feedback_report()
     }
 
+    /// Prepare on `charges`' device, a feedback preparation's trials
+    /// allocated through `charges`.
     fn prepare(
-        device: &Device,
+        charges: &Charges,
         options: PreparationOptions,
         bindings: seismic_lang::entry::ElementBindings,
     ) -> Result<Self, LoadError> {
@@ -5214,7 +5304,7 @@ impl<E: Entry> Kernel<E> {
             module.checked(),
             entry.id(),
             bindings,
-            device.inner(),
+            charges.inner(),
             options,
         )
         .map(|inner| Self {
@@ -5224,9 +5314,10 @@ impl<E: Entry> Kernel<E> {
         .map_err(LoadError::from_prepare)
     }
 
-    pub fn call(&self, args: E::Args<'_>) -> Result<E::Results, CallError> {
+    /// A call, every allocation it makes charged to `charges`.
+    pub fn call(&self, charges: &Charges, args: E::Args<'_>) -> Result<E::Results, CallError> {
         let encoded = E::encode(args);
-        let decoded = seismic_runtime::api::kernel::call(&self.inner, encoded)?;
+        let decoded = seismic_runtime::api::kernel::call(&self.inner, charges.inner(), encoded)?;
         Ok(E::decode(decoded))
     }
 }
@@ -5305,14 +5396,15 @@ impl<E: Entry> NativeKernel<E> {
     /// Calls cycling through `rotation`, each argument set validated and
     /// placed once with results of its own, as [`measure::measure`] times
     /// them.
-    pub fn point(&self, rotation: Vec<E::Args<'_>>) -> Result<KernelPoint, CallError> {
+    pub fn point(&self, charges: &Charges, rotation: Vec<E::Args<'_>>) -> Result<KernelPoint, CallError> {
         self.inner
-            .point(rotation.into_iter().map(E::encode).collect())
+            .point(charges.inner(), rotation.into_iter().map(E::encode).collect())
     }
 
-    pub fn call(&self, args: E::Args<'_>) -> Result<E::Results, CallError> {
+    /// A call, its results and scratch allocated through `charges`.
+    pub fn call(&self, charges: &Charges, args: E::Args<'_>) -> Result<E::Results, CallError> {
         let encoded = E::encode(args);
-        let decoded = seismic_runtime::api::kernel::call_native(&self.inner, encoded)?;
+        let decoded = seismic_runtime::api::kernel::call_native(&self.inner, charges.inner(), encoded)?;
         Ok(E::decode(decoded))
     }
 
@@ -5321,9 +5413,9 @@ impl<E: Entry> NativeKernel<E> {
     /// nothing, so it runs on every backend, where kernels park and where a
     /// graph's park is a submission boundary alike (a graph binds such a
     /// park answered: `NativeGraphBindings::set_answered`).
-    pub fn call_answered(&self, args: E::Args<'_>) -> Result<E::Results, CallError> {
+    pub fn call_answered(&self, charges: &Charges, args: E::Args<'_>) -> Result<E::Results, CallError> {
         let encoded = E::encode(args);
-        let decoded = seismic_runtime::api::kernel::call_native_answered(&self.inner, encoded)?;
+        let decoded = seismic_runtime::api::kernel::call_native_answered(&self.inner, charges.inner(), encoded)?;
         Ok(E::decode(decoded))
     }
 
@@ -5331,13 +5423,14 @@ impl<E: Entry> NativeKernel<E> {
     /// representation, device, and extents. Scalar results remain returned.
     pub fn call_into(
         &self,
+        charges: &Charges,
         args: E::Args<'_>,
         outputs: E::OutputArgs<'_>,
     ) -> Result<E::Results, CallError> {
         let encoded = E::encode(args);
         let encoded_outputs = E::encode_outputs(outputs);
         let decoded =
-            seismic_runtime::api::kernel::call_native_into(&self.inner, encoded, encoded_outputs)?;
+            seismic_runtime::api::kernel::call_native_into(&self.inner, charges.inner(), encoded, encoded_outputs)?;
         Ok(E::decode(decoded))
     }
 }
@@ -5739,8 +5832,10 @@ pub mod generated {
         value.inner
     }
 
+    /// Prepare `E` on `charges`' device, a feedback preparation's trials
+    /// allocated through `charges`.
     pub fn prepare<E: Entry>(
-        device: &Device,
+        charges: &Charges,
         options: PreparationOptions,
         elements: &[(&str, Element)],
     ) -> Result<Kernel<E>, LoadError> {
@@ -5748,11 +5843,13 @@ pub mod generated {
             seismic_lang::entry::ElementBindings::new(),
             |bindings, (name, element)| bindings.bind(name, element.id()),
         );
-        Kernel::prepare(device, options, bindings)
+        Kernel::prepare(charges, options, bindings)
     }
 
+    /// Start a feedback preparation of `E` on `charges`' device, its trials
+    /// allocated through `charges`.
     pub fn start_feedback<'device, E: Entry>(
-        device: &'device Device,
+        charges: &'device Charges,
         precision: PrecisionPolicy,
         options: FeedbackOptions,
         elements: &[(&str, Element)],
@@ -5761,7 +5858,7 @@ pub mod generated {
             seismic_lang::entry::ElementBindings::new(),
             |bindings, (name, element)| bindings.bind(name, element.id()),
         );
-        FeedbackPreparation::start(device, precision, options, bindings)
+        FeedbackPreparation::start(charges, precision, options, bindings)
     }
 
     fn element_bindings(elements: &[(&str, Element)]) -> seismic_lang::entry::ElementBindings {
@@ -6327,7 +6424,7 @@ pub mod generated {
     }
 
     pub fn tune_native<E: Entry>(
-        device: &Device,
+        charges: &Charges,
         statics: &NativeSpecialization,
         elements: &[(&str, Element)],
         cpu: Option<&'static native_cpu::CpuNativeKernels>,
@@ -6339,7 +6436,7 @@ pub mod generated {
         let entry =
             E::resolve(module).map_err(|error| TuneError::Declaration(error.to_string()))?;
         seismic_runtime::native::tune::tune(seismic_runtime::native::tune::TuneRequest {
-            device: device.inner(),
+            charges: charges.inner(),
             module: module.checked(),
             entry: entry.id(),
             bindings: element_bindings(elements),
@@ -6351,9 +6448,10 @@ pub mod generated {
         })
     }
 
-    /// Open the search of the tuning unit of `E` at `statics` on `device`.
+    /// Open the search of the tuning unit of `E` at `statics` on `charges`'
+    /// device, what it allocates charged to them.
     pub fn search_native<'a, E: Entry>(
-        device: &Device,
+        charges: &Charges,
         statics: &NativeSpecialization,
         elements: &[(&str, Element)],
         cpu: Option<&'static native_cpu::CpuNativeKernels>,
@@ -6365,7 +6463,7 @@ pub mod generated {
         Ok(NativeSearch {
             inner: seismic_runtime::native::tune::UnitSearch::open(
                 seismic_runtime::native::tune::UnitRequest {
-                    device: device.inner(),
+                    charges: charges.inner(),
                     module: module.checked(),
                     entry: entry.id(),
                     bindings: element_bindings(elements),
@@ -6435,12 +6533,4 @@ pub mod precision {
     pub use seismic_lang::precision::*;
 }
 
-/// The scope of [`Device::lift_table_seal`].
-/// It belongs to the thread that took it.
-pub struct TableSealLifted(Device, std::marker::PhantomData<*const ()>);
 
-impl Drop for TableSealLifted {
-    fn drop(&mut self) {
-        self.0.inner.restore_table_seal();
-    }
-}

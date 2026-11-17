@@ -10,6 +10,7 @@ fn a_running_kernel_and_the_host_exchange_words() {
     use std::time::{Duration, Instant};
 
     let Some(device) = seismic_native_tests::fresh_device(BackendName::Metal) else { return };
+    let charges = seismic::Charges::tally(&device);
     let kernel = word_exchange::native_for_device(&device, &NativeSpecialization::new()).unwrap();
     let mut graph = device.native_graph();
     let mut exchange = graph.port(Element::i32(), &[4]).unwrap();
@@ -22,14 +23,14 @@ fn a_running_kernel_and_the_host_exchange_words() {
         )
         .unwrap();
     let plan = graph.seal().unwrap();
-    let mut slot = plan.new_slot().unwrap();
-    let words = Tensor::shared(&device, Element::i32(), &[4]).unwrap();
+    let mut slot = plan.new_slot(&charges).unwrap();
+    let words = Tensor::shared(&charges, Element::i32(), &[4]).unwrap();
     // SAFETY: no device work uses the tensor yet.
     unsafe { words.write_shared(0, &[0; 16]).unwrap() };
     let mut bindings = plan.bindings();
-    bindings.set(&exchange, &words).unwrap();
+    bindings.set(&charges, &exchange, &words).unwrap();
     let (_, completion) = slot
-        .attach(bindings, plan.new_outputs().unwrap())
+        .attach(bindings, plan.new_outputs(&charges).unwrap())
         .unwrap()
         .submit()
         .unwrap();

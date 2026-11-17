@@ -90,6 +90,8 @@ impl Evidence {
 struct Shared {
     /// The declaration's native default: the canonical kernel itself.
     default: Arc<NativePrepared>,
+    /// What its observations' calls and placements allocate through.
+    charges: crate::memory::Charges,
     requirement: NumericalRequirement,
     logical: Arc<LogicalEntry>,
     pages: RefCell<ReferencePages>,
@@ -180,7 +182,7 @@ impl<'a> PreparedPoint<'a> {
                 deadline.check(Duration::ZERO)?;
                 let results = shared
                     .default
-                    .call(args.clone())
+                    .call(&shared.charges, args.clone())
                     .map_err(|e| execution(&e))?;
                 let expected = observe(
                     results.into_values(),
@@ -263,6 +265,7 @@ impl<'a> PreparedPoint<'a> {
         let inputs = self.inputs();
         let mut witnesses = PointTiming::new(
             kernel,
+            &self.shared.charges,
             rotations
                 .iter()
                 .map(|rotation| inputs.rotation[*rotation].clone())
@@ -440,11 +443,13 @@ impl Validator {
         mutable: &[(usize, String)],
         requirement: &NumericalRequirement,
         default: &Arc<NativePrepared>,
+        charges: &crate::memory::Charges,
     ) -> Self {
         Self {
             mutable: mutable.to_vec(),
             shared: Rc::new(Shared {
                 default: default.clone(),
+                charges: charges.clone(),
                 requirement: requirement.clone(),
                 logical: logical.clone(),
                 pages: RefCell::new(ReferencePages::default()),

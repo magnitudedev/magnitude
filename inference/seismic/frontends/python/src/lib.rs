@@ -29,8 +29,8 @@ fn discovered() -> PyResult<&'static Mutex<seismic::Devices>> {
 static TALLIES: Mutex<Vec<(seismic::ExecutorId, Vec<seismic::memory::Tally>)>> = Mutex::new(Vec::new());
 
 /// Executor `id` of `devices`, opened once in the process over tallies of
-/// its stores, and its device store's tally.
-fn open_tallied(devices: &seismic::Devices, id: seismic::ExecutorId) -> Result<(seismic::Device, seismic::memory::Tally), seismic::OpenError> {
+/// its stores.
+fn open_tallied(devices: &seismic::Devices, id: seismic::ExecutorId) -> Result<seismic::Device, seismic::OpenError> {
     let tallies = {
         let mut held = TALLIES.lock().expect("tally list lock poisoned");
         match held.iter().find(|(of, _)| *of == id) {
@@ -43,9 +43,7 @@ fn open_tallied(devices: &seismic::Devices, id: seismic::ExecutorId) -> Result<(
         }
     };
     let stores = tallies.iter().map(|tally| std::sync::Arc::new(tally.clone()) as std::sync::Arc<dyn seismic::memory::Store>).collect();
-    let device = devices.open_in(id, Default::default(), stores)?;
-    let tally = device_tally(&device);
-    Ok((device, tally))
+    devices.open_in(id, Default::default(), stores)
 }
 
 /// The tally of `device`'s own store, of those it was opened over
@@ -67,6 +65,21 @@ struct Device {
     /// The tally of the device's own store, which counts and bounds what it
     /// holds there: the frontend keeps no ledger of its own.
     tally: seismic::memory::Tally,
+}
+
+impl Device {
+    /// `inner`, a device the frontend opened over its tallies.
+    fn opened(inner: seismic::Device) -> Self {
+        let tally = device_tally(&inner);
+        Self { inner, tally }
+    }
+
+    /// What allocations on it are charged to: the tallies it was opened
+    /// over ([`open_tallied`]), each its store's one entry, minted for each
+    /// allocating call.
+    fn charges(&self) -> seismic::Charges {
+        seismic::Charges::tally(&self.inner)
+    }
 }
 #[pymethods]
 impl Device {
@@ -132,8 +145,8 @@ fn device(py: Python<'_>, selector: &str) -> PyResult<Device> {
                     ))
                 })?,
         };
-        let (inner, tally) = open_tallied(&c, id).map_err(|e| error(d::Error::new("TargetError", e)))?;
-        Ok(Device { inner, tally })
+        let inner = open_tallied(&c, id).map_err(|e| error(d::Error::new("TargetError", e)))?;
+        Ok(Device::opened(inner))
     })
 }
 
@@ -152,20 +165,20 @@ impl Tensor {
         shape: Vec<u64>,
         bytes: Vec<u8>,
     ) -> PyResult<Self> {
-        let device = device.inner.clone();
+        let charges = device.charges();
         let element = element(name)?;
         py.detach(move || {
-            d::Tensor::from_host(&device, element, &shape, &bytes)
+            d::Tensor::from_host(&charges, element, &shape, &bytes)
                 .map(|inner| Self { inner })
                 .map_err(error)
         })
     }
     #[staticmethod]
     fn zeros(py: Python<'_>, device: &Device, name: &str, shape: Vec<u64>) -> PyResult<Self> {
-        let device = device.inner.clone();
+        let charges = device.charges();
         let element = element(name)?;
         py.detach(move || {
-            d::Tensor::zeros(&device, element, &shape)
+            d::Tensor::zeros(&charges, element, &shape)
                 .map(|inner| Self { inner })
                 .map_err(error)
         })
@@ -180,9 +193,7 @@ impl Tensor {
     }
     #[getter]
     fn device(&self) -> PyResult<Device> {
-        let inner = self.inner.device().map_err(error)?;
-        let tally = device_tally(&inner);
-        Ok(Device { inner, tally })
+        Ok(Device::opened(self.inner.device().map_err(error)?))
     }
     #[getter]
     fn nbytes(&self) -> PyResult<u64> {
@@ -196,7 +207,8 @@ impl Tensor {
         py.detach(|| self.inner.write(&bytes)).map_err(error)
     }
     fn copy(&self, py: Python<'_>) -> PyResult<Self> {
-        py.detach(|| self.inner.copy())
+        let charges = self.device()?.charges();
+        py.detach(|| self.inner.copy(&charges))
             .map(|inner| Self { inner })
             .map_err(error)
     }
@@ -544,9 +556,9 @@ impl Function {
                 .apply_scope(&mut options, &scope.inner)
                 .map_err(error)?;
         }
-        let device = device.inner.clone();
+        let charges = device.charges();
         let (session, kernel) = py
-            .detach(|| self.inner.start_feedback(&device, elements, options))
+            .detach(|| self.inner.start_feedback(&charges, elements, options))
             .map_err(error)?;
         let last_report = report_json(session.report());
         Ok((
@@ -580,7 +592,7 @@ impl Function {
                 .apply_scope(&mut options, &scope.inner)
                 .map_err(error)?;
         }
-        let device = device.inner.clone();
+        let charges = device.charges();
         let inner = py
             .detach(|| {
                 if native {
@@ -593,9 +605,9 @@ impl Function {
                         .fold(specialization, |specialization, (name, value)| {
                             specialization.with_param(name, value)
                         });
-                    self.inner.prepare_native(&device, elements, specialization)
+                    self.inner.prepare_native(&charges, elements, specialization)
                 } else {
-                    self.inner.prepare(&device, elements, options)
+                    self.inner.prepare(&charges, elements, options)
                 }
             })
             .map_err(error)?;
@@ -753,7 +765,7 @@ impl Workflow {
     #[new]
     fn new(device: &Device) -> Self {
         Self {
-            inner: d::Workflow::new(&device.inner),
+            inner: d::Workflow::new(&device.charges()),
         }
     }
     fn close(&mut self) {

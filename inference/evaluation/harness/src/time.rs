@@ -150,7 +150,7 @@ pub fn run(
     // A streamed bank's device ceilings, which its bars price moving its
     // experts by, before any step.
     let ceilings = match engine.domain.expert_bank_plan().filter(|_| streams) {
-        Some(plan) => Some(Ceilings::beside(&engine.domain, plan, engine.device(), options.cache_dir.as_deref())?),
+        Some(plan) => Some(Ceilings::beside(&engine.domain, plan, options.cache_dir.as_deref())?),
         None => None,
     };
     let devices = vec![engine.device().info().name().to_owned()];
@@ -385,8 +385,10 @@ struct Ceilings {
 }
 
 impl Ceilings {
-    /// [`Self::measure`] beside the load in `domain`, its own traffic held
-    /// and drained first (`ExecutorDomain::hold_expert_traffic`), as the
+    /// [`Self::measure`] beside the load in `domain`, on its device and
+    /// charged to its ledgers' measurement holding
+    /// (`ExecutorDomain::measurement_charges`), its own traffic held and
+    /// drained first (`ExecutorDomain::hold_expert_traffic`), as the
     /// measurement job's room beside a model holds it: no point reads the
     /// load's copies, reads or landings. Why the drain ended short: serving
     /// ended, or the load stops (a read or copy that never ends trips the
@@ -394,24 +396,25 @@ impl Ceilings {
     fn beside(
         domain: &magnitude_executor::ExecutorDomain,
         plan: &magnitude_executor::ExpertBankPlan,
-        device: &seismic::Device,
         cache: Option<&std::path::Path>,
     ) -> Result<Self, String> {
         // Held until this returns, by whichever exit.
         let _traffic = domain.hold_expert_traffic();
         domain
             .wait_expert_traffic_quiet()
-            .map(|()| Self::measure(device, plan, cache))
+            .map(|()| Self::measure(&domain.measurement_charges(), plan, cache))
             .map_err(engine::text)
     }
 
+    /// The ceilings measured on the device of `charges`, which the points
+    /// allocate through.
     fn measure(
-        device: &seismic::Device,
+        charges: &seismic::Charges,
         plan: &magnitude_executor::ExpertBankPlan,
         cache: Option<&std::path::Path>,
     ) -> Self {
-        let link = plan.tiered().then(|| with_records(cache, |store| Self::link(device, store)));
-        Self { convert: with_records(cache, |store| Self::convert(device, plan, store)), link }
+        let link = plan.tiered().then(|| with_records(cache, |store| Self::link(charges, store)));
+        Self { convert: with_records(cache, |store| Self::convert(charges, plan, store)), link }
     }
 
     /// The link's ceiling, a byte's seconds: a tier copy on the whole grid
@@ -420,11 +423,12 @@ impl Ceilings {
     /// holds none ([`measure_requested`]). A route's rate is a kernel's
     /// reading weights, which the link's peak is not.
     fn link(
-        device: &seismic::Device,
+        charges: &seismic::Charges,
         store: &dyn seismic::measure::RecordStore<seismic::PointKey>,
     ) -> Result<f64, String> {
         use magnitude_executor::assessment::{PointRequest, TierCopyCosts};
-        measure_requested(device, store, &[PointRequest::TierCopy])?;
+        measure_requested(charges, store, &[PointRequest::TierCopy])?;
+        let device = &charges.device();
         let costs = TierCopyCosts::stored(device.topology(), device.info(), store).map_err(|error| error.to_string())?;
         Ok(costs.link_byte_seconds())
     }
@@ -433,25 +437,26 @@ impl Ceilings {
     /// points measured first where `store` holds none, as the measurement
     /// job measures requested points ([`measure_requested`]).
     fn convert(
-        device: &seismic::Device,
+        charges: &seismic::Charges,
         plan: &magnitude_executor::ExpertBankPlan,
         store: &dyn seismic::measure::RecordStore<seismic::PointKey>,
     ) -> Result<Vec<f64>, String> {
         use magnitude_executor::assessment::{ConvertCosts, PointRequest};
         let requests = ConvertCosts::forms(plan).map(PointRequest::Convert).collect::<Vec<_>>();
-        measure_requested(device, store, &requests)?;
+        measure_requested(charges, store, &requests)?;
+        let device = &charges.device();
         ConvertCosts::of_bank(device.topology(), device.info(), plan, store).map_err(|error| error.to_string())
     }
 }
 
-/// Measure `requests` (a load's) on `device` in this process, as the
-/// measurement job measures them (`assessment::requests::measure`), each
-/// walk given its job time (`worker::measure::JobTime`), into `store`,
-/// until no point is left expired: the harness is a tool, which may
-/// measure in its own process.
+/// Measure `requests` (a load's) on the device of `charges`, which its
+/// points allocate through, in this process, as the measurement job
+/// measures them (`assessment::requests::measure`), each walk given its job
+/// time (`worker::measure::JobTime`), into `store`, until no point is left
+/// expired: the harness is a tool, which may measure in its own process.
 /// Why the walks could not run, or stopped before measuring the rest.
 fn measure_requested(
-    device: &seismic::Device,
+    charges: &seismic::Charges,
     store: &dyn seismic::measure::RecordStore<seismic::PointKey>,
     requests: &[magnitude_executor::assessment::PointRequest],
 ) -> Result<(), String> {
@@ -465,7 +470,7 @@ fn measure_requested(
         let (mut measured, mut failed, mut expired) = (false, false, false);
         let walked = requests::measure(
             &mut measurer,
-            device,
+            charges,
             store,
             &magnitude_executor::assessment::Outstanding { standing: Vec::new(), loads: requests.to_vec() },
             deadline,

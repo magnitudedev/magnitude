@@ -63,6 +63,7 @@ fn specialization(
 }
 
 fn taps_write_their_column_blocks(device: &Device) {
+    let charges = seismic::Charges::tally(device);
     for (rows, width, taps) in [(1usize, 64usize, 2usize), (5, 96, 3), (17, 128, 5)] {
         let extents = [
             ("M", rows as u64),
@@ -86,7 +87,7 @@ fn taps_write_their_column_blocks(device: &Device) {
             .unwrap();
         let sentinel = vec![7.0f32; rows * taps * width];
         let mut buffer = Tensor::from_host(
-            device,
+            &charges,
             Element::bf16(),
             &[rows as u64, (taps * width) as u64],
             &bf16_bytes(&sentinel),
@@ -97,16 +98,16 @@ fn taps_write_their_column_blocks(device: &Device) {
         for tap in (0..taps).step_by(2) {
             let residual_values = values(rows * width, tap as u32 + 1);
             let residual = Tensor::from_host(
-                device,
+                &charges,
                 Element::f32(),
                 &[rows as u64, width as u64],
                 &f32_bytes(&residual_values),
             )
             .unwrap();
-            let index = Tensor::from_host(device, Element::i32(), &[1], &i32_bytes(&[tap as i32]))
+            let index = Tensor::from_host(&charges, Element::i32(), &[1], &i32_bytes(&[tap as i32]))
                 .unwrap();
             kernel
-                .call(tap_rows::Args {
+                .call(&charges, tap_rows::Args {
                     residual: &residual,
                     index: &index,
                     taps: &mut buffer,
@@ -129,6 +130,7 @@ fn taps_write_their_column_blocks(device: &Device) {
 }
 
 fn features_gather_the_published_rows(device: &Device) {
+    let charges = seismic::Charges::tally(device);
     for (rows, width, published) in [(1usize, 64usize, vec![0i32]), (9, 96, vec![8, 0, 3])] {
         let outputs = published.len();
         let extents = [
@@ -153,21 +155,21 @@ fn features_gather_the_published_rows(device: &Device) {
             .unwrap();
         let fused_values = values(rows * width, 11);
         let fused = Tensor::from_host(
-            device,
+            &charges,
             Element::f32(),
             &[rows as u64, width as u64],
             &f32_bytes(&fused_values),
         )
         .unwrap();
         let out_rows = Tensor::from_host(
-            device,
+            &charges,
             Element::i32(),
             &[outputs as u64],
             &i32_bytes(&published),
         )
         .unwrap();
         let features = kernel
-            .call(feature_rows::Args {
+            .call(&charges, feature_rows::Args {
                 fused: &fused,
                 out_rows: &out_rows,
             })
@@ -191,6 +193,7 @@ fn features_gather_the_published_rows(device: &Device) {
 }
 
 fn confidence_declines_below_the_threshold(device: &Device) {
+    let charges = seismic::Charges::tally(device);
     let (slots, width, rank) = (6usize, 128usize, 32usize);
     let extents = [
         ("S", slots as u64),
@@ -246,40 +249,40 @@ fn confidence_declines_below_the_threshold(device: &Device) {
     let threshold = (sorted[slots / 2 - 1] + sorted[slots / 2]) / 2.0;
     assert!(sorted[slots / 2] - sorted[slots / 2 - 1] > 1.0e-3);
     let features = Tensor::from_host(
-        device,
+        &charges,
         Element::bf16(),
         &[slots as u64, width as u64],
         &bf16_bytes(&feature_values),
     )
     .unwrap();
     let memory = Tensor::from_host(
-        device,
+        &charges,
         Element::bf16(),
         &[slots as u64, rank as u64],
         &bf16_bytes(&memory_values),
     )
     .unwrap();
     let weight = Tensor::from_host(
-        device,
+        &charges,
         Element::f32(),
         &[(width + rank) as u64],
         &f32_bytes(&weight_values),
     )
     .unwrap();
-    let bias = Tensor::from_host(device, Element::f32(), &[1], &f32_bytes(&[bias_value])).unwrap();
+    let bias = Tensor::from_host(&charges, Element::f32(), &[1], &f32_bytes(&[bias_value])).unwrap();
     // Every slot proposes token 10 + slot; slot 0 already failed selection.
     let initial = (0..slots)
         .flat_map(|slot| [10 + slot as i32, i32::from(slot == 0)])
         .collect::<Vec<_>>();
     let mut selection = Tensor::from_host(
-        device,
+        &charges,
         Element::i32(),
         &[slots as u64, 2],
         &i32_bytes(&initial),
     )
     .unwrap();
     kernel
-        .call(draft_confidence::Args {
+        .call(&charges, draft_confidence::Args {
             features: &features,
             memory: &memory,
             weight: &weight,
@@ -310,6 +313,7 @@ fn confidence_declines_below_the_threshold(device: &Device) {
 /// Each selection's token probability under the softmax of the logits row
 /// it names, and 0 for a selection that failed.
 fn token_confidence_is_the_selected_probability(device: &Device) {
+    let charges = seismic::Charges::tally(device);
     let implementation = token_confidence::native_implementation(device)
         .unwrap()
         .expect("token_confidence has a native implementation on every device");
@@ -346,30 +350,30 @@ fn token_confidence_is_the_selected_probability(device: &Device) {
         })
         .collect::<Vec<_>>();
     let logits = Tensor::from_host(
-        device,
+        &charges,
         Element::f32(),
         &[rows as u64, vocabulary as u64],
         &f32_bytes(&logit_values),
     )
     .unwrap();
     let selection = Tensor::from_host(
-        device,
+        &charges,
         Element::i32(),
         &[rows as u64, 2],
         &i32_bytes(&selection_values),
     )
     .unwrap();
     let mut confidence = Tensor::from_host(
-        device,
+        &charges,
         Element::f32(),
         &[rows as u64],
         &f32_bytes(&vec![f32::NAN; rows]),
     )
     .unwrap();
     kernel
-        .call(token_confidence::Args {
+        .call(&charges, token_confidence::Args {
             logits: &logits,
-            rows: &Tensor::from_host(device, Element::i32(), &[rows as u64], &i32_bytes(&row_map))
+            rows: &Tensor::from_host(&charges, Element::i32(), &[rows as u64], &i32_bytes(&row_map))
                 .unwrap(),
             selection: &selection,
             confidence: &mut confidence,

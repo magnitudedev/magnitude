@@ -329,7 +329,8 @@ fn stored_rows_match(source: &str, resident: &str, as_stored: Option<bool>) {
         // The slots in one allocation, and in a store of one slab a record
         // that the host writes record by record.
         let placements = devices().into_iter().flat_map(|device| {
-            let whole = Tensor::from_host(&device, resident_element, &extents, &resident_slots).unwrap();
+            let charges = seismic::Charges::tally(&device);
+            let whole = Tensor::from_host(&charges, resident_element, &extents, &resident_slots).unwrap();
             let regions = [seismic::SlabRegion { element: resident_element, row_shape: vec![per as u64, width as u64] }];
             let records_store = crate::common::slab_tensor(&device, 1, records as u64, &regions);
             for (record, bytes) in resident_slots.chunks_exact(record_bytes).enumerate() {
@@ -342,8 +343,9 @@ fn stored_rows_match(source: &str, resident: &str, as_stored: Option<bool>) {
             [(device.clone(), whole, None), (device, recorded, Some(records_store))]
         });
         for (device, slots_tensor, _records_store) in placements {
+            let charges = seismic::Charges::tally(&device);
             let result = stored_rows_native(&device, width as u64, resident_element)
-                .call(stored_rows::Args {
+                .call(&charges, stored_rows::Args {
                     slots: &slots_tensor,
                     tokens: &ints(&device, &[selections.len() as u64 / 2, 2], &selections),
                     directory: &ints(&device, &[shape[0] as u64, shape[1] as u64], directory),
@@ -403,6 +405,7 @@ fn embedding_rows_through_a_hashed_directory_read_the_slots_it_names() {
         .flat_map(|pair| [found(&dense, pair[0]).map_or(-1, |slot| slot as i32), pair[1]])
         .collect::<Vec<_>>();
     for device in devices() {
+        let charges = seismic::Charges::tally(&device);
         let kernel = embedding_rows_at(&device, width);
         let table = tensor(
             &device,
@@ -412,7 +415,7 @@ fn embedding_rows_through_a_hashed_directory_read_the_slots_it_names() {
         );
         let read_through = |selections: &[i32], directory: &[i32], shape: [u64; 2]| {
             let result = kernel
-                .call(embedding_rows::Args {
+                .call(&charges, embedding_rows::Args {
                     table: &table,
                     tokens: &ints(&device, &[selections.len() as u64 / 2, 2], selections),
                     directory: &ints(&device, &shape, directory),
@@ -470,11 +473,12 @@ fn a_row_that_names_no_table_row_reads_zeros() {
         (hashed, [buckets as u64, 2]),
     ];
     for device in devices() {
+        let charges = seismic::Charges::tally(&device);
         let embedding = embedding_rows_at(&device, width);
         let table = tensor(&device, Element::bf16(), &[slots as u64, width as u64], &values);
         // The slots as one record of every slot (`stored_rows`' [C, P, W]).
         let slots_tensor = Tensor::from_host(
-            &device,
+            &charges,
             resident,
             &[1, slots as u64, width as u64],
             &resident_slots,
@@ -483,7 +487,7 @@ fn a_row_that_names_no_table_row_reads_zeros() {
         let backend = device.backend();
         let embed = |tokens: &[i32], directory: &[i32], shape: [u64; 2], normalize: i32| {
             let result = embedding
-                .call(embedding_rows::Args {
+                .call(&charges, embedding_rows::Args {
                     table: &table,
                     tokens: &ints(&device, &[tokens.len() as u64 / 2, 2], tokens),
                     directory: &ints(&device, &shape, directory),
@@ -516,7 +520,7 @@ fn a_row_that_names_no_table_row_reads_zeros() {
         for (directory, shape) in &forms {
             let stored = read(
                 &stored_rows_native(&device, width as u64, resident)
-                    .call(stored_rows::Args {
+                    .call(&charges, stored_rows::Args {
                         slots: &slots_tensor,
                         tokens: &ints(&device, &[4, 2], &selections),
                         directory: &ints(&device, shape, directory),

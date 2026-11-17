@@ -30,6 +30,12 @@ pub enum CommittedKind {
     /// A program set's qualification fixtures, held while its preparation
     /// runs.
     Qualification,
+    /// A measurement job's memory in this process (a tool's, a test's):
+    /// its points' operands, backings and kernels, grown as it allocates
+    /// them and held while its charges live
+    /// ([`super::DeviceLedgers::measurement`]). A job in a process of its
+    /// own is held room by its grant ([`GrantRole::Measurement`]).
+    Measurement,
     /// An import's upload window, staged through host RAM where that is a
     /// store apart: held while the import runs.
     Upload,

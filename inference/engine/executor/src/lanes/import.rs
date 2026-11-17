@@ -4,7 +4,7 @@ use crate::{
     ImportArtifactTensor, ImportWorkspaceLease, InvariantError, PoolClass, ResourceDomainId,
     WeightPlan, WeightStorageIdentity,
 };
-use seismic::{Device, Tensor};
+use seismic::Tensor;
 
 /// A persistent destination allocated once from an admitted weight plan.
 /// Dropping it before residency publication releases the uncommitted memory.
@@ -17,7 +17,8 @@ pub struct ResidentWeightSlot {
 }
 
 impl ResidentWeightSlot {
-    pub fn new(plan: &WeightPlan, device: &Device, tensor: Tensor) -> Result<Self, InvariantError> {
+    pub fn new(plan: &WeightPlan, charges: &seismic::Charges, tensor: Tensor) -> Result<Self, InvariantError> {
+        let device = &charges.device();
         let invariant = |detail: String| InvariantError {
             context: "resident weight slot",
             detail,
@@ -41,7 +42,7 @@ impl ResidentWeightSlot {
             )));
         }
         let bound = (plan.bound != 0)
-            .then(|| Tensor::zeros(device, seismic::Element::f32(), &[plan.bound]))
+            .then(|| Tensor::zeros(charges, seismic::Element::f32(), &[plan.bound]))
             .transpose()
             .map_err(|error| invariant(error.to_string()))?;
         Ok(Self {

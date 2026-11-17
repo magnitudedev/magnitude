@@ -22,6 +22,7 @@ fn f32_bytes(values: &[f32]) -> Vec<u8> {
 fn the_host_answers_a_parked_call() {
     let n = 8u64;
     for device in seismic_native_tests::devices(&[BackendName::Metal, BackendName::Cuda, BackendName::Vulkan]) {
+        let charges = seismic::Charges::tally(&device);
         let backend = device.backend();
         let kernel = parked_scale::native_for_device(&device, &NativeSpecialization::new()).unwrap();
         let mut graph = device.native_graph();
@@ -44,12 +45,12 @@ fn the_host_answers_a_parked_call() {
         graph.export(&value).unwrap();
         let plan = graph.seal().unwrap();
         let family = NativeGraphFamily::new(&[plan.clone()], 1).unwrap();
-        let mut slot = family.new_slot(&[family.upload_bytes()]).unwrap();
+        let mut slot = family.new_slot(&charges, &[family.upload_bytes()]).unwrap();
 
         let values = (0..n).map(|value| value as f32).collect::<Vec<_>>();
-        let x = Tensor::from_host(&device, Element::f32(), &[n], &f32_bytes(&values)).unwrap();
-        let word = Tensor::shared(&device, Element::i32(), &[1]).unwrap();
-        let skipped = Tensor::shared(&device, Element::i32(), &[1]).unwrap();
+        let x = Tensor::from_host(&charges, Element::f32(), &[n], &f32_bytes(&values)).unwrap();
+        let word = Tensor::shared(&charges, Element::i32(), &[1]).unwrap();
+        let skipped = Tensor::shared(&charges, Element::i32(), &[1]).unwrap();
         // Three runs, the second leaving the call out: it takes no park
         // value, and the third's lies past the first's.
         let (parks, done) = (
@@ -64,11 +65,11 @@ fn the_host_answers_a_parked_call() {
                 word.write_shared(0, &[0; 4]).unwrap();
                 skipped.write_shared(0, &i32::from(skip_step).to_le_bytes()).unwrap();
             }
-            let outputs = family.new_output_slot().unwrap().activate(&plan).unwrap();
+            let outputs = family.new_output_slot(&charges).unwrap().activate(&plan).unwrap();
             let mut bindings = plan.bindings();
-            bindings.set(&answer, &word).unwrap();
-            bindings.set(&skip, &skipped).unwrap();
-            bindings.set(&input, &x).unwrap();
+            bindings.set(&charges, &answer, &word).unwrap();
+            bindings.set(&charges, &skip, &skipped).unwrap();
+            bindings.set(&charges, &input, &x).unwrap();
             bindings.set_park(park, &parks).unwrap();
             bindings.set_timeline(after, &done, step).unwrap();
             let mut active = slot.activate(&plan).unwrap();
@@ -128,6 +129,7 @@ fn the_host_answers_a_parked_call() {
 fn a_publication_ends_a_submission_after_its_call_and_waits_for_nothing() {
     let n = 8u64;
     for device in seismic_native_tests::devices(&[BackendName::Metal, BackendName::Cuda, BackendName::Vulkan]) {
+        let charges = seismic::Charges::tally(&device);
         let backend = device.backend();
         let rows = scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1)).unwrap();
         let mut graph = device.native_graph();
@@ -163,18 +165,18 @@ fn a_publication_ends_a_submission_after_its_call_and_waits_for_nothing() {
         graph.export(&value).unwrap();
         let plan = graph.seal().unwrap();
         let family = NativeGraphFamily::new(&[plan.clone()], 1).unwrap();
-        let mut slot = family.new_slot(&[family.upload_bytes()]).unwrap();
-        let x = Tensor::from_host(&device, Element::f32(), &[n], &f32_bytes(&vec![1.0; n as usize])).unwrap();
-        let row = Tensor::from_host(&device, Element::f32(), &[1, 4], &f32_bytes(&[1.0; 4])).unwrap();
-        let word = Tensor::shared(&device, Element::i32(), &[1]).unwrap();
-        let skipped = Tensor::shared(&device, Element::i32(), &[1]).unwrap();
+        let mut slot = family.new_slot(&charges, &[family.upload_bytes()]).unwrap();
+        let x = Tensor::from_host(&charges, Element::f32(), &[n], &f32_bytes(&vec![1.0; n as usize])).unwrap();
+        let row = Tensor::from_host(&charges, Element::f32(), &[1, 4], &f32_bytes(&[1.0; 4])).unwrap();
+        let word = Tensor::shared(&charges, Element::i32(), &[1]).unwrap();
+        let skipped = Tensor::shared(&charges, Element::i32(), &[1]).unwrap();
         let parks = Timeline::new(&device).unwrap();
-        let outputs = family.new_output_slot().unwrap().activate(&plan).unwrap();
+        let outputs = family.new_output_slot(&charges).unwrap().activate(&plan).unwrap();
         let mut bindings = plan.bindings();
-        bindings.set(&published, &row).unwrap();
-        bindings.set(&answer, &word).unwrap();
-        bindings.set(&skip, &skipped).unwrap();
-        bindings.set(&input, &x).unwrap();
+        bindings.set(&charges, &published, &row).unwrap();
+        bindings.set(&charges, &answer, &word).unwrap();
+        bindings.set(&charges, &skip, &skipped).unwrap();
+        bindings.set(&charges, &input, &x).unwrap();
         bindings.set_park(publication, &parks).unwrap();
         bindings.set_park(park, &parks).unwrap();
         let mut active = slot.activate(&plan).unwrap();
@@ -253,6 +255,7 @@ fn a_park_pairs_with_a_call_that_parks() {
 fn a_park_answered_before_the_run_waits_for_nothing() {
     let n = 4u64;
     for device in seismic_native_tests::devices(&[BackendName::Metal, BackendName::Cuda, BackendName::Vulkan]) {
+        let charges = seismic::Charges::tally(&device);
         let backend = device.backend();
         let kernel = parked_scale::native_for_device(&device, &NativeSpecialization::new()).unwrap();
         let mut graph = device.native_graph();
@@ -274,21 +277,21 @@ fn a_park_answered_before_the_run_waits_for_nothing() {
         let after = graph.timeline(seismic::timeline::Signal);
         graph.export(&value).unwrap();
         let plan = graph.seal().unwrap();
-        let mut slot = plan.new_slot().unwrap();
+        let mut slot = plan.new_slot(&charges).unwrap();
         let values = (0..n).map(|value| value as f32).collect::<Vec<_>>();
-        let x = Tensor::from_host(&device, Element::f32(), &[n], &f32_bytes(&values)).unwrap();
-        let word = Tensor::shared(&device, Element::i32(), &[1]).unwrap();
+        let x = Tensor::from_host(&charges, Element::f32(), &[n], &f32_bytes(&values)).unwrap();
+        let word = Tensor::shared(&charges, Element::i32(), &[1]).unwrap();
         word.store_release(0, 3).unwrap();
-        let run = Tensor::shared(&device, Element::i32(), &[1]).unwrap();
+        let run = Tensor::shared(&charges, Element::i32(), &[1]).unwrap();
         run.store_release(0, 0).unwrap();
         let done = Timeline::<seismic::timeline::Reached>::new(&device).unwrap();
         let mut bindings = plan.bindings();
-        bindings.set(&answer, &word).unwrap();
-        bindings.set(&skip, &run).unwrap();
-        bindings.set(&input, &x).unwrap();
+        bindings.set(&charges, &answer, &word).unwrap();
+        bindings.set(&charges, &skip, &run).unwrap();
+        bindings.set(&charges, &input, &x).unwrap();
         bindings.set_answered(park).unwrap();
         bindings.set_timeline(after, &done, 1).unwrap();
-        let (outputs, completion) = slot.attach(bindings, plan.new_outputs().unwrap()).unwrap().submit().unwrap();
+        let (outputs, completion) = slot.attach(bindings, plan.new_outputs(&charges).unwrap()).unwrap().submit().unwrap();
         completion.wait().unwrap();
         assert_eq!(
             outputs
@@ -310,18 +313,19 @@ fn a_park_answered_before_the_run_waits_for_nothing() {
 #[test]
 fn standalone_awaited_preparation_requires_kernel_parking() {
     for device in seismic_native_tests::devices(&[BackendName::Vulkan]) {
+        let charges = seismic::Charges::tally(&device);
         let kernel = parked_scale::native_for_device(&device, &NativeSpecialization::new()).unwrap();
-        let answer = Tensor::shared(&device, Element::i32(), &[1]).unwrap();
-        let skip = Tensor::shared(&device, Element::i32(), &[1]).unwrap();
-        let x = Tensor::from_host(&device, Element::f32(), &[1], &1.0f32.to_le_bytes()).unwrap();
-        let mut value = Tensor::shared(&device, Element::f32(), &[1]).unwrap();
+        let answer = Tensor::shared(&charges, Element::i32(), &[1]).unwrap();
+        let skip = Tensor::shared(&charges, Element::i32(), &[1]).unwrap();
+        let x = Tensor::from_host(&charges, Element::f32(), &[1], &1.0f32.to_le_bytes()).unwrap();
+        let mut value = Tensor::shared(&charges, Element::f32(), &[1]).unwrap();
         let args = || parked_scale::Args { answer: &answer, skip: &skip, x: &x };
         let refused = |result: Result<(), seismic::CallError>| assert!(matches!(
             result, Err(seismic::CallError::Workflow(seismic::WorkflowError::ParkRequiresGraph))
         ));
-        refused(kernel.call(args()).map(|_| ()));
-        refused(kernel.point(vec![args()]).map(|_| ()));
-        let mut batch = seismic::NativeTensorBatch::new(&device);
+        refused(kernel.call(&charges, args()).map(|_| ()));
+        refused(kernel.point(&charges, vec![args()]).map(|_| ()));
+        let mut batch = seismic::NativeTensorBatch::new(&charges);
         refused(batch.push(&kernel, args(), parked_scale::OutputArgs { value: &mut value }));
     }
 }

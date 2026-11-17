@@ -1615,7 +1615,7 @@ impl Programs {
 /// a kernel that did not form can never make it ([`Unformed::Never`]), and
 /// anything else that fails (its operands' allocation first) fails it now
 /// ([`Unformed::Now`]).
-type Build<'b> = dyn FnMut(&Device, &Programs, &mut Backings) -> Result<Point, Unformed<ExecutorCostsError>>
+type Build<'b> = dyn FnMut(&seismic::Charges, &Programs, &mut Backings) -> Result<Point, Unformed<ExecutorCostsError>>
     + 'b;
 
 /// Where the walk's timings come from.
@@ -1866,6 +1866,10 @@ struct Measured<'a, 'd> {
     records: Records<'a>,
     measurer: &'a mut Measurer,
     device: &'d Device,
+    /// What its points' operands and calls allocate through: the job's
+    /// ([`requests::measure`](super::requests::measure)), borrowed for the
+    /// job alone.
+    charges: &'d seismic::Charges,
     attempting: &'a mut dyn FnMut(&PointKey) -> Attempt,
     /// The walk's kernels, formed before the first point no record holds: a
     /// job whose points are all stored forms nothing.
@@ -2097,7 +2101,7 @@ impl Times for Measured<'_, '_> {
         // program is formed, all at once, when the first point no record
         // holds is reached, before the host records its attempt: a compile
         // that fails or ends the job is no point's.
-        let device = self.device;
+        let (device, charges) = (self.device, self.charges);
         let formed = &self.programs;
         let backings = &mut self.backings;
         let host = &mut *self.attempting;
@@ -2110,7 +2114,7 @@ impl Times for Measured<'_, '_> {
         let mut outcomes = self.measurer.measure_all(
             vec![(key, || {
                 let formed = &formed.get_or_init(|| programs.form(device, deadline)).programs;
-                let point = build(device, formed, backings)?;
+                let point = build(charges, formed, backings)?;
                 if formed.touches_host(share.host) {
                     backings.settle();
                 }
@@ -2201,7 +2205,8 @@ pub(super) fn rotation_sets(cache: u64, bytes: u64) -> u64 {
 struct Route {
     route: NativeKind,
     storage: OperandStorage,
-    /// The placement's paths along the route, where an operand must land.
+    /// The placement's paths along the route: what a history rotation may
+    /// take and which store holds it are read from them.
     along: Vec<AccessPathId>,
 }
 
@@ -2297,40 +2302,29 @@ impl Route {
         ]
     }
 
-    /// `allocate`'s tensors, allocated confined to the route's kind
-    /// ([`Device::in_kind`]), each landed along the route.
+    /// `allocate`'s tensors, allocated through `charges` confined to the
+    /// route's kind ([`seismic::Charges::confined`]): every allocation
+    /// through them, their record tables included, lands in that kind and
+    /// lies along its paths, or is refused.
     fn place(
         &self,
-        device: &Device,
-        allocate: impl FnOnce() -> Result<Vec<Tensor>, ExecutorCostsError>,
+        charges: &seismic::Charges,
+        allocate: impl FnOnce(&seismic::Charges) -> Result<Vec<Tensor>, ExecutorCostsError>,
     ) -> Result<Vec<Tensor>, ExecutorCostsError> {
-        let tensors = device.in_kind(self.route, allocate)?;
-        for tensor in &tensors {
-            let charges = tensor
-                .observe_storage()
-                .path_charges()
-                .expect("a held tensor's storage is charged");
-            if let Some((path, _)) = charges.iter().find(|(path, _)| !self.along.contains(path)) {
-                return Err(ExecutorCostsError(format!(
-                    "an operand for the {:?} route landed on path {path:?}, off it",
-                    self.route
-                )));
-            }
-        }
-        Ok(tensors)
+        allocate(&charges.confined(self.route))
     }
 
     /// A zero-filled tensor of the route's storage kind.
     fn zeros(
         &self,
-        device: &Device,
+        charges: &seismic::Charges,
         element: Element,
         extents: &[u64],
     ) -> Result<Tensor, seismic::TensorError> {
         match self.storage {
-            OperandStorage::Device => Tensor::zeros(device, element, extents),
-            OperandStorage::Upload => Tensor::upload(device, element, extents),
-            OperandStorage::Host => Tensor::shared(device, element, extents),
+            OperandStorage::Device => Tensor::zeros(charges, element, extents),
+            OperandStorage::Upload => Tensor::upload(charges, element, extents),
+            OperandStorage::Host => Tensor::shared(charges, element, extents),
         }
     }
 }
@@ -2504,12 +2498,12 @@ impl Backings {
     /// it.
     fn lay_out<const N: usize>(
         &mut self,
-        device: &Device,
+        charges: &seismic::Charges,
         route: &Route,
         operands: [Operand; N],
     ) -> Result<[Vec<Tensor>; N], ExecutorCostsError> {
         let error = failed("rotated operands");
-        let largest = device.info().limits().max_allocation.bytes();
+        let largest = charges.device().info().limits().max_allocation.bytes();
         let index = match self
             .routes
             .iter()
@@ -2560,12 +2554,12 @@ impl Backings {
         let added = sizes[backing.len()..].to_vec();
         if !added.is_empty() {
             let began = std::time::Instant::now();
-            backing.extend(route.place(device, || {
+            backing.extend(route.place(charges, |confined| {
                 added
                     .iter()
                     .map(|&bytes| {
                         route
-                            .zeros(device, Element::bool(), &[bytes])
+                            .zeros(confined, Element::bool(), &[bytes])
                             .map_err(|cause| error(&cause))
                     })
                     .collect()
@@ -2623,7 +2617,7 @@ impl ExpandCase {
     /// `sets` argument sets, each with weights of its own along `route`;
     /// the rows and the constants are one set's for all.
     fn new(
-        device: &Device,
+        charges: &seismic::Charges,
         backings: &mut Backings,
         weight: Element,
         route: &Route,
@@ -2632,13 +2626,13 @@ impl ExpandCase {
         sets: u64,
     ) -> Result<Vec<Self>, ExecutorCostsError> {
         let [gates, ups] =
-            backings.lay_out(device, route, Self::operands(weight, features, sets)?)?;
-        Self::over(device, weight, rows, gates, ups)
+            backings.lay_out(charges, route, Self::operands(weight, features, sets)?)?;
+        Self::over(charges, weight, rows, gates, ups)
     }
 
     /// One argument set per gate and up weight of `gates` and `ups`.
     fn over(
-        device: &Device,
+        charges: &seismic::Charges,
         weight: Element,
         rows: u64,
         gates: Vec<Tensor>,
@@ -2646,11 +2640,11 @@ impl ExpandCase {
     ) -> Result<Vec<Self>, ExecutorCostsError> {
         let error = failed("dense_expand arguments");
         let zeros = |element, extents: &[u64]| {
-            Tensor::zeros(device, element, extents).map_err(|cause| error(&cause))
+            Tensor::zeros(charges, element, extents).map_err(|cause| error(&cause))
         };
         let residual = zeros(Element::f32(), &[rows, HIDDEN])?;
         let norm = zeros(Element::f32(), &[HIDDEN])?;
-        let out_rows = every_row(device, rows)?;
+        let out_rows = every_row(charges, rows)?;
         let scale = zeros(Element::f32(), &[0])?;
         let bound = zeros(Element::f32(), &[bound_extent(weight)])?;
         let glu_limit = zeros(Element::i32(), &[0, GluLimit::word(None)])?;
@@ -2689,11 +2683,11 @@ impl ExpandCase {
 }
 
 /// The identity row table of `rows` rows: every row advances.
-fn every_row(device: &Device, rows: u64) -> Result<Tensor, ExecutorCostsError> {
+fn every_row(charges: &seismic::Charges, rows: u64) -> Result<Tensor, ExecutorCostsError> {
     let table = (0..rows as i32)
         .flat_map(i32::to_le_bytes)
         .collect::<Vec<_>>();
-    Tensor::from_host(device, Element::i32(), &[rows], &table)
+    Tensor::from_host(charges, Element::i32(), &[rows], &table)
         .map_err(|cause| failed("row table")(&cause))
 }
 
@@ -2919,21 +2913,21 @@ impl AttendCase {
     /// `sets` argument sets, each with history planes of its own along
     /// `route`; the row's operands and tables are one set's for all.
     fn new(
-        device: &Device,
+        charges: &seismic::Charges,
         backings: &mut Backings,
         layout: KvCodec,
         route: &Route,
         depth: u64,
         sets: u64,
     ) -> Result<Vec<Self>, ExecutorCostsError> {
-        let [histories] = backings.lay_out(device, route, [Self::operand(layout, depth, sets)?])?;
-        Self::over(device, backings, layout, depth, histories)
+        let [histories] = backings.lay_out(charges, route, [Self::operand(layout, depth, sets)?])?;
+        Self::over(charges, backings, layout, depth, histories)
     }
 
     /// One argument set per history of `histories`, each [`Self::operand`]'s
     /// run of slabs of `backings`, which restore the row each set appends.
     fn over(
-        device: &Device,
+        charges: &seismic::Charges,
         backings: &mut Backings,
         layout: KvCodec,
         depth: u64,
@@ -2941,10 +2935,10 @@ impl AttendCase {
     ) -> Result<Vec<Self>, ExecutorCostsError> {
         let error = failed("attention arguments");
         let zeros = |element, extents: &[u64]| {
-            Tensor::zeros(device, element, extents).map_err(|cause| error(&cause))
+            Tensor::zeros(charges, element, extents).map_err(|cause| error(&cause))
         };
         let host = |element, extents: &[u64], bytes: Vec<u8>| {
-            Tensor::from_host(device, element, extents, &bytes).map_err(|cause| error(&cause))
+            Tensor::from_host(charges, element, extents, &bytes).map_err(|cause| error(&cause))
         };
         let words = |values: &[i32]| {
             values
@@ -3031,7 +3025,7 @@ impl AttendCase {
         // Each set's history in a store of its own over its run of slabs.
         let (rows_per_slab, regions, slab, slabs) = history_store(layout, depth)?;
         let (offsets, _) = history_planes(&regions, rows_per_slab, slabs, &slab)?;
-        let pool = crate::experts::fixture_pool(device, seismic::Contract::DeviceOnly, rows_per_slab, rows, &regions, slabs)
+        let pool = crate::experts::fixture_pool(charges, seismic::Contract::DeviceOnly, rows_per_slab, rows, &regions, slabs)
             .map_err(|cause| error(&cause))?;
         let slab_rows = u32::try_from(rows_per_slab)
             .map_err(|_| ExecutorCostsError("history slab rows exceed u32".into()))?;
@@ -3047,7 +3041,7 @@ impl AttendCase {
                     })
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|cause| error(&cause))?;
-                let store = SlabTensor::in_pool_over(&pool, rows_per_slab, rows, &regions, lent)
+                let store = SlabTensor::in_pool_over(charges, &pool, rows_per_slab, rows, &regions, lent)
                     .map_err(|cause| error(&cause))?;
                 // The row the call appends, at `depth`, in every plane.
                 backings.writes(
@@ -3253,14 +3247,14 @@ fn timing_ordinal(timing: GraphTiming) -> u64 {
 
 impl SealedGraph {
     /// The graph's runs over its bound tensors, timed as `timing` says.
-    fn point(&self, timing: GraphTiming) -> Result<Point, ExecutorCostsError> {
+    fn point(&self, charges: &seismic::Charges, timing: GraphTiming) -> Result<Point, ExecutorCostsError> {
         let error = failed("graph point");
         let mut bindings = self.plan.bindings();
         for (port, tensor) in &self.bound {
-            bindings.set(port, tensor).map_err(|cause| error(&cause))?;
+            bindings.set(charges, port, tensor).map_err(|cause| error(&cause))?;
         }
         self.plan
-            .point(bindings, timing)
+            .point(charges, bindings, timing)
             .map(Point::Graph)
             .map_err(|cause| error(&cause))
     }
@@ -3269,11 +3263,11 @@ impl SealedGraph {
 /// The launch graph: [`GRAPH_CALLS`] dependent `conditioning_overlay` calls
 /// of one row, each reading the last one's output.
 fn launch_graph(
-    device: &Device,
+    charges: &seismic::Charges,
     kernel: &NativeKernel<conditioning_overlay::Entry>,
 ) -> Result<SealedGraph, ExecutorCostsError> {
     let error = failed("launch graph");
-    let mut graph = device.native_graph();
+    let mut graph = charges.device().native_graph();
     let mut port = || {
         graph
             .port(Element::f32(), &[1, GRAPH_WIDTH])
@@ -3301,7 +3295,7 @@ fn launch_graph(
     let bound = ports
         .into_iter()
         .map(|port| {
-            Tensor::zeros(device, Element::f32(), &[1, GRAPH_WIDTH])
+            Tensor::zeros(charges, Element::f32(), &[1, GRAPH_WIDTH])
                 .map(|tensor| (port, tensor))
                 .map_err(|cause| error(&cause))
         })
@@ -3373,7 +3367,7 @@ impl ChainOperands {
     /// and `depth` tokens of dense history, its weights and history along
     /// `route`.
     fn new(
-        device: &Device,
+        charges: &seismic::Charges,
         backings: &mut Backings,
         weight: Element,
         features: u64,
@@ -3383,7 +3377,7 @@ impl ChainOperands {
     ) -> Result<Self, ExecutorCostsError> {
         let [gate_weights, up_weights] = ExpandCase::operands(weight, features, sets)?;
         let [gates, ups, downs, histories] = backings.lay_out(
-            device,
+            charges,
             route,
             [
                 gate_weights,
@@ -3393,12 +3387,12 @@ impl ChainOperands {
             ],
         )?;
         let zeros = |element, extents: &[u64]| {
-            Tensor::zeros(device, element, extents)
+            Tensor::zeros(charges, element, extents)
                 .map_err(|cause| failed("composition chain arguments")(&cause))
         };
         Ok(Self {
-            expand: ExpandCase::over(device, weight, 1, gates, ups)?,
-            attend: AttendCase::over(device, backings, KvCodec::Dense, depth, histories)?,
+            expand: ExpandCase::over(charges, weight, 1, gates, ups)?,
+            attend: AttendCase::over(charges, backings, KvCodec::Dense, depth, histories)?,
             downs,
             down_bound: zeros(Element::f32(), &[bound_extent(weight)])?,
             residual: zeros(Element::f32(), &[1, HIDDEN])?,
@@ -3582,15 +3576,15 @@ fn composition_chain(
 fn calls<'f, E: Entry, C: 'f>(
     kernel: impl for<'p> Fn(&'p Programs) -> Result<&'p NativeKernel<E>, Unformed<ExecutorCostsError>>
         + 'f,
-    cases: impl Fn(&Device, &mut Backings) -> Result<Vec<C>, ExecutorCostsError> + 'f,
+    cases: impl Fn(&seismic::Charges, &mut Backings) -> Result<Vec<C>, ExecutorCostsError> + 'f,
     args: for<'a> fn(&'a mut C) -> E::Args<'a>,
-) -> impl FnMut(&Device, &Programs, &mut Backings) -> Result<Point, Unformed<ExecutorCostsError>> + 'f
+) -> impl FnMut(&seismic::Charges, &Programs, &mut Backings) -> Result<Point, Unformed<ExecutorCostsError>> + 'f
 {
-    move |device, programs, backings| {
+    move |charges, programs, backings| {
         let kernel = kernel(programs)?;
-        let mut cases = cases(device, backings).map_err(Unformed::Now)?;
+        let mut cases = cases(charges, backings).map_err(Unformed::Now)?;
         kernel
-            .point(cases.iter_mut().map(args).collect())
+            .point(charges, cases.iter_mut().map(args).collect())
             .map(Point::Kernel)
             .map_err(|error| Unformed::Now(failed(E::NAME)(&error)))
     }
@@ -3610,10 +3604,10 @@ fn launch_graph_point<T: Times>(
         &[("calls", GRAPH_CALLS as u64), ("width", GRAPH_WIDTH)],
         &[("timing", timing_ordinal(timing))],
     );
-    let mut build = |device: &Device, formed: &Programs, _: &mut Backings| {
+    let mut build = |charges: &seismic::Charges, formed: &Programs, _: &mut Backings| {
         let copy = formed.kernel(&formed.copy)?;
-        launch_graph(device, copy)
-            .and_then(|graph| graph.point(timing))
+        launch_graph(charges, copy)
+            .and_then(|graph| graph.point(charges, timing))
             .map_err(Unformed::Now)
     };
     let share = match timing {
@@ -4399,10 +4393,10 @@ impl Walk<'_> {
                 &[("depth", depth), ("sets", sets)],
             ),
             programs,
-            &mut |device: &Device, formed: &Programs, backings: &mut Backings| {
+            &mut |charges: &seismic::Charges, formed: &Programs, backings: &mut Backings| {
                 let kernels = ChainKernels::of(formed, chain_format)?;
                 let operands = ChainOperands::new(
-                    device,
+                    charges,
                     backings,
                     chain_format,
                     features,
@@ -4411,8 +4405,8 @@ impl Walk<'_> {
                     sets,
                 )
                 .map_err(Unformed::Now)?;
-                composition_chain(device, kernels, &operands, layers as usize)
-                    .and_then(|chain| chain.point(GraphTiming::Device))
+                composition_chain(&charges.device(), kernels, &operands, layers as usize)
+                    .and_then(|chain| chain.point(charges, GraphTiming::Device))
                     .map_err(Unformed::Now)
             },
             share.forecast(forecast),
@@ -4574,8 +4568,8 @@ fn weight_rate<T: Times>(
         programs,
         &mut calls::<dense_expand::Entry, _>(
             move |formed: &Programs| formed.expand(format, Rows::Decode),
-            move |device, backings| {
-                ExpandCase::new(device, backings, format, route, 1, features, sets)
+            move |charges, backings| {
+                ExpandCase::new(charges, backings, format, route, 1, features, sets)
             },
             ExpandCase::args,
         ),
@@ -4629,8 +4623,8 @@ fn matrix<T: Times>(
         programs,
         &mut calls::<dense_expand::Entry, _>(
             move |formed: &Programs| formed.expand(format, Rows::Matrix),
-            move |device, backings| {
-                ExpandCase::new(device, backings, format, route, rows, features, 1)
+            move |charges, backings| {
+                ExpandCase::new(charges, backings, format, route, rows, features, 1)
             },
             ExpandCase::args,
         ),
@@ -4693,7 +4687,7 @@ impl Walk<'_> {
         );
         let mut build = calls::<E, _>(
             |formed: &Programs| formed.kernel(E::formed(formed)),
-            move |device, backings| AttendCase::new(device, backings, layout, route, depth, sets),
+            move |charges, backings| AttendCase::new(charges, backings, layout, route, depth, sets),
             E::args,
         );
         let timing = match forecast {
@@ -4806,12 +4800,13 @@ pub(super) struct Walks<'a, 'd> {
 }
 
 impl<'a, 'd> Walks<'a, 'd> {
-    /// The walks of a job on `device` whose time ends at `deadlines`, or
-    /// why its executor has no records: it is not of its own topology's
-    /// revision.
+    /// The walks of a job on `device` whose time ends at `deadlines`, its
+    /// points allocating through `charges`, of that device; or why its
+    /// executor has no records: it is not of its own topology's revision.
     pub(super) fn new(
         measurer: &'a mut Measurer,
         device: &'d Device,
+        charges: &'d seismic::Charges,
         store: &'a dyn RecordStore<PointKey>,
         deadlines: JobDeadlines,
         attempting: &'a mut dyn FnMut(&PointKey) -> Attempt,
@@ -4826,6 +4821,7 @@ impl<'a, 'd> Walks<'a, 'd> {
             },
             measurer,
             device,
+            charges,
             attempting,
             programs: std::cell::OnceCell::new(),
             backings: Backings::default(),
@@ -4883,11 +4879,16 @@ impl<'a, 'd> Walks<'a, 'd> {
         self.measured.device
     }
 
+    /// What the job's points allocate through ([`Measured::charges`]).
+    pub(super) fn charges(&self) -> &'d seismic::Charges {
+        self.measured.charges
+    }
+
     /// Take the point `key` by `make`, on the job's device, under the job's
     /// attempts and its time: a point no timing loop measures. What `make`
     /// returns is stored and told as the walks' records are; why it fails
     /// is told, nothing stored, and the next job attempts it again.
-    pub(super) fn record(&mut self, key: PointKey, make: impl FnOnce(&'d Device) -> Result<Record, String>) {
+    pub(super) fn record(&mut self, key: PointKey, make: impl FnOnce(&seismic::Charges) -> Result<Record, String>) {
         let began = std::time::Instant::now();
         let (_, deadline) = self.measured.next(0.);
         let measured = &mut self.measured;
@@ -4896,9 +4897,9 @@ impl<'a, 'd> Walks<'a, 'd> {
             let kept = measured.kept(&key, Outcome::<String, String>::Expired, store, true);
             return measured.tell(key, kept, began);
         }
-        let made = match (measured.attempting)(&key) {
-            Attempt::Skip(reason) => Ok(Record::Unobtainable { reason }),
-            Attempt::Proceed => make(measured.device),
+        let (made, record) = match (measured.attempting)(&key) {
+            Attempt::Skip(reason) => (None, Ok(Record::Unobtainable { reason })),
+            Attempt::Proceed => (Some(std::time::Instant::now()), make(measured.charges)),
         };
         let stored = made.and_then(|record| {
             store.store(&key, &record).map_err(|error| error.to_string())?;

@@ -49,7 +49,7 @@ use crate::native::SiteForm;
 use crate::planning::BankBinding;
 use magnitude_kernels::constants::VERIFY_ROWS;
 use seismic::measure::{Attempt, JsonFileStore, Reason, Record, RecordStore, StoreError, Timing};
-use seismic::{Device, DeviceTopology, Executor, Identity, Measurer, PointKey};
+use seismic::{DeviceTopology, Executor, Identity, Measurer, PointKey};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -172,7 +172,7 @@ impl PointRequest {
             #[cfg(feature = "machine-line")]
             Self::Line => (super::line::MachineLine::measure(walks).err(), Vec::new()),
             Self::Site(site) => (site.measure(walks).err(), Vec::new()),
-            Self::CpuSite(form) => (CpuCosts::measure(walks.device(), form, walks.store()).err(), Vec::new()),
+            Self::CpuSite(form) => (CpuCosts::measure(walks.charges(), form, walks.store()).err(), Vec::new()),
             Self::Volume { file, urgent } => {
                 let urgent = VolumeCosts::urgent(urgent);
                 (VolumeCosts::measure(walks.device(), file, urgent.as_ref(), walks.store()).err(), Vec::new())
@@ -257,9 +257,9 @@ impl SiteRequest {
     /// request is no verdict: the job's two-job rule ends it.
     fn measure(&self, walks: &mut Walks<'_, '_>) -> Result<(), ExecutorCostsError> {
         let key = self.key(&walks.identity());
-        walks.record(key, |device| {
+        walks.record(key, |charges| {
             let began = std::time::Instant::now();
-            Ok(match crate::native::admit_site(device, self)? {
+            Ok(match crate::native::admit_site(charges, self)? {
                 Ok(()) => Record::Measured(Timing { median: began.elapsed().as_secs_f64(), interval: None, samples: 1 }),
                 Err(refusal) => Record::Unobtainable { reason: Reason::new(refusal) },
             })
@@ -267,7 +267,7 @@ impl SiteRequest {
         let (device, store) = (walks.device(), walks.store());
         let (topology, executor) = (device.topology(), device.info());
         match self.verdict(topology, executor, store).measured().is_some() && self.outstanding(topology, executor, store) {
-            true => CpuCosts::measure(device, &self.form, store),
+            true => CpuCosts::measure(walks.charges(), &self.form, store),
             false => Ok(()),
         }
     }
@@ -506,25 +506,30 @@ impl JobDeadlines {
     }
 }
 
-/// Measure `requests` on `device`, assessment's standing ones first and
-/// then the loads', each in the order given, each point stored in `store`
-/// as it is taken, by `deadlines`: each point loads from the records or is
-/// reported to `attempting`, then measured for its part of its time left
-/// (or until its median is resolved); `visit` is told what became of each
-/// point as soon as it is known. A standing point the time cannot hold is
-/// priced from those read, unless it reads a required figure; what the
-/// job's time leaves unread of those and of the loads' the next job
-/// measures. The job's split is traced, point by point and whole. Fails
-/// only when `device`'s executor is not of its own topology's revision.
+/// Measure `requests` on the device of `charges`, assessment's standing
+/// ones first and then the loads', each in the order given, each point
+/// stored in `store` as it is taken, by `deadlines`: each point loads from
+/// the records or is reported to `attempting`, then measured for its part
+/// of its time left (or until its median is resolved); `visit` is told
+/// what became of each point as soon as it is known. A standing point the
+/// time cannot hold is priced from those read, unless it reads a required
+/// figure; what the job's time leaves unread of those and of the loads'
+/// the next job measures. Every point's operands, backings and kernels are
+/// allocated through `charges`: a job's own device's tally
+/// (`Charges::tally`), or a measurement holding of a device's ledgers in
+/// this process (`DeviceLedgers::measurement`). The job's split is traced,
+/// point by point and whole. Fails only when the device's executor is not
+/// of its own topology's revision.
 pub fn measure(
     measurer: &mut Measurer,
-    device: &Device,
+    charges: &seismic::Charges,
     store: &dyn RecordStore<PointKey>,
     requests: &Outstanding,
     deadlines: JobDeadlines,
     attempting: &mut dyn FnMut(&PointKey) -> Attempt,
     visit: &mut Visit<'_>,
 ) -> Result<Measurement, ExecutorCostsError> {
+    let device = &charges.device();
     let (topology, executor) = (device.topology(), device.info());
     let requests = (requests.standing.iter().map(|request| (Whose::Standing, request)))
         .chain(requests.loads.iter().map(|request| (Whose::Loads, request)))
@@ -537,7 +542,7 @@ pub fn measure(
             0
         }))
         .collect::<Vec<_>>();
-    let mut walks = Walks::new(measurer, device, store, deadlines, attempting, visit)?;
+    let mut walks = Walks::new(measurer, device, charges, store, deadlines, attempting, visit)?;
     let mut failures = Vec::new();
     for (index, (whose, request)) in requests.iter().enumerate() {
         // Its points and those after it of the same whose.
@@ -624,7 +629,7 @@ mod tests {
             let deadlines = JobDeadlines::new(started, std::time::Duration::from_secs_f64(seconds));
             assert!(deadlines.standing() <= started + std::time::Duration::from_secs_f64(MEASUREMENT_SECONDS));
             let mut visited = Vec::new();
-            measure(&mut measurer, &device, store, &requests, deadlines, &mut |_| Attempt::Proceed, &mut |key, outcome| {
+            measure(&mut measurer, &seismic::Charges::tally(&device), store, &requests, deadlines, &mut |_| Attempt::Proceed, &mut |key, outcome| {
                 let readers = key.configuration["readers"];
                 visited.push((readers, outcome));
             })
@@ -646,7 +651,7 @@ mod tests {
         let mut measurer = Measurer::new(crate::SEARCH_SETTINGS.error_rate, crate::MIN_SAMPLE_SECONDS);
         let deadlines = JobDeadlines::new(std::time::Instant::now(), std::time::Duration::ZERO);
         let costs = Outstanding { standing: vec![PointRequest::Costs(CostWalk::Required)], loads: Vec::new() };
-        measure(&mut measurer, &device, &unheld, &costs, deadlines, &mut |_| Attempt::Proceed, &mut |_, _| {}).unwrap();
+        measure(&mut measurer, &seismic::Charges::tally(&device), &store, &costs, deadlines, &mut |_| Attempt::Proceed, &mut |_, _| {}).unwrap();
         assert!(matches!(
             super::super::ExecutorCosts::stored(topology, device.info(), &unheld),
             Ok(super::super::StoredCosts::Missing(_))
@@ -703,7 +708,7 @@ mod tests {
         assert!(!requests.is_empty());
         let mut measurer = Measurer::new(crate::SEARCH_SETTINGS.error_rate, crate::MIN_SAMPLE_SECONDS);
         let deadlines = JobDeadlines::new(std::time::Instant::now(), std::time::Duration::from_secs(60));
-        measure(&mut measurer, &device, &store, &requests, deadlines, &mut |_| Attempt::Proceed, &mut |_, _| {})
+        measure(&mut measurer, &seismic::Charges::tally(&device), &store, &requests, deadlines, &mut |_| Attempt::Proceed, &mut |_, _| {})
             .unwrap();
         match MachineLine::stored(topology, executor, &store) {
             Ok(line) => {

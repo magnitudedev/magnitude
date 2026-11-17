@@ -1329,7 +1329,7 @@ fn a_holding_update_beside_a_shrinks_release_classifies_within_the_charge() {
     for backend in bank_backends() {
         let (mut domain, mut bindings) = banked(backend, 4, 4);
         let row = bank_row(&domain);
-        let optional = seismic::Tensor::zeros(domain.domain.device(), seismic::Element::bool(), &[row]).unwrap();
+        let optional = seismic::Tensor::zeros(&seismic::Charges::tally(domain.domain.device()), seismic::Element::bool(), &[row]).unwrap();
         domain.family.optional = Some(optional);
         assert_eq!(domain.shrink_expert_bank_by(&mut bindings, 1, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
         // The first advance installs; the release is the bank's own thread's.
@@ -1673,7 +1673,7 @@ fn reconcile_encode<F: ProgramFamily>(
     image: ImageRef,
 ) -> FeatureRef {
     let tensor = Tensor::zeros(
-        domain.domain.device(),
+        &seismic::Charges::tally(domain.domain.device()),
         seismic::Element::f32(),
         &[
             (image.patches() / 4) as u64,
@@ -2355,18 +2355,18 @@ fn host_rows_from_the_token_history_equal_the_device_rows() {
                 .unwrap_or_else(|error| panic!("an available {backend:?} executor opens: {error}"))
         })
         .collect::<Vec<_>>();
-    let ints = |device: &seismic::Device, shape: &[u64], values: &[i32]| {
+    let ints = |charges: &seismic::Charges, shape: &[u64], values: &[i32]| {
         Tensor::from_host(
-            device,
+            charges,
             Element::i32(),
             shape,
             &values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>(),
         )
         .unwrap()
     };
-    let words = |device: &seismic::Device, values: &[u64]| {
+    let words = |charges: &seismic::Charges, values: &[u64]| {
         Tensor::from_host(
-            device,
+            charges,
             Element::u64(),
             &[values.len() as u64],
             &values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>(),
@@ -2383,8 +2383,9 @@ fn host_rows_from_the_token_history_equal_the_device_rows() {
     ];
     for (device, hash) in devices.iter().flat_map(|device| [(device, &raw), (device, &mapped)]) {
         let backend = device.backend().as_str();
+        let charges = seismic::Charges::tally(device);
         let slabs = crate::experts::pooled_slabs(
-            &device,
+            &charges,
             seismic::Contract::DeviceOnly,
             slab_banks,
             banks,
@@ -2437,28 +2438,28 @@ fn host_rows_from_the_token_history_equal_the_device_rows() {
             let host = hash.rows(&preceding, &fed.iter().map(|token| u64::from(token.0)).collect::<Vec<_>>());
             let rows = fed.len();
             let result = kernel
-                .call(ngram_rows::Args {
+                .call(&charges, ngram_rows::Args {
                     tokens: &ints(
-                        &device,
+                        &charges,
                         &[rows as u64, 2],
                         &fed.iter().flat_map(|token| [token.0 as i32, 0]).collect::<Vec<_>>(),
                     ),
-                    multipliers: &words(&device, &hash.multipliers),
-                    sizes: &words(&device, &hash.sizes),
-                    offsets: &words(&device, &hash.offsets),
+                    multipliers: &words(&charges, &hash.multipliers),
+                    sizes: &words(&charges, &hash.sizes),
+                    offsets: &words(&charges, &hash.offsets),
                     map: &Tensor::from_host(
-                        &device,
+                        &charges,
                         Element::u32(),
                         &[map.len() as u64],
                         &map.iter().flat_map(|id| id.to_le_bytes()).collect::<Vec<_>>(),
                     )
                     .unwrap(),
-                    boundary: &ints(&device, &[boundary.len() as u64], &boundary),
-                    segments: &ints(&device, &[2, 2], &[0, rows as i32, rows as i32, rows as i32]),
-                    stop: &ints(&device, &[1], &[*stop]),
-                    previous_bank: &ints(&device, &[1], &[*source]),
-                    previous_tape: &ints(&device, &[1], &[*taped]),
-                    following_bank: &ints(&device, &[1], &[*target]),
+                    boundary: &ints(&charges, &[boundary.len() as u64], &boundary),
+                    segments: &ints(&charges, &[2, 2], &[0, rows as i32, rows as i32, rows as i32]),
+                    stop: &ints(&charges, &[1], &[*stop]),
+                    previous_bank: &ints(&charges, &[1], &[*source]),
+                    previous_tape: &ints(&charges, &[1], &[*taped]),
+                    following_bank: &ints(&charges, &[1], &[*target]),
                     window: &mut window,
                     fill: hash.fill as i32,
                     slab_banks: slab_banks as u32,
@@ -2501,10 +2502,10 @@ fn failed_table_read(name: &str) -> (std::path::PathBuf, crate::programs::Stored
     let slab = seismic::SlabLayout::for_regions(64, 64, &[seismic::SlabRegion { element: resident, row_shape: vec![160] }]).unwrap();
     let granule = slab.slab_bytes.next_multiple_of(slab.slab_alignment);
     let entry: Arc<dyn seismic::memory::Entry> = Arc::new(seismic::memory::Tally::unbounded(seismic::StoreIdentity::HostRam));
-    let pool = device.pool(seismic::Contract::Shared, granule, 2 * granule, seismic::PoolEntries::one(entry)).unwrap();
+    let pool = seismic::Pool::open(&seismic::PoolCharges::one(&device.charges_in(seismic::Contract::Shared, entry)), seismic::Contract::Shared, granule, 2 * granule).unwrap();
     let table = Arc::new(
         StoredTable::new(
-            &device,
+            &seismic::Charges::tally(&device),
             &magnitude_family_contracts::WeightDescriptor::stored("ngram", [ROWS, 160]),
             seismic::Element::named("gguf_iq4_nl").unwrap(),
             resident,

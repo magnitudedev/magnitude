@@ -409,9 +409,11 @@ pub(crate) fn load_read(
         capacity,
     )
     .unwrap();
+    // What the load allocates outside its claims: each store's own entry.
+    let charges = seismic::Charges::tally(&device);
     let mut programs = AttestedPrograms::prepare_draft(
         &draft,
-        &device,
+        &charges,
         crate::TuningContext {
             definition,
             weights: &crate::ZeroTuningWeights,
@@ -495,10 +497,10 @@ pub(crate) fn load_read(
         &mut recorded,
         crate::memory::ledger::CommittedKind::Arena,
         scratch,
-        || {
+        |charges| {
             ResourceAllocator::allocate(
                 &execution,
-                &device,
+                charges,
                 identity.clone(),
                 programs.target_graphs().unwrap(),
                 programs.target_readout_graphs().unwrap(),
@@ -536,7 +538,7 @@ pub(crate) fn load_read(
     )
     .unwrap();
     let target = weights
-        .allocate(|| residency.load_target(definition, package, &host_tables, Box::new(|_, _| ())))
+        .allocate(&device, |charges| residency.load_target(charges, definition, package, &host_tables, Box::new(|_, _| ())))
         .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
     recorded.record(weights);
     recorded.record(host_tables);
@@ -550,8 +552,8 @@ pub(crate) fn load_read(
         false => None,
     };
     let plan = execution.resources().clone();
-    let target_state = plan.allocate_target_state(device.clone(), pools.state.clone()).unwrap();
-    let head_state = plan.head_state().map(|state| state.allocate(device.clone(), pools.state.clone()).unwrap());
+    let target_state = plan.allocate_target_state(&charges, pools.state.clone()).unwrap();
+    let head_state = plan.head_state().map(|state| state.allocate(&charges, pools.state.clone()).unwrap());
     // The constants its domain binds, as the engine's load claims them.
     let constants = crate::memory::ClaimDemand {
         device: programs.target_graphs().unwrap().binding_constant_bytes().unwrap(),

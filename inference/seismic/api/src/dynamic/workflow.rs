@@ -41,18 +41,19 @@ struct Node {
 }
 pub struct Workflow {
     id: usize,
-    device: Device,
+    /// What its runs allocate through.
+    charges: super::super::Charges,
     nodes: Vec<Node>,
     closed: bool,
     moved_external: BTreeSet<usize>,
     moved_pending: BTreeSet<(usize, usize)>,
 }
 impl Workflow {
-    pub fn new(device: &Device) -> Self {
+    pub fn new(charges: &super::super::Charges) -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(1);
         Self {
             id: NEXT.fetch_add(1, Ordering::Relaxed),
-            device: device.clone(),
+            charges: charges.share(),
             nodes: Vec::new(),
             closed: false,
             moved_external: BTreeSet::new(),
@@ -71,7 +72,7 @@ impl Workflow {
         if self.closed {
             return Err(Error::new("WorkflowError", "workflow is closed"));
         }
-        if kernel.is_native() || !kernel.device.same_device(&self.device) {
+        if kernel.is_native() || !kernel.device().same_device(&self.charges.device()) {
             return Err(Error::new(
                 "WorkflowError",
                 "workflow requires ordinary kernels on its opened device",
@@ -117,7 +118,7 @@ impl Workflow {
         storages.sort_by_key(|s| Arc::as_ptr(s) as usize);
         storages.dedup_by(|a, b| Arc::ptr_eq(a, b));
         let _guards: Vec<_> = storages.iter().map(|s| lock(&s.gate)).collect();
-        let mut draft = runtime::workflow(self.device.inner())
+        let mut draft = runtime::workflow(self.charges.inner())
             .map_err(|e| Error::from(CallError::Workflow(e)))?;
         let mut refs: Vec<Vec<runtime::WorkflowResultRef>> = Vec::new();
         let mut moves = Vec::new();

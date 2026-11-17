@@ -354,10 +354,10 @@ pub(crate) fn search(
     let report = tuning_report(manifest, TracedWork::Search, &numerical_profile, opened.device(), progress)?;
     let room = startup.room();
     let tuned = programs_claim
-        .allocate(|| {
+        .allocate(opened.device(), |charges| {
             AttestedPrograms::search_draft(
                 &draft,
-                opened.device(),
+                charges,
                 TuningContext {
                     definition: &manifest.definition,
                     weights: package,
@@ -506,9 +506,9 @@ fn prepare(
     let report = tuning_report(manifest, TracedWork::Load, &numerical_profile, opened.device(), progress)?;
     // The programs' storage is made under its claim, one change with its
     // record.
-    let mut programs = match programs_claim.allocate(|| AttestedPrograms::prepare_draft(
+    let mut programs = match programs_claim.allocate(opened.device(), |charges| AttestedPrograms::prepare_draft(
         &draft,
-        opened.device(),
+        charges,
         TuningContext {
             definition: &manifest.definition,
             weights: package,
@@ -840,10 +840,10 @@ fn build_held(
         ClaimDemand { device: plan.bytes().scratch, ..ClaimDemand::default() },
     )?;
     let resources = scratch
-        .allocate(|| {
+        .allocate(&device, |charges| {
             ResourceAllocator::allocate(
                 &execution_plan,
-                &device,
+                charges,
                 resource_identity.clone(),
                 target_graphs,
                 target_readout_graphs,
@@ -882,8 +882,9 @@ fn build_held(
     // opens and grows, the bank yielding them by relief.
     let slot = magnitude_executor::request_slot_bytes(&execution_plan).map_err(internal)?;
     let request_slot = startup
-        .claim_as("one request's opening", CommittedKind::RequestSlot, ClaimDemand { device: slot, ..ClaimDemand::default() })?
-        .into_request_slot();
+        .ledgers
+        .claim_request_slot_at(&startup.reading, startup.reader.device(), ClaimDemand { device: slot, ..ClaimDemand::default() })
+        .map_err(|short| refused("one request's opening", short))?;
     let constants_claim = startup.claim_as(
         "target binding constants",
         CommittedKind::Arena,
@@ -952,9 +953,10 @@ fn build_held(
     let import_progress = progress.clone();
     // The import and its record, its host tables' row caches with it, are
     // one change: the caches charged to their own claim.
-    let target = weights.allocate(|| {
+    let target = weights.allocate(&device, |charges| {
         residency
             .load_target(
+                charges,
                 &manifest.definition,
                 &package,
                 &host_tables,
@@ -1012,10 +1014,10 @@ fn build_held(
         })
         .transpose()
         .map_err(|error| internal(error.to_string()))?;
-    let target_state = state_tables.allocate(|| plan.allocate_target_state(device.clone(), pools.state.clone())).map_err(internal)?;
+    let target_state = state_tables.allocate(&device, |charges| plan.allocate_target_state(charges, pools.state.clone())).map_err(internal)?;
     let head_state = plan
         .head_state()
-        .map(|state| state_tables.allocate(|| state.allocate(device.clone(), pools.state.clone())).map_err(internal))
+        .map(|state| state_tables.allocate(&device, |charges| state.allocate(charges, pools.state.clone())).map_err(internal))
         .transpose()?;
     startup.recorded.record(state_tables);
     let (mut domain, bindings) = ExecutorDomain::new(
@@ -1050,9 +1052,6 @@ fn build_held(
     // process's report on demand (`magnitude_executor::diagnostics`).
     let phase = magnitude_executor::diagnostics::Phase::new("load", "warm-up forward");
     let mut bindings = warm_up(&mut domain, bindings, primes_drafter)?;
-    // Everything the load allocates is charged: tables formed from here on are
-    // outside it (`seismic::Device::seal_record_tables`).
-    device.seal_record_tables();
     phase.enter("loaded memory report");
     report_loaded_memory(&domain, &device).map_err(internal)?;
     phase.enter("pricing the load: its step, shrink moves and host storage's routes");

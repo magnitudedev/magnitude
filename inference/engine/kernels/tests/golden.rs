@@ -323,6 +323,8 @@ struct Variant {
 
 struct Ctx {
     device: Device,
+    /// What its tensors and kernels allocate through: the device's tallies.
+    charges: seismic::Charges,
     backend: BackendName,
     gguf: Option<Gguf>,
     /// Resident real weights by (tensor name, rows).
@@ -334,7 +336,7 @@ impl Ctx {
         self.backend.resident_layout()
     }
     fn tensor(&self, element: Element, shape: &[u64], bytes: &[u8]) -> Tensor {
-        Tensor::from_host(&self.device, element, shape, bytes)
+        Tensor::from_host(&self.charges, element, shape, bytes)
             .unwrap_or_else(|e| panic!("upload {} {shape:?}: {e}", element.name()))
     }
     fn dense(&self, element: Element, shape: &[u64], values: &[f32]) -> Arg {
@@ -2758,7 +2760,7 @@ fn run_entry(
                 .join(",");
             let prefix = format!("{}|{}", variant.label, config_label);
             let kernel = match function.prepare_native(
-                &ctx.device,
+                &ctx.charges,
                 elements.clone(),
                 specialization(&statics, config),
             ) {
@@ -2903,6 +2905,7 @@ fn golden() {
         .map(|list| list.split(',').map(str::trim).collect::<Vec<_>>());
     let gguf = std::env::var_os("GOLDEN_GGUF").map(|path| Gguf::open(Path::new(&path)));
     let ctx = Ctx {
+        charges: seismic::Charges::tally(&device),
         device,
         backend,
         gguf,

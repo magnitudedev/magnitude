@@ -38,6 +38,7 @@ use super::timing::{OutputPool, PointTiming};
 use super::validation::{PreparedPoint, Validator};
 use super::{FormationClass, HeldPrograms, NativePrepared, Rendered};
 use crate::api::device::DeviceInner;
+use crate::memory::Charges;
 use crate::api::kernel::{EncodedArgs, PrepareError};
 use crate::api::{CallError, TensorError};
 use seismic_compiler::errors::ExecutionError;
@@ -301,15 +302,16 @@ impl<'a> TuningPoint<'a> {
         })
     }
 
-    /// The point with the cold copies its timed passes on `device` run.
-    fn timed(mut self, device: &DeviceInner) -> Result<Self, BuildError> {
-        if let Some(cold) = super::point::cold_bytes(device) {
+    /// The point with the cold copies its timed passes on `charges`'
+    /// device run, allocated through them.
+    fn timed(mut self, charges: &Charges) -> Result<Self, BuildError> {
+        if let Some(cold) = super::point::cold_bytes(charges.device()) {
             let workload = self
                 .workload
                 .iter()
                 .map(|index| self.rotation[*index].clone())
                 .collect::<Vec<_>>();
-            self.copies = super::point::cold_copies(&workload, cold).map_err(BuildError::of)?;
+            self.copies = super::point::cold_copies(charges, &workload, cold).map_err(BuildError::of)?;
         }
         Ok(self)
     }
@@ -887,12 +889,13 @@ fn held_bytes(device: &DeviceInner, charged: u64, retained: u64, footprint: Opti
 /// timing: with the cold copies of its workload ([`TuningPoint::timed`]),
 /// which are part of its build.
 fn build_point<'a>(
-    device: &DeviceInner,
+    charges: &Charges,
     source: &mut dyn PointSource<'a>,
     spec: &PointSpec,
     index: usize,
     resident: &mut Observed,
 ) -> Result<Option<TuningPoint<'a>>, TuneError> {
+    let device = charges.device();
     let before = device.room(seismic_topology::Contract::DeviceOnly);
     // What the source built for a point that is not made is given up with
     // it: nothing holds the point, so nothing would give it up later.
@@ -903,7 +906,7 @@ fn build_point<'a>(
                 source.release(index);
             }
             point?
-                .timed(device)
+                .timed(charges)
                 .inspect_err(|_| source.release(index))
         }
         Err(error) => Err(error),
@@ -1114,7 +1117,8 @@ pub struct Standing {
 }
 
 pub struct TuneRequest<'r, 'a> {
-    pub device: &'r Arc<DeviceInner>,
+    /// What the tuning allocates through: its device's charges.
+    pub charges: &'r Charges,
     pub module: &'r CheckedModule,
     pub entry: EntryId,
     pub bindings: ElementBindings,
@@ -1129,7 +1133,7 @@ pub struct TuneRequest<'r, 'a> {
 
 /// Forms configurations of one entry's implementation.
 struct Formation<'s, 'm> {
-    device: &'s Arc<DeviceInner>,
+    charges: &'s Charges,
     module: &'m CheckedModule,
     entry: EntryId,
     logical: &'s Arc<LogicalEntry>,
@@ -1150,7 +1154,7 @@ struct Formation<'s, 'm> {
 macro_rules! formation {
     ($unit:expr) => {
         Formation {
-            device: &$unit.device,
+            charges: &$unit.charges,
             module: $unit.module,
             entry: $unit.entry,
             logical: &$unit.logical,
@@ -1323,7 +1327,7 @@ impl FormationPrice {
 /// search and submits nothing to the device, so it runs on any thread
 /// while the device measures other work.
 pub struct Forming<'m> {
-    device: Arc<DeviceInner>,
+    charges: Charges,
     module: &'m CheckedModule,
     entry: EntryId,
     logical: Arc<LogicalEntry>,
@@ -1361,14 +1365,14 @@ impl Forming<'_> {
                 ProcessMemory::footprint_now(),
             )
         };
-        let before = held(&self.device);
-        let products = concurrently(&self.device, &self.work, |(formable, rendered)| {
-            let class = rendered.class(&self.device);
+        let before = held(self.charges.device());
+        let products = concurrently(self.charges.device(), &self.work, |(formable, rendered)| {
+            let class = rendered.class(self.charges.device());
             let began = Instant::now();
             let product = match formable {
                 Formable::Launches(sources) => Product::Launches(
                     NativePrepared::hold_launch_variants(
-                        &self.device,
+                        self.charges.device(),
                         self.module,
                         self.entry,
                         &self.bindings,
@@ -1380,7 +1384,7 @@ impl Forming<'_> {
                 ),
                 Formable::Program(specialization) => Product::Program(
                     NativePrepared::prepare_implementation(
-                        &self.device,
+                        self.charges.device(),
                         self.module,
                         self.entry,
                         &self.logical,
@@ -1396,7 +1400,7 @@ impl Forming<'_> {
             (class, product, began.elapsed())
         });
         Formed {
-            added_bytes: held(&self.device) as f64 - before as f64,
+            added_bytes: held(self.charges.device()) as f64 - before as f64,
             calls: self
                 .work
                 .into_iter()
@@ -1467,7 +1471,7 @@ impl UnitSearch<'_, '_> {
 
 /// The compile of a unit's canonical program ([`UnitSearch::grounding`]).
 pub struct Grounding<'m> {
-    device: Arc<DeviceInner>,
+    charges: Charges,
     module: &'m CheckedModule,
     entry: EntryId,
     logical: Arc<LogicalEntry>,
@@ -1483,7 +1487,7 @@ impl Grounding<'_> {
     pub fn run(self) -> Grounded {
         let began = Instant::now();
         let kernel = NativePrepared::prepare_implementation(
-            &self.device,
+            self.charges.device(),
             self.module,
             self.entry,
             &self.logical,
@@ -1534,7 +1538,7 @@ impl<'m> Formation<'_, 'm> {
     /// What the one call forming `formable` does, read from the device's
     /// live programs and the artifact store before it starts.
     fn class(&self, formable: &Formable) -> Formative {
-        self.rendered(formable).class(self.device)
+        self.rendered(formable).class(self.charges.device())
     }
 
     /// Whether forming `formable` renders any program for a toolchain.
@@ -1551,7 +1555,7 @@ impl<'m> Formation<'_, 'm> {
             .entry(formable.clone())
             .or_insert_with(|| match formable {
                 Formable::Launches(sources) => NativePrepared::launch_variants_rendered(
-                    self.device,
+                    self.charges.device(),
                     self.module,
                     self.entry,
                     self.bindings,
@@ -1560,7 +1564,7 @@ impl<'m> Formation<'_, 'm> {
                     sources,
                 ),
                 Formable::Program(specialization) => NativePrepared::implementation_rendered(
-                    self.device,
+                    self.charges.device(),
                     self.module,
                     self.entry,
                     self.logical,
@@ -1581,7 +1585,7 @@ impl<'m> Formation<'_, 'm> {
     fn quote(&self, formables: &[Formable]) -> Quote {
         let mut quote = Quote::default();
         let threads = formation_threads(formables.len());
-        let toolchain = self.device.programs.compiled();
+        let toolchain = self.charges.device().programs.compiled();
         let formatives = formables
             .iter()
             .map(|formable| self.class(formable))
@@ -1609,7 +1613,7 @@ impl<'m> Formation<'_, 'm> {
     /// any thread; none when they are none.
     fn forming(&self, formables: Vec<Formable>) -> Option<Forming<'m>> {
         (!formables.is_empty()).then(|| Forming {
-            device: self.device.clone(),
+            charges: self.charges.clone(),
             module: self.module,
             entry: self.entry,
             logical: self.logical.clone(),
@@ -2083,11 +2087,11 @@ fn measure_matched(
         let mut candidate_slots = Vec::new();
         let admitting = Instant::now();
         for (point, workload) in points.iter().enumerate() {
-            let mut timing = match PointTiming::reusing_outputs(
+            let mut timing = match outputs.timing(
                 &formed.kernel,
+                &workload.label,
                 workload.workload_rotation(),
                 workload.copies(),
-                outputs.at(&workload.label),
             ) {
                 Ok(timing) => timing,
                 Err(error) => {
@@ -2180,11 +2184,11 @@ fn measure_matched(
             }
             continue;
         }
-        let beside = PointTiming::reusing_outputs(
+        let beside = outputs.timing(
             incumbent.kernel,
+            &workload.label,
             workload.workload_rotation(),
             workload.copies(),
-            outputs.at(&workload.label),
         )
         .map_err(|error| WorkError::Failed(measurement_failure(points, point, error)))
         .and_then(|mut timing| {
@@ -2583,11 +2587,11 @@ fn place<'a>(
             .map(
                 |(index, point)| -> Result<PointTiming<'a>, WorkError<Exclusion>> {
                     deadline.check(Duration::ZERO)?;
-                    Ok(PointTiming::reusing_outputs(
+                    Ok(outputs.timing(
                         kernel,
+                        &point.label,
                         point.workload_rotation(),
                         point.copies(),
-                        outputs.at(&point.label),
                     )
                     .map_err(|error| measurement_failure(points, index, error))?)
                 },
@@ -2647,11 +2651,11 @@ struct PointSurveyor {
 }
 
 impl PointSurveyor {
-    fn new(implementation: &NativeImplementation, gated: bool) -> Self {
+    fn new(implementation: &NativeImplementation, gated: bool, charges: &Charges) -> Self {
         Self {
             keying: Keying::of(implementation),
             measured: HashMap::new(),
-            outputs: OutputPool::default(),
+            outputs: OutputPool::new(charges.clone()),
             gated,
             shuffle: Shuffle::default(),
             clock: None,
@@ -3218,7 +3222,7 @@ impl ScopeQualification<'_, '_> {
 pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
     let began = Instant::now();
     let TuneRequest {
-        device,
+        charges,
         module,
         entry,
         bindings,
@@ -3228,6 +3232,7 @@ pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
         validation,
         strategy,
     } = request;
+    let device = charges.device();
     // The standalone consumer owns its formation's threads as a load's
     // tuner owns the load's: a device nobody lent workers gets its own for
     // this tuning, and they leave with it.
@@ -3242,7 +3247,7 @@ pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
         Staffed(device)
     });
     let request = UnitRequest {
-        device,
+        charges,
         module,
         entry,
         bindings,
@@ -3278,7 +3283,8 @@ pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
 
 /// What opening a unit's search needs.
 pub struct UnitRequest<'r, 'm> {
-    pub device: &'r Arc<DeviceInner>,
+    /// What the tuning allocates through: its device's charges.
+    pub charges: &'r Charges,
     pub module: &'m CheckedModule,
     pub entry: EntryId,
     pub bindings: ElementBindings,
@@ -3445,7 +3451,7 @@ struct Run {
 ///   whose lead is nominal, and its conversion if they resolve it.
 pub struct UnitSearch<'m, 'a> {
     expired: bool,
-    device: Arc<DeviceInner>,
+    charges: Charges,
     module: &'m CheckedModule,
     entry: EntryId,
     bindings: ElementBindings,
@@ -3527,7 +3533,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         domains: &BTreeMap<String, Vec<u64>>,
     ) -> Result<Self, TuneError> {
         let UnitRequest {
-            device,
+            charges,
             module,
             entry,
             bindings,
@@ -3535,6 +3541,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             cpu,
             validation: requirement,
         } = request;
+        let device = charges.device();
         let backend = super::backend_name(&device.kind);
         let entry_name = super::entry_name(module, entry);
         let implementation = super::offered(device, module, entry, &bindings)
@@ -3573,14 +3580,14 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                 implementation_identity,
                 parameters: entry_parameters(&implementation),
             },
-            device: device.clone(),
+            charges: charges.clone(),
             module,
             entry,
             bindings,
             statics,
             cpu,
             backend,
-            surveyor: Some(PointSurveyor::new(&implementation, true)),
+            surveyor: Some(PointSurveyor::new(&implementation, true, charges)),
             implementation: implementation.into_implementation(),
             logical,
             mutable,
@@ -3647,7 +3654,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     ) -> Result<Option<Grounding<'m>>, TuneError> {
         self.describe(source)?;
         Ok(self.ground.is_none().then(|| Grounding {
-            device: self.device.clone(),
+            charges: self.charges.clone(),
             module: self.module,
             entry: self.entry,
             logical: self.logical.clone(),
@@ -3668,6 +3675,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             &self.mutable,
             &self.unit.requirement,
             &kernel,
+            &self.charges,
         );
         kernel
             .hand_off()
@@ -3834,7 +3842,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         // A piece that follows builds the inputs again.
         self.offered.set(None);
         if let Some(surveyor) = &mut self.surveyor {
-            surveyor.outputs = OutputPool::default();
+            surveyor.outputs.release();
         }
         match &mut self.progress {
             Progress::Discovering(slots) => {
@@ -3852,7 +3860,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                         source.release(*index);
                     }
                 }
-                searching.run.outputs = OutputPool::default();
+                searching.run.outputs.release();
                 if exhausted {
                     self.programs.clear();
                 }
@@ -3955,8 +3963,8 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     /// The bytes held now ([`held_bytes`]).
     fn held(&self) -> u64 {
         held_bytes(
-            &self.device,
-            self.device.allocated(),
+            self.charges.device(),
+            self.charges.device().allocated(),
             self.ground
                 .as_ref()
                 .map_or(0, |ground| ground.validator.retained_bytes()),
@@ -3989,9 +3997,10 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             builds,
             resident_bytes,
             time,
-            device,
+            charges,
             ..
         } = self;
+        let device = charges.device();
         let Progress::Searching(searching) = progress else {
             return Ok(true);
         };
@@ -4015,7 +4024,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             let before = held();
             let building = Instant::now();
             let Some(built_point) = build_point(
-                device,
+                charges,
                 source,
                 &specs[index],
                 index,
@@ -4474,7 +4483,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         // What the piece holds is read from the ledgers' high-water marks,
         // started again here: what it took and gave back within itself is
         // seen.
-        self.device.restart_high_water();
+        self.charges.device().restart_high_water();
         if let Some(ground) = &self.ground {
             ground.validator.restart_retained_high_water();
         }
@@ -4484,7 +4493,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         // within it is over this.
         let ledgers = |unit: &Self| {
             (
-                (unit.device.allocated(), unit.device.high_water()),
+                (unit.charges.device().allocated(), unit.charges.device().high_water()),
                 unit.ground.as_ref().map_or((0, 0), |ground| {
                     (
                         ground.validator.retained_bytes(),
@@ -4573,26 +4582,26 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         let rise = high_water
             .saturating_sub(usage_began.0)
             .saturating_add(retained_most.saturating_sub(retained_began));
-        let host = footprint_peak(&self.device, host_began, host, rise);
+        let host = footprint_peak(self.charges.device(), host_began, host, rise);
         let memory = PieceMemory {
             began_bytes,
             peak_bytes: held_bytes(
-                &self.device,
-                self.device.high_water(),
+                self.charges.device(),
+                self.charges.device().high_water(),
                 self.ground
                     .as_ref()
                     .map_or(0, |ground| ground.validator.retained_high_water()),
                 host,
             ),
             ended_bytes: held_bytes(
-                &self.device,
-                self.device.allocated(),
+                self.charges.device(),
+                self.charges.device().allocated(),
                 self.ground
                     .as_ref()
                     .map_or(0, |ground| ground.validator.retained_bytes()),
                 ended,
             ),
-            ledger_peak_bytes: self.device.high_water()
+            ledger_peak_bytes: self.charges.device().high_water()
                 + self
                     .ground
                     .as_ref()
@@ -4648,11 +4657,12 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         // What the device's storage can take as the piece begins: a refusal
         // within it is priced from what the piece took of it.
         let before = self
-            .device
+            .charges
+            .device()
             .room(seismic_topology::Contract::DeviceOnly);
         let building = Instant::now();
         let Some(point) = build_point(
-            &self.device,
+            &self.charges,
             source,
             &self.specs[index],
             index,
@@ -4680,7 +4690,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         }
         let mut point = ground.validator.point(point)?;
         let shape =
-            point_shapes(&self.device, &self.logical, std::slice::from_ref(&point))?
+            point_shapes(self.charges.device(), &self.logical, std::slice::from_ref(&point))?
                 .remove(0);
         // The defaults' time here is the unit of every time the unit
         // records and the point's weight in what it optimises: the median
@@ -4860,7 +4870,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         // priced 21 s from the default's samples, ran 39 s to the cutoff
         // without completing a round (its single-participant challengers
         // sample 7 s at 512 rows) and recorded nothing.
-        if matches!(self.device.kind, crate::backends::OpenedKind::Cpu(_)) {
+        if matches!(self.charges.device().kind, crate::backends::OpenedKind::Cpu(_)) {
             if let Some(piece) = &mut searching.planned {
                 piece.keep_first();
             }
@@ -5319,7 +5329,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                     plan.start.clone(),
                 ),
                 keying,
-                outputs: OutputPool::default(),
+                outputs: OutputPool::new(self.charges.clone()),
                 samples,
                 shuffle: Shuffle::default(),
                 clock,
@@ -5375,7 +5385,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                 detail: error.to_string(),
             })?;
             let point = TuningPoint::new(spec, inputs)?
-                .timed(&self.device)
+                .timed(&self.charges)
                 .map_err(|error| TuneError::Inputs {
                     point: spec.label.clone(),
                     detail: error.to_string(),
@@ -5387,12 +5397,12 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             &self.implementation,
             &self.statics,
             &self.default,
-            point_shapes(&self.device, &self.logical, &points)?,
+            point_shapes(self.charges.device(), &self.logical, &points)?,
         )?;
         // The record names the domain surveyed.
         self.unit.parameters = entry_parameters(&domain.implementation);
         let formation = Formation {
-            device: &self.device,
+            charges: &self.charges,
             module: self.module,
             entry: self.entry,
             logical: &self.logical,
@@ -5759,7 +5769,7 @@ impl Programs {
             .map(|specialization| match self {
                 // Assembled from the held launch programs: nothing compiles.
                 Self::Launches(_) => NativePrepared::prepare_implementation(
-                    formation.device,
+                    formation.charges.device(),
                     formation.module,
                     formation.entry,
                     formation.logical,
@@ -7513,7 +7523,7 @@ impl Tuned<'_> {
         let mut time = TuningTime::default();
         // A survey measures and times every configuration whatever its
         // verdict, and prices nothing.
-        let mut surveyor = PointSurveyor::new(self.formation.implementation, false);
+        let mut surveyor = PointSurveyor::new(self.formation.implementation, false, self.formation.charges);
         // A survey resolves no comparison and names no error rate. Its
         // device is raised at the rate one of its samples stands for: what
         // the samples of a point can tell apart at all.
@@ -9580,7 +9590,7 @@ mod tests {
     fn recorded(points: usize) -> Recorded {
         let (logical, default, kernel) = project_kernel();
         let requirement = NumericalRequirement::BitExact;
-        let validator = Validator::new(&logical, &[], &requirement, &kernel);
+        let validator = Validator::new(&logical, &[], &requirement, &kernel, &crate::memory::Charges::tally(&kernel.public_device));
         let canonical = timed(points, |_| 0, |_| 1.);
         let cost = Weighing {
             weights: vec![1.; points],
@@ -10112,7 +10122,8 @@ mod tests {
         let default = implementation
             .default_specialization_without_device(&NativeSpecialization::new()).unwrap()
             .unwrap();
-        let surveyor = PointSurveyor::new(&implementation, false);
+        let device = crate::devices::Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+        let surveyor = PointSurveyor::new(&implementation, false, &crate::memory::Charges::tally(&device));
         let key = |working: Vec<usize>, specialization: &NativeSpecialization| {
             surveyor.keying.key(&implementation, working, specialization)
         };
@@ -10404,8 +10415,9 @@ mod tests {
         observed.observe((FormationClass::Compiled, 1), Duration::from_secs(5));
         observed.observe((FormationClass::Kept, 0), Duration::from_millis(1));
         let price = Mutex::new(observed);
+        let charges = Charges::tally(&device);
         let formation = Formation {
-            device: &device,
+            charges: &charges,
             module: &module,
             entry,
             logical: &logical,

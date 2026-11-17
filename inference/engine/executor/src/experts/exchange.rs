@@ -224,7 +224,7 @@ mod tests {
         let module = module();
         let device = crate::test_support::open_backend(&Devices::discover(&[]).unwrap(), BackendName::Cpu).unwrap();
         let table = SlotTable::file(1, 1);
-        let slots = ExchangeTable::new(Tensor::shared(&device, Element::i32(), &[table.words()]).unwrap(), table, &Pulse::new()).unwrap();
+        let slots = ExchangeTable::new(Tensor::shared(&seismic::Charges::tally(&device), Element::i32(), &[table.words()]).unwrap(), table, &Pulse::new()).unwrap();
         let q = (7u64 << 32) | 5;
         let states = [0, q - 1, q, q + 1, q | FAILED, (q - 1) | FAILED, (q + 1) | FAILED];
         for &request in &states[..4] {
@@ -243,7 +243,7 @@ mod tests {
     fn an_answer_only_moves_forward() {
         let device = crate::test_support::open_backend(&Devices::discover(&[]).unwrap(), BackendName::Cpu).unwrap();
         let table = SlotTable::scratch(2, 2);
-        let slots = ExchangeTable::new(Tensor::shared(&device, Element::i32(), &[table.words()]).unwrap(), table, &Pulse::new()).unwrap();
+        let slots = ExchangeTable::new(Tensor::shared(&seismic::Charges::tally(&device), Element::i32(), &[table.words()]).unwrap(), table, &Pulse::new()).unwrap();
         let lane = constants::SCRATCH_ROUND;
         slots.request(5, lane);
         assert!(!slots.answered(5, lane));
@@ -268,7 +268,7 @@ mod tests {
     fn a_table_pulses_from_its_making() {
         let device = crate::test_support::open_backend(&Devices::discover(&[]).unwrap(), BackendName::Cpu).unwrap();
         let table = SlotTable::scratch(3, 2);
-        let slots = ExchangeTable::new(Tensor::shared(&device, Element::i32(), &[table.words()]).unwrap(), table, &Pulse::new()).unwrap();
+        let slots = ExchangeTable::new(Tensor::shared(&seismic::Charges::tally(&device), Element::i32(), &[table.words()]).unwrap(), table, &Pulse::new()).unwrap();
         let beats = || {
             (0..table.slots())
                 .flat_map(|slot| (0..table.lanes()).map(move |lane| (slot, lane)))

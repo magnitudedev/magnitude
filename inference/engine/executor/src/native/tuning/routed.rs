@@ -547,7 +547,7 @@ pub(crate) fn tier_experts(bank: BankBinding) -> u64 {
 
 /// Zeroed i32 words of `extents`, host-shared as the bank holds them.
 pub(crate) fn words(inputs: &TuningInputs<'_, '_>, extents: &[u64]) -> Result<Tensor, BuildError> {
-    Ok(Tensor::shared(inputs.device, Element::i32(), extents)?)
+    Ok(Tensor::shared(inputs.charges, Element::i32(), extents)?)
 }
 
 /// Words of `extents` whose record word (`record` of each row of `width`

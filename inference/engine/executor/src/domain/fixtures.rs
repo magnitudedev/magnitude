@@ -280,13 +280,13 @@ pub fn fixture(control: Option<PendingControl>) -> Fixture {
 /// (`LayerRef::Head(0)`, the history a head launch appends): 64 rows per
 /// 64 KiB slab, 8192 rows, one slab backed, its slabs granules of `pool`. It
 /// grows independently of the target model.
-fn spare_head_store(device: Rc<seismic::Device>, pool: seismic::Pool) -> StoreBindings {
+fn spare_head_store(charges: &seismic::Charges, pool: seismic::Pool) -> StoreBindings {
     use magnitude_state::{
         BankCapacity, CodecSpec, ComponentDescriptor, HistoryDomainLayout, HistoryDomainPlan,
         LayerRef,
     };
     StateStore::new(
-        device,
+        charges,
         pool,
         8192,
         8192,
@@ -412,7 +412,7 @@ pub fn fixture_over(
     .unwrap();
     let mut programs = AttestedPrograms::prepare_draft(
         &draft,
-        &device,
+        &seismic::Charges::tally(&device),
         crate::TuningContext {
             definition: &definition,
             weights: &crate::ZeroTuningWeights,
@@ -474,10 +474,10 @@ pub fn fixture_over(
         .expect("the fixture's device opens its state pool");
     let scratch = crate::memory::ClaimDemand { device: execution.resources().bytes().scratch, ..Default::default() };
     let arena = crate::memory::ledger::CommittedKind::Arena;
-    let resources = fixture_charged(&device, &ledgers, &mut recorded, arena, scratch, || {
+    let resources = fixture_charged(&device, &ledgers, &mut recorded, arena, scratch, |charges| {
         ResourceAllocator::allocate(
             &execution,
-            &device,
+            charges,
             id,
             &target_graphs,
             &target_readout_graphs,
@@ -500,11 +500,11 @@ pub fn fixture_over(
     let head_tables = head_plan.map_or(0, |state| state.table_bytes().unwrap());
     let tables = crate::memory::ClaimDemand { device: target_state.table_bytes().unwrap() + head_tables, ..Default::default() };
     let kind = crate::memory::ledger::CommittedKind::StateTables;
-    let (store, head) = fixture_charged(&device, &ledgers, &mut recorded, kind, tables, || {
-        let store = target_state.allocate(device.clone(), pool.clone());
+    let (store, head) = fixture_charged(&device, &ledgers, &mut recorded, kind, tables, |charges| {
+        let store = target_state.allocate(charges, pool.clone());
         let head = match head_plan {
-            Some(state) => Some(state.allocate(device.clone(), pool.clone()).unwrap()),
-            None => head.then(|| spare_head_store(device.clone(), pool.clone())),
+            Some(state) => Some(state.allocate(charges, pool.clone()).unwrap()),
+            None => head.then(|| spare_head_store(charges, pool.clone())),
         };
         (store, head)
     });
@@ -542,10 +542,7 @@ pub fn fixture_over(
 /// counts and which lies within it.
 pub fn request_slot(ledgers: &crate::memory::ledger::DeviceLedgers, device: &seismic::Device, execution: &ExecutionPlan, spare: u64) -> crate::memory::ledger::Claim {
     let slot = crate::memory::ClaimDemand { device: super::request_slot_bytes(execution).unwrap() + spare, ..Default::default() };
-    ledgers
-        .claim(device, crate::memory::ledger::CommittedKind::RequestSlot, slot)
-        .expect("the fixture's ledgers hold its request slot")
-        .into_request_slot()
+    ledgers.claim_request_slot(device, slot).expect("the fixture's ledgers hold its request slot")
 }
 
 /// The bytes a request of `domain`'s load holds once reserved through
@@ -568,21 +565,21 @@ pub fn reservation_rows<F: ProgramFamily>(domain: &ExecutorDomain<F>, request: R
 
 /// `make`, an allocation a load makes as it starts, under its claim of
 /// `demand` on `ledgers` as `kind` (the load's own, or the arena's): every
-/// allocation Seismic makes in it charged to the claim
-/// (`seismic::memory::charging`) within one change of the ledgers' scope,
-/// and the claim recorded in `recorded`.
+/// allocation it makes through the charges it is given charged to the
+/// claim within one change of the ledgers' scope, and the claim recorded in
+/// `recorded`.
 pub(crate) fn fixture_charged<T>(
     device: &seismic::Device,
     ledgers: &crate::memory::ledger::DeviceLedgers,
     recorded: &mut crate::memory::ledger::Recorded,
     kind: crate::memory::ledger::CommittedKind,
     demand: crate::memory::ClaimDemand,
-    make: impl FnOnce() -> T,
+    make: impl FnOnce(&seismic::Charges) -> T,
 ) -> T {
     let mut held = ledgers
         .claim(device, kind, demand)
         .expect("the fixture's ledgers hold what it allocates");
-    let made = held.allocate(make);
+    let made = held.allocate(device, make);
     recorded.record(held);
     made
 }
@@ -601,8 +598,7 @@ fn fixture_pool(
     let granule = FAKE_BANK_GRANULE;
     let entries = ledgers.device().pool_block(class, std::num::NonZeroU64::new(granule).expect("a granule"));
     let entry = entries.blocks.clone();
-    let pool = device
-        .pool(seismic::Contract::DeviceOnly, granule, granule, entries)
+    let pool = seismic::Pool::open(&entries.charges(device, seismic::Contract::DeviceOnly), seismic::Contract::DeviceOnly, granule, granule)
         .unwrap_or_else(|error| panic!("the fixture's device opens its store's {class:?} pool: {error}"));
     (pool, entry)
 }
@@ -685,7 +681,7 @@ fn with_bank((mut domain, bindings): Fixture, backend: seismic::BackendName, row
     // The bank's slots lie in its store's records pool, as a load's records do.
     let (pool, entry) = fixture_pool(domain.domain.device(), domain.resources.ledgers(), crate::memory::ledger::PoolClass::Records);
     let region = [seismic::SlabRegion { element: seismic::Element::bool(), row_shape: vec![pool.granule()] }];
-    let slots = seismic::SlabTensor::in_pool(&pool, 1, rows, &region)
+    let slots = seismic::SlabTensor::in_pool(&seismic::Charges::tally(domain.domain.device()), &pool, 1, rows, &region)
         .unwrap_or_else(|error| panic!("{backend:?}: the device's pool holds the bank: {error}"));
     let bank = FakeBank::new(slots, domain.resources.ledgers().changes().clone());
     bank.hold_cache(domain.resources.ledgers(), entry, committed);
@@ -1581,6 +1577,18 @@ impl ElasticBank for FakeBank {
 }
 
 impl TestFamily {
+    /// As the bank's watcher takes or gives back a group's places
+    /// (`ExpertBank::hold_places`): only between flights, an invariant
+    /// broken while a step of the bank runs.
+    fn in_gap(&self) -> Result<(), String> {
+        match &self.bank {
+            Some(bank) if !bank.in_gap() => {
+                Err(format!("a bank resize while {} steps run", bank.steps.load(std::sync::atomic::Ordering::Relaxed)))
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn submit<L, W, O>(&self, core: L, workspace: W, output: O) -> TestSubmission<L, W, O> {
         match &self.control {
             Some(control) => TestSubmission::Pending(PendingSubmission {
@@ -1599,10 +1607,10 @@ impl ProgramFamily for TestFamily {
     type VisionSubmission = PendingFailureSubmission<CompletedVisionWork>;
     type StateSubmission =
         ReadySubmission<crate::StateLaunchCore, crate::NativeGraphWorkspaceLease, ()>;
-    fn bind_head(&mut self, _: crate::ResidentHead, _: &ModelDefinition) -> Result<(), String> {
+    fn bind_head(&mut self, _: &seismic::Charges, _: crate::ResidentHead, _: &ModelDefinition) -> Result<(), String> {
         Ok(())
     }
-    fn bind_vision(&mut self, _: crate::ResidentVision, _: &ModelDefinition) -> Result<(), String> {
+    fn bind_vision(&mut self, _: &seismic::Charges, _: crate::ResidentVision, _: &ModelDefinition) -> Result<(), String> {
         Ok(())
     }
     fn head_is_bound(&self) -> bool {
@@ -1631,17 +1639,17 @@ impl ProgramFamily for TestFamily {
         self.bank.as_ref().map(|bank| bank as &dyn ElasticBank)
     }
 
-    /// As the bank's watcher takes a group's places
-    /// (`ExpertBank::hold_places`): only between flights, an invariant
-    /// broken while a step of the bank runs.
-    fn hold_group(&self, _places: usize, _quiet: super::Quiet) -> Result<(), crate::resources::AllocationError> {
-        match &self.bank {
-            Some(bank) if !bank.in_gap() => Err(crate::resources::AllocationError::Plan(crate::error::InvariantError {
-                context: "a group's places",
-                detail: format!("a bank resize while {} steps run", bank.steps.load(std::sync::atomic::Ordering::Relaxed)),
-            })),
-            _ => Ok(()),
-        }
+    fn hold_group(
+        &self,
+        _charges: &seismic::Charges,
+        _places: std::num::NonZeroUsize,
+        _quiet: super::Quiet,
+    ) -> Result<(), crate::resources::AllocationError> {
+        self.in_gap().map_err(|detail| crate::resources::AllocationError::Plan(crate::error::InvariantError { context: "a group's places", detail }))
+    }
+
+    fn release_group(&self, _quiet: super::Quiet) -> Result<(), String> {
+        self.in_gap()
     }
 
     fn prepared_program_bytes(&self) -> u64 {

@@ -48,12 +48,12 @@ fn search_hinted(hints: &[(&str, u64)]) -> Strategy {
     Strategy::Search(plan)
 }
 
-fn f32_tensor(device: &Device, extents: &[u64], values: &[f32]) -> Tensor {
+fn f32_tensor(charges: &seismic::Charges, extents: &[u64], values: &[f32]) -> Tensor {
     let bytes = values
         .iter()
         .flat_map(|value| value.to_le_bytes())
         .collect::<Vec<_>>();
-    Tensor::from_host(device, Element::f32(), extents, &bytes).expect("host tensor")
+    Tensor::from_host(charges, Element::f32(), extents, &bytes).expect("host tensor")
 }
 
 fn read_f32(tensor: &Tensor) -> Vec<f32> {
@@ -94,6 +94,7 @@ fn metal_launch_scopes_form_and_execute_independently() {
     let Some(device) = seismic_native_tests::fresh_device(BackendName::Metal) else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let implementation = scoped_scale::native_implementation(&device)
         .unwrap()
         .expect("Metal has the scoped fixture");
@@ -113,9 +114,9 @@ fn metal_launch_scopes_form_and_execute_independently() {
         let kernel = scoped_scale::native_for_device(&device, &specialization)
             .expect("each scoped Metal specialization forms");
         let values = exact_values(rows);
-        let x = f32_tensor(&device, &[rows as u64], &values);
+        let x = f32_tensor(&charges, &[rows as u64], &values);
         let result = kernel
-            .call(scoped_scale::Args { x: &x })
+            .call(&charges, scoped_scale::Args { x: &x })
             .expect("scoped call");
         let expected = values.iter().map(|value| value * 2.0).collect::<Vec<_>>();
         assert_eq!(read_f32(&result.value), expected);
@@ -130,14 +131,15 @@ fn metal_launch_dispatches_the_grid_it_reads() {
     let Some(device) = seismic_native_tests::fresh_device(BackendName::Metal) else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let kernel = marked_groups::native_for_device(&device, &NativeSpecialization::new())
         .expect("Metal has the grid fixture");
     let words = |values: &[i32]| values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
     for groups in [0i32, 3, 8] {
-        let grid = Tensor::from_host(&device, Element::i32(), &[3], &words(&[groups, 1, 1])).unwrap();
-        let mut marks = Tensor::from_host(&device, Element::i32(), &[8], &words(&[7; 8])).unwrap();
+        let grid = Tensor::from_host(&charges, Element::i32(), &[3], &words(&[groups, 1, 1])).unwrap();
+        let mut marks = Tensor::from_host(&charges, Element::i32(), &[8], &words(&[7; 8])).unwrap();
         kernel
-            .call(marked_groups::Args {
+            .call(&charges, marked_groups::Args {
                 grid: &grid,
                 marks: &mut marks,
             })
@@ -162,14 +164,15 @@ fn metal_launch_dispatches_the_grid_it_reads() {
 fn a_launch_dispatches_the_grid_its_call_wrote() {
     let words = |values: &[i32]| values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
     for device in seismic_native_tests::every_device() {
+        let charges = seismic::Charges::tally(&device);
         let kernel = written_marks::native_for_device(&device, &NativeSpecialization::new())
             .expect("every backend has the written-grid fixture");
         for (n, count) in [(8u64, 0i32), (8, 3), (8, 8), (4096, 4093)] {
-            let count_tensor = Tensor::from_host(&device, Element::i32(), &[1], &words(&[count])).unwrap();
+            let count_tensor = Tensor::from_host(&charges, Element::i32(), &[1], &words(&[count])).unwrap();
             let mut marks =
-                Tensor::from_host(&device, Element::i32(), &[2, n], &words(&vec![7; 2 * n as usize])).unwrap();
+                Tensor::from_host(&charges, Element::i32(), &[2, n], &words(&vec![7; 2 * n as usize])).unwrap();
             kernel
-                .call(written_marks::Args {
+                .call(&charges, written_marks::Args {
                     count: &count_tensor,
                     marks: &mut marks,
                 })
@@ -194,9 +197,11 @@ fn metal_launch_grid_binds_no_slab_view() {
     let Some(device) = seismic_native_tests::fresh_device(BackendName::Metal) else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let kernel = marked_groups::native_for_device(&device, &NativeSpecialization::new())
         .expect("Metal has the grid fixture");
     let slabs = seismic::SlabTensor::in_pool(
+        &charges,
         &seismic_native_tests::pool(&device),
         3,
         3,
@@ -208,8 +213,8 @@ fn metal_launch_grid_binds_no_slab_view() {
     .unwrap();
     slabs.add_slab(seismic::SlabFill::Zeroed).unwrap();
     let grid = slabs.logical_region(0).unwrap();
-    let mut marks = Tensor::from_host(&device, Element::i32(), &[8], &[0; 32]).unwrap();
-    match kernel.call(marked_groups::Args {
+    let mut marks = Tensor::from_host(&charges, Element::i32(), &[8], &[0; 32]).unwrap();
+    match kernel.call(&charges, marked_groups::Args {
         grid: &grid,
         marks: &mut marks,
     }) {
@@ -232,7 +237,7 @@ fn metal_launch_grid_binds_no_slab_view() {
     let plan = graph.seal().unwrap();
     let mut bindings = plan.bindings();
     assert_eq!(
-        bindings.set(&port, &grid),
+        bindings.set(&charges, &port, &grid),
         Err(seismic::WorkflowError::NativePortSlabGrid { port: 0 })
     );
 }
@@ -244,8 +249,9 @@ fn serving_the_tuned_choice_forms_nothing_again() {
     let Some(device) = seismic_native_tests::fresh_device(BackendName::Metal) else {
         return;
     };
-    let small = f32_tensor(&device, &[7], &exact_values(7));
-    let large = f32_tensor(&device, &[35], &exact_values(35));
+    let charges = seismic::Charges::tally(&device);
+    let small = f32_tensor(&charges, &[7], &exact_values(7));
+    let large = f32_tensor(&charges, &[35], &exact_values(35));
     let point = |label: &str, x| TuningPoint {
         label: label.into(),
         weight: 1.0,
@@ -257,7 +263,7 @@ fn serving_the_tuned_choice_forms_nothing_again() {
         written: Default::default(),
     };
     let result = scoped_scale::native_tune(
-        &device,
+        &charges,
         &NativeSpecialization::new(),
         vec![point("m7", &small), point("m35", &large)],
         NumericalRequirement::BitExact,
@@ -275,8 +281,9 @@ fn metal_scoped_tuning_searches_launches_separately() {
     let Some(device) = seismic_native_tests::fresh_device(BackendName::Metal) else {
         return;
     };
-    let small = f32_tensor(&device, &[7], &exact_values(7));
-    let large = f32_tensor(&device, &[35], &exact_values(35));
+    let charges = seismic::Charges::tally(&device);
+    let small = f32_tensor(&charges, &[7], &exact_values(7));
+    let large = f32_tensor(&charges, &[35], &exact_values(35));
     let points = vec![
         TuningPoint {
             label: "m7".into(),
@@ -300,7 +307,7 @@ fn metal_scoped_tuning_searches_launches_separately() {
         },
     ];
     let result = scoped_scale::native_tune(
-        &device,
+        &charges,
         &NativeSpecialization::new(),
         points,
         NumericalRequirement::BitExact,
@@ -324,7 +331,7 @@ fn metal_scoped_tuning_searches_launches_separately() {
     let kernel =
         scoped_scale::native_for_device(&device, &result.overall.specialization()).unwrap();
     for (tensor, count) in [(&small, 7), (&large, 35)] {
-        let result = kernel.call(scoped_scale::Args { x: tensor }).unwrap();
+        let result = kernel.call(&charges, scoped_scale::Args { x: tensor }).unwrap();
         assert_eq!(
             read_f32(&result.value),
             exact_values(count)
@@ -351,8 +358,9 @@ fn metal_compiles_run_ahead_on_another_thread_and_the_piece_then_compiles_nothin
     let Some(device) = seismic_native_tests::devices_with(&[BackendName::Metal], own).pop() else {
         return;
     };
-    let small = f32_tensor(&device, &[7], &exact_values(7));
-    let large = f32_tensor(&device, &[35], &exact_values(35));
+    let charges = seismic::Charges::tally(&device);
+    let small = f32_tensor(&charges, &[7], &exact_values(7));
+    let large = f32_tensor(&charges, &[35], &exact_values(35));
     let point = |label: &str, x| TuningPoint {
         label: label.into(),
         weight: 1.0,
@@ -365,7 +373,7 @@ fn metal_compiles_run_ahead_on_another_thread_and_the_piece_then_compiles_nothin
     };
     let mut source = vec![point("m7", &small), point("m35", &large)];
     let mut unit = scoped_scale::native_search(
-        &device,
+        &charges,
         &NativeSpecialization::new(),
         NumericalRequirement::BitExact,
     )
@@ -475,8 +483,9 @@ fn metal_scoped_tuning_without_budget_serves_its_formed_defaults() {
     let Some(device) = seismic_native_tests::fresh_device(BackendName::Metal) else {
         return;
     };
-    let small = f32_tensor(&device, &[7], &exact_values(7));
-    let large = f32_tensor(&device, &[35], &exact_values(35));
+    let charges = seismic::Charges::tally(&device);
+    let small = f32_tensor(&charges, &[7], &exact_values(7));
+    let large = f32_tensor(&charges, &[35], &exact_values(35));
     let points = vec![
         TuningPoint {
             label: "m7".into(),
@@ -504,7 +513,7 @@ fn metal_scoped_tuning_without_budget_serves_its_formed_defaults() {
     };
     plan.allowance = Duration::ZERO;
     let result = scoped_scale::native_tune(
-        &device,
+        &charges,
         &NativeSpecialization::new(),
         points,
         NumericalRequirement::BitExact,
@@ -521,10 +530,11 @@ fn metal_scoped_tuning_without_budget_serves_its_formed_defaults() {
 #[test]
 fn every_admissible_split_sum_configuration_matches_the_reference() {
     for device in seismic_native_tests::every_device() {
+        let charges = seismic::Charges::tally(&device);
         let n = 1000usize;
         let values = exact_values(n);
         let expected: f32 = values.iter().sum();
-        let x = f32_tensor(&device, &[n as u64], &values);
+        let x = f32_tensor(&charges, &[n as u64], &values);
         let implementation = split_sum::native_implementation(&device)
             .expect("bundle")
             .expect("split_sum has an implementation on every backend");
@@ -540,7 +550,7 @@ fn every_admissible_split_sum_configuration_matches_the_reference() {
                 split_sum::native_for_device(&device, &configuration).unwrap_or_else(|error| {
                     panic!("{configuration:?} on {:?}: {error}", device.backend())
                 });
-            let result = kernel.call(split_sum::Args { x: &x }).expect("call");
+            let result = kernel.call(&charges, split_sum::Args { x: &x }).expect("call");
             assert_eq!(
                 read_f32(&result.value),
                 [expected],
@@ -590,13 +600,14 @@ fn specialization_errors_are_typed_at_preparation() {
 #[test]
 fn a_call_whose_static_dimension_differs_is_rejected() {
     for device in seismic_native_tests::every_device() {
+        let charges = seismic::Charges::tally(&device);
         let kernel = split_sum::native_for_device(
             &device,
             &statics(64).with_param("PARTS", 2).with_param("WIDTH", 32),
         )
         .unwrap();
-        let x = f32_tensor(&device, &[63], &exact_values(63));
-        match kernel.call(split_sum::Args { x: &x }) {
+        let x = f32_tensor(&charges, &[63], &exact_values(63));
+        match kernel.call(&charges, split_sum::Args { x: &x }) {
             Err(CallError::Invocation(InvocationError::StaticDimension {
                 dimension,
                 expected,
@@ -615,6 +626,7 @@ fn a_call_whose_static_dimension_differs_is_rejected() {
 #[test]
 fn graph_runs_submit_without_waiting_and_keep_their_inputs() {
     for device in seismic_native_tests::every_device() {
+        let charges = seismic::Charges::tally(&device);
         let (m, n) = (5u64, 37u64);
         let kernel = scale_rows::native_for_device(
             &device,
@@ -648,7 +660,7 @@ fn graph_runs_submit_without_waiting_and_keep_their_inputs() {
         assert!(plan.upload_bytes() >= m * n * 4);
         let family = NativeGraphFamily::new(&[plan.clone()], 1).unwrap();
         // One upload region per run kept in flight below.
-        let mut slot = family.new_slot(&[family.upload_bytes(); 3]).unwrap();
+        let mut slot = family.new_slot(&charges, &[family.upload_bytes(); 3]).unwrap();
         let mut runs = Vec::new();
         for run in 0..3u64 {
             let values = (0..m * n)
@@ -658,7 +670,7 @@ fn graph_runs_submit_without_waiting_and_keep_their_inputs() {
                 .iter()
                 .flat_map(|value| value.to_le_bytes())
                 .collect::<Vec<_>>();
-            let outputs = family.new_output_slot().unwrap().activate(&plan).unwrap();
+            let outputs = family.new_output_slot(&charges).unwrap().activate(&plan).unwrap();
             let mut active = slot.activate(&plan).unwrap();
             active.write_input(&input, &bytes).unwrap();
             let (outputs, completion) = active
@@ -680,16 +692,17 @@ fn graph_runs_submit_without_waiting_and_keep_their_inputs() {
 #[test]
 fn measurement_reports_device_time() {
     for device in seismic_native_tests::every_device() {
+        let charges = seismic::Charges::tally(&device);
         let kernel = split_sum::native_for_device(
             &device,
             &statics(4096).with_param("PARTS", 4).with_param("WIDTH", 64),
         )
         .unwrap();
         let rotation = (0..3)
-            .map(|_| f32_tensor(&device, &[4096], &exact_values(4096)))
+            .map(|_| f32_tensor(&charges, &[4096], &exact_values(4096)))
             .collect::<Vec<_>>();
         let point = kernel
-            .point(rotation.iter().map(|x| split_sum::Args { x }).collect())
+            .point(&charges, rotation.iter().map(|x| split_sum::Args { x }).collect())
             .unwrap();
         assert!(point.rotation_bytes() >= 3 * 4096 * 4);
         let measurement = measure(
@@ -709,9 +722,10 @@ fn measurement_reports_device_time() {
 #[test]
 fn tuning_searches_from_the_defaults_and_validates_its_choice() {
     for device in seismic_native_tests::every_device() {
+        let charges = seismic::Charges::tally(&device);
         let n = 4096u64;
         let inputs = (0..2)
-            .map(|_| f32_tensor(&device, &[n], &exact_values(n as usize)))
+            .map(|_| f32_tensor(&charges, &[n], &exact_values(n as usize)))
             .collect::<Vec<_>>();
         fn points(inputs: &[Tensor]) -> Vec<TuningPoint<'_, split_sum::Entry>> {
             vec![
@@ -738,7 +752,7 @@ fn tuning_searches_from_the_defaults_and_validates_its_choice() {
             ]
         }
         let result = split_sum::native_tune(
-            &device,
+            &charges,
             &statics(n),
             points(&inputs),
             NumericalRequirement::BitExact,
@@ -813,7 +827,7 @@ fn tuning_searches_from_the_defaults_and_validates_its_choice() {
         let kernel =
             split_sum::native_for_device(&device, &result.overall.specialization()).unwrap();
         let value = kernel
-            .call(split_sum::Args { x: &inputs[0] })
+            .call(&charges, split_sum::Args { x: &inputs[0] })
             .unwrap()
             .value;
         assert_eq!(
@@ -826,7 +840,7 @@ fn tuning_searches_from_the_defaults_and_validates_its_choice() {
         // program formed whole decides the work at each point: each point
         // holds every configuration of the domain.
         let survey = split_sum::native_tune(
-            &device,
+            &charges,
             &statics(n),
             points(&inputs),
             NumericalRequirement::BitExact,
@@ -872,15 +886,16 @@ fn surveyed(survey: &TuningResult) -> &SurveyRecord {
 #[test]
 fn a_search_freezes_all_positive_demand_representatives_before_candidates() {
     let Some(device) = seismic_native_tests::fresh_device(BackendName::Cpu) else { return };
+    let charges = seismic::Charges::tally(&device);
     let n = 4096u64;
-    let short = f32_tensor(&device, &[n], &exact_values(n as usize));
-    let long = f32_tensor(&device, &[n], &exact_values(n as usize));
+    let short = f32_tensor(&charges, &[n], &exact_values(n as usize));
+    let long = f32_tensor(&charges, &[n], &exact_values(n as usize));
     let tune = || {
         let Strategy::Search(plan) = search() else {
             unreachable!()
         };
         split_sum::native_tune(
-            &device,
+            &charges,
             &statics(n),
             vec![
                 TuningPoint {
@@ -943,8 +958,9 @@ fn already_expired_work_keeps_an_unmeasured_default_without_running_witnesses() 
     use std::cell::Cell;
     use std::rc::Rc;
     let Some(device) = seismic_native_tests::fresh_device(BackendName::Cpu) else { return };
+    let charges = seismic::Charges::tally(&device);
     let n = 64u64;
-    let x = f32_tensor(&device, &[n], &vec![1.; n as usize]);
+    let x = f32_tensor(&charges, &[n], &vec![1.; n as usize]);
     let resets = Rc::new(Cell::new(0));
     let counted = resets.clone();
     let mut source = vec![TuningPoint {
@@ -961,7 +977,7 @@ fn already_expired_work_keeps_an_unmeasured_default_without_running_witnesses() 
         written: Default::default(),
     }];
     let mut unit =
-        split_sum::native_search(&device, &statics(n), NumericalRequirement::BitExact).unwrap();
+        split_sum::native_search(&charges, &statics(n), NumericalRequirement::BitExact).unwrap();
     unit.prepare_defaults(&mut source).unwrap();
     let Strategy::Search(plan) = search() else {
         unreachable!()
@@ -989,9 +1005,10 @@ fn expiry_during_reset_preserves_the_choice_without_rejecting_the_candidate() {
     use std::rc::Rc;
     use std::time::Instant;
     let Some(device) = seismic_native_tests::fresh_device(BackendName::Cpu) else { return };
+    let charges = seismic::Charges::tally(&device);
     let n = 64u64;
-    let first = f32_tensor(&device, &[n], &vec![1.; n as usize]);
-    let second = f32_tensor(&device, &[n], &exact_values(n as usize));
+    let first = f32_tensor(&charges, &[n], &vec![1.; n as usize]);
+    let second = f32_tensor(&charges, &[n], &exact_values(n as usize));
     let countdown = Rc::new(Cell::new(0usize));
     let deadline = Rc::new(Cell::new(None::<Instant>));
     let counter = countdown.clone();
@@ -1022,7 +1039,7 @@ fn expiry_during_reset_preserves_the_choice_without_rejecting_the_candidate() {
         written: Default::default(),
     }];
     let mut unit =
-        split_sum::native_search(&device, &statics(n), NumericalRequirement::BitExact).unwrap();
+        split_sum::native_search(&charges, &statics(n), NumericalRequirement::BitExact).unwrap();
     unit.prepare_defaults(&mut source).unwrap();
     let Strategy::Search(plan) = search() else {
         unreachable!()
@@ -1079,14 +1096,15 @@ fn a_numerical_observation_is_made_once_per_point_and_key() {
     use std::cell::Cell;
     use std::rc::Rc;
     let Some(device) = seismic_native_tests::fresh_device(BackendName::Cpu) else { return };
+    let charges = seismic::Charges::tally(&device);
     // At 32 the staged launch alone works, whatever `SMALL` is: the mirrored
     // launch's participant count changes nothing there. At 200 the mirrored
     // launch works where `SMALL` is 64, so that count is surveyed there.
     let sizes = [32u64, 200];
     let witnesses = sizes.map(|n| {
         [
-            f32_tensor(&device, &[n], &exact_values(n as usize)),
-            f32_tensor(&device, &[n], &vec![1.; n as usize]),
+            f32_tensor(&charges, &[n], &exact_values(n as usize)),
+            f32_tensor(&charges, &[n], &vec![1.; n as usize]),
         ]
     });
     let resets = Rc::new(Cell::new(0usize));
@@ -1114,7 +1132,7 @@ fn a_numerical_observation_is_made_once_per_point_and_key() {
         })
         .collect::<Vec<_>>();
     let survey = gated_sum::native_tune(
-        &device,
+        &charges,
         &NativeSpecialization::new(),
         points,
         NumericalRequirement::BitExact,
@@ -1216,9 +1234,10 @@ fn the_census_retains_the_default_at_its_performance_invocations() {
     use std::cell::Cell;
     use std::rc::Rc;
     let Some(device) = seismic_native_tests::fresh_device(BackendName::Cpu) else { return };
+    let charges = seismic::Charges::tally(&device);
     let n = 64u64;
-    let first = f32_tensor(&device, &[n], &vec![1.; n as usize]);
-    let adversarial = f32_tensor(&device, &[n], &exact_values(n as usize));
+    let first = f32_tensor(&charges, &[n], &vec![1.; n as usize]);
+    let adversarial = f32_tensor(&charges, &[n], &exact_values(n as usize));
     let census = |workload, invocations: usize| {
         let resets = Rc::new(Cell::new(0));
         let observed = resets.clone();
@@ -1239,7 +1258,7 @@ fn the_census_retains_the_default_at_its_performance_invocations() {
             written: Default::default(),
         }];
         let mut unit =
-            split_sum::native_search(&device, &statics(n), NumericalRequirement::BitExact).unwrap();
+            split_sum::native_search(&charges, &statics(n), NumericalRequirement::BitExact).unwrap();
         unit.prepare_defaults(&mut points).unwrap();
         let Strategy::Search(plan) = search() else {
             unreachable!()
@@ -1273,8 +1292,9 @@ fn the_census_retains_the_default_at_its_performance_invocations() {
 #[test]
 fn canonical_discovery_transports_the_frozen_objective_without_remeasurement() {
     let Some(device) = seismic_native_tests::fresh_device(BackendName::Cpu) else { return };
+    let charges = seismic::Charges::tally(&device);
     let n = 4096u64;
-    let x = f32_tensor(&device, &[n], &exact_values(n as usize));
+    let x = f32_tensor(&charges, &[n], &exact_values(n as usize));
     let points = || {
         [("short", 1.0), ("required", 2.0), ("long", 3.0)]
             .into_iter()
@@ -1303,7 +1323,7 @@ fn canonical_discovery_transports_the_frozen_objective_without_remeasurement() {
     };
     // Direct tuning uses every positive-demand point as a representative.
     let mut unit =
-        split_sum::native_search(&device, &statics(n), NumericalRequirement::BitExact).unwrap();
+        split_sum::native_search(&charges, &statics(n), NumericalRequirement::BitExact).unwrap();
     let mut source = points();
     let Strategy::Search(plan) = search() else {
         unreachable!()
@@ -1430,14 +1450,15 @@ fn canonical_discovery_transports_the_frozen_objective_without_remeasurement() {
 #[test]
 fn a_spent_budget_still_forms_and_serves_the_canonical_defaults() {
     let Some(device) = seismic_native_tests::fresh_device(BackendName::Cpu) else { return };
+    let charges = seismic::Charges::tally(&device);
     let n = 4096u64;
-    let x = f32_tensor(&device, &[n], &exact_values(n as usize));
+    let x = f32_tensor(&charges, &[n], &exact_values(n as usize));
     let Strategy::Search(mut plan) = search() else {
         unreachable!()
     };
     plan.allowance = Duration::ZERO;
     let result = split_sum::native_tune(
-        &device,
+        &charges,
         &statics(n),
         vec![
             TuningPoint {
@@ -1479,16 +1500,17 @@ fn a_spent_budget_still_forms_and_serves_the_canonical_defaults() {
 #[test]
 fn a_search_choice_passes_validation_at_every_point_or_gives_way_to_the_defaults() {
     let Some(device) = seismic_native_tests::fresh_device(BackendName::Cpu) else { return };
+    let charges = seismic::Charges::tally(&device);
     let n = 4096u64;
     // Exact values sum exactly in any order; these do not, so a
     // configuration that reorders the sum fails the exact policy here.
     let inexact = (0..n)
         .map(|index| 1.0 + (index as f32) * 1.0e-3 + 1.0 / (index as f32 + 3.0))
         .collect::<Vec<_>>();
-    let timed = f32_tensor(&device, &[n], &exact_values(n as usize));
-    let validated = f32_tensor(&device, &[n], &inexact);
+    let timed = f32_tensor(&charges, &[n], &exact_values(n as usize));
+    let validated = f32_tensor(&charges, &[n], &inexact);
     let result = split_sum::native_tune(
-        &device,
+        &charges,
         &statics(n),
         vec![
             TuningPoint {
@@ -1551,7 +1573,7 @@ fn a_search_choice_passes_validation_at_every_point_or_gives_way_to_the_defaults
     let sum = |kernel: &seismic::NativeKernel<split_sum::Entry>| {
         read_f32(
             &kernel
-                .call(split_sum::Args { x: &validated })
+                .call(&charges, split_sum::Args { x: &validated })
                 .unwrap()
                 .value,
         )
@@ -1606,6 +1628,7 @@ fn a_graph_whose_static_dimension_differs_is_rejected_at_seal() {
 #[test]
 fn graph_nodes_with_scratch_run_from_the_slot_workspace() {
     for device in seismic_native_tests::every_device() {
+        let charges = seismic::Charges::tally(&device);
         let n = 1000u64;
         let kernel = split_sum::native_for_device(
             &device,
@@ -1636,7 +1659,7 @@ fn graph_nodes_with_scratch_run_from_the_slot_workspace() {
         let plan = graph.seal().unwrap();
         // Each node's four f32 partials; the second node may reuse the first's.
         assert!(plan.workspace_bytes() >= 16, "{:?}", device.backend());
-        let mut slot = plan.new_slot().unwrap();
+        let mut slot = plan.new_slot(&charges).unwrap();
         for run in 0..3usize {
             let first_values = (0..n as usize)
                 .map(|index| ((index + run) % 5) as f32 - 2.0)
@@ -1653,7 +1676,7 @@ fn graph_nodes_with_scratch_run_from_the_slot_workspace() {
             slot.write_input(&second_input, &bytes(&second_values))
                 .unwrap();
             let (outputs, completion) = slot
-                .attach(plan.bindings(), plan.new_outputs().unwrap())
+                .attach(plan.bindings(), plan.new_outputs(&charges).unwrap())
                 .unwrap()
                 .submit()
                 .unwrap();
@@ -1739,6 +1762,7 @@ fn scale_chain(
 #[test]
 fn a_graph_submission_encodes_every_node_into_one_encoder() {
     for device in seismic_native_tests::every_device() {
+        let charges = seismic::Charges::tally(&device);
         let nodes = 8;
         let (m, n) = (3u64, 50u64);
         let (plan, input, value) = scale_chain(&device, nodes, m, n);
@@ -1749,12 +1773,12 @@ fn a_graph_submission_encodes_every_node_into_one_encoder() {
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect::<Vec<_>>();
-        let mut slot = plan.new_slot().unwrap();
+        let mut slot = plan.new_slot(&charges).unwrap();
         let mut run = |detail: TraceDetail| {
             let trace = device.trace_submissions(detail).unwrap();
             slot.write_input(&input, &bytes).unwrap();
             let (outputs, completion) = slot
-                .attach(plan.bindings(), plan.new_outputs().unwrap())
+                .attach(plan.bindings(), plan.new_outputs(&charges).unwrap())
                 .unwrap()
                 .submit()
                 .unwrap();
@@ -1800,6 +1824,7 @@ fn a_graph_submission_encodes_every_node_into_one_encoder() {
 #[test]
 fn a_sequence_submits_chained_runs_as_one_unit_in_queue_order() {
     for device in seismic_native_tests::every_device() {
+        let charges = seismic::Charges::tally(&device);
         let (m, n) = (3u64, 64u64);
         let blocks = 5;
         let (entry, input, entry_value) = scale_chain(&device, 1, m, n);
@@ -1826,12 +1851,12 @@ fn a_sequence_submits_chained_runs_as_one_unit_in_queue_order() {
         // A launch on the block slot runs the block `blocks` times in one
         // submission, each run replaying a graph of the block's shape.
         let block_family = NativeGraphFamily::with_launches(&[block.clone()], &[vec![block.clone(); blocks]], 1, &[]).unwrap();
-        let mut entry_slot = entry_family.new_slot(&[entry_family.upload_bytes()]).unwrap();
-        let mut block_slot = block_family.new_slot(&[block_family.upload_bytes()]).unwrap();
-        let mut entry_output = Some(entry_family.new_output_slot().unwrap());
+        let mut entry_slot = entry_family.new_slot(&charges, &[entry_family.upload_bytes()]).unwrap();
+        let mut block_slot = block_family.new_slot(&charges, &[block_family.upload_bytes()]).unwrap();
+        let mut entry_output = Some(entry_family.new_output_slot(&charges).unwrap());
         let mut block_outputs = [
-            Some(block_family.new_output_slot().unwrap()),
-            Some(block_family.new_output_slot().unwrap()),
+            Some(block_family.new_output_slot(&charges).unwrap()),
+            Some(block_family.new_output_slot(&charges).unwrap()),
         ];
         for step in 0..3u64 {
             let values = (0..m * n)
@@ -1858,7 +1883,7 @@ fn a_sequence_submits_chained_runs_as_one_unit_in_queue_order() {
             for index in 0..blocks {
                 let parity = index % 2;
                 let mut bindings = block.bindings();
-                bindings.set(&x, &hidden).unwrap();
+                bindings.set(&charges, &x, &hidden).unwrap();
                 let outputs = block_slot
                     .activate(&block)
                     .unwrap()
@@ -1917,12 +1942,13 @@ fn a_sequence_submits_chained_runs_as_one_unit_in_queue_order() {
 #[test]
 fn runs_rebinding_the_same_storage_read_their_own_inputs() {
     for device in seismic_native_tests::every_device() {
+        let charges = seismic::Charges::tally(&device);
         let nodes = 6;
         let (m, n) = (4u64, 70u64);
         let (plan, input, value) = scale_chain(&device, nodes, m, n);
         let family = NativeGraphFamily::new(&[plan.clone()], 1).unwrap();
-        let mut slot = family.new_slot(&[family.upload_bytes()]).unwrap();
-        let mut output_slot = family.new_output_slot().unwrap();
+        let mut slot = family.new_slot(&charges, &[family.upload_bytes()]).unwrap();
+        let mut output_slot = family.new_output_slot(&charges).unwrap();
         for run in 0..4u64 {
             let values = (0..m * n)
                 .map(|index| (index + run * 100) as f32 * 0.5)
@@ -1955,6 +1981,7 @@ fn runs_rebinding_the_same_storage_read_their_own_inputs() {
 #[test]
 fn a_host_read_before_completion_returns_the_final_bytes() {
     for device in seismic_native_tests::every_device() {
+        let charges = seismic::Charges::tally(&device);
         let (m, n) = (64u64, 1024u64);
         let nodes = 64;
         let (plan, input, value) = scale_chain(&device, nodes, m, n);
@@ -1965,10 +1992,10 @@ fn a_host_read_before_completion_returns_the_final_bytes() {
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect::<Vec<_>>();
-        let mut slot = plan.new_slot().unwrap();
+        let mut slot = plan.new_slot(&charges).unwrap();
         slot.write_input(&input, &bytes).unwrap();
         let (outputs, completion) = slot
-            .attach(plan.bindings(), plan.new_outputs().unwrap())
+            .attach(plan.bindings(), plan.new_outputs(&charges).unwrap())
             .unwrap()
             .submit()
             .unwrap();
@@ -1993,14 +2020,21 @@ fn a_host_read_before_completion_returns_the_final_bytes() {
 fn assert_standalone_scratch_released(
     device: &Device,
     placed: u64,
-    call: impl Fn() -> Result<Tensor, CallError>,
+    call: impl Fn(&seismic::Charges) -> Result<Tensor, CallError>,
 ) -> u64 {
     let before = device.allocated();
-    let tally = seismic::memory::Tally::unbounded(
-        device.topology().store_identity(device.device_store()).unwrap(),
-    );
-    let entry: std::sync::Arc<dyn seismic::memory::Entry> = std::sync::Arc::new(tally.clone());
-    let result = seismic::memory::charging(&[entry], call).unwrap();
+    let identity = device.topology().store_identity(device.device_store()).unwrap();
+    let tally = seismic::memory::Tally::unbounded(identity.clone());
+    // Any other store the device reaches is charged to an unbounded tally
+    // of its own.
+    let charges = device.charges(|store| {
+        if *store == identity {
+            std::sync::Arc::new(tally.clone())
+        } else {
+            std::sync::Arc::new(seismic::memory::Tally::unbounded(store.clone()))
+        }
+    });
+    let result = call(&charges).unwrap();
     let charged = result.charged_bytes();
     let results = result.storage_bytes();
     if device.backend() != seismic::BackendName::Cpu {
@@ -2027,21 +2061,22 @@ fn assert_standalone_scratch_released(
 #[test]
 fn standalone_scratch_is_the_calls_own() {
     for device in seismic_native_tests::every_device() {
+        let charges = seismic::Charges::tally(&device);
         let kernel = split_sum::native_for_device(
             &device,
             &statics(64).with_param("PARTS", 4).with_param("WIDTH", 32),
         )
         .unwrap();
         let before = kernel.scalar_result_bytes();
-        let x = f32_tensor(&device, &[64], &exact_values(64));
+        let x = f32_tensor(&charges, &[64], &exact_values(64));
         let placed = kernel.standalone_scratch_bytes(split_sum::Args { x: &x }).unwrap();
-        let call = || {
+        let call = |charges: &seismic::Charges| {
             kernel
-                .call(split_sum::Args { x: &x })
+                .call(charges, split_sum::Args { x: &x })
                 .map(|results| results.value)
         };
         assert_eq!(
-            read_f32(&call().unwrap()),
+            read_f32(&call(&charges).unwrap()),
             [exact_values(64).iter().sum::<f32>()]
         );
         // Four f32 partials, and no sync region: the call places none.
@@ -2060,8 +2095,8 @@ fn standalone_scratch_is_the_calls_own() {
     }
 }
 
-fn zeroed(device: &Device, n: u64) -> Tensor {
-    f32_tensor(device, &[n], &vec![0.0; n as usize])
+fn zeroed(charges: &seismic::Charges, n: u64) -> Tensor {
+    f32_tensor(charges, &[n], &vec![0.0; n as usize])
 }
 
 /// S6: a point binding the same `&mut` tensor for every configuration
@@ -2069,9 +2104,10 @@ fn zeroed(device: &Device, n: u64) -> Tensor {
 #[test]
 fn tuning_rejects_shared_mutable_state_without_an_initializer() {
     for device in seismic_native_tests::every_device() {
+        let charges = seismic::Charges::tally(&device);
         let n = 256u64;
-        let mut state = zeroed(&device, n);
-        let x = f32_tensor(&device, &[n], &exact_values(n as usize));
+        let mut state = zeroed(&charges, n);
+        let x = f32_tensor(&charges, &[n], &exact_values(n as usize));
         let points = vec![TuningPoint {
             label: "rows".into(),
             weight: 1.0,
@@ -2086,7 +2122,7 @@ fn tuning_rejects_shared_mutable_state_without_an_initializer() {
             written: Default::default(),
         }];
         match accumulate::native_tune(
-            &device,
+            &charges,
             &NativeSpecialization::new(),
             points,
             NumericalRequirement::BitExact,
@@ -2108,12 +2144,13 @@ fn tuning_rejects_shared_mutable_state_without_an_initializer() {
 #[test]
 fn tuning_validates_in_place_parameters_and_excludes_misclassified_ones() {
     for device in seismic_native_tests::every_device() {
+        let charges = seismic::Charges::tally(&device);
         let n = 256u64;
-        let mut state = zeroed(&device, n);
+        let mut state = zeroed(&charges, n);
         let mut restore = state.clone();
         let zeros = vec![0u8; n as usize * 4];
         let initialize: TuningInitializer<'_> = Box::new(move || restore.write_from_host(&zeros));
-        let x = f32_tensor(&device, &[n], &exact_values(n as usize));
+        let x = f32_tensor(&charges, &[n], &exact_values(n as usize));
         let points = vec![TuningPoint {
             label: "rows".into(),
             weight: 1.0,
@@ -2128,7 +2165,7 @@ fn tuning_validates_in_place_parameters_and_excludes_misclassified_ones() {
             written: Default::default(),
         }];
         let result = accumulate::native_tune(
-            &device,
+            &charges,
             &NativeSpecialization::new(),
             points,
             NumericalRequirement::BitExact,
@@ -2200,6 +2237,7 @@ fn tuning_validates_in_place_parameters_and_excludes_misclassified_ones() {
 #[test]
 fn external_bindings_are_checked_at_attach() {
     for device in seismic_native_tests::every_device() {
+        let charges = seismic::Charges::tally(&device);
         let (m, n) = (2u64, 40u64);
         let scale = scale_rows::native_for_device(
             &device,
@@ -2221,19 +2259,19 @@ fn external_bindings_are_checked_at_attach() {
         graph.export(&doubled).unwrap();
         let plan = graph.seal().unwrap();
         let values = (0..m * n).map(|index| index as f32).collect::<Vec<_>>();
-        let input = f32_tensor(&device, &[m, n], &values);
-        let wrong = f32_tensor(&device, &[m, n + 1], &vec![0.0; (m * (n + 1)) as usize]);
+        let input = f32_tensor(&charges, &[m, n], &values);
+        let wrong = f32_tensor(&charges, &[m, n + 1], &vec![0.0; (m * (n + 1)) as usize]);
         assert!(matches!(
-            plan.bind_static(&[(&x, &wrong)]),
+            plan.bind_static(&charges, &[(&x, &wrong)]),
             Err(CallError::Workflow(
                 seismic::WorkflowError::NativePortBinding { port: 0, .. }
             ))
         ));
-        let bound = plan.bind_static(&[(&x, &input)]).unwrap();
-        let mut slot = plan.new_slot().unwrap();
+        let bound = plan.bind_static(&charges, &[(&x, &input)]).unwrap();
+        let mut slot = plan.new_slot(&charges).unwrap();
         for _ in 0..2 {
             let (outputs, completion) = slot
-                .attach(bound.bindings(), plan.new_outputs().unwrap())
+                .attach(bound.bindings(), plan.new_outputs(&charges).unwrap())
                 .unwrap()
                 .submit()
                 .unwrap();
@@ -2242,19 +2280,15 @@ fn external_bindings_are_checked_at_attach() {
             assert_eq!(read_f32(&outputs.exported(&doubled).unwrap()), expected);
         }
         assert!(matches!(
-            slot.attach(plan.bindings(), plan.new_outputs().unwrap())
+            slot.attach(plan.bindings(), plan.new_outputs(&charges).unwrap())
                 .err(),
             Some(CallError::Workflow(
                 seismic::WorkflowError::NativePortUnbound { port: 0 }
             ))
         ));
-        let mut bindings = plan.bindings();
-        bindings.set(&x, &wrong).unwrap();
         assert!(matches!(
-            slot.attach(bindings, plan.new_outputs().unwrap()).err(),
-            Some(CallError::Workflow(
-                seismic::WorkflowError::NativePortBinding { port: 0, .. }
-            ))
+            plan.bindings().set(&charges, &x, &wrong).err(),
+            Some(seismic::WorkflowError::NativePortBinding { port: 0, .. })
         ));
 
         // `accumulate` requires `state` and `x` to be disjoint; both are
@@ -2279,12 +2313,12 @@ fn external_bindings_are_checked_at_attach() {
             )
             .unwrap();
         let plan = graph.seal().unwrap();
-        let mut slot = plan.new_slot().unwrap();
-        let shared = f32_tensor(&device, &[n], &vec![1.0; n as usize]);
+        let mut slot = plan.new_slot(&charges).unwrap();
+        let shared = f32_tensor(&charges, &[n], &vec![1.0; n as usize]);
         let mut bindings = plan.bindings();
-        bindings.set(&state, &shared).unwrap();
-        bindings.set(&addend, &shared).unwrap();
-        match slot.attach(bindings, plan.new_outputs().unwrap()).err() {
+        bindings.set(&charges, &state, &shared).unwrap();
+        bindings.set(&charges, &addend, &shared).unwrap();
+        match slot.attach(bindings, plan.new_outputs(&charges).unwrap()).err() {
             Some(CallError::Invocation(InvocationError::IllegalAliasing { first, second })) => {
                 assert_eq!([first.as_str(), second.as_str()], ["state", "x"]);
             }
@@ -2293,12 +2327,12 @@ fn external_bindings_are_checked_at_attach() {
                 device.backend()
             ),
         }
-        let separate = f32_tensor(&device, &[n], &vec![2.0; n as usize]);
+        let separate = f32_tensor(&charges, &[n], &vec![2.0; n as usize]);
         let mut bindings = plan.bindings();
-        bindings.set(&state, &shared).unwrap();
-        bindings.set(&addend, &separate).unwrap();
+        bindings.set(&charges, &state, &shared).unwrap();
+        bindings.set(&charges, &addend, &separate).unwrap();
         let (_, completion) = slot
-            .attach(bindings, plan.new_outputs().unwrap())
+            .attach(bindings, plan.new_outputs(&charges).unwrap())
             .unwrap()
             .submit()
             .unwrap();
@@ -2311,7 +2345,7 @@ fn external_bindings_are_checked_at_attach() {
         );
         // Both ports bound statically: the aliasing is refused once, when
         // the plan is bound, so no run of it is ever formed.
-        match plan.bind_static(&[(&state, &shared), (&addend, &shared)]).err() {
+        match plan.bind_static(&charges, &[(&state, &shared), (&addend, &shared)]).err() {
             Some(CallError::Invocation(InvocationError::IllegalAliasing { first, second })) => {
                 assert_eq!([first.as_str(), second.as_str()], ["state", "x"]);
             }
@@ -2321,11 +2355,11 @@ fn external_bindings_are_checked_at_attach() {
             ),
         }
         // One port static, the other a run's: the run's attach refuses it.
-        let bound = plan.bind_static(&[(&state, &shared)]).unwrap();
+        let bound = plan.bind_static(&charges, &[(&state, &shared)]).unwrap();
         let mut bindings = bound.bindings();
-        bindings.set(&addend, &shared).unwrap();
+        bindings.set(&charges, &addend, &shared).unwrap();
         assert!(matches!(
-            slot.attach(bindings, plan.new_outputs().unwrap()).err(),
+            slot.attach(bindings, plan.new_outputs(&charges).unwrap()).err(),
             Some(CallError::Invocation(InvocationError::IllegalAliasing { .. }))
         ));
     }
@@ -2390,6 +2424,7 @@ fn gated(device: &Device, small: u64) -> seismic::NativeKernel<gated_sum::Entry>
 #[test]
 fn conditional_launches_run_only_the_active_launch() {
     for device in seismic_native_tests::every_device() {
+        let charges = seismic::Charges::tally(&device);
         // (N, SMALL, active launch ordinal). Vulkan forms group memory at
         // preparation, so SMALL = 2^20 (4 MiB staged) does not prepare there
         // (`inactive_launches_are_exempt_from_device_limits`).
@@ -2406,9 +2441,9 @@ fn conditional_launches_run_only_the_active_launch() {
             let values = exact_values(n as usize);
             let expected = portable_gated_sum(&values);
             let kernel = gated(&device, small);
-            let x = f32_tensor(&device, &[n], &values);
+            let x = f32_tensor(&charges, &[n], &values);
             let trace = device.trace_submissions(TraceDetail::Launches).unwrap();
-            let value = kernel.call(gated_sum::Args { x: &x }).unwrap().value;
+            let value = kernel.call(&charges, gated_sum::Args { x: &x }).unwrap().value;
             let submissions = trace.collect().unwrap();
             let case = format!("{:?} N {n} SMALL {small}", device.backend());
             assert_eq!(read_f32(&value), [expected], "{case}");
@@ -2438,14 +2473,14 @@ fn conditional_launches_run_only_the_active_launch() {
                 .value;
             graph.export(&sum).unwrap();
             let plan = graph.seal().unwrap();
-            let mut slot = plan.new_slot().unwrap();
+            let mut slot = plan.new_slot(&charges).unwrap();
             let bytes = values
                 .iter()
                 .flat_map(|value| value.to_le_bytes())
                 .collect::<Vec<_>>();
             slot.write_input(&input, &bytes).unwrap();
             let (outputs, completion) = slot
-                .attach(plan.bindings(), plan.new_outputs().unwrap())
+                .attach(plan.bindings(), plan.new_outputs(&charges).unwrap())
                 .unwrap()
                 .submit()
                 .unwrap();
@@ -2467,11 +2502,12 @@ fn conditional_launches_run_only_the_active_launch() {
 #[test]
 fn inactive_launches_are_exempt_from_device_limits() {
     for device in seismic_native_tests::every_device() {
+        let charges = seismic::Charges::tally(&device);
         let n = 1u64 << 17;
         let values = exact_values(n as usize);
-        let x = f32_tensor(&device, &[n], &values);
+        let x = f32_tensor(&charges, &[n], &values);
         let value = gated(&device, 64)
-            .call(gated_sum::Args { x: &x })
+            .call(&charges, gated_sum::Args { x: &x })
             .unwrap()
             .value;
         // Every partial sum of these values is exact, so any order agrees
@@ -2500,7 +2536,7 @@ fn inactive_launches_are_exempt_from_device_limits() {
             );
             continue;
         }
-        match gated(&device, 1_048_576).call(gated_sum::Args { x: &x }) {
+        match gated(&device, 1_048_576).call(&charges, gated_sum::Args { x: &x }) {
             Err(CallError::Execution(error)) => assert!(
                 error.to_string().contains("launch `gated_staged` needs")
                     && error.to_string().contains("the device allows"),
@@ -2524,14 +2560,15 @@ fn inactive_launches_are_exempt_from_device_limits() {
 #[test]
 fn inactive_scratch_is_charged_the_minimum() {
     for device in seismic_native_tests::every_device() {
+        let charges = seismic::Charges::tally(&device);
         let kernel = gated(&device, 64);
         let scratch = |n: u64| {
             let values = exact_values(n as usize);
-            let x = f32_tensor(&device, &[n], &values);
+            let x = f32_tensor(&charges, &[n], &values);
             let placed = kernel.standalone_scratch_bytes(gated_sum::Args { x: &x }).unwrap();
-            let call = || kernel.call(gated_sum::Args { x: &x }).map(|results| results.value);
+            let call = |charges: &seismic::Charges| kernel.call(charges, gated_sum::Args { x: &x }).map(|results| results.value);
             assert_eq!(
-                read_f32(&call().unwrap()),
+                read_f32(&call(&charges).unwrap()),
                 [portable_gated_sum(&values)],
                 "{:?} N {n}",
                 device.backend()
@@ -2579,8 +2616,10 @@ fn a_record_port_reads_pooled_records_through_their_table() {
         .into_iter()
         .filter(|device| matches!(device.backend(), BackendName::Metal | BackendName::Vulkan));
     for device in record_ports {
+        let charges = seismic::Charges::tally(&device);
         let backend = device.backend();
         let store = seismic::SlabTensor::in_pool(
+            &charges,
             &seismic_native_tests::pool(&device),
             1,
             records,
@@ -2608,10 +2647,10 @@ fn a_record_port_reads_pooled_records_through_their_table() {
             .value;
         graph.export(&tripled).unwrap();
         let plan = graph.seal().unwrap();
-        let bound = plan.bind_static(&[(&x, &view)]).unwrap();
-        let mut slot = plan.new_slot().unwrap();
+        let bound = plan.bind_static(&charges, &[(&x, &view)]).unwrap();
+        let mut slot = plan.new_slot(&charges).unwrap();
         let mut run = |backed: &[u64], step: &str| {
-            let (outputs, completion) = slot.attach(bound.bindings(), plan.new_outputs().unwrap()).unwrap().submit().unwrap();
+            let (outputs, completion) = slot.attach(bound.bindings(), plan.new_outputs(&charges).unwrap()).unwrap().submit().unwrap();
             completion.wait().unwrap();
             let read = read_f32(&outputs.exported(&tripled).unwrap());
             for &record in backed {
@@ -2689,15 +2728,16 @@ fn disagreeing_candidate_is_not_served(
 fn candidates_disagreeing_with_the_native_default_are_never_served() {
     use seismic_native_tests::wrong_default;
     for device in seismic_native_tests::every_device() {
-        let mut state = f32_tensor(&device, &[4], &[2.; 4]);
-        let x = f32_tensor(&device, &[4], &[1.; 4]);
+        let charges = seismic::Charges::tally(&device);
+        let mut state = f32_tensor(&charges, &[4], &[2.; 4]);
+        let x = f32_tensor(&charges, &[4], &[1.; 4]);
         let mut reset = state.clone();
         let initial: Vec<_> = [2f32; 4]
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect();
         let result = wrong_default::native_tune(
-            &device,
+            &charges,
             &NativeSpecialization::new(),
             vec![TuningPoint {
                 label: "mutable".into(),
@@ -2794,8 +2834,9 @@ fn a_disagreeing_candidate_ahead_in_its_rounds_is_witnessed_and_excluded() {
     use seismic_native_tests::paced_wrong_default;
     const N: usize = 64;
     for device in seismic_native_tests::every_device() {
-        let mut state = f32_tensor(&device, &[N as u64], &[2.; N]);
-        let x = f32_tensor(&device, &[N as u64], &[1.; N]);
+        let charges = seismic::Charges::tally(&device);
+        let mut state = f32_tensor(&charges, &[N as u64], &[2.; N]);
+        let x = f32_tensor(&charges, &[N as u64], &[1.; N]);
         let mut reset = state.clone();
         let initial: Vec<_> = [2f32; N]
             .iter()
@@ -2812,7 +2853,7 @@ fn a_disagreeing_candidate_ahead_in_its_rounds_is_witnessed_and_excluded() {
             .collect();
         let began = std::time::Instant::now();
         let result = paced_wrong_default::native_tune(
-            &device,
+            &charges,
             &NativeSpecialization::new(),
             vec![TuningPoint {
                 label: "paced".into(),
@@ -2891,8 +2932,9 @@ fn a_search_of_launch_groups_keeps_the_defaults_when_every_candidate_disagrees()
     let Some(device) = seismic_native_tests::fresh_device(BackendName::Metal) else {
         return;
     };
-    let small = f32_tensor(&device, &[7], &[1.; 7]);
-    let large = f32_tensor(&device, &[35], &[1.; 35]);
+    let charges = seismic::Charges::tally(&device);
+    let small = f32_tensor(&charges, &[7], &[1.; 7]);
+    let large = f32_tensor(&charges, &[35], &[1.; 35]);
     let points = [&small, &large]
         .into_iter()
         .enumerate()
@@ -2908,7 +2950,7 @@ fn a_search_of_launch_groups_keeps_the_defaults_when_every_candidate_disagrees()
         })
         .collect::<Vec<_>>();
     let result = scoped_wrong_default::native_tune(
-        &device,
+        &charges,
         &NativeSpecialization::new(),
         points,
         NumericalRequirement::BitExact,
@@ -2924,8 +2966,9 @@ fn a_search_of_launch_groups_keeps_the_defaults_when_every_candidate_disagrees()
 #[test]
 fn measurements_are_the_same_facts_under_every_alpha() {
     for device in seismic_native_tests::every_device() {
-        let x = f32_tensor(&device, &[4], &[1.; 4]);
-        let mut state = f32_tensor(&device, &[4], &[0.; 4]);
+        let charges = seismic::Charges::tally(&device);
+        let x = f32_tensor(&charges, &[4], &[1.; 4]);
+        let mut state = f32_tensor(&charges, &[4], &[0.; 4]);
         let mut run = |policy: NumericalRequirement| {
             let mut reset = state.clone();
             let bytes: Vec<_> = [0f32; 4]
@@ -2933,7 +2976,7 @@ fn measurements_are_the_same_facts_under_every_alpha() {
                 .flat_map(|value| value.to_le_bytes())
                 .collect();
             accumulate::native_tune(
-                &device,
+                &charges,
                 &NativeSpecialization::new(),
                 vec![TuningPoint {
                     label: "state".into(),
@@ -2988,8 +3031,9 @@ fn measurements_are_the_same_facts_under_every_alpha() {
 fn rejected_candidates_stop_after_the_first_timed_invocation() {
     use seismic_native_tests::wrong_default;
     for device in seismic_native_tests::every_device() {
-        let x = f32_tensor(&device, &[4], &[1.; 4]);
-        let mut state = f32_tensor(&device, &[4], &[2.; 4]);
+        let charges = seismic::Charges::tally(&device);
+        let x = f32_tensor(&charges, &[4], &[1.; 4]);
+        let mut state = f32_tensor(&charges, &[4], &[2.; 4]);
         let mut reset = state.clone();
         let initial: Vec<_> = [2f32; 4]
             .iter()
@@ -2998,7 +3042,7 @@ fn rejected_candidates_stop_after_the_first_timed_invocation() {
         let observed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let captures = observed.clone();
         let result = wrong_default::native_tune(
-            &device,
+            &charges,
             &NativeSpecialization::new(),
             vec![TuningPoint {
                 label: "early".into(),
@@ -3051,9 +3095,10 @@ fn rejected_candidates_stop_after_the_first_timed_invocation() {
 fn pooled_results_cannot_hide_a_candidates_missing_writes() {
     use seismic_native_tests::omitted_write;
     for device in seismic_native_tests::every_device() {
-        let x = f32_tensor(&device, &[4], &[1., 2., 3., 4.]);
+        let charges = seismic::Charges::tally(&device);
+        let x = f32_tensor(&charges, &[4], &[1., 2., 3., 4.]);
         let result = omitted_write::native_tune(
-            &device,
+            &charges,
             &NativeSpecialization::new(),
             vec![TuningPoint {
                 label: "missing-write".into(),
@@ -3100,9 +3145,10 @@ fn declared_rows_scope_state_observation_and_observing_the_rest_rejects_stray_wr
 }
 
 fn stray_writes_are_observed_where_declared(device: Device) {
+    let charges = seismic::Charges::tally(&device);
     use seismic_native_tests::stray_write;
     const N: usize = 8;
-    let x = f32_tensor(&device, &[N as u64], &[1.; N]);
+    let x = f32_tensor(&charges, &[N as u64], &[1.; N]);
     let initial: Vec<u8> = [0f32; N].iter().flat_map(|v| v.to_le_bytes()).collect();
     // The second point of a run: none, one observed whole, or one that
     // declares the written rows and observes the rest.
@@ -3113,8 +3159,8 @@ fn stray_writes_are_observed_where_declared(device: Device) {
         Rest,
     }
     let stray = |guard: Guard, requirement: NumericalRequirement| {
-        let mut declared = f32_tensor(&device, &[N as u64], &[0.; N]);
-        let mut observed = f32_tensor(&device, &[N as u64], &[0.; N]);
+        let mut declared = f32_tensor(&charges, &[N as u64], &[0.; N]);
+        let mut observed = f32_tensor(&charges, &[N as u64], &[0.; N]);
         let point = |label: &str, state: &Tensor, written: Option<bool>| {
             let mut reset = state.clone();
             let initial = initial.clone();
@@ -3143,7 +3189,7 @@ fn stray_writes_are_observed_where_declared(device: Device) {
         }
         let states = [&mut declared, &mut observed];
         let result = stray_write::native_tune(
-            &device,
+            &charges,
             &NativeSpecialization::new(),
             points
                 .into_iter()
@@ -3222,7 +3268,7 @@ fn a_build_the_memory_limit_refuses_prices_its_point_and_is_offered_again() {
     /// Points whose inputs are allocated on the device as they are built,
     /// each with state of `held` bytes the source keeps beside them.
     struct Allocated<'d> {
-        device: &'d Device,
+        charges: &'d seismic::Charges,
         n: u64,
         held: [u64; 2],
         kept: [Option<Tensor>; 2],
@@ -3245,8 +3291,8 @@ fn a_build_the_memory_limit_refuses_prices_its_point_and_is_offered_again() {
         fn build(&mut self, point: usize) -> Result<PointInputs<'static>, seismic::BuildError> {
             // The device's refusal converts to a typed refusal, which is what
             // classifies the build as one that did not fit.
-            let state = Tensor::zeros(self.device, Element::f32(), &[self.held[point] / 4])?;
-            let x = f32_tensor(self.device, &[self.n], &exact_values(self.n as usize));
+            let state = Tensor::zeros(self.charges, Element::f32(), &[self.held[point] / 4])?;
+            let x = f32_tensor(self.charges, &[self.n], &exact_values(self.n as usize));
             self.kept[point] = Some(state);
             Ok(seismic::point_inputs::<split_sum::Entry>(
                 vec![split_sum::Args { x: &x }],
@@ -3259,16 +3305,17 @@ fn a_build_the_memory_limit_refuses_prices_its_point_and_is_offered_again() {
 
     // Its own ledgers: the test bounds them alone.
     let Some((device, tally)) = seismic_native_tests::tallied_device(BackendName::Cpu) else { return };
+    let charges = seismic::Charges::tally(&device);
     let n = 64;
     let large = 8u64 << 20;
     let mut source = Allocated {
-        device: &device,
+        charges: &charges,
         n,
         held: [16, large],
         kept: [None, None],
     };
     let mut unit =
-        split_sum::native_search(&device, &statics(n), NumericalRequirement::BitExact).unwrap();
+        split_sum::native_search(&charges, &statics(n), NumericalRequirement::BitExact).unwrap();
     unit.prepare_defaults(&mut source).unwrap();
     let Strategy::Search(plan) = search() else {
         unreachable!()
@@ -3321,7 +3368,7 @@ fn a_defaults_measurement_the_memory_limit_refuses_prices_its_point_and_is_offer
     /// building `clamp` sets the device's limit to what is then charged, so
     /// that only the measurement's own allocations are refused.
     struct Clamping<'d> {
-        device: &'d Device,
+        charges: &'d seismic::Charges,
         tally: &'d seismic::memory::Tally,
         n: u64,
         clamp: Option<usize>,
@@ -3343,12 +3390,12 @@ fn a_defaults_measurement_the_memory_limit_refuses_prices_its_point_and_is_offer
                 .collect()
         }
         fn build(&mut self, point: usize) -> Result<PointInputs<'static>, seismic::BuildError> {
-            let x = f32_tensor(self.device, &[self.n], &exact_values(self.n as usize));
+            let x = f32_tensor(self.charges, &[self.n], &exact_values(self.n as usize));
             self.kept[point] = vec![x.clone()];
             if self.clamp == Some(point) {
                 // Fill the entry's active 1 MiB (`CARVED_LIMIT`) `Carver` block
                 // whole so the defaults measurement cannot carve from block slack.
-                let pad = Tensor::zeros(self.device, Element::f32(), &[(1 << 20) / 4])?;
+                let pad = Tensor::zeros(self.charges, Element::f32(), &[(1 << 20) / 4])?;
                 self.kept[point].push(pad);
                 self.tally.bound(self.tally.held());
             }
@@ -3363,16 +3410,17 @@ fn a_defaults_measurement_the_memory_limit_refuses_prices_its_point_and_is_offer
 
     // Its own ledgers: the test bounds them alone.
     let Some((device, tally)) = seismic_native_tests::tallied_device(BackendName::Cpu) else { return };
+    let charges = seismic::Charges::tally(&device);
     let n = 64;
     let mut source = Clamping {
-        device: &device,
+        charges: &charges,
         tally: &tally,
         n,
         clamp: None,
         kept: [Vec::new(), Vec::new()],
     };
     let mut unit =
-        split_sum::native_search(&device, &statics(n), NumericalRequirement::BitExact).unwrap();
+        split_sum::native_search(&charges, &statics(n), NumericalRequirement::BitExact).unwrap();
     unit.prepare_defaults(&mut source).unwrap();
     let Strategy::Search(plan) = search() else {
         unreachable!()
@@ -3414,22 +3462,23 @@ fn a_defaults_measurement_the_memory_limit_refuses_prices_its_point_and_is_offer
 #[test]
 fn a_ranged_kernel_forms_and_serves_only_its_range() {
     for device in seismic_native_tests::every_device() {
+        let charges = seismic::Charges::tally(&device);
         let ranged = NativeSpecialization::new()
             .with_param("SMALL", 64)
             .with_range("N", 65, 1000);
         let kernel = gated_sum::native_for_device(&device, &ranged)
             .unwrap_or_else(|error| panic!("{:?}: {error}", device.backend()));
         let values = exact_values(200);
-        let x = f32_tensor(&device, &[200], &values);
-        let value = kernel.call(gated_sum::Args { x: &x }).unwrap().value;
+        let x = f32_tensor(&charges, &[200], &values);
+        let value = kernel.call(&charges, gated_sum::Args { x: &x }).unwrap().value;
         assert_eq!(
             read_f32(&value),
             [portable_gated_sum(&values)],
             "{:?}",
             device.backend()
         );
-        let small = f32_tensor(&device, &[10], &exact_values(10));
-        match kernel.call(gated_sum::Args { x: &small }) {
+        let small = f32_tensor(&charges, &[10], &exact_values(10));
+        match kernel.call(&charges, gated_sum::Args { x: &small }) {
             Err(CallError::Invocation(InvocationError::OutsideRange {
                 dimension,
                 low: 65,
@@ -3483,10 +3532,11 @@ fn a_survey_times_every_launchs_choices_where_it_works() {
     let Some(device) = seismic_native_tests::fresh_device(BackendName::Metal) else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let implementation = scoped_scale::native_implementation(&device).unwrap().unwrap();
     assert!(implementation.launch_scoped());
-    let small = f32_tensor(&device, &[8], &exact_values(8));
-    let large = f32_tensor(&device, &[64], &exact_values(64));
+    let small = f32_tensor(&charges, &[8], &exact_values(8));
+    let large = f32_tensor(&charges, &[64], &exact_values(64));
     let points = [("small", &small), ("large", &large)]
         .into_iter()
         .map(|(label, x)| TuningPoint::<scoped_scale::Entry> {
@@ -3505,7 +3555,7 @@ fn a_survey_times_every_launchs_choices_where_it_works() {
         reports: Vec::new(),
     };
     let survey = scoped_scale::native_tune(
-        &device,
+        &charges,
         &NativeSpecialization::new(),
         &mut points,
         NumericalRequirement::BitExact,

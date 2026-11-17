@@ -547,7 +547,12 @@ impl ResidentWeight {
 struct TileImport {
     table: crate::host_tables::HostTable,
     import: crate::native::AttestedImport,
-    device: Rc<Device>,
+    /// What its conversions' calls are formed through as steps run: charges
+    /// that allocate nothing, as an import needs no storage of its own. Its
+    /// entries (`import_dense`, `repack_weight`) declare no scratch and
+    /// write into the supplied tile slots, whose record table the table's
+    /// slots hold from its creation (`DeviceTable::new`).
+    unallocating: seismic::Charges,
 }
 
 impl TileSource for TileImport {
@@ -578,7 +583,7 @@ impl TileSource for TileImport {
             .write_from_host(&bytes)
             .map_err(|error| failed(&error))?;
         // Every run's conversion is queued in one batch.
-        let mut batch = NativeTensorBatch::new(&self.device);
+        let mut batch = NativeTensorBatch::new(&self.unallocating);
         let mut staged = 0;
         for run in runs {
             let rows = run.tiles.len() as u64 * tile;
@@ -956,6 +961,7 @@ impl ResidencyStore {
     /// weight, and shared by every reader after.
     fn streamed(
         &mut self,
+        charges: &seismic::Charges,
         artifact: &GgufArtifact,
         descriptor: &WeightDescriptor,
     ) -> Result<Option<ResidentWeight>, WeightImportError> {
@@ -982,9 +988,9 @@ impl ResidencyStore {
         }
         let weight = match plan.stored_in_slots() {
             false => {
-                ResidentWeight::streamed(descriptor.clone(), self.stream_table(artifact, &plan)?)
+                ResidentWeight::streamed(descriptor.clone(), self.stream_table(charges, artifact, &plan)?)
             }
-            true => ResidentWeight::stored(descriptor.clone(), self.store_table(artifact, &plan)?),
+            true => ResidentWeight::stored(descriptor.clone(), self.store_table(charges, artifact, &plan)?),
         };
         // The plan charged the slots (their table too), the directory and
         // the staging.
@@ -1004,6 +1010,7 @@ impl ResidencyStore {
     /// filled with the rows worth holding before any step names one.
     fn stream_table(
         &self,
+        charges: &seismic::Charges,
         artifact: &GgufArtifact,
         plan: &WeightPlan,
     ) -> Result<Rc<DeviceTable>, WeightImportError> {
@@ -1032,7 +1039,7 @@ impl ResidencyStore {
             )
         });
         let table = DeviceTable::new(
-            &self.device,
+            charges,
             plan.resident,
             table.source(),
             streamed.table_rows,
@@ -1047,13 +1054,13 @@ impl ResidencyStore {
                     .programs
                     .import_entry(plan)
                     .map_err(|error| invalid(error.to_string()))?,
-                device: self.device.clone(),
+                unallocating: seismic::Charges::none(&self.device),
                 table,
             }),
             kept,
         )
         .map_err(invalid)?;
-        table.seed().map_err(invalid)?;
+        table.seed(charges).map_err(invalid)?;
         let table = Rc::new(table);
         crate::settle::owe(Rc::downgrade(&table));
         Ok(table)
@@ -1066,6 +1073,7 @@ impl ResidencyStore {
     /// (`import_transforms::row_tensors`), each from the file that holds it.
     fn store_table(
         &self,
+        charges: &seismic::Charges,
         artifact: &GgufArtifact,
         plan: &WeightPlan,
     ) -> Result<Arc<StoredTable>, WeightImportError> {
@@ -1132,7 +1140,7 @@ impl ResidencyStore {
             })
             .collect::<Result<Vec<_>, WeightImportError>>()?;
         let table = StoredTable::new(
-            &self.device,
+            charges,
             &plan.descriptor,
             plan.upload,
             plan.resident,
@@ -1156,6 +1164,7 @@ impl ResidencyStore {
     /// a load without one.
     pub(crate) fn open_expert_bank(
         &mut self,
+        charges: &seismic::Charges,
         artifact: &GgufArtifact,
     ) -> Result<Option<Arc<crate::experts::ExpertBank>>, WeightImportError> {
         let Some(plan) = self.execution.load().expert_bank() else {
@@ -1167,21 +1176,21 @@ impl ResidencyStore {
         // CPU pool's and landings' (`ExpertBank::lines`); the load's pricing
         // adds what the measurement job stored (`HostLines::of_bank`).
         let lines = crate::assessment::BankLines::of_bank(plan).map_err(|error| invalid(error.to_string()))?;
-        let bank = crate::experts::ExpertBank::open(&self.device, plan, artifact, &sites, lines, &self.cpu_site, self.pools.clone(), (self.changes.clone(), self.host_backing.take()))?;
+        let bank = crate::experts::ExpertBank::open(charges, plan, artifact, &sites, lines, &self.cpu_site, self.pools.clone(), (self.changes.clone(), self.host_backing.take()))?;
         // Each stack through the entry a resident load imports it with, from
         // a read around the file cache: no expert byte stays in it.
         if plan.whole() {
             bank.import_whole(&mut |weight, records, record_at| {
                 let entry = self.programs.import_entry(weight).map_err(|error| error.to_string())?;
                 let stored = Stored::from_gguf(artifact, &weight.descriptor).map_err(|error| error.to_string())?;
-                let source = crate::resources::filled_import(weight, &stored, &self.device)?;
+                let source = crate::resources::filled_import(weight, &stored, charges)?;
                 if entry.writes_records() {
-                    crate::programs::native_import::import_into(&entry, &source, records, None)
+                    crate::programs::native_import::import_into(&entry, charges, &source, records, None)
                         .map_err(|error| error.to_string())
                 } else {
                     crate::programs::native_import::import_records(
                         &entry,
-                        &self.device,
+                        charges,
                         &source,
                         records.extents(),
                         record_at,
@@ -1208,6 +1217,7 @@ impl ResidencyStore {
     /// holds the placed bytes as they are.
     pub(crate) fn import_progressive(
         &mut self,
+        charges: &seismic::Charges,
         artifact: &GgufArtifact,
         descriptor: &WeightDescriptor,
     ) -> Result<ResidentWeight, WeightImportError> {
@@ -1245,7 +1255,7 @@ impl ResidencyStore {
             .map_err(|error| invalid(error.to_string()))?;
         let bytes = crate::import_transforms::upload_bytes(&planned, stored, bytes)
             .map_err(invalid)?;
-        let tensor = Tensor::from_host(&self.device, planned.resident, &planned.shape, &bytes)
+        let tensor = Tensor::from_host(charges, planned.resident, &planned.shape, &bytes)
             .map_err(|error| WeightImportError::allocating(seismic::Contract::DeviceOnly, &error))?;
         let weight = ResidentWeight {
             descriptor: descriptor.clone(),
@@ -1261,6 +1271,7 @@ impl ResidencyStore {
     /// Imports a dense weight into the element its admitted plan chose.
     pub(crate) fn import_gguf_planned(
         &mut self,
+        charges: &seismic::Charges,
         artifact: &GgufArtifact,
         descriptor: &WeightDescriptor,
     ) -> Result<ResidentWeight, WeightImportError> {
@@ -1277,20 +1288,21 @@ impl ResidencyStore {
                     descriptor.name
                 ))
             })?;
-        self.import_gguf(artifact, descriptor, target)
+        self.import_gguf(charges, artifact, descriptor, target)
     }
 
     pub(crate) fn import_gguf(
         &mut self,
+        charges: &seismic::Charges,
         artifact: &GgufArtifact,
         descriptor: &WeightDescriptor,
         target: DType,
     ) -> Result<ResidentWeight, WeightImportError> {
-        if let Some(weight) = self.streamed(artifact, descriptor)? {
+        if let Some(weight) = self.streamed(charges, artifact, descriptor)? {
             return Ok(weight);
         }
         let (key, descriptor, scale, launch, mut program) =
-            match self.prepare_gguf(artifact, descriptor, target)? {
+            match self.prepare_gguf(charges, artifact, descriptor, target)? {
                 ImportPreparation::Resident(weight) => return Ok(weight),
                 ImportPreparation::Pending {
                     key,
@@ -1301,7 +1313,7 @@ impl ResidencyStore {
                 } => (key, descriptor, scale, launch, program),
             };
         let submission = program
-            .submit(launch)
+            .submit(charges, launch)
             .map_err(|(error, _launch)| WeightImportError::Submit(error))?;
         let completed = submission.finish().map_err(WeightImportError::Completion)?;
         let (_, destination) = completed.into_parts();
@@ -1319,6 +1331,7 @@ impl ResidencyStore {
 
     fn prepare_gguf(
         &self,
+        charges: &seismic::Charges,
         artifact: &GgufArtifact,
         descriptor: &WeightDescriptor,
         target: DType,
@@ -1406,24 +1419,24 @@ impl ResidencyStore {
             // SAFETY: the attested import's only result is this tensor. Both
             // Metal import kernels write every physical byte, including the
             // packed layout's row and plane padding, before submission returns.
-            unsafe { Tensor::uninitialized(&self.device, planned.resident, &planned.shape) }
+            unsafe { Tensor::uninitialized(charges, planned.resident, &planned.shape) }
         } else {
-            Tensor::zeros(&self.device, planned.resident, &planned.shape)
+            Tensor::zeros(charges, planned.resident, &planned.shape)
         }
         .map_err(|error| WeightImportError::allocating(seismic::Contract::DeviceOnly, &error))?;
-        let destination = ResidentWeightSlot::new(&planned, &self.device, tensor)
+        let destination = ResidentWeightSlot::new(&planned, charges, tensor)
             .map_err(WeightImportError::Invariant)?;
-        let allocate_workspace = || {
+        let allocate_workspace = |charges: &seismic::Charges| {
             ResourceAllocator::import_workspace(
                 &self.execution,
                 &planned,
-                &self.device,
+                charges,
                 self.domain.clone(),
             )
         };
         let workspace = match self.upload.borrow_mut().as_mut() {
-            Some(upload) => upload.allocate(allocate_workspace),
-            None => allocate_workspace(),
+            Some(upload) => upload.allocate(&self.device, allocate_workspace),
+            None => allocate_workspace(charges),
         }
         .map_err(|error| WeightImportError::of_allocation(seismic::Contract::DeviceOnly, error))?;
         let launch = ValidatedImportLaunch::new(
@@ -1438,7 +1451,7 @@ impl ResidencyStore {
         let scale = planned
             .scale
             .as_ref()
-            .map(|scale| import_scale(&self.device, artifact, scale))
+            .map(|scale| import_scale(charges, artifact, scale))
             .transpose()?;
         Ok(ImportPreparation::Pending {
             key,
@@ -1454,6 +1467,7 @@ impl ResidencyStore {
     /// draft), and a separate draft's include nothing of the projector.
     fn preload_components(
         &mut self,
+        charges: &seismic::Charges,
         package: &magnitude_artifacts::Package,
         weights: &[WeightPlan],
         activation: DType,
@@ -1470,12 +1484,12 @@ impl ResidencyStore {
                 }
             }
         }
-        self.preload_component(package.target(), &target, activation)?;
+        self.preload_component(charges, package.target(), &target, activation)?;
         if !draft.is_empty() {
             let artifact = package
                 .draft()
                 .ok_or_else(|| invalid("draft weights planned without the draft component"))?;
-            self.preload_component(artifact, &draft, activation)?;
+            self.preload_component(charges, artifact, &draft, activation)?;
         }
         Ok(())
     }
@@ -1486,6 +1500,7 @@ impl ResidencyStore {
     /// assembly below then reads the completed weights from the sole cache.
     fn preload_component(
         &mut self,
+        charges: &seismic::Charges,
         artifact: &GgufArtifact,
         weights: &[WeightPlan],
         activation: DType,
@@ -1511,12 +1526,12 @@ impl ResidencyStore {
                 .expect("the remaining import sources are nonempty");
             let last = first + batch_len;
             report.batches += 1;
-            let mut batch = NativeTensorBatch::new(&self.device);
+            let mut batch = NativeTensorBatch::new(charges);
             let mut pending = Vec::new();
             let mut traced_weights = Vec::new();
             let preparing = Instant::now();
             for item in &ordered[first..last] {
-                match self.prepare_gguf(artifact, &item.plan.descriptor, item.target)? {
+                match self.prepare_gguf(charges, artifact, &item.plan.descriptor, item.target)? {
                     ImportPreparation::Resident(_) => {}
                     ImportPreparation::Pending {
                         key,
@@ -1616,6 +1631,7 @@ impl ResidencyStore {
     /// `host_tables`, the load's claim of them.
     pub fn load_target(
         &mut self,
+        charges: &seismic::Charges,
         definition: &magnitude_family_contracts::ModelDefinition,
         package: &magnitude_artifacts::Package,
         host_tables: &crate::memory::ledger::Held,
@@ -1644,12 +1660,13 @@ impl ResidencyStore {
         });
         let target = self
             .preload_components(
+                charges,
                 package,
                 &weights,
                 crate::resident_weights::activation_dtype(definition.decoder.activation_dtype),
             )
             .map_err(crate::ResidencyError::from)
-            .and_then(|()| crate::resident_weights::import_target(definition, package, self, host_tables));
+            .and_then(|()| crate::resident_weights::import_target(definition, package, self, charges, host_tables));
         let mut progress = self
             .import_progress
             .take()
@@ -1662,6 +1679,7 @@ impl ResidencyStore {
 
     pub fn load_head(
         &mut self,
+        charges: &seismic::Charges,
         definition: &magnitude_family_contracts::ModelDefinition,
         package: &magnitude_artifacts::Package,
     ) -> Result<Option<crate::ResidentHead>, crate::ResidencyError> {
@@ -1670,16 +1688,18 @@ impl ResidencyStore {
             // A draft head's weights are the target's; a separate draft's
             // are its own component's, beside the target's tied ones.
             self.preload_components(
+                charges,
                 package,
                 &weights,
                 crate::resident_weights::activation_dtype(definition.decoder.activation_dtype),
             )?;
         }
-        crate::resident_weights::import_optional_head(definition, package, self)
+        crate::resident_weights::import_optional_head(definition, package, self, charges)
     }
 
     pub fn load_vision(
         &mut self,
+        charges: &seismic::Charges,
         definition: &magnitude_family_contracts::ModelDefinition,
         package: &magnitude_artifacts::Package,
     ) -> Result<Option<crate::ResidentVision>, crate::ResidencyError> {
@@ -1691,9 +1711,9 @@ impl ResidencyStore {
                 .map(|weights| weights.to_vec()),
             package.projector(),
         ) {
-            self.preload_component(projector, &weights, DType::F32)?;
+            self.preload_component(charges, projector, &weights, DType::F32)?;
         }
-        crate::resident_weights::import_optional_vision(definition, package, self)
+        crate::resident_weights::import_optional_vision(definition, package, self, charges)
     }
 }
 
@@ -1702,7 +1722,7 @@ impl ResidencyStore {
 /// matrix of a stack), uploaded as they are. A banked expert stack's is its
 /// bank's.
 pub(crate) fn import_scale(
-    device: &Device,
+    charges: &seismic::Charges,
     artifact: &GgufArtifact,
     scale: &crate::WeightScalePlan,
 ) -> Result<Tensor, WeightImportError> {
@@ -1729,7 +1749,7 @@ pub(crate) fn import_scale(
         1 => values.repeat(extent),
         _ => values[..extent * size_of::<f32>()].to_vec(),
     };
-    Tensor::from_host(device, Element::f32(), &[scale.extent], &bytes)
+    Tensor::from_host(charges, Element::f32(), &[scale.extent], &bytes)
         .map_err(|error| WeightImportError::allocating(seismic::Contract::DeviceOnly, &error))
 }
 
@@ -1780,6 +1800,7 @@ fn report_timed_import(
 
 type ComponentImport<T> = fn(
     &mut ResidencyStore,
+    &seismic::Charges,
     &magnitude_family_contracts::ModelDefinition,
     &magnitude_artifacts::Package,
 ) -> Result<Option<T>, crate::ResidencyError>;
@@ -1861,6 +1882,14 @@ impl<T: Clone> ComponentLoader<T> {
         matches!(&*self.cached.borrow(), Some(Ok(_)))
     }
 
+    /// The component, where it is imported ([`Self::import`]).
+    pub fn resident(&self) -> Option<T> {
+        match &*self.cached.borrow() {
+            Some(Ok(component)) => Some(component.clone()),
+            _ => None,
+        }
+    }
+
     /// Import the component under `held`, the claims of the bytes its
     /// import brings into its cache, kept until [`Self::unload`]. An attempt
     /// made before is returned as it ended, `held` released.
@@ -1868,19 +1897,21 @@ impl<T: Clone> ComponentLoader<T> {
         assert!(!self.imported(), "invariant violated: a component is imported once until unloaded");
         // The import's allocations charge its claims as Seismic makes them,
         // one change with the import.
-        let imported = held.allocate(|| self.load());
+        let device = self.store.borrow().device().clone();
+        let imported = held.allocate(&device, |charges| self.load(charges));
         if imported.is_ok() {
             *self.claims.borrow_mut() = held.into_claims();
         }
         imported
     }
 
-    pub fn load(&self) -> Result<T, Rc<crate::ResidencyError>> {
+    pub fn load(&self, charges: &seismic::Charges) -> Result<T, Rc<crate::ResidencyError>> {
         if let Some(cached) = self.cached.borrow().as_ref() {
             return cached.clone();
         }
         let imported = (self.import)(
             &mut self.store.borrow_mut(),
+            charges,
             &self.definition,
             &self.package,
         )
@@ -2121,10 +2152,10 @@ mod tests {
         let slab = seismic::SlabLayout::for_regions(1, 1, &regions).unwrap();
         let granule = slab.slab_bytes.next_multiple_of(slab.slab_alignment);
         let entry: Arc<dyn seismic::memory::Entry> = Arc::new(seismic::memory::Tally::unbounded(seismic::StoreIdentity::HostRam));
-        let pool = device.pool(seismic::Contract::Shared, granule, 2 * granule, seismic::PoolEntries::one(entry)).unwrap();
+        let pool = seismic::Pool::open(&seismic::PoolCharges::one(&device.charges_in(seismic::Contract::Shared, entry)), seismic::Contract::Shared, granule, 2 * granule).unwrap();
         let table = Arc::new(
             StoredTable::new(
-                &device,
+                &seismic::Charges::tally(&device),
                 &descriptor,
                 Element::named("gguf_iq4_nl").unwrap(),
                 Element::named("iq4g32s@rows16").unwrap(),
@@ -2206,7 +2237,7 @@ mod tests {
             };
             let weight = ResidentWeight {
                 descriptor: WeightDescriptor { name: name.into(), shape: vec![elements], transforms: Vec::new() },
-                tensor: Tensor::zeros(&device, Element::f32(), &[elements]).unwrap(),
+                tensor: Tensor::zeros(&seismic::Charges::tally(&device), Element::f32(), &[elements]).unwrap(),
                 scale: None,
                 bound: None,
                 table: ResidentTable::Whole,
@@ -2236,14 +2267,16 @@ mod tests {
     /// 1 MiB weight.
     #[test]
     fn an_allocation_without_room_is_refused_for_room() {
-        use crate::memory::ledger::{DeviceLedgers, Ledgers, LoadShape};
+        use crate::memory::ledger::{CommittedKind, DeviceLedgers, Ledgers, LoadShape};
         let catalog = seismic::Devices::discover(&[]).unwrap();
         let device = crate::test_support::open_backend(&catalog, seismic::BackendName::Cpu).unwrap();
         let full = crate::memory::supply::Reading::device(1 << 30, 0, crate::domain::fixtures::NO_LAG);
         let (ledgers, _) = DeviceLedgers::open_in(&Ledgers::new(), &device, std::sync::Arc::new(LoadShape { stores: Vec::new() })).read_scripted(full);
-        let ledger = ledgers.of_contract(&device, seismic::Contract::DeviceOnly);
-        let entry = seismic::memory::Store::own(ledger);
-        let error = seismic::memory::charging(&[entry], || Tensor::zeros(&device, Element::bool(), &[1 << 20]))
+        // A load's holding of none, which grows as it allocates, in every
+        // store the device reaches.
+        let error = ledgers
+            .holding(CommittedKind::Load, Vec::new())
+            .allocate(&device, |charges| Tensor::zeros(charges, Element::bool(), &[1 << 20]))
             .expect_err("a store with no room refuses");
         assert!(
             matches!(
