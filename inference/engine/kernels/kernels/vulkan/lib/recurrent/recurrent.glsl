@@ -469,7 +469,8 @@ void recurrent_store_gated8(recurrent_gated8 v, float inverse, uint64_t row, uin
 // gates the row's head from the raw outputs (`recurrent_raw`: a row no slot
 // covers from zeros, which the advance never stores). With `lanes` (the step
 // to 8 rows), W / 8 lanes each own eight columns, sum their squares in
-// column order, and a butterfly over the lanes gives the head's sum: the
+// column order, and a butterfly over the lanes (zeros past the W / 8 owners
+// up to the next power of two) gives the head's sum: the
 // order of the projection GEMV's staging. Otherwise lanes stride the columns and the
 // workgroup sums them: the order of its staging launch.
 void recurrent_gate(const bool lanes) {
@@ -480,18 +481,24 @@ void recurrent_gate(const bool lanes) {
     const int covered = versions_covered_end();
     const float eps = element_word_f32(SEISMIC_PARAM_EPSILON);
     if (lanes) {
-        // Lanes past W / 8 repeat the first W / 8, so every lane of a
-        // butterfly group takes part; they store nothing.
-        const uint i = 8u * (lane % (W / 8u));
+        // The butterfly runs over the power-of-two group of lanes holding
+        // the W / 8 owners (W / 8 itself when it is a power of two). Lanes
+        // past the owners read an owner's columns, so every address lies in
+        // the row, but add zero and store nothing: W / 8 = 12 (W = 96) would
+        // otherwise count columns 0..31 twice through lanes 12..15.
+        const uint owners = W / 8u;
+        const uint group = 1u << uint(findMSB(owners - 1u) + 1);
+        const uint i = 8u * (lane % owners);
         const recurrent_gated8 v = recurrent_gated_inputs8(in_, mixed, covered, row, head, i);
         float squares = 0.0;
         [[unroll]] for (uint j = 0u; j < 4u; ++j) {
             squares = seismic_fma_rn(v.me[j], v.me[j], squares);
             squares = seismic_fma_rn(v.mo[j], v.mo[j], squares);
         }
-        for (uint offset = 1u; offset < W / 8u; offset <<= 1)
+        squares = lane < owners ? squares : 0.0;
+        for (uint offset = 1u; offset < group; offset <<= 1)
             squares += subgroupShuffleXor(squares, offset);
-        if (lane < W / 8u)
+        if (lane < owners)
             recurrent_store_gated8(v, inversesqrt(seismic_div_rn(squares, float(W)) + eps), row, head, i);
         return;
     }

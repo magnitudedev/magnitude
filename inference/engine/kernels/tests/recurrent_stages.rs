@@ -1673,6 +1673,40 @@ fn step_and_chunk_match_the_portable_body() {
     }
 }
 
+/// The step gates over W / 8 lanes per row; at W = 96 that is 12, not a
+/// power of two, so the butterfly must not fold the group's lanes past 12
+/// (which read the first lanes' columns) into the head's square sum.
+#[test]
+fn step_gates_a_head_of_twelve_lanes() {
+    let geometry = Geometry {
+        key_heads: 2,
+        value_heads: 4,
+        width: 96,
+        decay_width: 1,
+        convolution: 4,
+        banks: 6,
+        tape: 0,
+    };
+    let case = Case::new(
+        geometry,
+        8,
+        vec![slot(2, 2, 1, 4), slot(1, 1, 2, 5), slot(3, 3, 0, 3)],
+        true,
+        2,
+    );
+    let oracle = case.oracle();
+    for device in devices() {
+        let step = case.native(&device, Element::f32(), None);
+        check(
+            &format!("{} W = 96: step", device.backend().as_str()),
+            &case,
+            &step,
+            &oracle,
+            between(step_of(&device), ORACLE),
+        );
+    }
+}
+
 fn step_and_chunk_match_the_portable_body_on(device: &Device) {
     let backend = device.backend().as_str();
     for (label, case) in small_cases() {

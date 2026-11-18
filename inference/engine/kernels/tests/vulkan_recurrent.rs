@@ -136,6 +136,32 @@ fn vulkan_step_and_chunk_match_the_portable_body() {
     }
 }
 
+/// To 8 rows the step gates over W / 8 lanes; at W = 96 that is 12, not a
+/// power of two, so the butterfly must not fold lanes 12..15 (which read
+/// lanes 0..3's columns) into the head's square sum.
+#[test]
+fn vulkan_step_gates_a_head_of_twelve_lanes() {
+    let Some(device) = vulkan() else { return };
+    let geometry = Geometry {
+        key_heads: 2,
+        value_heads: 4,
+        width: 96,
+        decay_width: 1,
+        convolution: 4,
+        banks: 6,
+        tape: 0,
+    };
+    let case = Case::new(
+        geometry,
+        8,
+        vec![slot(2, 2, 1, 4), slot(1, 1, 2, 5), slot(3, 3, 0, 3)],
+        true,
+        2,
+    );
+    let step = case.vulkan(&device, Element::f32(), false, MAPPINGS[0]);
+    check("W = 96: vulkan step", &case, &step, &case.oracle(), between(STEP, ORACLE));
+}
+
 #[test]
 fn vulkan_mapping_never_changes_bits_and_stop_equals_a_shorter_run() {
     let Some(device) = vulkan() else { return };
