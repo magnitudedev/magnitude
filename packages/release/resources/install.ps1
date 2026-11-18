@@ -238,7 +238,11 @@ function Initialize-CommandDirectory {
   $security.SetOwner($user)
   $security.SetAccessRuleProtection($true, $false)
   $security.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($user, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
-  Set-Acl -LiteralPath $commandDirectory -AclObject $security
+  # Set-Acl also writes the audit list, which needs a privilege standard users lack; Windows PowerShell has the
+  # DirectoryInfo method, PowerShell 7 the extension.
+  $directory = [IO.DirectoryInfo]::new($commandDirectory)
+  if ($directory.PSObject.Methods['SetAccessControl']) { $directory.SetAccessControl($security) }
+  else { [IO.FileSystemAclExtensions]::SetAccessControl($directory, $security) }
 }
 # A running launcher (a serve started at login, say) cannot be overwritten, but it can be renamed away.
 function Install-Launcher([string]$Source) {
