@@ -41,7 +41,7 @@ fn a_growth_joins_each_slot_as_every_group_holds_it() {
     let block = ledger.estimate().allocated() - opened;
     assert!(block >= 2 * granule, "a block is charged its granules at least: {block} bytes");
     let blocks = |slots: u64| opened + slots * block;
-    let claim = ledger.backing(crate::memory::ledger::PoolClass::Records, 6 * 2 * granule).expect("the slots fit");
+    let claim = ledger.change(|keeping| ledger.backing(&keeping.claims(), crate::memory::ledger::PoolClass::Records, 6 * 2 * granule)).expect("the slots fit");
     let (slots, stop, rises) = (AtomicU64::new(1), AtomicBool::new(false), Mutex::new(()));
     let posted = Mutex::new(Vec::new());
     let grown = grow_by_slots(
@@ -114,7 +114,7 @@ fn a_pools_absent_granule_is_committed_never_spare() {
     assert_eq!((opened.cache(), opened.committed()), (0, opened.allocated()), "committed, none of it spare");
     // A growth's first record takes a block: its other granule and the
     // block's rounding are spare.
-    let claim = ledger.backing(crate::memory::ledger::PoolClass::Records, granule).expect("room");
+    let claim = ledger.change(|keeping| ledger.backing(&keeping.claims(), crate::memory::ledger::PoolClass::Records, granule)).expect("room");
     changes.change(|_| assert_eq!(stores.claim_to(0, 1).unwrap(), [0]));
     let one = ledger.estimate();
     let block = one.allocated() - opened.allocated();
@@ -199,7 +199,7 @@ fn a_long_growth_beside_settled_samples_never_starves_or_panics_them() {
     changes.change(|_| (0..2).for_each(|group| assert_eq!(stores.claim_to(group, 1).unwrap(), [0])));
     // What the backend charges a block (whole host pages at least).
     let block = ledger.estimate().allocated() - opened;
-    let claim = ledger.backing(crate::memory::ledger::PoolClass::Records, SLOTS * 2 * granule).expect("the slots fit");
+    let claim = ledger.change(|keeping| ledger.backing(&keeping.claims(), crate::memory::ledger::PoolClass::Records, SLOTS * 2 * granule)).expect("the slots fit");
     let (slots, stop, rises, joined) = (Arc::new(AtomicU64::new(1)), Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(())), Arc::new(AtomicU64::new(0)));
     // The growth runs on the resize thread as the bank's does.
     let resize_thread = StorageThread::start("bank-test-growth").unwrap();

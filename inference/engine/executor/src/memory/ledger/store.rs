@@ -213,10 +213,10 @@ impl DeviceLedgers {
     }
 
     /// Claim `demand`, an allocation of `kind` about to be made, in the
-    /// stores `device` reaches ([`Self::placed`]), each claim admitted by
-    /// comparing its new bytes against its store's free room, cache
-    /// yielding to it, by the store's latest reading: a domain's claim as
-    /// it serves. A load claims at the reading it holds ([`Self::claim_at`]).
+    /// stores `device` reaches ([`Self::placed`]), in `claiming`, a
+    /// change's claim phase, each claim admitted by comparing its new bytes
+    /// against its store's free room, cache yielding to it, by the store's
+    /// latest reading: a domain's claim as it serves. A load claims at the reading it holds ([`Self::claim_at`]).
     /// Seismic charges the allocation's exact bytes to each claim's entry as
     /// it makes it ([`Held::allocate`]), and frees them as it frees it.
     /// Refused, nothing is held.
@@ -225,8 +225,8 @@ impl DeviceLedgers {
     /// For a sequence's state, which is claimed by its rows alone, or a
     /// pooled kind, whose granules its pool's entry allocates (the request
     /// slot is claimed by [`Self::claim_request_slot`]).
-    pub fn claim(&self, device: &seismic::Device, kind: CommittedKind, demand: crate::memory::ClaimDemand) -> Result<Held, Short> {
-        self.claim_judged(None, device, kind, demand)
+    pub fn claim(&self, claiming: &Claiming, device: &seismic::Device, kind: CommittedKind, demand: crate::memory::ClaimDemand) -> Result<Held, Short> {
+        self.claim_judged(claiming, None, device, kind, demand)
     }
 
     /// [`Self::claim`] at `reading`, the one a load holds from its start
@@ -234,8 +234,8 @@ impl DeviceLedgers {
     /// scope's stores counted now, so a load's claims read one reading and
     /// no concurrent reading, resize or pressure event moves what it was
     /// planned against (design §5).
-    pub fn claim_at(&self, reading: &DeviceReading, device: &seismic::Device, kind: CommittedKind, demand: crate::memory::ClaimDemand) -> Result<Held, Short> {
-        self.claim_judged(Some(reading), device, kind, demand)
+    pub fn claim_at(&self, claiming: &Claiming, reading: &DeviceReading, device: &seismic::Device, kind: CommittedKind, demand: crate::memory::ClaimDemand) -> Result<Held, Short> {
+        self.claim_judged(claiming, Some(reading), device, kind, demand)
     }
 
     /// `claims`, each of `kind` and taken in a store of these ledgers apart
@@ -273,26 +273,26 @@ impl DeviceLedgers {
     ///
     /// # Panics
     /// Where `demand` places bytes in other than one store.
-    pub fn claim_request_slot(&self, device: &seismic::Device, demand: crate::memory::ClaimDemand) -> Result<Claim, Short> {
-        self.claim_request_slot_judged(None, device, demand)
+    pub fn claim_request_slot(&self, claiming: &Claiming, device: &seismic::Device, demand: crate::memory::ClaimDemand) -> Result<Claim, Short> {
+        self.claim_request_slot_judged(claiming, None, device, demand)
     }
 
     /// [`Self::claim_request_slot`] at `reading`, the load's
     /// ([`Self::claim_at`]).
-    pub fn claim_request_slot_at(&self, reading: &DeviceReading, device: &seismic::Device, demand: crate::memory::ClaimDemand) -> Result<Claim, Short> {
-        self.claim_request_slot_judged(Some(reading), device, demand)
+    pub fn claim_request_slot_at(&self, claiming: &Claiming, reading: &DeviceReading, device: &seismic::Device, demand: crate::memory::ClaimDemand) -> Result<Claim, Short> {
+        self.claim_request_slot_judged(claiming, Some(reading), device, demand)
     }
 
-    fn claim_request_slot_judged(&self, reading: Option<&DeviceReading>, device: &seismic::Device, demand: crate::memory::ClaimDemand) -> Result<Claim, Short> {
+    fn claim_request_slot_judged(&self, claiming: &Claiming, reading: Option<&DeviceReading>, device: &seismic::Device, demand: crate::memory::ClaimDemand) -> Result<Claim, Short> {
         let (on_device, on_host) = self.placed(device, demand);
         let mut placed = self.judged(reading).into_iter().zip([on_device, on_host]).filter(|(_, bytes)| *bytes > 0);
         let (Some(((ledger, held), bytes)), None) = (placed.next(), placed.next()) else {
             panic!("invariant violated: a request slot is claimed in other than one store");
         };
-        ledger.claim_at(held, CommittedKind::RequestSlot, bytes)
+        ledger.claim_at(claiming, held, CommittedKind::RequestSlot, bytes)
     }
 
-    fn claim_judged(&self, reading: Option<&DeviceReading>, device: &seismic::Device, kind: CommittedKind, demand: crate::memory::ClaimDemand) -> Result<Held, Short> {
+    fn claim_judged(&self, claiming: &Claiming, reading: Option<&DeviceReading>, device: &seismic::Device, kind: CommittedKind, demand: crate::memory::ClaimDemand) -> Result<Held, Short> {
         assert!(!matches!(kind, CommittedKind::Request(_) | CommittedKind::Grant(_)), "a {kind:?} claim is taken by its own path");
         assert!(!Holding::Committed(kind).pooled(), "invariant violated: a pooled {kind:?} holding is claimed by its own path; its pool's entry allocates its granules");
         let (on_device, on_host) = self.placed(device, demand);
@@ -301,7 +301,7 @@ impl DeviceLedgers {
         let mut unclaimed = Vec::new();
         for (index, ((ledger, held), bytes)) in self.judged(reading).into_iter().zip([on_device, on_host]).enumerate() {
             if bytes > 0 {
-                claims.push(ledger.claim_at(held, kind, bytes)?);
+                claims.push(ledger.claim_at(claiming, held, kind, bytes)?);
             } else if !(unified && index == 1) {
                 unclaimed.push((ledger.clone(), kind));
             }
@@ -346,12 +346,14 @@ impl DeviceLedgers {
     }
 
     /// The most of `least..=most` whose `demand` fits, by halving at
-    /// `reading`, the one the load holds, claimed as `kind` there
-    /// ([`Self::claim_at`]), nothing allocated: `demand` never demands less
-    /// of a larger count, and an error of it ends the search as it is.
+    /// `reading`, the one the load holds, claimed as `kind` there in
+    /// `claiming` ([`Self::claim_at`]), nothing allocated: `demand` never
+    /// demands less of a larger count, and an error of it ends the search
+    /// as it is.
     /// Short as `least` is where not even it fits.
     pub fn admit_most<E>(
         &self,
+        claiming: &Claiming,
         reading: &DeviceReading,
         device: &seismic::Device,
         kind: CommittedKind,
@@ -378,7 +380,7 @@ impl DeviceLedgers {
                 fitting
             }
         };
-        Ok(self.claim_at(reading, device, kind, demand(fitting)?).map(|held| (fitting, held)))
+        Ok(self.claim_at(claiming, reading, device, kind, demand(fitting)?).map(|held| (fitting, held)))
     }
 
     /// Read every store `device` reaches from `sample`, one instant's, and
@@ -738,10 +740,12 @@ pub struct Held {
 
 impl Held {
     /// `make`, the allocation on the owner's thread, as one change
-    /// ([`Changes::change`]): handed the charges `device`'s ledger mints
-    /// from this holding ([`seismic::Device::charges`]), every allocation it
-    /// makes in a store the device reaches is charged to this holding's
-    /// non-pooled claim there, at its exact bytes, as Seismic makes it.
+    /// ([`Changes::change`]) in its claim phase (an allocation past its
+    /// claim takes cache as a claim does): handed the charges `device`'s
+    /// ledger mints from this holding ([`seismic::Device::charges`]), every
+    /// allocation it makes in a store the device reaches is charged to this
+    /// holding's non-pooled claim there, at its exact bytes, as Seismic
+    /// makes it.
     ///
     /// This is the only way an allocation is charged to a holding: the
     /// charges name a claim in every store the device reaches, those this
@@ -758,7 +762,8 @@ impl Held {
     /// ([`DeviceLedgers::claim`]), so only another device's would.
     pub fn allocate<T>(&mut self, device: &seismic::Device, make: impl FnOnce(&seismic::Charges) -> T) -> T {
         let changes = self.changes.clone();
-        changes.change(|_| {
+        changes.change(|keeping| {
+            let _claiming = keeping.claims();
             let mut extra: Vec<Claim> = self
                 .unclaimed
                 .iter()

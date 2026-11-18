@@ -107,8 +107,10 @@ fn prepare_every_entry(
     let mut tunings = Vec::with_capacity(loads);
     for load in 0..loads {
         let began = std::time::Instant::now();
+        let demand = ClaimDemand { device: AttestedPrograms::DEVICE_BYTES, ..ClaimDemand::default() };
         let mut programs_claim = ledgers
-            .claim_at(&reading, opened.device(), CommittedKind::Load, ClaimDemand { device: AttestedPrograms::DEVICE_BYTES, ..ClaimDemand::default() })
+            .changes()
+            .change(|keeping| ledgers.claim_at(&keeping.claims(), &reading, opened.device(), CommittedKind::Load, demand))
             .unwrap_or_else(|short| panic!("the programs' storage is claimed: {short:?}"));
         let programs = programs_claim.allocate(opened.device(), |charges| AttestedPrograms::prepare_draft(
             &draft,

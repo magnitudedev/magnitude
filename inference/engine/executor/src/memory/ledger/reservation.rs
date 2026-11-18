@@ -3,6 +3,7 @@
 //! so no row of it ever waits on memory mid-launch.
 
 use super::admission::Short;
+use super::changes::Claiming;
 use super::claims::Claim;
 use super::state::{EntryId, State};
 use super::view::Ledger;
@@ -22,7 +23,8 @@ pub struct Reservation {
 }
 
 impl Ledger {
-    /// Reserve `rows` rows of `sequence`'s state as it opens: what the slot
+    /// Reserve `rows` rows of `sequence`'s state as it opens, in
+    /// `claiming`, a change's claim phase: what the slot
     /// holds first, then free room beside the guarantee, within the
     /// boundary, the cache worth nothing yielding to it (`State::draw`).
     /// The bank and retained prefixes give it room only through a relief
@@ -31,7 +33,8 @@ impl Ledger {
     ///
     /// # Panics
     /// Where `slot` is not this store's request slot.
-    pub fn reserve(&self, slot: &Claim, sequence: RequestId, rows: u64) -> Result<Reservation, Short> {
+    pub fn reserve(&self, claiming: &Claiming, slot: &Claim, sequence: RequestId, rows: u64) -> Result<Reservation, Short> {
+        claiming.of_scope(&self.store.changes);
         self.check_slot(slot);
         let kind = CommittedKind::Request(sequence);
         let bytes = size(&self.shape, &Need::Request { sequence, rows });
@@ -40,13 +43,14 @@ impl Ledger {
     }
 
     /// Extend `reservation` to `rows` rows, ahead of the rows its next step
-    /// writes, as [`Self::reserve`] takes room. Short, it holds what it
+    /// writes, in `claiming`, as [`Self::reserve`] takes room. Short, it holds what it
     /// held, and the step is relieved or waits.
     ///
     /// # Panics
     /// Where `slot` is not this store's request slot, or `rows` holds no
     /// more than the reservation does.
-    pub fn extend(&self, slot: &Claim, reservation: &mut Reservation, rows: u64) -> Result<(), Short> {
+    pub fn extend(&self, claiming: &Claiming, slot: &Claim, reservation: &mut Reservation, rows: u64) -> Result<(), Short> {
+        claiming.of_scope(&self.store.changes);
         self.check_slot(slot);
         assert!(rows > reservation.rows, "invariant violated: a reservation of {} rows extends to {rows}", reservation.rows);
         let CommittedKind::Request(sequence) = reservation.claim.kind() else {

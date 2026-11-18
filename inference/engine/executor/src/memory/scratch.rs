@@ -6,7 +6,7 @@
 //! granules, bank slots above the floor), never preempting a sequence and
 //! never refused, and held, fixed, until the group closes.
 
-use super::ledger::{Claim, CommittedKind, Ledger};
+use super::ledger::{Claim, Claiming, CommittedKind, Ledger};
 use std::num::NonZeroU64;
 
 /// What a group's scratch is sized from: the bank's header-derived counts.
@@ -31,12 +31,13 @@ pub struct PromptScratch {
 }
 
 impl PromptScratch {
-    /// The scratch of a group opening now in `ledger` (the lender's store):
+    /// The scratch of a group opening now in `ledger` (the lender's store),
+    /// claimed in `claiming`:
     /// `S = min(cold, decode + the most records that yield at once)`, at
     /// least the decode set, which the floor holds; fixed for the group.
-    pub fn open(ledger: &Ledger, shape: ScratchShape) -> Self {
+    pub fn open(ledger: &Ledger, claiming: &Claiming, shape: ScratchShape) -> Self {
         let wanted = shape.cold.saturating_sub(shape.decode);
-        let (claim, more) = ledger.claim_units(CommittedKind::Scratch, shape.record_bytes, wanted);
+        let (claim, more) = ledger.claim_units(claiming, CommittedKind::Scratch, shape.record_bytes, wanted);
         Self { claim, records: shape.cold.min(shape.decode + more) }
     }
 
@@ -78,7 +79,7 @@ mod tests {
     #[test]
     fn a_group_takes_its_cold_need_where_room_holds_it() {
         let (_scope, ledger) = ledger(64 * RECORD);
-        let scratch = PromptScratch::open(&ledger, shape(16, 40));
+        let scratch = ledger.change(|keeping| PromptScratch::open(&ledger, &keeping.claims(), shape(16, 40)));
         assert_eq!((scratch.records(), scratch.bytes()), (40, 24 * RECORD));
         drop(scratch);
         assert_eq!(ledger.estimate().committed(), 0, "the group's close frees its scratch");
@@ -90,17 +91,17 @@ mod tests {
     #[test]
     fn a_group_takes_only_what_yields_at_once() {
         let (_scope, ledger) = ledger(64 * RECORD);
-        let committed = ledger.claim_at(None, crate::memory::ledger::CommittedKind::Load, 50 * RECORD).expect("room");
+        let committed = ledger.change(|keeping| ledger.claim_at(&keeping.claims(), None, crate::memory::ledger::CommittedKind::Load, 50 * RECORD)).expect("room");
         // The bank's slots are granules of the store's pool.
         let _pool = ledger.pool_block(crate::memory::ledger::PoolClass::Records, NonZeroU64::new(RECORD).unwrap()).blocks;
         let bank = ledger.cached(CacheKind::Bank, 10 * RECORD + RECORD / 2).expect("room");
         // Free: 3.5 records; the bank's cache: 10.5. Whole records: 14.
-        let scratch = PromptScratch::open(&ledger, shape(16, 40));
+        let scratch = ledger.change(|keeping| PromptScratch::open(&ledger, &keeping.claims(), shape(16, 40)));
         assert_eq!(scratch.records(), 16 + 14);
         assert_eq!(committed.bytes(), 50 * RECORD, "no committed claim yielded");
         assert!(bank.bytes() < 10 * RECORD + RECORD / 2, "the bank's cache yielded");
         // With nothing left to yield, the scratch is the decode set.
-        let none = PromptScratch::open(&ledger, shape(16, 40));
+        let none = ledger.change(|keeping| PromptScratch::open(&ledger, &keeping.claims(), shape(16, 40)));
         assert_eq!((none.records(), none.bytes()), (16, 0));
     }
 
@@ -108,7 +109,7 @@ mod tests {
     #[test]
     fn a_cold_need_within_the_decode_set_takes_nothing() {
         let (_scope, ledger) = ledger(64 * RECORD);
-        let scratch = PromptScratch::open(&ledger, shape(16, 12));
+        let scratch = ledger.change(|keeping| PromptScratch::open(&ledger, &keeping.claims(), shape(16, 12)));
         assert_eq!((scratch.records(), scratch.bytes()), (12, 0));
     }
 }

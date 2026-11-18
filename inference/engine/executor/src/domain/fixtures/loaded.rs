@@ -520,10 +520,10 @@ pub(crate) fn load_read(
         None => load.target_weight_demand(),
     }
     .unwrap();
-    let mut weights = ledgers.claim(&device, crate::memory::ledger::CommittedKind::Load, demand).unwrap();
+    let mut weights = ledgers.changes().change(|keeping| ledgers.claim(&keeping.claims(), &device, crate::memory::ledger::CommittedKind::Load, demand)).unwrap();
     // As the engine's load claims them: its host tables' row caches.
     let host_tables = crate::memory::ClaimDemand { host: load.host_table_bytes().unwrap(), ..Default::default() };
-    let host_tables = ledgers.claim(&device, crate::memory::ledger::CommittedKind::Load, host_tables).unwrap();
+    let host_tables = ledgers.changes().change(|keeping| ledgers.claim(&keeping.claims(), &device, crate::memory::ledger::CommittedKind::Load, host_tables)).unwrap();
     // As the engine's load opens them: the state's pool, and the bank's
     // records pool where it has a bank.
     let pools = crate::LoadPools::open(&device, &ledgers, &execution).unwrap();
@@ -559,7 +559,11 @@ pub(crate) fn load_read(
         device: programs.target_graphs().unwrap().binding_constant_bytes().unwrap(),
         ..Default::default()
     };
-    let constants = resources.ledgers().claim(&device, crate::memory::ledger::CommittedKind::Load, constants).unwrap();
+    let constants = resources
+        .ledgers()
+        .changes()
+        .change(|keeping| resources.ledgers().claim(&keeping.claims(), &device, crate::memory::ledger::CommittedKind::Load, constants))
+        .unwrap();
     let request_slot = crate::domain::fixtures::request_slot(resources.ledgers(), &device, &execution, 0);
     let reader = crate::DeviceReader::open(reading.clone(), release, device).unwrap();
     let (mut domain, mut bindings) = ExecutorDomain::new(

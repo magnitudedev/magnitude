@@ -886,7 +886,11 @@ fn build_held(
     let slot = magnitude_executor::request_slot_bytes(&execution_plan).map_err(internal)?;
     let request_slot = startup
         .ledgers
-        .claim_request_slot_at(&startup.reading, startup.reader.device(), ClaimDemand { device: slot, ..ClaimDemand::default() })
+        .changes()
+        .change(|keeping| {
+            let demand = ClaimDemand { device: slot, ..ClaimDemand::default() };
+            startup.ledgers.claim_request_slot_at(&keeping.claims(), &startup.reading, startup.reader.device(), demand)
+        })
         .map_err(|short| refused("one request's opening", short))?;
     let constants_claim = startup.claim_as(
         "target binding constants",
@@ -1738,7 +1742,8 @@ impl Startup {
     }
 
     /// Claim `demand`, an allocation the load makes and keeps, at the
-    /// load's reading; refused as insufficient memory for `purpose`.
+    /// load's reading, in a change that keeps nothing; refused as
+    /// insufficient memory for `purpose`.
     fn claim(&self, purpose: &str, demand: ClaimDemand) -> Result<Held, LoadError> {
         self.claim_as(purpose, CommittedKind::Load, demand)
     }
@@ -1748,7 +1753,11 @@ impl Startup {
     /// minimum request state's, or one the load frees as it starts (its
     /// qualification fixtures, its upload window).
     fn claim_as(&self, purpose: &str, kind: CommittedKind, demand: ClaimDemand) -> Result<Held, LoadError> {
-        self.ledgers.claim_at(&self.reading, self.reader.device(), kind, demand).map_err(|short| refused(purpose, short))
+        let device = self.reader.device();
+        self.ledgers
+            .changes()
+            .change(|keeping| self.ledgers.claim_at(&keeping.claims(), &self.reading, device, kind, demand))
+            .map_err(|short| refused(purpose, short))
     }
 
     /// [`Self::claim`] of `bytes` of device storage.
@@ -1793,7 +1802,9 @@ impl Startup {
                 (bank.floor(), bank.slots, most)
             }
         };
-        match self.ledgers.admit_most(&self.reading, self.reader.device(), CommittedKind::Load, floor, most, demand)? {
+        let device = self.reader.device();
+        let admitted = self.ledgers.changes().change(|keeping| self.ledgers.admit_most(&keeping.claims(), &self.reading, device, CommittedKind::Load, floor, most, demand))?;
+        match admitted {
             Ok((slots, held)) if slots == planned => Ok(Imported::Planned(held)),
             Ok((slots, held)) => {
                 tracing::info!(
@@ -2287,7 +2298,7 @@ mod tests {
             let selected = crate::planning::select_load_device(&catalog, &manifest).unwrap();
             let read = read_device(catalog.clone(), &manifest, &selected).unwrap_or_else(|error| panic!("{backend:?} opens and is read: {error:?}"));
             let demand = ClaimDemand { device: 1 << 20, ..ClaimDemand::default() };
-            let claim = read.ledgers.claim_at(&read.reading, read.opened.device(), CommittedKind::Qualification, demand);
+            let claim = read.ledgers.changes().back(|claiming| read.ledgers.claim_at(&claiming, &read.reading, read.opened.device(), CommittedKind::Qualification, demand));
             assert!(claim.is_ok(), "{backend:?}: a load claims in the store its open read: {:?}", claim.err());
         }
     }

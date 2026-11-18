@@ -644,8 +644,8 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// as it unbinds.
     vision_binding: Vec<crate::memory::ledger::Claim>,
     /// The bound optional components held as cache while no request is
-    /// resident (`ExecutorDomain::release_yielded`), committed again as one
-    /// opens (`ExecutorDomain::activate_components`).
+    /// resident (`ExecutorDomain::release_yielded`), kept again as one opens
+    /// (`ExecutorDomain::keep_components`).
     idle_components: Vec<serving_heap::IdleComponent>,
     /// The latest reading's answer ([`MemoryProbe::answer`]): each store's
     /// generation at it, and the response the owner owes.
@@ -1248,7 +1248,7 @@ impl<'d> MemoryProbe<'d> {
                 // A plan of cache alone is carried out at once; one naming
                 // requests, each evictable now, is the owner's.
                 let owed = match shortage.as_mut().and_then(|shortage| shortage.response.relief.take_if(|plan| plan.preempt().is_empty())) {
-                    Some(plan) => ledger.execute(plan),
+                    Some(plan) => ledger.change(|keeping| ledger.execute(&keeping.claims(), plan)),
                     None => crate::memory::ledger::Owed::default(),
                 };
                 StoreAnswer { ledger, generation, shortage, owed }
@@ -2444,68 +2444,76 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// Import and bind the optional component `lane` needs when it is
-    /// unbound, each allocation under its claim (`Self::claim_growth`): the
-    /// import's resident weights held by its loader for the import's life,
-    /// its upload peak only while it runs, and its graph constants for its
-    /// binding's life.
+    /// unbound, each allocation under its claim (`Self::claim_growth`), in
+    /// one change that keeps nothing: the import's resident weights held by
+    /// its loader for the import's life, its upload peak only while it
+    /// runs, and its graph constants for its binding's life.
     fn bind_component(&mut self, lane: ReservationLane) -> Result<(), DomainError> {
-        // Its import and binding allocate under the claims below, tables included.
-        let device = self.domain.device().clone();
-        match lane {
-            ReservationLane::Head if !self.family.head_is_bound() => {
-                let loader = self
-                    .head_loader
-                    .as_ref()
-                    .ok_or_else(|| DomainError::Input("head component is disabled".into()))?;
-                let constants = loader.binding_constant_bytes().map_err(DomainError::Input)?;
-                let resident = self.import_component(
-                    loader,
-                    self.execution.resources().bytes().head_weights,
-                    self.execution.load().head_upload_peak_bytes(),
-                )?;
-                let mut binding = self.claim_growth(
-                    crate::memory::ledger::CommittedKind::Component,
-                    crate::memory::ClaimDemand { device: constants, ..Default::default() },
-                )?;
-                binding.allocate(&device, |charges| self.family.bind_head(charges, resident, &self.definition))?;
-                self.head_binding = binding.into_claims();
-                self.hold_bound_head()?;
-                Ok(())
+        let changes = self.resources.ledgers().changes().clone();
+        changes.change(|keeping| {
+            let claiming = &keeping.claims();
+            // Its import and binding allocate under the claims below, tables included.
+            let device = self.domain.device().clone();
+            match lane {
+                ReservationLane::Head if !self.family.head_is_bound() => {
+                    let loader = self
+                        .head_loader
+                        .as_ref()
+                        .ok_or_else(|| DomainError::Input("head component is disabled".into()))?;
+                    let constants = loader.binding_constant_bytes().map_err(DomainError::Input)?;
+                    let resident = self.import_component(
+                        claiming,
+                        loader,
+                        self.execution.resources().bytes().head_weights,
+                        self.execution.load().head_upload_peak_bytes(),
+                    )?;
+                    let mut binding = self.claim_growth(
+                        claiming,
+                        crate::memory::ledger::CommittedKind::Component,
+                        crate::memory::ClaimDemand { device: constants, ..Default::default() },
+                    )?;
+                    binding.allocate(&device, |charges| self.family.bind_head(charges, resident, &self.definition))?;
+                    self.head_binding = binding.into_claims();
+                    self.hold_bound_head(claiming)?;
+                    Ok(())
+                }
+                ReservationLane::Vision if !self.family.vision_is_bound() => {
+                    let loader = self
+                        .vision_loader
+                        .as_ref()
+                        .ok_or_else(|| DomainError::Input("vision component is disabled".into()))?;
+                    let constants = loader.binding_constant_bytes().map_err(DomainError::Input)?;
+                    let resident = self.import_component(
+                        claiming,
+                        loader,
+                        self.execution.resources().bytes().vision_weights,
+                        self.execution.load().vision_upload_peak_bytes(),
+                    )?;
+                    let mut binding = self.claim_growth(
+                        claiming,
+                        crate::memory::ledger::CommittedKind::Component,
+                        crate::memory::ClaimDemand { device: constants, ..Default::default() },
+                    )?;
+                    binding.allocate(&device, |charges| self.family.bind_vision(charges, resident, &self.definition))?;
+                    self.vision_binding = binding.into_claims();
+                    Ok(())
+                }
+                _ => Ok(()),
             }
-            ReservationLane::Vision if !self.family.vision_is_bound() => {
-                let loader = self
-                    .vision_loader
-                    .as_ref()
-                    .ok_or_else(|| DomainError::Input("vision component is disabled".into()))?;
-                let constants = loader.binding_constant_bytes().map_err(DomainError::Input)?;
-                let resident = self.import_component(
-                    loader,
-                    self.execution.resources().bytes().vision_weights,
-                    self.execution.load().vision_upload_peak_bytes(),
-                )?;
-                let mut binding = self.claim_growth(
-                    crate::memory::ledger::CommittedKind::Component,
-                    crate::memory::ClaimDemand { device: constants, ..Default::default() },
-                )?;
-                binding.allocate(&device, |charges| self.family.bind_vision(charges, resident, &self.definition))?;
-                self.vision_binding = binding.into_claims();
-                Ok(())
-            }
-            _ => Ok(()),
-        }
+        })
     }
 
     /// `loader`'s component, imported where it is not yet: its `resident`
     /// bytes claimed for the import's life, kept by the loader, and its
     /// upload `peak` (staged through host RAM where that is a store apart)
-    /// claimed only while the import runs.
-    fn import_component<T: Clone>(&self, loader: &ComponentLoader<T>, resident: u64, peak: u64) -> Result<T, DomainError> {
+    /// claimed only while the import runs, each in `claiming`.
+    fn import_component<T: Clone>(&self, claiming: &crate::memory::ledger::Claiming, loader: &ComponentLoader<T>, resident: u64, peak: u64) -> Result<T, DomainError> {
         let imported = match loader.resident() {
             Some(resident) => Ok(resident),
             None => {
                 use crate::memory::{ClaimDemand, ledger::CommittedKind};
-                let weights = self.claim_growth(CommittedKind::Component, ClaimDemand { device: resident, ..Default::default() })?;
-                let _upload = self.claim_growth(CommittedKind::Upload, ClaimDemand { device: peak, staged: peak, ..Default::default() })?;
+                let weights = self.claim_growth(claiming, CommittedKind::Component, ClaimDemand { device: resident, ..Default::default() })?;
+                let _upload = self.claim_growth(claiming, CommittedKind::Upload, ClaimDemand { device: peak, staged: peak, ..Default::default() })?;
                 loader.import(weights)
             }
         };

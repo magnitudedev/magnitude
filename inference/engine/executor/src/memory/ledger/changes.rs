@@ -24,6 +24,14 @@
 //!   free on any thread, the pool-return thread's included), which begins at
 //!   once and waits for no sample. A change begun where its thread has one
 //!   under way joins it: one logical change, one number.
+//! - **What it keeps before it claims.** An owner's change runs in two
+//!   phases ([`Keeping`], then [`Claiming`]): cache it takes up again (an
+//!   idle component, a closed group's idle slots) is committed again only
+//!   while it keeps ([`Keeping::keep`]), and memory is claimed, reserved or
+//!   granted, and cache yields, only once it claims ([`Keeping::claims`]).
+//!   So no claim of a change takes the cache it keeps. A step
+//!   ([`Changes::back`]) only claims. A change joined where its thread's
+//!   change claims already claims too: a keep there panics.
 //! - **Who may wait inside one.** A change holds readings off for its
 //!   length: a sample ([`Sample::try_now`]) stands only where none was under
 //!   way, and a settled one ([`Sample::settled`]) waits for them to end. So
@@ -33,6 +41,7 @@
 //!   owner's thread waits for a settled sample before it begins, never
 //!   inside.
 
+use std::marker::PhantomData;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -141,7 +150,7 @@ impl Changes {
             self.meet().owner += 1;
         }
         let number = self.count.fetch_add(ONE_CHANGE + 1, Ordering::SeqCst) >> IN_FLIGHT_BITS;
-        OPEN.with_borrow_mut(|open| open.push((self.key(), number, owner)));
+        OPEN.with_borrow_mut(|open| open.push(Open { key: self.key(), number, owner, claims: false }));
         Changing { changes: self.clone(), number, owner, joined: false }
     }
 
@@ -152,13 +161,27 @@ impl Changes {
 
     /// The number of the change of this scope this thread has under way.
     pub(super) fn open_here(&self) -> Option<u64> {
-        OPEN.with_borrow(|open| open.iter().find(|(key, ..)| *key == self.key()).map(|(_, number, _)| *number))
+        OPEN.with_borrow(|open| open.iter().find(|open| open.key == self.key()).map(|open| open.number))
     }
 
     /// Whether the change of this scope this thread has under way is an
     /// owner's ([`Self::change`], [`OpenChange`]).
     fn owner_open_here(&self) -> bool {
-        OPEN.with_borrow(|open| open.iter().any(|(key, _, owner)| *key == self.key() && *owner))
+        OPEN.with_borrow(|open| open.iter().any(|open| open.key == self.key() && open.owner))
+    }
+
+    /// Whether the change of this scope this thread has under way claims
+    /// ([`Claiming`]).
+    fn claims_here(&self) -> bool {
+        OPEN.with_borrow(|open| open.iter().any(|open| open.key == self.key() && open.claims))
+    }
+
+    /// The change of this scope this thread has under way claims from now.
+    fn claim_here(&self) {
+        OPEN.with_borrow_mut(|open| {
+            let open = open.iter_mut().find(|open| open.key == self.key()).expect("a change under way is open on its thread");
+            open.claims = true;
+        });
     }
 
     /// From now, a record outside a change panics in this test's scope, as
@@ -170,9 +193,11 @@ impl Changes {
 
     /// `change`, an OS change of the scope's memory on the owner's thread
     /// and its records in the ledgers, run as one: no sample beside it
-    /// stands. The owner takes no reading while it runs.
-    pub fn change<R>(self: &Arc<Self>, change: impl FnOnce(&Changing) -> R) -> R {
-        change(&self.begin(true))
+    /// stands. The owner takes no reading while it runs. It is handed in
+    /// its keep phase ([`Keeping`]), which it ends to claim.
+    pub fn change<R>(self: &Arc<Self>, change: impl FnOnce(Keeping<'_>) -> R) -> R {
+        let changing = self.begin(true);
+        change(Keeping { changing: &changing, _thread: PhantomData })
     }
 
     /// The calling thread as an owner of the scope's memory until the
@@ -189,14 +214,16 @@ impl Changes {
     /// ([`Sample::settled`]), so such a sample waits for the steps
     /// under way, however long a growth of many steps runs; beside a change
     /// of the owner's, which may wait on it, it waits for none. A step its
-    /// thread runs within a change under way joins it.
-    pub fn back<R>(self: &Arc<Self>, step: impl FnOnce(&Changing) -> R) -> R {
+    /// thread runs within a change under way joins it. A step keeps
+    /// nothing: it is handed its claim phase ([`Claiming`]).
+    pub fn back<R>(self: &Arc<Self>, step: impl FnOnce(Claiming<'_>) -> R) -> R {
         if self.open_here().is_none() {
             let meet = self.meet();
             let waiting = |meet: &mut Meet| meet.wanted > 0 && meet.owner == 0;
             drop(self.moved.wait_while(meet, waiting).expect("the changes' meet is never left by a panic"));
         }
-        step(&self.begin(false))
+        let changing = self.begin(false);
+        step(Claiming::of(&changing))
     }
 }
 
@@ -237,7 +264,19 @@ impl OpenChange {
 thread_local! {
     /// The change each scope has under way on this thread
     /// ([`Changes::begin`]): every record this thread makes is part of it.
-    static OPEN: std::cell::RefCell<Vec<(usize, u64, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static OPEN: std::cell::RefCell<Vec<Open>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A scope's change under way on a thread ([`OPEN`]).
+struct Open {
+    /// The scope's identity ([`Changes::key`]).
+    key: usize,
+    /// Its place among the scope's changes.
+    number: u64,
+    /// An owner's change ([`Changes::change`]).
+    owner: bool,
+    /// Whether it claims ([`Claiming`]): it keeps nothing from then.
+    claims: bool,
 }
 
 /// A change of the scope's memory under way ([`Changes::change`],
@@ -264,7 +303,7 @@ impl Drop for Changing {
             return;
         }
         OPEN.with_borrow_mut(|open| {
-            let at = open.iter().rposition(|(key, ..)| *key == self.changes.key()).expect("a change under way is open on its thread");
+            let at = open.iter().rposition(|open| open.key == self.changes.key()).expect("a change under way is open on its thread");
             open.remove(at);
         });
         self.changes.count.fetch_sub(1, Ordering::SeqCst);
@@ -273,6 +312,60 @@ impl Drop for Changing {
         meet.owner -= usize::from(self.owner);
         drop(meet);
         self.changes.moved.notify_all();
+    }
+}
+
+/// An owner's change in its keep phase ([`Changes::change`]): the cache it
+/// takes up again is committed in place here ([`Keeping::keep`]), the one
+/// way cache is committed again, before any claim of the change exists. It
+/// claims nothing: it ends in its claim phase ([`Self::claims`]), which
+/// keeps nothing, so no claim of a change can take the cache it keeps. Of
+/// its thread, as its change is.
+pub struct Keeping<'c> {
+    changing: &'c Changing,
+    _thread: PhantomData<*const ()>,
+}
+
+impl<'c> Keeping<'c> {
+    /// The keep phase ended: the change claims from now.
+    pub fn claims(self) -> Claiming<'c> {
+        Claiming::of(self.changing)
+    }
+
+    /// Before a keep of cache held in a store of `changes`' scope: the
+    /// change, joined ones and all, has claimed nothing yet.
+    ///
+    /// # Panics
+    /// Where it has (a change joined to one that claims keeps nothing), or
+    /// where it is another scope's change.
+    pub(super) fn may_keep(&self, changes: &Arc<Changes>) {
+        assert!(Arc::ptr_eq(&self.changing.changes, changes), "invariant violated: cache kept in another scope's change");
+        assert!(!changes.claims_here(), "invariant violated: a change keeps cache after it claimed");
+    }
+}
+
+/// A change in its claim phase: the right to claim, reserve and grant
+/// memory and to yield cache to a relief, in its scope's ledgers. It keeps
+/// nothing ([`Keeping`]). An owner's change reaches it by ending its keep
+/// phase ([`Keeping::claims`]); a step off the owner's thread is handed it
+/// ([`Changes::back`]). Of its thread, as its change is.
+pub struct Claiming<'c> {
+    changing: &'c Changing,
+    _thread: PhantomData<*const ()>,
+}
+
+impl<'c> Claiming<'c> {
+    fn of(changing: &'c Changing) -> Self {
+        changing.changes.claim_here();
+        Self { changing, _thread: PhantomData }
+    }
+
+    /// Before a claim in a store of `changes`' scope.
+    ///
+    /// # Panics
+    /// Where it is another scope's change.
+    pub(super) fn of_scope(&self, changes: &Arc<Changes>) {
+        assert!(Arc::ptr_eq(&self.changing.changes, changes), "invariant violated: a claim made in another scope's change");
     }
 }
 

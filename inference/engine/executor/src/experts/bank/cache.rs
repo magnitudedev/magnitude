@@ -296,7 +296,7 @@ mod tests {
     fn a_bank_served_after_its_open_finds_its_host_backing() {
         let scope = Ledgers::new();
         let ledgers = device_ledgers(&scope);
-        let claim = ledgers.host().backing(crate::memory::ledger::PoolClass::Records, 8 * GB).expect("room");
+        let claim = ledgers.host().change(|keeping| ledgers.host().backing(&keeping.claims(), crate::memory::ledger::PoolClass::Records, 8 * GB)).expect("room");
         let cache = BankCache::opened(scope.changes().clone(), 4, Some(claim));
         cache.served_on(&ledgers, 4);
         assert!(cache.growing(BankHolding::Host));
@@ -309,9 +309,9 @@ mod tests {
     fn an_expert_growth_runs_beside_the_host_backing() {
         let scope = Ledgers::new();
         let ledgers = device_ledgers(&scope);
-        let backing = ledgers.host().backing(crate::memory::ledger::PoolClass::Records, 8 * GB).expect("room");
+        let backing = ledgers.host().change(|keeping| ledgers.host().backing(&keeping.claims(), crate::memory::ledger::PoolClass::Records, 8 * GB)).expect("room");
         let cache = BankCache::opened(scope.changes().clone(), 4, Some(backing));
-        let claim = ledgers.of(crate::planning::BankTier::Bank).backing(crate::memory::ledger::PoolClass::Records, GB).expect("room");
+        let claim = ledgers.of(crate::planning::BankTier::Bank).change(|keeping| ledgers.of(crate::planning::BankTier::Bank).backing(&keeping.claims(), crate::memory::ledger::PoolClass::Records, GB)).expect("room");
         cache.grow(BankHolding::Experts, claim);
         assert!(cache.growing(BankHolding::Host) && cache.growing(BankHolding::Experts));
         cache.settle(&BankResized::Stopped { holding: BankHolding::Experts, at: 10 });
@@ -340,7 +340,7 @@ mod tests {
         let (scope, ledger, pool) = ledger();
         let cache = BankCache::new(scope.changes().clone());
         let holding = BankHolding::Experts;
-        let claim = ledger.backing(crate::memory::ledger::PoolClass::Records, 3 * GB).expect("room");
+        let claim = ledger.change(|keeping| ledger.backing(&keeping.claims(), crate::memory::ledger::PoolClass::Records, 3 * GB)).expect("room");
         assert_eq!(ledger.estimate().allocated(), 0, "nothing backs it yet");
         ledger.change(|_| { let entry = &pool; entry.take(&entry.change(), 3 * GB, seismic::memory::Wiring::Pageable) }).expect("the pool backs its slots");
         cache.grow(holding, claim);

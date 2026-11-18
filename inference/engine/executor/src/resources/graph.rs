@@ -684,7 +684,7 @@ mod tests {
         let shape = std::sync::Arc::new(crate::memory::ledger::LoadShape { stores: Vec::new() });
         let (ledgers, _) = DeviceLedgers::open_in(&Ledgers::new(), &device, shape)
             .read_scripted(crate::memory::supply::Reading::device(8 << 30, 8 << 30, crate::domain::fixtures::NO_LAG));
-        let held = ledgers.claim(&device, CommittedKind::GroupClass, ClaimDemand { device: 1 << 20, ..Default::default() }).expect("room");
+        let held = ledgers.changes().change(|keeping| ledgers.claim(&keeping.claims(), &device, CommittedKind::GroupClass, ClaimDemand { device: 1 << 20, ..Default::default() })).expect("room");
         let slot = super::Claimed::allocate(&device, held, |_| Ok::<_, ()>(())).expect("made");
         assert_eq!(ledgers.device().estimate().committed(), 1 << 20, "the freed slot's claim is held until its release");
         assert_eq!(slot.release(|()| 0), 0);

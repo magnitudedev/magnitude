@@ -2927,14 +2927,16 @@ fn cpu_loads_whole_and_tier_placed_expert_banks() {
         }
         .unwrap();
         let mut weights = ledgers
-            .claim(&device, crate::memory::ledger::CommittedKind::Load, demand)
+            .changes()
+            .change(|keeping| ledgers.claim(&keeping.claims(), &device, crate::memory::ledger::CommittedKind::Load, demand))
             .unwrap();
         let host_tables = crate::memory::ClaimDemand {
             host: load.host_table_bytes().unwrap(),
             ..Default::default()
         };
         let host_tables = ledgers
-            .claim(&device, crate::memory::ledger::CommittedKind::Load, host_tables)
+            .changes()
+            .change(|keeping| ledgers.claim(&keeping.claims(), &device, crate::memory::ledger::CommittedKind::Load, host_tables))
             .unwrap();
         // On CPU both `DeviceOnly` and `Shared` lie in `HostRam` at the bank's
         // one uniform granule, so a tier-placed CPU fixture shares that single

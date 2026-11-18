@@ -2869,7 +2869,7 @@ mod tests {
         let device = crate::test_support::open_backend(&catalog, BackendName::Cpu).expect("the CPU backend opens");
         let (ledgers, _) = DeviceLedgers::open_in(&scope, &device, std::sync::Arc::new(LoadShape { stores: Vec::new() }))
             .read_scripted(crate::memory::supply::Reading::device(64 << 30, 64 << 30, crate::domain::fixtures::NO_LAG));
-        let mut weights = ledgers.claim(&device, CommittedKind::Load, crate::memory::ClaimDemand::default()).expect("nothing to claim");
+        let mut weights = ledgers.changes().change(|keeping| ledgers.claim(&keeping.claims(), &device, CommittedKind::Load, crate::memory::ClaimDemand::default())).expect("nothing to claim");
         // The claim `BankCache::opened` requires of a bank with host slots.
         let backing = ledgers.host_backing(&mut weights, &load).unwrap();
         assert_eq!(backing.as_ref().map(crate::memory::ledger::Claim::bytes), Some(0), "a tier of host slots is claimed at no bytes");
@@ -3151,10 +3151,10 @@ mod tests {
             .read_scripted(crate::memory::supply::Reading::device(2 * whole_bytes, target, crate::domain::fixtures::NO_LAG));
         // The whole plan is refused for room ...
         let load = crate::memory::ledger::CommittedKind::Load;
-        assert!(ledgers.admit_most(&reading, &host, load, 0, 0, |_| Ok::<_, std::convert::Infallible>(import(whole.load()))).unwrap().is_err());
+        assert!(ledgers.changes().change(|keeping| ledgers.admit_most(&keeping.claims(), &reading, &host, load, 0, 0, |_| Ok::<_, std::convert::Infallible>(import(whole.load())))).unwrap().is_err());
         // ... and the streamed plan's bank is fitted into it: the most slots
         // that fit, and no more.
-        let (slots, _held) = ledgers.admit_most(&reading, &host, load, bank.floor(), bank.slots, &at).unwrap().unwrap();
+        let (slots, _held) = ledgers.changes().change(|keeping| ledgers.admit_most(&keeping.claims(), &reading, &host, load, bank.floor(), bank.slots, &at)).unwrap().unwrap();
         assert!(at(slots).unwrap().device <= target, "{slots} slots of {} fit the {target} bytes left", bank.slots);
         assert!(slots == bank.slots || at(slots + 1).unwrap().device > target, "{slots} slots are the most that fit");
     }

@@ -59,9 +59,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// history it replays), with its drafter's rows past them and a launch's
     /// rows ahead (`RequestRows::opening`, `Ledger::reserve`), so no prompt
     /// row waits on memory. Its later rows are reserved ahead at its steps'
-    /// boundaries ([`Self::provision`]). Opened, the request holds its
-    /// reservation, backed, and the idle optional components are committed
-    /// again for it to draft and encode with.
+    /// boundaries ([`Self::provision`]). The idle optional components are
+    /// kept for it to draft and encode with in the same change, before its
+    /// reservation claims (`Self::keep_components`), so the reservation
+    /// cannot take them; refused, they idle again as they were. Opened, the
+    /// request holds its reservation, backed.
     pub fn open_state(
         &mut self,
         mut unchained: Unchained<'_>,
@@ -81,13 +83,19 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             "invariant violated: request {} resumes at row {resumes}, past the {rows} rows it opens with",
             request.0
         );
-        let ledgers = self.resources.ledgers();
         let reserved = crate::memory::ledger::RequestRows::of(&self.execution).opening(rows);
-        let mut reservation = ledgers
-            .device()
-            .reserve(&self.request_slot, request, reserved)
+        let changes = self.resources.ledgers().changes().clone();
+        let mut reservation = changes
+            .change(|keeping| {
+                let kept = self.keep_components(&keeping);
+                let reservation = self.resources.ledgers().device().reserve(&keeping.claims(), &self.request_slot, request, reserved);
+                match reservation {
+                    Ok(_) => self.activate_components(kept),
+                    Err(_) => self.idle_kept(kept),
+                }
+                reservation
+            })
             .map_err(DomainError::request_short)?;
-        self.activate_components();
         self.conclude_chain()?;
         let (target, head) = match from {
             Some(from) => self.fork_resume_state(from),
@@ -95,7 +103,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         };
         let position = target.position();
         reservation.grow(position as u64);
-        self.change_state(|this| this.state_claims.insert(request, reservation));
+        self.change_state(|this, _| this.state_claims.insert(request, reservation));
         self.target.insert(request, target);
         if let Some(head) = head {
             self.head.insert(request, head);
@@ -103,7 +111,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if let Err(error) = self.back_reservation(unchained.bindings(), request) {
             self.target.remove(&request);
             self.head.remove(&request);
-            self.change_state(|this| this.drop_state_claim(request));
+            self.change_state(|this, _| this.drop_state_claim(request));
             return Err(error);
         }
         let installed = self.input.get_mut(&request).expect("input checked above");
@@ -257,7 +265,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.publishing.remove(&request);
         self.input.remove(&request);
         self.target.remove(&request);
-        self.change_state(|this| this.drop_state_claim(request));
+        self.change_state(|this, _| this.drop_state_claim(request));
         self.poisoned.remove(&request);
         Ok(())
     }
@@ -293,7 +301,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             self.target.remove(request);
             self.head.remove(request);
         }
-        self.change_state(|this| requests.iter().for_each(|request| this.drop_state_claim(*request)));
+        self.change_state(|this, _| requests.iter().for_each(|request| this.drop_state_claim(*request)));
         Ok(())
     }
 }

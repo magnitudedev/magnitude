@@ -542,7 +542,7 @@ pub fn fixture_over(
 /// counts and which lies within it.
 pub fn request_slot(ledgers: &crate::memory::ledger::DeviceLedgers, device: &seismic::Device, execution: &ExecutionPlan, spare: u64) -> crate::memory::ledger::Claim {
     let slot = crate::memory::ClaimDemand { device: super::request_slot_bytes(execution).unwrap() + spare, ..Default::default() };
-    ledgers.claim_request_slot(device, slot).expect("the fixture's ledgers hold its request slot")
+    ledgers.changes().change(|keeping| ledgers.claim_request_slot(&keeping.claims(), device, slot)).expect("the fixture's ledgers hold its request slot")
 }
 
 /// The bytes a request of `domain`'s load holds once reserved through
@@ -577,7 +577,8 @@ pub(crate) fn fixture_charged<T>(
     make: impl FnOnce(&seismic::Charges) -> T,
 ) -> T {
     let mut held = ledgers
-        .claim(device, kind, demand)
+        .changes()
+        .change(|keeping| ledgers.claim(&keeping.claims(), device, kind, demand))
         .expect("the fixture's ledgers hold what it allocates");
     let made = held.allocate(device, make);
     recorded.record(held);
@@ -746,13 +747,8 @@ pub fn shrink_settled<F: ProgramFamily>(domain: &mut ExecutorDomain<F>, bindings
 /// measurement claiming all the room there is takes it, held until it
 /// drops.
 pub fn take_all_cache<F: ProgramFamily>(domain: &ExecutorDomain<F>) -> crate::memory::ledger::Claim {
-    domain
-        .resources
-        .ledgers()
-        .device()
-        .clone()
-        .claim_units(crate::memory::ledger::CommittedKind::Scratch, std::num::NonZeroU64::MIN, u64::MAX)
-        .0
+    let ledger = domain.resources.ledgers().device();
+    ledger.change(|keeping| ledger.claim_units(&keeping.claims(), crate::memory::ledger::CommittedKind::Scratch, std::num::NonZeroU64::MIN, u64::MAX)).0
 }
 
 /// The growth rule's inputs: the decode the fake bank counted, the
@@ -1401,11 +1397,11 @@ impl ElasticBank for FakeBank {
         }
         if holding == crate::BankHolding::Host {
             let from = self.host.load(std::sync::atomic::Ordering::Relaxed);
-            let Ok(claim) = ledgers.of(crate::planning::BankTier::Host).backing(crate::memory::ledger::PoolClass::Records, to.saturating_sub(from)) else {
+            let host = ledgers.of(crate::planning::BankTier::Host);
+            let Ok(claim) = host.change(|keeping| host.backing(&keeping.claims(), crate::memory::ledger::PoolClass::Records, to.saturating_sub(from))) else {
                 return Ok(BankStep::Deferred);
             };
             // Its slots back at once, the host pool's blocks charged.
-            let host = ledgers.of(crate::planning::BankTier::Host);
             ledgers.changes().change(|_| { let entry = self.pool(host); entry.take(&entry.change(), to.saturating_sub(from), seismic::memory::Wiring::Pageable) }).expect("the claim admitted the slots");
             self.cache.grow(holding, claim);
             self.host.store(to, std::sync::atomic::Ordering::Relaxed);
@@ -1426,7 +1422,8 @@ impl ElasticBank for FakeBank {
             return Ok(BankStep::Begun(crate::planning::BankTier::Host));
         }
         let bytes = to.saturating_sub(self.slots()) * self.row();
-        let Ok(claim) = ledgers.of(crate::planning::BankTier::Bank).backing(crate::memory::ledger::PoolClass::Records, bytes) else {
+        let bank = ledgers.of(crate::planning::BankTier::Bank);
+        let Ok(claim) = bank.change(|keeping| bank.backing(&keeping.claims(), crate::memory::ledger::PoolClass::Records, bytes)) else {
             return Ok(BankStep::Deferred);
         };
         let step = self.begin(to, wake)?;
