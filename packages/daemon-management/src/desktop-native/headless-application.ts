@@ -4,7 +4,7 @@ import { LoginStartupFailed, type OwnedServiceState } from "@magnitudedev/sdk/de
 import type { OwnerCapability } from "@magnitudedev/acn-protocol"
 import type { UpdateCheckReason } from "@magnitudedev/release/hosted-update"
 import { unavailableApplicationUpdate, type ApplicationUpdate } from "../application-update/application-update"
-import { makeHeadlessUpdateControl, reportUpdateOutcome } from "../application-update/headless-update"
+import { makeHeadlessUpdateControl, packageInstallRefusal, reportUpdateOutcome, type HeadlessInstall } from "../application-update/headless-update"
 import { containerUpdateRefusal } from "../application-update/container-update"
 import { UpdateHardwareSource, updateHardwareFromService } from "../application-update/update-hardware"
 import { WindowsPipeName, nativeWindowsPrivatePipesLayer } from "@magnitudedev/utils/windows-native"
@@ -98,7 +98,9 @@ export const runHeadlessApplication = (options: {
   // Update checks start once the service is ready, so a new version reports `applied` only after it starts.
   const firstReady = yield* Deferred.make<void>()
   const report = (reason: UpdateCheckReason) => reportUpdateOutcome(updates, reason)
-  const update = yield* makeHeadlessUpdateControl(updates, Deferred.await(firstReady), options.container ? containerUpdateRefusal(options.container.image) : undefined)
+  const install: HeadlessInstall = options.container ? { _tag: "Refuse", message: containerUpdateRefusal(options.container.image) }
+    : options.runtime._tag === "Installed" && options.runtime.layout === "Standalone" && options.installWhenIdle ? { _tag: "WhenIdle" } : packageInstallRefusal
+  const update = yield* makeHeadlessUpdateControl(updates, Deferred.await(firstReady), install)
   if (options.updateReady) {
     const notify = options.updateReady
     yield* updates.changes.pipe(Stream.map(state => state.transfer), Stream.changesWith((a, b) =>

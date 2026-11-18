@@ -37,10 +37,18 @@ export const runLocalUpdateMaintenance = (options: {
     }
     const preparation = yield* makeInstalledUpdatePreparation({ resources: runtime.resourcesDirectory, layout: runtime.layout, addonPath: addon,
       dataDirectory: options.dataDirectory, version: CLI_VERSION, osVersion, platform, architecture, isolated: options.isolated, owner: "headless" })
+    const prepare = (action: "check" | "download") => preparation.makeSource.pipe(Effect.provideService(UpdateHardwareSource, unavailableUpdateHardware),
+      Effect.flatMap(source => runFiniteUpdatePreparation(action).pipe(Effect.provideService(ApplicationUpdateSource, source))))
     const execute = Effect.gen(function* () {
       if (options.action === "status") return yield* readPreparedUpdateState
       if (options.action === "install") {
         if (standalone) {
+          // On demand, a CLI-only installation downloads the newest release first when nothing is prepared.
+          const prepared = yield* readPreparedUpdateState
+          if (prepared.transfer._tag !== "Ready" && prepared.transfer._tag !== "InstallationFailed") {
+            const downloaded = yield* prepare("download")
+            if (downloaded.transfer._tag !== "Ready") return yield* new ApplicationUpdateControlFailed({ message: "Magnitude is up to date." })
+          }
           yield* acquireUpdateInstallationLease(options.stateDirectory)
           yield* completeStandaloneUpdate({ root: standaloneInstallationRoot(runtime, platform), runningVersion: CLI_VERSION, platform, environment: process.env }).pipe(
             Effect.provide(nativeStandaloneCodeVerifier(platform, addon, preparation.configuration.windowsPublisher)))
@@ -55,9 +63,7 @@ export const runLocalUpdateMaintenance = (options: {
         return yield* readPreparedUpdateState
       }
       if (options.action === "discard") return yield* discardPreparedUpdate
-      const source = yield* preparation.makeSource.pipe(Effect.provideService(UpdateHardwareSource, unavailableUpdateHardware))
-      return yield* runFiniteUpdatePreparation(options.action === "check" ? "check" : "download").pipe(
-        Effect.provideService(ApplicationUpdateSource, source))
+      return yield* prepare(options.action === "check" ? "check" : "download")
     })
     return yield* execute.pipe(Effect.provideService(PreparedUpdateStore, preparation.store),
       Effect.provideService(UpdatePreferences, preparation.preferences))

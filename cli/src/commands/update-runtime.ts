@@ -26,7 +26,7 @@ export const renderApplicationUpdate = (state: ApplicationUpdateState, owner: "D
     case "Staging": return `Preparing Magnitude ${state.transfer.version}.\nCheck progress: magnitude update status\n`
     case "InstallationFailed": return `${state.transfer.message}\nRetry installation: magnitude update install\nDiscard download: magnitude update discard\n`
     case "Ready": return `Magnitude ${state.transfer.version} is ready to install.\n${owner === "Headless"
-      ? "`magnitude serve` installs it once it is idle when it can without a password. To install it now, stop `magnitude serve`, then run: magnitude update install"
+      ? "`magnitude serve` installs it once it is idle."
       : owner === "None" ? "Install: magnitude update install" : "Install and restart: magnitude update install"}\n`
     case "ImageAvailable": return `${containerUpdateNotice(state.transfer.version, state.transfer.image)}\n`
     case "Cancelling": return "Cancelling the automatic update download.\nCheck progress: magnitude update status\n"
@@ -36,6 +36,11 @@ export const renderApplicationUpdate = (state: ApplicationUpdateState, owner: "D
       : state.check._tag === "Failed" ? `${state.check.message}\n` : "No update check has completed.\nCheck now: magnitude update\n"
   }
 }
+
+/** The reply to an install request a running `magnitude serve` accepts: it installs the update at its next idle point. */
+export const renderIdleInstallation = (state: ApplicationUpdateState): string => state.transfer._tag === "Downloading" || state.transfer._tag === "Staging" || state.transfer._tag === "Ready"
+  ? `Magnitude ${state.transfer.version} will be installed once \`magnitude serve\` is idle; it restarts into the new version.\nCheck progress: magnitude update status\n`
+  : renderApplicationUpdate(state, "Headless")
 
 /** Polls the update status until a check started by `update check` finishes, so its result is what is printed. */
 export const awaitUpdateCheck = <A extends { readonly state: ApplicationUpdateState }, E, R>(started: A, status: Effect.Effect<A, E, R>) =>
@@ -47,5 +52,8 @@ export const runUpdate = (input: string) => runCommand({
   effect: Schema.decodeUnknown(ApplicationUpdateAction)(input).pipe(Effect.flatMap(action => updateApplication(action).pipe(
     Effect.flatMap(result => action === "check" ? awaitUpdateCheck(result, updateApplication("status")) : Effect.succeed(result)),
     Effect.map(result => ({ action, ...result }))))),
-  render: ({ action, state, owner }) => action === "install" ? owner === "None" ? "The Magnitude update was installed.\n" : "Magnitude is stopping its model and service to install the update and restart.\n" : action === "discard" ? "The prepared update was discarded.\n" : renderApplicationUpdate(state, owner),
+  render: ({ action, state, owner }) => action === "install" ? owner === "None" ? "The Magnitude update was installed.\n"
+    : owner === "Headless" ? renderIdleInstallation(state)
+    : "Magnitude is stopping its model and service to install the update and restart.\n"
+    : action === "discard" ? "The prepared update was discarded.\n" : renderApplicationUpdate(state, owner),
 })

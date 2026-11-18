@@ -1,4 +1,4 @@
-import { Deferred, Effect, Fiber, Stream, SubscriptionRef, TestClock, TestContext } from "effect"
+import { Deferred, Effect, Fiber, Option, Stream, SubscriptionRef, TestClock, TestContext } from "effect"
 import type { ApplicationUpdateState } from "@magnitudedev/sdk/desktop-host"
 import { describe, expect, it } from "vitest"
 import type { ApplicationUpdate } from "./application-update"
@@ -16,7 +16,7 @@ const fixture = () => {
   return { calls, updates, state }
 }
 describe("running headless update control", () => {
-  it("observes and prepares but rejects installation without closing the owner", async () => {
+  it("observes and prepares but refuses to install a package installation, saying how", async () => {
     const { calls, updates, state } = fixture()
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const control = yield* makeHeadlessUpdateControl(updates)
@@ -36,9 +36,31 @@ describe("running headless update control", () => {
   it("explains how an installation that never installs in place is updated instead", async () => {
     const { calls, updates } = fixture()
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-      const control = yield* makeHeadlessUpdateControl(updates, Effect.void, "Pull the new image.")
+      const control = yield* makeHeadlessUpdateControl(updates, Effect.void, { _tag: "Refuse", message: "Pull the new image." })
       expect((yield* control("install").pipe(Effect.flip)).message).toBe("Pull the new image.")
       expect(calls).toEqual([])
+    })).pipe(Effect.provide(TestContext.TestContext)))
+  })
+  it("installs a CLI-only installation at the next idle point: checks, then downloads the offer", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const calls: string[] = []
+      const scope = yield* Effect.scope
+      const state = yield* SubscriptionRef.make<ApplicationUpdateState>({ transfer: { _tag: "Idle" }, check: { _tag: "Idle" }, preference: { _tag: "Known", autoDownload: false } })
+      const updates: ApplicationUpdate = { state: SubscriptionRef.get(state), changes: state.changes,
+        check: reason => SubscriptionRef.update(state, (current): ApplicationUpdateState => ({ ...current, check: { _tag: "Checking" } })).pipe(
+          Effect.zipRight(Effect.sync(() => { calls.push(`check:${reason}`) })),
+          Effect.zipRight(SubscriptionRef.update(state, (current): ApplicationUpdateState => ({ ...current, check: { _tag: "Succeeded", at: 0 },
+            transfer: { _tag: "Available", version: "0.2.0", bytes: 1, failed: Option.none() } })).pipe(Effect.delay("1 seconds"), Effect.forkIn(scope))), Effect.asVoid),
+        download: Effect.sync(() => { calls.push("download") }).pipe(Effect.zipRight(SubscriptionRef.update(state, (current): ApplicationUpdateState => ({ ...current,
+          transfer: { _tag: "Downloading", version: "0.2.0", completed: 0, total: 1 } })))),
+        discard: Effect.die("unused"), close: Effect.void, requireReady: Effect.die("unused"), setAutoDownload: () => Effect.die("unused"),
+      }
+      const control = yield* makeHeadlessUpdateControl(updates, Effect.void, { _tag: "WhenIdle" })
+      yield* TestClock.adjust("1 millis")
+      const reply = yield* control("install").pipe(Effect.fork)
+      yield* TestClock.adjust("1 seconds")
+      expect((yield* Fiber.join(reply)).state.transfer._tag).toBe("Downloading")
+      expect(calls).toEqual(["check:manual", "download"])
     })).pipe(Effect.provide(TestContext.TestContext)))
   })
   it("runs no manual check before the service is first ready, so no outcome is reported early", async () => {

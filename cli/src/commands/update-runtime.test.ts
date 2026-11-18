@@ -1,14 +1,19 @@
 import { Effect, Option } from "effect"
 import { describe, expect, it } from "vitest"
 import { ApplicationUpdateState } from "@magnitudedev/sdk/desktop-host"
-import { awaitUpdateCheck, renderApplicationUpdate } from "./update-runtime"
+import { awaitUpdateCheck, renderApplicationUpdate, renderIdleInstallation } from "./update-runtime"
 const state = (transfer: ApplicationUpdateState["transfer"], check: ApplicationUpdateState["check"] = { _tag: "Succeeded", at: 1 }) => ApplicationUpdateState.make({ transfer, check, preference: { _tag: "Known", autoDownload: false } })
 describe("headless application update output", () => {
   it("gives owner-specific installation instructions without suggesting a live server restart", () => {
     const ready = state({ _tag: "Ready", version: "2.0.0" })
-    expect(renderApplicationUpdate(ready, "Headless")).toBe("Magnitude 2.0.0 is ready to install.\n`magnitude serve` installs it once it is idle when it can without a password. To install it now, stop `magnitude serve`, then run: magnitude update install\n")
+    expect(renderApplicationUpdate(ready, "Headless")).toBe("Magnitude 2.0.0 is ready to install.\n`magnitude serve` installs it once it is idle.\n")
     expect(renderApplicationUpdate(ready, "None")).toBe("Magnitude 2.0.0 is ready to install.\nInstall: magnitude update install\n")
     expect(renderApplicationUpdate(ready, "Desktop")).toContain("Install and restart: magnitude update install")
+  })
+  it("says a running serve installs an accepted update once idle, and otherwise reports why nothing installs", () => {
+    expect(renderIdleInstallation(state({ _tag: "Downloading", version: "2.0.0", completed: 1, total: 2 })))
+      .toBe("Magnitude 2.0.0 will be installed once `magnitude serve` is idle; it restarts into the new version.\nCheck progress: magnitude update status\n")
+    expect(renderIdleInstallation(state({ _tag: "Idle" }))).toBe("Magnitude is up to date.\n")
   })
   it("distinguishes available, downloading and prepared updates with exact next commands", () => {
     expect(renderApplicationUpdate(state({ _tag: "Available", version: "2.0.0", bytes: 17800000000, failed: Option.none() }))).toContain("17.8 GB")

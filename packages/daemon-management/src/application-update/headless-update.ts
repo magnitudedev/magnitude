@@ -1,19 +1,41 @@
-import { Deferred, Effect, Stream } from "effect"
+import { Deferred, Effect, Option, Stream } from "effect"
 import type { UpdateCheckReason } from "@magnitudedev/release/hosted-update"
-import { ApplicationUpdateControlFailed, type ApplicationUpdateAction } from "@magnitudedev/sdk/desktop-host"
+import { ApplicationUpdateControlFailed, type ApplicationUpdateAction, type ApplicationUpdateState } from "@magnitudedev/sdk/desktop-host"
 import type { ApplicationUpdate } from "./application-update"
 import { makeUpdateSchedule } from "./update-schedule"
 
-const serverInstallRefusal = "A running `magnitude serve` installs a downloaded update by itself once it is idle, when it can without a password; restart it to install sooner. Otherwise stop it and run `magnitude update install`."
+/**
+ * What an install request does while `magnitude serve` owns updates. A CLI-only installation installs
+ * at the server's next idle point (`WhenIdle`); any other installation explains how it is updated.
+ */
+export type HeadlessInstall = { readonly _tag: "WhenIdle" } | { readonly _tag: "Refuse"; readonly message: string }
 
-/** A running server owns preparation only; no control request can install or stop it. `installRefusal` says how it is updated instead. */
-export const makeHeadlessUpdateControl = (updates: ApplicationUpdate, start: Effect.Effect<void> = Effect.void, installRefusal: string = serverInstallRefusal) => Effect.gen(function* () {
+export const packageInstallRefusal: HeadlessInstall = { _tag: "Refuse",
+  message: "To install the update now, stop `magnitude serve` and run `magnitude update install`." }
+
+const preparing = (state: ApplicationUpdateState) =>
+  state.transfer._tag === "Downloading" || state.transfer._tag === "Staging" || state.transfer._tag === "Ready"
+
+/** A running server owns preparation; control requests never stop it. An install request follows `install`. */
+export const makeHeadlessUpdateControl = (updates: ApplicationUpdate, start: Effect.Effect<void> = Effect.void, install: HeadlessInstall = packageInstallRefusal) => Effect.gen(function* () {
   // A check reports the previous update's outcome, so none runs before the service is first ready:
   // a version that never starts must report failed/startup, never applied.
   const started = yield* Deferred.make<void>()
   const schedule = yield* makeUpdateSchedule(updates.check, start.pipe(Effect.zipRight(Deferred.succeed(started, undefined)), Effect.asVoid))
+  /** Checks unless an update is already offered or under way, then downloads an offer; the server installs a ready download once idle. */
+  const prepareForIdleInstall = Effect.gen(function* () {
+    if (!(yield* Deferred.isDone(started))) return yield* new ApplicationUpdateControlFailed({ message: "`magnitude serve` is still starting. Run `magnitude update install` again once it is ready." })
+    const current = yield* updates.state
+    const checked = preparing(current) || current.transfer._tag === "Available" ? current
+      : yield* schedule.check.pipe(Effect.zipRight(updates.changes.pipe(Stream.filter(state => state.check._tag !== "Checking"), Stream.runHead)),
+        Effect.timeout("1 minute"), Effect.orElseSucceed(() => Option.none<ApplicationUpdateState>()), Effect.map(Option.getOrElse(() => current)))
+    if (checked.transfer._tag === "Available") yield* updates.download
+  })
   return (action: ApplicationUpdateAction) => Effect.gen(function* () {
-    if (action === "install") return yield* new ApplicationUpdateControlFailed({ message: installRefusal })
+    if (action === "install") {
+      if (install._tag === "Refuse") return yield* new ApplicationUpdateControlFailed({ message: install.message })
+      yield* prepareForIdleInstall
+    }
     if (action === "check" && (yield* Deferred.isDone(started))) yield* schedule.check
     if (action === "download") yield* updates.download
     if (action === "discard") yield* updates.discard
