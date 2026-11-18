@@ -242,7 +242,9 @@ pub fn settle_prices(manifest: &ExecutionManifest) -> Result<u64, LoadError> {
             .map(drop)
             .map_err(|stopped| internal(format!("the plan's prices are pending, and {stopped}")))
     };
-    now(priced(
+    // Settled once the preview is no longer pending: what it then previews
+    // is the load's to report, not this.
+    let _previewed = now(priced(
         || std::future::ready(manifest.preview(&catalog)),
         || std::future::ready(manifest.request_prices(&catalog).map_err(internal)),
         || std::future::ready(measured()),

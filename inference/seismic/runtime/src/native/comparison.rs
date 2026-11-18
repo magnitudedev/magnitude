@@ -616,7 +616,15 @@ pub(super) mod tests {
             let enumerated = Enumerated::of(&cells);
             let largest = *enumerated.magnitudes.last().unwrap();
             let gap = largest - enumerated.magnitudes[enumerated.magnitudes.len() - 2];
-            let mut values = vec![0., f64::from(f32::MIN_POSITIVE), 1e-30, 0.1, 1., 3.1415926, 1e4];
+            let mut values = vec![
+                0.,
+                f64::from(f32::MIN_POSITIVE),
+                1e-30,
+                0.1,
+                1.,
+                std::f64::consts::PI,
+                1e4,
+            ];
             // Around a binade boundary, an exact tie on either side of an
             // even payload, and either side of the overflow threshold.
             for payload in [0x3bfe, 0x3bff, 0x3c00, 0x3c01, 1, 2] {
