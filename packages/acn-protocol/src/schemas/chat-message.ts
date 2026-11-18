@@ -239,6 +239,16 @@ const between = (from: DateTime.Utc, to: DateTime.Utc) => DateTime.toEpochMillis
 /** Tokens a second over a measured span; none when nothing was measured. */
 const rate = (tokens: number, ms: number) => (ms > 0 ? Option.some((tokens / ms) * 1000) : Option.none<number>())
 
+/**
+ * Decode speed, as the engine reports it: `responses` responses generated `tokens` in all over `ms` of decoding, and
+ * each one's first token comes from its prompt's pass, so decode made the rest. None where decode made nothing, as in
+ * a response of one token.
+ */
+export const decodeRate = (tokens: number, ms: number, responses = 1): Option.Option<number> => {
+  const decoded = tokens - responses
+  return decoded > 0 ? rate(decoded, ms) : Option.none()
+}
+
 /** The engine's report of a response: its usage and timings, both or neither. */
 export interface EngineReport {
   readonly usage: Option.Option<ResponseUsage>
@@ -247,12 +257,10 @@ export interface EngineReport {
 
 /**
  * Output tokens a second, from the engine's report: final, or the latest while a response runs. The engine's
- * `predicted_ms` is its decode work after the first token, which the prompt's processing produces, so it spans the
- * tokens after the first; a response of one token decoded nothing and has no speed.
+ * `predicted_ms` is its decode work after the first token ([`decodeRate`]).
  */
 export const tokensPerSecond = ({ usage, timings }: EngineReport) =>
-  Option.flatMap(Option.all([usage, timings]), ([u, t]) =>
-    u.completionTokens >= 2 ? rate(u.completionTokens - 1, t.predictedMs) : Option.none())
+  Option.flatMap(Option.all([usage, timings]), ([u, t]) => decodeRate(u.completionTokens, t.predictedMs))
 
 /** What the engine measured of a response, read from its report. */
 export const engineMetrics = (report: EngineReport): EngineMetrics => {

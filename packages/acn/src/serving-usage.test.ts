@@ -25,8 +25,8 @@ it("persists once across restarts and filters models without adding cached input
     const store = yield* ServingUsage
     return [yield* store.read(query), yield* store.read({ ...query, model: Option.some(ServingModelId.make("model-b")) })]
   }).pipe(Effect.provide(layer(directory))))
-  expect(values[0]).toMatchObject({ _tag: "Available", requests: 2, inputTokens: 200, cachedInputTokens: 80, outputTokens: 100, totalTokens: 300, tokensPerSecond: 100 / 3, timeToFirstTokenMs: 300 })
-  expect(values[1]).toMatchObject({ requests: 1, totalTokens: 180, tokensPerSecond: 40, models: [{ id: "model-a", requests: 1 }, { id: "model-b", requests: 1 }] })
+  expect(values[0]).toMatchObject({ _tag: "Available", requests: 2, inputTokens: 200, cachedInputTokens: 80, outputTokens: 100, totalTokens: 300, tokensPerSecond: 98 / 3, timeToFirstTokenMs: 300 })
+  expect(values[1]).toMatchObject({ requests: 1, totalTokens: 180, tokensPerSecond: 39.5, models: [{ id: "model-a", requests: 1 }, { id: "model-b", requests: 1 }] })
 })
 it("uses the caller's local day across a DST boundary", async () => {
   vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-03-08T18:00:00Z"))
@@ -46,7 +46,18 @@ it("excludes absent timing samples and reports partial evidence", async () => {
     yield* store.record(record("partial", { input: 5, cached: null, output: null, generationMs: null, firstTokenMs: null, complete: false }))
     return yield* store.read(query)
   }).pipe(Effect.provide(layer(root()))))
-  expect(value).toMatchObject({ requests: 2, incompleteRequests: 1, totalTokens: 125, cachedInputRequests: 1, speedSamples: 1, latencySamples: 1, tokensPerSecond: 20, timeToFirstTokenMs: 200 })
+  expect(value).toMatchObject({ requests: 2, incompleteRequests: 1, totalTokens: 125, cachedInputRequests: 1, speedSamples: 1, latencySamples: 1, tokensPerSecond: 19, timeToFirstTokenMs: 200 })
+})
+it("counts decode speed over the tokens after each response's first, as the engine does", async () => {
+  const value = await Effect.runPromise(Effect.gen(function* () {
+    const store = yield* ServingUsage
+    yield* store.record(record("short", { output: 11, generationMs: 500 }))
+    yield* store.record(record("long", { output: 21, generationMs: 1000 }))
+    // One token decoded nothing, so the engine reports no generation time for it.
+    yield* store.record(record("single", { output: 1, generationMs: null }))
+    return yield* store.read(query)
+  }).pipe(Effect.provide(layer(root()))))
+  expect(value).toMatchObject({ requests: 3, speedSamples: 2, tokensPerSecond: 20 })
 })
 it("reports damaged storage as unavailable rather than empty history and does not fail serving writes", async () => {
   const directory = root(); writeFileSync(join(directory, "serving-usage.sqlite"), "corrupt")

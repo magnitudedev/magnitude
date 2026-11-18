@@ -1,7 +1,7 @@
 import { FileSystem, Path } from "@effect/platform"
 import { Database } from "bun:sqlite"
 import { Context, DateTime, Effect, Layer, Option, Schema } from "effect"
-import { ServingModelId, ServingUsageRequest, ServingUsageSnapshot } from "@magnitudedev/acn-protocol"
+import { decodeRate, ServingModelId, ServingUsageRequest, ServingUsageSnapshot } from "@magnitudedev/acn-protocol"
 import { GlobalStorage } from "@magnitudedev/storage"
 
 const Count = Schema.Number.pipe(Schema.int(), Schema.nonNegative())
@@ -77,11 +77,15 @@ export const ServingUsageLive = Layer.scoped(ServingUsage, Effect.gen(function* 
         COALESCE(SUM(output), 0) AS outputTokens,
         COALESCE(SUM(COALESCE(input, 0) + COALESCE(output, 0)), 0) AS totalTokens,
         COUNT(cached) AS cachedInputRequests,
-        SUM(CASE WHEN generation_ms > 0 THEN output END) * 1000.0 / SUM(generation_ms) AS tokensPerSecond,
-        AVG(first_token_ms) AS timeToFirstTokenMs, COUNT(generation_ms) AS speedSamples,
+        SUM(CASE WHEN generation_ms IS NOT NULL THEN output END) AS speedTokens,
+        SUM(CASE WHEN output IS NOT NULL THEN generation_ms END) AS speedMs,
+        AVG(first_token_ms) AS timeToFirstTokenMs, COUNT(CASE WHEN output IS NOT NULL THEN generation_ms END) AS speedSamples,
         COUNT(first_token_ms) AS latencySamples
         FROM usage WHERE completed_at >= ? AND (? IS NULL OR model = ?)`)
-        .get(since, model, model)
+        .get(since, model, model) as { readonly speedTokens: number | null; readonly speedMs: number | null; readonly speedSamples: number }
+      const { speedTokens, speedMs, ...counted } = totals
+      // The responses that report a generation time, at the speed the engine reports for each ([`decodeRate`]).
+      const tokensPerSecond = Option.getOrNull(decodeRate(speedTokens ?? 0, speedMs ?? 0, counted.speedSamples))
       // One indexed interval per local calendar day keeps DST and fractional-offset zones exact.
       // Activity spans 53 Sunday-first weeks through today, independently of the summary period.
       const today = DateTime.startOf(zone.value, "day")
@@ -97,7 +101,7 @@ export const ServingUsageLive = Layer.scoped(ServingUsage, Effect.gen(function* 
         GROUP BY days.date ORDER BY days.date`).all(...days.flat(), model, model)
       const models = db.query("SELECT model AS id, COUNT(*) AS requests FROM usage GROUP BY model ORDER BY model").all()
       const metadata = db.query("SELECT since FROM metadata WHERE id = 1").get()
-      return Schema.decodeUnknownSync(ServingUsageSnapshot)({ _tag: "Available", ...metadata!, ...totals!, dailyActivity, models, recordingFailures })
+      return Schema.decodeUnknownSync(ServingUsageSnapshot)({ _tag: "Available", ...metadata!, ...counted, tokensPerSecond, dailyActivity, models, recordingFailures })
     })
   })).pipe(Effect.catchAll(error => Effect.succeed({ _tag: "Unavailable" as const, message: error.message })))
   return ServingUsage.of({ record, read })

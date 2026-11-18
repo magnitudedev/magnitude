@@ -5,6 +5,7 @@ import {
   ChatAssistantMessage,
   type ChatContentPart,
   ChatMessage,
+  decodeRate,
   responseMetrics,
   responseStatus,
   responseStatusText,
@@ -210,5 +211,14 @@ describe("runningResponse", () => {
 
   it("follows only the latest response, not an earlier one left without an end", () => {
     expect(runningResponse([response({ end: undefined, id: "earlier" }), user, ended({ type: "finished", finishReason: "stop" })])).toEqual(Option.none())
+  })
+})
+
+describe("decode rate", () => {
+  it("counts each response's tokens after its first, and none where decode made nothing", () => {
+    expect(decodeRate(7, 3)).toEqual(Option.some(2_000))
+    expect(decodeRate(32, 1_500, 2)).toEqual(Option.some(20))
+    expect(decodeRate(1, 0.02)).toEqual(Option.none())
+    expect(decodeRate(5, 0)).toEqual(Option.none())
   })
 })

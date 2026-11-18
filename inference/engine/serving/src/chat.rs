@@ -643,17 +643,21 @@ pub(crate) fn timing_values(snapshot: &TimingSnapshot) -> Timings {
         .prompt_tokens
         .saturating_sub(snapshot.cached_prompt_tokens);
     let timings = &snapshot.timings;
+    let (prompt_per_token_ms, prompt_per_second) = throughput(prompt_n, timings.prompt_ms);
+    // Decode produces every token after the first, which the prompt's pass produces.
+    let (predicted_per_token_ms, predicted_per_second) =
+        throughput(snapshot.generated_tokens.saturating_sub(1), timings.decode_ms);
     Timings {
         cache_n: snapshot.cached_prompt_tokens,
         prompt_n,
         prompt_ms: timings.prompt_ms,
         time_to_first_token_ms: timings.time_to_first_token_ms,
-        prompt_per_token_ms: per_token_ms(prompt_n, timings.prompt_ms),
-        prompt_per_second: rate(prompt_n, timings.prompt_ms),
+        prompt_per_token_ms,
+        prompt_per_second,
         predicted_n: snapshot.generated_tokens,
         predicted_ms: timings.decode_ms,
-        predicted_per_token_ms: per_token_ms(snapshot.generated_tokens, timings.decode_ms),
-        predicted_per_second: rate(snapshot.generated_tokens, timings.decode_ms),
+        predicted_per_token_ms,
+        predicted_per_second,
         sampler_ms: timings.sampler_ms,
         parser_ms: timings.parser_ms,
         draft_n: (timings.draft_tokens > 0).then_some(timings.draft_tokens),
@@ -661,19 +665,13 @@ pub(crate) fn timing_values(snapshot: &TimingSnapshot) -> Timings {
     }
 }
 
-fn per_token_ms(tokens: u64, elapsed_ms: f64) -> f64 {
-    if tokens == 0 {
-        0.0
-    } else {
-        elapsed_ms / tokens as f64
-    }
-}
-
-fn rate(tokens: u64, elapsed_ms: f64) -> f64 {
+/// `tokens` produced in `elapsed_ms` as milliseconds a token and tokens a second, each the other's
+/// inverse; both zero where nothing was produced or no time passed.
+fn throughput(tokens: u64, elapsed_ms: f64) -> (f64, f64) {
     if tokens == 0 || elapsed_ms <= 0.0 {
-        0.0
+        (0.0, 0.0)
     } else {
-        1_000.0 * tokens as f64 / elapsed_ms
+        (elapsed_ms / tokens as f64, 1_000.0 * tokens as f64 / elapsed_ms)
     }
 }
 
