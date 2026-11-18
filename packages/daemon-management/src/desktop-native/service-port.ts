@@ -1,6 +1,6 @@
 import { createServer } from "node:net"
 import { FetchHttpClient } from "@effect/platform"
-import { Duration, Effect, Option } from "effect"
+import { Duration, Effect, Layer, Option } from "effect"
 import { MagnitudeClient } from "@magnitudedev/sdk"
 import { OwnedChildSpawner, OwnedChildSpawnFailed } from "./owned-child"
 
@@ -50,7 +50,7 @@ export const takeOverServicePort = (port: number) => Effect.gen(function* () {
   if (!(yield* portServedByOtherMagnitude(port))) return
   yield* Effect.logInfo(`Asking the Magnitude serving port ${port} to stop so the desktop app can serve`)
   yield* Effect.scoped(Effect.flatMap(MagnitudeClient, client => client.application.quitApplication({}))).pipe(
-    Effect.provide(MagnitudeClient.layer({ origin: `http://127.0.0.1:${port}`, autoStart: false })), Effect.provide(FetchHttpClient.layer),
+    Effect.provide(MagnitudeClient.layer({ origin: `http://127.0.0.1:${port}`, autoStart: false }).pipe(Layer.provide(FetchHttpClient.layer))),
     Effect.timeout("10 seconds"), Effect.catchAll(error => Effect.logWarning(`The other Magnitude did not accept the request to stop: ${String(error)}`)))
   const deadline = Date.now() + Duration.toMillis("30 seconds")
   while (Date.now() < deadline && Option.isSome(yield* probePort(port))) yield* Effect.sleep("250 millis")
