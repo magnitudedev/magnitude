@@ -1258,11 +1258,14 @@ mod tests {
 
     impl Materialised {
         fn of(implementation: &NativeImplementation) -> Self {
-            Self {
-                admissible: implementation
-                    .admissible(&NativeSpecialization::new())
-                    .unwrap(),
-            }
+            let mut admissible = Vec::new();
+            implementation
+                .walk_admissible(&NativeSpecialization::new(), |configuration| {
+                    admissible.push(configuration.clone());
+                    true
+                })
+                .unwrap();
+            Self { admissible }
         }
 
         fn active_sets(

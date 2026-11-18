@@ -839,14 +839,16 @@ mod tests {
         let tiles = |backend: BackendName, file: &str| {
             let module = crate::source::check_beside(sources(&declaration(backend.as_str(), file)), &directory)
                 .expect("the tile declaration checks");
+            let mut tiles = Vec::new();
             module
                 .native_implementation(module.entries()[0].id, backend)
                 .unwrap()
-                .admissible(&crate::checked::NativeSpecialization::new())
-                .unwrap()
-                .iter()
-                .map(|point| (point.param("SUB_M").unwrap(), point.param("SUB_N").unwrap()))
-                .collect::<Vec<_>>()
+                .walk_admissible(&crate::checked::NativeSpecialization::new(), |point| {
+                    tiles.push((point.param("SUB_M").unwrap(), point.param("SUB_N").unwrap()));
+                    true
+                })
+                .unwrap();
+            tiles
         };
         let vulkan = tiles(BackendName::Vulkan, "template.comp");
         assert!(!vulkan.is_empty());

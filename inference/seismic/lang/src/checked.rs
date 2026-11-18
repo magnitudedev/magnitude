@@ -396,36 +396,53 @@ pub struct CheckedModule {
     /// heap: they are most of a bundle, and a process reads one backend's.
     pub(crate) assets: std::collections::BTreeMap<(EntryId, BackendName), Cow<'static, str>>,
     /// Each native implementation's declarations at element bindings, one
-    /// per combination of the values of the element reads it makes, formed
-    /// when first asked for (`native_implementation_at`).
+    /// per vector of the values of the element reads it makes at bindings
+    /// asked for, formed when first asked for (`native_implementation_at`).
     bound: Arc<[std::sync::OnceLock<BoundImplementation>]>,
 }
 
 /// A native implementation's declarations at element bindings: one per
-/// combination of the values its element reads (`operands(W)`,
-/// `form(W, NAME)`, ..) take. Each element parameter is bound on its own, so
-/// a combination is one value tuple per element, of those its reads take
-/// together over the registry's representations: digit i of a slot's index,
-/// in base `elements[i].tuples.len()`, is the position of element i's tuple.
+/// vector of the values its element reads (`operands(W)`, `form(W, NAME)`,
+/// ..) take at the bindings asked for, so what it holds grows with the
+/// formations asked for, never with every combination the registry's
+/// representations could give.
 #[derive(Debug)]
 struct BoundImplementation {
-    elements: Vec<ElementReads>,
-    slots: Vec<std::sync::OnceLock<NativeImplementation>>,
+    /// The reads, each once: element i of a key is read i's value.
+    reads: Vec<(String, ElementQuery)>,
+    formed: Formed,
 }
 
-/// The reads an implementation makes of one element parameter, and every
-/// tuple of their values a representation it forms at gives, ascending.
+/// Formed implementations by key, append-only: a key's position is taken
+/// once under the lock, and its implementation lives in a chunk that never
+/// moves (chunk k holds positions 2^k - 1 .. 2^(k+1) - 1), so a reference to
+/// it lives as long as the module.
 #[derive(Debug)]
-struct ElementReads {
-    element: String,
-    queries: Vec<ElementQuery>,
-    tuples: Vec<Vec<u64>>,
+struct Formed {
+    positions: std::sync::Mutex<std::collections::HashMap<Vec<u64>, usize>>,
+    chunks: [std::sync::OnceLock<Box<[std::sync::OnceLock<NativeImplementation>]>>; usize::BITS as usize],
 }
 
-impl ElementReads {
-    /// The reads' values for `representation`; `None` where one has none.
-    fn of(&self, representation: RepresentationId) -> Option<Vec<u64>> {
-        self.queries.iter().map(|query| query.of(representation)).collect()
+impl Formed {
+    fn new() -> Self {
+        Self {
+            positions: Default::default(),
+            chunks: std::array::from_fn(|_| std::sync::OnceLock::new()),
+        }
+    }
+
+    /// The implementation at `key`, formed by `form` when first asked for.
+    fn get_or_form(&self, key: Vec<u64>, form: impl FnOnce() -> NativeImplementation) -> &NativeImplementation {
+        let position = {
+            let mut positions = self.positions.lock().expect("no thread panics holding the positions");
+            let next = positions.len();
+            *positions.entry(key).or_insert(next)
+        };
+        let chunk = (position + 1).ilog2() as usize;
+        let chunk_start = (1usize << chunk) - 1;
+        self.chunks[chunk]
+            .get_or_init(|| (0..1usize << chunk).map(|_| std::sync::OnceLock::new()).collect())[position - chunk_start]
+            .get_or_init(form)
     }
 }
 
@@ -470,7 +487,7 @@ impl CheckedModule {
 
     /// The native implementation of an entry for a backend at element
     /// bindings `bindings`, every element read substituted: formed once per
-    /// combination of the values it reads, and shared by every caller
+    /// vector of the values it reads there, and shared by every caller
     /// after. `None` when the backend has none, or it does not form at
     /// `bindings` ([`NativeImplementation::at_elements`]).
     pub fn native_implementation_at(
@@ -485,39 +502,23 @@ impl CheckedModule {
             .iter()
             .position(|native| native.entry == entry && native.backend == backend)?;
         let native = &self.inner.native_implementations[index];
-        let bound = self.bound[index].get_or_init(|| {
-            let mut elements: Vec<ElementReads> = Vec::new();
-            for (element, query) in native.element_reads() {
-                match elements.last_mut() {
-                    Some(reads) if reads.element == element => reads.queries.push(query),
-                    _ => elements.push(ElementReads { element, queries: vec![query], tuples: Vec::new() }),
-                }
-            }
-            for reads in &mut elements {
-                let tuples: std::collections::BTreeSet<Vec<u64>> =
-                    registry::representations().iter().filter_map(|info| reads.of(info.id)).collect();
-                reads.tuples = tuples.into_iter().collect();
-            }
-            let slots = (0..elements.iter().map(|reads| reads.tuples.len()).product::<usize>())
-                .map(|_| std::sync::OnceLock::new())
-                .collect();
-            BoundImplementation { elements, slots }
-        });
-        if bound.elements.is_empty() {
+        let bound = self.bound[index]
+            .get_or_init(|| BoundImplementation { reads: native.element_reads(), formed: Formed::new() });
+        if bound.reads.is_empty() {
             return Some(native);
         }
-        let mut slot = 0usize;
-        for reads in &bound.elements {
-            let representation = bindings
-                .get(&reads.element)
-                .unwrap_or_else(|| panic!("element parameter `{}` is bound", reads.element));
-            let digit = reads
-                .tuples
-                .binary_search(&reads.of(representation)?)
-                .expect("an element's tuples hold each its reads take");
-            slot = slot * reads.tuples.len() + digit;
-        }
-        Some(bound.slots[slot].get_or_init(|| {
+        let key = bound
+            .reads
+            .iter()
+            .map(|(element, query)| {
+                query.of(
+                    bindings
+                        .get(element)
+                        .unwrap_or_else(|| panic!("element parameter `{element}` is bound")),
+                )
+            })
+            .collect::<Option<Vec<u64>>>()?;
+        Some(bound.formed.get_or_form(key, || {
             native
                 .at_elements(bindings)
                 .expect("every element read has a value at these bindings")
@@ -3288,21 +3289,6 @@ impl NativeImplementation {
         Some(size)
     }
 
-    /// Every admissible specialization for the given static values: the
-    /// cartesian product of the parameter domains in declaration order,
-    /// filtered by the `where` condition.
-    pub fn admissible(
-        &self,
-        statics: &NativeSpecialization,
-    ) -> Result<Vec<NativeSpecialization>, NativeSpecializationError> {
-        let mut admissible = Vec::new();
-        self.walk_admissible(statics, |configuration| {
-            admissible.push(configuration.clone());
-            true
-        })?;
-        Ok(admissible)
-    }
-
     /// Whether the statics lie inside the implementation's domain: some
     /// configuration is admissible at them (`Inadmissible` when none is).
     /// Unlike [`OnDevice::default_specialization`] it reads no default, so
@@ -3820,11 +3806,12 @@ impl NativeImplementation {
         None
     }
 
-    /// Visit the admissible specializations at `statics` in declaration
-    /// order until `visit` returns false. A caller that needs a few of them
-    /// (the nearest to one, the distinct values of a field) takes them here:
-    /// their number is the product of the parameter domains, which
-    /// [`Self::admissible`] holds all at once.
+    /// Visit the admissible specializations at `statics` (the cartesian
+    /// product of the parameter domains in declaration order, filtered by
+    /// the `where` condition) in that order until `visit` returns false.
+    /// Their number is the product of the parameter domains, so a caller
+    /// takes what it needs of them here (the nearest to one, the distinct
+    /// values of a field), never all at once.
     pub fn walk_admissible(
         &self,
         statics: &NativeSpecialization,
@@ -4404,6 +4391,19 @@ pub(crate) mod internals {
 mod native_tests {
     use super::*;
 
+    /// The configurations a test's domain admits at `statics`, in walk order.
+    fn walked(
+        native: &NativeImplementation,
+        statics: &NativeSpecialization,
+    ) -> Result<Vec<NativeSpecialization>, NativeSpecializationError> {
+        let mut walked = Vec::new();
+        native.walk_admissible(statics, |configuration| {
+            walked.push(configuration.clone());
+            true
+        })?;
+        Ok(walked)
+    }
+
     #[test]
     fn a_repeat_block_dispatches_in_order_and_only_on_metal() {
         let check = |target: &str| {
@@ -4654,7 +4654,7 @@ mod native_tests {
         let native = module
             .native_implementation(module.entries()[0].id, BackendName::Metal)
             .unwrap();
-        let configurations = native.admissible(&NativeSpecialization::new()).unwrap();
+        let configurations = walked(native, &NativeSpecialization::new()).unwrap();
         assert_eq!(configurations.len(), 8);
         let default = native
             .default_specialization_without_device(&NativeSpecialization::new()).unwrap()
@@ -4889,7 +4889,7 @@ mod native_tests {
         let native = module
             .native_implementation(module.entries()[0].id, BackendName::Metal)
             .unwrap();
-        let configurations = native.admissible(&NativeSpecialization::new()).unwrap();
+        let configurations = walked(native, &NativeSpecialization::new()).unwrap();
         assert_eq!(configurations.len(), 2);
         let error =
             crate::native_source::check_fixture(source(&source_text("ROWS < TILE")), &[]).expect_err("cross-launch conjunct");
@@ -4906,7 +4906,7 @@ mod native_tests {
         let native = module
             .native_implementation(module.entries()[0].id, BackendName::Metal)
             .unwrap();
-        let configurations = native.admissible(&NativeSpecialization::new()).unwrap();
+        let configurations = walked(native, &NativeSpecialization::new()).unwrap();
         let values = configurations
             .iter()
             .map(|configuration| {
@@ -4988,7 +4988,7 @@ mod native_tests {
         let native = module
             .native_implementation(module.entries()[0].id, BackendName::Metal)
             .unwrap();
-        let base = native.admissible(&NativeSpecialization::new()).unwrap()[0].clone();
+        let base = walked(native, &NativeSpecialization::new()).unwrap()[0].clone();
         assert_eq!(
             (base.param("A"), base.param("B"), base.param("C"), base.launch_param(0, "ROWS")),
             (Some(1), Some(5), Some(2), Some(1))
@@ -5356,7 +5356,7 @@ mod native_tests {
             .native_implementation(module.entries()[0].id, BackendName::Cuda)
             .unwrap();
         let statics = NativeSpecialization::new().with_static("N", 256);
-        let admissible = native.admissible(&statics).expect("statics are complete");
+        let admissible = walked(native, &statics).expect("statics are complete");
         // PARTS * WIDTH <= 256 admits (1,64) (1,128) (2,64) (2,128) (4,64).
         assert_eq!(admissible.len(), 5);
         assert!(
@@ -5372,13 +5372,13 @@ mod native_tests {
             native.default_specialization_without_device(&small).unwrap(),
             Err(NativeSpecializationError::Inadmissible)
         ));
-        assert!(native.admissible(&small).unwrap().is_empty());
+        assert!(matches!(native.admits(&small), Err(NativeSpecializationError::Inadmissible)));
         assert!(matches!(
             native.validate(&default.clone().with_param("WIDTH", 96)),
             Err(NativeSpecializationError::OutsideDomain { .. })
         ));
         assert!(matches!(
-            native.admissible(&NativeSpecialization::new()),
+            native.admits(&NativeSpecialization::new()),
             Err(NativeSpecializationError::MissingStatic(_))
         ));
     }
@@ -5407,8 +5407,7 @@ mod native_tests {
             Err(NativeSpecializationError::Default { .. })
         ));
         // The launch's `where` is one of the declaration's conjuncts.
-        assert!(native
-            .admissible(&at(300))
+        assert!(walked(native, &at(300))
             .unwrap()
             .iter()
             .all(|configuration| configuration.param("ROWS").unwrap()
@@ -5510,7 +5509,7 @@ mod native_tests {
             (wide.param("ROWS"), wide.param("LANES")),
             (Some(2), Some(32))
         );
-        assert_eq!(Some(&wide), native.admissible(&at(4096)).unwrap().first());
+        assert_eq!(Some(&wide), walked(native, &at(4096)).unwrap().first());
         assert!(matches!(
             native.default_specialization_without_device(&at(65_536)).unwrap(),
             Err(NativeSpecializationError::Inadmissible)
@@ -5527,7 +5526,7 @@ mod native_tests {
             .native_implementation(module.entries()[0].id, BackendName::Cuda)
             .unwrap();
         // `where` gained `or`: PARTS 4 is outside it.
-        let admissible = native.admissible(&NativeSpecialization::new()).unwrap();
+        let admissible = walked(native, &NativeSpecialization::new()).unwrap();
         assert_eq!(
             admissible
                 .iter()
@@ -5686,6 +5685,63 @@ mod native_tests {
         assert_eq!(at(registry::representation("gguf_q4_k").unwrap(), unconverted), (false, false));
     }
 
+    /// A native over several weights, each read as a segmented projection
+    /// reads its weights, holds one formation per vector of read values
+    /// asked for: never one per combination the registry's representations
+    /// give, which is the weights' read tuples to the power of their number.
+    #[test]
+    fn an_implementation_holds_only_the_formations_asked_for() {
+        let mut sources = SourceSet::default();
+        let reads = ["QW", "GW", "KW", "VW"]
+            .map(|w| format!("row_bytes({w}, codes, 64) + row_bytes({w}, coefficients, 256) + axis({w}, COEFF_GROUP) + form({w}, INT8) + dense_bytes({w})"))
+            .join(" + ");
+        sources.push(SourceFile {
+            path: "project.seismic".to_owned(),
+            text: format!(
+                "fn project[N](src: &tensor[N] A, dst: &mut tensor[N] A, q: &tensor[N] QW, g: &tensor[N] GW, k: &tensor[N] KW, v: &tensor[N] VW):\n    dst[0:N] = src[0:N]\n\nnative project for cuda from \"project.cu\":\n    launch project:\n        threadgroups ({reads}, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n"
+            ),
+        });
+        let module = check_source(sources).expect("the projection checks");
+        let entry = module.entry_named("project").unwrap();
+        let native = module.native_implementation(entry, BackendName::Cuda).unwrap();
+        let combinations: usize = ["QW", "GW", "KW", "VW"]
+            .iter()
+            .map(|weight| {
+                let reads: Vec<_> =
+                    native.element_reads().into_iter().filter(|(element, _)| element == weight).collect();
+                registry::representations()
+                    .iter()
+                    .filter_map(|info| reads.iter().map(|(_, query)| query.of(info.id)).collect::<Option<Vec<_>>>())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+            })
+            .product();
+        assert!(combinations > 10_000, "{combinations}");
+        let formed = || module.bound[0].get().map_or(0, |bound| bound.formed.positions.lock().unwrap().len());
+        let at = |q: RepresentationId, rest: RepresentationId| {
+            let bindings = ElementBindings::new()
+                .bind("A", registry::dense(DType::F32))
+                .bind("QW", q)
+                .bind("GW", rest)
+                .bind("KW", rest)
+                .bind("VW", rest);
+            let bound = module.native_implementation_at(entry, BackendName::Cuda, &bindings).unwrap();
+            assert_eq!(Some(bound), native.at_elements(&bindings).as_ref());
+            std::ptr::from_ref(bound)
+        };
+        let q4k = registry::storage("q4k", registry::Layout::Mma16).unwrap();
+        assert_eq!(formed(), 0);
+        let packed = at(q4k, q4k);
+        assert_eq!((formed(), at(q4k, q4k)), (1, packed), "asked again, it is the one formed");
+        let bf16 = at(q4k, registry::dense(DType::BF16));
+        assert_ne!(bf16, packed);
+        assert_eq!(
+            (formed(), at(q4k, registry::dense(DType::F16))),
+            (2, bf16),
+            "a representation of the same reads shares its formation"
+        );
+    }
+
     /// `form(W, NAME)` is the backend's admission of form NAME for the
     /// representation `W` is bound to, and `where` may read it: the
     /// configurations are the implementation's at its bindings, and the
@@ -5729,8 +5785,7 @@ mod native_tests {
                 .native_implementation_at(entry, BackendName::Cuda, &bindings)
                 .unwrap();
             assert_eq!(Some(bound), native.at_elements(&bindings).as_ref(), "{storage}");
-            bound
-                .admissible(&statics)
+            walked(bound, &statics)
                 .unwrap()
                 .iter()
                 .map(|configuration| configuration.param("INT8").unwrap())
