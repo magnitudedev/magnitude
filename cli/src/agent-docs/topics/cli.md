@@ -16,7 +16,7 @@ curl -fsSL https://magnitude.dev/install.sh | sh -s -- --desktop
 & ([scriptblock]::Create((irm https://magnitude.dev/install.ps1))) -Desktop
 ```
 
-For servers and headless use, install the CLI only, without the app:
+For a server, or any machine without the desktop app, install the CLI only:
 
 ```sh
 curl -fsSL https://magnitude.dev/install.sh | sh
@@ -42,7 +42,7 @@ magnitude status
 magnitude hardware
 magnitude models list [--all]
 magnitude models recommend [--country <code>] [--limit <count>]
-magnitude models search <query> [--limit <count>]
+magnitude models search <query> [--limit <count>] [--more <cursor>]
 magnitude models show <model-id | owner/repo[:QUANT] | huggingface-url>
 magnitude models pull <model-id | owner/repo[:QUANT] | huggingface-url> [--drafter auto|none|<drafter>] [--force] [--only projector|drafter]
 magnitude models cancel|rm <model-id>
@@ -62,7 +62,9 @@ magnitude hf login|status|logout
 magnitude docs [topic-id]
 ```
 
-Run `magnitude serve` to host inference in the foreground, or open the desktop app. To keep `serve`
+Run `magnitude serve` to host inference in the foreground, or open the desktop app. While `serve`
+runs, the Magnitude app is also in a browser at `http://127.0.0.1:10100`; with the CLI only,
+`magnitude app open` opens it there. To keep `serve`
 running in the background, see `magnitude docs headless`; for other devices, see
 `magnitude docs remote-access`. While the desktop app is open it serves, and `serve` waits until it
 quits. Model, hardware, and connection setup commands require an existing service; they do not
@@ -71,7 +73,7 @@ foreground server with Ctrl+C. Desktop launch-at-login and Quit are available in
 
 `update check` checks for a release; `download` waits until it is prepared; `status` reports the
 current update state; `discard` removes a prepared update. None of these commands opens Desktop.
-`update install` restarts a running Desktop to install. A CLI-only install updates itself while
+`update install` restarts a running Desktop to install. On macOS and Linux, and with the CLI only on Windows, Magnitude updates itself while
 `serve` runs: it downloads updates, waits until no inference request is running, then installs and
 restarts in place. With `autoDownloadUpdates` set to `false`, `serve` only prints that an update is
 available; run `update install` to install it. Failed installation attempts require explicit retry.
@@ -86,14 +88,14 @@ of the same facts instead of text, with exact IDs, structured reasons a model ca
 engine's developer `detail`), and drafter verdicts. Optional fields are omitted when absent. Errors
 stay on stderr with a nonzero exit in both modes; with `--json` an error is one JSON document,
 `{"error": {"message": "...", "code": "..."}}`, whose `code` is a stable snake_case identifier. No command prompts or reads standard input: where
-a choice is needed it takes the desktop's default and prints what it chose.
+a choice is needed it takes the app's default and prints what it chose.
 
 `models` finds, downloads, and runs models. `models recommend` lists the tested models for this
 computer at the quant chosen for each, with every quant of its ladder; `models search` searches
 Hugging Face, with each result's base model and how its recommended quant runs here; `models show`
 shows every quant of a model with its bit width, size, speed, served context and placement, and for
 the chosen quant the bytes it holds on the device, in host RAM and reads from disk, and its decode
-speed at each assessed context depth. `models list` shows what is on this computer (catalog models,
+speed at each assessed context depth. `models list` shows what is on this computer (recommended models,
 models added from Hugging Face or as a file, and models found in other apps' folders) with the
 assessment progress, and `models families` the model families Magnitude runs. Assessment,
 downloads, and model loading are background work: observation commands return the current state and

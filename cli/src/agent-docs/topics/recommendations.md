@@ -4,7 +4,8 @@
 recommends them for this computer. Each tested model has a ladder of quants, smallest to largest,
 and each recommendation names the quant chosen for this computer: the largest one that fits in
 memory, has room on disk and is estimated to decode at 20 tokens per second or more in a long agent
-conversation, or else the fastest one that fits.
+conversation; else the largest within 90% of the fastest that fits; and where no speed can be
+measured, the smallest that fits.
 
 Models whose chosen quant reaches 20 tokens per second come first, by intelligence; the rest follow,
 also by intelligence, marked "below 20 tok/s on this computer". `--country US` recommends only
@@ -40,7 +41,7 @@ a starting point for choosing with the user, not a claim that one model is best 
   context, placement and model ID; `*` marks the chosen one.
 - **Acceleration** identifies the speculative-decoding method Magnitude has prepared for that
   configuration. See `magnitude docs speculative-methods` for what `None`, `MTP`, `DFlash`,
-  `DSpark`, and `LiLiCorr` mean and how Magnitude sets them up.
+  `DSpark`, `DFlash2` and `LiLiCorr` mean and how Magnitude sets them up.
 - **Capabilities** identify supported features such as vision, tool use, structured output, and
   reasoning. These can matter more than a small speed or intelligence difference when the user has
   a specific task in mind.
@@ -77,6 +78,6 @@ These scores are a September 1, 2026 snapshot of Artificial Analysis Intelligenc
 | [GPT-5.6 Luna](https://artificialanalysis.ai/models/gpt-5-6-luna) | Max effort | 52 |
 
 Compare scores from the same index version and similar reasoning settings when possible. Artificial
-Analysis may revise its methodology or results over time. Magnitude ships reviewed scores with its
-catalog rather than refreshing them from the network during recommendation, and clearly labels an
+Analysis may revise its methodology or results over time. Magnitude ships reviewed scores with the
+models it recommends rather than refreshing them from the network during recommendation, and clearly labels an
 authored estimate when a directly measured score is unavailable.

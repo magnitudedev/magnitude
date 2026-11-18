@@ -35,7 +35,7 @@ export const documentationTopics: readonly DocumentationTopic[] = [
   },
   {
     id: "speculative-methods",
-    description: "Understand None, MTP, DFlash, DSpark, and LiLiCorr acceleration",
+    description: "Understand None, MTP, DFlash, DSpark, DFlash2, and LiLiCorr acceleration",
     markdown: speculativeMethodsMarkdown,
   },
   {

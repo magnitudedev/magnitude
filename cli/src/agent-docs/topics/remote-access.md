@@ -64,8 +64,8 @@ is needed through this loopback tunnel. Model management commands still run on t
 A Linux server set up as a system service by an earlier version of Magnitude keeps working after it
 updates: it still runs as `magnitude.service` under the `magnitude` account, with the same address, port and key.
 Its data and configuration are in `/var/lib/magnitude/.magnitude/`, so its configuration file is
-`/var/lib/magnitude/.magnitude/config.json`. Logs: `journalctl -u magnitude`. On a machine without a
-graphical desktop, `magnitude status` and the model commands run against that service for any account.
+`/var/lib/magnitude/.magnitude/config.json`. Logs: `journalctl -u magnitude`. Other accounts can't use or
+control that service with the `magnitude` command: `magnitude status` reports it as another account's.
 
 ## Updates on a server
 
@@ -75,3 +75,11 @@ is back. See `magnitude docs headless`.
 ## WSL
 
 Inside WSL on Windows, `127.0.0.1` is the Linux distribution, not Windows. With WSL mirrored networking, `http://127.0.0.1:10100` works. Otherwise use the Windows host address from `ip route show default | awk '{print $3}'` with Network access on and the API key.
+
+## Docker
+
+The `magnitudedev/magnitude` image runs `magnitude serve` and always accepts connections on every
+interface with an API key. `MAGNITUDE_NETWORK_KEY` sets the key, and `MAGNITUDE_ALLOWED_HOSTS` adds host
+names, comma-separated. Use the port the container publishes on its host, such as
+`http://HOST:10100`, not the container's own `127.0.0.1`. Run commands inside it with
+`docker exec <container> magnitude ...`.

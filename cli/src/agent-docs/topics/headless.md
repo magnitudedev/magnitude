@@ -17,7 +17,7 @@ Magnitude installs in one of two ways:
   & ([scriptblock]::Create((irm https://magnitude.dev/install.ps1))) -Desktop
   ```
 
-- **CLI only**, for servers and headless use:
+- **CLI only**, for a server, or any machine without the desktop app:
 
   ```sh
   curl -fsSL https://magnitude.dev/install.sh | sh
@@ -47,6 +47,13 @@ API and the Magnitude app on `http://127.0.0.1:10100`, so by default only this c
 
 - OpenAI-compatible: `http://127.0.0.1:10100/inference/v1`
 - Anthropic-compatible: `http://127.0.0.1:10100/inference/anthropic`
+
+While it serves, `magnitude app open` opens the Magnitude app in this computer's browser at
+`http://127.0.0.1:10100`, or prints that address where there is no browser. It is the same app as the
+desktop app, without one-click Connect in Connections.
+
+A loaded model is unloaded after an hour without requests, or when the system runs short of memory;
+the next request, or `magnitude models load`, loads it again.
 
 Run other commands, such as `magnitude status`, `magnitude models recommend` and
 `magnitude models pull <model-id>`, in another shell while it serves. They use the running service
@@ -302,8 +309,9 @@ Install the desktop app from https://magnitude.dev/download, or rerun the instal
 stay, since both use `~/.magnitude`. A background service set up above keeps working on every OS: it
 calls the `magnitude` command, which is now the app's CLI, and it waits while the app is open.
 
-On Linux the desktop package provides `/usr/bin/magnitude`. The CLI-only copy keeps running until the
-app is first opened; then `~/.magnitude/bin/magnitude` points at `/usr/bin/magnitude`.
+On Linux the desktop package provides `/usr/bin/magnitude`. With `--desktop`, the installer points
+`~/.magnitude/bin/magnitude` at it straight away. With a downloaded package, the CLI-only copy keeps
+running until the app is first opened; then `~/.magnitude/bin/magnitude` points at `/usr/bin/magnitude`.
 
 ## Removing the CLI-only install
 
@@ -314,7 +322,7 @@ app is first opened; then `~/.magnitude/bin/magnitude` points at `/usr/bin/magni
 
    ```sh
    rm -rf ~/.magnitude/cli ~/.magnitude/bin/magnitude && rmdir ~/.magnitude/bin 2>/dev/null
-   for f in ~/.zprofile ~/.zshrc ~/.bash_profile ~/.bash_login ~/.profile ~/.bashrc ~/.config/fish/config.fish; do
+   for f in "${ZDOTDIR:-$HOME}/.zprofile" "${ZDOTDIR:-$HOME}/.zshrc" ~/.bash_profile ~/.bash_login ~/.profile ~/.bashrc "${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish"; do
      [ -f "$f" ] && sed -i.bak '/# >>> Magnitude CLI PATH >>>/,/# <<< Magnitude CLI PATH <<</d' "$f"
    done
    ```

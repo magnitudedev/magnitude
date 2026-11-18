@@ -10,7 +10,7 @@ quality rating.
 For the methods Magnitude reports, use this rule of thumb for decode speed:
 
 ```text
-None (usually slowest) -> MTP -> DFlash -> DSpark -> LiLiCorr (usually fastest)
+None (usually slowest) -> MTP -> DFlash -> DSpark -> DFlash2 -> LiLiCorr (usually fastest)
 ```
 
 This is a typical ordering, not a guarantee. Actual speed depends on the target and draft models,
@@ -38,19 +38,22 @@ evidence over the method name alone.
   head can also trim low-confidence suffix tokens before verification. This retains most of the
   parallel drafting speed while producing longer useful prefixes and avoiding wasted target
   verification, so DSpark is typically faster than DFlash.
-- **LiLiCorr**: Runs a DFlash-style parallel backbone with grouped causal convolutions, then a
+- **DFlash2**: A DFlash drafter whose parallel backbone uses grouped causal convolutions and proposes
+  several candidates for each block position. Magnitude ranks it above DSpark.
+- **LiLiCorr**: Runs DFlash2's backbone, then a
   lightweight candidate corrector considers every block position's top candidates together and
   picks the most consistent path through them. Correcting the whole block jointly restores in-block
-  dependencies and yields longer accepted prefixes, so LiLiCorr is typically faster than DSpark on
+  dependencies and yields longer accepted prefixes, so LiLiCorr is typically faster than DFlash2 on
   the targets that ship a LiLiCorr drafter.
 
 ## What Magnitude handles
 
-For a catalog model, Magnitude's reviewed configuration declares the exact speculative method and
+For a recommended model, Magnitude's reviewed configuration declares the exact speculative method and
 any required draft material. `magnitude models pull` acquires a separate draft artifact when the
 configuration needs one. Assessment and loading validate the target, draft, method, hardware fit,
 and serving configuration; Magnitude then activates the method automatically during inference.
 
-The user does not need to select a method or pair a draft model manually. Magnitude does not attach
-an arbitrary draft model to a target. If a catalog configuration has no reviewed compatible
-speculative method, it runs without speculative decoding.
+The user does not need to select a method or pair a draft model manually. If a recommended model's
+configuration has no reviewed compatible speculative method, it runs without speculative decoding.
+Other models from Hugging Face get a drafter chosen automatically, which you can change; see
+`magnitude docs custom-models`.
