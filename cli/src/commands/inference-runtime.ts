@@ -92,8 +92,8 @@ const assessingCount = (models: readonly CatalogLocalModel[]): { assessing: numb
 const assessmentNotice = (models: readonly CatalogLocalModel[]): string[] => {
   const { assessing, failed } = assessingCount(models)
   return [
-    ...(assessing > 0 ? [`Assessing ${plural(assessing, "additional catalog model")}; recommendations may change.`] : []),
-    ...(failed > 0 ? [`Assessment failed for ${plural(failed, "catalog model")}.`] : []),
+    ...(assessing > 0 ? [`Assessing ${plural(assessing, "more model")}; recommendations may change.`] : []),
+    ...(failed > 0 ? [`Assessment failed for ${plural(failed, "model")}.`] : []),
   ]
 }
 
@@ -230,7 +230,7 @@ export const showRecommendations = (
 
 const catalogWarnings = (catalog: ModelCatalogState): string[] => catalog._tag === "Initializing"
   ? []
-  : [...new Set(catalog.failures.map(({ message }) => message.trim()).filter(Boolean))].map((message) => `Catalog warning: ${message}`)
+  : [...new Set(catalog.failures.map(({ message }) => message.trim()).filter(Boolean))].map((message) => `Model warning: ${message}`)
 
 export function renderRecommendations({
   catalog,
@@ -239,7 +239,7 @@ export function renderRecommendations({
   developerCountry,
   recommended,
 }: RecommendationsView): string {
-  if (catalog._tag === "Initializing") return "The local model catalog is initializing.\n"
+  if (catalog._tag === "Initializing") return "Magnitude is still preparing its recommendations.\n"
   const system = describeLocalHardware(hardware).system.name
   const notice = [...assessmentNotice(models), ...catalogWarnings(catalog)]
   const scope = Option.match(developerCountry, { onNone: () => "", onSome: (country) => ` from ${country} developers` })

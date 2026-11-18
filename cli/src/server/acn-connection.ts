@@ -5,7 +5,7 @@ import { makeFirstPartyConnection } from "@magnitudedev/client-common"
 import { Effect, Layer, Schema } from "effect"
 
 export class NoServiceRunning extends Schema.TaggedError<NoServiceRunning>()("NoServiceRunning", {}) {
-  override get message() { return "No Magnitude service is running. Open the Magnitude desktop app or run `magnitude serve`." }
+  override get message() { return "No Magnitude service is running. Run `magnitude serve`, or open the Magnitude desktop app if it's installed." }
 }
 
 /** Connection whose startup requires an already-usable service. */

@@ -301,7 +301,7 @@ const program = Effect.scoped(Effect.gen(function* () {
   const openLink = (url: string) => Either.match(parseDeepLink(url), {
     onLeft: error => Effect.logWarning(`Ignored link: ${error.message}`).pipe(
       Effect.zipRight(show()),
-      Effect.zipRight(showNotice({ title: "Couldn’t open this link", description: `${error.message} Magnitude opens model links from “Use this model” on Hugging Face.` }))),
+      Effect.zipRight(showNotice({ title: "Couldn’t open this link", description: error.message }))),
     onRight: link => Effect.gen(function* () {
       const action = { _tag: "OpenHuggingFaceModel" as const, repository: link.repository, file: link.file }
       yield* show("models")

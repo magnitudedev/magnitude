@@ -25,7 +25,7 @@ export const isLegacyServerMarked = (platform: NodeJS.Platform) => platform !== 
 export const legacyServerUnit = `# Written by the Magnitude desktop package to convert the Magnitude server into a CLI-only install.
 [Unit]
 Description=Magnitude server
-Documentation=https://docs.magnitude.dev/remote-server
+Documentation=https://docs.magnitude.dev/installation/cli-only
 After=network-online.target
 Wants=network-online.target
 

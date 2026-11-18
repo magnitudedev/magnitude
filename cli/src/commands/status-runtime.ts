@@ -182,7 +182,7 @@ export const renderStatus = (status: ServiceStatusPresentation): string => [
     "that account can quit it."]
     : ["", "Another Magnitude is answering on this computer's port, outside this profile. This account can't see or control it."] }),
   ...(Option.isNone(status.owner) && Option.isNone(status.elsewhere) ? [
-    "", "Not running", "Open the Magnitude desktop app or run `magnitude serve`.",
+    "", "Not running", "Run `magnitude serve`, or open the Magnitude desktop app if it's installed.",
   ] : []),
   "",
 ].join("\n")

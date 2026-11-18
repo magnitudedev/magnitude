@@ -41,7 +41,7 @@ export const downloadNotice = (failure: ModelAcquisitionFailure): NoticeContent 
     case "CorruptDownload": return { title: "The download couldn’t be verified", description: "Try downloading the model again." }
     case "Internal": return { title: "The download couldn’t finish", description: "Try the download again." }
     case "HuggingFaceAccessRequired": return failure.access === "SignIn"
-      ? { title: "Sign in to Hugging Face to use this model", description: "This model is gated. Sign in under Settings → Hugging Face, then try the download again." }
+      ? { title: "Sign in to Hugging Face to use this model", description: "This model is gated. Sign in under Settings → General → Hugging Face, then try the download again." }
       : { title: "Accept this model’s terms on Hugging Face", description: "Accept its terms on the model’s Hugging Face page, then try the download again. Some models also need the author’s approval." }
   }
 }

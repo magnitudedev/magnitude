@@ -89,7 +89,7 @@ export const ModelCommandsLive: Layer.Layer<
   const downloadable = (modelId: CatalogFormModelId) => Effect.all([localModels.state, catalogSync.listed(modelId)]).pipe(Effect.flatMap(([{ models, preparation }, inCatalog]): Effect.Effect<CatalogFormModelId, ModelVersionNotRunnable | LocalModelMutationFailed> => {
     if (!inCatalog) return Effect.fail(new LocalModelMutationFailed({
       code: "catalog_model_not_found",
-      message: `There’s no model ${modelId} in the catalog.`,
+      message: `There’s no model ${modelId}.`,
       retryable: false,
     }))
     const model = models.find((candidate) => candidate.modelId === modelId)
@@ -211,7 +211,7 @@ export const ModelCommandsLive: Layer.Layer<
       (id) => catalogSync.downloadComponent(id, component),
       (id) => Effect.fail(new LocalModelMutationFailed({
         code: "catalog_component_requires_catalog_model",
-        message: `${id} is not a catalog model; only catalog models have components to download`,
+        message: `${id} is not a recommended model; only recommended models have components to download`,
         retryable: false,
       })),
     ),

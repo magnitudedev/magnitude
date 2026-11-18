@@ -45,7 +45,7 @@ describe("non-interactive inference commands", () => {
         const timeout = new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 8_000))
         const outcome = await Promise.race([child.exited, timeout])
         expect(outcome).not.toBe("timeout")
-        const message = "No Magnitude service is running. Open the Magnitude desktop app or run `magnitude serve`."
+        const message = "No Magnitude service is running. Run `magnitude serve`, or open the Magnitude desktop app if it's installed."
         const stderr = await new Response(child.stderr).text()
         if ((args as readonly string[]).includes("--json")) expect(JSON.parse(stderr)).toEqual({ error: { message, code: "no_service_running" } })
         else expect(stderr).toBe(`${message}\n`)

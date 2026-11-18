@@ -153,7 +153,7 @@ describe("inference argument validation", () => {
     [() => pullModel(""), "Expected a model ID, a Hugging Face link, or owner/repo[:QUANT]: "],
     [() => pullModel("not a model"), "Expected a model ID, a Hugging Face link, or owner/repo[:QUANT]: not a model"],
     [() => pullModel("https://example.com/owner/repo"), "Expected a model ID, a Hugging Face link, or owner/repo[:QUANT]: https://example.com/owner/repo"],
-    [() => pullModel("test:gguf:q4", { drafter: "none" }), "Catalog models come with their drafter; --drafter applies only to models from Hugging Face."],
+    [() => pullModel("test:gguf:q4", { drafter: "none" }), "Recommended models come with their drafter; --drafter applies only to other models from Hugging Face."],
     [() => pullModel("owner/repo", { drafter: " " }), "Drafter must be auto, none, built-in, a model ID, a Hugging Face reference, or a GGUF path"],
     [() => cancelDownload(""), "Invalid model ID: "],
     [() => removeModel("nonsense"), "Invalid model ID: nonsense"],
@@ -163,7 +163,7 @@ describe("inference argument validation", () => {
     [() => searchHuggingFace("qwen", { limit: "0" }), "Limit must be an integer from 1 to 50"],
     [() => showModel("/models/qwen.gguf"), "Expected a model ID, a Hugging Face link, or owner/repo[:QUANT]: /models/qwen.gguf"],
     [() => setModelDrafter("test:gguf:q4", "auto"),
-      "test:gguf:q4 is a catalog model. Catalog models keep the drafter Magnitude ships with them; it changes only when you update with `magnitude models pull test:gguf:q4`."],
+      "test:gguf:q4 is a recommended model. Recommended models keep the drafter Magnitude ships with them; it changes only when you update with `magnitude models pull test:gguf:q4`."],
     [() => setModelDrafter("garbage", "auto"), "Invalid model ID: garbage"],
     [() => hideModel("nope"), "Invalid model ID: nope"],
     [() => unhideModel("nope"), "Invalid model ID: nope"],
@@ -275,7 +275,7 @@ describe("recommendations, families, and assessment progress", () => {
     })
     const models = [model, assessing]
     expect(renderRecommendations({ catalog: catalogState(models), models, hardware: makeHardware(), developerCountry: Option.none(), recommended: [model].map(recommendedModel) }))
-      .toContain("Assessing 1 additional catalog model; recommendations may change.")
+      .toContain("Assessing 1 more model; recommendations may change.")
   })
 
   it("shows each recommendation's chosen quant with its speed, context and placement, and its ladder", () => {

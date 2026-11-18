@@ -155,7 +155,7 @@ export const renderRemoval = (
   switch (Option.getOrUndefined(kind)) {
     case "hide": return `Hid ${modelId} from Magnitude. Its files are untouched.\nUnhide it: magnitude models unhide ${modelId}\n`
     default: return Schema.is(CatalogFormModelIdSchema)(modelId)
-      ? `Removed ${modelId} from this computer.\nThe model remains available in the catalog.\n`
+      ? `Removed ${modelId} from this computer.\nYou can download it again with \`magnitude models pull ${modelId}\`.\n`
       : `Removed ${modelId}.\nMagnitude deleted only its own copy; files other apps manage are untouched.\n`
   }
 }
@@ -299,7 +299,7 @@ export const renderModelsList = ({ models, unsupported, hidden, all, preparation
       ...(hidden.length > 0 ? [`${plural(hidden.length, "hidden model")}.`] : []),
       ...(unsupported.length > 0 || hidden.length > 0 ? ["List them: magnitude models list --all"] : []),
     ]),
-    ...warnings.map((message) => `Catalog warning: ${message}`),
+    ...warnings.map((message) => `Model warning: ${message}`),
     renderPreparation(preparation),
   ]
   const unsupportedSection = all && unsupported.length > 0 ? [

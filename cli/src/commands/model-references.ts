@@ -21,7 +21,7 @@ const fail = (message: string) => Effect.fail(new ModelCommandError({ message })
 
 export const decodeCatalogId = (input: string): Effect.Effect<CatalogFormModelId, ModelCommandError> =>
   Schema.decodeUnknown(CatalogFormModelIdSchema)(input).pipe(
-    Effect.mapError(() => new ModelCommandError({ message: `Invalid catalog model ID: ${input}` })),
+    Effect.mapError(() => new ModelCommandError({ message: `Invalid model ID: ${input}` })),
   )
 
 export const decodeModelId = (input: string): Effect.Effect<ModelId, ModelCommandError> =>

@@ -369,7 +369,7 @@ it("refuses to download a catalog model that does not fit or that the catalog dr
   expect(dropped).toMatchObject({ _tag: "Left", left: { _tag: "LocalModelMutationFailed", code: "catalog_model_not_offered" } })
   // An ID the catalog never had is said to be no model, not one whose check failed.
   const unknown = await Effect.runPromise(sync("lfm3-1.7b:gguf:q5"))
-  expect(unknown).toMatchObject({ _tag: "Left", left: { _tag: "LocalModelMutationFailed", code: "catalog_model_not_found", message: "There’s no model lfm3-1.7b:gguf:q5 in the catalog." } })
+  expect(unknown).toMatchObject({ _tag: "Left", left: { _tag: "LocalModelMutationFailed", code: "catalog_model_not_found", message: "There’s no model lfm3-1.7b:gguf:q5." } })
   expect(installs).toEqual(["installed-too-large:gguf:q4", "assessing:gguf:q4", "fits:gguf:q4"])
   // A disabled model is listed: ICN answers it with its own reason, so it is passed on, not refused here.
   await Effect.runPromise(sync("disabled:gguf:q4"))

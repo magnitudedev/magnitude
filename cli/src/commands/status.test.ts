@@ -74,7 +74,7 @@ describe("Magnitude service definitions", () => {
   it("reports absence with actionable startup guidance and no desktop fields", () => {
     const output = renderStatus({ status: "Stopped", address: "127.0.0.1:10100", version: Option.none(),
       startsAutomaticallyOnLogin: Option.none(), activeModel: { _tag: "Unavailable" }, owner: Option.none(), reach: Option.none(), retrying: Option.none(), imageNotice: Option.none(), elsewhere: Option.none() })
-    expect(output).toContain("Not running\nOpen the Magnitude desktop app or run `magnitude serve`.\n")
+    expect(output).toContain("Not running\nRun `magnitude serve`, or open the Magnitude desktop app if it's installed.\n")
     expect(output).not.toMatch(/Tray|Starts at login|Active model/)
   })
 
