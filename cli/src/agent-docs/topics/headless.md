@@ -319,8 +319,13 @@ app is first opened; then `~/.magnitude/bin/magnitude` points at `/usr/bin/magni
    ```powershell
    $dir = "$env:LOCALAPPDATA\Programs\Magnitude CLI"
    Remove-Item -Recurse -Force $dir, "$env:USERPROFILE\.magnitude\cli"
-   $path = [Environment]::GetEnvironmentVariable("Path", "User") -split ";" | Where-Object { $_ -and $_.TrimEnd("\") -ne $dir }
-   [Environment]::SetEnvironmentVariable("Path", ($path -join ";"), "User")
+   # Edit the registry value directly so it keeps its type and unexpanded entries such as %USERPROFILE%.
+   $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Environment", $true)
+   $kind = $key.GetValueKind("Path")
+   $path = $key.GetValue("Path", "", "DoNotExpandEnvironmentNames") -split ";" |
+     Where-Object { $_ -and [Environment]::ExpandEnvironmentVariables($_).TrimEnd("\") -ne $dir }
+   $key.SetValue("Path", ($path -join ";"), $kind)
+   $key.Close()
    ```
 
 3. Models, settings, keys and logs stay in `~/.magnitude` (`%USERPROFILE%\.magnitude` on Windows), so
