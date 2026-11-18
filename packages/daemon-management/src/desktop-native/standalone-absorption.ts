@@ -1,5 +1,5 @@
 import { FileSystem } from "@effect/platform"
-import { Effect } from "effect"
+import { Effect, Schedule } from "effect"
 import { lstat, readlink, rename, symlink } from "node:fs/promises"
 import { posix, win32 } from "node:path"
 
@@ -31,6 +31,7 @@ export const absorbStandaloneInstallation = (options: { readonly home: string; r
       })
     }
   }
-  yield* fs.remove(root, { recursive: true })
+  // A CLI-only serve that just yielded may still hold its files open for a few seconds (Windows refuses the delete).
+  yield* fs.remove(root, { recursive: true }).pipe(Effect.retry(Schedule.spaced("1 second").pipe(Schedule.compose(Schedule.recurs(15)))))
   yield* Effect.logInfo("Replaced the CLI-only installation with the desktop app's CLI")
 }).pipe(Effect.catchAll(error => Effect.logWarning(`Could not replace the CLI-only installation: ${String(error)}`)))
