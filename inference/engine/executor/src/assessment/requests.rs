@@ -398,17 +398,13 @@ impl PointRequests {
     pub fn request(&self, executor: &Identity, request: PointRequest, waiter: Waiter) -> Result<(), StoreError> {
         let key = (executor, &request);
         let stored = Stored { executor: executor.clone(), request: request.clone(), waiter };
+        // A request held by a waiter as late or later is left as it is.
         self.files
-            .update(&key, LARGEST_REQUEST, |held: Option<Stored>| {
-                Ok::<_, std::convert::Infallible>(match held {
-                    Some(held) if held.waiter >= waiter => held,
-                    _ => stored,
-                })
+            .update(&key, LARGEST_REQUEST, |held: Option<Stored>| match held {
+                Some(held) if held.waiter >= waiter => Err(()),
+                _ => Ok(Some(stored)),
             })
-            .map(|updated| match updated {
-                Ok(()) => (),
-                Err(never) => match never {},
-            })
+            .map(|_written_or_left| ())
     }
 
     /// The requests on `executor` whose points `store`'s records do not all
@@ -435,7 +431,18 @@ impl PointRequests {
             }
             match stored.request.outstanding(topology, executor, store, costs_outstanding) {
                 true => waiting.push(stored),
-                false => self.files.remove::<Stored>(&(&stored.executor, &stored.request)).map_err(|error| error.to_string())?,
+                // Forgotten under the request's lock, and only as it was
+                // judged: a waiter that touched it since keeps it.
+                false => {
+                    let judged = &stored.waiter;
+                    let _forgotten_or_kept = self
+                        .files
+                        .update(&(&stored.executor, &stored.request), LARGEST_REQUEST, |held: Option<Stored>| match held {
+                            Some(held) if held.waiter != *judged => Err(()),
+                            _ => Ok(None),
+                        })
+                        .map_err(|error| error.to_string())?;
+                }
             }
         }
         waiting.sort_by(|first, second| second.waiter.cmp(&first.waiter));

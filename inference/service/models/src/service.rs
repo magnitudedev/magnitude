@@ -1,16 +1,16 @@
-use std::collections::BTreeSet;
-use std::fs::{self, File};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use futures_util::future::BoxFuture;
 use magnitude_service_contracts::{
-    DeletePlan, DeletedModel, ExternalOrigin, InventoryEntryId, InventoryError, InventoryModel, ModelAvailability,
+    DeletePlan, ExternalOrigin, ModelComponent, InventoryEntryId, InventoryError, InventoryModel, ModelAvailability,
     ModelInventory, ModelLocation, ModelSource, ResolvedComponent, ResolvedModel,
 };
 
-use crate::inventory::{LinkedFiles, ManagedModelStore, hf_repo_dir, repository_lock_path};
+use crate::inventory::{LinkedFiles, ManagedModelStore, hf_repo_dir};
 use crate::snapshot_blobs::{BlobStorage, RepositoryBlobs};
-use crate::store_fs::acquire_exclusive_lock;
+use crate::store_fs::{Garbage, RepositoryGarbage, StoredFile, finish, model_store, repository_record, snapshot_entry};
 
 impl ModelInventory for ManagedModelStore {
     fn list(&self) -> BoxFuture<'_, Result<Vec<InventoryModel>, InventoryError>> {
@@ -34,16 +34,7 @@ impl ModelInventory for ManagedModelStore {
 
     fn get(&self, id: &InventoryEntryId) -> BoxFuture<'_, Result<InventoryModel, InventoryError>> {
         let id = id.clone();
-        Box::pin(async move {
-            let model = self
-                .models
-                .read()
-                .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?
-                .get(&id)
-                .cloned()
-                .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
-            Ok(model)
-        })
+        Box::pin(async move { self.published_model(&id) })
     }
 
     fn plan_delete(
@@ -52,13 +43,7 @@ impl ModelInventory for ManagedModelStore {
     ) -> BoxFuture<'_, Result<DeletePlan, InventoryError>> {
         let id = id.clone();
         Box::pin(async move {
-            let model = self
-                .models
-                .read()
-                .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?
-                .get(&id)
-                .cloned()
-                .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
+            let model = self.published_model(&id)?;
             ensure_deletable_status(&model)?;
             match &model.location {
                 ModelLocation::MagnitudeCache { components, .. } => {
@@ -79,29 +64,13 @@ impl ModelInventory for ManagedModelStore {
         })
     }
 
-    fn delete(&self, id: &InventoryEntryId) -> BoxFuture<'_, Result<DeletedModel, InventoryError>> {
-        let id = id.clone();
-        Box::pin(async move {
-            self.delete_entries(std::slice::from_ref(&id))
-                .await?
-                .pop()
-                .ok_or_else(|| InventoryError::NotFound(id.0.clone()))
-        })
-    }
-
     fn resolve_ready(
         &self,
         id: &InventoryEntryId,
     ) -> BoxFuture<'_, Result<ResolvedModel, InventoryError>> {
         let id = id.clone();
         Box::pin(async move {
-            let model = self
-                .models
-                .read()
-                .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?
-                .get(&id)
-                .cloned()
-                .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
+            let model = self.published_model(&id)?;
             if !matches!(model.availability, ModelAvailability::Available { .. }) {
                 return Err(InventoryError::NotReady(id.0.clone()));
             }
@@ -284,14 +253,24 @@ fn invalid_split_layout(role: &magnitude_service_contracts::ComponentRole) -> In
 type SnapshotFile = (String, String, PathBuf);
 
 impl ManagedModelStore {
-    /// Deletes Magnitude's copies of `ids` as one removal. A snapshot file stays while a model
-    /// outside `ids` is served from it (a variant's target holding the projector its sibling
-    /// variant shares); a file several of `ids` hold goes with the first of them.
-    pub(crate) async fn delete_entries(
+    /// Deletes Magnitude's copies of `ids` as one removal: the bytes freed. A snapshot file stays
+    /// while a model outside `ids` is served from it (a variant's target holding the projector
+    /// its sibling variant shares); a file several of `ids` hold goes with the first of them.
+    ///
+    /// The removal is its files' transitions in their owner ([`crate::store_fs::Readers`]): it
+    /// takes them from every acquirer
+    /// at once (T3), refused while a download, another process or another removal holds one, and
+    /// finds what it deletes; `release_resident` lets go of the model loading or serving them
+    /// (T4); it waits for the holds left here, which are finite (T6); commits in one durable
+    /// write, its garbage record, which removes the models (T7); and deletes the garbage (T8).
+    /// Every refusal or failure before the commit drops the removal, which leaves everything
+    /// installed (T5).
+    pub(crate) async fn remove_entries(
         &self,
         ids: &[InventoryEntryId],
-    ) -> Result<Vec<DeletedModel>, InventoryError> {
-        self.ensure_installed_model_inventory().await?;
+        release_resident: BoxFuture<'_, Result<(), InventoryError>>,
+    ) -> Result<u64, InventoryError> {
+        let root = &self.config.root;
         let removing = ids.iter().collect::<BTreeSet<_>>();
         let in_use = self
             .models
@@ -301,75 +280,63 @@ impl ManagedModelStore {
             .filter(|model| !removing.contains(&model.id))
             .flat_map(|model| snapshot_files(model).into_iter().map(|(file, _)| file))
             .collect::<BTreeSet<_>>();
-        let mut deleted_files = BTreeSet::new();
-        let mut deleted = Vec::new();
+        let (mut removals, mut deleted_files, mut repositories, mut files) =
+            (Vec::new(), BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
         for id in ids {
-            deleted.push(self.delete_entry(id, &in_use, &mut deleted_files).await?);
+            let model = self.published_model(id)?;
+            ensure_deletable_status(&model)?;
+            // Magnitude deletes only from its own store. Every other location belongs to the
+            // user or another tool, whatever the request.
+            let (ModelLocation::MagnitudeCache { .. }, ModelSource::HuggingFace { repository, .. }) =
+                (&model.location, &model.source)
+            else {
+                return Err(InventoryError::Unsupported(EXTERNAL_READ_ONLY.to_owned()));
+            };
+            repositories.insert(repository_record(repository));
+            let mut owned = Vec::new();
+            for (file, component) in snapshot_files(&model) {
+                if !in_use.contains(&file) && deleted_files.insert(file.clone()) {
+                    owned.push(component.clone());
+                    let (repository, commit, path) = &file;
+                    files.insert(StoredFile::new(repository, commit, path));
+                }
+            }
+            removals.push((model, owned));
         }
-        Ok(deleted)
+        let removal = self.readers.begin_removal(root, &repositories, &files).await?;
+        let garbage = magnitude_service_utils::blocking::run({
+            let root = root.clone();
+            move || garbage(&root, &removals)
+        })
+        .await?;
+        release_resident.await?;
+        removal.drained().await;
+        let store = model_store(root);
+        let garbage = magnitude_service_utils::blocking::run(move || garbage.commit(&store).map(|()| garbage)).await?;
+        // The commit removed the models: the inventory here takes it in at once, as every scan does.
+        self.remove_published_models(ids).await?;
+        let store = model_store(root);
+        let freed_bytes = magnitude_service_utils::blocking::run(move || {
+            garbage.0.keys().fold(0_u64, |freed, repository| match finish(&store, repository) {
+                Ok(bytes) => freed.saturating_add(bytes),
+                Err(error) => {
+                    tracing::warn!(repository = %repository.display(), %error, "removed model garbage is left for the repository's next holder");
+                    freed
+                }
+            })
+        })
+        .await;
+        drop(removal);
+        Ok(freed_bytes)
     }
 
-    async fn delete_entry(
-        &self,
-        id: &InventoryEntryId,
-        in_use: &BTreeSet<SnapshotFile>,
-        deleted_files: &mut BTreeSet<SnapshotFile>,
-    ) -> Result<DeletedModel, InventoryError> {
-        let observed = self
-            .models
+    fn published_model(&self, id: &InventoryEntryId) -> Result<InventoryModel, InventoryError> {
+        self.models
             .read()
             .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?
             .get(id)
             .cloned()
-            .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
-        let lock_path = match (&observed.location, &observed.source) {
-            (
-                ModelLocation::MagnitudeCache { .. },
-                ModelSource::HuggingFace { repository, .. },
-            ) => repository_lock_path(&self.config.root, repository),
-            _ => self
-                .config
-                .root
-                .join("locks")
-                .join(format!("{}.lock", id.0)),
-        };
-        let lock = acquire_delete_lock(&lock_path)?;
-        let model = self
-            .models
-            .read()
-            .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?
-            .get(id)
-            .cloned()
-            .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
-        ensure_deletable_status(&model)?;
-        // Magnitude deletes only from its own store. Every other location belongs to the
-        // user or another tool, whatever the request.
-        if !matches!(model.location, ModelLocation::MagnitudeCache { .. }) {
-            return Err(InventoryError::Unsupported(EXTERNAL_READ_ONLY.to_owned()));
-        }
-        let mut shared = Vec::new();
-        let mut owned = Vec::new();
-        for (file, component) in snapshot_files(&model) {
-            if in_use.contains(&file) {
-                shared.push(component.clone());
-            } else if deleted_files.insert(file) {
-                owned.push(component.clone());
-            }
-        }
-        let mut plan = plan_managed_delete(&self.config.root, &model, &owned)?;
-        plan.retained_shared_bytes = shared.iter().fold(plan.retained_shared_bytes, |total, component| {
-            total.saturating_add(component.size_bytes)
-        });
-        let freed_bytes = delete_managed(&self.config.root, &model, &owned)?;
-        drop(lock);
-        self.remove_published_model(id).await?;
-        Ok(DeletedModel {
-            id: id.clone(),
-            deleted: true,
-            freed_bytes,
-            retained_shared_bytes: plan.retained_shared_bytes,
-            plan,
-        })
+            .ok_or_else(|| InventoryError::NotFound(id.0.clone()))
     }
 }
 
@@ -425,43 +392,41 @@ fn plan_managed_delete(
     })
 }
 
-fn delete_managed(
-    root: &Path,
-    model: &InventoryModel,
-    components: &[magnitude_service_contracts::ModelComponent],
-) -> Result<u64, InventoryError> {
-    let ModelSource::HuggingFace {
-        repository, commit, ..
-    } = &model.source
-    else {
-        return Err(InventoryError::Internal(
-            "managed location is missing Hugging Face identity".to_owned(),
-        ));
-    };
-    let repo_root = root.join("hub").join(hf_repo_dir(repository));
-    let snapshot = repo_root.join("snapshots").join(commit);
-    let ManagedSnapshotEntries {
-        entries,
-        referenced,
-    } = managed_snapshot_entries(root, repository, commit, components)?;
-    let mut freed = 0_u64;
-    for ManagedSnapshotEntry { link, blob } in entries {
-        if link.symlink_metadata().is_ok() {
-            fs::remove_file(&link).map_err(io_error)?;
-        }
-        if !referenced.contains(&blob)
-            && let Ok(metadata) = blob.metadata()
-        {
-            fs::remove_file(&blob).map_err(io_error)?;
-            freed = freed.saturating_add(metadata.len());
-            let mut checkpoint = blob.into_os_string();
-            checkpoint.push(".integrity");
-            let _ = fs::remove_file(checkpoint);
+/// The garbage of removing `removals`' components ([`Garbage`]): every entry must resolve to a
+/// blob of its repository, and a blob another entry still publishes stays. Its caller holds the
+/// repositories' records.
+fn garbage(root: &Path, removals: &[(InventoryModel, Vec<ModelComponent>)]) -> Result<Garbage, InventoryError> {
+    let mut opened = BTreeMap::<PathBuf, (RepositoryBlobs, BTreeSet<PathBuf>, BTreeSet<PathBuf>)>::new();
+    for (model, owned) in removals {
+        let ModelSource::HuggingFace { repository, commit, .. } = &model.source else {
+            return Err(InventoryError::Internal("managed location is missing Hugging Face identity".to_owned()));
+        };
+        let record = repository_record(repository);
+        let (blobs, entries, removed) = match opened.entry(record.clone()) {
+            std::collections::btree_map::Entry::Occupied(found) => found.into_mut(),
+            std::collections::btree_map::Entry::Vacant(vacant) => {
+                let blobs = RepositoryBlobs::open(&root.join(&record)).map_err(io_error)?;
+                vacant.insert((blobs, BTreeSet::new(), BTreeSet::new()))
+            }
+        };
+        for component in owned {
+            let link = root.join(snapshot_entry(repository, commit, &component.path));
+            removed.insert(repository_blob(blobs, &link)?);
+            entries.insert(link);
         }
     }
-    remove_empty_parents(&snapshot, &repo_root.join("snapshots"));
-    crate::store_fs::prune_empty_repository(&repo_root);
-    Ok(freed)
+    let relative = |path: &PathBuf| path.strip_prefix(root).expect("a path of the store").to_owned();
+    let mut garbage = Garbage::default();
+    for (record, (blobs, entries, mut removed)) in opened {
+        let mut referenced = BTreeSet::new();
+        collect_other_snapshot_blobs(&root.join(&record).join("snapshots"), &blobs, &entries, &mut referenced)?;
+        removed.retain(|blob| !referenced.contains(blob));
+        garbage.0.insert(record, RepositoryGarbage {
+            entries: entries.iter().map(relative).collect(),
+            blobs: removed.iter().map(relative).collect(),
+        });
+    }
+    Ok(garbage)
 }
 
 struct ManagedSnapshotEntry {
@@ -572,7 +537,7 @@ fn hf_hub_root(snapshot: &Path) -> Result<PathBuf, InventoryError> {
         .ok_or_else(|| InventoryError::DeletionUnsafe("snapshot has no hub root".to_owned()))
 }
 
-fn remove_empty_parents(path: &Path, stop: &Path) {
+pub(crate) fn remove_empty_parents(path: &Path, stop: &Path) {
     let mut current = path.to_path_buf();
     while current.starts_with(stop) && current != stop {
         if fs::remove_dir(&current).is_err() {
@@ -583,10 +548,6 @@ fn remove_empty_parents(path: &Path, stop: &Path) {
         };
         current = parent.to_path_buf();
     }
-}
-
-fn acquire_delete_lock(path: &Path) -> Result<File, InventoryError> {
-    acquire_exclusive_lock(path)
 }
 
 fn io_error(error: impl std::fmt::Display) -> InventoryError {

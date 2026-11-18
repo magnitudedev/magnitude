@@ -6,8 +6,8 @@
 //! measurement job's probe results are not the cache's: every device forms
 //! through Seismic's one store of the process (`seismic::ProgramStore::user`),
 //! whichever cache a load names. The directory is a Seismic [`DirectoryStore`],
-//! which owns its files, their writes and their eviction: the cache is the
-//! engine's entries in it. Layout:
+//! whose [`seismic_io::Store`] owns its files, their writes, locks and
+//! eviction: the cache is the engine's entries in it. Layout:
 //!
 //! ```text
 //! <root>/tuning/<key>.json             one unit's choice per tuning key: what a load
@@ -30,8 +30,9 @@
 //!                                      how many measurement jobs ended while
 //!                                      measuring one point
 //!                                      ([`KernelCache::measurement_attempts`])
-//! <root>/lock                          the store's lock, which orders the records'
+//! <root>/.lock                         the store's lock, which orders the records'
 //!                                      readers, writers and eviction
+//!                                      ([`seismic_io::store`])
 //! ```
 //!
 //! A cache an earlier build kept also held `<root>/artifacts/`: the programs
@@ -93,6 +94,7 @@ use seismic::measure::JsonFileStore;
 #[cfg(test)]
 use seismic::TuningTime;
 use seismic::{DirectoryStore, Eviction, TuningResult};
+use seismic_io::Durability;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -131,7 +133,7 @@ fn layout(path: &Path, records: &seismic::Examining<'_>) -> Eviction {
         return placed;
     };
     let choice = KernelCache::choice(&TuningCacheKey(key.clone()));
-    match records.examine(&choice) {
+    match records.examine(&choice, u64::MAX) {
         Ok(choice) if choice.as_deref().and_then(named_evidence).as_deref() == Some(digest) => placed,
         Ok(_) => Eviction::Unreachable,
         Err(error) => {
@@ -374,7 +376,7 @@ impl KernelCache {
         let records = self.store.reading().map_err(|error| self.failed("cannot take its lock to read a record", error))?;
         let choice = Self::choice(key);
         let Some(entry) = records
-            .read(&choice)
+            .read(&choice, u64::MAX)
             .map_err(|error| self.failed(&format!("cannot read {}", choice.display()), error))?
             .and_then(|bytes| serde_json::from_slice::<ChoiceEntry<C>>(&bytes).ok())
         else {
@@ -382,7 +384,7 @@ impl KernelCache {
         };
         let path = Self::evidence_path(key, &entry.evidence);
         let bytes = records
-            .read(&path)
+            .read(&path, u64::MAX)
             .map_err(|error| self.failed(&format!("cannot read {}", path.display()), error))?
             .ok_or_else(|| {
                 format!(
@@ -417,13 +419,13 @@ impl KernelCache {
         // What the choice being replaced names, examined: it is replaced,
         // not used. A choice that does not parse names nothing.
         let replaced = records
-            .examine(&choice_path)
+            .examine(&choice_path, u64::MAX)
             .map_err(|error| self.failed(&format!("cannot read {}", choice_path.display()), error))?
             .and_then(|bytes| named_evidence(&bytes))
             .filter(|replaced| *replaced != digest);
         let path = Self::evidence_path(key, &digest);
         records
-            .write(&path, &bytes)
+            .write(&path, &bytes, Durability::Durable)
             .map_err(|error| self.failed(&format!("cannot write {}", path.display()), error))?;
         let entry = ChoiceEntry {
             evidence: digest,
@@ -431,7 +433,7 @@ impl KernelCache {
         };
         let bytes = serde_json::to_vec(&entry).expect("a tuning choice serializes");
         records
-            .write(&choice_path, &bytes)
+            .write(&choice_path, &bytes, Durability::Durable)
             .map_err(|error| self.failed(&format!("cannot write {}", choice_path.display()), error))?;
         let Some(replaced) = replaced else {
             return Ok(());
@@ -459,7 +461,7 @@ impl KernelCache {
         let path = Self::prepared_path(key);
         let records = self.store.reading().map_err(|error| self.failed("cannot take its lock to read a record", error))?;
         records
-            .read(&path)
+            .read(&path, u64::MAX)
             .map(|record| record.is_some())
             .map_err(|error| self.failed(&format!("cannot read {}", path.display()), error))
     }
@@ -469,7 +471,7 @@ impl KernelCache {
         let path = Self::prepared_path(key);
         let records = self.store.writing().map_err(|error| self.failed("cannot take its lock to store a record", error))?;
         records
-            .write(&path, b"{}")
+            .write(&path, b"{}", Durability::Durable)
             .map_err(|error| self.failed(&format!("cannot write {}", path.display()), error))
     }
 }
@@ -496,7 +498,7 @@ mod tests {
         fs::create_dir_all(root.join(TUNING)).unwrap();
         fs::write(root.join(KernelCache::choice(&key)), b"{ not json").unwrap();
         assert!(cache.tuning::<serde_json::Value>(&key).unwrap().is_none());
-        cache.store.writing().unwrap().write(&KernelCache::choice(&key), b"rewritten").unwrap();
+        cache.store.writing().unwrap().write(&KernelCache::choice(&key), b"rewritten", Durability::Durable).unwrap();
         assert_eq!(fs::read(root.join(KernelCache::choice(&key))).unwrap(), b"rewritten");
         fs::remove_dir_all(root).unwrap();
     }
@@ -556,11 +558,7 @@ mod tests {
 
     /// The evidence files under `root`, temporary files apart.
     fn evidence_files(root: &Path) -> usize {
-        fs::read_dir(root.join(EVIDENCE))
-            .unwrap()
-            .flatten()
-            .filter(|item| !seismic_io::unpublished(&item.file_name()))
-            .count()
+        seismic_io::Store::new(root.to_owned(), seismic_io::Privacy::Shared).list(Path::new(EVIDENCE)).unwrap().len()
     }
 
     /// A stored choice names the evidence it was made from; replacing the
@@ -597,10 +595,12 @@ mod tests {
         let orphans = [KernelCache::evidence_path(&live, "0123456789abcdef"), KernelCache::evidence_path(&abandoned, "0123456789abcdef")];
         let records = cache.store.writing().unwrap();
         for orphan in &orphans {
-            records.write(orphan, b"{}").unwrap();
+            records.write(orphan, b"{}", Durability::Durable).unwrap();
         }
-        drop(records);
+        // Counted under the lock: the first opening's eviction may run
+        // once it is released.
         assert_eq!(evidence_files(&root), 3);
+        drop(records);
         // Opening evicts on a thread of its own.
         let _evicting = KernelCache::open(root.clone(), DEFAULT_KERNEL_CACHE_BYTES).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

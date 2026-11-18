@@ -531,20 +531,23 @@ impl<T: Toolchain> ProgramFormer<T> {
     }
 
     /// The artifact `kept` names, its bytes checked against the pointer's
-    /// digest and decoded, opened in place where the store keeps them in a
-    /// file ([`ArtifactStore::file`]); none when the store has dropped it,
-    /// or keeps bytes that do not match the digest or do not decode
-    /// (damaged), which are reported, counted as a load miss and compiled
-    /// again: the store is a cache, and the compile rewrites them.
+    /// digest and decoded, opened in place where it opens so and the store
+    /// keeps them in a file: bytes and file both read under the store's
+    /// hold ([`ArtifactStore::held`]), which the artifact keeps while it
+    /// lives, so no eviction removes the file before its platform opens it.
+    /// None when the store has dropped it, or keeps bytes that do not match
+    /// the digest or do not decode (damaged), which are reported, counted as
+    /// a load miss and compiled again: the store is a cache, and the compile
+    /// rewrites them.
     fn artifact(&self, kept: &Pointer) -> Option<T::Artifact> {
         let namespace = self.toolchain.identity().namespace;
-        let bytes = self.store.get(namespace, &kept.artifact)?;
+        let (bytes, held) = match T::Artifact::IN_PLACE.then(|| self.store.held(namespace, &kept.artifact)).flatten() {
+            Some((bytes, held)) => (bytes, Some(held)),
+            None => (self.store.get(namespace, &kept.artifact)?, None),
+        };
         let damage = match kept.holds(&bytes) {
             false => "does not match the digest its pointer names",
-            true => match T::Artifact::decode(
-                &bytes,
-                T::Artifact::IN_PLACE.then(|| self.store.file(namespace, &kept.artifact)).flatten().as_deref(),
-            ) {
+            true => match T::Artifact::decode(&bytes, held) {
                 Some(artifact) => return Some(artifact),
                 None => "does not decode",
             },
@@ -698,7 +701,7 @@ mod tests {
 
     impl Artifact for Names {
         const ENCODING: u32 = 1;
-        fn decode(bytes: &[u8], _: Option<&std::path::Path>) -> Option<Self> {
+        fn decode(bytes: &[u8], _: Option<seismic_native_target::HeldFile>) -> Option<Self> {
             let (names, _) = std::str::from_utf8(bytes).ok()?.split_once('#')?;
             Some(Self(names.split(',').map(str::to_owned).collect()))
         }
@@ -1060,10 +1063,11 @@ mod tests {
             }
         });
         assert_eq!(racing.iter().map(compiles).collect::<Vec<_>>(), [1, 1], "each process read a miss and compiled");
-        let pointer = reader.file("echo", &entry).expect("a pointer landed");
-        let held = std::fs::read_dir(pointer.parent().unwrap()).unwrap().flatten().count();
+        let (bytes, pointer) = reader.held("echo", &entry).expect("a pointer landed");
+        let held = std::fs::read_dir(pointer.path().parent().unwrap()).unwrap().flatten().count();
         assert_eq!(held, 3, "the pointer and each process's own artifact, no temporary file");
-        whole(&std::fs::read(&pointer).unwrap());
+        whole(&bytes);
+        drop(pointer);
         let later = process(2, None);
         drop(later.form(&[launch]).unwrap());
         assert_eq!((compiles(&later), later.programs_formed().load_misses), (0, 0));

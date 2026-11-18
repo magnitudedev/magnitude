@@ -14,7 +14,6 @@
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -62,32 +61,34 @@ struct Records {
 /// The verdicts and completions of one ledger file.
 ///
 /// Every process with the ledger open appends to the same file, and any of
-/// them may compact it. Appending and compacting hold one lock beside the
-/// file (`<ledger>.lock`) exclusively, across processes: an append writes
-/// to the file the path names when it holds the lock, never to one a
-/// compaction has since replaced, and a compaction reads every record
-/// appended before it, by any process, into the file it publishes. So no
-/// record is lost to a compaction. A record enters the ledger's memory and
-/// its file under the one lock hold ([`Ledger::establish`]), so no
-/// compaction falls between them to fold an older record of its key over
-/// it: what the ledger holds is what its file says.
+/// them may compact it. The file lies in a [`seismic_io::Store`] at its
+/// directory, and every read, append and compaction holds the store's lock,
+/// across processes: shared to read, exclusively to append or compact. An
+/// append writes to the file the path names when it holds the lock, never
+/// to one a compaction has since replaced, and a compaction reads every
+/// record appended before it, by any process, into the file it publishes;
+/// a reader never finds an append part written. So no record is lost to a
+/// compaction. A record enters the ledger's memory and its file under the
+/// one lock hold ([`Ledger::establish`]), so no compaction falls between
+/// them to fold an older record of its key over it: what the ledger holds
+/// is what its file says.
 pub struct Ledger {
-    path: PathBuf,
-    lock: PathBuf,
+    store: seismic_io::Store,
+    /// The file's name in the store.
+    name: PathBuf,
     records: Mutex<Records>,
 }
 
 impl Ledger {
     /// The ledger at `path`, empty if there is none.
     pub fn open(path: &Path) -> std::io::Result<Self> {
-        let records = read(path)?;
-        if let Some(directory) = path.parent() {
-            std::fs::create_dir_all(directory)?;
-        }
-        let name = path.file_name().expect("a ledger is a file").to_string_lossy();
+        let directory = path.parent().expect("a ledger lives in a directory");
+        let name = PathBuf::from(path.file_name().expect("a ledger is a file"));
+        let store = seismic_io::Store::new(directory.to_owned(), seismic_io::Privacy::Shared);
+        let records = parsed(store.shared()?.read(&name, u64::MAX)?);
         Ok(Self {
-            path: path.to_owned(),
-            lock: path.with_file_name(format!("{name}.lock")),
+            store,
+            name,
             records: Mutex::new(records),
         })
     }
@@ -116,14 +117,14 @@ impl Ledger {
         });
     }
 
-    /// Rewrite the file as its records, sorted, each once, the ledger's lock
-    /// held: this ledger's and every one any process appended to the file,
-    /// which this ledger then holds too. The file is replaced in one atomic
-    /// step ([`seismic_io::publish`]), so a reader finds it as it was or as
-    /// this compaction wrote it, never part written.
+    /// Rewrite the file as its records, sorted, each once, the store's lock
+    /// held exclusively: this ledger's and every one any process appended to
+    /// the file, which this ledger then holds too. The file is replaced in
+    /// one atomic step ([`seismic_io::Exclusive::write`]), so a reader finds
+    /// it as it was or as this compaction wrote it, never part written.
     pub fn compact(&self) -> std::io::Result<()> {
-        let _held = self.held()?;
-        let appended = read(&self.path)?;
+        let held = self.store.exclusive()?;
+        let appended = parsed(held.examine(&self.name, u64::MAX)?);
         let text = {
             let mut records = self.records();
             records.verdicts.extend(appended.verdicts);
@@ -137,7 +138,7 @@ impl Ledger {
             }
             text
         };
-        seismic_io::publish(&self.path, seismic_io::Durability::Volatile, |file| file.write_all(text.as_bytes()))
+        held.write(&self.name, text.as_bytes(), seismic_io::Durability::Volatile)
     }
 
     fn records(&self) -> std::sync::MutexGuard<'_, Records> {
@@ -146,47 +147,28 @@ impl Ledger {
             .expect("no thread panics holding the ledger")
     }
 
-    /// Hold the ledger's lock exclusively, of every thread and process,
-    /// until the returned file is dropped.
-    fn held(&self) -> std::io::Result<std::fs::File> {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&self.lock)?;
-        file.lock()?;
-        Ok(file)
-    }
-
     /// Establish a record: append its `line` to the file and, once it is
-    /// there, `insert` it into memory, both under one hold of the ledger's
-    /// lock, so memory never holds a record the file lacks (which a
+    /// there, `insert` it into memory, both under one exclusive hold of the
+    /// store's lock, so memory never holds a record the file lacks (which a
     /// compaction, folding the file over memory, would replace with an
     /// older line). A failed write is reported and the record is not
     /// established: a later formation records it again.
     fn establish(&self, line: &str, insert: impl FnOnce(&mut Records)) {
-        let appended = self.held().and_then(|held| {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.path)?
-                .write_all(line.as_bytes())?;
+        let appended = self.store.exclusive().and_then(|held| {
+            held.append(&self.name, line.as_bytes())?;
             Ok(held)
         });
         match appended {
             Ok(_held) => insert(&mut self.records()),
-            Err(error) => eprintln!("formation ledger {}: {error}", self.path.display()),
+            Err(error) => eprintln!("formation ledger {}: {error}", self.store.root().join(&self.name).display()),
         }
     }
 }
 
-/// The records of the ledger file at `path`, none if there is no file.
-fn read(path: &Path) -> std::io::Result<Records> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => Ok(parse(&text)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Records::default()),
-        Err(error) => Err(error),
-    }
+/// The records of a ledger file's bytes, none if there is no file. A line
+/// that does not parse is ignored.
+fn parsed(bytes: Option<Vec<u8>>) -> Records {
+    bytes.map_or_else(Records::default, |bytes| parse(&String::from_utf8_lossy(&bytes)))
 }
 
 fn verdict_line(key: &str, verdict: Established) -> String {

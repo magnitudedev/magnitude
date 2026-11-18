@@ -1428,15 +1428,6 @@ pub struct InstalledModelPackagesResponse {
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RemoveInstalledModelPackageResponse {
-    pub package_id: ModelPackageId,
-    pub removed: bool,
-    pub freed_bytes: u64,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase")]
 pub enum ServableModelBundle {
     Standalone {
@@ -1448,6 +1439,19 @@ pub enum ServableModelBundle {
         draft_source: SpeculativeDraftSource,
         method: SpeculativeMethod,
     },
+}
+
+impl ServableModelBundle {
+    /// The installed packages the bundle reads: its target, and a separate draft.
+    pub fn package_ids(&self) -> Vec<ModelPackageId> {
+        match self {
+            Self::Standalone { package } => vec![package.id.clone()],
+            Self::SpeculativeDecoding { target, draft_source, .. } => match draft_source {
+                SpeculativeDraftSource::Embedded => vec![target.id.clone()],
+                SpeculativeDraftSource::Separate { draft } => vec![target.id.clone(), draft.id.clone()],
+            },
+        }
+    }
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -3248,16 +3252,19 @@ pub trait InstalledModelPackages: Send + Sync + 'static {
         &self,
         bundle: ModelBundleInput,
     ) -> BoxFuture<'_, Result<ResolvedServableModelBundle, InventoryError>>;
-    fn remove_installed(
-        &self,
-        package_id: &ModelPackageId,
-    ) -> BoxFuture<'_, Result<RemoveInstalledModelPackageResponse, InventoryError>>;
     /// Removes Magnitude's copies of `package_ids` as one removal, returning the bytes freed: a
-    /// file another installed package is served from stays.
-    fn remove_installed_packages(
-        &self,
-        package_ids: &[ModelPackageId],
-    ) -> BoxFuture<'_, Result<u64, InventoryError>>;
+    /// file another installed package is served from stays. Its files are taken from every
+    /// acquirer at once, never waiting for a download or a load, refused retryably
+    /// ([`InventoryError::Busy`]) while another holds one; then `release_resident` lets go of the
+    /// model loading or serving them (stops it, or refuses the removal), the removal waits for the
+    /// readers left here, which are finite, and unpublishes them in one step. A refusal or a
+    /// failure up to that step leaves the packages installed. Only the residency's remover
+    /// ([`CatalogPackageRemover`]) calls it.
+    fn remove_installed_packages<'a>(
+        &'a self,
+        package_ids: &'a [ModelPackageId],
+        release_resident: BoxFuture<'a, Result<(), InventoryError>>,
+    ) -> BoxFuture<'a, Result<u64, InventoryError>>;
 }
 
 pub trait RecommendableModelCatalogProvider: Send + Sync + 'static {
@@ -3364,10 +3371,27 @@ pub trait CatalogModelOptimizer: Send + Sync + 'static {
     ) -> BoxFuture<'static, ()>;
 }
 
+/// What a removal does when a resident model has one of its packages loaded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadedPackages {
+    /// The model is stopped first, as its user stops it, and then its files go: a removal its
+    /// user asked of that model, which succeeds whether it is loaded or not.
+    Stop,
+    /// The removal is refused ([`InventoryError::Loaded`]): one no user asked of the running
+    /// model (maintenance, drafter pruning, an update's cleanup), which leaves it serving.
+    Keep,
+}
+
+/// The one way installed packages are removed: the residency's, which, as `loaded` says, stops
+/// or keeps a model loading or serving one of them, and removes them
+/// ([`InstalledModelPackages::remove_installed_packages`]). Whether it can is decided before the
+/// model is stopped: one meeting a download or another reader of the files refuses with a
+/// retryable error and changes nothing. It runs to its end whatever its caller does.
 pub trait CatalogPackageRemover: Send + Sync + 'static {
     fn remove_catalog_packages(
         &self,
         package_ids: Vec<ModelPackageId>,
+        loaded: LoadedPackages,
     ) -> BoxFuture<'_, Result<u64, InventoryError>>;
 }
 

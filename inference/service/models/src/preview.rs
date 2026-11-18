@@ -2323,11 +2323,15 @@ impl ManagedModelStore {
         .then_some(bytes)
     }
 
-    /// Stores a header in the header cache, keeping the headers installed packages and the
-    /// release catalog need when the cache evicts.
+    /// Stores a header in the header cache.
     pub(crate) fn write_header(&self, header: &[u8]) -> String {
-        self.cache
-            .write_header(header, || self.pinned_header_digests())
+        self.cache.write_header(header)
+    }
+
+    /// Pin the headers installed packages and the release catalog need, as they are now, for
+    /// every cache's eviction: at opening and whenever the installed packages change.
+    pub(crate) fn pin_headers(&self) {
+        self.cache.pin_headers(self.pinned_header_digests());
     }
 
     /// The headers the header cache never evicts: the release catalog's, and those of every file

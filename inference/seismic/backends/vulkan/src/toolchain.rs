@@ -63,7 +63,7 @@ impl SpirvPipelines {
 impl Artifact for SpirvPipelines {
     const ENCODING: u32 = 1;
 
-    fn decode(bytes: &[u8], _: Option<&std::path::Path>) -> Option<Self> {
+    fn decode(bytes: &[u8], _: Option<seismic_native_target::HeldFile>) -> Option<Self> {
         let length = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?) as usize;
         let end = 4usize.checked_add(length)?;
         Some(Self {

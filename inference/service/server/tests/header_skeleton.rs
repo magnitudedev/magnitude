@@ -4,7 +4,6 @@
 //! admitted and inspected exactly as the whole header.
 
 use std::cell::Cell;
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -43,7 +42,7 @@ impl HeaderSource for Skeletons {
         let data_offset = read.read(&mut std::fs::File::open(path)?)?.data_offset;
         let mut bytes = read.into_bytes();
         bytes.truncate(data_offset);
-        let digest = self.cache.write_header(&bytes, BTreeSet::new);
+        let digest = self.cache.write_header(&bytes);
         let tokens = match read_header(bytes)?.value("tokenizer.ggml.tokens") {
             Some(Value::Array(tokens)) => Some(tokens.digest()?),
             _ => None,

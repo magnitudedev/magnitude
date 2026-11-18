@@ -431,9 +431,9 @@ async fn headers(output: PathBuf, store: &StoreArgs) -> anyhow::Result<PathBuf> 
     if current {
         eprintln!("Catalog headers are already current.");
     } else {
-        // Staged under a name of its own and published whole (`seismic_io::StagedDirectory`): a
-        // run exporting at once with this one, or reading the export, never finds it part written.
-        let staging = seismic_io::StagedDirectory::new(&exported)?;
+        // Staged under a name of its own and published whole (`seismic_io::Store::stage`): a run
+        // exporting at once with this one, or reading the export, never finds it part written.
+        let staging = seismic_io::Store::new(output.clone(), seismic_io::Privacy::Shared).stage(Path::new("headers"))?;
         let components = load_release_catalog(&bundle)?.export_headers(staging.path())?;
         let models = store.open().await?;
         for artifact in &artifacts {
@@ -530,16 +530,22 @@ fn report_progress(stage: &str, completed: usize, total: usize) {
     }
 }
 
-/// Write `bytes` at `output` whole ([`seismic_io::publish`]): a reader, or another run writing
-/// it at once, finds it as it was or as one run wrote it, never part written.
+/// Write `bytes` at `output` whole, through the store of its directory ([`seismic_io::Store`]): a
+/// reader, or another run writing it at once, finds it as it was or as one run wrote it, never
+/// part written.
 async fn publish(output: &Path, bytes: Vec<u8>) -> anyhow::Result<()> {
     let parent = output
         .parent()
-        .context("catalog output must have a parent directory")?;
-    tokio::fs::create_dir_all(parent).await?;
-    let output = output.to_owned();
+        .context("catalog output must have a parent directory")?
+        .to_owned();
+    let name = output
+        .file_name()
+        .context("catalog output must name a file")?
+        .to_owned();
     tokio::task::spawn_blocking(move || {
-        seismic_io::publish(&output, seismic_io::Durability::Volatile, |file| std::io::Write::write_all(file, &bytes))
+        seismic_io::Store::new(parent, seismic_io::Privacy::Shared).publish(Path::new(&name), seismic_io::Durability::Volatile, |file| {
+            std::io::Write::write_all(file, &bytes)
+        })
     })
     .await??;
     Ok(())

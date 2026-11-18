@@ -52,6 +52,7 @@ impl CatalogPackageRemover for NoCatalogEffects {
     fn remove_catalog_packages(
         &self,
         _package_ids: Vec<ModelPackageId>,
+        _loaded: magnitude_service_contracts::models::LoadedPackages,
     ) -> BoxFuture<'_, Result<u64, InventoryError>> {
         Box::pin(async {
             Err(InventoryError::Unsupported(

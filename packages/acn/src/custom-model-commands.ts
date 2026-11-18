@@ -195,6 +195,16 @@ export class CustomModelCommands extends Context.Tag("CustomModelCommands")<
 >() {}
 
 
+/**
+ * Whether the inference service says trying again may succeed (a removal racing a model's load
+ * is refused for the moment), as its error body's own flag says; a server error where it says
+ * nothing.
+ */
+const remoteRetryable = (cause: GeneratedClientError<unknown> & { readonly _tag: "GeneratedClientRemoteError" }): boolean => {
+  const body = cause.body as { readonly error?: { readonly retryable?: unknown } } | undefined
+  return typeof body?.error?.retryable === "boolean" ? body.error.retryable : cause.status >= 500
+}
+
 const remoteMessage = (cause: GeneratedClientError<unknown>): string => {
   if (cause._tag === "GeneratedClientRemoteError") {
     const body = cause.body as { readonly error?: { readonly message?: unknown } } | undefined
@@ -301,7 +311,7 @@ const commandFailed = (operation: string) => (cause: GeneratedClientError<unknow
     : new LocalModelMutationFailed({
         code: `custom_model_${operation}_failed`,
         message: remoteMessage(cause),
-        retryable: cause._tag !== "GeneratedClientRemoteError" || cause.status >= 500,
+        retryable: cause._tag !== "GeneratedClientRemoteError" || remoteRetryable(cause),
       })
 
 const withoutKey = <K extends string, V>(record: Readonly<Partial<Record<K, V>>>, key: K): Partial<Record<K, V>> => {

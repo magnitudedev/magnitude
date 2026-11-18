@@ -313,8 +313,8 @@ async fn prepare(
     // Its plan waits for its prices as a load's does, holding nothing of the device.
     let previewed = priced(
         &environment.device,
-        || preview(&environment.catalog, &resolved),
-        || request_prices(&environment.catalog, &resolved),
+        || preview(&environment.catalog, &resolved.configuration),
+        || request_prices(&environment.catalog, &resolved.configuration),
     );
     let Ok(preview) = previewed.await else {
         return Ok(Preparation::Skipped("the load preview failed"));

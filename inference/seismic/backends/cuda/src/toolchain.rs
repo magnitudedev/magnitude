@@ -78,7 +78,7 @@ impl Cubin {
 impl Artifact for Cubin {
     const ENCODING: u32 = 1;
 
-    fn decode(bytes: &[u8], _: Option<&std::path::Path>) -> Option<Self> {
+    fn decode(bytes: &[u8], _: Option<seismic_native_target::HeldFile>) -> Option<Self> {
         let (names, image) = unpack(bytes)?;
         Some(Self {
             names,

@@ -9,20 +9,21 @@
 //! ([`HeaderCache::read_skeleton`]), its directory without those payloads, is read from its recipe
 //! alone. The cache is bounded by the bytes of its recipes and the chunks they reference. Reading a
 //! header marks it used; once the cache outgrows its capacity the least recently used headers are
-//! evicted, except those pinned by the caller (installed packages and the release catalog's
-//! headers) and those used within a grace period (an operation in flight). Chunks no recipe
+//! evicted, except those pinned (installed packages and the release catalog's headers) by any
+//! cache of the store that lives, in whichever process and of whichever release, and those used
+//! within a grace period (an operation in flight). Chunks no recipe
 //! references any more go with them. Every read verifies the recipe against its own sha256, and a
 //! whole header's read verifies the assembled bytes against the header's, so an evicted, partially
 //! evicted or damaged header is a miss that its caller re-fetches.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
-use magnitude_service_utils::file_cache::{read_bytes, write_bytes_atomic, write_bytes_atomic_waiting};
+use seismic_io::{Durability, Eviction, Examining, Layout, Store};
 
 use magnitude_artifacts::gguf::{Absence, Entry, HEADER_LIMIT, Skeleton, Walk, sha256, walk};
 
@@ -40,6 +41,21 @@ pub(crate) fn shared(entry: &Entry<'_>) -> bool {
 pub(crate) const HEADER_CAPACITY_BYTES: u64 = 512 * 1024 * 1024;
 /// A header used this recently is never evicted.
 pub(crate) const HEADER_EVICTION_GRACE: Duration = Duration::from_secs(10 * 60);
+
+/// Where the cache's files lie under the store's root: each header's recipe by its sha256, each
+/// shared payload's chunk by its own, and each large entry's fixed part's list of the headers
+/// holding it.
+const RECIPES: &str = "blobs/gguf-headers";
+const CHUNKS: &str = "blobs/gguf-header-chunks";
+const HEADS: &str = "blobs/gguf-header-heads";
+/// Each live cache's pins, one file of digests per cache, under the cache's own lease
+/// ([`HeaderCache::all_pinned`]).
+const PINS: &str = "blobs/gguf-header-pins";
+/// A pin file is read to this: a digest's line is 65 bytes.
+const PINS_BYTES: u64 = 16 * 1024 * 1024;
+/// The kernel cache under the model cache's root (`ModelCache::kernel_directory`): a store of
+/// its own, which eviction leaves apart.
+const KERNELS: &str = "kernels";
 
 /// What another header's read can borrow for one large entry: headers holding it, or the claim to
 /// fetch it.
@@ -67,7 +83,7 @@ impl Drop for Claim {
 
 /// Headers listed, and lent, per large entry's fixed part: the most recently seen first.
 const MAX_HEAD_REFERENCES: usize = 2;
-const HEADS_INDEX_BYTES: usize = 4 * 1024;
+const HEADS_INDEX_BYTES: u64 = 4 * 1024;
 
 const RECIPE_MAGIC: &[u8; 4] = b"MGHR";
 const RECIPE_VERSION: u32 = 2;
@@ -77,23 +93,40 @@ const INLINE: u8 = 0;
 const CHUNK: u8 = 1;
 const MAX_SEGMENTS: usize = 4096;
 
-#[derive(Debug)]
-struct SweepState {
-    written_since_sweep: u64,
-    swept: bool,
-}
-
+/// The header cache, in the model cache's store ([`seismic_io::Store`]), which every process
+/// naming the cache root shares.
+///
+/// Recipes and chunks are content addresses: a recipe is the one encoding of its header, a chunk
+/// its payload's bytes, so every writer of one writes what every other does, without a lock. A
+/// header is read, whole or as its skeleton, under the store's lock held shared, so no eviction
+/// removes a chunk between its recipe and its bytes; eviction holds it exclusively, from its
+/// listing to its last removal, in whichever process it runs, so none evicts what another is
+/// reading. What a skeleton's absent payloads are read from later is a chunk eviction may have
+/// removed since: that read fails, and its caller discards the header and fetches it again. A
+/// head's list of headers changes under its record's lock, from what it holds then, so no
+/// header's reference is lost to another writer's.
 #[derive(Clone, Debug)]
 pub(crate) struct HeaderCache {
-    recipes: PathBuf,
-    chunks: PathBuf,
-    heads: PathBuf,
+    store: Arc<Store>,
     flights: Arc<Mutex<BTreeMap<String, tokio::sync::watch::Receiver<bool>>>>,
-    lock: PathBuf,
-    heads_lock: PathBuf,
     capacity: u64,
     grace: Duration,
-    state: Arc<Mutex<SweepState>>,
+    /// The bytes of headers this process stored since its cache last evicted: the store's own
+    /// count ([`Store::written`]) holds every index of the root too.
+    written: Arc<AtomicU64>,
+    /// Whether this process's cache has evicted once.
+    evicted: Arc<AtomicBool>,
+    /// This cache's pins as the store holds them, from the first [`HeaderCache::pin`].
+    pins: Arc<Mutex<Option<Pins>>>,
+}
+
+/// A cache's pins in the store: its lease among the caches that pin ([`Store::lease`]), whose
+/// file names its digests, which it holds for as long as it lives, in whichever process: another's
+/// eviction keeps the headers it names while the lease is held.
+#[derive(Debug)]
+struct Pins {
+    lease: seismic_io::Lease,
+    published: Option<BTreeSet<String>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -103,21 +136,26 @@ enum Segment {
 }
 
 impl HeaderCache {
-    pub(crate) fn new(root: &Path, capacity: u64, grace: Duration) -> Self {
+    /// The cache in `store`, bounded by `capacity` bytes of recipes and the chunks they reference,
+    /// a header used within `grace` never evicted.
+    pub(crate) fn new(store: Arc<Store>, capacity: u64, grace: Duration) -> Self {
         Self {
-            recipes: root.join("blobs/gguf-headers"),
-            chunks: root.join("blobs/gguf-header-chunks"),
-            heads: root.join("blobs/gguf-header-heads"),
+            store,
             flights: Arc::new(Mutex::new(BTreeMap::new())),
-            lock: root.join(".locks/gguf-headers.lock"),
-            heads_lock: root.join(".locks/gguf-header-heads.lock"),
             capacity,
             grace,
-            state: Arc::new(Mutex::new(SweepState {
-                written_since_sweep: 0,
-                swept: false,
-            })),
+            written: Arc::new(AtomicU64::new(0)),
+            evicted: Arc::new(AtomicBool::new(false)),
+            pins: Arc::new(Mutex::new(None)),
         }
+    }
+
+    fn recipe(digest: &str) -> PathBuf {
+        Path::new(RECIPES).join(digest)
+    }
+
+    fn chunk(digest: &[u8; 32]) -> PathBuf {
+        Path::new(CHUNKS).join(hex(digest))
     }
 
     /// The header with this sha256, marked used, or `None` when it isn't (completely) stored.
@@ -125,21 +163,19 @@ impl HeaderCache {
         if !valid_digest(digest) {
             return None;
         }
-        let path = self.recipes.join(digest);
-        let recipe = read_bytes(&path, HEADER_LIMIT)?;
-        match self
-            .assemble(&recipe)
-            .filter(|header| hex_sha256(header) == digest)
-        {
-            Some(header) => {
-                touch(&path);
-                Some(header)
+        let recipe = {
+            let shared = self.store.shared().ok()?;
+            let recipe = shared.read(&Self::recipe(digest), HEADER_LIMIT as u64).ok().flatten()?;
+            match self
+                .assemble(&shared, &recipe)
+                .filter(|header| hex_sha256(header) == digest)
+            {
+                Some(header) => return Some(header),
+                None => recipe,
             }
-            None => {
-                self.discard(&path, &recipe);
-                None
-            }
-        }
+        };
+        self.discard(digest, &recipe);
+        None
     }
 
     /// The skeleton of the header with this sha256 (every chunk's payload absent), marked used,
@@ -149,22 +185,21 @@ impl HeaderCache {
         if !valid_digest(digest) {
             return None;
         }
-        let path = self.recipes.join(digest);
-        let recipe = read_bytes(&path, HEADER_LIMIT)?;
-        match skeleton(&self.chunks, &recipe) {
-            Some(skeleton) => {
-                touch(&path);
-                Some(skeleton)
+        let recipe = {
+            let shared = self.store.shared().ok()?;
+            let recipe = shared.read(&Self::recipe(digest), HEADER_LIMIT as u64).ok().flatten()?;
+            match skeleton(&self.store.root().join(CHUNKS), &recipe) {
+                Some(skeleton) => return Some(skeleton),
+                None => recipe,
             }
-            None => {
-                self.discard(&path, &recipe);
-                None
-            }
-        }
+        };
+        self.discard(digest, &recipe);
+        None
     }
 
-    /// The bytes a recipe assembles, when it parses and every chunk it names is whole.
-    fn assemble(&self, recipe: &[u8]) -> Option<Vec<u8>> {
+    /// The bytes a recipe assembles, when it parses and every chunk it names is whole, read under
+    /// the store's lock held shared.
+    fn assemble(&self, shared: &seismic_io::Shared<'_>, recipe: &[u8]) -> Option<Vec<u8>> {
         let (segments, mut inline) = parse_recipe(recipe)?;
         let mut header = Vec::new();
         for segment in segments {
@@ -175,7 +210,7 @@ impl HeaderCache {
                     inline = rest;
                 }
                 Segment::Chunk { digest, length } => {
-                    let chunk = read_bytes(&self.chunks.join(hex(&digest)), length)?;
+                    let chunk = shared.read(&Self::chunk(&digest), length as u64).ok().flatten()?;
                     if chunk.len() != length {
                         return None;
                     }
@@ -189,18 +224,31 @@ impl HeaderCache {
         inline.is_empty().then_some(header)
     }
 
-    /// Removes a recipe that doesn't assemble its header, and every chunk it names whose bytes
-    /// aren't their name's, so the next write stores them again.
-    fn discard(&self, path: &Path, recipe: &[u8]) {
-        let _ = fs::remove_file(path);
+    /// Removes the recipe of `digest` that read as `recipe` and didn't assemble its header, and
+    /// every chunk it names whose bytes aren't their name's, so the next write stores them again;
+    /// under the store's lock held exclusively, so what it judges is what it removes: a recipe
+    /// another writer stored again since is left.
+    fn discard(&self, digest: &str, recipe: &[u8]) {
+        let Ok(exclusive) = self.store.exclusive() else {
+            return;
+        };
+        let path = Self::recipe(digest);
+        if exclusive.examine(&path, HEADER_LIMIT as u64).ok().flatten().as_deref() == Some(recipe) {
+            let _ = exclusive.remove(&path);
+        }
         for segment in parse_table(recipe)
             .map(|(segments, _)| segments)
             .unwrap_or_default()
         {
             if let Segment::Chunk { digest, length } = segment {
-                let chunk = self.chunks.join(hex(&digest));
-                if read_bytes(&chunk, length).is_none_or(|bytes| sha256(&bytes) != digest) {
-                    let _ = fs::remove_file(chunk);
+                let chunk = Self::chunk(&digest);
+                if exclusive
+                    .examine(&chunk, length as u64)
+                    .ok()
+                    .flatten()
+                    .is_none_or(|bytes| bytes.len() != length || sha256(&bytes) != digest)
+                {
+                    let _ = exclusive.remove(&chunk);
                 }
             }
         }
@@ -213,44 +261,52 @@ impl HeaderCache {
         if !valid_digest(digest) {
             return;
         }
-        let path = self.recipes.join(digest);
-        if let Some(recipe) = read_bytes(&path, HEADER_LIMIT) {
-            self.discard(&path, &recipe);
+        if let Some(recipe) = self.store.read(&Self::recipe(digest), HEADER_LIMIT as u64).ok().flatten() {
+            self.discard(digest, &recipe);
         }
     }
 
     /// Whether the header with this sha256 is stored with every chunk it needs, marking it used
     /// for the read that follows; `read` still verifies it.
     pub(crate) fn contains(&self, digest: &str) -> bool {
-        let path = self.recipes.join(digest);
-        let stored = valid_digest(digest)
-            && self
-                .recipe_chunks(&path)
-                .is_some_and(|chunks| chunks.iter().all(|chunk| self.chunks.join(chunk).is_file()));
-        if stored {
-            touch(&path);
+        if !valid_digest(digest) {
+            return false;
         }
-        stored
+        let Ok(shared) = self.store.shared() else {
+            return false;
+        };
+        let root = self.store.root();
+        shared
+            .read(&Self::recipe(digest), HEADER_LIMIT as u64)
+            .ok()
+            .flatten()
+            .and_then(|recipe| recipe_chunks(&recipe))
+            .is_some_and(|chunks| chunks.iter().all(|chunk| root.join(chunk).is_file()))
     }
 
-    /// Stores `header`, returning its sha256, and evicts the least recently used headers not in
-    /// `pinned` once the cache has outgrown its capacity.
-    pub(crate) fn write(&self, header: &[u8], pinned: impl FnOnce() -> BTreeSet<String>) -> String {
+    /// Stores `header`, returning its sha256, and evicts the least recently used headers no live
+    /// cache pins once the cache has outgrown its capacity: at this process's first write, and
+    /// every eighth of its capacity it writes after.
+    pub(crate) fn write(&self, header: &[u8]) -> String {
         let digest = hex_sha256(header);
         if header.len() > HEADER_LIMIT {
             return digest;
         }
-        let Ok(mut state) = self.state.lock() else {
-            return digest;
-        };
-        let recipe_path = self.recipes.join(&digest);
         if !self.contains(&digest) {
+            let walked = walk(header);
+            if let Ok(Walk::Complete(layout)) = &walked {
+                self.index_entries(header, &layout.entries, &digest);
+            }
+            // The chunks and the recipe naming them are written under the store's lock held
+            // shared, so no eviction falls between a chunk found there and the recipe naming it.
+            let Ok(_writing) = self.store.shared() else {
+                return digest;
+            };
             let mut segments = Vec::new();
             let mut inline = Vec::new();
             let mut written = 0_u64;
             let mut cursor = 0;
-            if let Ok(Walk::Complete(layout)) = walk(header) {
-                self.index_entries(header, &layout.entries, &digest);
+            if let Ok(Walk::Complete(layout)) = &walked {
                 for entry in layout.entries.iter().filter(|entry| shared(entry)) {
                     let range = entry.head().end..entry.end;
                     if range.start > cursor {
@@ -259,13 +315,8 @@ impl HeaderCache {
                     }
                     let bytes = &header[range];
                     let chunk = sha256(bytes);
-                    let path = self.chunks.join(hex(&chunk));
-                    if fs::metadata(&path)
-                        .is_ok_and(|metadata| metadata.len() == bytes.len() as u64)
-                    {
-                        touch(&path);
-                    } else {
-                        write_bytes_atomic_waiting(&path, &self.lock, bytes, HEADER_LIMIT);
+                    // Every read verifies a chunk against its name, so a torn one is a miss.
+                    if self.store.put_if_absent(&Self::chunk(&chunk), bytes, Durability::Volatile).unwrap_or(false) {
                         written += bytes.len() as u64;
                     }
                     segments.push(Segment::Chunk {
@@ -279,15 +330,20 @@ impl HeaderCache {
                 segments.push(Segment::Inline(header.len() - cursor));
                 inline.extend_from_slice(&header[cursor..]);
             }
+            // Replacing what is there, which did not hold the header (a recipe of another
+            // version, or one whose chunks are gone): every writer writes this one encoding.
             let recipe = encode_recipe(&segments, &inline);
-            write_bytes_atomic_waiting(&recipe_path, &self.lock, &recipe, HEADER_LIMIT);
-            written += recipe.len() as u64;
-            state.written_since_sweep += written;
+            if self
+                .store
+                .publish(&Self::recipe(&digest), Durability::Volatile, |file| std::io::Write::write_all(file, &recipe))
+                .is_ok()
+            {
+                written += recipe.len() as u64;
+            }
+            self.written.fetch_add(written, Ordering::Relaxed);
         }
-        if !state.swept || state.written_since_sweep >= self.capacity / 8 {
-            self.sweep(&pinned());
-            state.swept = true;
-            state.written_since_sweep = 0;
+        if !self.evicted.load(Ordering::Relaxed) || self.written.load(Ordering::Relaxed) >= self.capacity / 8 {
+            self.evict();
         }
         digest
     }
@@ -296,7 +352,12 @@ impl HeaderCache {
     /// any repository: references for reading another file's header without fetching that entry
     /// (see `remote_header`). Each is verified against its digest; an evicted one is skipped.
     pub(crate) fn sharing(&self, head: &[u8]) -> Vec<Vec<u8>> {
-        let Some(list) = read_bytes(&self.heads.join(hex_sha256(head)), HEADS_INDEX_BYTES) else {
+        let Some(list) = self
+            .store
+            .read(&Path::new(HEADS).join(hex_sha256(head)), HEADS_INDEX_BYTES)
+            .ok()
+            .flatten()
+        else {
             return Vec::new();
         };
         String::from_utf8_lossy(&list)
@@ -347,9 +408,14 @@ impl HeaderCache {
         }
     }
 
+    /// Lists `digest` first among the headers holding the large entry whose fixed part is `head`,
+    /// its record's lock held from the read to the write, so another writer's reference is never
+    /// lost to this one.
     fn index_head(&self, head: &[u8], digest: &str) {
-        let path = self.heads.join(hex_sha256(head));
-        let list = read_bytes(&path, HEADS_INDEX_BYTES).unwrap_or_default();
+        let Ok(record) = self.store.lock(&Path::new(HEADS).join(hex_sha256(head))) else {
+            return;
+        };
+        let list = record.read(HEADS_INDEX_BYTES).ok().flatten().unwrap_or_default();
         let listed = String::from_utf8_lossy(&list).into_owned();
         if listed.lines().any(|line| line == digest) {
             return;
@@ -359,104 +425,127 @@ impl HeaderCache {
             .take(MAX_HEAD_REFERENCES)
             .collect::<Vec<_>>()
             .join("\n");
-        write_bytes_atomic(&path, &self.heads_lock, kept.as_bytes(), HEADS_INDEX_BYTES);
+        // A torn list holds lines that are no header's, which every reader skips.
+        let _ = record.write(kept.as_bytes(), Durability::Volatile);
     }
 
-    /// Evicts least recently used headers until the cache fits its capacity, keeping pinned and
-    /// recently used ones, then removes chunks no remaining header references.
-    fn sweep(&self, pinned: &BTreeSet<String>) {
-        let now = SystemTime::now();
-        let recent = |modified: SystemTime| {
-            now.duration_since(modified)
-                .map_or(true, |age| age < self.grace)
-        };
-        let chunk_files = files(&self.chunks)
+    /// Evicts least recently used headers until the cache fits its capacity, keeping what every
+    /// live cache pins ([`HeaderCache::all_pinned`]), recently used ones, and the chunks the
+    /// headers kept reference ([`Headers`]). An eviction that finds the store held passes, and the
+    /// next write evicts again.
+    fn evict(&self) {
+        let pinned = self.all_pinned();
+        let layout = Headers { pinned: &pinned };
+        match self.store.evict(self.capacity, self.grace, &layout) {
+            Ok(true) => {
+                self.evicted.store(true, Ordering::Relaxed);
+                self.written.store(0, Ordering::Relaxed);
+            }
+            Ok(false) => {}
+            Err(error) => tracing::warn!("header cache {}: eviction failed: {error}", self.store.root().display()),
+        }
+    }
+
+    /// Pin `pinned` (the headers the installed packages and the release catalog need): published
+    /// in the store as this cache's pins, under its lease, so every cache's eviction keeps them,
+    /// in whichever process, while this cache lives. Its owner pins again whenever they change.
+    pub(crate) fn pin(&self, pinned: BTreeSet<String>) {
+        let mut own = self.pins.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if own.is_none() {
+            match self.store.lease(Path::new(PINS)) {
+                Ok(lease) => *own = Some(Pins { lease, published: None }),
+                Err(error) => tracing::warn!("header cache {}: cannot hold its pins: {error}", self.store.root().display()),
+            }
+        }
+        if let Some(pins) = own.as_mut().filter(|pins| pins.published.as_ref() != Some(&pinned)) {
+            let lines = pinned.iter().map(|digest| format!("{digest}\n")).collect::<String>();
+            match self.store.publish(pins.lease.record(), Durability::Volatile, |file| std::io::Write::write_all(file, lines.as_bytes())) {
+                Ok(()) => pins.published = Some(pinned),
+                Err(error) => tracing::warn!("header cache {}: cannot publish its pins: {error}", self.store.root().display()),
+            }
+        }
+    }
+
+    /// What every live cache of the store pins, this one among them, in whichever process: each
+    /// cache's published pins, which hold while its lease does; a gone cache's go
+    /// ([`Store::leases`]).
+    fn all_pinned(&self) -> BTreeSet<String> {
+        let mut all = BTreeSet::new();
+        let live = self.store.leases(Path::new(PINS)).unwrap_or_else(|error| {
+            tracing::warn!("header cache {}: cannot list the pins: {error}", self.store.root().display());
+            Vec::new()
+        });
+        for record in live {
+            if let Ok(Some(bytes)) = self.store.read(&record, PINS_BYTES) {
+                all.extend(String::from_utf8_lossy(&bytes).lines().filter(|line| valid_digest(line)).map(str::to_owned));
+            }
+        }
+        all
+    }
+}
+
+/// How the header cache's eviction places the files of the model cache's store: each recipe an
+/// entry of its own, pinned where the caller pins it, referencing the chunks its table names,
+/// which entries share; a file in the recipes that names no header, unreachable. A recipe whose
+/// table does not parse (a damaged one, or one of another recipe version a build sharing the cache
+/// writes) references nothing and is evicted as any other, least recently used first. The kernel
+/// cache under the root is a store of its own, apart; everything else under the root (the head
+/// lists, the indexes, the workspaces) is kept.
+struct Headers<'a> {
+    pinned: &'a BTreeSet<String>,
+}
+
+impl Layout for Headers<'_> {
+    fn place(&self, path: &Path, _: &Examining<'_>) -> Eviction {
+        if path == Path::new(KERNELS) {
+            return Eviction::Apart;
+        }
+        if path == Path::new("blobs") || path == Path::new(RECIPES) || path == Path::new(CHUNKS) {
+            // Walked, for what they hold.
+            return Eviction::Alone;
+        }
+        let directory = path.parent().unwrap_or(Path::new(""));
+        if directory == Path::new(CHUNKS) {
+            return Eviction::Shared;
+        }
+        if directory != Path::new(RECIPES) {
+            return Eviction::Kept;
+        }
+        let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+        match (valid_digest(name), self.pinned.contains(name)) {
+            (false, _) => Eviction::Unreachable,
+            (true, true) => Eviction::Pinned,
+            (true, false) => Eviction::Alone,
+        }
+    }
+
+    /// A recipe's chunks; no other file references any (a kept file beside them, as the local
+    /// models' configuration at the root, is never read).
+    fn references(&self, path: &Path, examining: &Examining<'_>) -> Vec<PathBuf> {
+        if path.parent() != Some(Path::new(RECIPES)) {
+            return Vec::new();
+        }
+        examining
+            .examine(path, HEADER_LIMIT as u64)
+            .ok()
+            .flatten()
+            .and_then(|recipe| recipe_chunks(&recipe))
+            .unwrap_or_default()
+    }
+}
+
+/// The chunks a recipe references, under the store's root, read from its segment table alone.
+fn recipe_chunks(recipe: &[u8]) -> Option<Vec<PathBuf>> {
+    let (segments, _) = parse_table(recipe)?;
+    Some(
+        segments
             .into_iter()
-            .map(|(name, path, size, modified)| (name, (path, size, modified)))
-            .collect::<BTreeMap<_, _>>();
-        let mut recipes = Vec::new();
-        for (name, path, size, modified) in files(&self.recipes) {
-            match self.recipe_chunks(&path).filter(|_| valid_digest(&name)) {
-                Some(chunks) => recipes.push((name, path, size, modified, chunks)),
-                None if !recent(modified) => {
-                    let _ = fs::remove_file(&path);
-                }
-                None => {}
-            }
-        }
-        recipes.sort_by(|left, right| right.3.cmp(&left.3));
-        let mut referenced = BTreeSet::new();
-        let mut total = 0_u64;
-        for (name, path, size, modified, chunks) in recipes {
-            let added = size
-                + chunks
-                    .iter()
-                    .filter(|chunk| !referenced.contains(*chunk))
-                    .filter_map(|chunk| chunk_files.get(chunk).map(|(_, size, _)| *size))
-                    .sum::<u64>();
-            if pinned.contains(&name) || recent(modified) || total + added <= self.capacity {
-                total += added;
-                referenced.extend(chunks);
-            } else {
-                let _ = fs::remove_file(&path);
-            }
-        }
-        for (name, (path, _, modified)) in chunk_files {
-            if !referenced.contains(&name) && !recent(modified) {
-                let _ = fs::remove_file(&path);
-            }
-        }
-    }
-
-    /// The chunks a stored recipe references, read from its segment table alone.
-    fn recipe_chunks(&self, path: &Path) -> Option<Vec<String>> {
-        let mut file = fs::File::open(path).ok()?;
-        let mut preamble = [0_u8; RECIPE_PREAMBLE];
-        file.read_exact(&mut preamble).ok()?;
-        let count = segment_count(&preamble)?;
-        let mut bytes = preamble.to_vec();
-        file.take((count * (1 + 8 + 32)) as u64)
-            .read_to_end(&mut bytes)
-            .ok()?;
-        let (segments, _) = parse_table(&bytes)?;
-        Some(
-            segments
-                .into_iter()
-                .filter_map(|segment| match segment {
-                    Segment::Chunk { digest, .. } => Some(hex(&digest)),
-                    Segment::Inline(_) => None,
-                })
-                .collect(),
-        )
-    }
-}
-
-/// The regular files of `directory`: name, path, size and modification time.
-fn files(directory: &Path) -> Vec<(String, PathBuf, u64, SystemTime)> {
-    let Ok(read) = fs::read_dir(directory) else {
-        return Vec::new();
-    };
-    read.filter_map(Result::ok)
-        .filter_map(|entry| {
-            let metadata = entry.metadata().ok()?;
-            if !metadata.is_file() {
-                return None;
-            }
-            Some((
-                entry.file_name().into_string().ok()?,
-                entry.path(),
-                metadata.len(),
-                metadata.modified().ok()?,
-            ))
-        })
-        .collect()
-}
-
-/// Marks a file used. Failure only makes it look older.
-fn touch(path: &Path) {
-    if let Ok(file) = fs::File::options().write(true).open(path) {
-        let _ = file.set_modified(SystemTime::now());
-    }
+            .filter_map(|segment| match segment {
+                Segment::Chunk { digest, .. } => Some(HeaderCache::chunk(&digest)),
+                Segment::Inline(_) => None,
+            })
+            .collect(),
+    )
 }
 
 /// `MGHR`, the format version, the sha256 of the rest, the segment count, each segment's kind,
@@ -591,6 +680,28 @@ pub(crate) fn valid_digest(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use seismic_io::Privacy;
+    use std::time::SystemTime;
+
+    /// A header cache in a store of its own over `directory`, as another process opens it.
+    fn cache(directory: &Path, capacity: u64, grace: Duration) -> HeaderCache {
+        HeaderCache::new(Arc::new(Store::new(directory.to_path_buf(), Privacy::Owner)), capacity, grace)
+    }
+
+    /// The regular files of `directory`: name, path, size and modification time.
+    fn files(directory: &Path) -> Vec<(String, PathBuf, u64, SystemTime)> {
+        let Ok(read) = fs::read_dir(directory) else {
+            return Vec::new();
+        };
+        read.filter_map(Result::ok)
+            .filter_map(|entry| {
+                let metadata = entry.metadata().ok()?;
+                metadata.is_file().then(|| {
+                    (entry.file_name().into_string().unwrap(), entry.path(), metadata.len(), metadata.modified().unwrap())
+                })
+            })
+            .collect()
+    }
 
     fn string(bytes: &mut Vec<u8>, value: &str) {
         bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
@@ -643,7 +754,7 @@ mod tests {
     fn age(cache: &HeaderCache, digest: &str, seconds: u64) {
         let file = fs::File::options()
             .write(true)
-            .open(cache.recipes.join(digest))
+            .open(cache.store.root().join(RECIPES).join(digest))
             .unwrap();
         file.set_modified(SystemTime::now() - Duration::from_secs(seconds))
             .unwrap();
@@ -652,17 +763,13 @@ mod tests {
     #[test]
     fn headers_sharing_a_tokenizer_store_it_once() {
         let directory = tempfile::tempdir().unwrap();
-        let cache = HeaderCache::new(
-            directory.path(),
-            HEADER_CAPACITY_BYTES,
-            HEADER_EVICTION_GRACE,
-        );
+        let cache = cache(directory.path(), HEADER_CAPACITY_BYTES, HEADER_EVICTION_GRACE);
         let headers = (0..10)
             .map(|index| header(&format!("Model Q{index}"), 20_000))
             .collect::<Vec<_>>();
         let digests = headers
             .iter()
-            .map(|header| cache.write(header, BTreeSet::new))
+            .map(|header| cache.write(header))
             .collect::<Vec<_>>();
         for (header, digest) in headers.iter().zip(&digests) {
             assert_eq!(cache.read(digest).as_ref(), Some(header));
@@ -679,7 +786,7 @@ mod tests {
             "{stored} bytes stored for {whole}"
         );
         let small = header("tiny", 4);
-        let digest = cache.write(&small, BTreeSet::new);
+        let digest = cache.write(&small);
         assert_eq!(
             cache.read(&digest),
             Some(small),
@@ -694,13 +801,9 @@ mod tests {
             gguf::{Element, Value, read_header, read_skeleton},
         };
         let directory = tempfile::tempdir().unwrap();
-        let cache = HeaderCache::new(
-            directory.path(),
-            HEADER_CAPACITY_BYTES,
-            HEADER_EVICTION_GRACE,
-        );
+        let cache = cache(directory.path(), HEADER_CAPACITY_BYTES, HEADER_EVICTION_GRACE);
         let header = header("Model", 20_000);
-        let digest = cache.write(&header, BTreeSet::new);
+        let digest = cache.write(&header);
         let skeleton = cache.read_skeleton(&digest).unwrap();
         assert_eq!(skeleton.absent.len(), 1);
         assert!(
@@ -735,7 +838,7 @@ mod tests {
         // The whole directory, its apart payload read from its chunk.
         assert_eq!(skeletal, whole);
 
-        let recipe = cache.recipes.join(&digest);
+        let recipe = directory.path().join(RECIPES).join(&digest);
         let mut damaged = fs::read(&recipe).unwrap();
         *damaged.last_mut().unwrap() ^= 1;
         fs::write(&recipe, damaged).unwrap();
@@ -753,11 +856,7 @@ mod tests {
             gguf::{Array, Element, Skeleton, Value, read_skeleton},
         };
         let directory = tempfile::tempdir().unwrap();
-        let cache = HeaderCache::new(
-            directory.path(),
-            HEADER_CAPACITY_BYTES,
-            HEADER_EVICTION_GRACE,
-        );
+        let cache = cache(directory.path(), HEADER_CAPACITY_BYTES, HEADER_EVICTION_GRACE);
         let tokens = |skeleton: Skeleton| -> Array {
             match read_skeleton(skeleton)
                 .unwrap()
@@ -768,8 +867,8 @@ mod tests {
             }
         };
         // A tokenizer no other test's header has, so only this test holds its payload.
-        let first = cache.write(&header("Model A", 20_001), BTreeSet::new);
-        let second = cache.write(&header("Model B", 20_001), BTreeSet::new);
+        let first = cache.write(&header("Model A", 20_001));
+        let second = cache.write(&header("Model B", 20_001));
         let first = tokens(cache.read_skeleton(&first).unwrap());
         let skeleton = cache.read_skeleton(&second).unwrap();
         let chunk = skeleton.absent[0].file.clone();
@@ -799,13 +898,9 @@ mod tests {
     #[test]
     fn a_skeleton_whose_chunk_is_missing_or_not_its_length_is_a_miss() {
         let directory = tempfile::tempdir().unwrap();
-        let cache = HeaderCache::new(
-            directory.path(),
-            HEADER_CAPACITY_BYTES,
-            HEADER_EVICTION_GRACE,
-        );
+        let cache = cache(directory.path(), HEADER_CAPACITY_BYTES, HEADER_EVICTION_GRACE);
         let header = header("Model", 20_002);
-        let digest = cache.write(&header, BTreeSet::new);
+        let digest = cache.write(&header);
         let chunk = cache.read_skeleton(&digest).unwrap().absent[0].file.clone();
         let mut bytes = fs::read(&chunk).unwrap();
         bytes.pop();
@@ -815,7 +910,7 @@ mod tests {
             "a chunk short of its length"
         );
         assert!(!cache.contains(&digest), "and the entry is discarded");
-        assert_eq!(cache.write(&header, BTreeSet::new), digest);
+        assert_eq!(cache.write(&header), digest);
         fs::remove_file(&chunk).unwrap();
         assert!(cache.read_skeleton(&digest).is_none(), "a missing chunk");
         assert!(!cache.contains(&digest));
@@ -824,26 +919,46 @@ mod tests {
     #[test]
     fn a_recipe_of_the_previous_version_is_a_miss_and_is_stored_again() {
         let directory = tempfile::tempdir().unwrap();
-        let cache = HeaderCache::new(directory.path(), HEADER_CAPACITY_BYTES, Duration::ZERO);
+        let cache = cache(directory.path(), HEADER_CAPACITY_BYTES, Duration::ZERO);
         let header = header("Model", 20_000);
-        let digest = cache.write(&header, BTreeSet::new);
-        let recipe = cache.recipes.join(&digest);
+        let digest = cache.write(&header);
+        let recipe = directory.path().join(RECIPES).join(&digest);
         let mut previous = fs::read(&recipe).unwrap();
         previous[4..8].copy_from_slice(&(RECIPE_VERSION - 1).to_le_bytes());
         fs::write(&recipe, previous).unwrap();
         assert!(!cache.contains(&digest));
         assert!(cache.read_skeleton(&digest).is_none());
         assert!(cache.read(&digest).is_none());
-        assert_eq!(cache.write(&header, BTreeSet::new), digest);
+        assert_eq!(cache.write(&header), digest);
         assert_eq!(cache.read(&digest), Some(header));
+    }
+
+    /// A header another live cache pins (another process, of another catalog) stays through this
+    /// cache's eviction, which pins nothing, from the moment that cache pins it, before it ever
+    /// evicts; once that cache is gone, its pins go and so does the header.
+    #[test]
+    fn a_header_another_live_cache_pins_stays_until_that_cache_is_gone() {
+        let directory = tempfile::tempdir().unwrap();
+        let writer = cache(directory.path(), HEADER_CAPACITY_BYTES, Duration::ZERO);
+        let digest = writer.write(&header("Model A", 20_000));
+        drop(writer);
+        let service = cache(directory.path(), 0, Duration::ZERO);
+        service.pin(BTreeSet::from([digest.clone()]));
+        let tool = cache(directory.path(), 0, Duration::ZERO);
+        tool.evict();
+        assert!(tool.contains(&digest), "another live cache's pin holds");
+        drop(service);
+        tool.evict();
+        assert!(!tool.contains(&digest), "a gone cache's pins go with it");
+        assert!(files(&directory.path().join(PINS)).is_empty(), "no live cache pins anything");
     }
 
     #[test]
     fn eviction_keeps_the_cache_within_capacity_by_recency_and_spares_pinned_headers() {
         let directory = tempfile::tempdir().unwrap();
         let one = header("Model A", 20_000).len() as u64;
-        let writer = HeaderCache::new(directory.path(), HEADER_CAPACITY_BYTES, Duration::ZERO);
-        let cache = HeaderCache::new(directory.path(), 3 * one + one / 2, Duration::ZERO);
+        let writer = cache(directory.path(), HEADER_CAPACITY_BYTES, Duration::ZERO);
+        let cache = cache(directory.path(), 3 * one + one / 2, Duration::ZERO);
         let headers = (0..6)
             .map(|index| header(&format!("Model {index}"), 20_000 + index))
             .collect::<Vec<_>>();
@@ -851,15 +966,15 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, header)| {
-                let digest = writer.write(header, BTreeSet::new);
+                let digest = writer.write(header);
                 age(&cache, &digest, 1000 - index as u64 * 100);
                 digest
             })
             .collect::<Vec<_>>();
         // The oldest header is pinned and the second oldest was read last.
         assert!(cache.read(&digests[1]).is_some());
-        let pinned = BTreeSet::from([digests[0].clone()]);
-        cache.sweep(&pinned);
+        cache.pin(BTreeSet::from([digests[0].clone()]));
+        cache.evict();
         assert!(stored_bytes(directory.path()) <= cache.capacity + one);
         assert!(
             cache.contains(&digests[0]),
@@ -877,7 +992,7 @@ mod tests {
             files(&directory.path().join("blobs/gguf-headers")).len(),
             "chunks of evicted headers go with them"
         );
-        let rewritten = cache.write(&headers[2], || pinned.clone());
+        let rewritten = cache.write(&headers[2]);
         assert_eq!(
             cache.read(&rewritten).as_ref(),
             Some(&headers[2]),
@@ -888,19 +1003,46 @@ mod tests {
     #[test]
     fn a_damaged_or_foreign_entry_is_a_miss_and_is_swept() {
         let directory = tempfile::tempdir().unwrap();
-        let cache = HeaderCache::new(directory.path(), HEADER_CAPACITY_BYTES, Duration::ZERO);
+        let cache = cache(directory.path(), HEADER_CAPACITY_BYTES, Duration::ZERO);
         let first = header("Model A", 20_000);
-        let digest = cache.write(&first, BTreeSet::new);
-        let chunk = files(&cache.chunks).pop().unwrap();
+        let digest = cache.write(&first);
+        let chunk = files(&directory.path().join(CHUNKS)).pop().unwrap();
         fs::write(&chunk.1, b"damaged").unwrap();
         assert!(cache.read(&digest).is_none());
         assert!(!chunk.1.exists(), "a damaged chunk is removed");
-        assert_eq!(cache.write(&first, BTreeSet::new), digest);
+        assert_eq!(cache.write(&first), digest);
         assert_eq!(cache.read(&digest), Some(first.clone()), "and stored again");
-        let legacy = cache.recipes.join("0".repeat(64));
+        let legacy = directory.path().join(RECIPES).join("0".repeat(64));
         fs::write(&legacy, &first).unwrap();
         assert!(cache.read(&"0".repeat(64)).is_none());
-        cache.sweep(&BTreeSet::new());
-        assert!(!legacy.exists(), "a raw or unparsable entry is removed");
+        assert!(!legacy.exists(), "a raw or unparsable entry read is removed");
+        let foreign = directory.path().join(RECIPES).join("not-a-digest");
+        fs::write(&foreign, &first).unwrap();
+        cache.evict();
+        assert!(!foreign.exists(), "a file that names no header is swept");
+    }
+
+    /// Two processes listing headers of one large entry at once each keep the other's: the
+    /// second's read waits, through the head's record lock, for the first's write.
+    #[test]
+    fn heads_listed_at_once_by_two_processes_keep_both() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = cache(directory.path(), HEADER_CAPACITY_BYTES, HEADER_EVICTION_GRACE);
+        let second = cache(directory.path(), HEADER_CAPACITY_BYTES, HEADER_EVICTION_GRACE);
+        let head = b"tokenizer.ggml.tokens";
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        let record = Path::new(HEADS).join(hex_sha256(head));
+        // The first has read the list (empty) and is about to write its own.
+        let held = first.store.lock(&record).unwrap();
+        assert_eq!(held.read(HEADS_INDEX_BYTES).unwrap(), None);
+        std::thread::scope(|scope| {
+            let listing = seismic_threads::spawn_scoped(scope, "listing", || second.index_head(head, &b)).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            held.write(a.as_bytes(), Durability::Volatile).unwrap();
+            drop(held);
+            listing.join().unwrap();
+        });
+        let list = second.store.read(&record, HEADS_INDEX_BYTES).unwrap().unwrap();
+        assert_eq!(String::from_utf8(list).unwrap(), format!("{b}\n{a}"), "the second lists itself before the first, which it read");
     }
 }

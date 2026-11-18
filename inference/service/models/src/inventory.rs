@@ -55,20 +55,38 @@ pub(crate) struct CachedModelMetadata {
     pub(crate) supported_parameters: Vec<String>,
 }
 
+/// The inventory index: what a scan found, and the evidence each cacheable model was inspected
+/// from, which the next scan reuses where it still holds. It is derived from the models on disk
+/// alone, so what it lacks is inspected again; the installed packages are derived from its models
+/// whenever they are read, and are not kept in it.
 #[derive(Debug, serde::Serialize)]
 struct InventoryCache {
     models: BTreeMap<InventoryEntryId, InventoryModel>,
     evidence: BTreeMap<InventoryEntryId, CacheEvidence>,
-    installed: InstalledPackageSnapshot,
 }
 
 type HydratedInventory = (
     BTreeMap<InventoryEntryId, InventoryModel>,
     BTreeMap<InventoryEntryId, CacheEvidence>,
-    InstalledPackageSnapshot,
 );
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+/// What a process changes of the inventory index ([`persist_inventory_index`]).
+enum IndexChange {
+    /// A whole scan: the index is then what it found.
+    Scanned {
+        models: BTreeMap<InventoryEntryId, InventoryModel>,
+        evidence: BTreeMap<InventoryEntryId, CacheEvidence>,
+    },
+    /// One model published, with its evidence where it is cacheable.
+    Published {
+        model: InventoryModel,
+        evidence: Option<CacheEvidence>,
+    },
+    /// One model removed.
+    Removed(InventoryEntryId),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct InstalledPackageRecord {
     pub(crate) installed: InstalledModelPackage,
     pub(crate) model: InventoryModel,
@@ -77,7 +95,7 @@ pub(crate) struct InstalledPackageRecord {
 
 /// Every installed package occurrence, and every directory inside a location that could not be
 /// read. An unreadable directory is skipped so the rest of its location is still listed.
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct InstalledPackageSnapshot {
     pub(crate) records: BTreeMap<InventoryEntryId, InstalledPackageRecord>,
     pub(crate) unreadable_directories: BTreeSet<UnreadableDirectory>,
@@ -85,7 +103,7 @@ pub(crate) struct InstalledPackageSnapshot {
 
 /// A directory inside the location `source` names, rooted at `root`, that Magnitude could not
 /// read, with why.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct UnreadableDirectory {
     pub(crate) source: FoundSource,
     pub(crate) root: PathBuf,
@@ -410,7 +428,6 @@ pub struct ManagedModelStore {
     pub(crate) model_assessments:
         Arc<RwLock<BTreeMap<String, crate::cache::CachedModelAssessment>>>,
     pub(crate) catalog_affiliations: Arc<RwLock<CatalogAffiliations>>,
-    pub(crate) catalog_affiliations_dirty: Arc<AtomicBool>,
     cache_evidence: Arc<RwLock<BTreeMap<InventoryEntryId, CacheEvidence>>>,
     ensure_gate: Arc<tokio::sync::Mutex<()>>,
     ensure_generation: Arc<AtomicU64>,
@@ -421,6 +438,8 @@ pub struct ManagedModelStore {
     reconciliation_complete: Arc<AtomicBool>,
     installed_packages_observer: Arc<RwLock<Option<Weak<dyn InstalledPackagesObserver>>>>,
     ollama_hub_resolution: Arc<AtomicBool>,
+    /// The readers of the store's files here, and which of them a removal has claimed.
+    pub(crate) readers: Arc<crate::store_fs::Readers>,
 }
 
 /// The space the model store's downloads may take on its volume, above the
@@ -481,7 +500,6 @@ impl Clone for ManagedModelStore {
             installed_packages: Arc::clone(&self.installed_packages),
             model_assessments: Arc::clone(&self.model_assessments),
             catalog_affiliations: Arc::clone(&self.catalog_affiliations),
-            catalog_affiliations_dirty: Arc::clone(&self.catalog_affiliations_dirty),
             cache_evidence: Arc::clone(&self.cache_evidence),
             ensure_gate: Arc::clone(&self.ensure_gate),
             ensure_generation: Arc::clone(&self.ensure_generation),
@@ -490,6 +508,7 @@ impl Clone for ManagedModelStore {
             reconciliation_complete: Arc::clone(&self.reconciliation_complete),
             installed_packages_observer: Arc::clone(&self.installed_packages_observer),
             ollama_hub_resolution: Arc::clone(&self.ollama_hub_resolution),
+            readers: Arc::clone(&self.readers),
         }
     }
 }
@@ -507,6 +526,7 @@ impl ManagedModelStore {
     }
 
     fn notify_installed_packages_changed(&self) {
+        self.pin_headers();
         let observer = self
             .installed_packages_observer
             .read()
@@ -697,7 +717,6 @@ impl ManagedModelStore {
             installed_packages: Arc::new(RwLock::new(InstalledPackageSnapshot::default())),
             model_assessments: Arc::new(RwLock::new(BTreeMap::new())),
             catalog_affiliations: Arc::new(RwLock::new(catalog_affiliations)),
-            catalog_affiliations_dirty: Arc::new(AtomicBool::new(false)),
             cache_evidence: Arc::new(RwLock::new(BTreeMap::new())),
             ensure_gate: Arc::new(tokio::sync::Mutex::new(())),
             ensure_generation: Arc::new(AtomicU64::new(0)),
@@ -706,7 +725,11 @@ impl ManagedModelStore {
             reconciliation_complete: Arc::new(AtomicBool::new(false)),
             installed_packages_observer: Arc::new(RwLock::new(None)),
             ollama_hub_resolution: Arc::new(AtomicBool::new(false)),
+            readers: Arc::default(),
         };
+        // The release catalog's headers are pinned from the start; the installed packages' once
+        // reconciliation finds them.
+        manager.pin_headers();
         manager.request_installed_model_reconciliation();
         Ok(manager)
     }
@@ -945,10 +968,12 @@ impl ManagedModelStore {
 
         persist_inventory_index(
             &self.cache,
-            &discovered,
-            &next_evidence,
-            &installed_packages,
-        );
+            IndexChange::Scanned {
+                models: discovered.clone(),
+                evidence: next_evidence.clone(),
+            },
+        )
+        .await;
         *self
             .models
             .write()
@@ -970,6 +995,9 @@ impl ManagedModelStore {
         self.ensure_generation.fetch_add(1, Ordering::AcqRel);
         self.request_ollama_hub_resolution();
         let became_authoritative = !self.reconciliation_complete.swap(true, Ordering::AcqRel);
+        if installed_packages_changed {
+            self.pin_headers();
+        }
         if !(installed_packages_changed || became_authoritative) {
             return Ok(());
         }
@@ -1157,7 +1185,14 @@ impl ManagedModelStore {
             .unreadable_directories
             .clone();
         let installed = self.build_installed_package_snapshot(&models, unreadable_directories)?;
-        persist_inventory_index(&self.cache, &models, &cache, &installed);
+        persist_inventory_index(
+            &self.cache,
+            IndexChange::Published {
+                model: model.clone(),
+                evidence: cache.get(&model.id).cloned(),
+            },
+        )
+        .await;
         *self
             .models
             .write()
@@ -1176,9 +1211,10 @@ impl ManagedModelStore {
         Ok(model)
     }
 
-    pub(crate) async fn remove_published_model(
+    /// Let the models `ids` go from the inventory, in one step.
+    pub(crate) async fn remove_published_models(
         &self,
-        id: &InventoryEntryId,
+        ids: &[InventoryEntryId],
     ) -> Result<(), InventoryError> {
         let _guard = self.ensure_gate.lock().await;
         let mut models = self
@@ -1191,8 +1227,10 @@ impl ManagedModelStore {
             .read()
             .map_err(|_| InventoryError::Internal("inventory cache lock poisoned".to_owned()))?
             .clone();
-        models.remove(id);
-        cache.remove(id);
+        for id in ids {
+            models.remove(id);
+            cache.remove(id);
+        }
         let mut installed = self
             .installed_packages
             .read()
@@ -1200,8 +1238,10 @@ impl ManagedModelStore {
                 InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
             })?
             .clone();
-        installed.records.remove(id);
-        persist_inventory_index(&self.cache, &models, &cache, &installed);
+        for id in ids {
+            installed.records.remove(id);
+            persist_inventory_index(&self.cache, IndexChange::Removed(id.clone())).await;
+        }
         *self
             .models
             .write()
@@ -1270,19 +1310,19 @@ fn inventory_snapshot_is_current(
 }
 
 fn load_inventory_index(cache: &ModelCache) -> HydratedInventory {
-    let Some(mut index) = cache.read_inventory() else {
-        return (
-            BTreeMap::new(),
-            BTreeMap::new(),
-            InstalledPackageSnapshot::default(),
-        );
+    decode_inventory_index(cache.read_inventory())
+}
+
+/// The models and evidence of the inventory index `index`, each entry that decodes, none where
+/// there is no index.
+fn decode_inventory_index(
+    index: Option<serde_json::Map<String, serde_json::Value>>,
+) -> HydratedInventory {
+    let Some(mut index) = index else {
+        return (BTreeMap::new(), BTreeMap::new());
     };
     let raw_models = recover_map::<InventoryModel>(index.remove("models"), MAX_SCAN_ENTRIES);
     let raw_evidence = recover_map::<CacheEvidence>(index.remove("evidence"), MAX_SCAN_ENTRIES);
-    let installed = index
-        .remove("installed")
-        .and_then(|value| serde_json::from_value(value).ok())
-        .unwrap_or_default();
     let mut models = BTreeMap::new();
     for (raw_id, model) in raw_models {
         let Ok(id) = InventoryEntryId::parse(raw_id) else {
@@ -1303,20 +1343,48 @@ fn load_inventory_index(cache: &ModelCache) -> HydratedInventory {
         }
         evidence.insert(id, entry);
     }
-    (models, evidence, installed)
+    (models, evidence)
 }
 
-fn persist_inventory_index(
-    cache: &ModelCache,
-    models: &BTreeMap<InventoryEntryId, InventoryModel>,
-    evidence: &BTreeMap<InventoryEntryId, CacheEvidence>,
-    installed: &InstalledPackageSnapshot,
-) {
-    cache.write_inventory(&InventoryCache {
-        models: models.clone(),
-        evidence: evidence.clone(),
-        installed: installed.clone(),
-    });
+/// Apply `change` to the inventory index as it is on disk, its record's lock held from the read
+/// to the write, so what another process published or removed meanwhile is kept: a model
+/// published or removed changes its own entry alone. A scan replaces the whole index, as it is
+/// the index derived again from every model on disk; a model another process published after the
+/// scan read the disk is then inspected again by the next scan, never served from evidence that
+/// does not hold. It runs on the blocking pool, as another process may hold the lock.
+async fn persist_inventory_index(cache: &ModelCache, change: IndexChange) {
+    let cache = cache.clone();
+    magnitude_service_utils::blocking::run(move || {
+        cache.update_inventory(|held| {
+            let (models, evidence) = match change {
+                IndexChange::Scanned { models, evidence } => (models, evidence),
+                IndexChange::Published {
+                    model,
+                    evidence: published,
+                } => {
+                    let (mut models, mut evidence) = decode_inventory_index(held);
+                    match published {
+                        Some(published) => {
+                            evidence.insert(model.id.clone(), published);
+                        }
+                        None => {
+                            evidence.remove(&model.id);
+                        }
+                    }
+                    models.insert(model.id.clone(), model);
+                    (models, evidence)
+                }
+                IndexChange::Removed(id) => {
+                    let (mut models, mut evidence) = decode_inventory_index(held);
+                    models.remove(&id);
+                    evidence.remove(&id);
+                    (models, evidence)
+                }
+            };
+            InventoryCache { models, evidence }
+        });
+    })
+    .await;
 }
 
 fn model_primary_path(root: &Path, model: &InventoryModel) -> Option<PathBuf> {
@@ -1525,7 +1593,7 @@ fn scan(
         }
     }
     crate::local_roots::scan_attached_drafters(local, &mut discovered);
-    let (mut cached_models, cached_evidence, _) =
+    let (mut cached_models, cached_evidence) =
         load_inventory_index(&ModelCache::new(&config.cache_root));
     // The durable entry controls cache validity. Overlay only transient runtime state for an entry
     // that independently survived durable schema validation.
@@ -1631,6 +1699,9 @@ fn scan_managed(
     if !managed.is_dir() {
         return Ok(());
     }
+    // A committed removal's models are gone, whatever of their files is left on disk.
+    let removed = crate::store_fs::committed_entries(&crate::store_fs::model_store(&config.root))?;
+    let found = output.len();
     let mut count = 0;
     for repo_entry in read_dir_sorted(&managed)? {
         let repo_name = repo_entry.file_name().to_string_lossy().into_owned();
@@ -1641,7 +1712,9 @@ fn scan_managed(
         let snapshots = read_dir_sorted(&repository_root.join("snapshots"))?;
         for snapshot_entry in snapshots {
             let snapshot_kind = snapshot_entry.file_type().map_err(io_error)?;
-            if !snapshot_kind.is_dir() || snapshot_kind.is_symlink() {
+            // A snapshot being staged, or set aside, is the store's temporary
+            // (`seismic_io::Store::stage`), never a commit.
+            if !snapshot_kind.is_dir() || snapshot_kind.is_symlink() || snapshot_entry.file_name().to_string_lossy().starts_with('.') {
                 continue;
             }
             count += 1;
@@ -1714,7 +1787,25 @@ fn scan_managed(
             }
         }
     }
+    if !removed.is_empty() {
+        let mut scanned = output.split_off(found);
+        scanned.retain(|candidate| !removed_by(&removed, candidate));
+        output.append(&mut scanned);
+    }
     Ok(())
+}
+
+/// Whether a committed removal named one of `candidate`'s snapshot entries ([`scan_managed`]).
+fn removed_by(removed: &BTreeSet<PathBuf>, candidate: &DiscoveryCandidate) -> bool {
+    let DiscoveryCandidate::Artifact(candidate) = candidate;
+    let (ModelLocation::MagnitudeCache { components, .. }, ModelSource::HuggingFace { repository, commit, .. }) =
+        (&candidate.location, &candidate.source)
+    else {
+        return false;
+    };
+    components
+        .iter()
+        .any(|component| removed.contains(&crate::store_fs::snapshot_entry(repository, commit, &component.path)))
 }
 
 pub(crate) fn components_for_catalog_package(
@@ -2725,11 +2816,6 @@ pub(crate) fn hf_repo_dir(repository: &str) -> String {
     format!("models--{}", repository.replace('/', "--"))
 }
 
-pub(crate) fn repository_lock_path(root: &Path, repository: &str) -> PathBuf {
-    root.join("locks")
-        .join(format!("{}.lock", hf_repo_dir(repository)))
-}
-
 pub(crate) fn modified_seconds(path: &Path) -> Option<u64> {
     path.metadata()
         .ok()?
@@ -2897,8 +2983,8 @@ mod tests {
     use magnitude_service_contracts::models::{
         CatalogBaseId, CatalogVariantId, InstalledCatalogAttribution, InstalledModelPackages,
         ModelFile, ModelFileId, ModelFileRole, ModelPackageInstallationOrigin,
-        ModelPackageProperties, ModelReleaseDate, ModelServingConfiguration, PackageValidation,
-        RecommendableModel, ServableModelBundle, ServingProfile,
+        ModelPackageProperties, ModelReleaseDate, ModelServingConfiguration,
+        PackageValidation, RecommendableModel, ServableModelBundle, ServingProfile,
     };
 
     fn catalog_model(package: ModelPackage) -> RecommendableModel {
@@ -3283,12 +3369,33 @@ mod tests {
             installed.packages[0].origin,
             ModelPackageInstallationOrigin::Magnitude
         );
-        let removed = manager
-            .remove_installed(&installed.packages[0].package.id)
+        // A resolution of its files here delays the removal while it lives: no removal unlinks
+        // a file a load reads.
+        let resolution = manager
+            .resolve_bundle(magnitude_service_contracts::models::ModelBundleInput::Standalone {
+                package: magnitude_service_contracts::models::ModelPackageOperand::Installed {
+                    package_id: installed.packages[0].package.id.clone(),
+                },
+            })
             .await
             .unwrap();
-        assert!(removed.removed);
-        assert_eq!(removed.freed_bytes, u64::try_from(bytes.len()).unwrap());
+        let package_ids = [installed.packages[0].package.id.clone()];
+        let (begun, on_begun) = tokio::sync::oneshot::channel();
+        let mut removal = manager.remove_installed_packages(
+            &package_ids,
+            Box::pin(async move {
+                let _ = begun.send(());
+                Ok(())
+            }),
+        );
+        tokio::select! {
+            _ = &mut removal => panic!("the removal ends before the resolution goes"),
+            _ = on_begun => {}
+        }
+        assert!(blob.exists());
+        drop(resolution);
+        let freed_bytes = removal.await.unwrap();
+        assert_eq!(freed_bytes, u64::try_from(bytes.len()).unwrap());
         assert!(!blob.exists());
         assert!(!snapshot.join("model.gguf").exists());
         assert!(
@@ -3296,6 +3403,241 @@ mod tests {
             "a repository folder left without a model is removed from Magnitude's store"
         );
         assert!(manager.list().await.unwrap().is_empty());
+    }
+
+    /// A catalog package of `repository` at `commit`, one weights file `file` of its own bytes
+    /// (named `name`), stored in Magnitude's store at `store` as a download leaves it.
+    fn stored_catalog_package(store: &Path, repository: &str, commit: &str, file: &str, name: &str) -> ModelPackage {
+        let repository_root = store.join("hub").join(hf_repo_dir(repository));
+        let (snapshot, blobs) = (repository_root.join("snapshots").join(commit), repository_root.join("blobs"));
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::create_dir_all(&blobs).unwrap();
+        let written = snapshot.join(file);
+        write_minimal_gguf_with_string_metadata(&written, &[("general.name", name)]);
+        let bytes = fs::read(&written).unwrap();
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let blob = blobs.join(blob_key(&ContentIdentity::Sha256 { value: digest.clone() }));
+        fs::rename(&written, &blob).unwrap();
+        fs::hard_link(&blob, &written).unwrap();
+        ModelPackage {
+            id: ModelPackageId(format!("package_{name}")),
+            source: ModelPackageSource::HuggingFace {
+                repository: repository.to_owned(),
+                revision: commit.to_owned(),
+            },
+            files: vec![ModelFile {
+                id: ModelFileId(format!("file_{digest}")),
+                path: PathBuf::from(file),
+                role: ModelFileRole::Weights,
+                size_bytes: u64::try_from(bytes.len()).unwrap(),
+                tensor_storage_bytes: None,
+                sha256: digest,
+            }],
+            relationships: Vec::new(),
+            properties: ModelPackageProperties {
+                format: "gguf".to_owned(),
+                quantization: "unknown".to_owned(),
+                quantization_name: "unknown".to_owned(),
+                architecture: "unknown".to_owned(),
+                maximum_context_length: Some(4_096),
+                intrinsic_model_id: None,
+                intrinsic_quality_id: None,
+            },
+        }
+    }
+
+    /// The installed package Magnitude's store at `store` holds as `file` of `repository`'s
+    /// snapshot `commit`.
+    async fn installed_id(manager: &ManagedModelStore, repository: &str, commit: &str, file: &str) -> ModelPackageId {
+        use magnitude_service_contracts::models::InstalledModelPackages as _;
+        manager
+            .list_installed()
+            .await
+            .unwrap()
+            .packages
+            .into_iter()
+            .find(|installed| {
+                matches!(&installed.package.source, ModelPackageSource::HuggingFace { repository: found, revision }
+                    if found == repository && revision == commit)
+                    && installed.package.files.iter().any(|stored| stored.path == Path::new(file))
+            })
+            .unwrap_or_else(|| panic!("{file} of {repository} at {commit} is installed"))
+            .package
+            .id
+    }
+
+    /// The installed packages of Magnitude's store at `store`, each a catalog model's variant.
+    async fn store_of(temporary: &Path, store: &Path, packages: &[(&ModelPackage, &str)]) -> ManagedModelStore {
+        let mut config = InventoryConfig::with_roots(store.to_owned(), temporary.join("cache")).unwrap();
+        config.catalog_models = packages
+            .iter()
+            .map(|(package, variant)| RecommendableModel {
+                variant_id: CatalogVariantId::new(*variant).unwrap(),
+                ..catalog_model((*package).clone())
+            })
+            .collect();
+        let manager = ManagedModelStore::open_unbounded(config).await.unwrap();
+        manager.ensure_installed_model_inventory().await.unwrap();
+        manager
+    }
+
+    fn resolve<'a>(manager: &'a ManagedModelStore, package_id: &ModelPackageId) -> futures_util::future::BoxFuture<'a, Result<magnitude_service_contracts::models::ResolvedServableModelBundle, InventoryError>> {
+        use magnitude_service_contracts::models::{InstalledModelPackages as _, ModelBundleInput, ModelPackageOperand};
+        manager.resolve_bundle(ModelBundleInput::Standalone {
+            package: ModelPackageOperand::Installed { package_id: package_id.clone() },
+        })
+    }
+
+    /// A removal that lets go of no resident model.
+    fn alone<'a>() -> futures_util::future::BoxFuture<'a, Result<(), InventoryError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// A resolution here holds exactly the files it reads: while one of a repository's Q4 lives
+    /// (a load), the same snapshot's Q8 is removed, and so is an older commit's copy an update
+    /// replaced; the Q4's own removal waits for it (T6), refusing every resolution of the file
+    /// meanwhile, and ends once it goes.
+    #[tokio::test]
+    async fn a_resolution_delays_only_the_removal_of_the_files_it_reads() {
+        use magnitude_service_contracts::models::InstalledModelPackages as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let store = temporary.path().join("store");
+        let repository = "owner/model";
+        let q4 = stored_catalog_package(&store, repository, "new", "model-Q4.gguf", "q4");
+        let q8 = stored_catalog_package(&store, repository, "new", "model-Q8.gguf", "q8");
+        let replaced = stored_catalog_package(&store, repository, "old", "model-Q4.gguf", "replaced");
+        let manager = store_of(temporary.path(), &store, &[(&q4, "gguf:q4"), (&q8, "gguf:q8"), (&replaced, "gguf:old")]).await;
+        assert_eq!(manager.list_installed().await.unwrap().packages.len(), 3);
+        let [q4, q8, replaced] = [("new", "model-Q4.gguf"), ("new", "model-Q8.gguf"), ("old", "model-Q4.gguf")];
+        let (q4, q8, replaced) = (
+            installed_id(&manager, repository, q4.0, q4.1).await,
+            installed_id(&manager, repository, q8.0, q8.1).await,
+            installed_id(&manager, repository, replaced.0, replaced.1).await,
+        );
+        let resolution = resolve(&manager, &q4).await.unwrap();
+        assert!(manager.remove_installed_packages(std::slice::from_ref(&q8), alone()).await.unwrap() > 0, "the same snapshot's other file");
+        assert!(manager.remove_installed_packages(std::slice::from_ref(&replaced), alone()).await.unwrap() > 0, "the replaced commit's copy");
+        let (begun, on_begun) = tokio::sync::oneshot::channel();
+        let mut removal = manager.remove_installed_packages(
+            std::slice::from_ref(&q4),
+            Box::pin(async move {
+                let _ = begun.send(());
+                Ok(())
+            }),
+        );
+        tokio::select! {
+            _ = &mut removal => panic!("the removal ends before the resolution goes"),
+            _ = on_begun => {}
+        }
+        assert!(matches!(resolve(&manager, &q4).await, Err(InventoryError::Busy(_))), "no resolution begins once the removal has");
+        drop(resolution);
+        assert!(removal.await.unwrap() > 0);
+    }
+
+    /// A reader in another process refuses a removal at once, naming it, before any model is
+    /// released (T3), and the files stay installed; a holder here (an assessment reading the
+    /// headers) is waited for (T6), as the resident model the removal releases (T4) is, and
+    /// no resolution of the files begins meanwhile.
+    #[tokio::test]
+    async fn a_removal_refuses_another_process_at_once_and_waits_for_this_ones() {
+        use magnitude_service_contracts::models::InstalledModelPackages as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let store = temporary.path().join("store");
+        let packages = [
+            stored_catalog_package(&store, "owner/model", "commit", "model-Q4.gguf", "resident"),
+            stored_catalog_package(&store, "owner/model", "commit", "model-Q8.gguf", "assessed"),
+        ];
+        let manager = store_of(temporary.path(), &store, &[(&packages[0], "gguf:q4"), (&packages[1], "gguf:q8")]).await;
+        let resident = installed_id(&manager, "owner/model", "commit", "model-Q4.gguf").await;
+        let assessed = installed_id(&manager, "owner/model", "commit", "model-Q8.gguf").await;
+        let snapshot = store.join("hub").join(hf_repo_dir("owner/model")).join("snapshots/commit");
+        let package_ids = [resident.clone(), assessed.clone()];
+        let loaded = resolve(&manager, &resident).await.unwrap();
+
+        // Another process reads the resident model's file.
+        let elsewhere = crate::store_fs::model_store(&store)
+            .lease(&Path::new("readers").join(hf_repo_dir("owner/model")).join("commit/model-Q4.gguf"))
+            .unwrap();
+        let released = AtomicBool::new(false);
+        let refused = manager
+            .remove_installed_packages(&package_ids, Box::pin(async {
+                released.store(true, Ordering::Release);
+                Ok(())
+            }))
+            .await;
+        assert!(matches!(&refused, Err(InventoryError::Busy(holder)) if holder.contains("process")), "{refused:?}");
+        assert!(!released.load(Ordering::Acquire), "a refused removal releases no model");
+        assert!(snapshot.join("model-Q4.gguf").exists() && snapshot.join("model-Q8.gguf").exists());
+        assert_eq!(manager.list_installed().await.unwrap().packages.len(), 2);
+        drop(elsewhere);
+
+        // An assessment here reads the other file.
+        let assessing = resolve(&manager, &assessed).await.unwrap();
+        let (begun, on_begun) = tokio::sync::oneshot::channel();
+        let mut removal = manager.remove_installed_packages(
+            &package_ids,
+            Box::pin(async move {
+                let _ = begun.send(());
+                drop(loaded);
+                Ok(())
+            }),
+        );
+        tokio::select! {
+            _ = &mut removal => panic!("the removal ends before the assessment does"),
+            _ = on_begun => {}
+        }
+        assert!(matches!(resolve(&manager, &resident).await, Err(InventoryError::Busy(_))), "no load of the files begins once the removal has");
+        assert!(snapshot.join("model-Q4.gguf").exists() && snapshot.join("model-Q8.gguf").exists());
+        drop(assessing);
+        assert!(removal.await.unwrap() > 0);
+        assert!(!snapshot.join("model-Q4.gguf").exists() && !snapshot.join("model-Q8.gguf").exists());
+        assert!(manager.list_installed().await.unwrap().packages.is_empty());
+    }
+
+    /// A committed removal is final whatever is left of its files: garbage that cannot be deleted
+    /// now leaves the models gone, here and from every scan of the store (another process's
+    /// opening), and the repository's next holder deletes it once it can.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_committed_removal_is_final_and_its_garbage_goes_with_the_repositorys_next_holder() {
+        use magnitude_service_contracts::models::InstalledModelPackages as _;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let store = temporary.path().join("store");
+        let packages = [
+            stored_catalog_package(&store, "owner/model", "a", "model.gguf", "first"),
+            stored_catalog_package(&store, "owner/model", "b", "model.gguf", "second"),
+        ];
+        let installed = [(&packages[0], "gguf:a"), (&packages[1], "gguf:b")];
+        let manager = store_of(temporary.path(), &store, &installed).await;
+        let package_ids = [
+            installed_id(&manager, "owner/model", "a", "model.gguf").await,
+            installed_id(&manager, "owner/model", "b", "model.gguf").await,
+        ];
+        // The second snapshot's entry cannot be deleted.
+        let snapshots = store.join("hub").join(hf_repo_dir("owner/model")).join("snapshots");
+        fs::set_permissions(snapshots.join("b"), fs::Permissions::from_mode(0o555)).unwrap();
+        manager.remove_installed_packages(&package_ids, alone()).await.expect("the removal commits");
+        assert!(snapshots.join("b/model.gguf").exists(), "what cannot be deleted is left");
+        assert!(manager.list_installed().await.unwrap().packages.is_empty());
+        for package_id in &package_ids {
+            assert!(resolve(&manager, package_id).await.is_err(), "a removed model does not resolve");
+        }
+        drop(manager);
+
+        let reopened = store_of(temporary.path(), &store, &installed).await;
+        assert!(reopened.list_installed().await.unwrap().packages.is_empty(), "no scan finds a removed model");
+        assert!(snapshots.join("b/model.gguf").exists());
+        drop(reopened);
+
+        fs::set_permissions(snapshots.join("b"), fs::Permissions::from_mode(0o755)).unwrap();
+        let reopened = store_of(temporary.path(), &store, &installed).await;
+        assert!(!snapshots.join("b/model.gguf").exists(), "the opening finishes the removal");
+        assert!(reopened.list_installed().await.unwrap().packages.is_empty());
+        assert!(crate::store_fs::model_store(&store).list(Path::new("removed")).unwrap().is_empty(), "its record goes with its garbage");
     }
 
     #[tokio::test]

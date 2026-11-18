@@ -71,12 +71,15 @@ pub trait Artifact: Sized + Send + Sync {
     /// kept under a key always decode.
     const ENCODING: u32;
     /// Whether its platform opens it by path (Metal's archives), so a load
-    /// gives [`Artifact::decode`] the store's file of it, to open in place.
+    /// gives [`Artifact::decode`] the store's file of it, held, to open in
+    /// place.
     const IN_PLACE: bool = false;
-    /// The artifact `bytes` encode, which the store also keeps in `file`
-    /// where the artifact opens in place ([`Artifact::IN_PLACE`]) and the
-    /// store keeps them in one. None when they do not decode.
-    fn decode(bytes: &[u8], file: Option<&std::path::Path>) -> Option<Self>;
+    /// The artifact `bytes` encode, which the store also keeps in `file`,
+    /// held, where the artifact opens in place ([`Artifact::IN_PLACE`]) and
+    /// the store keeps them in one: an artifact that opens its file by path
+    /// keeps the hold while it lives, so the store keeps the file there.
+    /// None when they do not decode.
+    fn decode(bytes: &[u8], file: Option<crate::HeldFile>) -> Option<Self>;
 }
 
 /// A backend's compiler for one opened device. A program is had in one of

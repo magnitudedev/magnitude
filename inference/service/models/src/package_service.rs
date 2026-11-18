@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
 
 use futures_util::future::BoxFuture;
 use magnitude_service_contracts::models::{
@@ -9,7 +8,7 @@ use magnitude_service_contracts::models::{
     ModelBundleInput, ModelFailure, ModelFile, ModelFileId, ModelFileRelationship, ModelFileRole,
     ModelId, ModelPackage, ModelPackageId, ModelPackageInstallationOrigin, ModelPackageOperand,
     ModelPackageProperties, ModelPackageSource, PackageValidation,
-    RemoveInstalledModelPackageResponse, ResolvedServableModelBundle, ServableModelBundle,
+    ResolvedServableModelBundle, ServableModelBundle,
     ServingProfile,
 };
 use magnitude_service_contracts::{
@@ -20,8 +19,8 @@ use magnitude_service_contracts::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::PreparedPreview;
 use crate::cache::{CachedModelAssessment, ModelIndexKind};
+use crate::catalog_affiliations::CatalogAffiliations;
 use crate::inventory::{
     InstalledPackageRecord, InstalledPackageSnapshot, ManagedModelStore, UnreadableDirectory,
     catalog_packages,
@@ -32,7 +31,9 @@ use crate::inventory::{
 struct ResolvedPackageOperand {
     package: ModelPackage,
     model: ResolvedModel,
-    resolution_guard: Option<PreparedPreview>,
+    /// What keeps what it resolved there while the resolution lives: the readers' hold of
+    /// Magnitude's files of it ([`crate::store_fs::Readers::hold`]), or a preview's workspace.
+    resolution_guard: Option<Box<dyn Send + Sync>>,
 }
 
 /// Private structural fingerprint used only by ICN's material caches and work coordination.
@@ -959,17 +960,19 @@ impl ManagedModelStore {
             return;
         };
         if affiliations.forget_package(&package.id) {
-            self.catalog_affiliations_dirty
-                .store(true, Ordering::Release);
-            match affiliations.persist(&self.config.root) {
-                Ok(()) => self
-                    .catalog_affiliations_dirty
-                    .store(false, Ordering::Release),
-                Err(error) => tracing::warn!(
-                    %error,
-                    "failed to persist catalog package affiliations; retrying on the next inventory reconciliation"
-                ),
-            }
+            self.persist_catalog_affiliations(&mut affiliations);
+        }
+    }
+
+    /// Persist what this process changed of the catalog affiliations, and nothing when it changed
+    /// nothing; a failure keeps the change for the next persist, at the latest the next inventory
+    /// reconciliation's.
+    fn persist_catalog_affiliations(&self, affiliations: &mut CatalogAffiliations) {
+        if let Err(error) = affiliations.persist(&self.config.root) {
+            tracing::warn!(
+                %error,
+                "failed to persist catalog package affiliations; retrying on the next inventory reconciliation"
+            );
         }
     }
 
@@ -986,28 +989,14 @@ impl ManagedModelStore {
             tracing::warn!("catalog affiliation lock poisoned while recording installed package");
             return;
         };
-        let added = affiliations.add(CatalogPackageAffiliation {
+        affiliations.add(CatalogPackageAffiliation {
             model_id: catalog_model.model_id.clone(),
             variant_id: catalog_model.variant_id.clone(),
             package_id: package.id.clone(),
             repository: repository.clone(),
             role,
         });
-        if added {
-            self.catalog_affiliations_dirty
-                .store(true, Ordering::Release);
-        }
-        if self.catalog_affiliations_dirty.load(Ordering::Acquire) {
-            match affiliations.persist(&self.config.root) {
-                Ok(()) => self
-                    .catalog_affiliations_dirty
-                    .store(false, Ordering::Release),
-                Err(error) => tracing::warn!(
-                    %error,
-                    "failed to persist catalog package affiliations; retrying on the next inventory reconciliation"
-                ),
-            }
-        }
+        self.persist_catalog_affiliations(&mut affiliations);
     }
 
     pub(crate) fn inspect_package_from_resolved(
@@ -1148,22 +1137,11 @@ impl ManagedModelStore {
     }
 
     fn retry_catalog_affiliation_persistence(&self) {
-        if !self.catalog_affiliations_dirty.load(Ordering::Acquire) {
-            return;
-        }
-        let Ok(affiliations) = self.catalog_affiliations.read() else {
+        let Ok(mut affiliations) = self.catalog_affiliations.write() else {
             tracing::warn!("catalog affiliation lock poisoned while retrying persistence");
             return;
         };
-        match affiliations.persist(&self.config.root) {
-            Ok(()) => self
-                .catalog_affiliations_dirty
-                .store(false, Ordering::Release),
-            Err(error) => tracing::warn!(
-                %error,
-                "failed to persist catalog package affiliations; retrying on the next inventory reconciliation"
-            ),
-        }
+        self.persist_catalog_affiliations(&mut affiliations);
     }
 
     #[must_use]
@@ -1292,19 +1270,21 @@ impl ManagedModelStore {
         match operand {
             ModelPackageOperand::Installed { package_id } => {
                 let (package, model) = self.installed_package(&package_id).await?;
+                let resolution_guard = self.readers_guard(&model).await?;
                 Ok(ResolvedPackageOperand {
                     package,
                     model,
-                    resolution_guard: None,
+                    resolution_guard,
                 })
             }
             ModelPackageOperand::SourceBacked { package } => {
                 match self.installed_package(&package.id).await {
                     Ok((package, model)) => {
+                        let resolution_guard = self.readers_guard(&model).await?;
                         return Ok(ResolvedPackageOperand {
                             package,
                             model,
-                            resolution_guard: None,
+                            resolution_guard,
                         });
                     }
                     Err(InventoryError::NotFound(_)) | Err(InventoryError::NotReady(_)) => {}
@@ -1395,10 +1375,21 @@ impl ManagedModelStore {
                 Ok(ResolvedPackageOperand {
                     package: resolved_package,
                     model,
-                    resolution_guard: Some(prepared),
+                    resolution_guard: Some(Box::new(prepared)),
                 })
             }
         }
+    }
+
+    /// The readers' hold of Magnitude's files of `model`, as a resolution's guard: a removal of
+    /// them, in this process or another, refuses at or waits for it while the resolution lives,
+    /// and it is refused while a removal holds them.
+    async fn readers_guard(&self, model: &ResolvedModel) -> Result<Option<Box<dyn Send + Sync>>, InventoryError> {
+        Ok(self
+            .readers
+            .hold(&self.config.root, &model.model)
+            .await?
+            .map(|hold| Box::new(hold) as Box<dyn Send + Sync>))
     }
 }
 
@@ -1474,42 +1465,23 @@ impl InstalledModelPackages for ManagedModelStore {
         })
     }
 
-    fn remove_installed(
-        &self,
-        package_id: &ModelPackageId,
-    ) -> BoxFuture<'_, Result<RemoveInstalledModelPackageResponse, InventoryError>> {
-        let package_id = package_id.clone();
-        Box::pin(async move {
-            let (removed, freed_bytes) = self
-                .remove_managed_packages(std::slice::from_ref(&package_id))
-                .await?;
-            Ok(RemoveInstalledModelPackageResponse {
-                package_id,
-                removed,
-                freed_bytes,
-            })
-        })
-    }
-
-    fn remove_installed_packages(
-        &self,
-        package_ids: &[ModelPackageId],
-    ) -> BoxFuture<'_, Result<u64, InventoryError>> {
-        let package_ids = package_ids.to_vec();
-        Box::pin(async move {
-            Ok(self.remove_managed_packages(&package_ids).await?.1)
-        })
+    fn remove_installed_packages<'a>(
+        &'a self,
+        package_ids: &'a [ModelPackageId],
+        release_resident: BoxFuture<'a, Result<(), InventoryError>>,
+    ) -> BoxFuture<'a, Result<u64, InventoryError>> {
+        Box::pin(self.remove_managed_packages(package_ids, release_resident))
     }
 }
 
 impl ManagedModelStore {
-    /// Deletes every Magnitude occurrence of `package_ids` as one removal: whether any was
-    /// deleted, and the bytes freed.
+    /// Deletes every Magnitude occurrence of `package_ids` as one removal: the bytes freed.
     async fn remove_managed_packages(
         &self,
         package_ids: &[ModelPackageId],
-    ) -> Result<(bool, u64), InventoryError> {
-        // Occurrence ids must come from the same observation that `delete` validates against.
+        release_resident: BoxFuture<'_, Result<(), InventoryError>>,
+    ) -> Result<u64, InventoryError> {
+        // Occurrence ids must come from the same observation that the removal validates against.
         self.ensure_installed_model_inventory().await?;
         let occurrences = {
             let installed = self.installed_packages.read().map_err(|_| {
@@ -1535,15 +1507,14 @@ impl ManagedModelStore {
             occurrences.dedup();
             occurrences
         };
-        let deleted = self.delete_entries(&occurrences).await.inspect_err(|error| {
-            tracing::warn!(?package_ids, %error, "installed model package removal failed");
-        })?;
-        let removed = deleted.iter().any(|model| model.deleted);
-        let freed_bytes = deleted
-            .iter()
-            .fold(0_u64, |total, model| total.saturating_add(model.freed_bytes));
-        tracing::info!(?package_ids, removed, freed_bytes, "removed installed model packages");
-        Ok((removed, freed_bytes))
+        let freed_bytes = self
+            .remove_entries(&occurrences, release_resident)
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(?package_ids, %error, "installed model package removal failed");
+            })?;
+        tracing::info!(?package_ids, freed_bytes, "removed installed model packages");
+        Ok(freed_bytes)
     }
 }
 

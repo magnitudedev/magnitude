@@ -277,7 +277,7 @@ impl<'a> Reader<'a> {
 impl Artifact for CpuArtifact {
     const ENCODING: u32 = 1;
 
-    fn decode(bytes: &[u8], _: Option<&std::path::Path>) -> Option<Self> {
+    fn decode(bytes: &[u8], _: Option<seismic_native_target::HeldFile>) -> Option<Self> {
         let mut reader = Reader(bytes);
         let symbol = reader.text()?;
         let frame_size = reader.u32()?;

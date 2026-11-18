@@ -251,7 +251,7 @@ impl AttemptMarkers {
     /// ([`JsonFileStore::update`]); none leaves it as it is.
     fn change(&self, key: &impl Serialize, change: impl FnOnce(AttemptRecord) -> Option<AttemptRecord>) -> Result<(), StoreError> {
         self.files
-            .update(key, LARGEST_RECORD, |record: Option<AttemptRecord>| change(record.unwrap_or_default()).ok_or(()))
+            .update(key, LARGEST_RECORD, |record: Option<AttemptRecord>| change(record.unwrap_or_default()).map(Some).ok_or(()))
             .map(|_changed_or_left| ())
     }
 

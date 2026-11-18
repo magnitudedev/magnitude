@@ -26,7 +26,7 @@ use magnitude_engine::preview::LoadPreview;
 use magnitude_engine::worker::{EngineClient, Preparation, load_prepared};
 use magnitude_engine::worker::protocol::{LoadProgress, MemoryObservation, RoomAnswer};
 use magnitude_service_contracts::models::{
-    CatalogModelOptimizer, CatalogOptimizationProgress, CatalogPackageRemover,
+    CatalogModelOptimizer, CatalogOptimizationProgress, CatalogPackageRemover, LoadedPackages,
     InstalledModelPackages as _, MemoryShortage, ModelAssessment, ModelAssessmentDomainSnapshot,
     CatalogModelSelection, ModelAssessmentEntryState, ModelAssessmentSubject, ModelAssessments,
     ModelAssessmentsSnapshot, ModelId, ModelInstance,
@@ -49,7 +49,7 @@ use super::{
     PreparedResidency, ReleaseControl, ResidencyAcquisition, ResidencyClient, ResidencyGrant,
     ResidencyLease, ResidencyNotification, ResidencyWorker, ResolvedResidencyTarget,
 };
-use crate::configurations::{ResolvedConfiguration, ResolvedConfigurations};
+use crate::configurations::{HeldConfiguration, ResolvedConfiguration, ResolvedConfigurations};
 use crate::device_lock::{DeviceHold, DeviceLock, DeviceShare, IdleResident, ResidentRoom};
 use crate::hardware::execution_backend;
 use crate::memory_domains::instance_allocation;
@@ -74,7 +74,7 @@ pub struct ResidentEngine {
     pub host: Arc<HostArtifacts>,
     pub client: EngineClient,
     pub context_window_tokens: u32,
-    _configuration: Arc<ResolvedConfiguration>,
+    _configuration: Arc<HeldConfiguration>,
 }
 
 /// Everything a model load needs besides the model.
@@ -211,7 +211,7 @@ impl ModelInstances {
             .configurations
             .resolve(&target.configuration)
             .await?;
-        let preview = preview(&self.environment.catalog, &resolved)
+        let preview = preview(&self.environment.catalog, &resolved.configuration)
             .await
             .map_err(|error| InventoryError::from(preview_failure(error)))?;
         load_plan(&preview).map_err(InventoryError::from)
@@ -365,20 +365,22 @@ impl CatalogPackageRemover for ModelInstances {
     fn remove_catalog_packages(
         &self,
         package_ids: Vec<ModelPackageId>,
+        loaded: LoadedPackages,
     ) -> BoxFuture<'_, Result<u64, InventoryError>> {
+        let (models, residency) = (Arc::clone(&self.environment.models), self.residency.clone());
+        // On a task of its own: a removal runs to its end whatever its caller does.
+        let removal = tokio::spawn(async move {
+            let release = residency.release_packages(package_ids.clone(), loaded);
+            models.remove_installed_packages(&package_ids, Box::pin(release)).await
+        });
         Box::pin(async move {
-            let permit = self
-                .residency
-                .acquire_package_removal(package_ids.clone())
-                .await?;
-            self.environment.configurations.evict_packages(&package_ids);
-            let reclaimed_bytes = self
-                .environment
-                .models
-                .remove_installed_packages(&package_ids)
-                .await?;
-            drop(permit);
-            Ok(reclaimed_bytes)
+            match removal.await {
+                Ok(removed) => removed,
+                Err(ended) => match ended.try_into_panic() {
+                    Ok(panic) => std::panic::resume_unwind(panic),
+                    Err(_) => Err(InventoryError::Internal("the removal's task was cancelled".to_owned())),
+                },
+            }
         })
     }
 }
@@ -776,14 +778,14 @@ impl EngineResidency {
         sequence: LoadSequence,
     ) -> Result<PreparedResidency<ResidentEngine>, ModelOperationFailure> {
         let environment = &self.environment;
-        let resolved = environment.configurations.resolve(&configuration).await?;
+        let resolved = Arc::new(environment.configurations.resolve(&configuration).await?);
         // The preview stands unless the load waits for the device or for memory below, which
         // change the room its plan settles into.
         let mut previewed = Some(
             priced(
                 &environment.device,
-                || preview(&environment.catalog, &resolved),
-                || self.defer_unpriced(instance_id, &resolved),
+                || preview(&environment.catalog, &resolved.configuration),
+                || self.defer_unpriced(instance_id, &resolved.configuration),
             )
             .await?,
         );
@@ -821,8 +823,8 @@ impl EngineResidency {
             None => {
                 priced(
                     &environment.device,
-                    || preview(&environment.catalog, &resolved),
-                    || self.defer_unpriced(instance_id, &resolved),
+                    || preview(&environment.catalog, &resolved.configuration),
+                    || self.defer_unpriced(instance_id, &resolved.configuration),
                 )
                 .await?
             }

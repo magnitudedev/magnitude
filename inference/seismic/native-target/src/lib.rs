@@ -31,4 +31,4 @@ pub use program::{
     Artifact, Compile, Declined, Formed, LaunchProgram, ProgramEntry, ProgramSource, ProgramStatistic, Programs,
     StatisticValue, Toolchain, ToolchainIdentity,
 };
-pub use store::{ArtifactKey, ArtifactStore, MemoryStore, PROBES};
+pub use store::{ArtifactKey, ArtifactStore, HeldFile, MemoryStore, PROBES};

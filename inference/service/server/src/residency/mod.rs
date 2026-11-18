@@ -10,6 +10,7 @@ pub mod supervisor;
 pub mod worker;
 
 use std::sync::Arc;
+
 use magnitude_serving::source::ModelLoadDetails;
 
 use magnitude_service_contracts::InventoryError;
@@ -17,7 +18,7 @@ use magnitude_service_contracts::models::{
     MemoryShortage, ModelId, ModelInstance, ModelInstanceAllocation, ModelInstanceFailure,
     ModelInstanceId, ModelInstanceLifecycle, ModelInstancesInvalidation, ModelInstancesSnapshot,
     ModelLoadDevice, ModelLoadPlan,
-    ModelLoadStage, ModelPackageId, ModelReleaseReason, ModelServingConfiguration,
+    LoadedPackages, ModelLoadStage, ModelPackageId, ModelReleaseReason, ModelServingConfiguration,
     ModelStoppingAllocation,
 };
 
@@ -226,7 +227,6 @@ struct TerminalInstance {
 /// these, whatever is resident. They share the command channel so their order with load
 /// completion is preserved.
 pub enum ResidencyNotification {
-    PackageRemovalFinished,
     LoadWorkerStarted {
         instance_id: ModelInstanceId,
         worker: Arc<dyn ResidencyWorker>,
@@ -277,9 +277,10 @@ enum ResidencyCommand<R> {
     Snapshot {
         reply: tokio::sync::oneshot::Sender<ModelInstancesSnapshot>,
     },
-    AcquirePackageRemoval {
+    ReleasePackages {
         package_ids: Vec<ModelPackageId>,
-        reply: tokio::sync::oneshot::Sender<Result<PackageRemovalPermit, InventoryError>>,
+        loaded: LoadedPackages,
+        reply: tokio::sync::oneshot::Sender<Result<(), InventoryError>>,
     },
     LoadFinished {
         instance_id: ModelInstanceId,
@@ -345,8 +346,6 @@ impl<R> Clone for ResidencyClient<R> {
 pub struct ResidencyInbox<R> {
     commands: tokio::sync::mpsc::UnboundedReceiver<ResidencyCommand<R>>,
 }
-
-const PACKAGE_REMOVAL_ADMISSION: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn owner_stopped() -> InventoryError {
     InventoryError::Internal("model residency owner stopped".to_owned())
@@ -422,41 +421,24 @@ impl<R: Send + 'static> ResidencyClient<R> {
         response.await.map_err(|_| owner_stopped())
     }
 
-    /// One exclusive admission covering every package of a removal; asking for each package
-    /// separately while holding an earlier permit would wait on itself. Admission waits behind a
-    /// load, a release or another removal for at most `PACKAGE_REMOVAL_ADMISSION`, then refuses
-    /// with a retryable error, so a removal request never hangs.
-    pub async fn acquire_package_removal(
+    /// Let go of the model loading or serving one of `package_ids`, for their removal, which
+    /// no load of them begins during (T4 of the removal state machine): it refuses the removal
+    /// ([`InventoryError::Loaded`]), or, as `loaded` says, is stopped as its user stops it, and
+    /// this answers once its release has ended.
+    pub async fn release_packages(
         &self,
         package_ids: Vec<ModelPackageId>,
-    ) -> Result<PackageRemovalPermit, InventoryError> {
+        loaded: LoadedPackages,
+    ) -> Result<(), InventoryError> {
         let (reply, response) = tokio::sync::oneshot::channel();
         self.commands
-            .send(ResidencyCommand::AcquirePackageRemoval { package_ids, reply })
+            .send(ResidencyCommand::ReleasePackages { package_ids, loaded, reply })
             .map_err(|_| owner_stopped())?;
-        match tokio::time::timeout(PACKAGE_REMOVAL_ADMISSION, response).await {
-            Ok(result) => result.map_err(|_| owner_stopped())?,
-            Err(_) => Err(InventoryError::ModelOperation {
-                code: "model_removal_busy".to_owned(),
-                message: "Magnitude is still loading or stopping a model, or removing other files. Try again when that finishes.".to_owned(),
-                retryable: true,
-            }),
-        }
+        response.await.map_err(|_| owner_stopped())?
     }
 
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<ModelInstancesInvalidation> {
         self.changes.subscribe()
-    }
-}
-
-/// Exclusive admission for removing installed packages; dropping it ends the removal.
-pub struct PackageRemovalPermit {
-    notifier: ResidencyNotifier,
-}
-
-impl Drop for PackageRemovalPermit {
-    fn drop(&mut self) {
-        self.notifier.send(ResidencyNotification::PackageRemovalFinished);
     }
 }
 
@@ -672,11 +654,6 @@ pub struct ModelResidency<D: ModelResidencyDriver> {
     terminals: std::collections::BTreeMap<ModelInstanceId, TerminalInstance>,
     revision: u64,
     next_lease_token: u64,
-    package_removal_active: bool,
-    package_removals: std::collections::VecDeque<(
-        Vec<ModelPackageId>,
-        tokio::sync::oneshot::Sender<Result<PackageRemovalPermit, InventoryError>>,
-    )>,
     /// The ready instance last published idle ([`ModelResidencyDriver::resident_idle`]).
     idle: Option<ModelInstanceId>,
     /// Whether residency has demand for the device, as it last stood: its end is the driver's
@@ -693,8 +670,6 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             terminals: std::collections::BTreeMap::new(),
             revision: 0,
             next_lease_token: 1,
-            package_removal_active: false,
-            package_removals: std::collections::VecDeque::new(),
             idle: None,
             demanded: false,
         }
@@ -764,9 +739,8 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             ResidencyCommand::Snapshot { reply } => {
                 let _ = reply.send(self.snapshot());
             }
-            ResidencyCommand::AcquirePackageRemoval { package_ids, reply } => {
-                self.package_removals.push_back((package_ids, reply));
-                self.admit_package_removal();
+            ResidencyCommand::ReleasePackages { package_ids, loaded, reply } => {
+                self.release_packages(&package_ids, loaded, reply);
             }
             ResidencyCommand::LoadFinished {
                 instance_id,
@@ -778,10 +752,6 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
 
     fn notify(&mut self, notification: ResidencyNotification) {
         match notification {
-            ResidencyNotification::PackageRemovalFinished => {
-                self.package_removal_active = false;
-                self.resume_pending();
-            }
             ResidencyNotification::LoadWorkerStarted {
                 instance_id,
                 worker,
@@ -882,8 +852,6 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             let _ = waiter.reply.send(Err(Self::inventory_failure(failure)));
             return;
         }
-        // A package removal excludes only new loads: demand for the current instance joins it.
-        let removing = self.package_removal_active || !self.package_removals.is_empty();
         match &mut self.state {
             ResidencyState::Loading(loading)
                 if loading.instance.model_id == waiter.target.model_id
@@ -898,7 +866,6 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             {
                 self.grant_ready(waiter);
             }
-            _ if removing => self.enqueue(waiter),
             ResidencyState::Vacant => self.start_loading(waiter),
             ResidencyState::Loading(_) | ResidencyState::Releasing(_) => {
                 self.enqueue(waiter);
@@ -924,45 +891,35 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         self.queue.push_back(waiter);
     }
 
-    fn admit_package_removal(&mut self) {
+    fn release_packages(
+        &mut self,
+        package_ids: &[ModelPackageId],
+        loaded: LoadedPackages,
+        reply: tokio::sync::oneshot::Sender<Result<(), InventoryError>>,
+    ) {
         if let Some(failure) = self.retirement_failure() {
-            let errors = self
-                .package_removals
-                .iter()
-                .map(|_| Self::inventory_failure(failure))
-                .collect::<Vec<_>>();
-            for ((_, reply), error) in self.package_removals.drain(..).zip(errors) {
-                let _ = reply.send(Err(error));
-            }
+            let _ = reply.send(Err(Self::inventory_failure(failure)));
             return;
         }
-        if self.package_removal_active
-            || matches!(
-                self.state,
-                ResidencyState::Loading(_) | ResidencyState::Releasing(_)
-            )
-        {
-            return;
-        }
-        while let Some((package_ids, reply)) = self.package_removals.pop_front() {
-            if reply.is_closed() {
-                continue;
+        let reading = |read: &[ModelPackageId]| package_ids.iter().find(|package_id| read.contains(package_id)).cloned();
+        // The instance loading or serving one of the packages, and the first it reads.
+        let reader = match &self.state {
+            ResidencyState::Loading(loading) => reading(&loading.configuration.bundle.package_ids())
+                .map(|package_id| (loading.instance.id.clone(), package_id)),
+            ResidencyState::Ready(ready) => {
+                reading(&ready.resources.package_ids).map(|package_id| (ready.instance.id.clone(), package_id))
             }
-            let loaded = match &self.state {
-                ResidencyState::Ready(ready) => package_ids
-                    .iter()
-                    .find(|package_id| ready.resources.package_ids.contains(package_id)),
-                _ => None,
-            };
-            if let Some(package_id) = loaded {
-                let _ = reply.send(Err(InventoryError::Loaded(package_id.0.clone())));
-                continue;
+            // A release under way ends by itself; the removal waits for what it held.
+            ResidencyState::Vacant | ResidencyState::Releasing(_) => None,
+        };
+        match (reader, loaded) {
+            (None, _) => {
+                let _ = reply.send(Ok(()));
             }
-            self.package_removal_active = true;
-            let _ = reply.send(Ok(PackageRemovalPermit {
-                notifier: self.controller.client().notifier(),
-            }));
-            break;
+            (Some((_, package_id)), LoadedPackages::Keep) => {
+                let _ = reply.send(Err(InventoryError::Loaded(package_id.0)));
+            }
+            (Some((instance_id, _)), LoadedPackages::Stop) => self.stop(instance_id, reply),
         }
     }
 
@@ -1307,14 +1264,11 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 );
                 self.state = ResidencyState::Ready(ready);
                 self.publish_current();
-                self.admit_package_removal();
-                if !self.package_removal_active {
-                    self.queue.retain(|waiter| !waiter.reply.is_closed());
-                    if self.queue.is_empty() {
-                        self.refresh_idle_deadline();
-                    } else {
-                        self.begin_ready_release(ModelReleaseReason::Replacement, Vec::new());
-                    }
+                self.queue.retain(|waiter| !waiter.reply.is_closed());
+                if self.queue.is_empty() {
+                    self.refresh_idle_deadline();
+                } else {
+                    self.begin_ready_release(ModelReleaseReason::Replacement, Vec::new());
                 }
             }
             Err(failure) => {
@@ -1460,7 +1414,6 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                     let _ = waiter.reply.send(Err(Self::inventory_failure(&failure)));
                 }
                 releasing.operation = ReleaseOperation::RetirementFailed { worker, failure };
-                self.admit_package_removal();
                 self.publish_current();
             }
         }
@@ -1623,11 +1576,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
     }
 
     fn start_next_queued(&mut self) {
-        self.admit_package_removal();
-        if self.package_removal_active
-            || !self.package_removals.is_empty()
-            || !matches!(self.state, ResidencyState::Vacant)
-        {
+        if !matches!(self.state, ResidencyState::Vacant) {
             return;
         }
         while let Some(waiter) = self.queue.pop_front() {
@@ -1636,22 +1585,6 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             }
             self.start_loading(waiter);
             break;
-        }
-    }
-
-    fn resume_pending(&mut self) {
-        self.queue.retain(|waiter| !waiter.reply.is_closed());
-        self.admit_package_removal();
-        if self.package_removal_active || !self.package_removals.is_empty() {
-            return;
-        }
-        match &self.state {
-            ResidencyState::Vacant => self.start_next_queued(),
-            ResidencyState::Ready(_) if !self.queue.is_empty() => {
-                self.begin_ready_release(ModelReleaseReason::Replacement, Vec::new());
-            }
-            ResidencyState::Ready(_) => {}
-            ResidencyState::Loading(_) | ResidencyState::Releasing(_) => {}
         }
     }
 
@@ -2030,7 +1963,8 @@ mod tests {
                     completion.finish(
                         instance_id,
                         Ok(PreparedResidency {
-                            package_ids: Vec::new(),
+                            // One package, named as its model.
+                            package_ids: vec![ModelPackageId(model_id.to_string())],
                             allocation: allocation(1),
                             device: test_device(),
                             worker,
@@ -2385,131 +2319,40 @@ mod tests {
         actor.abort();
     }
 
+    /// A removal releases the model reading its packages as its caller says: one no user asked
+    /// of the model is refused while it serves, which it goes on doing; one its user asked
+    /// stops it, and is answered once it has stopped. A model reading none of them is left
+    /// serving.
     #[tokio::test]
-    async fn package_removal_admission_excludes_new_model_loads() {
-        let (client, mut loads, _, actor) = test_residency(false);
-        let permit = client
-            .acquire_package_removal(vec![ModelPackageId("package-a".to_owned())])
-            .await
-            .expect("package removal admitted");
-        let request = tokio::spawn({
-            let client = client.clone();
-            async move {
-                client
-                    .acquire(test_target("model-a"), ResidencyAcquisition::Warm)
-                    .await
-            }
-        });
-        tokio::task::yield_now().await;
-        assert!(loads.try_recv().is_err());
-
-        drop(permit);
-        let (instance_id, model_id) = loads.recv().await.expect("load admitted after removal");
-        assert_eq!(model_id, "model-a:gguf:test");
-        client.stop(instance_id).await.expect("load stopped");
-        assert_explicit_stop(request.await.expect("request waiter"));
-        actor.abort();
-    }
-
-    /// Overnight soak: removing another installed model while a resident one served requests
-    /// released the resident with reason Replacement once the removal ended, because a request
-    /// for the resident arriving during the removal was queued as a load.
-    #[tokio::test]
-    async fn a_package_removal_neither_delays_nor_replaces_requests_for_the_resident_model() {
-        let (client, mut loads, workers, actor) = test_residency(true);
-        let serving = client
-            .acquire(
-                test_target("model-a"),
-                ResidencyAcquisition::Inference { progress: None },
-            )
-            .await
-            .expect("first acquisition");
-        let _ = loads.recv().await.expect("resident load");
-        let permit = client
-            .acquire_package_removal(vec![ModelPackageId("removed-package".to_owned())])
-            .await
-            .expect("removal of another model's package admitted");
-        let during = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            client.acquire(
-                test_target("model-a"),
-                ResidencyAcquisition::Inference { progress: None },
-            ),
-        )
-        .await
-        .expect("a request for the resident model is not queued behind the removal")
-        .expect("a request for the resident model is granted during the removal");
-        assert!(matches!(during, ResidencyGrant::Lease(_)));
-        drop(permit);
-        drop(during);
-        drop(serving);
-        let after = client
-            .acquire(test_target("model-a"), ResidencyAcquisition::Warm)
-            .await
-            .expect("the resident model is still granted");
-        assert!(matches!(after, ResidencyGrant::Ready(_)));
-        assert!(loads.try_recv().is_err(), "nothing was loaded again");
-        assert_eq!(
-            workers.lock().expect("test worker lock")[0]
-                .shutdown
-                .load(Ordering::Acquire),
-            0,
-            "the resident model was not released"
-        );
-        let snapshot = client.snapshot().await.unwrap();
-        assert!(matches!(
-            snapshot.instances.last().map(|instance| &instance.lifecycle),
-            Some(ModelInstanceLifecycle::Ready { .. })
-        ));
-        actor.abort();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn one_permit_covers_a_target_and_its_drafter_after_the_model_stopped() {
+    async fn a_removal_stops_or_keeps_the_model_reading_its_packages() {
         let (client, mut loads, _, actor) = test_residency(true);
         let ready = client
             .acquire(test_target("model-a"), ResidencyAcquisition::Warm)
             .await
             .expect("warm acquisition");
-        assert!(matches!(ready, ResidencyGrant::Ready(_)));
-        let (instance_id, _) = loads.recv().await.expect("model load");
-        client.stop(instance_id).await.expect("model stopped");
-
-        let permit = client
-            .acquire_package_removal(vec![
-                ModelPackageId("target".to_owned()),
-                ModelPackageId("drafter".to_owned()),
-            ])
-            .await
-            .expect("removal of the target and its drafter admitted at once");
-        drop(permit);
+        let _ = loads.recv().await.expect("resident load");
+        let package = ModelPackageId("model-a:gguf:test".to_owned());
+        let lifecycle = || async {
+            client.snapshot().await.unwrap().instances.last().map(|instance| instance.lifecycle.clone())
+        };
         client
-            .acquire_package_removal(vec![ModelPackageId("target".to_owned())])
+            .release_packages(vec![ModelPackageId("another".to_owned())], LoadedPackages::Stop)
             .await
-            .expect("the finished removal released its admission");
-        actor.abort();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn blocked_package_removal_is_refused_instead_of_waiting_forever() {
-        let (client, _, _, actor) = test_residency(false);
-        let held = client
-            .acquire_package_removal(vec![ModelPackageId("package-a".to_owned())])
-            .await
-            .expect("first removal admitted");
-        let refused = client
-            .acquire_package_removal(vec![ModelPackageId("package-b".to_owned())])
-            .await;
+            .expect("no model reads another package");
         assert!(matches!(
-            refused,
-            Err(InventoryError::ModelOperation { code, retryable: true, .. })
-                if code == "model_removal_busy"
+            client.release_packages(vec![package.clone()], LoadedPackages::Keep).await,
+            Err(InventoryError::Loaded(_))
         ));
-        drop(held);
+        assert!(matches!(lifecycle().await, Some(ModelInstanceLifecycle::Ready { .. })));
+        drop(ready);
         client
-            .acquire_package_removal(vec![ModelPackageId("package-b".to_owned())])
+            .release_packages(vec![package], LoadedPackages::Stop)
             .await
-            .expect("an abandoned admission request does not block the next one");
+            .expect("the model reading the package stopped");
+        assert!(matches!(
+            lifecycle().await,
+            Some(ModelInstanceLifecycle::Stopped { reason: ModelReleaseReason::UserStop })
+        ));
         actor.abort();
     }
 
@@ -2653,7 +2496,7 @@ mod tests {
                 assert_eq!(snapshot.instances[0].id, instance_id);
                 assert!(matches!(snapshot.instances[0].lifecycle, ModelInstanceLifecycle::Stopping { .. }));
                 assert!(client.acquire(test_target("model-b"), ResidencyAcquisition::Warm).await.is_err());
-                assert!(client.acquire_package_removal(vec![ModelPackageId("test-package".into())]).await.is_err());
+                assert!(client.release_packages(vec![ModelPackageId("test-package".into())], LoadedPackages::Stop).await.is_err());
                 assert!(loads.try_recv().is_err());
                 worker.fail_retirement.store(false, Ordering::Release);
                 client.stop(instance_id).await.expect("retry retires canceled load worker");
@@ -2765,7 +2608,7 @@ mod tests {
                 assert_eq!(snapshot.instances[0].id, instance_id);
                 assert!(matches!(snapshot.instances[0].lifecycle,
                     ModelInstanceLifecycle::Stopping { reason: ModelReleaseReason::Failure, .. }));
-                assert!(client.acquire_package_removal(vec![ModelPackageId("test-package".into())]).await.is_err());
+                assert!(client.release_packages(vec![ModelPackageId("test-package".into())], LoadedPackages::Stop).await.is_err());
                 assert!(loads.try_recv().is_err());
                 worker.fail_retirement.store(false, Ordering::Release);
                 client.stop(instance_id.clone()).await.expect("cleanup retry retires failed worker");
@@ -2804,7 +2647,7 @@ mod tests {
                 assert_eq!(snapshot.instances[0].id, first_id);
                 assert!(matches!(snapshot.instances[0].lifecycle, ModelInstanceLifecycle::Stopping { .. }));
                 assert!(client.acquire(test_target("model-b"), ResidencyAcquisition::Warm).await.is_err());
-                assert!(client.acquire_package_removal(vec![ModelPackageId("test-package".into())]).await.is_err());
+                assert!(client.release_packages(vec![ModelPackageId("test-package".into())], LoadedPackages::Stop).await.is_err());
                 assert!(loads.try_recv().is_err(), "unproven retirement admitted a new load");
                 worker.fail_retirement.store(false, Ordering::Release);
                 client.stop(first_id.clone()).await.expect("retry retires the same worker");
@@ -2984,11 +2827,10 @@ mod tests {
         let _ = loads.recv().await.expect("model load");
 
         tokio::time::advance(timeout / 2).await;
-        let permit = client
-            .acquire_package_removal(vec![ModelPackageId("unrelated-package".to_owned())])
+        client
+            .release_packages(vec![ModelPackageId("unrelated-package".to_owned())], LoadedPackages::Keep)
             .await
-            .expect("unrelated package removal admitted");
-        drop(permit);
+            .expect("no model reads an unrelated package");
         tokio::task::yield_now().await;
 
         tokio::time::advance(timeout / 2).await;

@@ -28,9 +28,10 @@
 
 mod directory;
 
-pub use directory::{DirectoryStore, Eviction, Examining, Layout, DEFAULT_CAPACITY};
+pub use directory::{DirectoryStore, Writing, DEFAULT_CAPACITY};
+pub use seismic_io::{Eviction, Examining, Layout};
 
-pub use seismic_native_target::{ArtifactKey, ArtifactStore, MemoryStore};
+pub use seismic_native_target::{ArtifactKey, ArtifactStore, HeldFile, MemoryStore};
 use std::sync::Arc;
 
 /// The store every device forms its programs through: `bytes`, where
@@ -345,8 +346,8 @@ impl ArtifactStore for ProgramStore {
         self.bytes.contains(namespace, key)
     }
 
-    fn file(&self, namespace: &str, key: &ArtifactKey) -> Option<std::path::PathBuf> {
-        self.bytes.file(namespace, key)
+    fn held(&self, namespace: &str, key: &ArtifactKey) -> Option<(Vec<u8>, HeldFile)> {
+        self.bytes.held(namespace, key)
     }
 
     fn put(&self, namespace: &str, key: &ArtifactKey, bytes: &[u8]) {

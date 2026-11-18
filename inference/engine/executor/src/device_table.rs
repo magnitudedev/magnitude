@@ -317,8 +317,20 @@ impl State {
 
 /// The rows steps named, kept in a file for the next time the table is
 /// served. An optimization: a file that cannot be read or written keeps
-/// none.
-pub struct KeptRows(PathBuf);
+/// none. The file is published whole without a lock ([`seismic_io::Store::publish`]):
+/// every writer of one table's rows writes rows any reader may seed from,
+/// and the last to land is kept. It states its count of rows and ends in a
+/// newline, so a file a crash left torn reads as none, never as fewer rows.
+///
+/// The directory lies in the kernel cache (`table-rows`), whose eviction
+/// places each file as an entry of its own; its writes are not counted
+/// toward the cache's eviction trigger: a table's rows are kilobytes against
+/// the quarter of its capacity the trigger waits for, and every opening of
+/// the cache evicts.
+pub struct KeptRows {
+    store: seismic_io::Store,
+    name: PathBuf,
+}
 
 impl KeptRows {
     /// The file in `directory` of the table `table` describes: everything
@@ -328,29 +340,39 @@ impl KeptRows {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        Self(directory.join(format!("{name}.rows")))
+        Self { store: seismic_io::Store::new(directory.to_owned(), seismic_io::Privacy::Shared), name: PathBuf::from(format!("{name}.rows")) }
+    }
+
+    /// Where the rows are kept.
+    #[cfg(test)]
+    fn path(&self) -> PathBuf {
+        self.store.root().join(&self.name)
     }
 
     pub(crate) fn read(&self) -> Vec<u64> {
-        std::fs::read_to_string(&self.0)
+        self.store
+            .read(&self.name, KEPT_ROWS_BYTES)
             .ok()
+            .flatten()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
             .and_then(|text| {
-                text.split_whitespace()
-                    .map(|row| row.parse().ok())
-                    .collect::<Option<Vec<_>>>()
+                let mut fields = text.strip_suffix('\n')?.split(' ');
+                let count = fields.next()?.parse::<usize>().ok()?;
+                let rows = fields.map(|row| row.parse().ok()).collect::<Option<Vec<_>>>()?;
+                (rows.len() == count).then_some(rows)
             })
             .unwrap_or_default()
     }
 
     pub(crate) fn write(&self, rows: &[u64]) {
-        let text = rows.iter().map(u64::to_string).collect::<Vec<_>>().join(" ");
-        let _ = self
-            .0
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| std::fs::write(&self.0, text));
+        let text = std::iter::once(rows.len()).map(|count| count.to_string()).chain(rows.iter().map(u64::to_string)).collect::<Vec<_>>().join(" ") + "\n";
+        let _ = self.store.publish(&self.name, seismic_io::Durability::Volatile, |file| std::io::Write::write_all(file, text.as_bytes()));
     }
 }
+
+/// The most bytes a table's kept rows are read as: a row's index is at most
+/// twenty digits and a space, and no table keeps more than its slots.
+const KEPT_ROWS_BYTES: u64 = 64 << 20;
 
 /// A read of rows the device selects, queued but not yet submitted: what
 /// its step binds. Dropped unsubmitted, it is abandoned: its filler opens its
@@ -1329,7 +1351,7 @@ mod tests {
             "magnitude-device-table-{}",
             std::process::id()
         ));
-        let file = KeptRows::of(&kept, "table").0;
+        let file = KeptRows::of(&kept, "table").path();
         let table = device_table(Some(&kept));
         crate::settle::owe(Rc::downgrade(&table));
         let table = ResidentTable::streamed(table);
@@ -1340,11 +1362,20 @@ mod tests {
         for _ in 1..DeviceTable::KEPT_AFTER_STEPS {
             table.indices(&[1]).unwrap();
         }
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "1 6");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "2 1 6\n");
         table.indices(&[3]).unwrap();
         crate::settle::settle();
         drop(table);
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "1 3 6");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "3 1 3 6\n");
+        // A file torn short, or of rows another count than it states, keeps
+        // none.
+        let kept_rows = KeptRows::of(&kept, "table");
+        for torn in ["3 1 3 6", "3 1 3\n", "1 3 6"] {
+            std::fs::write(&file, torn).unwrap();
+            assert_eq!(kept_rows.read(), Vec::<u64>::new(), "{torn:?}");
+        }
+        std::fs::write(&file, "3 1 3 6\n").unwrap();
+        assert_eq!(kept_rows.read(), [1, 3, 6]);
 
         // The kept rows take the first slots.
         let table = ResidentTable::streamed(device_table(Some(&kept)));

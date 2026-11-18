@@ -1,4 +1,4 @@
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -15,6 +15,7 @@ use magnitude_service_contracts::{
     Integrity, InventoryError, InventoryModel, InventoryProperties, ModelAvailability,
     ModelComponent, ModelDownloadEvent, ModelLocation, ModelSource,
 };
+use seismic_io::Privacy;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sha2_state::digest::common::hazmat::{SerializableState, SerializedState};
@@ -24,14 +25,8 @@ use tokio::sync::watch;
 
 use crate::hugging_face::{HubCredential, require_requested_revision, revision_metadata_url};
 use crate::identity::{content_id, inventory_entry_id};
-use crate::inventory::{
-    DownloadSpace, ManagedModelStore, build_model, hf_repo_dir, now,
-    repository_lock_path,
-};
-use crate::store_fs::{
-    acquire_exclusive_lock, ensure_owned_directory as ensure_store_directory,
-    quarantine_owned_path_sync,
-};
+use crate::inventory::{DownloadSpace, ManagedModelStore, build_model, hf_repo_dir, now};
+use crate::store_fs::{ensure_owned_directory as ensure_store_directory, lock_repository};
 use crate::validation::ValidatedDownloadPackage;
 
 const MAX_ATTEMPTS: usize = 5;
@@ -848,8 +843,9 @@ impl ManagedModelStore {
         operation.ensure_active()?;
         let (repository, _) = package.repository_revision();
         let repo_root = self.config.root.join("hub").join(hf_repo_dir(repository));
-        let repository_lock =
-            acquire_lock(repository_lock_path(&self.config.root, repository)).await?;
+        let repository_lock = lock_repository(&self.config.root, repository)
+            .await
+            .map_err(inventory_download_error)?;
         let components = package.components().to_vec();
         let result = self
             .run_download_inner(operation_id, package, operation, companion_bytes)
@@ -1120,7 +1116,7 @@ impl ManagedModelStore {
         }
 
         operation.ensure_active()?;
-        publish_package_snapshot(&repo_root, &snapshot, &commit, &components).await?;
+        publish_package_snapshot(&repo_root, &snapshot, &components).await?;
         let ready_at = now();
         let primary = components
             .iter()
@@ -1188,13 +1184,9 @@ impl ManagedModelStore {
 async fn publish_package_snapshot(
     repo_root: &Path,
     snapshot: &Path,
-    commit: &str,
     components: &[ModelComponent],
 ) -> Result<(), DownloadError> {
-    let incomplete = repo_root.join(".incomplete");
-    let snapshots = repo_root.join("snapshots");
-    ensure_owned_directory(&incomplete).await?;
-    ensure_owned_directory(&snapshots).await?;
+    ensure_owned_directory(&repo_root.join("snapshots")).await?;
 
     match tokio::fs::symlink_metadata(snapshot).await {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
@@ -1208,18 +1200,15 @@ async fn publish_package_snapshot(
         Err(error) => return Err(download_io(error)),
     }
 
-    // One fixed stage per commit is safe: every writer of this repository's snapshots, its
-    // stage and its blobs holds the repository lock (`inventory::repository_lock_path`,
-    // `<root>/locks/<repository>.lock`) exclusively across processes, a download from
-    // `run_download_locked` and a removal from the service alike. A stage a dead writer left is
-    // quarantined before it is used again.
-    let staged_snapshot = incomplete.join(format!("snapshot-{commit}"));
-    quarantine(&staged_snapshot).await?;
-    ensure_owned_directory(&staged_snapshot).await?;
+    // Staged beside the snapshot under a name of its own (`seismic_io::Store::stage`) and
+    // published whole: a reader finds the snapshot whole or absent, and a stage a dead writer
+    // left is the store's sweep's. Every writer of this repository's snapshots holds its record's
+    // lock (`store_fs::repository_record`), a download and a removal alike.
+    let staged = crate::store_fs::stage(snapshot).map_err(download_io)?;
     for component in components {
-        publish_snapshot_link(repo_root, &staged_snapshot, component).await?;
+        publish_snapshot_link(repo_root, staged.path(), component).await?;
     }
-    tokio::fs::rename(staged_snapshot, snapshot)
+    magnitude_service_utils::blocking::run(move || staged.publish())
         .await
         .map_err(download_io)?;
     sync_parent(snapshot).await
@@ -1533,12 +1522,12 @@ fn space_bytes(components: &[ModelComponent], sources: &[ComponentSource]) -> u6
 /// Whether the file system holding `directory` clones `source` into it: a clone made in
 /// `directory` and removed again (a clone it cannot remove is an error, never left behind unnamed).
 fn clones_into(source: &Path, directory: &Path) -> std::io::Result<bool> {
-    let probe = random_id("clone-probe").map_err(std::io::Error::other)?;
-    let probe = directory.join(format!(".{probe}"));
-    let cloned = clone_file(source, &probe);
+    // A name the store's sweep removes, should this process die before it does.
+    let probe = seismic_io::Temporary::reserve(directory, std::ffi::OsStr::new("clone-probe"));
+    let cloned = clone_file(source, probe.path());
     if cloned {
-        std::fs::remove_file(&probe).map_err(|error| {
-            let message = format!("removing the clone probe {}: {error}", probe.display());
+        std::fs::remove_file(probe.path()).map_err(|error| {
+            let message = format!("removing the clone probe {}: {error}", probe.path().display());
             std::io::Error::new(error.kind(), message)
         })?;
     }
@@ -1569,15 +1558,13 @@ fn clone_file(source: &Path, destination: &Path) -> bool {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn clone_file(source: &Path, destination: &Path) -> bool {
     use std::os::fd::AsRawFd as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
     let Ok(input) = File::open(source) else {
         return false;
     };
-    let Ok(output) = OpenOptions::new()
+    let Ok(output) = Privacy::Owner
+        .options()
         .write(true)
         .create_new(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .mode(0o600)
         .open(destination)
     else {
         return false;
@@ -1755,10 +1742,12 @@ async fn persist_integrity_checkpoint(
     Ok(())
 }
 
-/// Rename the verified partial blob onto the blob. The repository lock
-/// (`inventory::repository_lock_path`, `<root>/locks/<repository>.lock`), which
-/// `run_download_locked` holds exclusively across processes for the whole download, makes this
-/// download the only writer of both paths; the rename shows a reader the blob whole or absent.
+/// Rename the verified partial blob onto the blob, its content address, which it then holds
+/// unchanged until it is removed. The partial is no temporary file of the store: a download
+/// resumes it in place, across restarts, so it is named `<key>.incomplete`, which the store's
+/// sweep keeps. The repository's record lock (`store_fs::repository_record`), which
+/// `run_download_locked` holds across processes for the whole download, makes this download the
+/// only writer of both paths; the rename shows a reader the blob whole or absent.
 async fn publish_verified_blob(paths: &DownloadComponentPaths) -> Result<(), DownloadError> {
     tokio::fs::rename(&paths.partial, &paths.blob)
         .await
@@ -1889,7 +1878,7 @@ async fn publish_snapshot_link(
                 if matching {
                     return Ok(());
                 }
-                quarantine_owned_path_sync(&destination_clone).map_err(inventory_download_error)?;
+                crate::store_fs::quarantine_sync(&destination_clone).map_err(download_io)?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(download_io(error)),
@@ -1934,11 +1923,9 @@ async fn atomic_json(path: &Path, value: &impl serde::Serialize) -> Result<(), D
         resumable: true,
     })?;
     let path = path.to_owned();
-    magnitude_service_utils::blocking::run(move || {
-        magnitude_service_utils::file_cache::publish_private(&path, &bytes)
-    })
-    .await
-    .map_err(download_io)
+    magnitude_service_utils::blocking::run(move || crate::store_fs::publish_file(&path, &bytes))
+        .await
+        .map_err(download_io)
 }
 
 async fn sync_parent(path: &Path) -> Result<(), DownloadError> {
@@ -1997,26 +1984,9 @@ async fn recoverable_download_bytes(
         .unwrap_or(0)
 }
 
+/// Set what is at `path` aside, for the store's sweep ([`crate::store_fs::quarantine`]).
 async fn quarantine(path: &Path) -> Result<(), DownloadError> {
-    match tokio::fs::symlink_metadata(path).await {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(download_io(error)),
-    }
-    let destination = path.with_extension(format!(
-        "invalid-{}",
-        random_id("partial").map_err(inventory_download_error)?
-    ));
-    tokio::fs::rename(path, destination)
-        .await
-        .map_err(download_io)
-}
-
-async fn acquire_lock(path: PathBuf) -> Result<File, DownloadError> {
-    magnitude_service_utils::blocking::run(move || {
-        acquire_exclusive_lock(&path).map_err(inventory_download_error)
-    })
-    .await
+    crate::store_fs::quarantine(path).await.map_err(download_io)
 }
 
 fn open_partial(path: &Path) -> Result<File, DownloadError> {
@@ -2031,15 +2001,13 @@ fn open_partial(path: &Path) -> Result<File, DownloadError> {
             resumable: false,
         });
     }
-    let mut options = OpenOptions::new();
-    options.create(true).read(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-        options.mode(0o600);
-    }
-    options.open(path).map_err(download_io)
+    Privacy::Owner
+        .options()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(download_io)
 }
 
 /// Whether a newer operation has taken over this inventory entry, so a settling operation must
@@ -2674,6 +2642,7 @@ fn progress_totals(event: &ModelDownloadEvent) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store_fs::repository_record;
     use crate::inventory::InventoryConfig;
     use crate::package_service::validated_package_from_resolved;
     use magnitude_service_contracts::models::{
@@ -2791,14 +2760,9 @@ mod tests {
         tokio::fs::write(&paths.blob, b"current")
             .await
             .expect("current blob");
-        publish_package_snapshot(
-            &repository,
-            &repository.join("snapshots/current"),
-            "current",
-            &[component],
-        )
-        .await
-        .expect("additive snapshot publication");
+        publish_package_snapshot(&repository, &repository.join("snapshots/current"), &[component])
+            .await
+            .expect("additive snapshot publication");
 
         assert!(repository.join("snapshots/old").is_dir());
         assert!(repository.join("snapshots/current").is_dir());
@@ -2809,14 +2773,7 @@ mod tests {
     async fn publishing_the_first_revision_creates_the_snapshot_directory() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let repository = directory.path().join("repository");
-        let staged = repository.join(".incomplete/snapshot-current");
         let published = repository.join("snapshots/current");
-        tokio::fs::create_dir_all(&staged)
-            .await
-            .expect("staged snapshot");
-        tokio::fs::write(staged.join("model.gguf"), b"verified")
-            .await
-            .expect("staged model");
 
         let component = model_component(b"verified");
         let paths =
@@ -2828,11 +2785,15 @@ mod tests {
             .await
             .expect("verified blob");
 
-        publish_package_snapshot(&repository, &published, "current", &[component])
+        publish_package_snapshot(&repository, &published, &[component])
             .await
             .expect("first snapshot publication");
 
-        assert!(!staged.exists());
+        let snapshots = std::fs::read_dir(repository.join("snapshots"))
+            .expect("snapshots")
+            .map(|entry| entry.expect("snapshot").file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(snapshots, ["current"], "the stage is published, not left beside it");
         assert_eq!(
             tokio::fs::read(published.join("model.gguf"))
                 .await
@@ -2867,10 +2828,10 @@ mod tests {
                 .expect("verified blob");
         }
 
-        publish_package_snapshot(&repository, &snapshot, "current", &[target])
+        publish_package_snapshot(&repository, &snapshot, &[target])
             .await
             .expect("target publication");
-        publish_package_snapshot(&repository, &snapshot, "current", &[draft])
+        publish_package_snapshot(&repository, &snapshot, &[draft])
             .await
             .expect("draft publication");
 
@@ -3149,11 +3110,9 @@ mod tests {
         );
 
         // Holding the repository lock keeps fresh work from reaching the network.
-        let repository_lock = acquire_exclusive_lock(&repository_lock_path(
-            &manager.config.root,
-            "owner/repository",
-        ))
-        .expect("repository lock");
+        let repository_lock = crate::store_fs::model_store(&manager.config.root)
+            .lock_owned(&repository_record("owner/repository"))
+            .expect("repository lock");
         start().await.expect("retry");
         let retried = Arc::clone(
             manager
@@ -3200,11 +3159,9 @@ mod tests {
                 .await
                 .expect("checkpoint");
             // The operation waits on the repository lock, so it is cancelled before any transfer.
-            let repository_lock = acquire_exclusive_lock(&repository_lock_path(
-                &manager.config.root,
-                "owner/repository",
-            ))
-            .expect("repository lock");
+            let repository_lock = crate::store_fs::model_store(&manager.config.root)
+                .lock_owned(&repository_record("owner/repository"))
+                .expect("repository lock");
             let mut stream = manager
                 .start_target_downloads(vec![package.clone()])
                 .await
@@ -3252,11 +3209,9 @@ mod tests {
             .await
             .insert(key.clone(), Arc::clone(&settling));
         // Holding the repository lock keeps the new operation from reaching the network.
-        let repository_lock = acquire_exclusive_lock(&repository_lock_path(
-            &manager.config.root,
-            "owner/repository",
-        ))
-        .expect("repository lock");
+        let repository_lock = crate::store_fs::model_store(&manager.config.root)
+            .lock_owned(&repository_record("owner/repository"))
+            .expect("repository lock");
 
         let mut streams = manager
             .start_target_downloads(vec![package])
