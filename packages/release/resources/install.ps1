@@ -261,9 +261,10 @@ function Install-Launcher([string]$Source) {
 # Names the version in one replacement, so the launcher reads either the old or the new version.
 function Set-CurrentVersion([string]$Version) {
   $current = Join-Path $cliRoot 'current'
+  Get-ChildItem -LiteralPath $cliRoot -Force -Filter '.current-*' | Remove-Item -Force -ErrorAction SilentlyContinue
   $temporary = Join-Path $cliRoot ('.current-' + [Guid]::NewGuid().ToString('N'))
   [IO.File]::WriteAllText($temporary, "$Version`n")
-  if (Test-Path -LiteralPath $current) { [IO.File]::Replace($temporary, $current, $null) }
+  if (Test-Path -LiteralPath $current) { [IO.File]::Replace($temporary, $current, [NullString]::Value) }
   else { [IO.File]::Move($temporary, $current) }
 }
 function Assert-CliFiles([string]$Directory) {
