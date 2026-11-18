@@ -9,5 +9,5 @@ export const STANDALONE_CLI_DIRECTORY = MAC_CLI_DIRECTORY
  * same marked startup-file block the desktop's macOS command registration writes. It only edits that block;
  * it never touches other `magnitude` commands or PATH entries.
  */
-export const installStandaloneCliPath = (options: { readonly home: string; readonly environment: Readonly<Record<string, string>> }) =>
-  Effect.flatMap(makeMacCliPath(options.home, options.environment), path => path.install)
+export const installStandaloneCliPath = (options: { readonly home: string; readonly environment: Readonly<Record<string, string>>; readonly platform: NodeJS.Platform }) =>
+  Effect.flatMap(makeMacCliPath(options.home, options.environment, options.platform !== "darwin"), path => path.install)

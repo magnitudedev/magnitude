@@ -139,7 +139,9 @@ DWORD magnitude_cli_run(magnitude_cli_resolver resolve, int argc, WCHAR **argv, 
   if (!SetEnvironmentVariableW(L"MAGNITUDE_CLI_LAUNCHER_PROTOCOL", serving ? MAGNITUDE_CLI_LAUNCHER_PROTOCOL : NULL)) {
     failure = GetLastError(); goto cleanup;
   }
-  for (int attempt = 0; attempt < 2; ++attempt) {
+  /* Each continuation (a startup update, or a standalone update while serving) must run a different
+     executable, so a server that updates many times keeps going while nothing can loop in place. */
+  for (int attempt = 0;; ++attempt) {
     if (!resolve(executable)) {
       fputs("Magnitude is not installed. Install it from https://magnitude.dev, then run this command again.\n", stderr);
       code = 1;
@@ -162,7 +164,6 @@ DWORD magnitude_cli_run(magnitude_cli_resolver resolve, int argc, WCHAR **argv, 
     command[used] = 0;
     failure = run_child(executable, command, directory, serving, &code);
     if (failure || !serving || code != MAGNITUDE_CLI_CONTINUE || InterlockedCompareExchange(&stopping, 0, 0)) break;
-    if (attempt != 0) { failure = ERROR_RETRY; break; }
   }
 cleanup:
   SetConsoleCtrlHandler(console_control, FALSE);
