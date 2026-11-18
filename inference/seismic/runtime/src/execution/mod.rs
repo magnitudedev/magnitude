@@ -131,6 +131,7 @@ impl<T: TargetFamily, E: NativeExecutor<T>> AdmittedRun<T, E> {
     }
 
     pub(crate) fn submit(mut self) -> Result<SubmittedRun<T, E>, CallError> {
+        self.charges.device().ran_work();
         let mut issued = Ok(());
         let mut termination = SourceTermination::Returned(());
         let mut deferred_error = None;

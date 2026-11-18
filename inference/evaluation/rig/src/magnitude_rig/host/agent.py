@@ -87,7 +87,9 @@ in `logs/<phase>.log`:
                                               shares a checkout its tree is installed in;
                                               `tests` writes the test executables the
                                               build's cargo steps produced to PATH first
-                                              (`[[executable, manifest], ...]`)
+                                              (`{"tests": [[executable, manifest, target,
+                                              kind], ...], "build_scripts": {out_dir:
+                                              script or null}}`)
     {"op": "built", "side": S, "release": R,  complete the build's output (the executables
      "provenance": P}                         build provenance record P kept); record the
                                               units the build's cargo steps reference, trim
@@ -158,8 +160,9 @@ link keeps the bytes it was made of); the build's environment (`venv`) is synced
 build itself, without editable installs, so it names no checkout. When the build ends, the
 output gets every executable of the target's profile and example directories and every test
 executable the build's cargo steps produced, linked at their paths under its `target`, and the
-list of those test executables with their packages' directories in its `src` (`TESTS`), and is
-complete (`OUTPUT_DONE`): a run of the same tree and build that finds it complete reuses it.
+list of those test executables with their packages' directories and their ledger keys
+(`binary_key`) in its `src` (`TESTS`), and is complete (`OUTPUT_DONE`): a run of the same tree
+and build that finds it complete reuses it.
 Its `src` and `target` are each made aside and moved in under the guard, so the first run to
 finish one gives it and an output is never completed from parts; one no live run holds that
 is not complete was left by a run that died making it, and is discarded before it is held.
@@ -334,6 +337,22 @@ CLAIMED = ("checkout:", "output:")
 # In `<root>/outputs/<tree>-<build>/`: a build's output (`Runner.materialize`), complete once
 # `OUTPUT_DONE` is there, kept while a live run holds it.
 OUTPUTS, OUTPUT_DONE, TESTS = "outputs", "complete", "tests.json"
+# Cargo's target kinds whose test executable is named by `--<kind> NAME`; every other kind (lib,
+# rlib, proc-macro, cdylib...) is the package's library, `--lib`.
+NAMED_KINDS = ("bin", "test", "bench", "example")
+
+
+def target_kind(kinds: list) -> str:
+    """The kind of a cargo target (its `kind` list, as cargo's messages and metadata give it):
+    one of `NAMED_KINDS`, or `lib`."""
+    return next((kind for kind in kinds if kind in NAMED_KINDS), "lib")
+
+
+def binary_key(package: str, kind: str, name: str) -> str:
+    """A test executable's name across builds: its package's directory in the workspace, its
+    target kind and its target name (`engine/kernels:test:routed`), the ledger's key
+    (`ledger.py`)."""
+    return "%s:%s:%s" % (package, kind, name)
 # In a checkout: the key of the source last installed into it, and the tree it holds once installed.
 SOURCE, TREE = "source", "tree"
 # In a checkout: for each build (`engine.build_key`) it keeps, the units its latest build
@@ -1505,7 +1524,9 @@ class Runner:
         # What the current build's cargo steps reference (None before its first), and whether one
         # left it unknown (`_units`).
         self.units, self.unknown = None, False
-        self.tests = []  # the test executables the current build's cargo steps produced: (executable, manifest)
+        self.tests = []  # the test executables the current build's cargo steps produced: (executable, manifest, target, kind)
+        self.scripts = {}  # its build scripts' executables, by package id
+        self.build_scripts = {}  # its build scripts' executables, by the output directory each run wrote
         self.outputs = {}  # side -> its build output's directory
         self._phase_started = time.monotonic()
 
@@ -1580,23 +1601,26 @@ class Runner:
         its path under the output's `target`, and the list of the test executables with their
         packages' directories in the output's source (`TESTS`). The executables linked."""
         output, checkout = self.outputs[side], self.rig.checkout(self.checkouts[side])
-        tests, self.tests = self.tests, []
+        tests, self.tests, self.scripts, self.build_scripts = self.tests, [], {}, {}
         if os.path.exists(os.path.join(output, OUTPUT_DONE)):
             return 0
         target, into = os.path.realpath(os.path.join(checkout, "target")), os.path.join(output, "target")
         staged = os.path.join(output, ".target.%d" % os.getpid())
         os.makedirs(staged)
-        tests = [(os.path.realpath(path), manifest) for path, manifest in tests]
+        tests = [(os.path.realpath(path), manifest, name, kind) for path, manifest, name, kind in tests]
         with open(proven) as stream:
-            executables = set(json.load(stream)["kept"]) | {path for path, _ in tests}
+            executables = set(json.load(stream)["kept"]) | {path for path, *_ in tests}
         for path in executables:
             relative = os.path.relpath(path, target)
             os.makedirs(os.path.dirname(os.path.join(staged, relative)), exist_ok=True)
             os.link(path, os.path.join(staged, relative))
         source = os.path.join(checkout, "src")
-        listed = [{"executable": os.path.join(into, os.path.relpath(path, target)),
-                   "directory": os.path.join(output, "src", os.path.relpath(os.path.dirname(manifest), source))}
-                  for path, manifest in tests]
+        listed = []
+        for path, manifest, name, kind in tests:
+            package = os.path.relpath(os.path.dirname(manifest), source)
+            listed.append({"executable": os.path.join(into, os.path.relpath(path, target)),
+                           "directory": os.path.join(output, "src", package),
+                           "binary": binary_key(package, kind, name)})
         moved = self._move_in(staged, into, (os.path.join(output, TESTS), listed),
                               (os.path.join(output, OUTPUT_DONE), _now()))
         return len(executables) if moved else 0
@@ -1632,10 +1656,16 @@ class Runner:
                 self.events.output("stderr", message["message"]["rendered"])
             elif message.get("reason") == "compiler-artifact":
                 paths.extend(message["filenames"])
+                if "custom-build" in message["target"]["kind"]:
+                    self.scripts[message["package_id"]] = message["filenames"][0]
                 if message.get("executable") and message["profile"]["test"]:
-                    self.tests.append((message["executable"], message["manifest_path"]))
+                    target = message["target"]
+                    self.tests.append((message["executable"], message["manifest_path"], target["name"],
+                                       target_kind(target["kind"])))
             elif message.get("reason") == "build-script-executed":
                 paths.append(message["out_dir"])
+                # None where configuration overrides the script (`links`): nothing compiled it.
+                self.build_scripts[message["out_dir"]] = self.scripts.get(message["package_id"])
 
         return dict(request, argv=argv[:2] + [messages] + argv[2:]), output, paths
 
@@ -1728,7 +1758,8 @@ class Runner:
             self.events.note("skipped `%s`: checkout %s holds this tree" % (" ".join(argv)[:160], self.checkouts[op["install"]]))
             return
         if "tests" in op:  # the build's test executables, for its provenance step
-            _write_json(self._fill(op["tests"]), [list(test) for test in self.tests])
+            _write_json(self._fill(op["tests"]), {"tests": [list(test) for test in self.tests],
+                                                  "build_scripts": self.build_scripts})
         self.events.note("$ " + " ".join(argv))
         watch = None
         if "job" in op:

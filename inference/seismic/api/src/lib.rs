@@ -32,7 +32,17 @@ pub mod testing {
     pub use seismic_compiler::numerics::{compare_element, ElementComparison};
     use super::{Availability, BackendName, DeviceTopology, Executor};
 
-    pub use seismic_lang::registry::requested_test_backend as requested_backend;
+    /// The backend the test runner requests
+    /// ([`seismic_lang::registry::requested_test_backend`]), recorded as the
+    /// current test asking it: a test that chooses its devices by it is a
+    /// device test, judged by what it ran
+    /// ([`seismic_lang::registry::record_test_asked`]).
+    pub fn requested_backend() -> Option<BackendName> {
+        let requested = seismic_lang::registry::requested_test_backend();
+        seismic_lang::registry::record_test_asked(requested);
+        requested
+    }
+    pub use seismic_lang::registry::record_test_selected_none as record_selected_none;
     pub use seismic_lang::registry::{
         test_setup_only as setup_only, TEST_SETUP_CHECKED as SETUP_CHECKED,
         TEST_SETUP_UNCHECKED as SETUP_UNCHECKED,
@@ -104,7 +114,9 @@ pub mod testing {
 
     /// [`selected`] under the backend `requested`.
     fn selected_under(requested: Option<BackendName>, topology: &DeviceTopology, backend: BackendName) -> Option<&Executor> {
-        if requested.is_some_and(|requested| requested != backend) {
+        if let Some(requested) = requested.filter(|requested| *requested != backend) {
+            // Selecting `backend`, the test selects none of the backend the run requests.
+            seismic_lang::registry::record_test_selected_none(requested);
             return None;
         }
         let found = topology
@@ -119,6 +131,9 @@ pub mod testing {
                 .map(|executor| format!("{}: {:?}", executor.selector(), executor.availability()))
                 .collect::<Vec<_>>();
             panic!("the run requests {backend:?}, and this host has no available {backend:?} executor: {listed:?}");
+        }
+        if found.is_none() {
+            seismic_lang::registry::record_test_selected_none(backend);
         }
         found
     }

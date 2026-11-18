@@ -54,7 +54,8 @@ def test_test_builds_without_running_then_runs_its_executables_from_the_output_o
     (build,) = plan.builds  # it names its target, so no documentation tests
     assert build.argv == ("cargo", "test", "--message-format=short", "--no-run", "-p", "magnitude-kernels", "--test", "routed")
     ((_, job),) = plan.jobs
-    assert job.argv == ("{python}", "-m", "magnitude_rig.host", "tests", "--list", "{output}/tests.json", "--", "general")
+    assert job.argv == ("{python}", "-m", "magnitude_rig.host", "tests", "--list", "{output}/tests.json",
+                        "--ran", "{run_dir}/ran.json", "--", "general")
     # A cargo suite has the release catalog's headers, so no test of it lacks its inputs; the
     # host package is on PYTHONPATH from the job's `record`, not set again.
     assert plan.device == "device" and job.env == (("SEISMIC_TEST_BACKEND", "cuda"), ("MAGNITUDE_MODELS", "{models}"),
@@ -66,11 +67,18 @@ def test_test_builds_without_running_then_runs_its_executables_from_the_output_o
         ((_, filtered),) = REGISTRY["test"].plan(parse("test", *COMMON, "--", *given), None, "alpha").jobs
         assert filtered.argv[filtered.argv.index("--") + 1:] == passed
     assert not job.checkout
-    # One that runs documentation tests (names no target, or `--doc`) runs cargo in its checkout,
-    # which it keeps for the job.
-    for given in (("-p", "x"), ("-p", "x", "--doc"), ("-p", "x", "--lib", "--doc")):
-        ((_, whole),) = REGISTRY["test"].plan(parse("test", *COMMON, "--", *given, "--", "f"), None, "alpha").jobs
-        assert whole.argv == ("cargo", "test", *given, "--", "f") and whole.checkout
+    # One that runs documentation tests (names no target, or `--doc`) also runs them by cargo in
+    # its checkout, which it keeps for that job; its executables run from the output as any.
+    for given, built in ((("-p", "x"), ("-p", "x")), (("-p", "x", "--doc"), None),
+                         (("-p", "x", "--lib", "--doc"), ("-p", "x", "--lib"))):
+        planned = REGISTRY["test"].plan(parse("test", *COMMON, "--", *given, "f", "--", "--exact"), None, "alpha")
+        jobs = dict(planned.jobs)
+        assert jobs["doc"].argv == ("cargo", "test", "--doc", "-p", "x", "--", "f", "--exact") and jobs["doc"].checkout
+        if built is None:
+            assert planned.builds == () and "test" not in jobs
+        else:
+            assert planned.builds[0].argv[-len(built) - 1:] == (*built, "f")
+            assert jobs["test"].argv[-3:] == ("--", "f", "--exact") and not jobs["test"].checkout
     ((_, named),) = REGISTRY["test"].plan(parse("test", *COMMON, "--", "-p", "x", "--test=routed"), None, "alpha").jobs
     assert not named.checkout
     assert plan.acquires == engine.Headers(None)
@@ -80,7 +88,7 @@ def test_test_builds_without_running_then_runs_its_executables_from_the_output_o
             ("SEISMIC_TEST_BACKEND", backend), ("MAGNITUDE_MODELS", "{models}"),
             ("MAGNITUDE_CATALOG_HEADERS", "{catalog}/headers"))
     cpu = parse("test", "--backend", "cpu", "--purpose", "p", "--estimate", "1m", "--", "-p", "x")
-    assert "SEISMIC_TEST_BACKEND" not in dict(REGISTRY["test"].plan(cpu, None, "alpha").jobs[0][1].env)
+    assert dict(REGISTRY["test"].plan(cpu, None, "alpha").jobs[0][1].env)["SEISMIC_TEST_BACKEND"] == "cpu"
     # One that reads a model's files has the model, not the catalog.
     model = REGISTRY["test"].plan(parse("test", *COMMON, "--model", MODEL, "--", "-p", "x"), None, "alpha")
     assert model.acquires == engine.Weights(MODEL)
@@ -127,26 +135,6 @@ def test_python_test_answer_counts_pytests_summary(tmp_path):
     answer = REGISTRY["test"].answer(arguments, {"test": JobResult(tmp_path, log, 1)})
     assert answer.lines[0] == "FAIL 12 passed, 1 failed, 3 skipped (cuda)"
     assert answer.lines[1] == "failed: references/tests/test_released.py::test_a[x]"
-
-
-def test_test_answer_counts_and_names_failures(tmp_path):
-    log = tmp_path / "job.log"
-    log.write_text(
-        "running 3 tests\n---- routed::a stdout ----\n[stderr] thread 'routed::a' panicked at src/x.rs:1:1:\n"
-        "test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured\n"
-    )
-    answer = REGISTRY["test"].answer(parse("test", *COMMON, "--", "-p", "x"), {"test": JobResult(tmp_path, log, 101)})
-    assert not answer.ok
-    assert answer.lines[0] == "FAIL 2 passed, 1 failed, 0 ignored (cuda)"
-    assert answer.lines[1] == "failed: routed::a"
-
-
-def test_a_test_without_the_libtest_harness_reports_its_exit_and_its_own_output(tmp_path):
-    log = tmp_path / "job.log"
-    log.write_text("[stderr]      Running tests/residency_lifecycle.rs\nG-D residency lifecycle: all scenarios passed\n")
-    answer = REGISTRY["test"].answer(parse("test", *COMMON, "--", "-p", "x"), {"test": JobResult(tmp_path, log, 0)})
-    assert answer.ok and answer.lines == ("PASS exit 0, no test counts (cuda)",
-                                          "  G-D residency lifecycle: all scenarios passed")
 
 
 def test_script_ships_the_file_and_runs_it_by_its_interpreter(tmp_path):

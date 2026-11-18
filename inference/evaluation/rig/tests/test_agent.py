@@ -1352,7 +1352,8 @@ def _build_plan(stage: Path, tree: str, *after: dict, kept: tuple = ()) -> list:
     """Claim, install `stage`, build the crate's tests and record the build, its provenance keeping
     the executables `kept`, then run the tests from the output: a run of tree `tree`."""
     src, env = "{checkout:s}/src", {"CARGO_TARGET_DIR": "{checkout:s}/target"}
-    tests = run_op([sys.executable, "-m", "magnitude_rig.host", "tests", "--list", "{output:s}/tests.json"],
+    tests = run_op([sys.executable, "-m", "magnitude_rig.host", "tests", "--list", "{output:s}/tests.json",
+                    "--ran", "{output:s}/ran.json"],
                    stage, job="tests")
     tests["env"] = {"PYTHONPATH": str(AGENT.parents[2])}
     return [*_claim_and_install(stage, tree),
@@ -1415,6 +1416,7 @@ def test_a_build_runs_from_its_output_releases_its_checkout_and_trims_what_no_ke
     output = tmp_path / "outputs" / "t2-b"
     listed = json.loads((output / agent.TESTS).read_text())  # its library's unit tests and its `here`
     assert len(listed) == 2 and {test["directory"] for test in listed} == {str(output / "src" / "lib")}
+    assert {test["binary"] for test in listed} == {"lib:lib:my_lib", "lib:test:here"}
     assert all(test["executable"].startswith(str(output / "target" / "release" / "deps")) for test in listed)
     held = {e["kind"] for e in status(tmp_path)["entries"] if e["run"] == "second"}
     assert "output:t2-b" in held and not any(kind.startswith("checkout:") for kind in held)  # released at its build's end
@@ -1528,22 +1530,57 @@ def test_a_run_sharing_a_checkout_neither_trims_nor_records_it_nor_makes_room(tm
     assert ended(tmp_path, "holder")["failed"] is None
 
 
-def test_a_suite_run_from_its_output_fails_with_its_first_failure(tmp_path):
+LIBTEST = """#!{python}
+import os, sys
+if sys.argv[1:2] == ["--list"]:
+    print(*(["c: test"] if "--ignored" in sys.argv else ["a: test", "b: test", "c: test"]), sep="\\n")
+    raise SystemExit(0)
+with open(os.environ["SEISMIC_TEST_RECORD"], "a") as record:
+    record.write("ask metal a\\nopen metal a\\nrun metal a\\nask metal b\\nnone metal b\\nopen metal \\n")
+print(os.getcwd() == os.environ["CARGO_MANIFEST_DIR"], sys.argv[1:])
+print("running 3 tests", "test a ... ok", "test b ... ok", "test c ... ignored",
+      "test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out", sep="\\n")
+"""
+
+
+def test_a_suite_run_from_its_output_records_what_each_executable_ran(tmp_path):
     """`tests` runs each listed executable from its directory with CARGO_MANIFEST_DIR naming it,
-    and exits with the first failure."""
+    exits with the first failure, and records what each ran: libtest's outcomes and listing, and
+    from each test's record the backends it asked for, opened, worked on and selected none of, device use
+    on a thread no test names under that thread's name (here unnamed). An executable
+    without the libtest harness is one test, on its main thread; a selection runs only the
+    executables it keys, each on the tests it names."""
     host = lambda *argv: subprocess.run([sys.executable, "-m", "magnitude_rig.host", *argv], capture_output=True,
                                         text=True, env=dict(os.environ, PYTHONPATH=str(AGENT.parents[2])))
     (tmp_path / "pkg").mkdir()
     listed = []
-    for name, code in (("passes", 0), ("fails", 7)):
+    scripts = {"libtest": LIBTEST.format(python=sys.executable),
+               "bare": f"#!{sys.executable}\nimport os\nopen(os.environ['SEISMIC_TEST_RECORD'], 'a')"
+                       ".write('open cpu main\\nrun cpu main\\n')\nraise SystemExit(7)\n",
+               "unselected": f"#!{sys.executable}\nraise SystemExit(9)\n"}
+    for name, text in scripts.items():
         script = tmp_path / name
-        script.write_text(f"#!{sys.executable}\nimport os, sys\nprint(os.getcwd() == os.environ['CARGO_MANIFEST_DIR'], "
-                          f"sys.argv[1:])\nraise SystemExit({code})\n")
+        script.write_text(text)
         script.chmod(0o755)
-        listed.append({"executable": str(script), "directory": str(tmp_path / "pkg")})
+        listed.append({"executable": str(script), "directory": str(tmp_path / "pkg"), "binary": f"pkg:test:{name}"})
     (tmp_path / "tests.json").write_text(json.dumps(listed))
-    ran = host("tests", "--list", str(tmp_path / "tests.json"), "--", "filter")
-    assert ran.returncode == 7 and ran.stdout.count("True ['filter']") == 2
+    ran = host("tests", "--list", str(tmp_path / "tests.json"), "--ran", str(tmp_path / "ran.json"), "--", "filter")
+    assert ran.returncode == 7 and ran.stdout.count("True ['filter']") == 1
+    libtest, bare, _ = json.loads((tmp_path / "ran.json").read_text())
+    assert libtest == {"binary": "pkg:test:libtest", "executable": "libtest", "code": 0,
+                       "outcomes": {"a": "ok", "b": "ok", "c": "ignored"}, "counts": [2, 0, 1],
+                       "listed": ["a", "b", "c"], "ignored": ["c"],
+                       "executions": {"a": {"asked": ["metal"], "opened": ["metal"], "ran": ["metal"], "none": []},
+                                      "b": {"asked": ["metal"], "opened": [], "ran": [], "none": ["metal"]},
+                                      "": {"asked": [], "opened": ["metal"], "ran": [], "none": []}}}
+    assert bare["outcomes"] == {"": "FAILED"} and bare["listed"] == [""] and bare["counts"] is None
+    assert bare["executions"] == {"": {"asked": [], "opened": ["cpu"], "ran": ["cpu"], "none": []}}
+    (tmp_path / "selection.json").write_text(json.dumps({"pkg:test:libtest": ["a"], "pkg:test:bare": None}))
+    ran = host("tests", "--list", str(tmp_path / "tests.json"), "--ran", str(tmp_path / "ran.json"),
+               "--selection", str(tmp_path / "selection.json"), "--", "--include-ignored")
+    assert ran.returncode == 7 and "True ['--exact', 'a', '--include-ignored']" in ran.stdout
+    assert [record["binary"] for record in json.loads((tmp_path / "ran.json").read_text())] == \
+        ["pkg:test:libtest", "pkg:test:bare"]
 
 
 def test_the_disk_owner_removes_every_build_output_no_live_run_holds(tmp_path):

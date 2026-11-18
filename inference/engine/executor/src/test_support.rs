@@ -117,5 +117,9 @@ pub(crate) fn is_device_backend(selected: &crate::platform::SelectedDevice) -> b
     if !device && seismic::testing::requested_backend().is_some_and(|requested| requested != seismic::BackendName::Cpu) {
         panic!("the run requests {:?}, and this host selects {backend:?}", seismic::testing::requested_backend());
     }
+    if !device {
+        // The test has nothing to run here, which the runner records rather than a pass.
+        seismic::testing::record_selected_none(backend);
+    }
     device
 }

@@ -6421,6 +6421,129 @@ pub fn test_device_reached(what: &str) {
     }
 }
 
+/// The file the test runner asks each test's executions to be recorded in
+/// (`SEISMIC_TEST_RECORD`), the one owner of that variable; None when it
+/// asks none.
+fn test_record() -> Option<&'static std::path::Path> {
+    static RECORD: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    RECORD.get_or_init(|| std::env::var_os("SEISMIC_TEST_RECORD").map(Into::into)).as_deref()
+}
+
+/// Append `<event> <backend> <test>` to the runner's record, in one write,
+/// so the tests of a process record side by side. The test is the name
+/// libtest gives each test's thread; a thread it did not name (one a test
+/// or a worker pool spawned) records an empty name, which the runner reports
+/// as device use outside any test.
+fn append_test_record(path: &std::path::Path, event: &str, backend: &str) {
+    append_line(path, &format!("{event} {backend} {}\n", std::thread::current().name().unwrap_or("")));
+}
+
+fn append_line(path: &std::path::Path, line: &str) {
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(line.as_bytes()))
+        .unwrap_or_else(|error| panic!("the test record {path:?} cannot be written: {error}"));
+}
+
+/// A device's record of the tests that used it ([`TestDevice::ran`]): every
+/// test that opened it, the first its opener, and whether each has been
+/// credited with work on its backend. A test is credited with a backend only
+/// where it worked there, never for opening a device and skipping.
+pub struct TestDevice {
+    path: &'static std::path::Path,
+    backend: BackendName,
+    /// The tests that opened the device, in order, each with whether its
+    /// work there is recorded.
+    tests: std::sync::Mutex<Vec<(Option<String>, bool)>>,
+}
+
+impl TestDevice {
+    /// Record that the current thread's test opened a device of `backend`
+    /// (every open of the process, `seismic-runtime`'s), and the device's
+    /// recorder; None when the runner records nothing.
+    pub fn opened(backend: BackendName) -> Option<TestDevice> {
+        let path = test_record()?;
+        append_test_record(path, "open", backend.as_str());
+        let test = std::thread::current().name().map(str::to_owned);
+        Some(TestDevice { path, backend, tests: std::sync::Mutex::new(vec![(test, false)]) })
+    }
+
+    /// Record that the current thread's test opened the device again: it
+    /// shares the open device another test opened.
+    pub fn reopened(&self) {
+        append_test_record(self.path, "open", self.backend.as_str());
+        let test = std::thread::current().name().map(str::to_owned);
+        let mut tests = self.tests.lock().expect("test record lock is never poisoned");
+        if !tests.iter().any(|(known, _)| *known == test) {
+            tests.push((test, false));
+        }
+    }
+
+    /// The device did work (a submission, or memory allocated on it):
+    /// recorded once per test, for the test of the thread that did it where
+    /// that test opened the device, else for the test that opened it first
+    /// (the work of a thread a test spawned).
+    pub fn ran(&self) {
+        let mut tests = self.tests.lock().expect("test record lock is never poisoned");
+        if let Some(test) = credited(&mut tests, std::thread::current().name()) {
+            append_line(self.path, &format!("run {} {}\n", self.backend.as_str(), test.as_deref().unwrap_or("")));
+        }
+    }
+}
+
+/// The test of `tests` (a device's openers, the first its opener, each with
+/// whether it is credited) that work the thread named `current` did is
+/// credited to: that thread's test where it opened the device, else the
+/// opener. None where that test is credited already.
+fn credited<'a>(tests: &'a mut [(Option<String>, bool)], current: Option<&str>) -> Option<&'a Option<String>> {
+    let index = current
+        .and_then(|name| tests.iter().position(|(known, _)| known.as_deref() == Some(name)))
+        .unwrap_or(0);
+    let (test, done) = &mut tests[index];
+    (!std::mem::replace(done, true)).then_some(&*test)
+}
+
+#[cfg(test)]
+mod test_device_tests {
+    use super::credited;
+
+    /// Work on a shared device is its submitting thread's test's, once
+    /// each; a thread no opener names (a worker a test spawned) works for
+    /// the device's opener.
+    #[test]
+    fn a_shared_devices_work_is_credited_to_the_test_whose_thread_did_it() {
+        let name = |test: &str| Some(test.to_owned());
+        let mut tests = vec![(name("opener"), false), (name("sharer"), false)];
+        assert_eq!(credited(&mut tests, Some("sharer")), Some(&name("sharer")));
+        assert_eq!(credited(&mut tests, Some("sharer")), None);
+        assert_eq!(credited(&mut tests, Some("worker")), Some(&name("opener")));
+        assert_eq!(credited(&mut tests, None), None);
+        assert_eq!(credited(&mut tests, Some("opener")), None);
+    }
+}
+
+/// Record that the current thread's test selected no device of `backend`,
+/// the backend the runner requests, to run on: it lies outside the test's
+/// domain, or the host has none.
+pub fn record_test_selected_none(backend: BackendName) {
+    if let Some(path) = test_record() {
+        append_test_record(path, "none", backend.as_str());
+    }
+}
+
+/// Record that the current thread's test asked which backend the runner
+/// requests (`requested`, None for none): it chooses its devices, so it is
+/// never a host test, and where it neither works on the requested backend
+/// nor selects none of it, it was skipped there.
+pub fn record_test_asked(requested: Option<BackendName>) {
+    if let Some(path) = test_record() {
+        append_test_record(path, "ask", requested.map_or("any", BackendName::as_str));
+    }
+}
+
 /// The backend the test runner requests (`SEISMIC_TEST_BACKEND`), the one
 /// owner of that variable: a test then runs on it alone, and is skipped
 /// where it lies outside the test's backends. None when the variable is

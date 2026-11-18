@@ -31,18 +31,69 @@ def runs_doc_tests(arguments: list[str]) -> bool:
 
 def test_name(arguments: list[str]) -> list[str]:
     """The test name filter among cargo test's own `arguments` (its positional TESTNAME, which
-    cargo passes each test executable ahead of the arguments after `--`), or nothing. A valued
-    option takes the next argument, unless that is itself an option (`--test` alone, which lists
-    the targets)."""
-    names, taking = [], False
+    cargo passes each test executable ahead of the arguments after `--`), or nothing."""
+    return [value for option, value in options(arguments) if option == ""]
+
+
+def options(arguments: list[str]) -> list[tuple[str, str | None]]:
+    """Cargo test's own `arguments` as (option, value or None), positional names as ("", name):
+    a valued option takes the next argument, unless joined to it (`--opt=v`) or that is itself
+    an option (`--test` alone, which lists the targets)."""
+    found, taking = [], None
     for argument in arguments:
-        if taking and not argument.startswith("-"):
-            taking = False
+        if taking is not None and not argument.startswith("-"):
+            found.append((taking, argument))
+            taking = None
+            continue
+        if taking is not None:
+            found.append((taking, None))
+            taking = None
+        if argument.startswith("-") and "=" in argument:
+            found.append(tuple(argument.split("=", 1)))
+        elif argument in VALUED:
+            taking = argument
         elif argument.startswith("-"):
-            taking = argument in VALUED
+            found.append((argument, None))
         else:
-            names.append(argument)
-    return names
+            found.append(("", argument))
+    if taking is not None:
+        found.append((taking, None))
+    return found
+
+
+PACKAGES = {"-p", "--package"}
+FEATURES = {"-F", "--features", "--all-features", "--no-default-features"}
+PROFILES = {"--release", "-r", "--profile"}
+
+
+def packages(arguments: list[str]) -> set[str]:
+    """The packages cargo test's own `arguments` select."""
+    return {value for option, value in options(arguments) if option in PACKAGES and value}
+
+
+def configuration(arguments: list[str]) -> str:
+    """What cargo test's own `arguments` build the selected tests as, beyond the tree: the
+    profile, the feature options and the target, in one canonical text (`release`,
+    `test +a,b --target x`), which equal trees build equally under."""
+    found = options(arguments)
+    profile = next((value if option == "--profile" else "release" for option, value in found
+                    if option in PROFILES), "test")
+    features = sorted({feature for option, value in found if option in {"-F", "--features"} and value
+                       for feature in value.replace(",", " ").split()})
+    flags = sorted({option for option, _ in found if option in {"--all-features", "--no-default-features"}})
+    target = [f"--target {value}" for option, value in found if option == "--target"]
+    return " ".join([profile, *([f"+{','.join(features)}"] if features else []), *flags, *target])
+
+
+def without_targets(arguments: list[str]) -> list[str]:
+    """Cargo test's own `arguments` without their target selections and test name filter:
+    what builds the selection, and selects its packages."""
+    kept = []
+    for option, value in options(arguments):
+        if option == "" or option.split("=", 1)[0] in TARGETS | {"--doc"}:
+            continue
+        kept += [option] if value is None else [option, value]
+    return kept
 
 
 def failures(lines: list[str], limit: int = 20) -> list[str]:

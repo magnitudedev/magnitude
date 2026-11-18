@@ -3549,6 +3549,7 @@ pub(crate) fn submit(
             }
         }
     }
+    first.public_device.ran_work();
     let trace = first.public_device.active_trace();
     let encode_start = trace::host_seconds();
     let labels = trace.as_ref().map(|_| launch_labels(list, repetitions));

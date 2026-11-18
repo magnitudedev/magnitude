@@ -191,6 +191,11 @@ class Work:
     files: tuple[Path, ...] = ()  # local files the jobs read, as `{inputs}/<name>`
 
 
+# Each side's build provenance in its run's results (`host/provenance.py`).
+PROVENANCE = "provenance-{side}.json"
+TESTS = "tests-{side}.json"  # a side's test executables, as its build's runner writes them
+
+
 class Refused(Exception):
     """Why a request's work cannot be planned for a host: a fact of it the plan reads is not
     recorded."""
@@ -728,8 +733,8 @@ def _build(plan: Plan, side: Side) -> None:
         unless = {} if step.unless is None else {"unless": _fill(step.unless, tokens)}
         plan.step(side, _substitute(step.argv, tokens), plan.environment(step, tokens), **unless)
     tokens = plan.tokens(side, None)
-    output = plan.remote.path("runs", plan.run_id, f"provenance-{side.label}.json")
-    tests = plan.remote.path("runs", plan.run_id, f"tests-{side.label}.json")  # the runner writes it
+    output = plan.remote.path("runs", plan.run_id, PROVENANCE.format(side=side.label))
+    tests = plan.remote.path("runs", plan.run_id, TESTS.format(side=side.label))  # the runner writes it
     argv, env = plan.host_module(side, "provenance", "--output", output, "--source", tokens["src"],
                                  "--target", tokens["target"], "--tests", tests, "--", *_texts(plan, side))
     plan.step(side, argv, env, tests=tests)

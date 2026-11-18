@@ -733,6 +733,9 @@ pub mod device {
     /// One opened executor: its immutable description, execution resources
     /// and the stores it charges.
     pub struct DeviceInner {
+        /// The tests that opened the device, which its work is recorded for
+        /// where the test runner asks (`seismic_lang::registry::TestDevice`).
+        pub(crate) test: Option<seismic_lang::registry::TestDevice>,
         pub(crate) info: Executor,
         pub(crate) topology: Arc<DeviceTopology>,
         pub(crate) memory: Arc<crate::memory::DeviceStores>,
@@ -765,6 +768,14 @@ pub mod device {
         >,
     }
     impl DeviceInner {
+        /// The device did work, a submission or an allocation: its test
+        /// ran there (`seismic_lang::registry::TestDevice::ran`).
+        pub(crate) fn ran_work(&self) {
+            if let Some(test) = &self.test {
+                test.ran();
+            }
+        }
+
         pub(crate) fn active_trace(&self) -> Option<Arc<crate::native::trace::TraceSink>> {
             self.trace
                 .lock()
@@ -844,15 +855,6 @@ pub mod device {
             self.capabilities
                 .get_or_init(|| self.kind.capabilities())
                 .as_slice()
-        }
-        pub(crate) fn map_read_only_host_region(
-            self: &Arc<Self>,
-            region: super::HostRegion,
-            alignment: u64,
-        ) -> Result<Arc<Allocation>, super::TensorError> {
-            self.kind
-                .map_read_only_host_region(region, alignment)
-                .map_err(super::TensorError::Execution)
         }
         pub(crate) fn allocation_address(&self, allocation: &Arc<Allocation>, offset: u64) -> u64 {
             self.kind.allocation_address(allocation, offset)
@@ -1282,7 +1284,7 @@ pub mod tensor {
         let bytes = seismic_lang::registry::record_table(
             offsets.map(|offset| device.allocation_address(storage, offset)),
         );
-        let table = device.kind.allocate_contract(
+        let table = device.allocate_contract(
             charges.of(Contract::DeviceOnly, bytes.len() as u64)?,
             bytes.len() as u64,
             seismic_lang::registry::RECORD_TABLE_ENTRY_BYTES,

@@ -161,6 +161,7 @@ fn tallied_devices(
     let selected = seismic::testing::requested_backend();
     if let Some(backend) = selected.filter(|backend| !backends.contains(backend)) {
         eprintln!("native test backends: none, {backend:?} is outside this test's backend domain");
+        seismic::testing::record_selected_none(backend);
         return Vec::new();
     }
     let discovery = Devices::discover(&[]).expect("test device discovery");
