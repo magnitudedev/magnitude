@@ -1,16 +1,17 @@
-"""Fitting fixtures to context lengths with one engine's own rendering.
+"""Fitting sessions to their templates' contexts with one engine's own rendering, for a run
+that measures no GGUF engine (whose sizing is the harness's, ``harness.HarnessRenderer``).
 
-``Fixture.sized`` asks for one rendered length at a time. Rendering is a process call (the
-harness, or a comparison engine's own template path), so the sizing of every fixture runs
-in lockstep: each sizing waits on its own thread, and the lengths all pending sizings ask
-for are rendered together in one batch.
+``Session.sized`` asks for one rendered length at a time. Rendering is a process call (a
+comparison engine's own template path), so the sizing of every session runs in lockstep: each
+sizing waits on its own thread, and the lengths all pending sizings ask for are rendered
+together in one batch.
 """
 
 import asyncio
 from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 
-from magnitude_fixtures import Conversation, Fixture
+from magnitude_fixtures import Conversation, Session
 from magnitude_fixtures.canonical import encoded
 
 Message = dict
@@ -27,9 +28,9 @@ def chat(messages: list[Message], tools: list[Message]) -> dict:
     }
 
 
-async def size(targets: list[tuple[Fixture, int]], lengths: Lengths) -> list[Conversation]:
-    """Each fixture sized to its target by the contract rule (the most history at or under
-    the target), in order; renders are batched and never repeated. A fixture whose whole
+async def size(targets: list[tuple[Session, int]], lengths: Lengths) -> list[Conversation]:
+    """Each session sized to its target by the contract rule (the most history at or under
+    the target), in order; renders are batched and never repeated. A session whose whole
     history fits under its target is refused rather than served short."""
     loop = asyncio.get_running_loop()
     known: dict[str, int] = {}
@@ -70,21 +71,21 @@ async def size(targets: list[tuple[Fixture, int]], lengths: Lengths) -> list[Con
     # One thread per sizing: a sizing that could not start would stall the lockstep.
     threads = ThreadPoolExecutor(max_workers=max(1, len(targets)), thread_name_prefix="sizing")
 
-    async def one(fixture: Fixture, target: int) -> Conversation:
+    async def one(session: Session, target: int) -> Conversation:
         nonlocal live
         try:
             conversation = await loop.run_in_executor(
-                threads, fixture.sized, target, rendered_length
+                threads, session.sized, target, rendered_length
             )
         finally:
             live -= 1
             await flush()
-        if len(conversation.messages) == len(fixture.messages):
+        if len(conversation.messages) == len(session.messages):
             # Every unit fits: the context would be measured shorter than it is named.
-            raise ValueError(f"{fixture.id} holds too little history to fill {target} tokens")
+            raise ValueError(f"a session holds too little history to fill {target} tokens")
         return conversation
 
     try:
-        return list(await asyncio.gather(*(one(fixture, target) for fixture, target in targets)))
+        return list(await asyncio.gather(*(one(session, target) for session, target in targets)))
     finally:
         threads.shutdown(wait=False, cancel_futures=True)

@@ -1,4 +1,5 @@
-"""RULER-derived key/value retrieval sessions with needles at the start of the context.
+"""The ``ruler`` fixture: RULER-derived key/value ``retrieve`` sessions with needles at the
+start of the context.
 
 Adapted from NVIDIA/RULER's NIAH record-haystack and multi-query tasks:
 https://github.com/NVIDIA/RULER/tree/c3f5e3b4f87f97e048793bb510a3a6b19a46bf3a
@@ -12,10 +13,9 @@ farthest facts from the question, whatever the context length.
 """
 
 import json
-from typing import Literal
 
 from .canonical import digest
-from .fixture import Fixture, Generation, Message, Source, TurnSizing
+from .session import Generation, Message, Session, Source
 
 SOURCE = {
     "repository": "https://github.com/NVIDIA/RULER",
@@ -24,6 +24,9 @@ SOURCE = {
     "recipe": "ruler-record-retrieval-v2",
 }
 OUTPUT_TOKENS = 1_024
+#: Needles a probe asks for.
+QUERIES = 4
+SEED = 42
 RECORDS_PER_TURN = 64
 DISTRACTOR_TURNS = 192
 INSTRUCTION = (
@@ -44,23 +47,23 @@ def block(lines: list[str]) -> str:
     return "Records:\n" + "\n".join(lines)
 
 
-def build(*, count: int, queries: int, seed: int = 42) -> list[Fixture]:
-    """``count`` sessions; lane ``k`` draws its facts from seed ``seed + k``."""
-    if count < 1:
-        raise ValueError("retrieval fixtures need at least one probe")
-    if not 1 <= queries <= 16:
-        raise ValueError("retrieval queries must be within 1..16")
-    variant: Literal["single", "multiquery"] = "single" if queries == 1 else "multiquery"
-    source = Source(name="ruler", digest=digest(SOURCE))
-    fixtures = []
-    for lane in range(count):
-        lane_seed = seed + lane
-        needles = dict(record(lane_seed, i) for i in range(queries))
+def source() -> Source:
+    return Source(name="ruler", digest=digest({**SOURCE, "queries": QUERIES, "seed": SEED}))
+
+
+def build(*, lanes: int) -> list[Session]:
+    """``lanes`` sessions; lane ``k`` draws its facts from seed ``SEED + k``."""
+    if lanes < 1:
+        raise ValueError("retrieve yields at least one lane")
+    sessions = []
+    for lane in range(lanes):
+        lane_seed = SEED + lane
+        needles = dict(record(lane_seed, i) for i in range(QUERIES))
         total = RECORDS_PER_TURN * (1 + DISTRACTOR_TURNS)
         lines = [": ".join(record(lane_seed, i)) for i in range(total)]
-        # Records 0..queries are the needles, placed in the middle of the first block.
-        middle = queries + (RECORDS_PER_TURN - queries) // 2
-        first = lines[queries:middle] + lines[:queries] + lines[middle:RECORDS_PER_TURN]
+        # Records 0..QUERIES are the needles, placed in the middle of the first block.
+        middle = QUERIES + (RECORDS_PER_TURN - QUERIES) // 2
+        first = lines[QUERIES:middle] + lines[:QUERIES] + lines[middle:RECORDS_PER_TURN]
         messages: list[Message] = [
             {"role": "system", "content": INSTRUCTION},
             {"role": "user", "content": block(first)},
@@ -76,16 +79,14 @@ def build(*, count: int, queries: int, seed: int = 42) -> list[Fixture]:
             {"role": "user", "content": "Return the values for these keys: " + ", ".join(needles)}
         )
         messages.append({"role": "assistant", "content": json.dumps(needles), "scored": True})
-        fixtures.append(
-            Fixture(
-                id=f"retrieval/ruler/{variant}-q{queries}-s{lane_seed}",
-                family="retrieval",
-                source=source,
+        sessions.append(
+            Session(
+                key="retrieve",
                 messages=messages,
                 generation=Generation(
                     prefix=prefix, max_tokens=OUTPUT_TOKENS, expected={"values": needles}
                 ),
-                sizing=TurnSizing(keep_head=3),
+                keep_head=3,
             )
         )
-    return fixtures
+    return sessions

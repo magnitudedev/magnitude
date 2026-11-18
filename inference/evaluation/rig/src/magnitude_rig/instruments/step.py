@@ -1,7 +1,8 @@
-"""`step`: how fast is the model's step at this context, prefill and decode, and where does the
+"""`step`: how fast is the model's step on this template, prefill and decode, and where does the
 decode step's time go?
 
-The harness `time` at one context and `--sequences` decoded together (one by default), without
+The harness `time` on one template (its context) and `--sequences` decoded together (one by
+default; sequence k is the template's lane k, so C sequences are C distinct requests), without
 drafting (the drafter is `draft`'s), on the host's kernel cache (so stored tuning is
 reused, never searched afresh between runs), or, under `--cold`, caches of the run's own: the median
 step with its 95% interval from the measured steps, the launches per step, and the device
@@ -27,8 +28,8 @@ charge is `memory`'s.
 `--resident RUN` takes the resident cell from earlier step run RUN's recorded result instead of
 timing it again, when the question is only the streamed cells': the streamed cells are predicted
 from, and the ratios and verdict read, that record. Only a record of the same resident cell
-serves (`_accept_resident`): the same host, model, backend, build identity, context, sequences,
-lookahead, timing, tuning budget and fixture set; any other refuses the host, so the run goes to the host the
+serves (`_accept_resident`): the same host, model, backend, build identity, template file, sequences,
+lookahead, timing and tuning budget; any other refuses the host, so the run goes to the host the
 record was measured on, or fails naming what differs.
 
 `--streamed-only` asks only the streamed cells' absolute terms (their steps, the window's device
@@ -58,7 +59,7 @@ import json
 import shutil
 from pathlib import Path
 
-from .. import store, sync
+from .. import store, sync, templates
 from ..engine import Refused, Step, Weights
 from . import Answer, Instrument, JobResult, Measure, Plan, harness, lacking, unrecorded
 from .assess import preceded, priced
@@ -70,7 +71,8 @@ UNMEASURED = "magnitude-assess: not measured: "
 
 def configure(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--sequences", type=int, default=1,
-                        help="sequences prefilled and decoded together, each at the context (default 1)")
+                        help="sequences prefilled and decoded together, lanes 0 … n − 1 of the template, "
+                             "each at its context (default 1)")
     parser.add_argument("--warm", type=int, default=8,
                         help="decode steps before the measured ones (default 8)")
     parser.add_argument("--steps", type=int, default=64, help="measured decode steps (default 64)")
@@ -91,7 +93,7 @@ def configure(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--resident", metavar="RUN",
                         help="take the resident cell from step run RUN's recorded result, not timed again "
                              "(with --weight-cap; refused unless RUN measured the same host, model, backend, "
-                             "build, context, sequences, lookahead, timing, tuning budget and fixture set)")
+                             "build, template file, sequences, lookahead, timing and tuning budget)")
     parser.add_argument("--streamed-only", action="store_true",
                         help="with --weight-cap: time no resident cell; report the streamed cells' absolute "
                              "terms alone, never a ratio to resident")
@@ -132,13 +134,18 @@ def caches(arguments) -> tuple[tuple[str, str], ...]:
     return (("XDG_CACHE_HOME", f"{own}/user"), ("CUDA_CACHE_PATH", f"{own}/nv"))
 
 
-def time(arguments, family: str, *extra: str) -> tuple[str, ...]:
+def template(arguments) -> Path:
+    """The run's template file: lanes 0 … `--sequences` − 1 of `--template`."""
+    return templates.file(arguments.template, arguments.sequences)
+
+
+def time(arguments, *extra: str) -> tuple[str, ...]:
     return (
         harness.EXECUTABLE, "time",
-        "--artifacts", "{artifacts}", "--fixtures", f"{{inputs}}/{family}.jsonl",
+        "--artifacts", "{artifacts}", "--template", templates.argument(template(arguments)),
         "--output", "{run_dir}", "--build-identity", "{build_file}",
         "--cache-dir", kernels(arguments), "--device", arguments.backend,
-        "--contexts", str(arguments.context), "--concurrency", str(arguments.sequences),
+        "--concurrency", str(arguments.sequences),
         "--warm", str(arguments.warm), "--steps", str(arguments.steps),
         "--attribution-steps", str(arguments.attribution),
         *(("--prefill-attribution",) if arguments.attribution else ()),
@@ -165,12 +172,11 @@ def jobs(arguments, prefix: str, *pinning: str) -> tuple[tuple[str, Step], ...]:
     """The resident step (unless taken from a record, `--resident`), then, under weight caps, the
     measurement and each streamed step, predicted from the resident step's result
     (`{runs}/<prefix>step`, or the record's in the inputs)."""
-    family = arguments.fixture.stem
     if arguments.streamed_only:
         resident, against = (), ()
     elif arguments.resident is None:
         fresh = ("--fresh-tuning",) if arguments.fresh_tuning else ()
-        load = Step("time", time(arguments, family, *pinning, *fresh), env=caches(arguments))
+        load = Step("time", time(arguments, *pinning, *fresh), env=caches(arguments))
         resident = (("step", load), *((("warm", load),) if arguments.cold else ()))
         against = ("--resident-decode", f"{{runs}}/{prefix}step/result.json")
     else:
@@ -179,7 +185,7 @@ def jobs(arguments, prefix: str, *pinning: str) -> tuple[tuple[str, Step], ...]:
         return resident
     caps = tuple(
         (harness.streamed(cap), Step("time", time(
-            arguments, family, *pinning, "--weight-cap", str(cap), *against,
+            arguments, *pinning, "--weight-cap", str(cap), *against,
         ), env=caches(arguments), fresh=True))
         for cap in arguments.weight_cap
     )  # fmt: skip
@@ -206,7 +212,7 @@ def plan(arguments, source, host) -> Plan:
         jobs=jobs(arguments, ""),
         device="device" if arguments.untimed else "timed",
         acquires=Weights(arguments.model),
-        files=(arguments.fixture, *(() if arguments.resident is None else (_recorded(arguments),)),
+        files=(template(arguments), *(() if arguments.resident is None else (_recorded(arguments),)),
                *((arguments.tuning_replay,) if arguments.tuning_replay else ())),
     ), bool(arguments.weight_cap), arguments.backend)
 
@@ -226,12 +232,12 @@ def _identity(record: dict) -> dict:
     replay = _option(command, "--tuning-replay")
     return {
         "host": record["host"]["alias"], "model": record["model"], "build": record["build"],
-        "backend": _option(command, "--device"), "context": _option(command, "--contexts"),
+        "backend": _option(command, "--device"),
         "sequences": _option(command, "--concurrency"), "lookahead": _option(command, "--lookahead"),
         "untimed": "--untimed" in command, "tuning_budget": _option(command, "--tuning-budget"),
         "tuning_defaults": "--tuning-defaults" in command,
         "tuning_replay": replay and Path(replay).name,
-        "fixtures": record["fixture_set"]["digest"],
+        "templates": [entry["digest"] for entry in record["templates"]],
     }
 
 
@@ -239,12 +245,12 @@ def _wanted(arguments, source, host: str) -> dict:
     """`_identity` of the cells this run would measure on `host`."""
     return {
         "host": host, "model": arguments.model, "build": source.identity.to_json(),
-        "backend": arguments.backend, "context": str(arguments.context), "sequences": str(arguments.sequences),
+        "backend": arguments.backend, "sequences": str(arguments.sequences),
         "lookahead": arguments.lookahead, "untimed": arguments.untimed,
         "tuning_budget": str(arguments.tuning_budget) if arguments.tuning_budget else None,  # as `time` passes it
         "tuning_defaults": arguments.tuning_defaults,
         "tuning_replay": arguments.tuning_replay and arguments.tuning_replay.name,
-        "fixtures": hashlib.sha256(arguments.fixture.read_bytes()).hexdigest(),
+        "templates": [hashlib.sha256(template(arguments).read_bytes()).hexdigest()],
     }
 
 
@@ -282,6 +288,16 @@ def alternate(arguments, side: str, index: int) -> tuple[tuple[str, Step], ...]:
     else:
         pinning = harness.REPLAY
     return preceded(jobs(arguments, f"{side}-r{index}-", *pinning), bool(arguments.weight_cap), arguments.backend)
+
+
+def _digests(result: JobResult, detail: dict) -> str:
+    """What makes the decode comparable with another run's: its template, the digest of each
+    lane's rendered prompt and of the tokens it selected; two runs compare only when all match."""
+    decode = cell(result, "decode")
+    if missing := lacking(decode, "template", "prompt_sha256") + lacking(detail, "selected_sha256"):
+        return unrecorded("digests", missing)
+    prompts = ",".join(digest[:12] for digest in decode["prompt_sha256"])
+    return f"  {decode['template']} · prompt {prompts} · selected {detail['selected_sha256'][:12]}"
 
 
 def cell(result: JobResult, phase: str) -> dict:
@@ -831,9 +847,9 @@ def answer(arguments, results: dict[str, JobResult]) -> Answer:
     tok_s = 1000 * arguments.sequences / step_ms
     cold = "" if lacking(prefill, "cold_ms") else f" · cold {prefill['cold_ms']:.1f} ms"
     lines = [
-        (f"step @{arguments.context}{together} · {step_ms:.3f} ms (±{half:.3f}, ±{100 * half / step_ms:.1f}%) · "
+        (f"step {arguments.template.name}{together} · {step_ms:.3f} ms (±{half:.3f}, ±{100 * half / step_ms:.1f}%) · "
          f"{tok_s:.1f} tok/s" + (f" · {launches} launches" if launches is not None else "")),
-        (f"prefill @{arguments.context} · {prefill_ms:.1f} ms (±{prefill_half:.1f}, "
+        (f"prefill {arguments.template.name} · {prefill_ms:.1f} ms (±{prefill_half:.1f}, "
          f"±{100 * prefill_half / prefill_ms:.1f}%) · {1000 * prefill['rows'] / prefill_ms:.0f} tok/s{cold}"),
         *_idle(detail),
     ]
@@ -875,7 +891,7 @@ def answer(arguments, results: dict[str, JobResult]) -> Answer:
         loads = {phase: _load_ms(result) for phase, result in (("cold", result), ("warm", warm))}
         lines.insert(0, f"load cold {loads['cold'] / 1000:.2f} s · warm {loads['warm'] / 1000:.2f} s")
         measures.update({f"{phase}_load_ms": Measure(ms, "ms", None, True) for phase, ms in loads.items()})
-    lines.append(tuning)
+    lines += [_digests(result, detail), tuning]
     return Answer(tuple(lines), ok, measures)
 
 
@@ -887,9 +903,9 @@ def _load_ms(result: JobResult) -> float:
 INSTRUMENT = Instrument(
     name="step",
     kind="speed",
-    question="How fast is the model's step at this context (prefill and decode), and per entry?",
+    question="How fast is the model's step on this template (prefill and decode), and per entry?",
     observable="decode step time with per-entry attribution",
-    selectors=("backend", "host", "build", "model", "context", "fixture", "purpose", "estimate"),
+    selectors=("backend", "host", "build", "model", "template", "purpose", "estimate"),
     configure=configure,
     plan=plan,
     answer=answer,

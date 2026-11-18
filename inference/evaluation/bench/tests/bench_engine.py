@@ -22,7 +22,7 @@ class Handler(BaseHTTPRequestHandler):
         assert body["chat_template_kwargs"] == {"enable_thinking": False}
         events = [
             {
-                "id": "fixture",
+                "id": "stream",
                 "choices": [
                     {
                         "index": 0,
@@ -39,11 +39,11 @@ class Handler(BaseHTTPRequestHandler):
                 ],
             },
             {
-                "id": "fixture",
+                "id": "stream",
                 "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
             },
             {
-                "id": "fixture",
+                "id": "stream",
                 "choices": [],
                 "usage": {
                     "prompt_tokens": 10,

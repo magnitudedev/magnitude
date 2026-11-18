@@ -1,6 +1,6 @@
 import pytest
-from magnitude_fixtures.code import File
-from magnitude_fixtures.tools import materialize
+from magnitude_fixtures.bfcl import materialize
+from magnitude_fixtures.bigcodebench import Task
 
 
 def bfcl(index: int, name: str, value: int) -> tuple[dict, dict]:
@@ -39,9 +39,13 @@ def book():
 
 
 @pytest.fixture
-def files():
+def tasks():
     return [
-        File(path="src/a.rs", content="fn a() {}\n"),
-        File(path="src/b.ts", content="export const b = 1;\n"),
-        File(path="src/c.py", content="def c():\n    return 3\n"),
+        Task(
+            task_id=f"BigCodeBench/{i}",
+            instruct_prompt=f"Return {i}.\nYou should write self-contained code starting with:\n```\ndef task_func():\n```",
+            code_prompt="def task_func():\n",
+            canonical_solution=f"    return {i}\n",
+        )
+        for i in range(4)
     ]

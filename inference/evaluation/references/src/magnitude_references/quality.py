@@ -3,7 +3,7 @@ contract summary, and the noise-aware judgement of a candidate against a base.
 
 `KL(P || Q)` takes P as the truth: the reference when judging an engine, the base when judging
 the candidate against it. Both outputs must be over the same rendered input, and the tested
-output's rows, matched by fixture and position, must be distinct and among the truth's (contract
+output's rows, matched by session (template and lane) and position, must be distinct and among the truth's (contract
 "Logits output"). An output whose header names no `sample` scored every row, so its rows must be
 exactly the truth's; one that names its sample scored the rows that sample chose, which its
 producer, the one owner of the selection rule, lists.
@@ -37,7 +37,7 @@ class Incomparable(ValueError):
 class Positions:
     """Per-position KL and top-1 agreement of one pair, aligned with the logits rows."""
 
-    rows: tuple[dict, ...]  # {"fixture_id", "position"}
+    rows: tuple[dict, ...]  # {"template", "lane", "position"}
     kl: np.ndarray
     agree: np.ndarray
 
@@ -47,14 +47,19 @@ class Positions:
         return Positions(rows, self.kl[index], self.agree[index])
 
 
+def key(row: dict) -> tuple[str, int, int]:
+    """A logits row's identity: its session (template and lane) and position."""
+    return row["template"], row["lane"], row["position"]
+
+
 def matched(rows: tuple[dict, ...] | list[dict], subset: tuple[dict, ...] | list[dict]) -> np.ndarray:
-    """The index into `rows` of each row of `subset`, matched by fixture and position."""
-    where = {(row["fixture_id"], row["position"]): index for index, row in enumerate(rows)}
-    missing = [row for row in subset if (row["fixture_id"], row["position"]) not in where]
+    """The index into `rows` of each row of `subset`, matched by session and position."""
+    where = {key(row): index for index, row in enumerate(rows)}
+    missing = [row for row in subset if key(row) not in where]
     if missing:
         raise Incomparable(f"{len(missing)} rows are not among the rows compared against: first {missing[0]}")
     return np.fromiter(
-        (where[row["fixture_id"], row["position"]] for row in subset), dtype=np.intp, count=len(subset)
+        (where[key(row)] for row in subset), dtype=np.intp, count=len(subset)
     )
 
 
@@ -124,7 +129,7 @@ def compare_outputs(truth: Path, test: Path) -> Positions:
 
 
 def _distinct(directory: Path, rows: tuple[dict, ...] | list[dict]) -> None:
-    keys = {(row["fixture_id"], row["position"]) for row in rows}
+    keys = {key(row) for row in rows}
     if len(keys) != len(rows):
         raise Incomparable(f"{directory} repeats {len(rows) - len(keys)} of its rows")
 

@@ -15,14 +15,14 @@ always.
 Each topology is one run of its own, all at once, each placed by the rig's placement among the
 hosts of that topology (a host of another refuses the plan). Under one device hold (no thermal
 gate: nothing is timed), every entry at its declared default (no tuning search) and with the
-gate's model, context and weight cap (`MODEL`, `CONTEXT`, `WEIGHT_CAP`), its experts read from
+gate's model, template and weight cap (`MODEL`, `TEMPLATE`, `WEIGHT_CAP`), its experts read from
 storage, it runs:
 
 - `step`: `step`'s harness `time` as served (lookahead on, no logits exported), at the fewest
   steps and samples the harness takes: it loads streamed, prefills (a cold and a warm sample) and
   decodes `STEPS` steps;
-- `logits`: `kl`'s harness `logits`, streamed likewise, on the first fixture of the step's own
-  rendering cut to its first `ROWS` scored rows (`trim`): one prefill, then `ROWS` decodes, each
+- `logits`: `kl`'s harness `logits`, streamed likewise, on the same template, scoring one window
+  of `ROWS` predicting positions (`--sample 1,ROWS`): one prefill, then `ROWS` decodes, each
   exporting its logits;
 - `finite`: whether every logit the logits job produced is finite.
 
@@ -63,31 +63,19 @@ KIND = "correctness"
 QUESTION = "Does this build load and step correctly on every topology?"
 OBSERVABLE = "a streamed load's prefill, decode steps and logits, per topology"
 MODEL = "qwen3.6-35b-a3b:gguf:q4"
-CONTEXT = 4096
+TEMPLATE = "repeat:4k"
 # The ceiling on MODEL's weight bytes: the bank grows to the most expert slots the cap holds, at
 # most every expert, so a cap at or above the load's weights with every expert resident streams
 # nothing and the gate would pass without exercising streaming; below the weights its bank needs
 # at its minimum the load is refused. This one holds about a fifth of each layer's experts, the
 # shape expert streaming is measured at, so the rest stream from storage.
 WEIGHT_CAP = 6890894474
-FIXTURE = "prose-repeat"
 STEPS = 2  # the fewest measured steps the harness `time` takes
 ROWS = 4  # the logits job's decodes
 MEMORIES = ("unified", "dedicated")
 UNGATED = ("cpu",)
 DEFAULTS = ("--tuning-defaults",)
 
-# The rendering's first fixture, its first scored span cut to its first ROWS rows: argv[1] the
-# rendering, argv[2] the output, argv[3] ROWS. Run on the host.
-TRIM = (
-    "import json, sys\n"
-    "with open(sys.argv[1]) as stream:\n"
-    "    line = json.loads(stream.readline())\n"
-    "start, end = line['scored_spans'][0]\n"
-    "line['scored_spans'] = [[start, min(end, start + int(sys.argv[3]))]]\n"
-    "with open(sys.argv[2], 'w') as stream:\n"
-    "    stream.write(json.dumps(line) + '\\n')\n"
-)
 # Whether every float32 of the logits file argv[1] is finite; the first non-finite one named.
 FINITE = (
     "import array, math, sys\n"
@@ -263,23 +251,20 @@ def _arguments(backend: str) -> argparse.Namespace:
     """What `step.time` and `kl.logits` read of their arguments: the step instrument's own parser
     at the gate's settings, so an option the step gains can't go missing here."""
     parser = argparse.ArgumentParser()
-    selectors.add(parser, ("backend", "context", "fixture"))
+    selectors.add(parser, ("backend", "template"))
     step.configure(parser)
     return parser.parse_args((
-        "--backend", backend, "--context", str(CONTEXT), "--fixture", FIXTURE, "--warm", "0",
+        "--backend", backend, "--template", TEMPLATE, "--warm", "0",
         "--steps", str(STEPS), "--prefill-samples", "1", "--attribution", "0", "--untimed",
     ))  # fmt: skip
 
 
 def jobs(backend: str) -> tuple[tuple[str, engine.Step], ...]:
     arguments = _arguments(backend)
-    timed = step.time(arguments, arguments.fixture.stem, *DEFAULTS, "--weight-cap", str(WEIGHT_CAP))
+    timed = step.time(arguments, *DEFAULTS, "--weight-cap", str(WEIGHT_CAP))
     return (
         ("step", engine.Step("time", timed, fresh=True)),
-        ("trim", engine.Step("trim", ("{python}", "-c", TRIM, "{runs}/step/rendered.jsonl",
-                                      "{run_dir}/rendered.jsonl", str(ROWS)))),
-        ("logits", kl.logits(arguments, rendered="{runs}/trim/rendered.jsonl", pinning=DEFAULTS,
-                             weight_cap=WEIGHT_CAP)),
+        ("logits", kl.logits(arguments, pinning=(*DEFAULTS, "--sample", f"1,{ROWS}"), weight_cap=WEIGHT_CAP)),
         ("finite", engine.Step("finite", ("{python}", "-c", FINITE, "{runs}/logits/logits.f32"))),
     )
 
@@ -294,7 +279,7 @@ def _work(wanted: Topology, source: sources.Source):
             jobs=tuple(engine.Job("source", name, job) for name, job in jobs(wanted.backend)),
             device="device",
             acquires=engine.Weights(MODEL),
-            files=(_arguments(wanted.backend).fixture,),
+            files=(step.template(_arguments(wanted.backend)),),
         )
 
     return work
@@ -315,7 +300,7 @@ def answer(arguments, results: dict[str, JobResult]) -> Answer:
         if result.code != 0:
             return Answer((f"{name} exited {result.code}: {_said(result)}", f"  log: {result.log}"), False)
     finite = _said(results["finite"])
-    return Answer((f"{MODEL} @{CONTEXT} streamed under {WEIGHT_CAP} · loaded, prefilled and decoded "
+    return Answer((f"{MODEL} {TEMPLATE} streamed under {WEIGHT_CAP} · loaded, prefilled and decoded "
                    f"{STEPS} steps as served · {ROWS} logits rows: {finite.removeprefix('gate: ')}",), True)
 
 
@@ -417,7 +402,7 @@ def run(arguments) -> int:
 def configure(parser: argparse.ArgumentParser) -> None:
     parser.description = f"{QUESTION} (observes: {OBSERVABLE})"
     parser.epilog = (__doc__.split("\n\n", 1)[1]
-                     .replace("(`MODEL`, `CONTEXT`, `WEIGHT_CAP`)", f"({MODEL}, {CONTEXT} tokens, weight cap {WEIGHT_CAP})")
+                     .replace("(`MODEL`, `TEMPLATE`, `WEIGHT_CAP`)", f"({MODEL}, {TEMPLATE}, weight cap {WEIGHT_CAP})")
                      .replace("`STEPS`", str(STEPS)).replace("`ROWS`", str(ROWS)))
     parser.formatter_class = argparse.RawDescriptionHelpFormatter
     selectors.add(parser, ("build", "purpose"))

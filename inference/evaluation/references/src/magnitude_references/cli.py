@@ -1,6 +1,6 @@
 """magnitude-references: independent float32 references of the model families.
 
-  run            reference logits + sanity gate for a rendered fixture set (exit 1 when the gate fails)
+  run            reference logits + sanity gate for a template's rendered sessions (exit 1 when the gate fails)
   kl             a build's logits against the cached reference (and against a base build's, and a
                  yardstick's or the storage-resolution bar's, `--yardstick-perturbed SEED...`); a layer
                  slice's reference (a target with a slice's provenance record) is judged by its admission alone,
@@ -48,7 +48,7 @@ def parser() -> argparse.ArgumentParser:
                                    formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = root.add_subparsers(dest="command", required=True)
 
-    run = commands.add_parser("run", help="reference logits and sanity gate for rendered fixtures")
+    run = commands.add_parser("run", help="reference logits and sanity gate for rendered sessions")
     run.add_argument("--rendered", type=Path, required=True, help="harness `render` output (JSON Lines)")
     run.add_argument("--artifacts", type=Path, required=True, help="catalog acquisition object (JSON)")
     run.add_argument("--output", type=Path, help="run directory (default: <stamp>-reference-<id> in the repository's results store, "
@@ -73,7 +73,7 @@ def parser() -> argparse.ArgumentParser:
                      help="the storage-resolution bar: the reference over its stored values moved by one step of "
                      "their formats, one draw per seed (the `perturbed:SEED` variant, built and cached when missing); "
                      "the build is within it when every judgeable row's KL is within 64 times the draws' largest there")
-    kl.add_argument("--own-rendering", type=Path, help="the build's own `render` of the fixtures, to compare")
+    kl.add_argument("--own-rendering", type=Path, help="the build's own `render` of the template, to compare")
     kl.add_argument("--artifacts", type=Path, required=True, help="catalog acquisition object (JSON)")
     kl.add_argument("--build-identity", type=Path, required=True, help="identity of the reference tools' tree")
     kl.add_argument("--cache", type=Path, required=True, help="the host's reference cache")

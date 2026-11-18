@@ -1,4 +1,4 @@
-"""Independent float32 model-family references: the true outputs for rendered fixtures.
+"""Independent float32 model-family references: the true outputs for rendered sessions.
 
 Python API: `build_reference(rendered, artifacts, output, Options(device))` writes the contract logits
 output, `reference.json` (with the sanity gate) and `result.json`; the CLI is `magnitude-references`.

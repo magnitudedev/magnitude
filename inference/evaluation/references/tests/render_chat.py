@@ -1,6 +1,6 @@
-"""TEST-ONLY helper: a small rendered-fixture JSONL for smoke-testing a reference on real weights.
+"""TEST-ONLY helper: a small rendered-session JSONL for smoke-testing a reference on real weights.
 
-Not part of the package: real rendered fixtures come only from the harness `render` subcommand (the
+Not part of the package: real rendered sessions come only from the harness `render` subcommand (the
 engine's own template and tokenizer path). This helper exists because the harness is built in
 parallel; it renders chat conversations with the GGUF's own chat template (jinja2, as transformers
 renders it) and the model's Hugging Face `tokenizer.json`, and can also emit the same text without any
@@ -82,7 +82,6 @@ def main() -> None:
     bos = tokens_table[package.metadata["tokenizer.ggml.bos_token_id"].value] if adds_bos else ""
     target_sha256 = sha256(options.gguf)
     conversations = json.loads(options.conversations.read_text())
-    set_digest = sha256(options.conversations)
     options.output.mkdir(parents=True, exist_ok=True)
     lines = []
     for index, messages in enumerate(conversations):
@@ -93,16 +92,18 @@ def main() -> None:
         encoding = tokenizer.encode(text, add_special_tokens=False)
         spans = token_spans(encoding.offsets, char_spans(text, messages))
         lines.append({
-            "fixture_id": f"smoke/{'raw' if options.raw else 'chat'}/{index}", "fixture_set_digest": set_digest,
+            "template": f"smoke-{'raw' if options.raw else 'chat'}", "lane": index,
             "model": options.model, "target_sha256": target_sha256,
-            "template_sha256": hashlib.sha256(b"" if options.raw else template.encode()).hexdigest(),
-            "context_target": None, "tokens": encoding.ids, "scored_spans": spans, "generation_prefix_tokens": None,
+            "chat_template_sha256": hashlib.sha256(b"" if options.raw else template.encode()).hexdigest(),
+            "request_options": {}, "context": len(encoding.ids), "history": 0, "tokens": encoding.ids,
+            "prompt_sha256": hashlib.sha256(b"".join(token.to_bytes(4, "little") for token in encoding.ids)).hexdigest(),
+            "scored_spans": spans, "generation_prefix_tokens": spans[0][0],
         })
     (options.output / "rendered.jsonl").write_text("".join(json.dumps(line) + "\n" for line in lines))
     (options.output / "artifacts.json").write_text(json.dumps({
         "model": options.model, "target": str(options.gguf.resolve()), "target_sha256": target_sha256,
         "drafter": None, "projector": None}, indent=1) + "\n")
-    print(json.dumps([{"fixture_id": line["fixture_id"], "tokens": len(line["tokens"]),
+    print(json.dumps([{"lane": line["lane"], "tokens": len(line["tokens"]),
                        "scored": sum(e - s for s, e in line["scored_spans"])} for line in lines]))
 
 

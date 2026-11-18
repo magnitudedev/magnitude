@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from test_instruments import record_topology
 
-from magnitude_rig import engine, gate, state, store
+from magnitude_rig import engine, gate, state, store, templates
 from magnitude_rig.cli import parser
 from magnitude_rig.connection import HostError
 from magnitude_rig.hosts import HostConfig, Hosts
@@ -89,7 +89,7 @@ def test_the_gate_runs_each_recorded_topology_once_among_its_hosts(tmp_path, mon
     # A topology's run is placed only among its own hosts.
     work = gate._work(CUDA, source=None)
     assert work("rtx-b").device == "device" and [job.name for job in work("rtx-b").jobs] == \
-        ["step", "trim", "logits", "finite"]
+        ["step", "logits", "finite"]
     with pytest.raises(engine.Refused, match="cuda device is unified, not dedicated"):
         work("gb10")
     with pytest.raises(engine.Refused, match="run mrig device --host fresh first"):
@@ -97,30 +97,25 @@ def test_the_gate_runs_each_recorded_topology_once_among_its_hosts(tmp_path, mon
 
 
 def test_each_topology_streams_a_capped_load_at_the_fewest_steps_and_checks_its_logits():
-    timed, trim, logits, finite = (step for _, step in gate.jobs("vulkan"))
+    timed, logits, finite = (step for _, step in gate.jobs("vulkan"))
     argv = list(timed.argv)
     option = lambda flag: argv[argv.index(flag) + 1]
     assert timed.fresh and logits.fresh  # each a streamed load, its experts read from storage
-    assert option("--weight-cap") == str(gate.WEIGHT_CAP) and option("--contexts") == str(gate.CONTEXT)
+    assert option("--weight-cap") == str(gate.WEIGHT_CAP) and "--contexts" not in argv
+    assert json.loads(Path(option("--template").replace("{inputs}", str(templates.TEMPLATES))).read_text())["template"] \
+        == gate.TEMPLATE
     assert option("--device") == "vulkan" and option("--steps") == "2" and option("--warm") == "0"
     assert option("--prefill-samples") == "2" and option("--attribution-steps") == "0"
     assert option("--lookahead") == "on" and "--untimed" in argv and "--tuning-defaults" in argv
-    assert "{runs}/trim/rendered.jsonl" in logits.argv and "--tuning-defaults" in logits.argv
+    assert logits.argv[logits.argv.index("--template") + 1] == option("--template")
+    assert logits.argv[logits.argv.index("--sample") + 1] == f"1,{gate.ROWS}" and "--tuning-defaults" in logits.argv
     assert finite.argv[-1] == "{runs}/logits/logits.f32"
 
 
-def test_the_host_checks_cut_the_rendering_and_find_a_non_finite_logit(tmp_path):
+def test_the_host_check_finds_a_non_finite_logit(tmp_path):
     import array
     import subprocess
     import sys
-
-    rendered = tmp_path / "rendered.jsonl"
-    rendered.write_text(json.dumps({"fixture_id": "a", "scored_spans": [[100, 300], [400, 500]]}) + "\n"
-                        + json.dumps({"fixture_id": "b", "scored_spans": [[50, 60]]}) + "\n")
-    cut = tmp_path / "cut.jsonl"
-    subprocess.run([sys.executable, "-c", gate.TRIM, str(rendered), str(cut), "4"], check=True)
-    assert [json.loads(line) for line in cut.read_text().splitlines()] == \
-        [{"fixture_id": "a", "scored_spans": [[100, 104]]}]
 
     def check(values) -> subprocess.CompletedProcess:
         path = tmp_path / "logits.f32"
@@ -204,9 +199,9 @@ def test_each_topologys_line_is_pass_or_its_first_error(tmp_path):
     panicked = gate.answer(arguments, {
         "step": job("step", 101, "[stderr] thread 'main' panicked at src/plan.rs:9:5:", "[stderr] bindings alias",
                     "[stderr] note: run with RUST_BACKTRACE=1"),
-        "trim": job("trim", 1, "FileNotFoundError"), "logits": job("logits", 1), "finite": job("finite", 1)})
+        "logits": job("logits", 1), "finite": job("finite", 1)})
     assert not panicked.ok
     assert panicked.lines[0] == "step exited 101: thread 'main' panicked at src/plan.rs:9:5: bindings alias"
-    passed = gate.answer(arguments, {name: job(name, 0) for name in ("step", "trim", "logits")}
+    passed = gate.answer(arguments, {name: job(name, 0) for name in ("step", "logits")}
                          | {"finite": job("finite", 0, "gate: logits finite: 600000 values")})
     assert passed.ok and passed.lines[0].endswith("logits finite: 600000 values")

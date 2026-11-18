@@ -221,11 +221,13 @@ def test_pressure_rejects_missing_observations_and_windows():
 
 def test_pressure_selector_and_dedicated_serving_options_share_the_cli_judge():
     base = ["--bin", "bin", "--backend", "cuda", "--memory", "dedicated", "--scratch", "scratch",
-            "--artifacts", "artifacts", "--context", "4096", "--weight-cap", "1000",
-            "--residency", "harness", "fixture", "256"]
+            "--artifacts", "artifacts", "--weight-cap", "1000",
+            "--residency", "template.json", "256"]
     assert "unified-memory load" in memory.refusal(memory.parser().parse_args(base))
     assert memory.refusal(memory.parser().parse_args([*base, "--pressure-store", "device"])) is None
     assert "it takes --pressure-store" in memory.refusal(memory.parser().parse_args([*base, "--pressure-prompt"]))
+    assert "takes no --context" in memory.refusal(memory.parser().parse_args(
+        [*base, "--pressure-store", "device", "--context", "4096"]))
 
 
 def test_owner_events_retain_resizes_yields_and_shortages():
@@ -242,17 +244,21 @@ def test_owner_events_retain_resizes_yields_and_shortages():
 
 def test_dedicated_pressure_plans_the_existing_serving_harness(monkeypatch):
     from argparse import Namespace
-    from pathlib import Path
+    from magnitude_fixtures import Template
+    from magnitude_rig import templates
     from magnitude_rig.instruments import memory as instrument, harness
     monkeypatch.setattr(instrument.device, "memory", lambda host, backend: "dedicated")
     arguments = Namespace(backend="cuda", model="qwen3.6-35b-a3b:gguf:q4", weight_cap=1000,
-                          context=4096, residency=256, pressure_store="device",
-                          pressure_prompt=False, fixture=Path("fixture.jsonl"))
+                          context=None, residency=256, pressure_store="device",
+                          pressure_prompt=False, template=Template.parse("repeat:4k"))
     plan = instrument.plan(arguments, None, None)
     assert harness.BUILD in plan.builds
     assert [name for name, job in plan.jobs] == ["measure", "memory"]
-    assert plan.files == (arguments.fixture,)
-    assert "--pressure-store" in plan.jobs[-1][1].argv
+    (template,) = plan.files
+    assert template == templates.file(arguments.template, 1)
+    argv = plan.jobs[-1][1].argv
+    assert "--pressure-store" in argv and "--context" not in argv
+    assert argv[argv.index("--residency") + 1:argv.index("--residency") + 3] == (templates.argument(template), "256")
 
 
 def _response(at, store="HostRam", **taken):

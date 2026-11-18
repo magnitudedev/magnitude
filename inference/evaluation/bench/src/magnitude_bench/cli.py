@@ -1,8 +1,13 @@
-"""magnitude-bench: the serving benchmark, over HTTP, on a catalog model at context lengths.
+"""magnitude-bench: the serving benchmark, over HTTP, on a catalog model at templates.
 
-    magnitude-bench job --mode tools --model qwen3.5-4b:gguf:q4 --context 4k,16k \\
+    magnitude-bench job --template FILE [--template FILE ...] --model qwen3.5-4b:gguf:q4 \\
         [--engine magnitude --engine llama.cpp ...] [--section context,parallel] \\
         [--tuning-seconds 60] [--fresh-tuning] --artifacts FILE --output DIR --build-identity FILE
+
+Each `--template` is a template file (`magnitude_fixtures.TemplateFile`) holding the bench's
+lanes and its qualification lane: one fixture and response kind at several contexts, the run's
+checkpoints. `mrig bench --template NAME` builds them; `--template` is `job`'s own option, not a
+measurement option, since the rig names templates and the job reads files.
 
 `job` measures inside a run directory on the executing host; `mrig bench` takes the same
 measurement options and runs it there (building our engine and the harness, acquiring the
@@ -33,7 +38,7 @@ from .options import (
     Watchdog,
 )
 from .plan import SECTIONS
-from .policy import ENGINES, MODES
+from .policy import ENGINES
 from .store import RunStore
 
 #: Engines whose prompts the harness renders host-only (GGUF): their runs need `--harness`.
@@ -49,20 +54,9 @@ def choices(value: str, allowed: tuple[str, ...]) -> tuple[str, ...]:
     return selected
 
 
-def contexts(value: str) -> tuple[int, ...]:
-    result = []
-    for part in value.lower().split(","):
-        number = int(part[:-1]) * 1024 if part.endswith("k") else int(part)
-        if number <= 0:
-            raise ValueError("context lengths must be positive")
-        result.append(number)
-    return tuple(sorted(set(result)))
-
-
 def measurement_options(parser: argparse.ArgumentParser) -> None:
-    """The options of a measurement, apart from its model: `job`'s, and `mrig bench`'s."""
-    parser.add_argument("--mode", required=True, choices=MODES, help="fixture family served")
-    parser.add_argument("--context", required=True, help="context lengths, e.g. 4k,16k")
+    """The options of a measurement, apart from its model and its templates: `job`'s, and
+    `mrig bench`'s."""
     parser.add_argument("--engine", action="append", choices=ENGINES, default=[],
                         help="repeatable; default magnitude")
     parser.add_argument(
@@ -132,6 +126,8 @@ def parser() -> argparse.ArgumentParser:
     job.add_argument("--model", help="catalog reference <model>:<variant>; absent for a held set, which the "
                      "acquisition (--artifacts) names by its own bytes")
     measurement_options(job)
+    job.add_argument("--template", type=Path, action="append", required=True,
+                     help="a template file (repeatable): the checkpoints of one fixture and response kind")
     job.add_argument("--inference", type=Path, required=True,
                      help="the checkout's inference/ tree: its catalog, binaries and runtimes (given, never found)")
     job.add_argument("--artifacts", type=Path, required=True, help="catalog acquisition JSON")
@@ -248,10 +244,9 @@ def job(argv: list[str], args: argparse.Namespace) -> int:
         managed(
             measure(
                 RunStore(args.output),
-                args.mode,
+                args.template,
                 selected,
                 choices(args.section, tuple(SECTIONS)),
-                contexts(args.context),
                 acquisition,
                 args.artifacts,
                 json.loads(args.build_identity.read_text()),
@@ -271,7 +266,6 @@ def check(args: argparse.Namespace, inference: Path) -> None:
     if args.model is not None:
         catalog_reference(args.model, inference)
     choices(args.section, tuple(SECTIONS))
-    contexts(args.context)
     artifact_pairs(args.artifact)
     engine_options(args, inference)
 

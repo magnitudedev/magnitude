@@ -3,7 +3,7 @@
 By default the binary is this tree's build; any other (for example origin's) is measured the
 same way over HTTP and recorded by its bytes and declared source build.
 
-Prompts are counted, and fixtures sized, host-only by the engine's own serving render path
+Prompts are counted, and sessions sized, host-only by the engine's own serving render path
 (``magnitude-harness render``, run by the runner for every GGUF engine). The engine tunes on its first load under the run's budget
 and appends its tuning trace to the run directory's ``tuning.jsonl``. It serves from the
 kernel cache ``cache_dir`` when given (`mrig bench` gives each run a fresh one, priced by the

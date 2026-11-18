@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "magnitude-fixtures"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = ["pydantic==2.13.5"]
+dependencies = ["pyarrow>=18", "pydantic==2.13.5"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/magnitude_fixtures"]

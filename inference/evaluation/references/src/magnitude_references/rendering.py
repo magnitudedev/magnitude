@@ -1,4 +1,4 @@
-"""Whether two builds render a fixture set to the same tokens.
+"""Whether two builds render a template's sessions to the same tokens.
 
 Rendering belongs to the engine's serving path (chat template and tokenizer), so a difference
 between builds is a finding in itself: template or tokenizer behaviour changed. Quality
@@ -24,11 +24,11 @@ def _first_difference(left: list[int], right: list[int]) -> int:
 
 
 def differences(base: list[dict], candidate: list[dict]) -> list[dict]:
-    """Per-fixture differences between two rendered-fixture files (empty when identical)."""
-    base_ids = [line["fixture_id"] for line in base]
-    candidate_ids = [line["fixture_id"] for line in candidate]
+    """Per-session differences between two rendered-session files (empty when identical)."""
+    base_ids = [[line["template"], line["lane"]] for line in base]
+    candidate_ids = [[line["template"], line["lane"]] for line in candidate]
     if base_ids != candidate_ids:
-        return [{"fixtures": {"base": base_ids, "candidate": candidate_ids}}]
+        return [{"sessions": {"base": base_ids, "candidate": candidate_ids}}]
     found = []
     for left, right in zip(base, candidate, strict=True):
         if left == right:
@@ -36,11 +36,11 @@ def differences(base: list[dict], candidate: list[dict]) -> list[dict]:
         fields = sorted(
             name for name in left.keys() | right.keys() if left.get(name) != right.get(name)
         )
-        difference = {"fixture_id": left["fixture_id"], "fields": fields}
-        if "template_sha256" in fields:
-            difference["template_sha256"] = {
-                "base": left["template_sha256"],
-                "candidate": right["template_sha256"],
+        difference = {"template": left["template"], "lane": left["lane"], "fields": fields}
+        if "chat_template_sha256" in fields:
+            difference["chat_template_sha256"] = {
+                "base": left["chat_template_sha256"],
+                "candidate": right["chat_template_sha256"],
             }
         if "tokens" in fields:
             difference["tokens"] = {
@@ -57,4 +57,4 @@ def compare_files(base: Path, candidate: Path) -> list[dict]:
         return []
     found = differences(read_lines(base), read_lines(candidate))
     # Identical content in different bytes still changes the rendered digest.
-    return found or [{"encoding": "the rendered files hold the same fixtures in different bytes"}]
+    return found or [{"encoding": "the rendered files hold the same sessions in different bytes"}]

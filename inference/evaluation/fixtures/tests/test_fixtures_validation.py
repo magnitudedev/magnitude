@@ -1,7 +1,7 @@
 import json
 
 import pytest
-from magnitude_fixtures.validation import GeneratedCall, retrieval, tool_calls
+from magnitude_fixtures.validation import GeneratedCall, retrieve, tool_calls
 
 EXPECTED = {
     "calls": [
@@ -48,7 +48,7 @@ def test_mismatched_calls_explain_why(actual, reason):
     ],
 )
 def test_retrieval_scores_strict_json(text, exact, correct, valid):
-    score = retrieval({"values": {"a": "1", "b": "2"}}, text)
+    score = retrieve({"values": {"a": "1", "b": "2"}}, text)
     assert (score.exact_match, score.correct, score.total, score.format_valid) == (
         exact,
         correct,

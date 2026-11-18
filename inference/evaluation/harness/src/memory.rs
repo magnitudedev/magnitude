@@ -14,7 +14,9 @@
 //! load end (its storage by term) and the worker's own costs, and where a
 //! streamed load's experts are stored.
 //!
-//! With `--decode`, the load decodes a rendered fixture greedily and prints
+//! With `--template`, the load is at the template's context and the
+//! decode's tokens, and decodes lane 0 of the template, rendered at its
+//! context, greedily and prints
 //! its tokens; with `--pressure-store` too, a sibling process (`occupy`)
 //! takes what that store gives, past the guarantee the load's ledger keeps
 //! free there, and one block of its bank more, from a quarter of the decode
@@ -67,7 +69,7 @@ pub struct Load {
     pub numerical_profile: Option<magnitude_executor::NumericalProfile>,
     pub context_tokens: Option<usize>,
     pub weight_cap: Option<u64>,
-    /// The rendered fixture decoded once loaded, and its tokens.
+    /// The template lane decoded once loaded, and its tokens.
     pub decode: Option<Decode>,
     /// Another process's pressure on the load over the decode.
     pub pressure: Option<Pressing>,
@@ -87,11 +89,11 @@ pub struct Pressing {
     pub from_prompt: bool,
 }
 
-/// A decode the load runs before its experts' residency is read again: the
-/// first fixture of a rendered set (`magnitude-harness render`), its first
-/// `prompt_tokens` when given, `tokens` tokens greedily.
+/// A decode the load runs before its experts' residency is read again: lane
+/// 0 of a template file, rendered at its context, its first `prompt_tokens`
+/// when given, `tokens` tokens greedily.
 pub struct Decode {
-    pub rendered: PathBuf,
+    pub template: PathBuf,
     pub tokens: usize,
     pub prompt_tokens: Option<usize>,
 }
@@ -109,7 +111,18 @@ pub fn load(load: Load) -> Result<(), String> {
         pressure,
         hold,
     } = load;
+    // A decoded template's load holds its context and the decode's tokens.
+    let decode = decode
+        .map(|decode| Ok::<_, String>((crate::template::TemplateFile::read(&decode.template)?, decode)))
+        .transpose()?;
+    let context_tokens = match &decode {
+        Some((template, decode)) => Some(template.context + decode.tokens),
+        None => context_tokens,
+    };
     let Planned { host, manifest, devices, structure, planned } = plan(backend, &target, kernel_cache.clone(), numerical_profile, context_tokens, weight_cap)?;
+    let decode = decode
+        .map(|(template, decode)| Ok::<_, String>((lane_prompt(&host, &template)?, decode)))
+        .transpose()?;
     let context = manifest.definition.decoder.context_limit;
     // The charge the load's planning confirmed of its plan.
     let charge = planned.charge().clone();
@@ -214,12 +227,12 @@ pub fn load(load: Load) -> Result<(), String> {
     };
     let engine = ReadyEngine::new(host, *connection).map_err(|error| error.to_string())?;
     // The experts' pages the file cache holds once loaded, then once the
-    // load has decoded a rendered fixture.
+    // load has decoded a template's lane.
     let (residency, decoded) = match decode {
         None => (None, None),
-        Some(decode) => {
+        Some((prompt, decode)) => {
             let loaded = crate::engine::cached_pages(&expert_ranges)?;
-            let tokens = match (generate(&engine, &decode, pressure.as_mut()), pressure.as_mut()) {
+            let tokens = match (generate(&engine, &prompt, &decode, pressure.as_mut()), pressure.as_mut()) {
                 (Ok(tokens), _) => Some(tokens),
                 (Err(Failure::Unloaded(failure)), Some(pressure)) => {
                     pressure.failed(failure)?;
@@ -578,44 +591,34 @@ impl From<RequestError> for Failure {
     }
 }
 
-/// Decode `decode`'s fixture greedily: `decode.tokens` tokens from its first
+/// Decode `prompt` greedily: `decode.tokens` tokens from its first
 /// `decode.prompt_tokens`, or, under `pressure`, as long as its window needs
 /// ([`Pressure::decode`]). The prompt's tokens decoded from, and the tokens.
-fn generate(engine: &ReadyEngine, decode: &Decode, pressure: Option<&mut Pressure>) -> Result<(usize, Vec<u32>), Failure> {
-    let prompt = rendered_prompt(&decode.rendered)?;
+fn generate(engine: &ReadyEngine, prompt: &[TokenId], decode: &Decode, pressure: Option<&mut Pressure>) -> Result<(usize, Vec<u32>), Failure> {
     match pressure {
-        Some(pressure) => pressure.decode(engine, &prompt, decode.tokens),
+        Some(pressure) => pressure.decode(engine, prompt, decode.tokens),
         None => {
             let length = decode.prompt_tokens.unwrap_or(prompt.len());
             let prompt = prompt
                 .get(..length)
-                .ok_or_else(|| format!("the fixture has {} tokens, not {length}", prompt.len()))?;
+                .ok_or_else(|| format!("the lane has {} tokens, not {length}", prompt.len()))?;
             let (tokens, _) = decoded(engine, prompt, decode.tokens, |_| Ok(false))?;
             Ok((prompt.len(), tokens))
         }
     }
 }
 
-/// The first fixture of a rendered set: its tokens.
-fn rendered_prompt(rendered: &std::path::Path) -> Result<Vec<TokenId>, String> {
-    let text = std::fs::read_to_string(rendered).map_err(|error| format!("{}: {error}", rendered.display()))?;
-    let line = text
-        .lines()
-        .next()
-        .ok_or_else(|| format!("{} renders no fixture", rendered.display()))?;
-    let rendered: Value = serde_json::from_str(line).map_err(|error| error.to_string())?;
-    rendered["tokens"]
-        .as_array()
-        .ok_or("a rendered fixture has no tokens")?
-        .iter()
-        .map(|token| {
-            token
-                .as_u64()
-                .and_then(|token| u32::try_from(token).ok())
-                .map(TokenId)
-                .ok_or_else(|| format!("{token} is no token"))
-        })
-        .collect()
+/// Lane 0 of `template`, rendered at its context as the engine serves it:
+/// its tokens.
+fn lane_prompt(host: &magnitude_engine::host::HostArtifacts, template: &crate::template::TemplateFile) -> Result<Vec<TokenId>, String> {
+    let options = crate::render::standard_request_options();
+    // The served model's name does not change the prompt.
+    let renderer = crate::render::Renderer::new(host, "evaluation", &options);
+    let session = template.sessions.first().expect("a template file holds a lane");
+    let rendered = renderer
+        .render_lane(&template.name, 0, session, template.context)
+        .map_err(|error| format!("{} lane 0: {error}", template.name))?;
+    Ok(rendered.tokens.into_iter().map(TokenId).collect())
 }
 
 /// The tokens a request's prompt and output may hold together.

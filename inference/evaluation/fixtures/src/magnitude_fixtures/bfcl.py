@@ -1,8 +1,10 @@
-"""Tool sessions from pinned BFCL v4 decisions, with canonically completed history.
+"""The ``bfcl`` fixture: ``tools`` sessions from pinned BFCL v4 decisions, with canonically
+completed history.
 
-Each fixture is one session: a system message, every other selected BFCL decision completed
+Lane ``k`` is one session: a system message, every other selected BFCL decision completed
 with its ground-truth calls and a synthetic acknowledgement reply, then the probe decision.
-Only the probe's call message is scored and served. The top-level ``tools`` are the probe's
+Lane ``k`` probes the ``k``-th selected decision. Only the probe's call message is scored and
+served. The session's top-level ``tools`` are the probe's
 functions; each history question carries the functions its calls use, so a sized
 conversation offers exactly the tools of the turns it keeps.
 """
@@ -13,7 +15,7 @@ from pathlib import Path
 from pydantic import Field, JsonValue
 
 from .canonical import Record, digest, encoded
-from .fixture import Fixture, Generation, Message, Source, TurnSizing
+from .session import Generation, Message, Session, Source
 from .sources import DATA, LockedFile, cache_root, fetch
 
 CATEGORIES = {
@@ -50,7 +52,7 @@ class Interaction(Record):
         """The decision completed with its first allowed argument values.
 
         A history turn's question carries the functions it calls; the probe's functions are
-        the fixture's top-level tools and its call message is scored.
+        the session's top-level tools and its call message is scored.
         """
         calls: list[JsonValue] = []
         replies: list[Message] = []
@@ -179,17 +181,17 @@ def load(*, cache: Path | None = None) -> tuple[list[Interaction], Source]:
 
 def build(
     interactions: list[Interaction],
-    source: Source,
     *,
-    count: int,
+    lanes: int,
     categories: tuple[str, ...] = tuple(CATEGORIES),
-) -> list[Fixture]:
-    """One session per probe: the first ``count`` decisions of the selected categories."""
+) -> list[Session]:
+    """One session per lane: lane ``k`` probes the ``k``-th decision of the selected
+    categories after every other one."""
     selected = [i for i in interactions if i.category in categories]
-    if not 1 <= count <= len(selected):
-        raise ValueError(f"tools fixtures need 1..{len(selected)} probes, got {count}")
-    fixtures = []
-    for lane, probe in enumerate(selected[:count]):
+    if not 1 <= lanes <= len(selected):
+        raise ValueError(f"tools yields 1..{len(selected)} lanes, not {lanes}")
+    sessions = []
+    for lane, probe in enumerate(selected[:lanes]):
         history = selected[lane + 1 :] + selected[:lane]
         messages: list[Message] = [
             {"role": "system", "content": f"Session {lane}. Use the supplied tools."}
@@ -198,11 +200,9 @@ def build(
             messages.extend(interaction.turn(f"call_{lane}_{turn}", probe=False))
         prefix = len(messages) + 1
         messages.extend(probe.turn(f"call_{lane}_{len(history)}", probe=True))
-        fixtures.append(
-            Fixture(
-                id=f"tools/bfcl/{probe.id}",
-                family="tools",
-                source=source,
+        sessions.append(
+            Session(
+                key="tools",
                 tools=probe.tools,
                 messages=messages,
                 generation=Generation(
@@ -210,7 +210,7 @@ def build(
                     max_tokens=MAX_OUTPUT_TOKENS,
                     expected={"calls": [call.model_dump(mode="json") for call in probe.expected]},
                 ),
-                sizing=TurnSizing(keep_head=1),
+                keep_head=1,
             )
         )
-    return fixtures
+    return sessions

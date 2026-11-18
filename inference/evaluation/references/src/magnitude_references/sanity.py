@@ -1,6 +1,6 @@
 """The reference sanity gate: is the dense model in a sane regime on this exact input?
 
-A reference is only worth comparing against when the dense model itself predicts the fixture well.
+A reference is only worth comparing against when the dense model itself predicts the rendered sessions well.
 On out-of-distribution input (for example an instruct model fed untemplated raw text) the dense
 distributions are garbage or near-flat, and any comparison against them measures noise
 (Gemma 4 12B on raw text had dense perplexity 1,232; on chat-templated text 1.90).
@@ -10,7 +10,7 @@ token):
 - perplexity: exp(mean negative log-likelihood of the actual next token);
 - top-1 accuracy: fraction of rows whose argmax is the actual next token.
 
-Default bounds, from Gemma 4 QAT references (float32, MPS), per fixture:
+Default bounds, from Gemma 4 QAT references (float32, MPS), per session:
 
 | input                                                          | perplexity | top-1 |
 |----------------------------------------------------------------|-----------:|------:|
@@ -25,10 +25,10 @@ English but miss the author's word choice with near-zero probability, which is a
 high perplexity and a low top-1. Perplexity separates the regimes by an order of magnitude; top-1
 does not (the sane and broken ranges nearly touch), so it only guards against degenerate output:
 - `perplexity_max` 300.0: about 2x above the hardest sane prose measured and 4.8x below the best
-  broken-regime fixture;
-- `top1_min` 0.10: below every sane fixture measured, above a near-flat or constant prediction.
+  broken-regime session;
+- `top1_min` 0.10: below every sane session measured, above a near-flat or constant prediction.
 
-Both must hold for every fixture on its own rows, so one broken fixture fails the reference however
+Both must hold for every session on its own rows, so one broken session fails the reference however
 sane the rest are; the aggregate over the set is recorded too. Bounds can be overridden per run and
 are recorded with the result.
 """
@@ -96,31 +96,31 @@ class Accumulator:
 
 
 class Gate:
-    """The sanity gate over a fixture set: each fixture's rows measured on their own, and the set."""
+    """The sanity gate over rendered sessions: each session's rows measured on their own, and all of them."""
 
     def __init__(self):
-        self.fixtures: dict[str, Accumulator] = {}
+        self.sessions: dict[tuple[str, int], Accumulator] = {}
 
-    def add(self, fixture_id: str, logits: torch.Tensor, targets: torch.Tensor) -> None:
-        self.fixtures.setdefault(fixture_id, Accumulator()).add(logits, targets)
+    def add(self, template: str, lane: int, logits: torch.Tensor, targets: torch.Tensor) -> None:
+        self.sessions.setdefault((template, lane), Accumulator()).add(logits, targets)
 
     @property
     def count(self) -> int:
-        return sum(accumulator.count for accumulator in self.fixtures.values())
+        return sum(accumulator.count for accumulator in self.sessions.values())
 
     def result(self, bounds: Bounds) -> dict:
-        """The `sanity` record: aggregate perplexity and top-1, bounds, per-fixture values, and
-        `passed` only when every fixture passes on its own."""
+        """The `sanity` record: aggregate perplexity and top-1, bounds, per-session values, and
+        `passed` only when every session passes on its own."""
         total = Accumulator()
-        fixtures = []
-        for fixture_id, accumulator in self.fixtures.items():
+        sessions = []
+        for (template, lane), accumulator in self.sessions.items():
             total.merge(accumulator)
-            fixtures.append({"fixture_id": fixture_id, **accumulator.measure(bounds)})
+            sessions.append({"template": template, "lane": lane, **accumulator.measure(bounds)})
         aggregate = total.measure(bounds)
         return {"perplexity": aggregate["perplexity"], "top1_accuracy": aggregate["top1_accuracy"],
-                "bounds": bounds.to_json(), "passed": all(fixture["passed"] for fixture in fixtures),
-                "fixtures": fixtures}
+                "bounds": bounds.to_json(), "passed": all(session["passed"] for session in sessions),
+                "sessions": sessions}
 
     @staticmethod
     def failing(sanity: dict) -> list[str]:
-        return [fixture["fixture_id"] for fixture in sanity["fixtures"] if not fixture["passed"]]
+        return [f"{session['template']}/{session['lane']}" for session in sanity["sessions"] if not session["passed"]]

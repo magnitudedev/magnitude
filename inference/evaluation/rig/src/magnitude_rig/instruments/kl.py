@@ -1,11 +1,13 @@
-"""`kl`: how far is one build's model from the float32 reference, at one fixture family and
-context? The harness `logits` on the host's kernel cache, then `magnitude-references kl`
-against the host's cached reference of the same rendered tokens, built when missing (the
-reference is the slow part the first time; it is cached for every later run and build).
+"""`kl`: how far is one build's model from the float32 reference, on one template? The harness
+`logits` on the host's kernel cache over the template (its lane 0, sized to its context), then
+`magnitude-references kl` against the host's cached reference, keyed by the template, the model
+and the rendered prompt's digest, built when missing (the reference is the slow part the first
+time; it is cached for every later run and build).
 
-`mrig ab kl` runs both builds on the base's tuning (`harness`), measures the candidate on the
-base's exact tokens, judges it against the base with a paired interval, and says whether the
-two builds' outputs are identical.
+`mrig ab kl` runs both builds on the base's tuning (`harness`), each rendering the template
+itself, judges the candidate against the base with a paired interval, and says whether the two
+builds' outputs are identical. Builds that render the template to other tokens are not
+comparable, and the judgement refuses them.
 
 `--selection TRACE` asks what a tuning selection costs in precision: the build runs every unit
 at its declared default, then the configurations one load of the trace chose (on the same
@@ -28,13 +30,13 @@ reference; a model that does not fit its device streams.
 
 `--weight-cap BYTES` (repeatable) asks whether streaming the experts changes only where they
 live: the uncapped load's logits and each streamed load's (its experts read from storage,
-`fresh`), on the uncapped load's tokens, every entry at its declared default. A streamed load
+`fresh`), each rendering the same template, every entry at its declared default. A streamed load
 whose logits equal the uncapped load's, bit for bit, passes. One whose logits differ fails with
 where they part: the rows that differ, the first of them, the largest difference, and its KL
 against its base (mean, p99 and max over the rows) and top-1 agreement. A non-finite logit in
 either load fails it. A float32 reference of the whole model does not say where two loads
-diverge, so none is read. `--context` sizes the prompt: a few hundred tokens already miss at
-every streamed layer of a bank below its experts.
+diverge, so none is read. The template's context sizes the prompt: a few hundred tokens already
+miss at every streamed layer of a bank below its experts.
 
 Each streamed load must also have missed at every streamed layer, or it did not ask the
 question; a load that held its experts whole streamed nothing.
@@ -54,7 +56,7 @@ unanswered, which fails.
 second streamed load against the first.
 
 `--repeat PASSES` under one `--weight-cap`, without `--between` or `--without-site`, asks whether
-one load gives one answer: PASSES passes over the fixtures on one load, the file left in the page
+one load gives one answer: PASSES passes over the template on one load, the file left in the page
 cache, each compared with the first.
 """
 
@@ -63,6 +65,7 @@ import dataclasses
 import json
 from pathlib import Path
 
+from .. import templates
 from ..engine import Step, Weights
 from . import Answer, Instrument, JobResult, Pairing, Plan, environment, harness, held
 from .assess import priced
@@ -158,7 +161,7 @@ def configure(parser: argparse.ArgumentParser) -> None:
     held.option(parser, " (with --yardstick-perturbed)")
     parser.add_argument("--references-only", action="store_true",
                         help="build and cache the references (the reference and each --yardstick-perturbed draw) of the "
-                        "fixtures' rendered tokens and judge no build: the passes that depend only on the model's "
+                        "template's rendered tokens and judge no build: the passes that depend only on the model's "
                         "stored values, done before any build is final")
     parser.add_argument("--profile-references", action="store_true",
                         help="time each batch of the reference builds it starts: wall, read and dequantize seconds")
@@ -189,32 +192,33 @@ def _selecting(arguments) -> tuple[str, ...]:
     )
 
 
-def logits(arguments, *, rendered: str | None = None, pinning: tuple[str, ...] = (),
-           weight_cap: int | None = None, fresh: bool | None = None) -> Step:
-    sizing = ("--rendered", rendered) if rendered else ("--context", str(arguments.context))
+def template(arguments) -> Path:
+    """The run's template file: the template is its lane 0."""
+    return templates.file(arguments.template, 1)
+
+
+def logits(arguments, *, pinning: tuple[str, ...] = (), weight_cap: int | None = None,
+           fresh: bool | None = None) -> Step:
     capped = ("--weight-cap", str(weight_cap)) if weight_cap is not None else ()
     return Step("logits", (
         harness.EXECUTABLE, "logits", "--artifacts", "{artifacts}",
-        "--fixtures", f"{{inputs}}/{arguments.fixture.name}", "--output", "{run_dir}",
+        "--template", templates.argument(template(arguments)), "--output", "{run_dir}",
         "--build-identity", "{build_file}", "--cache-dir", "{engine_cache}/kernels",
-        "--device", arguments.backend, *sizing, *pinning, *capped,
+        "--device", arguments.backend, *pinning, *capped,
     ), fresh=weight_cap is not None if fresh is None else fresh)  # fmt: skip
 
 
 def render(arguments) -> Step:
     return Step("render", (
         harness.EXECUTABLE, "render", "--artifacts", "{artifacts}",
-        "--fixtures", f"{{inputs}}/{arguments.fixture.name}", "--output", "{run_dir}",
-        "--context", str(arguments.context),
+        "--template", templates.argument(template(arguments)), "--output", "{run_dir}",
     ))  # fmt: skip
 
 
-def judge(arguments, logits_run: str, *, base: str | None = None, own_rendering: str | None = None) -> Step:
+def judge(arguments, logits_run: str, *, base: str | None = None) -> Step:
     """The judgement of `logits_run` against the reference (and `base`, and the storage-resolution
     bar where the run names its seeds), which then removes the logits it read from the host."""
-    extra = (("--base", f"{{runs}}/{base}") if base else ()) + (
-        ("--own-rendering", f"{{runs}}/{own_rendering}/rendered.jsonl") if own_rendering else ()
-    ) + (() if arguments.yardstick_perturbed is None
+    extra = (("--base", f"{{runs}}/{base}") if base else ()) + (() if arguments.yardstick_perturbed is None
          else ("--yardstick-perturbed", *map(str, arguments.yardstick_perturbed)))
     return Step("kl", (
         REFERENCES, "kl", "--logits", f"{{runs}}/{logits_run}", *extra,
@@ -251,9 +255,9 @@ def _loads(arguments) -> tuple[str | None, list[tuple[str, int, bool]]]:
 
 
 def _capped(arguments) -> tuple[tuple[str, Step], ...]:
-    """`--weight-cap`'s loads at the defaults, each streamed load on its base's tokens (the
-    uncapped load's, or under `--between` the first streamed load's), then each one's comparison
-    with its base. Under `--without-site` the base approves no CPU site either, so every miss it
+    """`--weight-cap`'s loads at the defaults, each rendering the template as its base does (the
+    uncapped load, or under `--between` the first streamed load), then each one's comparison with
+    its base. Under `--without-site` the base approves no CPU site either, so every miss it
     takes, where it does not fit its device, is the device's."""
     defaults = ("--tuning-defaults",)
     unsited = ("--numerical-profile", UNSITED)
@@ -263,8 +267,7 @@ def _capped(arguments) -> tuple[tuple[str, Step], ...]:
     jobs.append((base_run, logits(arguments, pinning=(*defaults, *(unsited if arguments.without_site else ())),
                                   weight_cap=base)))
     for run, cap, approved in loads:
-        jobs.append((run, logits(arguments, rendered=f"{{runs}}/{base_run}/rendered.jsonl",
-                                 pinning=(*defaults, *(() if approved else unsited)), weight_cap=cap)))
+        jobs.append((run, logits(arguments, pinning=(*defaults, *(() if approved else unsited)), weight_cap=cap)))
     for index, (run, _, _) in enumerate(loads):
         keep = index + 1 < len(loads)  # a later comparison reads the base's logits
         jobs.append((_compared(run), Step("compare", (
@@ -310,10 +313,10 @@ def plan(arguments, source, host) -> Plan:
     if arguments.references_only:
         return Plan(builds=BUILDS, jobs=(*held.jobs(arguments), ("render", render(arguments)),
                                          ("references", references(arguments))),
-                    device="device", acquires=held.acquires(arguments), files=(arguments.fixture,))
+                    device="device", acquires=held.acquires(arguments), files=(template(arguments),))
     if arguments.checkpoint is not None:
         jobs = (*held.jobs(arguments), ("logits", logits(arguments)), ("kl", judge(arguments, "logits")))
-        return priced(Plan(builds=BUILDS, jobs=jobs, device="device", acquires=None, files=(arguments.fixture,)),
+        return priced(Plan(builds=BUILDS, jobs=jobs, device="device", acquires=None, files=(template(arguments),)),
                       True, arguments.backend)
     if arguments.between and len(arguments.weight_cap or ()) != 2:
         raise SystemExit("kl: --between compares the loads under exactly two --weight-cap")
@@ -324,7 +327,7 @@ def plan(arguments, source, host) -> Plan:
                          "without --between or --without-site")
     if arguments.repeat:
         return priced(Plan(builds=BUILDS, jobs=_repeated(arguments), device="device",
-                           acquires=Weights(arguments.model), files=(arguments.fixture,)), True, arguments.backend)
+                           acquires=Weights(arguments.model), files=(template(arguments),)), True, arguments.backend)
     if arguments.weight_cap:
         if arguments.selection is not None:
             raise SystemExit("kl: --weight-cap compares loads at the defaults, not a selection")
@@ -334,10 +337,10 @@ def plan(arguments, source, host) -> Plan:
     else:
         jobs = (
             ("defaults", logits(arguments, pinning=("--tuning-defaults",))),
-            ("selected", logits(arguments, rendered="{runs}/defaults/rendered.jsonl", pinning=_selecting(arguments))),
+            ("selected", logits(arguments, pinning=_selecting(arguments))),
             ("kl", judge(arguments, "selected", base="defaults")),
         )
-    files = (arguments.fixture,) + ((arguments.selection,) if arguments.selection else ())
+    files = (template(arguments),) + ((arguments.selection,) if arguments.selection else ())
     return priced(Plan(builds=BUILDS, jobs=jobs, device="device", acquires=Weights(arguments.model), files=files),
                   bool(arguments.weight_cap), arguments.backend)
 
@@ -374,7 +377,7 @@ def _selection(arguments, results: dict[str, JobResult]) -> Answer:
     summary = json.loads((results["kl"].directory / "kl.json").read_text())
     selection = json.loads((results["selected"].directory / "selection.json").read_text())
     lines = [
-        (f"{arguments.model} · {arguments.fixture.stem} @{arguments.context} · "
+        (f"{arguments.model} · {arguments.template.name} · "
          f"{len(selection['units'])} selected units of load {arguments.load}"),
         _line("defaults vs reference", summary["base"]),
         _line("selection vs reference", summary["build"]),
@@ -396,6 +399,11 @@ def _selection(arguments, results: dict[str, JobResult]) -> Answer:
     return Answer(tuple(lines), not regressed)
 
 
+def _at(row: dict) -> str:
+    """A scored row's place: its template, lane and position."""
+    return f"{row['template']}/{row['lane']}@{row['position']}"
+
+
 def _compared(run: str) -> str:
     """The job comparing streamed load `run` with its base."""
     return f"compare-{run}"
@@ -405,7 +413,7 @@ def _parted(summary: dict) -> str:
     """Where a streamed load's logits part from its base's, and its KL and top-1 against it."""
     first, kl = summary["first"], summary["kl"]
     return (f"logits differ at {summary['differing']} of {summary['rows']} rows, first "
-            f"{first['fixture_id']}@{first['position']}, largest {summary['largest']:.3g}; "
+            f"{_at(first)}, largest {summary['largest']:.3g}; "
             f"KL against its base mean {kl['mean']:.3g}, p99 {kl['p99']:.3g}, max {kl['max']:.3g}, "
             f"top-1 {100 * summary['top1']:.2f}%")
 
@@ -434,7 +442,7 @@ def _streamed(arguments, results: dict[str, JobResult]) -> Answer:
     base_sited = 0 if base_experts is None else base_experts["sited"]
     assert not arguments.without_site or base_sited == 0, (
         f"the base's CPU site served {base_sited} misses under a profile approving none")
-    lines = [f"{arguments.model} · {arguments.fixture.stem} @{arguments.context} · against {base or 'uncapped'}, "
+    lines = [f"{arguments.model} · {arguments.template.name} · against {base or 'uncapped'}, "
              f"which {_held(base_experts)}"]
     holds = True
     for (run, cap, approved), summary in zip(loads, summaries):
@@ -450,7 +458,7 @@ def _streamed(arguments, results: dict[str, JobResult]) -> Answer:
         if nonfinite["base"] or nonfinite["candidate"]:
             first = nonfinite["first"]
             outcome = (f"non-finite logits at {nonfinite['base']} rows of its base and {nonfinite['candidate']} "
-                       f"of its own of {summary['rows']}, first {first['fixture_id']}@{first['position']}")
+                       f"of its own of {summary['rows']}, first {_at(first)}")
             held = False
         else:
             compared = f"equal logits ({summary['rows']} rows)" if summary["differing"] == 0 else _parted(summary)
@@ -475,7 +483,7 @@ def answer(arguments, results: dict[str, JobResult]) -> Answer:
     if arguments.references_only:
         obtained = json.loads((results["references"].directory / "references.json").read_text())
         subject = held.name(arguments)
-        return Answer((f"{subject} · {arguments.fixture.stem} @{arguments.context} · references only",
+        return Answer((f"{subject} · {arguments.template.name} · references only",
                        *(f"{name}: {'cached' if each['cached'] else 'built this run'}"
                          for name, each in (("reference", obtained["reference"]),
                                             *((f"draw {seed}", draw) for seed, draw in
@@ -489,7 +497,7 @@ def answer(arguments, results: dict[str, JobResult]) -> Answer:
     summary = json.loads((results["kl"].directory / "kl.json").read_text())
     reference = "cached" if summary["reference"]["cached"] else "built this run"
     lines = [
-        f"{held.name(arguments)} · {arguments.fixture.stem} @{arguments.context} · "
+        f"{held.name(arguments)} · {arguments.template.name} · "
         f"reference {reference}",
         _line("vs reference", summary["build"]),
     ]
@@ -510,15 +518,15 @@ def _resolution(resolution: dict, seeds: list[int]) -> list[str]:
     if resolution["unjudgeable_top1_agreement"] is not None:
         lines.append(f"unjudgeable rows' top-1 agreement {100 * resolution['unjudgeable_top1_agreement']:.2f}%")
     lines.append(f"{len(over)} rows past the bar")
-    lines += [f"  {row['fixture_id']}@{row['position']} ratio {row['ratio']:.4g}"
+    lines += [f"  {_at(row)} ratio {row['ratio']:.4g}"
               f"{', top-1 flipped' if row['top1_flipped'] else ''}" for row in sorted(over, key=lambda row: -row["ratio"])[:10]]
     lines.append(("within" if resolution["within"] else "NOT within") + f" the storage-resolution bar (seeds {' '.join(map(str, seeds))})")
     return lines
 
 
 def pair_jobs(arguments, base: str, candidate: str) -> tuple[tuple[str, str, Step], ...]:
-    """(side, run name, step): the base renders and measures; the candidate is measured on the
-    base's exact tokens, its own rendering compared, then judged against the base. Both run the
+    """(side, run name, step): each build renders the template and measures it, then the candidate
+    is judged against the base, which refuses builds that rendered other tokens. Both run the
     base's tuning, or both the selection."""
     _subject(arguments)
     if arguments.weight_cap:
@@ -531,10 +539,8 @@ def pair_jobs(arguments, base: str, candidate: str) -> tuple[tuple[str, str, Ste
         base_pinning = candidate_pinning = _selecting(arguments)
     return (
         (base, "base-logits", logits(arguments, pinning=base_pinning)),
-        (candidate, "candidate-render", render(arguments)),
-        (candidate, "candidate-logits",
-         logits(arguments, rendered="{runs}/base-logits/rendered.jsonl", pinning=candidate_pinning)),
-        (candidate, "kl", judge(arguments, "candidate-logits", base="base-logits", own_rendering="candidate-render")),
+        (candidate, "candidate-logits", logits(arguments, pinning=candidate_pinning)),
+        (candidate, "kl", judge(arguments, "candidate-logits", base="base-logits")),
     )
 
 
@@ -543,7 +549,7 @@ def pair_answer(arguments, results: dict[str, JobResult]) -> Answer:
         return failure
     summary = json.loads((results["kl"].directory / "kl.json").read_text())
     lines = [
-        f"{arguments.model} · {arguments.fixture.stem} @{arguments.context}",
+        f"{arguments.model} · {arguments.template.name}",
         _line("base vs reference", summary["base"]),
         _line("candidate vs reference", summary["build"]),
         "builds identical: " + ("yes (bit-identical outputs)" if summary["builds_identical"] else
@@ -551,18 +557,15 @@ def pair_answer(arguments, results: dict[str, JobResult]) -> Answer:
     ]
     changes, regressed = _changes(summary)
     lines += changes
-    differences = summary.get("rendering_differences") or []
-    if differences:
-        lines.append(f"rendering differs in {len(differences)} fixtures: the candidate renders other tokens")
     return Answer(tuple(lines), not regressed)
 
 
 INSTRUMENT = Instrument(
     name="kl",
     kind="fidelity",
-    question="How far is one build from the float32 reference, at one fixture family and context?",
+    question="How far is one build from the float32 reference, on one template?",
     observable="divergence from the reference",
-    selectors=("backend", "host", "build", "model-or-checkpoint", "context", "fixture", "purpose", "estimate"),
+    selectors=("backend", "host", "build", "model-or-checkpoint", "template", "purpose", "estimate"),
     configure=configure,
     plan=plan,
     answer=answer,

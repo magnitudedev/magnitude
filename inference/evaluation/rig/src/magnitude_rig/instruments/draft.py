@@ -1,9 +1,10 @@
-"""`draft`: how well does the catalog drafter propose for this model? The harness `draft` at
-anchors spread over each fixture's scored spans: the target prefills to the anchor, the
+"""`draft`: how well does the catalog drafter propose for this model, on one template? The
+harness `draft` at anchors spread over the template's scored spans (its lane 0, sized to its
+context): the target prefills to the anchor, the
 drafter (primed as the served path primes it) proposes greedily, and the target verifies; the
 accepted prefix is the proposals equal to the target's own greedy choices. Reports the tokens
 each verification commits, the share of proposals accepted, and how often proposals also match
-the fixture's own next tokens. With `--attribute`, each anchor's draft, verification and one
+the session's own next tokens. With `--attribute`, each anchor's draft, verification and one
 plain decode step are timed on the device, under the timed hold.
 
 `--weight-cap BYTES` (repeatable) asks whether drafting streamed keeps the output: after the
@@ -23,6 +24,7 @@ import argparse
 import json
 from dataclasses import dataclass
 
+from .. import templates
 from ..engine import Step
 from . import Answer, Instrument, JobResult, Measure, Plan, harness, held, lacking, unrecorded
 from .assess import priced
@@ -34,7 +36,7 @@ MEASURED = ("proposed", "accepted", "anchors", "tokens_per_verify")
 
 def configure(parser: argparse.ArgumentParser) -> None:
     held.option(parser)
-    parser.add_argument("--anchors", type=int, default=8, help="anchors per fixture (default 8)")
+    parser.add_argument("--anchors", type=int, default=8, help="anchors per lane (default 8)")
     parser.add_argument("--proposals", type=int, help="proposals per draft (the drafter's own width by default)")
     parser.add_argument("--attribute", action="store_true",
                         help="time each anchor's draft, verification and a plain decode step on the device")
@@ -46,13 +48,14 @@ def plan(arguments, source, host) -> Plan:
     held.subject("draft", arguments)
     if arguments.weight_cap and arguments.attribute:
         raise SystemExit("draft: --weight-cap compares outputs; time them with --attribute alone")
+    template = templates.file(arguments.template, 1)
 
     def job(*capped: str, fresh: bool = False) -> Step:
         return Step("draft", (
             harness.EXECUTABLE, "draft", "--artifacts", "{artifacts}",
-            "--fixtures", f"{{inputs}}/{arguments.fixture.name}", "--output", "{run_dir}",
+            "--template", templates.argument(template), "--output", "{run_dir}",
             "--build-identity", "{build_file}", "--cache-dir", "{engine_cache}/kernels",
-            "--device", arguments.backend, "--context", str(arguments.context),
+            "--device", arguments.backend,
             "--anchors", str(arguments.anchors),
             *(("--proposals", str(arguments.proposals)) if arguments.proposals else ()),
             *(("--attribute",) if arguments.attribute else ()), *capped,
@@ -62,7 +65,7 @@ def plan(arguments, source, host) -> Plan:
     return priced(Plan(builds=(harness.BUILD,), jobs=jobs,
                        device="timed" if arguments.attribute else "device",
                        acquires=held.acquires(arguments),
-                       files=(arguments.fixture,)), bool(caps) or arguments.checkpoint is not None, arguments.backend)
+                       files=(template,)), bool(caps) or arguments.checkpoint is not None, arguments.backend)
 
 
 def answer(arguments, results: dict[str, JobResult]) -> Answer:
@@ -74,10 +77,10 @@ def answer(arguments, results: dict[str, JobResult]) -> Answer:
         return Answer((f"this build's harness records no {', '.join(missing)}",), False)
     drafting = record["measurements"]["drafting"]
     proposed, accepted, anchors = drafting["proposed"], drafting["accepted"], drafting["anchors"]
-    matched = ("" if lacking(drafting, "matched_fixture") else
-               f" · matched the fixture {100 * drafting['matched_fixture'] / max(proposed, 1):.1f}%")
+    matched = ("" if lacking(drafting, "matched_session") else
+               f" · matched the session {100 * drafting['matched_session'] / max(proposed, 1):.1f}%")
     lines = [
-        f"{held.name(arguments)} · {arguments.fixture.stem} @{arguments.context} · "
+        f"{held.name(arguments)} · {arguments.template.name} · "
         f"{anchors} anchors",
         (f"{drafting['tokens_per_verify']:.3f} tokens per verification · accepted {accepted} of {proposed} "
          f"proposals ({100 * accepted / max(proposed, 1):.1f}%){matched}"),
@@ -103,7 +106,7 @@ def answer(arguments, results: dict[str, JobResult]) -> Answer:
 def _rows(result: JobResult) -> list[tuple]:
     """Each anchor's identity and output, in order: what a streamed load must reproduce."""
     rows = [json.loads(line) for line in (result.directory / "draft.jsonl").read_text().splitlines()]
-    return [(row["fixture_id"], row["anchor"], row["proposals"], row["target"]) for row in rows]
+    return [(f"{row['template']}/{row['lane']}", row["anchor"], row["proposals"], row["target"]) for row in rows]
 
 
 @dataclass(frozen=True)
@@ -135,8 +138,8 @@ def _compare(cap: int, result: JobResult, reference: list[tuple]) -> _Reproduced
     differing = [(mine, theirs) for mine, theirs in zip(rows, reference) if mine != theirs]
     if not differing:
         return _Reproduced(len(rows))
-    (fixture, anchor, proposals, target), (_, _, base_proposals, base_target) = differing[0]
-    return _Parted((f"streamed {cap}: {len(differing)} of {len(rows)} anchors differ, first {fixture} @{anchor}: "
+    (session, anchor, proposals, target), (_, _, base_proposals, base_target) = differing[0]
+    return _Parted((f"streamed {cap}: {len(differing)} of {len(rows)} anchors differ, first {session} @{anchor}: "
                     f"proposals {proposals} vs {base_proposals}, target {target} vs {base_target}",))
 
 
@@ -161,9 +164,9 @@ def _streamed(arguments, results: dict[str, JobResult], uncapped: JobResult) -> 
 INSTRUMENT = Instrument(
     name="draft",
     kind="fidelity",
-    question="How well does the catalog drafter propose for this model, at one fixture family and context?",
+    question="How well does the catalog drafter propose for this model, on one template?",
     observable="drafter proposals the target accepts",
-    selectors=("backend", "host", "build", "model-or-checkpoint", "context", "fixture", "purpose", "estimate"),
+    selectors=("backend", "host", "build", "model-or-checkpoint", "template", "purpose", "estimate"),
     configure=configure,
     plan=plan,
     answer=answer,

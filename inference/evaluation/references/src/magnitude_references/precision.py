@@ -1,4 +1,4 @@
-"""Development controls for local precision premises on catalog-rendered fixtures.
+"""Development controls for local precision premises on catalog-rendered sessions.
 
 This is a CPU reference-family perturbation experiment, not native-kernel qualification.
 Noise is applied at its defined variance, without normalizing each random realization.
@@ -323,18 +323,18 @@ def checked_reference(path, rendered, vocabulary):
             or header.get("model") != rendered.model or header.get("rendered_digest") != rendered.digest
             or header.get("vocabulary") != vocabulary or not header.get("producer", "").startswith("reference:")):
         raise ValueError(f"{path}: independent reference identity/sanity does not match")
-    expected = [{"fixture_id": f.fixture_id, "position": p} for f in rendered.fixtures for p in f.positions()]
+    expected = [{"template": s.template, "lane": s.lane, "position": p} for s in rendered.sessions for p in s.positions()]
     if header["rows"] != expected:
-        raise ValueError(f"{path}: independent reference rows do not match rendered fixtures")
+        raise ValueError(f"{path}: independent reference rows do not match rendered sessions")
     offset, result, sanity = 0, {}, Gate()
-    for fixture in rendered.fixtures:
+    for fixture in rendered.sessions:
         length = len(fixture.positions())
-        result[fixture.fixture_id] = values[offset:offset + length]
+        result[fixture.name] = values[offset:offset + length]
         for start in range(0, length, 64):
             logits = torch.from_numpy(np.asarray(values[offset + start:offset + min(length, start + 64)]).copy())
             if not torch.isfinite(logits).all():
                 raise ValueError(f"{path}: nonfinite independent-reference logits")
-            sanity.add(fixture.fixture_id, logits, torch.tensor(fixture.targets()[start:start + 64]))
+            sanity.add(fixture.template, fixture.lane, logits, torch.tensor(fixture.targets()[start:start + 64]))
         offset += length
     measured_sanity = sanity.result(Bounds())
     if not measured_sanity["passed"]:
@@ -353,13 +353,13 @@ def run(args) -> dict:
     rendered_sets = [read_rendered(path) for path in args.rendered]
     for rendered in rendered_sets:
         check_match(rendered, artifacts)
-    selected = set(args.fixture or [])
-    fixtures = [fixture for rendered in rendered_sets for fixture in rendered.fixtures
-                if not selected or fixture.fixture_id in selected]
-    if not fixtures or (selected and selected != {f.fixture_id for f in fixtures}):
-        raise ValueError("selected fixtures must all occur in the rendered inputs")
-    if len({f.fixture_id for f in fixtures}) != len(fixtures):
-        raise ValueError("duplicate selected fixture identities")
+    selected = set(args.session or [])
+    fixtures = [fixture for rendered in rendered_sets for fixture in rendered.sessions
+                if not selected or fixture.name in selected]
+    if not fixtures or (selected and selected != {f.name for f in fixtures}):
+        raise ValueError("selected sessions must all occur in the rendered inputs")
+    if len({f.name for f in fixtures}) != len(fixtures):
+        raise ValueError("duplicate selected session identities")
     reference = open_reference(artifacts.target, torch.device("cpu"), cache=True)
     weight = reference.weights(args.unit)
     steps = q40_steps(reference.weights.package, args.unit, weight)
@@ -376,16 +376,15 @@ def run(args) -> dict:
             external_records.append(identity)
     identity = {
         "artifacts": artifacts.record, "rendered": [{"path": str(r.path), "sha256": r.digest} for r in rendered_sets],
-        "fixtures": [f.fixture_id for f in fixtures], "reference_implementation": digest.implementation(type(reference), None, "cpu"),
+        "sessions": [f.name for f in fixtures], "reference_implementation": digest.implementation(type(reference), None, "cpu"),
         "probe_sha256": sha256(Path(__file__)), "torch": torch.__version__, "numpy": np.__version__,
         "unit": args.unit, "independent_references": external_records,
     }
     identity_digest = digest.canonical(identity)
-    fixture_sets = {r.fixtures[0].fixture_id.split("/", 1)[0]: r.fixture_set_digest for r in rendered_sets}
     result = {"schema": "evaluation-result/1", "tool": "precision-controls", "started_at": started,
               "build": json.loads(args.build_identity.read_text()) if args.build_identity else record.build(),
               "model": artifacts.model, "artifacts": artifacts.record,
-              "fixture_set": {"path": None, "sets": fixture_sets, "digest": digest.canonical(fixture_sets)},
+              "templates": [{"template": r.template, "prompt_sha256": r.prompt_sha256} for r in rendered_sets],
               "rendered_digest": rendered_sets[0].digest if len(rendered_sets) == 1 else None,
               "host": record.host(torch.device("cpu")), "command": sys.argv, "identity": identity,
               "identity_digest": identity_digest, "measurements": {}, "traces": {},
@@ -412,17 +411,17 @@ def run(args) -> dict:
                 base = hidden(fixture)
             again = hidden(fixture)
             if not torch.equal(base, again):
-                raise ValueError(f"{fixture.fixture_id}: exact baseline replay changed hidden states")
-            bases[fixture.fixture_id], captured[fixture.fixture_id] = base, saved
+                raise ValueError(f"{fixture.name}: exact baseline replay changed hidden states")
+            bases[fixture.name], captured[fixture.name] = base, saved
             for start in range(0, len(base), 64):
                 logits = reference.logits(base[start:start + 64])
                 if not torch.isfinite(logits).all():
-                    raise ValueError(f"{fixture.fixture_id}: nonfinite baseline logits")
-                gate.add(fixture.fixture_id, logits, torch.tensor(fixture.targets()[start:start + 64]))
-            filename = digest.canonical(fixture.fixture_id)[:16]
+                    raise ValueError(f"{fixture.name}: nonfinite baseline logits")
+                gate.add(fixture.template, fixture.lane, logits, torch.tensor(fixture.targets()[start:start + 64]))
+            filename = digest.canonical(fixture.name)[:16]
             np.savez(args.output / f"baseline-{filename}.npz", hidden=base.numpy(), x=saved["x"].numpy(),
-                     y=saved["y"].numpy(), positions=np.array(fixture.positions()), fixture=fixture.fixture_id)
-            print(f"baseline replayed and captured: {fixture.fixture_id}", flush=True)
+                     y=saved["y"].numpy(), positions=np.array(fixture.positions()), fixture=fixture.name)
+            print(f"baseline replayed and captured: {fixture.name}", flush=True)
         sanity = gate.result(Bounds())
         result["measurements"]["sanity"] = sanity
         result["measurements"]["exact_baseline_replay"] = True
@@ -434,9 +433,9 @@ def run(args) -> dict:
             for seed in args.seed:
                 errors, stats = {}, {}
                 for fixture in fixtures:
-                    values = captured[fixture.fixture_id]
+                    values = captured[fixture.name]
                     error, variance = make_error(values["x"], values["y"], weight, steps, kind,
-                                                 seed, artifacts.target_sha256, args.unit, fixture.fixture_id)
+                                                 seed, artifacts.target_sha256, args.unit, fixture.name)
                     native = statistics(error, values["y"], variance)
                     # Deterministic technique/structure probes use one fixed normalization per
                     # captured tensor, then reuse that exact tensor at all signed amplitudes.
@@ -445,19 +444,19 @@ def run(args) -> dict:
                         if power == 0:
                             raise ValueError(f"{kind}: cannot normalize zero technique error")
                         error *= math.sqrt(float(variance.double().sum()) / power)
-                    errors[fixture.fixture_id] = error
-                    stats[fixture.fixture_id] = {
+                    errors[fixture.name] = error
+                    stats[fixture.name] = {
                         "native": native, "applied_at_one": statistics(error, values["y"], variance),
                         "subspace_correction": subspace_correction(error, values["x"], values["y"], steps),
                     }
-                    np.save(args.output / f"error-{kind}-{seed}-{digest.canonical(fixture.fixture_id)[:16]}.npy", error.numpy())
+                    np.save(args.output / f"error-{kind}-{seed}-{digest.canonical(fixture.name)[:16]}.npy", error.numpy())
                 for amplitude in args.amplitude:
                     begun, metrics, fixture_stats = time.monotonic(), {}, {}
                     for fixture in fixtures:
-                        error = errors[fixture.fixture_id]
+                        error = errors[fixture.name]
 
                         def perturb(x, y):
-                            original = captured[fixture.fixture_id]
+                            original = captured[fixture.name]
                             if not torch.equal(x, original["x"]) or not torch.equal(y, original["y"]):
                                 raise ValueError("single-site baseline inputs changed before perturbation")
                             return y + amplitude * error
@@ -466,9 +465,9 @@ def run(args) -> dict:
                             candidate = hidden(fixture)
                         parts = {}
                         for start in range(0, len(candidate), 64):
-                            default_logits = reference.logits(bases[fixture.fixture_id][start:start + 64])
+                            default_logits = reference.logits(bases[fixture.name][start:start + 64])
                             candidate_logits = reference.logits(candidate[start:start + 64])
-                            independent = external.get(fixture.fixture_id)
+                            independent = external.get(fixture.name)
                             measured = compare_logits(default_logits, candidate_logits,
                                                       None if independent is None else independent[start:start + 64])
                             for key, value in measured.items():
@@ -476,15 +475,15 @@ def run(args) -> dict:
                         combined = {key: np.concatenate(value) for key, value in parts.items()}
                         for key, value in combined.items():
                             metrics.setdefault(key, []).append(value)
-                        fixture_stats[fixture.fixture_id] = {key: (float(value.mean()) if key == "top1_agreement"
+                        fixture_stats[fixture.name] = {key: (float(value.mean()) if key == "top1_agreement"
                                                                   else distribution(value)) for key, value in combined.items()}
-                        output = args.output / f"{kind}-{seed}-{amplitude:g}-{digest.canonical(fixture.fixture_id)[:16]}.npz"
-                        np.savez(output, **combined, fixture=fixture.fixture_id, positions=np.array(fixture.positions()))
+                        output = args.output / f"{kind}-{seed}-{amplitude:g}-{digest.canonical(fixture.name)[:16]}.npz"
+                        np.savez(output, **combined, fixture=fixture.name, positions=np.array(fixture.positions()))
                     totals = {key: np.concatenate(value) for key, value in metrics.items()}
                     measured = {key: (float(value.mean()) if key == "top1_agreement" else distribution(value))
                                 for key, value in totals.items()}
                     row = {"kind": kind, "seed": seed, "amplitude": amplitude, "seconds": time.monotonic() - begun,
-                           "metrics": measured, "fixtures": fixture_stats, "local": stats}
+                           "metrics": measured, "sessions": fixture_stats, "local": stats}
                     rows.append(row)
                     result["measurements"]["conditions"] = rows
                     result["finished_at"] = record.utc_now()
@@ -498,7 +497,7 @@ def main():
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--rendered", type=Path, action="append", required=True)
     parser.add_argument("--reference", type=Path, action="append")
-    parser.add_argument("--fixture", action="append")
+    parser.add_argument("--session", action="append", help="a rendered session <template>/<lane> (repeatable)")
     parser.add_argument("--unit", required=True)
     parser.add_argument("--kind", choices=KINDS, action="append", required=True)
     parser.add_argument("--seed", type=int, action="append", required=True)

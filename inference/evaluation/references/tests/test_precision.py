@@ -107,17 +107,17 @@ def test_reference_sanity_is_remeasured_not_trusted_from_a_flag(tmp_path):
     (tmp_path / "reference.json").write_text(json.dumps({"model": "model", "rendered_digest": "rendered",
         "implementation_digest": "implementation", "sanity": {"passed": True}}))
     header = {"model": "model", "rendered_digest": "rendered", "vocabulary": 2,
-              "producer": "reference:test", "rows": [{"fixture_id": "fixture", "position": 0}]}
+              "producer": "reference:test", "rows": [{"template": "t", "lane": 0, "position": 0}]}
     (tmp_path / "logits.json").write_text(json.dumps(header))
     np.array([[0., 100.]], dtype="<f4").tofile(tmp_path / "logits.f32")
-    fixture = SimpleNamespace(fixture_id="fixture", positions=lambda: [0], targets=lambda: [0])
-    rendered = SimpleNamespace(model="model", digest="rendered", fixtures=[fixture])
+    session = SimpleNamespace(template="t", lane=0, name="t/0", positions=lambda: [0], targets=lambda: [0])
+    rendered = SimpleNamespace(model="model", digest="rendered", sessions=[session])
     with pytest.raises(ValueError, match="sanity gate"):
         checked_reference(tmp_path, rendered, 2)
     np.array([[100., 0.]], dtype="<f4").tofile(tmp_path / "logits.f32")
     values, identity = checked_reference(tmp_path, rendered, 2)
     assert identity["remeasured_sanity"]["passed"]
-    assert values["fixture"].shape == (1, 2)
+    assert values["t/0"].shape == (1, 2)
     header["rows"][0]["position"] = 1
     (tmp_path / "logits.json").write_text(json.dumps(header))
     with pytest.raises(ValueError, match="rows do not match"):

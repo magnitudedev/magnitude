@@ -12,7 +12,8 @@ from types import SimpleNamespace
 import numpy
 import pytest
 
-from magnitude_rig import ab, cli, engine, selectors, sources, store
+from magnitude_fixtures import Template
+from magnitude_rig import ab, cli, engine, selectors, sources, store, templates
 from magnitude_rig.build import BuildIdentity
 from magnitude_rig.host import memory
 from magnitude_rig.instruments import REGISTRY, WORKSPACE, JobResult, Measure, device, harness
@@ -30,6 +31,7 @@ MODEL = "qwen3.5-4b:gguf:q4"  # a catalog model
 # catalog's headers.
 SOURCE = SimpleNamespace(directory=sources.checkout())
 LLAMA = "magnitude-family-llama"
+TEMPLATE = Template.parse("repeat:4k")
 
 
 def test_durations():
@@ -139,7 +141,7 @@ def test_every_environment_reinstalls_the_workspace_packages_from_the_tree_it_bu
     assert set(WORKSPACE) == {tomllib.loads((workspace / member / "pyproject.toml").read_text())["project"]["name"]
                               for member in members}
     syncs = [REGISTRY["test"].plan(parse("test", *COMMON, "--suite", "python", "--", "x"), None, "alpha").builds[0],
-             REGISTRY["kl"].plan(parse("kl", "--backend", "metal", "--model", MODEL, "--context", "4096", "--purpose", "p",
+             REGISTRY["kl"].plan(parse("kl", "--backend", "metal", "--model", MODEL, "--template", "repeat:4k", "--purpose", "p",
                                        "--estimate", "1m"), None, "alpha").builds[1]]
     for step in syncs:
         assert step.argv[:4] == ("uv", "sync", "--frozen", "--no-editable")
@@ -166,6 +168,13 @@ def test_script_ships_the_file_and_runs_it_by_its_interpreter(tmp_path):
     job = plan.jobs[0][1]
     assert job.argv[:2] == ("{python}", "-c") and dict(job.env)["MRIG_RUN"] == "{run_dir}"
     assert plan.files == (script,) and job.argv[-1] == "{inputs}/probe.sh"
+    assert "MRIG_TEMPLATE" not in dict(job.env)
+    # A script names its request as every instrument does, and receives its built file.
+    named = REGISTRY["script"].plan(parse("script", *COMMON, str(script), "--template", "retrieve:1k",
+                                          "--lanes", "2"), None, "alpha")
+    template = templates.file(templates.name("retrieve:1k"), 2)
+    assert named.files == (script, template)
+    assert dict(named.jobs[0][1].env)["MRIG_TEMPLATE"] == f"{{inputs}}/{template.name}"
 
 
 def test_large_script_uses_staged_input_without_command_line_payload(tmp_path):
@@ -252,7 +261,7 @@ def test_step_answers_a_record_whose_harness_lacks_optional_sections(tmp_path):
     _step_record(tmp_path / "step", resident)
     streamed_detail = {"steps": steps, "window": {"wall_ms_per_step": 16.0}}
     _step_record(tmp_path / "streamed-7", streamed_detail, {"model": {"predicted_tok_s": 60.0, "all_hit": {}}})
-    arguments = argparse.Namespace(context=4096, sequences=1, weight_cap=[7], untimed=False, resident=None, streamed_only=False, tuning_defaults=False, tuning_record=None, tuning_replay=None)
+    arguments = argparse.Namespace(template=TEMPLATE, sequences=1, weight_cap=[7], untimed=False, resident=None, streamed_only=False, tuning_defaults=False, tuning_record=None, tuning_replay=None, cold=False)
     log = tmp_path / "log"
     results = {name: JobResult(tmp_path / name, log, 0) for name in ("step", "streamed-7")}
     results["measure"] = JobResult(tmp_path, log, 0)
@@ -276,7 +285,7 @@ def test_a_step_cell_whose_bank_resized_in_steady_decode_fails(tmp_path):
     moved = lambda resizes: {"resizes_begun": resizes, "resizing": [False, False], "resize_advances": 0,
                              "slots": [48, 48 - resizes], "host_slots": [None, None], "cover_begun": 1 - resizes,
                              "covering": [False, False]}
-    arguments = argparse.Namespace(context=4096, sequences=1, weight_cap=[7], untimed=False, resident=None, streamed_only=False, tuning_defaults=False, tuning_record=None, tuning_replay=None, cold=False)
+    arguments = argparse.Namespace(template=TEMPLATE, sequences=1, weight_cap=[7], untimed=False, resident=None, streamed_only=False, tuning_defaults=False, tuning_record=None, tuning_replay=None, cold=False)
     log = tmp_path / "log"
     for unsteady, ok in (([{"step": 3, "moved": moved(0)}], True),
                          ([{"step": 3, "moved": moved(1)}, {"warm": moved(1)}], False)):
@@ -293,7 +302,7 @@ def test_a_step_cell_whose_tuning_stopped_at_its_budget_is_void(tmp_path):
     _timed_result(tmp_path / "step", 13.0, 12.5, "aa")
     (tmp_path / "step" / "tuning.jsonl").write_text(json.dumps(
         {"event": "budget", "budget_seconds": 60.0, "used_seconds": 57.4, "refused": [{"unit": "u", "class": "measure", "reason": "seconds"}, {"unit": "v", "class": "form", "reason": "bytes"}]}) + "\n")
-    arguments = argparse.Namespace(context=4096, sequences=1, weight_cap=None, untimed=False, resident=None, streamed_only=False, tuning_defaults=False, tuning_record=None, tuning_replay=None)
+    arguments = argparse.Namespace(template=TEMPLATE, sequences=1, weight_cap=None, untimed=False, resident=None, streamed_only=False, tuning_defaults=False, tuning_record=None, tuning_replay=None, cold=False)
     answer = REGISTRY["step"].answer(arguments, {"step": JobResult(tmp_path / "step", tmp_path / "log", 0)})
     assert not answer.ok
     assert answer.lines[-1] == (
@@ -309,8 +318,8 @@ def test_a_pinned_cell_is_never_void_and_reports_what_the_pin_lacked(tmp_path):
         {"event": "pinned", "entry": "a", "choice": "replayed"},
         {"event": "pinned", "entry": "b", "choice": "not_replayed"},
     )) + "\n")
-    base = dict(context=4096, sequences=1, weight_cap=None, untimed=False, resident=None, streamed_only=False,
-                tuning_defaults=False, tuning_record=None)
+    base = dict(template=TEMPLATE, sequences=1, weight_cap=None, untimed=False, resident=None, streamed_only=False,
+                tuning_defaults=False, tuning_record=None, cold=False)
     answer = REGISTRY["step"].answer(argparse.Namespace(**base, tuning_replay=Path("metal.json")),
                                      {"step": JobResult(tmp_path / "step", tmp_path / "log", 0)})
     assert answer.ok
@@ -321,15 +330,15 @@ def test_a_recording_keeps_its_configurations_on_this_machine(tmp_path):
     _timed_result(tmp_path / "step", 13.0, 12.5, "aa")
     (tmp_path / "tuning-pins.json").write_text("[]")
     kept = tmp_path / "kept"
-    arguments = argparse.Namespace(context=4096, sequences=1, weight_cap=None, untimed=False, resident=None,
-                                   streamed_only=False, tuning_defaults=False, tuning_record=kept, tuning_replay=None)
+    arguments = argparse.Namespace(template=TEMPLATE, sequences=1, weight_cap=None, untimed=False, resident=None,
+                                   streamed_only=False, tuning_defaults=False, tuning_record=kept, tuning_replay=None, cold=False)
     REGISTRY["step"].answer(arguments, {"step": JobResult(tmp_path / "step", tmp_path / "log", 0)})
     assert kept.read_text() == "[]"
 
 
 def test_step_names_the_measurement_a_builds_record_lacks(tmp_path):
     _step_record(tmp_path, {"median_step": {}})
-    arguments = argparse.Namespace(context=4096, sequences=1, weight_cap=None, untimed=False, resident=None, streamed_only=False, tuning_defaults=False, tuning_record=None, tuning_replay=None)
+    arguments = argparse.Namespace(template=TEMPLATE, sequences=1, weight_cap=None, untimed=False, resident=None, streamed_only=False, tuning_defaults=False, tuning_record=None, tuning_replay=None, cold=False)
     answer = REGISTRY["step"].answer(arguments, {"step": JobResult(tmp_path, tmp_path / "log", 0)})
     assert not answer.ok and answer.lines == ("this build's harness records no detail.steps",)
     # A step timed by its own wall time, not from the completion before it, is no interval.
@@ -350,10 +359,10 @@ def test_step_answers_the_median_step_its_interval_launches_and_entries(tmp_path
     (tmp_path / "result.json").write_text(json.dumps({"measurements": {"speed": [
         {"phase": "prefill", "detail": {"rows": 4096, "cold_ms": 900.0, "samples_ms": [600.0, 610.0, 590.0]}},
         decode]}}))
-    arguments = argparse.Namespace(context=4096, sequences=1, weight_cap=None, untimed=False, resident=None, streamed_only=False, tuning_defaults=False, tuning_record=None, tuning_replay=None)
+    arguments = argparse.Namespace(template=TEMPLATE, sequences=1, weight_cap=None, untimed=False, resident=None, streamed_only=False, tuning_defaults=False, tuning_record=None, tuning_replay=None, cold=False)
     answer = REGISTRY["step"].answer(arguments, {"step": JobResult(tmp_path, tmp_path / "log", 0)})
-    assert answer.lines[0].startswith("step @4096 · 15.020 ms") and answer.lines[0].endswith("28 launches")
-    assert answer.lines[1].startswith("prefill @4096 · 600.0 ms (±10.0") and "6827 tok/s" in answer.lines[1]
+    assert answer.lines[0].startswith("step repeat:4k · 15.020 ms") and answer.lines[0].endswith("28 launches")
+    assert answer.lines[1].startswith("prefill repeat:4k · 600.0 ms (±10.0") and "6827 tok/s" in answer.lines[1]
     assert "dense_expand#1" in answer.lines[4]
     assert answer.measures["prefill_ms"].value == 600.0
     assert answer.measures["step_ms"].value == 15.02 and answer.measures["step_ms"].lower_is_better
@@ -403,8 +412,8 @@ def test_kernel_shows_configurations_as_changes_from_the_default_and_the_search(
 def test_kernel_tunes_over_the_models_own_weights():
     # Over the header export every weight is zero: every configuration's output is zero, and
     # validation admits every configuration alike.
-    arguments = parse("kernel", "--backend", "metal", "--model", MODEL, "--context", "4096", "--entry", "e",
-                      "--purpose", "p", "--estimate", "5m")
+    arguments = parse("kernel", "--backend", "metal", "--model", MODEL, "--template", "repeat:4k",
+                      "--entry", "e", "--purpose", "p", "--estimate", "5m")
     assert REGISTRY["kernel"].plan(arguments, None, "alpha").acquires == engine.Weights(MODEL)
 
 
@@ -426,7 +435,7 @@ def test_assess_breakdown_sums_each_entrys_launches_and_time(tmp_path):
 
 
 def test_ab_step_runs_every_round_on_the_bases_first_tuning():
-    arguments = parse("ab", "step", "--backend", "vulkan", "--model", MODEL, "--context", "4096",
+    arguments = parse("ab", "step", "--backend", "vulkan", "--model", MODEL, "--template", "repeat:4k",
                       "--base", "main", "--rounds", "2", "--purpose", "p", "--estimate", "5m")
     plans = {side: REGISTRY["step"].plan(arguments, None, "alpha") for side in ab.SIDES}
     jobs = ab._jobs(REGISTRY["step"], arguments, plans)
@@ -449,14 +458,14 @@ def test_every_checkout_on_a_host_shares_its_kernel_cache():
     tokens = [plan.tokens(side, None) for side in sides]
     assert tokens[0]["checkout"] != tokens[1]["checkout"]
     assert tokens[0]["engine_cache"] == tokens[1]["engine_cache"] == "/r/cache/engine"
-    arguments = parse("step", "--backend", "metal", "--model", MODEL, "--context", "4096", "--purpose", "p",
+    arguments = parse("step", "--backend", "metal", "--model", MODEL, "--template", "repeat:4k", "--purpose", "p",
                       "--estimate", "5m")
     argv = dict(REGISTRY["step"].plan(arguments, None, "h").jobs)["step"].argv
     assert argv[argv.index("--cache-dir") + 1] == "{engine_cache}/kernels"
 
 
 def test_a_streamed_step_measures_then_times_resident_then_each_cap_from_storage():
-    arguments = parse("step", "--backend", "metal", "--model", MODEL, "--context", "4096", "--purpose", "p",
+    arguments = parse("step", "--backend", "metal", "--model", MODEL, "--template", "repeat:4k", "--purpose", "p",
                       "--estimate", "5m", "--weight-cap", "13041030544", "--weight-cap", "21775704464")
     plan = REGISTRY["step"].plan(arguments, None, "alpha")
     assert [name for name, _ in plan.jobs] == ["measure", "step", "streamed-13041030544", "streamed-21775704464"]
@@ -477,32 +486,31 @@ def test_a_streamed_step_takes_its_resident_cell_only_from_a_record_of_the_same_
     """`--resident RUN` serves the streamed cells from RUN's recorded resident step, untimed again,
     on the host, model, backend and build it was measured at; any other refuses, naming why."""
     monkeypatch.setattr(store, "results", lambda: tmp_path / "results")
-    fixture = tmp_path / "prose-repeat.jsonl"
-    fixture.write_text("{}\n")
+    template = templates.file(TEMPLATE, 1)
     build = BuildIdentity("c" * 40, None)
     run = tmp_path / "results" / "earlier"
     _timed_result(run / "step", 13.0, 12.5, "aa")
     record = json.loads((run / "step" / "result.json").read_text())
     record.update(host={"alias": "alpha"}, model=MODEL, build=build.to_json(),
-                  fixture_set={"digest": hashlib.sha256(fixture.read_bytes()).hexdigest()},
-                  command=["magnitude-harness", "time", "--device", "cuda", "--contexts", "4096",
-                           "--concurrency", "1", "--lookahead", "on"])
+                  templates=[{"template": TEMPLATE.name, "context": 4096, "path": "t.json",
+                              "digest": hashlib.sha256(template.read_bytes()).hexdigest()}],
+                  command=["magnitude-harness", "time", "--device", "cuda", "--concurrency", "1", "--lookahead", "on"])
     (run / "step" / "result.json").write_text(json.dumps(record))
     (run / "rig.json").write_text(json.dumps({"codes": {"step": 0}}))
-    arguments = parse("step", *COMMON, "--model", MODEL, "--context", "4096", "--weight-cap", "7", "--resident", "earlier")
-    arguments.fixture = fixture
+    arguments = parse("step", *COMMON, "--model", MODEL, "--template", "repeat:4k", "--weight-cap", "7", "--resident", "earlier")
     source = SimpleNamespace(identity=build)
     plan = REGISTRY["step"].plan(arguments, source, "alpha")
     assert [name for name, _ in plan.jobs] == ["measure", "streamed-7"]
     streamed = dict(plan.jobs)["streamed-7"]
     assert streamed.argv[streamed.argv.index("--resident-decode") + 1] == "{inputs}/result.json"
-    assert plan.files == (fixture, run / "step" / "result.json")
+    assert plan.files == (template, run / "step" / "result.json")
     _timed_result(tmp_path / "cap", 20.0, 25.0, "aa", {"unavailable": "a test"})
     answer = REGISTRY["step"].answer(arguments, {"measure": JobResult(tmp_path, tmp_path / "log", 0),
                                                  "streamed-7": JobResult(tmp_path / "cap", tmp_path / "log", 0)})
     assert answer.lines[0] == "resident step recorded by run earlier, not timed again"
-    assert answer.lines[1].startswith("step @4096 · 13.000 ms") and answer.measures["step_ms"].value == 13.0
+    assert answer.lines[1].startswith("step repeat:4k · 13.000 ms") and answer.measures["step_ms"].value == 13.0
     assert any(line.startswith("streamed 7 · mean 25.000 ms · 40.0 tok/s · 0.500× resident") for line in answer.lines)
+    assert answer.lines[-2] == f"  repeat:4k · prompt {'e' * 12} · selected aa"
     with pytest.raises(engine.Refused, match="another build"):
         REGISTRY["step"].plan(arguments, SimpleNamespace(identity=BuildIdentity("d" * 40, None)), "alpha")
     with pytest.raises(engine.Refused, match="host 'alpha', not 'beta'"):
@@ -515,8 +523,9 @@ def test_a_streamed_step_takes_its_resident_cell_only_from_a_record_of_the_same_
 def _timed_result(directory: Path, step_ms: float, mean_ms: float, selected: str,
                   model: dict | None = None, cached: tuple[int, int] = (0, 0)) -> None:
     directory.mkdir(parents=True, exist_ok=True)
-    decode = {"phase": "decode", "detail": {"steps": [{"interval_ms": step_ms}] * 8, "selected_sha256": selected,
-                                            "window": {"wall_ms_per_step": mean_ms}}}
+    decode = {"phase": "decode", "template": "repeat:4k", "prompt_sha256": ["e" * 64],
+              "detail": {"steps": [{"interval_ms": step_ms}] * 8, "selected_sha256": selected,
+                         "window": {"wall_ms_per_step": mean_ms}}}
     if model is not None:
         decode["model"] = model
         before, after = cached
@@ -554,7 +563,7 @@ def test_a_streamed_step_answers_against_resident_and_voids_a_cache_served_one(t
     ]) + "\n")
     measure = tmp_path / "measure.log"
     measure.write_text("[stderr] magnitude-assess: not measured: the reads of v: expired\n")
-    arguments = argparse.Namespace(context=4096, sequences=1, weight_cap=[7], untimed=False, resident=None, streamed_only=False, tuning_defaults=False, tuning_record=None, tuning_replay=None)
+    arguments = argparse.Namespace(template=TEMPLATE, sequences=1, weight_cap=[7], untimed=False, resident=None, streamed_only=False, tuning_defaults=False, tuning_record=None, tuning_replay=None, cold=False)
     results = {"step": JobResult(tmp_path / "step", tmp_path / "log", 0),
                "measure": JobResult(tmp_path, measure, 0),
                "streamed-7": JobResult(tmp_path / "cap", log, 0)}
@@ -644,7 +653,7 @@ def test_a_streamed_only_step_times_no_resident_cell_and_answers_absolute_terms_
     """`--streamed-only` plans no resident step and prices no streamed one against one; its answer
     is the cells' absolute terms (steps, device busy and idle, boundaries' held and queued time,
     the estimate), never a ratio to resident; it takes no recorded resident cell either."""
-    common = ("step", "--backend", "vulkan", "--model", MODEL, "--context", "4096", "--purpose", "p",
+    common = ("step", "--backend", "vulkan", "--model", MODEL, "--template", "repeat:4k", "--purpose", "p",
               "--estimate", "5m", "--weight-cap", "7", "--streamed-only")
     plan = REGISTRY["step"].plan(parse(*common), None, "alpha")
     assert [name for name, _ in plan.jobs] == ["measure", "streamed-7"]
@@ -701,7 +710,7 @@ def test_a_streamed_only_step_times_no_resident_cell_and_answers_absolute_terms_
 def test_kl_judges_a_held_checkpoint_by_the_storage_resolution_bar(tmp_path):
     """A set no host fetches is read where it lies: the run writes its acquisition object, opens it
     for the logits and the judgement, and is within the bar exactly when the references say so."""
-    common = ("kl", "--backend", "cuda", "--context", "1024", "--purpose", "p", "--estimate", "5m")
+    common = ("kl", "--backend", "cuda", "--template", "repeat:1k", "--purpose", "p", "--estimate", "5m")
     arguments = parse(*common, "--checkpoint", "/models/set", "--yardstick-perturbed", "1", "2")
     plan = REGISTRY["kl"].plan(arguments, None, "alpha")
     assert plan.acquires is None and [name for name, _ in plan.jobs] == ["checkpoint", "measure", "logits", "kl"]
@@ -724,7 +733,7 @@ def test_kl_judges_a_held_checkpoint_by_the_storage_resolution_bar(tmp_path):
     # The answer is the references' own verdict.
     (tmp_path / "kl").mkdir()
     for within in (True, False):
-        over = [] if within else [{"fixture_id": "f", "position": 3, "ratio": 2.5, "top1_flipped": True}]
+        over = [] if within else [{"template": "t", "lane": 0, "position": 3, "ratio": 2.5, "top1_flipped": True}]
         (tmp_path / "kl" / "kl.json").write_text(json.dumps({
             "reference": {"cached": True},
             "build": {"mean_kl": 0.001, "p99_kl": 0.01, "max_kl": 0.02, "top1_agreement": 0.99, "positions": 64},
@@ -732,15 +741,15 @@ def test_kl_judges_a_held_checkpoint_by_the_storage_resolution_bar(tmp_path):
                            "ratio": {"median": 0.1, "p90": 0.3, "p99": 0.6, "max": 2.5 if over else 0.9},
                            "over": over, "unjudgeable_top1_agreement": 1.0, "worst": None, "within": within}}))
         answer = REGISTRY["kl"].answer(arguments, {"kl": JobResult(tmp_path / "kl", tmp_path / "log", 0)})
-        assert answer.ok is within and answer.lines[0] == "checkpoint /models/set · prose-repeat @1024 · reference cached"
+        assert answer.ok is within and answer.lines[0] == "checkpoint /models/set · repeat:1k · reference cached"
         assert answer.lines[-1] == ("within" if within else "NOT within") + " the storage-resolution bar (seeds 1 2)"
         text = "\n".join(answer.lines)
-        assert ("1 rows past the bar\n  f@3 ratio 2.5, top-1 flipped" in text) is not within
+        assert ("1 rows past the bar\n  t/0@3 ratio 2.5, top-1 flipped" in text) is not within
         assert ("0 rows past the bar" in text) is within
 
 
 def test_kl_with_weight_caps_passes_equal_logits_and_says_where_others_part(tmp_path):
-    arguments = parse("kl", "--backend", "metal", "--model", MODEL, "--context", "512", "--purpose", "p",
+    arguments = parse("kl", "--backend", "metal", "--model", MODEL, "--template", "repeat:1k", "--purpose", "p",
                       "--estimate", "5m", "--weight-cap", "7", "--weight-cap", "9")
     plan = REGISTRY["kl"].plan(arguments, None, "alpha")
     assert [name for name, _ in plan.jobs] == ["measure", "logits", "streamed-7", "streamed-9", "compare-streamed-7",
@@ -752,10 +761,10 @@ def test_kl_with_weight_caps_passes_equal_logits_and_says_where_others_part(tmp_
     for cap in (7, 9):
         step = jobs[f"streamed-{cap}"]
         assert step.fresh and "--tuning-defaults" in step.argv
-        assert step.argv[step.argv.index("--rendered") + 1] == "{runs}/logits/rendered.jsonl"
+        assert "--rendered" not in step.argv, "each load renders the template itself"
     # On the host: each comparison writes where the logits part, removes the candidate's logits,
     # and keeps the base's until the last comparison has read them.
-    rows = [{"fixture_id": "f", "position": position} for position in range(3)]
+    rows = [{"template": "t", "lane": 0, "position": position} for position in range(3)]
     loads = (("logits", [[0, 1], [2, 3], [4, 5]], None),
              ("streamed-7", [[0, 1], [2, 3], [4, 5]], {"least_layer_misses": 2, "misses": 9, "sited": 0}),
              ("streamed-9", [[0, 1], [2, 3.5], [4, 5]], {"least_layer_misses": 1, "misses": 5, "sited": 0}))
@@ -780,7 +789,7 @@ def test_kl_with_weight_caps_passes_equal_logits_and_says_where_others_part(tmp_
     # The differing row's KL against its base: softmax([2, 3]) against softmax([2, 3.5]).
     p, q = (numpy.exp(row) / numpy.exp(row).sum() for row in (numpy.array([2., 3.]), numpy.array([2., 3.5])))
     kl = numpy.array([0., float((p * numpy.log(p / q)).sum()), 0.])
-    assert answer.lines[2] == ("streamed 9: logits differ at 1 of 3 rows, first f@1, largest 0.5; "
+    assert answer.lines[2] == ("streamed 9: logits differ at 1 of 3 rows, first t/0@1, largest 0.5; "
                                f"KL against its base mean {kl.mean():.3g}, p99 {numpy.percentile(kl, 99):.3g}, "
                                f"max {kl.max():.3g}, top-1 100.00%; fewest misses at a streamed layer 1, 0 sited")
     assert not answer.ok
@@ -795,7 +804,7 @@ def test_kl_with_weight_caps_passes_equal_logits_and_says_where_others_part(tmp_
     # On a discrete device, the base and each streamed load beside its own also run under a
     # profile approving no CPU site, so every miss on either side is the device's: that load must
     # equal the base with its site serving nothing, and the other's site must have served misses.
-    discrete = parse("kl", "--backend", "cuda", "--model", MODEL, "--context", "512", "--purpose", "p",
+    discrete = parse("kl", "--backend", "cuda", "--model", MODEL, "--template", "repeat:1k", "--purpose", "p",
                      "--estimate", "5m", "--weight-cap", "7", "--without-site")
     jobs = dict(REGISTRY["kl"].plan(discrete, None, "alpha").jobs)
     assert list(jobs) == ["measure", "profile", "logits", "streamed-7", "unsited-7", "compare-streamed-7", "compare-unsited-7"]
@@ -823,7 +832,7 @@ def test_kl_with_weight_caps_passes_equal_logits_and_says_where_others_part(tmp_
     # verdict is the load approving no CPU site's.
     assert answer.lines[1] == ("streamed 7: its CPU site served misses in arithmetic admitted against α, so this is "
                                "not an equality check (the load approving no CPU site judges it): logits differ at "
-                               "1 of 3 rows, first f@1, largest 0.5; KL against its base mean 0.01, p99 0.02, max "
+                               "1 of 3 rows, first t/0@1, largest 0.5; KL against its base mean 0.01, p99 0.02, max "
                                "0.03, top-1 100.00%; fewest misses at a streamed layer 2, 4 sited")
     assert answer.ok and answer.lines[2] == ("streamed 7 approving no CPU site: equal logits (3 rows); "
                                              "fewest misses at a streamed layer 2, 0 sited")
@@ -851,7 +860,7 @@ def test_kl_with_weight_caps_passes_equal_logits_and_says_where_others_part(tmp_
             REGISTRY["kl"].answer(discrete, results)
         (tmp_path / name / "compare.json").write_text(json.dumps(compared(0, 4 if name == "compare-streamed-7" else 0)))
     # Without --without-site, a sited load's row is unjudged.
-    sited = parse("kl", "--backend", "cuda", "--model", MODEL, "--context", "512", "--purpose", "p",
+    sited = parse("kl", "--backend", "cuda", "--model", MODEL, "--template", "repeat:1k", "--purpose", "p",
                   "--estimate", "5m", "--weight-cap", "7")
     (tmp_path / "compare-streamed-7" / "compare.json").write_text(json.dumps(compared(0, 4)))
     answer = REGISTRY["kl"].answer(sited, {"compare-streamed-7": results["compare-streamed-7"]})
@@ -866,18 +875,19 @@ def test_kl_with_weight_caps_passes_equal_logits_and_says_where_others_part(tmp_
     assert not answer.ok and answer.lines[0].endswith("which streamed, fewest misses at a streamed layer 3, 5 sited")
     assert answer.lines[1] == (
         "streamed 7: its base's CPU site served misses in arithmetic admitted against α, so this is not an equality "
-        "check (unjudged: --without-site judges it): logits differ at 1 of 3 rows, first f@1, largest 0.5; KL against "
+        "check (unjudged: --without-site judges it): logits differ at 1 of 3 rows, first t/0@1, largest 0.5; KL against "
         "its base mean 0.01, p99 0.02, max 0.03, top-1 100.00%; fewest misses at a streamed layer 2, 0 sited")
     # A load that held its experts whole streamed nothing, and says nothing of misses.
     (tmp_path / "compare-streamed-7" / "compare.json").write_text(json.dumps({**compared(0, 0), "experts": None}))
     answer = REGISTRY["kl"].answer(sited, {"compare-streamed-7": results["compare-streamed-7"]})
     assert not answer.ok and answer.lines[1] == "streamed 7: held its experts whole, so it streamed nothing"
     # Under --between the first streamed load is the base, and no uncapped load runs.
-    between = parse("kl", "--backend", "metal", "--model", MODEL, "--context", "512", "--purpose", "p",
+    between = parse("kl", "--backend", "metal", "--model", MODEL, "--template", "repeat:1k", "--purpose", "p",
                     "--estimate", "5m", "--weight-cap", "7", "--weight-cap", "9", "--between")
     jobs = dict(REGISTRY["kl"].plan(between, None, "alpha").jobs)
     assert list(jobs) == ["measure", "streamed-7", "streamed-9", "compare-streamed-9"]
-    assert jobs["streamed-9"].argv[jobs["streamed-9"].argv.index("--rendered") + 1] == "{runs}/streamed-7/rendered.jsonl"
+    assert jobs["streamed-9"].argv[jobs["streamed-9"].argv.index("--template") + 1] == \
+        jobs["streamed-7"].argv[jobs["streamed-7"].argv.index("--template") + 1]
     assert "--weight-cap" in jobs["streamed-7"].argv and jobs["streamed-7"].fresh, "the base is itself streamed"
     # The second cap holds where its logits equal the first's and it missed at every streamed layer.
     (tmp_path / "between").mkdir()
@@ -896,7 +906,7 @@ def test_kl_with_weight_caps_passes_equal_logits_and_says_where_others_part(tmp_
     assert not REGISTRY["kl"].answer(between, results).ok
     # --repeat runs its passes on one load under one cap: neither comparison of loads takes it.
     for refused in (("--weight-cap", "9", "--between"), ("--without-site",)):
-        repeated = parse("kl", "--backend", "cuda", "--model", MODEL, "--context", "512", "--purpose", "p",
+        repeated = parse("kl", "--backend", "cuda", "--model", MODEL, "--template", "repeat:1k", "--purpose", "p",
                          "--estimate", "5m", "--weight-cap", "7", "--repeat", "2", *refused)
         with pytest.raises(SystemExit, match="--repeat"):
             REGISTRY["kl"].plan(repeated, None, "alpha")
@@ -905,10 +915,10 @@ def test_kl_with_weight_caps_passes_equal_logits_and_says_where_others_part(tmp_
 def test_kl_fails_a_streamed_load_whose_logits_are_not_finite(tmp_path):
     """A NaN row is neither equal logits nor a difference: it fails by name, whichever load holds
     it, even where both loads hold the same bits."""
-    arguments = parse("kl", "--backend", "metal", "--model", MODEL, "--context", "512", "--purpose", "p",
+    arguments = parse("kl", "--backend", "metal", "--model", MODEL, "--template", "repeat:1k", "--purpose", "p",
                       "--estimate", "5m", "--weight-cap", "7")
     jobs = dict(REGISTRY["kl"].plan(arguments, None, "alpha").jobs)
-    rows = [{"fixture_id": "f", "position": position} for position in range(3)]
+    rows = [{"template": "t", "lane": 0, "position": position} for position in range(3)]
     nan = float("nan")
     for base, candidate, counts in (([[0, 1], [2, 3], [4, 5]], [[0, 1], [nan, nan], [4, 5]], (0, 1)),
                                     ([[0, 1], [2, nan], [4, 5]], [[0, 1], [2, nan], [4, 5]], (1, 1))):
@@ -927,12 +937,12 @@ def test_kl_fails_a_streamed_load_whose_logits_are_not_finite(tmp_path):
         answer = REGISTRY["kl"].answer(arguments, {"compare-streamed-7": JobResult(tmp_path / "compare", tmp_path / "log", 0)})
         assert not answer.ok
         assert answer.lines[1] == (f"streamed 7: non-finite logits at {counts[0]} rows of its base and {counts[1]} of its "
-                                   "own of 3, first f@1; fewest misses at a streamed layer 2, 0 sited")
+                                   "own of 3, first t/0@1; fewest misses at a streamed layer 2, 0 sited")
 
 
 def test_bench_takes_its_measurement_options_and_builds_our_binaries_apart():
     arguments = parse("bench", "--backend", "vulkan", "--model", MODEL,
-                      "--purpose", "p", "--estimate", "5m", "--mode", "tools", "--context", "4k",
+                      "--purpose", "p", "--estimate", "5m", "--template", "retrieve:4k",
                       "--engine", "magnitude", "--engine", "llama.cpp", "--passes", "2")
     plan = REGISTRY["bench"].plan(arguments, None, "alpha")
     jobs = dict(plan.jobs)
@@ -946,6 +956,10 @@ def test_bench_takes_its_measurement_options_and_builds_our_binaries_apart():
     assert argv[argv.index("--magnitude-cache-dir") + 1] == "{runs}/kernels"
     assert jobs["measure"].argv == ("{target}/release/magnitude-assess", "--device", "vulkan",
                                     "--kernels", "{runs}/kernels", "--topology")
+    # The template's file, its traffic lanes and its qualification lane, among the run's inputs.
+    (template,) = plan.files
+    assert argv[argv.index("--template") + 1] == f"{{inputs}}/{template.name}"
+    assert len(json.loads(template.read_text())["sessions"]) == 9
     # The served engine and the harness never share a cargo invocation (feature unification).
     cargo = [step.argv for step in plan.builds if step.argv[0] == "cargo"]
     assert cargo == [("cargo", "build", "--release", "-p", "magnitude-engine-cli"),
@@ -953,14 +967,14 @@ def test_bench_takes_its_measurement_options_and_builds_our_binaries_apart():
                      ("cargo", "build", "--release", "-p", "magnitude-harness")]
     # A cache the run names is priced and served as given.
     named = parse("bench", "--backend", "cuda", "--model", MODEL, "--purpose", "p",
-                  "--estimate", "5m", "--mode", "tools", "--context", "4k", "--magnitude-cache-dir", "/c")
+                  "--estimate", "5m", "--template", "retrieve:4k", "--magnitude-cache-dir", "/c")
     jobs = dict(REGISTRY["bench"].plan(named, None, "alpha").jobs)
     assert jobs["measure"].argv[jobs["measure"].argv.index("--kernels") + 1] == "/c"
     assert jobs["bench"].argv.count("--magnitude-cache-dir") == 1
     assert jobs["bench"].argv[jobs["bench"].argv.index("--magnitude-cache-dir") + 1] == "/c"
     # Without our engine, nothing of ours is built, priced or passed.
     other = parse("bench", "--backend", "cuda", "--model", MODEL, "--purpose", "p",
-                  "--estimate", "5m", "--mode", "tools", "--context", "4k", "--engine", "mlx-vlm")
+                  "--estimate", "5m", "--template", "retrieve:4k", "--engine", "mlx-vlm")
     plan = REGISTRY["bench"].plan(other, None, "alpha")
     argv = dict(plan.jobs)["bench"].argv
     assert [name for name, _ in plan.jobs] == ["bench"]
@@ -977,30 +991,30 @@ def test_a_bench_whose_machine_measurement_failed_has_no_answer(tmp_path):
     assert REGISTRY["bench"].answer(None, {"bench": bench}).ok  # another engine alone
 
 
-def test_kl_judges_a_selection_against_the_defaults_on_the_same_tokens(tmp_path):
+def test_kl_judges_a_selection_against_the_defaults_on_the_same_template(tmp_path):
     trace = tmp_path / "run" / "tuning.jsonl"
     trace.parent.mkdir()
     trace.write_text("")
     model = MODEL
-    arguments = parse("kl", *COMMON, "--model", model, "--context", "4096", "--selection", str(trace.parent),
+    arguments = parse("kl", *COMMON, "--model", model, "--template", "repeat:4k", "--selection", str(trace.parent),
                       "--unit", "dense_expand")
     plan = REGISTRY["kl"].plan(arguments, None, "alpha")
     jobs = dict(plan.jobs)
     assert "--tuning-defaults" in jobs["defaults"].argv
     selected = jobs["selected"].argv
-    assert selected[selected.index("--rendered") + 1] == "{runs}/defaults/rendered.jsonl"
+    assert selected[selected.index("--template") + 1] == jobs["defaults"].argv[jobs["defaults"].argv.index("--template") + 1]
     assert selected[selected.index("--tuning-select") + 1] == "{inputs}/tuning.jsonl"
     assert selected[selected.index("--tuning-select-unit") + 1] == "dense_expand"
     assert jobs["kl"].argv[jobs["kl"].argv.index("--base") + 1] == "{runs}/defaults"
     assert trace in plan.files
     with pytest.raises(SystemExit):
-        parse("kl", *COMMON, "--model", model, "--context", "4096", "--selection", str(tmp_path / "none"))
+        parse("kl", *COMMON, "--model", model, "--template", "repeat:4k", "--selection", str(tmp_path / "none"))
 
 
 def test_draft_answers_the_drafters_acceptance_exactly(tmp_path):
     (tmp_path / "result.json").write_text(json.dumps({"measurements": {"drafting": {
-        "proposed": 64, "accepted": 40, "tokens_per_verify": 2.25, "matched_fixture": 30, "anchors": 32}}}))
-    arguments = argparse.Namespace(model="m:v", fixture=Path("prose-repeat.jsonl"), context=4096, attribute=False,
+        "proposed": 64, "accepted": 40, "tokens_per_verify": 2.25, "matched_session": 30, "anchors": 32}}}))
+    arguments = argparse.Namespace(model="m:v", template=TEMPLATE, attribute=False,
                                    weight_cap=None)
     answer = REGISTRY["draft"].answer(arguments, {"draft": JobResult(tmp_path, tmp_path / "log", 0)})
     assert answer.lines[1].startswith("2.250 tokens per verification · accepted 40 of 64 proposals (62.5%)")
@@ -1010,7 +1024,7 @@ def test_draft_answers_the_drafters_acceptance_exactly(tmp_path):
 def test_draft_takes_a_held_checkpoint_in_place_of_a_catalog_model(tmp_path):
     """A set no host fetches is drafted where it lies: its acquisition is written first, the
     streamed loads read it as every run's, and exactly one subject is named."""
-    common = ("draft", "--backend", "cuda", "--context", "1024", "--purpose", "p", "--estimate", "5m")
+    common = ("draft", "--backend", "cuda", "--template", "repeat:1k", "--purpose", "p", "--estimate", "5m")
     arguments = parse(*common, "--checkpoint", "/models/set", "--weight-cap", "7")
     plan = REGISTRY["draft"].plan(arguments, None, "alpha")
     assert plan.acquires is None and [name for name, _ in plan.jobs] == ["checkpoint", "measure", "draft", "streamed-7"]
@@ -1027,7 +1041,7 @@ def test_draft_takes_a_held_checkpoint_in_place_of_a_catalog_model(tmp_path):
         "proposed": 64, "accepted": 40, "tokens_per_verify": 2.25, "anchors": 32}}}))
     uncapped = parse(*common, "--checkpoint", "/models/set")
     answer = REGISTRY["draft"].answer(uncapped, {"draft": JobResult(tmp_path, tmp_path / "log", 0)})
-    assert answer.lines[0] == "checkpoint /models/set · prose-repeat @1024 · 32 anchors"
+    assert answer.lines[0] == "checkpoint /models/set · repeat:1k · 32 anchors"
 
 
 def test_every_streamed_job_follows_its_machines_measurement_job_and_its_acquisition(tmp_path):
@@ -1037,7 +1051,7 @@ def test_every_streamed_job_follows_its_machines_measurement_job_and_its_acquisi
     from magnitude_rig.instruments.binaries import ASSESS_BUILD
 
     def plan(*argv):
-        return REGISTRY[argv[0]].plan(parse(*argv, "--backend", "cuda", "--context", "1024", "--purpose", "p",
+        return REGISTRY[argv[0]].plan(parse(*argv, "--backend", "cuda", "--template", "repeat:1k", "--purpose", "p",
                                             "--estimate", "5m"), None, "alpha")
 
     streamed = (
@@ -1057,8 +1071,7 @@ def test_every_streamed_job_follows_its_machines_measurement_job_and_its_acquisi
 def test_bench_serves_a_held_set_in_place_of_a_catalog_model(tmp_path):
     """`--checkpoint` is the one held-set owner's (`held`): its acquisition is written first, the bench reads it
     and names no catalog model, and exactly one subject is named."""
-    common = ("bench", "--backend", "cuda", "--purpose", "p", "--estimate", "5m", "--mode", "prose-repeat",
-              "--context", "4k")
+    common = ("bench", "--backend", "cuda", "--purpose", "p", "--estimate", "5m", "--template", "repeat:4k")
     plan = REGISTRY["bench"].plan(parse(*common, "--checkpoint", "/models/set"), None, "alpha")
     assert plan.acquires is None and [name for name, _ in plan.jobs] == ["checkpoint", "measure", "bench"]
     assert "--model" not in dict(plan.jobs)["bench"].argv
@@ -1072,9 +1085,9 @@ def test_bench_serves_a_held_set_in_place_of_a_catalog_model(tmp_path):
 
 
 def test_kl_builds_the_references_alone_before_any_build_is_judged(tmp_path):
-    """`--references-only` renders the fixtures' tokens and obtains the reference and each draw of the bar, which
+    """`--references-only` renders the template's tokens and obtains the reference and each draw of the bar, which
     depend on the stored values and the tokens alone; no engine load runs, so no measurement job is needed."""
-    common = ("kl", "--backend", "cuda", "--context", "1024", "--purpose", "p", "--estimate", "5m")
+    common = ("kl", "--backend", "cuda", "--template", "repeat:1k", "--purpose", "p", "--estimate", "5m")
     plan = REGISTRY["kl"].plan(parse(*common, "--checkpoint", "/models/set", "--references-only",
                                      "--yardstick-perturbed", "1", "2"), None, "alpha")
     assert plan.acquires is None and [name for name, _ in plan.jobs] == ["checkpoint", "render", "references"]
@@ -1107,10 +1120,10 @@ def test_draft_compares_each_streamed_load_with_the_uncapped_anchor_by_anchor(tm
         return JobResult(directory, directory / "log", code)
 
     def row(anchor: int, target: list[int]) -> dict:
-        return {"fixture_id": "f", "anchor": anchor, "proposals": [1, 2], "target": target}
+        return {"template": "t", "lane": 0, "anchor": anchor, "proposals": [1, 2], "target": target}
 
     uncapped = [row(3, [1, 2, 9]), row(7, [1, 5, 9])]
-    arguments = argparse.Namespace(model="m:v", fixture=Path("prose-repeat.jsonl"), context=4096, attribute=False,
+    arguments = argparse.Namespace(model="m:v", template=TEMPLATE, attribute=False,
                                    weight_cap=[10, 20])
     answer = REGISTRY["draft"].answer(arguments, {
         "draft": run("draft", uncapped),
@@ -1119,7 +1132,7 @@ def test_draft_compares_each_streamed_load_with_the_uncapped_anchor_by_anchor(tm
         harness.streamed(20): run("other", [row(3, [1, 2, 9]), row(7, [1, 6, 9])]),
     })
     assert "streamed 10: same proposals and target tokens at all 2 anchors" in answer.lines
-    assert any(line.startswith("streamed 20: 1 of 2 anchors differ, first f @7") for line in answer.lines)
+    assert any(line.startswith("streamed 20: 1 of 2 anchors differ, first t/0 @7") for line in answer.lines)
     assert not answer.ok, "a cap that differs fails the answer"
     alone = argparse.Namespace(**{**vars(arguments), "weight_cap": [10]})
 
@@ -1135,7 +1148,7 @@ def test_draft_compares_each_streamed_load_with_the_uncapped_anchor_by_anchor(tm
     nothing = REGISTRY["draft"].answer(alone, {"draft": run("empty-draft", []), "measure": run("empty-measure", []),
                                                harness.streamed(10): run("empty", [])})
     assert not nothing.ok, "no anchor compared is no pass"
-    plan = REGISTRY["draft"].plan(parse("draft", *COMMON, "--model", MODEL, "--context", "4096", "--weight-cap", "10"), None, "alpha")
+    plan = REGISTRY["draft"].plan(parse("draft", *COMMON, "--model", MODEL, "--template", "repeat:4k", "--weight-cap", "10"), None, "alpha")
     assert [name for name, _ in plan.jobs] == ["measure", "draft", harness.streamed(10)]
 
 
@@ -1245,13 +1258,20 @@ def test_the_host_costs_fit_covers_every_load_at_the_least_overcharge():
     assert sum(charge(load) - load["own_bytes"] for load in loads) <= 7_500_000
 
 
-def test_a_fixture_set_is_built_and_stored_by_its_content(tmp_path, monkeypatch):
-    monkeypatch.setattr(selectors, "FIXTURES", tmp_path)
-    path = selectors.fixture("retrieval")
-    assert path.name == "retrieval.jsonl" and path.parent.parent == tmp_path
-    assert selectors.fixture("retrieval") == path
-    with pytest.raises(argparse.ArgumentTypeError):
-        selectors.fixture("nope")
+def test_a_template_file_is_built_with_its_lanes_and_stored_by_its_content(tmp_path, monkeypatch):
+    monkeypatch.setattr(templates, "TEMPLATES", tmp_path)
+    templates.file.cache_clear()
+    template = templates.name("retrieve:8k")
+    path = templates.file(template, 2)
+    assert path.parent == tmp_path and path.name == hashlib.sha256(path.read_bytes()).hexdigest()[:16] + ".json"
+    record = json.loads(path.read_text())
+    assert record["template"] == "retrieve:8k" and record["context"] == 8192 and len(record["sessions"]) == 2
+    assert templates.file(template, 1) != path
+    assert json.loads(templates.file(template, 1).read_text())["sessions"] == record["sessions"][:1]
+    templates.file.cache_clear()
+    for wrong in ("nope", "prose-repeat:4k", "repeat:4096"):
+        with pytest.raises(argparse.ArgumentTypeError, match="repeat, twist, retrieve, code, tools"):
+            templates.name(wrong)
 
 
 RECORDS = Path(__file__).parent / "records"
@@ -1296,17 +1316,23 @@ def test_step_names_what_a_recorded_prompt_group_lacks():
 
 def test_a_served_run_installs_the_catalog_beside_the_model_and_bounds_only_what_it_is_given():
     arguments = argparse.Namespace(scenario="stop", context=4096, weight_cap=None, plain=True, model="m:gguf:q4",
-                                   fixture=Path("set.jsonl"), backend="cuda")
+                                   template=TEMPLATE, backend="cuda")
     plan = REGISTRY["served"].plan(arguments, None, "host")
     assert plan.acquires == engine.Weights("m:gguf:q4", headers=True)
     assert plan.device == "device"
-    (name, job), (_, answers), (_, decoded), (_, judge) = plan.jobs
+    (_, render), (_, prompts), (name, job), (_, answers), (_, decoded), (_, judge) = plan.jobs
     assert name == "served" and job.fresh
+    # The service is asked the template's lanes as the harness sizes them.
+    (template,) = plan.files
+    assert len(json.loads(template.read_text())["sessions"]) == 2
+    assert render.argv[render.argv.index("--template") + 1] == f"{{inputs}}/{template.name}"
+    assert prompts.argv[-2:] == ("{runs}/render/rendered.jsonl", "{run_dir}/prompts.json")
+    assert job.argv[job.argv.index("--prompts") + 1] == "{runs}/prompts/prompts.json"
     # Its answers are teacher-forced through the whole model, computed again as the service
     # computes them on the same tokens, then judged.
-    assert answers.argv[answers.argv.index("--fixtures") + 1] == "{runs}/served/answers.jsonl"
+    assert answers.argv[answers.argv.index("--template") + 1] == "{runs}/served/answers.json"
     assert "--weight-cap" not in answers.argv and "--tuning-defaults" in answers.argv
-    assert decoded.argv[decoded.argv.index("--rendered") + 1] == "{runs}/answers/rendered.jsonl"
+    assert decoded.argv[decoded.argv.index("--template") + 1] == "{runs}/served/answers.json"
     assert "--tuning-defaults" not in decoded.argv and decoded.argv[decoded.argv.index("--batch") + 1] == "1"
     assert judge.argv[-3:] == ("{runs}/answers", "{runs}/decoded", "{run_dir}/judged.json")
     assert job.argv[job.argv.index("--context") + 1] == "4096"
@@ -1316,8 +1342,8 @@ def test_a_served_run_installs_the_catalog_beside_the_model_and_bounds_only_what
 
 def test_a_served_run_on_vulkan_hides_cuda_and_fails_when_the_service_selects_another_backend(tmp_path):
     arguments = argparse.Namespace(scenario="stop", context=None, weight_cap=None, plain=False, model="m:gguf:q4",
-                                   fixture=Path("set.jsonl"), backend="vulkan")
-    (_, job), *_ = REGISTRY["served"].plan(arguments, None, "host").jobs
+                                   template=TEMPLATE, backend="vulkan")
+    job = dict(REGISTRY["served"].plan(arguments, None, "host").jobs)["served"]
     assert dict(job.env)["CUDA_VISIBLE_DEVICES"] == ""
     (tmp_path / "served.json").write_text(json.dumps({"report": ["ready"]}))
     (tmp_path / "service-capped.log").write_text('\x1b[2mserving device selected\x1b[0m backend="cuda"\n')
@@ -1335,12 +1361,12 @@ def _judged_answers(tmp_path, rows: list[list[float]], targets: list[int], serve
     from magnitude_rig.instruments import served as instrument
     for directory in ("served", "answers", "decoded", "judge"):
         (tmp_path / directory).mkdir(parents=True)
-    fixture = {"id": "a", "sizing": {"unit": "fixed"}, "messages": [], "served": served}
-    (tmp_path / "served" / host.ANSWERS).write_text(json.dumps(fixture) + "\n")
-    (tmp_path / "served" / host.RESULTS).write_text(json.dumps({"report": [], "unjudged": []}))
+    (tmp_path / "served" / host.RESULTS).write_text(json.dumps(
+        {"report": [], "answers": [{"name": "a", "lane": 0, "served": served}], "unjudged": []}))
     prompt = 3
-    (tmp_path / "answers" / "rendered.jsonl").write_text(json.dumps({"fixture_id": "a", "tokens": [0] * prompt + targets}) + "\n")
-    header = {"vocabulary": len(rows[0]), "rows": [{"fixture_id": "a", "position": prompt - 1 + index} for index in range(len(rows))]}
+    (tmp_path / "answers" / "rendered.jsonl").write_text(json.dumps({"template": "t", "lane": 0, "tokens": [0] * prompt + targets}) + "\n")
+    header = {"vocabulary": len(rows[0]),
+              "rows": [{"template": "t", "lane": 0, "position": prompt - 1 + index} for index in range(len(rows))]}
     decoded = numpy.asarray(rows, dtype="<f4")
     for (row, token), delta in (deltas if deltas is not None else {(0, int(decoded[0].argmax())): 0.1}).items():
         decoded[row, token] += delta
@@ -1366,7 +1392,7 @@ def test_a_served_answer_may_part_only_within_the_measured_move_of_a_competing_m
     lines, passed = judged(run / "served", run / "judge")
     assert passed and lines[1:] == ["a: 2/3 tokens their row's top, worst 0.087 nats at token 1"]
     assert lines[0].startswith("largest move between the reference and the service-shaped computation of a margin below "
-                               "a row's top, among the tokens competing with it, 0.1000 (at a position 2, token 0: 0.0500")
+                               "a row's top, among the tokens competing with it, 0.1000 (at answer a position 2, token 0: 0.0500")
     run = _judged_answers(tmp_path / "wide", [near(0.05), near(0.12), top(2)], [1, 0, 2], {"tokens": 3, "finish": "length"})
     lines, passed = judged(run / "served", run / "judge")
     assert not passed and lines[1] == "a: 2/3 tokens their row's top, worst 0.120 nats at token 1, 1 past 0.1000 FAILED"
@@ -1389,7 +1415,7 @@ def test_a_served_corruption_nats_below_the_top_fails_whatever_the_tail_differs_
     run = _judged_answers(tmp_path, rows, [0, 0, 2], {"tokens": 3, "finish": "length"}, {(0, 2): 0.1, (0, 1): 3.0})
     lines, passed = judged(run / "served", run / "judge")
     assert lines[0].startswith("largest move between the reference and the service-shaped computation of a margin below "
-                               "a row's top, among the tokens competing with it, 0.1000 (at a position 2, token 2")
+                               "a row's top, among the tokens competing with it, 0.1000 (at answer a position 2, token 2")
     assert not passed and lines[1] == "a: 2/3 tokens their row's top, worst 1.500 nats at token 1, 1 past 0.1000 FAILED"
 
 
@@ -1417,18 +1443,25 @@ def test_a_served_answer_the_harness_tokenized_otherwise_is_unjudged(tmp_path):
 def test_a_served_answer_that_only_reasoned_is_kept_for_judgement(tmp_path):
     """A model whose reasoning cannot be turned off answers in its reasoning: that answer is
     judged as any other, and only one that generated nothing is unjudged."""
+    from magnitude_fixtures import TemplateFile
     from magnitude_rig.host.served import ANSWERS, RESULTS, Run
     run = Run.__new__(Run)
     run.directory, run.scratch, run.report, run.record, run.answers = tmp_path, tmp_path / "scratch", [], {}, []
-    asked = [{"role": "user", "content": "q"}]
+    run.template = json.loads(templates.file(TEMPLATE, 1).read_text())
+    asked = {"lane": 0, "messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "q"}],
+             "tools": [], "answer_tokens": 2}
     served = {"usage": {"completion_tokens": 2}, "finish": "length"}
     run.answered("thought", asked, served, "", "so")
     run.answered("silent", asked, served, "", "")
     run.finish()
-    kept = [json.loads(line) for line in (tmp_path / ANSWERS).read_text().splitlines()]
-    assert [fixture["id"] for fixture in kept] == ["thought"]
-    assert kept[0]["messages"][-1] == {"role": "assistant", "content": "", "scored": True, "reasoning_content": "so"}
-    assert json.loads((tmp_path / RESULTS).read_text())["unjudged"] == ["silent"]
+    # The answers are a template file of the asked template's name, each answered conversation whole.
+    answers = TemplateFile.read(tmp_path / ANSWERS)
+    assert answers.template == TEMPLATE.name and len(answers.sessions) == 1
+    (session,) = answers.sessions
+    assert session.messages[-1] == {"role": "assistant", "content": "", "scored": True, "reasoning_content": "so"}
+    assert session.conversation_with(0).messages[:-1] == asked["messages"]
+    record = json.loads((tmp_path / RESULTS).read_text())
+    assert [answer["name"] for answer in record["answers"]] == ["thought"] and record["unjudged"] == ["silent"]
 
 
 def test_a_served_run_counts_overlapping_workers_from_the_services_own_records():

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -90,13 +91,14 @@ def write_tiny_llama(path: Path, seed: int = 0, sharp: float = 0.0) -> None:
     writer.close()
 
 
-def write_rendered(directory: Path, model: Path, fixtures: list[tuple[list[int], list[list[int]]]],
+def write_rendered(directory: Path, model: Path, sessions: list[tuple[list[int], list[list[int]]]],
                    model_id: str = "tiny:gguf:f32") -> tuple[Path, Path]:
     target_sha256 = sha256(model)
-    lines = [{"fixture_id": f"test/{index}", "fixture_set_digest": "0" * 64, "model": model_id,
-              "target_sha256": target_sha256, "template_sha256": "1" * 64, "context_target": None,
-              "tokens": tokens, "scored_spans": spans, "generation_prefix_tokens": None}
-             for index, (tokens, spans) in enumerate(fixtures)]
+    lines = [{"template": "repeat:1k", "lane": lane, "model": model_id, "target_sha256": target_sha256,
+              "chat_template_sha256": "1" * 64, "request_options": {}, "context": 1024, "history": 0,
+              "tokens": tokens, "prompt_sha256": hashlib.sha256(np.asarray(tokens, dtype="<u4").tobytes()).hexdigest(),
+              "scored_spans": spans, "generation_prefix_tokens": spans[0][0]}
+             for lane, (tokens, spans) in enumerate(sessions)]
     rendered = directory / "rendered.jsonl"
     rendered.write_text("".join(json.dumps(line) + "\n" for line in lines))
     artifacts = directory / "artifacts.json"

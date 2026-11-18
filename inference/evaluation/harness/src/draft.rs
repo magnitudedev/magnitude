@@ -1,12 +1,12 @@
-//! `draft`: the catalog drafter's behaviour on fixtures. At anchors spread
-//! over each fixture's scored spans, the target prefills the tokens before
+//! `draft`: the catalog drafter's behaviour on template lanes. At anchors
+//! spread over each lane's scored spans, the target prefills the tokens before
 //! the anchor (its features condition the drafter), a drafter keeping its own
 //! history is primed on them as the served path primes it (one reading the
 //! target's history, such as an MTP assistant, enters none), drafts greedy
 //! proposals from the
 //! anchor token, and the target verifies them: the accepted prefix is the
 //! proposals equal to the target's own greedy choices. Proposals are also
-//! compared with the fixture's own next tokens.
+//! compared with the session's own next tokens.
 
 use crate::artifacts::Artifacts;
 use crate::engine::{self, Engine, EngineOptions, Load, PREFILL_ROWS, text};
@@ -24,7 +24,7 @@ use std::io::Write;
 use std::path::Path;
 
 pub struct DraftOptions {
-    /// Anchors per fixture, spread evenly over its scored positions.
+    /// Anchors per lane, spread evenly over its scored positions.
     pub anchors: usize,
     /// How the load drafts: the catalog's drafter or head (`Auto`), or a named method.
     pub method: ModelMethod,
@@ -35,7 +35,7 @@ pub struct DraftOptions {
     pub attribute: bool,
 }
 
-/// Draft at every fixture's anchors, writing one JSON line per anchor to
+/// Draft at every lane's anchors, writing one JSON line per anchor to
 /// `records`. Returns the drafting measurement and the device's name.
 pub fn run(
     artifacts: &Artifacts,
@@ -46,9 +46,9 @@ pub fn run(
 ) -> Result<(Value, String), String> {
     let longest = rendered
         .iter()
-        .map(|fixture| fixture.tokens.len())
+        .map(|lane| lane.tokens.len())
         .max()
-        .expect("a fixture set is nonempty");
+        .expect("a run renders at least one lane");
     let mut engine = Engine::open(
         artifacts,
         options,
@@ -56,7 +56,7 @@ pub fn run(
             method: draft.method,
             proposals: draft.proposals,
             context_tokens: longest + 2 * usize::from(u8::MAX),
-            // One fixture's sequence at a time.
+            // One lane's sequence at a time.
             sequences: std::num::NonZeroUsize::MIN,
             decode_rows: magnitude_executor::StepAllowances::EVALUATION_DRAFTING.decode_tokens,
             exported_logits_rows: 0,
@@ -69,21 +69,22 @@ pub fn run(
     let mut file = std::fs::File::create(records)
         .map_err(|error| format!("{}: {error}", records.display()))?;
     let (mut proposed, mut accepted, mut matched, mut verifications) = (0, 0, 0, 0);
-    for fixture in rendered {
-        let tokens = engine::tokens(&fixture.tokens);
-        for anchor in anchors(fixture, draft.anchors) {
+    for lane in rendered {
+        let tokens = engine::tokens(&lane.tokens);
+        for anchor in anchors(lane, draft.anchors) {
             let outcome = draft_at(&mut engine, drafter, &tokens, anchor, draft.attribute)?;
             proposed += outcome.proposals.len();
             accepted += outcome.accepted;
             matched += outcome.matched;
             verifications += 1;
             let record = json!({
-                "fixture_id": fixture.fixture_id,
+                "template": lane.template,
+                "lane": lane.lane,
                 "anchor": anchor,
                 "proposals": outcome.proposals.iter().map(|token| token.0).collect::<Vec<_>>(),
                 "target": outcome.target.iter().map(|token| token.0).collect::<Vec<_>>(),
                 "accepted": outcome.accepted,
-                "matched_fixture": outcome.matched,
+                "matched_session": outcome.matched,
                 "attribution": outcome.attribution,
             });
             serde_json::to_writer(&mut file, &record)
@@ -97,21 +98,21 @@ pub fn run(
             "proposed": proposed,
             "accepted": accepted,
             "tokens_per_verify": (accepted + verifications) as f64 / verifications.max(1) as f64,
-            "matched_fixture": matched,
+            "matched_session": matched,
             "anchors": verifications,
         }),
         device,
     ))
 }
 
-/// Up to `count` anchors spread evenly over the fixture's scored positions,
+/// Up to `count` anchors spread evenly over the lane's scored positions,
 /// each with a committed token before it and a next token after it.
-fn anchors(fixture: &Rendered, count: usize) -> Vec<usize> {
-    let positions = fixture
+fn anchors(lane: &Rendered, count: usize) -> Vec<usize> {
+    let positions = lane
         .scored_spans
         .iter()
         .flat_map(|span| span.clone())
-        .filter(|&position| position >= 1 && position + 1 < fixture.tokens.len())
+        .filter(|&position| position >= 1 && position + 1 < lane.tokens.len())
         .collect::<Vec<_>>();
     if positions.is_empty() || count == 0 {
         return Vec::new();

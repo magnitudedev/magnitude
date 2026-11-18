@@ -4,10 +4,7 @@ from magnitude_bench import cli
 from magnitude_bench.models import catalog_reference, targets
 
 
-def test_contexts_and_sections():
-    assert cli.contexts("16k,4k,4096") == (4096, 16384)
-    with pytest.raises(ValueError):
-        cli.contexts("0")
+def test_sections():
     assert cli.choices("all", ("a", "b")) == ("a", "b")
     with pytest.raises(ValueError):
         cli.choices("context,nope", ("context",))
@@ -40,7 +37,7 @@ def test_gguf_engines_serve_the_catalog_target_and_others_name_their_form(acquis
 
 
 def test_measurement_options_round_trip_through_their_arguments():
-    given = ["--mode", "tools", "--context", "4k,16k", "--engine", "llama.cpp", "--engine", "magnitude",
+    given = ["--section", "context,parallel", "--engine", "llama.cpp", "--engine", "magnitude",
              "--llama-binary", "bin/llama-server", "--fresh-tuning", "--passes", "2",
              "--magnitude-build", '{"commit":"c","dirty_digest":null}', "--ollama-answer-prefill"]
     parser = cli.argparse.ArgumentParser()
@@ -51,9 +48,22 @@ def test_measurement_options_round_trip_through_their_arguments():
     assert "--llama-gpu-layers" not in cli.arguments(parsed)  # defaults stay unsaid
 
 
+def test_templates_are_the_jobs_own_repeatable_option(tmp_path):
+    """The rig names templates and builds their files; the job reads them, so `--template` is not
+    a measurement option the rig passes through."""
+    parser = cli.argparse.ArgumentParser()
+    cli.measurement_options(parser)
+    assert "--template" not in parser._option_string_actions
+    args = cli.parser().parse_args([
+        "job", "--template", "a.json", "--template", "b.json", "--inference", "i",
+        "--artifacts", "a", "--output", "o", "--build-identity", "b",
+    ])
+    assert [str(path) for path in args.template] == ["a.json", "b.json"]
+
+
 def test_invalid_selection_fails_before_any_job():
     args = cli.parser().parse_args([
-        "job", "--mode", "tools", "--model", "qwen3.5-4b:gguf:q3", "--context", "4k",
+        "job", "--template", "t.json", "--model", "qwen3.5-4b:gguf:q3",
         "--inference", "i", "--artifacts", "a.json", "--output", "out", "--build-identity", "b.json",
     ])
     with pytest.raises(ValueError, match="no variant"):
@@ -63,7 +73,7 @@ def test_invalid_selection_fails_before_any_job():
 def test_a_held_set_is_served_under_the_name_its_acquisition_gives_it(tmp_path):
     """`job` takes no catalog reference for a set the host holds: the acquisition names it, and a catalog
     reference, where given, must be the one the acquisition names."""
-    base = ["job", "--mode", "prose-repeat", "--context", "4k", "--inference", str(tmp_path), "--artifacts", str(tmp_path / "a.json"),
+    base = ["job", "--template", str(tmp_path / "t.json"), "--inference", str(tmp_path), "--artifacts", str(tmp_path / "a.json"),
             "--output", str(tmp_path / "out"), "--build-identity", str(tmp_path / "b.json")]
     held = cli.parser().parse_args(base)
     assert held.model is None

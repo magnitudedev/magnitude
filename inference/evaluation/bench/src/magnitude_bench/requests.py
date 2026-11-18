@@ -3,26 +3,34 @@
 import json
 from typing import Literal
 
-from magnitude_fixtures import Family, Generation
+from magnitude_fixtures import Generation, Key
 from magnitude_fixtures.canonical import Record, digest, encoded
 from pydantic import Field, JsonValue
 
 from .policy import SEED
 
-Section = Literal["single", "context", "session", "parallel", "fork", "concurrency", "memory"]
+Section = Literal["context", "session", "parallel", "fork", "concurrency", "memory", "vision"]
+#: What a request's answer is checked as: a template key, or the bench's own image
+#: capability check (``vision``), which is not a template.
+Check = Key | Literal["vision"]
 
 
 class Request(Record):
-    """One serving request: a sized fixture's conversation up to its generation prefix."""
+    """One serving request: a template lane's sized conversation up to its generation prefix,
+    or one case of the bench's vision check."""
 
     id: str
     section: Section
     session: str
-    #: The context the fixture was sized to; 0 for an unsized (head and probe only) request.
+    #: The context the template sizes its lane to; 0 for a vision case, which is not sized.
     checkpoint: int = Field(ge=0)
     concurrency: int = Field(default=1, ge=1)
-    family: Family
-    fixture_id: str
+    #: The template's name; None for a vision case.
+    template: str | None
+    lane: int = Field(ge=0)
+    key: Check
+    #: The digest of the lane's rendered tokens, where the catalog GGUF's rendering sized it.
+    prompt_sha256: str | None = None
     messages: list[dict[str, JsonValue]]
     tools: list[dict[str, JsonValue]]
     generation: Generation
@@ -34,7 +42,7 @@ class Request(Record):
         return self.generation.max_tokens
 
     def body(self, model: str) -> dict:
-        """Greedy, seeded, thinking disabled; tools are required when the fixture offers them."""
+        """Greedy, seeded, thinking disabled; tools are required when the session offers them."""
         return json.loads(
             encoded(
                 {
@@ -58,7 +66,7 @@ class Plan(Record):
     warmup: Request
     requests: tuple[Request, ...]
     parallel_sequences: int = Field(ge=1)
-    # Sharing a fixture's history is not evidence that an engine retained a prefix.
+    # Sharing a session's history is not evidence that an engine retained a prefix.
     cache_policy: Literal["disabled"] = "disabled"
 
     @property

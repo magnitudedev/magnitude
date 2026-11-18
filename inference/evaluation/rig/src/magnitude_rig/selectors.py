@@ -6,21 +6,15 @@ wrong argument fails in a second instead of after a queue and a build.
 """
 
 import argparse
-import hashlib
-import os
 import re
 from dataclasses import dataclass
-from pathlib import Path
 
 from magnitude_bench.models import catalog_reference
-from magnitude_fixtures import FAMILIES, encode_set, read_set
-from magnitude_fixtures import build as build_set
 
+from . import templates
 from .sources import WORKTREE, SourceUnavailable, checkout, commit
-from .state import HOME
 
 BACKENDS = ("metal", "cuda", "vulkan", "cpu")
-FIXTURES = HOME / "fixtures"
 _DURATION = re.compile(r"^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+(?:\.\d+)?)s?)?$")
 
 
@@ -40,35 +34,6 @@ def model(text: str) -> str:
         return catalog_reference(text, checkout())
     except (ValueError, SourceUnavailable) as error:
         raise argparse.ArgumentTypeError(str(error)) from None
-
-
-def fixture(text: str) -> Path:
-    """The family's fixture set as this checkout's fixtures build it (deterministically, from
-    pinned sources), or a fixture set file (one an earlier run measured on, to measure on
-    exactly its fixtures), stored by its content digest: equal sets are one file, and the hosts'
-    cached references, keyed by what the set renders to, are shared by every run of it."""
-    if text in FAMILIES:
-        fixtures, family = build_set(text), text
-    elif Path(text).is_file():
-        try:
-            fixtures, _ = read_set(Path(text))
-        except ValueError as error:
-            raise argparse.ArgumentTypeError(f"{text}: not a fixture set: {error}") from None
-        families = {fixture.family for fixture in fixtures}
-        if len(families) != 1:
-            raise argparse.ArgumentTypeError(f"{text}: a fixture set is of one family, not {sorted(families)}")
-        (family,) = families
-    else:
-        raise argparse.ArgumentTypeError(
-            f"{text!r} is neither a fixture family ({', '.join(FAMILIES)}) nor a fixture set file")
-    content = encode_set(fixtures)
-    path = FIXTURES / hashlib.sha256(content).hexdigest()[:16] / f"{family}.jsonl"
-    if not path.is_file():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        staged = path.with_suffix(f".{os.getpid()}.tmp")
-        staged.write_bytes(content)
-        staged.replace(path)
-    return path
 
 
 def build(text: str) -> str:
@@ -100,11 +65,12 @@ SELECTORS = {
                                                    "help": "catalog model <id>:<variant>, or --checkpoint DIR"}),
     "model-or-catalog": Selector(("--model",), {"type": model,
                                                 "help": "catalog model <id>:<variant>, or --catalog for all"}),
-    "context": Selector(("--context",), {"type": int, "required": True,
-                                         "help": "context length in tokens"}),
-    "fixture": Selector(("--fixture",), {"type": fixture, "default": "prose-repeat",
-                                         "help": f"fixture family ({', '.join(FAMILIES)}) or a fixture "
-                                                 "set file; default prose-repeat"}),
+    "template": Selector(("--template",), {"type": templates.name, "required": True,
+                                           "help": "the request measured, <key>:<context>, "
+                                                   "e.g. repeat:8k (1k = 1024 tokens)"}),
+    "templates": Selector(("--template",), {"type": templates.name, "action": "append", "required": True,
+                                            "help": "a request measured (repeatable), "
+                                                    "<key>:<context>, e.g. repeat:8k"}),
     "entry": Selector(("--entry",), {"required": True, "help": "kernel entry name, e.g. attention_decode_k8v4"}),
     "purpose": Selector(("--purpose",), {"required": True,
                                          "help": "what this run settles, in a sentence"}),

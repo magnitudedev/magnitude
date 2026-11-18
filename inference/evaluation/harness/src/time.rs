@@ -1,14 +1,16 @@
-//! `time`: prefill and decode throughput at context lengths and concurrency,
-//! on fixtures sized to each context, without drafting (the drafter's
-//! acceptance is `draft`'s; served drafting is the serving benchmark's).
+//! `time`: prefill and decode throughput at each template's context and
+//! concurrency, without drafting (the drafter's acceptance is `draft`'s;
+//! served drafting is the serving benchmark's).
 //!
-//! Cells, at each context N and concurrency C:
-//! - `prefill`: C fresh sequences take their fixtures' tokens in prefill
+//! Cells, for each template (its lanes sized to its context N) and
+//! concurrency C, of lanes 0 … C − 1 (a template with fewer lanes fails the
+//! run: a cell never repeats a request):
+//! - `prefill`: C fresh sequences take their lanes' tokens in prefill
 //!   steps of at most `PREFILL_ROWS` rows packed across sequences, as the
 //!   service bounds them; one cold sample, then warm samples (median). With
 //!   `--prefill-attribution`, one further sample runs each launch in its own
 //!   timed unit and decomposes the prefill's device time by entry;
-//! - `decode`: C sequences hold their fixtures' tokens as history, then
+//! - `decode`: C sequences hold their lanes' tokens as history, then
 //!   decode together, each step feeding back its greedy selections: warm
 //!   steps, then measured steps (median).
 //!
@@ -36,7 +38,7 @@
 use crate::rest::{BankRest, Progress, decode_context_rows, steady_window};
 use crate::artifacts::Artifacts;
 use crate::engine::{self, Checkpoint, Engine, EngineOptions, Load, PREFILL_ROWS, Sequence, Step};
-use crate::fixture::FixtureSet;
+use crate::template::TemplateFile;
 use crate::render::{Rendered, Renderer};
 use crate::steps::{self, attribution, device_end, median, medians, summary, window};
 use magnitude_executor::{Demand, Operation, WorkKind};
@@ -46,7 +48,6 @@ use serde_json::{Value, json};
 const MS: f64 = 1e3;
 
 pub struct TimeOptions {
-    pub contexts: Vec<usize>,
     pub concurrency: Vec<usize>,
     pub warm: usize,
     pub steps: usize,
@@ -101,7 +102,7 @@ pub struct Timed {
 
 pub fn run(
     artifacts: &Artifacts,
-    set: &FixtureSet,
+    templates: &[TemplateFile],
     renderer: &Renderer<'_>,
     options: &EngineOptions,
     time: &TimeOptions,
@@ -113,22 +114,36 @@ pub fn run(
     {
         return Err(format!("{}: the resident result does not exist", resident.display()));
     }
-    let mut by_context = Vec::with_capacity(time.contexts.len());
-    for &context in &time.contexts {
-        let rendered = set
-            .fixtures
+    let widest = time.concurrency.iter().copied().max().expect("a run has a concurrency");
+    let mut by_template = Vec::with_capacity(templates.len());
+    for file in templates {
+        if file.sessions.len() < widest {
+            return Err(format!(
+                "{}: {} holds {} lanes; concurrency {widest} needs {widest}",
+                file.path.display(),
+                file.name,
+                file.sessions.len()
+            ));
+        }
+        // Only the lanes a cell decodes are rendered.
+        let file_lanes = &file.sessions[..widest];
+        let rendered = file_lanes
             .iter()
-            .map(|fixture| renderer.render(fixture, Some(context)))
+            .enumerate()
+            .map(|(lane, session)| {
+                renderer
+                    .render_lane(&file.name, lane, session, file.context)
+                    .map_err(|error| format!("{} lane {lane}: {error}", file.name))
+            })
             .collect::<Result<Vec<_>, _>>()?;
-        by_context.push((context, rendered));
+        by_template.push((file.context, rendered));
     }
 
-    let longest = by_context
+    let longest = by_template
         .iter()
-        .flat_map(|(_, rendered)| rendered.iter().map(|fixture| fixture.tokens.len()))
+        .flat_map(|(_, rendered)| rendered.iter().map(|lane| lane.tokens.len()))
         .max()
-        .expect("a fixture set is nonempty");
-    let widest = time.concurrency.iter().copied().max().expect("a run has a concurrency");
+        .expect("a run reads at least one template");
     let two_row = time.modes.contains(&DecodeMode::TwoRow);
     if two_row && widest != 1 {
         return Err("a two-row decode is timed at concurrency 1".into());
@@ -198,11 +213,9 @@ pub fn run(
     };
     let devices = vec![engine.device().info().name().to_owned()];
     let mut speed = Vec::new();
-    for (context, rendered) in &by_context {
+    for (context, rendered) in &by_template {
         for &concurrency in &time.concurrency {
-            let histories = (0..concurrency)
-                .map(|index| &rendered[index % rendered.len()])
-                .collect::<Vec<_>>();
+            let histories = rendered[..concurrency].iter().collect::<Vec<_>>();
             eprintln!("magnitude-harness: prefill context={context} concurrency={concurrency}");
             // The last timed sample's prompt groups, judged once the decode
             // cell has given the run its read line.
@@ -274,7 +287,7 @@ pub fn run(
         }
     }
     drop(engine);
-    let rendered = by_context
+    let rendered = by_template
         .into_iter()
         .flat_map(|(_, rendered)| rendered)
         .collect::<Vec<_>>();
@@ -333,10 +346,11 @@ fn with_cell(
     cell["phase"] = json!(phase);
     cell["context"] = json!(context);
     cell["concurrency"] = json!(concurrency);
-    cell["fixtures"] = json!(
+    cell["template"] = json!(histories[0].template);
+    cell["prompt_sha256"] = json!(
         histories
             .iter()
-            .map(|history| &history.fixture_id)
+            .map(|history| history.prompt_sha256())
             .collect::<Vec<_>>()
     );
     cell["history_tokens"] = json!(

@@ -4,14 +4,14 @@
 //! the forward of `tokens[p]` returns, the prediction of `tokens[p + 1]`, so
 //! a span `[start, end)` yields rows at positions `start - 1 ..= end - 2`.
 //!
-//! Each fixture's tokens before those positions are prefilled in chunks of
-//! at most `PREFILL_ROWS` rows, packed across the fixtures decoded together;
+//! Each lane's tokens before those positions are prefilled in chunks of
+//! at most `PREFILL_ROWS` rows, packed across the lanes decoded together;
 //! each predicting position is then fed as a decode (or, with a verify width
 //! above one, as rows of one verification forward).
 //!
 //! With a sample, only runs of a few predicting positions spread evenly over
-//! each fixture's are scored, the tokens between them prefilled: decode steps
-//! from many depths of every fixture at a fraction of the rows.
+//! each lane's are scored, the tokens between them prefilled: decode steps
+//! from many depths of every lane at a fraction of the rows.
 
 use crate::artifacts::Artifacts;
 use crate::engine::{self, Engine, EngineOptions, Load, PREFILL_ROWS, Sequence};
@@ -24,33 +24,33 @@ use std::ops::Range;
 use std::path::Path;
 
 pub struct LogitsOptions {
-    /// Fixtures decoded together.
+    /// Lanes decoded together.
     pub batch: usize,
     /// Scored rows per teacher-forced forward; above one they run as one
     /// verification forward.
     pub verify_width: usize,
-    /// Passes over the fixtures on the one load.
+    /// Passes over the lanes on the one load.
     pub passes: usize,
-    /// Score only a sample of each fixture's predicting positions.
+    /// Score only a sample of each lane's predicting positions.
     pub sample: Option<Sample>,
 }
 
 /// `windows` runs of `steps` predicting positions, spread evenly over a
-/// fixture's predicting positions.
+/// lane's predicting positions.
 #[derive(Clone, Copy)]
 pub struct Sample {
     pub windows: usize,
     pub steps: usize,
 }
 
-/// One fixture's walk through its tokens: its sequence, its tokens, the
+/// One lane's walk through its tokens: its sequence, its tokens, the
 /// positions it scores and where its rows go in the output.
 struct Walk {
     sequence: Sequence,
     tokens: Vec<TokenId>,
     /// The ascending, disjoint, nonempty runs of predicting positions scored.
     scored: Vec<Range<usize>>,
-    /// The first output row of this fixture.
+    /// The first output row of this lane.
     base: usize,
 }
 
@@ -132,9 +132,9 @@ pub fn run(
 ) -> Result<String, String> {
     let longest = rendered
         .iter()
-        .map(|fixture| fixture.tokens.len())
+        .map(|lane| lane.tokens.len())
         .max()
-        .expect("a fixture set is nonempty");
+        .expect("a run renders at least one lane");
     let batch = logits.batch.min(rendered.len());
     let rows_per_step = batch * logits.verify_width;
     let mut engine = Engine::open(
@@ -144,9 +144,9 @@ pub fn run(
             method: magnitude_engine::options::ModelMethod::Plain,
             proposals: None,
             context_tokens: longest + logits.verify_width,
-            // Every fixture of a batch holds its sequence until it is scored.
+            // Every lane of a batch holds its sequence until it is scored.
             sequences: std::num::NonZeroUsize::new(batch)
-                .expect("a positive batch of a nonempty fixture set"),
+                .expect("a positive batch of a nonempty run"),
             decode_rows: rows_per_step,
             exported_logits_rows: rows_per_step.max(PREFILL_ROWS),
             lookahead: false,
@@ -156,23 +156,23 @@ pub fn run(
     let vocabulary = engine.vocabulary;
     let mut rows = Vec::new();
     let mut scored = Vec::with_capacity(rendered.len());
-    for fixture in rendered {
-        if fixture
+    for lane in rendered {
+        if lane
             .scored_spans
             .iter()
-            .any(|span| span.start == 0 || span.end > fixture.tokens.len())
+            .any(|span| span.start == 0 || span.end > lane.tokens.len())
         {
             return Err(format!(
-                "fixture {}: a scored span must follow its first token and lie within its tokens",
-                fixture.fixture_id
+                "{}: a scored span must follow its first token and lie within its tokens",
+                lane.label()
             ));
         }
-        let runs = scored_rows(&fixture.scored_spans, logits.sample);
+        let runs = scored_rows(&lane.scored_spans, logits.sample);
         let base = rows.len();
         for window in &runs {
             rows.extend(
                 window.clone().map(
-                    |position| json!({ "fixture_id": fixture.fixture_id, "position": position }),
+                    |position| json!({ "template": lane.template, "lane": lane.lane, "position": position }),
                 ),
             );
         }
@@ -180,7 +180,7 @@ pub fn run(
     }
     let indices = (0..rendered.len()).collect::<Vec<_>>();
     let scoring = std::time::Instant::now();
-    // Each pass over the fixtures runs on the one load, in the state the last left its bank.
+    // Each pass over the lanes runs on the one load, in the state the last left its bank.
     for pass in 0..logits.passes {
         let data = match pass {
             0 => stem.with_extension("f32"),
@@ -216,7 +216,7 @@ pub fn run(
                 engine.close(walk.sequence)?;
             }
             eprintln!(
-                "magnitude-harness: scored {} of {} fixtures (batch {group})",
+                "magnitude-harness: scored {} of {} lanes (batch {group})",
                 (group * batch + chunk.len()).min(rendered.len()),
                 rendered.len()
             );
