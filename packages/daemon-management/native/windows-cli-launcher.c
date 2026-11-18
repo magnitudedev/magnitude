@@ -127,7 +127,7 @@ cleanup:
 
 DWORD magnitude_cli_run(magnitude_cli_resolver resolve, int argc, WCHAR **argv, BOOL serving) {
   WCHAR directory[32768], safe_directory[32768], command[32768], executable[32768];
-  FILE_ID_INFO before, after;
+  FILE_ID_INFO before = {0}, after = {0};
   DWORD failure = ERROR_SUCCESS, code = 1;
   DWORD length = GetCurrentDirectoryW(32768, directory);
   if (!length || length >= 32768) return 1;
