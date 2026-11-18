@@ -8,13 +8,12 @@ import { ErrorNotice } from "../error-notice"
 import { ModelsSkeleton } from "./skeletons"
 import { cn } from "@/lib/utils"
 import { fitLabel } from "./parts"
-import { ownedModel, unrunnableFile } from "./data"
+import { ownedModel, transferLabel, unrunnableFile } from "./data"
 import { Hidden, Unrunnable, YourModels, type OwnedModel, type UnrunnableFile } from "./your-models"
 import { DrafterDialog } from "./drafter-picker"
 
 const residencyOf = (model: LocalModel) => "residencyState" in model.acquisitionState ? model.acquisitionState.residencyState : undefined
 
-const transferStage = { queued: "Queued", resolving: "Preparing", checking_space: "Checking space", downloading: "Downloading", verifying: "Verifying", publishing: "Finishing" } as const
 
 function Status({ tone = "muted", busy = false, title, children }: { tone?: "muted" | "running" | "failed"; busy?: boolean; title?: string; children: ReactNode }) {
   return <span title={title} className={cn("inline-flex items-center gap-1.5 whitespace-nowrap text-xs", tone === "failed" ? "text-red-600 dark:text-red-400" : tone === "running" ? "text-green-700 dark:text-green-400" : "text-slate-500")}>
@@ -67,12 +66,11 @@ export function ModelsScreen({ onExplore, empty }: { onExplore: (search: { reado
     const stop = <Button size="sm" variant="outline" onClick={() => mutations.stop()}><StopIcon />Stop</Button>
     const load = <Button size="sm" variant="outline" onClick={() => mutations.load(model.modelId)}><PlayIcon />Load</Button>
     if (state._tag === "Installing" || state._tag === "Updating") {
-      const { progress } = state
-      const fraction = progress.totalBytes > 0 ? progress.completedBytes / progress.totalBytes : 0
+      const { text, fraction } = transferLabel(state.progress)
       return <span className="flex items-center gap-2">
         <span className="flex w-28 flex-col items-end gap-1">
-          <span className="text-xs tabular-nums text-slate-500">{transferStage[progress.stage]}{progress.stage === "downloading" ? ` ${Math.round(fraction * 100)}%` : "…"}</span>
-          <span className="h-1 w-full overflow-hidden rounded-full bg-slate-150 dark:bg-slate-750"><span className="block h-full bg-blue-600 dark:bg-blue-400" style={{ width: `${fraction * 100}%` }} /></span>
+          <span className="text-xs tabular-nums text-slate-500">{text}</span>
+          <span className="h-1 w-full overflow-hidden rounded-full bg-slate-150 dark:bg-slate-750">{fraction !== null && <span className="block h-full bg-blue-600 dark:bg-blue-400" style={{ width: `${fraction * 100}%` }} />}</span>
         </span>
         <Button size="sm" variant="ghost" onClick={() => mutations.cancel(model.modelId)}>Cancel</Button>
       </span>

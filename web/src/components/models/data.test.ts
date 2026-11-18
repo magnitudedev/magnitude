@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import { CatalogFormModelIdSchema, type LocalModel, type RecommendedModel } from "@magnitudedev/sdk"
 import { makeSetupModel } from "@magnitudedev/client-common/fixtures/model"
-import { offeredFromRecommendation, ownedModel } from "./data"
+import { offeredFromRecommendation, ownedModel, transferLabel } from "./data"
 
 const GB = 1e9
 const rung = (id: string, storageBytes: number, installed = false): LocalModel =>
@@ -41,5 +41,20 @@ describe("a model's quant name", () => {
     const model = { ...ladder[0]!, presentation: { ...ladder[0]!.presentation, variantLabel: "Q4 QAT" },
       catalogData: { ...(ladder[0] as { catalogData: object }).catalogData, quant: { name: "QAD-Q4_0", repository: "LiquidAI/LFM3-1.7B-GGUF" } } } as unknown as LocalModel
     expect(ownedModel(model, "Device").quant.name).toBe("QAD-Q4_0")
+  })
+})
+
+describe("a transfer's label", () => {
+  const progress = (stage: "queued" | "resolving" | "downloading", completedBytes: number, totalBytes: number) =>
+    ({ stage, completedBytes, totalBytes, bytesPerSecond: Option.none() })
+
+  it("says no 0% before bytes are downloading against a known total, as while queued to resume after a restart", () => {
+    expect(transferLabel(progress("queued", 0, 0))).toEqual({ text: "Queued…", fraction: null })
+    expect(transferLabel(progress("resolving", 0, 3_470_000_000))).toEqual({ text: "Preparing…", fraction: null })
+    expect(transferLabel(progress("downloading", 0, 0))).toEqual({ text: "Downloading…", fraction: null })
+  })
+
+  it("gives the real percentage once downloading, the bytes already here included", () => {
+    expect(transferLabel(progress("downloading", 1_353_300_000, 3_470_000_000))).toEqual({ text: "Downloading 39%", fraction: 0.39 })
   })
 })

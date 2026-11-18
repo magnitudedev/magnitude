@@ -6,7 +6,7 @@ import { HUGGING_FACE_SEARCH_QUERY_MAXIMUM_BYTES, repositoryDisplayName, type Ca
 import { drafterCandidateDownloadBytes, formatStorageSize, readSearchChecks, useAgentClient, useLocalModelMutations, useLocalModels, type AgentClient, type QuickSearchCheck, type ServingMemory } from "@magnitudedev/client-common"
 import { Button } from "../ui/button"
 import { labForDeveloper } from "../model-logo"
-import { downloadContents, methodName, onThisComputer, quantView, transferOf } from "./data"
+import { downloadContents, transferLabel, methodName, onThisComputer, quantView, transferOf } from "./data"
 import { AUTO_DRAFTER, DrafterSection, drafterChoice, useDrafters, type DrafterSelection } from "./drafter-picker"
 import type { QuantView } from "./view"
 import type { OfferedModel } from "./expanding-model"
@@ -218,10 +218,7 @@ export function useDownload(selections: Readonly<Record<string, DrafterSelection
   return (model: OfferedModel, quant: QuantView) => {
     const existing = byId.get(quant.key)
     const transfer = existing ? transferOf(existing) : undefined
-    if (transfer) {
-      const percent = transfer.totalBytes > 0 ? Math.round(transfer.completedBytes / transfer.totalBytes * 100) : 0
-      return <Button disabled><CircleNotchIcon className="motion-safe:animate-spin" />Downloading {percent}%</Button>
-    }
+    if (transfer) return <Button disabled><CircleNotchIcon className="motion-safe:animate-spin" />{transferLabel(transfer).text}</Button>
     if (existing && onThisComputer(existing)) return <Button disabled variant="outline"><CheckIcon />Downloaded</Button>
     if (model.catalog) return <DownloadButton key={quant.key} size={quant.downloadBytes} contents={downloadContents({ drafter: null }, quant)} disabled={!quant.fits || quant.missingDiskBytes > 0} start={() => install(quant.key as CatalogFormModelId)} />
     if (quant.repository === null) return null

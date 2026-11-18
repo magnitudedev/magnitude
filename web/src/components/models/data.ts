@@ -1,5 +1,5 @@
 import { Option } from "effect"
-import { localModelResidency, type CustomLocalModel, type DrafterTarget, type LocalModel, type LocalModelAssessment, type LocalModelDeveloper, type LocalModelFamily, type RecommendedModel, type SpeculativeMethod, type UnsupportedLocalModel } from "@magnitudedev/sdk"
+import { localModelResidency, type CustomLocalModel, type DrafterTarget, type LocalModel, type LocalModelAssessment, type LocalModelDeveloper, type LocalModelFamily, type ModelTransferProgress, type RecommendedModel, type SpeculativeMethod, type UnsupportedLocalModel } from "@magnitudedev/sdk"
 import { describeModelLoadFailure, fitPlacementPhrase, modelDownloadFailureMessage, modelFailureLabel, formatStorageSize, ladderBitWidths, localModelQuantName, localModelSizeBytes, quantBitWidth, type ServingMemory } from "@magnitudedev/client-common"
 import { labForDeveloper } from "../model-logo"
 import type { DiscoveredModel } from "./onboarding"
@@ -86,6 +86,18 @@ export const downloadContents = (model: Pick<OfferedModel, "drafter">, quant: Pi
 }
 
 /** A transfer in progress for a model: its first download or an update. */
+const transferStage = { queued: "Queued", resolving: "Preparing", checking_space: "Checking space", downloading: "Downloading", verifying: "Verifying", publishing: "Finishing" } as const
+
+/**
+ * A transfer as its row says it: a percentage only while bytes are downloading against a known total; before that
+ * (queued, preparing, or resuming after a restart until the service reports the bytes already here) only its stage,
+ * never a 0% that isn't so.
+ */
+export const transferLabel = (progress: ModelTransferProgress): { readonly text: string; readonly fraction: number | null } =>
+  progress.stage === "downloading" && progress.totalBytes > 0
+    ? { text: `Downloading ${Math.round(progress.completedBytes / progress.totalBytes * 100)}%`, fraction: progress.completedBytes / progress.totalBytes }
+    : { text: `${transferStage[progress.stage]}…`, fraction: null }
+
 export const transferOf = (model: LocalModel) => {
   const state = model.acquisitionState
   return state._tag === "Installing" || state._tag === "Updating" ? state.progress : undefined
