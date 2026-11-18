@@ -264,10 +264,6 @@ pub fn expansion_bound(
         .unzip()
 }
 
-/// The largest row count the CUDA K1 GEMV serves (`projection::GEMV_ROWS`);
-/// larger counts run the GEMM.
-pub const GEMV_ROWS: usize = bound::gemv_rows(BackendName::Cuda);
-
 /// The largest row count the small-band GEMM serves
 /// (`projection::SMALL_GEMM_ROWS`); larger counts run the large-band GEMM.
 pub const SMALL_GEMM_ROWS: usize = 64;
@@ -467,9 +463,9 @@ pub fn expansion(
 }
 
 /// The mappings a test offers an entry at `m` rows: the GEMV's up to
-/// `GEMV_ROWS`, else the GEMM's.
+/// [`bound::gemv_rows`], else the GEMM's.
 pub fn candidates(m: usize) -> &'static [Mapping] {
-    if m <= GEMV_ROWS {
+    if m <= bound::gemv_rows(BackendName::Cuda) {
         &GEMV_MAPPINGS
     } else {
         &GEMM_MAPPINGS

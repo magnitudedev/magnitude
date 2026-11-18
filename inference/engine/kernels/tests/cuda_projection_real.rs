@@ -211,7 +211,7 @@ fn mapping_label(mapping: Mapping, rows: usize) -> String {
     } else {
         "16-bit"
     };
-    let kernel = if rows <= GEMV_ROWS {
+    let kernel = if rows <= bound::gemv_rows(seismic::BackendName::Cuda) {
         "gemv"
     } else if rows <= SMALL_GEMM_ROWS {
         "gemm_small"

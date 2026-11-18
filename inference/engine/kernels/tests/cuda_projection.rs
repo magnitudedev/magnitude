@@ -315,7 +315,7 @@ fn cuda_int8_activations_follow_the_cpu_rule() {
     let mapping = GEMM_MAPPINGS[1];
     assert!(mapping.quantizes() && projection.admits(&device, mapping));
     for (at, groups) in int8_rule::blocks().chunks(SMALL_GEMM_ROWS).enumerate() {
-        let rows = groups.len().max(GEMV_ROWS + 1);
+        let rows = groups.len().max(bound::gemv_rows(BackendName::Cuda) + 1);
         let mut source = vec![0.0f32; rows * k];
         for (row, group) in groups.iter().enumerate() {
             source[row * k..row * k + int8_rule::GROUP].copy_from_slice(group);

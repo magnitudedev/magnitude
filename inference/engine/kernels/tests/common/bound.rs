@@ -93,16 +93,34 @@ pub fn gamma(n: usize) -> f64 {
     nu / (1.0 - nu)
 }
 
-/// The most rows a backend's `project_rows` serves with its GEMV launches,
-/// where it sums in F32 over unstaged operands (the GEMM runs past it): the
-/// rows its first GEMM launch starts past in `dense.seismic`, which
-/// `tests/projection_rows.rs` pins.
-pub const fn gemv_rows(backend: BackendName) -> usize {
-    match backend {
-        BackendName::Cpu => usize::MAX,
-        BackendName::Metal | BackendName::Cuda => 16,
-        BackendName::Vulkan => 8,
+/// The most rows a backend's `project_rows` serves with its GEMV launches
+/// (Metal's batched GEMV among them), where it sums in F32 over unstaged
+/// operands: the rows below the first row count at which `dense.seismic`
+/// lets one of its GEMM launches (`gemm`, `gemm_<form>`) run, read from the
+/// declaration's launch conditions; every row count where it declares no
+/// GEMM (the CPU).
+pub fn gemv_rows(backend: BackendName) -> usize {
+    use magnitude_kernels::project_rows::Entry;
+    let native = seismic::generated::native_implementation_for_backend::<Entry>(backend)
+        .expect("the kernel bundle decodes")
+        .unwrap_or_else(|| panic!("`project_rows` has a {backend:?} implementation"));
+    let gemm = format!("{}_gemm", <Entry as seismic::Entry>::NAME);
+    let form = format!("{gemm}_");
+    let gemms: Vec<usize> = native.launches.iter().enumerate()
+        .filter(|(_, launch)| launch.kernel == gemm || launch.kernel.starts_with(&form))
+        .map(|(ordinal, _)| ordinal)
+        .collect();
+    if gemms.is_empty() {
+        return usize::MAX;
     }
+    // Every declared GEMM starts within 4096 rows.
+    let first = (1..=4096u64)
+        .find(|&rows| {
+            let at = seismic::NativeSpecialization::new().with_range("M", rows, rows);
+            gemms.iter().any(|&launch| native.reachable(&at, launch))
+        })
+        .unwrap_or_else(|| panic!("{backend:?}: `project_rows` declares a GEMM no row count up to 4096 runs"));
+    usize::try_from(first - 1).expect("a row count fits usize")
 }
 
 /// The supremum of `|d/dx x / (1 + e^-x)|`: 1.09984 at `x = 2.3993`.
@@ -269,17 +287,15 @@ impl Form {
     /// changes what it stages changes this:
     /// - CPU (`cpu/lib/projection/stage.rs`, `projection.rs`): both
     ///   operands widened exactly to F32.
-    /// - Metal: the GEMVs and batched GEMVs (`M <= 16`) hold both in F32
-    ///   (`metal/lib/projection/gemv.h`, `projection.h` `matrix_value`).
-    ///   Past 16 rows (`dense.seismic` `project_rows_gemm_small when
-    ///   M > 16`) every GEMM keeps the A words unchanged
+    /// - Metal: the GEMVs and batched GEMVs (to [`gemv_rows`]) hold both in
+    ///   F32 (`metal/lib/projection/gemv.h`, `projection.h` `matrix_value`).
+    ///   Past them every GEMM keeps the A words unchanged
     ///   (`metal/lib/projection/projection.h` above `gemm_tile`) and rounds
     ///   the weight's F32 values to half (`gemm_store_step`, and the tall
     ///   form's staging `half4(half(even.x), …)`).
-    /// - Vulkan: the GEMVs (`M <= 8`) hold both in F32
+    /// - Vulkan: the GEMVs (to [`gemv_rows`]) hold both in F32
     ///   (`vulkan/lib/projection/projection.glsl` `element_split8`). The
-    ///   GEMM past 8 rows (`dense.seismic` `project_rows_gemm when
-    ///   M > 8`) packs both as F16 (`projection_gemm_load_a`,
+    ///   GEMM past them packs both as F16 (`projection_gemm_load_a`,
     ///   `projection_gemm_store_b_of`: `element_pack8(ELEMENT_F16, …)`), a
     ///   BF16 row first scaled by `2^-(e'-15)` when its largest magnitude
     ///   `2^e'·m` reaches 2^15 (`projection_gemm_row_exponent`).
@@ -287,8 +303,8 @@ impl Form {
     ///   is exact and any other is converted to A
     ///   (`seismic/lang/native-library/cuda/packets.cuh` `Dense`). A packed
     ///   weight's codes or table values are exact in A, its scales folded
-    ///   in F32, in the GEMVs (`M <= 16`, `cuda/lib/projection/projection.cuh`)
-    ///   and in the GEMMs past 16 rows over the formats CUDA's GEMM folds
+    ///   in F32, in the GEMVs (to [`gemv_rows`], `cuda/lib/projection/projection.cuh`)
+    ///   and in the GEMMs past them over the formats CUDA's GEMM folds
     ///   ([`Element::cuda_gemm_fold`]); over the rest the GEMM rounds each
     ///   value `code · scale - bias` to A (`projection.cuh`
     ///   `dequantize_pair`).
