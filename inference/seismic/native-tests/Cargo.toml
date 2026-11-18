@@ -13,3 +13,6 @@ seismic-lang.workspace = true
 
 [build-dependencies]
 seismic-build.workspace = true
+
+[lints]
+workspace = true

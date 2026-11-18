@@ -4,6 +4,14 @@
 //! instant among them), the OS's memory pressure events, and the host's
 //! processors and their pinning.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests start threads of their own; the code they test starts its threads through seismic-threads"
+    )
+)]
+
 #[cfg(windows)]
 mod adapters;
 #[cfg(any(test, feature = "fixtures"))]

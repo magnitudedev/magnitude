@@ -4,6 +4,8 @@
 //! it serves, the shared resolved-configuration cache, the hardware endpoint's provider and
 //! contained child processes.
 
+#![cfg_attr(test, allow(clippy::disallowed_methods, reason = "tests start threads of their own; the code they test starts its threads through seismic-threads"))]
+
 pub mod assessment;
 pub mod build_identity;
 pub mod configurations;

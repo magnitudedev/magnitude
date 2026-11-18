@@ -83,3 +83,6 @@ expert-routing = ["magnitude-executor/expert-routing"]
 # Development-only: the machine's line, measured on request
 # (`magnitude-assess --line`, `magnitude-harness`).
 machine-line = ["magnitude-executor/machine-line"]
+
+[lints]
+workspace = true

@@ -21,3 +21,6 @@ libc.workspace = true
 
 [build-dependencies]
 magnitude-source-identity = { path = "../../engine/source-identity" }
+
+[lints]
+workspace = true

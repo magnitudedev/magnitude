@@ -141,12 +141,51 @@ jobs:
       docker_repository: magnitudedev/magnitude
     secrets: inherit
 
+  # Clippy over the inference workspace, beside the build, on each system and
+  # architecture whose code differs (Metal builds only on macOS). Publishing
+  # waits for it; it denies the workspace's lint table (inference/Cargo.toml).
+  clippy:
+    permissions:
+      contents: read
+    needs: preflight
+    if: needs.preflight.outputs.action == 'release'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            runner: blacksmith-16vcpu-ubuntu-2404
+          - os: linux
+            runner: blacksmith-16vcpu-ubuntu-2404-arm
+          - os: macos
+            runner: blacksmith-12vcpu-macos-15
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        working-directory: inference
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.source_commit }}
+      # The toolchain and components inference/rust-toolchain.toml names.
+      - name: Install the toolchain
+        run: rustup toolchain install
+      - uses: ./.github/actions/build-cache
+        with:
+          scope: inference-clippy
+      - if: matrix.os == 'linux'
+        uses: ./.github/actions/linux-build-tools
+        with:
+          packages: build-essential cmake clang
+      - name: Clippy
+        run: cargo clippy --locked --keep-going --workspace --all-targets
+
   publish:
     environment: apple-release
     env:
       MAGNITUDE_APPLE_RECEIPTS: release-artifacts
       MAGNITUDE_SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
-    needs: [preflight, build]
+    needs: [preflight, build, clippy]
     if: needs.preflight.outputs.action == 'release'
     runs-on: ubuntu-22.04
     steps:

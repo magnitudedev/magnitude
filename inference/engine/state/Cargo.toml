@@ -11,3 +11,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 seismic = { workspace = true, features = ["fixtures"] }
+
+[lints]
+workspace = true

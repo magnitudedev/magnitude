@@ -21,3 +21,6 @@ seismic-lang.workspace = true
 
 [dev-dependencies]
 seismic-lang = { workspace = true, features = ["fixtures"] }
+
+[lints]
+workspace = true

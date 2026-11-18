@@ -22,3 +22,6 @@ magnitude-ggml.workspace = true
 # Deterministic source bytes (`registry::pseudo_random_bytes`), for other
 # crates' tests.
 fixtures = []
+
+[lints]
+workspace = true

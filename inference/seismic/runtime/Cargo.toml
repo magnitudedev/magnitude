@@ -65,3 +65,6 @@ windows-sys = { version = "0.61", features = [
 [[test]]
 name = "probes"
 harness = false
+
+[lints]
+workspace = true

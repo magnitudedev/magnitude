@@ -15,3 +15,6 @@ magnitude-family-muse-glimmer = { path = "../muse_glimmer" }
 magnitude-family-nemotron-h = { path = "../nemotron_h" }
 magnitude-family-qwen35 = { path = "../qwen35" }
 magnitude-family-qwen4exp = { path = "../qwen4exp" }
+
+[lints]
+workspace = true

@@ -357,7 +357,7 @@ UPLIFTED_FROM = ("deps", "examples")
 # count still to come).
 UNRECORDED = "unrecorded"
 # The cargo commands whose units a build keeps (`Runner._units`).
-CARGO_BUILDS = ("build", "check", "test", "bench", "rustc")
+CARGO_BUILDS = ("build", "check", "clippy", "test", "bench", "rustc")
 # How warm a claimed checkout's target is for the run's source, so how long its build takes:
 # last installed from that source, from another source (rebuilds what differs), or built from
 # nothing (a new checkout).

@@ -27,3 +27,6 @@ utoipa.workspace = true
 http-body-util.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tower = { workspace = true, features = ["util"] }
+
+[lints]
+workspace = true

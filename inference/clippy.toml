@@ -1,0 +1,20 @@
+# Every engine thread starts through seismic-threads, which gives it the
+# engine's stack and its panic semantics. The lint is denied workspace-wide
+# (`[workspace.lints]`); seismic-threads itself and test code allow it.
+disallowed-methods = [
+  { path = "std::thread::spawn", reason = "start threads through seismic_threads::spawn" },
+  { path = "std::thread::Builder::spawn", reason = "start threads through seismic_threads::spawn" },
+  { path = "std::thread::Builder::spawn_unchecked", reason = "start threads through seismic_threads::spawn" },
+  { path = "std::thread::Builder::spawn_scoped", reason = "start scoped threads through seismic_threads::spawn_scoped or run" },
+  # `std::thread::scope` starts no thread; what starts one in it is this.
+  { path = "std::thread::Scope::spawn", reason = "start scoped threads through seismic_threads::spawn_scoped or run" },
+  # Also what `#[tokio::main]` expands to. Crates without Tokio cannot resolve these.
+  { path = "tokio::runtime::Builder::new_multi_thread", reason = "build runtimes through seismic_threads::runtime", allow-invalid = true },
+  { path = "tokio::runtime::Builder::new_current_thread", reason = "build runtimes through seismic_threads::runtime", allow-invalid = true },
+  { path = "tokio::runtime::Runtime::new", reason = "build runtimes through seismic_threads::runtime", allow-invalid = true },
+]
+
+# The most stack one function's frame may take: seismic_threads::FRAME_BYTES,
+# a quarter of the load path's stack budget, which a seismic-threads test
+# keeps this equal to. `large_stack_frames` is denied workspace-wide.
+stack-size-threshold = 65536

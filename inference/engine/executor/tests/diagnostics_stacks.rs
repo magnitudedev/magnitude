@@ -6,6 +6,10 @@
 //! the process with its signal.
 
 #![cfg(unix)]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "a test starts threads of its own"
+)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::{BufRead, BufReader};

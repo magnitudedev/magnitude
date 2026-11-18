@@ -25,6 +25,14 @@
 //!   implements, read bounded and written atomically ([`JsonFileStore`]),
 //!   or held for a host that keeps none ([`HeldStore`]).
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests start threads of their own; the code they test starts its threads through seismic-threads"
+    )
+)]
+
 pub mod clock;
 mod deadline;
 pub mod line;

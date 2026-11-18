@@ -3,6 +3,11 @@
 //! memory, conditional (`when`) launches and scratch, graphs with
 //! host-written inputs, asynchronous submission, measurement and tuning.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "a test starts threads of its own"
+)]
+
 use seismic::measure::{measure, Measure, Stop};
 use seismic::{
     AllocationLimit, BackendName, CallError, Device, Element, Exclusion, ExecutionError,

@@ -19,3 +19,6 @@ seismic-std.workspace = true
 [[test]]
 name = "public"
 path = "tests/public.rs"
+
+[lints]
+workspace = true

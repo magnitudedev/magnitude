@@ -13,3 +13,6 @@ tokio = { workspace = true, optional = true }
 [features]
 # `runtime`: a Tokio runtime whose threads are the owner's.
 tokio = ["dep:tokio"]
+
+[lints]
+workspace = true

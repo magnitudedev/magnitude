@@ -2,6 +2,14 @@
 //! the numerical worker and its protocol, and the typed outcomes of each.
 //! Common crates own artifacts, model families, execution, generation,
 //! scheduling, chat, and templates; this crate binds them.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests start threads of their own; the code they test starts its threads through seismic-threads"
+    )
+)]
+
 pub mod assessment;
 pub mod census;
 pub mod chat;

@@ -10,6 +10,11 @@
 //! submissions block. The call must end within a bound of its answer, with
 //! the bytes the host wrote.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "a test starts threads of its own"
+)]
+
 use seismic::{BackendName, Element, NativeGraphFamily, NativeSpecialization, Tensor, Timeline};
 use seismic_native_tests::{parked_scale, scale_rows};
 use std::sync::atomic::{AtomicU64, Ordering};

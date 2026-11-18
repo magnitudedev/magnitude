@@ -26,3 +26,6 @@ utoipa.workspace = true
 http-body-util = "0.1.3"
 tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
 tower = { version = "0.5.3", features = ["util"] }
+
+[lints]
+workspace = true

@@ -2,6 +2,11 @@
 //! backend and selection (`build.rs`), and the corpus-wide suites. Module
 //! paths are the filters of the interim checkpoints
 //! (`cargo test -p seismic-corpus areas__A2`, `... library`, `... hygiene`).
+
+#![allow(
+    clippy::large_stack_frames,
+    reason = "libtest's generated main holds a description of each of the target's tests in its one frame"
+)]
 mod bundle;
 mod common;
 mod history;

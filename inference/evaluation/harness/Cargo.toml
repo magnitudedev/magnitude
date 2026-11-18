@@ -41,3 +41,6 @@ tracing-subscriber.workspace = true
 # The controlled execution domain (`magnitude_executor::fixtures`) the
 # harness's step boundary is tested over.
 magnitude-executor = { path = "../../engine/executor", features = ["fixtures"] }
+
+[lints]
+workspace = true

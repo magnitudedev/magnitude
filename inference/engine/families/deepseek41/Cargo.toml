@@ -16,3 +16,6 @@ flate2.workspace = true
 # The reference's Engram rows of the R1 fixtures (`tests/fixtures/engram_rows.json`).
 serde_json.workspace = true
 sha2 = "=0.11.0"
+
+[lints]
+workspace = true

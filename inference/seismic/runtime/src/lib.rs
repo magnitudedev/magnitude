@@ -31,6 +31,14 @@
 //! limits, chooses an alternative after a failure, compiles on call, or
 //! interprets the portable body.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests start threads of their own; the code they test starts its threads through seismic-threads"
+    )
+)]
+
 pub mod api;
 pub use backends::unmeasured_graph_cost;
 /// What the process's large-page host backing came to (the host pages of

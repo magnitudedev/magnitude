@@ -8,6 +8,10 @@
 //! read_depth -- --ignored --nocapture`).
 
 #![cfg(unix)]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "a test starts threads of its own"
+)]
 
 mod measure;
 

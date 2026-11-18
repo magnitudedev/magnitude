@@ -37,3 +37,6 @@ libc.workspace = true
 magnitude-family-registry = { path = "../../engine/families/registry" }
 # Equality of header values, for the tests that compare them.
 magnitude-artifacts = { path = "../../engine/artifacts", features = ["equality"] }
+
+[lints]
+workspace = true

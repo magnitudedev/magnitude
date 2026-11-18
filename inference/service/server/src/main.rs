@@ -1,3 +1,11 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests start threads of their own; the code they test starts its threads through seismic-threads"
+    )
+)]
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;

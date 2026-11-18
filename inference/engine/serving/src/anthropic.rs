@@ -1,5 +1,6 @@
 //! Anthropic Messages (stream and non-stream) and `count_tokens`. Counting
 //! renders exactly as generation does and never binds or loads a model.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::num::NonZeroU32;
@@ -31,210 +32,283 @@ use crate::{Serving, media};
 
 const LOCAL_THINKING_SIGNATURE: &str = "magnitude-local-v1";
 
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct MessagesRequest {
-    pub model: String,
-    pub messages: Vec<Message>,
-    #[serde(default)]
-    #[schema(nullable = false)]
-    pub system: Option<SystemPrompt>,
-    pub max_tokens: u32,
-    #[serde(default)]
-    pub stop_sequences: Vec<String>,
-    #[serde(default)]
-    pub stream: bool,
-    pub temperature: Option<f32>,
-    pub top_p: Option<f32>,
-    pub top_k: Option<u32>,
-    pub seed: Option<u32>,
-    #[serde(default)]
-    pub tools: Vec<Tool>,
-    #[schema(nullable = false)]
-    pub tool_choice: Option<AnthropicToolChoice>,
-    #[schema(nullable = false)]
-    pub thinking: Option<Thinking>,
-    pub metadata: Option<Value>,
-    pub output_config: Option<OutputConfig>,
-}
+pub use schema::{
+    AnthropicToolChoice, Content, ContentBlock, CountTokensRequest, CountTokensResponse, ErrorBody,
+    ErrorEnvelope, ImageSource, Message, MessageResponse, MessagesRequest, OutputConfig,
+    ResponseContentBlock, Role, SystemBlock, SystemPrompt, Thinking, Tool, ToolResultBlock,
+    ToolResultContent, UsageResponse,
+};
 
-/// `count_tokens` takes only what renders the prompt; generation controls
-/// such as `max_tokens` belong to Messages alone.
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct CountTokensRequest {
-    pub model: String,
-    pub messages: Vec<Message>,
-    #[serde(default)]
-    #[schema(nullable = false)]
-    pub system: Option<SystemPrompt>,
-    #[serde(default)]
-    pub tools: Vec<Tool>,
-    #[schema(nullable = false)]
-    pub tool_choice: Option<AnthropicToolChoice>,
-    #[schema(nullable = false)]
-    pub thinking: Option<Thinking>,
-    pub output_config: Option<OutputConfig>,
-}
+/// The Anthropic Messages wire types, in a module of their own for the lint
+/// their derived schemas need.
+mod schema {
+    #![allow(
+        clippy::large_stack_frames,
+        reason = "utoipa's derived `ToSchema::schema` builds a whole type's schema in one generated frame, which this module cannot split; it runs only as the OpenAPI document is built"
+    )]
 
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct OutputConfig {
-    #[schema(nullable = false)]
-    pub effort: Option<ReasoningEffortRequest>,
-}
+    use super::*;
 
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(untagged)]
-pub enum SystemPrompt {
-    Text(String),
-    Blocks(Vec<SystemBlock>),
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum SystemBlock {
-    Text {
-        text: String,
+    #[derive(Debug, Deserialize, ToSchema)]
+    pub struct MessagesRequest {
+        pub model: String,
+        pub messages: Vec<Message>,
         #[serde(default)]
-        #[serde(rename = "cache_control")]
-        _cache_control: Option<Value>,
-    },
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct Message {
-    pub role: Role,
-    pub content: Content,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum Role {
-    System,
-    User,
-    Assistant,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(untagged)]
-pub enum Content {
-    Text(String),
-    Blocks(Vec<ContentBlock>),
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ContentBlock {
-    Text {
-        text: String,
-        #[serde(default)]
-        #[serde(rename = "cache_control")]
-        _cache_control: Option<Value>,
-    },
-    Thinking {
-        thinking: String,
-        #[serde(default)]
-        #[serde(rename = "signature")]
-        _signature: Option<String>,
-    },
-    Image {
-        source: ImageSource,
-        #[serde(default)]
-        #[serde(rename = "cache_control")]
-        _cache_control: Option<Value>,
-    },
-    ToolUse {
-        id: String,
-        name: String,
-        input: Map<String, Value>,
-        #[serde(default)]
-        #[serde(rename = "cache_control")]
-        _cache_control: Option<Value>,
-    },
-    ToolResult {
-        tool_use_id: String,
         #[schema(nullable = false)]
-        content: Option<ToolResultContent>,
+        pub system: Option<SystemPrompt>,
+        pub max_tokens: u32,
         #[serde(default)]
-        #[serde(rename = "is_error")]
-        _is_error: bool,
+        pub stop_sequences: Vec<String>,
+        #[serde(default)]
+        pub stream: bool,
+        pub temperature: Option<f32>,
+        pub top_p: Option<f32>,
+        pub top_k: Option<u32>,
+        pub seed: Option<u32>,
+        #[serde(default)]
+        pub tools: Vec<Tool>,
+        #[schema(nullable = false)]
+        pub tool_choice: Option<AnthropicToolChoice>,
+        #[schema(nullable = false)]
+        pub thinking: Option<Thinking>,
+        pub metadata: Option<Value>,
+        pub output_config: Option<OutputConfig>,
+    }
+
+    /// `count_tokens` takes only what renders the prompt; generation controls
+    /// such as `max_tokens` belong to Messages alone.
+    #[derive(Debug, Deserialize, ToSchema)]
+    pub struct CountTokensRequest {
+        pub model: String,
+        pub messages: Vec<Message>,
+        #[serde(default)]
+        #[schema(nullable = false)]
+        pub system: Option<SystemPrompt>,
+        #[serde(default)]
+        pub tools: Vec<Tool>,
+        #[schema(nullable = false)]
+        pub tool_choice: Option<AnthropicToolChoice>,
+        #[schema(nullable = false)]
+        pub thinking: Option<Thinking>,
+        pub output_config: Option<OutputConfig>,
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    pub struct OutputConfig {
+        #[schema(nullable = false)]
+        pub effort: Option<ReasoningEffortRequest>,
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    #[serde(untagged)]
+    pub enum SystemPrompt {
+        Text(String),
+        Blocks(Vec<SystemBlock>),
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub enum SystemBlock {
+        Text {
+            text: String,
+            #[serde(default)]
+            #[serde(rename = "cache_control")]
+            _cache_control: Option<Value>,
+        },
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    pub struct Message {
+        pub role: Role,
+        pub content: Content,
+    }
+
+    #[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
+    #[serde(rename_all = "lowercase")]
+    pub enum Role {
+        System,
+        User,
+        Assistant,
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    #[serde(untagged)]
+    pub enum Content {
+        Text(String),
+        Blocks(Vec<ContentBlock>),
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub enum ContentBlock {
+        Text {
+            text: String,
+            #[serde(default)]
+            #[serde(rename = "cache_control")]
+            _cache_control: Option<Value>,
+        },
+        Thinking {
+            thinking: String,
+            #[serde(default)]
+            #[serde(rename = "signature")]
+            _signature: Option<String>,
+        },
+        Image {
+            source: ImageSource,
+            #[serde(default)]
+            #[serde(rename = "cache_control")]
+            _cache_control: Option<Value>,
+        },
+        ToolUse {
+            id: String,
+            name: String,
+            input: Map<String, Value>,
+            #[serde(default)]
+            #[serde(rename = "cache_control")]
+            _cache_control: Option<Value>,
+        },
+        ToolResult {
+            tool_use_id: String,
+            #[schema(nullable = false)]
+            content: Option<ToolResultContent>,
+            #[serde(default)]
+            #[serde(rename = "is_error")]
+            _is_error: bool,
+            #[serde(default)]
+            #[serde(rename = "cache_control")]
+            _cache_control: Option<Value>,
+        },
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub enum ImageSource {
+        Base64 {
+            media_type: String,
+            data: String,
+        },
+        Url {
+            #[serde(rename = "url")]
+            _url: String,
+        },
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    #[serde(untagged)]
+    pub enum ToolResultContent {
+        Text(String),
+        Blocks(Vec<ToolResultBlock>),
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub enum ToolResultBlock {
+        Text {
+            text: String,
+            #[serde(default)]
+            #[serde(rename = "cache_control")]
+            _cache_control: Option<Value>,
+        },
+        Image {
+            source: ImageSource,
+            #[serde(default)]
+            #[serde(rename = "cache_control")]
+            _cache_control: Option<Value>,
+        },
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    pub struct Tool {
+        pub name: String,
+        pub description: Option<String>,
+        pub input_schema: Map<String, Value>,
         #[serde(default)]
         #[serde(rename = "cache_control")]
-        _cache_control: Option<Value>,
-    },
-}
+        pub _cache_control: Option<Value>,
+    }
 
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ImageSource {
-    Base64 {
-        media_type: String,
-        data: String,
-    },
-    Url {
-        #[serde(rename = "url")]
-        _url: String,
-    },
-}
+    #[derive(Debug, Deserialize, ToSchema)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub enum AnthropicToolChoice {
+        Auto {
+            #[serde(default)]
+            disable_parallel_tool_use: bool,
+        },
+        Any {
+            #[serde(default)]
+            disable_parallel_tool_use: bool,
+        },
+        Tool {
+            name: String,
+            #[serde(default)]
+            disable_parallel_tool_use: bool,
+        },
+        None,
+    }
 
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(untagged)]
-pub enum ToolResultContent {
-    Text(String),
-    Blocks(Vec<ToolResultBlock>),
-}
+    #[derive(Debug, Deserialize, ToSchema)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub enum Thinking {
+        /// Enables reasoning with a hard reasoning-token budget.
+        Enabled { budget_tokens: u32 },
+        Adaptive,
+        Disabled,
+    }
 
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ToolResultBlock {
-    Text {
-        text: String,
-        #[serde(default)]
-        #[serde(rename = "cache_control")]
-        _cache_control: Option<Value>,
-    },
-    Image {
-        source: ImageSource,
-        #[serde(default)]
-        #[serde(rename = "cache_control")]
-        _cache_control: Option<Value>,
-    },
-}
+    #[derive(Debug, Serialize, ToSchema)]
+    pub struct ErrorEnvelope {
+        pub r#type: &'static str,
+        pub error: ErrorBody,
+        pub request_id: String,
+    }
 
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct Tool {
-    pub name: String,
-    pub description: Option<String>,
-    pub input_schema: Map<String, Value>,
-    #[serde(default)]
-    #[serde(rename = "cache_control")]
-    pub _cache_control: Option<Value>,
-}
+    #[derive(Debug, Serialize, ToSchema)]
+    pub struct ErrorBody {
+        pub r#type: &'static str,
+        pub message: String,
+    }
 
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum AnthropicToolChoice {
-    Auto {
-        #[serde(default)]
-        disable_parallel_tool_use: bool,
-    },
-    Any {
-        #[serde(default)]
-        disable_parallel_tool_use: bool,
-    },
-    Tool {
-        name: String,
-        #[serde(default)]
-        disable_parallel_tool_use: bool,
-    },
-    None,
-}
+    #[derive(Debug, Serialize, ToSchema)]
+    pub struct MessageResponse {
+        pub id: String,
+        pub r#type: &'static str,
+        pub role: &'static str,
+        pub model: String,
+        pub content: Vec<ResponseContentBlock>,
+        pub stop_reason: &'static str,
+        pub stop_sequence: Option<String>,
+        pub usage: UsageResponse,
+    }
 
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum Thinking {
-    /// Enables reasoning with a hard reasoning-token budget.
-    Enabled { budget_tokens: u32 },
-    Adaptive,
-    Disabled,
+    #[derive(Debug, Serialize, ToSchema)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub enum ResponseContentBlock {
+        Thinking {
+            thinking: String,
+            signature: &'static str,
+        },
+        Text {
+            text: String,
+        },
+        ToolUse {
+            id: String,
+            name: String,
+            input: Map<String, Value>,
+        },
+    }
+
+    #[derive(Debug, Serialize, ToSchema)]
+    pub struct UsageResponse {
+        pub input_tokens: u64,
+        pub cache_creation_input_tokens: u64,
+        pub cache_read_input_tokens: u64,
+        pub output_tokens: u64,
+    }
+
+    #[derive(Debug, Serialize, ToSchema)]
+    pub struct CountTokensResponse {
+        pub input_tokens: u64,
+    }
 }
 
 pub struct AdaptedRequest {
@@ -694,56 +768,6 @@ fn image(source: ImageSource) -> Result<magnitude_chat::request::ImageInput, Api
     }
 }
 
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ErrorEnvelope {
-    pub r#type: &'static str,
-    pub error: ErrorBody,
-    pub request_id: String,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ErrorBody {
-    pub r#type: &'static str,
-    pub message: String,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct MessageResponse {
-    pub id: String,
-    pub r#type: &'static str,
-    pub role: &'static str,
-    pub model: String,
-    pub content: Vec<ResponseContentBlock>,
-    pub stop_reason: &'static str,
-    pub stop_sequence: Option<String>,
-    pub usage: UsageResponse,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ResponseContentBlock {
-    Thinking {
-        thinking: String,
-        signature: &'static str,
-    },
-    Text {
-        text: String,
-    },
-    ToolUse {
-        id: String,
-        name: String,
-        input: Map<String, Value>,
-    },
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct UsageResponse {
-    pub input_tokens: u64,
-    pub cache_creation_input_tokens: u64,
-    pub cache_read_input_tokens: u64,
-    pub output_tokens: u64,
-}
-
 /// Anthropic reports prompt tokens as disjoint parts whose sum is the prompt:
 /// `input_tokens` excludes the prefix restored from cache, which is
 /// `cache_read_input_tokens`. Engine usage counts the whole prompt as input.
@@ -759,11 +783,6 @@ impl From<TokenUsage> for UsageResponse {
             output_tokens: usage.output_tokens,
         }
     }
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct CountTokensResponse {
-    pub input_tokens: u64,
 }
 
 pub fn message(id: &str, model: &str, output: &Output, completion: &Completion) -> MessageResponse {

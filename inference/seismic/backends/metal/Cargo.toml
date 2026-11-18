@@ -33,3 +33,6 @@ block2 = "0.6"
 [build-dependencies]
 # The formation build identity (`toolchain::FORMATION_BUILD`).
 magnitude-source-identity = { path = "../../../engine/source-identity" }
+
+[lints]
+workspace = true

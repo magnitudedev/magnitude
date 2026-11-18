@@ -7,3 +7,6 @@ license.workspace = true
 [dependencies]
 magnitude-family-contracts = { path = "../families/contracts" }
 magnitude-state = { path = "../state" }
+
+[lints]
+workspace = true

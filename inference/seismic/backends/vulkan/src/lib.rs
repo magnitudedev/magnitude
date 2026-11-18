@@ -5,6 +5,14 @@
 //!
 //! There is no planned route: this crate implements no compiler target.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests start threads of their own; the code they test starts its threads through seismic-threads"
+    )
+)]
+
 mod device;
 pub mod direct;
 mod facts;

@@ -24,3 +24,6 @@ magnitude-family-registry = { path = "../registry" }
 # The worker wire's encoding, which every built definition crosses (`tests/catalog_definitions.rs`).
 postcard.workspace = true
 flate2.workspace = true
+
+[lints]
+workspace = true

@@ -8,6 +8,21 @@
 //! construction details. The semantic oracle is a validation consumer of the
 //! same entry graph, never a production execution path.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests start threads of their own; the code they test starts its threads through seismic-threads"
+    )
+)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::large_stack_frames,
+        reason = "libtest's generated main holds a description of each of the crate's tests in its one frame"
+    )
+)]
+
 pub mod analysis;
 pub mod bundle;
 pub mod cancellation;

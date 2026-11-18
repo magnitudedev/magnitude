@@ -9,6 +9,10 @@ symptom appears and gets patched too, and the work gets stuck iterating in a loo
 How to run checks and measurements is in the root `AGENTS.md` ("Running checks and
 measurements"); runs on hardware go through `mrig`.
 
+**Clippy blocks.** `mrig check` runs `cargo clippy`, which fails on the lints the workspace denies
+(`[workspace.lints]` in `inference/Cargo.toml`). The release runs the same clippy before
+publishing, so a change lands only once `mrig check` passes.
+
 **Check Windows when a change touches the OS.** The rig has no Windows host, so code that calls the
 OS (memory mapping, symbols, threads, files, processes) is checked for Windows by cross-compiling
 the shipped binaries' whole dependency tree: `bun run check:windows` (needs

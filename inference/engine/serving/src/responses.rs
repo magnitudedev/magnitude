@@ -2,6 +2,7 @@
 //! keeps per-connection logical history: `generate: false` warms a request
 //! without generating, and `previous_response_id` continues from the most
 //! recent concluded response's input and output with new input.
+
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::num::NonZeroU32;
@@ -40,153 +41,373 @@ use crate::sampling::{SamplingRequest, sampling};
 use crate::source::{GenerationEvent, GenerationStream, LoadProgress, ModelLoadProgress};
 use crate::{Serving, include_progress, media, unix_timestamp, with_request_id};
 
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct ResponseCreateRequest {
-    pub model: String,
-    pub input: ResponseInput,
-    pub instructions: Option<String>,
-    pub max_output_tokens: Option<u32>,
-    pub temperature: Option<f32>,
-    pub top_p: Option<f32>,
-    pub seed: Option<u32>,
-    pub tools: Option<Vec<ResponseTool>>,
-    #[schema(value_type = Object, nullable = false)]
-    pub tool_choice: Option<ResponseToolChoice>,
-    pub parallel_tool_calls: Option<bool>,
-    pub reasoning: Option<ResponseReasoning>,
-    pub text: Option<ResponseText>,
-    #[serde(default)]
-    pub stream: bool,
-    pub store: Option<bool>,
-    pub metadata: Option<Map<String, Value>>,
-    pub include: Option<Vec<String>>,
-    pub client_metadata: Option<Map<String, Value>>,
-    pub previous_response_id: Option<String>,
-    pub prompt_cache_key: Option<String>,
-    pub truncation: Option<String>,
-}
+pub use schema::{
+    FunctionCallOutput, FunctionCallOutputPart, IncompleteDetails, ResponseContentPart,
+    ResponseCreateRequest, ResponseError, ResponseFunctionCall, ResponseFunctionCallOutput,
+    ResponseFunctionCallOutputType, ResponseFunctionCallType, ResponseFunctionChoice,
+    ResponseFunctionTool, ResponseFunctionType, ResponseInput, ResponseInputMessage,
+    ResponseInputTokenDetails, ResponseMessageContent, ResponseMessageType, ResponseObject,
+    ResponseOutputContent, ResponseOutputItem, ResponseOutputTokenDetails, ResponseReasoning,
+    ResponseReasoningInput, ResponseReasoningInputContent, ResponseReasoningInputType,
+    ResponseReasoningResult, ResponseRole, ResponseStreamEvent, ResponseSummaryPart, ResponseText,
+    ResponseTextFormat, ResponseTextFormatResult, ResponseTextResult, ResponseToolChoice,
+    ResponseToolChoiceMode, ResponseUsage,
+};
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ResponseStreamEvent {
-    pub r#type: String,
-    pub sequence_number: u64,
-    #[serde(flatten)]
-    pub data: BTreeMap<String, Value>,
-}
+/// The Responses wire types, in a module of their own for the lint their
+/// derived schemas need.
+mod schema {
+    #![allow(
+        clippy::large_stack_frames,
+        reason = "utoipa's derived `ToSchema::schema` builds a whole type's schema in one generated frame, which this module cannot split; it runs only as the OpenAPI document is built"
+    )]
 
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ResponseObject {
-    pub id: String,
-    pub object: &'static str,
-    pub created_at: u64,
-    pub status: String,
-    pub error: Option<ResponseError>,
-    pub incomplete_details: Option<IncompleteDetails>,
-    pub instructions: Option<String>,
-    pub max_output_tokens: Option<u32>,
-    pub model: String,
-    pub output: Vec<ResponseOutputItem>,
-    pub parallel_tool_calls: bool,
-    pub previous_response_id: Option<String>,
-    pub reasoning: ResponseReasoningResult,
-    pub store: bool,
-    pub temperature: Option<f32>,
-    pub text: ResponseTextResult,
-    pub tool_choice: Value,
-    pub tools: Vec<Value>,
-    pub top_p: Option<f32>,
-    pub truncation: String,
-    pub usage: ResponseUsage,
-    pub metadata: Map<String, Value>,
-}
+    use super::*;
 
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ResponseError {
-    pub message: String,
-    pub r#type: String,
-    pub code: String,
-}
+    #[derive(Debug, Deserialize, ToSchema)]
+    pub struct ResponseCreateRequest {
+        pub model: String,
+        pub input: ResponseInput,
+        pub instructions: Option<String>,
+        pub max_output_tokens: Option<u32>,
+        pub temperature: Option<f32>,
+        pub top_p: Option<f32>,
+        pub seed: Option<u32>,
+        pub tools: Option<Vec<ResponseTool>>,
+        #[schema(value_type = Object, nullable = false)]
+        pub tool_choice: Option<ResponseToolChoice>,
+        pub parallel_tool_calls: Option<bool>,
+        pub reasoning: Option<ResponseReasoning>,
+        pub text: Option<ResponseText>,
+        #[serde(default)]
+        pub stream: bool,
+        pub store: Option<bool>,
+        pub metadata: Option<Map<String, Value>>,
+        pub include: Option<Vec<String>>,
+        pub client_metadata: Option<Map<String, Value>>,
+        pub previous_response_id: Option<String>,
+        pub prompt_cache_key: Option<String>,
+        pub truncation: Option<String>,
+    }
 
-#[derive(Debug, Serialize, ToSchema)]
-pub struct IncompleteDetails {
-    pub reason: &'static str,
-}
+    #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+    pub struct ResponseStreamEvent {
+        pub r#type: String,
+        pub sequence_number: u64,
+        #[serde(flatten)]
+        pub data: BTreeMap<String, Value>,
+    }
 
-#[derive(Debug, Serialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ResponseOutputItem {
-    Reasoning {
-        id: String,
-        status: &'static str,
-        summary: Vec<ResponseSummaryPart>,
-    },
-    Message {
-        id: String,
-        status: &'static str,
-        role: &'static str,
-        content: Vec<ResponseOutputContent>,
-    },
-    FunctionCall {
-        id: String,
-        status: &'static str,
-        call_id: String,
-        name: String,
-        arguments: String,
-    },
-}
+    #[derive(Debug, Serialize, ToSchema)]
+    pub struct ResponseObject {
+        pub id: String,
+        pub object: &'static str,
+        pub created_at: u64,
+        pub status: String,
+        pub error: Option<ResponseError>,
+        pub incomplete_details: Option<IncompleteDetails>,
+        pub instructions: Option<String>,
+        pub max_output_tokens: Option<u32>,
+        pub model: String,
+        pub output: Vec<ResponseOutputItem>,
+        pub parallel_tool_calls: bool,
+        pub previous_response_id: Option<String>,
+        pub reasoning: ResponseReasoningResult,
+        pub store: bool,
+        pub temperature: Option<f32>,
+        pub text: ResponseTextResult,
+        pub tool_choice: Value,
+        pub tools: Vec<Value>,
+        pub top_p: Option<f32>,
+        pub truncation: String,
+        pub usage: ResponseUsage,
+        pub metadata: Map<String, Value>,
+    }
 
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ResponseSummaryPart {
-    pub r#type: &'static str,
-    pub text: String,
-}
+    #[derive(Debug, Serialize, ToSchema)]
+    pub struct ResponseError {
+        pub message: String,
+        pub r#type: String,
+        pub code: String,
+    }
 
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ResponseOutputContent {
-    pub r#type: &'static str,
-    pub text: String,
-    pub annotations: Vec<Value>,
-}
+    #[derive(Debug, Serialize, ToSchema)]
+    pub struct IncompleteDetails {
+        pub reason: &'static str,
+    }
 
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ResponseReasoningResult {
-    pub effort: Option<String>,
-    pub summary: Option<String>,
-}
+    #[derive(Debug, Serialize, ToSchema)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub enum ResponseOutputItem {
+        Reasoning {
+            id: String,
+            status: &'static str,
+            summary: Vec<ResponseSummaryPart>,
+        },
+        Message {
+            id: String,
+            status: &'static str,
+            role: &'static str,
+            content: Vec<ResponseOutputContent>,
+        },
+        FunctionCall {
+            id: String,
+            status: &'static str,
+            call_id: String,
+            name: String,
+            arguments: String,
+        },
+    }
 
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct ResponseTextResult {
-    pub format: ResponseTextFormatResult,
-}
+    #[derive(Debug, Serialize, ToSchema)]
+    pub struct ResponseSummaryPart {
+        pub r#type: &'static str,
+        pub text: String,
+    }
 
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct ResponseTextFormatResult {
-    pub r#type: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub schema: Option<Map<String, Value>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub strict: Option<bool>,
-}
+    #[derive(Debug, Serialize, ToSchema)]
+    pub struct ResponseOutputContent {
+        pub r#type: &'static str,
+        pub text: String,
+        pub annotations: Vec<Value>,
+    }
 
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ResponseUsage {
-    pub input_tokens: u64,
-    pub input_tokens_details: ResponseInputTokenDetails,
-    pub output_tokens: u64,
-    pub output_tokens_details: ResponseOutputTokenDetails,
-    pub total_tokens: u64,
-}
+    #[derive(Debug, Serialize, ToSchema)]
+    pub struct ResponseReasoningResult {
+        pub effort: Option<String>,
+        pub summary: Option<String>,
+    }
 
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ResponseInputTokenDetails {
-    pub cached_tokens: u64,
-}
+    #[derive(Debug, Clone, Serialize, ToSchema)]
+    pub struct ResponseTextResult {
+        pub format: ResponseTextFormatResult,
+    }
 
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ResponseOutputTokenDetails {
-    pub reasoning_tokens: u64,
+    #[derive(Debug, Clone, Serialize, ToSchema)]
+    pub struct ResponseTextFormatResult {
+        pub r#type: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub schema: Option<Map<String, Value>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub strict: Option<bool>,
+    }
+
+    #[derive(Debug, Serialize, ToSchema)]
+    pub struct ResponseUsage {
+        pub input_tokens: u64,
+        pub input_tokens_details: ResponseInputTokenDetails,
+        pub output_tokens: u64,
+        pub output_tokens_details: ResponseOutputTokenDetails,
+        pub total_tokens: u64,
+    }
+
+    #[derive(Debug, Serialize, ToSchema)]
+    pub struct ResponseInputTokenDetails {
+        pub cached_tokens: u64,
+    }
+
+    #[derive(Debug, Serialize, ToSchema)]
+    pub struct ResponseOutputTokenDetails {
+        pub reasoning_tokens: u64,
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    #[serde(untagged)]
+    pub enum ResponseInput {
+        Text(String),
+        Items(Vec<ResponseInputItem>),
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    pub struct ResponseInputMessage {
+        #[serde(default)]
+        pub r#type: Option<ResponseMessageType>,
+        #[serde(default)]
+        pub id: Option<String>,
+        #[serde(default)]
+        pub status: Option<String>,
+        #[serde(default)]
+        pub phase: Option<String>,
+        pub role: ResponseRole,
+        pub content: ResponseMessageContent,
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    pub struct ResponseReasoningInput {
+        pub r#type: ResponseReasoningInputType,
+        #[serde(default)]
+        pub id: Option<String>,
+        #[serde(default)]
+        pub status: Option<String>,
+        #[serde(default, deserialize_with = "null_as_empty")]
+        pub content: Vec<ResponseReasoningInputContent>,
+        #[serde(default, deserialize_with = "null_as_empty")]
+        pub summary: Vec<ResponseReasoningInputContent>,
+        #[serde(default)]
+        pub encrypted_content: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub enum ResponseReasoningInputContent {
+        ReasoningText { text: String },
+        SummaryText { text: String },
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    pub struct ResponseFunctionCall {
+        pub r#type: ResponseFunctionCallType,
+        #[serde(default)]
+        pub id: Option<String>,
+        #[serde(default)]
+        pub status: Option<String>,
+        pub call_id: String,
+        pub name: String,
+        pub arguments: String,
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    pub struct ResponseFunctionCallOutput {
+        pub r#type: ResponseFunctionCallOutputType,
+        #[serde(default)]
+        pub id: Option<String>,
+        #[serde(default)]
+        pub status: Option<String>,
+        pub call_id: String,
+        pub output: FunctionCallOutput,
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ResponseMessageType {
+        Message,
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ResponseReasoningInputType {
+        Reasoning,
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ResponseFunctionCallType {
+        FunctionCall,
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ResponseFunctionCallOutputType {
+        FunctionCallOutput,
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    #[serde(untagged)]
+    pub enum FunctionCallOutput {
+        Text(String),
+        Parts(Vec<FunctionCallOutputPart>),
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub enum FunctionCallOutputPart {
+        InputText { text: String },
+        InputImage { image_url: String },
+    }
+
+    #[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
+    #[serde(rename_all = "lowercase")]
+    pub enum ResponseRole {
+        User,
+        Assistant,
+        System,
+        Developer,
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    #[serde(untagged)]
+    pub enum ResponseMessageContent {
+        Text(String),
+        Parts(Vec<ResponseContentPart>),
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub enum ResponseContentPart {
+        InputText {
+            text: String,
+        },
+        OutputText {
+            text: String,
+            #[serde(default)]
+            annotations: Vec<Value>,
+        },
+        InputImage {
+            image_url: String,
+        },
+    }
+
+    #[derive(Debug, Serialize, Deserialize, ToSchema)]
+    pub struct ResponseFunctionTool {
+        pub r#type: ResponseFunctionType,
+        pub name: String,
+        pub description: Option<String>,
+        pub parameters: Map<String, Value>,
+        pub strict: Option<bool>,
+    }
+
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ResponseFunctionType {
+        Function,
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    #[serde(untagged)]
+    pub enum ResponseToolChoice {
+        Mode(ResponseToolChoiceMode),
+        Function(ResponseFunctionChoice),
+    }
+
+    #[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ResponseToolChoiceMode {
+        None,
+        Auto,
+        Required,
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub enum ResponseFunctionChoice {
+        Function { name: String },
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    pub struct ResponseReasoning {
+        pub effort: Option<ReasoningEffortRequest>,
+        pub summary: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    pub struct ResponseText {
+        pub format: ResponseTextFormat,
+    }
+
+    #[derive(Debug, Deserialize, ToSchema)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub enum ResponseTextFormat {
+        Text,
+        JsonObject,
+        JsonSchema {
+            name: String,
+            schema: Map<String, Value>,
+            #[serde(default)]
+            strict: bool,
+        },
+    }
 }
 
 // One constructor per output item kind, shared by the non-streaming response
@@ -759,13 +980,6 @@ fn response_base(
     })
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(untagged)]
-pub enum ResponseInput {
-    Text(String),
-    Items(Vec<ResponseInputItem>),
-}
-
 // Untagged because the protocol's shorthand message form carries no `type`
 // discriminator; variants are matched by shape, and each explicit `type`
 // field is a single-literal enum so a present tag is still verified.
@@ -781,35 +995,6 @@ pub enum ResponseInputItem {
     FunctionCallOutput(ResponseFunctionCallOutput),
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct ResponseInputMessage {
-    #[serde(default)]
-    pub r#type: Option<ResponseMessageType>,
-    #[serde(default)]
-    pub id: Option<String>,
-    #[serde(default)]
-    pub status: Option<String>,
-    #[serde(default)]
-    pub phase: Option<String>,
-    pub role: ResponseRole,
-    pub content: ResponseMessageContent,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct ResponseReasoningInput {
-    pub r#type: ResponseReasoningInputType,
-    #[serde(default)]
-    pub id: Option<String>,
-    #[serde(default)]
-    pub status: Option<String>,
-    #[serde(default, deserialize_with = "null_as_empty")]
-    pub content: Vec<ResponseReasoningInputContent>,
-    #[serde(default, deserialize_with = "null_as_empty")]
-    pub summary: Vec<ResponseReasoningInputContent>,
-    #[serde(default)]
-    pub encrypted_content: Option<String>,
-}
-
 /// A replayed list that a client re-serialized as `null` (Codex does for the
 /// reasoning fields we omit) is empty.
 fn null_as_empty<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
@@ -818,36 +1003,6 @@ where
     T: Deserialize<'de>,
 {
     Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ResponseReasoningInputContent {
-    ReasoningText { text: String },
-    SummaryText { text: String },
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct ResponseFunctionCall {
-    pub r#type: ResponseFunctionCallType,
-    #[serde(default)]
-    pub id: Option<String>,
-    #[serde(default)]
-    pub status: Option<String>,
-    pub call_id: String,
-    pub name: String,
-    pub arguments: String,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct ResponseFunctionCallOutput {
-    pub r#type: ResponseFunctionCallOutputType,
-    #[serde(default)]
-    pub id: Option<String>,
-    #[serde(default)]
-    pub status: Option<String>,
-    pub call_id: String,
-    pub output: FunctionCallOutput,
 }
 
 impl PartialSchema for ResponseInputItem {
@@ -889,76 +1044,6 @@ impl ToSchema for ResponseInputItem {
     }
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ResponseMessageType {
-    Message,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ResponseReasoningInputType {
-    Reasoning,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ResponseFunctionCallType {
-    FunctionCall,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ResponseFunctionCallOutputType {
-    FunctionCallOutput,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(untagged)]
-pub enum FunctionCallOutput {
-    Text(String),
-    Parts(Vec<FunctionCallOutputPart>),
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum FunctionCallOutputPart {
-    InputText { text: String },
-    InputImage { image_url: String },
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum ResponseRole {
-    User,
-    Assistant,
-    System,
-    Developer,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(untagged)]
-pub enum ResponseMessageContent {
-    Text(String),
-    Parts(Vec<ResponseContentPart>),
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ResponseContentPart {
-    InputText {
-        text: String,
-    },
-    OutputText {
-        text: String,
-        #[serde(default)]
-        annotations: Vec<Value>,
-    },
-    InputImage {
-        image_url: String,
-    },
-}
-
 // Function declarations are the executable semantic core and stay strictly
 // typed. Every other declaration (namespace, web_search, and any future
 // hosted tool type) is opaque by policy: never locally executable, retained
@@ -969,21 +1054,6 @@ pub enum ResponseContentPart {
 pub enum ResponseTool {
     Function(ResponseFunctionTool),
     Other(Value),
-}
-
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct ResponseFunctionTool {
-    pub r#type: ResponseFunctionType,
-    pub name: String,
-    pub description: Option<String>,
-    pub parameters: Map<String, Value>,
-    pub strict: Option<bool>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ResponseFunctionType {
-    Function,
 }
 
 impl PartialSchema for ResponseTool {
@@ -1008,51 +1078,6 @@ impl ToSchema for ResponseTool {
         ));
         ResponseFunctionTool::schemas(schemas);
     }
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(untagged)]
-pub enum ResponseToolChoice {
-    Mode(ResponseToolChoiceMode),
-    Function(ResponseFunctionChoice),
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ResponseToolChoiceMode {
-    None,
-    Auto,
-    Required,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ResponseFunctionChoice {
-    Function { name: String },
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct ResponseReasoning {
-    pub effort: Option<ReasoningEffortRequest>,
-    pub summary: Option<String>,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct ResponseText {
-    pub format: ResponseTextFormat,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ResponseTextFormat {
-    Text,
-    JsonObject,
-    JsonSchema {
-        name: String,
-        schema: Map<String, Value>,
-        #[serde(default)]
-        strict: bool,
-    },
 }
 
 pub struct AdaptedResponseRequest {

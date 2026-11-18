@@ -23,3 +23,6 @@ seismic-topology = { workspace = true, features = ["fixtures"] }
 [build-dependencies]
 # The formation build identity (`toolchain::FORMATION_BUILD`).
 magnitude-source-identity = { path = "../../../engine/source-identity" }
+
+[lints]
+workspace = true

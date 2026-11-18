@@ -12,3 +12,6 @@ magnitude-family-qwen = { path = "../qwen" }
 
 [dev-dependencies]
 magnitude-family-common = { path = "../common", features = ["catalog-headers"] }
+
+[lints]
+workspace = true

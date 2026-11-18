@@ -16,6 +16,14 @@
 //! features of the generated tier boundary it inlines into; only component
 //! calls cross a function boundary.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests start threads of their own; the code they test starts its threads through seismic-threads"
+    )
+)]
+
 pub mod components;
 pub mod element;
 pub mod isa;
