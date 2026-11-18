@@ -102,7 +102,8 @@ fn minicpm5_string_arguments_read_raw_or_cdata_one_way() {
 
 /// Text that opens with `<think>` is reasoning, so content no reasoning
 /// precedes never opens with it; content after reasoning, or text that only
-/// resembles the tag, is unaffected.
+/// resembles the tag, is unaffected. Reasoning that never closes ends the
+/// output as reasoning, as no call is required here.
 #[test]
 fn minicpm5_content_never_opens_reasoning_it_does_not_close() {
     let source = minicpm5_model_opens_reasoning();
@@ -114,7 +115,7 @@ fn minicpm5_content_never_opens_reasoning_it_does_not_close() {
     ] {
         assert!(minicpm5_admits(&source, ToolChoice::Auto, output), "{output}");
     }
-    assert!(!minicpm5_admits(&source, ToolChoice::Auto, "<think>never closed"));
+    assert!(minicpm5_admits(&source, ToolChoice::Auto, "<think>never closed"));
 }
 
 /// LFM2.5's Python-style values own no whitespace after them: the separators
