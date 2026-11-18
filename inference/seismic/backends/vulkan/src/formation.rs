@@ -97,6 +97,33 @@ pub fn compile(
     compiled(source, kernel, environment).map(|(module, _)| module)
 }
 
+/// The variable naming a directory where formation writes the analysed copy
+/// (`analysed`, or `inlined` where the execution model was checked on that:
+/// [`execution_model`]) of each module it refuses for breaking the contract
+/// or the execution model, as SPIR-V assembly in `<kernel>-<digest>.spvasm`, one
+/// file per module: the module whose ids the refusal names.
+pub const ANALYSED_DIRECTORY: &str = "SEISMIC_VULKAN_ANALYSED";
+
+/// `module` as SPIR-V assembly, its ids as numbers.
+fn assembly(module: &[u32]) -> Result<String, NativeCompilationError> {
+    use spirv_tools::assembler::{Assembler, DisassembleOptions};
+    Ok(spirv_tools::assembler::create(Some(target()))
+        .disassemble(
+            module,
+            DisassembleOptions {
+                print: false,
+                color: false,
+                indent: false,
+                show_byte_offset: false,
+                no_header: true,
+                use_friendly_names: false,
+                comment: false,
+            },
+        )
+        .map_err(toolchain)?
+        .expect("a disassembly not printed is returned"))
+}
+
 /// [`compile`]'s module, and whether it reads its subgroups on some device:
 /// as formed for `environment`, or through a 32-lane hardware join, which
 /// is a subgroup operation on 64 lanes.
@@ -113,6 +140,18 @@ fn compiled(
     let (findings, analysed) = execution_model(&cleaned, &joins, checked, environment.maximal_reconvergence)?;
     violations.extend(findings.violations);
     if !violations.is_empty() {
+        if let Some(directory) = std::env::var_os(ANALYSED_DIRECTORY) {
+            // One file per module: the specializations of a kernel differ.
+            let digest = {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                analysed.hash(&mut hasher);
+                hasher.finish()
+            };
+            let path = std::path::Path::new(&directory).join(format!("{kernel}-{digest:016x}.spvasm"));
+            std::fs::write(&path, assembly(&analysed)?)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        }
         // Written as glslang writes a diagnostic, so readers that keep a
         // toolchain failure's error lines keep it.
         return Err(toolchain(format!(
@@ -1071,7 +1110,7 @@ fn by_value(
 /// workarounds on the generator), then validated as formation validates. A
 /// module without joins is shipped as it is.
 fn shipped(module: Vec<u32>, joins: &[uniformity::HardwareJoin]) -> Result<Vec<u32>, NativeCompilationError> {
-    use spirv_tools::assembler::{Assembler, AssemblerOptions, DisassembleOptions};
+    use spirv_tools::assembler::{Assembler, AssemblerOptions};
     const OP_FUNCTION_CALL: u32 = 57;
     if joins.is_empty() {
         return Ok(module);
@@ -1097,22 +1136,7 @@ fn shipped(module: Vec<u32>, joins: &[uniformity::HardwareJoin]) -> Result<Vec<u
         .flat_map(|join| join.ids)
         .chain(argument.keys().copied())
         .collect::<std::collections::HashSet<_>>();
-    let assembler = spirv_tools::assembler::create(Some(target()));
-    let text = assembler
-        .disassemble(
-            &module,
-            DisassembleOptions {
-                print: false,
-                color: false,
-                indent: false,
-                show_byte_offset: false,
-                no_header: true,
-                use_friendly_names: false,
-                comment: false,
-            },
-        )
-        .map_err(toolchain)?
-        .expect("a disassembly not printed is returned");
+    let text = assembly(&module)?;
     // Each kept line, with the function type it declares.
     let mut kept = Vec::new();
     let mut in_join = false;
@@ -1163,7 +1187,7 @@ fn shipped(module: Vec<u32>, joins: &[uniformity::HardwareJoin]) -> Result<Vec<u
         .filter(|(_, function_type)| function_type.is_none_or(|id| named.contains(&id)))
         .map(|(line, _)| format!("{line}\n"))
         .collect::<String>();
-    let mut shipped = assembler
+    let mut shipped = spirv_tools::assembler::create(Some(target()))
         .assemble(&text, AssemblerOptions { preserve_numeric_ids: true })
         .map(|binary| binary.as_words().to_vec())
         .map_err(toolchain)?;
