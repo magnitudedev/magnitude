@@ -39,6 +39,7 @@
 //!     }
 //!     pub struct Elements { pub <ELEM>: seismic::Element, .. }   // polymorphic entries only
 //!     pub struct Entry;                   // impl seismic::Entry
+//!     impl seismic::Untuned for Entry {}  // no native implementation declares a tuning parameter
 //!     pub fn for_device(charges: &seismic::Charges, options: seismic::PreparationOptions)
 //!         -> Result<seismic::Kernel<Entry>, seismic::LoadError>;                 // monomorphic
 //!     pub fn for_device_with(charges: &seismic::Charges, options: seismic::PreparationOptions, elements: Elements)
@@ -277,6 +278,9 @@ mod internals {
     struct EntryNative<'a> {
         entry: seismic_lang::ids::EntryId,
         cpu: Option<CpuAsset<'a>>,
+        /// Whether an implementation of the entry, on any backend, declares
+        /// tuning parameters.
+        tuned: bool,
     }
 
     /// A CPU native implementation and its authored source.
@@ -402,12 +406,14 @@ mod internals {
         let mut natives = Vec::new();
         for entry in module.entries() {
             let mut any = false;
+            let mut tuned = false;
             let mut cpu = None;
             for backend in BackendName::ALL {
                 let Some(definition) = module.native_implementation(entry.id, backend) else {
                     continue;
                 };
                 any = true;
+                tuned |= definition.has_tuning_parameters();
                 let source = module
                     .native_asset(entry.id, backend)
                     .expect("shared loader captures native assets")
@@ -456,6 +462,7 @@ mod internals {
                 natives.push(EntryNative {
                     entry: entry.id,
                     cpu,
+                    tuned,
                 });
             }
         }
@@ -1742,6 +1749,9 @@ mod internals {
             out.push_str(&format!("  pub fn native_tune<'a>(charges: &seismic::Charges, statics: &seismic::NativeSpecialization, mut points: impl seismic::PointSource<'a, Entry>, validation: seismic::NumericalRequirement, strategy: seismic::Strategy) -> Result<seismic::TuningResult, seismic::TuneError> {{ seismic::generated::tune_native::<Entry>(charges, statics, &[], {cpu}, &mut points, validation, strategy) }}\n"));
             out.push_str(&format!("  pub fn native_search<'a>(charges: &seismic::Charges, statics: &seismic::NativeSpecialization, validation: seismic::NumericalRequirement) -> Result<seismic::NativeSearch<'a, Entry>, seismic::TuneError> {{ seismic::generated::search_native::<Entry>(charges, statics, &[], {cpu}, validation) }}\n"));
             out.push_str(&format!("  pub fn native_digest(device: &seismic::Device, statics: &seismic::NativeSpecialization) -> Result<String, seismic::TuneError> {{ seismic::generated::digest_native::<Entry>(device, statics, &[], {cpu}) }}\n"));
+        }
+        if !native.tuned {
+            out.push_str("  impl seismic::Untuned for Entry {}\n");
         }
         out.push_str("  /// The checked native implementation for the device's backend.\n");
         out.push_str("  pub fn native_implementation(device: &seismic::Device) -> Result<Option<seismic::OnDevice>, seismic::CheckedBundleError> { seismic::generated::native_implementation::<Entry>(device) }\n");

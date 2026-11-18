@@ -108,8 +108,8 @@ pub(super) struct PreparationInputs<'a> {
     pub graph_demand: GraphInvocationDemand,
 }
 
-/// Prepare one entry that has no tuning case. Evaluates to `Option`: `None`
-/// during a count or a listing.
+/// Prepare one entry without tuning parameters ([`seismic::Untuned`]).
+/// Evaluates to `Option`: `None` during a count or a listing.
 macro_rules! fixed {
     ($spec:expr, $module:ident, $bindings:expr, $elements:expr) => {
         fixed!($spec, $module, $bindings, $elements, statics & [])

@@ -2287,6 +2287,13 @@ pub unsafe trait Entry: 'static {
     fn workflow_outputs(results: Self::WorkflowResults) -> Vec<generated::WorkflowResultRef>;
 }
 
+/// An entry none of whose native implementations, on any backend, declares
+/// a tuning parameter: its static values alone specialize it, so it is
+/// prepared without a tuning case. `seismic-build` implements it for every
+/// such entry and for no other, so preparing an entry that declares tuning
+/// parameters as an untuned one does not compile.
+pub trait Untuned: Entry {}
+
 /// A prepared kernel for one entry on one device under one precision
 /// policy. `call` validates, selects, allocates, and executes (§14.4).
 pub struct Kernel<E: Entry> {
