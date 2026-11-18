@@ -47,7 +47,7 @@ cleanup() {
   [ -z "$download_pid" ] || kill "$download_pid" 2>/dev/null
   stop_progress
   restore_server
-  [ -z "$keepalive" ] || kill "$keepalive" 2>/dev/null || true
+  [ -z "$keepalive" ] || kill -KILL "$keepalive" 2>/dev/null || true
   [ -z "$staging" ] || rm -rf "$staging"
   rm -rf "$scratch"
 }
@@ -57,9 +57,11 @@ trap 'printf "\n" >&2; exit 130' INT
 trap 'exit 143' TERM HUP
 scratch=$(cd "$scratch" && pwd -P)
 # Status goes to stderr so stdout stays usable by scripts. Only a terminal is redrawn.
+# SIGKILL, because a forked subshell can lose a TERM that arrives before it resets the installer's
+# inherited traps; it would then keep looping and `wait` would never return.
 stop_progress() {
   [ -n "$progress_pid" ] || return 0
-  kill "$progress_pid" 2>/dev/null || true
+  kill -KILL "$progress_pid" 2>/dev/null || true
   wait "$progress_pid" 2>/dev/null || true
   progress_pid=''
   [ "$progress_terminal" != yes ] || printf '\r\033[K' >&2
@@ -96,6 +98,7 @@ start_progress() {
   if [ "$progress_terminal" = yes ]; then printf '  %s...' "$progress_label" >&2
   else printf '%s...\n' "$progress_label" >&2; fi
   (
+    trap - EXIT INT TERM HUP
     progress_last_log=0
     # $$ stays the installer in this subshell: the loop ends with it even when it is killed without its exit trap.
     while sleep 1 </dev/null >/dev/null 2>&1 && kill -0 $$ 2>/dev/null; do
@@ -464,7 +467,7 @@ install_desktop_linux() {
     fi
     privilege=sudo
     # Detached from the terminal so the installer's session ends when it does.
-    ( while sleep 50 && kill -0 $$ 2>/dev/null; do sudo -n true 2>/dev/null || exit 0; done ) </dev/null >/dev/null 2>&1 &
+    ( trap - EXIT INT TERM HUP; while sleep 50 && kill -0 $$ 2>/dev/null; do sudo -n true 2>/dev/null || exit 0; done ) </dev/null >/dev/null 2>&1 &
     keepalive=$!
   fi
 
