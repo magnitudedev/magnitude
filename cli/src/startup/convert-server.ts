@@ -94,13 +94,16 @@ const removalCommand = Effect.gen(function* () {
 })
 
 /**
- * Headless machines no longer need the desktop package: admins get a wrapper for the service's command, and
- * the package is removed in a transient unit outside the service, once the package manager is free.
- * Graphical machines keep the package, whose app takes the service over while it is open.
+ * Headless machines (no display manager) no longer need the desktop package: admins get a wrapper for the
+ * service's command, and the package is removed in a transient unit outside the service, once the package
+ * manager is free. Machines with a display manager keep the package, whose app takes the service over while open.
  */
 const retireDesktopPackage = Effect.gen(function* () {
-  const target = yield* output("systemctl", "get-default").pipe(Effect.orElseSucceed(() => "graphical.target"))
-  if (target === "graphical.target") return "kept (graphical machine)"
+  // Server images often default to graphical.target without any display, so a display manager is the sign
+  // that someone may use the desktop app here; anything unclear keeps the package.
+  const displayManager = yield* output("systemctl", "show", "--property=LoadState", "--value", "display-manager.service").pipe(
+    Effect.map(state => state !== "not-found"), Effect.orElseSucceed(() => true))
+  if (displayManager) return "kept (graphical machine)"
   yield* step("Could not write the command wrapper", () => writeFile(LEGACY_SERVER_WRAPPER, wrapper, { mode: 0o755 }))
   const removal = yield* removalCommand
   if (removal === undefined) return "kept (no supported package manager found)"
