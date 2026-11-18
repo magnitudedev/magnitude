@@ -11,7 +11,8 @@
 //! same text (`build.rs`), which its decode functions are dispatched by
 //! (C++ functions on Metal and CUDA; on Vulkan the preprocessor macro a
 //! bound slot is held to, whose `DECODED` form admits the same weights,
-//! requirements included).
+//! requirements included). The CPU's library is Rust and reads admission
+//! itself, so its declaration renders nothing.
 
 use crate::forms::Form;
 pub use crate::producer_decl::Axis;
@@ -311,6 +312,8 @@ static CUDA: LazyLock<Declarations> =
     LazyLock::new(|| declarations(BackendName::Cuda, include_str!("../native-library/cuda/producers.decl")));
 static VULKAN: LazyLock<Declarations> =
     LazyLock::new(|| declarations(BackendName::Vulkan, include_str!("../native-library/vulkan/producers.decl")));
+static CPU: LazyLock<Declarations> =
+    LazyLock::new(|| declarations(BackendName::Cpu, include_str!("../native-library/cpu/producers.decl")));
 
 /// The declaration of `form`'s producers; `form` must be one the backend's
 /// table declares (every form whose reach its producers bound).
@@ -319,7 +322,7 @@ pub fn declaration(form: Form) -> &'static Declaration {
         BackendName::Metal => &METAL,
         BackendName::Cuda => &CUDA,
         BackendName::Vulkan => &VULKAN,
-        BackendName::Cpu => panic!("`{}` declares no producers", form.backend().as_str()),
+        BackendName::Cpu => &CPU,
     };
     table
         .get(&form)
@@ -345,7 +348,12 @@ mod tests {
     /// (`declarations`) and declares the producers of some form.
     #[test]
     fn declarations_parse() {
-        for (backend, table) in [(BackendName::Metal, &METAL), (BackendName::Cuda, &CUDA), (BackendName::Vulkan, &VULKAN)] {
+        for (backend, table) in [
+            (BackendName::Metal, &METAL),
+            (BackendName::Cuda, &CUDA),
+            (BackendName::Vulkan, &VULKAN),
+            (BackendName::Cpu, &CPU),
+        ] {
             assert!(!table.is_empty(), "`{}` declares the producers of some form", backend.as_str());
         }
     }

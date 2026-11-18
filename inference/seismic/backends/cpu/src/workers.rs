@@ -711,8 +711,8 @@ impl Workers {
     /// A pool of `count` participants (at least one): the submitting thread
     /// and `count - 1` pool threads.
     pub fn new(count: usize) -> Result<Self, std::io::Error> {
-        const _: () = assert!(seismic_lang::forms::CPU_MAX_UNITS < 1 << PARTICIPANT_BITS);
-        let count = count.clamp(1, seismic_lang::forms::CPU_MAX_UNITS as usize);
+        const _: () = assert!(seismic_lang::cpu::CPU_MAX_UNITS < 1 << PARTICIPANT_BITS);
+        let count = count.clamp(1, seismic_lang::cpu::CPU_MAX_UNITS as usize);
         let shared = Arc::new(Shared {
             participants: count,
             published: AtomicU64::new(0),

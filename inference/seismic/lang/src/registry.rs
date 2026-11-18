@@ -1373,6 +1373,33 @@ pub enum RowPlaneContent {
     },
 }
 
+/// The planes of a row layout a native declaration sizes by
+/// (`row_bytes(W, PART, VALUES)`, [`PackedRowLayout::row_bytes`]): those
+/// bearing codes (code planes, grid entries and their high bits) or those
+/// bearing coefficients (local and super coefficients); a records plane
+/// bears both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+pub enum RowPart {
+    Codes,
+    Coefficients,
+}
+
+impl RowPart {
+    pub const ALL: [Self; 2] = [Self::Codes, Self::Coefficients];
+
+    /// Its name in a native declaration.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Codes => "codes",
+            Self::Coefficients => "coefficients",
+        }
+    }
+
+    pub fn named(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|part| part.name() == name)
+    }
+}
+
 /// The coefficients a `Groups` row plane holds: the local coefficient codes
 /// (`scales`) or the super coefficients (`supers`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1433,6 +1460,30 @@ impl RowPlaneInfo {
 }
 
 impl PackedRowLayout {
+    /// Per row, the bytes of `values` values in the planes bearing `part`:
+    /// each code-bearing plane's bytes of them rounded up to a whole byte,
+    /// each coefficient-bearing plane's to a whole 4-byte word, summed.
+    pub fn row_bytes(&self, part: RowPart, values: u64) -> u64 {
+        let group = u64::from(self.packet.group);
+        self.planes
+            .iter()
+            .filter(|plane| match plane.content {
+                RowPlaneContent::Records { .. } => true,
+                RowPlaneContent::Codes { .. } | RowPlaneContent::Grids { .. } | RowPlaneContent::GridHigh { .. } => {
+                    part == RowPart::Codes
+                }
+                RowPlaneContent::Groups { .. } => part == RowPart::Coefficients,
+            })
+            .map(|plane| {
+                let bytes = (u64::from(plane.bytes_per_group) * values).div_ceil(group);
+                match part {
+                    RowPart::Codes => bytes,
+                    RowPart::Coefficients => bytes.next_multiple_of(4),
+                }
+            })
+            .sum()
+    }
+
     /// Logical values per storage group.
     pub fn group(&self) -> u32 {
         self.packet.group

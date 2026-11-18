@@ -2954,8 +2954,8 @@ __device__ __forceinline__ void gemm_rows(u8 *shared, const Rows &source, u32 M,
     static_assert(!S8 || Same<Operands, SemanticGemmOperands>::value,
                   "quantized activation GEMM requires the semantic operand policy");
     // The launch declares at least this layout's bytes: the 16-bit bound, or
-    // with two blocks an SM the weight's int8 layout bound
-    // (`form(W, INT8_SHARED)`, `dense.seismic`'s BLOCKS).
+    // with two blocks an SM the weights' int8 layout bound
+    // (`dense.seismic`'s INT8_LAYOUT, under BLOCKS).
     require_dynamic_shared(Shape::template LAYOUT_BYTES<WA, WB, S8>);
     if constexpr (S8)
         gemm_segment_s8<Shape>(shared, source, M, K, nblock, rows, wa, wb, epi, part, parts);

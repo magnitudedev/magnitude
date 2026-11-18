@@ -375,7 +375,7 @@ projection dense for metal:
 # `attention`, `recurrent`, `readout` and `draft`). BLOCKS (the launch
 # parameter, tuned; same bits at every value) is the large band's blocks an
 # SM: 2 halves its registers (128 a thread) and declares the int8 GEMM's own
-# layout bound (`form(W, INT8_SHARED)`) as its shared bytes, admitted for the
+# layout bound (INT8_LAYOUT, below) as its shared bytes, admitted for the
 # int8 GEMM of single or segmented weights whose bound fits half an SM's
 # shared memory (HALF_SM_SHARED: 100 KB an SM on sm_86 and sm_89, less 1 KB
 # reserved a block). Its loop stalls with 8 warps an SM: on an RTX 3090 at
@@ -460,6 +460,21 @@ projection dense for cuda:
     let ZSPLIT = 1 + (SPLIT - 1) * min(1, 128 / M) for single
     let OPERANDS = min(1, sum(W, operands(W)))
     let HALF_SM_SHARED = 49152
+    # The shared bytes that bound the int8 GEMM's layout of the weights, the
+    # most of any one's (`projection::GemmShape::LAYOUT_BYTES` of the 128-row
+    # band, `LargeGemm`: 2 stages, 8 warps of one weight tile each), 0 for a
+    # weight the int8 GEMM does not take; the GEMM traps where its layout
+    # exceeds what its launch declares. Per stage: the activation rows (128
+    # rows of 64 codes at a pitch of 80 bytes, then each row's two 16-byte
+    # groups) and 8 tiles' codes of one k-block (16 rows of the weight's code
+    # planes' bytes of 64 values); per record buffer (two): 128 rows'
+    # coefficient records of a 256-code superblock (the coefficient planes'
+    # bytes of it in whole words, the record in whole 16 bytes); per warp:
+    # its 16 rows' coefficients of a k-block (`GemmShape::COEF_ROW`: a scale,
+    # with a bias or local code where the weight has either, so one word a
+    # group only under direct coefficients without a bias, for each group of
+    # the k-block, in whole 16 bytes). Each term is the GEMM's own or more.
+    let INT8_LAYOUT = most(W, form(W, INT8) * (2 * (128 * 96 + 8 * 16 * row_bytes(W, codes, 64)) + 2 * 128 * 16 * ceil_div(row_bytes(W, coefficients, 256), 16) + 8 * 16 * 16 * ceil_div(4 * (64 / max(1, min(axis(W, COEFF_GROUP), 64))) * (2 - (2 - axis(W, COEFF)) * (1 - min(1, axis(W, COEFF_BIAS)))), 16)))
     params (arithmetic INT8 in [0, 1] default 0, arithmetic OPERAND in [0, 1] default 0,
         arithmetic SPLIT in [2, 1] default 2 for single,
         TPW in [1, 2] default 1 for ordered,
@@ -475,7 +490,7 @@ projection dense for cuda:
     where (OPERAND == 0 or (INT8 == 0 and PARTED == 0))
     where (INT8 == 0 or (each(W, form(W, INT8) == 1) and agree(W, form(W, S8_ENTRIES)))) for paired | single
     where (INT8 == 0 or (PARTED == 0 and each(W, N == 0 or form(W, INT8) == 1) and agree(W, form(W, S8_ENTRIES)))) for segmented
-    where (BLOCKS == 1 or (INT8 == 1 and each(W, N == 0 or form(W, INT8_SHARED) <= HALF_SM_SHARED))) for single | segmented
+    where (BLOCKS == 1 or (INT8 == 1 and INT8_LAYOUT <= HALF_SM_SHARED)) for single | segmented
     where BLOCKS == 1 for paired
     where (STAGING == 0 or PARTED == 0)
     where (RESIDENCY != 2 or each(W, form(W, GEMV_RECORDS) == 0)) for paired | single
@@ -548,7 +563,7 @@ projection dense for cuda:
         reads (INT8, OPERAND)
         threadgroups (tiles(W, ceil_div(ceil_div(N, 16), 8)), ceil_div(M, 128), ZSPLIT * G)
         threads_per_threadgroup (256, 1, 1)
-        shared_bytes ((2 - BLOCKS) * (2 * (128 * 144 + SERVED * 10240) + SERVED * 2048) + (BLOCKS - 1) * most(W, form(W, INT8_SHARED)))
+        shared_bytes ((2 - BLOCKS) * (2 * (128 * 144 + SERVED * 10240) + SERVED * 2048) + (BLOCKS - 1) * INT8_LAYOUT)
     launch finalize for single when ORDERED_ANY == 0 and M > 16 and M <= 128 and SPLIT > 1 and PLANES == 0:
         reads (SPLIT)
         threadgroups (ceil_div(M * N, 256), 1, G)

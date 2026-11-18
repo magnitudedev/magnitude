@@ -466,17 +466,19 @@ pub fn expansion(
     )
 }
 
-/// The mappings of `m` rows that `admits` holds for ([`admitted`]).
+/// The mappings a test offers an entry at `m` rows: the GEMV's up to
+/// `GEMV_ROWS`, else the GEMM's.
+pub fn candidates(m: usize) -> &'static [Mapping] {
+    if m <= GEMV_ROWS {
+        &GEMV_MAPPINGS
+    } else {
+        &GEMM_MAPPINGS
+    }
+}
+
+/// The `candidates` of `m` rows that `admits` holds for ([`admitted`]).
 pub fn mappings(entry: &str, m: usize, admits: impl Fn(Mapping) -> bool) -> Vec<Mapping> {
-    admitted(
-        entry,
-        if m <= GEMV_ROWS {
-            &GEMV_MAPPINGS
-        } else {
-            &GEMM_MAPPINGS
-        },
-        admits,
-    )
+    admitted(entry, candidates(m), admits)
 }
 
 /// The `mappings` that `admits` holds for: those every entry a test

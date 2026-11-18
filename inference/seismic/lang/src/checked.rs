@@ -402,15 +402,31 @@ pub struct CheckedModule {
 }
 
 /// A native implementation's declarations at element bindings: one per
-/// combination of the values of its element reads (`operands(W)`,
-/// `form(W, NAME)`). Digit i of a slot's index, in base
-/// `values[i].len()`, is the position of `reads[i]`'s value in `values[i]`,
-/// every value it takes over the registry's representations.
+/// combination of the values its element reads (`operands(W)`,
+/// `form(W, NAME)`, ..) take. Each element parameter is bound on its own, so
+/// a combination is one value tuple per element, of those its reads take
+/// together over the registry's representations: digit i of a slot's index,
+/// in base `elements[i].tuples.len()`, is the position of element i's tuple.
 #[derive(Debug)]
 struct BoundImplementation {
-    reads: Vec<(String, ElementQuery)>,
-    values: Vec<Vec<u64>>,
+    elements: Vec<ElementReads>,
     slots: Vec<std::sync::OnceLock<NativeImplementation>>,
+}
+
+/// The reads an implementation makes of one element parameter, and every
+/// tuple of their values a representation it forms at gives, ascending.
+#[derive(Debug)]
+struct ElementReads {
+    element: String,
+    queries: Vec<ElementQuery>,
+    tuples: Vec<Vec<u64>>,
+}
+
+impl ElementReads {
+    /// The reads' values for `representation`; `None` where one has none.
+    fn of(&self, representation: RepresentationId) -> Option<Vec<u64>> {
+        self.queries.iter().map(|query| query.of(representation)).collect()
+    }
 }
 
 impl CheckedModule {
@@ -470,32 +486,36 @@ impl CheckedModule {
             .position(|native| native.entry == entry && native.backend == backend)?;
         let native = &self.inner.native_implementations[index];
         let bound = self.bound[index].get_or_init(|| {
-            let reads = native.element_reads();
-            let values = reads
-                .iter()
-                .map(|(_, query)| query.values())
-                .collect::<Vec<_>>();
-            let slots = (0..values.iter().map(Vec::len).product::<usize>())
+            let mut elements: Vec<ElementReads> = Vec::new();
+            for (element, query) in native.element_reads() {
+                match elements.last_mut() {
+                    Some(reads) if reads.element == element => reads.queries.push(query),
+                    _ => elements.push(ElementReads { element, queries: vec![query], tuples: Vec::new() }),
+                }
+            }
+            for reads in &mut elements {
+                let tuples: std::collections::BTreeSet<Vec<u64>> =
+                    registry::representations().iter().filter_map(|info| reads.of(info.id)).collect();
+                reads.tuples = tuples.into_iter().collect();
+            }
+            let slots = (0..elements.iter().map(|reads| reads.tuples.len()).product::<usize>())
                 .map(|_| std::sync::OnceLock::new())
                 .collect();
-            BoundImplementation {
-                reads,
-                values,
-                slots,
-            }
+            BoundImplementation { elements, slots }
         });
-        if bound.reads.is_empty() {
+        if bound.elements.is_empty() {
             return Some(native);
         }
         let mut slot = 0usize;
-        for ((element, query), values) in bound.reads.iter().zip(&bound.values) {
+        for reads in &bound.elements {
             let representation = bindings
-                .get(element)
-                .unwrap_or_else(|| panic!("element parameter `{element}` is bound"));
-            let digit = values
-                .binary_search(&query.of(representation)?)
-                .expect("a query's values hold each value it has");
-            slot = slot * values.len() + digit;
+                .get(&reads.element)
+                .unwrap_or_else(|| panic!("element parameter `{}` is bound", reads.element));
+            let digit = reads
+                .tuples
+                .binary_search(&reads.of(representation)?)
+                .expect("an element's tuples hold each its reads take");
+            slot = slot * reads.tuples.len() + digit;
         }
         Some(bound.slots[slot].get_or_init(|| {
             native
@@ -1020,7 +1040,7 @@ pub struct NativeImplementation {
     pub launch_records: Vec<(usize, Vec<RecordPort>)>,
     /// The `where` condition restricting admissible parameter
     /// configurations. It reads only static dimensions, parameters and the
-    /// elements (`operands(W)`, `form(W, NAME)`, `packed(W)`, `dense_bytes(W)`, `unit_columns(W)`), whose reads make the
+    /// elements (`operands(W)`, `form(W, NAME)`, `packed(W)`, `dense_bytes(W)`, `unit_columns(W)`, `axis(W, NAME)`, `row_bytes(W, PART, VALUES)`), whose reads make the
     /// configurations the implementation's at its bindings
     /// ([`Self::at_elements`]).
     pub constraint: Option<NativeCondition>,
@@ -1234,7 +1254,7 @@ impl OnDevice {
 
 impl NativeImplementation {
     /// The implementation as formed at `bindings`: every element read
-    /// (`operands(W)`, `form(W, NAME)`, `packed(W)`, `dense_bytes(W)`, `unit_columns(W)`) is its value for the representation
+    /// (`operands(W)`, `form(W, NAME)`, `packed(W)`, `dense_bytes(W)`, `unit_columns(W)`, `axis(W, NAME)`, `row_bytes(W, PART, VALUES)`) is its value for the representation
     /// `W` is bound to. The checker admits element reads only over the
     /// entry's element parameters, and a formation binds every one of them.
     /// `None` when a read has no value at its binding (`unit_columns(U)`
@@ -2049,7 +2069,7 @@ pub enum NativeNatExpr {
     Dimension(String),
     Parameter(String),
     /// `query` of the representation element parameter `W` is bound to
-    /// (`operands(W)`, `form(W, NAME)`, `packed(W)`, `dense_bytes(W)`, `unit_columns(W)`). It has a value only in an
+    /// (`operands(W)`, `form(W, NAME)`, `packed(W)`, `dense_bytes(W)`, `unit_columns(W)`, `axis(W, NAME)`, `row_bytes(W, PART, VALUES)`). It has a value only in an
     /// implementation instantiated at its bindings
     /// ([`NativeImplementation::at_elements`]).
     Element(String, ElementQuery),
@@ -2092,6 +2112,29 @@ pub enum ElementQuery {
     /// `dense_bytes(W)`: the bytes of one element where `W` is a dense
     /// dtype, else 0 (packed or external).
     DenseBytes,
+    /// `axis(W, NAME)`: the value of decode axis NAME of `W`'s packed rows,
+    /// as the native ABI renders it (`SEISMIC_AXIS_<NAME>`,
+    /// [`crate::producers::Weight::value`]), 0 for other storage.
+    Axis(#[serde(with = "axis_name")] crate::producers::Axis),
+    /// `row_bytes(W, PART, VALUES)`: per row, the bytes of `VALUES` values
+    /// in `W`'s code-bearing or coefficient-bearing planes
+    /// ([`crate::registry::PackedRowLayout::row_bytes`]), 0 for other
+    /// storage.
+    RowBytes(crate::registry::RowPart, u64),
+}
+
+/// An axis as a bundle records it: by its ABI name.
+mod axis_name {
+    use crate::producers::Axis;
+
+    pub fn serialize<S: serde::Serializer>(axis: &Axis, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(axis.name())
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Axis, D::Error> {
+        let name = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Axis::named(&name).ok_or_else(|| serde::de::Error::custom(format!("no decode axis `{name}`")))
+    }
 }
 
 impl ElementQuery {
@@ -2102,8 +2145,12 @@ impl ElementQuery {
         match self {
             Self::Operands => Some(info.operands.code()),
             Self::Form(form) => Some(u64::from(form.of(representation))),
-            Self::UnitColumns => registry::ConversionLayout::of(&info.kind)
-                .map(|layout| u64::from(crate::repack::conversion_unit_columns(layout))),
+            Self::UnitColumns => registry::representation_conversions()
+                .iter()
+                .find(|conversion| conversion.destination == representation)
+                .map(|conversion| {
+                    u64::from(crate::repack::conversion_unit_columns(conversion.destination_layout))
+                }),
             Self::Packed => Some(u64::from(matches!(
                 info.kind,
                 registry::RepresentationKind::Packed(_) | registry::RepresentationKind::PackedRows(_)
@@ -2112,36 +2159,13 @@ impl ElementQuery {
                 registry::RepresentationKind::Dense(dtype) => u64::from(dtype.bytes()),
                 _ => 0,
             }),
-        }
-    }
-
-    /// Every value the query takes over the registry's representations, in
-    /// increasing order.
-    fn values(self) -> Vec<u64> {
-        match self {
-            Self::Operands => registry::OperandRecipe::ALL.map(registry::OperandRecipe::code).to_vec(),
-            Self::Form(form) => form.values().into_iter().map(u64::from).collect(),
-            Self::UnitColumns => {
-                let mut columns: Vec<u64> = registry::representation_conversions()
-                    .iter()
-                    .map(|conversion| {
-                        u64::from(crate::repack::conversion_unit_columns(
-                            conversion.destination_layout,
-                        ))
-                    })
-                    .collect();
-                columns.sort_unstable();
-                columns.dedup();
-                columns
-            }
-            Self::Packed => vec![0, 1],
-            Self::DenseBytes => {
-                let mut bytes: Vec<u64> =
-                    std::iter::once(0).chain(crate::types::DType::ALL.map(|dtype| u64::from(dtype.bytes()))).collect();
-                bytes.sort_unstable();
-                bytes.dedup();
-                bytes
-            }
+            Self::Axis(axis) => Some(crate::producers::Weight::of(info).map_or(0, |weight| {
+                u64::try_from(weight.value(axis).number()).expect("a decode axis is a natural number")
+            })),
+            Self::RowBytes(part, values) => Some(match &info.kind {
+                registry::RepresentationKind::PackedRows(rows) => rows.row_bytes(part, values),
+                _ => 0,
+            }),
         }
     }
 
@@ -2153,6 +2177,8 @@ impl ElementQuery {
             Self::UnitColumns => format!("unit_columns({element})"),
             Self::Packed => format!("packed({element})"),
             Self::DenseBytes => format!("dense_bytes({element})"),
+            Self::Axis(axis) => format!("axis({element}, {})", axis.name()),
+            Self::RowBytes(part, values) => format!("row_bytes({element}, {}, {values})", part.name()),
         }
     }
 }
@@ -5626,8 +5652,9 @@ mod native_tests {
 
     /// `unit_columns(U)` has a value only where `U` is a conversion's packed
     /// destination: at a dense destination, the element cast `repack` forms
-    /// between dense floats, an implementation reading it does not form,
-    /// and says so rather than panicking.
+    /// between dense floats, or a packed representation no conversion packs
+    /// into, an implementation reading it does not form, and says so rather
+    /// than panicking.
     #[test]
     fn an_implementation_reading_unit_columns_forms_only_at_packed_destinations() {
         let mut sources = SourceSet::default();
@@ -5653,6 +5680,10 @@ mod native_tests {
             at(registry::dense(DType::F16), registry::dense(DType::F32)),
             (false, false)
         );
+        // A packed representation no conversion packs into has no unit (its
+        // 16-column groups have no unit of whole words).
+        let unconverted = registry::storage("nvfp4_e2m1_block16", registry::Layout::Packet).unwrap();
+        assert_eq!(at(registry::representation("gguf_q4_k").unwrap(), unconverted), (false, false));
     }
 
     /// `form(W, NAME)` is the backend's admission of form NAME for the

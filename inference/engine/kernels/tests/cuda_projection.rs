@@ -230,17 +230,20 @@ fn grouped_project_rows_match_host_model(format: Format) {
         },
     );
     for o in ROWS {
+        if format.operands == OperandRecipe::Nvfp4Rows {
+            assert!(
+                candidates(o)
+                    .iter()
+                    .all(|&mapping| !projection.admits(&device, mapping)),
+                "{format:?} O={o}: a grouped NVFP4-operand projection is refused"
+            );
+            continue;
+        }
         let source: Vec<f32> = (0..o * groups * k)
             .map(|_| bf16_round(rng.uniform(-1.0, 1.0)))
             .collect();
         let source_tensor = bf16_tensor(&device, &[o as u64, (groups * k) as u64], &source);
-        let mappings = mappings("project_rows", o, |mapping| projection.admits(&device, mapping));
-        assert_eq!(
-            mappings.is_empty(),
-            format.operands == OperandRecipe::Nvfp4Rows,
-            "{format:?} O={o}: grouped mappings"
-        );
-        for mapping in mappings {
+        for mapping in mappings("project_rows", o, |mapping| projection.admits(&device, mapping)) {
             let mut expected = vec![0.0; o * groups * n];
             let mut tolerance = vec![0.0; o * groups * n];
             for group in 0..groups {

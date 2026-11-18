@@ -4204,7 +4204,7 @@ impl NativeGraphMetadata {
         width: Dim,
         activation: Element,
     ) -> Result<OperandCarry, NativeGraphMetadataError> {
-        let blocks = width.ceil_div(seismic_lang::forms::CPU_Q8_VALUES)
+        let blocks = width.ceil_div(seismic_lang::cpu::CPU_Q8_VALUES)
             * seismic_runtime::native::graph::OPERAND_CARRY_BLOCK_WORDS;
         let shape = [rows.recorded(), width.recorded()];
         Ok(OperandCarry {

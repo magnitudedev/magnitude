@@ -1,0 +1,11 @@
+# The decoders the CPU's producers read (`seismic_lang::producers`): the one
+# statement of reach, which form admission reads. The CPU's library is Rust
+# and reads admission itself (`forms::cpu_int8_of`), so the build renders
+# nothing from this declaration (seismic/lang/build.rs renders the C++ and
+# GLSL libraries' predicates alone).
+
+# The quantized dot reads the codes of every packed-rows decode
+# (`weights::Codes`); its dense rows (`weights::DenseRows`) are no packed
+# weight's.
+form INT8
+codes=*

@@ -19,7 +19,7 @@
 //! it as an `arithmetic` tuning parameter, validated like any other.
 
 use crate::element::{f16_to_f32, f32_to_f16};
-use seismic_lang::forms::{CPU_Q8_ALIGNMENT, CPU_Q8_BYTES, CPU_Q8_ROWS, CPU_Q8_VALUES};
+use seismic_lang::cpu::{CPU_Q8_ALIGNMENT, CPU_Q8_BYTES, CPU_Q8_ROWS, CPU_Q8_VALUES};
 
 /// Values per quantized activation block (the k-quant super block).
 pub const Q8_BLOCK: usize = CPU_Q8_VALUES as usize;
@@ -29,8 +29,8 @@ pub const Q8_BLOCK: usize = CPU_Q8_VALUES as usize;
 pub const Q8_BYTES: usize = CPU_Q8_BYTES as usize;
 
 /// One block of quantized activations, the CPU INT8 form's
-/// (`forms::CPU_Q8_BYTES`): its codes first and the block aligned to
-/// `forms::CPU_Q8_ALIGNMENT`, so every packet's codes are whole vectors on
+/// (`cpu::CPU_Q8_BYTES`): its codes first and the block aligned to
+/// `cpu::CPU_Q8_ALIGNMENT`, so every packet's codes are whole vectors on
 /// one cache line wherever the block lies.
 #[repr(C, align(64))]
 #[derive(Clone, Copy, Debug)]
@@ -109,7 +109,7 @@ pub struct Q8Tile<const R: usize = TILE_ROWS> {
 
 const _: () = assert!(
     std::mem::size_of::<Q8Tile>() <= TILE_ROWS * Q8_BYTES && std::mem::align_of::<Q8Tile>() == CPU_Q8_ALIGNMENT as usize,
-    "a tile fits its rows' blocks' bytes (`forms::CPU_Q8_ROWS`)"
+    "a tile fits its rows' blocks' bytes (`cpu::CPU_Q8_ROWS`)"
 );
 
 impl Q8Tile {

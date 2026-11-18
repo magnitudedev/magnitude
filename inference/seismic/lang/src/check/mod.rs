@@ -2698,6 +2698,49 @@ fn native_nat_expr(
             callee,
             bindings,
             args,
+        } if matches!(&callee.kind, ExprKind::Name(name) if name.name == "axis") => {
+            match (bindings.is_empty(), args.as_slice()) {
+                (true, [element, crate::syntax::ast::Arg { name: None, value }]) => {
+                    let axis = match &value.kind {
+                        ExprKind::Name(name) => crate::producers::Axis::named(&name.name),
+                        _ => None,
+                    }
+                    .ok_or_else(|| {
+                        let names: Vec<&str> = crate::producers::Axis::ALL.iter().map(|axis| axis.name()).collect();
+                        format!("`axis` names a decode axis: one of {}", names.join(", "))
+                    })?;
+                    Ok(N::Element(elements.parameter("axis", element)?, ElementQuery::Axis(axis)))
+                }
+                _ => Err("`axis` takes an element parameter and a decode axis name".to_owned()),
+            }
+        }
+        ExprKind::Call {
+            callee,
+            bindings,
+            args,
+        } if matches!(&callee.kind, ExprKind::Name(name) if name.name == "row_bytes") => {
+            match (bindings.is_empty(), args.as_slice()) {
+                (
+                    true,
+                    [element, crate::syntax::ast::Arg { name: None, value: part }, crate::syntax::ast::Arg { name: None, value: values }],
+                ) => {
+                    let part = match &part.kind {
+                        ExprKind::Name(name) => crate::registry::RowPart::named(&name.name),
+                        _ => None,
+                    }
+                    .ok_or_else(|| "`row_bytes` reads the `codes` or the `coefficients` planes".to_owned())?;
+                    let ExprKind::Int(values) = &values.kind else {
+                        return Err("`row_bytes` reads the bytes of an integer count of values".to_owned());
+                    };
+                    Ok(N::Element(elements.parameter("row_bytes", element)?, ElementQuery::RowBytes(part, *values)))
+                }
+                _ => Err("`row_bytes` takes an element parameter, `codes` or `coefficients`, and a count of values".to_owned()),
+            }
+        }
+        ExprKind::Call {
+            callee,
+            bindings,
+            args,
         } if bindings.is_empty()
             && args.len() == 2
             && args.iter().all(|arg| arg.name.is_none()) =>
@@ -2708,7 +2751,7 @@ fn native_nat_expr(
                 ExprKind::Name(name) if name.name == "max" => N::Max,
                 _ => {
                     return Err(
-                        "native expressions call only `ceil_div`, `min`, `max`, `operands`, `form`, `packed`, `dense_bytes` and `unit_columns`"
+                        "native expressions call only `ceil_div`, `min`, `max`, `operands`, `form`, `axis`, `row_bytes`, `packed`, `dense_bytes` and `unit_columns`"
                             .to_owned()
                     );
                 }
