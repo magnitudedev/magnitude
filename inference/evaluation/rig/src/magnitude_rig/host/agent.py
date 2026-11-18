@@ -273,6 +273,7 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -820,7 +821,7 @@ class Session:
             held = held_checkouts(live)
             if (held | {keep}) - set(sizes):
                 return None
-            before = shutil.disk_usage(self.rig.root).free
+            before = room_free(self.rig.root)
             fallback = largest(self.rig.directory)
             entries = checkout_entries(live)
 
@@ -841,8 +842,8 @@ class Session:
             removed = _remove_least_recent(self.rig.root, live, {keep}, needed)
             return {
                 "removed": removed,
-                "free_bytes": shutil.disk_usage(self.rig.root).free,
-                "freed_bytes": shutil.disk_usage(self.rig.root).free - before,
+                "free_bytes": room_free(self.rig.root),
+                "freed_bytes": room_free(self.rig.root) - before,
                 "needed_bytes": needed,
                 "own_bytes": sum(growth(key) for key in own),
                 "releasable_bytes": sum(sizes[key] for key in others),
@@ -965,10 +966,10 @@ def _unheld_outputs(root: str, live: list) -> list:
 
 def _remove_least_recent(root: str, live: list, keep: set, wanted: float) -> list:
     """Remove the least recently used of `_least_recent` until the volume has `wanted` bytes
-    free: the paths removed, relative to the root. Call guarded."""
+    free beyond its floor (`room_free`): the paths removed, relative to the root. Call guarded."""
     removed = []
     for kind, name in _least_recent(root, live, keep):
-        if shutil.disk_usage(root).free >= wanted:
+        if room_free(root) >= wanted:
             break
         _remove_tree(os.path.join(root, kind, name))
         removed.append("%s/%s" % (kind, name))
@@ -1727,7 +1728,8 @@ class Runner:
             short = (needed - free) / 1e9
             if free + evicted["releasable_bytes"] < evicted["own_bytes"]:
                 raise Failed(
-                    "%s: its building checkouts may grow by %.1f GB but only %.1f GB is free with "
+                    "%s: its building checkouts may grow by %.1f GB but only %.1f GB is free beyond "
+                    "the volume's floor (`SYSTEM_FLOOR`) with "
                     "every unheld checkout and ended run evicted (%.1f GB short), and the live runs' "
                     "checkouts would not cover its own %.1f GB as they end"
                     % (host, needed / 1e9, free / 1e9, short, evicted["own_bytes"] / 1e9))
@@ -1757,6 +1759,9 @@ class Runner:
         if "install" in op and op["install"] in self.shared:
             self.events.note("skipped `%s`: checkout %s holds this tree" % (" ".join(argv)[:160], self.checkouts[op["install"]]))
             return
+        short = short_volumes(self.rig.root, request["env"])
+        if short:
+            raise Failed(short_reason(short))
         if "tests" in op:  # the build's test executables, for its provenance step
             _write_json(self._fill(op["tests"]), {"tests": [list(test) for test in self.tests],
                                                   "build_scripts": self.build_scripts})
@@ -2155,8 +2160,9 @@ def fetched(arguments) -> int:
 def status(arguments) -> int:
     if not len(arguments.build) == len(arguments.tree) == len(arguments.source):
         raise SystemExit("status: one --tree and one --build for each --source")
-    found = report(arguments.root, list(zip(arguments.source, arguments.tree, arguments.build)), arguments.ahead_of)
-    print(json.dumps(dict(found, **capabilities(arguments.root, json.loads(arguments.env)))))
+    env = json.loads(arguments.env)
+    found = report(arguments.root, list(zip(arguments.source, arguments.tree, arguments.build)), arguments.ahead_of, env)
+    print(json.dumps(dict(found, **capabilities(arguments.root, env))))
     return 0
 
 
@@ -2184,7 +2190,7 @@ def waiting_request(live: list, run: str):
     return names[0] if names else None
 
 
-def report(root: str, sides: list, ahead_of: str | None = None) -> dict:
+def report(root: str, sides: list, ahead_of: str | None = None, env: dict | None = None) -> dict:
     """The host's live entries, each with the time its run is expected to take still and how far
     it is past its estimate (`remaining`, `over`), the wait of a new request of each kind behind
     the runs holding or queued for a conflicting hold (each once, by its `remaining`: `waits`),
@@ -2194,7 +2200,9 @@ def report(root: str, sides: list, ahead_of: str | None = None) -> dict:
     with its warmth for that source (None: none is free, a cold build), the commit it last built
     and whether it keeps that build (`built`); and the bytes its build may add as measured here (`need`,
     None when unmeasured), each build's measurements here (`measured`), the largest build of any
-    (`largest`), the slowest (`slowest`), and the room its builds would find (`room`). Given
+    (`largest`), the slowest (`slowest`), the room its builds would find (`room`), and the
+    volumes outside the rig root too full to run on, under the step environment `env`
+    (`short_volumes`, which a step refuses on: `short`). Given
     `ahead_of`, a run queued here, the host as that run sees it: only the other runs' entries
     that come before its waiting request (`comes_before`), and, while it waits for none, every
     other run, as a request it entered now would come after all of them."""
@@ -2268,7 +2276,8 @@ def report(root: str, sides: list, ahead_of: str | None = None) -> dict:
         "building": [owed for owed in (owing(entries, run, seconds, now) for run in live_runs) if owed > 0],
         "room": room(root, entries, {run: left for run, (left, *_) in runs.items()}, evictable),
         "device_lock_held_elsewhere": legacy,
-        "free_bytes": shutil.disk_usage(root).free,
+        "free_bytes": room_free(root),
+        "short": short_volumes(root, env or {}),
         "checkouts": checkouts,
         "needs": needs,
         "measured": {build: _measured(rig.directory, build) for _, _, build in sides},
@@ -2276,6 +2285,55 @@ def report(root: str, sides: list, ahead_of: str | None = None) -> dict:
         "slowest": seconds,
     }
     return found
+
+
+# The bytes each volume a run writes keeps free: the rig root's, whose room is what lies beyond
+# it (`room_free`), and each other one (`short_volumes`). Below it, Metal's shader caches,
+# temporary files and crash reports fail to write, and a Metal process dies of it silently, with
+# no test failure.
+SYSTEM_FLOOR = 5 << 30
+DARWIN_USER_CACHE_DIR = 65538  # `confstr`'s `_CS_DARWIN_USER_CACHE_DIR`: where Metal caches
+
+
+def short_volumes(root: str, env: dict) -> list[dict]:
+    """The volumes a run writes on outside the rig root `root` that hold less than `SYSTEM_FLOOR`
+    free, each by the first of its directories a run writes (`path`) and its free bytes: the
+    temporary directory of the step environment `env` and, on macOS, the user's cache directory
+    (where the system names one) and its crash reports. The rig root's own volume is never one:
+    its floor is in its room (`room_free`), which its runs' builds and evictions keep."""
+    paths = [env.get("TMPDIR") or os.environ.get("TMPDIR") or tempfile.gettempdir()]
+    if sys.platform == "darwin":
+        paths += [os.confstr(DARWIN_USER_CACHE_DIR), os.path.expanduser("~/Library/Logs/DiagnosticReports")]
+    paths = [os.path.abspath(path) for path in paths if path]
+    seen, found = {volume(root)[0]}, []
+    for path in paths:
+        device, free = volume(path)
+        if device not in seen and free < SYSTEM_FLOOR:
+            found.append({"path": path, "free_bytes": free})
+        seen.add(device)
+    return found
+
+
+def volume(path: str) -> tuple[int, int]:
+    """The volume `path` lies on, or would be made on, and its free bytes."""
+    path = os.path.abspath(path)
+    while not os.path.exists(path):  # the root always exists, so this ends
+        path = os.path.dirname(path)
+    return os.stat(path).st_dev, shutil.disk_usage(path).free
+
+
+def room_free(root: str) -> int:
+    """The bytes the rig root's volume holds free beyond `SYSTEM_FLOOR`, which its runs write
+    there too: the room every build's need and eviction counts (`room`, `Session.evict`), below
+    zero where the floor is not kept."""
+    return volume(root)[1] - SYSTEM_FLOOR
+
+
+def short_reason(short: list[dict]) -> str:
+    """Why a host whose `short_volumes` are `short` runs nothing."""
+    return "; ".join("%s has %.1f GB free, under the %.1f GB a run needs there (Metal caches, temporary "
+                     "files, crash reports)" % (found["path"], found["free_bytes"] / 1e9, SYSTEM_FLOOR / 1e9)
+                     for found in short)
 
 
 def room(root: str, live: list, left: dict, evictable: list) -> dict:
@@ -2292,7 +2350,7 @@ def room(root: str, live: list, left: dict, evictable: list) -> dict:
     debt = lambda name: max(owed(entry, fallback) for entry in held[name])
     ends = lambda name: max(left[entry["run"]] for entry in held[name])  # once every holder has ended
     return {
-        "available": shutil.disk_usage(root).free + sum(size(name) for name in evictable),
+        "available": room_free(root) + sum(size(name) for name in evictable),
         "owed": sum(debt(name) for name in held),
         "ending": [[end, size(name), owes] for end, name, owes in sorted((ends(name), name, debt(name)) for name in held)],
     }

@@ -93,7 +93,7 @@ from . import sources, state, store, sync
 from .connection import (
     AGENT, CommandFailed, HostError, HostRun, HostUnavailable, Remote, _ssh, connect, host_status, run_state,
 )
-from .host.agent import ENDED, NOTE, SAME
+from .host.agent import ENDED, NOTE, SAME, short_reason
 from .host.gate import GateSettings
 from .host.provenance import WRAPPER
 from .hosts import HostConfig, Hosts
@@ -404,6 +404,8 @@ def _candidates(request: Request, names: tuple, run_id: str) -> tuple[list[Candi
             return None, None, False
         if not status["ready"]:
             return None, f"{config.alias}: not set up (`mrig setup {config.alias}`)", False
+        if status["short"]:  # its steps refuse to run (`agent.short_volumes`)
+            return None, f"{config.alias}: {short_reason(status['short'])}", False
         return (remote, status, work), None, False
 
     with ThreadPoolExecutor(max_workers=8) as pool:
@@ -542,7 +544,8 @@ def _room(status: dict) -> str:
     """The host's room as placement counted it: free, and the rig's own to reclaim (the unheld
     checkouts its builds would evict, `host/agent.py`)."""
     reclaimable = status["room"]["available"] - status["free_bytes"]
-    return f"room {status['free_bytes'] / 1e9:.1f} GB free + {reclaimable / 1e9:.1f} GB of the rig's own to reclaim"
+    return (f"room {status['free_bytes'] / 1e9:.1f} GB free beyond the volume's floor + {reclaimable / 1e9:.1f} GB "
+            "of the rig's own to reclaim")
 
 
 def launch_line(request: Request, candidate: Candidate, idle: list[str]) -> str:

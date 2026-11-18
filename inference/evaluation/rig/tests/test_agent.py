@@ -535,12 +535,14 @@ def test_eviction_counts_what_every_building_checkout_may_still_add(tmp_path):
 
 
 def _volume(monkeypatch, root: Path, others: int) -> None:
-    """The rig root's volume as a test sets it: `others` bytes free beside the rig, less what the
-    root's checkouts hold by their recorded sizes, so an eviction frees its checkout's size."""
+    """The rig root's volume as a test sets it: `others` bytes free beside the rig beyond the
+    volume's floor (`agent.room_free`), less what the root's checkouts hold by their recorded
+    sizes, so an eviction frees its checkout's size."""
     def usage(path):
         held = sum(int((checkout / "size").read_text()) for checkout in (root / "checkouts").iterdir()
                    if (checkout / "size").exists())
-        return shutil._ntuple_diskusage(10**13, 10**13 - others + held, others - held)
+        free = others - held + agent.SYSTEM_FLOOR
+        return shutil._ntuple_diskusage(10**13, 10**13 - free, free)
 
     monkeypatch.setattr(agent.shutil, "disk_usage", usage)
 
@@ -1606,3 +1608,57 @@ def test_an_output_a_dead_run_left_incomplete_is_discarded_and_a_complete_one_re
     assert partial.is_dir() and not (partial / "src").exists()  # held anew, empty
     assert (complete / "src").is_dir()
     end(holding)
+
+
+def test_a_step_refuses_a_volume_it_writes_outside_the_rig_root_too_full_to_run_on(tmp_path, monkeypatch):
+    """The step environment's TMPDIR (and on macOS the user's cache directory and crash reports)
+    on a volume of its own under `SYSTEM_FLOOR` is what the host's status reports and what a
+    step refuses on, naming it; the rig root's own volume, whose room `room` counts, never."""
+    root, scratch = tmp_path / "root", tmp_path / "scratch"
+    root.mkdir()
+    free = {str(root): (1, 1 << 30), str(scratch): (2, 1 << 30)}
+    monkeypatch.setattr(agent, "volume", lambda path: free.get(path, (1, 1 << 30)))
+    monkeypatch.setattr(agent.sys, "platform", "linux")
+    assert agent.short_volumes(str(root), {"TMPDIR": str(root)}) == []  # the rig root's: room's
+    short = agent.short_volumes(str(root), {"TMPDIR": str(scratch)})
+    assert short == [{"path": str(scratch), "free_bytes": 1 << 30}]
+    assert agent.short_reason(short).startswith(f"{scratch} has 1.1 GB free, under the 5.4 GB a run needs there")
+    free[str(scratch)] = (2, agent.SYSTEM_FLOOR)
+    assert agent.short_volumes(str(root), {"TMPDIR": str(scratch)}) == []
+    assert agent.report(str(root), [], env={"TMPDIR": str(scratch)})["short"] == []
+    free[str(scratch)] = (2, 0)
+    assert agent.report(str(root), [], env={"TMPDIR": str(scratch)})["short"][0]["free_bytes"] == 0
+    # A real volume with no room: the device filesystem, of its own and never free.
+    full = "/dev/rig-scratch" if os.uname().sysname == "Darwin" else "/proc/rig-scratch"
+    start(root, "full", [run_op([sys.executable, "-c", "print('ran')"], tmp_path, job="j", env={"TMPDIR": full})])
+    refused = ended(root, "full")
+    assert refused["codes"] == {} and refused["failed"]["detail"].startswith(f"{full} has 0.0 GB free")
+
+
+def test_the_rig_roots_volume_keeps_the_floor_out_of_its_room(tmp_path, monkeypatch):
+    """The rig root's volume, where a Mac's runs write their caches too, keeps `SYSTEM_FLOOR` free:
+    its room, which placement and eviction both count, is what lies beyond it, so a build that
+    fits only by eating the floor evicts first."""
+    gb = 10**9
+    _stale(tmp_path, "oldest", 6 * gb, 1000)
+    (tmp_path / "checkouts" / "mine").mkdir()
+    (tmp_path / "checkouts" / "mine" / agent.SOURCE).write_text("source")
+    _volume(monkeypatch, tmp_path, others=10 * gb)  # 4 GB beyond the floor beside the rig's 6 GB
+    assert agent.room_free(str(tmp_path)) == 4 * gb
+    assert agent.report(str(tmp_path), [("source", "tree", BUILD)])["room"]["available"] == 10 * gb
+    measured(tmp_path, size=5 * gb)  # fits in what is free only by eating the floor
+    building = session(tmp_path, "building")
+    assert claim(building, "source") == "mine"
+    evicted = building.evict("mine")
+    assert evicted["removed"] == ["checkouts/oldest"] and evicted["free_bytes"] == 10 * gb
+    end(building)
+
+
+def test_a_volume_is_found_for_any_path_a_step_environment_names(tmp_path, monkeypatch):
+    """A relative TMPDIR that does not exist is the volume of where it would be made, from the
+    working directory; a cache directory the system does not name is none."""
+    monkeypatch.chdir(tmp_path)
+    assert agent.volume("not/made/yet") == agent.volume(str(tmp_path))
+    monkeypatch.setattr(agent.sys, "platform", "darwin")
+    monkeypatch.setattr(agent.os, "confstr", lambda name: None)
+    assert agent.short_volumes(str(tmp_path), {"TMPDIR": "relative"}) == []

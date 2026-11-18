@@ -316,7 +316,7 @@ def test_a_build_needs_its_measured_size_and_a_host_that_cannot_fit_it_ranks_las
     fits.status["waits"]["build"] = 7200.0  # however busy the host that fits
     assert min([never, fits], key=engine._start) is fits
     # The start line counts the rig's own checkouts as room: 13 GB free and 11 GB to reclaim.
-    assert engine._room(fits.status) == "room 13.0 GB free + 11.0 GB of the rig's own to reclaim"
+    assert engine._room(fits.status) == "room 13.0 GB free beyond the volume's floor + 11.0 GB of the rig's own to reclaim"
 
 
 def test_a_build_unmeasured_on_a_host_takes_its_size_from_hosts_of_its_platform_alone():
@@ -591,6 +591,13 @@ def test_placement_connects_a_healthy_host_once_and_one_whose_read_failed_again(
     connected.clear()
     candidates, skipped, unreadable = engine._candidates(asked, (hosts.host("alpha"),), "run")
     assert candidates == [] and unreadable == set() and "not set up" in skipped[0] and connected == []
+    ready.with_suffix(".away").rename(ready)
+    # A volume its runs write outside the rig root too full to run on (`agent.short_volumes`): its
+    # steps would refuse, so placement leaves it out, saying why.
+    short = [{"path": "/tmp", "free_bytes": 0}]
+    monkeypatch.setattr(engine, "host_status", lambda remote, *arguments: dict(read(remote, *arguments), short=short))
+    candidates, skipped, unreadable = engine._candidates(asked, (hosts.host("alpha"),), "run")
+    assert candidates == [] and unreadable == set() and skipped == [f"alpha: {agent.short_reason(short)}"]
 
 
 def test_a_reply_that_does_not_parse_is_the_agents_failure_and_never_ends_placing_again(monkeypatch):

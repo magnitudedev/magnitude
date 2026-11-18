@@ -117,7 +117,7 @@ def _inspect(arguments) -> int:
                 continue
             ready = "ready" if remote.ready else "not set up"
             free = status["free_bytes"] / 1e9
-            print(f"{remote.alias} ({'/'.join(remote.backends)}, {ready}, {free:.0f} GB free)")
+            print(f"{remote.alias} ({'/'.join(remote.backends)}, {ready}, {free:.0f} GB free beyond its floor)")
             legacy = status["device_lock_held_elsewhere"]
             if legacy is not None:
                 print(f"  device held outside mrig by {legacy.get('who', '?')} (run {legacy.get('run', '?')})")
