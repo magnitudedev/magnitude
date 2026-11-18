@@ -30,7 +30,8 @@ describe("running headless update control", () => {
         const reply = yield* control(action)
         yield* reply.afterReply
       }
-      expect(calls).toEqual(["check", "download", "discard"])
+      // The fixture's update is already downloaded, so a download request fetches nothing again.
+      expect(calls).toEqual(["check", "discard"])
     })).pipe(Effect.provide(TestContext.TestContext)))
   })
   it("explains how an installation that never installs in place is updated instead", async () => {
@@ -41,7 +42,7 @@ describe("running headless update control", () => {
       expect(calls).toEqual([])
     })).pipe(Effect.provide(TestContext.TestContext)))
   })
-  it("installs a CLI-only installation at the next idle point: checks, then downloads the offer", async () => {
+  it.each(["install", "download"] as const)("%s with nothing offered yet checks, then downloads the offer", async action => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const calls: string[] = []
       const scope = yield* Effect.scope
@@ -57,7 +58,7 @@ describe("running headless update control", () => {
       }
       const control = yield* makeHeadlessUpdateControl(updates, Effect.void, { _tag: "WhenIdle" })
       yield* TestClock.adjust("1 millis")
-      const reply = yield* control("install").pipe(Effect.fork)
+      const reply = yield* control(action).pipe(Effect.fork)
       yield* TestClock.adjust("1 seconds")
       expect((yield* Fiber.join(reply)).state.transfer._tag).toBe("Downloading")
       expect(calls).toEqual(["check:manual", "download"])

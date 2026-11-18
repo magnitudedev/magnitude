@@ -23,8 +23,8 @@ export const makeHeadlessUpdateControl = (updates: ApplicationUpdate, start: Eff
   const started = yield* Deferred.make<void>()
   const schedule = yield* makeUpdateSchedule(updates.check, start.pipe(Effect.zipRight(Deferred.succeed(started, undefined)), Effect.asVoid))
   /** Checks unless an update is already offered or under way, then downloads an offer; the server installs a ready download once idle. */
-  const prepareForIdleInstall = Effect.gen(function* () {
-    if (!(yield* Deferred.isDone(started))) return yield* new ApplicationUpdateControlFailed({ message: "`magnitude serve` is still starting. Run `magnitude update install` again once it is ready." })
+  const downloadOffer = (action: "download" | "install") => Effect.gen(function* () {
+    if (!(yield* Deferred.isDone(started))) return yield* new ApplicationUpdateControlFailed({ message: `\`magnitude serve\` is still starting. Run \`magnitude update ${action}\` again once it is ready.` })
     const current = yield* updates.state
     const checked = preparing(current) || current.transfer._tag === "Available" ? current
       : yield* schedule.check.pipe(Effect.zipRight(updates.changes.pipe(Stream.filter(state => state.check._tag !== "Checking"), Stream.runHead)),
@@ -34,10 +34,10 @@ export const makeHeadlessUpdateControl = (updates: ApplicationUpdate, start: Eff
   return (action: ApplicationUpdateAction) => Effect.gen(function* () {
     if (action === "install") {
       if (install._tag === "Refuse") return yield* new ApplicationUpdateControlFailed({ message: install.message })
-      yield* prepareForIdleInstall
+      yield* downloadOffer("install")
     }
     if (action === "check" && (yield* Deferred.isDone(started))) yield* schedule.check
-    if (action === "download") yield* updates.download
+    if (action === "download") yield* downloadOffer("download")
     if (action === "discard") yield* updates.discard
     return { state: yield* updates.state, afterReply: Effect.void }
   }).pipe(Effect.mapError(error => new ApplicationUpdateControlFailed({ message: error.message })))
