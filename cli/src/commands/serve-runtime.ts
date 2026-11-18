@@ -70,6 +70,18 @@ export const runServe = () => Effect.runPromise(Effect.scoped(Effect.gen(functio
     }
     return !(yield* Deferred.isDone(stopped))
   })
+  /**
+   * After yielding, the desktop still has to take the ownership lock this server just released; until it has,
+   * nothing appears to serve. Wait for the desktop to own the folder (or a minute, if it never does) so this
+   * server does not take the lock straight back.
+   */
+  const awaitDesktop = Effect.gen(function* () {
+    const deadline = Date.now() + 60_000
+    while (Date.now() < deadline && !(yield* Deferred.isDone(stopped))) {
+      if (Option.contains(yield* blocker, "Desktop")) return
+      yield* Effect.raceFirst(Effect.sleep("250 millis"), Deferred.await(stopped))
+    }
+  })
   // A restart request re-admits the owner in place, so settings read at service start take effect.
   for (;;) {
     yield* Ref.set(ready, false)
@@ -103,7 +115,8 @@ export const runServe = () => Effect.runPromise(Effect.scoped(Effect.gen(functio
     const stop = attempt.right
     // Installation replaces this process on success; otherwise the current version serves again.
     if (stop === "InstallUpdate" && Option.isSome(idle)) yield* idle.value.install
-    else if (stop !== "Restart" && stop !== "DesktopTakeover") return
+    else if (stop === "DesktopTakeover") yield* awaitDesktop
+    else if (stop !== "Restart") return
   }
 })).pipe(Effect.provide([BunContext.layer, BunSqliteDriverLayer]), Effect.catchAll(error => Effect.sync(() => {
   process.stderr.write(`${error.message}\n`)
