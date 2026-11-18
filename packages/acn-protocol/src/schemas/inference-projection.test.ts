@@ -21,7 +21,7 @@ const paths = [
   { id: 1, executor: "vulkan:0", store: "system", grant: null },
 ]
 const fields = (overrides: Record<string, unknown> = {}) => ({
-  captured_at: 1, platform: "linux", architecture: "x86_64", cpu_model: "AMD EPYC 7742", logical_cores: 4,
+  captured_at: 1, platform: "linux", architecture: "x86_64", cpu_model: "AMD EPYC 7742", chip_cores: 2, logical_cpus: 4, cpu_pool_cores: 2,
   native_build: "test", topology_fingerprint: "test", host_ram: host, device_memory: [],
   volumes: [], physical_devices: [cpu], selected_executor: "host-cpu", access_paths: [], transfer_paths: [], ...overrides,
 })
@@ -35,14 +35,17 @@ const instances = (...ready: { id: string; backend: string }[]) => Schema.decode
 })
 const none = instances()
 
-it("preserves machine-wide physical core counts independently of process parallelism", () => {
-  const value = Effect.runSync(projectInferenceHardware(snapshot({ physical_cores: 128 }), none))
-  expect(value.physicalCores).toEqual(Option.some(128))
-  expect(value.logicalCores).toBe(4)
+it("reports the topology's cores, its logical CPUs and the engine's pool as separate counts", () => {
+  // A 4-vCPU VM of two SMT cores, the service confined to one.
+  const value = Effect.runSync(projectInferenceHardware(snapshot({ chip_cores: 2, logical_cpus: 4, cpu_pool_cores: 1 }), none))
+  expect([value.chipCores, value.logicalCpus, value.cpuPoolCores]).toEqual([2, 4, 1])
   expect(value.processor).toEqual(Option.some("AMD EPYC 7742"))
 })
-it.each([undefined, null, 0])("keeps an unavailable physical core observation absent: %s", count => {
-  expect(Effect.runSync(projectInferenceHardware(snapshot(count === undefined ? {} : { physical_cores: count }), none)).physicalCores).toEqual(Option.none())
+it("admits no snapshot without its core counts", () => {
+  for (const field of ["chip_cores", "logical_cpus", "cpu_pool_cores"] as const) {
+    const { [field]: _, ...without } = fields()
+    expect(Either.isLeft(Schema.decodeUnknownEither(HardwareSnapshot)(without))).toBe(true)
+  }
 })
 it("counts host RAM within the process's memory limits, as a container's limit sets them", () => {
   const limited = { ...host, store: { ...store("system"), allocation_capacity_bytes: 6 }, current_free_bytes: 5 }
@@ -122,9 +125,9 @@ it("admits no snapshot without host RAM and its free reading, or without a servi
 })
 it("summarizes the serving device and counts one GPU across backend views", () => {
   const summary = Effect.runSync(summarizeInferenceHardware(
-    snapshot({ physical_devices: [gpu], selected_executor: "cuda:0", access_paths: paths, physical_cores: 8 }), none))
+    snapshot({ physical_devices: [gpu], selected_executor: "cuda:0", access_paths: paths, cpu_pool_cores: 8, logical_cpus: 16 }), none))
   expect(summary).toMatchObject({ backend: "cuda", gpuName: Option.some("Test GPU"), gpuKind: Option.some("integrated"),
-    gpuCount: 1, gpuMemoryBytes: Option.some(64), cpuCores: Option.some(8), memoryBytes: 64 })
+    gpuCount: 1, gpuMemoryBytes: Option.some(64), cpuPoolCores: 8, logicalCpus: 16, memoryBytes: 64 })
 })
 it("names a resident model's device, and otherwise the serving device", () => {
   const discrete = { id: "physical-dgpu", kind: "gpu", executors: [{ ...executor("cuda:1", "cuda", [2]), name: "Discrete GPU" }] }
@@ -164,5 +167,5 @@ it("explains an unused GPU from its own reason, then the backend diagnostic, and
 it("reports no GPU fields on a CPU-only machine", () => {
   const summary = Effect.runSync(summarizeInferenceHardware(snapshot({ cpu_model: null }), none))
   expect(summary).toEqual({ backend: "cpu", gpuName: Option.none(), gpuKind: Option.none(), gpuMemoryBytes: Option.none(),
-    gpuCount: 0, gpuUnusedReason: Option.none(), cpuModel: Option.none(), cpuCores: Option.some(4), memoryBytes: 64 })
+    gpuCount: 0, gpuUnusedReason: Option.none(), cpuModel: Option.none(), cpuPoolCores: 2, logicalCpus: 4, memoryBytes: 64 })
 })

@@ -59,8 +59,9 @@ export const makeHardware = (
   architecture: "X64",
   productName: Option.none(),
   processor: Option.some("Test CPU"),
-  physicalCores: Option.none(),
-  logicalCores: 16,
+  chipCores: 8,
+  logicalCpus: 16,
+  cpuPoolCores: 8,
   totalSystemMemoryBytes: 64 * GIB,
   accelerators: [{
     acceleratorId: LocalInferenceAcceleratorIdSchema.make("gpu"),

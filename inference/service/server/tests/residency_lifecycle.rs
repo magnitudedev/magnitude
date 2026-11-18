@@ -333,7 +333,8 @@ async fn hardware(
         volumes,
         served.serving,
         Arc::new(main.instances.clone()),
-    );
+    )
+    .map_err(anyhow::Error::msg)?;
     let snapshot = HardwareProvider::snapshot(&hardware).await?;
     assert_eq!(
         snapshot.selected_executor, device.id,

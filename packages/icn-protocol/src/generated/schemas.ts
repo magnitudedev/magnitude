@@ -1698,17 +1698,15 @@ export const HardwareSnapshot = S.Struct({
     { exact: true, as: "Option" },
   ),
   captured_at: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  chip_cores: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   cpu_model: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
+  cpu_pool_cores: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   device_memory: S.Array(
     S.suspend((): S.Schema<HardwareDeviceMemory, HardwareDeviceMemoryEncoded> => HardwareDeviceMemory),
   ),
   host_ram: S.suspend((): S.Schema<HardwareHostRam, HardwareHostRamEncoded> => HardwareHostRam),
-  logical_cores: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  logical_cpus: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   native_build: S.String,
-  physical_cores: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
-    exact: true,
-    as: "Option",
-  }),
   physical_devices: S.Array(
     S.suspend((): S.Schema<HardwarePhysicalDevice, HardwarePhysicalDeviceEncoded> => HardwarePhysicalDevice),
   ),

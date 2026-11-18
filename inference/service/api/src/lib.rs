@@ -2579,7 +2579,9 @@ mod tests {
                     "platform": "test",
                     "architecture": "test64",
                     "cpu_model": "Test CPU",
-                    "logical_cores": 8,
+                    "chip_cores": 4,
+                    "logical_cpus": 8,
+                    "cpu_pool_cores": 4,
                     "native_build": "test-build",
                     "topology_fingerprint": "topology",
                     "host_ram": {

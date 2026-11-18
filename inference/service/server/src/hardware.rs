@@ -44,25 +44,32 @@ pub fn execution_backend(backend: BackendName) -> ExecutionBackend {
 struct MachineDescription {
     system_product_name: Option<String>,
     cpu_model: Option<String>,
-    physical_cores: Option<usize>,
-    logical_cores: usize,
+    // Every count is the engine's own processors' (`seismic::Processors`): at least one, since
+    // the pool's count (`Processors::cores`) is.
+    chip_cores: usize,
+    logical_cpus: usize,
+    cpu_pool_cores: usize,
 }
 
 impl MachineDescription {
-    fn discover() -> Self {
+    fn discover() -> Result<Self, String> {
         let system = sysinfo::System::new_with_specifics(
             sysinfo::RefreshKind::nothing().with_cpu(sysinfo::CpuRefreshKind::nothing()),
         );
-        Self {
+        let processors = seismic::Processors::discover()
+            .map_err(|error| format!("the host's processors: {error}"))?;
+        let cores = || processors.nodes().iter().flat_map(|node| &node.cores);
+        Ok(Self {
             system_product_name: system_product_name(),
             cpu_model: system
                 .cpus()
                 .first()
                 .map(|cpu| cpu.brand().trim().to_owned())
                 .filter(|brand| !brand.is_empty()),
-            physical_cores: physical_cores(),
-            logical_cores: std::thread::available_parallelism().map_or(1, |cores| cores.get()),
-        }
+            chip_cores: cores().count(),
+            logical_cpus: cores().map(|core| core.threads.len()).sum(),
+            cpu_pool_cores: processors.cores()?.get(),
+        })
     }
 }
 
@@ -89,20 +96,20 @@ pub struct HardwareInventory {
 impl HardwareInventory {
     /// Describe the machine once; every snapshot then reads `inventory`'s current topology, a
     /// fresh status sample and the resident worker's fresh observations, and reports `serving`
-    /// as the device the service serves on.
+    /// as the device the service serves on. An error is the host's processors unreadable.
     pub fn new(
         inventory: Arc<Inventory>,
         volumes: ServedVolumes,
         serving: ServingDevice,
         resident: Arc<dyn ResidentMemory>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, String> {
+        Ok(Self {
             inventory,
             volumes: Arc::new(volumes),
             serving,
-            machine: Arc::new(MachineDescription::discover()),
+            machine: Arc::new(MachineDescription::discover()?),
             resident,
-        }
+        })
     }
 
     /// The snapshot of `inventory`'s current topology from one sample, which
@@ -390,8 +397,9 @@ fn snapshot(
         architecture: std::env::consts::ARCH.to_owned(),
         system_product_name: machine.system_product_name.clone(),
         cpu_model: machine.cpu_model.clone(),
-        physical_cores: machine.physical_cores,
-        logical_cores: machine.logical_cores,
+        chip_cores: machine.chip_cores,
+        logical_cpus: machine.logical_cpus,
+        cpu_pool_cores: machine.cpu_pool_cores,
         native_build: build_identity::native_build(),
         backend_diagnostics,
         topology_fingerprint: format!("{:x}", Sha256::digest(topology.normalized().as_bytes())),
@@ -456,70 +464,11 @@ fn normalize_product_name(value: &[u8]) -> Option<String> {
     (!name.is_empty() && !placeholder).then_some(name)
 }
 
-#[cfg(not(target_os = "linux"))]
-fn physical_cores() -> Option<usize> {
-    // sysctl on macOS, GetLogicalProcessorInformationEx on Windows.
-    sysinfo::System::physical_core_count().filter(|cores| *cores > 0)
-}
-
-#[cfg(target_os = "linux")]
-fn physical_cores() -> Option<usize> {
-    std::fs::read_to_string("/proc/cpuinfo")
-        .ok()
-        .and_then(|text| parse_linux_physical_cores(&text))
-}
-
-/// Distinct (package, core) pairs. ARM and virtualized `/proc/cpuinfo` may omit topology; their
-/// logical processor records are never counted as physical cores.
-#[cfg(any(target_os = "linux", test))]
-fn parse_linux_physical_cores(text: &str) -> Option<usize> {
-    let mut cores = std::collections::BTreeSet::new();
-    for record in text.split("\n\n") {
-        let mut processor = false;
-        let mut package = None;
-        let mut core = None;
-        for line in record.lines() {
-            let Some((key, value)) = line.split_once(':') else {
-                continue;
-            };
-            match key.trim() {
-                "processor" => processor = true,
-                "physical id" => package = Some(value.trim().parse::<u32>().ok()?),
-                "core id" => core = Some(value.trim().parse::<u32>().ok()?),
-                _ => {}
-            }
-        }
-        if processor {
-            cores.insert((package?, core?));
-        }
-    }
-    (!cores.is_empty()).then_some(cores.len())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use magnitude_executor::platform::VolumeReserves;
     use magnitude_service_contracts::HardwareVolumeRole;
-
-    #[test]
-    fn physical_cores_separate_smt_threads_and_sockets() {
-        let mut text = String::new();
-        for socket in 0..2 {
-            for core in 0..4 {
-                for thread in 0..2 {
-                    text.push_str(&format!(
-                        "processor : {}\nphysical id : {socket}\ncore id : {core}\n\n",
-                        socket * 8 + core * 2 + thread
-                    ));
-                }
-            }
-        }
-        assert_eq!(parse_linux_physical_cores(&text), Some(8));
-        for incomplete in ["", "processor : 0\n", "processor : 0\ncore id : 0"] {
-            assert_eq!(parse_linux_physical_cores(incomplete), None);
-        }
-    }
 
     #[test]
     fn product_name_placeholders_are_absent() {
@@ -587,7 +536,7 @@ mod tests {
             &inventory,
             &served,
             ServingDevice::of(seismic::ExecutorSelector::HostCpu),
-            &MachineDescription::discover(),
+            &MachineDescription::discover().unwrap(),
             None,
         )
         .unwrap();
@@ -608,7 +557,7 @@ mod tests {
             &inventory,
             &ServedVolumes::new(Arc::new(VolumeReserves::new(None))),
             serving,
-            &MachineDescription::discover(),
+            &MachineDescription::discover().unwrap(),
             None,
         )
         .unwrap();

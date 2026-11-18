@@ -338,7 +338,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
                     volumes,
                     serving,
                     Arc::new(instances.clone()),
-                )))
+                ).map_err(anyhow::Error::msg)?))
                 .with_model_controller(Arc::new(instances.clone()));
             if let Some(auth_token) = auth_token {
                 state = state.with_authorization(auth_token);

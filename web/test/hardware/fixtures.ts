@@ -3,9 +3,9 @@ import { LocalInferenceHardwareSchema } from "@magnitudedev/sdk"
 import { MachineIdentityObservation } from "@magnitudedev/sdk/desktop-host"
 const GiB = 1024 ** 3
 export const identity = (manufacturer: string, model: string, formFactor = "Unknown") => Schema.decodeUnknownSync(MachineIdentityObservation)({ _tag: "Identified", manufacturer, model, formFactor })
-export const hardware = (processor: string, memory: number, cores: number, accelerators: readonly { name: string; memory: number; shared?: boolean }[] = [], physicalCores?: number) => Schema.decodeUnknownSync(LocalInferenceHardwareSchema)({
+export const hardware = (processor: string, memory: number, logicalCpus: number, accelerators: readonly { name: string; memory: number; shared?: boolean }[] = [], chipCores = logicalCpus) => Schema.decodeUnknownSync(LocalInferenceHardwareSchema)({
   platform: processor.startsWith("Apple") ? "MacOS" : "Linux", architecture: processor.startsWith("Apple") || processor === "NVIDIA GB10" ? "Arm64" : "X64", processor,
-  ...(physicalCores === undefined ? {} : { physicalCores }), logicalCores: cores, totalSystemMemoryBytes: memory * GiB,
+  chipCores, logicalCpus, cpuPoolCores: chipCores, totalSystemMemoryBytes: memory * GiB,
   accelerators: accelerators.map((gpu, i) => ({ acceleratorId: `gpu-${i}`, name: gpu.name, executors: [{ deviceId: `executor-${i}`, backend: processor.startsWith("Apple") ? "metal" : /nvidia|rtx|gb10/i.test(gpu.name) ? "cuda" : "vulkan", memoryDomainIds: [gpu.shared ? "system" : `gpu-${i}`] }] })),
   // The active device is the first GPU's executor, or the host CPU without one; host RAM is unified when it is that GPU's memory.
   activeDeviceId: accelerators.length > 0 ? "executor-0" : "host-cpu",

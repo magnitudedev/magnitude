@@ -6481,7 +6481,9 @@
           "captured_at",
           "platform",
           "architecture",
-          "logical_cores",
+          "chip_cores",
+          "logical_cpus",
+          "cpu_pool_cores",
           "native_build",
           "topology_fingerprint",
           "physical_devices",
@@ -6516,16 +6518,19 @@
               "null"
             ]
           },
-          "physical_cores": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "description": "OS-reported physical CPU cores, independent of process scheduling limits.",
+          "chip_cores": {
+            "type": "integer",
+            "description": "The chip's cores of every kind, as the host's processor topology reports them, whatever\nthis process may run on: what identifies the chip's variant. A virtual machine's are its\nhypervisor's virtual cores.",
             "minimum": 0
           },
-          "logical_cores": {
+          "logical_cpus": {
             "type": "integer",
+            "description": "The host's logical CPUs (hardware threads) in that topology: a VM's vCPUs.",
+            "minimum": 0
+          },
+          "cpu_pool_cores": {
+            "type": "integer",
+            "description": "The cores the engine's CPU pool runs on: the performance cores this process may run\non, under its CPU quota, one thread each.",
             "minimum": 0
           },
           "native_build": {

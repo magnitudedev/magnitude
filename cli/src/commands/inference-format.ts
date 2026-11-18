@@ -13,6 +13,8 @@ export interface LocalHardwarePresentation {
   readonly accelerators: readonly { readonly name: string; readonly details: string }[]
 }
 
+const count = (value: number, noun: string) => `${value} ${noun}${value === 1 ? "" : "s"}`
+
 export const describeLocalHardware = (
   hardware: LocalInferenceHardware,
 ): LocalHardwarePresentation => {
@@ -24,7 +26,7 @@ export const describeLocalHardware = (
     system: {
       name: roles.machineName,
       details: [
-        `${hardware.platform === "MacOS" ? "macOS" : hardware.platform} · ${hardware.architecture === "Arm64" ? "ARM64" : "x86-64"} · ${hardware.logicalCores} logical CPU core${hardware.logicalCores === 1 ? "" : "s"}`,
+        `${hardware.platform === "MacOS" ? "macOS" : hardware.platform} · ${hardware.architecture === "Arm64" ? "ARM64" : "x86-64"} · CPU inference on ${count(hardware.cpuPoolCores, "core")}, ${count(hardware.logicalCpus, "logical CPU")}`,
         `${formatMemoryCapacity(hardware.totalSystemMemoryBytes)} ${roles.unifiedMemory ? "unified" : "system"} memory${unifiedGpu === undefined ? "" : ` · ${formatLocalInferenceBackend(unifiedGpu.backend)} GPU acceleration · in use`}`,
       ],
     },

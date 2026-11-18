@@ -271,9 +271,15 @@ mod schema {
         #[serde(default)]
         pub system_product_name: Option<String>,
         pub cpu_model: Option<String>,
-        /// OS-reported physical CPU cores, independent of process scheduling limits.
-        pub physical_cores: Option<usize>,
-        pub logical_cores: usize,
+        /// The chip's cores of every kind, as the host's processor topology reports them, whatever
+        /// this process may run on: what identifies the chip's variant. A virtual machine's are its
+        /// hypervisor's virtual cores.
+        pub chip_cores: usize,
+        /// The host's logical CPUs (hardware threads) in that topology: a VM's vCPUs.
+        pub logical_cpus: usize,
+        /// The cores the engine's CPU pool runs on: the performance cores this process may run
+        /// on, under its CPU quota, one thread each.
+        pub cpu_pool_cores: usize,
         /// Engine build identity: engine version plus kernel bundle identity.
         pub native_build: String,
         /// Backends that discovery could not enumerate on this machine, with the engine's own reason,

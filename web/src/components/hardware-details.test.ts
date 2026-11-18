@@ -76,23 +76,17 @@ it("covers bandwidth for every cataloged discrete GPU without inventing dedicate
   }
 })
 
-it("shows one CPU core count, preferring detection and never substituting threads", () => {
-  const value = { ...hardware("Intel Core i7-13700H", 32, 4), physicalCores: Option.some(12) }
-  const result = hardwareDetails(null, value)
-  expect(result.summary.filter(f => /CPU|threads/.test(f.label))).toEqual([{ label: "CPU cores", value: "12" }])
-  expect(hardwareDetails(null, hardware("Unknown", 32, 4)).summary.some(f => /CPU|threads/.test(f.label))).toBe(false)
-  expect(hardwareDetails(null, hardware("Apple M4 Pro", 32, 12)).summary.some(f => /CPU core/.test(f.label))).toBe(false)
-})
-it("does not use a per-processor specification as a server total", () => {
-  expect(hardwareDetails(identity("Custom", "Server", "Server"), hardware("AMD EPYC 7742", 256, 128)).summary.some(f => f.label === "CPU cores")).toBe(false)
+it("shows the CPU cores and the logical CPUs, each under its own label", () => {
+  // A 4-vCPU VM of two SMT cores.
+  const vm = hardware("AMD EPYC 7763 64-Core Processor", 16, 4, [], 2)
+  expect(hardwareDetails(null, vm).summary.filter(f => /CPU|threads/.test(f.label)))
+    .toEqual([{ label: "CPU cores", value: "2" }, { label: "logical CPUs", value: "4" }])
 })
 it("matches decorated CPU names without collapsing different SKUs", () => {
   expect(normalizeProcessorName("13th Gen Intel(R) Core(TM) i7-13700H @ 2.40GHz")).toBe("intel core i7-13700h")
   expect(normalizeProcessorName("AMD Ryzen 7 7840U w/ Radeon 780M Graphics")).toBe("amd ryzen 7 7840u")
-  const known = hardwareDetails(null, hardware("13th Gen Intel(R) Core(TM) i7-13700H", 32, 20))
-  expect(known.summary).toContainEqual({ label: "CPU cores", value: "14" })
-  const unknown = hardwareDetails(null, hardware("Intel Core i7-13700HK", 32, 20))
-  expect(unknown.summary.some(f => f.label.endsWith("(spec)"))).toBe(false)
+  expect(hardwareDetails(null, hardware("13th Gen Intel(R) Core(TM) i7-13700H", 32, 20, [], 14)).groups[0]?.truncateName).toBe(false)
+  expect(hardwareDetails(null, hardware("Intel Core i7-13700HK", 32, 20, [], 14)).groups[0]?.truncateName).toBe(true)
 })
 
 it.each(hardwareScenarios)("presents $label from observed data", scenario => {
@@ -125,16 +119,15 @@ it("keeps multi-GPU memory separate and handles duplicate names", () => {
   expect(result.accelerators.map(gpu => gpu.detail)).toEqual(["34.4 GB VRAM", "34.4 GB VRAM"])
   expect(new Set(result.accelerators.map(gpu => gpu.id)).size).toBe(2)
 })
-it("never infers variable Apple chip specifications or a desktop SKU from a mobile suffix", () => {
-  const result = hardwareDetails(null, hardware("Apple M4 Max", 64, 16, [{ name: "RTX 4090 Laptop GPU", memory: 16 }]))
-  expect(result.summary.some(fact => fact.label === "GPU cores (spec)" || fact.label === "Memory bandwidth (spec)")).toBe(false)
+it("never infers a desktop SKU from a mobile suffix", () => {
+  const result = hardwareDetails(null, hardware("Unknown", 64, 16, [{ name: "RTX 4090 Laptop GPU", memory: 16 }]))
   expect(result.accelerators[0]?.facts).toContainEqual({ label: "CUDA cores (spec)", value: "9,728" })
 })
-it("resolves Apple bins only from physical cores, never scheduling parallelism", () => {
-  const limited = { ...hardware("Apple M4 Max", 64, 4), physicalCores: Option.some(16) }
+it("resolves Apple bins from the chip's cores, never the engine's pool", () => {
+  const limited = { ...hardware("Apple M4 Max", 64, 16), cpuPoolCores: 4 }
   expect(hardwareDetails(null, limited).summary).toContainEqual({ label: "GPU cores (spec)", value: "40" })
   expect(hardwareDetails(null, limited).summary).toContainEqual({ label: "Memory bandwidth (spec)", value: "546 GB/s" })
-  const ambiguous = { ...hardware("Apple M5 Max", 64, 18), physicalCores: Option.some(18) }
+  const ambiguous = hardware("Apple M5 Max", 64, 18)
   expect(hardwareDetails(null, ambiguous).summary.some(fact => fact.label === "GPU cores (spec)" || fact.label === "Memory bandwidth (spec)")).toBe(false)
 })
 it("does not promote a chip into a particular mini PC", () => {

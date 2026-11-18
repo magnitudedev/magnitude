@@ -1976,8 +1976,12 @@ export const LocalInferenceHardwareSchema = Schema.Struct({
   architecture: Schema.Literal("Arm64", "X64"),
   productName: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
   processor: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
-  physicalCores: Schema.optionalWith(PositiveSafeInteger, { as: "Option", exact: true }),
-  logicalCores: PositiveSafeInteger,
+  /** The chip's cores of every kind, as its processor topology reports them, which identify its variant: a VM's virtual cores. Never what inference runs on (`cpuPoolCores`). */
+  chipCores: PositiveSafeInteger,
+  /** The host's logical CPUs (hardware threads): a VM's vCPUs. */
+  logicalCpus: PositiveSafeInteger,
+  /** The cores the engine's CPU pool runs on: the performance cores the service may run on, under its CPU quota. */
+  cpuPoolCores: PositiveSafeInteger,
   totalSystemMemoryBytes: NonNegativeSafeInteger,
   accelerators: Schema.Array(LocalInferenceAcceleratorSchema),
   /** The active device: the one a resident model runs on, and otherwise the service's serving device. */

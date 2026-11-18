@@ -120,8 +120,9 @@ export const projectInferenceHardware = (
     architecture,
     productName: Option.flatMap(hardware.system_product_name, Option.fromNullable),
     processor: Option.flatMap(hardware.cpu_model, Option.fromNullable),
-    physicalCores: Option.filter(Option.flatMap(hardware.physical_cores, Option.fromNullable), count => count > 0),
-    logicalCores: Math.max(1, hardware.logical_cores),
+    chipCores: hardware.chip_cores,
+    logicalCpus: hardware.logical_cpus,
+    cpuPoolCores: hardware.cpu_pool_cores,
     totalSystemMemoryBytes: host.store.allocation_capacity_bytes,
     accelerators,
     activeDeviceId: LocalInferenceDeviceIdSchema.make(active.executor.id),
@@ -189,8 +190,8 @@ export const summarizeInferenceHardware = (
     gpuCount: hardware.physical_devices.filter(physical => physical.kind !== "cpu").length,
     gpuUnusedReason: unused ? Option.some(unusedReason(unused)) : Option.none(),
     cpuModel: Option.flatMap(hardware.cpu_model, Option.fromNullable).pipe(Option.filter(model => model.trim().length > 0)),
-    cpuCores: Option.flatMap(hardware.physical_cores, Option.fromNullable).pipe(Option.filter(count => count > 0),
-      Option.orElse(() => hardware.logical_cores > 0 ? Option.some(hardware.logical_cores) : Option.none())),
+    cpuPoolCores: hardware.cpu_pool_cores,
+    logicalCpus: hardware.logical_cpus,
     memoryBytes: hardware.host_ram.store.total_capacity_bytes,
   } satisfies AcnHardwareSummary
 })
