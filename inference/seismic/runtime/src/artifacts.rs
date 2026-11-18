@@ -238,10 +238,13 @@ pub(crate) fn user_on_disk() -> Option<&'static DirectoryStore> {
     USER.1.as_deref()
 }
 
-/// The directory store in the user's cache directory ([`ProgramStore::user`]).
+/// The directory store in the user's cache directory ([`ProgramStore::user`]):
+/// `%LOCALAPPDATA%` on Windows, which sets no `HOME`.
 fn user_directory() -> Result<DirectoryStore, String> {
     let cache = match std::env::var_os("XDG_CACHE_HOME") {
         Some(cache) => std::path::PathBuf::from(cache),
+        None if cfg!(windows) => std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from)
+            .ok_or("the user's program store has no directory to open: neither XDG_CACHE_HOME nor LOCALAPPDATA is set")?,
         None => {
             let home = std::env::var_os("HOME")
                 .ok_or("the user's program store has no directory to open: neither XDG_CACHE_HOME nor HOME is set")?;
