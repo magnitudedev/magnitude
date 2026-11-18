@@ -2763,9 +2763,10 @@ pub struct StateCheckpoint {
     tape: usize,
 }
 
-/// An accepted state temporarily owned by a submitted continuation rather
-/// than the domain's request map. Its history and bank remain in the
-/// in-flight census until the continuation reconciles or is dropped.
+/// An accepted state temporarily owned by submitted work (a continuation,
+/// or a head launch reading target history) rather than the domain's request
+/// map. Its history and bank remain in the in-flight census until the work
+/// returns it or is dropped.
 pub struct InFlightState {
     state: SequenceState,
     _transaction: Transaction,
@@ -2783,6 +2784,14 @@ impl InFlightState {
 
     pub fn into_state(self) -> SequenceState {
         self.state
+    }
+}
+
+impl std::ops::Deref for InFlightState {
+    type Target = SequenceState;
+
+    fn deref(&self) -> &SequenceState {
+        &self.state
     }
 }
 impl Drop for StateCheckpoint {

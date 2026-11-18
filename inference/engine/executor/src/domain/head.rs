@@ -288,7 +288,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         operations: &[Operation],
         graph_workspace: NativeGraphWorkspaceLease,
         graph_output: NativeGraphOutputLease,
-        states: Vec<SequenceState>,
+        states: Vec<InFlightState>,
     ) -> Result<HeadFlight<F>, SubmitFailure> {
         let launch = self.target_reading_launch(operations, &states);
         let (batch, history, metadata, steps) = match launch {
@@ -353,9 +353,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// Return the accepted target states a head reading them held.
-    fn restore_target_reads(&mut self, operations: &[Operation], states: Vec<SequenceState>) {
+    fn restore_target_reads(&mut self, operations: &[Operation], states: Vec<InFlightState>) {
         for (operation, state) in operations.iter().zip(states) {
-            self.target.insert(operation.request(), state);
+            self.target.insert(operation.request(), state.into_state());
         }
     }
 
@@ -366,7 +366,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     fn target_reading_launch(
         &self,
         operations: &[Operation],
-        states: &[SequenceState],
+        states: &[InFlightState],
     ) -> Result<
         (
             crate::batching::ValidatedHeadBatch,
@@ -807,7 +807,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 ));
             }
             for ((request, _, _), state) in requests.iter().zip(reads.states) {
-                if self.target.insert(*request, state).is_some() {
+                if self.target.insert(*request, state.into_state()).is_some() {
                     return Err(DomainError::invariant(
                         "request already has another physical state owner",
                     ));

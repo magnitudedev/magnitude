@@ -520,7 +520,7 @@ pub enum HeadReservation {
     /// state. The flight reads its history and returns it unchanged at
     /// physical completion; while it is held the request has no other target
     /// work, checkpoint or close, exactly as for an in-flight advance.
-    TargetReads(Vec<SequenceState>),
+    TargetReads(Vec<InFlightState>),
 }
 
 /// Complete target capacity is owned before launch construction. Decoder
@@ -2686,11 +2686,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
             ReservedResources::Head(_, _, HeadReservation::TargetReads(states)) => {
                 for operation in operations {
-                    states.push(
+                    states.push(InFlightState::new(
                         self.target
                             .remove(&operation.request())
                             .expect("reservation preflight established target ownership"),
-                    );
+                    ));
                 }
             }
             ReservedResources::Head(_, _, HeadReservation::Advances(advances)) => {

@@ -5,7 +5,7 @@ use crate::{
     ResourceDomainId,
 };
 use magnitude_batching::{coalesce_spans, HeadPasses, ValidatedHeadBatch};
-use magnitude_state::{SequenceState, StateStore, TentativeAdvance};
+use magnitude_state::{InFlightState, StateStore, TentativeAdvance};
 use std::rc::Rc;
 
 /// What conditions a head launch's entry rows.
@@ -26,8 +26,9 @@ pub enum HeadConditioning {
 /// each slot's accepted target state, held unchanged while the launch is in
 /// flight, and per head block the target history it binds.
 pub struct TargetReads {
-    /// Per slot, the request's accepted target state at the anchor.
-    pub states: Vec<SequenceState>,
+    /// Per slot, the request's accepted target state at the anchor, its
+    /// claims in the in-flight census while the launch holds it.
+    pub states: Vec<InFlightState>,
     /// Per head block, in block order.
     pub history: Vec<TargetHistoryRead>,
 }
