@@ -75,7 +75,7 @@ export const runHeadlessApplication = (options: {
   // Only the Magnitude command launcher contains a Windows server's process tree.
   if (process.platform === "win32") yield* native.guardParent(0).pipe(Effect.mapError(() => new HeadlessApplicationFailed({ message: windowsUncontainedServe })))
   const serviceStarted = yield* native.isServiceSession.pipe(Effect.mapError(error => new HeadlessApplicationFailed({ message: error.message })))
-  const owner = yield* acquireApplicationOwner(options.stateDirectory, { _tag: "Headless" }, options.profile.sharedControl)
+  const owner = yield* acquireApplicationOwner(options.stateDirectory, { _tag: "Headless" })
   if (owner._tag !== "Owner") return yield* new HeadlessApplicationFailed({ message: "Magnitude is already running." })
   if (yield* isUpdateInstallationActive(options.stateDirectory)) return yield* new HeadlessApplicationFailed({ message: "A Magnitude update is being installed. Run `magnitude serve` when it finishes." })
   if (yield* Deferred.isDone(stop)) return yield* Deferred.await(stop)
@@ -132,7 +132,7 @@ export const runHeadlessApplication = (options: {
   if (process.platform === "win32") {
     const name = yield* Schema.decodeUnknown(WindowsPipeName)(owner.socketPath)
     yield* serveWindowsApplicationControl(name, control).pipe(Effect.provide(nativeWindowsPrivatePipesLayer(addon)))
-  } else yield* serveApplicationControl(owner.socketPath, control, options.profile.sharedControl)
+  } else yield* serveApplicationControl(owner.socketPath, control)
   yield* service.changes.pipe(Stream.runForEach(state => (state._tag === "Ready" ? Deferred.succeed(firstReady, undefined) : Effect.void).pipe(
     Effect.zipRight(options.observe(state)))), Effect.forkScoped)
   if (options.installWhenIdle) {

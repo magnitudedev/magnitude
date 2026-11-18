@@ -55,7 +55,7 @@ for ((attempt=0; attempt<100; attempt++)); do
   sleep 0.1
 done
 test -f "$root/listening"
-bash "$root/hosting/install.sh" > "$root/install.log" 2>&1
+bash "$root/hosting/install.sh" --desktop > "$root/install.log" 2>&1
 export MAGNITUDE_DEV_DATA_DIR="$root/profile"
 export MAGNITUDE_DESKTOP_STATE_DIR="$root/state"
 export MAGNITUDE_DEV_PORT=11237
@@ -77,7 +77,7 @@ grep -Eq 'Owner[[:space:]]+Headless' "$root/status.txt"
 kill -TERM "$owner_pid"
 wait "$owner_pid"
 owner_pid=''
-bash "$root/hosting/install.sh" > "$root/repeat-install.log" 2>&1
+bash "$root/hosting/install.sh" --desktop > "$root/repeat-install.log" 2>&1
 /usr/bin/magnitude status > "$root/final-status.txt"
 grep -Eq 'Runtime[[:space:]]+Stopped' "$root/final-status.txt"
 printf '%s\n' 'HTTPS script installation, foreground serve, CLI queries, graceful shutdown and repeat installation passed' | tee "$root/result.txt"

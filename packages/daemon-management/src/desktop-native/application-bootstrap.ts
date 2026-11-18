@@ -9,7 +9,6 @@ import { makeOwnedService, type OwnerAgent } from "./owned-service"
 import { previousInstallationUpgrade } from "./previous-installation-live"
 import { checkServicePort, requireServicePort, takeOverServicePort } from "./service-port"
 import type { ChildOutputMode } from "./child-output"
-import { SERVER_DATA_DIRECTORY, SERVER_PORT } from "./server-profile"
 
 /** `Desktop`: the CLI inside the desktop app. `Standalone`: a CLI-only install, `<root>/cli/<version>/`. */
 export const InstallationLayout = Schema.Literal("Desktop", "Standalone")
@@ -48,10 +47,8 @@ export const resolveInstalledApplicationRuntime = (executable: string, platform:
 /** A standalone installation's root, which holds each version folder and the `current` pointer. */
 export const standaloneInstallationRoot = (runtime: Extract<ApplicationRuntime, { _tag: "Installed" }>, platform: string) =>
   paths(platform).dirname(runtime.resourcesDirectory)
-/** `sharedControl`: the server profile opens its control endpoint to every local account; data stays private. */
 export const ApplicationProfile = Schema.Struct({
   dataDirectory: Schema.String, isolated: Schema.Boolean, port: Schema.Number, endpoint: Schema.String,
-  sharedControl: Schema.Boolean,
 })
 export type ApplicationProfile = typeof ApplicationProfile.Type
 
@@ -62,18 +59,13 @@ const paths = (platform: string) => platform === "win32" ? win32 : posix
 export const resolveApplicationProfile = (options: {
   readonly runtime: ApplicationRuntime; readonly home: string; readonly platform: string
   readonly acceptance: boolean; readonly environment: Environment
-  /** Whether the installed Linux server profile is active; see `isServerProfileActive`. */
-  readonly server: boolean
 }): ApplicationProfile => {
   const { runtime, environment, acceptance } = options
-  if (options.server && runtime._tag === "Installed" && !acceptance) {
-    return { dataDirectory: SERVER_DATA_DIRECTORY, isolated: false, port: SERVER_PORT, endpoint: `http://127.0.0.1:${SERVER_PORT}`, sharedControl: true }
-  }
   const isolated = acceptance || runtime._tag === "Development" || environment.MAGNITUDE_DEV_DATA_DIR !== undefined
   const dataDirectory = environment.MAGNITUDE_DEV_DATA_DIR ?? paths(options.platform).join(options.home,
     acceptance ? ".magnitude-update-acceptance" : runtime._tag === "Installed" ? ".magnitude" : ".magnitude-desktop-dev")
   const port = isolated ? Number(environment.MAGNITUDE_DEV_PORT ?? (acceptance ? 11143 : 11101)) : 10100
-  return { dataDirectory, isolated, port, endpoint: `http://127.0.0.1:${port}`, sharedControl: false }
+  return { dataDirectory, isolated, port, endpoint: `http://127.0.0.1:${port}` }
 }
 
 export const applicationNativeHostPath = (runtime: ApplicationRuntime, platform: string, architecture: string) =>
@@ -96,8 +88,6 @@ export const applicationServiceCommand = (options: {
     arguments: [...(runtime._tag === "Installed" ? [] : [path.join(runtime.repository, "packages/acn/src/binary.ts")]),
       "serve", "--data-dir", profile.dataDirectory, "--port", String(profile.port)],
     environment: { ...environment, MAGNITUDE_NATIVE_HOST: applicationNativeHostPath(runtime, platform, architecture),
-      // The server's service account has no harnesses; each person connects theirs from the CLI.
-      ...(profile.sharedControl ? { MAGNITUDE_SERVER_SERVICE: "1" } : {}),
       ...(runtime._tag === "Installed" || environment.MAGNITUDE_ICN_PATH ? {} : {
         MAGNITUDE_ICN_PATH: path.join(runtime.repository, "inference/target/development/installation.json"),
       }) },

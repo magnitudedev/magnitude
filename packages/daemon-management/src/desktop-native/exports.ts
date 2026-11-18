@@ -1,5 +1,6 @@
 export * from "./index"
 export { makeMacCliRegistration } from "./mac-cli-registration"
+export { installStandaloneCliPath, STANDALONE_CLI_DIRECTORY } from "./standalone-cli-path"
 export { adoptLinuxInstallationLease, acquireLinuxInstallationLease, linuxInstallationLockHeldByOthers } from "./linux-installation-lease"
 export { WindowsInstallerVerifier, nativeWindowsInstallerVerifier } from "./windows-update-signature"
 export { MacBundleVerifier, MacBundleVerificationFailed, MacBundleExpectation, nativeMacBundleVerifier } from "./mac-update-validation"
@@ -45,9 +46,6 @@ export { makeUnixProcessContinuation, ForegroundContinuationFailed } from "./uni
 export { acquireMacApplicationInstallationLease, nativeMacUpdateAdmission } from "./mac-update-lease"
 export type { OwnerAgent } from "./owned-service"
 export { ownerDone, ownerResult, ownerUnsupported } from "./owner-agent"
-export { SERVER_DATA_DIRECTORY, SERVER_USER, SERVER_PORT, SERVER_MARKER_PATH, SERVER_MARKER_CONTENT, SERVER_SUDOERS_PATH, SERVER_SUDOERS_RULE, MAC_SERVER_LABEL, MAC_SERVER_PLIST, isServerProfileActive } from "./server-profile"
+export * from "./legacy-server"
 export { TerminalCommand, TerminalCommandFailed, nodeTerminalCommand } from "./terminal-command"
-export { closeServerFirewall, openServerFirewall, recordOpenedServerFirewall } from "./server-firewall"
-export { ServerInstallationFailed, installedServerCli, parseServerInstallation, requireInstalledRoot, installLinuxServer, removeLinuxServer, installMacServer, removeMacServer, macServerPlist,
-  restoreLinuxServerGrant, classifyServerAccounts, inspectServerAccounts, hasLinuxServerRemnants, systemIdRange } from "./server-installation"
 export * from "./standalone-absorption"

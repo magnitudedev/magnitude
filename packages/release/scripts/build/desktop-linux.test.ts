@@ -78,7 +78,7 @@ describe("Linux system files", () => {
   const listing = new Map<string, { mode: number; owner: string }>(linuxSystemFiles.map(file => [file.path, { mode: file.mode, owner: "root/root" }]))
   const validate = (entries: Map<string, { mode: number; owner: string }>, paths: readonly string[] = [...entries.keys()]) =>
     Effect.runPromise(validateLinuxSystemFiles(paths, path => Option.fromNullable(entries.get(path))))
-  it("accepts the root-owned unit, Polkit actions and their wrappers", async () => {
+  it("accepts the root-owned Polkit action and its wrapper", async () => {
     await expect(validate(listing)).resolves.toBeUndefined()
   })
   it.each(["usr/lib/.build-id", "usr/lib/.build-id/5c", "usr/lib/.build-id/5c/b76311ea91b4bc51b112829d8b06cd2398a6ba"])("rejects global build-ID entry %s", async path => {
@@ -87,20 +87,20 @@ describe("Linux system files", () => {
   it("accepts bundled binaries in the application directory", async () => {
     await expect(validate(listing, [...listing.keys(), "usr/lib/magnitude-desktop/chrome-sandbox", "usr/lib/magnitude-desktop/libEGL.so"])).resolves.toBeUndefined()
   })
-  it("rejects a group-writable unit", async () => {
-    await expect(validate(new Map([...listing, ["usr/lib/systemd/system/magnitude.service", { mode: 0o664, owner: "root/root" }]]))).rejects.toThrow("root-owned")
+  it("rejects a group-writable policy", async () => {
+    await expect(validate(new Map([...listing, ["usr/share/polkit-1/actions/dev.magnitude.update.policy", { mode: 0o664, owner: "root/root" }]]))).rejects.toThrow("root-owned")
   })
-  it.each(["magnitude-install-update", "magnitude-server-remove"].flatMap(wrapper => [
+  it.each(["magnitude-install-update"].flatMap(wrapper => [
     [`a group-writable ${wrapper}`, wrapper, { mode: 0o775, owner: "root/root" }],
     [`a setuid ${wrapper}`, wrapper, { mode: 0o4755, owner: "root/root" }],
     [`a foreign-owned ${wrapper}`, wrapper, { mode: 0o755, owner: "builder/root" }],
   ] as const))("rejects %s", async (_, wrapper, entry) => {
     await expect(validate(new Map([...listing, [`usr/lib/magnitude-desktop/resources/${wrapper}`, entry]]))).rejects.toThrow("root-owned")
   })
-  it.each(["dev.magnitude.update.policy", "dev.magnitude.server-remove.policy", "magnitude-install-update", "magnitude-server-remove"])("rejects a package missing %s", async name => {
+  it.each(["dev.magnitude.update.policy", "magnitude-install-update"])("rejects a package missing %s", async name => {
     await expect(validate(new Map([...listing].filter(([path]) => !path.includes(name))))).rejects.toThrow("root-owned")
   })
-  it.each(["etc/sudoers.d/magnitude", "etc/sudoers.d"])("rejects a package that ships %s, which only server setup writes", async path => {
+  it.each(["etc/sudoers.d/magnitude", "etc/sudoers.d"])("rejects a package that ships %s", async path => {
     await expect(validate(listing, [...listing.keys(), path])).rejects.toThrow("must not contain a sudoers rule")
   })
   it("ships nothing under /etc", () => {
@@ -121,7 +121,7 @@ describe("Linux password-free Polkit actions", () => {
     })
     it.each([
       ["the CLI itself", policy.replace(wrapper, "/usr/lib/magnitude-desktop/resources/magnitude")],
-      ["another wrapper", policy.replace(wrapper, linuxPolkitActions.find(other => other.wrapper !== wrapper)!.wrapper)],
+      ["another wrapper", policy.replace(wrapper, "/usr/lib/magnitude-desktop/resources/magnitude-other")],
       ["an argument annotation polkit 0.105 ignores", policy.replace("</annotate>", `</annotate>\n    ${annotation("argv1", "_install-application-update")}`)],
       ["a second action", policy.replace("</policyconfig>", `${policy.slice(policy.indexOf("  <action"), policy.indexOf("</policyconfig>"))}</policyconfig>`)],
       ["no program", policy.replace(/\s*<annotate[^\n]*\n/, "\n")],
@@ -168,29 +168,6 @@ describe("Linux password-free Polkit actions", () => {
       [["/a/updates/update.json", "--parent-stdin", "x"]],
       [["--parent-stdin", "/a/updates/update.json"]],
       [["-c", "id"]],
-    ])("refuses %j without running the CLI", args => {
-      expect(run(...args)).toEqual({ status: 3, stdout: "" })
-    })
-  })
-
-  describe("server removal wrapper", () => {
-    const { text, run } = wrapperRunner("magnitude-server-remove")
-    it("runs the installed CLI's server removal by absolute path", () => {
-      expect(text.startsWith("#!/bin/sh\n")).toBe(true)
-      expect(text).toMatch(/^set -eu$/m)
-      expect(text.match(/^exec .*$/gm)).toEqual(["exec /usr/lib/magnitude-desktop/resources/magnitude _server-remove"])
-    })
-    it("runs server removal without arguments", () => {
-      expect(run()).toEqual({ status: 0, stdout: "_server-remove\n" })
-    })
-    it.each([
-      [["_server-install"]],
-      [["_server-remove"]],
-      [["--help"]],
-      [["serve"]],
-      [["/a/updates/update.json"]],
-      [["-c", "id"]],
-      [[""]],
     ])("refuses %j without running the CLI", args => {
       expect(run(...args)).toEqual({ status: 3, stdout: "" })
     })
@@ -251,13 +228,10 @@ describe.skipIf(process.platform !== "linux" || !hasBsdtar)("pacman package asse
       expect(mtree).not.toMatch(/sudoers/)
       expect(read(".INSTALL").toString()).toContain("rm -f /etc/sudoers.d/magnitude")
       expect(read("usr/share/applications/magnitude-desktop.desktop").toString()).toBe(linuxDesktopEntry)
-      expect(read("usr/lib/systemd/system/magnitude.service").toString()).toContain("ExecStart=/usr/bin/env /usr/lib/magnitude-desktop/resources/magnitude serve")
+      expect(mtree).not.toMatch(/systemd\/system\/magnitude\.service|magnitude-server-remove/)
       expect(read("usr/share/polkit-1/actions/dev.magnitude.update.policy").toString()).toContain("<allow_active>yes</allow_active>")
       expect(read("usr/lib/magnitude-desktop/resources/magnitude-install-update").toString()).toContain("_install-application-update")
       expect(mtreeFileModes(mtree).get("usr/lib/magnitude-desktop/resources/magnitude-install-update")).toBe(0o755)
-      expect(read("usr/share/polkit-1/actions/dev.magnitude.server-remove.policy").toString()).toContain("<allow_active>yes</allow_active>")
-      expect(read("usr/lib/magnitude-desktop/resources/magnitude-server-remove").toString()).toContain("_server-remove")
-      expect(mtreeFileModes(mtree).get("usr/lib/magnitude-desktop/resources/magnitude-server-remove")).toBe(0o755)
       expect(mtreeFileModes(mtree).get(".INSTALL")).toBe(0o644)
       expect(mtreeFileModes(mtree).get(".PKGINFO")).toBe(0o644)
       const listing = spawnSync("bsdtar", ["-tvf", output], { env: { ...process.env, LC_ALL: "C" } }).stdout.toString()

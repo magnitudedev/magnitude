@@ -7,7 +7,7 @@ import { Deferred, Effect, Option, Ref, Runtime, Schema } from "effect"
 import { BunSqliteDriverLayer } from "@magnitudedev/storage/sqlite/bun"
 import { bundledWindowsNative } from "@magnitudedev/daemon-management/bun"
 import { applicationNativeHostPath, applicationStateDirectory, holdContainerData, nativeHostLayer, resolveApplicationProfile,
-  resolveInstalledApplicationRuntime, runHeadlessApplication, servingBlocker, type ApplicationRuntime } from "@magnitudedev/daemon-management/desktop-native"
+  isLegacyServerMarked, resolveInstalledApplicationRuntime, runHeadlessApplication, servingBlocker, type ApplicationRuntime } from "@magnitudedev/daemon-management/desktop-native"
 import { containerImage } from "@magnitudedev/daemon-management/application-update"
 import { isDevelopmentBuild } from "../runtime/environment"
 import { CLI_VERSION } from "../version"
@@ -29,10 +29,11 @@ export const runServe = () => Effect.runPromise(Effect.scoped(Effect.gen(functio
   const runtime: ApplicationRuntime = isDevelopmentBuild()
     ? { _tag: "Development", repository: resolve(dirname(fileURLToPath(import.meta.url)), "../../..") }
     : yield* resolveInstalledApplicationRuntime(process.execPath, process.platform)
-  const { server, owner } = yield* resolveServeOwner
-  if (server && owner !== "service") return yield* new ServeRefused({ message: "Magnitude runs as a server on this machine, so it is already serving. "
-    + "Run `magnitude status` to see how to reach it, or `magnitude server remove` to stop the server." })
-  const profile = resolveApplicationProfile({ runtime, home: homedir(), platform: process.platform, acceptance: false, environment: process.env, server })
+  const owner = yield* resolveServeOwner
+  // A server set up before the CLI-only install is converted by its service's next start; until then nothing serves.
+  if (yield* isLegacyServerMarked(process.platform)) return yield* new ServeRefused({ message: "This machine's Magnitude server is being converted into a CLI-only install. "
+    + "Its service converts it when it next starts: `sudo systemctl restart magnitude`." })
+  const profile = resolveApplicationProfile({ runtime, home: homedir(), platform: process.platform, acceptance: false, environment: process.env })
   const container = yield* isContainer(runtime)
   if (container) yield* requireWritableDataDirectory(profile.dataDirectory)
   const stateDirectory = yield* applicationStateDirectory({ platform: process.platform, dataDirectory: profile.dataDirectory, override: Option.fromNullable(process.env.MAGNITUDE_DESKTOP_STATE_DIR) })

@@ -21,6 +21,7 @@ describe("installation distribution", () => {
     expect((yield* fs.readDirectory(output)).sort()).toEqual(["install.ps1", "install.sh"])
     expect(yield* fs.readFileString(join(output, "install.sh"))).toContain("$origin/api/installer?os=$1&arch=$arch&package=$2&offer=1")
     expect(yield* fs.readFileString(join(output, "install.ps1"))).toContain("$origin/api/installer?os=windows&arch=x64&package=windows-exe&offer=1")
+    expect(yield* fs.readFileString(join(output, "install.ps1"))).toContain("$origin/api/installer?os=windows&arch=x64&package=cli-only&offer=1")
     expect(yield* writeInstallationDistribution(options(output)).pipe(Effect.isFailure)).toBe(true)
   })).pipe(Effect.provide(NodeContext.layer))))
   it("rejects an invalid publisher key before writing", () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {

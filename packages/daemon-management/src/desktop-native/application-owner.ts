@@ -30,21 +30,16 @@ export const ApplicationOwnerRequest = Schema.Union(
 )
 export type ApplicationOwnerRequest = typeof ApplicationOwnerRequest.Type
 
-/**
- * Private profiles keep the ownership directory owner-only. The server profile lets every local
- * account traverse it to reach the control socket, without listing it or opening the lock.
- */
-const ownershipDirectoryMode = (sharedControl: boolean) => sharedControl ? 0o711 : 0o700
 
 const USABLE_FOLDER = "Check that the folder is on a local drive you can write to."
 
-const prepareOwnershipDirectory = (directory: string, sharedControl = false) => Effect.tryPromise({ try: async () => {
+const prepareOwnershipDirectory = (directory: string) => Effect.tryPromise({ try: async () => {
     // Windows creates the final directory with its private ACL inside native acquisition.
-    await mkdir(process.platform === "win32" ? dirname(directory) : directory, { recursive: true, mode: ownershipDirectoryMode(sharedControl) })
+    await mkdir(process.platform === "win32" ? dirname(directory) : directory, { recursive: true, mode: 0o700 })
     if (process.platform !== "win32") {
       const info = await lstat(directory)
       if (!info.isDirectory() || info.isSymbolicLink() || info.uid !== process.getuid!()) throw new Error("Application directory must belong to the current user")
-      await chmod(directory, ownershipDirectoryMode(sharedControl))
+      await chmod(directory, 0o700)
     }
   }, catch: error => new DataFolderUnusable({
     reason: `Magnitude couldn’t prepare its data folder ${directory}. ${USABLE_FOLDER}`,
@@ -63,9 +58,9 @@ const ownershipLock = (native: NativeHost, directory: string) => native.acquireO
 )
 
 /** A handoff requests cooperation; only acquisition of the retained kernel lock admits a new owner. */
-export const acquireApplicationOwner = (directory: string, request: ApplicationOwnerRequest, sharedControl = false) => Effect.gen(function* () {
+export const acquireApplicationOwner = (directory: string, request: ApplicationOwnerRequest) => Effect.gen(function* () {
   const native = yield* NativeHost
-  yield* prepareOwnershipDirectory(directory, sharedControl)
+  yield* prepareOwnershipDirectory(directory)
   for (;;) {
     const lock = yield* ownershipLock(native, directory)
     if (Option.isSome(lock)) return { _tag: "Owner" as const, socketPath: yield* native.ownedEndpoint(lock.value, directory), lock: lock.value }
@@ -95,9 +90,9 @@ export const acquireApplicationOwner = (directory: string, request: ApplicationO
 }) }))
 
 /** Finite mutations use the same kernel ownership, with no control listener, takeover or service. */
-export const acquireApplicationMaintenance = (directory: string, sharedControl = false) => Effect.gen(function* () {
+export const acquireApplicationMaintenance = (directory: string) => Effect.gen(function* () {
   const native = yield* NativeHost
-  yield* prepareOwnershipDirectory(directory, sharedControl)
+  yield* prepareOwnershipDirectory(directory)
   const lock = yield* ownershipLock(native, directory)
   if (Option.isNone(lock)) return yield* applicationAlreadyRunning(directory)
   if (yield* isUpdateInstallationActive(directory)) return yield* new ApplicationOwnershipFailed({

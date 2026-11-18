@@ -506,7 +506,7 @@ const ensureNetworkKey = (dataDir: string, network: NetworkAccess, container: Op
         `It is saved as network.apiKey in ${storage.paths.configFile}; read it again with \`docker exec <container> cat ${storage.paths.configFile}\`,`,
         "or set your own with the MAGNITUDE_NETWORK_KEY environment variable."].join("\n"))
       : Effect.logWarning(`Network access was on without a key, so Magnitude made one and saved it as network.apiKey in ${storage.paths.configFile}. `
-      + "Other computers need it: find it in Settings → Network access in the app on this computer, or run `magnitude server setup` again on a server.")),
+      + "Other computers need it: find it in Settings → Network access in the app on this computer, or as network.apiKey in that file.")),
     Effect.catchAll(error => Effect.logWarning("Network access is on without a key, and a key could not be saved, so other computers can't connect. "
       + "Turn network access on in Settings → Network access, or add a network.apiKey to config.json.").pipe(
       Effect.annotateLogs({ cause: String(error) }), Effect.as(network))),

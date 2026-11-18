@@ -11,8 +11,6 @@ import { NativeHost, NativeHostUnavailable, nativeHostLayer } from "./index"
 import { WindowsProcessObserver, WindowsProcessObserverUnavailable, nativeWindowsProcessObserverLayer } from "./windows-process-observer"
 import { WindowsProcessId } from "@magnitudedev/utils/windows-native"
 import { applicationStateDirectory } from "./application-state-directory"
-import { SERVER_DATA_DIRECTORY, isServerProfileActive } from "./server-profile"
-import { BunFileSystem } from "@effect/platform-bun"
 import { LINUX_DESKTOP_EXECUTABLE_PATH } from "@magnitudedev/release/executables"
 import { NativeMacApplicationInstallation, waitForMacApplicationInstallation } from "./mac-update-installation"
 
@@ -37,9 +35,7 @@ export const makeDesktopApplicationHost = (developmentRepository: Option.Option<
   const windowsExecutable = process.env.MAGNITUDE_DESKTOP_PATH ? Effect.succeed(process.env.MAGNITUDE_DESKTOP_PATH)
     : localAppDataDirectory.pipe(Effect.map(directory => join(directory, "Programs/Magnitude/Magnitude.exe")),
       Effect.mapError(error => new ApplicationLaunchFailed({ message: error.message })))
-  // Where the server profile is set up, every CLI command addresses the service's profile.
-  const serverProfile = desktopIsolatedProfile ? Effect.succeed(false) : isServerProfileActive(process.platform).pipe(Effect.provide(BunFileSystem.layer))
-  const applicationDataDirectory = serverProfile.pipe(Effect.map(server => server ? SERVER_DATA_DIRECTORY : desktopDataDirectory))
+  const applicationDataDirectory = Effect.succeed(desktopDataDirectory)
   const stateDirectory = applicationDataDirectory.pipe(Effect.flatMap(dataDirectory =>
     applicationStateDirectory({ platform: process.platform, dataDirectory, override: Option.fromNullable(process.env.MAGNITUDE_DESKTOP_STATE_DIR) })))
   const endpoint = process.platform === "win32" ? stateDirectory.pipe(Effect.flatMap(directory => Effect.flatMap(NativeHost, native => native.inspectEndpoint(directory))),
@@ -118,6 +114,6 @@ export const makeDesktopApplicationHost = (developmentRepository: Option.Option<
   const updateDesktopApplication = (action: import("@magnitudedev/sdk/desktop-host").ApplicationUpdateAction) =>
     endpoint.pipe(Effect.flatMap(path => requestApplicationUpdate(path, action)))
 
-  return { updateDesktopApplication, desktopIsolatedProfile, desktopDataDirectory, serverProfile, applicationDataDirectory, desktopServiceOrigin, desktopApplication, startDesktopApplication, stopDesktopApplication, readDesktopLoginStartup, setDesktopLoginStartup }
+  return { updateDesktopApplication, desktopIsolatedProfile, desktopDataDirectory, applicationDataDirectory, desktopServiceOrigin, desktopApplication, startDesktopApplication, stopDesktopApplication, readDesktopLoginStartup, setDesktopLoginStartup }
 
 }

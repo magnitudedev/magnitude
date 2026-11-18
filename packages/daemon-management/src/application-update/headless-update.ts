@@ -4,7 +4,7 @@ import { ApplicationUpdateControlFailed, type ApplicationUpdateAction } from "@m
 import type { ApplicationUpdate } from "./application-update"
 import { makeUpdateSchedule } from "./update-schedule"
 
-const serverInstallRefusal = "A server set up with `magnitude server setup` installs a downloaded update by itself once it is idle; restart it to install sooner. For `magnitude serve` started by hand, stop it and run `magnitude update install`."
+const serverInstallRefusal = "A running `magnitude serve` installs a downloaded update by itself once it is idle, when it can without a password; restart it to install sooner. Otherwise stop it and run `magnitude update install`."
 
 /** A running server owns preparation only; no control request can install or stop it. `installRefusal` says how it is updated instead. */
 export const makeHeadlessUpdateControl = (updates: ApplicationUpdate, start: Effect.Effect<void> = Effect.void, installRefusal: string = serverInstallRefusal) => Effect.gen(function* () {

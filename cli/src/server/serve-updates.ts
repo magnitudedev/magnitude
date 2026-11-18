@@ -229,7 +229,7 @@ export const idleInstallationSystem = (options: {
   const store = preparation(options.runtime, options.profile, options.addon, options.owner).pipe(
     Effect.map(prepared => prepared.store), Effect.provide(privateFiles))
   const installLinux = Effect.scoped(Effect.gen(function* () {
-    yield* acquireApplicationMaintenance(options.stateDirectory, options.profile.sharedControl)
+    yield* acquireApplicationMaintenance(options.stateDirectory)
     const continuation = yield* makeUnixProcessContinuation(options.addon)
     yield* acquireUpdateInstallationLease(options.stateDirectory)
     const version = yield* completeLinuxForegroundUpdate(options.profile.dataDirectory, "Server").pipe(Effect.provideServiceEffect(PreparedUpdateStore, store), Effect.provide(nodeTerminalCommand))
@@ -240,7 +240,7 @@ export const idleInstallationSystem = (options: {
   const standaloneRoot = standaloneInstallationRoot(options.runtime, platform)
   /** Unpacks beside the running version, makes it current and restarts into it; Windows asks its launcher to restart. */
   const installStandalone = Effect.scoped(Effect.gen(function* () {
-    yield* acquireApplicationMaintenance(options.stateDirectory, options.profile.sharedControl)
+    yield* acquireApplicationMaintenance(options.stateDirectory)
     const continuation = platform === "win32" ? Option.none() : Option.some(yield* makeUnixProcessContinuation(options.addon))
     yield* acquireUpdateInstallationLease(options.stateDirectory)
     const prepared = yield* store

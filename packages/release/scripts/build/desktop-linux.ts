@@ -9,7 +9,7 @@ import { ReleaseArtifactSchema } from "../../src/contracts"
 import { sha256File } from "../../src/macos-app"
 import { LINUX_GLIBC_MINIMUM, LinuxPackageFormat, linuxPackageArchitecture, linuxPackageVersion, pacmanPackageIdentity } from "../../src/linux-package"
 import { linuxDesktopInstaller } from "../../src/targets"
-import { refreshDesktopDatabase, reloadSystemd, removeServerGrant, renderLinuxMaintainerScripts, renderPacmanInstallScript, restoreServerGrant } from "./linux-maintainer-scripts"
+import { refreshDesktopDatabase, reloadSystemd, removeServerGrant, renderLinuxMaintainerScripts, renderPacmanInstallScript, writeConvertedServerUnit } from "./linux-maintainer-scripts"
 import { verifyLinuxElfDirectory } from "./linux-elf"
 import { linuxPolkitActions, linuxSystemFiles } from "./linux-system-files"
 
@@ -98,7 +98,7 @@ export const validateLinuxSystemFiles = (paths: readonly string[], entry: (path:
     return yield* new DesktopBuildFailed({ message: "Linux installer must not contain global build-ID links that can conflict with other applications" })
   }
   if (paths.some(path => path === "etc/sudoers.d" || path.startsWith("etc/sudoers.d/") || path === "etc/sudoers")) {
-    return yield* new DesktopBuildFailed({ message: "Linux installer must not contain a sudoers rule; `magnitude server setup` writes it" })
+    return yield* new DesktopBuildFailed({ message: "Linux installer must not contain a sudoers rule" })
   }
   for (const file of linuxSystemFiles) {
     const found = entry(file.path)
@@ -240,7 +240,7 @@ const buildElectronInstaller = (options: LinuxInstallerOptions & { readonly form
   const specTemplate = join(stage, "desktop.spec.ejs")
   const spec = yield* fs.readFileString(join(root, "packages/release/resources/linux/desktop.spec.ejs"))
   yield* fs.writeFileString(specTemplate, spec.replaceAll("@MAGNITUDE_INSTALL_BEGIN@", begin).replaceAll("@MAGNITUDE_INSTALL_END@", end).replaceAll("@MAGNITUDE_REMOVE_SERVER_GRANT@", removeServerGrant)
-    .replaceAll("@MAGNITUDE_RESTORE_SERVER_GRANT@", restoreServerGrant).replaceAll("@MAGNITUDE_RELOAD_SYSTEMD@", reloadSystemd).replaceAll("@MAGNITUDE_REFRESH_DESKTOP_DATABASE@", refreshDesktopDatabase)
+    .replaceAll("@MAGNITUDE_CONVERT_SERVER_UNIT@", writeConvertedServerUnit).replaceAll("@MAGNITUDE_RELOAD_SYSTEMD@", reloadSystemd).replaceAll("@MAGNITUDE_REFRESH_DESKTOP_DATABASE@", refreshDesktopDatabase)
     .replaceAll("@MAGNITUDE_SYSTEM_INSTALL@", linuxSystemFiles.map(file => `install -D -m ${file.mode.toString(8).padStart(4, "0")} '${file.source}' '%{buildroot}/${file.path}'`).join("\n"))
     .replaceAll("@MAGNITUDE_SYSTEM_FILES@", linuxSystemFiles.map(file => `%attr(${file.mode.toString(8).padStart(4, "0")},root,root) /${file.path}`).join("\n")))
   const desktopTemplate = join(stage, "magnitude.desktop.ejs")
