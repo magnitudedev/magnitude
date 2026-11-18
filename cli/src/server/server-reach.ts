@@ -49,8 +49,8 @@ export const renderServerReach = (reach: ServerReach): readonly string[] => {
     lines.push(`From other devices: http://<this machine>:${network.port}; the browser app asks for the network access key.`)
   } else {
     lines.push(
-      "Only this computer can reach it. To use it from other devices, turn on network access in",
-      `Settings → Network access, or set "network": { "enabled": true } in ${reach.configPath} and restart.`,
+      "Only this computer can reach it. To use it from other devices, turn on network access in the browser app",
+      `(${reach.endpoint}, Settings → Network access), or set "network": { "enabled": true } in ${reach.configPath} and restart.`,
       `Or reach it through an SSH tunnel: ${sshTunnel(reach.endpoint)}`,
     )
   }
