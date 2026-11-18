@@ -2,9 +2,6 @@
 #if SEISMIC_TUNE_HISTORY_STAGE
 #define ATTENTION_HISTORY_STAGING 1
 #endif
-#define ATTENTION_KEY_CODE_WORDS SEISMIC_DIM_KC
-#define ATTENTION_VALUE_CODE_WORDS SEISMIC_DIM_VC
-#define ATTENTION_KEY_COEFFICIENTS SEISMIC_DIM_KP
 // Sink logits (SK): an unsplit tile's direct store and the split merge add
 // each head's sink to its denominator (`attention::normalizer`).
 #define ATTENTION_SINKS SEISMIC_DIM_SK
@@ -30,7 +27,7 @@
 #include "lib/attention/prefill.cuh"
 
 // Affine history planes: codes [T, KV, W * B / 32] u32 and group (scale,
-// zero) pairs [T, KV, W / 16] f16, one aligned u32 per pair.
+// zero) pairs [T, KV, 2 * W / GROUP] f16, one aligned u32 per pair.
 #define HISTORY()                                                                              \
     attention::AffineHistory {                                                                 \
         reinterpret_cast<const attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY_CODES)),   \
@@ -163,9 +160,9 @@ extern "C" __global__ void __launch_bounds__(256)
     if (staged.valid[slot * 8 + row / 32] & (1u << (row & 31))) {
         const int token = staged.tiles[slot * staged.tile_stride] * 256 + row;
         const auto source = HISTORY().reads().vectors(token, kv);
-        k = attention::prefill::key_chunk(source.key_codes[chunk * 2], source.key_codes[chunk * 2 + 1],
-                                        source.key_pairs[chunk * 8 / attention::GROUP]);
-        v = attention::prefill::value_chunk(source.value_codes[chunk], source.value_pairs[chunk * 8 / attention::GROUP]);
+        k = attention::key_chunk(source.key_codes[chunk * 2], source.key_codes[chunk * 2 + 1],
+                                 source.key_pairs[chunk * 8 / attention::GROUP]);
+        v = attention::value_chunk(source.value_codes[chunk], source.value_pairs[chunk * 8 / attention::GROUP]);
     }
     reinterpret_cast<uint4 *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_HISTORY_KEYS))[index] = k;
     reinterpret_cast<uint4 *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_HISTORY_VALUES))[index] = v;

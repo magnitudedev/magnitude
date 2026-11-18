@@ -1095,30 +1095,6 @@ struct affine_history {
         decode(held_encoding<KEY>(x), x);
     }
 
-    // Code piece c (16 bytes: 128 / B codes, within one group) of one
-    // vector's code row decoded to F16 (`decode_pair`), element pairs with
-    // the low element in the low half. DIRECT reads history through it and
-    // fresh rows through `held`, which decodes with the same `decode_pair`:
-    // one F16 FMA, a single rounding of code * scale + zero, so a key reads
-    // the same bits before and after its append.
-    template <uint B>
-    static inline void decode_piece(device const uint *codes, device const half *coefficients, uint c,
-        thread uint (&packed)[64 / B]) {
-        constexpr uint PER = 128 / B;
-        constexpr uint MASK = (1u << B) - 1u;
-        static_assert(ATTENTION_GROUP % PER == 0, "a code piece lies in one group");
-        const uint4 words = *reinterpret_cast<device const uint4 *>(codes + c * 4);
-        const half2 pair = *reinterpret_cast<device const half2 *>(
-            coefficients + (c * PER / ATTENTION_GROUP) * 2);
-        ATTENTION_UNROLL
-        for (uint i = 0; i < PER; i += 2) {
-            const uint word = words[i * B / 32];
-            const uint shift = (i * B) % 32;
-            packed[i / 2] =
-                as_type<uint>(decode_pair(((word >> shift) & MASK) | (((word >> (shift + B)) & MASK) << 16), pair));
-        }
-    }
-
     // Rows [first, first + KEYS) of one kv head decoded into `staged`, one
     // code piece per item; rows at or past `end` are zero.
     template <uint B, uint THREADS, uint KEYS = PREFILL_KEYS>
@@ -1142,7 +1118,7 @@ struct affine_history {
                 device const half *coefficients = slab::row<half>(coefficient_table, ulong(t), rows_per_slab,
                     SEISMIC_DIM_KV * PAIRS * 2);
                 uint packed[PER / 2];
-                decode_piece<B>(codes + ulong(kv_head) * ROW_WORDS, coefficients + ulong(kv_head) * PAIRS * 2, c,
+                read_piece<B>(codes + ulong(kv_head) * ROW_WORDS, coefficients + ulong(kv_head) * PAIRS * 2, c,
                     packed);
                 ATTENTION_UNROLL
                 for (uint j = 0; j < PER / 2; j += 4)
@@ -1180,7 +1156,7 @@ struct affine_history {
             const uint c = item % PIECES;
             uint packed[PER / 2];
             if (decode) {
-                decode_piece<B>(codes + kv_head * ROW_WORDS, coefficients + kv_head * PAIRS * 2, c, packed);
+                read_piece<B>(codes + kv_head * ROW_WORDS, coefficients + kv_head * PAIRS * 2, c, packed);
             } else {
                 ATTENTION_UNROLL
                 for (uint j = 0; j < PER / 2; ++j)
@@ -1248,10 +1224,9 @@ struct affine_history {
             }
         }
 
-        // Decodes each element pair in F16 (`decode_pair`).
+        // Decodes each piece in F16 (`decode_piece`).
         template <uint PITCH = WC + 8>
         inline void store(threadgroup half *staged, uint lane) const {
-            constexpr uint MASK = (1u << B) - 1u;
             ATTENTION_UNROLL
             for (uint n = 0; n < COUNT; ++n) {
                 const uint item = lane + n * 32;
@@ -1259,13 +1234,7 @@ struct affine_history {
                     continue;
                 threadgroup half *to = staged + (item / PIECES) * PITCH + (item % PIECES) * PER;
                 uint packed[PER / 2];
-                ATTENTION_UNROLL
-                for (uint i = 0; i < PER; i += 2) {
-                    const uint word = words[n][i * B / 32];
-                    const uint shift = (i * B) % 32;
-                    packed[i / 2] = as_type<uint>(
-                        decode_pair(((word >> shift) & MASK) | (((word >> (shift + B)) & MASK) << 16), pair[n]));
-                }
+                decode_piece<B>(words[n], pair[n], packed);
                 ATTENTION_UNROLL
                 for (uint j = 0; j < PER / 2; j += 4)
                     *reinterpret_cast<threadgroup uint4 *>(to + 2 * j) =

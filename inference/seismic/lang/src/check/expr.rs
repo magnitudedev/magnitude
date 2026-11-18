@@ -91,6 +91,26 @@ fn same_bound(a: &Option<CheckedExpr>, b: &Option<CheckedExpr>) -> bool {
     }
 }
 
+/// An operand whose value its literals alone fix: a literal, or integer
+/// literals combined by `+ - * / %` (module constants are literals once
+/// parsed). Like a literal it has no dtype of its own, so on the left of an
+/// operator it takes the right operand's, and `(32 / 8) * N` is the integer
+/// `4 N` exactly as `4 * N` is, never word arithmetic on a converted `N`.
+fn literal_constant(e: &ast::Expr) -> bool {
+    fn integer(e: &ast::Expr) -> bool {
+        match &e.kind {
+            A::Int(_) => true,
+            A::Binary {
+                op: BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem,
+                lhs,
+                rhs,
+            } => integer(lhs) && integer(rhs),
+            _ => false,
+        }
+    }
+    matches!(e.kind, A::Float(_)) || integer(e)
+}
+
 fn quantity(ty: &ValueType) -> bool {
     matches!(ty, ValueType::Integer | ValueType::Index { .. })
 }
@@ -1260,8 +1280,9 @@ impl<'a> Checker<'a> {
             Some(l0.ty.clone())
         };
         let r = self.expr(rhs, r_hint.as_ref().or(hint))?;
-        // A literal on the left adopts the right operand's dtype.
-        let l = if matches!(lhs.kind, A::Int(_) | A::Float(_)) && !is_shift {
+        // A literal on the left, or integer literals combined by arithmetic
+        // (`literal_constant`), adopts the right operand's dtype.
+        let l = if literal_constant(lhs) && !is_shift {
             self.expr(lhs, Some(&r.ty))?
         } else {
             l0
@@ -2273,6 +2294,19 @@ mod word_value_tests {
             error.contains("`index` needs its bound: `index[B](w)`"),
             "{error}"
         );
+    }
+
+    /// Integer literals combined by arithmetic on the left of an operator
+    /// take the right operand's type, as one literal does: a branch on
+    /// `(32 / 8) * N == W` proves `i / 4 < N` exactly as `4 * N == W` does.
+    #[test]
+    fn a_literal_constant_operand_adopts_the_other_operands_type() {
+        for factor in ["4", "(32 / 8)", "(2 * 2)", "(6 - 2)"] {
+            check(&format!(
+                "fn probe[N, W](codes: &tensor[N] u32, x: &mut tensor[W] f32) where 4 * N == W or 8 * N == W:\n    if {factor} * N == W:\n        for i in 0..W:\n            x[i] = f32(codes[i / 4])\n"
+            ))
+            .unwrap_or_else(|error| panic!("{factor}: {error}"));
+        }
     }
 
     #[test]

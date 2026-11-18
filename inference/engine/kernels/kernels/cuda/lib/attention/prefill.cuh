@@ -26,7 +26,7 @@
 // the previous tile; named barriers hand the two stages back and forth. Without
 // producer warps (ATTENTION_PRODUCER_WARPS = 0) the MMA warps copy the codes
 // with `cp.async` as dense tiles are copied and decode each tile once it lands
-// (`stage_codes`, `decode_codes`). The products are then the dense ones over
+// (`AffineTiles` in `history.cuh`). The products are then the dense ones over
 // the decoded history (the Metal and Vulkan staging).
 //
 // The rows policy supplies the query tile and fresh tiles and stores the
@@ -269,270 +269,30 @@ __device__ __forceinline__ void stage_history(const DenseReads &history, u8 *k_t
 
 // ---------------------------------------------------------------------------
 #ifdef ATTENTION_AFFINE_HISTORY
-// Affine history tiles, produced by the producer warps.
+// Affine history tiles, decoded by the producer warps or, without them, by
+// the MMA warps from code stages (`AffineTiles`, `history.cuh`).
 
 // Producer threads (the entry's ATTENTION_PRODUCER_WARPS warps; 0 for dense
-// history, which has none), the 16-byte code pieces of a key and a value row,
-// and the codes of one piece (all in one group). Fewer producer warps than MMA
-// warps leave the MMA warps more registers (a block's registers split evenly
-// over its threads).
+// history, which has none). Fewer producer warps than MMA warps leave the MMA
+// warps more registers (a block's registers split evenly over its threads).
 constexpr int PRODUCERS = ATTENTION_PRODUCER_WARPS * 32;
-constexpr int PRODUCER_STRIDE = PRODUCERS > 0 ? PRODUCERS : 1;
-// Key code pieces of one staged key piece.
-constexpr int KEY_PIECES = PIECE * KEY_BITS / 128;
-// Value pieces of one output window.
-constexpr int VALUE_PIECES = WINDOW * VALUE_BITS / 128;
-constexpr int KEY_ITEMS = (KEYS * KEY_PIECES + PRODUCER_STRIDE - 1) / PRODUCER_STRIDE;
-constexpr int VALUE_ITEMS = (KEYS * VALUE_PIECES + PRODUCER_STRIDE - 1) / PRODUCER_STRIDE;
-constexpr int KEY_PIECE_CODES = 128 / KEY_BITS;
-constexpr int VALUE_PIECE_CODES = 128 / VALUE_BITS;
-static_assert(GROUP % KEY_PIECE_CODES == 0 && GROUP % VALUE_PIECE_CODES == 0,
-              "a code piece lies in one group");
-// Codes decode in packed F16 (the affine operands' element): code c sits in
-// the mantissa of the F16 1024 (0x6400 | c, exact), 1024 is subtracted
-// exactly, and one F16x2 fma applies the group's (scale, zero) `pair`,
-// rounding once (the F32 fma rounded to F16 gives the same operands on the
-// goldens), two dimensions per instruction. Every affine operand, history or
-// fresh, is decoded here.
-__device__ __forceinline__ u32 half_decode(u32 biased, u32 pair) {
-    const u32 scales = __byte_perm(pair, 0, 0x1010);
-    const u32 zeros = __byte_perm(pair, 0, 0x3232);
-    u32 code, value;
-    asm("sub.rn.f16x2 %0, %1, %2;" : "=r"(code) : "r"(biased), "r"(0x64006400u));
-    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(value) : "r"(code), "r"(scales), "r"(zeros));
-    return value;
-}
 
-// Eight 8-bit codes (two words) decoded with their group's (scale, zero)
-// `pair` into one operand chunk.
-__device__ __forceinline__ uint4 key_chunk(u32 low, u32 high, u32 pair) {
-    return make_uint4(half_decode(__byte_perm(low, 0x64646464u, 0x4140), pair),
-                      half_decode(__byte_perm(low, 0x64646464u, 0x4342), pair),
-                      half_decode(__byte_perm(high, 0x64646464u, 0x4140), pair),
-                      half_decode(__byte_perm(high, 0x64646464u, 0x4342), pair));
-}
-
-// Eight 4-bit codes (one word) decoded with their group's pair into one
-// operand chunk: dimension pair j is byte j's low and high nibbles.
-__device__ __forceinline__ uint4 value_chunk(u32 word, u32 pair) {
-    // Byte j of `low` holds nibble 2j, of `high` nibble 2j + 1; pair j
-    // gathers both into bytes 0 and 1, then under the F16 1024's exponent.
-    const u32 low = word & 0x0F0F0F0Fu;
-    const u32 high = (word >> 4) & 0x0F0F0F0Fu;
-    u32 biased[4];
-#pragma unroll
-    for (int j = 0; j < 4; ++j)
-        biased[j] = __byte_perm(__byte_perm(low, high, static_cast<u32>(j) | (static_cast<u32>(4 + j) << 4)),
-                                0x64646464u, 0x4140);
-    return make_uint4(half_decode(biased[0], pair), half_decode(biased[1], pair),
-                      half_decode(biased[2], pair), half_decode(biased[3], pair));
-}
-
-// A lane's share of an encoded vector decoded into its DPL operands, as F32
-// (exact): dimension pairs decode as a history tile's (`half_decode`).
-template <int B>
-__device__ __forceinline__ void decoded(const LaneEncoding<B> &e, float (&x)[DPL]) {
-    typedef LaneCodes<B> Codes;
-    const u32 pair = element::F16::pack2(e.scale, e.zero);
-#pragma unroll
-    for (int d = 0; d < DPL; d += 2) {
-        const u32 high = d + 1 < DPL ? Codes::at(e.codes, d + 1) : 0u;
-        const u32 biased = (0x6400u | Codes::at(e.codes, d)) | ((0x6400u | high) << 16);
-        const float2 values = seismic_unpack_f16x2(half_decode(biased, pair));
-        x[d] = values.x;
-        if (d + 1 < DPL) x[d + 1] = values.y;
+// The operand tiles affine history decodes into: KEYS-row K piece and V
+// window tiles in the swizzled layout.
+struct OperandTiles {
+    static constexpr int KEYS = prefill::KEYS;
+    static constexpr int PIECE = prefill::PIECE;
+    static constexpr int PIECES = prefill::PIECES;
+    static constexpr int PIECE_CHUNKS = prefill::PIECE_CHUNKS;
+    static constexpr int WINDOW = prefill::WINDOW;
+    static constexpr int WINDOW_CHUNKS = prefill::WINDOW_CHUNKS;
+    static constexpr int PRODUCERS = prefill::PRODUCERS;
+    template <int ROW_CHUNKS>
+    __device__ static __forceinline__ u32 swizzled(int row, int chunk) {
+        return prefill::swizzled<ROW_CHUNKS>(row, chunk);
     }
-}
-
-// A producer thread's codes and (scale, zero) pairs of one affine unit, held
-// in registers between their loads and their decode.
-struct ProducedCodes {
-    uint4 key_bits[KEY_ITEMS];
-    u32 key_pairs[KEY_ITEMS];
-    uint4 value_bits[VALUE_ITEMS];
-    u32 value_pairs[VALUE_ITEMS];
 };
-
-// Producer thread `thread`'s loads of a contiguous affine history slice
-// `[first, first + rows)`. Every load is issued before any is used.
-__device__ __forceinline__ ProducedCodes fetch_produced(const AffineReads &history, int first, int rows, int kv,
-                                                        int piece, int column0, int thread) {
-    const int key_piece0 = piece * KEY_PIECES;
-    const int value_piece0 = column0 * VALUE_BITS / 128;
-    const bool values = piece + 1 == PIECES;
-    ProducedCodes codes;
-#pragma unroll
-    for (int k = 0; k < KEY_ITEMS; ++k) {
-        const int index = thread + k * PRODUCERS;
-        const int token = first + index / KEY_PIECES;
-        const int code = key_piece0 + index % KEY_PIECES;
-        codes.key_bits[k] = make_uint4(0, 0, 0, 0);
-        codes.key_pairs[k] = 0u;
-        if (index < rows * KEY_PIECES) {
-            const AffineReads::Vectors v = history.vectors(token, kv);
-            codes.key_bits[k] = seismic_ld_nc_v4(v.key_codes + code * 4);
-            codes.key_pairs[k] = seismic_ld_nc_u32(v.key_pairs + code * KEY_PIECE_CODES / GROUP);
-        }
-    }
-#pragma unroll
-    for (int k = 0; k < VALUE_ITEMS; ++k) {
-        const int index = thread + k * PRODUCERS;
-        const int token = first + index / VALUE_PIECES;
-        const int code = value_piece0 + index % VALUE_PIECES;
-        codes.value_bits[k] = make_uint4(0, 0, 0, 0);
-        codes.value_pairs[k] = 0u;
-        if (values && index < rows * VALUE_PIECES) {
-            const AffineReads::Vectors v = history.vectors(token, kv);
-            codes.value_bits[k] = seismic_ld_nc_v4(v.value_codes + code * 4);
-            codes.value_pairs[k] = seismic_ld_nc_u32(v.value_pairs + code * VALUE_PIECE_CODES / GROUP);
-        }
-    }
-    return codes;
-}
-
-// Producer thread `thread`'s fetched codes of rows [0, rows) decoded into the
-// swizzled K operand tile (key piece `piece`) and, with the last piece, the V
-// operand tile, each code piece with its group's (scale, zero) pair.
-__device__ __forceinline__ void store_produced(const ProducedCodes &codes, u8 *k_tile, u8 *v_tile, int rows,
-                                               int piece, int thread) {
-    const bool values = piece + 1 == PIECES;
-#pragma unroll
-    for (int k = 0; k < KEY_ITEMS; ++k) {
-        const int index = thread + k * PRODUCERS;
-        if (index < rows * KEY_PIECES) {
-            // A 16-byte key piece: 16 codes, two operand chunks.
-            const int r = index / KEY_PIECES;
-            const int chunk = (index % KEY_PIECES) * 2;
-            const u32 pair = codes.key_pairs[k];
-            *reinterpret_cast<uint4 *>(k_tile + swizzled<PIECE_CHUNKS>(r, chunk)) =
-                key_chunk(codes.key_bits[k].x, codes.key_bits[k].y, pair);
-            *reinterpret_cast<uint4 *>(k_tile + swizzled<PIECE_CHUNKS>(r, chunk + 1)) =
-                key_chunk(codes.key_bits[k].z, codes.key_bits[k].w, pair);
-        }
-    }
-#pragma unroll
-    for (int k = 0; k < VALUE_ITEMS; ++k) {
-        const int index = thread + k * PRODUCERS;
-        if (values && index < rows * VALUE_PIECES) {
-            // A 16-byte value piece: 32 codes, four operand chunks.
-            const int r = index / VALUE_PIECES;
-            const int chunk = (index % VALUE_PIECES) * 4;
-            const u32 pair = codes.value_pairs[k];
-            *reinterpret_cast<uint4 *>(v_tile + swizzled<WINDOW_CHUNKS>(r, chunk)) =
-                value_chunk(codes.value_bits[k].x, pair);
-            *reinterpret_cast<uint4 *>(v_tile + swizzled<WINDOW_CHUNKS>(r, chunk + 1)) =
-                value_chunk(codes.value_bits[k].y, pair);
-            *reinterpret_cast<uint4 *>(v_tile + swizzled<WINDOW_CHUNKS>(r, chunk + 2)) =
-                value_chunk(codes.value_bits[k].z, pair);
-            *reinterpret_cast<uint4 *>(v_tile + swizzled<WINDOW_CHUNKS>(r, chunk + 3)) =
-                value_chunk(codes.value_bits[k].w, pair);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Affine history decoded by the MMA warps themselves (no producer warps): a
-// unit's code rows and (scale, zero) pairs are copied with `cp.async` into a
-// code stage beside its operand stage, as dense history is copied, and
-// decoded into the operand stage once they land. The MMA warps keep the whole
-// register file (dense's budget); the decode is a few ALU instructions per
-// operand beside the tensor-core products. Heads of 128 to 256 columns: every
-// code and pair row is whole 16-byte chunks.
-//
-// A code stage: key codes [KEYS][PIECE] u8, key pairs [KEYS][PIECE / GROUP]
-// u32, value codes [KEYS][WINDOW / 2] u8, value pairs [KEYS][WINDOW / GROUP]
-// u32.
-constexpr int KEY_PAIR_CHUNKS = PIECE / GROUP * 4 / 16;
-constexpr int VALUE_PAIR_CHUNKS = WINDOW / GROUP * 4 / 16;
-constexpr int KEY_ROW_CHUNKS = KEY_PIECES + KEY_PAIR_CHUNKS;
-constexpr int CODE_ROW_CHUNKS = KEY_ROW_CHUNKS + VALUE_PIECES + VALUE_PAIR_CHUNKS;
-constexpr int CODE_STAGE_BYTES = KEYS * CODE_ROW_CHUNKS * 16;
-constexpr int KEY_PAIRS_AT = KEYS * KEY_PIECES * 16;
-constexpr int VALUE_CODES_AT = KEY_PAIRS_AT + KEYS * KEY_PAIR_CHUNKS * 16;
-constexpr int VALUE_PAIRS_AT = VALUE_CODES_AT + KEYS * VALUE_PIECES * 16;
-
-// Copy the affine unit's history rows [0, rows) (`keys`, as `stage_history`;
-// key piece `piece`, and with the last piece the output window's values from
-// column0) into code stage `codes` by `threads` threads of which this is
-// `thread`: threads / KEYS consecutive threads per row, so each locates its
-// row's slab once and a row's chunks are copied contiguously. A zero row, or
-// one past `rows`, is zero codes and pairs (they decode to exact zeros).
-template <class Keys>
-__device__ __forceinline__ void stage_codes(const AffineReads &history, u8 *codes, const Keys &keys,
-                                            int rows, int kv, int piece, int column0, int thread,
-                                            int threads) {
-    const int per_row = threads / KEYS;
-    const int r = thread / per_row;
-    const int raw = keys(min(r, KEYS - 1));
-    const int token = r < rows ? raw : -1;
-    const bool live = token >= 0;
-    // A dead row still names a valid source (the tile's first row).
-    const int zero = keys(0);
-    const AffineReads::Vectors v = history.vectors(live ? token : zero, kv);
-    const u32 bytes = live ? 16u : 0u;
-    const u8 *key_codes = reinterpret_cast<const u8 *>(v.key_codes) + piece * PIECE;
-    const u8 *key_pairs = reinterpret_cast<const u8 *>(v.key_pairs) + piece * PIECE / GROUP * 4;
-    const u8 *value_codes = reinterpret_cast<const u8 *>(v.value_codes) + column0 / 2;
-    const u8 *value_pairs = reinterpret_cast<const u8 *>(v.value_pairs) + column0 / GROUP * 4;
-    const int chunks = piece + 1 == PIECES ? CODE_ROW_CHUNKS : KEY_ROW_CHUNKS;
-    for (int c = thread % per_row; c < chunks; c += per_row) {
-        u8 *to;
-        const u8 *from;
-        if (c < KEY_PIECES) {
-            to = codes + (r * KEY_PIECES + c) * 16;
-            from = key_codes + c * 16;
-        } else if (c < KEY_ROW_CHUNKS) {
-            const int d = c - KEY_PIECES;
-            to = codes + KEY_PAIRS_AT + (r * KEY_PAIR_CHUNKS + d) * 16;
-            from = key_pairs + d * 16;
-        } else if (c < KEY_ROW_CHUNKS + VALUE_PIECES) {
-            const int d = c - KEY_ROW_CHUNKS;
-            to = codes + VALUE_CODES_AT + (r * VALUE_PIECES + d) * 16;
-            from = value_codes + d * 16;
-        } else {
-            const int d = c - KEY_ROW_CHUNKS - VALUE_PIECES;
-            to = codes + VALUE_PAIRS_AT + (r * VALUE_PAIR_CHUNKS + d) * 16;
-            from = value_pairs + d * 16;
-        }
-        seismic_cp_async_16_zfill(to, from, bytes);
-    }
-}
-
-// Decode rows [0, rows) of code stage `codes` into the swizzled K operand
-// tile and, with the last piece, the V operand tile, by `threads` threads of
-// which this is `thread`.
-__device__ __forceinline__ void decode_codes(const u8 *codes, u8 *k_tile, u8 *v_tile, bool values, int rows,
-                                             int thread, int threads) {
-    for (int index = thread; index < rows * KEY_PIECES; index += threads) {
-        // A 16-byte key piece: 16 codes, two operand chunks.
-        const int r = index / KEY_PIECES;
-        const int p = index % KEY_PIECES;
-        const uint4 bits = *reinterpret_cast<const uint4 *>(codes + index * 16);
-        const u32 pair = *reinterpret_cast<const u32 *>(
-            codes + KEY_PAIRS_AT + r * KEY_PAIR_CHUNKS * 16 + p * KEY_PIECE_CODES / GROUP * 4);
-        *reinterpret_cast<uint4 *>(k_tile + swizzled<PIECE_CHUNKS>(r, 2 * p)) =
-            key_chunk(bits.x, bits.y, pair);
-        *reinterpret_cast<uint4 *>(k_tile + swizzled<PIECE_CHUNKS>(r, 2 * p + 1)) =
-            key_chunk(bits.z, bits.w, pair);
-    }
-    if (!values) return;
-    for (int index = thread; index < rows * VALUE_PIECES; index += threads) {
-        // A 16-byte value piece: 32 codes, four operand chunks.
-        const int r = index / VALUE_PIECES;
-        const int p = index % VALUE_PIECES;
-        const uint4 bits = *reinterpret_cast<const uint4 *>(codes + VALUE_CODES_AT + index * 16);
-        const u32 pair = *reinterpret_cast<const u32 *>(
-            codes + VALUE_PAIRS_AT + r * VALUE_PAIR_CHUNKS * 16 + p * VALUE_PIECE_CODES / GROUP * 4);
-        *reinterpret_cast<uint4 *>(v_tile + swizzled<WINDOW_CHUNKS>(r, 4 * p)) =
-            value_chunk(bits.x, pair);
-        *reinterpret_cast<uint4 *>(v_tile + swizzled<WINDOW_CHUNKS>(r, 4 * p + 1)) =
-            value_chunk(bits.y, pair);
-        *reinterpret_cast<uint4 *>(v_tile + swizzled<WINDOW_CHUNKS>(r, 4 * p + 2)) =
-            value_chunk(bits.z, pair);
-        *reinterpret_cast<uint4 *>(v_tile + swizzled<WINDOW_CHUNKS>(r, 4 * p + 3)) =
-            value_chunk(bits.w, pair);
-    }
-}
+typedef AffineTiles<OperandTiles> Affine;
 
 #endif
 
@@ -1133,7 +893,7 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
     typedef Operands<History> Ops;
     constexpr bool CODED = History::CODED;
     // Affine history is decoded by producer warps, or without them by the
-    // MMA warps from code stages (`stage_codes`, `decode_codes`).
+    // MMA warps from code stages (`AffineTiles::stage_codes`, `decode_codes`).
 #ifdef ATTENTION_AFFINE_HISTORY
     constexpr bool PRODUCED = CODED && PRODUCERS > 0;
     constexpr bool INLINE = CODED && PRODUCERS == 0;
@@ -1174,7 +934,7 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
     // are copied once the previous unit's are decoded, while its products run.
     constexpr int CODE_STAGES = SPLIT_SCORES ? 1 : STAGES;
 #ifdef ATTENTION_AFFINE_HISTORY
-    constexpr int STAGED_BYTES = STAGES * STAGE_BYTES + (INLINE ? CODE_STAGES * CODE_STAGE_BYTES : 0);
+    constexpr int STAGED_BYTES = STAGES * STAGE_BYTES + (INLINE ? CODE_STAGES * Affine::CODE_STAGE_BYTES : 0);
 #else
     constexpr int STAGED_BYTES = STAGES * STAGE_BYTES;
 #endif
@@ -1185,7 +945,7 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
     auto k_tile = [&](int b) { return kv_tiles + b * STAGE_BYTES; };
     auto v_tile = [&](int b) { return kv_tiles + b * STAGE_BYTES + KEYS * PIECE * 2; };
 #ifdef ATTENTION_AFFINE_HISTORY
-    auto code_tile = [&](int b) { return kv_tiles + STAGES * STAGE_BYTES + (b % CODE_STAGES) * CODE_STAGE_BYTES; };
+    auto code_tile = [&](int b) { return kv_tiles + STAGES * STAGE_BYTES + (b % CODE_STAGES) * Affine::CODE_STAGE_BYTES; };
 #endif
     constexpr int POSITION_ROWS = static_cast<int>(SEISMIC_CONST_VERIFY_ROWS);
     static_assert(POSITION_ROWS <= 32, "a verify launch's rows fit one warp's lanes");
@@ -1618,7 +1378,7 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
                     f0 = s.first;
                     rows_cnt = min(KEYS, max(table[s.span * 4 + 1] - f0, 0));
                 }
-                return fetch_produced(history, f0, rows_cnt, kv, s_piece, column0, thread);
+                return Affine::fetch_produced(history, f0, rows_cnt, kv, s_piece, column0, thread);
             };
             auto produce_straddled = [&](const Step &s, int held, int buffer, int s_piece, int column0) {
                 if constexpr (Rows::POSITIONS) {
@@ -1626,43 +1386,19 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
                     const int st = cold_lane_token(s.index, s.first, s_held, thread & 31);
                     int step_p = PRODUCERS;
                     asm("" : "+r"(step_p));
-                    const int k_total = s_held * KEY_PIECES;
+                    const int k_total = s_held * Affine::KEY_PIECES;
                     const int k_span = ((k_total + PRODUCERS - 1) / PRODUCERS) * PRODUCERS;
-                    const int v_total = s_piece + 1 == PIECES ? s_held * VALUE_PIECES : 0;
+                    const int v_total = s_piece + 1 == PIECES ? s_held * Affine::VALUE_PIECES : 0;
                     for (int base_idx = 0; base_idx < k_span + v_total; base_idx += step_p) {
                         const bool is_v = base_idx >= k_span;
                         const int local = (is_v ? base_idx - k_span : base_idx) + thread;
                         const int limit = is_v ? v_total : k_total;
-                        const int pieces = is_v ? VALUE_PIECES : KEY_PIECES;
+                        const int pieces = is_v ? Affine::VALUE_PIECES : Affine::KEY_PIECES;
                         const int r = min(local / pieces, KEYS - 1);
                         const int tok = __shfl_sync(0xffffffffu, st, r);
-                        if (local < limit && tok >= 0) {
-                            const int p = local % pieces;
-                            const AffineReads::Vectors v = history.vectors(tok, kv);
-                            if (!is_v) {
-                                const int code = s_piece * KEY_PIECES + p;
-                                const uint4 bits = seismic_ld_nc_v4(v.key_codes + code * 4);
-                                const u32 pair = seismic_ld_nc_u32(v.key_pairs + code * KEY_PIECE_CODES / GROUP);
-                                u8 *k_dst = k_tile(buffer);
-                                *reinterpret_cast<uint4 *>(k_dst + swizzled<PIECE_CHUNKS>(r, 2 * p)) =
-                                    key_chunk(bits.x, bits.y, pair);
-                                *reinterpret_cast<uint4 *>(k_dst + swizzled<PIECE_CHUNKS>(r, 2 * p + 1)) =
-                                    key_chunk(bits.z, bits.w, pair);
-                            } else {
-                                const int code = column0 * VALUE_BITS / 128 + p;
-                                const uint4 bits = seismic_ld_nc_v4(v.value_codes + code * 4);
-                                const u32 pair = seismic_ld_nc_u32(v.value_pairs + code * VALUE_PIECE_CODES / GROUP);
-                                u8 *v_dst = v_tile(buffer);
-                                *reinterpret_cast<uint4 *>(v_dst + swizzled<WINDOW_CHUNKS>(r, 4 * p)) =
-                                    value_chunk(bits.x, pair);
-                                *reinterpret_cast<uint4 *>(v_dst + swizzled<WINDOW_CHUNKS>(r, 4 * p + 1)) =
-                                    value_chunk(bits.y, pair);
-                                *reinterpret_cast<uint4 *>(v_dst + swizzled<WINDOW_CHUNKS>(r, 4 * p + 2)) =
-                                    value_chunk(bits.z, pair);
-                                *reinterpret_cast<uint4 *>(v_dst + swizzled<WINDOW_CHUNKS>(r, 4 * p + 3)) =
-                                    value_chunk(bits.w, pair);
-                            }
-                        }
+                        if (local < limit && tok >= 0)
+                            Affine::produce_piece(history.vectors(tok, kv), is_v, r, local % pieces, s_piece, column0,
+                                                  k_tile(buffer), v_tile(buffer));
                     }
                 }
             };
@@ -1670,7 +1406,7 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
                 const int column0 = window * WINDOW;
                 Step step = first_step();
                 int piece = 0;
-                ProducedCodes ahead{};
+                Affine::ProducedCodes ahead{};
                 const int first_held = units > 0 ? history_rows(step) : 0;
                 if (first_held > 0 && !is_straddle(step, first_held))
                     ahead = issue_fetch(step, piece, first_held, column0);
@@ -1685,20 +1421,20 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
                     const int next_held = j + 1 < units ? history_rows(next) : 0;
                     const bool next_prefetched = next_held > 0 && !is_straddle(next, next_held);
                     if (cur_held == KEYS && !cur_straddle) {
-                        const ProducedCodes current = ahead;
-                        ahead = next_prefetched ? issue_fetch(next, next_piece, next_held, column0) : ProducedCodes{};
+                        const Affine::ProducedCodes current = ahead;
+                        ahead = next_prefetched ? issue_fetch(next, next_piece, next_held, column0) : Affine::ProducedCodes{};
                         if (i >= STAGES) named_sync(EMPTY + b, THREADS);
-                        store_produced(current, k_tile(b), v_tile(b), KEYS, piece, thread);
+                        Affine::store_produced(current, k_tile(b), v_tile(b), KEYS, piece, thread);
                     } else {
                         if (i >= STAGES) named_sync(EMPTY + b, THREADS);
                         if (cur_straddle) produce_straddled(step, cur_held, b, piece, column0);
-                        else if (cur_held > 0) store_produced(ahead, k_tile(b), v_tile(b), cur_held, piece, thread);
+                        else if (cur_held > 0) Affine::store_produced(ahead, k_tile(b), v_tile(b), cur_held, piece, thread);
                         if (cur_held < KEYS) {
                             stage_fresh_at(step, cur_held, b, piece, column0, thread, PRODUCERS);
                             seismic_cp_async_commit();
                             seismic_cp_async_wait<0>();
                         }
-                        ahead = next_prefetched ? issue_fetch(next, next_piece, next_held, column0) : ProducedCodes{};
+                        ahead = next_prefetched ? issue_fetch(next, next_piece, next_held, column0) : Affine::ProducedCodes{};
                     }
                     __threadfence_block();
                     named_arrive(FULL + b, THREADS);
@@ -1989,10 +1725,10 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
 #ifdef ATTENTION_AFFINE_HISTORY
                     if constexpr (INLINE) {
                         if (Rows::POSITIONS && straddle) {
-                            stage_codes(history, code_tile(buffer), tokens_at(st), held, kv, tile_piece, column0,
+                            Affine::stage_codes(history, code_tile(buffer), tokens_at(st), held, kv, tile_piece, column0,
                                         threadIdx.x, MMA_THREADS);
                         } else {
-                            stage_codes(history, code_tile(buffer), [f0, lim](int r) { return f0 + r < lim ? f0 + r : -1; },
+                            Affine::stage_codes(history, code_tile(buffer), [f0, lim](int r) { return f0 + r < lim ? f0 + r : -1; },
                                         held, kv, tile_piece, column0, threadIdx.x, MMA_THREADS);
                         }
                     } else
@@ -2033,7 +1769,7 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
                     __syncthreads();
                     const int held = history_rows(current);
                     if (held > 0) {
-                        decode_codes(code_tile(0), k_tile(i % STAGES), v_tile(i % STAGES), true, held,
+                        Affine::decode_codes(code_tile(0), k_tile(i % STAGES), v_tile(i % STAGES), true, held,
                                      threadIdx.x, MMA_THREADS);
                     }
                     __syncthreads();
@@ -2072,7 +1808,7 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
                     if constexpr (INLINE) {
                         const int held = history_rows(current);
                         if (held > 0) {
-                            decode_codes(code_tile(i % STAGES), k_tile(i % STAGES), v_tile(i % STAGES),
+                            Affine::decode_codes(code_tile(i % STAGES), k_tile(i % STAGES), v_tile(i % STAGES),
                                          piece + 1 == PIECES, held, threadIdx.x, MMA_THREADS);
                             __syncthreads();
                         }

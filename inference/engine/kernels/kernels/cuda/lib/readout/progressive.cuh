@@ -57,6 +57,11 @@ __device__ __forceinline__ float value_of(u32 k) {
 
 __device__ __forceinline__ float infinity() { return __int_as_float(0x7f800000); }
 
+// Every reader here is written for the planes' bit order (`readout.seismic`):
+// a plane word per group of 32 codes, its 8 lanes the quarters' nibbles.
+static_assert(SEISMIC_CONST_PROGRESSIVE_GROUP == 32 && SEISMIC_CONST_PROGRESSIVE_LANES == 8,
+              "a plane word is one group, its nibbles the quarters' codes");
+
 // Quarter q of a bit plane word: the bit of code 8q + e in nibble e.
 __device__ __forceinline__ u32 quarter(u32 plane, u32 q) {
     return (plane >> q) & 0x11111111u;

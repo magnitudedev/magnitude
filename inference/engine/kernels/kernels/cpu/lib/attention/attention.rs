@@ -3,8 +3,8 @@
 // `attention_{decode,prefill}_k8v4`): the per-row preparation (optional RMS
 // norm and amplitude-scaled partial M-RoPE of every query and key head), a
 // row's key walk, decode partition bounds, the online-softmax absorb, the
-// fixed-order merge of partial states, the output gate, and the affine codec
-// (encode on append, decode on read). The counterpart of
+// fixed-order merge of partial states and the output gate; the affine codec
+// (encode on append, decode on read) is `history.rs`. The counterpart of
 // `metal/lib/attention/attention.h`, `cuda/lib/attention/*.cuh` and
 // `vulkan/lib/attention/*.glsl`; each entry keeps its own launch structure and
 // calls these.
@@ -19,7 +19,7 @@
 // backend is qualified under.
 
 use super::super::core::{activation, reduce, rounding::Rounding};
-use seismic::cpu::{math, slab::{SlabTensor, SlabWalk}, Dense, Element, Isa, Store, F16, F32, U32};
+use seismic::cpu::{math, slab::SlabTensor, Dense, Isa, Store, F32};
 use std::{marker::PhantomData, ops::Range};
 
 /// How many keys ahead of its scoring a key's rows are prefetched: a key
@@ -33,9 +33,6 @@ pub const BLOCK: usize = 32;
 /// The fewest keys of a decode partition: shorter rows use fewer partitions.
 pub const PARTITION_KEYS: usize = 128;
 
-/// Columns of the native SIMD affine group32 implementation. Its entry
-/// eligibility checks the descriptor coefficient extent before dispatch.
-pub const GROUP: usize = 32;
 /// The head geometry of an entry: KV key/value heads of G query heads each,
 /// rows of W = 2P + S columns whose first 2P rotate.
 #[derive(Clone, Copy, Debug)]
@@ -1275,156 +1272,12 @@ pub fn batch_rows<'a>(rows: &'a [f32], kv: usize, head: usize, w: usize) -> Dens
     DenseRows::new(move |token| &rows[(token * kv + head) * w..][..w])
 }
 
-/// Affine history rows of `BITS`-bit codes (8 or 4) in GROUP-column groups
-/// of kv head `head` in slab-stored history: codes in `codes`, (scale,
-/// zero) F16 pairs in `coefficients`, both of one slab size.
-pub struct AffineRows<'a, const BITS: u32, C: Element<Storage = u16>> {
-    codes: SlabTensor<'a, U32, 3>,
-    coefficients: SlabTensor<'a, C, 3>,
-    head: usize,
-}
-
-impl<const BITS: u32, C: Element<Storage = u16>> Rows for AffineRows<'_, BITS, C> {
-    #[inline(always)]
-    fn coefficients(&self, w: usize) -> usize {
-        2 * w / GROUP
-    }
-
-    #[inline(always)]
-    fn load(&self, index: usize, out: &mut [f32]) {
-        let (codes, coefficients) = (self.codes.row([index, self.head, 0]), self.coefficients.row([index, self.head, 0]));
-        affine_decode(codes, coefficients, BITS, out);
-    }
-
-    type Walk = SlabWalk;
-
-    #[inline(always)]
-    fn walk(&self, first: usize) -> SlabWalk {
-        self.codes.walk(first)
-    }
-
-    #[inline(always)]
-    unsafe fn next(&self, walk: &mut SlabWalk, w: usize, coefficients: &mut [f32]) -> *const u8 {
-        const { assert!(BITS == 8 || BITS == 4) };
-        let index = [walk.index(), self.head, 0];
-        let (codes, pairs) = (self.codes.row_at(walk, index), self.coefficients.row_at(walk, index));
-        assert!(codes.len() * 32 >= w * BITS as usize && pairs.len() >= coefficients.len());
-        // SAFETY: the caller's tier.
-        unsafe { widen_f16(&pairs[..coefficients.len()], coefficients) };
-        walk.step();
-        codes.as_ptr().cast()
-    }
-
-    #[inline(always)]
-    fn prefetch(&self, walk: &mut SlabWalk, w: usize) {
-        let index = [walk.index(), self.head, 0];
-        lines(&self.codes.row_at(walk, index)[..w * BITS as usize / 32]);
-        lines(&self.coefficients.row_at(walk, index)[..2 * w / GROUP]);
-        walk.step();
-    }
-
-    const GROUP_CHUNKS: usize = GROUP / 8;
-
-    /// The group's (scale, zero), each in every lane.
-    type Scale = (F8, F8);
-
-    #[inline(always)]
-    unsafe fn scale(coefficients: &[f32], group: usize) -> (F8, F8) {
-        unsafe { (F8::splat(coefficients[2 * group]), F8::splat(coefficients[2 * group + 1])) }
-    }
-
-    #[inline(always)]
-    unsafe fn chunk(row: *const u8, (scale, zero): (F8, F8), c: usize) -> F8 {
-        unsafe {
-            let codes = if BITS == 8 {
-                F8::bytes(row.add(8 * c))
-            } else {
-                F8::nibbles(row.cast::<u32>().add(c).read_unaligned())
-            };
-            zero.fma(codes, scale)
-        }
-    }
-}
-
-/// One kv head's prepared key and value (`key` and `value`, W floats each)
-/// encoded into affine history row `destination`: keys at `key_bits` bits,
-/// values at `value_bits`.
-///
-/// # Safety
-/// `destination` is a freshly reserved row no other work item of the call
-/// reads or writes.
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-pub unsafe fn store_affine_head(
-    key: &[f32],
-    value: &[f32],
-    (key_bits, value_bits): (u32, u32),
-    (key_codes, key_coefficients): (&SlabTensor<'_, U32, 3>, &SlabTensor<'_, F16, 3>),
-    (value_codes, value_coefficients): (&SlabTensor<'_, U32, 3>, &SlabTensor<'_, F16, 3>),
-    destination: usize,
-    head: usize,
-) {
-    // SAFETY: the caller's.
-    unsafe {
-        affine_encode(
-            key,
-            key_bits,
-            key_codes.row_mut([destination, head, 0]),
-            key_coefficients.row_mut([destination, head, 0]),
-        );
-        affine_encode(
-            value,
-            value_bits,
-            value_codes.row_mut([destination, head, 0]),
-            value_coefficients.row_mut([destination, head, 0]),
-        );
-    }
-}
-
-/// The K8/V4 rows of kv head `head` in slab-stored affine history.
-#[inline(always)]
-pub fn affine_rows<'a, const BITS: u32, C: Element<Storage = u16>>(
-    codes: &SlabTensor<'a, U32, 3>,
-    coefficients: &SlabTensor<'a, C, 3>,
-    head: usize,
-) -> AffineRows<'a, BITS, C> {
-    assert_eq!(codes.rows_per_slab(), coefficients.rows_per_slab());
-    AffineRows { codes: *codes, coefficients: *coefficients, head }
-}
-
 /// Prefetches every cache line of `row`.
 #[inline(always)]
-fn lines<T>(row: &[T]) {
+pub(super) fn lines<T>(row: &[T]) {
     let (at, bytes) = (row.as_ptr().cast::<u8>(), std::mem::size_of_val(row));
     for offset in (0..bytes).step_by(64) {
         prefetch(at.wrapping_add(offset));
-    }
-}
-
-/// F16 `values` widened into `out`, eight at a time (`Dense::widen` bit for
-/// bit).
-///
-/// # Safety
-/// The tier runs [`F8`].
-#[inline(always)]
-unsafe fn widen_f16(values: &[u16], out: &mut [f32]) {
-    assert_eq!(values.len(), out.len());
-    let chunks = values.chunks_exact(8);
-    let tail = chunks.remainder();
-    for (chunk, target) in chunks.zip(out.chunks_exact_mut(8)) {
-        // SAFETY: eight values in, eight out.
-        unsafe { F8::widen::<F16>(chunk.as_ptr()).store(target.as_mut_ptr()) };
-    }
-    if !tail.is_empty() {
-        // The tail's words gathered in one register and stored whole, which
-        // the widen's 16-byte load forwards from (a padded copy's narrow
-        // stores cannot forward).
-        let words = tail.iter().rev().fold(0u128, |words, value| words << 16 | u128::from(*value));
-        let mut widened = [0.0f32; 8];
-        // SAFETY: eight values in (the tail's, then zeros), eight out.
-        unsafe { F8::widen::<F16>((&words as *const u128).cast()).store(widened.as_mut_ptr()) };
-        let at = values.len() - tail.len();
-        out[at..].copy_from_slice(&widened[..tail.len()]);
     }
 }
 
@@ -1445,7 +1298,7 @@ mod lanes {
     }
 
     #[derive(Clone, Copy)]
-    pub struct F8(__m256);
+    pub struct F8(pub(in super::super) __m256);
 
     impl F8 {
         #[inline(always)]
@@ -1524,21 +1377,6 @@ mod lanes {
         pub unsafe fn widen<E: Dense>(at: *const E::Storage) -> Self {
             unsafe { Self(E::widen_x86(at)) }
         }
-
-        /// The eight 8-bit codes at `at`.
-        #[inline(always)]
-        pub unsafe fn bytes(at: *const u8) -> Self {
-            unsafe { Self(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64(at.cast())))) }
-        }
-
-        /// The eight 4-bit codes of `word`, code k at bits 4k.
-        #[inline(always)]
-        pub unsafe fn nibbles(word: u32) -> Self {
-            unsafe {
-                let shifted = _mm256_srlv_epi32(_mm256_set1_epi32(word as i32), _mm256_setr_epi32(0, 4, 8, 12, 16, 20, 24, 28));
-                Self(_mm256_cvtepi32_ps(_mm256_and_si256(shifted, _mm256_set1_epi32(15))))
-            }
-        }
     }
 }
 
@@ -1556,7 +1394,7 @@ mod lanes {
     }
 
     #[derive(Clone, Copy)]
-    pub struct F8([float32x4_t; 2]);
+    pub struct F8(pub(in super::super) [float32x4_t; 2]);
 
     impl F8 {
         #[inline(always)]
@@ -1615,29 +1453,6 @@ mod lanes {
         #[inline(always)]
         pub unsafe fn widen<E: Dense>(at: *const E::Storage) -> Self {
             unsafe { Self(E::widen_neon(at)) }
-        }
-
-        /// The eight 8-bit codes at `at`.
-        #[inline(always)]
-        pub unsafe fn bytes(at: *const u8) -> Self {
-            unsafe { Self::codes(vld1_u8(at)) }
-        }
-
-        /// The eight 4-bit codes of `word`, code k at bits 4k.
-        #[inline(always)]
-        pub unsafe fn nibbles(word: u32) -> Self {
-            unsafe {
-                let bytes = vcreate_u8(u64::from(word));
-                Self::codes(vzip1_u8(vand_u8(bytes, vdup_n_u8(15)), vshr_n_u8::<4>(bytes)))
-            }
-        }
-
-        #[inline(always)]
-        unsafe fn codes(codes: uint8x8_t) -> Self {
-            unsafe {
-                let wide = vmovl_u8(codes);
-                Self([vcvtq_f32_u32(vmovl_u16(vget_low_u16(wide))), vcvtq_f32_u32(vmovl_high_u16(wide))])
-            }
         }
     }
 
@@ -1899,4 +1714,5 @@ pub fn merge<'p>(
     total
 }
 
-pub use super::history::{affine_decode, affine_encode, affine_round_trip};
+use super::history::GROUP;
+pub use super::history::{affine_round_trip, affine_rows, store_affine_head, KEY_BITS, VALUE_BITS};

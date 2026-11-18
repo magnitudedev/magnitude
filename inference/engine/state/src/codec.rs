@@ -1,3 +1,4 @@
+use magnitude_kernels::constants;
 use seismic::DType;
 use std::{fmt, sync::Arc};
 
@@ -125,8 +126,19 @@ pub struct CodecSpec {
 }
 
 /// Values per (scale, zero) pair of the affine K8/V4 codec: llama.cpp's
-/// q8_0/q4_0 block size. A head width must be a multiple of it.
-pub const AFFINE_GROUP: usize = 32;
+/// q8_0/q4_0 block size. A head width must be a multiple of it. The codec's
+/// geometry is the kernels' (`attention.seismic`), which every backend's
+/// reader reads.
+pub const AFFINE_GROUP: usize = constants::AFFINE_GROUP as usize;
+/// The affine K8/V4 codec's key and value code bits.
+const AFFINE_KEY_BITS: u8 = code_bits(constants::AFFINE_KEY_BITS);
+const AFFINE_VALUE_BITS: u8 = code_bits(constants::AFFINE_VALUE_BITS);
+
+/// A kernel constant's code bits, which a `u32` code word holds.
+const fn code_bits(bits: u64) -> u8 {
+    assert!(bits >= 1 && bits <= 32, "a code fits a u32 word");
+    bits as u8
+}
 
 /// Host-selectable KV storage policy. These names are the stable public
 /// options; their numerical constants are centralized here so model-family
@@ -188,12 +200,12 @@ impl KvCodec {
             ),
             Self::AffineK8V4 => (
                 Codec::Affine {
-                    bits: 8,
+                    bits: AFFINE_KEY_BITS,
                     group: AFFINE_GROUP,
                     scale_dtype: DType::F16,
                 },
                 Codec::Affine {
-                    bits: 4,
+                    bits: AFFINE_VALUE_BITS,
                     group: AFFINE_GROUP,
                     scale_dtype: DType::F16,
                 },

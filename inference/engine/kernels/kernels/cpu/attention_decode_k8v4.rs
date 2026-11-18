@@ -14,7 +14,7 @@
 // `nvfp4_result_0_rows()`). Head widths are whole affine groups (the
 // declaration's `where`), so every vector has at least one group.
 
-use lib::attention::attention::{self, Form, Layout, Online, BLOCK};
+use lib::attention::attention::{self, Form, Layout, Online, BLOCK, KEY_BITS, VALUE_BITS};
 use lib::core::{arrive, spans};
 use lib::projection::projection;
 use seismic::cpu::slab::SlabTensor;
@@ -115,8 +115,6 @@ fn attention_decode_k8v4_attend<L: Isa, E: Elements>(l: L, cx: &Context<'_, E>, 
         SlabTensor::from_scalars(cx.arg_history_value_codes(), slab_rows),
         SlabTensor::from_bound(cx.arg_history_value_coefficients(), slab_rows),
     );
-    let bits = |words: u64| (32 * words / (2 * cx.dim_p() + cx.dim_s())) as u32;
-    let (key_bits, value_bits) = (bits(cx.dim_kc()), bits(cx.dim_vc()));
     if append {
         // SAFETY: destinations are distinct, freshly reserved history rows
         // no row of the call reads.
@@ -124,7 +122,6 @@ fn attention_decode_k8v4_attend<L: Isa, E: Elements>(l: L, cx: &Context<'_, E>, 
             attention::store_affine_head(
                 &keys[row * w..][..w],
                 &values[row * w..][..w],
-                (key_bits, value_bits),
                 (&key_codes, &key_coefficients),
                 (&value_codes, &value_coefficients),
                 destination as usize,
@@ -136,12 +133,12 @@ fn attention_decode_k8v4_attend<L: Isa, E: Elements>(l: L, cx: &Context<'_, E>, 
     // encoded as its append encodes it, decoded back.
     for fresh_row in spans::span(fresh.0, fresh.1) {
         let at = fresh_row as usize * w;
-        attention::affine_round_trip(&mut keys[at..][..w], key_bits, cx.dim_kp() as usize);
-        attention::affine_round_trip(&mut values[at..][..w], value_bits, cx.dim_vp() as usize);
+        attention::affine_round_trip(&mut keys[at..][..w], KEY_BITS);
+        attention::affine_round_trip(&mut values[at..][..w], VALUE_BITS);
     }
     let history = (
-        attention::affine_rows::<8, _>(&key_codes, &key_coefficients, kv_head),
-        attention::affine_rows::<4, _>(&value_codes, &value_coefficients, kv_head),
+        attention::affine_rows::<KEY_BITS, _>(&key_codes, &key_coefficients, kv_head),
+        attention::affine_rows::<VALUE_BITS, _>(&value_codes, &value_coefficients, kv_head),
     );
     let batch = (attention::batch_rows(keys, 1, 0, w), attention::batch_rows(values, 1, 0, w));
     attention::attend(

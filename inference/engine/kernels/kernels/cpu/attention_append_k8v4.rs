@@ -53,10 +53,6 @@ fn attention_append_k8v4<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group:
                 attention::store_affine_head(
                     &keys[head * w..][..w],
                     &values[head * w..][..w],
-                    (
-                        (32 * cx.dim_kc() / (2 * cx.dim_p() + cx.dim_s())) as u32,
-                        (32 * cx.dim_vc() / (2 * cx.dim_p() + cx.dim_s())) as u32,
-                    ),
                     (&key_codes, &key_coefficients),
                     (&value_codes, &value_coefficients),
                     destination,

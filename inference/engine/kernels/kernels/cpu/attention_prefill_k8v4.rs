@@ -8,7 +8,7 @@
 // absorbs them. Head widths are whole affine groups
 // (the declaration's `where`), so every vector has at least one group.
 
-use lib::attention::attention::{self, Form, Layout, Online, BLOCK};
+use lib::attention::attention::{self, Form, Layout, Online, BLOCK, KEY_BITS, VALUE_BITS};
 use lib::core::spans;
 use seismic::cpu::slab::SlabTensor;
 
@@ -83,8 +83,6 @@ fn attention_prefill_k8v4_prepare<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E
         keys,
         values,
     );
-    let bits = |words: u64| (32 * words / (2 * cx.dim_p() + cx.dim_s())) as u32;
-    let (key_bits, value_bits) = (bits(cx.dim_kc()), bits(cx.dim_vc()));
     let destination = cx.arg_destinations().get([row]);
     if destination >= 0 {
         let destination = destination as usize;
@@ -104,7 +102,6 @@ fn attention_prefill_k8v4_prepare<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E
                 attention::store_affine_head(
                     &keys[head * w..][..w],
                     &values[head * w..][..w],
-                    (key_bits, value_bits),
                     (&key_codes, &key_coefficients),
                     (&value_codes, &value_coefficients),
                     destination,
@@ -116,8 +113,8 @@ fn attention_prefill_k8v4_prepare<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E
     // The row's keys and values as the history row it becomes reads: each
     // encoded as its append encodes it, decoded back.
     for head in 0..kv {
-        attention::affine_round_trip(&mut keys[head * w..][..w], key_bits, cx.dim_kp() as usize);
-        attention::affine_round_trip(&mut values[head * w..][..w], value_bits, cx.dim_vp() as usize);
+        attention::affine_round_trip(&mut keys[head * w..][..w], KEY_BITS);
+        attention::affine_round_trip(&mut values[head * w..][..w], VALUE_BITS);
     }
 }
 
@@ -173,8 +170,8 @@ fn attention_prefill_k8v4_attend<L: Isa, E: Elements>(l: L, cx: &Context<'_, E>,
         SlabTensor::from_bound(cx.arg_history_value_coefficients(), slab_rows),
     );
     let history = (
-        attention::affine_rows::<8, _>(&key_codes, &key_coefficients, kv_head),
-        attention::affine_rows::<4, _>(&value_codes, &value_coefficients, kv_head),
+        attention::affine_rows::<KEY_BITS, _>(&key_codes, &key_coefficients, kv_head),
+        attention::affine_rows::<VALUE_BITS, _>(&value_codes, &value_coefficients, kv_head),
     );
     let batch = (attention::batch_rows(keys, kv, kv_head, w), attention::batch_rows(values, kv, kv_head, w));
     attention::attend_rows(

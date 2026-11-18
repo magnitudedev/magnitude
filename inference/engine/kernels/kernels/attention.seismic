@@ -14,21 +14,31 @@
 # family's axes are described with `attention_project` below.
 
 # Affine K8/V4 history (the `affine_k8_uniform_v4` KV codec). Every (history
-# row, kv head) vector of W values is split into affine groups of 32
+# row, kv head) vector of W values is split into affine groups of AFFINE_GROUP
 # consecutive values x, each stored as codes plus an F16 coefficient pair
 # (scale, zero): zero = f16(min x), scale = f16((max x - min x) / L) and
 # code = min(L, u32(fma(x - zero, 1 / scale, 0.5))) (0 when scale is 0),
 # decoded as code * scale + zero. A vector's pairs are consecutive, group
-# order (C = W / 16 halves). Keys use 8-bit codes (L = 255, four per u32
-# word), values 4-bit codes (L = 15, eight per word); code i sits at bits
-# B * (i % (32 / B)) of word i / (32 / B). The key encoded is the prepared key
-# rounded to the activation dtype, the value the projected value.
+# order (C = 2 W / AFFINE_GROUP halves). Keys use AFFINE_KEY_BITS-bit codes
+# (L = 255, four per u32 word), values AFFINE_VALUE_BITS-bit codes (L = 15,
+# eight per word); code i sits at bits B * (i % (32 / B)) of word i / (32 / B).
+# The key encoded is the prepared key rounded to the activation dtype, the
+# value the projected value.
 #
 # A key has one value: the one history will hold. A fresh row of the batch has
 # one encoding, the one appended for it, and every read of it decodes that
 # encoding, so a row attends an earlier row of its batch exactly as a later
 # one-row decode reads it from history. The encode is deterministic, so a
 # backend may repeat it per reader rather than store it first.
+#
+# The codec's geometry, the one statement of it: every k8v4 declaration's
+# extents follow from it, each backend's reader reads it (`SEISMIC_CONST_*`,
+# the CPU's `constants`), and the engine's state contract takes its plane
+# extents from it (`magnitude_state::AFFINE_GROUP`).
+const AFFINE_GROUP = 32
+const AFFINE_KEY_BITS = 8
+const AFFINE_VALUE_BITS = 4
+
 fn affine_encode[W, N, C](x: &tensor[W] f32, codes: &mut tensor[N] u32,
     coefficients: &mut tensor[C] f16):
     let levels = (u32(1) << u32(32 * N / W)) - u32(1)
@@ -55,19 +65,19 @@ fn affine_encode[W, N, C](x: &tensor[W] f32, codes: &mut tensor[N] u32,
         coefficients[2 * group + 1] = zero
 
 fn affine_decode[W, N, C](codes: &tensor[N] u32, coefficients: &tensor[C] f16,
-    x: &mut tensor[W] f32) where W % 32 == 0 and 16 * C == W and (4 * N == W or 8 * N == W):
-    if 4 * N == W:
+    x: &mut tensor[W] f32) where W % AFFINE_GROUP == 0 and (AFFINE_GROUP / 2) * C == W and ((32 / AFFINE_KEY_BITS) * N == W or (32 / AFFINE_VALUE_BITS) * N == W):
+    if (32 / AFFINE_KEY_BITS) * N == W:
         for i in 0..W:
-            let word = i / 4
-            let group = i / 32
-            let code = (codes[word] >> (u32(i % 4) * u32(8))) & u32(255)
+            let word = i / (32 / AFFINE_KEY_BITS)
+            let group = i / AFFINE_GROUP
+            let code = (codes[word] >> (u32(i % (32 / AFFINE_KEY_BITS)) * u32(AFFINE_KEY_BITS))) & ((u32(1) << u32(AFFINE_KEY_BITS)) - u32(1))
             x[i] = fma(f32(code), f32(coefficients[2 * group]), f32(coefficients[2 * group + 1]))
     else:
-        if 8 * N == W:
+        if (32 / AFFINE_VALUE_BITS) * N == W:
             for i in 0..W:
-                let word = i / 8
-                let group = i / 32
-                let code = (codes[word] >> (u32(i % 8) * u32(4))) & u32(15)
+                let word = i / (32 / AFFINE_VALUE_BITS)
+                let group = i / AFFINE_GROUP
+                let code = (codes[word] >> (u32(i % (32 / AFFINE_VALUE_BITS)) * u32(AFFINE_VALUE_BITS))) & ((u32(1) << u32(AFFINE_VALUE_BITS)) - u32(1))
                 x[i] = fma(f32(code), f32(coefficients[2 * group]), f32(coefficients[2 * group + 1]))
 
 # One decoded history key/value absorbed by the online softmax of G query
@@ -1171,7 +1181,7 @@ fn attention_rows_k8v4[M, T, KV, G, P, S, I, U, F, NQ, N, NV, R, B, KC, KP, VC, 
     history_value_codes: &mut tensor[T, KV, VC] u32,
     history_value_coefficients: &mut tensor[T, KV, VP] f16, rotary_layout: &tensor[0, RA, RT, RO] i32,
     epsilon: f32, scale: f32, gate_function: i32) -> tensor[M, KV * G, 2 * P + S] A
-    where P >= 0 and S >= 0 and 2 * P + S >= 32 and I >= 0 and U >= 0 and F >= 0 and NQ >= 0 and N >= 0 and NV >= 0 and (2 * P + S) % 32 == 0 and 4 * KC == 2 * P + S and 8 * VC == 2 * P + S and 16 * KP == 2 * P + S and KP == VP and B >= 0 and SK >= 0 and RA >= 0 and RA <= 1 and RT >= 0 and RT <= 1 and RO >= 0 and RO <= 1:
+    where P >= 0 and S >= 0 and 2 * P + S >= AFFINE_GROUP and I >= 0 and U >= 0 and F >= 0 and NQ >= 0 and N >= 0 and NV >= 0 and (2 * P + S) % AFFINE_GROUP == 0 and (32 / AFFINE_KEY_BITS) * KC == 2 * P + S and (32 / AFFINE_VALUE_BITS) * VC == 2 * P + S and (AFFINE_GROUP / 2) * KP == 2 * P + S and KP == VP and B >= 0 and SK >= 0 and RA >= 0 and RA <= 1 and RT >= 0 and RT <= 1 and RO >= 0 and RO <= 1:
     let mut fresh_key = tensor[F, M, KV, 2 * P + S] A
     let mut fresh_value = tensor[F, M, KV, 2 * P + S] A
     let mut fresh_key_codes = tensor[F, M, KV, KC] u32
@@ -1357,7 +1367,7 @@ fn attention_append_k8v4[M, T, KV, P, S, F, N, NV, KC, KP, VC, VP, RA, RT, VK](
     history_value_codes: &slab mut tensor[T, KV, VC] u32,
     history_value_coefficients: &slab mut tensor[T, KV, VP] f16, form: &host tensor[0, RA, RT, VK] i32,
     epsilon: f32, slab_rows: u32)
-    where P >= 0 and S >= 0 and 2 * P + S >= 32 and F >= 0 and N >= 0 and NV >= 0 and (2 * P + S) % 32 == 0 and 4 * KC == 2 * P + S and 8 * VC == 2 * P + S and 16 * KP == 2 * P + S and KP == VP and RA >= 0 and RA <= 1 and RT >= 0 and RT <= 1 and VK >= 0 and VK == 0:
+    where P >= 0 and S >= 0 and 2 * P + S >= AFFINE_GROUP and F >= 0 and N >= 0 and NV >= 0 and (2 * P + S) % AFFINE_GROUP == 0 and (32 / AFFINE_KEY_BITS) * KC == 2 * P + S and (32 / AFFINE_VALUE_BITS) * VC == 2 * P + S and (AFFINE_GROUP / 2) * KP == 2 * P + S and KP == VP and RA >= 0 and RA <= 1 and RT >= 0 and RT <= 1 and VK >= 0 and VK == 0:
     # Publication has no output rotary.
     let layout = tensor[0, RA, RT, 0] i32
     append_rows_k8v4(key, value, key_norm, value_norm, rotary_components, rotary_frequencies,
@@ -1377,7 +1387,7 @@ fn append_rows_k8v4[M, T, KV, P, S, F, N, NV, KC, KP, VC, VP, RA, RT, RO](
     history_value_codes: &mut tensor[T, KV, VC] u32,
     history_value_coefficients: &mut tensor[T, KV, VP] f16, layout: &tensor[0, RA, RT, RO] i32,
     epsilon: f32)
-    where P >= 0 and S >= 0 and 2 * P + S >= 32 and F >= 0 and N >= 0 and NV >= 0 and (2 * P + S) % 32 == 0 and 4 * KC == 2 * P + S and 8 * VC == 2 * P + S and 16 * KP == 2 * P + S and KP == VP and RA >= 0 and RA <= 1 and RT >= 0 and RT <= 1 and RO >= 0:
+    where P >= 0 and S >= 0 and 2 * P + S >= AFFINE_GROUP and F >= 0 and N >= 0 and NV >= 0 and (2 * P + S) % AFFINE_GROUP == 0 and (32 / AFFINE_KEY_BITS) * KC == 2 * P + S and (32 / AFFINE_VALUE_BITS) * VC == 2 * P + S and (AFFINE_GROUP / 2) * KP == 2 * P + S and KP == VP and RA >= 0 and RA <= 1 and RT >= 0 and RT <= 1 and RO >= 0:
     for layer in 0..F:
         for row in 0..M:
             if destinations[row] >= 0 and (2 * P + S) / 16 >= 1 and (2 * P + S) / 8 >= 1 and (2 * P + S) / 4 >= 1:
@@ -1397,14 +1407,14 @@ fn append_rows_k8v4[M, T, KV, P, S, F, N, NV, KC, KP, VC, VP, RA, RT, RO](
 
 native attention_append_k8v4 for metal from "metal/attention_append_k8v4.metal":
     static (KV, P, S, F, N, NV, KC, KP, VC, VP, RA, RT, VK)
-    where RA <= 1 and RT <= 1 and VK == 0 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32) and 32 * KC == 8 * (2 * P + S) and 32 * VC == 4 * (2 * P + S) and 16 * KP == 2 * P + S and KP == VP and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0
+    where RA <= 1 and RT <= 1 and VK == 0 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32) and 32 * KC == AFFINE_KEY_BITS * (2 * P + S) and 32 * VC == AFFINE_VALUE_BITS * (2 * P + S) and AFFINE_GROUP * KP == 2 * (2 * P + S) and KP == VP and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0
     launch attention_append_k8v4:
         threadgroups (ceil_div(M * KV, 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
 native attention_append_k8v4 for cuda from "cuda/attention_append_k8v4.cu":
     static (KV, P, S, F, N, NV, KC, KP, VC, VP, RA, RT, VK)
-    where RA == 0 and RT == 0 and VK == 0 and 32 * KC == 8 * (2 * P + S) and 32 * VC == 4 * (2 * P + S) and 16 * KP == 2 * P + S and KP == VP and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0
+    where RA == 0 and RT == 0 and VK == 0 and 32 * KC == AFFINE_KEY_BITS * (2 * P + S) and 32 * VC == AFFINE_VALUE_BITS * (2 * P + S) and AFFINE_GROUP * KP == 2 * (2 * P + S) and KP == VP and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0
     launch attention_append_k8v4:
         threadgroups (ceil_div(M * KV, 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
@@ -1412,14 +1422,14 @@ native attention_append_k8v4 for cuda from "cuda/attention_append_k8v4.cu":
 
 native attention_append_k8v4 for vulkan from "vulkan/attention_append_k8v4.comp":
     static (KV, P, S, F, N, NV, KC, KP, VC, VP, RA, RT, VK)
-    where RA == 0 and RT == 0 and VK == 0 and 32 * KC == 8 * (2 * P + S) and 32 * VC == 4 * (2 * P + S) and 16 * KP == 2 * P + S and KP == VP and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0
+    where RA == 0 and RT == 0 and VK == 0 and 32 * KC == AFFINE_KEY_BITS * (2 * P + S) and 32 * VC == AFFINE_VALUE_BITS * (2 * P + S) and AFFINE_GROUP * KP == 2 * (2 * P + S) and KP == VP and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0
     launch attention_append_k8v4:
         threadgroups (ceil_div(M * KV, 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
 native attention_append_k8v4 for cpu from "cpu/attention_append_k8v4.rs":
     static (P, S, F, N, NV, KC, KP, VC, VP, RA, RT, VK)
-    where RA <= 1 and RT <= 1 and VK == 0 and 32 * KC == 8 * (2 * P + S) and 32 * VC == 4 * (2 * P + S) and 16 * KP == 2 * P + S and KP == VP and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0
+    where RA <= 1 and RT <= 1 and VK == 0 and 32 * KC == AFFINE_KEY_BITS * (2 * P + S) and 32 * VC == AFFINE_VALUE_BITS * (2 * P + S) and AFFINE_GROUP * KP == 2 * (2 * P + S) and KP == VP and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0
     launch attention_append_k8v4:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (1, 1, 1)
@@ -1440,7 +1450,7 @@ fn attention_decode_k8v4[M, T, KV, G, P, S, I, U, F, NQ, N, NV, R, KC, KP, VC, V
     history_value_coefficients: &slab mut tensor[T, KV, VP] f16, form: &host tensor[0, RA, RT, RO, VK] i32,
     epsilon: f32, scale: f32, gate_function: i32, slab_rows: u32)
     -> tensor[M, KV * G, 2 * P + S] A
-    where P >= 0 and S >= 0 and 2 * P + S >= 32 and I >= 0 and U >= 0 and F >= 0 and NQ >= 0 and N >= 0 and NV >= 0 and (2 * P + S) % 32 == 0 and 4 * KC == 2 * P + S and 8 * VC == 2 * P + S and 16 * KP == 2 * P + S and KP == VP and SK >= 0 and RA >= 0 and RA <= 1 and RT >= 0 and RT <= 1 and RO >= 0 and RO <= 1 and VK >= 0 and VK == 0 and M <= VERIFY_ROWS:
+    where P >= 0 and S >= 0 and 2 * P + S >= AFFINE_GROUP and I >= 0 and U >= 0 and F >= 0 and NQ >= 0 and N >= 0 and NV >= 0 and (2 * P + S) % AFFINE_GROUP == 0 and (32 / AFFINE_KEY_BITS) * KC == 2 * P + S and (32 / AFFINE_VALUE_BITS) * VC == 2 * P + S and (AFFINE_GROUP / 2) * KP == 2 * P + S and KP == VP and SK >= 0 and RA >= 0 and RA <= 1 and RT >= 0 and RT <= 1 and RO >= 0 and RO <= 1 and VK >= 0 and VK == 0 and M <= VERIFY_ROWS:
     let every = tensor[M, 0] u32
     let layout = tensor[0, RA, RT, RO] i32
     return attention_rows_k8v4(query, gate, key, value, query_norm, key_norm, value_norm, sinks,
@@ -1481,7 +1491,7 @@ fn attention_prefill_k8v4[M, T, KV, G, P, S, I, U, F, NQ, N, NV, R, B, BR, L, HT
     history_value_coefficients: &slab mut tensor[T, KV, VP] f16, form: &host tensor[0, RA, RT, RO, VK] i32,
     epsilon: f32, scale: f32, gate_function: i32, slab_rows: u32)
     -> tensor[M, KV * G, 2 * P + S] A
-    where P >= 0 and S >= 0 and 2 * P + S >= 32 and I >= 0 and U >= 0 and F >= 0 and NQ >= 0 and N >= 0 and NV >= 0 and L >= 0 and (2 * P + S) % 32 == 0 and 4 * KC == 2 * P + S and 8 * VC == 2 * P + S and 16 * KP == 2 * P + S and KP == VP and B >= 0 and BR >= 1 and SK >= 0 and RA >= 0 and RA <= 1 and RT >= 0 and RT <= 1 and RO >= 0 and RO <= 1 and VK >= 0 and VK == 0:
+    where P >= 0 and S >= 0 and 2 * P + S >= AFFINE_GROUP and I >= 0 and U >= 0 and F >= 0 and NQ >= 0 and N >= 0 and NV >= 0 and L >= 0 and (2 * P + S) % AFFINE_GROUP == 0 and (32 / AFFINE_KEY_BITS) * KC == 2 * P + S and (32 / AFFINE_VALUE_BITS) * VC == 2 * P + S and (AFFINE_GROUP / 2) * KP == 2 * P + S and KP == VP and B >= 0 and BR >= 1 and SK >= 0 and RA >= 0 and RA <= 1 and RT >= 0 and RT <= 1 and RO >= 0 and RO <= 1 and VK >= 0 and VK == 0:
     # Prefill publishes before reading, including earlier destinations in
     # the current causal batch. The common body repeats those same writes
     # after attention; both executions have identical observable final state.
@@ -1542,7 +1552,7 @@ native attention_decode_k8v4 for metal from "metal/attention_decode_k8v4.metal":
     params (arithmetic SPAN in [32, 64, 128, 256] default 32, arithmetic PARTS in [16, 8, 32, 64, 128, 256, 512] default 16,
         arithmetic SIMDS in [4, 8, 2, 16] default 4, arithmetic SLICES in [2, 1, 4, 8] default 2,
         arithmetic form MATRIX in [0, 1] default 0, arithmetic KEYS in [16, 8, 32] default 16, arithmetic TOKENS in [1, 2, 4, 8] default 1, arithmetic form HEAD_BAND in [0, 8] default 0)
-    where NQ <= 1 and RA <= 1 and RT <= 1 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32) and RO <= 1 and (RO == 0 or (P > 0 and I == 0 and U == 0 and 2 * P + S <= 1024)) and VK == 0 and SK <= 1 and ((HEAD_BAND == 0 and (32 * KC == 8 * (2 * P + S) and 32 * VC == 4 * (2 * P + S) and 16 * KP == 2 * P + S and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0 and G % SLICES == 0 and SIMDS % SLICES == 0 and (MATRIX == 1 or (KEYS == 16 and TOKENS == 1)) and (MATRIX == 1 or (G / SLICES) * ((2 * P + S) / 32) <= 32 or SLICES == 8 or G % (2 * SLICES) != 0) and (MATRIX == 1 or SIMDS * (G / SLICES) * 8 + max(SIMDS * (2 * P + S) * 4, G * (2 * P + S) * 2) <= 32768) and (MATRIX == 0 or SLICES == 1) and (MATRIX == 0 or ((2 * P + S) % max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) == 0 and ((2 * P + S) / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)) % 32 == 0 and SIMDS % max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) == 0 and ((2 - min(2, max(1, SIMDS / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)))) * (((ceil_div(TOKENS * G, 8) * 8) * (2 * P + S) * 2) + max((SIMDS * KEYS * ((2 * P + S) / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)) * 2), (min(1, max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) - 1) * 2 * SIMDS * (ceil_div(TOKENS * G, 8) * 8) * KEYS * 4))) + min(1, max(1, SIMDS / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)) - 1) * (((ceil_div(TOKENS * G, 8) * 8) * (2 * P + S) * 2) + max(SIMDS * KEYS * (((2 * P + S) / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)) + 8) * 2 + (min(1, max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) - 1) * 2 * SIMDS * (ceil_div(TOKENS * G, 8) * 8) * KEYS * 4), (ceil_div(TOKENS * G, 8) * 8) * (2 * P + S) * 4) + (SIMDS / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) * (ceil_div(TOKENS * G, 8) * 8) * 8))) <= 32768 or (min(TOKENS / 4, 4 / TOKENS) * min(1, 8 / G) * min((2 * P + S) / 128, 256 / (2 * P + S)) * min(SIMDS / TOKENS, TOKENS / SIMDS) * min(1, 32768 / (max(TOKENS * 8 * (2 * P + S) * 2, max(KEYS * (2 * P + S) * 4, 8 * (2 * P + S) * 4)) + 8 * 8))) == 1)))) or (32 * KC == 8 * (2 * P + S) and 32 * VC == 4 * (2 * P + S) and 16 * KP == 2 * P + S and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and P % ((2 * P + S) / 32) == 0 and HEAD_BAND == 8 and MATRIX == 1 and TOKENS == 2 and SIMDS == 4 and SLICES == 1 and (2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and max(2 * 8 * (2 * P + S) * 2, KEYS * (2 * P + S) * 4 + 2 * SIMDS * 8 * KEYS * 4) + 64 <= 32768))
+    where NQ <= 1 and RA <= 1 and RT <= 1 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32) and RO <= 1 and (RO == 0 or (P > 0 and I == 0 and U == 0 and 2 * P + S <= 1024)) and VK == 0 and SK <= 1 and ((HEAD_BAND == 0 and (32 * KC == AFFINE_KEY_BITS * (2 * P + S) and 32 * VC == AFFINE_VALUE_BITS * (2 * P + S) and AFFINE_GROUP * KP == 2 * (2 * P + S) and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0 and G % SLICES == 0 and SIMDS % SLICES == 0 and (MATRIX == 1 or (KEYS == 16 and TOKENS == 1)) and (MATRIX == 1 or (G / SLICES) * ((2 * P + S) / 32) <= 32 or SLICES == 8 or G % (2 * SLICES) != 0) and (MATRIX == 1 or SIMDS * (G / SLICES) * 8 + max(SIMDS * (2 * P + S) * 4, G * (2 * P + S) * 2) <= 32768) and (MATRIX == 0 or SLICES == 1) and (MATRIX == 0 or ((2 * P + S) % max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) == 0 and ((2 * P + S) / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)) % 32 == 0 and SIMDS % max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) == 0 and ((2 - min(2, max(1, SIMDS / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)))) * (((ceil_div(TOKENS * G, 8) * 8) * (2 * P + S) * 2) + max((SIMDS * KEYS * ((2 * P + S) / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)) * 2), (min(1, max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) - 1) * 2 * SIMDS * (ceil_div(TOKENS * G, 8) * 8) * KEYS * 4))) + min(1, max(1, SIMDS / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)) - 1) * (((ceil_div(TOKENS * G, 8) * 8) * (2 * P + S) * 2) + max(SIMDS * KEYS * (((2 * P + S) / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)) + 8) * 2 + (min(1, max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) - 1) * 2 * SIMDS * (ceil_div(TOKENS * G, 8) * 8) * KEYS * 4), (ceil_div(TOKENS * G, 8) * 8) * (2 * P + S) * 4) + (SIMDS / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) * (ceil_div(TOKENS * G, 8) * 8) * 8))) <= 32768 or (min(TOKENS / 4, 4 / TOKENS) * min(1, 8 / G) * min((2 * P + S) / 128, 256 / (2 * P + S)) * min(SIMDS / TOKENS, TOKENS / SIMDS) * min(1, 32768 / (max(TOKENS * 8 * (2 * P + S) * 2, max(KEYS * (2 * P + S) * 4, 8 * (2 * P + S) * 4)) + 8 * 8))) == 1)))) or (32 * KC == AFFINE_KEY_BITS * (2 * P + S) and 32 * VC == AFFINE_VALUE_BITS * (2 * P + S) and AFFINE_GROUP * KP == 2 * (2 * P + S) and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and P % ((2 * P + S) / 32) == 0 and HEAD_BAND == 8 and MATRIX == 1 and TOKENS == 2 and SIMDS == 4 and SLICES == 1 and (2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and max(2 * 8 * (2 * P + S) * 2, KEYS * (2 * P + S) * 4 + 2 * SIMDS * 8 * KEYS * 4) + 64 <= 32768))
     scratch partials bytes (M * KV * G * PARTS * (2 * P + S) * 4)
     scratch statistics bytes (M * KV * G * PARTS * 8)
     launch attention_decode_k8v4_partial:
@@ -1588,7 +1598,7 @@ native attention_decode_k8v4 for cuda from "cuda/attention_decode_k8v4.cu":
         arithmetic SLICES in [1, 2, 4, 8] default least where G % SLICES == 0 and ((G / SLICES) * ((2 * P + S) / 32) <= 32 or SLICES == 8 or G % (2 * SLICES) != 0),
         arithmetic form MATRIX in [0, 1] default 0,
         arithmetic STAGES in [2, 3, 4] default 2, arithmetic COLUMNS in [1, 2, 4] default 1, arithmetic QREG in [0, 1] default 0)
-    where NQ == N and RA == 0 and RT == 0 and RO == 0 and VK == 0 and SK <= 1 and 32 * KC == 8 * (2 * P + S) and 32 * VC == 4 * (2 * P + S) and 16 * KP == 2 * P + S and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and G % SLICES == 0 and WARPS % SLICES == 0 and (1 + MATRIX) * COLUMNS * WARPS * 32 <= 1024 and (MATRIX == 1 or (WARPS >= 4 and STAGES == 2 and COLUMNS == 1 and QREG == 0)) and (MATRIX == 1 or (G / SLICES) * ((2 * P + S) / 32) <= 64 or SLICES == 8 or G % (2 * SLICES) != 0) and (MATRIX == 1 or (G + WARPS) * (2 * P + S) * 4 + WARPS * (G / SLICES) * 8 <= 98304) and (MATRIX == 0 or (SLICES == 1 and (QREG == 0 or 2 * P + S <= 256) and G <= WARPS * 16 and min((2 * P + S), 256 * COLUMNS) % (16 * COLUMNS) == 0 and ((2 * P + S) <= 256 or (2 * P + S) % 256 == 0) and ((1 - QREG) * (WARPS * 16 * (2 * P + S) + STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * (min((2 * P + S), 256) + min((2 * P + S), 256 * COLUMNS))) + QREG * max(WARPS * 16 * (2 * P + S), STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * (min((2 * P + S), 256) + min((2 * P + S), 256 * COLUMNS)))) * 2 + WARPS * COLUMNS * (2 * P + S) * 4 <= 98304))
+    where NQ == N and RA == 0 and RT == 0 and RO == 0 and VK == 0 and SK <= 1 and 32 * KC == AFFINE_KEY_BITS * (2 * P + S) and 32 * VC == AFFINE_VALUE_BITS * (2 * P + S) and AFFINE_GROUP * KP == 2 * (2 * P + S) and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and G % SLICES == 0 and WARPS % SLICES == 0 and (1 + MATRIX) * COLUMNS * WARPS * 32 <= 1024 and (MATRIX == 1 or (WARPS >= 4 and STAGES == 2 and COLUMNS == 1 and QREG == 0)) and (MATRIX == 1 or (G / SLICES) * ((2 * P + S) / 32) <= 64 or SLICES == 8 or G % (2 * SLICES) != 0) and (MATRIX == 1 or (G + WARPS) * (2 * P + S) * 4 + WARPS * (G / SLICES) * 8 <= 98304) and (MATRIX == 0 or (SLICES == 1 and (QREG == 0 or 2 * P + S <= 256) and G <= WARPS * 16 and min((2 * P + S), 256 * COLUMNS) % (16 * COLUMNS) == 0 and ((2 * P + S) <= 256 or (2 * P + S) % 256 == 0) and ((1 - QREG) * (WARPS * 16 * (2 * P + S) + STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * (min((2 * P + S), 256) + min((2 * P + S), 256 * COLUMNS))) + QREG * max(WARPS * 16 * (2 * P + S), STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * (min((2 * P + S), 256) + min((2 * P + S), 256 * COLUMNS)))) * 2 + WARPS * COLUMNS * (2 * P + S) * 4 <= 98304))
     scratch partials bytes (M * KV * G * PARTS * (2 * P + S) * 4)
     scratch statistics bytes (M * KV * G * PARTS * 8)
     launch attention_decode_k8v4_partial:
@@ -1631,7 +1641,7 @@ native attention_decode_k8v4 for vulkan from "vulkan/attention_decode_k8v4.comp"
     params (arithmetic SPAN in [32, 64, 128, 256] default 32, arithmetic PARTS in [16, 8, 32, 64, 128, 256, 512] default 16,
         arithmetic SIMDS in [4, 8, 1, 2] default 2, arithmetic SLICES in [1, 2, 4, 8] default 1,
         arithmetic form MATRIX in [0, 1] default 0, arithmetic form KEYWISE in [0, 1] default 1)
-    where NQ == N and RA == 0 and RT == 0 and RO == 0 and VK == 0 and SK <= 1 and 32 * KC == 8 * (2 * P + S) and 32 * VC == 4 * (2 * P + S) and 16 * KP == 2 * P + S and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0 and G % SLICES == 0 and SIMDS % SLICES == 0 and (MATRIX == 1 or KEYWISE == 1 or SIMDS >= 4) and (MATRIX == 0 or KEYWISE == 0) and (MATRIX == 1 or SIMDS * (G / SLICES) * 8 + (1 - KEYWISE) * max(SIMDS, ceil_div(G, 2)) * (2 * P + S) * 4 + KEYWISE * max(SIMDS * (2 * P + S) * 4, 32 + G * (2 * P + S) * 4 + SIMDS * (G / SLICES) * 128 + G * (2 * P + S) / 8 + SIMDS * 512 * (max(min((2 * P + S), 128) / 16, (2 * P + S) / 32 + ceil_div((2 * P + S), 128)) + 1)) <= 32768) and (MATRIX == 0 or (SLICES == 1 and SPAN == 32 and G <= SIMDS * 16 and ((2 * P + S) <= 64 or (2 * P + S) % 64 == 0) and ((2 * P + S) <= 256 or (2 * P + S) % 256 == 0) and 64 * (min((2 * P + S), 256) + 8) + SIMDS * 2048 + SIMDS * 16 * ((2 * P + S) + 8) * 2 + SIMDS * 16 * 4 <= 32768))
+    where NQ == N and RA == 0 and RT == 0 and RO == 0 and VK == 0 and SK <= 1 and 32 * KC == AFFINE_KEY_BITS * (2 * P + S) and 32 * VC == AFFINE_VALUE_BITS * (2 * P + S) and AFFINE_GROUP * KP == 2 * (2 * P + S) and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0 and G % SLICES == 0 and SIMDS % SLICES == 0 and (MATRIX == 1 or KEYWISE == 1 or SIMDS >= 4) and (MATRIX == 0 or KEYWISE == 0) and (MATRIX == 1 or SIMDS * (G / SLICES) * 8 + (1 - KEYWISE) * max(SIMDS, ceil_div(G, 2)) * (2 * P + S) * 4 + KEYWISE * max(SIMDS * (2 * P + S) * 4, 32 + G * (2 * P + S) * 4 + SIMDS * (G / SLICES) * 128 + G * (2 * P + S) / 8 + SIMDS * 512 * (max(min((2 * P + S), 128) / 16, (2 * P + S) / 32 + ceil_div((2 * P + S), 128)) + 1)) <= 32768) and (MATRIX == 0 or (SLICES == 1 and SPAN == 32 and G <= SIMDS * 16 and ((2 * P + S) <= 64 or (2 * P + S) % 64 == 0) and ((2 * P + S) <= 256 or (2 * P + S) % 256 == 0) and 64 * (min((2 * P + S), 256) + 8) + SIMDS * 2048 + SIMDS * 16 * ((2 * P + S) + 8) * 2 + SIMDS * 16 * 4 <= 32768))
     scratch partials bytes (M * KV * G * PARTS * (2 * P + S) * 4)
     scratch statistics bytes (M * KV * G * PARTS * 8)
     launch attention_decode_k8v4_partial:
@@ -1650,7 +1660,7 @@ native attention_decode_k8v4 for vulkan from "vulkan/attention_decode_k8v4.comp"
 # whole affine groups.
 native attention_decode_k8v4 for cpu from "cpu/attention_decode_k8v4.rs":
     static (P, S, I, U, F, NQ, N, NV, KC, KP, VC, VP, SK, RA, RT, RO, VK)
-    where NQ <= 1 and RA <= 1 and RT <= 1 and RO <= 1 and (RO == 0 or (P > 0 and I == 0 and U == 0)) and VK == 0 and SK <= 1 and 32 * KC == 8 * (2 * P + S) and 32 * VC == 4 * (2 * P + S) and 16 * KP == 2 * P + S and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0
+    where NQ <= 1 and RA <= 1 and RT <= 1 and RO <= 1 and (RO == 0 or (P > 0 and I == 0 and U == 0)) and VK == 0 and SK <= 1 and 32 * KC == AFFINE_KEY_BITS * (2 * P + S) and 32 * VC == AFFINE_VALUE_BITS * (2 * P + S) and AFFINE_GROUP * KP == 2 * (2 * P + S) and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % AFFINE_GROUP == 0
     scratch partials bytes (M * KV * MAX_UNITS * G * (2 * P + S) * 4)
     scratch statistics bytes (M * KV * MAX_UNITS * G * 8)
     scratch arrivals bytes (M * KV * 4) sync
@@ -1722,7 +1732,7 @@ native attention_prefill_k8v4 for metal from "metal/attention_prefill_k8v4.metal
     let WINDOW = SPARE / 256 * 256
     let ROUND = max((SPARE - STATE) / 256 * 256, 256 * (1 - DIRECT))
     let ROUNDS = max(1, DIRECT * min(1, HT * 256 / (WINDOW + 1)) * ceil_div(HT * 256, ROUND))
-    where NQ <= 1 and RA <= 1 and RT <= 1 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32) and RO <= 1 and (RO == 0 or (P > 0 and I == 0 and U == 0)) and VK == 0 and SK <= 1 and (B == 0 or (DIRECT == 0 and COISSUE == 0 and L == 0)) and 32 * KC == 8 * (2 * P + S) and 32 * VC == 4 * (2 * P + S) and 16 * KP == 2 * P + S and KP == VP and L <= 1 and (DIRECT == 0 or (L == 1 and KV * ceil_div(G, 16) <= 8)) and (DIRECT == 0 or QT >= 16 or (COISSUE == 1 and 2 * P + S == 512)) and (COISSUE == 0 or (DIRECT == 1 and (2 * P + S == 128 or 2 * P + S == 256 or (2 * P + S == 512 and QT == 8)) and 32 + QT * min(HEADS, G) / 8 * max(1, (2 * P + S) / 256) * (48 + 2 * ((96 - 64 * min(1, (2 * P + S) / 129)) * 16 + 32) + 32 * min(2 * P + S, 256) + 2048 * min(1, (2 * P + S) / 512)) + 65 * 64 + 16 <= 32768)) and (HEADS <= G or HEADS / 2 < G) and QT * min(HEADS, G) * (4 - 2 * DIRECT + 6 * COISSUE + 8 * COISSUE * ((2 * P + S) / 512)) <= 1024 and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0
+    where NQ <= 1 and RA <= 1 and RT <= 1 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32) and RO <= 1 and (RO == 0 or (P > 0 and I == 0 and U == 0)) and VK == 0 and SK <= 1 and (B == 0 or (DIRECT == 0 and COISSUE == 0 and L == 0)) and 32 * KC == AFFINE_KEY_BITS * (2 * P + S) and 32 * VC == AFFINE_VALUE_BITS * (2 * P + S) and AFFINE_GROUP * KP == 2 * (2 * P + S) and KP == VP and L <= 1 and (DIRECT == 0 or (L == 1 and KV * ceil_div(G, 16) <= 8)) and (DIRECT == 0 or QT >= 16 or (COISSUE == 1 and 2 * P + S == 512)) and (COISSUE == 0 or (DIRECT == 1 and (2 * P + S == 128 or 2 * P + S == 256 or (2 * P + S == 512 and QT == 8)) and 32 + QT * min(HEADS, G) / 8 * max(1, (2 * P + S) / 256) * (48 + 2 * ((96 - 64 * min(1, (2 * P + S) / 129)) * 16 + 32) + 32 * min(2 * P + S, 256) + 2048 * min(1, (2 * P + S) / 512)) + 65 * 64 + 16 <= 32768)) and (HEADS <= G or HEADS / 2 < G) and QT * min(HEADS, G) * (4 - 2 * DIRECT + 6 * COISSUE + 8 * COISSUE * ((2 * P + S) / 512)) <= 1024 and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0
     scratch queries bytes (ceil_div(M, QT) * QT * KV * G * (2 * P + S) * 2)
     scratch keys bytes (max(M + 32 * DIRECT, COISSUE * (96 - 64 * min(1, (2 * P + S) / 129))) * KV * (2 * P + S) * 2)
     scratch values bytes (max(M + 32 * DIRECT, COISSUE * (96 - 64 * min(1, (2 * P + S) / 129))) * KV * (2 * P + S) * 2)
@@ -1784,7 +1794,7 @@ native attention_prefill_k8v4 for cuda from "cuda/attention_prefill_k8v4.cu":
     static (KV, G, P, S, I, U, F, NQ, N, NV, B, L, KC, KP, VC, VP, SK, RA, RT, RO, VK)
     params (arithmetic WARPS in [4, 2, 8] default 4, arithmetic SPLIT_GROUPS in [256, 1, 512] default 256, arithmetic STAGES in [2, 3] default 2,
         arithmetic COLUMNS in [1, 2] default 1, QREG in [0, 1] default 0, arithmetic PRODUCERS in [4, 0, 1, 2, 8] default 4, form HISTORY_STAGE in [0, 1] default 0)
-    where NQ == N and RA == 0 and RT == 0 and RO == 0 and VK == 0 and SK <= 1 and (B == 0 or (HISTORY_STAGE == 0 and L == 0)) and (HISTORY_STAGE == 0 or (L == 1 and PRODUCERS == 0)) and 32 * KC == 8 * (2 * P + S) and 32 * VC == 4 * (2 * P + S) and 16 * KP == 2 * P + S and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and G <= WARPS * 16 and (QREG == 0 or 2 * P + S <= 256 or COLUMNS >= 2) and min(2 * P + S, 256 * COLUMNS) % (16 * COLUMNS) == 0 and (HISTORY_STAGE == 1 or PRODUCERS > 0 or ((2 * P + S) >= 128 and (2 * P + S) <= 256) or (2 * P + S) == 512) and ((1 - QREG) * ((WARPS * 16 * (2 * P + S) * 2) + (STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * ((min((2 * P + S), 256) + min(1, COLUMNS - 1) * ((2 * P + S) - min((2 * P + S), 256))) + min((2 * P + S), 256 * COLUMNS)) * 2 + (1 - HISTORY_STAGE) * (max(1, PRODUCERS) - PRODUCERS) * (STAGES - (STAGES - 1) * min(1, COLUMNS - 1) * min(1, (2 * P + S) / 257)) * (32 - 16 * min(1, (2 * P + S) / 257)) * (9 * (min((2 * P + S), 256) + min(1, COLUMNS - 1) * ((2 * P + S) - min((2 * P + S), 256))) + 5 * min((2 * P + S), 256 * COLUMNS)) / 8)) + QREG * max((WARPS * 16 * (2 * P + S) * 2), (STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * ((min((2 * P + S), 256) + min(1, COLUMNS - 1) * ((2 * P + S) - min((2 * P + S), 256))) + min((2 * P + S), 256 * COLUMNS)) * 2 + (1 - HISTORY_STAGE) * (max(1, PRODUCERS) - PRODUCERS) * (STAGES - (STAGES - 1) * min(1, COLUMNS - 1) * min(1, (2 * P + S) / 257)) * (32 - 16 * min(1, (2 * P + S) / 257)) * (9 * (min((2 * P + S), 256) + min(1, COLUMNS - 1) * ((2 * P + S) - min((2 * P + S), 256))) + 5 * min((2 * P + S), 256 * COLUMNS)) / 8))) + min(1, COLUMNS - 1) * min(1, (2 * P + S) / 257) * (1 + min(1, PRODUCERS)) * COLUMNS * WARPS * 1024 <= 98304
+    where NQ == N and RA == 0 and RT == 0 and RO == 0 and VK == 0 and SK <= 1 and (B == 0 or (HISTORY_STAGE == 0 and L == 0)) and (HISTORY_STAGE == 0 or (L == 1 and PRODUCERS == 0)) and 32 * KC == AFFINE_KEY_BITS * (2 * P + S) and 32 * VC == AFFINE_VALUE_BITS * (2 * P + S) and AFFINE_GROUP * KP == 2 * (2 * P + S) and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and G <= WARPS * 16 and (QREG == 0 or 2 * P + S <= 256 or COLUMNS >= 2) and min(2 * P + S, 256 * COLUMNS) % (16 * COLUMNS) == 0 and (HISTORY_STAGE == 1 or PRODUCERS > 0 or ((2 * P + S) >= 128 and (2 * P + S) <= 256) or (2 * P + S) == 512) and ((1 - QREG) * ((WARPS * 16 * (2 * P + S) * 2) + (STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * ((min((2 * P + S), 256) + min(1, COLUMNS - 1) * ((2 * P + S) - min((2 * P + S), 256))) + min((2 * P + S), 256 * COLUMNS)) * 2 + (1 - HISTORY_STAGE) * (max(1, PRODUCERS) - PRODUCERS) * (STAGES - (STAGES - 1) * min(1, COLUMNS - 1) * min(1, (2 * P + S) / 257)) * (32 - 16 * min(1, (2 * P + S) / 257)) * (9 * (min((2 * P + S), 256) + min(1, COLUMNS - 1) * ((2 * P + S) - min((2 * P + S), 256))) + 5 * min((2 * P + S), 256 * COLUMNS)) / 8)) + QREG * max((WARPS * 16 * (2 * P + S) * 2), (STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * ((min((2 * P + S), 256) + min(1, COLUMNS - 1) * ((2 * P + S) - min((2 * P + S), 256))) + min((2 * P + S), 256 * COLUMNS)) * 2 + (1 - HISTORY_STAGE) * (max(1, PRODUCERS) - PRODUCERS) * (STAGES - (STAGES - 1) * min(1, COLUMNS - 1) * min(1, (2 * P + S) / 257)) * (32 - 16 * min(1, (2 * P + S) / 257)) * (9 * (min((2 * P + S), 256) + min(1, COLUMNS - 1) * ((2 * P + S) - min((2 * P + S), 256))) + 5 * min((2 * P + S), 256 * COLUMNS)) / 8))) + min(1, COLUMNS - 1) * min(1, (2 * P + S) / 257) * (1 + min(1, PRODUCERS)) * COLUMNS * WARPS * 1024 <= 98304
     scratch queries bytes (M * KV * G * (2 * P + S) * 2)
     scratch keys bytes (M * KV * (2 * P + S) * 2)
     scratch values bytes (M * KV * (2 * P + S) * 2)
@@ -1824,7 +1834,7 @@ native attention_prefill_k8v4 for cuda from "cuda/attention_prefill_k8v4.cu":
 native attention_prefill_k8v4 for vulkan from "vulkan/attention_prefill_k8v4.comp":
     static (KV, G, P, S, I, U, F, NQ, N, NV, B, KC, KP, VC, VP, SK, RA, RT, RO, VK)
     params (arithmetic ROWS in [64, 128] default 64, arithmetic SPLIT_GROUPS in [256, 128, 512, 1] default 256)
-    where NQ == N and RA == 0 and RT == 0 and RO == 0 and VK == 0 and SK <= 1 and 32 * KC == 8 * (2 * P + S) and 32 * VC == 4 * (2 * P + S) and 16 * KP == 2 * P + S and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0 and G <= ROWS and ROWS / G <= 32 and 64 * (min(2 * P + S, 256) + 8) + ROWS / 16 * 2048 <= 32768
+    where NQ == N and RA == 0 and RT == 0 and RO == 0 and VK == 0 and SK <= 1 and 32 * KC == AFFINE_KEY_BITS * (2 * P + S) and 32 * VC == AFFINE_VALUE_BITS * (2 * P + S) and AFFINE_GROUP * KP == 2 * (2 * P + S) and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0 and G <= ROWS and ROWS / G <= 32 and 64 * (min(2 * P + S, 256) + 8) + ROWS / 16 * 2048 <= 32768
     scratch queries bytes ((ceil_div(M, ROWS / G) * (ROWS / G) * KV * G + ROWS) * (2 * P + S) * 2)
     scratch keys bytes (M * KV * (2 * P + S) * 2)
     scratch values bytes (M * KV * (2 * P + S) * 2)
@@ -1855,7 +1865,7 @@ native attention_prefill_k8v4 for vulkan from "vulkan/attention_prefill_k8v4.com
 native attention_prefill_k8v4 for cpu from "cpu/attention_prefill_k8v4.rs":
     static (P, S, I, U, F, NQ, N, NV, KC, KP, VC, VP, SK, RA, RT, RO, VK)
     params (ROWS in [16, 8, 32, 4] default 16)
-    where NQ <= 1 and RA <= 1 and RT <= 1 and RO <= 1 and (RO == 0 or (P > 0 and I == 0 and U == 0)) and VK == 0 and SK <= 1 and 32 * KC == 8 * (2 * P + S) and 32 * VC == 4 * (2 * P + S) and 16 * KP == 2 * P + S and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0
+    where NQ <= 1 and RA <= 1 and RT <= 1 and RO <= 1 and (RO == 0 or (P > 0 and I == 0 and U == 0)) and VK == 0 and SK <= 1 and 32 * KC == AFFINE_KEY_BITS * (2 * P + S) and 32 * VC == AFFINE_VALUE_BITS * (2 * P + S) and AFFINE_GROUP * KP == 2 * (2 * P + S) and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % AFFINE_GROUP == 0
     scratch queries bytes (M * KV * G * (2 * P + S) * 4)
     scratch keys bytes (M * KV * (2 * P + S) * 4)
     scratch values bytes (M * KV * (2 * P + S) * 4)

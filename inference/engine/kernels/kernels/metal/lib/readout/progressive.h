@@ -28,6 +28,10 @@
 #define PROGRESSIVE_OFFSET (1u << (2u * PROGRESSIVE_HALF_BITS - 1u))
 #define PROGRESSIVE_COARSE_SCALE (1u << PROGRESSIVE_HALF_BITS)
 #define PROGRESSIVE_COARSE_BIAS (0.5f * float(PROGRESSIVE_COARSE_SCALE - 1u) - float(PROGRESSIVE_OFFSET))
+// Every reader here is written for the planes' bit order (`readout.seismic`):
+// a plane word per group of 32 codes, its 8 lanes the quarters' nibbles.
+static_assert(SEISMIC_CONST_PROGRESSIVE_GROUP == 32 && SEISMIC_CONST_PROGRESSIVE_LANES == 8,
+    "a plane word is one group, its nibbles the quarters' codes");
 
 inline uint4 progressive_high(device const uint *row, uint group) {
     if constexpr (PROGRESSIVE_LOW_PLANES == 3u)

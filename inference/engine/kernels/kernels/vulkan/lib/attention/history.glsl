@@ -23,16 +23,24 @@
 #include "flash.glsl"
 
 #ifdef ATTENTION_AFFINE_HISTORY
-#define HISTORY_KEY_BITS (32u * uint(ATTENTION_KEY_CODE_WORDS) / ATTENTION_W)
-#define HISTORY_VALUE_BITS (32u * uint(ATTENTION_VALUE_CODE_WORDS) / ATTENTION_W)
-// Columns per (scale, zero) pair: the codec's group (model-state
-// `AFFINE_GROUP`); the (scale, zero) pairs per vector; the lanes sharing one.
-#define HISTORY_GROUP (2u * ATTENTION_W / uint(ATTENTION_KEY_COEFFICIENTS))
+// The codec's code bits and its columns per (scale, zero) pair
+// (attention.seismic's AFFINE_*); the (scale, zero) pairs per vector; the
+// lanes sharing one.
+#define HISTORY_KEY_BITS uint(SEISMIC_CONST_AFFINE_KEY_BITS)
+#define HISTORY_VALUE_BITS uint(SEISMIC_CONST_AFFINE_VALUE_BITS)
+#define HISTORY_GROUP uint(SEISMIC_CONST_AFFINE_GROUP)
 #define HISTORY_PAIRS (ATTENTION_W / HISTORY_GROUP)
 #define HISTORY_PAIR_LANES (HISTORY_GROUP / ATTENTION_E)
-// The words a lane's codes of one vector span (keys, the wider codes): two
-// up to W = 256, four at W = 512.
-#define HISTORY_LANE_WORDS (ATTENTION_E > 8u ? ATTENTION_E / 4u : 2u)
+// The words a lane's codes of one vector span (keys, the wider codes), at
+// least the two eight key codes take (`history_piece`).
+#define HISTORY_LANE_WORDS (ATTENTION_E * HISTORY_KEY_BITS > 64u ? ATTENTION_E * HISTORY_KEY_BITS / 32u : 2u)
+// The 16-byte pieces of a key's code row.
+#define HISTORY_KEY_PIECES (ATTENTION_W * HISTORY_KEY_BITS / 128u)
+// The keywise path (`history_keywise_*`) reads a group's key codes as two
+// 16-byte pieces of four codes a word, against four query columns at a time.
+#if SEISMIC_CONST_AFFINE_KEY_BITS != 8 || SEISMIC_CONST_AFFINE_GROUP != 32
+#error "the keywise path reads a group of 32 8-bit key codes"
+#endif
 
 
 #endif
@@ -296,7 +304,7 @@ uvec4 history_piece(attention_history h, const bool is_key, int t, uint kv_head,
     [[unroll]] for (uint j = 0u; j < HISTORY_LANE_WORDS; ++j)
         w[j] = 0u;
     w[0] = element_u32_at(word);
-    w[1] = b == 8u ? element_u32_at(word + 4ul) : 0u;
+    w[1] = b == HISTORY_KEY_BITS ? element_u32_at(word + 4ul) : 0u;
     float v[8];
     [[unroll]] for (uint i = 0u; i < 8u; ++i)
         v[i] = history_decoded(b, w, sz, i);
@@ -348,10 +356,10 @@ uint64_t history_shuffle(uint64_t a, uint lane) { return packUint2x32(subgroupSh
 // (HISTORY_VALUE_PIECES uvec4) then its coefficient pairs, then a pad keeping
 // a quarter subgroup's row reads on distinct banks.
 #define HISTORY_STAGE_CHUNK (ATTENTION_W < 128u ? ATTENTION_W : 128u)
-#define HISTORY_VALUE_PIECES (ATTENTION_W / 32u)
+#define HISTORY_VALUE_PIECES (ATTENTION_W * HISTORY_VALUE_BITS / 128u)
 #define HISTORY_STAGE_PITCH (max(HISTORY_STAGE_CHUNK / 16u, HISTORY_VALUE_PIECES + (HISTORY_PAIRS + 3u) / 4u) + 1u)
 // The words a lane's value codes of one vector span, when whole.
-#define HISTORY_VALUE_WORDS (ATTENTION_E > 8u ? ATTENTION_E / 8u : 1u)
+#define HISTORY_VALUE_WORDS (ATTENTION_E * HISTORY_VALUE_BITS > 32u ? ATTENTION_E * HISTORY_VALUE_BITS / 32u : 1u)
 
 // One group's share of a keywise score: its 32 codes (`low`, then `high`,
 // four a word) against the heads head0.. of the keywise queries, corrected
@@ -573,7 +581,7 @@ void history_keywise_absorb(const uint n, const bool contiguous, history_source 
 // quarter subgroup's row reads fall on distinct banks), up to
 // HISTORY_FRESH_KEYS of them per step; value rows use the history value layout
 // at row hist_n + j of the tile alongside any historical prefix.
-#define HISTORY_FRESH_PITCH ((ATTENTION_W / 16u + (HISTORY_PAIRS + 3u) / 4u) | 1u)
+#define HISTORY_FRESH_PITCH ((HISTORY_KEY_PIECES + (HISTORY_PAIRS + 3u) / 4u) | 1u)
 #define HISTORY_FRESH_KEYS min(ATTENTION_KEYS, ATTENTION_KEYS * HISTORY_STAGE_PITCH / HISTORY_FRESH_PITCH)
 
 // Key j of a fresh step, encoded (`history_quantize`: this lane's codes `w`
@@ -581,7 +589,7 @@ void history_keywise_absorb(const uint n, const bool contiguous, history_source 
 // The whole subgroup calls it.
 void history_keywise_fresh_key(uint j, uint w[HISTORY_LANE_WORDS], vec2 sz, uint tile) {
     const uint row = (tile + j * HISTORY_FRESH_PITCH) * 4u;
-    history_shared_store(HISTORY_KEY_BITS, w, sz, row, row + ATTENTION_W / 4u, SEISMIC_LANE);
+    history_shared_store(HISTORY_KEY_BITS, w, sz, row, row + HISTORY_KEY_PIECES * 4u, SEISMIC_LANE);
 }
 
 // Value `slot` of a batch, encoded, into its row of the tile.
@@ -601,7 +609,7 @@ void history_keywise_fresh_score(uint key, uint tile, uint queries, uint sums, u
     [[unroll]] for (uint group = 0u; group < HISTORY_PAIRS; ++group)
         history_keywise_group(group, seismic_shared_uvec4[row + 2u * group],
             seismic_shared_uvec4[row + 2u * group + 1u],
-            element_unpack2(ELEMENT_F16, seismic_shared_u32[(row + ATTENTION_W / 16u) * 4u + group]), queries, sums,
+            element_unpack2(ELEMENT_F16, seismic_shared_u32[(row + HISTORY_KEY_PIECES) * 4u + group]), queries, sums,
             head0, score);
 }
 
