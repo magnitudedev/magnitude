@@ -5,8 +5,7 @@
 //
 // Per (token, 32 columns) the activations are rounded to integer codes under
 // a gain, and the operand element of two tokens is 2^16 top + low
-// (`packing_lanes<2>`; the packed-rows GEMV also takes three,
-// `gemv_packed.h`). The weights enter as their stored codes minus their
+// (`packing_lanes`). The weights enter as their stored codes minus their
 // centre, so a 32-column block of one weight row accumulates
 // A = 2^16 T + L in an F32 accumulator; each lane's sum is split off, over
 // 2^15 (`packing_split`), and folds into the output under (token scale) x
@@ -532,61 +531,36 @@ template <typename... W> constexpr bool packing_path() {
     return packing_forms;
 }
 
-// The fields of N lanes of tokens in one packed element, for weights without
-// the top sum's residue (`packing_fields` with RESIDUE 0 is the case N = 2).
-// Lane 0 is the bottom one and lane N - 1 the top. An element is
-// sum_l 2^shift(l) a_l x `element` for lane codes a_l, so a run of n columns
-// accumulates A = sum_l 2^shift(l) S_l for the lanes' sums S_l against the
-// weights' codes minus their centre. Lane l < N - 1 has a field of
-// `width(l)` bits, holding |S_l| up to 2^(width(l) - 1); the top lane's
-// field is free, and its sum stays within
-// `limit` so that |A| < 2^exponent. Each of a run's n roundings is then at
-// most 2^(exponent - 25), which the bottom lane's limit takes off its field:
-// the exponent is the largest (up to 31) that leaves the bottom lane at least
-// half its field over a run of 32 columns.
-//
-// Widths per lane count: N = 2 (16), and N = 3 (10, 10), the layout P2
-// found within 1.002-1.03 of the int8 path's error on ternary, +-1 and 2-bit
-// weights (op-packing-design.md §2.3). Lane codes: the top lane's are within
-// `codes(N - 1)` (the element
-// stays below 2^24; twice that and one more beside even bottom codes, as for
-// N = 2), a lower lane's within its field above it, `codes(l)`.
-template <uint N>
-constexpr uint packing_lane_width(uint l) {
-    return N == 2 ? 16u : 10u;
-}
-template <uint N>
-constexpr uint packing_lane_shift(uint l) {
-    return l == 0 ? 0u : packing_lane_shift<N>(l - 1u) + packing_lane_width<N>(l - 1u);
-}
-template <uint N>
+// The tokens one operand element of the packed GEMM carries, two: narrow
+// codes would leave room for three, but three tokens' bottom lane of about
+// 5-bit codes errs above admission at every format that admits it (tuner
+// ratio 10-40 BF16 steps against alpha 8 at 4096 x 4096, 512 rows).
+constant constexpr uint packing_gemm_lanes = 2;
+
+// The fields of the two lanes of tokens in one packed element, for weights
+// without the top sum's residue (`packing_fields` with RESIDUE 0 is this
+// case). Lane 0 is the bottom one and lane 1 the top. An element is
+// (2^16 a_1 + a_0) x `element` for lane codes a_l, so a run of n columns
+// accumulates A = 2^16 S_1 + S_0 for the lanes' sums S_l against the
+// weights' codes minus their centre. The bottom lane has a field of 16 bits,
+// holding |S_0| up to 2^15; the top lane's field is free, and its sum stays
+// within `limit` so that |A| < 2^31. Each of a run's n roundings is then at
+// most 2^6, which the bottom lane's limit takes off its field. Lane codes:
+// the top lane's are within `codes(1)` (the element stays below 2^24; twice
+// that and one more beside even bottom codes), the bottom lane's within its
+// field, `codes(0)`.
 struct packing_lanes {
-    static_assert(N == 2 || N == 3, "two or three lanes an element");
-    static constexpr uint width(uint l) { return packing_lane_width<N>(l); }
-    static constexpr uint shift(uint l) { return packing_lane_shift<N>(l); }
-    static constant constexpr uint top_shift = packing_lane_shift<N>(N - 1u);
-    // 25 + log2(2^(width(0) - 2) / 32), at most 31.
-    static constant constexpr uint exponent =
-        18u + packing_lane_width<N>(0) < 31u ? 18u + packing_lane_width<N>(0) : 31u;
+    static constexpr uint shift(uint l) { return 16u * l; }
+    static constant constexpr uint top_shift = 16;
     static constant constexpr float element = float(1u << 24);
     static constexpr float codes(uint l) {
-        return l == N - 1u ? float((1u << (24u - top_shift)) - 1u) : float((1u << width(l)) - 1u);
+        return l == 1u ? float((1u << (24u - top_shift)) - 1u) : float((1u << 16) - 1u);
     }
     // The largest |S_l| of a run of n columns.
     static constexpr float limit(uint l, float n) {
-        if (l == N - 1u)
-            return float((1u << (exponent - top_shift)) - 1u);
-        const float field = float(1u << (width(l) - 1u)) - 1.0f;
-        return l == 0 ? field - n * float(1u << (exponent - 25u)) : field;
+        return l == 1u ? float((1u << (31u - top_shift)) - 1u) : 32767.0f - n * 64.0f;
     }
 };
-
-// The tokens one operand element of the packed GEMM carries. Narrow codes
-// leave room for three (`packing_lanes<3>`, which the packed-rows GEMV takes),
-// but three tokens' bottom lane of about 5-bit codes errs above admission at
-// every format that admits it (tuner ratio 10-40 BF16 steps against alpha 8
-// at 4096 x 4096, 512 rows), so the GEMM packs two.
-constant constexpr uint packing_gemm_lanes = 2;
 
 // The lane token `position` of an element takes in `phase`
 // (`packing_phase`), and the position whose token takes lane `position`
@@ -641,11 +615,11 @@ constexpr uint packing_peaks() {
 // low sum of a run of n columns: its field's 32767, less the accumulator's
 // rounding (each of n roundings at most 64) and, where the low sum is
 // divided, the truncation of the read. Without residue bits these are two
-// lanes' (`packing_lanes<2>`).
+// lanes' (`packing_lanes`).
 template <uint RESIDUE>
 struct packing_fields {
     static_assert(RESIDUE <= 2, "the top sum's residue is one or two bit planes");
-    typedef packing_lanes<2> lanes;
+    typedef packing_lanes lanes;
     static constant constexpr uint low_shift = RESIDUE != 0 ? 3 : 0;
     static constant constexpr uint top_bit = lanes::top_shift - RESIDUE;
     static constant constexpr uint top_shift = top_bit + low_shift;
@@ -666,32 +640,31 @@ struct packing_fields {
         (0.5f + float((1u << RESIDUE) - 1u) / float(2u << RESIDUE)) / 32768.0f;
 };
 
-// A run's accumulator A (an integer, `packing_lanes<N>`) as its lanes' sums
+// A run's accumulator A (an integer, `packing_lanes`) as its lanes' sums
 // over 2^15, bottom lane first, by exact F32 operations of full rate: from
 // the top down, a lane's sum over 2^15 is the remainder over 2^shift rounded
-// at 384 (whose unit is 2^-15), and the remainder loses it. N = 2 is the
-// shipped split: (fma(A, 2^-31, 384) - 384, fma(top, -2^16, A 2^-15)),
-// A 2^-15 being exact.
+// at 384 (whose unit is 2^-15), and the remainder loses it:
+// (fma(A, 2^-31, 384) - 384, fma(top, -2^16, A 2^-15)), A 2^-15 being exact.
 // T is float or a float vector (several accumulator elements at once).
-template <uint N, typename T>
-inline void packing_split(T v, thread T (&sums)[N]) {
-    typedef packing_lanes<N> lanes;
+template <typename T>
+inline void packing_split(T v, thread T (&sums)[packing_gemm_lanes]) {
+    typedef packing_lanes lanes;
     T rest = v * 0x1p-15f;
     PROJECTION_UNROLL
-    for (uint l = N - 1u; l > 0u; --l) {
+    for (uint l = packing_gemm_lanes - 1u; l > 0u; --l) {
         sums[l] = metal::fma(rest, T(1.0f / float(1u << lanes::shift(l))), T(384.0f)) - 384.0f;
         rest = metal::fma(sums[l], T(-float(1u << lanes::shift(l))), rest);
     }
     sums[0] = rest;
 }
 
-// The packed element of N lanes' codes, bottom lane first.
-template <uint N, typename T>
-inline T packing_element(thread const T (&codes)[N]) {
-    typedef packing_lanes<N> lanes;
+// The packed element of the lanes' codes, bottom lane first.
+template <typename T>
+inline T packing_element(thread const T (&codes)[packing_gemm_lanes]) {
+    typedef packing_lanes lanes;
     T element = codes[0];
     PROJECTION_UNROLL
-    for (uint l = 1; l < N; ++l)
+    for (uint l = 1; l < packing_gemm_lanes; ++l)
         element = metal::fma(codes[l], T(float(1u << lanes::shift(l))), element);
     return element * lanes::element;
 }
@@ -833,7 +806,7 @@ struct packing_bounded {
     static constant constexpr uint value = (SERVED & ~BOUNDED) == 0 ? SERVED : 0;
 };
 
-// The held scales of an element's LANES tokens of one run (`scales`, by
+// The held scales of an element's two tokens of one run (`scales`, by
 // lane), from their `packing_norms` (`norms`, by lane), of fields F against
 // codes minus `centre`; returned, the step of the bottom lane's codes. Each
 // lane's scale is certified (`packing_lane_scale`). A lane's codes stay within its
@@ -841,31 +814,24 @@ struct packing_bounded {
 // (the element is then even, so exact below 2^25); the element takes the
 // wider top where it lowers the sum of the top and bottom tokens' squared
 // relative steps (64 / gain over |x|_1, the bottom token's doubled by its
-// step), which only a top capped by its codes can. The other lanes' steps
-// do not change, so they do not enter the choice.
-template <typename F, uint LANES, uint FOLDS, bool BOUNDED>
-inline float packing_lane_scales(thread const float3 (&norms)[LANES], float squares, uint centre,
-    thread float (&scales)[LANES]) {
-    constexpr uint TOP = LANES - 1u;
+// step), which only a top capped by its codes can.
+template <typename F, uint FOLDS, bool BOUNDED>
+inline float packing_lane_scales(thread const float3 (&norms)[packing_gemm_lanes], float squares, uint centre,
+    thread float (&scales)[packing_gemm_lanes]) {
     // Each lane's certified scale, then the bottom lane's with even codes.
-    float certified[LANES + 1];
-    PROJECTION_UNROLL
-    for (uint l = 0; l < LANES; ++l)
-        certified[l] = packing_lane_scale<F, FOLDS, BOUNDED>(l, norms[l], squares, centre, 1.0f);
-    certified[LANES] = packing_lane_scale<F, FOLDS, BOUNDED>(0, norms[0], squares, centre, 2.0f);
-    PROJECTION_UNROLL
-    for (uint l = 1; l < TOP; ++l)
-        scales[l] = packing_held(metal::max(certified[l], norms[l].y * (64.0f / F::codes(l))));
-    constexpr float NARROW = 64.0f / F::codes(TOP), WIDE = 64.0f / (2.0f * F::codes(TOP) + 1.0f);
+    const float certified_top = packing_lane_scale<F, FOLDS, BOUNDED>(1, norms[1], squares, centre, 1.0f);
+    const float certified_low = packing_lane_scale<F, FOLDS, BOUNDED>(0, norms[0], squares, centre, 1.0f);
+    const float certified_even = packing_lane_scale<F, FOLDS, BOUNDED>(0, norms[0], squares, centre, 2.0f);
+    constexpr float NARROW = 64.0f / F::codes(1), WIDE = 64.0f / (2.0f * F::codes(1) + 1.0f);
     constexpr float BOTTOM = 64.0f / F::codes(0);
-    const float3 top = norms[TOP], low = norms[0];
-    const float narrow = packing_held(metal::max(certified[TOP], top.y * NARROW));
-    const float wide = packing_held(metal::max(certified[TOP], top.y * WIDE));
-    const float fine = packing_held(metal::max(certified[0], low.y * BOTTOM));
-    const float even = packing_held(metal::max(certified[LANES], low.y * BOTTOM));
+    const float3 top = norms[1], low = norms[0];
+    const float narrow = packing_held(metal::max(certified_top, top.y * NARROW));
+    const float wide = packing_held(metal::max(certified_top, top.y * WIDE));
+    const float fine = packing_held(metal::max(certified_low, low.y * BOTTOM));
+    const float even = packing_held(metal::max(certified_even, low.y * BOTTOM));
     const bool widen = narrow * narrow * low.x * low.x + fine * fine * top.x * top.x
         > wide * wide * low.x * low.x + 4.0f * even * even * top.x * top.x;
-    scales[TOP] = widen ? wide : narrow;
+    scales[1] = widen ? wide : narrow;
     scales[0] = widen ? even : fine;
     return widen ? 2.0f : 1.0f;
 }
@@ -928,7 +894,7 @@ inline void packing_operand(thread const In &in, thread const packing_scratch &s
     static_assert(!SUMS || FOLDS == 2, "a run's own code sums are those of two runs a block");
     // The threadgroup's tokens.
     constexpr uint TOKENS = 2u * packing_gemm_lanes;
-    typedef metal::conditional_t<(RESIDUE != 0), packing_fields<RESIDUE>, packing_lanes<packing_gemm_lanes>> fields;
+    typedef metal::conditional_t<(RESIDUE != 0), packing_fields<RESIDUE>, packing_lanes> fields;
     const uint groups = columns / 32u, steps = columns / 8u;
     const uint tile = index / 16u, within = (2u * index) & 31u;
     constexpr uint ENTRY = packing_entry<RESIDUE, SUMS>();
@@ -961,9 +927,7 @@ inline void packing_operand(thread const In &in, thread const packing_scratch &s
             for (uint l = 0; l < packing_gemm_lanes; ++l)
                 lane_norms[l] = norms[packing_gemm_lanes * p + packing_role(l, phase)];
             float scales[packing_gemm_lanes];
-            const float step =
-                packing_lane_scales<fields, packing_gemm_lanes, FOLDS, (BOUNDS != 0)>(lane_norms, bound, CENTRE,
-                    scales);
+            const float step = packing_lane_scales<fields, FOLDS, (BOUNDS != 0)>(lane_norms, bound, CENTRE, scales);
             float4 codes_even[packing_gemm_lanes], codes_odd[packing_gemm_lanes];
             float sums[packing_gemm_lanes];
             PROJECTION_UNROLL
@@ -976,8 +940,8 @@ inline void packing_operand(thread const In &in, thread const packing_scratch &s
                 packed_even[p] = (codes_even[1] * float(1u << fields::top_shift) + codes_even[0]) * fields::element;
                 packed_odd[p] = (codes_odd[1] * float(1u << fields::top_shift) + codes_odd[0]) * fields::element;
             } else {
-                packed_even[p] = packing_element<packing_gemm_lanes>(codes_even);
-                packed_odd[p] = packing_element<packing_gemm_lanes>(codes_odd);
+                packed_even[p] = packing_element(codes_even);
+                packed_odd[p] = packing_element(codes_odd);
             }
             // The element's scales over what their sums are read over (with
             // residue bits the top's over 2^RESIDUE and the low's over
@@ -1411,7 +1375,7 @@ inline void gemm_packed_sums(thread const Weights<W> &w, thread const packing_sc
                         // Each element's lane sums over 2^15, bottom lane
                         // first.
                         float2 parts[packing_gemm_lanes];
-                        packing_split<packing_gemm_lanes>(v, parts);
+                        packing_split(v, parts);
                         PROJECTION_UNROLL
                         for (uint e = 0; e < 2; ++e) {
                             PROJECTION_UNROLL

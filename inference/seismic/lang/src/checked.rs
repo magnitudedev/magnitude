@@ -2388,29 +2388,6 @@ impl NativeNatExpr {
 }
 
 impl NativeCondition {
-    /// The parameters the condition holds at one value wherever it holds:
-    /// those a conjunct compares equal to a constant.
-    pub(crate) fn pinned(&self, out: &mut Vec<String>) {
-        match self {
-            Self::Compare {
-                comparison: NativeComparison::Eq,
-                left,
-                right,
-            } => {
-                if let (NativeNatExpr::Parameter(name), NativeNatExpr::Constant(_))
-                | (NativeNatExpr::Constant(_), NativeNatExpr::Parameter(name)) = (left, right)
-                {
-                    out.push(name.clone());
-                }
-            }
-            Self::And(left, right) => {
-                left.pinned(out);
-                right.pinned(out);
-            }
-            Self::Compare { .. } | Self::Or(..) => {}
-        }
-    }
-
     /// The condition with every element read replaced by `code(W, query)`.
     fn at_elements(&self, code: &impl Fn(&str, ElementQuery) -> u64) -> Self {
         match self {
@@ -4728,40 +4705,6 @@ mod native_tests {
             let error = crate::native_source::check_fixture(declaration, &[]).expect_err(what);
             assert!(error.to_string().contains(expected), "{what}: {error}");
         }
-    }
-
-    /// An `alike` launch whose `when` pins a reduction order to one value
-    /// (another launch takes the rows at its other values, so the order is a
-    /// code parameter the `alike` launch's template states) reads no order
-    /// by it; one its `when` only bounds still differs from the one-row
-    /// launch's.
-    #[test]
-    fn an_order_an_alike_launch_pins_is_not_read() {
-        let declaration = |pin: &str| {
-            source(&format!(
-                concat!(
-                    "native scale for metal from \"scale.metal\":\n",
-                    "    params (arithmetic LANES in [16, 8] default 16, arithmetic form PACKED in [0, 2] default 0)\n",
-                    "    launch one when N < 2:\n",
-                    "        threadgroups (ceil_div(N, LANES), 1, 1)\n",
-                    "        threads_per_threadgroup (32, 1, 1)\n",
-                    "    launch several when N >= 2 and {pin}:\n",
-                    "        alike (one)\n",
-                    "        threadgroups (ceil_div(N, LANES), 1, 1)\n",
-                    "        threads_per_threadgroup (32, 1, 1)\n",
-                    "    launch packed when N >= 2 and PACKED > 0:\n",
-                    "        params (ROWS in [1, 2] default 1)\n",
-                    "        threadgroups (ceil_div(N, LANES * ROWS * PACKED), 1, 1)\n",
-                    "        threads_per_threadgroup (32, 1, 1)\n",
-                ),
-                pin = pin,
-            ))
-        };
-        let codes = ["LANES", "PACKED", "ROWS"];
-        crate::native_source::check_fixture(declaration("PACKED == 0"), &codes).expect("a pinned order is not read");
-        let error = crate::native_source::check_fixture(declaration("PACKED < 1"), &codes)
-            .expect_err("a bounded order is read");
-        assert!(error.to_string().contains("must read the same reduction orders"), "{error}");
     }
 
     /// A `staging` launch is recorded on the checked launch, and a launch

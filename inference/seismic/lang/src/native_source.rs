@@ -336,22 +336,12 @@ pub fn derive_codes(
 /// selects the launch by rows and is no reduction) and, in a templated
 /// source, its code parameters.
 fn check_alike(implementation: &NativeImplementation) -> Result<(), NativeReadError> {
-    // A parameter the launch's `when` pins to one value orders nothing
-    // across the configurations the launch runs in.
     let orders = |ordinal: usize| {
-        let launch = &implementation.launches[ordinal];
-        let mut pinned = Vec::new();
-        if let Some(when) = &launch.when {
-            when.pinned(&mut pinned);
-        }
-        let mut names = launch.dispatch_parameters();
+        let mut names = implementation.launches[ordinal].dispatch_parameters();
         names.extend(
             implementation.code_parameters(ordinal).into_iter().map(|(_, name)| name.to_owned()),
         );
-        names.retain(|name| {
-            !pinned.contains(name)
-                && implementation.params.iter().any(|own| &own.name == name && own.arithmetic)
-        });
+        names.retain(|name| implementation.params.iter().any(|own| &own.name == name && own.arithmetic));
         names.sort();
         names.dedup();
         names

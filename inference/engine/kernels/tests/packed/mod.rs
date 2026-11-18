@@ -72,7 +72,7 @@ fn role(position: usize, phase: usize) -> usize {
     (1 - position + phase) % 2
 }
 
-/// The fields of an element and its run accumulator (`packing_lanes<N>`, or
+/// The fields of an element and its run accumulator (`packing_lanes`, or
 /// `packing_fields<R>` with residue bits), bottom lane first: each lane's
 /// largest code, the largest |S_l| of a run (`limit`), the exponent of its
 /// unit in the accumulator, and the accumulator's bound 2^exponent.
@@ -120,7 +120,7 @@ impl Fields {
 /// `packing_lane_scale`: lane `l`'s certified scale for a token of a run's
 /// norms |x|_1 and |x|_2^2, codes in multiples of `step`, against codes
 /// minus `centre`, with the tensors' bound B^2 of the run where given.
-pub fn certified_scale(
+fn certified_scale(
     fields: &Fields,
     l: usize,
     l1: f64,

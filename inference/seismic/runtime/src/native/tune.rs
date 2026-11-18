@@ -9304,9 +9304,9 @@ mod tests {
         };
         assert!(run.structural, "the first piece is the other forms'");
         // Forms: TALL, INT8, PACK, RESIDUE, MATRIX, SMALL, STAGE, and TILED
-        // and PACKED_ROWS (two non-default values each), each at its other
-        // values that the declaration's restrictions admit.
-        assert!(first.len() <= 11, "{}", first.len());
+        // (two non-default values), each at its other values that the
+        // declaration's restrictions admit.
+        assert!(first.len() <= 9, "{}", first.len());
         let packing = first
             .iter()
             .find(|form| form.param("PACK") == Some(1))
@@ -9314,7 +9314,7 @@ mod tests {
         // Each differs from the defaults in its form, and in what that
         // form's restrictions couple to it alone.
         assert!(first.iter().all(|form| {
-            ["TALL", "INT8", "PACK", "RESIDUE", "MATRIX", "SMALL", "STAGE", "TILED", "PACKED_ROWS"]
+            ["TALL", "INT8", "PACK", "RESIDUE", "MATRIX", "SMALL", "STAGE", "TILED"]
                 .iter()
                 .filter(|name| form.param(name) != seed.param(name))
                 .count()

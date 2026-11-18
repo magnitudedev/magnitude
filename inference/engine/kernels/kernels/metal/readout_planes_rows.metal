@@ -73,13 +73,13 @@ kernel void readout_planes_rows_gemv(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUME
 }
 #endif
 #ifdef SEISMIC_FORMING_READOUT_PLANES_ROWS_GEMV_PAIR
-template <uint LANES, uint TILED, uint STAGE, uint PACKED_ROWS, uint ROWS>
+template <uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void readout_planes_rows_gemv_pair(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(PAIR, TILED);
 }
 #endif
 #ifdef SEISMIC_FORMING_READOUT_PLANES_ROWS_GEMV_ROWS
-template <uint LANES, uint TILED, uint STAGE, uint PACKED_ROWS, uint ROWS>
+template <uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void readout_planes_rows_gemv_rows(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(SEVERAL, TILED);
 }

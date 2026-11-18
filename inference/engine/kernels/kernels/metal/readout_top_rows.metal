@@ -167,14 +167,14 @@ kernel void readout_top_rows_gemv(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS
 }
 #endif
 #ifdef SEISMIC_FORMING_READOUT_TOP_ROWS_GEMV_PAIR
-template <uint LANES, uint TILED, uint STAGE, uint PACKED_ROWS, uint ROWS>
+template <uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void readout_top_rows_gemv_pair(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS, TOP_ROWS_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(PAIR, TILED);
     TOP_ROWS_PUBLISH;
 }
 #endif
 #ifdef SEISMIC_FORMING_READOUT_TOP_ROWS_GEMV_ROWS
-template <uint LANES, uint TILED, uint STAGE, uint PACKED_ROWS, uint ROWS>
+template <uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void readout_top_rows_gemv_rows(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS, TOP_ROWS_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(SEVERAL, TILED);
     TOP_ROWS_PUBLISH;

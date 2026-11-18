@@ -124,26 +124,6 @@
     const auto x = Operands::rows(input, m, k, globals, simdgroups, sg, lane);                                  \
     PROJECTION_GEMV(packets::W0, packets::W0, false, ROWS, LANES, TILED, COUNT, x, out, w, w, m, n, k)
 
-// The packed-rows GEMV (PACKED_ROWS rows an operand, `gemv_packed`), on a
-// device that runs the packed forms (`packing_forms`); elsewhere the GEMV's
-// row mapping in its place, as the PACK form's `unpacked` launch.
-#define PROJECTION_SINGLE_GEMV_PACKED                                                                           \
-    const uint tile = position.x;                                                                               \
-    PROJECTION_OPERANDS(PROJECTION_GROUP(position.z));                                                          \
-    PROJECTION_GEMV_INPUT(input);                                                                               \
-    PROJECTION_OPERANDS_SHARED(globals, NVFP4);                                                                 \
-    const auto x = Operands::rows(input, m, k, globals, simdgroups, sg, lane);                                  \
-    if constexpr (projection::packing_forms) {                                                                  \
-        PROJECTION_BOUNDS;                                                                                      \
-        PROJECTION_FOR_PACKED_ROWS(m,                                                                           \
-            projection::gemv_packed<packets::W0, PACKED_ROWS, ROWS, MAXM, LANES, BOUNDS>(x, out, w, bounds, m,   \
-                n, k, tile, shared, simdgroups, sg, lane));                                                     \
-    } else {                                                                                                    \
-        PROJECTION_FOR_PACKED_ROWS(m,                                                                           \
-            projection::gemv_form<packets::W0, packets::W0, false, ROWS, MAXM, LANES, false, false>(x, out, w, w, \
-                m, n, k, tile, shared, simdgroups, sg, lane));                                                  \
-    }
-
 #define PROJECTION_SINGLE_BATCH                                                                                 \
     const uint tile = position.x;                                                                               \
     PROJECTION_OPERANDS(PROJECTION_GROUP(position.z));                                                          \
