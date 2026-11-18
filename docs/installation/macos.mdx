@@ -11,16 +11,6 @@ description: "Install Magnitude on an Apple Silicon or Intel Mac."
 
 Apple Silicon uses Metal GPU acceleration. Intel Macs use CPU inference. See [Hardware](/hardware) for memory and performance guidance.
 
-## Install from the terminal
-
-```sh
-curl -fsSL https://magnitude.dev/install.sh | sh
-```
-
-The installer selects Apple Silicon or Intel automatically, verifies the download, installs Magnitude in `/Applications`, and registers the `magnitude` CLI. Open a new terminal to use the command.
-
-Open Magnitude from Applications and follow [Quick start](/get-started). For a headless session, run `magnitude serve` instead; the installer does not require opening the desktop app.
-
 ## Download the installer
 
 1. Visit [Download Magnitude](https://magnitude.dev/download?os=macos#downloads).
@@ -28,10 +18,28 @@ Open Magnitude from Applications and follow [Quick start](/get-started). For a h
 3. Open the `.dmg` and drag **Magnitude** into **Applications**.
 4. Open Magnitude from Applications, then follow [Quick start](/get-started). Opening the app registers the CLI; use a new terminal for the `magnitude` command.
 
-To run Magnitude as a service on a Mac that serves other computers, see [Remote server](/remote-server).
+## Install from the terminal
+
+To install the desktop app from a terminal:
+
+```sh
+curl -fsSL https://magnitude.dev/install.sh | sh -s -- --desktop
+```
+
+The installer selects Apple Silicon or Intel automatically, verifies the download, installs Magnitude in `/Applications`, and registers the `magnitude` CLI. Open a new terminal to use the command.
+
+## Install the CLI only
+
+For a Mac that serves other computers or apps without the desktop app:
+
+```sh
+curl -fsSL https://magnitude.dev/install.sh | sh
+```
+
+This installs only the CLI, into `~/.magnitude/cli`, with the `magnitude` command in `~/.magnitude/bin`. It needs no administrator password and updates itself while `magnitude serve` runs. Open a new terminal, then run `magnitude serve`. To keep it running in the background, see [Remote server](/remote-server). Installing the desktop app later replaces the CLI-only install.
 
 ## Updates and removal
 
 Check **Settings → Application updates** to download and install updates. Restarting to update stops the running model and service.
 
-To remove the app, quit Magnitude and move it from Applications to Trash. Your downloaded models and settings live separately under `~/.magnitude`; removing the app does not mean that data has been deleted. Keep that folder if you intend to reinstall.
+To remove the app, quit Magnitude and move it from Applications to Trash. To remove a CLI-only install, see [Remote server](/remote-server#remove-the-cli-only-install). Your downloaded models and settings live separately under `~/.magnitude`; removing the app does not mean that data has been deleted. Keep that folder if you intend to reinstall.

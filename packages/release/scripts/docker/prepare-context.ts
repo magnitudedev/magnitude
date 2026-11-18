@@ -1,18 +1,18 @@
 /**
  * Writes the Docker build context for one architecture of a release:
  *
- *   magnitude-desktop.deb       the release's Debian package, or the one given with --deb
+ *   magnitude-cli-only.tar.gz   the release's CLI-only payload, or the one given with --payload
  *   inference/                  the release's inference engine with its installation.json
  *   magnitude-release.json      the release manifest every artifact was checked against
  *   update-configuration.json   only with --update-configuration (QA images)
  *
  * Usage:
  *   bun packages/release/scripts/docker/prepare-context.ts --version 0.2.14 --arch amd64 \
- *     --output ./docker-context [--candidate ./release-candidate | --deb ./magnitude-desktop.deb] \
+ *     --output ./docker-context [--candidate ./release-candidate | --payload ./magnitude-cli-only-linux-x64-gnu.tar.gz] \
  *     [--update-configuration ./update.json]
  *
  * The release is the published one named by --version, or with --candidate the not yet published
- * candidate that assemble.ts wrote. With --deb, only the engine comes from the release.
+ * candidate that assemble.ts wrote. With --payload, only the engine comes from the release.
  */
 import { FetchHttpClient, FileSystem, Path } from "@effect/platform"
 import { BunContext, BunRuntime } from "@effect/platform-bun"
@@ -26,7 +26,7 @@ import { inferenceRequiredPaths } from "../../src/inference-installation"
 import { sha256File } from "../../src/macos-app"
 import { hostById } from "../../src/targets"
 import type { ReleaseArtifact } from "../../src/contracts"
-import { debArtifactId, parseDockerArchitecture, releaseHostOf } from "./image"
+import { cliOnlyArtifactId, parseDockerArchitecture, releaseHostOf } from "./image"
 
 class DockerContextFailed extends Data.TaggedError("DockerContextFailed")<{ readonly message: string }> {}
 
@@ -40,7 +40,7 @@ const readArguments = Effect.try({
       arch: { type: "string" },
       output: { type: "string" },
       candidate: { type: "string" },
-      deb: { type: "string" },
+      payload: { type: "string" },
       "update-configuration": { type: "string" },
     },
     strict: true,
@@ -59,8 +59,8 @@ const run = Effect.scoped(Effect.gen(function* () {
   const architecture = yield* parseDockerArchitecture(yield* required(args.arch, "arch"))
   const output = path.resolve(yield* required(args.output, "output"))
   const candidate = Option.map(Option.fromNullable(args.candidate), (directory) => path.resolve(directory))
-  const localDeb = Option.map(Option.fromNullable(args.deb), (file) => path.resolve(file))
-  if (Option.isSome(candidate) && Option.isSome(localDeb)) return yield* fail("--candidate already holds the Debian package; omit --deb")
+  const localPayload = Option.map(Option.fromNullable(args.payload), (file) => path.resolve(file))
+  if (Option.isSome(candidate) && Option.isSome(localPayload)) return yield* fail("--candidate already holds the CLI-only payload; omit --payload")
   const updateConfiguration = Option.map(Option.fromNullable(args["update-configuration"]), (file) => path.resolve(file))
   const host = releaseHostOf(architecture)
   const baseUrl = releaseBaseUrl()
@@ -106,22 +106,22 @@ const run = Effect.scoped(Effect.gen(function* () {
   const declaration = yield* Schema.encode(Schema.parseJson(IcnInstallationDeclaration))({ schemaVersion: 1, nativeBuild })
   yield* fs.writeFileString(path.join(inference, "installation.json"), `${declaration}\n`)
 
-  const deb = path.join(output, "magnitude-desktop.deb")
-  const debArtifact = Effect.suspend(() => {
-    const artifact = release.manifest.artifacts.find((entry) => entry.id === debArtifactId(architecture))
-    return artifact === undefined ? Effect.fail(fail(`${version} has no ${debArtifactId(architecture)} artifact`)) : Effect.succeed(artifact)
+  const payload = path.join(output, "magnitude-cli-only.tar.gz")
+  const payloadArtifact = Effect.suspend(() => {
+    const artifact = release.manifest.artifacts.find((entry) => entry.id === cliOnlyArtifactId(architecture))
+    return artifact === undefined ? Effect.fail(fail(`${version} has no ${cliOnlyArtifactId(architecture)} artifact`)) : Effect.succeed(artifact)
   })
-  if (Option.isSome(localDeb)) {
-    yield* Effect.logInfo(`Using the local package ${localDeb.value}`)
-    yield* fs.copyFile(localDeb.value, deb)
+  if (Option.isSome(localPayload)) {
+    yield* Effect.logInfo(`Using the local CLI-only payload ${localPayload.value}`)
+    yield* fs.copyFile(localPayload.value, payload)
   } else if (Option.isSome(candidate)) {
-    yield* fs.copyFile(yield* candidateFile(candidate.value, yield* debArtifact), deb)
+    yield* fs.copyFile(yield* candidateFile(candidate.value, yield* payloadArtifact), payload)
   } else {
-    const artifact = yield* debArtifact
+    const artifact = yield* payloadArtifact
     yield* Effect.logInfo(`Downloading ${artifact.filename} (${artifact.bytes} bytes)`)
     yield* downloadArtifact({
       url: releaseUrl(baseUrl, version, artifact.filename),
-      destination: deb,
+      destination: payload,
       bytes: artifact.bytes,
       sha256: artifact.sha256,
       strategy: { _tag: "Sequential" },

@@ -1,4 +1,5 @@
 import { Option } from "effect"
+import { ACN_EXECUTABLE_NAME } from "./executables"
 import { linuxPackageArchitecture, linuxPackageVersion, type LinuxPackageFormat } from "./linux-package"
 
 export type HostId =
@@ -144,6 +145,21 @@ export const linuxDesktopInstaller = (host: "linux-arm64-gnu" | "linux-x64-gnu",
   }
 }
 export const icnBaseArchive = (host: HostId) => `magnitude-icn-base-${host}.tar.gz`
+export const cliOnlyArchive = (host: HostId) => `magnitude-cli-only-${host}.tar.gz`
+
+/** Every file of a host's CLI-only payload, sorted. They sit directly at the archive root and run from one directory. */
+export const cliOnlyPayloadPaths = (host: HostId): readonly string[] => {
+  const windows = host === "windows-x64-msvc"
+  return [
+    windows ? "magnitude.exe" : "magnitude",
+    `${ACN_EXECUTABLE_NAME}${windows ? ".exe" : ""}`,
+    "desktop-host.node",
+    windows ? "magnitude-launcher.exe" : "magnitude-command",
+    "update-configuration.json",
+    "update-trust.json",
+    "LICENSE",
+  ].sort()
+}
 
 export const currentHost = (): HostId => {
   const key = `${process.platform}-${process.arch}`

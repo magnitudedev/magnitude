@@ -1,6 +1,6 @@
 name: Docker image
 
-# Builds the image of a release from its own .deb and engine, natively per architecture, pushes
+# Builds the image of a release from its own CLI-only payload and engine, natively per architecture, pushes
 # each by digest (untagged, so unpublished) and smoke-tests exactly that digest. The release build
 # calls it with the candidate's artifacts before anything is published, and the release tags the
 # tested digests after publication with docker-tags.yml. Dispatch it to rebuild and tag a published

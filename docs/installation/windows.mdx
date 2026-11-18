@@ -11,16 +11,6 @@ description: "Install Magnitude on Windows."
 
 The current Windows build supports CPU inference and compatible NVIDIA CUDA or Vulkan GPUs on Windows. See [Hardware](/hardware).
 
-## Install from PowerShell
-
-```powershell
-irm https://magnitude.dev/install.ps1 | iex
-```
-
-The script verifies the download and runs the Windows installer silently. It includes the desktop app and CLI, and makes `magnitude` available in the current PowerShell session. Open a new terminal to use it in other shells that were already running.
-
-Open Magnitude from the Start menu and follow [Quick start](/get-started). For a headless session, run `magnitude serve` instead.
-
 ## Download the installer
 
 1. Download the Windows installer from [Download Magnitude](https://magnitude.dev/download?os=windows#downloads).
@@ -29,10 +19,30 @@ Open Magnitude from the Start menu and follow [Quick start](/get-started). For a
 
 The installer installs for your user account under `%LOCALAPPDATA%\Programs\Magnitude`.
 
+## Install from PowerShell
+
+To install the desktop app from PowerShell:
+
+```powershell
+& ([scriptblock]::Create((irm https://magnitude.dev/install.ps1))) -Desktop
+```
+
+The script verifies the download and runs the Windows installer silently. It includes the desktop app and CLI, and makes `magnitude` available in the current PowerShell session. Open a new terminal to use it in other shells that were already running.
+
+## Install the CLI only
+
+For a machine that serves other computers or apps without the desktop app:
+
+```powershell
+irm https://magnitude.dev/install.ps1 | iex
+```
+
+This installs only the CLI, into `%USERPROFILE%\.magnitude\cli`, with the `magnitude` command in `%LOCALAPPDATA%\Programs\Magnitude CLI`. It needs no administrator rights and updates itself while `magnitude serve` runs. Run `magnitude serve` to serve; to keep it running in the background, see [Remote server](/remote-server). Installing the desktop app later replaces the CLI-only install.
+
 ## Updates and removal
 
 Use **Settings → Application updates** to check for updates. **Restart to update** stops local inference while the application is replaced.
 
-Uninstall Magnitude through Windows **Settings → Apps**. Downloaded models and settings are stored separately in `%USERPROFILE%\.magnitude`; keep them if you intend to reinstall.
+Uninstall Magnitude through Windows **Settings → Apps**. To remove a CLI-only install, see [Remote server](/remote-server#remove-the-cli-only-install). Downloaded models and settings are stored separately in `%USERPROFILE%\.magnitude`; keep them if you intend to reinstall.
 
 Agents installed inside WSL need a small amount of configuration; see [Windows and WSL](/api/windows-wsl).

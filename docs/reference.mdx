@@ -3,7 +3,7 @@ title: "CLI reference"
 description: "Run Magnitude, manage models, and install updates from your terminal."
 ---
 
-The Magnitude installation includes the `magnitude` CLI. In a new terminal, run:
+The desktop app includes the `magnitude` CLI, and the CLI-only install provides it alone for servers and headless use (see [Remote server](/remote-server)). In a new terminal, run:
 
 ```sh
 magnitude --help
@@ -20,8 +20,8 @@ Running `magnitude` without a subcommand prints help. No npm installation is req
 | `magnitude status` | Check whether Magnitude is running and inspect service and model status. |
 
 Model, hardware, and connection setup commands require a running Desktop or `magnitude serve`.
-Stop a foreground server with Ctrl+C. Opening Desktop takes over from a foreground server.
-Only one Desktop or `serve` instance can run under the same user account. Fully quit Desktop or stop the existing `serve` command before starting another server. See [Remote server](/remote-server) for setup.
+Stop a foreground server with Ctrl+C. While Desktop is open it serves, and `serve` waits until Desktop quits, then resumes.
+Only one `serve` can run under the same user account. To keep `serve` running in the background at login or at boot, see [Remote server](/remote-server#keep-it-running-in-the-background).
 
 Use **Launch at login** in Desktop Settings for login startup, and **Quit Magnitude** to stop Desktop.
 
@@ -68,9 +68,9 @@ Harness IDs: `pi`, `opencode`, `hermes`, `openclaw`, `codex`, `claude-code`, `oh
 | `magnitude update install` | Install a prepared update; stop inference and restart Desktop if it was running. |
 | `magnitude update discard` | Remove a retained update download. |
 
-These commands update Desktop, the server, and CLI together. Checking, downloading, inspecting, or discarding an update does not open Desktop.
+These commands update Desktop and its CLI together, or the CLI-only install. Checking, downloading, inspecting, or discarding an update does not open Desktop.
 
-`update install` refuses to interrupt a running `serve` command. Stop the server first. Installation leaves a stopped server stopped; run `magnitude serve` afterward. A prepared update is also installed at the next startup unless an earlier installation attempt failed. Failed attempts require an explicit `update install` retry. Linux installation may require administrator authorization.
+A CLI-only install updates itself while `magnitude serve` runs: it downloads updates, waits until no inference request is running, then installs and restarts in place. With `autoDownloadUpdates` set to `false`, run `magnitude update install` to install one. Failed attempts require an explicit `update install` retry. Desktop installation on Linux may require administrator authorization.
 
 ## Help
 

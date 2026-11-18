@@ -1,6 +1,7 @@
 import { acnExecutableRelativePath } from "../../src/macos-app"
 import { buildMacApp } from "../apple/build-app"
 import { buildDesktopApplication, DesktopBuildFailed } from "./desktop"
+import { stageCliOnlyPayload } from "./cli-only"
 import { buildLinuxDesktopInstaller } from "./desktop-linux"
 import { linuxPackageFormats } from "../../src/linux-package"
 import { buildWindowsDesktopInstaller } from "./desktop-windows"
@@ -14,6 +15,7 @@ import {
   chmod,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   rm,
   writeFile,
@@ -30,6 +32,8 @@ import {
   desktopInstaller,
   desktopUpdateArchive,
   cliArchive,
+  cliOnlyArchive,
+  cliOnlyPayloadPaths,
   currentHost,
   hostById,
   icnBaseArchive,
@@ -66,18 +70,20 @@ export const smokeHostArchives = async (
   acnArchivePath: string,
   icnArchivePath: string,
   icnArtifact: ReleaseArtifact,
+  cliOnlyArchivePath: string,
 ): Promise<void> => {
   const root = await mkdtemp(resolve(tmpdir(), `magnitude-${host.id}-`))
   try {
-    const [cliRoot, acnRoot, icnRoot] = ["cli", "acn", "icn"].map((name) =>
+    const [cliRoot, acnRoot, icnRoot, cliOnlyRoot] = ["cli", "acn", "icn", "cli-only"].map((name) =>
       resolve(root, name)
-    )
-    await Promise.all([cliRoot, acnRoot, icnRoot].map((directory) =>
+    ) as [string, string, string, string]
+    await Promise.all([cliRoot, acnRoot, icnRoot, cliOnlyRoot].map((directory) =>
       mkdir(directory, { recursive: true, mode: 0o700 })
     ))
     await run(["tar", "-xzf", cliArchivePath, "-C", cliRoot])
     await run(["tar", "-xzf", acnArchivePath, "-C", acnRoot])
     await run(["tar", "-xzf", icnArchivePath, "-C", icnRoot])
+    await run(["tar", "-xzf", cliOnlyArchivePath, "-C", cliOnlyRoot])
 
     const packageJson = JSON.parse(
       await readFile(resolve(PROJECT_ROOT, "packages/launcher/package.json"), "utf8"),
@@ -97,6 +103,10 @@ export const smokeHostArchives = async (
         "version",
       ])).trim() !== version
     ) throw new Error(`${host.id} ACN archive returned the wrong version`)
+    const cliOnlyFiles = (await readdir(cliOnlyRoot)).sort()
+    if (JSON.stringify(cliOnlyFiles) !== JSON.stringify(cliOnlyPayloadPaths(host.id))) throw new Error(`${host.id} CLI-only archive has the wrong files`)
+    if ((await run([resolve(cliOnlyRoot, `magnitude${extension}`), "--version"])).trim() !== version) throw new Error(`${host.id} CLI-only CLI returned the wrong version`)
+    if ((await run([resolve(cliOnlyRoot, `${ACN_EXECUTABLE_NAME}${extension}`), "version"])).trim() !== version) throw new Error(`${host.id} CLI-only service returned the wrong version`)
     if (
       Number((await run([
         resolve(acnRoot, acnExecutableRelativePath(host.id)),
@@ -129,6 +139,9 @@ export const smokeHostArchives = async (
       const signing = await runAppleBuild(appleSigning)
       await run(["/usr/bin/codesign", "--verify", "--deep", "--strict", "-R", `=${appleRequirement("dev.magnitude.service", signing.team)}`, app])
       await run(["/usr/bin/codesign", "--verify", "--strict", "-R", `=${appleRequirement("dev.magnitude.cli", signing.team)}`, resolve(cliRoot, "bin/magnitude-cli")])
+      for (const [file, identifier] of [["magnitude", "dev.magnitude.cli"], [ACN_EXECUTABLE_NAME, "dev.magnitude.service"], ["desktop-host.node", "dev.magnitude.desktop-host"], ["magnitude-command", "dev.magnitude.command"]] as const) {
+        await run(["/usr/bin/codesign", "--verify", "--strict", "-R", `=${appleRequirement(identifier, signing.team)}`, resolve(cliOnlyRoot, file)])
+      }
       if (signing.mode === "developer-id") await runAppleBuild(appleCommand("/usr/bin/xcrun", "stapler", "validate", app))
     }
   } finally {
@@ -281,6 +294,23 @@ export const buildHostArtifacts = async (
     }).pipe(Effect.provide(BunContext.layer)))
     desktopArtifacts.push(installer.artifact)
   }
+  const cliOnly = await runAppleBuild(stageCliOnlyPayload({ host, cli, service: acn, stage: resolve(output, ".cli-only"), output }))
+  if (host.id.startsWith("darwin-")) {
+    await verifyAppleDeploymentTarget(host.id, cliOnly.sources.filter((source) => source.mode === 0o755).map((source) => source.source))
+  }
+  notarizations.push(cliOnly.notarization)
+  const cliOnlyArchivePath = resolve(output, cliOnlyArchive(host.id))
+  const cliOnlyArtifact = await buildArchive(
+    cliOnlyArchivePath,
+    resolve(output, `cli-only-${host.id}.artifact.json`),
+    {
+      id: `cli-only-${host.id}`,
+      kind: "desktop",
+      host: Option.some(host.id),
+      nativeBuild: Option.none(),
+    },
+    cliOnly.sources,
+  )
   const acnArtifact = await buildArchive(
     acnArchivePath,
     resolve(output, `acn-${host.id}.artifact.json`),
@@ -309,12 +339,14 @@ export const buildHostArtifacts = async (
     acnArchivePath,
     icnArchivePath,
     icnArtifact,
+    cliOnlyArchivePath,
   )
   if (host.id.startsWith("darwin-")) {
-    await runAppleBuild(writeAppleReceipt(output, [cliArtifact, acnArtifact, icnArtifact, ...desktopArtifacts], notarizations, true))
+    await runAppleBuild(writeAppleReceipt(output, [cliArtifact, acnArtifact, icnArtifact, cliOnlyArtifact, ...desktopArtifacts], notarizations, true))
     await rm(resolve(output, ".app-build"), { recursive: true, force: true })
   }
   await rm(resolve(output, ".desktop-build"), { recursive: true, force: true })
+  await rm(resolve(output, ".cli-only"), { recursive: true, force: true })
 }
 
 if (import.meta.main) {

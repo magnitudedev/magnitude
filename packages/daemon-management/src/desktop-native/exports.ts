@@ -22,7 +22,8 @@ export * from "./login-startup"
 export { LinuxTrayHost, linuxTrayHostLayer, type TrayHostState } from "./tray-host"
 
 export { makeWindowsOwnedChildSpawner } from "./windows-owned-child"
-export { requireServicePort } from "./service-port"
+export { requireServicePort, takeOverServicePort, portServedByOtherMagnitude } from "./service-port"
+export * from "./serving-turn"
 export { installLinuxApplicationUpdate, guardLinuxInstallerParent, parseLinuxUpdateInstallation } from "./linux-update-maintenance"
 export { LinuxPackageUpdate, linuxPackageUpdateExitCode, linuxUpdateFailureReason } from "./linux-update-package"
 export { relaunchLinuxAfterUpdate, LinuxUpdateHandoffRequest, startLinuxUpdateHandoff, completeLinuxUpdateHandoff } from "./linux-update-handoff"
@@ -38,7 +39,7 @@ export { AppearancePreferences, AppearancePreferencesFailed, makeAppearancePrefe
 
 export { recoverWindowsUpdateDirectory, WindowsUpdateDirectoryFailed } from "./windows-update-directory"
 
-export { ApplicationRuntime, ApplicationProfile, ApplicationRuntimeUnavailable, resolveInstalledApplicationRuntime, resolveApplicationProfile, applicationNativeHostPath, applicationServiceCommand, makeApplicationService } from "./application-bootstrap"
+export { ApplicationRuntime, InstallationLayout, standaloneInstallationRoot, ApplicationProfile, ApplicationRuntimeUnavailable, resolveInstalledApplicationRuntime, resolveApplicationProfile, applicationNativeHostPath, applicationServiceCommand, makeApplicationService } from "./application-bootstrap"
 export { makeUnixProcessContinuation, ForegroundContinuationFailed } from "./unix-continuation"
 
 export { acquireMacApplicationInstallationLease, nativeMacUpdateAdmission } from "./mac-update-lease"
@@ -49,3 +50,4 @@ export { TerminalCommand, TerminalCommandFailed, nodeTerminalCommand } from "./t
 export { closeServerFirewall, openServerFirewall, recordOpenedServerFirewall } from "./server-firewall"
 export { ServerInstallationFailed, installedServerCli, parseServerInstallation, requireInstalledRoot, installLinuxServer, removeLinuxServer, installMacServer, removeMacServer, macServerPlist,
   restoreLinuxServerGrant, classifyServerAccounts, inspectServerAccounts, hasLinuxServerRemnants, systemIdRange } from "./server-installation"
+export * from "./standalone-absorption"

@@ -125,8 +125,8 @@ cleanup:
   return failure;
 }
 
-DWORD magnitude_cli_run(const WCHAR *executable, int argc, WCHAR **argv, BOOL serving) {
-  WCHAR directory[32768], safe_directory[32768], command[32768];
+DWORD magnitude_cli_run(magnitude_cli_resolver resolve, int argc, WCHAR **argv, BOOL serving) {
+  WCHAR directory[32768], safe_directory[32768], command[32768], executable[32768];
   FILE_ID_INFO before, after;
   DWORD failure = ERROR_SUCCESS, code = 1;
   DWORD length = GetCurrentDirectoryW(32768, directory);
@@ -140,6 +140,17 @@ DWORD magnitude_cli_run(const WCHAR *executable, int argc, WCHAR **argv, BOOL se
     failure = GetLastError(); goto cleanup;
   }
   for (int attempt = 0; attempt < 2; ++attempt) {
+    if (!resolve(executable)) {
+      fputs("Magnitude is not installed. Install it from https://magnitude.dev, then run this command again.\n", stderr);
+      code = 1;
+      break;
+    }
+    if (attempt != 0) {
+      failure = identity(executable, &after);
+      if (failure) break;
+      if (before.VolumeSerialNumber == after.VolumeSerialNumber &&
+          !memcmp(&before.FileId, &after.FileId, sizeof(before.FileId))) { failure = ERROR_FILE_INVALID; break; }
+    }
     failure = identity(executable, &before);
     if (failure) break;
     size_t used = 0;
@@ -152,10 +163,6 @@ DWORD magnitude_cli_run(const WCHAR *executable, int argc, WCHAR **argv, BOOL se
     failure = run_child(executable, command, directory, serving, &code);
     if (failure || !serving || code != MAGNITUDE_CLI_CONTINUE || InterlockedCompareExchange(&stopping, 0, 0)) break;
     if (attempt != 0) { failure = ERROR_RETRY; break; }
-    failure = identity(executable, &after);
-    if (failure) break;
-    if (before.VolumeSerialNumber == after.VolumeSerialNumber &&
-        !memcmp(&before.FileId, &after.FileId, sizeof(before.FileId))) { failure = ERROR_FILE_INVALID; break; }
   }
 cleanup:
   SetConsoleCtrlHandler(console_control, FALSE);

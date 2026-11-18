@@ -9,7 +9,7 @@ import { validateLinuxDesktopInstaller } from "./build/desktop-linux"
 import { linuxPackageFormats } from "../src/linux-package"
 import { ACN_COORDINATION_REVISION } from "@magnitudedev/version"
 import { ReleaseArtifactSchema } from "../src/contracts"
-import { acnArchive, cliArchive, hostById, icnBaseArchive, type HostId } from "../src/targets"
+import { acnArchive, cliArchive, cliOnlyArchive, hostById, icnBaseArchive, type HostId } from "../src/targets"
 import { smokeHostArchives } from "./build/host"
 
 const hostId = process.argv[2] as HostId | undefined
@@ -22,7 +22,7 @@ const artifact = Schema.decodeUnknownSync(Schema.parseJson(ReleaseArtifactSchema
   await readFile(resolve(root, `icn-base-${hostId}.artifact.json`), "utf8")
 )
 
-const ids = ["cli", "acn", "icn-base"].map(kind => `${kind}-${hostId}`)
+const ids = ["cli", "acn", "icn-base", "cli-only"].map(kind => `${kind}-${hostId}`)
 if (hostId.startsWith("darwin-")) ids.push(`desktop-${hostId}`, `desktop-update-${hostId}`)
 if (hostId === "linux-arm64-gnu" || hostId === "linux-x64-gnu") ids.push(...linuxPackageFormats(hostId === "linux-arm64-gnu" ? "arm64" : "x64").map(format => `desktop-${hostId}-${format}`))
 if (hostId === "windows-x64-msvc") ids.push(`desktop-${hostId}`)
@@ -49,7 +49,8 @@ await smokeHostArchives(
   resolve(root, cliArchive(hostId)),
   resolve(root, acnArchive(hostId)),
   resolve(root, icnBaseArchive(hostId)),
-  artifact
+  artifact,
+  resolve(root, cliOnlyArchive(hostId)),
 )
 
 if (hostId.startsWith("darwin-")) await runAppleBuild(writeAppleConsumerReceipt(root, artifacts))

@@ -10,6 +10,11 @@ export class DesktopBuildFailed extends Schema.TaggedError<DesktopBuildFailed>()
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../../..")
 const PackageVersion = Schema.Struct({ version: Schema.NonEmptyString })
 const ApplicationPackage = Schema.Struct({ name: Schema.String, version: Schema.String, type: Schema.Literal("module"), main: Schema.String })
+/** The update origin and publisher trust the desktop build generates; every installed payload bundles these exact files. */
+export const desktopUpdateTrustFiles = {
+  configuration: join(root, "desktop/out/main/update-configuration.json"),
+  trust: join(root, "desktop/out/main/update-trust.json"),
+} as const
 export const DesktopTarget = Schema.Union(
   Schema.Struct({ platform: Schema.Literal("darwin", "linux"), arch: Schema.Literal("arm64", "x64") }),
   Schema.Struct({ platform: Schema.Literal("win32"), arch: Schema.Literal("x64") }),
@@ -76,9 +81,9 @@ export const buildDesktopApplication = (options: {
   const trayStatus = join(resources, "tray-status.node")
   const launcher = join(resources, "magnitude-launcher.exe")
   const updateConfiguration = join(resources, "update-configuration.json")
-  yield* fs.copyFile(join(root, "desktop/out/main/update-configuration.json"), updateConfiguration)
+  yield* fs.copyFile(desktopUpdateTrustFiles.configuration, updateConfiguration)
   const updateTrust = join(resources, "update-trust.json")
-  yield* fs.copyFile(join(root, "desktop/out/main/update-trust.json"), updateTrust)
+  yield* fs.copyFile(desktopUpdateTrustFiles.trust, updateTrust)
   yield* fs.copyFile(options.service, service)
   yield* fs.chmod(service, 0o755)
   yield* fs.copyFile(options.cli, cli)

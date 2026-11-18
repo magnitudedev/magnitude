@@ -5,28 +5,30 @@ Use Desktop or `magnitude serve` to run inference.
 
 ## Installation
 
-Magnitude includes the desktop app and CLI in one installation. No separate npm package is needed.
+The desktop app includes the CLI. Download it from https://magnitude.dev/download, or install it from
+a terminal:
 
-macOS / Linux:
+```sh
+curl -fsSL https://magnitude.dev/install.sh | sh -s -- --desktop
+```
+
+```powershell
+& ([scriptblock]::Create((irm https://magnitude.dev/install.ps1))) -Desktop
+```
+
+For servers and headless use, install the CLI only, without the app:
 
 ```sh
 curl -fsSL https://magnitude.dev/install.sh | sh
 ```
 
-Windows PowerShell:
-
 ```powershell
 irm https://magnitude.dev/install.ps1 | iex
 ```
 
-On macOS, open a new terminal or SSH session after installation to use `magnitude`. The Windows script
-updates PATH in its current PowerShell session. Manual installers are at https://magnitude.dev/download.
-
-The Linux installer asks whether to set up a persistent server service. Choose Yes only for a machine
-intended to serve persistently; without an interactive terminal it skips setup. Installation itself does
-not require opening Desktop. Use `magnitude serve` for a foreground headless session. On a dedicated
-Linux or macOS server, use `magnitude server setup` if the installer has not already set it up;
-see `magnitude docs remote-access`.
+No npm package is needed. Open a new terminal or SSH session after installation to use `magnitude`;
+the Windows script also updates PATH in its current PowerShell session. See `magnitude docs headless`
+for the CLI-only install, running `magnitude serve` in the background at login, updates, and removal.
 
 ## Commands
 
@@ -36,7 +38,6 @@ The following commands manage models and agent connections:
 magnitude update [check|status|download|install|discard]
 magnitude app open
 magnitude serve
-magnitude server setup|remove
 magnitude status
 magnitude hardware
 magnitude models list [--all]
@@ -61,21 +62,20 @@ magnitude hf login|status|logout
 magnitude docs [topic-id]
 ```
 
-Run `magnitude serve` to host inference in the foreground, or open the desktop app. On Linux and
-macOS, `magnitude server setup` runs Magnitude as a service that starts at boot, with Network access
-on; `magnitude server remove` removes it and keeps its data. See `magnitude docs remote-access`.
-Model, hardware, and connection setup commands require an existing service; they do not
+Run `magnitude serve` to host inference in the foreground, or open the desktop app. To keep `serve`
+running in the background, see `magnitude docs headless`; for other devices, see
+`magnitude docs remote-access`. While the desktop app is open it serves, and `serve` waits until it
+quits. Model, hardware, and connection setup commands require an existing service; they do not
 start one. `magnitude status` reports service and model status without starting anything. Stop a
 foreground server with Ctrl+C. Desktop launch-at-login and Quit are available in the desktop app.
 
 `update check` checks for a release; `download` waits until it is prepared; `status` reports the
 current update state; `discard` removes a prepared update. None of these commands opens Desktop.
-`update install` restarts a running Desktop to install. It refuses to interrupt a running server:
-on Linux and macOS a server installs downloaded updates by itself between requests when it can without
-a password, and otherwise prints that the update is downloaded. Stop `serve` (or a Windows service
-wrapper) first, run `update install`, then start it again. Starting `serve` again does not install a
-downloaded update. Failed installation attempts require explicit retry. Linux installation may require
-system authorization.
+`update install` restarts a running Desktop to install. A CLI-only install updates itself while
+`serve` runs: it downloads updates, waits until no inference request is running, then installs and
+restarts in place. With `autoDownloadUpdates` set to `false`, `serve` only prints that an update is
+available; run `update install` to install it. Failed installation attempts require explicit retry.
+Desktop updates on Linux may require system authorization.
 
 Each command prints only the product information relevant to that operation. Collection commands
 use borderless tables when the rows are directly comparable; detail commands use labeled fields.

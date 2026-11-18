@@ -5,17 +5,18 @@ import { NativeHost } from "./index"
 import { DataFolderUnusable, requestApplication } from "./application-control"
 import { ApplicationOpenUrl } from "@magnitudedev/sdk/desktop-host"
 import { isUpdateInstallationActive } from "./update-installation-lease"
-import { occupiedMessage } from "./service-port"
 
 export class ApplicationOwnershipFailed extends Schema.TaggedError<ApplicationOwnershipFailed>()("ApplicationOwnershipFailed", { message: Schema.String }) {}
-export class ApplicationServiceRunning extends Schema.TaggedError<ApplicationServiceRunning>()("ApplicationServiceRunning", { message: Schema.String }) {}
+/** Which kind of application owns `directory`, or none when no owner answers within a second. */
+export const observeApplicationOwner = (directory: string) => Effect.gen(function* () {
+  const native = yield* NativeHost
+  const endpoint = yield* native.inspectEndpoint(directory)
+  if (Option.isNone(endpoint)) return Option.none<"Desktop" | "Headless">()
+  return Option.some((yield* requestApplication(endpoint.value, "Observe")).owner._tag)
+}).pipe(Effect.timeout("1 second"), Effect.catchAll(() => Effect.succeed(Option.none<"Desktop" | "Headless">())))
+
 const applicationAlreadyRunning = (directory: string) => Effect.gen(function* () {
-  const owner = yield* Effect.gen(function* () {
-    const native = yield* NativeHost
-    const endpoint = yield* native.inspectEndpoint(directory)
-    if (Option.isNone(endpoint)) return Option.none()
-    return Option.some((yield* requestApplication(endpoint.value, "Observe")).owner._tag)
-  }).pipe(Effect.timeout("1 second"), Effect.catchAll(() => Effect.succeed(Option.none())))
+  const owner = yield* observeApplicationOwner(directory)
   return yield* new ApplicationOwnershipFailed({ message: Option.match(owner, {
     onNone: () => "Magnitude is already running. Stop the existing application or server before retrying.",
     onSome: owner => owner === "Desktop"
@@ -79,10 +80,6 @@ export const acquireApplicationOwner = (directory: string, request: ApplicationO
     )
     if (Option.isNone(observed)) { yield* Effect.sleep("100 millis"); continue }
     const response = observed.value
-    // A service manager would restart a service the desktop stopped, so only a terminal serve yields.
-    if (response.owner._tag === "Headless" && response.owner.service) {
-      return yield* new ApplicationServiceRunning({ message: occupiedMessage(Number(new URL(response.endpoint).port), true) })
-    }
     const forwarded = yield* requestApplication(socketPath, response.owner._tag === "Desktop" ? request.intent : "Yield").pipe(
       Effect.map(Option.some), Effect.catchTags({ ApplicationControlUnavailable: () => Effect.succeed(Option.none()),
         ApplicationControlClosed: () => Effect.succeed(Option.none()) }),

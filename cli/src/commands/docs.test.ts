@@ -16,6 +16,37 @@ describe("Magnitude documentation", () => {
     }
   })
 
+  it("lists the headless topic first", () => {
+    expect(documentationTopics[0]?.id).toBe("headless")
+    const rows = renderDocumentationDirectory().split("\n").filter((line) => /^\S+\s{2,}\S/.test(line))
+    expect(rows[1]?.startsWith("headless ")).toBe(true)
+  })
+
+  it("documents background serving through the magnitude command on every OS", () => {
+    const result = resolveDocumentationCommand("headless")
+
+    expect(result._tag).toBe("Success")
+    if (result._tag === "Failure") return
+    expect(result.output).toContain("Ask your user before setting this up.")
+    expect(result.output).toContain("<string>$HOME/.magnitude/bin/magnitude</string><string>serve</string>")
+    expect(result.output).toContain("launchctl bootstrap gui/$(id -u)")
+    expect(result.output).toContain("<key>UserName</key>")
+    expect(result.output).toContain("ExecStart=%h/.magnitude/bin/magnitude serve")
+    expect(result.output).toContain("sudo loginctl enable-linger $USER")
+    expect(result.output).toContain("New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME")
+    expect(result.output).toContain("-ExecutionTimeLimit ([TimeSpan]::Zero)")
+    expect(result.output).toContain("Unregister-ScheduledTask")
+    expect(result.output).toContain("autoDownloadUpdates")
+    expect(result.output).not.toMatch(/cli\/(current|<version>|\d)[^`\n]*magnitude serve/)
+  })
+
+  it("no longer documents server mode", () => {
+    for (const topic of documentationTopics) {
+      expect(topic.markdown).not.toContain("server setup")
+      expect(topic.markdown).not.toContain("server remove")
+    }
+  })
+
   it("returns bundled Markdown with exactly one trailing newline", () => {
     const result = resolveDocumentationCommand("custom-endpoints")
 

@@ -3,12 +3,20 @@ import { UpdateClientMetadata, type UpdateOwner } from "@magnitudedev/release/ho
 import { LinuxInstallationKind } from "@magnitudedev/release/linux-package"
 import { Effect, Schema } from "effect"
 import { join } from "node:path"
+import type { InstallationLayout } from "../desktop-native/application-bootstrap"
 
-export const readLinuxUpdateMetadata = (resources: string, version: string, osVersion: string, owner: UpdateOwner) => Effect.gen(function* () {
+const PackageMarker = Schema.parseJson(Schema.Struct({ format: LinuxInstallationKind }))
+
+/**
+ * A desktop package names its format in `update-package.json`. A standalone installation is `cli-only`,
+ * unless its marker says it is a Docker image.
+ */
+export const readLinuxUpdateMetadata = (resources: string, layout: InstallationLayout, version: string, osVersion: string, owner: UpdateOwner) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
-  const format = yield* fs.readFileString(join(resources, "update-package.json")).pipe(
-    Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(Schema.Struct({ format: LinuxInstallationKind })))),
-  )
+  const marker = fs.readFileString(join(resources, "update-package.json")).pipe(Effect.flatMap(Schema.decodeUnknown(PackageMarker)))
+  const format = layout === "Desktop" ? yield* marker
+    : yield* marker.pipe(Effect.map(read => read.format === "docker" ? read : { format: "cli-only" as const }),
+      Effect.catchIf(error => error._tag === "SystemError" && error.reason === "NotFound", () => Effect.succeed({ format: "cli-only" as const })))
   const distro: Record<string, string> = {}
   for (const line of (yield* fs.readFileString("/etc/os-release")).split("\n")) {
     const field = /^(ID|VERSION_ID)=(?:"([^"\\]*)"|'([^'\\]*)'|([^\s'"\\]+))$/.exec(line)

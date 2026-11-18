@@ -81,7 +81,7 @@ export const runHeadlessApplication = (options: {
   if (yield* Deferred.isDone(stop)) return yield* Deferred.await(stop)
   if (options.prepareStartup) yield* Effect.raceFirst(options.prepareStartup, Deferred.await(stop))
   if (yield* Deferred.isDone(stop)) return yield* Deferred.await(stop)
-  if (options.runtime._tag === "Installed") {
+  if (options.runtime._tag === "Installed" && options.runtime.layout === "Desktop") {
     if (process.platform === "linux") yield* acquireLinuxInstallationLease(addon)
     if (process.platform === "darwin") {
       const bundle = dirname(dirname(options.runtime.resourcesDirectory))

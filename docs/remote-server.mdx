@@ -5,73 +5,227 @@ description: "Run models on a dedicated machine and use them from another comput
 
 Use a machine such as a Mac Studio, a DGX Spark or a Linux box with a GPU for inference while your agent runs on your laptop. The server needs to be reachable from your laptop, through your local network or a private network such as Tailscale.
 
-On Linux and macOS, Magnitude runs as a service: it starts at boot, keeps running after you log out, restarts if it crashes, and installs its own updates between requests. On Windows, run `magnitude serve` under a service wrapper; see [Windows](#windows).
+On the server, install the CLI only, turn on network access, and run `magnitude serve`, by hand or as a background service that starts at login or at boot.
 
 ## Install on the server
 
-On the Linux or macOS machine that will run inference:
-
+<Tabs>
+<Tab title="macOS / Linux">
 ```sh
 curl -fsSL https://magnitude.dev/install.sh | sh
 ```
-
-This installs the desktop app and CLI without requiring a graphical session. On Linux, answer **Yes** when asked whether to run Magnitude as a server; this also runs server setup. On Linux, the installer preserves an existing server setup.
-
-On macOS, open a new terminal or SSH session after installation to use the `magnitude` command. Then run the command below. Also run it on Linux if you skipped the server question, or installed without an interactive terminal:
-
-```sh
-magnitude server setup
-```
-
-Run it as yourself, not with `sudo`: it asks for your password once, for the one step that needs it.
-
-To use an installer instead, see [Linux installation](/installation/linux#download-the-installer) or [macOS installation](/installation/macos#download-the-installer).
-
-To run the server in a container instead, see [Docker](/installation/docker).
-
-## What setup does
-
-`magnitude server setup` registers Magnitude as a service, turns on [network access](/api/network-access), creates a network access key, and prints how to reach the server:
-
-```text
-Magnitude is running as a server on this machine.
-
-Open it in a browser on another computer:
-  http://192.168.1.20:10100
-
-Network access key: mag_…
-```
-
-Save the key; `magnitude status` never shows it. Afterwards it is in **Settings → Network access** in the browser app on this machine, and setting the server up again keeps it.
-
-<Tabs>
-<Tab title="Linux">
-Magnitude runs as the `magnitude.service` systemd unit under its own `magnitude` system account. Its models, settings and logs live in `/var/lib/magnitude`, and its configuration in `/var/lib/magnitude/config.json`. Any account on the machine can run `magnitude status`, `magnitude update` and `magnitude models` right away; the models, settings and keys stay readable only by the service.
-
-Setup creates the `magnitude` account as a system account with no login. If the machine already has an account or group named `magnitude` that isn't one, such as a person's account, setup leaves it alone and stops without changing anything.
-
-Logs: `journalctl -u magnitude`
 </Tab>
-<Tab title="macOS">
-Magnitude runs as a LaunchDaemon, `dev.magnitude.server`, as you. It uses your own `~/.magnitude`, so the desktop app and the server share models and settings. It starts at boot before anyone logs in and keeps running after you log out.
-
-- macOS lists it in **System Settings → General → Login Items** as Magnitude. If you switch it off there, it no longer starts at boot.
-- With FileVault on, nothing starts until someone unlocks the disk after a restart.
-- As a background service it can't read privacy-protected folders such as Desktop and Documents without Full Disk Access. Serving models isn't affected.
-
-Logs: `~/.magnitude/logs/server.log`
+<Tab title="Windows PowerShell">
+```powershell
+irm https://magnitude.dev/install.ps1 | iex
+```
 </Tab>
 </Tabs>
 
-If setup stops partway, for example because the server didn't start within two minutes, it says where to look; run `magnitude server setup` again to finish once that's fixed.
+This installs only the CLI, without the desktop app and without a graphical session. It installs into your own home folder (`~/.magnitude/cli`, or `%USERPROFILE%\.magnitude\cli` on Windows), so it needs no `sudo` or administrator rights. The `magnitude` command is `~/.magnitude/bin/magnitude` on macOS and Linux, and `%LOCALAPPDATA%\Programs\Magnitude CLI\magnitude.exe` on Windows. Open a new terminal or SSH session to use it.
 
-Check on the server at any time with:
+If the server also has the desktop app, you already have the CLI; skip this step.
+
+To run the server in a container instead, see [Docker](/installation/docker).
+
+## Turn on network access
+
+Create a long, random key:
+
+<Tabs>
+<Tab title="macOS / Linux">
+```sh
+openssl rand -hex 32
+```
+</Tab>
+<Tab title="Windows PowerShell">
+```powershell
+$b = New-Object byte[] 32; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b); ($b | % { $_.ToString("x2") }) -join ""
+```
+</Tab>
+</Tabs>
+
+Add a `network` object with it to `~/.magnitude/config.json` (`%USERPROFILE%\.magnitude\config.json` on Windows), creating the file if needed and keeping any other fields:
+
+```json
+{
+  "network": {
+    "enabled": true,
+    "apiKey": "YOUR_LONG_RANDOM_KEY"
+  }
+}
+```
+
+This serves every network the server is on. To serve only one, such as Tailscale, add `"bind"` with the server's address on it. See [Network access](/api/network-access) for addresses, hostnames and an SSH tunnel that needs no key, and [Configuration file](/reference/configuration-file) for every field.
+
+If the server runs a firewall, allow inbound TCP port `10100`: for example `sudo ufw allow 10100/tcp`, or `sudo firewall-cmd --permanent --add-port=10100/tcp && sudo firewall-cmd --reload`. On Windows, see [Windows](#windows).
+
+## Serve
+
+```sh
+magnitude serve
+```
+
+It serves until you press Ctrl+C. Check on it from another terminal:
 
 ```sh
 magnitude status
 ```
 
 It shows each address other devices can use, without the key.
+
+## Keep it running in the background
+
+To serve after you disconnect and after a restart, register `magnitude serve` with the system's service manager. Every definition below runs the `magnitude` command, never a versioned path inside `~/.magnitude/cli`, so it keeps working after updates. Set up only one per machine.
+
+<Tabs>
+<Tab title="macOS">
+**At login.** A LaunchAgent runs `serve` while you're logged in at the Mac:
+
+```sh
+mkdir -p ~/Library/LaunchAgents ~/.magnitude/logs
+cat > ~/Library/LaunchAgents/dev.magnitude.serve.plist <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>dev.magnitude.serve</string>
+  <key>ProgramArguments</key>
+  <array><string>$HOME/.magnitude/bin/magnitude</string><string>serve</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>StandardOutPath</key><string>$HOME/.magnitude/logs/serve.log</string>
+  <key>StandardErrorPath</key><string>$HOME/.magnitude/logs/serve.log</string>
+</dict>
+</plist>
+EOF
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.magnitude.serve.plist
+```
+
+To stop and remove it:
+
+```sh
+launchctl bootout gui/$(id -u)/dev.magnitude.serve
+rm ~/Library/LaunchAgents/dev.magnitude.serve.plist
+```
+
+**At boot, before anyone logs in.** On a headless Mac, use a LaunchDaemon instead. It still runs as you, with your `~/.magnitude`. Run these as yourself, not in a root shell:
+
+```sh
+mkdir -p ~/.magnitude/logs
+sudo tee /Library/LaunchDaemons/dev.magnitude.serve.plist > /dev/null <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>dev.magnitude.serve</string>
+  <key>ProgramArguments</key>
+  <array><string>$HOME/.magnitude/bin/magnitude</string><string>serve</string></array>
+  <key>UserName</key><string>$(id -un)</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>$HOME</string>
+    <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>WorkingDirectory</key><string>$HOME</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>StandardOutPath</key><string>$HOME/.magnitude/logs/serve.log</string>
+  <key>StandardErrorPath</key><string>$HOME/.magnitude/logs/serve.log</string>
+</dict>
+</plist>
+EOF
+sudo chown root:wheel /Library/LaunchDaemons/dev.magnitude.serve.plist
+sudo chmod 644 /Library/LaunchDaemons/dev.magnitude.serve.plist
+sudo launchctl bootstrap system /Library/LaunchDaemons/dev.magnitude.serve.plist
+```
+
+With FileVault on, nothing starts after a restart until someone unlocks the disk. To stop and remove it:
+
+```sh
+sudo launchctl bootout system/dev.magnitude.serve
+sudo rm /Library/LaunchDaemons/dev.magnitude.serve.plist
+```
+
+Logs: `~/.magnitude/logs/serve.log` and `~/.magnitude/logs/service.log`
+</Tab>
+<Tab title="Linux">
+A systemd user unit runs `serve` as you:
+
+```sh
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/magnitude.service <<'EOF'
+[Unit]
+Description=Magnitude
+
+[Service]
+ExecStart=%h/.magnitude/bin/magnitude serve
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+EOF
+systemctl --user daemon-reload && systemctl --user enable --now magnitude
+```
+
+This starts it now and whenever you log in. To start it at boot and keep it running when you're not logged in:
+
+```sh
+sudo loginctl enable-linger $USER
+```
+
+Logs: `journalctl --user -u magnitude`
+
+To stop and remove it:
+
+```sh
+systemctl --user disable --now magnitude
+rm ~/.config/systemd/user/magnitude.service
+systemctl --user daemon-reload
+```
+</Tab>
+<Tab title="Windows">
+**At sign-in.** In your own PowerShell, register a scheduled task:
+
+```powershell
+$action = New-ScheduledTaskAction -Execute "$env:LOCALAPPDATA\Programs\Magnitude CLI\magnitude.exe" -Argument "serve"
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
+Register-ScheduledTask -TaskName "Magnitude" -Action $action -Trigger $trigger -Settings $settings -Principal $principal
+Start-ScheduledTask -TaskName "Magnitude"
+```
+
+It runs in your session with a console window; closing the window stops serving until you sign in again.
+
+**At startup, before anyone signs in.** On a machine such as Windows Server, register it at startup from an administrator PowerShell, for the account that installed Magnitude:
+
+```powershell
+$account = "$env:COMPUTERNAME\alice"
+$userProfile = "C:\Users\alice"
+$action = New-ScheduledTaskAction -Execute "$userProfile\AppData\Local\Programs\Magnitude CLI\magnitude.exe" -Argument "serve"
+$trigger = New-ScheduledTaskTrigger -AtStartup
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+$principal = New-ScheduledTaskPrincipal -UserId $account -LogonType S4U -RunLevel Limited
+Register-ScheduledTask -TaskName "Magnitude" -Action $action -Trigger $trigger -Settings $settings -Principal $principal
+Start-ScheduledTask -TaskName "Magnitude"
+```
+
+`S4U` runs it as that account without storing a password and without a window, but without access to network shares. If your models are on a network share, register with the account's password instead: replace `-Principal $principal` with `-User $account -Password (Get-Credential $account).GetNetworkCredential().Password -RunLevel Limited`.
+
+Logs: `%USERPROFILE%\.magnitude\logs\service.log`
+
+To stop and remove it (from an administrator PowerShell for the startup task):
+
+```powershell
+Stop-ScheduledTask -TaskName "Magnitude"
+Unregister-ScheduledTask -TaskName "Magnitude" -Confirm:$false
+```
+</Tab>
+</Tabs>
 
 ## Download a model
 
@@ -114,69 +268,47 @@ This writes the agent's configuration into your home folder, pointing at the ser
 
 ## Updates
 
-The server checks for updates about once an hour, downloads them, and installs them when no request or agent turn is running. Clients reconnect after a short pause. If an update needs something only you can do, `magnitude status` and the logs say so. To install a downloaded update right away, restart the server (`sudo systemctl restart magnitude` on Linux, `sudo launchctl kickstart -k system/dev.magnitude.server` on macOS); it installs the update as soon as it is idle.
+While `magnitude serve` runs, it checks for updates, downloads them, and installs them when no inference request is running, then restarts in place. Clients reconnect after a short pause, and a background service keeps running through the update. If a new version fails, it is held back and the current one keeps serving.
+
+To turn off automatic downloads, set `"autoDownloadUpdates": false` in `~/.magnitude/config.json`. `serve` then prints that an update is available, and `magnitude update install` installs it.
 
 ## The desktop app on the same machine
 
-The app and the server can't run at the same time. Opening the app while the server runs shows a screen that offers to keep the server, which opens it in your browser instead, or to stop it and use the app. On Linux, stopping it from the app at your desktop needs no password; over a remote session, and on macOS, it asks for administrator authorization.
+The desktop app always takes priority. While it is open, it serves, and `magnitude serve`, by hand or as a background service, waits and prints that another Magnitude app is serving. When you quit the app, `serve` resumes by itself.
 
-## Stop and remove the server
+Installing the desktop app, from [Download](https://magnitude.dev/download) or with `--desktop` (`-Desktop` on Windows), replaces the CLI-only install. Your models and settings stay. A background service keeps working on every OS, because it runs the `magnitude` command, which becomes the app's CLI. On Linux, `~/.magnitude/bin/magnitude` points at the package's `/usr/bin/magnitude` once the app has been opened.
 
+## Remove the CLI-only install
+
+1. Stop and remove the background service, if you set one up, with the commands under [Keep it running in the background](#keep-it-running-in-the-background).
+2. Delete the CLI:
+
+<Tabs>
+<Tab title="macOS / Linux">
 ```sh
-magnitude server remove
+rm -rf ~/.magnitude/cli ~/.magnitude/bin/magnitude
+for f in ~/.zprofile ~/.zshrc ~/.bash_profile ~/.bash_login ~/.profile ~/.bashrc ~/.config/fish/config.fish; do
+  [ -f "$f" ] && sed -i.bak '/# >>> Magnitude CLI PATH >>>/,/# <<< Magnitude CLI PATH <<</d' "$f"
+done
 ```
 
-It stops the service and removes it, and asks for your password once. Its data stays: in `/var/lib/magnitude` on Linux, now owned by root, or in `~/.magnitude` on macOS. Run `magnitude server setup` again to bring the server back with the same models. If removal stops partway, run it again to finish.
-
-## Without the service
-
-To serve only until you stop it, for example to try things out:
-
-```sh
-magnitude serve
+The loop removes the PATH block the installer added to your shell startup files, keeping a `.bak` copy of each file it changes.
+</Tab>
+<Tab title="Windows PowerShell">
+```powershell
+$dir = "$env:LOCALAPPDATA\Programs\Magnitude CLI"
+Remove-Item -Recurse -Force $dir, "$env:USERPROFILE\.magnitude\cli"
+$path = [Environment]::GetEnvironmentVariable("Path", "User") -split ";" | Where-Object { $_ -and $_.TrimEnd("\") -ne $dir }
+[Environment]::SetEnvironmentVariable("Path", ($path -join ";"), "User")
 ```
+</Tab>
+</Tabs>
 
-It runs in the foreground and Ctrl+C stops it. On Linux, `nohup magnitude serve &` keeps it serving after you disconnect, until the machine restarts; on macOS, closing the terminal stops it. Opening the desktop app stops it and takes over serving. Like the service, it installs downloaded updates between requests whenever it can without asking for a password: on Linux when `sudo` doesn't ask you for one, on macOS when you can write to the Applications folder. Otherwise it prints a line saying the update is downloaded; stop it, run `magnitude update install`, and start it again. For network access without the service, see [Network access](/api/network-access).
+Your models, settings and keys stay in `~/.magnitude` (`%USERPROFILE%\.magnitude` on Windows). Delete that folder too if you don't want them.
 
 ## Windows
 
-Magnitude has no server mode on Windows; `magnitude server setup` explains this and changes nothing. To run Magnitude as a service, wrap `magnitude serve` with [NSSM](https://nssm.cc), as you might for Ollama. Download NSSM and use the full path to its `nssm.exe` (for example `C:\nssm\win64\nssm.exe`) wherever these steps say `nssm`, unless you put it on your `PATH`.
-
-1. Sign in as the account that will run the server and install Magnitude for [Windows](/installation/windows). The service must run as this same account: the installation is private to it, so other accounts, including `LocalSystem`, can't start it. This account doesn't need to be an administrator.
-2. Still signed in as that account, turn on network access: create or edit `%USERPROFILE%\.magnitude\config.json` with a `network` object and a long, random key. All fields are in [Configuration file](/reference/configuration-file).
-
-```json
-{
-  "network": {
-    "enabled": true,
-    "apiKey": "YOUR_LONG_RANDOM_KEY"
-  }
-}
-```
-
-Then create the folder for the service's log in PowerShell:
-
-```powershell
-New-Item -ItemType Directory -Force "$env:USERPROFILE\.magnitude\logs"
-```
-
-3. In an administrator PowerShell, register the service to run as that account. An administrator can do this from their own session: set `$account` to the account from step 1 (`COMPUTERNAME\user`, or `DOMAIN\user` for a domain account) and `$userProfile` to its profile folder. `magnitude serve` must be started through the Magnitude command in `Magnitude CLI`, as below; the app's own `resources\magnitude.exe` refuses to serve.
-
-```powershell
-$account = "$env:COMPUTERNAME\alice"
-$userProfile = "C:\Users\alice"
-$cred = Get-Credential $account
-nssm install Magnitude "$userProfile\AppData\Local\Programs\Magnitude CLI\magnitude.exe" serve
-nssm set Magnitude ObjectName $account $cred.GetNetworkCredential().Password
-nssm set Magnitude AppStdout "$userProfile\.magnitude\logs\server.log"
-nssm set Magnitude AppStderr "$userProfile\.magnitude\logs\server.log"
-nssm set Magnitude AppExit Default Restart
-nssm start Magnitude
-```
-
-`Get-Credential` asks for the account's password in a prompt, so it isn't typed on the command line or saved in your PowerShell history. Don't write the password into the `nssm set` command itself. If the account's password changes, run the `Get-Credential` and `ObjectName` lines again.
-
-4. If other computers need to reach the server, allow inbound TCP port 10100 in Windows Defender Firewall from the administrator PowerShell:
+If other computers need to reach the server, allow inbound TCP port 10100 in Windows Defender Firewall from an administrator PowerShell:
 
 ```powershell
 New-NetFirewallRule -DisplayName "Magnitude" -Direction Inbound -Protocol TCP -LocalPort 10100 -Action Allow -Profile Private
@@ -184,11 +316,8 @@ New-NetFirewallRule -DisplayName "Magnitude" -Direction Inbound -Protocol TCP -L
 
 This allows connections on networks Windows treats as private. If the server's network is set to Public, change its profile to Private in Settings, or use `-Profile Private,Public` only if you trust that network.
 
-5. Download a model. Models download through the running server, so do this once the service is running: use the commands in [Download a model](#download-a-model) on the server, or the browser app from your laptop.
+## Servers set up by earlier versions
 
-The service keeps running when you or another user log off. Don't open the desktop app while it runs: the app can't serve until you stop the service, and says so. To install an update, stop the service (`nssm stop Magnitude`), run `magnitude update install`, then start it again. To remove the service, stop it first, then remove it; a running service keeps serving, including on the network, until it stops:
-
-```powershell
-nssm stop Magnitude
-nssm remove Magnitude confirm
-```
+- **Linux:** a server set up as a system service by an earlier version keeps working after it updates itself, with the same address, port and key. It runs as `magnitude.service` under the `magnitude` account, with its data and configuration in `/var/lib/magnitude/.magnitude/`. Logs: `journalctl -u magnitude`.
+- **macOS:** a server set up by an earlier version runs as the `dev.magnitude.server` LaunchDaemon and keeps working. To remove it: `sudo launchctl bootout system/dev.magnitude.server && sudo rm /Library/LaunchDaemons/dev.magnitude.server.plist`.
+- **Windows:** a `magnitude serve` service wrapped with NSSM keeps working.

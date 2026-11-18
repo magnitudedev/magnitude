@@ -72,11 +72,12 @@ static void containment(BOOL cancel, BOOL finite) {
   require(GetExitCodeProcess(process.hProcess, &code) && code == (cancel ? (DWORD)ERROR_CANCELLED : 91U), "launcher exit status");
   CloseHandle(child); CloseHandle(descendant); CloseHandle(process.hProcess); CloseHandle(reader);
 }
+static BOOL resolve_self(WCHAR *target) { return wcscpy_s(target, 32768, executable) == 0; }
 int wmain(int argc, WCHAR **argv) {
   require(GetModuleFileNameW(NULL, executable, 32768) != 0, "executable location");
   if (argc > 1) {
-    if (!wcscmp(argv[1], L"--run")) return (int)magnitude_cli_run(executable, argc - 1, argv + 1, TRUE);
-    if (!wcscmp(argv[1], L"--run-finite")) return (int)magnitude_cli_run(executable, argc - 1, argv + 1, FALSE);
+    if (!wcscmp(argv[1], L"--run")) return (int)magnitude_cli_run(resolve_self, argc - 1, argv + 1, TRUE);
+    if (!wcscmp(argv[1], L"--run-finite")) return (int)magnitude_cli_run(resolve_self, argc - 1, argv + 1, FALSE);
     BOOL independent = !wcscmp(argv[1], L"--independent") || !wcscmp(argv[1], L"--independent-leaf");
     if (independent || !wcscmp(argv[1], L"--child") || !wcscmp(argv[1], L"--leaf")) {
       if (!independent) require(magnitude_owned_validate_current() == ERROR_SUCCESS, "child job containment");

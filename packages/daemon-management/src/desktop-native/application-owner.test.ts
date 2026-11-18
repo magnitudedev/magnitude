@@ -135,7 +135,7 @@ describe.skipIf(process.platform === "win32")("native application owner arbitrat
     })).pipe(Effect.provide(nativeHostLayer(addon))))
   })
 
-  it.each([true, false])("with a service-started server %s, takes over only a terminal serve", async service => {
+  it.each([true, false])("with a service-started server %s, takes over the serve, whether or not a service manager started it", async service => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const root = yield* directory
       const firstScope = yield* Scope.make()
@@ -148,14 +148,8 @@ describe.skipIf(process.platform === "win32")("native application owner arbitrat
           Effect.zipRight(intent === "Yield" ? Effect.forkDaemon(Scope.close(firstScope, Exit.void)) : Effect.void), Effect.asVoid),
       }).pipe(Effect.provideService(Scope.Scope, firstScope))
       const desktop = yield* acquireApplicationOwner(root, { _tag: "Desktop", intent: "ShowWindow" }).pipe(Effect.either, Effect.timeout("5 seconds"))
-      if (service) {
-        expect(desktop._tag === "Left" && desktop.left).toMatchObject({ _tag: "ApplicationServiceRunning", message: occupiedMessage(11101, true) })
-        expect(yield* Ref.get(intents)).toEqual(["Observe"])
-        expect(yield* acquireApplicationMaintenance(root).pipe(Effect.isFailure)).toBe(true)
-      } else {
-        expect(desktop._tag === "Right" && desktop.right._tag).toBe("Owner")
-        expect(yield* Ref.get(intents)).toEqual(["Observe", "Yield"])
-      }
+      expect(desktop._tag === "Right" && desktop.right._tag).toBe("Owner")
+      expect(yield* Ref.get(intents)).toEqual(["Observe", "Yield"])
     })).pipe(Effect.provide(nativeHostLayer(addon))))
   })
 

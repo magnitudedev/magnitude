@@ -73,6 +73,7 @@ it("words another Magnitude server's advice for the platform", () => {
   expect(occupiedMessage(10100, true, "win32")).toContain("nssm stop Magnitude")
   expect(occupiedMessage(10100, true, "linux")).toContain("sudo systemctl stop magnitude")
   expect(occupiedMessage(10100, true, "linux")).not.toContain("NSSM")
-  expect(occupiedMessage(10100, true, "darwin")).toContain("magnitude server remove")
+  expect(occupiedMessage(10100, true, "darwin")).toContain("stop its service")
+  expect(occupiedMessage(10100, true, "darwin")).not.toContain("server remove")
   expect(occupiedMessage(10100, true, "darwin")).not.toContain("NSSM")
 })

@@ -62,7 +62,7 @@ log "Healthy"
 status=$(docker exec "$name" magnitude status) || fail 'magnitude status failed'
 grep -Eq 'Runtime[[:space:]]+Ready' <<<"$status" || fail "status is not Ready: $status"
 test "$(docker exec "$name" id -u)" = 1000 || fail 'the service does not run as uid 1000'
-test "$(docker exec "$name" cat /usr/lib/magnitude-desktop/resources/update-package.json)" = '{"format":"docker"}' \
+test "$(docker exec "$name" cat /opt/magnitude/cli/current/update-package.json)" = '{"format":"docker"}' \
   || fail 'update-package.json is not the docker format'
 if test -n "$version"; then
   installed=$(docker exec "$name" magnitude --version | tr -d '[:space:]')

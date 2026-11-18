@@ -17,7 +17,7 @@ magnitude status
 
 ## Another Magnitude instance is running
 
-Fully quit Desktop before starting `magnitude serve`. Closing its window can leave it running. If another `serve` command is running, stop that command before starting another.
+While Desktop is open, it serves, and `magnitude serve` prints that another Magnitude app is serving and waits until Desktop quits. Closing Desktop's window can leave it running; quit it fully. If another `serve` command is running under your account, stop that command before starting another.
 
 ## Magnitude command not found
 
@@ -25,7 +25,7 @@ Open a **new terminal** and run `magnitude --help`.
 
 - **macOS:** the terminal installer registers the CLI automatically; after installing from the DMG, open Desktop once to register it. If installation reported a PATH warning, add `~/.magnitude/bin` to your shell's PATH. Without a graphical session, you can also run `/Applications/Magnitude.app/Contents/Resources/magnitude` directly. See [macOS installation](/installation/macos).
 - **Windows:** the installer updates your user PATH; existing terminals may retain the old PATH. The PowerShell install script also updates PATH in the session that ran it. Rerun the installer if command registration failed.
-- **Linux:** install the desktop package through your package manager; it owns `/usr/bin/magnitude`.
+- **Linux:** the desktop package owns `/usr/bin/magnitude`. A CLI-only install puts the command at `~/.magnitude/bin/magnitude` and adds `~/.magnitude/bin` to PATH in your shell startup files; open a new shell, or run it by its full path.
 
 If an old CLI still runs, inspect which executable your terminal finds:
 

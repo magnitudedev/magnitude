@@ -118,4 +118,15 @@ describe("update request admission", () => {
     const changed = url(); changed.searchParams.append("version", "1.2.3")
     expect(Either.isLeft(await Effect.runPromise(Effect.either(decodeUpdateRequest(changed, 1000000))))).toBe(true)
   })
+  it("accepts a CLI-only installation on every host and Windows only on x64", async () => {
+    const decode = (os: string, arch: string) => {
+      const changed = url()
+      changed.searchParams.set("os", os); changed.searchParams.set("arch", arch); changed.searchParams.set("package", "cli-only")
+      return Effect.runPromise(Effect.either(decodeUpdateRequest(changed, 1000000)))
+    }
+    for (const [os, arch] of [["darwin", "arm64"], ["darwin", "x64"], ["linux", "arm64"], ["linux", "x64"], ["windows", "x64"]]) {
+      expect(Either.getOrThrow(await decode(os!, arch!)).package).toBe("cli-only")
+    }
+    expect(Either.isLeft(await decode("windows", "arm64"))).toBe(true)
+  })
 })

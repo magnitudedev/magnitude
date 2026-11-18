@@ -1,12 +1,12 @@
 import { describe, expect, it } from "vitest"
-import { mkdtemp, mkdir, writeFile, symlink, rm } from "node:fs/promises"
+import { mkdtemp, mkdir, writeFile, symlink, rm, realpath } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { NodeContext } from "@effect/platform-node"
 import { Effect } from "effect"
 import { applicationNativeHostPath, applicationServiceCommand, resolveApplicationProfile, resolveInstalledApplicationRuntime, type ApplicationRuntime } from "./application-bootstrap"
 
-const installed: ApplicationRuntime = { _tag: "Installed", resourcesDirectory: "/Applications/Magnitude.app/Contents/Resources" }
+const installed: ApplicationRuntime = { _tag: "Installed", resourcesDirectory: "/Applications/Magnitude.app/Contents/Resources", layout: "Desktop" }
 const development: ApplicationRuntime = { _tag: "Development", repository: "/work/Magnitude Source" }
 
 describe("application bootstrap selection", () => {
@@ -26,6 +26,24 @@ describe("application bootstrap selection", () => {
       const invalid = await Effect.runPromise(resolveInstalledApplicationRuntime(join(root, "standalone"), "darwin").pipe(Effect.either, Effect.provide(NodeContext.layer)))
       expect(invalid._tag === "Left" && invalid.left._tag).toBe("ApplicationRuntimeUnavailable")
     } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
+  it("recognises a standalone installation through its command link, and only with its service beside it", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "magnitude-standalone-runtime-")))
+    try {
+      const version = join(root, "cli", "1.0.0")
+      await mkdir(version, { recursive: true })
+      await mkdir(join(root, "bin"))
+      await writeFile(join(version, "magnitude"), "")
+      await symlink(join(version, "magnitude"), join(root, "bin", "magnitude"))
+      const resolve = () => Effect.runPromise(resolveInstalledApplicationRuntime(join(root, "bin", "magnitude"), "linux").pipe(Effect.either, Effect.provide(NodeContext.layer)))
+      expect((await resolve())._tag).toBe("Left")
+      await writeFile(join(version, "magnitude-service"), "")
+      const resolved = await resolve()
+      expect(resolved._tag === "Right" && resolved.right).toEqual({ _tag: "Installed", resourcesDirectory: version, layout: "Standalone" })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it("preserves production, development and acceptance profile isolation", () => {
@@ -52,7 +70,7 @@ describe("application bootstrap selection", () => {
     ["linux", "/usr/lib/magnitude-desktop/resources", "/usr/lib/magnitude-desktop/resources/magnitude-service"],
     ["win32", "C:\\Users\\Test User\\Magnitude\\resources", "C:\\Users\\Test User\\Magnitude\\resources\\magnitude-service.exe"],
   ])("uses matched installed resources on %s", (platform, resourcesDirectory, executable) => {
-    const runtime: ApplicationRuntime = { _tag: "Installed", resourcesDirectory }
+    const runtime: ApplicationRuntime = { _tag: "Installed", resourcesDirectory, layout: "Desktop" }
     const environment = Object.freeze({ KEEP: "unchanged", MAGNITUDE_ICN_PATH: "/explicit/engine" })
     const profile = resolveApplicationProfile({ runtime, platform, home: platform === "win32" ? "C:\\Users\\Test User" : "/home/user", acceptance: false, environment, server: false })
     const command = applicationServiceCommand({ output: "DiagnosticTail", runtime, profile, platform, architecture: "x64", environment })
@@ -63,7 +81,7 @@ describe("application bootstrap selection", () => {
   })
 
   it("marks the server profile's service so it never writes harness configuration", () => {
-    const runtime: ApplicationRuntime = { _tag: "Installed", resourcesDirectory: "/usr/lib/magnitude-desktop/resources" }
+    const runtime: ApplicationRuntime = { _tag: "Installed", resourcesDirectory: "/usr/lib/magnitude-desktop/resources", layout: "Desktop" }
     const command = (server: boolean) => applicationServiceCommand({ output: "Foreground", runtime, platform: "linux", architecture: "x64", environment: {},
       profile: resolveApplicationProfile({ runtime, home: "/home/ada", platform: "linux", acceptance: false, environment: {}, server }) })
     expect(command(true).environment.MAGNITUDE_SERVER_SERVICE).toBe("1")

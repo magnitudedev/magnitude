@@ -1,3 +1,4 @@
+import headlessMarkdown from "./topics/headless.md" with { type: "text" }
 import customEndpointsMarkdown from "./topics/custom-endpoints.md" with { type: "text" }
 import cliMarkdown from "./topics/cli.md" with { type: "text" }
 import recommendationsMarkdown from "./topics/recommendations.md" with { type: "text" }
@@ -12,6 +13,11 @@ export interface DocumentationTopic {
 }
 
 export const documentationTopics: readonly DocumentationTopic[] = [
+  {
+    id: "headless",
+    description: "Install the CLI only, run `magnitude serve` in the background, update, and remove it",
+    markdown: headlessMarkdown,
+  },
   {
     id: "cli",
     description: "Use the non-interactive Magnitude CLI",

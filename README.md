@@ -24,7 +24,14 @@ Magnitude is an open source inference engine that tunes its kernels on your hard
 
 ## Get started
 
-Magnitude comes with a desktop app and a CLI. Install from your terminal:
+[Download Magnitude](https://magnitude.dev/download) for your computer:
+
+- **macOS:** [Apple silicon](https://magnitude.dev/api/installer?os=darwin&arch=arm64&package=dmg) · [Intel](https://magnitude.dev/api/installer?os=darwin&arch=x64&package=dmg)
+- **Windows:** [x64](https://magnitude.dev/api/installer?os=windows&arch=x64&package=windows-exe)
+- **Linux x64:** [.deb](https://magnitude.dev/api/installer?os=linux&arch=x64&package=deb) · [.rpm](https://magnitude.dev/api/installer?os=linux&arch=x64&package=rpm) · [.pkg.tar.zst](https://magnitude.dev/api/installer?os=linux&arch=x64&package=pacman)
+- **Linux ARM64:** [.deb](https://magnitude.dev/api/installer?os=linux&arch=arm64&package=deb) · [.rpm](https://magnitude.dev/api/installer?os=linux&arch=arm64&package=rpm)
+
+The desktop app includes the `magnitude` CLI. Or install from your terminal:
 
 macOS / Linux:
 
@@ -38,12 +45,7 @@ Windows PowerShell:
 irm https://magnitude.dev/install.ps1 | iex
 ```
 
-Or download the installer:
-
-- **macOS:** [Apple silicon](https://magnitude.dev/api/installer?os=darwin&arch=arm64&package=dmg) · [Intel](https://magnitude.dev/api/installer?os=darwin&arch=x64&package=dmg)
-- **Windows:** [x64](https://magnitude.dev/api/installer?os=windows&arch=x64&package=windows-exe)
-- **Linux x64:** [.deb](https://magnitude.dev/api/installer?os=linux&arch=x64&package=deb) · [.rpm](https://magnitude.dev/api/installer?os=linux&arch=x64&package=rpm) · [.pkg.tar.zst](https://magnitude.dev/api/installer?os=linux&arch=x64&package=pacman)
-- **Linux ARM64:** [.deb](https://magnitude.dev/api/installer?os=linux&arch=arm64&package=deb) · [.rpm](https://magnitude.dev/api/installer?os=linux&arch=arm64&package=rpm)
+Installs the CLI only, for servers and headless use. For the desktop app, use the download links above, or add `--desktop` (on Windows, see [the PowerShell command](https://docs.magnitude.dev/installation/windows#install-from-powershell)).
 
 To run Magnitude as a service other computers can use, see [Remote server](https://docs.magnitude.dev/remote-server). To run it in a container, see [Docker](https://docs.magnitude.dev/installation/docker).
 

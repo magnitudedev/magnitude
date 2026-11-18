@@ -7,12 +7,16 @@ import { makeUnixOwnedChildSpawner, OwnedChildSpawner, OwnedChildSpawnFailed, ty
 import { makeWindowsOwnedChildSpawner } from "./windows-owned-child"
 import { makeOwnedService, type OwnerAgent } from "./owned-service"
 import { previousInstallationUpgrade } from "./previous-installation-live"
-import { checkServicePort, requireServicePort } from "./service-port"
+import { checkServicePort, requireServicePort, takeOverServicePort } from "./service-port"
 import type { ChildOutputMode } from "./child-output"
 import { SERVER_DATA_DIRECTORY, SERVER_PORT } from "./server-profile"
 
+/** `Desktop`: the CLI inside the desktop app. `Standalone`: a CLI-only install, `<root>/cli/<version>/`. */
+export const InstallationLayout = Schema.Literal("Desktop", "Standalone")
+export type InstallationLayout = typeof InstallationLayout.Type
+
 export const ApplicationRuntime = Schema.Union(
-  Schema.TaggedStruct("Installed", { resourcesDirectory: Schema.String }),
+  Schema.TaggedStruct("Installed", { resourcesDirectory: Schema.String, layout: InstallationLayout }),
   Schema.TaggedStruct("Development", { repository: Schema.String }),
 )
 export type ApplicationRuntime = typeof ApplicationRuntime.Type
@@ -29,13 +33,21 @@ export const resolveInstalledApplicationRuntime = (executable: string, platform:
   const resourcesDirectory = path.dirname(resolved)
   const name = path.basename(resolved)
   const resources = path.basename(resourcesDirectory)
-  const matched = platform === "darwin"
+  const command = platform === "win32" ? "magnitude.exe" : "magnitude"
+  const desktop = platform === "darwin"
     ? name === "magnitude" && resources === "Resources" && path.basename(path.dirname(resourcesDirectory)) === "Contents"
       && path.dirname(path.dirname(resourcesDirectory)).endsWith(".app")
-    : name === (platform === "win32" ? "magnitude.exe" : "magnitude") && resources === "resources"
-  if (!matched) return yield* new ApplicationRuntimeUnavailable({ message: "This command is not inside a complete Magnitude installation. Reinstall Magnitude." })
-  return { _tag: "Installed", resourcesDirectory } satisfies ApplicationRuntime
+    : name === command && resources === "resources"
+  if (desktop) return { _tag: "Installed", resourcesDirectory, layout: "Desktop" } satisfies ApplicationRuntime
+  const standalone = name === command && path.basename(path.dirname(resourcesDirectory)) === "cli"
+    && (yield* fs.exists(path.join(resourcesDirectory, platform === "win32" ? "magnitude-service.exe" : "magnitude-service")).pipe(Effect.orElseSucceed(() => false)))
+  if (standalone) return { _tag: "Installed", resourcesDirectory, layout: "Standalone" } satisfies ApplicationRuntime
+  return yield* new ApplicationRuntimeUnavailable({ message: "This command is not inside a complete Magnitude installation. Reinstall Magnitude." })
 })
+
+/** A standalone installation's root, which holds each version folder and the `current` pointer. */
+export const standaloneInstallationRoot = (runtime: Extract<ApplicationRuntime, { _tag: "Installed" }>, platform: string) =>
+  paths(platform).dirname(runtime.resourcesDirectory)
 /** `sharedControl`: the server profile opens its control endpoint to every local account; data stays private. */
 export const ApplicationProfile = Schema.Struct({
   dataDirectory: Schema.String, isolated: Schema.Boolean, port: Schema.Number, endpoint: Schema.String,
@@ -99,6 +111,8 @@ export const makeApplicationService = (options: {
   readonly output: ChildOutputMode
   readonly admission: "Immediate" | "Supervised"
   readonly owner: OwnerAgent
+  /** The desktop asks another Magnitude serving its port to quit before each start (see `takeOverServicePort`). */
+  readonly takeOverPort?: boolean
 }) => Effect.gen(function* () {
   const addon = applicationNativeHostPath(options.runtime, process.platform, process.arch)
   const spawner = process.platform === "win32" ? yield* Effect.gen(function* () {
@@ -115,8 +129,10 @@ export const makeApplicationService = (options: {
     yield* checkServicePort(options.profile.port, command.executable)
   }
   const checked = yield* requireServicePort(options.profile.port).pipe(Effect.provideService(OwnedChildSpawner, spawner))
+  const takeOver = options.takeOverPort ? takeOverServicePort(options.profile.port) : Effect.void
   const admitted = OwnedChildSpawner.of({ spawn: command => (options.admission === "Supervised" ? upgrade : Effect.void).pipe(
     Effect.mapError(error => new OwnedChildSpawnFailed({ executable: command.executable, message: error.message })),
+    Effect.zipRight(takeOver),
     Effect.zipRight(checked.spawn(command)),
   ) })
   return yield* makeOwnedService(command, MAGNITUDE_RPC_VERSION, options.owner)
