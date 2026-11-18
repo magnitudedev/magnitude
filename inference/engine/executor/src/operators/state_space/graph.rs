@@ -784,11 +784,13 @@ mod tests {
                 .iter()
                 .map(|weight| weight.storage_bytes().unwrap())
                 .sum::<u64>();
+            // Each weight's storage is its representation, its scale and,
+            // where Metal's token-packing GEMM reads it, its F32 packing bound.
             assert_eq!(
                 packed_bytes,
                 load.target()
                     .iter()
-                    .map(|weight| weight.resident_bytes)
+                    .map(|weight| weight.resident_bytes + 4 * weight.bound)
                     .sum::<u64>()
                     + scale_bytes
             );
