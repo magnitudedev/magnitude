@@ -1084,7 +1084,7 @@ describe("--json output", () => {
       checkHuggingFaceRepository: (request: { readonly repository: string }) => Effect.succeed(searchChecks(makeSearchResponse())(request)),
       getLocalEnvironment: () => Effect.succeed(makeHardware()),
     })
-    const effect = readSearch(client, "qwen", Option.some(5))
+    const effect = readSearch(client, "qwen", Option.some(5), Option.none())
     const json = await capture(() => runCommand({ effect, render: renderSearch, json: asJson({ json: true }, searchJson) }))
     expect(json.stderr).toBe("")
     expect(JSON.parse(json.stdout).results).toHaveLength(2)

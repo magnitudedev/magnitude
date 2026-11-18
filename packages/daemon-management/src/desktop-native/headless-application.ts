@@ -25,8 +25,8 @@ import { ProcessGroupControllerLive } from "@magnitudedev/utils/process-groups/n
 export class HeadlessApplicationFailed extends Schema.TaggedError<HeadlessApplicationFailed>()("HeadlessApplicationFailed", { message: Schema.String }) {}
 
 const windowsUncontainedServe = "On Windows, start `magnitude serve` with the Magnitude command, "
-  + "%LOCALAPPDATA%\\Programs\\Magnitude CLI\\magnitude.exe, not the app's resources\\magnitude.exe. "
-  + "Service wrappers such as NSSM and scheduled tasks must start that command too."
+  + "%LOCALAPPDATA%\\Programs\\Magnitude CLI\\magnitude.exe, which contains the server's processes, "
+  + "not a magnitude.exe inside the app's resources or a CLI-only version folder. Scheduled tasks and service wrappers such as NSSM must start that command too."
 
 /**
  * In a Docker installation the image is the installation and the container's lifecycle is the
