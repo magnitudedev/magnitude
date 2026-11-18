@@ -104,7 +104,8 @@ const retireDesktopPackage = Effect.gen(function* () {
   const displayManager = yield* output("systemctl", "show", "--property=LoadState", "--value", "display-manager.service").pipe(
     Effect.map(state => state !== "not-found"), Effect.orElseSucceed(() => true))
   if (displayManager) return "kept (graphical machine)"
-  yield* step("Could not write the command wrapper", () => writeFile(LEGACY_SERVER_WRAPPER, wrapper, { mode: 0o755 }))
+  // The unit's UMask=0007 would leave the wrapper root-only, so its mode is set after writing.
+  yield* step("Could not write the command wrapper", () => writeFile(LEGACY_SERVER_WRAPPER, wrapper).then(() => chmod(LEGACY_SERVER_WRAPPER, 0o755)))
   const removal = yield* removalCommand
   if (removal === undefined) return "kept (no supported package manager found)"
   yield* output("systemd-run", "--unit=magnitude-desktop-removal", "--collect", "--on-active=60", "/bin/sh", "-c", removal)
