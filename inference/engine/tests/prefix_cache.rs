@@ -312,7 +312,6 @@ fn conversation_turns_resume_at_the_previous_reply() {
         prompt = path(&done);
         prompt.extend(text(&tokenizer, 100 + turn, 40));
     }
-    host.owner().reconcile_memory_charge().unwrap();
 }
 
 /// The prefixes a growing conversation leaves cached never take the state
@@ -340,9 +339,7 @@ fn a_growing_conversation_stays_within_the_charged_workload_state() {
         if let Some(end) = previous {
             assert_eq!(done.cached, end, "turn {turn} resumes at the last reply");
         }
-        let charge = host.owner().reconcile_memory_charge().unwrap();
-        let occupied = charge.target_state.occupied()
-            + charge.head_state.map_or(0, |head| head.occupied());
+        let occupied = host.owner().state_bytes().occupied();
         eprintln!(
             "turn {turn}: prompt={} cached={} prefixes={} occupied={occupied} workload={workload}",
             done.prompt.len(),
@@ -378,9 +375,7 @@ fn distinct_conversations_commit_no_state_beyond_the_charged_workload() {
     for conversation in 0..24 {
         let prompt = text(&tokenizer, 200 + conversation, 600);
         run(&mut host, vocabulary, &[prompt], 12);
-        let charge = host.owner().reconcile_memory_charge().unwrap();
-        let committed =
-            charge.target_state.total() + charge.head_state.map_or(0, |head| head.total());
+        let committed = host.owner().state_bytes().committed();
         let prefixes = host.owner().cached_prefixes();
         released |= prefixes < 2 * (conversation as usize + 1);
         eprintln!("conversation {conversation}: prefixes={prefixes} committed={committed} workload={workload}");
@@ -457,7 +452,6 @@ fn short_rewritten_turns_resume_where_the_previous_turn_left_its_prompt() {
         assert_ne!(reply[0], suffix[0]);
         history.extend(reply);
     }
-    host.owner().reconcile_memory_charge().unwrap();
 }
 
 /// A long system prompt, then a last message that changes on every request,
@@ -499,7 +493,6 @@ fn a_changed_last_message_resumes_at_its_declared_start() {
         cached.push(done.cached);
     }
     assert_eq!(cached, [0, system.len(), system.len()]);
-    host.owner().reconcile_memory_charge().unwrap();
 }
 
 /// Without a declared cache point, a changed last message diverges below
@@ -601,7 +594,6 @@ fn arbitrary_request_sequences_resume_from_their_deepest_cached_prefix() {
             assert!(turn.cached < turn.prompt.len());
         }
         finished.extend(turns);
-        host.owner().reconcile_memory_charge().unwrap();
     }
 }
 
@@ -742,7 +734,6 @@ fn vision_claims_its_slots_on_an_image_and_releases_them_at_idle() {
         let idle = charged(&domain);
         assert_eq!(encoded - idle, released);
         assert!(released > 0, "idle released no vision storage");
-        domain.reconcile_memory_charge(&[]).unwrap();
         eprintln!(
             "vision cycle: opened={opened} encoded={encoded} idle={idle} released={released}"
         );
@@ -787,7 +778,6 @@ fn image_conditioning_survives_eviction_and_cached_resumption() {
     let encodes = domain.open_served(&mut bindings, reference, None).unwrap();
     assert_eq!(encodes.len(), 1);
     bindings = encode(&mut domain, bindings, encodes);
-    domain.reconcile_memory_charge(&[]).unwrap();
     bindings = forward(&mut domain, bindings, reference, &input, 0..split).1;
     let after_image = domain.resume_state(reference).unwrap();
     let (expected, next) = forward(&mut domain, bindings, reference, &input, split..end);
@@ -822,7 +812,5 @@ fn image_conditioning_survives_eviction_and_cached_resumption() {
     assert_eq!(bits(&continued), bits(&expected));
     domain.close(resumed).unwrap();
 
-    domain.reconcile_memory_charge(&[&after_image]).unwrap();
     drop(after_image);
-    domain.reconcile_memory_charge(&[]).unwrap();
 }

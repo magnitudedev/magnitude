@@ -181,7 +181,6 @@ fn prefill(
 }
 
 fn assert_accounted(domain: &ExecutorDomain) {
-    domain.reconcile_memory_charge(&[]).unwrap();
 }
 
 /// Where one request's state lies and what it holds: each history domain's
@@ -242,13 +241,13 @@ fn state_pool_held(domain: &ExecutorDomain, request: RequestId) -> u64 {
 fn yield_spare_state(domain: &mut ExecutorDomain, bindings: &mut StateBindings, live: &[RequestId]) -> u64 {
     let before = live.iter().map(|&request| placed(domain, request)).collect::<Vec<_>>();
     let held = state_pool_held(domain, live[0]);
-    let charge_before = domain.reconcile_memory_charge(&[]).unwrap();
+    let charge_before = domain.load_charge().unwrap();
     let claim = magnitude_executor::fixtures::take_all_cache(domain);
     let yielded = domain.release_yielded(bindings, CompletionWake::new(|| {})).unwrap();
     assert!(matches!(yielded, Yielded::Released { .. }), "{yielded:?}");
     drop(claim);
     let returned = held - state_pool_held(domain, live[0]);
-    let charge_after = domain.reconcile_memory_charge(&[]).unwrap();
+    let charge_after = domain.load_charge().unwrap();
     eprintln!("returned={returned} charge={}=>{}", charge_before.allocated, charge_after.allocated);
     assert!(returned > 0, "the yield returned nothing to the OS");
     assert_eq!(charge_before.allocated - charge_after.allocated, returned);

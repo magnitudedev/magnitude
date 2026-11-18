@@ -539,11 +539,11 @@ impl Session {
             self.observations.swap_remove(index);
             match reply {
                 Ok(WorkerReply::Observed {
-                    reconciliation,
+                    stores: allocations,
                     readings,
                     serving,
                 }) => {
-                    let census = AllocationCensus::classify(&reconciliation, serving);
+                    let census = AllocationCensus { stores: allocations, serving };
                     let stores = readings
                         .iter()
                         .map(|reading| StoreHeadroom {
@@ -568,8 +568,7 @@ impl Session {
                 })?,
             }
         }
-        if let Some((reconciliation, serving)) = self.loaded.census.take(&self.waker) {
-            let census = AllocationCensus::classify(&reconciliation, serving);
+        if let Some(census) = self.loaded.census.take(&self.waker) {
             self.send(WorkerMessage::Census { census })?;
         }
         self.forward_streams()?;

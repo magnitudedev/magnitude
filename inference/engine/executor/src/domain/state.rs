@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::planning::graph_demand;
-use magnitude_state::{GrowthChoice, Holder, RowDemand, StateHoldingCensus, StoreCopy};
+use magnitude_state::{GrowthChoice, RowDemand, StateStore, StoreCopy};
 
 /// The storage of `kind` this executor places first: its store.
 pub(super) fn storage_store(topology: &seismic::DeviceTopology, executor: &seismic::Executor, kind: seismic::Contract) -> Option<seismic::StoreId> {
@@ -42,17 +42,46 @@ pub enum SlotRelease {
     Running,
 }
 
-/// What the device's ledgers hold allocated, the one count of the
-/// process's memory (block slack and driver objects included), by store
-/// and class, read from the ledgers' entries (`stores`); beside it, what
-/// the holders report holding (the state census and the holders' own
-/// bytes), which describes the classes and is never summed against them.
+/// What one state store commits and what its holders occupy of it, read
+/// from the store's own record of its claims.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoreStateBytes {
+    pub committed: u64,
+    pub occupied: u64,
+}
+
+impl StoreStateBytes {
+    fn of(store: &StateStore) -> Self {
+        Self { committed: store.committed_bytes(), occupied: store.occupied_bytes() }
+    }
+}
+
+/// The state stores' bytes: the target's and, where the drafter keeps its
+/// own history, the drafter's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StateBytes {
+    pub target: StoreStateBytes,
+    pub head: Option<StoreStateBytes>,
+}
+
+impl StateBytes {
+    pub fn committed(self) -> u64 {
+        self.target.committed + self.head.map_or(0, |head| head.committed)
+    }
+
+    pub fn occupied(self) -> u64 {
+        self.target.occupied + self.head.map_or(0, |head| head.occupied)
+    }
+}
+
+/// What a load holds as it ends, by the plan's terms beside what the
+/// device's ledgers hold allocated (`allocated`, the one count of the
+/// process's memory): the load's memory record. The terms describe the
+/// allocation and are never summed against it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MemoryChargeReconciliation {
-    pub stores: Vec<StoreAllocation>,
+pub struct LoadCharge {
     pub allocated: u64,
-    pub target_state: StateHoldingCensus,
-    pub head_state: Option<StateHoldingCensus>,
+    pub state: StateBytes,
     pub graph_pools: u64,
     pub owned_features: u64,
     pub target_weights: u64,
@@ -158,11 +187,42 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .ok_or_else(|| "optional component release increased what the process holds".to_owned())
     }
 
-    pub fn reconcile_memory_charge(
-        &self,
-        retained: &[&ResumeState],
-    ) -> Result<MemoryChargeReconciliation, String> {
-        let (target_state, head_state) = self.state_holding_census(retained)?;
+    /// The state stores' bytes, each read from its own record.
+    pub fn state_bytes(&self) -> StateBytes {
+        StateBytes {
+            target: StoreStateBytes::of(&self.target_store),
+            head: self.head_store.as_deref().map(StoreStateBytes::of),
+        }
+    }
+
+    /// What each store's ledger holds allocated, by class
+    /// ([`crate::memory::ledger::Ledger::charge_classes`]), each read in one
+    /// hold: the classes sum to what the store has allocated.
+    pub fn store_allocations(&self) -> Vec<StoreAllocation> {
+        self.store_ledgers()
+            .map(|ledger| {
+                let classes = ledger.charge_classes();
+                StoreAllocation {
+                    store: ledger.store(),
+                    model_bytes: classes.model,
+                    context_bytes: classes.context,
+                    compute_bytes: classes.compute,
+                    auxiliary_bytes: classes.auxiliary,
+                }
+            })
+            .collect()
+    }
+
+    /// Each store's ledger, the device's first.
+    fn store_ledgers(&self) -> impl Iterator<Item = &crate::memory::ledger::Ledger> {
+        let ledgers = self.resources.ledgers();
+        let device = ledgers.device();
+        std::iter::once(device).chain((ledgers.host().store() != device.store()).then(|| ledgers.host()))
+    }
+
+    /// What the load holds as it ends, by the plan's terms
+    /// ([`LoadCharge`]).
+    pub fn load_charge(&self) -> Result<LoadCharge, String> {
         // The graph pools' storage, and what the device's graph budget
         // costs, which its slots' holds charge to the ledger.
         let device = self.domain.device();
@@ -191,30 +251,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .ok_or("optional resident charge overflows")?;
         let prepared_programs = self.family.prepared_program_bytes();
         let bound_constants = self.family.bound_constant_bytes()?;
-        // Each store's classes, read from its ledger in one hold: they sum
-        // to what it has allocated (`Ledger::charge_classes`).
-        let ledgers = self.resources.ledgers();
-        let device_ledger = ledgers.device();
-        let stores = std::iter::once(device_ledger)
-            .chain((ledgers.host().store() != device_ledger.store()).then(|| ledgers.host()))
-            .map(|ledger| (ledger.store(), ledger.charge_classes()))
-            .collect::<Vec<_>>();
-        let allocated = stores.iter().map(|(_, classes)| classes.allocated()).sum::<u64>();
-        let stores = stores
-            .into_iter()
-            .map(|(store, classes)| StoreAllocation {
-                store,
-                model_bytes: classes.model,
-                context_bytes: classes.context,
-                compute_bytes: classes.compute,
-                auxiliary_bytes: classes.auxiliary,
-            })
-            .collect();
-        Ok(MemoryChargeReconciliation {
-            stores,
+        let allocated = self.store_ledgers().map(|ledger| ledger.charge_classes().allocated()).sum::<u64>();
+        Ok(LoadCharge {
             allocated,
-            target_state,
-            head_state,
+            state: self.state_bytes(),
             graph_pools,
             owned_features,
             target_weights,
@@ -222,46 +262,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             prepared_programs,
             bound_constants,
         })
-    }
-
-    /// Account for each state arena from resident requests, retained resume
-    /// states, and the store's registered submitted transactions.
-    /// Unregistered omissions remain an error rather than being mislabeled as
-    /// surplus.
-    pub fn state_holding_census(
-        &self,
-        retained: &[&ResumeState],
-    ) -> Result<(StateHoldingCensus, Option<StateHoldingCensus>), String> {
-        let target_live = self.target.values().map(Holder::State).collect::<Vec<_>>();
-        let target_retained = retained
-            .iter()
-            .map(|state| Holder::Checkpoint(&state.target))
-            .collect::<Vec<_>>();
-        let target = self
-            .target_store
-            .holding_census(&target_live, &target_retained, &[])
-            .map_err(|error| error.to_string())?;
-        let head = self
-            .head_store
-            .as_ref()
-            .map(|store| {
-                let live = self.head.values().map(Holder::State).collect::<Vec<_>>();
-                let retained = retained
-                    .iter()
-                    .map(|state| {
-                        state
-                            .head
-                            .as_ref()
-                            .map(Holder::Checkpoint)
-                            .ok_or("retained resume state has no head state")
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                store
-                    .holding_census(&live, &retained, &[])
-                    .map_err(|error| error.to_string())
-            })
-            .transpose()?;
-        Ok((target, head))
     }
 
     /// Commit state backing for a launch before its capacity check: the rows

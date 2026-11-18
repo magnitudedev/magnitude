@@ -100,7 +100,7 @@ pub(super) struct PrimingFlight<H> {
     /// For a claimed queued step: the accepted head state its successor
     /// advance attaches to at finish, or `None` when nobody claimed it (its
     /// rows are discarded). `None` for an ordinary flight.
-    pub(super) continuation: Option<Option<InFlightState>>,
+    pub(super) continuation: Option<Option<SequenceState>>,
 }
 
 /// One submitted target step: a group's flight, or a step queued behind one
@@ -139,7 +139,7 @@ pub(super) enum Source {
     /// Nothing: nobody claimed the slot, and its rows are discarded.
     Unclaimed,
     /// The accepted state its successor advance attaches to.
-    Accepted(InFlightState),
+    Accepted(SequenceState),
     /// The chain its chained chunk joins, which the chunk carries until its
     /// outcome reconciles or aborts.
     Chain(OwnedChainAdvance),

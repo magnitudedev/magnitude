@@ -73,9 +73,9 @@ pub use device_resources::{
 pub use domain::{
     MEMORY_TRACE, BankHolding, BankResize, BankResized, BankStep, Followed, Yielded, TableResidency, DeviceReader, LoadRoom, MachineReading, PlanningRoom, DomainError, DomainRequirements, DomainReservation, ExecutorDomain, Unchained,
     ExpertMeasures, LoadCosts, LoadMeasures, ExpertCover, ExpertResidency, ExpertResizes, HeldBy, HostResidency, ThreadHeld, OptionalComponent, DecodeStep,
-    ExpertTargets, HeadFlight, LaunchDuration, MemoryChargeReconciliation, MemoryRead, MemoryReading, MemoryResponse, NativeFamily, OpenRequirements,
+    ExpertTargets, HeadFlight, LaunchDuration, LoadCharge, MemoryRead, MemoryReading, MemoryResponse, NativeFamily, OpenRequirements,
     PendingOperationOutcome, PhysicalDecision, PrimingCompletionFlight, ProgramFamily,
-    ReservedResources, ResumeState, RunningBegun, RunningPressure, StateBindings, StoreAllocation, SubmitFailure, request_slot_bytes,
+    ReservedResources, ResumeState, RunningBegun, RunningPressure, StateBindings, StateBytes, StoreAllocation, StoreStateBytes, SubmitFailure, request_slot_bytes,
     TargetContinuation, TargetFlight, TargetHostTiming, TrafficHold, VisionFlight, SizingFigures, SizingTerm, SizingTerms,
 };
 #[cfg(any(test, feature = "fixtures"))]

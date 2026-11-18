@@ -10,7 +10,7 @@ use crate::publication::PublicationReceiver;
 use crate::serving::ServingCensus;
 use crate::owner::{AdmissionError, Status};
 use magnitude_executor::platform::DomainReading;
-use magnitude_executor::{MemoryChargeReconciliation, RequestId};
+use magnitude_executor::{RequestId, StoreAllocation};
 use magnitude_family_contracts::PreparedModelInput;
 use magnitude_generation::GenerationSeed;
 use serde::{Deserialize, Serialize};
@@ -167,8 +167,8 @@ pub enum WorkerReply {
     /// `None` when the request is not live.
     Status(Option<RequestSnapshot>),
     Observed {
-        /// Seismic's charge classified by every holder the owner keeps.
-        reconciliation: MemoryChargeReconciliation,
+        /// What each store's ledger holds allocated, by class.
+        stores: Vec<StoreAllocation>,
         /// A fresh reading of every memory domain the device uses.
         readings: Vec<DomainReading>,
         serving: ServingCensus,

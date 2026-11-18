@@ -1041,13 +1041,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         .target
                         .remove(&operation.request())
                         .expect("invariant violated: a claimed slot's accepted state is absent");
-                    Source::Accepted(InFlightState::new(state))
+                    Source::Accepted(state)
                 }
             };
         }
         flight.continuation = Some(sources);
         if let Some(priming) = &mut flight.priming {
-            priming.continuation = Some(self.head.remove(&priming.request).map(InFlightState::new));
+            priming.continuation = Some(self.head.remove(&priming.request));
         }
         flight
     }

@@ -1634,30 +1634,25 @@ fn report_load_memory(moment: &str, device: &seismic::Device) {
     tracing::info!(record = %load_memory_record(moment, device), "load memory");
 }
 
-/// The load's end (`loaded`): its memory record with Seismic's charge
-/// split by the domain's holders (`MemoryChargeReconciliation`), each in
-/// the plan's term that charges it, so the plan's terms read beside what
-/// the load holds of each.
+/// The load's end (`loaded`): its memory record with what the ledgers hold
+/// allocated beside the plan's terms that charge it (`LoadCharge`), so the
+/// plan's terms read beside what the load holds of each.
 fn report_loaded_memory(
     domain: &ExecutorDomain,
     device: &seismic::Device,
 ) -> Result<(), String> {
-    let charge = domain.reconcile_memory_charge(&[])?;
+    let charge = domain.load_charge()?;
     let sum = |terms: &[u64]| {
         terms
             .iter()
             .try_fold(0u64, |sum, &term| sum.checked_add(term))
             .ok_or_else(|| format!("the load's charge terms {terms:?} overflow"))
     };
-    let state = sum(&[
-        charge.target_state.total(),
-        charge.head_state.map_or(0, |state| state.total()),
-    ])?;
     let mut record = load_memory_record("loaded", device);
     record["charge"] = serde_json::json!({
         "allocated": charge.allocated,
         "weights": sum(&[charge.target_weights, charge.optional_weights])?,
-        "state": state,
+        "state": charge.state.committed(),
         "graphs": sum(&[charge.graph_pools, charge.bound_constants])?,
         "programs": charge.prepared_programs,
         "owned_features": charge.owned_features,

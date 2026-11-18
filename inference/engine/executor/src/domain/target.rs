@@ -861,7 +861,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 }
                 // `claim_slots` found the state the successor follows.
                 (TentativeAdvance::Successor(successor), Some(Source::Accepted(state))) => {
-                    match successor.attach(state.into_state()) {
+                    match successor.attach(state) {
                         Ok(advance) => Advance::Step(advance),
                         Err((_, error)) => panic!("invariant violated: a claimed queued slot no longer follows its state: {error}"),
                     }
@@ -941,7 +941,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         match (advance, priming.continuation) {
             (TentativeAdvance::Accepted(advance), None) => Ok(Some((priming.request, advance))),
             // `claim_slots` found the state the successor follows.
-            (TentativeAdvance::Successor(successor), Some(Some(state))) => match successor.attach(state.into_state()) {
+            (TentativeAdvance::Successor(successor), Some(Some(state))) => match successor.attach(state) {
                 Ok(advance) => Ok(Some((priming.request, advance))),
                 Err((_, error)) => panic!("invariant violated: a claimed drafter entry no longer follows its state: {error}"),
             },

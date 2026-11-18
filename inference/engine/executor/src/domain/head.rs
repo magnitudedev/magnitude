@@ -282,7 +282,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         operations: &[Operation],
         graph_workspace: NativeGraphWorkspaceLease,
         graph_output: NativeGraphOutputLease,
-        states: Vec<InFlightState>,
+        states: Vec<SequenceState>,
     ) -> Result<HeadFlight<F>, SubmitFailure> {
         let launch = self.target_reading_launch(operations, &states);
         let (batch, history, metadata, steps) = match launch {
@@ -347,9 +347,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// Return the accepted target states a head reading them held.
-    fn restore_target_reads(&mut self, operations: &[Operation], states: Vec<InFlightState>) {
+    fn restore_target_reads(&mut self, operations: &[Operation], states: Vec<SequenceState>) {
         for (operation, state) in operations.iter().zip(states) {
-            self.target.insert(operation.request(), state.into_state());
+            self.target.insert(operation.request(), state);
         }
     }
 
@@ -360,7 +360,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     fn target_reading_launch(
         &self,
         operations: &[Operation],
-        states: &[InFlightState],
+        states: &[SequenceState],
     ) -> Result<
         (
             crate::batching::ValidatedHeadBatch,
@@ -789,7 +789,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             assert_eq!(reads.states.len(), requests.len(), "invariant violated: a head flight's target reads differ from its requests");
             for ((request, _, _), state) in requests.iter().zip(reads.states) {
                 assert!(
-                    self.target.insert(*request, state.into_state()).is_none(),
+                    self.target.insert(*request, state).is_none(),
                     "invariant violated: a head flight's target state has another owner"
                 );
             }

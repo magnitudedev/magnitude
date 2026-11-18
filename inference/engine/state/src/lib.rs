@@ -1,6 +1,8 @@
-//! Family-neutral accepted sequence state and transactional history ownership.
-//! Owned transactions can cross a submission boundary. Their callers reconcile
-//! only after physical completion has been observed.
+//! Family-neutral accepted sequence state and its history ownership. A row
+//! or bank is held exactly as long as a claim of it lives: the store's arenas
+//! and bank pool are the one record of what its state occupies. Owned
+//! advances can cross a submission boundary; their callers reconcile only
+//! after physical completion has been observed.
 mod advance;
 mod bank;
 mod codec;
@@ -558,39 +560,6 @@ impl Arena {
         }
     }
 
-    /// Rows of `ranges` (with multiplicity) that no claim outside them
-    /// references: the rows released if exactly those claims were dropped.
-    fn exclusive_rows(&self, ranges: &[(usize, usize)]) -> usize {
-        let mut events = ranges
-            .iter()
-            .flat_map(|&(start, count)| [(start, 1isize), (start + count, -1)])
-            .collect::<Vec<_>>();
-        events.sort_unstable();
-        let mut exclusive = 0;
-        let mut depth = 0isize;
-        let mut from = 0;
-        for (row, delta) in events {
-            if depth > 0 && row > from {
-                exclusive += self.rows_with_references(from, row, depth as usize);
-            }
-            depth += delta;
-            from = row;
-        }
-        exclusive
-    }
-
-    fn rows_with_references(&self, start: usize, end: usize, references: usize) -> usize {
-        let first = self
-            .runs
-            .range(..=start)
-            .next_back()
-            .map_or(start, |(&row, _)| row);
-        self.runs
-            .range(first..end)
-            .filter(|(_, run)| run.references == references)
-            .map(|(&row, run)| (row + run.count).min(end).saturating_sub(row.max(start)))
-            .sum()
-    }
 }
 
 /// One registered history: address ranges in logical order (physically
@@ -1043,79 +1012,6 @@ struct HistorySlabs {
     rows: usize,
 }
 
-/// A registered history claim: its domain and its entry in that domain's
-/// arena.
-type HistoryKey = (usize, u64);
-
-/// The history and bank claims that transactions (advances, relocations,
-/// conversions) hold on this store's rows and banks: shared ownership, not a
-/// right to change slab bindings ([`StoreBindings`]).
-#[derive(Default)]
-struct TransactionClaims {
-    histories: BTreeMap<HistoryKey, usize>,
-    banks: BTreeMap<usize, usize>,
-}
-
-#[derive(Clone)]
-struct Transactions(Rc<RefCell<TransactionClaims>>);
-
-struct Transaction {
-    claims: Rc<RefCell<TransactionClaims>>,
-    histories: Vec<HistoryKey>,
-    banks: Vec<usize>,
-}
-
-impl Transactions {
-    fn begin(&self) -> Transaction {
-        Transaction {
-            claims: self.0.clone(),
-            histories: Vec::new(),
-            banks: Vec::new(),
-        }
-    }
-}
-
-impl Transaction {
-    /// Track one claim per stored domain, in domain order, and a bank.
-    fn track(&mut self, claims: &[Claims], bank: &BankHandle) {
-        for (domain, claims) in claims.iter().enumerate() {
-            self.track_history(HistoryDomainId(domain), claims);
-        }
-        self.track_bank(bank);
-    }
-    fn track_history(&mut self, domain: HistoryDomainId, claims: &Claims) {
-        let key = (domain.0, claims.id);
-        self.histories.push(key);
-        *self.claims.borrow_mut().histories.entry(key).or_default() += 1;
-    }
-    fn track_bank(&mut self, bank: &BankHandle) {
-        self.banks.push(bank.index());
-        *self.claims.borrow_mut().banks.entry(bank.index()).or_default() += 1;
-    }
-}
-
-impl Drop for Transaction {
-    fn drop(&mut self) {
-        let mut tracked = self.claims.borrow_mut();
-        for id in &self.histories {
-            let count = tracked
-                .histories
-                .get_mut(id)
-                .expect("tracked history claim");
-            *count -= 1;
-            if *count == 0 {
-                tracked.histories.remove(id);
-            }
-        }
-        for id in &self.banks {
-            let count = tracked.banks.get_mut(id).expect("tracked bank claim");
-            *count -= 1;
-            if *count == 0 {
-                tracked.banks.remove(id);
-            }
-        }
-    }
-}
 /// One stored history domain of a store: its layout, placement geometry and
 /// the arena of its rows (free space and per-row references).
 struct HistoryDomain {
@@ -1252,12 +1148,6 @@ pub struct StateStore {
     recurrent_views: RefCell<Option<Rc<[Tensor]>>>,
     banks: BankPool,
     zero_seed: BankHandle,
-    /// Live sequences and checkpoints: the store is idle only without both.
-    owners: Cell<usize>,
-    /// Live sequences alone: each may reserve a successor bank, while a
-    /// checkpoint is frozen until a fork of it becomes a sequence.
-    sequences: Cell<usize>,
-    transactions: Transactions,
 }
 
 /// One store's demand for `rows` free rows in one stored history domain.
@@ -1334,28 +1224,6 @@ impl StoreBindings {
 pub struct StateGrowthClaim {
     pub minimum_bytes: u64,
     pub preferred_bytes: u64,
-}
-
-/// A physical census of one state store. Shared rows and recurrent banks are
-/// assigned to the strongest holder class, without charging aliases twice.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct StateHoldingCensus {
-    pub surplus: u64,
-    pub retained: u64,
-    pub live: u64,
-    pub in_flight: u64,
-    pub model_seed: u64,
-}
-
-impl StateHoldingCensus {
-    pub fn total(self) -> u64 {
-        self.surplus + self.retained + self.live + self.in_flight + self.model_seed
-    }
-
-    /// Every byte a holder references: the total less committed surplus.
-    pub fn occupied(self) -> u64 {
-        self.retained + self.live + self.in_flight + self.model_seed
-    }
 }
 
 impl Drop for StateStore {
@@ -1513,9 +1381,6 @@ impl StateStore {
             recurrent_views: RefCell::new(None),
             banks,
             zero_seed,
-            owners: Cell::new(0),
-            sequences: Cell::new(0),
-            transactions: Transactions(Rc::new(RefCell::new(TransactionClaims::default()))),
         });
         Ok((store.clone(), StoreBindings { store }))
     }
@@ -1603,113 +1468,13 @@ impl StateStore {
         history + banks * self.recurrent_bank_bytes
     }
 
-    /// Classify committed state backing from its actual row and bank claims.
-    /// Every registered holder must be supplied or owned by an outstanding
-    /// transaction. An untracked omission is an error rather than surplus.
-    pub fn holding_census(
-        self: &Rc<Self>,
-        live: &[Holder<'_>],
-        retained: &[Holder<'_>],
-        in_flight: &[Holder<'_>],
-    ) -> Result<StateHoldingCensus, Error> {
-        let holders = live
-            .iter()
-            .chain(retained)
-            .chain(in_flight)
-            .collect::<Vec<_>>();
-        let keys = |holder: &Holder<'_>| {
-            holder
-                .claims()
-                .iter()
-                .enumerate()
-                .map(|(domain, claims)| (domain, claims.id))
-                .collect::<Vec<HistoryKey>>()
-        };
-        let mut supplied = BTreeSet::new();
-        let mut banks = BTreeSet::new();
-        for holder in &holders {
-            if !Rc::ptr_eq(self, holder.store()) {
-                return Err(Error::Request(
-                    "state census holder belongs to another store".into(),
-                ));
-            }
-            for key in keys(holder) {
-                if !supplied.insert(key) {
-                    return Err(Error::Request(
-                        "state census holder appears more than once".into(),
-                    ));
-                }
-            }
-            banks.insert(holder.bank().index());
-        }
-        let tracked = self.transactions.0.borrow();
-        if live
-            .iter()
-            .chain(retained)
-            .flat_map(keys)
-            .any(|key| tracked.histories.contains_key(&key))
-        {
-            return Err(Error::Request(
-                "state census marks a submitted history as live or retained".into(),
-            ));
-        }
-        for (index, domain) in self.domains.iter().enumerate() {
-            let arena = domain.arena.borrow();
-            if arena.entries.keys().any(|&id| {
-                !supplied.contains(&(index, id)) && !tracked.histories.contains_key(&(index, id))
-            }) {
-                return Err(Error::Request(
-                    "state census omits a registered history claim".into(),
-                ));
-            }
-            if self.backing.borrow().history[index].rows < arena.referenced {
-                return Err(Error::Request(
-                    "state census does not reconcile to committed backing".into(),
-                ));
-            }
-        }
-        if self
-            .banks
-            .claimed()
-            .into_iter()
-            .filter(|&slot| slot != ZERO_SEED_BANK)
-            .any(|slot| !banks.contains(&slot) && !tracked.banks.contains_key(&slot))
-        {
-            return Err(Error::Request(
-                "state census omits a recurrent bank claim".into(),
-            ));
-        }
-        let occupied = self.referenced_bytes();
-        let model_seed = self.recurrent_bank_bytes;
-        let committed = self.committed_bytes();
-        let surplus = committed
-            .checked_sub(occupied)
-            .and_then(|bytes| bytes.checked_sub(model_seed))
-            .ok_or_else(|| Error::Request("state census exceeds committed backing".into()))?;
-        drop(tracked);
-        let retained_only = self.exclusive_bytes(retained)?;
-        let non_flight = live.iter().chain(retained).copied().collect::<Vec<_>>();
-        let in_flight_bytes = occupied
-            .checked_sub(self.exclusive_bytes(&non_flight)?)
-            .ok_or_else(|| Error::Request("state census flight exceeds occupied bytes".into()))?;
-        let live_bytes = occupied
-            .checked_sub(retained_only)
-            .and_then(|bytes| bytes.checked_sub(in_flight_bytes))
-            .ok_or_else(|| Error::Request("state census classes overlap".into()))?;
-        let census = StateHoldingCensus {
-            surplus,
-            retained: retained_only,
-            live: live_bytes,
-            in_flight: in_flight_bytes,
-            model_seed,
-        };
-        if census.total() != committed {
-            return Err(Error::Request(
-                "state census does not reconcile to committed backing".into(),
-            ));
-        }
-        Ok(census)
+    /// The state the store holds for its holders: what they reference and
+    /// the model's seed bank. The rest of [`Self::committed_bytes`] is
+    /// backing no claim uses.
+    pub fn occupied_bytes(&self) -> u64 {
+        self.referenced_bytes() + self.recurrent_bank_bytes
     }
+
     /// The store's stored history domains, in plan order.
     pub fn history_domains(&self) -> impl Iterator<Item = HistoryDomainId> {
         (0..self.domains.len()).map(HistoryDomainId)
@@ -2271,61 +2036,6 @@ impl StateStore {
     pub fn occupied_rows(&self, domain: HistoryDomainId) -> usize {
         self.domains[domain.0].arena.borrow().referenced
     }
-    /// Bytes released if exactly the given holders were dropped: history rows
-    /// and recurrent banks that no claim outside the set references. Shared
-    /// prefixes are priced once, as a set; checkpoints, descendants and
-    /// in-flight advances outside the set pin what they reference, and the
-    /// zero seed is never released. Repeated holders count once.
-    pub fn exclusive_bytes(self: &Rc<Self>, holders: &[Holder<'_>]) -> Result<u64, Error> {
-        let mut distinct: Vec<&Holder<'_>> = Vec::with_capacity(holders.len());
-        for holder in holders {
-            if !Rc::ptr_eq(self, holder.store()) {
-                return Err(Error::Request(
-                    "exclusive accounting requires holders from this store".into(),
-                ));
-            }
-            if !distinct.iter().any(|seen| seen.same(holder)) {
-                distinct.push(holder);
-            }
-        }
-        let mut history = 0u64;
-        for (index, domain) in self.domains.iter().enumerate() {
-            let ranges = distinct
-                .iter()
-                .flat_map(|holder| holder.claims()[index].ranges())
-                .collect::<Vec<_>>();
-            let rows = domain.arena.borrow().exclusive_rows(&ranges);
-            history = (rows as u64)
-                .checked_mul(domain.row_bytes)
-                .and_then(|bytes| history.checked_add(bytes))
-                .ok_or_else(|| Error::Request("exclusive state byte count overflow".into()))?;
-        }
-        let mut banks = 0u64;
-        let mut counted: Vec<*const BankClaim> = Vec::new();
-        for holder in &distinct {
-            let bank = holder.bank();
-            let claim = Rc::as_ptr(&bank.0);
-            if bank.index() == ZERO_SEED_BANK || counted.contains(&claim) {
-                continue;
-            }
-            counted.push(claim);
-            let selected = distinct
-                .iter()
-                .filter(|other| Rc::ptr_eq(&other.bank().0, &bank.0))
-                .count();
-            if selected == Rc::strong_count(&bank.0) {
-                banks += 1;
-            }
-        }
-        self.recurrent_bank_bytes
-            .checked_mul(banks)
-            .and_then(|recurrent| history.checked_add(recurrent))
-            .ok_or_else(|| Error::Request("exclusive state byte count overflow".into()))
-    }
-    pub fn idle(&self) -> bool {
-        self.owners.get() == 0
-    }
-
     pub fn available_banks(&self) -> usize {
         self.banks.available()
     }
@@ -2346,8 +2056,6 @@ impl StateStore {
                 claims
             })
             .collect::<Vec<_>>();
-        self.owners.set(self.owners.get() + 1);
-        self.sequences.set(self.sequences.get() + 1);
         Ok(SequenceState {
             store: self.clone(),
             position: 0,
@@ -2436,9 +2144,6 @@ impl StateStore {
         self.banks.acquire()
     }
 
-    fn begin_transaction(&self) -> Transaction {
-        self.transactions.begin()
-    }
 
     /// The first `rows` rows (at most a page) of a free page, as a fresh
     /// history takes them: the destination of a relocated last page. `None`
@@ -2450,41 +2155,6 @@ impl StateStore {
         }
         let ranges = arena.borrow_mut().claim(None, rows);
         Some(Claims::new(arena, ranges))
-    }
-}
-
-/// A claim holder priced by [`StateStore::exclusive_bytes`].
-#[derive(Clone, Copy)]
-pub enum Holder<'a> {
-    State(&'a SequenceState),
-    Checkpoint(&'a StateCheckpoint),
-}
-
-impl Holder<'_> {
-    fn store(&self) -> &Rc<StateStore> {
-        match self {
-            Self::State(state) => &state.store,
-            Self::Checkpoint(checkpoint) => &checkpoint.store,
-        }
-    }
-    fn claims(&self) -> &[Claims] {
-        match self {
-            Self::State(state) => &state.claims,
-            Self::Checkpoint(checkpoint) => &checkpoint.claims,
-        }
-    }
-    fn bank(&self) -> &BankHandle {
-        match self {
-            Self::State(state) => &state.bank,
-            Self::Checkpoint(checkpoint) => &checkpoint.bank,
-        }
-    }
-    fn same(&self, other: &Holder<'_>) -> bool {
-        match (self, other) {
-            (Holder::State(left), Holder::State(right)) => std::ptr::eq(*left, *right),
-            (Holder::Checkpoint(left), Holder::Checkpoint(right)) => std::ptr::eq(*left, *right),
-            _ => false,
-        }
     }
 }
 
@@ -2512,12 +2182,6 @@ pub struct SequenceState {
     /// advance replays those tape rows before its own (see
     /// [`OwnedStateAdvance::begin_speculative`]). 0 after a plain advance.
     tape: usize,
-}
-impl Drop for SequenceState {
-    fn drop(&mut self) {
-        self.store.owners.set(self.store.owners.get() - 1);
-        self.store.sequences.set(self.store.sequences.get() - 1);
-    }
 }
 impl SequenceState {
     pub fn position(&self) -> usize {
@@ -2661,7 +2325,6 @@ impl SequenceState {
     /// Window(n), rows `[position - n, position)`), which forks and resumed
     /// requests share without copying.
     pub fn checkpoint(&self) -> StateCheckpoint {
-        self.store.owners.set(self.store.owners.get() + 1);
         StateCheckpoint {
             store: self.store.clone(),
             position: self.position,
@@ -2765,42 +2428,6 @@ pub struct StateCheckpoint {
     tape: usize,
 }
 
-/// An accepted state temporarily owned by submitted work (a continuation,
-/// or a head launch reading target history) rather than the domain's request
-/// map. Its history and bank remain in the in-flight census until the work
-/// returns it or is dropped.
-pub struct InFlightState {
-    state: SequenceState,
-    _transaction: Transaction,
-}
-
-impl InFlightState {
-    pub fn new(state: SequenceState) -> Self {
-        let mut transaction = state.store.begin_transaction();
-        transaction.track(&state.claims, &state.bank);
-        Self {
-            state,
-            _transaction: transaction,
-        }
-    }
-
-    pub fn into_state(self) -> SequenceState {
-        self.state
-    }
-}
-
-impl std::ops::Deref for InFlightState {
-    type Target = SequenceState;
-
-    fn deref(&self) -> &SequenceState {
-        &self.state
-    }
-}
-impl Drop for StateCheckpoint {
-    fn drop(&mut self) {
-        self.store.owners.set(self.store.owners.get() - 1);
-    }
-}
 impl StateCheckpoint {
     pub fn position(&self) -> usize {
         self.position
@@ -2829,8 +2456,6 @@ impl StateCheckpoint {
         for claims in &claims {
             claims.set_live(true);
         }
-        self.store.owners.set(self.store.owners.get() + 1);
-        self.store.sequences.set(self.store.sequences.get() + 1);
         SequenceState {
             store: self.store.clone(),
             position: self.position,
@@ -3544,9 +3169,7 @@ mod tests {
         assert_eq!(committed_extent(&store).0, 0);
         assert!(store.history_slabs().backed().is_empty());
         assert_eq!(device.tally.held(), charged);
-        // The census counts the store's committed backing, its tables alone;
-        // the pool holds the viewed slab's block beside its absent granule.
-        assert_eq!(store.holding_census(&[], &[], &[]).unwrap().total(), store.committed_bytes());
+        // The pool holds the viewed slab's block beside its absent granule.
         assert_eq!(device.pool.held_bytes(), 2 * block);
         drop(binding);
         assert_eq!(device.pool.return_freed(0).unwrap(), 0);
@@ -3579,15 +3202,6 @@ mod tests {
         let mut five = path.clone();
         drop(five.split_off(5));
         assert_eq!(arena.borrow().referenced, 12);
-        // Pricing is by set: the path alone owns rows 8..12; the path and
-        // the 8-row branch own 5..12; all three own everything.
-        assert_eq!(arena.borrow().exclusive_rows(&[(0, 12)]), 4);
-        assert_eq!(arena.borrow().exclusive_rows(&[(0, 12), (0, 8)]), 7);
-        assert_eq!(
-            arena.borrow().exclusive_rows(&[(0, 12), (0, 8), (0, 5)]),
-            12
-        );
-        assert_eq!(arena.borrow().exclusive_rows(&[(0, 5)]), 0);
         drop(path);
         assert_eq!(arena.borrow().referenced, 8);
         assert_eq!(arena.borrow().free, vec![(8, 24)]);
@@ -3949,8 +3563,8 @@ mod tests {
     }
 
     /// Shared system prompt, two divergent requests and retained checkpoints
-    /// on one path: every holder sees the same physical prefix rows, the
-    /// store holds them once, and pricing a set charges them once.
+    /// on one path: every holder sees the same physical prefix rows, and the
+    /// store holds them once, until their last holder drops.
     #[test]
     fn shared_prefix_is_the_same_rows_and_is_charged_once() {
         let device = cpu_device();
@@ -3999,77 +3613,17 @@ mod tests {
             assert_eq!(branch.history_ranges(TOKEN).len(), 2);
         }
         assert_eq!(store.occupied_rows(TOKEN), page + 8 + 6 + 3);
-        let census = store
-            .holding_census(
-                &[Holder::State(&a), Holder::State(&b), Holder::State(&c)],
-                &[Holder::Checkpoint(&system), Holder::Checkpoint(&a_turn)],
-                &[],
-            )
-            .unwrap();
-        assert_eq!(census.retained, bank);
-        assert_eq!(census.live, (page as u64 + 8 + 6 + 3) * row + 3 * bank);
-        assert_eq!(census.total(), store.committed_bytes());
+        // A, B and C each hold a bank of their own; the system prompt holds
+        // the prompt's, and A's turn shares A's.
+        assert_eq!(store.referenced_bytes(), (page as u64 + 8 + 6 + 3) * row + 4 * bank);
         device.assert_holds(&store);
-        let submitted = store
-            .holding_census(
-                &[Holder::State(&b), Holder::State(&c)],
-                &[Holder::Checkpoint(&system), Holder::Checkpoint(&a_turn)],
-                &[Holder::State(&a)],
-            )
-            .unwrap();
-        assert_eq!(submitted.in_flight, (page as u64 + 8) * row + bank);
-        assert_eq!(submitted.live, (6 + 3) * row + 2 * bank);
-        assert_eq!(submitted.retained, bank);
-        assert_eq!(submitted.total(), store.committed_bytes());
-        assert!(
-            store
-                .holding_census(
-                    &[Holder::State(&a), Holder::State(&b)],
-                    &[Holder::Checkpoint(&system), Holder::Checkpoint(&a_turn)],
-                    &[],
-                )
-                .is_err()
-        );
-        // Alone, each live request owns only its private tail and its bank.
-        assert_eq!(
-            store.exclusive_bytes(&[Holder::State(&b)]).unwrap(),
-            6 * row + bank
-        );
-        // The retained set (system prompt + A's turn) owns the prefix only
-        // once every live request is gone, and A's tail and bank once A is.
-        let retained = [Holder::Checkpoint(&system), Holder::Checkpoint(&a_turn)];
-        assert_eq!(store.exclusive_bytes(&retained).unwrap(), bank);
         drop(a);
-        let after_a = store
-            .holding_census(
-                &[Holder::State(&b), Holder::State(&c)],
-                &[Holder::Checkpoint(&system), Holder::Checkpoint(&a_turn)],
-                &[],
-            )
-            .unwrap();
-        assert_eq!(after_a.retained, 8 * row + 2 * bank);
-        assert_eq!(after_a.total(), store.committed_bytes());
-        assert_eq!(
-            store.exclusive_bytes(&retained).unwrap(),
-            8 * row + 2 * bank
-        );
+        assert_eq!(store.referenced_bytes(), (page as u64 + 8 + 6 + 3) * row + 4 * bank, "A's turn keeps A's rows and bank");
         drop((b, c));
-        assert_eq!(
-            store.exclusive_bytes(&retained).unwrap(),
-            (page as u64 + 8) * row + 2 * bank
-        );
-        // Repeated holders count once.
-        let repeated = [
-            Holder::Checkpoint(&system),
-            Holder::Checkpoint(&system),
-            Holder::Checkpoint(&a_turn),
-        ];
-        assert_eq!(
-            store.exclusive_bytes(&repeated).unwrap(),
-            (page as u64 + 8) * row + 2 * bank
-        );
+        assert_eq!(store.referenced_bytes(), (page as u64 + 8) * row + 2 * bank);
         drop((system, a_turn));
         assert_eq!(store.occupied_rows(TOKEN), 0);
+        assert_eq!(store.referenced_bytes(), 0);
     }
 
     /// A history that fills its page continues in the page at its end; a

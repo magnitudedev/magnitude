@@ -31,7 +31,7 @@ use super::{
 };
 use magnitude_executor::{
     BankResize, BankResized, BankStep, BankTier, DomainError, Followed, LoadMeasures, InvariantError,
-    MemoryChargeReconciliation, MemoryReading, NativeFamily, SizingTerm, SizingTerms,
+    MemoryReading, StateBytes, StoreAllocation, NativeFamily, SizingTerm, SizingTerms,
     Operation, Outcome, PendingOperationOutcome, PhysicalDecision,
     ProgramFamily, RequestId, ResourceKind, ResourcePlan, StateBindings, SubmitError,
     SubmitFailure, WorkKind, Yielded,
@@ -136,20 +136,6 @@ fn prompt_boundary(record: &Record, generation: &Generation) -> Option<usize> {
 /// beside a method checkpoint that accounts for the same rows.
 fn resumes_from_stop(layout: &InputLayout, position: usize, method: &MethodCheckpoint) -> bool {
     position >= MIN_PREFIX_HIT && layout.boundary(position) && method.accounts_for(position)
-}
-
-/// The state every holder occupies, cached prefixes included: what the
-/// prefix cache holds within the state the memory plan charges.
-fn occupied_state<F: ProgramFamily>(
-    domain: &ExecutorDomain<F>,
-    cache: &PrefixCache<ResumeState>,
-) -> Result<u64, String> {
-    let cached = cache.states().collect::<Vec<_>>();
-    let (target, head) = domain.state_holding_census(&cached)?;
-    target
-        .occupied()
-        .checked_add(head.map_or(0, |head| head.occupied()))
-        .ok_or_else(|| "occupied state overflows".to_owned())
 }
 
 /// The first position after `position` where the request's prefill stops
@@ -995,12 +981,12 @@ impl<F: ProgramFamily> Owner<F> {
         ))
     }
 
-    /// A fresh reading of every memory domain, then Seismic's charge
-    /// classified by every holder the owner keeps.
+    /// A fresh reading of every memory domain, then what each store's
+    /// ledger holds allocated, by class.
     pub fn observe(&self) -> Result<WorkerReply, String> {
         Ok(WorkerReply::Observed {
             readings: self.service.domain.observe_memory(),
-            reconciliation: self.reconcile_memory_charge()?,
+            stores: self.store_allocations(),
             serving: self.serving_census()?,
         })
     }
@@ -1016,12 +1002,15 @@ impl<F: ProgramFamily> Owner<F> {
         })
     }
 
-    /// Seismic's charge reconciled against every state holder the owner
-    /// keeps: resident requests and cached prefixes; submitted work is
-    /// counted through its stores' claims.
-    pub fn reconcile_memory_charge(&self) -> Result<MemoryChargeReconciliation, String> {
-        let cached = self.service.prefix_cache.states().collect::<Vec<_>>();
-        self.service.domain.reconcile_memory_charge(&cached)
+    /// What each store's ledger holds allocated, by class.
+    pub fn store_allocations(&self) -> Vec<StoreAllocation> {
+        self.service.domain.store_allocations()
+    }
+
+    /// The state stores' bytes, every holder's (cached prefixes included)
+    /// read from the stores' own records.
+    pub fn state_bytes(&self) -> StateBytes {
+        self.service.domain.state_bytes()
     }
 
     pub fn completed_service_ns(&self) -> u128 {
@@ -3313,9 +3302,9 @@ impl<F: ProgramFamily> Service<F> {
         if retained {
             let held = self.held_entries(None);
             let domain = &self.domain;
-            self.prefix_cache
-                .release_beyond_workload(&held, |cache| occupied_state(domain, cache))
-                .map_err(invariant("prefix retention"))?;
+            // The state every holder occupies, the cached prefixes included,
+            // read from the stores as each release drops its entry.
+            self.prefix_cache.release_beyond_workload(&held, || domain.state_bytes().occupied());
         }
         Ok(())
     }

@@ -3,31 +3,28 @@
 
 use crate::error::UnloadCause;
 use crate::execution::{LoadPricing, load_measures};
-use magnitude_executor::{MemoryChargeReconciliation, ProgramFamily};
+use crate::census::AllocationCensus;
+use magnitude_executor::ProgramFamily;
 use magnitude_generation::Method;
 use magnitude_scheduler::{
     owner::{AdmissionError, Owner, Ran},
     protocol::{AdmitRequest, RoomGrant, WorkerCommand, WorkerReply},
     publication::{ModelUnloadCause, RequestError},
-    serving::ServingCensus,
     worker::{Driven, Event, Reread},
 };
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
-
-/// What the owner counts of its memory: the census's inputs.
-type Counted = (MemoryChargeReconciliation, ServingCensus);
 
 /// The census the owner counted last and the session has not sent yet:
 /// published by the owner as its count changes after a run, taken by the
 /// session, which sends it to the host. Pushed on change, never sampled.
 #[derive(Default)]
 pub(crate) struct CensusWatch {
-    state: Mutex<(Option<Counted>, Option<Waker>)>,
+    state: Mutex<(Option<AllocationCensus>, Option<Waker>)>,
 }
 
 impl CensusWatch {
-    fn publish(&self, counted: Counted) {
+    fn publish(&self, counted: AllocationCensus) {
         let mut state = self.state.lock().unwrap();
         state.0 = Some(counted);
         if let Some(waker) = state.1.take() {
@@ -37,7 +34,7 @@ impl CensusWatch {
 
     /// The census counted since the last take; otherwise `waker` is woken
     /// once one is.
-    pub(crate) fn take(&self, waker: &Waker) -> Option<Counted> {
+    pub(crate) fn take(&self, waker: &Waker) -> Option<AllocationCensus> {
         let mut state = self.state.lock().unwrap();
         let counted = state.0.take();
         if counted.is_none() {
@@ -68,7 +65,7 @@ pub(crate) struct ExecutionOwner<F: ProgramFamily> {
     pricing: LoadPricing,
     /// Where the census goes as it changes, and what it was last.
     census: Arc<CensusWatch>,
-    counted: Option<Counted>,
+    counted: Option<AllocationCensus>,
     /// What the census was last counted at (`Owner::census_key`): nothing
     /// it counts changes while it stands, and readings never move it.
     counted_at: Option<(u64, Option<magnitude_executor::ExpertCover>)>,
@@ -96,7 +93,7 @@ impl<F: ProgramFamily> ExecutionOwner<F> {
             return Ok(());
         }
         self.counted_at = Some(key);
-        let counted = (owner.reconcile_memory_charge()?, owner.serving_census()?);
+        let counted = AllocationCensus { stores: owner.store_allocations(), serving: owner.serving_census()? };
         if self.counted.as_ref() != Some(&counted) {
             self.counted = Some(counted.clone());
             self.census.publish(counted);

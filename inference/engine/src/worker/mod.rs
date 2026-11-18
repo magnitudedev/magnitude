@@ -388,10 +388,7 @@ fn load(
             Arc::new(wakes) as Arc<dyn Wakes>,
         )
         .map_err(internal)?;
-        let census = owner
-            .reconcile_memory_charge()
-            .and_then(|charge| owner.serving_census().map(|serving| AllocationCensus::classify(&charge, serving)))
-            .map_err(internal)?;
+        let census = AllocationCensus { stores: owner.store_allocations(), serving: owner.serving_census().map_err(internal)? };
         let ready = ExecutionReady {
             model,
             resources,

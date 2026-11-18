@@ -953,22 +953,6 @@ fn pending_target_request_cancellation_aborts_then_device_failure_consumes_the_b
     assert!(failed_domain.resume_state(failed_request).is_err());
 }
 
-#[test]
-fn pending_target_state_is_classified_as_in_flight() {
-    let control = PendingControl::default();
-    let (mut domain, mut bindings) = fixture(Some(control.clone()));
-    let request = RequestId(9);
-    open(&mut domain, &mut bindings, request);
-    let before = domain.reconcile_memory_charge(&[]).unwrap();
-    let flight = submit_reserved_target(&mut domain, bindings, vec![forward(request, 0)]);
-    let pending = domain.reconcile_memory_charge(&[]).unwrap();
-    assert!(pending.target_state.in_flight > before.target_state.in_flight);
-    control.resolve(Ok(()));
-    for outcome in domain.finish_target(flight).unwrap().0 {
-        domain.abort(outcome).unwrap();
-    }
-}
-
 /// What the domain's ledgers count it allocated in every store it
 /// reaches: the process's one count of its memory.
 fn charged<F: ProgramFamily>(domain: &ExecutorDomain<F>) -> u64 {

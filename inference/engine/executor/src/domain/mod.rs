@@ -21,7 +21,7 @@ use crate::{
 };
 use magnitude_family_contracts::{ModelDefinition, PreparedModelInput};
 use magnitude_state::{
-    InFlightState, OwnedAdvanceResolution, OwnedChainAdvance, OwnedStateAdvance,
+    OwnedAdvanceResolution, OwnedChainAdvance, OwnedStateAdvance,
     OwnedTailRelocation, RowDemand, SequenceState, StateCheckpoint, StateStore, StoreBindings,
     TentativeAdvance,
 };
@@ -61,7 +61,7 @@ pub use in_flight::{
 };
 use in_flight::{PrimingFlight, Source, TargetWork, decode_selected};
 pub use ownership::OpenRequirements;
-pub use state::{MemoryChargeReconciliation, StoreAllocation};
+pub use state::{LoadCharge, StateBytes, StoreAllocation, StoreStateBytes};
 #[cfg(any(test, feature = "fixtures"))]
 pub use state::{SlotRelease, StateShrink, StateYield};
 pub use target::TargetHostTiming;
@@ -517,7 +517,7 @@ pub enum HeadReservation {
     /// state. The flight reads its history and returns it unchanged at
     /// physical completion; while it is held the request has no other target
     /// work, checkpoint or close, exactly as for an in-flight advance.
-    TargetReads(Vec<InFlightState>),
+    TargetReads(Vec<SequenceState>),
 }
 
 /// Complete target capacity is owned before launch construction. Decoder
@@ -2664,11 +2664,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
             ReservedResources::Head(_, _, HeadReservation::TargetReads(states)) => {
                 for operation in operations {
-                    states.push(InFlightState::new(
+                    states.push(
                         self.target
                             .remove(&operation.request())
                             .expect("reservation preflight established target ownership"),
-                    ));
+                    );
                 }
             }
             ReservedResources::Head(_, _, HeadReservation::Advances(advances)) => {
