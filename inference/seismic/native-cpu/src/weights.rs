@@ -1050,7 +1050,7 @@ impl<'a> Block<'a> {
 
 /// The interpretations of codes (`registry::CodeInterpretation`): a raw
 /// `bits`-bit code's exact integer value. Which interpretations a code plane
-/// reads are the [`Codes`] implementations.
+/// reads are those with [`ByteValues`].
 pub mod codes {
     /// The code itself.
     #[derive(Clone, Copy, Debug)]
@@ -1159,32 +1159,156 @@ impl<const ID: usize> Interpretation for Table<ID> {
     }
 }
 
-/// How a code component's codes lie in rows8 panels
-/// (`registry::Layout::Rows8`): the bits of its low and high planes, and
-/// a raw code's value, `values[raw]` with a table (at most four bits),
-/// else `raw + offset` (as bytes).
+/// Raw codes' values as bytes, a value domain as data: every reader of
+/// [`Planes`] codes, whatever its shape (`Codes`' methods, a rows8 tile's
+/// spans), applies one of these, so an interpretation is stated once.
+/// No closures apply them: a closure would not take its caller's target
+/// features.
 #[derive(Clone, Copy, Debug)]
-pub struct PanelCodes {
-    pub low: u32,
-    pub high: u32,
-    pub table: Option<[i8; 16]>,
-    pub offset: i8,
+pub enum CodeValues {
+    /// `table[raw]`, of raw codes of at most four bits (a byte shuffle's
+    /// indices).
+    Table([i8; 16]),
+    /// `raw + offset`, or `2 raw + offset` where `double`, as bytes: adds,
+    /// no lookup.
+    Affine { double: bool, offset: i8 },
 }
 
-impl PanelCodes {
-    /// Codes of `low` and `high` bits whose value is `raw + offset`.
-    const fn offset(low: u32, high: u32, offset: i32) -> Option<Self> {
-        Some(Self { low, high, table: None, offset: offset as i8 })
+impl CodeValues {
+    /// These values less `least`, as bytes: the x86 dots' shifted operands
+    /// (unsigned bytes, `packed_x86::shift`).
+    pub const fn less(self, least: i32) -> Self {
+        match self {
+            Self::Table(mut table) => {
+                let mut raw = 0;
+                while raw < 16 {
+                    table[raw] = (table[raw] as i32 - least) as u8 as i8;
+                    raw += 1;
+                }
+                Self::Table(table)
+            }
+            Self::Affine { double, offset } => Self::Affine { double, offset: (offset as i32 - least) as u8 as i8 },
+        }
     }
 
     /// The value of raw code `raw`.
     #[inline(always)]
-    fn value(self, raw: u8) -> i8 {
-        match self.table {
-            Some(table) => table[usize::from(raw)],
-            None => (raw as i8).wrapping_add(self.offset),
+    pub fn value(self, raw: u8) -> i8 {
+        match self {
+            Self::Table(table) => table[usize::from(raw)],
+            Self::Affine { double, offset } => {
+                let raw = raw as i8;
+                if double { raw.wrapping_add(raw) } else { raw }.wrapping_add(offset)
+            }
         }
     }
+
+    /// The values of 16 raw codes.
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    pub unsafe fn neon(self, raw: std::arch::aarch64::int8x16_t) -> std::arch::aarch64::int8x16_t {
+        use std::arch::aarch64::*;
+        unsafe {
+            match self {
+                Self::Table(table) => vqtbl1q_s8(vld1q_s8(table.as_ptr()), vreinterpretq_u8_s8(raw)),
+                Self::Affine { double, offset } => {
+                    let raw = if double { vaddq_s8(raw, raw) } else { raw };
+                    if offset == 0 { raw } else { vaddq_s8(raw, vdupq_n_s8(offset)) }
+                }
+            }
+        }
+    }
+
+    /// The values of 32 raw codes.
+    ///
+    /// # Safety
+    /// The caller's tier has 256-bit integer vectors.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    pub unsafe fn x86(self, raw: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m256i {
+        use std::arch::x86_64::*;
+        unsafe {
+            match self {
+                Self::Table(table) => {
+                    _mm256_shuffle_epi8(_mm256_broadcastsi128_si256(_mm_loadu_si128(table.as_ptr().cast())), raw)
+                }
+                Self::Affine { double, offset } => {
+                    let raw = if double { _mm256_add_epi8(raw, raw) } else { raw };
+                    if offset == 0 { raw } else { _mm256_add_epi8(raw, _mm256_set1_epi8(offset)) }
+                }
+            }
+        }
+    }
+
+    /// The values of 64 raw codes.
+    ///
+    /// # Safety
+    /// The caller's tier has AVX-512 (BW).
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    pub unsafe fn x86_wide(self, raw: std::arch::x86_64::__m512i) -> std::arch::x86_64::__m512i {
+        use std::arch::x86_64::*;
+        unsafe {
+            match self {
+                Self::Table(table) => {
+                    _mm512_shuffle_epi8(_mm512_broadcast_i32x4(_mm_loadu_si128(table.as_ptr().cast())), raw)
+                }
+                Self::Affine { double, offset } => {
+                    let raw = if double { _mm512_add_epi8(raw, raw) } else { raw };
+                    if offset == 0 { raw } else { _mm512_add_epi8(raw, _mm512_set1_epi8(offset)) }
+                }
+            }
+        }
+    }
+}
+
+/// An interpretation's values ([`CodeValues`]) of the raw codes a
+/// `LOW`-bit low plane joined with a `HIGH`-bit high plane holds: the
+/// interpretations [`Planes`] codes read.
+pub trait ByteValues<const LOW: u32, const HIGH: u32>: Interpretation {
+    const VALUES: CodeValues;
+}
+
+impl<const LOW: u32, const HIGH: u32> ByteValues<LOW, HIGH> for Unsigned {
+    const VALUES: CodeValues = CodeValues::Affine { double: false, offset: 0 };
+}
+
+/// Whole bytes are their own two's complement values; narrower codes have
+/// none here.
+impl<const LOW: u32, const HIGH: u32> ByteValues<LOW, HIGH> for Twos {
+    const VALUES: CodeValues = {
+        assert!(LOW + HIGH == 8, "two's complement codes of whole bytes");
+        CodeValues::Affine { double: false, offset: 0 }
+    };
+}
+
+impl<const LOW: u32, const HIGH: u32, const C: i32> ByteValues<LOW, HIGH> for Offset<C> {
+    const VALUES: CodeValues = {
+        assert!(-C >= i8::MIN as i32 && -C <= i8::MAX as i32, "an offset of a byte");
+        CodeValues::Affine { double: false, offset: -C as i8 }
+    };
+}
+
+/// `2 (c - K) + 1` is the doubled code plus `1 - 2 K`.
+impl<const LOW: u32, const HIGH: u32, const K: i32> ByteValues<LOW, HIGH> for Odd<K> {
+    const VALUES: CodeValues = CodeValues::Affine { double: true, offset: (1 - 2 * K) as i8 };
+}
+
+impl<const LOW: u32, const HIGH: u32, const ID: usize> ByteValues<LOW, HIGH> for Table<ID> {
+    const VALUES: CodeValues = {
+        assert!(LOW + HIGH <= 4, "codebook codes of at most four bits");
+        CodeValues::Table(Table::<ID>::VALUES)
+    };
+}
+
+/// How a code component's codes lie in rows8 panels
+/// (`registry::Layout::Rows8`): the bits of its low and high planes, and
+/// the joined raw codes' values.
+#[derive(Clone, Copy, Debug)]
+pub struct PanelCodes {
+    pub low: u32,
+    pub high: u32,
+    pub values: CodeValues,
 }
 
 /// A packet's 32 exact integer values: a code component.
@@ -1387,8 +1511,8 @@ impl<const LOW: u32, const HIGH: u32, I, const LEAST: i32, const GREATEST: i32>
     unsafe fn raw(at: At) -> [u8; PACKET] {
         const {
             assert!(
-                matches!(LOW, 1 | 2 | 4) && HIGH <= 2,
-                "a 1-, 2- or 4-bit low plane and a high plane of at most 2 bits"
+                matches!(LOW, 1 | 2 | 4) && HIGH <= 2 || LOW == 8 && HIGH == 0,
+                "a 1-, 2- or 4-bit low plane and a high plane of at most 2 bits, or an 8-bit plane alone"
             )
         };
         let mut codes = [0u8; PACKET];
@@ -1412,7 +1536,7 @@ impl<const LOW: u32, const HIGH: u32, I, const LEAST: i32, const GREATEST: i32>
             }
             return codes;
         }
-        let mut bytes = [0u8; 16];
+        let mut bytes = [0u8; PACKET];
         unsafe {
             std::ptr::copy_nonoverlapping(
                 packet_bytes(at, RowPlaneRole::Codes),
@@ -1421,8 +1545,10 @@ impl<const LOW: u32, const HIGH: u32, I, const LEAST: i32, const GREATEST: i32>
             )
         };
         // Code `(8 / LOW) i + j` is bits `LOW j ..` of byte `i`.
-        if LOW == 4 {
-            for (i, byte) in bytes.iter().enumerate() {
+        if LOW == 8 {
+            codes = bytes;
+        } else if LOW == 4 {
+            for (i, byte) in bytes[..16].iter().enumerate() {
                 codes[2 * i] = byte & 15;
                 codes[2 * i + 1] = byte >> 4;
             }
@@ -1634,179 +1760,17 @@ impl<const LOW: u32, const HIGH: u32, I, const LEAST: i32, const GREATEST: i32>
     }
 }
 
-impl<const LOW: u32, const HIGH: u32, const LEAST: i32, const GREATEST: i32> Codes
-    for Planes<LOW, HIGH, Unsigned, LEAST, GREATEST>
+/// Every shape of the codes is the raw codes read in that shape, then their
+/// values (`ByteValues`) applied.
+impl<const LOW: u32, const HIGH: u32, I: ByteValues<LOW, HIGH>, const LEAST: i32, const GREATEST: i32> Codes
+    for Planes<LOW, HIGH, I, LEAST, GREATEST>
 {
     const LEAST: i32 = Self::DOMAIN.0;
     const GREATEST: i32 = Self::DOMAIN.1;
-    const NIBBLE_LANES: Option<(u32, i32)> = if LOW == 4 && HIGH <= 2 { Some((HIGH, 0)) } else { None };
-    const PANEL: Option<PanelCodes> = PanelCodes::offset(LOW, HIGH, 0);
-
-    #[inline(always)]
-    unsafe fn values(at: At) -> [i8; PACKET] {
-        let raw = unsafe { Self::raw(at) };
-        let mut values = [0i8; PACKET];
-        for i in 0..PACKET {
-            values[i] = raw[i] as i8;
-        }
-        values
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[inline(always)]
-    unsafe fn neon(at: At) -> [std::arch::aarch64::int8x16_t; 2] {
-        unsafe { Self::raw_neon(at) }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[inline(always)]
-    unsafe fn neon_pair(at: At) -> [[std::arch::aarch64::int8x16_t; 2]; 2] {
-        unsafe { Self::raw_neon_pair(at) }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[inline(always)]
-    unsafe fn neon_partners(g: At, partner: At) -> [[[std::arch::aarch64::int8x16_t; 2]; 2]; 2] {
-        unsafe { Self::raw_neon_partners(g, partner) }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[inline(always)]
-    unsafe fn x86(at: At) -> std::arch::x86_64::__m256i {
-        unsafe { Self::raw_x86(at) }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[inline(always)]
-    unsafe fn x86_pair(at: At) -> [std::arch::x86_64::__m256i; 2] {
-        unsafe { Self::raw_x86_pair(at) }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[inline(always)]
-    unsafe fn x86_partners(g: At, partner: At) -> [[std::arch::x86_64::__m256i; 2]; 2] {
-        unsafe { Self::raw_x86_partners(g, partner) }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[inline(always)]
-    unsafe fn x86_shifted(at: At) -> std::arch::x86_64::__m256i {
-        unsafe { Self::raw_x86(at) }
-    }
-}
-
-impl<const LOW: u32, const HIGH: u32, const C: i32, const LEAST: i32, const GREATEST: i32> Codes
-    for Planes<LOW, HIGH, Offset<C>, LEAST, GREATEST>
-{
-    const LEAST: i32 = Self::DOMAIN.0;
-    const GREATEST: i32 = Self::DOMAIN.1;
-    const NIBBLE_LANES: Option<(u32, i32)> = if LOW == 4 && HIGH <= 2 { Some((HIGH, -C)) } else { None };
-    const PANEL: Option<PanelCodes> = PanelCodes::offset(LOW, HIGH, -C);
-
-    #[inline(always)]
-    unsafe fn values(at: At) -> [i8; PACKET] {
-        let raw = unsafe { Self::raw(at) };
-        let mut values = [0i8; PACKET];
-        for i in 0..PACKET {
-            values[i] = (i32::from(raw[i]) - C) as i8;
-        }
-        values
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[inline(always)]
-    unsafe fn neon(at: At) -> [std::arch::aarch64::int8x16_t; 2] {
-        use std::arch::aarch64::*;
-        let offset = unsafe { vdupq_n_s8(C as i8) };
-        unsafe { Self::raw_neon(at) }.map(|codes| unsafe { vsubq_s8(codes, offset) })
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[inline(always)]
-    unsafe fn neon_pair(at: At) -> [[std::arch::aarch64::int8x16_t; 2]; 2] {
-        use std::arch::aarch64::*;
-        let offset = unsafe { vdupq_n_s8(C as i8) };
-        unsafe { Self::raw_neon_pair(at) }.map(|packet| packet.map(|codes| unsafe { vsubq_s8(codes, offset) }))
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[inline(always)]
-    unsafe fn neon_partners(g: At, partner: At) -> [[[std::arch::aarch64::int8x16_t; 2]; 2]; 2] {
-        use std::arch::aarch64::*;
-        let offset = unsafe { vdupq_n_s8(C as i8) };
-        let mut codes = unsafe { Self::raw_neon_partners(g, partner) };
-        for row in &mut codes {
-            for packet in row {
-                for half in packet {
-                    *half = unsafe { vsubq_s8(*half, offset) };
-                }
-            }
-        }
-        codes
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[inline(always)]
-    unsafe fn x86(at: At) -> std::arch::x86_64::__m256i {
-        use std::arch::x86_64::*;
-        let offset = _mm256_set1_epi8(C as i8);
-        unsafe { _mm256_sub_epi8(Self::raw_x86(at), offset) }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[inline(always)]
-    unsafe fn x86_pair(at: At) -> [std::arch::x86_64::__m256i; 2] {
-        use std::arch::x86_64::*;
-        let offset = _mm256_set1_epi8(C as i8);
-        let [first, second] = unsafe { Self::raw_x86_pair(at) };
-        unsafe { [_mm256_sub_epi8(first, offset), _mm256_sub_epi8(second, offset)] }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[inline(always)]
-    unsafe fn x86_partners(g: At, partner: At) -> [[std::arch::x86_64::__m256i; 2]; 2] {
-        use std::arch::x86_64::*;
-        let offset = _mm256_set1_epi8(C as i8);
-        let [[a, b], [c, d]] = unsafe { Self::raw_x86_partners(g, partner) };
-        unsafe {
-            [
-                [_mm256_sub_epi8(a, offset), _mm256_sub_epi8(b, offset)],
-                [_mm256_sub_epi8(c, offset), _mm256_sub_epi8(d, offset)],
-            ]
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[inline(always)]
-    unsafe fn x86_shifted(at: At) -> std::arch::x86_64::__m256i {
-        unsafe { Self::raw_x86(at) }
-    }
-}
-
-/// Odd codes' values from their raw codes: `2 * code + 1 - 2 * K`. (A
-/// function, not a closure: a closure would not take the caller's
-/// features, and its intrinsics would compile as calls.)
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn odd_x86<const K: i32>(codes: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m256i {
-    use std::arch::x86_64::*;
-    unsafe { _mm256_add_epi8(_mm256_add_epi8(codes, codes), _mm256_set1_epi8((1 - 2 * K) as i8)) }
-}
-
-impl<const LOW: u32, const HIGH: u32, const K: i32, const LEAST: i32, const GREATEST: i32> Codes
-    for Planes<LOW, HIGH, Odd<K>, LEAST, GREATEST>
-{
-    const LEAST: i32 = Self::DOMAIN.0;
-    const GREATEST: i32 = Self::DOMAIN.1;
-    const PANEL: Option<PanelCodes> = {
-        assert!(LOW + HIGH <= 4, "odd codes of at most four bits");
-        let mut table = [0i8; 16];
-        let mut raw = 0;
-        while raw < 16 {
-            table[raw] = (2 * (raw as i32 - K) + 1) as i8;
-            raw += 1;
-        }
-        Some(PanelCodes { low: LOW, high: HIGH, table: Some(table), offset: 0 })
+    const PANEL: Option<PanelCodes> = Some(PanelCodes { low: LOW, high: HIGH, values: I::VALUES });
+    const NIBBLE_LANES: Option<(u32, i32)> = match I::VALUES {
+        CodeValues::Affine { double: false, offset } if LOW == 4 && HIGH <= 2 => Some((HIGH, offset as i32)),
+        _ => None,
     };
 
     #[inline(always)]
@@ -1814,99 +1778,7 @@ impl<const LOW: u32, const HIGH: u32, const K: i32, const LEAST: i32, const GREA
         let raw = unsafe { Self::raw(at) };
         let mut values = [0i8; PACKET];
         for i in 0..PACKET {
-            values[i] = Odd::<K>::value::<0>(u32::from(raw[i])) as i8;
-        }
-        values
-    }
-
-    // `2 (c - K) + 1` is the doubled code plus `1 - 2 K`.
-    #[cfg(target_arch = "aarch64")]
-    #[inline(always)]
-    unsafe fn neon(at: At) -> [std::arch::aarch64::int8x16_t; 2] {
-        use std::arch::aarch64::*;
-        let offset = unsafe { vdupq_n_s8((1 - 2 * K) as i8) };
-        unsafe { Self::raw_neon(at) }
-            .map(|codes| unsafe { vaddq_s8(vaddq_s8(codes, codes), offset) })
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[inline(always)]
-    unsafe fn neon_pair(at: At) -> [[std::arch::aarch64::int8x16_t; 2]; 2] {
-        use std::arch::aarch64::*;
-        let offset = unsafe { vdupq_n_s8((1 - 2 * K) as i8) };
-        unsafe { Self::raw_neon_pair(at) }
-            .map(|packet| packet.map(|codes| unsafe { vaddq_s8(vaddq_s8(codes, codes), offset) }))
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[inline(always)]
-    unsafe fn neon_partners(g: At, partner: At) -> [[[std::arch::aarch64::int8x16_t; 2]; 2]; 2] {
-        use std::arch::aarch64::*;
-        let offset = unsafe { vdupq_n_s8((1 - 2 * K) as i8) };
-        unsafe { Self::raw_neon_partners(g, partner) }.map(|row| {
-            row.map(|packet| packet.map(|codes| unsafe { vaddq_s8(vaddq_s8(codes, codes), offset) }))
-        })
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[inline(always)]
-    unsafe fn x86(at: At) -> std::arch::x86_64::__m256i {
-        unsafe { odd_x86::<K>(Self::raw_x86(at)) }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[inline(always)]
-    unsafe fn x86_pair(at: At) -> [std::arch::x86_64::__m256i; 2] {
-        let [first, second] = unsafe { Self::raw_x86_pair(at) };
-        unsafe { [odd_x86::<K>(first), odd_x86::<K>(second)] }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[inline(always)]
-    unsafe fn x86_partners(g: At, partner: At) -> [[std::arch::x86_64::__m256i; 2]; 2] {
-        let [[a, b], [c, d]] = unsafe { Self::raw_x86_partners(g, partner) };
-        unsafe { [[odd_x86::<K>(a), odd_x86::<K>(b)], [odd_x86::<K>(c), odd_x86::<K>(d)]] }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[inline(always)]
-    unsafe fn x86_shifted(at: At) -> std::arch::x86_64::__m256i {
-        use std::arch::x86_64::*;
-        let codes = unsafe { Self::raw_x86(at) };
-        let offset = _mm256_set1_epi8((1 - 2 * K - LEAST) as i8);
-        unsafe { _mm256_add_epi8(_mm256_add_epi8(codes, codes), offset) }
-    }
-}
-
-impl<const ID: usize, const LEAST: i32, const GREATEST: i32>
-    Planes<4, 0, Table<ID>, LEAST, GREATEST>
-{
-    /// The codebook shifted to start at zero, as unsigned bytes.
-    #[cfg(target_arch = "x86_64")]
-    const SHIFTED: [i8; 16] = {
-        let mut shifted = [0i8; 16];
-        let mut i = 0;
-        while i < 16 {
-            shifted[i] = (Table::<ID>::VALUES[i] as i32 - LEAST) as u8 as i8;
-            i += 1;
-        }
-        shifted
-    };
-}
-
-impl<const ID: usize, const LEAST: i32, const GREATEST: i32> Codes
-    for Planes<4, 0, Table<ID>, LEAST, GREATEST>
-{
-    const LEAST: i32 = Self::DOMAIN.0;
-    const GREATEST: i32 = Self::DOMAIN.1;
-    const PANEL: Option<PanelCodes> = Some(PanelCodes { low: 4, high: 0, table: Some(Table::<ID>::VALUES), offset: 0 });
-
-    #[inline(always)]
-    unsafe fn values(at: At) -> [i8; PACKET] {
-        let raw = unsafe { Self::raw(at) };
-        let mut values = [0i8; PACKET];
-        for i in 0..PACKET {
-            values[i] = Table::<ID>::value::<4>(u32::from(raw[i])) as i8;
+            values[i] = I::VALUES.value(raw[i]);
         }
         values
     }
@@ -1914,33 +1786,29 @@ impl<const ID: usize, const LEAST: i32, const GREATEST: i32> Codes
     #[cfg(target_arch = "aarch64")]
     #[inline(always)]
     unsafe fn neon(at: At) -> [std::arch::aarch64::int8x16_t; 2] {
-        use std::arch::aarch64::*;
-        let table = unsafe { vld1q_s8(Table::<ID>::VALUES.as_ptr()) };
-        unsafe { Self::raw_neon(at) }
-            .map(|codes| unsafe { vqtbl1q_s8(table, vreinterpretq_u8_s8(codes)) })
+        let mut codes = unsafe { Self::raw_neon(at) };
+        for half in &mut codes {
+            *half = unsafe { I::VALUES.neon(*half) };
+        }
+        codes
     }
 
     #[cfg(target_arch = "aarch64")]
     #[inline(always)]
     unsafe fn neon_pair(at: At) -> [[std::arch::aarch64::int8x16_t; 2]; 2] {
-        use std::arch::aarch64::*;
-        let table = unsafe { vld1q_s8(Table::<ID>::VALUES.as_ptr()) };
-        unsafe { Self::raw_neon_pair(at) }
-            .map(|packet| packet.map(|codes| unsafe { vqtbl1q_s8(table, vreinterpretq_u8_s8(codes)) }))
+        let mut codes = unsafe { Self::raw_neon_pair(at) };
+        for half in codes.as_flattened_mut() {
+            *half = unsafe { I::VALUES.neon(*half) };
+        }
+        codes
     }
 
     #[cfg(target_arch = "aarch64")]
     #[inline(always)]
     unsafe fn neon_partners(g: At, partner: At) -> [[[std::arch::aarch64::int8x16_t; 2]; 2]; 2] {
-        use std::arch::aarch64::*;
-        let table = unsafe { vld1q_s8(Table::<ID>::VALUES.as_ptr()) };
         let mut codes = unsafe { Self::raw_neon_partners(g, partner) };
-        for row in &mut codes {
-            for packet in row {
-                for half in packet {
-                    *half = unsafe { vqtbl1q_s8(table, vreinterpretq_u8_s8(*half)) };
-                }
-            }
+        for half in codes.as_flattened_mut().as_flattened_mut() {
+            *half = unsafe { I::VALUES.neon(*half) };
         }
         codes
     }
@@ -1948,80 +1816,33 @@ impl<const ID: usize, const LEAST: i32, const GREATEST: i32> Codes
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     unsafe fn x86(at: At) -> std::arch::x86_64::__m256i {
-        unsafe { packed_x86::lookup(packed_x86::table(&Table::<ID>::VALUES), Self::raw_x86(at)) }
+        unsafe { I::VALUES.x86(Self::raw_x86(at)) }
     }
 
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     unsafe fn x86_pair(at: At) -> [std::arch::x86_64::__m256i; 2] {
-        let table = unsafe { packed_x86::table(&Table::<ID>::VALUES) };
-        let [first, second] = unsafe { Self::raw_x86_pair(at) };
-        unsafe { [packed_x86::lookup(table, first), packed_x86::lookup(table, second)] }
+        let mut codes = unsafe { Self::raw_x86_pair(at) };
+        for packet in &mut codes {
+            *packet = unsafe { I::VALUES.x86(*packet) };
+        }
+        codes
     }
 
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     unsafe fn x86_partners(g: At, partner: At) -> [[std::arch::x86_64::__m256i; 2]; 2] {
-        let table = unsafe { packed_x86::table(&Table::<ID>::VALUES) };
-        let [[a, b], [c, d]] = unsafe { Self::raw_x86_partners(g, partner) };
-        unsafe {
-            [
-                [packed_x86::lookup(table, a), packed_x86::lookup(table, b)],
-                [packed_x86::lookup(table, c), packed_x86::lookup(table, d)],
-            ]
+        let mut codes = unsafe { Self::raw_x86_partners(g, partner) };
+        for packet in codes.as_flattened_mut() {
+            *packet = unsafe { I::VALUES.x86(*packet) };
         }
+        codes
     }
 
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     unsafe fn x86_shifted(at: At) -> std::arch::x86_64::__m256i {
-        unsafe { packed_x86::lookup(packed_x86::table(&Self::SHIFTED), Self::raw_x86(at)) }
-    }
-}
-
-impl<const LEAST: i32, const GREATEST: i32> Codes for Planes<8, 0, Twos, LEAST, GREATEST> {
-    const LEAST: i32 = Self::DOMAIN.0;
-    const GREATEST: i32 = Self::DOMAIN.1;
-    const PANEL: Option<PanelCodes> = PanelCodes::offset(8, 0, 0);
-
-    #[inline(always)]
-    unsafe fn values(at: At) -> [i8; PACKET] {
-        match at.code(RowPlaneRole::Codes) {
-            CodeBytes::Packet(bytes) => unsafe { read(bytes) },
-            CodeBytes::Lanes(lanes) => unsafe { lane_codes(lanes, 8) }.map(|code| code as i8),
-            CodeBytes::Panel(units) => unsafe { panel_codes(units, 8) }.map(|code| code as i8),
-        }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[inline(always)]
-    unsafe fn neon(at: At) -> [std::arch::aarch64::int8x16_t; 2] {
-        use std::arch::aarch64::*;
-        match at.code(RowPlaneRole::Codes) {
-            CodeBytes::Packet(bytes) => unsafe {
-                let bytes = bytes.cast::<i8>();
-                [vld1q_s8(bytes), vld1q_s8(bytes.add(16))]
-            },
-            CodeBytes::Lanes(lanes) => unsafe { packed_neon::lane_bytes(lanes) },
-            CodeBytes::Panel(units) => unsafe { packed_neon::panel::<8>(units) },
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[inline(always)]
-    unsafe fn x86(at: At) -> std::arch::x86_64::__m256i {
-        match at.code(RowPlaneRole::Codes) {
-            CodeBytes::Packet(bytes) => unsafe { packed_x86::load(bytes.cast()) },
-            CodeBytes::Lanes(lanes) => unsafe { packed_x86::lane_bytes(lanes) },
-            CodeBytes::Panel(units) => unsafe { packed_x86::panel::<8>(units) },
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[inline(always)]
-    unsafe fn x86_shifted(at: At) -> std::arch::x86_64::__m256i {
-        use std::arch::x86_64::*;
-        unsafe { _mm256_xor_si256(Self::x86(at), _mm256_set1_epi8(i8::MIN)) }
+        unsafe { const { I::VALUES.less(Self::LEAST) }.x86(Self::raw_x86(at)) }
     }
 }
 
@@ -4878,15 +4699,19 @@ mod packed_neon {
     /// A packet's codes of a `LOW`-bit low plane (`4 LOW` bytes) in element
     /// order: code `(8 / LOW) i + j` is bits `LOW j ..` of byte `i`, joined
     /// with its bit of `high` (a 1-bit high plane's packet word) at bit
-    /// `LOW`. Codes are at most 31, so they are also signed bytes.
+    /// `LOW`. Codes of at most 4 bits are at most 31, so they are also
+    /// signed bytes; an 8-bit plane's are its bytes, with no high plane.
     ///
     /// # Safety
     /// `bytes` addresses the packet's `4 LOW` code bytes.
     #[inline(always)]
     pub(super) unsafe fn codes<const LOW: u32>(bytes: *const u8, high: u32) -> [int8x16_t; 2] {
-        const { assert!(matches!(LOW, 1 | 2 | 4), "a 1-, 2- or 4-bit low plane") };
+        const { assert!(matches!(LOW, 1 | 2 | 4 | 8), "a 1-, 2-, 4- or 8-bit low plane") };
         unsafe {
-            if LOW == 4 {
+            if LOW == 8 {
+                let bytes = bytes.cast::<i8>();
+                [vld1q_s8(bytes), vld1q_s8(bytes.add(16))]
+            } else if LOW == 4 {
                 nibbles(bytes, high)
             } else if LOW == 2 {
                 crumbs(bytes, high)
@@ -5146,11 +4971,12 @@ mod packed_neon {
         }
     }
 
-    /// The row's `LOW`-bit codes (1, 2 or 4) of an `mma16` codes plane in
-    /// element order.
+    /// The row's `LOW`-bit codes (1, 2, 4 or 8) of an `mma16` codes plane
+    /// in element order.
     #[inline(always)]
     pub(super) unsafe fn lane_codes<const LOW: u32>(lanes: Lanes) -> [int8x16_t; 2] {
         match LOW {
+            8 => unsafe { lane_bytes(lanes) },
             4 => unsafe { lane_nibbles(lanes) },
             _ => unsafe { lane_bits(lanes, LOW) }.map(|codes| unsafe { vreinterpretq_s8_u8(codes) }),
         }
@@ -5500,9 +5326,11 @@ mod packed_x86 {
     /// order: code `(8 / LOW) i + j` is bits `LOW j ..` of byte `i`.
     #[inline(always)]
     pub(super) unsafe fn codes<const LOW: u32>(bytes: *const u8) -> __m256i {
-        const { assert!(matches!(LOW, 1 | 2 | 4), "a 1-, 2- or 4-bit low plane") };
+        const { assert!(matches!(LOW, 1 | 2 | 4 | 8), "a 1-, 2-, 4- or 8-bit low plane") };
         unsafe {
-            if LOW == 1 {
+            if LOW == 8 {
+                load(bytes.cast())
+            } else if LOW == 1 {
                 // Code i is bit i of the packet's word.
                 high_bits::<0>(super::read(bytes))
             } else if LOW == 4 {
@@ -5582,19 +5410,6 @@ mod packed_x86 {
             );
             _mm256_set_m128i(_mm_unpackhi_epi8(even, odd), _mm_unpacklo_epi8(even, odd))
         }
-    }
-
-    /// The 32 values of a 16-entry table `table` (broadcast to both halves)
-    /// at the nibble codes `codes`.
-    #[inline(always)]
-    pub(super) unsafe fn lookup(table: __m256i, codes: __m256i) -> __m256i {
-        unsafe { _mm256_shuffle_epi8(table, codes) }
-    }
-
-    /// A 16-entry byte table in both halves of a vector.
-    #[inline(always)]
-    pub(super) unsafe fn table(values: &[i8; 16]) -> __m256i {
-        unsafe { _mm256_broadcastsi128_si256(_mm_loadu_si128(values.as_ptr().cast())) }
     }
 
     use super::{lane_order, Lanes};
@@ -5774,11 +5589,12 @@ mod packed_x86 {
         }
     }
 
-    /// The row's `LOW`-bit codes (1, 2 or 4) of an `mma16` codes plane in
-    /// element order.
+    /// The row's `LOW`-bit codes (1, 2, 4 or 8) of an `mma16` codes plane
+    /// in element order.
     #[inline(always)]
     pub(super) unsafe fn lane_codes<const LOW: u32>(lanes: Lanes) -> __m256i {
         match LOW {
+            8 => unsafe { lane_bytes(lanes) },
             4 => unsafe { lane_nibbles(lanes) },
             _ => unsafe { lane_bits(lanes, LOW) },
         }
