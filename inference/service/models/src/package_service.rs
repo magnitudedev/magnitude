@@ -28,6 +28,9 @@ use crate::inventory::{
     catalog_target, origin_precedence,
 };
 
+/// Resolved boxed ([`ManagedModelStore::resolve_package_operand`]): a package
+/// and its model are kilobytes, which each result and step of a bundle's
+/// resolution would otherwise copy through its future.
 struct ResolvedPackageOperand {
     package: ModelPackage,
     model: ResolvedModel,
@@ -1263,122 +1266,191 @@ impl ManagedModelStore {
         }
     }
 
-    async fn resolve_package_operand(
+    /// A standalone bundle's resolution. Each kind of bundle resolves in a
+    /// future of its own: the bundles and models it builds are kilobytes,
+    /// which one future polling both kinds would hold together.
+    fn resolve_standalone(
         &self,
-        operand: ModelPackageOperand,
-    ) -> Result<ResolvedPackageOperand, InventoryError> {
-        match operand {
-            ModelPackageOperand::Installed { package_id } => {
-                let (package, model) = self.installed_package(&package_id).await?;
-                let resolution_guard = self.readers_guard(&model).await?;
-                Ok(ResolvedPackageOperand {
-                    package,
-                    model,
-                    resolution_guard,
-                })
+        package: ModelPackageOperand,
+    ) -> BoxFuture<'_, Result<ResolvedServableModelBundle, InventoryError>> {
+        Box::pin(async move {
+            let resolved = self.resolve_package_operand(package).await?;
+            let bundle = ServableModelBundle::Standalone {
+                package: resolved.package,
+            };
+            let mut result = ResolvedServableModelBundle::new(bundle, resolved.model, None);
+            if let Some(guard) = resolved.resolution_guard {
+                result = result.retain_resolution_guard(guard);
             }
-            ModelPackageOperand::SourceBacked { package } => {
-                match self.installed_package(&package.id).await {
-                    Ok((package, model)) => {
-                        let resolution_guard = self.readers_guard(&model).await?;
-                        return Ok(ResolvedPackageOperand {
-                            package,
-                            model,
-                            resolution_guard,
-                        });
+            Ok(result)
+        })
+    }
+
+    /// A speculative-decoding bundle's resolution ([`Self::resolve_standalone`]).
+    fn resolve_speculative(
+        &self,
+        target: ModelPackageOperand,
+        draft_source: magnitude_service_contracts::models::SpeculativeDraftSourceInput,
+        method: magnitude_service_contracts::models::SpeculativeMethod,
+    ) -> BoxFuture<'_, Result<ResolvedServableModelBundle, InventoryError>> {
+        Box::pin(async move {
+            let target = self.resolve_package_operand(target).await?;
+            let (draft_source, draft_model, draft_guard) = match draft_source {
+                magnitude_service_contracts::models::SpeculativeDraftSourceInput::Embedded => (
+                    magnitude_service_contracts::models::SpeculativeDraftSource::Embedded,
+                    None,
+                    None,
+                ),
+                magnitude_service_contracts::models::SpeculativeDraftSourceInput::Separate {
+                    draft,
+                } => {
+                    let resolved = self.resolve_package_operand(draft).await?;
+                    if resolved.package.id == target.package.id {
+                        return Err(InventoryError::InvalidRequest(
+                            "a separate speculative draft must be distinct from its target"
+                                .to_owned(),
+                        ));
                     }
-                    Err(InventoryError::NotFound(_)) | Err(InventoryError::NotReady(_)) => {}
-                    Err(error) => return Err(error),
+                    (
+                        magnitude_service_contracts::models::SpeculativeDraftSource::Separate {
+                            draft: resolved.package,
+                        },
+                        Some(resolved.model),
+                        resolved.resolution_guard,
+                    )
                 }
-                let ModelPackageSource::HuggingFace {
-                    repository,
-                    revision,
-                } = &package.source
-                else {
-                    return Err(InventoryError::NotReady(package.id.0));
-                };
-                let primary = package
-                    .files
-                    .iter()
-                    .filter(|file| file.role == ModelFileRole::Weights)
-                    .min_by(|left, right| left.path.cmp(&right.path))
-                    .ok_or_else(|| {
-                        InventoryError::InvalidRequest(format!(
-                            "package {} has no weights",
-                            package.id.0
-                        ))
-                    })?;
-                let additional_components = package
-                    .files
-                    .iter()
-                    .filter(|file| file.id != primary.id)
-                    .filter_map(|file| {
-                        let role = match file.role {
-                            ModelFileRole::Projector => {
-                                magnitude_service_contracts::ModelPreviewComponentRole::Projector
-                            }
-                            ModelFileRole::Draft => {
-                                let method =
-                                    package.relationships.iter().find_map(|relationship| {
-                                        match relationship {
-                                            ModelFileRelationship::DraftFor {
-                                                draft_file_id,
-                                                weights_file_id,
-                                                method,
-                                            } if draft_file_id == &file.id
-                                                && weights_file_id == &primary.id =>
-                                            {
-                                                Some(method.clone())
-                                            }
-                                            _ => None,
-                                        }
-                                    });
-                                let Some(method) = method else {
-                                    return Some(Err(InventoryError::InvalidRequest(format!(
-                                        "draft file {} has no typed relationship to target {}",
-                                        file.id.0, primary.id.0
-                                    ))));
-                                };
-                                return Some(Ok(ModelPreviewComponentSource {
-                                    path: file.path.clone(),
-                                    role: magnitude_service_contracts::ModelPreviewComponentRole::Draft {
-                                        method,
-                                    },
-                                }));
-                            }
-                            ModelFileRole::Mtp => magnitude_service_contracts::ModelPreviewComponentRole::Mtp,
-                            ModelFileRole::Auxiliary => return None,
-                            ModelFileRole::Weights => return None,
-                        };
-                        Some(Ok(ModelPreviewComponentSource {
-                            path: file.path.clone(),
-                            role,
-                        }))
-                    })
-                    .collect::<Result<Vec<_>, InventoryError>>()?;
-                let prepared = self
-                    .prepare_preview(&ModelPreviewSource {
-                        repository: repository.clone(),
-                        revision: revision.clone(),
-                        primary_gguf: primary.path.clone(),
-                        additional_components,
-                    })
-                    .await?;
-                let resolved_package = preview_package(&prepared.model)?;
-                if resolved_package.id != package.id {
-                    return Err(InventoryError::Integrity(format!(
-                        "source-backed package {} resolved as {}",
-                        package.id.0, resolved_package.id.0
-                    )));
-                }
-                let model = prepared.model.clone();
-                Ok(ResolvedPackageOperand {
-                    package: resolved_package,
-                    model,
-                    resolution_guard: Some(Box::new(prepared)),
-                })
+            };
+            let bundle = ServableModelBundle::SpeculativeDecoding {
+                target: target.package,
+                draft_source,
+                method,
+            };
+            let mut result = ResolvedServableModelBundle::new(bundle, target.model, draft_model);
+            for guard in [target.resolution_guard, draft_guard].into_iter().flatten() {
+                result = result.retain_resolution_guard(guard);
             }
-        }
+            Ok(result)
+        })
+    }
+
+    fn resolve_package_operand<'a>(
+        &'a self,
+        operand: ModelPackageOperand,
+    ) -> BoxFuture<'a, Result<Box<ResolvedPackageOperand>, InventoryError>> {
+        Box::pin(async move {
+            match operand {
+                ModelPackageOperand::Installed { package_id } => {
+                    let (package, model) = self.installed_package(&package_id).await?;
+                    let resolution_guard = self.readers_guard(&model).await?;
+                    Ok(Box::new(ResolvedPackageOperand {
+                        package,
+                        model,
+                        resolution_guard,
+                    }))
+                }
+                ModelPackageOperand::SourceBacked { package } => {
+                    match self.installed_package(&package.id).await {
+                        Ok((package, model)) => {
+                            let resolution_guard = self.readers_guard(&model).await?;
+                            return Ok(Box::new(ResolvedPackageOperand {
+                                package,
+                                model,
+                                resolution_guard,
+                            }));
+                        }
+                        Err(InventoryError::NotFound(_)) | Err(InventoryError::NotReady(_)) => {}
+                        Err(error) => return Err(error),
+                    }
+                    let ModelPackageSource::HuggingFace {
+                        repository,
+                        revision,
+                    } = &package.source
+                    else {
+                        return Err(InventoryError::NotReady(package.id.0));
+                    };
+                    let primary = package
+                        .files
+                        .iter()
+                        .filter(|file| file.role == ModelFileRole::Weights)
+                        .min_by(|left, right| left.path.cmp(&right.path))
+                        .ok_or_else(|| {
+                            InventoryError::InvalidRequest(format!(
+                                "package {} has no weights",
+                                package.id.0
+                            ))
+                        })?;
+                    let additional_components = package
+                        .files
+                        .iter()
+                        .filter(|file| file.id != primary.id)
+                        .filter_map(|file| {
+                            let role = match file.role {
+                                ModelFileRole::Projector => {
+                                    magnitude_service_contracts::ModelPreviewComponentRole::Projector
+                                }
+                                ModelFileRole::Draft => {
+                                    let method =
+                                        package.relationships.iter().find_map(|relationship| {
+                                            match relationship {
+                                                ModelFileRelationship::DraftFor {
+                                                    draft_file_id,
+                                                    weights_file_id,
+                                                    method,
+                                                } if draft_file_id == &file.id
+                                                    && weights_file_id == &primary.id =>
+                                                {
+                                                    Some(method.clone())
+                                                }
+                                                _ => None,
+                                            }
+                                        });
+                                    let Some(method) = method else {
+                                        return Some(Err(InventoryError::InvalidRequest(format!(
+                                            "draft file {} has no typed relationship to target {}",
+                                            file.id.0, primary.id.0
+                                        ))));
+                                    };
+                                    return Some(Ok(ModelPreviewComponentSource {
+                                        path: file.path.clone(),
+                                        role: magnitude_service_contracts::ModelPreviewComponentRole::Draft {
+                                            method,
+                                        },
+                                    }));
+                                }
+                                ModelFileRole::Mtp => magnitude_service_contracts::ModelPreviewComponentRole::Mtp,
+                                ModelFileRole::Auxiliary => return None,
+                                ModelFileRole::Weights => return None,
+                            };
+                            Some(Ok(ModelPreviewComponentSource {
+                                path: file.path.clone(),
+                                role,
+                            }))
+                        })
+                        .collect::<Result<Vec<_>, InventoryError>>()?;
+                    let prepared = self
+                        .prepare_preview(&ModelPreviewSource {
+                            repository: repository.clone(),
+                            revision: revision.clone(),
+                            primary_gguf: primary.path.clone(),
+                            additional_components,
+                        })
+                        .await?;
+                    let resolved_package = preview_package(&prepared.model)?;
+                    if resolved_package.id != package.id {
+                        return Err(InventoryError::Integrity(format!(
+                            "source-backed package {} resolved as {}",
+                            package.id.0, resolved_package.id.0
+                        )));
+                    }
+                    let model = prepared.model.clone();
+                    Ok(Box::new(ResolvedPackageOperand {
+                        package: resolved_package,
+                        model,
+                        resolution_guard: Some(Box::new(prepared)),
+                    }))
+                }
+            }
+        })
     }
 
     /// The readers' hold of Magnitude's files of `model`, as a resolution's guard: a removal of
@@ -1404,65 +1476,14 @@ impl InstalledModelPackages for ManagedModelStore {
         &self,
         bundle: ModelBundleInput,
     ) -> BoxFuture<'_, Result<ResolvedServableModelBundle, InventoryError>> {
-        Box::pin(async move {
-            match bundle {
-                ModelBundleInput::Standalone { package } => {
-                    let resolved = self.resolve_package_operand(package).await?;
-                    let bundle = ServableModelBundle::Standalone {
-                        package: resolved.package,
-                    };
-                    let mut result = ResolvedServableModelBundle::new(bundle, resolved.model, None);
-                    if let Some(guard) = resolved.resolution_guard {
-                        result = result.retain_resolution_guard(guard);
-                    }
-                    Ok(result)
-                }
-                ModelBundleInput::SpeculativeDecoding {
-                    target,
-                    draft_source,
-                    method,
-                } => {
-                    let target = self.resolve_package_operand(target).await?;
-                    let (draft_source, draft_model, draft_guard) = match draft_source {
-                        magnitude_service_contracts::models::SpeculativeDraftSourceInput::Embedded => (
-                            magnitude_service_contracts::models::SpeculativeDraftSource::Embedded,
-                            None,
-                            None,
-                        ),
-                        magnitude_service_contracts::models::SpeculativeDraftSourceInput::Separate { draft } => {
-                            let resolved = self.resolve_package_operand(draft).await?;
-                            if resolved.package.id == target.package.id {
-                                return Err(InventoryError::InvalidRequest(
-                                    "a separate speculative draft must be distinct from its target"
-                                        .to_owned(),
-                                ));
-                            }
-                            (
-                                magnitude_service_contracts::models::SpeculativeDraftSource::Separate {
-                                    draft: resolved.package,
-                                },
-                                Some(resolved.model),
-                                resolved.resolution_guard,
-                            )
-                        }
-                    };
-                    let bundle = ServableModelBundle::SpeculativeDecoding {
-                        target: target.package,
-                        draft_source,
-                        method,
-                    };
-                    let mut result =
-                        ResolvedServableModelBundle::new(bundle, target.model, draft_model);
-                    if let Some(guard) = target.resolution_guard {
-                        result = result.retain_resolution_guard(guard);
-                    }
-                    if let Some(guard) = draft_guard {
-                        result = result.retain_resolution_guard(guard);
-                    }
-                    Ok(result)
-                }
-            }
-        })
+        match bundle {
+            ModelBundleInput::Standalone { package } => self.resolve_standalone(package),
+            ModelBundleInput::SpeculativeDecoding {
+                target,
+                draft_source,
+                method,
+            } => self.resolve_speculative(target, draft_source, method),
+        }
     }
 
     fn remove_installed_packages<'a>(

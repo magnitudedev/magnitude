@@ -218,6 +218,14 @@ struct DrafterTarget {
     weights: Option<WeightSource>,
 }
 
+/// What one pass read of the repository a custom model comes from: its snapshot from the Hub, or
+/// locally the cached snapshot an added model was downloaded from, and the lineage it declares.
+struct RepositoryReach {
+    snapshot: Option<HuggingFaceRepositorySnapshot>,
+    downloaded_from: Option<HuggingFaceRepositorySnapshot>,
+    lineage: BTreeSet<String>,
+}
+
 /// Where a target's own weights are read for its weight sample: a file holding its bytes, or its
 /// file in a Hub repository at a commit.
 enum WeightSource {
@@ -587,13 +595,15 @@ impl ManagedModelCandidates {
     /// own shortfall. Its built-in heads serve
     /// while the drafter is not on this computer when they are automatic: the engine binds them
     /// and they keep the model fitting.
-    async fn catalog_drafter_fit(
-        &self,
-        model_id: &ModelId,
-    ) -> Result<CatalogDrafterFit, InventoryError> {
-        let target = self.model_target(model_id, Reach::Hub).await?;
-        let candidates = self.enumerate_drafters(&target, None, false).await?;
-        Ok(catalog_drafter_fit(&candidates))
+    fn catalog_drafter_fit<'a>(
+        &'a self,
+        model_id: &'a ModelId,
+    ) -> BoxFuture<'a, Result<CatalogDrafterFit, InventoryError>> {
+        Box::pin(async move {
+            let target = self.model_target(model_id, Reach::Hub).await?;
+            let candidates = self.enumerate_drafters(&target, None, false).await?;
+            Ok(catalog_drafter_fit(&candidates))
+        })
     }
 
     /// A custom model's lineage hint and recommended drafter, from what `reach` reads.
@@ -807,39 +817,41 @@ impl ManagedModelCandidates {
 
     /// Whether each catalog model with a drafter fits only without it, once: it depends on the
     /// release material and this computer, never on the files here. Whether every one is known.
-    async fn fit_catalog_drafters(&self, resolver: &ModelDomainResolver, revision: u64) -> bool {
-        let catalog = self
-            .catalog
-            .list_catalog()
-            .await
-            .map(|response| response.models)
-            .unwrap_or_default();
-        let mut complete = true;
-        for model in catalog {
-            if resolver.custom_model_inputs_revision().ok() != Some(revision) {
-                break;
-            }
-            if model.desired.speculative_method.is_none()
-                || self.enrichment.has_catalog_drafter_fit(&model.id)
-            {
-                continue;
-            }
-            match self.catalog_drafter_fit(&model.id).await {
-                Ok(fit) => {
-                    if self.enrichment.record_catalog_drafter_fit(model.id, fit) {
-                        resolver.catalog_drafter_fit_changed();
+    fn fit_catalog_drafters<'a>(&'a self, resolver: &'a ModelDomainResolver, revision: u64) -> BoxFuture<'a, bool> {
+        Box::pin(async move {
+            let catalog = self
+                .catalog
+                .list_catalog()
+                .await
+                .map(|response| response.models)
+                .unwrap_or_default();
+            let mut complete = true;
+            for model in catalog {
+                if resolver.custom_model_inputs_revision().ok() != Some(revision) {
+                    break;
+                }
+                if model.desired.speculative_method.is_none()
+                    || self.enrichment.has_catalog_drafter_fit(&model.id)
+                {
+                    continue;
+                }
+                match self.catalog_drafter_fit(&model.id).await {
+                    Ok(fit) => {
+                        if self.enrichment.record_catalog_drafter_fit(model.id, fit) {
+                            resolver.catalog_drafter_fit_changed();
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(model.id = %model.id.as_str(), %error, "catalog drafter fit failed");
+                        complete = false;
+                        if self.enrichment.record_catalog_drafter_fits_unreachable() {
+                            resolver.catalog_drafter_fit_changed();
+                        }
                     }
                 }
-                Err(error) => {
-                    tracing::warn!(model.id = %model.id.as_str(), %error, "catalog drafter fit failed");
-                    complete = false;
-                    if self.enrichment.record_catalog_drafter_fits_unreachable() {
-                        resolver.catalog_drafter_fit_changed();
-                    }
-                }
             }
-        }
-        complete
+            complete
+        })
     }
 
     /// The drafter reference a model's configuration chooses explicitly.
@@ -1187,58 +1199,68 @@ impl ManagedModelCandidates {
         })
     }
 
-    /// A resolved bundle's target (and projector) as material, identified by its exact package.
-    fn resolved_target(
-        resolved: magnitude_service_contracts::models::ResolvedServableModelBundle,
-    ) -> Result<TargetMaterial, InventoryError> {
-        let (target, projector) = resolved_paths(&resolved.target_model)?;
-        let identity = format!("package:{}", bundle_target(&resolved.bundle).id.0);
-        Ok(TargetMaterial {
-            target,
-            projector,
-            identity,
-            headers: BTreeMap::new(),
-            _guards: vec![Arc::new(resolved)],
+    /// A bundle's target (and projector) as material, resolved and identified by its exact
+    /// package.
+    fn target_material(
+        &self,
+        bundle: ServableModelBundle,
+    ) -> BoxFuture<'_, Result<TargetMaterial, InventoryError>> {
+        Box::pin(async move {
+            let resolved = self.assessor.resolve_material(bundle).await?;
+            let (target, projector) = resolved_paths(&resolved.target_model)?;
+            let identity = format!("package:{}", bundle_target(&resolved.bundle).id.0);
+            Ok(TargetMaterial {
+                target,
+                projector,
+                identity,
+                headers: BTreeMap::new(),
+                _guards: vec![Arc::new(resolved)],
+            })
         })
     }
 
-    /// The separate draft of a resolved bundle as material.
-    fn resolved_drafter(
-        resolved: magnitude_service_contracts::models::ResolvedServableModelBundle,
-    ) -> Result<Option<DrafterMaterial>, InventoryError> {
-        let ServableModelBundle::SpeculativeDecoding {
-            draft_source: SpeculativeDraftSource::Separate { draft },
-            ..
-        } = &resolved.bundle
-        else {
-            return Ok(None);
-        };
-        let identity = format!("package:{}", draft.id.0);
-        let path = resolved
-            .draft_model
-            .as_ref()
-            .and_then(|model| {
-                model
-                    .components
-                    .iter()
-                    .filter(|component| {
-                        matches!(
-                            component.role,
-                            ComponentRole::Weights | ComponentRole::Draft
-                        )
-                    })
-                    .map(|component| component.path.clone())
-                    .min()
-            })
-            .ok_or_else(|| {
-                InventoryError::Integrity("the draft resolved without weights".to_owned())
-            })?;
-        Ok(Some(DrafterMaterial {
-            path,
-            identity,
-            headers: BTreeMap::new(),
-            _guards: vec![Arc::new(resolved)],
-        }))
+    /// A bundle's separate draft as material, resolved and identified by its exact package;
+    /// none when the bundle has no separate draft.
+    fn drafter_material(
+        &self,
+        bundle: ServableModelBundle,
+    ) -> BoxFuture<'_, Result<Option<DrafterMaterial>, InventoryError>> {
+        Box::pin(async move {
+            let resolved = self.assessor.resolve_material(bundle).await?;
+            let ServableModelBundle::SpeculativeDecoding {
+                draft_source: SpeculativeDraftSource::Separate { draft },
+                ..
+            } = &resolved.bundle
+            else {
+                return Ok(None);
+            };
+            let identity = format!("package:{}", draft.id.0);
+            let path = resolved
+                .draft_model
+                .as_ref()
+                .and_then(|model| {
+                    model
+                        .components
+                        .iter()
+                        .filter(|component| {
+                            matches!(
+                                component.role,
+                                ComponentRole::Weights | ComponentRole::Draft
+                            )
+                        })
+                        .map(|component| component.path.clone())
+                        .min()
+                })
+                .ok_or_else(|| {
+                    InventoryError::Integrity("the draft resolved without weights".to_owned())
+                })?;
+            Ok(Some(DrafterMaterial {
+                path,
+                identity,
+                headers: BTreeMap::new(),
+                _guards: vec![Arc::new(resolved)],
+            }))
+        })
     }
 
     // Classification -------------------------------------------------------------------------
@@ -1681,134 +1703,136 @@ impl ManagedModelCandidates {
 
     // Inspection -----------------------------------------------------------------------------
 
-    async fn inspect_hugging_face(
-        &self,
+    fn inspect_hugging_face<'a>(
+        &'a self,
         repository: HuggingFaceRepositoryId,
         revision: String,
-        progress: &InspectionProgress,
-    ) -> Result<CandidateInspection, InventoryError> {
-        let snapshot = self.snapshot(repository.as_str(), &revision).await?;
-        let classified = self.classify_hugging_face(&snapshot, progress).await?;
-        let projector = choose_projector(&classified);
-        let targets = classified
-            .iter()
-            .filter(|group| matches!(group.role, CandidateFileRole::Target { .. }))
-            .collect::<Vec<_>>();
-        let unsupported_architecture = self.unsupported_architecture(&targets);
-        let custom = self.custom_models().await;
-        let catalog_installed = self.installed_catalog_models().await;
-        let projector_path = projector.map(|projector| projector.group.primary().path.clone());
-        progress.checking_versions(version_rows(&targets));
-        let mut pending = Vec::new();
-        for group in &targets {
-            pending.push(self.version_assessment(
-                group,
-                self.cached_hugging_face_identity(
-                    &snapshot,
-                    &group.group,
-                    projector_path.as_deref(),
-                ),
-                self.hugging_face_target(
-                    &snapshot,
-                    &group.group.primary().path,
-                    projector_path.as_deref(),
-                ),
-            ));
-        }
-        let assessments = checked_versions(pending, progress).await;
-        let source = CandidateSource::HuggingFace {
-            repository: repository.clone(),
-            commit: snapshot.commit.clone(),
-        };
-        let projector_file = projector.map(|projector| candidate_file(projector.group.primary()));
-        let assessments = self
-            .compose_recommended(&source, &targets, assessments, projector_file.clone(), progress)
-            .await;
-        let versions = targets
-            .iter()
-            .copied()
-            .zip(assessments)
-            .filter_map(|(group, ComposedVersion { assessment, drafter })| {
-                let model_id = hugging_face_model_id(&snapshot.repository, &group.group)?;
-                // The catalog target at its commit, or its bytes at another commit of its
-                // repository, which install as that catalog model all the same.
-                let catalog_model = self
-                    .lineage
-                    .exact_target(
-                        &snapshot.repository,
-                        &snapshot.commit,
-                        &group.group.primary().path,
-                    )
-                    .or_else(|| {
-                        self.lineage.target_with_weights(
-                            &snapshot.repository,
-                            &snapshot_weights(&snapshot, &group.group)?,
-                        )
-                    })
-                    .map(|matched| matched.model_id);
-                let on_this_computer = catalog_model
-                    .clone()
-                    .filter(|model_id| catalog_installed.contains(model_id))
-                    .or_else(|| {
-                        on_this_computer(
-                            self.models(),
-                            &custom,
-                            Some((&model_id, snapshot.commit.as_str())),
-                            group,
-                            None,
-                        )
-                    });
-                Some(AssessedVersion {
+        progress: &'a InspectionProgress,
+    ) -> BoxFuture<'a, Result<CandidateInspection, InventoryError>> {
+        Box::pin(async move {
+            let snapshot = self.snapshot(repository.as_str(), &revision).await?;
+            let classified = self.classify_hugging_face(&snapshot, progress).await?;
+            let projector = choose_projector(&classified);
+            let targets = classified
+                .iter()
+                .filter(|group| matches!(group.role, CandidateFileRole::Target { .. }))
+                .collect::<Vec<_>>();
+            let unsupported_architecture = self.unsupported_architecture(&targets);
+            let custom = self.custom_models().await;
+            let catalog_installed = self.installed_catalog_models().await;
+            let projector_path = projector.map(|projector| projector.group.primary().path.clone());
+            progress.checking_versions(version_rows(&targets));
+            let mut pending = Vec::new();
+            for group in &targets {
+                pending.push(self.version_assessment(
                     group,
-                    assessment,
-                    model_id,
-                    catalog_model,
-                    on_this_computer,
-                    drafter,
-                })
-            })
-            .collect::<Vec<_>>();
-        let variant_of = self.inspection_variant_of(&versions).await;
-        let catalog = &self.catalog_facts().await.fingerprints;
-        let families = versions.iter().map(|version| {
-            let shape = self
-                .read_cached(&version.group.header_digest, ModelShape::from_header_directory)
-                .or_else(|| version.assessment.as_ref()?.fingerprint.as_ref().map(ModelShape::of));
-            let family = version.catalog_model.clone().or_else(|| shape.and_then(|shape| shape.variant_of(catalog)));
-            (version.model_id.clone(), family)
-        }).collect::<BTreeMap<_, _>>();
-        let projector_bytes = projector.map_or(0, |projector| projector.group.size_bytes());
-        let inspection = CandidateInspection {
-            source: CandidateSource::HuggingFace {
-                repository: HuggingFaceRepositoryId::new(snapshot.repository.clone())
-                    .map_err(|error| InventoryError::InvalidRequest(error.to_string()))?,
+                    self.cached_hugging_face_identity(
+                        &snapshot,
+                        &group.group,
+                        projector_path.as_deref(),
+                    ),
+                    self.hugging_face_target(
+                        &snapshot,
+                        &group.group.primary().path,
+                        projector_path.as_deref(),
+                    ),
+                ));
+            }
+            let assessments = checked_versions(pending, progress).await;
+            let source = CandidateSource::HuggingFace {
+                repository: repository.clone(),
                 commit: snapshot.commit.clone(),
-            },
-            display_name: display_name(&snapshot.repository),
-            license: snapshot.license.clone(),
-            developer: inspection_developer(
-                Some(&snapshot.repository),
-                &targets,
-                variant_of.as_ref(),
-            ),
-            variant_of,
-            versions: candidate_versions(versions, Some(projector_bytes)),
-            projector: projector.map(|projector| candidate_file(projector.group.primary())),
-            unsupported_architecture,
-        };
-        let mut changed = false;
-        for version in &inspection.versions {
-            changed |= self.remember_presentation(&version.model_id, &snapshot.commit, CachedModelPresentation {
-                display_name: inspection.display_name.clone(),
-                variant_label: version.label.clone(),
-                variant_of: families.get(&version.model_id).cloned().flatten(),
-                license: inspection.license.clone(),
-            });
-        }
-        if changed && let Some(resolver) = self.resolver.get() {
-            resolver.custom_model_enrichment_changed();
-        }
-        Ok(inspection)
+            };
+            let projector_file = projector.map(|projector| candidate_file(projector.group.primary()));
+            let assessments = self
+                .compose_recommended(&source, &targets, assessments, projector_file.clone(), progress)
+                .await;
+            let versions = targets
+                .iter()
+                .copied()
+                .zip(assessments)
+                .filter_map(|(group, ComposedVersion { assessment, drafter })| {
+                    let model_id = hugging_face_model_id(&snapshot.repository, &group.group)?;
+                    // The catalog target at its commit, or its bytes at another commit of its
+                    // repository, which install as that catalog model all the same.
+                    let catalog_model = self
+                        .lineage
+                        .exact_target(
+                            &snapshot.repository,
+                            &snapshot.commit,
+                            &group.group.primary().path,
+                        )
+                        .or_else(|| {
+                            self.lineage.target_with_weights(
+                                &snapshot.repository,
+                                &snapshot_weights(&snapshot, &group.group)?,
+                            )
+                        })
+                        .map(|matched| matched.model_id);
+                    let on_this_computer = catalog_model
+                        .clone()
+                        .filter(|model_id| catalog_installed.contains(model_id))
+                        .or_else(|| {
+                            on_this_computer(
+                                self.models(),
+                                &custom,
+                                Some((&model_id, snapshot.commit.as_str())),
+                                group,
+                                None,
+                            )
+                        });
+                    Some(AssessedVersion {
+                        group,
+                        assessment,
+                        model_id,
+                        catalog_model,
+                        on_this_computer,
+                        drafter,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let variant_of = self.inspection_variant_of(&versions).await;
+            let catalog = &self.catalog_facts().await.fingerprints;
+            let families = versions.iter().map(|version| {
+                let shape = self
+                    .read_cached(&version.group.header_digest, ModelShape::from_header_directory)
+                    .or_else(|| version.assessment.as_ref()?.fingerprint.as_ref().map(ModelShape::of));
+                let family = version.catalog_model.clone().or_else(|| shape.and_then(|shape| shape.variant_of(catalog)));
+                (version.model_id.clone(), family)
+            }).collect::<BTreeMap<_, _>>();
+            let projector_bytes = projector.map_or(0, |projector| projector.group.size_bytes());
+            let inspection = CandidateInspection {
+                source: CandidateSource::HuggingFace {
+                    repository: HuggingFaceRepositoryId::new(snapshot.repository.clone())
+                        .map_err(|error| InventoryError::InvalidRequest(error.to_string()))?,
+                    commit: snapshot.commit.clone(),
+                },
+                display_name: display_name(&snapshot.repository),
+                license: snapshot.license.clone(),
+                developer: inspection_developer(
+                    Some(&snapshot.repository),
+                    &targets,
+                    variant_of.as_ref(),
+                ),
+                variant_of,
+                versions: candidate_versions(versions, Some(projector_bytes)),
+                projector: projector.map(|projector| candidate_file(projector.group.primary())),
+                unsupported_architecture,
+            };
+            let mut changed = false;
+            for version in &inspection.versions {
+                changed |= self.remember_presentation(&version.model_id, &snapshot.commit, CachedModelPresentation {
+                    display_name: inspection.display_name.clone(),
+                    variant_label: version.label.clone(),
+                    variant_of: families.get(&version.model_id).cloned().flatten(),
+                    license: inspection.license.clone(),
+                });
+            }
+            if changed && let Some(resolver) = self.resolver.get() {
+                resolver.custom_model_enrichment_changed();
+            }
+            Ok(inspection)
+        })
     }
 
     async fn inspect_local(
@@ -2297,22 +2321,32 @@ impl ManagedModelCandidates {
     /// target package. Locally, a model from a known Hub repository has no snapshot, and the
     /// lineage its header declares and its repository's Hub lineage already on this computer; an
     /// added model has the repository snapshot it was downloaded from, when that is cached.
-    async fn model_target(
-        &self,
-        model_id: &ModelId,
+    fn model_target<'a>(
+        &'a self,
+        model_id: &'a ModelId,
         reach: Reach,
-    ) -> Result<DrafterTarget, InventoryError> {
-        if let ParsedModelId::Catalog { .. } = model_id.parsed() {
+    ) -> BoxFuture<'a, Result<DrafterTarget, InventoryError>> {
+        match model_id.parsed() {
+            ParsedModelId::Catalog { .. } => self.catalog_target(model_id, reach),
+            _ => self.custom_target(model_id, reach),
+        }
+    }
+
+    /// A catalog model's target: its release material.
+    fn catalog_target<'a>(
+        &'a self,
+        model_id: &'a ModelId,
+        reach: Reach,
+    ) -> BoxFuture<'a, Result<DrafterTarget, InventoryError>> {
+        Box::pin(async move {
             let matched = self
                 .lineage
                 .variant(model_id)
                 .ok_or_else(|| InventoryError::NotFound(model_id.as_str().to_owned()))?;
-            let resolved = self
-                .assessor
-                .resolve_material(matched.model.configuration.bundle.clone())
-                .await?;
-            return Ok(DrafterTarget {
-                material: Self::resolved_target(resolved)?,
+            Ok(DrafterTarget {
+                material: self
+                    .target_material(matched.model.configuration.bundle.clone())
+                    .await?,
                 repository: None,
                 primary: None,
                 folders: Vec::new(),
@@ -2322,104 +2356,166 @@ impl ManagedModelCandidates {
                 catalog: Some(model_id.clone()),
                 reach,
                 weights: None,
-            });
-        }
-        let model = self
-            .custom_models()
-            .await
-            .into_iter()
-            .find(|model| &model.model_id == model_id)
-            .ok_or_else(|| InventoryError::NotFound(model_id.as_str().to_owned()))?;
-        let configuration = self
-            .assessor
-            .configuration_for(&ModelAssessmentSubject::Custom {
-                model_id: model_id.clone(),
-            })?;
-        let target = bundle_target(&configuration.bundle).clone();
-        let resolved = self
-            .assessor
-            .resolve_material(ServableModelBundle::Standalone {
-                package: target.clone(),
             })
-            .await?;
-        let material = Self::resolved_target(resolved)?;
-        let repository = match (&model.origin, &target.source) {
-            (CustomModelOrigin::Added { repository, commit }, _) => {
-                Some((repository.as_str().to_owned(), commit.clone()))
-            }
-            (
-                _,
-                ModelPackageSource::HuggingFace {
-                    repository,
-                    revision,
+        })
+    }
+
+    /// A custom model's target: its installed target package, with the lineage and drafter
+    /// folders of the repository it comes from as `reach` reads them.
+    fn custom_target<'a>(
+        &'a self,
+        model_id: &'a ModelId,
+        reach: Reach,
+    ) -> BoxFuture<'a, Result<DrafterTarget, InventoryError>> {
+        Box::pin(async move {
+            let model = self
+                .custom_models()
+                .await
+                .into_iter()
+                .find(|model| &model.model_id == model_id)
+                .ok_or_else(|| InventoryError::NotFound(model_id.as_str().to_owned()))?;
+            let configuration = self
+                .assessor
+                .configuration_for(&ModelAssessmentSubject::Custom {
+                    model_id: model_id.clone(),
+                })?;
+            let target = bundle_target(&configuration.bundle).clone();
+            let material = self
+                .target_material(ServableModelBundle::Standalone {
+                    package: target.clone(),
+                })
+                .await?;
+            let repository = match (&model.origin, &target.source) {
+                (CustomModelOrigin::Added { repository, commit }, _) => {
+                    Some((repository.as_str().to_owned(), commit.clone()))
+                }
+                (
+                    _,
+                    ModelPackageSource::HuggingFace {
+                        repository,
+                        revision,
+                    },
+                ) => Some((repository.clone(), revision.clone())),
+                _ => match model_id.parsed() {
+                    ParsedModelId::HuggingFace { repository_id, .. } => {
+                        Some((repository_id.as_str().to_owned(), String::new()))
+                    }
+                    // A `local:` model whose location names a repository (an Ollama `hf.co` pull)
+                    // takes its lineage and drafters from it, even when no file there has its bytes.
+                    _ => self
+                        .resolver
+                        .get()
+                        .and_then(|resolver| resolver.custom_model_lineage_repository(model_id).ok())
+                        .flatten()
+                        .map(|repository| (repository, String::new())),
                 },
-            ) => Some((repository.clone(), revision.clone())),
-            _ => match model_id.parsed() {
-                ParsedModelId::HuggingFace { repository_id, .. } => {
-                    Some((repository_id.as_str().to_owned(), String::new()))
+            };
+            let primary = target
+                .files
+                .iter()
+                .filter(|file| file.role == ModelFileRole::Weights)
+                .map(|file| file.path.clone())
+                .min();
+            let mut lineage = self.header_lineage(&material.target, &material.headers);
+            let (snapshot, downloaded_from) = match &repository {
+                Some(repository) => {
+                    let added = matches!(model.origin, CustomModelOrigin::Added { .. });
+                    let reached = self.repository_reach(repository, added, reach).await?;
+                    lineage.extend(reached.lineage);
+                    (reached.snapshot, reached.downloaded_from)
                 }
-                // A `local:` model whose location names a repository (an Ollama `hf.co` pull)
-                // takes its lineage and drafters from it, even when no file there has its bytes.
-                _ => self
-                    .resolver
-                    .get()
-                    .and_then(|resolver| resolver.custom_model_lineage_repository(model_id).ok())
-                    .flatten()
-                    .map(|repository| (repository, String::new())),
-            },
-        };
-        let primary = target
-            .files
-            .iter()
-            .filter(|file| file.role == ModelFileRole::Weights)
-            .map(|file| file.path.clone())
-            .min();
-        let mut lineage = self.header_lineage(&material.target, &material.headers);
-        // A model from a known Hub repository takes the lineage that repository declares, at its
-        // commit or else at `main`, and lists that repository's drafters; never whatever else
-        // shares its folder. Locally, the lineage is the Hub's answers already on this computer,
-        // and an added model lists the drafters of its repository already downloaded. A Hub pass
-        // that can't read the repository fails, to be retried, rather than answering without its
-        // drafters; a repository the Hub says isn't there has none.
-        let (snapshot, downloaded_from) = match &repository {
-            Some((repository, commit)) => {
-                let revision = if is_commit(commit) {
-                    commit.as_str()
-                } else {
-                    "main"
-                };
-                match reach {
-                    Reach::Hub => {
-                        let snapshot = match self.snapshot(repository, revision).await {
-                            Ok(snapshot) => Some(snapshot),
-                            Err(error) if transient(&error) => return Err(error),
-                            Err(_) => None,
-                        };
-                        let first_hop = snapshot
-                            .as_ref()
-                            .map(|snapshot| snapshot.base_models.clone());
-                        lineage.extend(self.lineage.hub().lineage(repository, first_hop).await);
-                        (snapshot, None)
-                    }
-                    Reach::Local => {
-                        let cached = magnitude_service_models::cached_hugging_face_repository(
-                            self.models(),
-                            &HuggingFaceRepositoryRequest {
-                                repository: repository.clone(),
-                                revision: revision.to_owned(),
-                            },
-                        );
-                        let first_hop = cached.as_ref().map(|snapshot| snapshot.base_models.clone());
-                        lineage.extend(self.lineage.hub().known_lineage(repository, first_hop));
-                        let added = matches!(model.origin, CustomModelOrigin::Added { .. });
-                        (None, cached.filter(|_| added))
+                None => (None, None),
+            };
+            let (folders, weights) = self.own_bytes(
+                model_id,
+                &model,
+                repository
+                    .as_ref()
+                    .map(|(repository, _)| repository.as_str()),
+                snapshot.as_ref(),
+                primary.as_deref(),
+            );
+            Ok(DrafterTarget {
+                material,
+                repository,
+                primary,
+                folders,
+                snapshot,
+                downloaded_from,
+                lineage,
+                catalog: None,
+                reach,
+                weights,
+            })
+        })
+    }
+
+    /// What `reach` reads of the repository a custom model comes from, at its commit or else at
+    /// `main`. A model from a known Hub repository takes the lineage that repository declares and
+    /// lists that repository's drafters; never whatever else shares its folder. Locally, the
+    /// lineage is the Hub's answers already on this computer, and an `added` model lists the
+    /// drafters of its repository already downloaded. A Hub pass that can't read the repository
+    /// fails, to be retried, rather than answering without its drafters; a repository the Hub says
+    /// isn't there has none.
+    fn repository_reach<'a>(
+        &'a self,
+        (repository, commit): &'a (String, String),
+        added: bool,
+        reach: Reach,
+    ) -> BoxFuture<'a, Result<RepositoryReach, InventoryError>> {
+        Box::pin(async move {
+            let revision = if is_commit(commit) {
+                commit.as_str()
+            } else {
+                "main"
+            };
+            Ok(match reach {
+                Reach::Hub => {
+                    let snapshot = match self.snapshot(repository, revision).await {
+                        Ok(snapshot) => Some(snapshot),
+                        Err(error) if transient(&error) => return Err(error),
+                        Err(_) => None,
+                    };
+                    let first_hop = snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.base_models.clone());
+                    RepositoryReach {
+                        lineage: self.lineage.hub().lineage(repository, first_hop).await,
+                        snapshot,
+                        downloaded_from: None,
                     }
                 }
-            }
-            None => (None, None),
-        };
-        // Each place this model's own bytes are found gives its folder; never the folder of the
-        // file its target package resolves to, nor of another model sharing its header.
+                Reach::Local => {
+                    let cached = magnitude_service_models::cached_hugging_face_repository(
+                        self.models(),
+                        &HuggingFaceRepositoryRequest {
+                            repository: repository.clone(),
+                            revision: revision.to_owned(),
+                        },
+                    );
+                    let first_hop = cached.as_ref().map(|snapshot| snapshot.base_models.clone());
+                    RepositoryReach {
+                        lineage: self.lineage.hub().known_lineage(repository, first_hop),
+                        snapshot: None,
+                        downloaded_from: cached.filter(|_| added),
+                    }
+                }
+            })
+        })
+    }
+
+    /// A custom model's drafter folders and the source of its own weights. Each place its own
+    /// bytes are found gives its folder; never the folder of the file its target package resolves
+    /// to, nor of another model sharing its header. Its weights are its own bytes where they are
+    /// found, else its Hub file when its repository is known.
+    fn own_bytes(
+        &self,
+        model_id: &ModelId,
+        model: &CustomModel,
+        repository: Option<&str>,
+        snapshot: Option<&HuggingFaceRepositorySnapshot>,
+        primary: Option<&Path>,
+    ) -> (Vec<DrafterFolder>, Option<WeightSource>) {
         let locations = self
             .resolver
             .get()
@@ -2437,9 +2533,7 @@ impl ManagedModelCandidates {
         for location in &locations {
             if let Some(folder) = drafter_folder(
                 &model.origin,
-                repository
-                    .as_ref()
-                    .map(|(repository, _)| repository.as_str()),
+                repository,
                 snapshot.is_some(),
                 location.parent(),
             ) && !folders.contains(&folder)
@@ -2447,31 +2541,19 @@ impl ManagedModelCandidates {
                 folders.push(folder);
             }
         }
-        // Its own bytes where they are found, else its Hub file when its repository is known.
         let weights = match (
             locations.iter().find(|location| location.is_file()),
-            &snapshot,
-            &primary,
+            snapshot,
+            primary,
         ) {
             (Some(location), _, _) => Some(WeightSource::File(location.clone())),
             (None, Some(snapshot), Some(primary)) => Some(WeightSource::Hub {
                 snapshot: snapshot.clone(),
-                path: primary.clone(),
+                path: primary.to_path_buf(),
             }),
             _ => None,
         };
-        Ok(DrafterTarget {
-            material,
-            repository,
-            primary,
-            folders,
-            snapshot,
-            downloaded_from,
-            lineage,
-            catalog: None,
-            reach,
-            weights,
-        })
+        (folders, weights)
     }
 
     // Drafter enumeration --------------------------------------------------------------------
@@ -2507,141 +2589,143 @@ impl ManagedModelCandidates {
     /// package, or the same repository, commit and path), else its own Other row.
     /// `progress` counts the drafter checks: the target's own built-in heads, each drafter next to
     /// it and each catalog drafter, as each is about to run.
-    async fn drafter_list(
-        &self,
-        target: &DrafterTarget,
-        other: Option<&str>,
+    fn drafter_list<'a>(
+        &'a self,
+        target: &'a DrafterTarget,
+        other: Option<&'a str>,
         stop_at_first_automatic: bool,
-        progress: &InspectionProgress,
-    ) -> Result<DrafterList, InventoryError> {
-        let bare = self
-            .assess(&target.material, None, ModelMethod::Plain)
-            .await?;
-        if matches!(bare.profile, ModelAssessment::Unsupported { .. }) {
-            return Ok(DrafterList::default());
-        }
-        let fits_plain = fits(&bare.profile);
-        // The target as the engine takes it on its own: with its built-in heads when it has any.
-        progress.drafters_planned(1);
-        let own = self
-            .assess(&target.material, None, ModelMethod::Auto)
-            .await;
-        progress.drafter_checked();
-        let own = own?;
-        let matches = match &target.catalog {
-            Some(model_id) => self
-                .lineage
-                .variant(model_id)
-                .map(|matched| (matched, DrafterLineage::Exact))
-                .into_iter()
-                .collect(),
-            None => self.catalog_matches(target, own.fingerprint.as_ref()).await,
-        };
-        let matched = matches.first().cloned();
-        let decide = |mut candidate: DrafterCandidate| {
-            candidate.automatic &= fits_plain;
-            candidate
-        };
-        let embedded_catalog = matched.as_ref().is_some_and(|(matched, _)| {
-            matches!(
-                &matched.model.configuration.bundle,
-                ServableModelBundle::SpeculativeDecoding {
-                    draft_source: SpeculativeDraftSource::Embedded,
-                    ..
-                }
-            )
-        });
-        // The target's built-in heads, when it has any and the catalog drafter isn't them.
-        let built_in = || {
-            let verdict = verdict_of(&own.profile);
-            (!embedded_catalog && !matches!(verdict, DrafterVerdict::None)).then(|| {
-                decide(DrafterCandidate {
-                    category: DrafterCategory::BuiltIn,
-                    automatic: is_bound(&verdict) && fits(&own.profile),
-                    reference: DrafterReference::Embedded,
-                    name: embedded_drafter_name(bound_method(&verdict).as_ref()),
-                    label: "Built into this model".to_owned(),
-                    size_bytes: 0,
-                    lineage: DrafterLineage::Exact,
-                    method: bound_method(&verdict),
-                    verdict,
-                    on_this_computer: true,
-                })
-            })
-        };
-        // A catalog model, and a file that is exactly a catalog model's target, use only that
-        // catalog model's drafter, unless it would keep a model that fits without it from fitting,
-        // and their built-in heads, which serve while that drafter is not on this computer.
-        let exact_catalog = matches!(&matched, Some((_, DrafterLineage::Exact)));
-        if target.catalog.is_some() || exact_catalog {
-            let Some((matched, lineage)) = &matched else {
+        progress: &'a InspectionProgress,
+    ) -> BoxFuture<'a, Result<DrafterList, InventoryError>> {
+        Box::pin(async move {
+            let bare = self
+                .assess(&target.material, None, ModelMethod::Plain)
+                .await?;
+            if matches!(bare.profile, ModelAssessment::Unsupported { .. }) {
                 return Ok(DrafterList::default());
+            }
+            let fits_plain = fits(&bare.profile);
+            // The target as the engine takes it on its own: with its built-in heads when it has any.
+            progress.drafters_planned(1);
+            let own = self
+                .assess(&target.material, None, ModelMethod::Auto)
+                .await;
+            progress.drafter_checked();
+            let own = own?;
+            let matches = match &target.catalog {
+                Some(model_id) => self
+                    .lineage
+                    .variant(model_id)
+                    .map(|matched| (matched, DrafterLineage::Exact))
+                    .into_iter()
+                    .collect(),
+                None => self.catalog_matches(target, own.fingerprint.as_ref()).await,
             };
-            let catalog = self
-                .catalog_drafter(&target, matched, *lineage, progress)
-                .await
-                .map(decide);
-            return Ok(DrafterList {
-                candidates: in_choice_order(catalog.into_iter().chain(built_in()).collect()),
-                entered: None,
+            let matched = matches.first().cloned();
+            let decide = |mut candidate: DrafterCandidate| {
+                candidate.automatic &= fits_plain;
+                candidate
+            };
+            let embedded_catalog = matched.as_ref().is_some_and(|(matched, _)| {
+                matches!(
+                    &matched.model.configuration.bundle,
+                    ServableModelBundle::SpeculativeDecoding {
+                        draft_source: SpeculativeDraftSource::Embedded,
+                        ..
+                    }
+                )
             });
-        }
-        let done = |candidates: &[DrafterCandidate]| {
-            stop_at_first_automatic && candidates.iter().any(|candidate| candidate.automatic)
-        };
-        let catalog_file = matched
-            .as_ref()
-            .and_then(|(matched, _)| catalog_draft_key(&matched.model));
-        let mut candidates = self
-            .next_to_model(&target, catalog_file.as_deref(), progress)
-            .await?
-            .into_iter()
-            .map(decide)
-            .collect::<Vec<_>>();
-        // The best catalog match's drafter; when the engine rejects it, the fingerprint-matched
-        // catalog model's drafter is offered too.
-        for (matched, lineage) in &matches {
-            if done(&candidates) {
-                break;
-            }
-            let Some(candidate) = self
-                .catalog_drafter(&target, matched, *lineage, progress)
-                .await
-            else {
-                continue;
+            // The target's built-in heads, when it has any and the catalog drafter isn't them.
+            let built_in = || {
+                let verdict = verdict_of(&own.profile);
+                (!embedded_catalog && !matches!(verdict, DrafterVerdict::None)).then(|| {
+                    decide(DrafterCandidate {
+                        category: DrafterCategory::BuiltIn,
+                        automatic: is_bound(&verdict) && fits(&own.profile),
+                        reference: DrafterReference::Embedded,
+                        name: embedded_drafter_name(bound_method(&verdict).as_ref()),
+                        label: "Built into this model".to_owned(),
+                        size_bytes: 0,
+                        lineage: DrafterLineage::Exact,
+                        method: bound_method(&verdict),
+                        verdict,
+                        on_this_computer: true,
+                    })
+                })
             };
-            let bound = is_bound(&candidate.verdict);
-            candidates.push(decide(candidate));
-            if bound {
-                break;
+            // A catalog model, and a file that is exactly a catalog model's target, use only that
+            // catalog model's drafter, unless it would keep a model that fits without it from fitting,
+            // and their built-in heads, which serve while that drafter is not on this computer.
+            let exact_catalog = matches!(&matched, Some((_, DrafterLineage::Exact)));
+            if target.catalog.is_some() || exact_catalog {
+                let Some((matched, lineage)) = &matched else {
+                    return Ok(DrafterList::default());
+                };
+                let catalog = self
+                    .catalog_drafter(&target, matched, *lineage, progress)
+                    .await
+                    .map(decide);
+                return Ok(DrafterList {
+                    candidates: in_choice_order(catalog.into_iter().chain(built_in()).collect()),
+                    entered: None,
+                });
             }
-        }
-        if !done(&candidates) {
-            candidates.extend(built_in());
-        }
-        let mut candidates = in_choice_order(candidates);
-        let mut entered = None;
-        if let Some(other) = other {
-            let mut related = target.lineage.clone();
-            if let Some((matched, _)) = &matched {
-                related.extend(self.lineage.lineage_of(&matched.model_id).await);
-            }
-            let candidate = self.other_drafter(&target, &related, other).await?;
-            let key = reference_key(&candidate.reference);
-            match candidates
-                .iter()
-                .find(|listed| self.drafter_file_key(&listed.reference) == key)
-            {
-                Some(listed) => entered = Some(listed.reference.clone()),
-                None => {
-                    entered = Some(candidate.reference.clone());
-                    candidates.push(candidate);
+            let done = |candidates: &[DrafterCandidate]| {
+                stop_at_first_automatic && candidates.iter().any(|candidate| candidate.automatic)
+            };
+            let catalog_file = matched
+                .as_ref()
+                .and_then(|(matched, _)| catalog_draft_key(&matched.model));
+            let mut candidates = self
+                .next_to_model(&target, catalog_file.as_deref(), progress)
+                .await?
+                .into_iter()
+                .map(decide)
+                .collect::<Vec<_>>();
+            // The best catalog match's drafter; when the engine rejects it, the fingerprint-matched
+            // catalog model's drafter is offered too.
+            for (matched, lineage) in &matches {
+                if done(&candidates) {
+                    break;
+                }
+                let Some(candidate) = self
+                    .catalog_drafter(&target, matched, *lineage, progress)
+                    .await
+                else {
+                    continue;
+                };
+                let bound = is_bound(&candidate.verdict);
+                candidates.push(decide(candidate));
+                if bound {
+                    break;
                 }
             }
-        }
-        Ok(DrafterList {
-            candidates,
-            entered,
+            if !done(&candidates) {
+                candidates.extend(built_in());
+            }
+            let mut candidates = in_choice_order(candidates);
+            let mut entered = None;
+            if let Some(other) = other {
+                let mut related = target.lineage.clone();
+                if let Some((matched, _)) = &matched {
+                    related.extend(self.lineage.lineage_of(&matched.model_id).await);
+                }
+                let candidate = self.other_drafter(&target, &related, other).await?;
+                let key = reference_key(&candidate.reference);
+                match candidates
+                    .iter()
+                    .find(|listed| self.drafter_file_key(&listed.reference) == key)
+                {
+                    Some(listed) => entered = Some(listed.reference.clone()),
+                    None => {
+                        entered = Some(candidate.reference.clone());
+                        candidates.push(candidate);
+                    }
+                }
+            }
+            Ok(DrafterList {
+                candidates,
+                entered,
+            })
         })
     }
 
@@ -2658,27 +2742,29 @@ impl ManagedModelCandidates {
         .unwrap_or_else(|| reference_key(reference))
     }
 
-    async fn catalog_drafter(
-        &self,
-        target: &DrafterTarget,
-        matched: &CatalogLineageMatch,
+    fn catalog_drafter<'a>(
+        &'a self,
+        target: &'a DrafterTarget,
+        matched: &'a CatalogLineageMatch,
         lineage: DrafterLineage,
-        progress: &InspectionProgress,
-    ) -> Option<DrafterCandidate> {
-        let ServableModelBundle::SpeculativeDecoding {
-            draft_source,
-            method,
-            ..
-        } = &matched.model.configuration.bundle
-        else {
-            return None;
-        };
-        progress.drafters_planned(1);
-        let candidate = self
-            .catalog_drafter_candidate(target, matched, lineage, draft_source, method)
-            .await;
-        progress.drafter_checked();
-        candidate
+        progress: &'a InspectionProgress,
+    ) -> BoxFuture<'a, Option<DrafterCandidate>> {
+        Box::pin(async move {
+            let ServableModelBundle::SpeculativeDecoding {
+                draft_source,
+                method,
+                ..
+            } = &matched.model.configuration.bundle
+            else {
+                return None;
+            };
+            progress.drafters_planned(1);
+            let candidate = self
+                .catalog_drafter_candidate(target, matched, lineage, draft_source, method)
+                .await;
+            progress.drafter_checked();
+            candidate
+        })
     }
 
     async fn catalog_drafter_candidate(
@@ -2692,15 +2778,14 @@ impl ManagedModelCandidates {
         let (drafter, size_bytes, on_this_computer) = match draft_source {
             SpeculativeDraftSource::Embedded => (None, 0, true),
             SpeculativeDraftSource::Separate { draft } => {
-                let resolved = self
-                    .assessor
-                    .resolve_material(matched.model.configuration.bundle.clone())
+                let material = self
+                    .drafter_material(matched.model.configuration.bundle.clone())
                     .await
                     .map_err(
                         |error| tracing::warn!(%error, "catalog drafter material is unavailable"),
                     )
-                    .ok()?;
-                let material = Self::resolved_drafter(resolved).ok().flatten()?;
+                    .ok()
+                    .flatten()?;
                 let reference = DrafterReference::Catalog {
                     model_id: matched.model_id.clone(),
                 };
@@ -3031,11 +3116,8 @@ impl ManagedModelCandidates {
                     .lineage
                     .variant(model_id)
                     .ok_or_else(|| InventoryError::NotFound(model_id.as_str().to_owned()))?;
-                let resolved = self
-                    .assessor
-                    .resolve_material(matched.model.configuration.bundle.clone())
-                    .await?;
-                Self::resolved_drafter(resolved)
+                self.drafter_material(matched.model.configuration.bundle.clone())
+                    .await
             }
             DrafterReference::HuggingFace {
                 repository,

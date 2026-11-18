@@ -245,8 +245,7 @@ fn worker_process(arguments: &Arguments) -> Result<(Vec<TokenId>, FinishReason),
     else {
         return Err("a load serving canonical defaults stopped unprepared".into());
     };
-    let engine =
-        ReadyEngine::new(Arc::new(resolved.host), *connection).map_err(|error| error.to_string())?;
+    let engine = ReadyEngine::new(resolved.host, *connection).map_err(|error| error.to_string())?;
     eprintln!(
         "worker process: ready in {:.2} s",
         started.elapsed().as_secs_f64()

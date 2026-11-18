@@ -80,7 +80,7 @@ impl Reader<'_> {
 pub fn describe_projector(
     directory: &Directory,
     target_width: u64,
-) -> Result<VisionDescription, Error> {
+) -> Result<Box<VisionDescription>, Error> {
     projector_type(directory, &[("minicpmv4_7", ())], target_width)?;
     if let Some((_, entry)) = architecture_keys(directory, PROJECTOR_ARCHITECTURE)
         .find(|(_, entry)| !KEYS.contains(&entry.name.as_str()))
@@ -215,7 +215,7 @@ pub fn describe_projector(
         merge: 2,
     };
     r.tensors.finish().map_err(Error::from)?;
-    let description = VisionDescription {
+    let description = Box::new(VisionDescription {
         activation_dtype: ActivationDType::F16,
         hidden,
         output_hidden,
@@ -224,7 +224,7 @@ pub fn describe_projector(
         window: None,
         blocks,
         merger,
-    };
+    });
     description.validate().map_err(|e| invalid(e.to_string()))?;
     Ok(description)
 }

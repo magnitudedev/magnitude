@@ -8,6 +8,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
+use futures_util::future::BoxFuture;
+
 use magnitude_engine::assessment::{
     AssessmentSetup, AssessmentStructure, DrafterVerdict as EngineDrafterVerdict,
     HeaderExtent as EngineHeaderExtent,
@@ -167,12 +169,14 @@ impl ModelAssessor {
 
     /// Resolve a bundle's exact material: release headers for a catalog bundle, installed files
     /// or source-backed previews for everything else.
-    pub async fn resolve_material(
-        &self,
+    pub fn resolve_material<'a>(
+        &'a self,
         bundle: ServableModelBundle,
-    ) -> Result<ResolvedServableModelBundle, InventoryError> {
-        let bundle_key = servable_model_bundle_key_for_bundle(&bundle);
-        self.resolve(&bundle_key, bundle).await
+    ) -> BoxFuture<'a, Result<ResolvedServableModelBundle, InventoryError>> {
+        Box::pin(async move {
+            let bundle_key = servable_model_bundle_key_for_bundle(&bundle);
+            self.resolve(&bundle_key, bundle).await
+        })
     }
 
     /// Whether `subject`'s configuration still waits on its catalog drafter's fit.

@@ -296,7 +296,8 @@ pub struct ExecutionShortfall {
 /// ([`crate::FloorForms`]), at the model's largest served context: every
 /// fit is arithmetic over them ([`assess_execution_fit`]).
 pub struct PreparedExecutionAssessment {
-    prepared_definition: ModelDefinition,
+    /// The definition the forms plan, at the largest served context.
+    definition: ModelDefinition,
     demand: DecodeDemand,
     /// Of a plan that banks its experts, its demand holding them whole: the
     /// resident form its decode runs while its bank holds every expert. None
@@ -306,6 +307,11 @@ pub struct PreparedExecutionAssessment {
 }
 
 impl PreparedExecutionAssessment {
+    /// The definition the forms plan, at the largest served context.
+    pub fn definition(&self) -> &ModelDefinition {
+        &self.definition
+    }
+
     /// The plain decode step's demand under the planned history codec.
     pub fn demand(&self) -> &DecodeDemand {
         &self.demand
@@ -346,22 +352,21 @@ impl PreparedExecutionAssessment {
 /// Perform model-specific arithmetic while the fixed generic basis is
 /// measured: the plain decode step's demand ([`decode_demand`]) of the
 /// forms' primary plan, and of a plan that banks its experts its demand
-/// holding them whole, beside the forms' charge structures.
+/// holding them whole, beside the forms' charge structures. Boxed: a
+/// preparation holds a whole definition and its demands, and is moved by
+/// value through deep frames, whose stacks hold every by-value copy
+/// (`seismic_threads::STACK_BYTES`).
 pub fn prepare_execution_assessment(
-    definition: &ModelDefinition,
+    definition: ModelDefinition,
     forms: crate::FloorForms,
-) -> Result<PreparedExecutionAssessment, AssessmentError> {
+) -> Result<Box<PreparedExecutionAssessment>, AssessmentError> {
     let draft = &forms.primary().draft;
     let whole = match draft.load().expert_bank() {
-        Some(_) => Some(decode_demand(definition, &draft.held_whole(definition)?)?),
+        Some(_) => Some(decode_demand(&definition, &draft.held_whole(&definition)?)?),
         None => None,
     };
-    Ok(PreparedExecutionAssessment {
-        prepared_definition: definition.clone(),
-        demand: decode_demand(definition, draft)?,
-        whole,
-        forms,
-    })
+    let demand = decode_demand(&definition, draft)?;
+    Ok(Box::new(PreparedExecutionAssessment { definition, demand, whole, forms }))
 }
 
 /// The standard workload's checked memory charge of `definition` planned
@@ -693,7 +698,7 @@ pub fn assess_execution_fit(
                 }
             }
             for win in &bank.windowed {
-                let structure = win.structure(&prepared.prepared_definition)?;
+                let structure = win.structure(&prepared.definition)?;
                 let at_win = |slots: u64| -> Result<_, AssessmentError> {
                     let draft = win.at_slots(slots)?.with_graph_pricing(pricing);
                     let charge = structure.charge(definition, &draft)?;
@@ -812,14 +817,14 @@ pub(crate) mod tests {
     impl Environment {
         /// The draft prepared as assessment prepares it: each way of holding
         /// its experts outlined at its floor.
-        fn prepared(&self) -> PreparedExecutionAssessment {
+        fn prepared(&self) -> Box<PreparedExecutionAssessment> {
             let forms = self
                 .draft
                 .floor_forms::<(), AssessmentError>(&self.definition, None, |draft| {
                     StructuralCharge::of(&self.definition, draft).map(|charge| (charge, ()))
                 })
                 .unwrap();
-            prepare_execution_assessment(&self.definition, forms).unwrap()
+            prepare_execution_assessment(self.definition.clone(), forms).unwrap()
         }
 
         /// The prepared draft's fit.

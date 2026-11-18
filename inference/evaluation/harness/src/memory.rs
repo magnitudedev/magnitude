@@ -30,7 +30,7 @@ pub use store::PressureStore;
 use magnitude_engine::{
     LoadAttempt,
     assessment::AssessmentStructure,
-    composition::{EngineConfiguration, ReadyEngine},
+    composition::{EngineConfiguration, ReadyEngine, ResolvedEngineConfiguration},
     error::{RequestError, UnloadCause},
     options::{ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection, standard_service_limits},
     planning::plan_execution,
@@ -369,13 +369,30 @@ fn plan(
     let devices = Devices::discover(&[]).map_err(|error| error.to_string())?;
     let topology = devices.topology();
     let release = ReleaseRate::of_machine(kernel_cache.as_deref().zip(Some(&*topology)));
-    let resolved = EngineConfiguration {
+    let ResolvedEngineConfiguration { host, manifest } =
+        configured(target, policy.clone(), context_tokens, device, kernel_cache, release)?;
+    let (structure, planned) = charged(&devices, &manifest, device, release, policy)?;
+    Ok(Planned { host, manifest, devices, structure, planned })
+}
+
+/// The configuration the worker loads `target` at: plain `policy`, without
+/// its drafter or projector, at `context_tokens` or its declared context, on
+/// `device`, its kernels from `kernel_cache`.
+fn configured(
+    target: &std::path::Path,
+    policy: ModelPolicy,
+    context_tokens: Option<usize>,
+    device: DeviceRequest,
+    kernel_cache: Option<PathBuf>,
+    release: ReleaseRate,
+) -> Result<ResolvedEngineConfiguration, String> {
+    EngineConfiguration {
         package: PackageOptions {
             target: target.to_path_buf(),
             projector: ProjectorSelection::Disabled,
             draft: None,
         },
-        model: policy.clone(),
+        model: policy,
         context_tokens,
         service: standard_service_limits(),
         path: ExecutionPath::Native,
@@ -384,11 +401,21 @@ fn plan(
         release,
     }
     .resolve()
-    .map_err(|error| error.to_string())?;
-    let (host, manifest) = (Arc::new(resolved.host), resolved.manifest);
-    // The charge: the manifest the worker loads, planned on the same device.
+    .map_err(|error| error.to_string())
+}
+
+/// The charge of `manifest`, the manifest the worker loads, planned on the
+/// same device: the assessment structure it is drawn on and the plan, as the
+/// load plans it once its prices are measured.
+fn charged(
+    devices: &Devices,
+    manifest: &magnitude_engine::options::ExecutionManifest,
+    device: DeviceRequest,
+    release: ReleaseRate,
+    policy: ModelPolicy,
+) -> Result<(AssessmentStructure, magnitude_executor::ChargedDraft), String> {
     let structure = AssessmentStructure::discover(
-        &devices,
+        devices,
         device,
         manifest.kernel_cache.as_deref(),
         release,
@@ -396,10 +423,9 @@ fn plan(
         standard_service_limits(),
     )
     .map_err(|error| error.to_string())?;
-    // Planned as the load plans, once its prices are measured.
-    magnitude_engine::composition::settle_prices(&manifest).map_err(|error| error.to_string())?;
-    let planned = plan_execution(&manifest, &structure.selected).map_err(|error| error.to_string())?;
-    Ok(Planned { host, manifest, devices, structure, planned })
+    magnitude_engine::composition::settle_prices(manifest).map_err(|error| error.to_string())?;
+    let planned = plan_execution(manifest, &structure.selected).map_err(|error| error.to_string())?;
+    Ok((structure, planned))
 }
 
 /// Another process's memory, taking what the load's store gives past the

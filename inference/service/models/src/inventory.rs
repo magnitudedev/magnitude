@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use futures_util::future::BoxFuture;
 use hf_hub::HFClient;
 use magnitude_service_contracts::models::{
     CatalogPackageRole, FoundSource, InstalledCatalogAttribution,
@@ -693,45 +694,47 @@ impl ManagedModelStore {
 
     /// Open the store of `config`, whose downloads take the space
     /// `download_space` reports.
-    pub async fn open(
+    pub fn open(
         config: InventoryConfig,
         download_space: Arc<dyn DownloadSpace>,
-    ) -> Result<Self, InventoryError> {
-        config.prepare_roots().await?;
-        let client = hub_client(&config, None)?;
-        let cache = ModelCache::with_header_capacity(&config.cache_root, config.header_cache_capacity);
-        let catalog_affiliations = CatalogAffiliations::load(&config.root);
-        let local_models = Arc::new(RwLock::new(config.local_models.clone()));
-        let manager = Self {
-            volume: Arc::new(crate::download::VolumeWrites::new(download_space)),
-            download_slots: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_downloads)),
-            config,
-            client,
-            hub_credential: Arc::new(RwLock::new(None)),
-            http: reqwest::Client::new(),
-            models: Arc::new(RwLock::new(BTreeMap::new())),
-            operations: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
-            cache,
-            local_models,
-            root_scans: Arc::default(),
-            installed_packages: Arc::new(RwLock::new(InstalledPackageSnapshot::default())),
-            model_assessments: Arc::new(RwLock::new(BTreeMap::new())),
-            catalog_affiliations: Arc::new(RwLock::new(catalog_affiliations)),
-            cache_evidence: Arc::new(RwLock::new(BTreeMap::new())),
-            ensure_gate: Arc::new(tokio::sync::Mutex::new(())),
-            ensure_generation: Arc::new(AtomicU64::new(0)),
-            packages_revision: Arc::new(AtomicU64::new(0)),
-            reconciliation_running: Arc::new(AtomicBool::new(false)),
-            reconciliation_complete: Arc::new(AtomicBool::new(false)),
-            installed_packages_observer: Arc::new(RwLock::new(None)),
-            ollama_hub_resolution: Arc::new(AtomicBool::new(false)),
-            readers: Arc::default(),
-        };
-        // The release catalog's headers are pinned from the start; the installed packages' once
-        // reconciliation finds them.
-        manager.pin_headers();
-        manager.request_installed_model_reconciliation();
-        Ok(manager)
+    ) -> BoxFuture<'static, Result<Self, InventoryError>> {
+        Box::pin(async move {
+            config.prepare_roots().await?;
+            let client = hub_client(&config, None)?;
+            let cache = ModelCache::with_header_capacity(&config.cache_root, config.header_cache_capacity);
+            let catalog_affiliations = CatalogAffiliations::load(&config.root);
+            let local_models = Arc::new(RwLock::new(config.local_models.clone()));
+            let manager = Self {
+                volume: Arc::new(crate::download::VolumeWrites::new(download_space)),
+                download_slots: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_downloads)),
+                config,
+                client,
+                hub_credential: Arc::new(RwLock::new(None)),
+                http: reqwest::Client::new(),
+                models: Arc::new(RwLock::new(BTreeMap::new())),
+                operations: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+                cache,
+                local_models,
+                root_scans: Arc::default(),
+                installed_packages: Arc::new(RwLock::new(InstalledPackageSnapshot::default())),
+                model_assessments: Arc::new(RwLock::new(BTreeMap::new())),
+                catalog_affiliations: Arc::new(RwLock::new(catalog_affiliations)),
+                cache_evidence: Arc::new(RwLock::new(BTreeMap::new())),
+                ensure_gate: Arc::new(tokio::sync::Mutex::new(())),
+                ensure_generation: Arc::new(AtomicU64::new(0)),
+                packages_revision: Arc::new(AtomicU64::new(0)),
+                reconciliation_running: Arc::new(AtomicBool::new(false)),
+                reconciliation_complete: Arc::new(AtomicBool::new(false)),
+                installed_packages_observer: Arc::new(RwLock::new(None)),
+                ollama_hub_resolution: Arc::new(AtomicBool::new(false)),
+                readers: Arc::default(),
+            };
+            // The release catalog's headers are pinned from the start; the installed packages' once
+            // reconciliation finds them.
+            manager.pin_headers();
+            manager.request_installed_model_reconciliation();
+            Ok(manager)
+        })
     }
 
     /// Resolves the Hub files of unresolved `hf.co` Ollama pulls in the background, and rescans the
@@ -3751,7 +3754,8 @@ mod tests {
         let attribution =
             |target: ModelPackage, hidden: Vec<magnitude_service_contracts::models::ModelId>| {
                 let (store, cache, hf_cache) = (store.clone(), cache.clone(), hf_cache.clone());
-                async move {
+                // Boxed: the test awaits it again and again, each await a copy.
+                Box::pin(async move {
                     let mut configured = InventoryConfig::with_roots(store, cache).unwrap();
                     configured.add_hugging_face_caches([hf_cache]);
                     configured.local_models.hidden = hidden;
@@ -3761,7 +3765,7 @@ mod tests {
                     manager.list_installed().await.unwrap().packages[0]
                         .catalog_attribution
                         .clone()
-                }
+                })
             };
 
         assert!(matches!(

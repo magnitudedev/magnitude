@@ -560,44 +560,50 @@ fn main() -> anyhow::Result<()> {
     })
 }
 
+/// The command's work, boxed: the futures of every command together would
+/// otherwise fill the one frame that polls them.
 async fn run(command: Command) -> anyhow::Result<()> {
-    match command {
+    let work: futures_util::future::LocalBoxFuture<'static, anyhow::Result<()>> = match command {
         Command::UpdateLock {
             output,
             models,
             store,
-        } => {
+        } => Box::pin(async move {
             let advance = if models.is_empty() {
                 CatalogLockAdvance::All
             } else {
                 CatalogLockAdvance::Models(models.into_iter().collect())
             };
             update_lock(output, advance, &store).await
+        }),
+        Command::BuildBundle { output, store } => {
+            Box::pin(async move { build_bundle(output, &store).await })
         }
-        Command::BuildBundle { output, store } => build_bundle(output, &store).await,
-        Command::Headers { output, store } => {
+        Command::Headers { output, store } => Box::pin(async move {
             let exported = headers(output, &store).await?;
             println!("{}", exported.display());
             Ok(())
-        }
-        Command::Acquire { model, store } => acquire(model, &store).await,
+        }),
+        Command::Acquire { model, store } => Box::pin(async move { acquire(model, &store).await }),
         Command::FixtureHeader {
             repository,
             revision,
             path,
             output_dir,
             store,
-        } => fixture_header(repository, revision, path, output_dir, store).await,
+        } => Box::pin(fixture_header(
+            repository, revision, path, output_dir, store,
+        )),
         Command::WeightSample {
             source,
             name,
             output_dir,
-        } => weight_sample(source, name, output_dir).await,
-        Command::Header { source } => {
+        } => Box::pin(weight_sample(source, name, output_dir)),
+        Command::Header { source } => Box::pin(async move {
             let gguf = Gguf::open(&source).await?;
             println!("{}", serde_json::to_string_pretty(&describe(&gguf)?)?);
             Ok(())
-        }
+        }),
         Command::Slice {
             output,
             layers,
@@ -606,39 +612,34 @@ async fn run(command: Command) -> anyhow::Result<()> {
             list,
             parallel,
             source,
-        } => {
-            let options = slice::Options {
-                source,
-                output,
-                layers,
-                minimum,
-                no_mtp,
-                list,
-                parallel,
-            };
-            slice::run(options).await
-        }
+        } => Box::pin(slice::run(slice::Options {
+            source,
+            output,
+            layers,
+            minimum,
+            no_mtp,
+            list,
+            parallel,
+        })),
         Command::SliceRecord {
             source,
             layers,
             output,
-        } => {
-            slice::record_existing(slice::RecordOptions {
-                output,
-                source,
-                layers,
-            })
-            .await
-        }
+        } => Box::pin(slice::record_existing(slice::RecordOptions {
+            output,
+            source,
+            layers,
+        })),
         Command::Audit {
             headers: output,
             output: report,
             store,
-        } => {
+        } => Box::pin(async move {
             let exported = headers(output, &store).await?;
             audit::run(&exported, &report)
-        }
-    }
+        }),
+    };
+    work.await
 }
 
 #[cfg(test)]

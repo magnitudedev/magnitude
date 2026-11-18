@@ -7,6 +7,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 
+use futures_util::future::BoxFuture;
+
 use magnitude_engine::assessment::ModelPackagePaths;
 use magnitude_engine::composition::EngineConfiguration;
 use magnitude_engine::error::ResolveError;
@@ -109,27 +111,29 @@ impl ResolvedConfigurations {
     /// now: a package is named by its content, which may be in several places or move, so a file
     /// moved, or the copy that served it gone, resolves afresh from where the package is, never
     /// from where it was.
-    pub async fn resolve(
-        &self,
-        configuration: &ModelServingConfiguration,
-    ) -> Result<HeldConfiguration, InventoryError> {
-        let (input, package_ids) = (installed_bundle(&configuration.bundle), configuration.bundle.package_ids());
-        let material = self.models.resolve_bundle(input).await?;
-        let paths = engine_material(&material)?;
-        let context_tokens = configuration.profile.context_length;
-        let key = ResolutionKey {
-            bundle: servable_model_bundle_key_for_bundle(&configuration.bundle),
-            context_tokens,
-            files: std::iter::once(paths.target.clone())
-                .chain(paths.projector.clone())
-                .chain(paths.draft.clone())
-                .collect(),
-        };
-        let configuration = self
-            .cache
-            .resolve(key, || self.resolve_material(paths, package_ids, context_tokens))
-            .await?;
-        Ok(HeldConfiguration { configuration, _material: material })
+    pub fn resolve<'a>(
+        &'a self,
+        configuration: &'a ModelServingConfiguration,
+    ) -> BoxFuture<'a, Result<HeldConfiguration, InventoryError>> {
+        Box::pin(async move {
+            let (input, package_ids) = (installed_bundle(&configuration.bundle), configuration.bundle.package_ids());
+            let material = self.models.resolve_bundle(input).await?;
+            let paths = engine_material(&material)?;
+            let context_tokens = configuration.profile.context_length;
+            let key = ResolutionKey {
+                bundle: servable_model_bundle_key_for_bundle(&configuration.bundle),
+                context_tokens,
+                files: std::iter::once(paths.target.clone())
+                    .chain(paths.projector.clone())
+                    .chain(paths.draft.clone())
+                    .collect(),
+            };
+            let configuration = self
+                .cache
+                .resolve(key, || self.resolve_material(paths, package_ids, context_tokens))
+                .await?;
+            Ok(HeldConfiguration { configuration, _material: material })
+        })
     }
 
     async fn resolve_material(
@@ -150,7 +154,7 @@ impl ResolvedConfigurations {
             .await
             .map_err(resolve_failure)?;
         Ok(Arc::new(ResolvedConfiguration {
-            host: Arc::new(resolved.host),
+            host: resolved.host,
             manifest: resolved.manifest,
             package_ids,
         }))

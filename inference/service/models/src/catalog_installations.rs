@@ -199,41 +199,45 @@ impl ManagedCatalogInstallations {
         Ok(())
     }
 
-    pub(crate) async fn install(
-        &self,
-        id: &ModelId,
-    ) -> Result<CatalogInstallationAdmission, InventoryError> {
-        let _mutation = self.mutations.lock().await;
-        reject_unavailable(id, self.resolver.catalog_definition(id)?)?;
-        self.reject_active(id).await?;
-        let bundle = self.resolver.desired_catalog_configuration(id)?.bundle;
-        let requested = RequestedDownload {
-            model: id.clone(),
-            part: None,
-        };
-        self.admit(id, bundle, requested).await
+    pub(crate) fn install<'a>(
+        &'a self,
+        id: &'a ModelId,
+    ) -> BoxFuture<'a, Result<CatalogInstallationAdmission, InventoryError>> {
+        Box::pin(async move {
+            let _mutation = self.mutations.lock().await;
+            reject_unavailable(id, self.resolver.catalog_definition(id)?)?;
+            self.reject_active(id).await?;
+            let bundle = self.resolver.desired_catalog_configuration(id)?.bundle;
+            let requested = RequestedDownload {
+                model: id.clone(),
+                part: None,
+            };
+            self.admit(id, bundle, requested).await
+        })
     }
 
     /// Fetches only one component a found exact target lacks; the found weights stay where they
     /// are and the rest of the bundle is untouched.
-    pub(crate) async fn install_component(
-        &self,
-        id: &ModelId,
+    pub(crate) fn install_component<'a>(
+        &'a self,
+        id: &'a ModelId,
         component: CatalogComponent,
-    ) -> Result<CatalogInstallationAdmission, InventoryError> {
-        let _mutation = self.mutations.lock().await;
-        reject_unavailable(id, self.resolver.catalog_definition(id)?)?;
-        self.reject_active(id).await?;
-        match self.resolver.catalog_component_download(id, component)? {
-            Some(bundle) => {
-                let requested = RequestedDownload {
-                    model: id.clone(),
-                    part: Some(component.into()),
-                };
-                self.admit(id, bundle, requested).await
+    ) -> BoxFuture<'a, Result<CatalogInstallationAdmission, InventoryError>> {
+        Box::pin(async move {
+            let _mutation = self.mutations.lock().await;
+            reject_unavailable(id, self.resolver.catalog_definition(id)?)?;
+            self.reject_active(id).await?;
+            match self.resolver.catalog_component_download(id, component)? {
+                Some(bundle) => {
+                    let requested = RequestedDownload {
+                        model: id.clone(),
+                        part: Some(component.into()),
+                    };
+                    self.admit(id, bundle, requested).await
+                }
+                None => Ok(CatalogInstallationAdmission::Current),
             }
-            None => Ok(CatalogInstallationAdmission::Current),
-        }
+        })
     }
 
     async fn reject_active(&self, id: &ModelId) -> Result<(), InventoryError> {

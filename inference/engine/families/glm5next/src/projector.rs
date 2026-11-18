@@ -115,7 +115,7 @@ const POST_NORM_EPSILON: f64 = 1e-5;
 pub fn describe_projector(
     directory: &Directory,
     target_width: u64,
-) -> Result<VisionDescription, FamilyError> {
+) -> Result<Box<VisionDescription>, FamilyError> {
     projector_type(directory, &[(PROJECTOR_TYPE, ())], target_width)?;
     if let Some(entry) = directory
         .metadata
@@ -306,7 +306,7 @@ pub fn describe_projector(
         output_norm: None,
     };
     tensors.finish()?;
-    let description = VisionDescription {
+    let description = Box::new(VisionDescription {
         // F16 intermediates around an F32 residual stream, as the Qwen3-VL
         // tower the vision kernels were measured on: the clamps bound the
         // feed-forward products, and the norms bound the rest.
@@ -329,7 +329,7 @@ pub fn describe_projector(
         window: None,
         blocks,
         merger,
-    };
+    });
     description
         .validate()
         .map_err(|error| invalid(error.to_string()))?;

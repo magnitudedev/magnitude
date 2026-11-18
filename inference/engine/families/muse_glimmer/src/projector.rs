@@ -80,7 +80,7 @@ pub fn describe_projector(
     directory: &Directory,
     output_hidden: u64,
     feature_epsilon: f64,
-) -> Result<VisionDescription, Error> {
+) -> Result<Box<VisionDescription>, Error> {
     projector_type(directory, &[("muse-glimmer", ())], output_hidden)?;
     if let Some((_, entry)) = architecture_keys(directory, PROJECTOR_ARCHITECTURE)
         .find(|(_, entry)| !KEYS.contains(&entry.name.as_str()))
@@ -201,7 +201,7 @@ pub fn describe_projector(
     // one frame (a still image repeats its frame).
     let frame = t.bind("v.patch_embd.weight", &[hidden, 3, patch, patch])?;
     t.finish()?;
-    let description = VisionDescription {
+    let description = Box::new(VisionDescription {
         activation_dtype: ActivationDType::BF16,
         hidden,
         output_hidden,
@@ -240,7 +240,7 @@ pub fn describe_projector(
                 epsilon: feature_epsilon,
             }),
         },
-    };
+    });
     description
         .validate()
         .map_err(|error| invalid(error.to_string()))?;

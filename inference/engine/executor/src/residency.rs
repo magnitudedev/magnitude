@@ -787,9 +787,7 @@ impl Imports {
 pub struct ResidencyStore {
     device: Rc<Device>,
     programs: Rc<crate::native::AttestedPrograms>,
-    /// Boxed: a plan is kilobytes, which the store, every component loader
-    /// holding one, and the domain holding those would carry by value.
-    execution: Box<ExecutionPlan>,
+    execution: ExecutionPlan,
     domain: ResourceDomainId,
     resident: Imports,
     /// Whose import the store makes now: the target's until an optional
@@ -884,7 +882,7 @@ impl ResidencyStore {
         Ok(Self {
             device,
             programs,
-            execution: Box::new(execution),
+            execution,
             domain,
             resident: Imports::default(),
             importer: Importer::Target,

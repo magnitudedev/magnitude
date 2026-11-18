@@ -31,7 +31,7 @@ use super::selection::{
 };
 use super::split::{AttentionBlock, AttentionTopology, PickedPart, Plane, SelectedRead, SelectionReals, both, picked as picked_part};
 use crate::planning::{RoundingArguments, axis};
-use crate::programs::native_target_graph::{PackedWeight, PlannedWeights, WeightOperands, WeightPort};
+use crate::programs::native_target_graph::{PackedWeight, PlannedWeights, WeightOperands, WeightPort, weight};
 use crate::{AttentionBinding, AttentionShape, AttentionValues, SublayerTail};
 use crate::{
     native::{
@@ -667,10 +667,12 @@ pub(crate) struct AttentionWeights {
     pub post_norm: Option<WorkflowTensor>,
     /// The projections' scales and packing bounds.
     pub operands: AttentionOperands,
-    /// A selected read's weights.
-    pub selection: Option<SelectionWeights>,
-    /// An indexing index-list source's weights.
-    pub picked: Option<PickedWeights>,
+    /// A selected read's weights, held apart: only an operator that selects
+    /// has them.
+    pub selection: Option<Box<SelectionWeights>>,
+    /// An indexing index-list source's weights, held apart: only an
+    /// operator with its own indexer has them.
+    pub picked: Option<Box<PickedWeights>>,
 }
 
 /// The scales and packing bounds of an attention block's projections, in
@@ -688,11 +690,12 @@ pub(crate) struct AttentionOperands {
     pub output: WeightOperands,
     pub grouped: WeightOperands,
     pub absorbed: WeightOperands,
-    /// A selected read's projections'.
-    pub selection: Option<SelectionOperands>,
+    /// A selected read's projections', held apart: only an operator that
+    /// selects has them.
+    pub selection: Option<Box<SelectionOperands>>,
     /// An indexing index-list source's projections', where the block
-    /// attends.
-    pub picked: Option<PickedOperands>,
+    /// attends, held apart: only an operator with its own indexer has them.
+    pub picked: Option<Box<PickedOperands>>,
 }
 
 /// An indexing index-list source's projections' operands: an own source's
@@ -733,7 +736,7 @@ impl AttentionOperands {
     /// (`attention_weights`): the query, gate and output's only where it
     /// attends (`attends`), and none of an absent segment's.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn planned<G: GraphDraft>(
+    fn planned<G: GraphDraft>(
         graph: &mut G,
         weights: &(impl PlannedWeights + ?Sized),
         scope: WeightScope,
@@ -766,7 +769,7 @@ impl AttentionOperands {
         // its indexer run by those that attend and score.
         let selection = match &numbers.selection {
             None => None,
-            Some(read) => Some(SelectionOperands {
+            Some(read) => Some(Box::new(SelectionOperands {
                 projection: operands(graph, true, WeightKind::IndexerKey)?,
                 gate: match read.keys.gated {
                     true => Some(operands(graph, true, WeightKind::IndexerKeyGate)?),
@@ -776,10 +779,10 @@ impl AttentionOperands {
                     true => Some(indexer!(read.source.head_weights)),
                     false => None,
                 },
-            }),
+            })),
         };
         let picked = match picked_part(topology, numbers) {
-            Some(PickedPart::Indexed { source: index, .. }) if attends => Some(PickedOperands {
+            Some(PickedPart::Indexed { source: index, .. }) if attends => Some(Box::new(PickedOperands {
                 rows: match &index.own {
                     Some(own) => Some(PooledOperands {
                         projection: operands(graph, true, WeightKind::PooledProjection)?,
@@ -792,7 +795,7 @@ impl AttentionOperands {
                     None => None,
                 },
                 indexer: indexer!(index.head_weights),
-            }),
+            })),
             _ => None,
         };
         Ok(Self {
@@ -1383,9 +1386,56 @@ pub(crate) fn history_tile_bytes(visible: &[u8], tiles: usize) -> Option<Vec<u8>
         .map(|tiles| tiles.iter().flat_map(|tile| tile.to_le_bytes()).collect())
 }
 
+impl AttentionWeights {
+    /// The weights at `scope` of the block `topology` at `numbers` that its
+    /// graph over `form` reads, its output's only where it attends
+    /// (`attends`): their operands ([`AttentionOperands::planned`]), then
+    /// each weight's port, but the input norm `input_norm` gives where it
+    /// gives one.
+    pub(crate) fn planned<G: GraphDraft>(
+        graph: &mut G,
+        planned: &(impl PlannedWeights + ?Sized),
+        scope: WeightScope,
+        (topology, numbers): (&AttentionTopology, &AttentionBlock),
+        (form, attends): (InputForm, bool),
+        input_norm: Option<&WorkflowTensor>,
+        (ports, constants): (&mut Vec<(WeightPort, NativePort)>, &mut Vec<GraphConstant>),
+    ) -> Result<Self, GraphError> {
+        let operands = AttentionOperands::planned(graph, planned, scope, topology, numbers, attends, ports, constants)?;
+        attention_weights(topology, numbers, form, attends, operands, |kind| match (kind, input_norm) {
+            (WeightKind::InputNorm, Some(norm)) => Ok(norm.clone()),
+            (kind, _) => weight(graph, planned, scope, kind, ports),
+        })
+    }
+
+    /// These weights as another pass of the same layer reads them under its
+    /// own `input_norm`: every projection and its operands, with no post-norm
+    /// tail and no selected read or index-list source of the pass's own.
+    pub(crate) fn for_block(&self, input_norm: WorkflowTensor) -> Self {
+        Self {
+            input_norm: Some(input_norm),
+            query: self.query.clone(),
+            low_rank_query: self.low_rank_query.clone(),
+            absorbed: self.absorbed.clone(),
+            gate: self.gate.clone(),
+            key: self.key.clone(),
+            value: self.value.clone(),
+            query_norm: self.query_norm.clone(),
+            key_norm: self.key_norm.clone(),
+            sinks: self.sinks.clone(),
+            output: self.output.clone(),
+            grouped: self.grouped.clone(),
+            post_norm: None,
+            operands: self.operands.clone(),
+            selection: None,
+            picked: None,
+        }
+    }
+}
+
 /// The block's attention weights in the order and presence its topology,
 /// input form, sublayer tail and projection operands define.
-pub(crate) fn attention_weights(
+fn attention_weights(
     topology: &AttentionTopology,
     numbers: &AttentionBlock,
     form: InputForm,
@@ -1418,13 +1468,13 @@ pub(crate) fn attention_weights(
             WeightKind::AttentionOutputGrouped,
         )?,
         post_norm: present(topology.post_norm.is_some(), WeightKind::PostNorm)?,
-        picked: match (&operands.picked, picked_part(topology, numbers)) {
+        picked: match (operands.picked.as_deref(), picked_part(topology, numbers)) {
             (Some(picked), Some(PickedPart::Indexed { reals: index, .. })) => {
                 let packed = |weight: WorkflowTensor, operands: &WeightOperands| PackedWeight {
                     weight,
                     operands: operands.clone(),
                 };
-                Some(PickedWeights {
+                Some(Box::new(PickedWeights {
                     rows: match &picked.rows {
                         Some(rows) => Some(PooledWeights {
                             projection: packed(weight(WeightKind::PooledProjection)?, &rows.projection),
@@ -1439,20 +1489,20 @@ pub(crate) fn attention_weights(
                         None => None,
                     },
                     indexer: indexer_weights(&picked.indexer, index.query_norm.is_some(), &mut weight)?,
-                })
+                }))
             }
             (None, _) => None,
             (Some(_), _) => {
                 return Err("index-list operands of an operator without its own indexer".into());
             }
         },
-        selection: match (&operands.selection, both(&numbers.selection, &topology.selection, "selected read")) {
+        selection: match (operands.selection.as_deref(), both(&numbers.selection, &topology.selection, "selected read")) {
             (Some(selection), Some((read, reals))) => {
                 let packed = |weight: WorkflowTensor, operands: &WeightOperands| PackedWeight {
                     weight,
                     operands: operands.clone(),
                 };
-                Some(SelectionWeights {
+                Some(Box::new(SelectionWeights {
                     projection: packed(weight(WeightKind::IndexerKey)?, &selection.projection),
                     gate: match &selection.gate {
                         Some(gate) => Some(packed(weight(WeightKind::IndexerKeyGate)?, gate)),
@@ -1475,7 +1525,7 @@ pub(crate) fn attention_weights(
                         )?),
                         None => None,
                     },
-                })
+                }))
             }
             (None, None) => None,
             _ => return Err("a selected read's operands and block disagree".into()),
@@ -1704,7 +1754,7 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
     // the low-rank query's `qr`.
     let selection = match (
         kernels.selection,
-        &weights.selection,
+        weights.selection.as_deref(),
         both(&numbers.selection, &topology.selection, "selected read"),
     ) {
         (None, None, None) => None,
@@ -1734,7 +1784,7 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
         Some(PickedPart::Reused { plane }) => Some(Picked::Reused { plane }),
         Some(PickedPart::Indexed { source, reals }) => {
             let (Some(entries), Some(weights), Some((qr, rank, qr_epsilon, qr_norm))) =
-                (kernels.picked, &weights.picked, &qr_rows)
+                (kernels.picked, weights.picked.as_deref(), &qr_rows)
             else {
                 return Err(
                     "an indexing index-list source without its entries, weights or low-rank query"

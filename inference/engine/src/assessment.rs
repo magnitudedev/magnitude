@@ -356,7 +356,7 @@ pub enum PreparedDrafter {
     /// plan's charge less of.
     Bound {
         method: SpeculativeMethod,
-        alone: TargetAlone,
+        alone: Box<TargetAlone>,
     },
     Rejected(UnsupportedModel),
 }
@@ -364,7 +364,9 @@ pub enum PreparedDrafter {
 /// The target's plan alone at a drafted plan's holding of experts
 /// (`ExecutionPlanDraft::holding_as`) and its charge's structure, whose
 /// target and vision families are the drafted plan's without its drafter's
-/// writes (`StructuralCharge::undrafted`).
+/// writes (`StructuralCharge::undrafted`). Boxed where it is made
+/// ([`target_alone`]): it carries a whole definition, plan draft and charge
+/// structure, and a preparation is moved by value through deep frames.
 pub struct TargetAlone {
     definition: ModelDefinition,
     draft: ExecutionPlanDraft,
@@ -374,11 +376,10 @@ pub struct TargetAlone {
 impl PreparedDrafter {
     /// The drafter's verdict at `context` tokens of the served context, its
     /// graphs priced at `pricing`: a bound drafter's memory is the drafted
-    /// plan's serving and host charge (`execution`'s primary form of
-    /// `definition`) less the target's alone at the same holding of experts.
+    /// plan's serving and host charge (`execution`'s primary form of its
+    /// definition) less the target's alone at the same holding of experts.
     fn verdict(
         &self,
-        definition: &ModelDefinition,
         execution: &PreparedExecutionAssessment,
         context: u32,
         pricing: GraphPricing,
@@ -398,7 +399,7 @@ impl PreparedDrafter {
                 .map_err(ModelAssessmentError::Planning)
         };
         let primary = execution.primary();
-        let with = held(definition, &primary.draft, &primary.structure)?;
+        let with = held(execution.definition(), &primary.draft, &primary.structure)?;
         let without = held(&alone.definition, &alone.draft, &alone.structure)?;
         assert!(
             with >= without,
@@ -518,18 +519,16 @@ pub enum PreparedModelAssessment {
         fingerprint: Option<ModelFingerprint>,
     },
     /// The package planned at its largest served tier, `facts.context_limit`
-    /// (`definition` and `execution`, its drafter in `facts`): every served
-    /// tier's fit and its drafter's memory are arithmetic over it
-    /// ([`finish_model_assessment`]).
+    /// (`execution` with the definition it plans, its drafter in `facts`):
+    /// every served tier's fit and its drafter's memory are arithmetic over
+    /// it ([`finish_model_assessment`]).
     ///
-    /// Its facts, definition and execution are boxed: each carries whole
-    /// definitions and plan drafts, and a preparation is returned by value
-    /// through deep frames, whose stacks hold every by-value copy
+    /// Its facts and execution are boxed: each carries whole definitions and
+    /// plan drafts, and a preparation is returned by value through deep
+    /// frames, whose stacks hold every by-value copy
     /// (`seismic_threads::STACK_BYTES`).
     Planned {
         facts: Box<ModelFacts<PreparedDrafter>>,
-        /// The definition `execution` plans, at the largest served tier.
-        definition: Box<ModelDefinition>,
         execution: Box<PreparedExecutionAssessment>,
         /// The package's served tiers, largest first: every one of
         /// [`served_contexts`], or the one
@@ -577,7 +576,7 @@ pub fn finish_model_assessment(
     performance_depths: &[u32],
     sequences: u32,
 ) -> Result<ModelAssessment, ModelAssessmentError> {
-    let (facts, definition, execution, tiers) = match prepared {
+    let (facts, execution, tiers) = match prepared {
         PreparedModelAssessment::Unsupported {
             unsupported,
             fingerprint,
@@ -587,8 +586,9 @@ pub fn finish_model_assessment(
                 fingerprint: fingerprint.clone(),
             });
         }
-        PreparedModelAssessment::Planned { facts, definition, execution, tiers } => (&**facts, &**definition, &**execution, tiers),
+        PreparedModelAssessment::Planned { facts, execution, tiers } => (&**facts, &**execution, tiers),
     };
+    let definition = execution.definition();
     let structure = &setup.structure;
     let pricing = structure.selected.graph_cost;
     let served = served_tier(tiers.len(), |index| {
@@ -608,7 +608,7 @@ pub fn finish_model_assessment(
     let tier = match &served {
         Ok((tier, _)) | Err((tier, _)) => *tier,
     };
-    let facts = facts.with_drafter(facts.drafter.verdict(definition, execution, tier, pricing)?);
+    let facts = facts.with_drafter(facts.drafter.verdict(execution, tier, pricing)?);
     let fit = match served {
         Ok((_, fit)) => fit,
         Err((_, shortfall)) => {
@@ -809,7 +809,7 @@ pub fn prepare_model_assessment_from(
         }
         Admission::Admitted(admitted) => admitted.served_at(structure.served_context)?,
     };
-    let (drafter, definition, execution) = match plan_package(&admitted, structure)? {
+    let (drafter, execution) = match plan_package(&admitted, structure)? {
         Ok(planned) => planned,
         Err(unsupported) => {
             return Ok(PreparedModelAssessment::Unsupported {
@@ -820,8 +820,7 @@ pub fn prepare_model_assessment_from(
     };
     Ok(PreparedModelAssessment::Planned {
         facts: Box::new(admitted.facts(drafter)),
-        definition: Box::new(definition),
-        execution: Box::new(execution),
+        execution,
         tiers: match structure.served_context {
             Some(_) => vec![admitted.context_limit],
             None => served_contexts(admitted.context_limit),
@@ -836,7 +835,7 @@ pub fn prepare_model_assessment_from(
 fn plan_package(
     admitted: &AdmittedPackage,
     structure: &AssessmentStructure,
-) -> Result<Result<(PreparedDrafter, ModelDefinition, PreparedExecutionAssessment), UnsupportedModel>, ModelAssessmentError> {
+) -> Result<Result<(PreparedDrafter, Box<PreparedExecutionAssessment>), UnsupportedModel>, ModelAssessmentError> {
     let environment = Environment {
         policy: &structure.policy,
         service: &structure.service,
@@ -846,31 +845,13 @@ fn plan_package(
     let plain = environment
         .plain(admitted, admitted.definition.clone())
         .map_err(ModelAssessmentError::Configuration)?;
-    let drafted = match &admitted.drafter {
-        DrafterAdmission::None => Err(PreparedDrafter::None),
-        DrafterAdmission::Rejected(unsupported) => {
-            Err(PreparedDrafter::Rejected(unsupported.clone()))
-        }
-        DrafterAdmission::Candidate { definition, method } => environment
-            .drafted(admitted, definition, *method)
-            .and_then(|(manifest, method)| {
-                match prepare_forms(&manifest, &structure.selected, StructuralCharge::with_undrafted) {
-                    Ok(forms) => Ok((method, manifest, forms)),
-                    Err(Refusal::Unsupported(unsupported)) => Err(unsupported),
-                    Err(Refusal::Failed(error)) => {
-                        Err(UnsupportedModel::mismatch(error.to_string()))
-                    }
-                }
-            })
-            .map_err(PreparedDrafter::Rejected),
-    };
     // The target's plan alone is a package's refusal: a drafter's own is
     // the drafter's.
     let refused = |refusal| match refusal {
         Refusal::Unsupported(unsupported) => Ok(Err(unsupported)),
         Refusal::Failed(error) => Err(error),
     };
-    let (drafter, definition, forms) = match drafted {
+    let (drafter, definition, forms) = match drafted_plan(&environment, admitted, &structure.selected) {
         Ok((method, manifest, forms)) => match target_alone(plain, &structure.selected, &forms) {
             Ok(alone) => (PreparedDrafter::Bound { method, alone }, manifest.definition, forms.structures()),
             Err(refusal) => return refused(refusal),
@@ -885,10 +866,41 @@ fn plan_package(
             }
         }
     };
-    match prepare_execution_assessment(&definition, forms) {
-        Ok(execution) => Ok(Ok((drafter, definition, execution))),
+    match prepare_execution_assessment(definition, forms) {
+        Ok(execution) => Ok(Ok((drafter, execution))),
         Err(AssessmentError::Graph(error)) => refused(Refusal::of(classify_graph(error))),
         Err(error) => Err(ModelAssessmentError::Assessment(error)),
+    }
+}
+
+/// `admitted` drafting with its drafter, planned on `selected` with each
+/// way of holding its experts outlined once beside the target's writes
+/// alone (`StructuralCharge::with_undrafted`), and the method that drafts;
+/// or the drafter's verdict where there is no drafter, or it does not plan.
+/// A frame of its own: its manifests are each a whole definition, which
+/// [`plan_package`]'s frame would hold beside the target's.
+fn drafted_plan(
+    environment: &Environment<'_>,
+    admitted: &AdmittedPackage,
+    selected: &SelectedDevice,
+) -> Result<(SpeculativeMethod, ExecutionManifest, FloorForms<UndraftedBounds>), PreparedDrafter> {
+    match &admitted.drafter {
+        DrafterAdmission::None => Err(PreparedDrafter::None),
+        DrafterAdmission::Rejected(unsupported) => {
+            Err(PreparedDrafter::Rejected(unsupported.clone()))
+        }
+        DrafterAdmission::Candidate { definition, method } => environment
+            .drafted(admitted, definition, *method)
+            .and_then(|(manifest, method)| {
+                match prepare_forms(&manifest, selected, StructuralCharge::with_undrafted) {
+                    Ok(forms) => Ok((method, manifest, forms)),
+                    Err(Refusal::Unsupported(unsupported)) => Err(unsupported),
+                    Err(Refusal::Failed(error)) => {
+                        Err(UnsupportedModel::mismatch(error.to_string()))
+                    }
+                }
+            })
+            .map_err(PreparedDrafter::Rejected),
     }
 }
 
@@ -902,7 +914,7 @@ fn target_alone(
     plain: ExecutionManifest,
     selected: &SelectedDevice,
     drafted: &FloorForms<UndraftedBounds>,
-) -> Result<TargetAlone, Refusal> {
+) -> Result<Box<TargetAlone>, Refusal> {
     let backend = selected.info.backend();
     let primary = drafted.primary();
     let draft = plan_resident(&plain, selected)
@@ -913,7 +925,7 @@ fn target_alone(
         AssessmentError::Graph(error) => Refusal::of(classify_graph(error)),
         error => Refusal::Failed(ModelAssessmentError::Assessment(error)),
     })?;
-    Ok(TargetAlone { definition: plain.definition, draft, structure })
+    Ok(Box::new(TargetAlone { definition: plain.definition, draft, structure }))
 }
 
 /// The native kernels a load of one package prepares on a backend, or why
@@ -938,7 +950,7 @@ pub fn kernel_inventory(
         Admission::Unsupported { unsupported, .. } => {
             return Ok(KernelInventory::Unsupported(unsupported));
         }
-        Admission::Admitted(admitted) => *admitted,
+        Admission::Admitted(admitted) => admitted,
     };
     let environment = Environment {
         policy,
@@ -1178,7 +1190,7 @@ struct AdmittedPackage {
 impl AdmittedPackage {
     /// The package planned at `served` tokens of context, as a load serving
     /// it at that context holds it; at its declared limit when none.
-    fn served_at(mut self: Box<Self>, served: Option<usize>) -> Result<Self, ModelAssessmentError> {
+    fn served_at(mut self: Box<Self>, served: Option<usize>) -> Result<Box<Self>, ModelAssessmentError> {
         let limit = crate::host::resolve_served_context(served, self.definition.decoder.context_limit)
             .map_err(|error| ModelAssessmentError::Configuration(error.to_string()))?;
         self.definition.decoder.context_limit = limit;
@@ -1188,7 +1200,7 @@ impl AdmittedPackage {
             definition.decoder.context_limit = limit;
         }
         self.context_limit = u32::try_from(limit).map_err(|_| ModelAssessmentError::ContextLimit(limit))?;
-        Ok(*self)
+        Ok(self)
     }
 
     fn facts<D>(&self, drafter: D) -> ModelFacts<D> {

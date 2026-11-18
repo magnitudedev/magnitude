@@ -17,8 +17,8 @@
 use super::{DeviceSubmission, HeadOutput, HeadProgram, HeadSelections};
 use crate::device_table::SelectedRead;
 use crate::operators::streams::{
-    BlockStreams, StreamsGeometry,
-    graph::{CheckedStreamsEntries, StreamsEntries, mix_site},
+    BlockStreams, Sites, StreamsGeometry,
+    graph::{CheckedStreamsEntries, MixSite, SiteEntries, StreamsEntries, mix_site},
 };
 use crate::operators::{
     self, CausalHeadBlock, InputForm, Join, Mixer, SublayerInput, paired_block,
@@ -30,8 +30,8 @@ use crate::{
     completion::CompletionWaiter,
     native::{AttestedFeedForward, AttestedHead, AttestedHeadBlock, AttestedLanding},
     operators::attention::graph::{
-        self as attention_graph, AttentionGraphEntries, AttentionOperands,
-        CheckedAttentionEntries, IndexerControlPorts, IndexerStatePorts, attention_weights,
+        self as attention_graph, AttentionGraphEntries, AttentionWeights,
+        CheckedAttentionEntries, IndexerControlPorts, IndexerStatePorts,
     },
     operators::attention::split::{AttentionBlock, AttentionSite, AttentionTopology, SelectionSite, split},
     planning::{DomainRows, HeadHistoryGeometry},
@@ -835,19 +835,18 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
     numbers: &HeadNumbers,
 ) -> Result<HeadGraphParts<G>, GraphError> {
     let planned = &numbers.weights;
-    let HeadPasses { shaped, device, prefix } = topology.passes;
+    let HeadPasses { device, prefix, .. } = topology.passes;
     let steps = topology.drafting.map_or(0, |drafting| drafting.steps.get());
     let (entry_rows, slots, hidden, vocabulary) =
         (&numbers.attention.rows, &numbers.slots, &numbers.hidden, &numbers.vocabulary);
-    let streams = numbers.streams.clone();
+    let streams = &numbers.streams;
     let sites = entries
         .streams
         .map(|entries| entries.low_rank().ok_or(crate::operators::SINKHORN_HEAD))
         .transpose()?;
     let stream_count = streams.as_ref().map_or(1, |streams| streams.streams);
     let conditioning_width = hidden * stream_count;
-    let residual_chain = topology.residual_chain;
-    let conditioning_element = if residual_chain {
+    let conditioning_element = if topology.residual_chain {
         Element::f32()
     } else {
         topology.activation
@@ -864,10 +863,8 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
         };
     }
     // The one supported head block: its own weights, then its attention and
-    // feed-forward sublayers.
+    // feed-forward sublayers ([`head_sublayer`]).
     let head = WeightScope::HeadBlock(0);
-    let [attention_scope, feed_forward_scope] =
-        [0, 1].map(|sublayer| WeightScope::HeadSublayer(SublayerIndex { block: 0, sublayer }));
     // The entry pass embeds the host's tokens, a chained pass the tokens
     // the device selected.
     let mut table = GatheredTable::of(
@@ -882,26 +879,15 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
     let combine = weight!(head, WeightKind::HeadCombine);
     let inject_only = topology.drafting.is_none();
     let mut constants = Vec::new();
-    // The head's attention at a pass of `rows` rows.
-    let attention_pass = |rows: &Dim| numbers.attention.at_rows(rows.clone());
-    let operands = AttentionOperands::planned(
+    // Draft head sublayers add their outputs to the residual (admission).
+    let attention_weights = AttentionWeights::planned(
         &mut graph,
         planned,
-        attention_scope,
-        &topology.attention,
-        &numbers.attention,
-        !inject_only,
-        &mut weights,
-        &mut constants,
-    )?;
-    // Draft head sublayers add their outputs to the residual (admission).
-    let attention_weights = attention_weights(
-        &topology.attention,
-        &numbers.attention,
-        form,
-        !inject_only,
-        operands,
-        |kind| weight(&mut graph, planned, attention_scope, kind, &mut weights),
+        head_sublayer(0),
+        (&topology.attention, &numbers.attention),
+        (form, !inject_only),
+        None,
+        (&mut weights, &mut constants),
     )?;
     let output_norm = if inject_only {
         None
@@ -995,7 +981,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
             ],
         )?)
     };
-    let mut selections = (steps > 0)
+    let selections = (steps > 0)
         .then(|| {
             graph.local_for(
                 entries.sample,
@@ -1025,445 +1011,55 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
             ))
         })
         .transpose()?;
+    let context = HeadPassContext {
+        entries: &entries,
+        topology,
+        numbers,
+        sites,
+        stream_count,
+        conditioning_width: &conditioning_width,
+        form,
+        epsilon,
+        attention_weights: &attention_weights,
+        embedding_norm: &embedding_norm,
+        hidden_norm: &hidden_norm,
+        combine: &combine,
+        tokens: &tokens,
+        entry_conditioning: assembled.as_ref().or(conditioning.as_ref()),
+        output_norm: output_norm.as_ref(),
+        out_rows: out_rows.as_ref(),
+        projection: projection.as_ref(),
+        selections: selections.as_ref(),
+        confidence: confidence.as_ref(),
+    };
     let mut passes = Vec::new();
     let mut entry_features = None;
     let mut previous: Option<WorkflowTensor> = None;
     for pass in 0..steps.max(1) {
-        let rows = if pass == 0 { entry_rows.clone() } else { slots.clone() };
-        let (input, landed) = match &previous {
-            None => {
-                let directory = table.by_rows(&mut graph, &mut constants)?;
-                let input = graph
-                    .enqueue(
-                        G::pick(entries.input, &rows),
-                        &[
-                            ("M", rows.clone()),
-                            ("V", table.rows.clone()),
-                            ("D", hidden.clone()),
-                            ("S", Dim::from(stream_count)),
-                            ("R", directory.shape[0].clone()),
-                            ("F", directory.shape[1].clone()),
-                        ],
-                        draft_rows::WorkflowArgs {
-                            tokens: tokens.tensor().into(),
-                            directory: (&directory.tensor).into(),
-                            table: (&table.table).into(),
-                            conditioning: assembled
-                                .as_ref()
-                                .or(conditioning.as_ref())
-                                .unwrap()
-                                .tensor()
-                                .into(),
-                            embedding_norm: (&embedding_norm).into(),
-                            hidden_norm: (&hidden_norm).into(),
-                            combine: (&combine).into(),
-                            epsilon,
-                        },
-                    )?
-                    .value;
-                (input, None)
+        match head_pass(&mut graph, &context, pass, previous.as_ref(), &mut table, &mut weights, &mut constants)? {
+            HeadPass::Causal(ports, attended) => {
+                return Ok(HeadGraphParts {
+                    plan: graph,
+                    tokens,
+                    conditioning,
+                    previous: prefix_conditioning,
+                    out_rows: None,
+                    passes: vec![ports],
+                    constants,
+                    weights,
+                    projection: None,
+                    output: attended,
+                    confidence: None,
+                });
             }
-            Some(features) => {
-                let selected = selections
-                    .as_ref()
-                    .ok_or_else(|| "chained pass without selections".to_owned())?
-                    .tensor()
-                    .slice_leading(slots * (pass - 1), slots * pass);
-                let (gathered, table_rows) = (table.table.clone(), table.rows.clone());
-                table.read_selected(
-                    &mut graph,
-                    planned,
-                    &mut weights,
-                    &mut constants,
-                    entries.landing,
-                    (&selected).into(),
-                    &rows,
-                    None,
-                    |graph, directory| {
-                        Ok(graph
-                            .enqueue(
-                                G::pick(entries.input, &rows),
-                                &[
-                                    ("M", rows.clone()),
-                                    ("V", table_rows),
-                                    ("D", hidden.clone()),
-                                    ("S", Dim::from(stream_count)),
-                                    ("R", directory.shape[0].clone()),
-                                    ("F", directory.shape[1].clone()),
-                                ],
-                                draft_rows::WorkflowArgs {
-                                    tokens: (&selected).into(),
-                                    directory: (&directory.tensor).into(),
-                                    table: (&gathered).into(),
-                                    conditioning: features.into(),
-                                    embedding_norm: (&embedding_norm).into(),
-                                    hidden_norm: (&hidden_norm).into(),
-                                    combine: (&combine).into(),
-                                    epsilon,
-                                },
-                            )?
-                            .value)
-                    },
-                )?
-            }
-        };
-        let attention_site = match (&streams, &sites) {
-            (Some(streams), Some(sites)) => Some(mix_site(
-                &mut graph,
-                sites.mixer,
-                planned,
-                attention_scope,
-                streams.clone(),
-                &input,
-                rows.clone(),
-                epsilon,
-                true,
-                &mut weights,
-            )?),
-            (None, None) => None,
-            _ => return Err("head streams entries disagree with its residual form".into()),
-        };
-        let join = Join {
-            values: attention_site.as_ref().and_then(|site| site.inject.clone()),
-            streams: Dim::from(stream_count),
-            width: Dim::from(streams.as_ref().map_or(0, |streams| streams.streams)),
-            class: (pass == 0).then_some("head_entry_rows"),
-        };
-        let (attended, state, controls) = attention_graph::attention(
-            &mut graph,
-            AttentionGraphEntries {
-                project: if inject_only {
-                    entries.priming_project
-                } else {
-                    entries.attention.project
-                },
-                ..entries.attention
-            },
-            &topology.attention,
-            &attention_pass(&rows),
-            &attention_weights,
-            &mut constants,
-            SublayerInput {
-                rows: attention_site
-                    .as_ref()
-                    .map_or(&input, |site| &site.partials),
-                form,
-            },
-            &input,
-            &join,
-        )?;
-        let (Some(output_norm), Some(out_rows)) = (&output_norm, &out_rows) else {
-            graph.export(&attended)?;
-            return Ok(HeadGraphParts {
-                plan: graph,
-                tokens,
-                conditioning,
-                previous: prefix_conditioning,
-                out_rows: None,
-                passes: vec![PassPorts {
-                    coordinates: controls.coordinates,
-                    visible: controls.visible,
-                    fresh: controls.fresh,
-                    destinations: controls.destinations,
-                    planes: state.planes,
-                    indexer: IndexerPorts::of(state.indexer, controls.indexer)?,
-                    selection: None,
-                    landed,
-                }],
-                constants,
-                weights,
-                projection: None,
-                output: attended,
-                confidence: None,
-            });
-        };
-        let feed_forward_site = match (&streams, &sites) {
-            (Some(streams), Some(sites)) => Some(mix_site(
-                &mut graph,
-                sites
-                    .feed_forward
-                    .ok_or("head streams entries lack the feed-forward site")?,
-                planned,
-                feed_forward_scope,
-                streams.clone(),
-                &attended,
-                rows.clone(),
-                epsilon,
-                true,
-                &mut weights,
-            )?),
-            _ => None,
-        };
-        let advanced = match (&entries.feed_forward, &topology.feed_forward, &numbers.feed_forward) {
-            (
-                HeadFeedForwardEntries::Dense(entries),
-                HeadFeedForward::Dense(expansion),
-                HeadFeedForwardNumbers::Dense(dense_numbers),
-            ) => {
-                // A head's feed-forward adds to its residual: it has no
-                // post-norm tail.
-                let TailEntries::Residual(output) = entries.output else {
-                    return Err("draft head feed-forward has a post-norm tail".into());
-                };
-                let output = crate::operators::dense_ffn::graph::dense(
-                    &mut graph,
-                    DenseGraphEntries { expand: entries.expand, output: TailEntries::Residual(output) },
-                    *expansion,
-                    dense_numbers,
-                    planned,
-                    feed_forward_scope,
-                    &mut weights,
-                    &mut constants,
-                    &attended,
-                    &attended,
-                    &rows,
-                    (pass == 0).then_some("head_entry_rows"),
-                    epsilon,
-                    None,
-                )?;
-                output
-            }
-            (
-                HeadFeedForwardEntries::Routed(entries),
-                HeadFeedForward::Routed(routed_topology),
-                HeadFeedForwardNumbers::Routed(shape),
-            ) => {
-                let join = Join {
-                    values: feed_forward_site
-                        .as_ref()
-                        .and_then(|site| site.inject.clone()),
-                    streams: Dim::from(stream_count),
-                    width: Dim::from(streams.as_ref().map_or(0, |streams| streams.streams)),
-                    class: (pass == 0).then_some("head_entry_rows"),
-                };
-                // A head's routed layers hold their experts whole: a
-                // streamed one is refused (`routed`: its bank entries
-                // disagree with its plan).
-                let (output, _) = routed::routed(
-                    &mut graph,
-                    RoutedGraphEntries {
-                        route: entries.route,
-                        decode: entries.decode,
-                        output: entries.output,
-                        operand_norm: entries.operand_norm,
-                        group: entries.group,
-                        experts: entries.experts,
-                        combine: entries.combine,
-                    },
-                    crate::operators::routed::streamed::LayerBank::Held,
-                    routed_topology,
-                    shape,
-                    planned,
-                    feed_forward_scope,
-                    &mut weights,
-                    &mut constants,
-                    SublayerInput {
-                        rows: feed_forward_site
-                            .as_ref()
-                            .map_or(&attended, |site| &site.partials),
-                        form,
-                    },
-                    &attended,
-                    &join,
-                    &rows,
-                    epsilon,
-                    None,
-                    None,
-                )?;
-                output
-            }
-            (
-                HeadFeedForwardEntries::GeneralRouted(entries),
-                HeadFeedForward::GeneralRouted(general_topology),
-                HeadFeedForwardNumbers::GeneralRouted(layer),
-            ) => {
-                // The body's general routed lowering over the head's single
-                // residual (`operators::admit` refuses low-rank streams),
-                // its experts held whole.
-                if feed_forward_site.is_some() {
-                    return Err("a general routed draft head over low-rank streams".into());
+            HeadPass::Drafted { ports, features, chained } => {
+                passes.push(ports);
+                if pass == 0 {
+                    entry_features = Some(features);
                 }
-                // Its row dimension is the pass's rows: the entry's, or a
-                // chained pass's slots, each a scope of its own.
-                graph.set_class_scope(Some(if pass == 0 { "head-entry-routed" } else { "head-chained-routed" }));
-                let (output, _) = general_routed(
-                    &mut graph,
-                    *entries,
-                    LayerBank::Held,
-                    general_topology,
-                    layer,
-                    planned,
-                    feed_forward_scope,
-                    &mut weights,
-                    &mut constants,
-                    &attended,
-                    RoutedSum::Residual,
-                    &rows,
-                    epsilon,
-                    None,
-                )?;
-                graph.set_class_scope((pass == 0).then_some("head-entry"));
-                output
+                previous = Some(chained);
             }
-            _ => return Err("head feed-forward entries and plan disagree".into()),
-        };
-        // The entry pass reads each slot's last entry row; a chained
-        // pass has one row per slot.
-        let chained_rows = (pass > 0)
-            .then(|| GraphConstant::identity(&mut graph, slots))
-            .transpose()?;
-        let mixed = match (&streams, &sites) {
-            (Some(streams), Some(sites)) => {
-                mix_site(
-                    &mut graph,
-                    sites
-                        .exit
-                        .ok_or("head streams entries lack the exit site")?,
-                    planned,
-                    head,
-                    streams.clone(),
-                    &advanced,
-                    rows.clone(),
-                    epsilon,
-                    false,
-                    &mut weights,
-                )?
-                .partials
-            }
-            _ => advanced.clone(),
-        };
-        let features = graph
-            .enqueue(
-                entries.features,
-                &[
-                    ("M", rows.clone()),
-                    ("O", slots.clone()),
-                    ("D", hidden.clone()),
-                    ("PT", Dim::from(form.parts)),
-                    ("NM", form.norm_extent(hidden.clone())),
-                ],
-                readout_features_rows::WorkflowArgs {
-                    hidden: (&mixed.reshape(&[rows.clone(), Dim::from(form.parts), hidden.clone()])).into(),
-                    norm: output_norm.into(),
-                    out_rows: chained_rows
-                        .as_ref()
-                        .map_or(out_rows.tensor(), |rows| rows.port().tensor())
-                        .into(),
-                    epsilon,
-                },
-            )?
-            .value;
-        let pass_rows = chained_rows
-            .as_ref()
-            .map_or(out_rows.tensor(), |rows| rows.port().tensor())
-            .clone();
-        let chained_features = if residual_chain {
-            graph
-                .enqueue(
-                    entries.gather,
-                    &[("M", rows.clone()), ("O", slots.clone()), ("D", conditioning_width.clone())],
-                    feature_rows::WorkflowArgs {
-                        fused: (&advanced).into(),
-                        out_rows: (&pass_rows).into(),
-                    },
-                )?
-                .value
-        } else {
-            features.clone()
-        };
-        constants.extend(chained_rows);
-        let selection = match (&projection, selections.as_mut()) {
-            (Some(projection), Some(selections)) => {
-                let projection_entries = entries.logits.borrowed();
-                let input = match projection {
-                    readout::ProjectionPorts::Packed { .. } => {
-                        readout::ReadoutInput::PreparedFeatures {
-                            features: &features,
-                            canonical_rows: None,
-                        }
-                    }
-                    readout::ProjectionPorts::Progressive { .. } => readout::ReadoutInput::RawRms {
-                        hidden: &mixed,
-                        norm: output_norm,
-                        form,
-                        out_rows: &pass_rows,
-                        epsilon,
-                    },
-                };
-                let readout::Readout {
-                    mut logits,
-                    certified,
-                } = readout::project_readout(
-                    &mut graph,
-                    projection_entries,
-                    projection,
-                    input,
-                    readout::ProjectionGeometry {
-                        rows: rows.clone(),
-                        projected: slots.clone(),
-                        selected: slots.clone(),
-                        vocabulary: vocabulary.clone(),
-                        hidden: hidden.clone(),
-                        columns: vocabulary.clone(),
-                    },
-                    Argument::from(0.0),
-                    Some(entries.sample),
-                    &mut constants,
-                )?;
-                let mut result = selections
-                    .tensor()
-                    .slice_leading(slots * pass, slots * (pass + 1));
-                let (inputs, view) = match certified {
-                    Some(certified) => (certified.selecting, Some(certified.view)),
-                    None => (
-                        readout::selection_inputs(
-                            &mut graph,
-                            entries.sample,
-                            slots,
-                            vocabulary,
-                        )?,
-                        None,
-                    ),
-                };
-                let (confidence, rows) = confidence
-                    .as_ref()
-                    .ok_or_else(|| "a drafting pass without confidences".to_owned())?;
-                let mut confidence =
-                    confidence.slice_leading(slots * pass, slots * (pass + 1));
-                Some(readout::select(
-                    &mut graph,
-                    readout::SelectionEntries {
-                        shape: entries.shape,
-                        sample: entries.sample,
-                        confidence: entries.confidence,
-                    },
-                    vocabulary,
-                    &mut logits,
-                    view.as_ref(),
-                    rows.port().tensor(),
-                    slots,
-                    shaped,
-                    inputs,
-                    &mut result,
-                    &mut confidence,
-                )?)
-            }
-            _ => None,
-        };
-        passes.push(PassPorts {
-            coordinates: controls.coordinates,
-            visible: controls.visible,
-            fresh: controls.fresh,
-            destinations: controls.destinations,
-            planes: state.planes,
-            indexer: IndexerPorts::of(state.indexer, controls.indexer)?,
-            selection,
-            landed,
-        });
-        if pass == 0 {
-            entry_features = Some(features.clone());
         }
-        previous = Some(chained_features);
     }
     let output = match &selections {
         Some(selections) => selections.tensor().clone(),
@@ -1490,6 +1086,553 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
         output,
         confidence,
     })
+}
+
+/// The scope of sublayer `sublayer` of the one supported head block: its
+/// attention (0) or its feed-forward (1).
+fn head_sublayer(sublayer: u32) -> WeightScope {
+    WeightScope::HeadSublayer(SublayerIndex { block: 0, sublayer })
+}
+
+/// What every pass of a head graph reads beside the graph, its token
+/// table, its weights and its constants ([`head_pass`]).
+struct HeadPassContext<'r, 'a, G: GraphDraft + 'a> {
+    entries: &'r HeadGraphEntries<'a, G>,
+    topology: &'r HeadForm,
+    numbers: &'r HeadNumbers,
+    /// Its low-rank streams' mix sites' entries; none for a single residual
+    /// stream.
+    sites: Option<Sites<SiteEntries<'a, G>>>,
+    stream_count: u64,
+    /// The width of a pass's conditioning rows: every stream's.
+    conditioning_width: &'r Dim,
+    form: InputForm,
+    epsilon: Argument<f32>,
+    attention_weights: &'r AttentionWeights,
+    embedding_norm: &'r WorkflowTensor,
+    hidden_norm: &'r WorkflowTensor,
+    combine: &'r WorkflowTensor,
+    /// The entry pass's tokens.
+    tokens: &'r NativePort,
+    /// The entry pass's conditioning rows: a prefix class's assembled rows,
+    /// or the bound or host-written rows.
+    entry_conditioning: Option<&'r NativePort>,
+    /// Its output norm and each slot's last entry row, of a drafting graph.
+    output_norm: Option<&'r WorkflowTensor>,
+    out_rows: Option<&'r NativePort>,
+    /// Its drafting passes' projection, selections and their confidences
+    /// (with the identity row map of the slots).
+    projection: Option<&'r readout::ProjectionPorts>,
+    selections: Option<&'r NativePort>,
+    confidence: Option<&'r (WorkflowTensor, GraphConstant)>,
+}
+
+/// One pass of a head graph ([`head_pass`]).
+enum HeadPass {
+    /// A causal-only graph's one pass: its ports and its attended rows, the
+    /// graph's exported result.
+    Causal(PassPorts, WorkflowTensor),
+    /// A drafting pass: its ports, its features and the rows the next pass
+    /// is conditioned by.
+    Drafted { ports: PassPorts, features: WorkflowTensor, chained: WorkflowTensor },
+}
+
+/// Pass `pass` of a head graph, the next after `previous`'s rows (none for
+/// the entry pass): its input, attention and, of a drafting graph,
+/// feed-forward, features and selection.
+fn head_pass<'a, G: GraphDraft + 'a>(
+    graph: &mut G,
+    context: &HeadPassContext<'_, 'a, G>,
+    pass: u64,
+    previous: Option<&WorkflowTensor>,
+    table: &mut GatheredTable,
+    weights: &mut Vec<(WeightPort, NativePort)>,
+    constants: &mut Vec<GraphConstant>,
+) -> Result<HeadPass, GraphError> {
+    let (entries, topology, numbers) = (context.entries, context.topology, context.numbers);
+    let planned = &numbers.weights;
+    let (slots, hidden, streams) = (&numbers.slots, &numbers.hidden, &numbers.streams);
+    let (form, epsilon, stream_count) = (context.form, context.epsilon, context.stream_count);
+    let rows = if pass == 0 { numbers.attention.rows.clone() } else { slots.clone() };
+    let (input, landed) = pass_input(graph, context, (pass, &rows), previous, table, weights, constants)?;
+    let attention_site = match (streams, &context.sites) {
+        (Some(streams), Some(sites)) => Some(mix_site(
+            graph,
+            sites.mixer,
+            planned,
+            head_sublayer(0),
+            streams.clone(),
+            &input,
+            rows.clone(),
+            epsilon,
+            true,
+            weights,
+        )?),
+        (None, None) => None,
+        _ => return Err("head streams entries disagree with its residual form".into()),
+    };
+    let join = Join {
+        values: attention_site.as_ref().and_then(|site| site.inject.clone()),
+        streams: Dim::from(stream_count),
+        width: Dim::from(streams.as_ref().map_or(0, |streams| streams.streams)),
+        class: (pass == 0).then_some("head_entry_rows"),
+    };
+    let (attended, state, controls) = attention_graph::attention(
+        graph,
+        AttentionGraphEntries {
+            project: if topology.drafting.is_none() {
+                entries.priming_project
+            } else {
+                entries.attention.project
+            },
+            ..entries.attention
+        },
+        &topology.attention,
+        &numbers.attention.at_rows(rows.clone()),
+        context.attention_weights,
+        constants,
+        SublayerInput {
+            rows: attention_site
+                .as_ref()
+                .map_or(&input, |site| &site.partials),
+            form,
+        },
+        &input,
+        &join,
+    )?;
+    let (Some(output_norm), Some(out_rows)) = (context.output_norm, context.out_rows) else {
+        graph.export(&attended)?;
+        return Ok(HeadPass::Causal(
+            PassPorts {
+                coordinates: controls.coordinates,
+                visible: controls.visible,
+                fresh: controls.fresh,
+                destinations: controls.destinations,
+                planes: state.planes,
+                indexer: IndexerPorts::of(state.indexer, controls.indexer)?,
+                selection: None,
+                landed,
+            },
+            attended,
+        ));
+    };
+    let feed_forward_site = match (streams, &context.sites) {
+        (Some(streams), Some(sites)) => Some(mix_site(
+            graph,
+            sites
+                .feed_forward
+                .ok_or("head streams entries lack the feed-forward site")?,
+            planned,
+            head_sublayer(1),
+            streams.clone(),
+            &attended,
+            rows.clone(),
+            epsilon,
+            true,
+            weights,
+        )?),
+        _ => None,
+    };
+    let advanced = head_feed_forward(
+        graph,
+        context,
+        (pass, &rows),
+        (&attended, feed_forward_site.as_ref()),
+        weights,
+        constants,
+    )?;
+    // The entry pass reads each slot's last entry row; a chained
+    // pass has one row per slot.
+    let chained_rows = (pass > 0)
+        .then(|| GraphConstant::identity(graph, slots))
+        .transpose()?;
+    let mixed = match (streams, &context.sites) {
+        (Some(streams), Some(sites)) => {
+            mix_site(
+                graph,
+                sites
+                    .exit
+                    .ok_or("head streams entries lack the exit site")?,
+                planned,
+                WeightScope::HeadBlock(0),
+                streams.clone(),
+                &advanced,
+                rows.clone(),
+                epsilon,
+                false,
+                weights,
+            )?
+            .partials
+        }
+        _ => advanced.clone(),
+    };
+    let features = graph
+        .enqueue(
+            entries.features,
+            &[
+                ("M", rows.clone()),
+                ("O", slots.clone()),
+                ("D", hidden.clone()),
+                ("PT", Dim::from(form.parts)),
+                ("NM", form.norm_extent(hidden.clone())),
+            ],
+            readout_features_rows::WorkflowArgs {
+                hidden: (&mixed.reshape(&[rows.clone(), Dim::from(form.parts), hidden.clone()])).into(),
+                norm: output_norm.into(),
+                out_rows: chained_rows
+                    .as_ref()
+                    .map_or(out_rows.tensor(), |rows| rows.port().tensor())
+                    .into(),
+                epsilon,
+            },
+        )?
+        .value;
+    let pass_rows = chained_rows
+        .as_ref()
+        .map_or(out_rows.tensor(), |rows| rows.port().tensor())
+        .clone();
+    let chained_features = if topology.residual_chain {
+        graph
+            .enqueue(
+                entries.gather,
+                &[("M", rows.clone()), ("O", slots.clone()), ("D", context.conditioning_width.clone())],
+                feature_rows::WorkflowArgs {
+                    fused: (&advanced).into(),
+                    out_rows: (&pass_rows).into(),
+                },
+            )?
+            .value
+    } else {
+        features.clone()
+    };
+    constants.extend(chained_rows);
+    let selection = pass_selection(
+        graph,
+        context,
+        (pass, &rows),
+        &features,
+        (&mixed, output_norm, &pass_rows),
+        constants,
+    )?;
+    Ok(HeadPass::Drafted {
+        ports: PassPorts {
+            coordinates: controls.coordinates,
+            visible: controls.visible,
+            fresh: controls.fresh,
+            destinations: controls.destinations,
+            planes: state.planes,
+            indexer: IndexerPorts::of(state.indexer, controls.indexer)?,
+            selection,
+            landed,
+        },
+        features,
+        chained: chained_features,
+    })
+}
+
+/// The `rows` input rows of pass `pass`: the entry pass embeds the host's
+/// tokens and combines them with its conditioning rows; a chained pass
+/// embeds the tokens the previous pass selected, read from `table` (landed,
+/// of a table with landing slots), and combines them with the `previous`
+/// pass's rows. Returns them and the landed read.
+fn pass_input<'a, G: GraphDraft + 'a>(
+    graph: &mut G,
+    context: &HeadPassContext<'_, 'a, G>,
+    (pass, rows): (u64, &Dim),
+    previous: Option<&WorkflowTensor>,
+    table: &mut GatheredTable,
+    weights: &mut Vec<(WeightPort, NativePort)>,
+    constants: &mut Vec<GraphConstant>,
+) -> Result<(WorkflowTensor, Option<LandedReadPorts>), GraphError> {
+    let (entries, numbers) = (context.entries, context.numbers);
+    let (slots, hidden) = (&numbers.slots, &numbers.hidden);
+    let (stream_count, epsilon) = (context.stream_count, context.epsilon);
+    Ok(match previous {
+        None => {
+            let directory = table.by_rows(graph, constants)?;
+            let input = graph
+                .enqueue(
+                    G::pick(entries.input, rows),
+                    &[
+                        ("M", rows.clone()),
+                        ("V", table.rows.clone()),
+                        ("D", hidden.clone()),
+                        ("S", Dim::from(stream_count)),
+                        ("R", directory.shape[0].clone()),
+                        ("F", directory.shape[1].clone()),
+                    ],
+                    draft_rows::WorkflowArgs {
+                        tokens: context.tokens.tensor().into(),
+                        directory: (&directory.tensor).into(),
+                        table: (&table.table).into(),
+                        conditioning: context.entry_conditioning.unwrap().tensor().into(),
+                        embedding_norm: context.embedding_norm.into(),
+                        hidden_norm: context.hidden_norm.into(),
+                        combine: context.combine.into(),
+                        epsilon,
+                    },
+                )?
+                .value;
+            (input, None)
+        }
+        Some(features) => {
+            let selected = context
+                .selections
+                .ok_or_else(|| "chained pass without selections".to_owned())?
+                .tensor()
+                .slice_leading(slots * (pass - 1), slots * pass);
+            let (gathered, table_rows) = (table.table.clone(), table.rows.clone());
+            table.read_selected(
+                graph,
+                &numbers.weights,
+                weights,
+                constants,
+                entries.landing,
+                (&selected).into(),
+                rows,
+                None,
+                |graph, directory| {
+                    Ok(graph
+                        .enqueue(
+                            G::pick(entries.input, rows),
+                            &[
+                                ("M", rows.clone()),
+                                ("V", table_rows),
+                                ("D", hidden.clone()),
+                                ("S", Dim::from(stream_count)),
+                                ("R", directory.shape[0].clone()),
+                                ("F", directory.shape[1].clone()),
+                            ],
+                            draft_rows::WorkflowArgs {
+                                tokens: (&selected).into(),
+                                directory: (&directory.tensor).into(),
+                                table: (&gathered).into(),
+                                conditioning: features.into(),
+                                embedding_norm: context.embedding_norm.into(),
+                                hidden_norm: context.hidden_norm.into(),
+                                combine: context.combine.into(),
+                                epsilon,
+                            },
+                        )?
+                        .value)
+                },
+            )?
+        }
+    })
+}
+
+/// Pass `pass`'s feed-forward over its `rows` `attended` rows (through its
+/// mix site `site`, of low-rank streams), which adds to its residual.
+fn head_feed_forward<'a, G: GraphDraft + 'a>(
+    graph: &mut G,
+    context: &HeadPassContext<'_, 'a, G>,
+    (pass, rows): (u64, &Dim),
+    (attended, site): (&WorkflowTensor, Option<&MixSite>),
+    weights: &mut Vec<(WeightPort, NativePort)>,
+    constants: &mut Vec<GraphConstant>,
+) -> Result<WorkflowTensor, GraphError> {
+    let (topology, numbers) = (context.topology, context.numbers);
+    let (planned, feed_forward_scope) = (&numbers.weights, head_sublayer(1));
+    let (form, epsilon) = (context.form, context.epsilon);
+    Ok(match (&context.entries.feed_forward, &topology.feed_forward, &numbers.feed_forward) {
+        (
+            HeadFeedForwardEntries::Dense(entries),
+            HeadFeedForward::Dense(expansion),
+            HeadFeedForwardNumbers::Dense(dense_numbers),
+        ) => {
+            // A head's feed-forward adds to its residual: it has no
+            // post-norm tail.
+            let TailEntries::Residual(output) = entries.output else {
+                return Err("draft head feed-forward has a post-norm tail".into());
+            };
+            crate::operators::dense_ffn::graph::dense(
+                graph,
+                DenseGraphEntries { expand: entries.expand, output: TailEntries::Residual(output) },
+                *expansion,
+                dense_numbers,
+                planned,
+                feed_forward_scope,
+                weights,
+                constants,
+                attended,
+                attended,
+                rows,
+                (pass == 0).then_some("head_entry_rows"),
+                epsilon,
+                None,
+            )?
+        }
+        (
+            HeadFeedForwardEntries::Routed(entries),
+            HeadFeedForward::Routed(routed_topology),
+            HeadFeedForwardNumbers::Routed(shape),
+        ) => {
+            let join = Join {
+                values: site.and_then(|site| site.inject.clone()),
+                streams: Dim::from(context.stream_count),
+                width: Dim::from(numbers.streams.as_ref().map_or(0, |streams| streams.streams)),
+                class: (pass == 0).then_some("head_entry_rows"),
+            };
+            // A head's routed layers hold their experts whole: a
+            // streamed one is refused (`routed`: its bank entries
+            // disagree with its plan).
+            let (output, _) = routed::routed(
+                graph,
+                RoutedGraphEntries {
+                    route: entries.route,
+                    decode: entries.decode,
+                    output: entries.output,
+                    operand_norm: entries.operand_norm,
+                    group: entries.group,
+                    experts: entries.experts,
+                    combine: entries.combine,
+                },
+                crate::operators::routed::streamed::LayerBank::Held,
+                routed_topology,
+                shape,
+                planned,
+                feed_forward_scope,
+                weights,
+                constants,
+                SublayerInput {
+                    rows: site.map_or(attended, |site| &site.partials),
+                    form,
+                },
+                attended,
+                &join,
+                rows,
+                epsilon,
+                None,
+                None,
+            )?;
+            output
+        }
+        (
+            HeadFeedForwardEntries::GeneralRouted(entries),
+            HeadFeedForward::GeneralRouted(general_topology),
+            HeadFeedForwardNumbers::GeneralRouted(layer),
+        ) => {
+            // The body's general routed lowering over the head's single
+            // residual (`operators::admit` refuses low-rank streams),
+            // its experts held whole.
+            if site.is_some() {
+                return Err("a general routed draft head over low-rank streams".into());
+            }
+            // Its row dimension is the pass's rows: the entry's, or a
+            // chained pass's slots, each a scope of its own.
+            graph.set_class_scope(Some(if pass == 0 { "head-entry-routed" } else { "head-chained-routed" }));
+            let (output, _) = general_routed(
+                graph,
+                *entries,
+                LayerBank::Held,
+                general_topology,
+                layer,
+                planned,
+                feed_forward_scope,
+                weights,
+                constants,
+                attended,
+                RoutedSum::Residual,
+                rows,
+                epsilon,
+                None,
+            )?;
+            graph.set_class_scope((pass == 0).then_some("head-entry"));
+            output
+        }
+        _ => return Err("head feed-forward entries and plan disagree".into()),
+    })
+}
+
+/// Pass `pass`'s selection of a drafting graph, from the logits of its
+/// `rows` `features` (a progressive projection's from its `raw` hidden rows,
+/// output norm and out rows); none of a graph that does not select.
+fn pass_selection<'a, G: GraphDraft + 'a>(
+    graph: &mut G,
+    context: &HeadPassContext<'_, 'a, G>,
+    (pass, rows): (u64, &Dim),
+    features: &WorkflowTensor,
+    (mixed, output_norm, pass_rows): (&WorkflowTensor, &WorkflowTensor, &WorkflowTensor),
+    constants: &mut Vec<GraphConstant>,
+) -> Result<Option<SelectionPorts>, GraphError> {
+    let (Some(projection), Some(selections)) = (context.projection, context.selections) else {
+        return Ok(None);
+    };
+    let (entries, numbers) = (context.entries, context.numbers);
+    let (slots, hidden, vocabulary) = (&numbers.slots, &numbers.hidden, &numbers.vocabulary);
+    let projection_entries = entries.logits.borrowed();
+    let input = match projection {
+        readout::ProjectionPorts::Packed { .. } => {
+            readout::ReadoutInput::PreparedFeatures {
+                features,
+                canonical_rows: None,
+            }
+        }
+        readout::ProjectionPorts::Progressive { .. } => readout::ReadoutInput::RawRms {
+            hidden: mixed,
+            norm: output_norm,
+            form: context.form,
+            out_rows: pass_rows,
+            epsilon: context.epsilon,
+        },
+    };
+    let readout::Readout {
+        mut logits,
+        certified,
+    } = readout::project_readout(
+        graph,
+        projection_entries,
+        projection,
+        input,
+        readout::ProjectionGeometry {
+            rows: rows.clone(),
+            projected: slots.clone(),
+            selected: slots.clone(),
+            vocabulary: vocabulary.clone(),
+            hidden: hidden.clone(),
+            columns: vocabulary.clone(),
+        },
+        Argument::from(0.0),
+        Some(entries.sample),
+        constants,
+    )?;
+    let mut result = selections
+        .tensor()
+        .slice_leading(slots * pass, slots * (pass + 1));
+    let (inputs, view) = match certified {
+        Some(certified) => (certified.selecting, Some(certified.view)),
+        None => (
+            readout::selection_inputs(
+                graph,
+                entries.sample,
+                slots,
+                vocabulary,
+            )?,
+            None,
+        ),
+    };
+    let (confidence, rows) = context
+        .confidence
+        .ok_or_else(|| "a drafting pass without confidences".to_owned())?;
+    let mut confidence =
+        confidence.slice_leading(slots * pass, slots * (pass + 1));
+    Ok(Some(readout::select(
+        graph,
+        readout::SelectionEntries {
+            shape: entries.shape,
+            sample: entries.sample,
+            confidence: entries.confidence,
+        },
+        vocabulary,
+        &mut logits,
+        view.as_ref(),
+        rows.port().tensor(),
+        slots,
+        context.topology.passes.shaped,
+        inputs,
+        &mut result,
+        &mut confidence,
+    )?))
 }
 
 pub(crate) fn checked_head_family_storage(

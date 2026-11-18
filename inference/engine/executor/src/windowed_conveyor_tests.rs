@@ -158,7 +158,11 @@ fn open_domain(
     backend: seismic::BackendName,
     limits: ResourceLimits,
     mode: Mode,
-) -> (ExecutorDomain, crate::StateBindings, crate::memory::ledger::DeviceLedgers) {
+) -> (
+    Box<ExecutorDomain>,
+    crate::StateBindings,
+    crate::memory::ledger::DeviceLedgers,
+) {
     crate::diagnostics::install();
     let release = platform::ReleaseRate::of_machine(None);
     let selected = platform::select_device(

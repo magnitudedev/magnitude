@@ -37,9 +37,11 @@ use crate::operators::routed::{fused_graph::DecodeForm, streamed};
 use crate::operators::streams::{BlockStreams, MixSite, SinkhornBinding};
 use crate::operators::{parallel::DenseBesideRouted, InputForm};
 use crate::{
-    CandidatesBinding, FeedForwardProgramSlot, GeneralRoutedBinding, MixerProgramSlot,
-    ModelLoadPlan, NGramGateForm, PerLayerEntryBinding, PickedBinding, ReadoutHead,
-    RecurrentForm, SublayerTail, WeightPlan,
+    AttentionBinding, CandidatesBinding, DenseBinding, FeedForwardProgramSlot,
+    GeneralRoutedBinding, MixerProgramSlot, ModelLoadPlan, NGramGateForm, ParallelBinding,
+    PerLayerBinding, PerLayerEntryBinding, PickedBinding, ReadoutHead, RecurrentBinding,
+    RecurrentForm, RoutedBinding, ShortConvBinding, StateSpaceBinding, SublayerTail,
+    TargetBlockProgramSlot, TargetProgramPlan, WeightPlan,
 };
 use magnitude_family_contracts::{
     InputNorm, ModelDefinition, SublayerIndex, WeightKind, WeightScope,
@@ -1293,7 +1295,6 @@ impl DecodeDemand {
             .map_err(|error| demand_error(error.to_string()))?;
         let layout =
             ModelStateLayout::derive(&definition.decoder, &[], codec, 0).map_err(demand_error)?;
-        let backend = declarations.backend();
         let target = program.target();
         let mut step = Step {
             declarations,
@@ -1324,565 +1325,714 @@ impl DecodeDemand {
         // The first bank component of the next recurrent mixer.
         let mut recurrent_component = 0usize;
         for (index, block) in target.blocks().iter().enumerate() {
-            let layer =
-                u32::try_from(index).map_err(|_| demand_error("block index exceeds u32"))?;
-            let [mixer_scope, feed_forward_scope] =
-                crate::programs::native_target_graph::block_scopes(index).map_err(demand_error)?;
-            let streams = block.block_streams();
-            // Block 0 widens the embedded row into the streams
-            // (`repeat_rows`), which streams no weight.
-            if index == 0 && streams.is_some() {
-                step.call(Kernel::of::<kernels::repeat_rows::Entry>(), Work::default())?;
-            }
-            let input = |step: &mut Step<'_>, scope, norm| {
-                sublayer_input(step, load, definition, scope, norm, streams)
-            };
-            let scope = mixer_scope;
-            let weight = |kind, bound| planned(load, scope, kind, bound);
-            let output = Kernel::of::<kernels::attention_output::Entry>();
-            match block.mixer() {
-                MixerProgramSlot::Attention(binding) => {
-                    input(&mut step, scope, binding.norm)?;
-                    let shape = binding.shape;
-                    let query = if shape.form.gate == crate::planning::GateForm::Interleaved {
-                        WeightKind::QueryGate
-                    } else {
-                        WeightKind::Query
-                    };
-                    // The fused projection's query segment: the query's, or
-                    // a low-rank query's `down` (`query_segment_kind`).
-                    let segment = match binding.low_rank_query {
-                        None => query,
-                        Some(_) => WeightKind::QueryDown,
-                    };
-                    let projections = [
-                        (true, segment, binding.query_segment()),
-                        (
-                            shape.gate_rows() > 0,
-                            WeightKind::AttentionGate,
-                            binding.gate,
-                        ),
-                        (shape.key_rows() > 0, WeightKind::Key, binding.key),
-                        (shape.value_rows() > 0, WeightKind::Value, binding.value),
-                    ]
-                    .into_iter()
-                    .filter(|(present, _, _)| *present)
-                    .map(|(_, kind, bound)| weight(kind, bound))
-                    .collect::<Result<Vec<_>, _>>()?;
-                    let project = Kernel::of::<kernels::attention_project::Entry>();
-                    step.call(project, projection(&projections)?)?;
-                    // A low-rank query's `qr` rows, widened to F32
-                    // (`widen_rows`), then projected to the query heads
-                    // through its up weight (`binding.query`) under its norm.
-                    if binding.low_rank_query.is_some() {
-                        step.call(Kernel::of::<kernels::widen_rows::Entry>(), Work::default())?;
-                        step.call(project, projection(&[weight(query, binding.query)?])?)?;
-                    }
-                    // An absorbed query's per-head products (`project_rows`),
-                    // the queries attention reads.
-                    if let Some(absorbed) = binding.absorbed {
-                        step.call(
-                            Kernel::of::<kernels::project_rows::Entry>(),
-                            projection(&[weight(WeightKind::QueryKeys, absorbed.element)?])?,
-                        )?;
-                    }
-                    // The entry attending the layer's history, and the
-                    // layout it reads: the layer's own (`history_codec`; the
-                    // model's own store is dense whatever the policy).
-                    let (attend, history_layout) = match binding.history.encoding() {
-                        // The entry the graph attends decode rows with
-                        // (`graph::dense_decodes`): the prefill entry where
-                        // the decode entry holds no form of the shape.
-                        HistoryEncoding::Dense => (
-                            if crate::operators::attention::graph::dense_decodes(backend, binding)
-                                .map_err(|error| demand_error(format!("{error:?}")))?
-                            {
-                                Kernel::of::<kernels::attention_decode::Entry>()
-                            } else {
-                                Kernel::of::<kernels::attention_prefill::Entry>()
-                            },
-                            KvCodec::Dense,
-                        ),
-                        HistoryEncoding::Affine => (
-                            Kernel::of::<kernels::attention_decode_k8v4::Entry>(),
-                            KvCodec::AffineK8V4,
-                        ),
-                        HistoryEncoding::Unsupported => {
-                            return Err(demand_error(
-                                "rotated K4/V4 history has no native attention entry",
-                            ));
-                        }
-                    };
-                    // The load prepares the attention entries per layer
-                    // form (a compressed layer's picks launch where a
-                    // window layer has none): the call is its layer's.
-                    let statics =
-                        crate::operators::attention::graph::form_statics(&shape, binding.history)
-                            .map_err(demand_error)?;
-                    let (row_bytes, window) =
-                        history_read(&layout.target_history, LayerRef::Target(layer))?;
-                    let widths = shape.widths;
-                    let flops_per_token = 2 * widths.kv_heads * widths.group * (2 * widths.width);
-                    let read = |window| HistoryRead {
-                        layout: Some(history_layout),
-                        bytes_per_token: row_bytes,
-                        flops_per_token,
-                        window,
-                    };
-                    // An index-list source's calls, and the picks attention
-                    // reads of its plane beside its history.
-                    let picks = match binding.picked {
-                        None => Work::default(),
-                        Some(source) => picked(
-                            &mut step,
-                            &layout.target_history,
-                            layer,
-                            source,
-                            (shape.widths.picks, flops_per_token),
-                            binding.activation,
-                            weight,
-                        )?,
-                    };
-                    match binding.selection {
-                        None => step.call_specialized(
-                            attend,
-                            &statics,
-                            &[],
-                            Work {
-                                history: Some(read(window)),
-                                ..picks
-                            },
-                        )?,
-                        // The indexer projects its query and key, selects,
-                        // and attention reads the selected blocks and the
-                        // row's tail: at most one block past them.
-                        Some(binding) => {
-                            selection(&mut step, &layout.target_history, layer, binding, &weight)?;
-                            let selected = (binding.indexer.top + 1)
-                                .checked_mul(binding.shape.block)
-                                .ok_or_else(|| demand_error("selected tokens overflow"))?;
-                            // The scoring class's call: a prefill entry reads
-                            // its selection through a bitmap of `B` words,
-                            // where a class that does not score yet (`B` 0)
-                            // reads every visible row, fewer than it selects.
-                            let scoring = statics
-                                .iter()
-                                .copied()
-                                .chain([("B", binding.shape.words)])
-                                .collect::<Vec<_>>();
-                            step.call_specialized(
-                                attend,
-                                &scoring,
-                                &[],
-                                Work {
-                                    history: Some(read(Some(
-                                        window.map_or(selected, |window| window.min(selected)),
-                                    ))),
-                                    ..picks
-                                },
-                            )?;
-                        }
-                    }
-                    // A grouped output's first product, each group's run of
-                    // the attended row through its block of `a`
-                    // (`project_rows`), which the output projection reads.
-                    if let Some(grouped) = binding.grouped {
-                        step.call(
-                            Kernel::of::<kernels::project_rows::Entry>(),
-                            projection(&[weight(
-                                WeightKind::AttentionOutputGrouped,
-                                grouped.element,
-                            )?])?,
-                        )?;
-                    }
-                    let projected = weight(WeightKind::AttentionOutput, binding.output)?;
-                    tail(&mut step, binding.tail, output, projected, weight)?;
-                }
-                // The query-only projection row (`attention_project`), the
-                // state advance over the layer's bank (window, state and
-                // tape components, `state_space_step`), the gated group norm
-                // (`state_space_gate`) and the output projection
-                // (`operators::state_space`).
-                MixerProgramSlot::StateSpace(binding) => {
-                    input(&mut step, scope, binding.norm)?;
-                    step.call(
-                        Kernel::of::<kernels::attention_project::Entry>(),
-                        projection(&[weight(
-                            WeightKind::StateSpaceProjection,
-                            binding.projection,
-                        )?])?,
-                    )?;
-                    step.call(
-                        Kernel::of::<kernels::state_space_step::Entry>(),
-                        sequences(bank_bytes(&layout, recurrent_component, 3, index)?),
-                    )?;
-                    recurrent_component += 3;
-                    step.call(
-                        Kernel::of::<kernels::state_space_gate::Entry>(),
-                        weights(&[weight(WeightKind::StateSpaceNorm, Element::f32())?])?,
-                    )?;
-                    step.call(
-                        output,
-                        projection(&[weight(WeightKind::RecurrentOutput, binding.output)?])?,
-                    )?;
-                }
-                // The segmented `u | C` projection (`short_conv_project`),
-                // the gated taps over the layer's window (its only bank
-                // component, `short_conv_rows`) and the output projection
-                // (`operators::short_conv`).
-                MixerProgramSlot::ShortConv(binding) => {
-                    input(&mut step, scope, binding.norm)?;
-                    step.call(
-                        Kernel::of::<kernels::short_conv_project::Entry>(),
-                        projection(&[
-                            weight(WeightKind::ShortConvInputGate, binding.input_gate)?,
-                            weight(WeightKind::ShortConvOutputGate, binding.output_gate)?,
-                            weight(WeightKind::ShortConvValue, binding.value)?,
-                        ])?,
-                    )?;
-                    let taps = weight(WeightKind::RecurrentConvolution, Element::f32())?;
-                    step.call(
-                        Kernel::of::<kernels::short_conv_rows::Entry>(),
-                        Work {
-                            weights: weight_bytes(&[taps])?,
-                            sequence_bytes: bank_bytes(&layout, recurrent_component, 1, index)?,
-                            ..Work::default()
-                        },
-                    )?;
-                    recurrent_component += 1;
-                    let projected = weight(WeightKind::RecurrentOutput, binding.output)?;
-                    tail(&mut step, binding.tail, output, projected, weight)?;
-                }
-                // The segmented projection, the step over the layer's
-                // recurrent bank (window, delta and tape components), in the
-                // backend's step form (`operators::gated_delta`), and the
-                // output projection.
-                MixerProgramSlot::Recurrent(binding) => {
-                    input(&mut step, scope, binding.norm)?;
-                    let advance = match binding.form {
-                        RecurrentForm::PerHead => {
-                            let (project, advance) =
-                                match StepForm::of(backend).map_err(demand_error)? {
-                                    StepForm::Step => (
-                                        Kernel::of::<kernels::gated_delta_project::Entry>(),
-                                        Kernel::of::<kernels::gated_delta_step::Entry>(),
-                                    ),
-                                    StepForm::Convolved => (
-                                        Kernel::of::<kernels::gated_delta_project_convolved::Entry>(),
-                                        Kernel::of::<kernels::gated_delta_step_convolved::Entry>(),
-                                    ),
-                                };
-                            step.call(
-                                project,
-                                projection(&[
-                                    weight(WeightKind::RecurrentQueryKeyValue, binding.qkv)?,
-                                    weight(WeightKind::RecurrentGate, binding.gate)?,
-                                    weight(WeightKind::RecurrentAlpha, binding.alpha)?,
-                                    weight(WeightKind::RecurrentBeta, binding.beta)?,
-                                ])?,
-                            )?;
-                            advance
-                        }
-                        // The projection (`attention_project`), the up
-                        // projections (`project_rows`) of its gate and decay
-                        // down products, and `kimi_delta_step`.
-                        RecurrentForm::PerChannel { gate_up, alpha_up, .. } => {
-                            step.call(
-                                Kernel::of::<kernels::attention_project::Entry>(),
-                                projection(&[
-                                    weight(WeightKind::RecurrentQueryKeyValue, binding.qkv)?,
-                                    weight(WeightKind::RecurrentGate, binding.gate)?,
-                                    weight(WeightKind::RecurrentAlpha, binding.alpha)?,
-                                    weight(WeightKind::RecurrentBeta, binding.beta)?,
-                                ])?,
-                            )?;
-                            for (kind, element) in [
-                                (WeightKind::RecurrentGateUp, gate_up),
-                                (WeightKind::RecurrentAlphaUp, alpha_up),
-                            ] {
-                                step.call(
-                                    Kernel::of::<kernels::project_rows::Entry>(),
-                                    projection(&[weight(kind, element)?])?,
-                                )?;
-                            }
-                            Kernel::of::<kernels::kimi_delta_step::Entry>()
-                        }
-                    };
-                    step.call(
-                        advance,
-                        sequences(bank_bytes(&layout, recurrent_component, 3, index)?),
-                    )?;
-                    recurrent_component += 3;
-                    weight(WeightKind::RecurrentNorm, binding.recurrent_norm)?;
-                    step.call(
-                        output,
-                        projection(&[weight(WeightKind::RecurrentOutput, binding.output)?])?,
-                    )?;
-                }
-            }
-            let scope = feed_forward_scope;
-            let weight = |kind, bound| planned(load, scope, kind, bound);
-            let Some(feed_forward) = block.feed_forward() else {
-                continue;
-            };
-            match feed_forward {
-                FeedForwardProgramSlot::Dense(binding) => {
-                    input(&mut step, scope, binding.norm)?;
-                    step.call(
-                        Kernel::of::<kernels::dense_expand::Entry>(),
-                        projection(&[
-                            weight(WeightKind::DenseGate, binding.gate)?,
-                            weight(WeightKind::DenseUp, binding.up)?,
-                        ])?,
-                    )?;
-                    let down = weight(WeightKind::DenseDown, binding.down)?;
-                    tail(
-                        &mut step,
-                        binding.tail,
-                        Kernel::of::<kernels::dense_output::Entry>(),
-                        down,
-                        weight,
-                    )?;
-                    sinkhorn_join(&mut step, streams)?;
-                }
-                // `operators::routed::fused_graph` at decode rows, in the
-                // backend's decode form: routing (`routed_route`), then the
-                // choices' and the shared expert's gate/up
-                // (`routed_expand`); or routing with the shared expert's
-                // gate/up (`routed_route_shared`), then the choices'
-                // (`routed_gate_up`). Then the choices' and the shared
-                // expert's down projections (`routed_output`). A streamed
-                // layer routes and combines in its streamed form ([`route`],
-                // [`combine`]).
-                FeedForwardProgramSlot::Routed(binding) => {
-                    input(&mut step, scope, binding.norm)?;
-                    let router = projection(&[weight(WeightKind::Router, binding.router)?])?;
-                    let shared = projection(&[
-                        weight(WeightKind::SharedGate, binding.shared_gate)?,
-                        weight(WeightKind::SharedUp, binding.shared_up)?,
-                    ])?;
-                    let choices = Work {
-                        experts: Some(experts(
-                            &[
-                                weight(WeightKind::ExpertGate, binding.expert_gate)?,
-                                weight(WeightKind::ExpertUp, binding.expert_up)?,
-                            ],
-                            binding.experts,
-                            binding.selected,
-                        )?),
-                        ..Work::default()
-                    };
-                    let sources = sources(load, scope);
-                    match DecodeForm::of(backend).map_err(demand_error)? {
-                        DecodeForm::Expand => {
-                            streamed::expand_form(streamed::streams(load, scope)).map_err(demand_error)?;
-                            step.call(Kernel::of::<kernels::routed_route::Entry>(), router)?;
-                            step.call(
-                                Kernel::of::<kernels::routed_expand::Entry>(),
-                                join([choices, shared])?,
-                            )?;
-                        }
-                        DecodeForm::SharedRoute => {
-                            route(
-                                &mut step,
-                                load,
-                                scope,
-                                [
-                                    Kernel::of::<kernels::routed_route_shared::Entry>(),
-                                    Kernel::of::<kernels::routed_route_streamed::Entry>(),
-                                    Kernel::of::<kernels::routed_hint_route::Entry>(),
-                                ],
-                                join([router, shared])?,
-                            )?;
-                            step.call_with(
-                                Kernel::of::<kernels::routed_gate_up::Entry>(),
-                                &sources,
-                                choices,
-                            )?;
-                        }
-                    }
-                    let down = Work {
-                        experts: Some(experts(
-                            &[weight(WeightKind::ExpertDown, binding.expert_down)?],
-                            binding.experts,
-                            binding.selected,
-                        )?),
-                        ..Work::default()
-                    };
-                    combine(
-                        &mut step,
-                        load,
-                        scope,
-                        [
-                            Kernel::of::<kernels::routed_output::Entry>(),
-                            Kernel::of::<kernels::routed_output_project::Entry>(),
-                            Kernel::of::<kernels::routed_output_sited::Entry>(),
-                        ],
-                        join([
-                            down,
-                            projection(&[weight(WeightKind::SharedDown, binding.shared_down)?])?,
-                        ])?,
-                    )?;
-                }
-                // `programs::graph::parallel`: the dense branch's expansion
-                // (`dense_expand`) and its projection into F32 rows
-                // (`project_rows`), the routed branch (summed onto zeros) in
-                // its own scope, then `moe_tail`.
-                FeedForwardProgramSlot::Parallel(binding) => {
-                    let WeightScope::TargetSublayer(sublayer) = scope else {
-                        return Err(demand_error("parallel branches outside a target sublayer"));
-                    };
-                    let [dense_scope, routed_scope] = DenseBesideRouted::scopes(sublayer);
-                    let dense = binding.dense;
-                    let weight = |kind, bound| planned(load, dense_scope, kind, bound);
-                    weight(WeightKind::InputNorm, dense.norm)?;
-                    step.call(
-                        Kernel::of::<kernels::dense_expand::Entry>(),
-                        projection(&[
-                            weight(WeightKind::DenseGate, dense.gate)?,
-                            weight(WeightKind::DenseUp, dense.up)?,
-                        ])?,
-                    )?;
-                    step.call(
-                        Kernel::of::<kernels::project_rows::Entry>(),
-                        projection(&[weight(WeightKind::DenseDown, dense.down)?])?,
-                    )?;
-                    planned(
-                        load,
-                        routed_scope,
-                        WeightKind::InputNorm,
-                        binding.routed.norm,
-                    )?;
-                    general_routed(&mut step, load, routed_scope, &binding.routed)?;
-                    // The branch and tail norms share the tail's element.
-                    let norms = [dense_scope, routed_scope, scope]
-                        .into_iter()
-                        .map(|norm_scope| {
-                            planned(load, norm_scope, WeightKind::PostNorm, binding.norm)
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    step.call(Kernel::of::<kernels::moe_tail::Entry>(), weights(&norms)?)?;
-                }
-                FeedForwardProgramSlot::GeneralRouted(binding) => {
-                    input(&mut step, scope, binding.norm)?;
-                    general_routed(&mut step, load, scope, &binding)?;
-                    sinkhorn_join(&mut step, streams)?;
-                }
-            }
-            // `programs::graph::per_layer`: the gate over the layer's slice
-            // of the per-layer rows (`per_layer_gate`), then its post-norm
-            // tail.
-            if let Some(binding) = block.per_layer() {
-                let scope = WeightScope::TargetSublayer(SublayerIndex {
-                    block: layer,
-                    sublayer: 2,
-                });
-                let SublayerTail::PostNorm { norm, .. } = binding.tail else {
-                    return Err(demand_error(
-                        "a per-layer input sublayer without a post-norm tail",
-                    ));
-                };
-                step.call(
-                    Kernel::of::<kernels::per_layer_gate::Entry>(),
-                    projection(&[planned(
-                        load,
-                        scope,
-                        WeightKind::PerLayerGate,
-                        binding.gate,
-                    )?])?,
-                )?;
-                post_norm(
-                    &mut step,
-                    planned(
-                        load,
-                        scope,
-                        WeightKind::PerLayerProjection,
-                        binding.projection,
-                    )?,
-                    planned(load, scope, WeightKind::PostNorm, norm)?,
-                )?;
-            }
-            if let Some(binding) = block.ngram() {
-                let scope = WeightScope::TargetSublayer(SublayerIndex {
-                    block: layer,
-                    sublayer: 2,
-                });
-                ngram(
-                    &mut step,
-                    load,
-                    &layout,
-                    scope,
-                    binding,
-                    recurrent_component,
-                    index,
-                )?;
-                recurrent_component += binding.bank_components();
-            }
-        }
-
-        // The last block's graph ends with the decoder's exit: a low-rank
-        // exit site, which injects into nothing, or the collapse of Sinkhorn
-        // streams `[S·H]` into one row `[H]` under the last site's pre.
-        match target.blocks().last().and_then(|block| block.block_streams()) {
-            Some(BlockStreams::LowRank(streams)) => {
-                if let Some(exit) = streams.exit {
-                    mix_site(&mut step, load, WeightScope::Target, exit, None)?;
-                }
-            }
-            Some(BlockStreams::Sinkhorn(SinkhornBinding { hidden, streams, .. })) => step.call(
-                Kernel::of::<kernels::stream_collapse::Entry>(),
-                rows(f32_bytes(streams * hidden + hidden)?),
-            )?,
-            None => {}
-        }
-
-        // The selection readout graph: the features over the final row under
-        // the exit norm (or the exit site's partials, unnormalized,
-        // `readout_features_rows`), the vocabulary projection (its physical
-        // matrix, even when tied to the embedding, `readout_head_rows`), and
-        // sampling of the one F32 logits row (`sample_rows`).
-        let readout = target.readout();
-        let norm = if InputForm::exit(&definition.decoder).normalized {
-            vec![planned(
+            recurrent_component = target_block(
+                &mut step,
                 load,
-                WeightScope::Target,
-                WeightKind::OutputNorm,
-                readout.norm,
-            )?]
-        } else {
-            Vec::new()
-        };
-        step.call(
-            Kernel::of::<kernels::readout_features_rows::Entry>(),
-            weights(&norm)?,
-        )?;
-        match readout.head {
-            // Admission keeps the canonical full-projection demand even
-            // when bounded classes have an optional qualified implementation.
-            ReadoutHead::Packed { weight, .. } | ReadoutHead::Qualified { weight, .. } => {
-                step.call(
-                    Kernel::of::<kernels::readout_head_rows::Entry>(),
-                    projection(&[planned(
-                        load,
-                        WeightScope::Target,
-                        WeightKind::Output,
-                        weight,
-                    )?])?,
-                )?;
-            }
+                definition,
+                &layout,
+                index,
+                block,
+                recurrent_component,
+            )?;
         }
-        step.call(
-            Kernel::of::<kernels::sample_rows::Entry>(),
-            rows(
-                definition
-                    .decoder
-                    .vocabulary
-                    .checked_mul(4)
-                    .ok_or_else(|| demand_error("logits bytes overflow"))?,
-            ),
-        )?;
+        decoder_exit(&mut step, load, target)?;
+        readout(&mut step, load, definition, target)?;
         Ok(Self { calls: step.calls, boundaries: step.boundaries })
     }
+}
+
+/// A target sublayer as its calls read it: the plans its weights and state
+/// come from, its block (`index`, as a layer `layer`), the scope its
+/// weights are planned in and the block's streams.
+struct Sublayer<'p> {
+    load: &'p ModelLoadPlan,
+    definition: &'p ModelDefinition,
+    layout: &'p ModelStateLayout,
+    index: usize,
+    layer: u32,
+    scope: WeightScope,
+    streams: Option<BlockStreams>,
+}
+
+impl<'p> Sublayer<'p> {
+    /// The planned weight of `kind` in the sublayer's scope ([`planned`]).
+    fn weight(&self, kind: WeightKind, bound: Element) -> Result<&'p WeightPlan, AssessmentError> {
+        planned(self.load, self.scope, kind, bound)
+    }
+
+    /// The sublayer's input under `norm` ([`sublayer_input`]).
+    fn input(&self, step: &mut Step<'_>, norm: Element) -> Result<(), AssessmentError> {
+        sublayer_input(step, self.load, self.definition, self.scope, norm, self.streams)
+    }
+}
+
+/// The calls of target block `index`: its mixer, its feed-forward, its
+/// per-layer input and its n-gram input. Its recurrent bank components
+/// start at `recurrent_component`; the first of the next block's.
+fn target_block(
+    step: &mut Step<'_>,
+    load: &ModelLoadPlan,
+    definition: &ModelDefinition,
+    layout: &ModelStateLayout,
+    index: usize,
+    block: &TargetBlockProgramSlot,
+    mut recurrent_component: usize,
+) -> Result<usize, AssessmentError> {
+    let layer = u32::try_from(index).map_err(|_| demand_error("block index exceeds u32"))?;
+    let [mixer_scope, feed_forward_scope] =
+        crate::programs::native_target_graph::block_scopes(index).map_err(demand_error)?;
+    let streams = block.block_streams();
+    // Block 0 widens the embedded row into the streams
+    // (`repeat_rows`), which streams no weight.
+    if index == 0 && streams.is_some() {
+        step.call(Kernel::of::<kernels::repeat_rows::Entry>(), Work::default())?;
+    }
+    let mixer = Sublayer {
+        load,
+        definition,
+        layout,
+        index,
+        layer,
+        scope: mixer_scope,
+        streams,
+    };
+    recurrent_component += match &block.mixer() {
+        MixerProgramSlot::Attention(binding) => {
+            attention_mixer(step, &mixer, binding)?;
+            0
+        }
+        MixerProgramSlot::StateSpace(binding) => {
+            state_space_mixer(step, &mixer, binding, recurrent_component)?
+        }
+        MixerProgramSlot::ShortConv(binding) => {
+            short_conv_mixer(step, &mixer, binding, recurrent_component)?
+        }
+        MixerProgramSlot::Recurrent(binding) => {
+            recurrent_mixer(step, &mixer, binding, recurrent_component)?
+        }
+    };
+    let Some(feed_forward) = block.feed_forward() else {
+        return Ok(recurrent_component);
+    };
+    let sublayer = Sublayer {
+        scope: feed_forward_scope,
+        ..mixer
+    };
+    match &feed_forward {
+        FeedForwardProgramSlot::Dense(binding) => dense_feed_forward(step, &sublayer, binding)?,
+        FeedForwardProgramSlot::Routed(binding) => routed_feed_forward(step, &sublayer, binding)?,
+        FeedForwardProgramSlot::Parallel(binding) => {
+            parallel_feed_forward(step, &sublayer, binding)?
+        }
+        FeedForwardProgramSlot::GeneralRouted(binding) => {
+            sublayer.input(step, binding.norm)?;
+            general_routed(step, load, feed_forward_scope, binding)?;
+            sinkhorn_join(step, streams)?;
+        }
+    }
+    if let Some(binding) = block.per_layer() {
+        per_layer_gate(step, load, layer, binding)?;
+    }
+    if let Some(binding) = block.ngram() {
+        let scope = WeightScope::TargetSublayer(SublayerIndex {
+            block: layer,
+            sublayer: 2,
+        });
+        ngram(step, load, layout, scope, binding, recurrent_component, index)?;
+        recurrent_component += binding.bank_components();
+    }
+    Ok(recurrent_component)
+}
+
+/// An attention mixer: its fused projection (`attention_project`), a
+/// low-rank or absorbed query's products, its picks and selection, the
+/// attention entry over its history and its output.
+fn attention_mixer(
+    step: &mut Step<'_>,
+    sublayer: &Sublayer<'_>,
+    binding: &AttentionBinding,
+) -> Result<(), AssessmentError> {
+    let weight = |kind, bound| sublayer.weight(kind, bound);
+    let layout = sublayer.layout;
+    let layer = sublayer.layer;
+    let backend = step.declarations.backend();
+    sublayer.input(step, binding.norm)?;
+    let shape = binding.shape;
+    let query = if shape.form.gate == crate::planning::GateForm::Interleaved {
+        WeightKind::QueryGate
+    } else {
+        WeightKind::Query
+    };
+    // The fused projection's query segment: the query's, or
+    // a low-rank query's `down` (`query_segment_kind`).
+    let segment = match binding.low_rank_query {
+        None => query,
+        Some(_) => WeightKind::QueryDown,
+    };
+    let projections = [
+        (true, segment, binding.query_segment()),
+        (
+            shape.gate_rows() > 0,
+            WeightKind::AttentionGate,
+            binding.gate,
+        ),
+        (shape.key_rows() > 0, WeightKind::Key, binding.key),
+        (shape.value_rows() > 0, WeightKind::Value, binding.value),
+    ]
+    .into_iter()
+    .filter(|(present, _, _)| *present)
+    .map(|(_, kind, bound)| weight(kind, bound))
+    .collect::<Result<Vec<_>, _>>()?;
+    let project = Kernel::of::<kernels::attention_project::Entry>();
+    step.call(project, projection(&projections)?)?;
+    // A low-rank query's `qr` rows, widened to F32
+    // (`widen_rows`), then projected to the query heads
+    // through its up weight (`binding.query`) under its norm.
+    if binding.low_rank_query.is_some() {
+        step.call(Kernel::of::<kernels::widen_rows::Entry>(), Work::default())?;
+        step.call(project, projection(&[weight(query, binding.query)?])?)?;
+    }
+    // An absorbed query's per-head products (`project_rows`),
+    // the queries attention reads.
+    if let Some(absorbed) = binding.absorbed {
+        step.call(
+            Kernel::of::<kernels::project_rows::Entry>(),
+            projection(&[weight(WeightKind::QueryKeys, absorbed.element)?])?,
+        )?;
+    }
+    // The entry attending the layer's history, and the
+    // layout it reads: the layer's own (`history_codec`; the
+    // model's own store is dense whatever the policy).
+    let (attend, history_layout) = match binding.history.encoding() {
+        // The entry the graph attends decode rows with
+        // (`graph::dense_decodes`): the prefill entry where
+        // the decode entry holds no form of the shape.
+        HistoryEncoding::Dense => (
+            if crate::operators::attention::graph::dense_decodes(backend, *binding)
+                .map_err(|error| demand_error(format!("{error:?}")))?
+            {
+                Kernel::of::<kernels::attention_decode::Entry>()
+            } else {
+                Kernel::of::<kernels::attention_prefill::Entry>()
+            },
+            KvCodec::Dense,
+        ),
+        HistoryEncoding::Affine => (
+            Kernel::of::<kernels::attention_decode_k8v4::Entry>(),
+            KvCodec::AffineK8V4,
+        ),
+        HistoryEncoding::Unsupported => {
+            return Err(demand_error(
+                "rotated K4/V4 history has no native attention entry",
+            ));
+        }
+    };
+    // The load prepares the attention entries per layer
+    // form (a compressed layer's picks launch where a
+    // window layer has none): the call is its layer's.
+    let statics = crate::operators::attention::graph::form_statics(&shape, binding.history)
+        .map_err(demand_error)?;
+    let (row_bytes, window) = history_read(&layout.target_history, LayerRef::Target(layer))?;
+    let widths = shape.widths;
+    let flops_per_token = 2 * widths.kv_heads * widths.group * (2 * widths.width);
+    let read = |window| HistoryRead {
+        layout: Some(history_layout),
+        bytes_per_token: row_bytes,
+        flops_per_token,
+        window,
+    };
+    // An index-list source's calls, and the picks attention
+    // reads of its plane beside its history.
+    let picks = match binding.picked {
+        None => Work::default(),
+        Some(source) => picked(
+            step,
+            &layout.target_history,
+            layer,
+            source,
+            (shape.widths.picks, flops_per_token),
+            binding.activation,
+            weight,
+        )?,
+    };
+    match binding.selection {
+        None => step.call_specialized(
+            attend,
+            &statics,
+            &[],
+            Work {
+                history: Some(read(window)),
+                ..picks
+            },
+        )?,
+        // The indexer projects its query and key, selects,
+        // and attention reads the selected blocks and the
+        // row's tail: at most one block past them.
+        Some(binding) => {
+            selection(step, &layout.target_history, layer, binding, &weight)?;
+            let selected = (binding.indexer.top + 1)
+                .checked_mul(binding.shape.block)
+                .ok_or_else(|| demand_error("selected tokens overflow"))?;
+            // The scoring class's call: a prefill entry reads
+            // its selection through a bitmap of `B` words,
+            // where a class that does not score yet (`B` 0)
+            // reads every visible row, fewer than it selects.
+            let scoring = statics
+                .iter()
+                .copied()
+                .chain([("B", binding.shape.words)])
+                .collect::<Vec<_>>();
+            step.call_specialized(
+                attend,
+                &scoring,
+                &[],
+                Work {
+                    history: Some(read(Some(
+                        window.map_or(selected, |window| window.min(selected)),
+                    ))),
+                    ..picks
+                },
+            )?;
+        }
+    }
+    // A grouped output's first product, each group's run of
+    // the attended row through its block of `a`
+    // (`project_rows`), which the output projection reads.
+    if let Some(grouped) = binding.grouped {
+        step.call(
+            Kernel::of::<kernels::project_rows::Entry>(),
+            projection(&[weight(
+                WeightKind::AttentionOutputGrouped,
+                grouped.element,
+            )?])?,
+        )?;
+    }
+    let projected = weight(WeightKind::AttentionOutput, binding.output)?;
+    tail(
+        step,
+        binding.tail,
+        Kernel::of::<kernels::attention_output::Entry>(),
+        projected,
+        weight,
+    )
+}
+
+/// A state-space mixer from bank component `first_component`: the
+/// query-only projection row (`attention_project`), the state advance over
+/// the layer's bank (window, state and tape components, `state_space_step`),
+/// the gated group norm (`state_space_gate`) and the output projection
+/// (`operators::state_space`). The bank components it advances over.
+fn state_space_mixer(
+    step: &mut Step<'_>,
+    sublayer: &Sublayer<'_>,
+    binding: &StateSpaceBinding,
+    first_component: usize,
+) -> Result<usize, AssessmentError> {
+    let weight = |kind, bound| sublayer.weight(kind, bound);
+    sublayer.input(step, binding.norm)?;
+    step.call(
+        Kernel::of::<kernels::attention_project::Entry>(),
+        projection(&[weight(
+            WeightKind::StateSpaceProjection,
+            binding.projection,
+        )?])?,
+    )?;
+    step.call(
+        Kernel::of::<kernels::state_space_step::Entry>(),
+        sequences(bank_bytes(sublayer.layout, first_component, 3, sublayer.index)?),
+    )?;
+    step.call(
+        Kernel::of::<kernels::state_space_gate::Entry>(),
+        weights(&[weight(WeightKind::StateSpaceNorm, Element::f32())?])?,
+    )?;
+    step.call(
+        Kernel::of::<kernels::attention_output::Entry>(),
+        projection(&[weight(WeightKind::RecurrentOutput, binding.output)?])?,
+    )?;
+    Ok(3)
+}
+
+/// A short-convolution mixer from bank component `first_component`: the
+/// segmented `u | C` projection (`short_conv_project`), the gated taps over
+/// the layer's window (its only bank component, `short_conv_rows`) and the
+/// output projection (`operators::short_conv`). The bank components it
+/// advances over.
+fn short_conv_mixer(
+    step: &mut Step<'_>,
+    sublayer: &Sublayer<'_>,
+    binding: &ShortConvBinding,
+    first_component: usize,
+) -> Result<usize, AssessmentError> {
+    let weight = |kind, bound| sublayer.weight(kind, bound);
+    sublayer.input(step, binding.norm)?;
+    step.call(
+        Kernel::of::<kernels::short_conv_project::Entry>(),
+        projection(&[
+            weight(WeightKind::ShortConvInputGate, binding.input_gate)?,
+            weight(WeightKind::ShortConvOutputGate, binding.output_gate)?,
+            weight(WeightKind::ShortConvValue, binding.value)?,
+        ])?,
+    )?;
+    let taps = weight(WeightKind::RecurrentConvolution, Element::f32())?;
+    step.call(
+        Kernel::of::<kernels::short_conv_rows::Entry>(),
+        Work {
+            weights: weight_bytes(&[taps])?,
+            sequence_bytes: bank_bytes(sublayer.layout, first_component, 1, sublayer.index)?,
+            ..Work::default()
+        },
+    )?;
+    let projected = weight(WeightKind::RecurrentOutput, binding.output)?;
+    tail(
+        step,
+        binding.tail,
+        Kernel::of::<kernels::attention_output::Entry>(),
+        projected,
+        weight,
+    )?;
+    Ok(1)
+}
+
+/// A recurrent mixer from bank component `first_component`: the segmented
+/// projection, the step over the layer's recurrent bank (window, delta and
+/// tape components), in the backend's step form (`operators::gated_delta`),
+/// and the output projection. The bank components it advances over.
+fn recurrent_mixer(
+    step: &mut Step<'_>,
+    sublayer: &Sublayer<'_>,
+    binding: &RecurrentBinding,
+    first_component: usize,
+) -> Result<usize, AssessmentError> {
+    let weight = |kind, bound| sublayer.weight(kind, bound);
+    let backend = step.declarations.backend();
+    sublayer.input(step, binding.norm)?;
+    let advance = match binding.form {
+        RecurrentForm::PerHead => {
+            let (project, advance) = match StepForm::of(backend).map_err(demand_error)? {
+                StepForm::Step => (
+                    Kernel::of::<kernels::gated_delta_project::Entry>(),
+                    Kernel::of::<kernels::gated_delta_step::Entry>(),
+                ),
+                StepForm::Convolved => (
+                    Kernel::of::<kernels::gated_delta_project_convolved::Entry>(),
+                    Kernel::of::<kernels::gated_delta_step_convolved::Entry>(),
+                ),
+            };
+            step.call(
+                project,
+                projection(&[
+                    weight(WeightKind::RecurrentQueryKeyValue, binding.qkv)?,
+                    weight(WeightKind::RecurrentGate, binding.gate)?,
+                    weight(WeightKind::RecurrentAlpha, binding.alpha)?,
+                    weight(WeightKind::RecurrentBeta, binding.beta)?,
+                ])?,
+            )?;
+            advance
+        }
+        // The projection (`attention_project`), the up
+        // projections (`project_rows`) of its gate and decay
+        // down products, and `kimi_delta_step`.
+        RecurrentForm::PerChannel { gate_up, alpha_up, .. } => {
+            step.call(
+                Kernel::of::<kernels::attention_project::Entry>(),
+                projection(&[
+                    weight(WeightKind::RecurrentQueryKeyValue, binding.qkv)?,
+                    weight(WeightKind::RecurrentGate, binding.gate)?,
+                    weight(WeightKind::RecurrentAlpha, binding.alpha)?,
+                    weight(WeightKind::RecurrentBeta, binding.beta)?,
+                ])?,
+            )?;
+            for (kind, element) in [
+                (WeightKind::RecurrentGateUp, gate_up),
+                (WeightKind::RecurrentAlphaUp, alpha_up),
+            ] {
+                step.call(
+                    Kernel::of::<kernels::project_rows::Entry>(),
+                    projection(&[weight(kind, element)?])?,
+                )?;
+            }
+            Kernel::of::<kernels::kimi_delta_step::Entry>()
+        }
+    };
+    step.call(
+        advance,
+        sequences(bank_bytes(sublayer.layout, first_component, 3, sublayer.index)?),
+    )?;
+    weight(WeightKind::RecurrentNorm, binding.recurrent_norm)?;
+    step.call(
+        Kernel::of::<kernels::attention_output::Entry>(),
+        projection(&[weight(WeightKind::RecurrentOutput, binding.output)?])?,
+    )?;
+    Ok(3)
+}
+
+/// A dense feed-forward: its expansion (`dense_expand`), its output and
+/// its Sinkhorn join.
+fn dense_feed_forward(
+    step: &mut Step<'_>,
+    sublayer: &Sublayer<'_>,
+    binding: &DenseBinding,
+) -> Result<(), AssessmentError> {
+    let weight = |kind, bound| sublayer.weight(kind, bound);
+    sublayer.input(step, binding.norm)?;
+    step.call(
+        Kernel::of::<kernels::dense_expand::Entry>(),
+        projection(&[
+            weight(WeightKind::DenseGate, binding.gate)?,
+            weight(WeightKind::DenseUp, binding.up)?,
+        ])?,
+    )?;
+    let down = weight(WeightKind::DenseDown, binding.down)?;
+    tail(
+        step,
+        binding.tail,
+        Kernel::of::<kernels::dense_output::Entry>(),
+        down,
+        weight,
+    )?;
+    sinkhorn_join(step, sublayer.streams)
+}
+
+/// A routed feed-forward: `operators::routed::fused_graph` at decode rows,
+/// in the backend's decode form: routing (`routed_route`), then the
+/// choices' and the shared expert's gate/up (`routed_expand`); or routing
+/// with the shared expert's gate/up (`routed_route_shared`), then the
+/// choices' (`routed_gate_up`). Then the choices' and the shared expert's
+/// down projections (`routed_output`). A streamed layer routes and combines
+/// in its streamed form ([`route`], [`combine`]).
+fn routed_feed_forward(
+    step: &mut Step<'_>,
+    sublayer: &Sublayer<'_>,
+    binding: &RoutedBinding,
+) -> Result<(), AssessmentError> {
+    let weight = |kind, bound| sublayer.weight(kind, bound);
+    let load = sublayer.load;
+    let scope = sublayer.scope;
+    sublayer.input(step, binding.norm)?;
+    let router = projection(&[weight(WeightKind::Router, binding.router)?])?;
+    let shared = projection(&[
+        weight(WeightKind::SharedGate, binding.shared_gate)?,
+        weight(WeightKind::SharedUp, binding.shared_up)?,
+    ])?;
+    let choices = Work {
+        experts: Some(experts(
+            &[
+                weight(WeightKind::ExpertGate, binding.expert_gate)?,
+                weight(WeightKind::ExpertUp, binding.expert_up)?,
+            ],
+            binding.experts,
+            binding.selected,
+        )?),
+        ..Work::default()
+    };
+    let sources = sources(load, scope);
+    match DecodeForm::of(step.declarations.backend()).map_err(demand_error)? {
+        DecodeForm::Expand => {
+            streamed::expand_form(streamed::streams(load, scope)).map_err(demand_error)?;
+            step.call(Kernel::of::<kernels::routed_route::Entry>(), router)?;
+            step.call(
+                Kernel::of::<kernels::routed_expand::Entry>(),
+                join([choices, shared])?,
+            )?;
+        }
+        DecodeForm::SharedRoute => {
+            route(
+                step,
+                load,
+                scope,
+                [
+                    Kernel::of::<kernels::routed_route_shared::Entry>(),
+                    Kernel::of::<kernels::routed_route_streamed::Entry>(),
+                    Kernel::of::<kernels::routed_hint_route::Entry>(),
+                ],
+                join([router, shared])?,
+            )?;
+            step.call_with(
+                Kernel::of::<kernels::routed_gate_up::Entry>(),
+                &sources,
+                choices,
+            )?;
+        }
+    }
+    let down = Work {
+        experts: Some(experts(
+            &[weight(WeightKind::ExpertDown, binding.expert_down)?],
+            binding.experts,
+            binding.selected,
+        )?),
+        ..Work::default()
+    };
+    combine(
+        step,
+        load,
+        scope,
+        [
+            Kernel::of::<kernels::routed_output::Entry>(),
+            Kernel::of::<kernels::routed_output_project::Entry>(),
+            Kernel::of::<kernels::routed_output_sited::Entry>(),
+        ],
+        join([
+            down,
+            projection(&[weight(WeightKind::SharedDown, binding.shared_down)?])?,
+        ])?,
+    )
+}
+
+/// A parallel feed-forward, `programs::graph::parallel`: the dense branch's
+/// expansion (`dense_expand`) and its projection into F32 rows
+/// (`project_rows`), the routed branch (summed onto zeros) in its own
+/// scope, then `moe_tail`.
+fn parallel_feed_forward(
+    step: &mut Step<'_>,
+    sublayer: &Sublayer<'_>,
+    binding: &ParallelBinding,
+) -> Result<(), AssessmentError> {
+    let load = sublayer.load;
+    let scope = sublayer.scope;
+    let WeightScope::TargetSublayer(index) = scope else {
+        return Err(demand_error("parallel branches outside a target sublayer"));
+    };
+    let [dense_scope, routed_scope] = DenseBesideRouted::scopes(index);
+    let dense = binding.dense;
+    let weight = |kind, bound| planned(load, dense_scope, kind, bound);
+    weight(WeightKind::InputNorm, dense.norm)?;
+    step.call(
+        Kernel::of::<kernels::dense_expand::Entry>(),
+        projection(&[
+            weight(WeightKind::DenseGate, dense.gate)?,
+            weight(WeightKind::DenseUp, dense.up)?,
+        ])?,
+    )?;
+    step.call(
+        Kernel::of::<kernels::project_rows::Entry>(),
+        projection(&[weight(WeightKind::DenseDown, dense.down)?])?,
+    )?;
+    planned(
+        load,
+        routed_scope,
+        WeightKind::InputNorm,
+        binding.routed.norm,
+    )?;
+    general_routed(step, load, routed_scope, &binding.routed)?;
+    // The branch and tail norms share the tail's element.
+    let norms = [dense_scope, routed_scope, scope]
+        .into_iter()
+        .map(|norm_scope| planned(load, norm_scope, WeightKind::PostNorm, binding.norm))
+        .collect::<Result<Vec<_>, _>>()?;
+    step.call(Kernel::of::<kernels::moe_tail::Entry>(), weights(&norms)?)
+}
+
+/// `programs::graph::per_layer` of target block `layer`: the gate over the
+/// layer's slice of the per-layer rows (`per_layer_gate`), then its
+/// post-norm tail.
+fn per_layer_gate(
+    step: &mut Step<'_>,
+    load: &ModelLoadPlan,
+    layer: u32,
+    binding: PerLayerBinding,
+) -> Result<(), AssessmentError> {
+    let scope = WeightScope::TargetSublayer(SublayerIndex {
+        block: layer,
+        sublayer: 2,
+    });
+    let SublayerTail::PostNorm { norm, .. } = binding.tail else {
+        return Err(demand_error(
+            "a per-layer input sublayer without a post-norm tail",
+        ));
+    };
+    step.call(
+        Kernel::of::<kernels::per_layer_gate::Entry>(),
+        projection(&[planned(
+            load,
+            scope,
+            WeightKind::PerLayerGate,
+            binding.gate,
+        )?])?,
+    )?;
+    post_norm(
+        step,
+        planned(
+            load,
+            scope,
+            WeightKind::PerLayerProjection,
+            binding.projection,
+        )?,
+        planned(load, scope, WeightKind::PostNorm, norm)?,
+    )
+}
+
+/// The decoder's exit, which ends the last block's graph: a low-rank exit
+/// site, which injects into nothing, or the collapse of Sinkhorn streams
+/// `[S·H]` into one row `[H]` under the last site's pre.
+fn decoder_exit(
+    step: &mut Step<'_>,
+    load: &ModelLoadPlan,
+    target: &TargetProgramPlan,
+) -> Result<(), AssessmentError> {
+    match target.blocks().last().and_then(|block| block.block_streams()) {
+        Some(BlockStreams::LowRank(streams)) => match streams.exit {
+            Some(exit) => mix_site(step, load, WeightScope::Target, exit, None),
+            None => Ok(()),
+        },
+        Some(BlockStreams::Sinkhorn(SinkhornBinding { hidden, streams, .. })) => step.call(
+            Kernel::of::<kernels::stream_collapse::Entry>(),
+            rows(f32_bytes(streams * hidden + hidden)?),
+        ),
+        None => Ok(()),
+    }
+}
+
+/// The selection readout graph: the features over the final row under the
+/// exit norm (or the exit site's partials, unnormalized,
+/// `readout_features_rows`), the vocabulary projection (its physical
+/// matrix, even when tied to the embedding, `readout_head_rows`), and
+/// sampling of the one F32 logits row (`sample_rows`).
+fn readout(
+    step: &mut Step<'_>,
+    load: &ModelLoadPlan,
+    definition: &ModelDefinition,
+    target: &TargetProgramPlan,
+) -> Result<(), AssessmentError> {
+    let readout = target.readout();
+    let norm = if InputForm::exit(&definition.decoder).normalized {
+        vec![planned(
+            load,
+            WeightScope::Target,
+            WeightKind::OutputNorm,
+            readout.norm,
+        )?]
+    } else {
+        Vec::new()
+    };
+    step.call(
+        Kernel::of::<kernels::readout_features_rows::Entry>(),
+        weights(&norm)?,
+    )?;
+    match readout.head {
+        // Admission keeps the canonical full-projection demand even
+        // when bounded classes have an optional qualified implementation.
+        ReadoutHead::Packed { weight, .. } | ReadoutHead::Qualified { weight, .. } => {
+            step.call(
+                Kernel::of::<kernels::readout_head_rows::Entry>(),
+                projection(&[planned(
+                    load,
+                    WeightScope::Target,
+                    WeightKind::Output,
+                    weight,
+                )?])?,
+            )?;
+        }
+    }
+    step.call(
+        Kernel::of::<kernels::sample_rows::Entry>(),
+        rows(
+            definition
+                .decoder
+                .vocabulary
+                .checked_mul(4)
+                .ok_or_else(|| demand_error("logits bytes overflow"))?,
+        ),
+    )
 }
 
 #[cfg(test)]

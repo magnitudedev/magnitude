@@ -58,7 +58,7 @@ fn triple(directory: &Directory, key: &str) -> Result<[f64; 3], Error> {
 pub fn describe_projector(
     directory: &Directory,
     target_width: u64,
-) -> Result<VisionDescription, Error> {
+) -> Result<Box<VisionDescription>, Error> {
     projector_type(directory, &[("qwen3vl_merger", ())], target_width)?;
     let depth = positive(directory, "clip.vision.block_count")?;
     let hidden = positive(directory, "clip.vision.embedding_length")?;
@@ -232,7 +232,7 @@ pub fn describe_projector(
         },
     ];
     tensors.finish()?;
-    let description = VisionDescription {
+    let description = Box::new(VisionDescription {
         // f16 intermediates around an F32 residual stream: 1.9% relative
         // RMS from an F64 forward of the 4B projector, where bf16 puts the
         // features 12.7% away (see the vision kernel family).
@@ -272,7 +272,7 @@ pub fn describe_projector(
             feed_forward: None,
             output_norm: None,
         },
-    };
+    });
     description
         .validate()
         .map_err(|error| invalid(error.to_string()))?;

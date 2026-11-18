@@ -157,12 +157,16 @@ impl Fault {
     }
 }
 
+/// What the reporter writes its reports in: the buffers too large for its
+/// frames, allocated once, as it starts, so that no report allocates.
+pub(super) use platform::Scratch;
+
 /// Write the faulted thread's stack first, when there is one, then every
 /// other thread's, then the images their addresses fall in, to `fd`.
 /// Allocates nothing, takes no lock a stuck thread can hold.
-pub(super) fn write(fd: libc::c_int, fault: Option<&Fault>) {
+pub(super) fn write(fd: libc::c_int, fault: Option<&Fault>, scratch: &mut Scratch) {
     let mut out = Out::new(fd);
-    platform::write(&mut out, fault);
+    platform::write(&mut out, fault, scratch);
     let _ = writeln!(out, "magnitude-engine: stacks end");
     out.flush();
 }
@@ -201,6 +205,27 @@ mod platform {
     /// How long a thread has to answer, and a walk to end: a walk is a few
     /// dozen system calls.
     const ANSWER: Duration = Duration::from_millis(500);
+
+    /// The most threads a report lists.
+    const THREADS: usize = 4096;
+
+    /// The process's thread list and, on x86-64, its images and unwinding
+    /// context.
+    pub(in super::super) struct Scratch {
+        tids: Box<[i64]>,
+        #[cfg(target_arch = "x86_64")]
+        images: super::cfi::Images,
+    }
+
+    impl Scratch {
+        pub(in super::super) fn new() -> Self {
+            Self {
+                tids: vec![0; THREADS].into_boxed_slice(),
+                #[cfg(target_arch = "x86_64")]
+                images: super::cfi::Images::new(),
+            }
+        }
+    }
 
     pub(super) fn install() {
         let mut fds = [0 as libc::c_int; 2];
@@ -411,16 +436,16 @@ mod platform {
         name(&comm[..length])
     }
 
-    pub(super) fn write(out: &mut Out, fault: Option<&Fault>) {
+    pub(super) fn write(out: &mut Out, fault: Option<&Fault>, scratch: &mut Scratch) {
         // SAFETY: `getpid` and `gettid` take nothing and cannot fail.
         let (pid, me) = unsafe { (libc::getpid(), libc::syscall(libc::SYS_gettid)) };
         let faulted = fault.map(|fault| fault.thread as i64);
-        let mut tids = [0i64; 4096];
-        let found = threads(&mut tids);
+        let tids = &mut scratch.tids[..];
+        let found = threads(tids);
         let listed = |tid: &&i64| **tid != me && Some(**tid) != faulted;
         let others = tids[..found].iter().filter(listed).count();
         #[cfg(target_arch = "x86_64")]
-        let mut images = super::cfi::Images::new();
+        let images = &mut scratch.images;
         #[cfg(target_arch = "x86_64")]
         let read = images.read();
         // The faulted thread first, from its registers at the fault: it is
@@ -716,7 +741,16 @@ mod platform {
         (identifier.thread_id, extended)
     }
 
-    pub(super) fn write(out: &mut Out, fault: Option<&Fault>) {
+    /// Nothing: a report here fits the reporter's frames.
+    pub(in super::super) struct Scratch;
+
+    impl Scratch {
+        pub(in super::super) fn new() -> Self {
+            Self
+        }
+    }
+
+    pub(super) fn write(out: &mut Out, fault: Option<&Fault>, _: &mut Scratch) {
         // SAFETY: a send right to the calling thread, released below.
         let me = unsafe { mach_thread_self() };
         let mut threads: *mut Port = std::ptr::null_mut();
@@ -816,7 +850,16 @@ mod platform {
         (unsafe { (*info).si_addr() } as u64, 0, Registers { pc: 0, link: None, frame: 0, sp: 0 })
     }
 
-    pub(super) fn write(out: &mut Out, fault: Option<&Fault>) {
+    /// Nothing: no stack is collected here.
+    pub(in super::super) struct Scratch;
+
+    impl Scratch {
+        pub(in super::super) fn new() -> Self {
+            Self
+        }
+    }
+
+    pub(super) fn write(out: &mut Out, fault: Option<&Fault>, _: &mut Scratch) {
         if let Some(fault) = fault {
             fault.heading(out, "?");
             let _ = writeln!(out);

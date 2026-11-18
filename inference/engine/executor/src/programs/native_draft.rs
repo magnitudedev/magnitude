@@ -34,7 +34,7 @@ use crate::{
     completion::CompletionWaiter,
     native::{AttestedDraft, AttestedLanding},
     operators::attention::graph::{
-        self as attention_graph, attention_weights, AttentionControlPorts, AttentionOperands,
+        self as attention_graph, AttentionControlPorts,
         AttentionGraphEntries, AttentionHistoryEntries, AttentionWeights, CheckedAttentionEntries, ProjectedRows,
     },
     operators::attention::split::{split, AttentionBlock, AttentionSite, AttentionTopology},
@@ -1628,10 +1628,6 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
     let class = draft_class.topology;
     let passes = &draft_class.passes;
     let planned = &numbers.weights;
-    let (hidden, vocabulary) = (&numbers.hidden, &numbers.vocabulary);
-    let activation = model.activation;
-    let scalars = reals.arguments(model.scalars);
-    let (epsilon, embedding_scale, softcap) = (scalars.epsilon.f32(), scalars.embedding_scale.f32(), scalars.softcap.f32());
     let layer_count = model.expansions.len();
     if [entries.layers.len(), passes.len(), numbers.dense.len()]
         .iter()
@@ -1648,96 +1644,23 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
     let mut layer_weights = Vec::with_capacity(layer_count);
     for index in 0..layer_count {
         // An injection-only class skips the layers it does not inject.
-        let Some(AttentionPass { topology, numbers }) = passes.injection(index) else {
-            layer_weights.push(None);
-            continue;
-        };
-        let scope = draft_sublayer(index, 0)?;
-        let operands = AttentionOperands::planned(
-            &mut graph,
-            planned,
-            scope,
-            topology,
-            numbers,
-            class.slots > 0,
-            &mut weights,
-            &mut constants,
-        )?;
-        let injection = attention_weights(
-            topology,
-            numbers,
-            InputForm::SINGLE,
-            class.slots > 0,
-            operands,
-            |kind| match kind {
-                WeightKind::InputNorm => Ok(fusion_norm.clone()),
-                kind => weight(&mut graph, planned, scope, kind, &mut weights),
-            },
-        )?;
-        layer_weights.push(Some(injection));
+        layer_weights.push(match passes.injection(index) {
+            Some(pass) => Some(AttentionWeights::planned(
+                &mut graph,
+                planned,
+                draft_sublayer(index, 0)?,
+                (&pass.topology, &pass.numbers),
+                (InputForm::SINGLE, class.slots > 0),
+                Some(&fusion_norm),
+                (&mut weights, &mut constants),
+            )?),
+            None => None,
+        });
     }
-
-    // Injection: each entry row appends its context K/V at its destination.
-    // The host writes the rows (an input of the first injection's
-    // projection; every layer's projection reads the same rows), or a
-    // device-conditioned class widens its bound target features.
-    let (first, first_weights) = layer_weights
-        .iter()
-        .enumerate()
-        .find_map(|(index, layer)| layer.as_ref().map(|layer| (index, layer)))
-        .ok_or("a draft has no injected layers")?;
-    let first_pass = passes.injection(first).expect("an injected layer has its injection");
-    let entry_rows = &draft_class.entry_rows;
-    let (conditioning, conditioning_rows) = if class.device {
-        let features = graph.port_with_class_extent(activation, &[entry_rows, hidden], 0, ENTRY_ROWS)?;
-        let widened = graph
-            .enqueue(
-                entries.widen,
-                &[("M", entry_rows), ("D", hidden)],
-                widen_rows::WorkflowArgs { rows: features.tensor().into() },
-            )?
-            .value;
-        (DraftConditioning::Features(features), widened)
-    } else {
-        let rows = graph.input_for(
-            G::first(entries.layers[first].injection.project),
-            "hidden",
-            &[
-                first_pass
-                    .numbers
-                    .widths
-                    .key_value_dimensions(&first_pass.topology.form, first_pass.numbers.rows.clone())
-                    .as_slice(),
-                first_weights.operands.project_dimensions(true).as_slice(),
-                &InputForm::SINGLE.dimensions(first_pass.numbers.widths.hidden.clone()),
-            ]
-            .concat(),
-        )?;
-        let tensor = rows.tensor().clone();
-        (DraftConditioning::Rows(rows), tensor)
-    };
-    let mut injection = Vec::with_capacity(layer_count);
-    let mut injected = None;
-    for (index, (layer_weight, layer)) in layer_weights.iter().zip(&entries.layers).enumerate() {
-        let (Some(weights_of), Some(pass)) = (layer_weight, passes.injection(index)) else {
-            injection.push(None);
-            continue;
-        };
-        let (mixed, state, controls) = attention_graph::attention(
-            &mut graph,
-            layer.injection,
-            &pass.topology,
-            &pass.numbers,
-            weights_of,
-            &mut constants,
-            SublayerInput::single(&conditioning_rows),
-            &conditioning_rows,
-            &Join::single(Some(ENTRY_ROWS)),
-        )?;
-        injection.push(Some(LayerPorts { controls, planes: state.planes }));
-        injected = Some(mixed);
-    }
-    let injected = injected.ok_or("a draft has no layers")?;
+    let (conditioning, conditioning_rows) =
+        draft_conditioning(&mut graph, &entries, model.activation, (numbers, draft_class), &layer_weights)?;
+    let (injection, injected) =
+        inject(&mut graph, &entries.layers, passes, &layer_weights, &conditioning_rows, &mut constants)?;
     let ClassPasses::Drafting(drafting) = passes else {
         graph.export(&injected)?;
         return Ok(DraftGraphParts {
@@ -1750,452 +1673,703 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
             output: injected,
         });
     };
-
-    // The block pass. Its rows, proposals and selections are counts of the
-    // class and the draft's block (its topology's), its widths the model's.
-    // Its unscaled weights bind the graph's absent operand
-    // (`GraphConstant::absent`).
-    let (slots, proposals, block_rows) = (class.slots, class.proposals, class.block_rows);
-    let rows = slots * block_rows;
-    let corrector = match (&numbers.method, &entries.corrector) {
-        (MethodNumbers::LiLiCorr { topology, widths }, Some(stages)) => Some((topology, widths, stages)),
-        (MethodNumbers::LiLiCorr { .. }, None) | (_, Some(_)) => {
-            return Err("draft method and corrector entries disagree".into());
-        }
-        _ => None,
-    };
-    // The selections, step-major; a corrector projects every mask row of
-    // every slot (slot-major), the rest each proposing row.
-    let selected = proposals * slots;
-    let mask_rows = model.mask_rows;
-    let outputs = match corrector {
-        Some(_) => slots * mask_rows,
-        None => selected,
-    };
-    // The block's tokens are the host's (`BoundDraftGraphs::embedding`).
-    let mut table = GatheredTable::of(&mut graph, planned, model.token_scope, WeightKind::Embedding, &mut weights)?;
-    // The empty directory: every table this graph gathers, it gathers by
-    // the host's rows or the rows of a table held whole (`gathered_table`).
-    let direct = table.by_rows(&mut graph, &mut constants)?;
-    let embedding_dims = [
-        ("M", Dim::from(rows)),
-        ("V", table.rows.clone()),
-        ("D", hidden.clone()),
-        ("R", direct.shape[0].clone()),
-        ("F", direct.shape[1].clone()),
-    ];
-    let tokens = graph.input_for(entries.embedding, "tokens", &embedding_dims)?;
-    let mut residual = graph
-        .enqueue(
-            entries.embedding,
-            &embedding_dims,
-            embedding_rows::WorkflowArgs {
-                table: (&table.table).into(),
-                tokens: tokens.tensor().into(),
-                directory: (&direct.tensor).into(),
-                scale: embedding_scale,
-                normalize: 0.into(),
-                epsilon,
-            },
-        )?
-        .r1;
-    let mut layers = Vec::with_capacity(layer_count);
-    // A convolved backbone's unfused layers read their normed rows through
-    // the identity row map of the block rows.
-    let convolved = match (&numbers.convolution, &entries.convolved) {
-        (Some([kernel, group]), Some(stages)) => {
-            let identity = GraphConstant::row_identity(&mut graph, rows, None)?;
-            let rows_map = identity.port().tensor().clone();
-            constants.push(identity);
-            Some((stages, kernel, group, rows_map))
-        }
-        (None, None) => None,
-        _ => return Err("draft convolutions and entries disagree".into()),
-    };
-    for (index, ((layer_weight, layer), drafting)) in
-        layer_weights.iter().zip(&entries.layers).zip(drafting).enumerate()
-    {
-        // A drafting class injects every layer.
-        let injection_weights = layer_weight.as_ref().expect("a drafting class injects every layer");
-        let (topology, block) = (&drafting.block.topology, &drafting.block.numbers);
-        if let Some((stages, kernel, group, rows_map)) = &convolved {
-            let ports;
-            (residual, ports) = convolved_layer(
-                &mut graph,
-                ConvolvedLayer {
-                    entries: &stages.layers[index],
-                    convolve_input: stages.convolve_input,
-                    convolve_residual: stages.convolve_residual,
-                    gated: stages.gated,
-                    mix: layer.attention.history,
-                    topology,
-                    block,
-                    epsilon,
-                    index,
-                    attention_weights: injection_weights,
-                    rows_map,
-                    block_rows,
-                    kernel,
-                    group,
-                    hidden,
-                    intermediate: &numbers.dense[index].features,
-                },
-                planned,
-                &mut weights,
-                &mut constants,
-                &residual,
-            )?;
-            layers.push(ports);
-            continue;
-        }
-        let input_norm = weight(&mut graph, planned, draft_sublayer(index, 0)?, WeightKind::InputNorm, &mut weights)?;
-        let block_weights = AttentionWeights {
-            input_norm: Some(input_norm),
-            query: injection_weights.query.clone(),
-            low_rank_query: injection_weights.low_rank_query.clone(),
-            absorbed: injection_weights.absorbed.clone(),
-            gate: injection_weights.gate.clone(),
-            key: injection_weights.key.clone(),
-            value: injection_weights.value.clone(),
-            query_norm: injection_weights.query_norm.clone(),
-            key_norm: injection_weights.key_norm.clone(),
-            sinks: injection_weights.sinks.clone(),
-            output: injection_weights.output.clone(),
-            grouped: injection_weights.grouped.clone(),
-            post_norm: None,
-            operands: injection_weights.operands.clone(),
-            selection: None,
-            picked: None,
-        };
-        let (mixed, state, controls) = attention_graph::attention(
-            &mut graph,
-            layer.attention,
-            topology,
-            block,
-            &block_weights,
-            &mut constants,
-            SublayerInput::single(&residual),
-            &residual,
-            &Join::single(None),
-        )?;
-        layers.push(LayerPorts { controls, planes: state.planes });
-        residual = dense_graph::dense(
-            &mut graph,
-            DenseGraphEntries { expand: layer.dense.expand, output: layer.dense.output },
-            model.expansions[index],
-            &numbers.dense[index],
-            planned,
-            draft_sublayer(index, 1)?,
-            &mut weights,
-            &mut constants,
-            &mixed,
-            &mixed,
-            &Dim::from(rows),
-            None,
-            epsilon,
-            None,
-        )?;
-    }
-    let output_norm = weight(&mut graph, planned, WeightScope::Draft, WeightKind::OutputNorm, &mut weights)?;
-    let readout_vocabulary = vocabulary.clone();
-    let mut leading = Vec::new();
-    // Full draft logits read the projection's vocabulary prefix as it is
-    // stored: the packed projection, or the planes of a scope another reader
-    // selected a class of (`ModelLoadPlan::finalize_readout`), through their
-    // full pass.
-    let projection = model.projection.ports(
-        &mut graph,
-        false,
-        &mut VocabularyPrefix {
-            planned,
-            vocabulary: &readout_vocabulary,
-            leading: &mut leading,
-            weights: &mut weights,
-            constants: &mut constants,
-        },
-    )?;
-    let mut dimensions = vec![
-        ("M", Dim::from(rows)),
-        ("O", Dim::from(outputs)),
-        ("V", readout_vocabulary.clone()),
-        ("D", hidden.clone()),
-        ("PT", Dim::from(1)),
-        ("NM", hidden.clone()),
-    ];
-    match &projection {
-        readout::ProjectionPorts::Packed { scale_extent, .. } => dimensions.push(("WS", scale_extent.clone())),
-        readout::ProjectionPorts::Progressive { depth, .. } => {
-            dimensions.push(("P", Dim::from(u64::from(depth.rest_planes()))));
-        }
-    }
-    let head_rows = entries.head.raw_out_rows(&mut graph, &projection, &dimensions)?;
-    let mut logits = readout::project_readout(
-        &mut graph,
-        entries.head.borrowed(),
-        &projection,
-        readout::ReadoutInput::RawRms {
-            hidden: &residual,
-            norm: &output_norm,
-            form: InputForm::SINGLE,
-            out_rows: head_rows.tensor(),
-            epsilon,
-        },
-        readout::ProjectionGeometry {
-            rows: Dim::from(rows),
-            projected: Dim::from(outputs),
-            selected: Dim::from(0),
-            vocabulary: readout_vocabulary.clone(),
-            hidden: hidden.clone(),
-            columns: readout_vocabulary.clone(),
-        },
-        softcap,
-        Some(entries.sample),
-        &mut constants,
-    )?
-    .logits;
-    let result = graph.local_for(entries.sample, "result", &[("M", Dim::from(selected)), ("V", readout_vocabulary.clone())])?;
-    // Each proposal's probability under the logits it was sampled from,
-    // step-major beside the selections, of a method that samples them.
-    let confidence = model
-        .samples
-        .then(|| {
-            Ok::<_, GraphError>(
-                graph
-                    .local_for(
-                        entries.confidence,
-                        "confidence",
-                        &[("M", Dim::from(selected)), ("N", Dim::from(outputs)), ("V", readout_vocabulary.clone())],
-                    )?
-                    .tensor()
-                    .clone(),
-            )
-        })
-        .transpose()?;
-    let sampled = || {
-        confidence
-            .as_ref()
-            .ok_or_else(|| GraphError::from("a sampling draft has no confidences".to_owned()))
-    };
-    let selection = (entries.shape, entries.sample, entries.confidence);
-    let selection_entries = move || readout::SelectionEntries {
-        shape: selection.0,
-        sample: selection.1,
-        confidence: selection.2,
-    };
-    let mut selections = Vec::new();
-    let mut anchor_rows = None;
-    let mut landed = None;
-    let anchors = match (&numbers.method, &entries.markov) {
-        (MethodNumbers::DFlash, None) => {
-            let mut all = result.tensor().slice_leading(0, outputs);
-            let mut all_confidence = sampled()?.slice_leading(0, outputs);
-            let identity = GraphConstant::identity(&mut graph, outputs)?;
-            let inputs =
-                readout::selection_inputs(&mut graph, entries.sample, &Dim::from(outputs), &readout_vocabulary)?;
-            selections.push(readout::select(
-                &mut graph,
-                selection_entries(),
-                &readout_vocabulary,
-                &mut logits,
-                None,
-                identity.port().tensor(),
-                &Dim::from(outputs),
-                class.shaped,
-                inputs,
-                &mut all,
-                &mut all_confidence,
-            )?);
-            constants.push(identity);
-            None
-        }
-        (MethodNumbers::DSpark { rank }, Some(chain)) => {
-            let markov_table =
-                weight(&mut graph, planned, WeightScope::Draft, WeightKind::MarkovEmbedding, &mut weights)?;
-            let markov_role = WeightRole { scope: WeightScope::Draft, kind: WeightKind::MarkovProjection };
-            // Its bias adds one logit per readout vocabulary row.
-            let markov_projection =
-                leading_port(&mut graph, planned, markov_role, &readout_vocabulary, rank, &mut leading)?;
-            let memory_dims = [
-                ("M", Dim::from(slots)),
-                ("V", vocabulary.clone()),
-                ("D", rank.clone()),
-                ("R", direct.shape[0].clone()),
-                ("F", direct.shape[1].clone()),
-            ];
-            let anchors = graph.input_for(chain.embedding, "tokens", &memory_dims)?;
-            // The projection's packing bound (a bound of all its rows bounds
-            // the readout vocabulary's).
-            let markov_bound = PackingBound::planned(&mut graph, planned, markov_role, &mut weights, &mut constants)?;
-            // An NVFP4 projection's second-level scale (absent otherwise).
-            let (markov_scale, markov_scale_extent) =
-                weight_scale_port(&mut graph, planned, markov_role, &mut weights, &mut constants)?;
-            // A step selects from its own biased rows, row `s` slot `s`.
-            let identity = GraphConstant::identity(&mut graph, slots)?;
-            for step in 0..proposals {
-                let rows_of_step = GraphConstant::i32(
-                    &mut graph,
-                    &(step * slots..(step + 1) * slots)
-                        .map(|row| i32::try_from(row).map_err(|_| "draft output row exceeds i32"))
-                        .collect::<Result<Vec<_>, _>>()?,
-                )?;
-                let previous = match step {
-                    0 => anchors.tensor().slice_leading(0, slots),
-                    _ => result.tensor().slice_leading((step - 1) * slots, step * slots),
-                };
-                let memory = graph
-                    .enqueue(
-                        chain.embedding,
-                        &memory_dims,
-                        embedding_rows::WorkflowArgs {
-                            table: (&markov_table).into(),
-                            tokens: (&previous).into(),
-                            directory: (&direct.tensor).into(),
-                            scale: 1.0.into(),
-                            normalize: 0.into(),
-                            epsilon,
-                        },
-                    )?
-                    .r0;
-                let mut biased = graph
-                    .enqueue(
-                        G::pick(chain.projection, &Dim::from(outputs)),
-                        &[
-                            ("M", Dim::from(outputs)),
-                            ("O", Dim::from(slots)),
-                            ("H", readout_vocabulary.clone()),
-                            ("F", rank.clone()),
-                            ("DS", markov_scale_extent.clone()),
-                            ("DB", markov_bound.extent.clone()),
-                        ],
-                        dense_output::WorkflowArgs {
-                            residual: (&logits).into(),
-                            product: (&memory).into(),
-                            down_weight: (&markov_projection).into(),
-                            out_rows: rows_of_step.port().tensor().into(),
-                            down_scale: markov_scale.tensor().into(),
-                            down_bound: (&markov_bound.tensor).into(),
-                        },
-                    )?
-                    .value;
-                let mut step_result = result.tensor().slice_leading(step * slots, (step + 1) * slots);
-                let inputs =
-                    readout::selection_inputs(&mut graph, entries.sample, &Dim::from(slots), &readout_vocabulary)?;
-                let mut step_confidence = sampled()?.slice_leading(step * slots, (step + 1) * slots);
-                // Its proposals' confidence is their probability under the
-                // biased logits they are drawn from. DSpark's own confidence
-                // head (sigmoid(score) < 0 at the service's fixed threshold)
-                // cannot decline a selection (including a NaN score), so
-                // neither its score nor its features are computed.
-                selections.push(readout::select(
-                    &mut graph,
-                    selection_entries(),
-                    &readout_vocabulary,
-                    &mut biased,
-                    None,
-                    identity.port().tensor(),
-                    &Dim::from(slots),
-                    class.shaped,
-                    inputs,
-                    &mut step_result,
-                    &mut step_confidence,
-                )?);
-                constants.push(rows_of_step);
-            }
-            constants.push(identity);
-            Some(anchors)
-        }
-        (MethodNumbers::DFlash2 { top_k, rank }, None) => {
-            let stages = entries.selector.as_ref().ok_or("a DFlash2 draft graph has no selector entries")?;
-            Some(selector_path(
-                &mut graph,
-                stages,
-                planned,
-                &mut weights,
-                &mut constants,
-                SelectorPath {
-                    direct: &direct,
-                    residual: &residual,
-                    output_norm: &output_norm,
-                    head_rows: head_rows.tensor(),
-                    logits: &logits,
-                    result: result.tensor(),
-                    rows,
-                    slots,
-                    proposals,
-                    vocabulary,
-                    readout_vocabulary: &readout_vocabulary,
-                    hidden,
-                    rank,
-                    top_k,
-                    epsilon,
-                },
-            )?)
-        }
-        (MethodNumbers::LiLiCorr { .. }, None) => {
-            let (corrector, widths, stages) = corrector.ok_or("a LiLiCorr draft graph has no corrector entries")?;
-            let (rows, read) = correct_candidates(
-                &mut graph,
-                stages,
-                entries.embedding,
-                entries.landing,
-                planned,
-                &mut weights,
-                &mut constants,
-                CorrectorPath {
-                    topology: reals.arguments(corrector.clone()),
-                    widths,
-                    table: &mut table,
-                    conditioning: &conditioning_rows,
-                    entry_rows,
-                    fusion_norm: &fusion_norm,
-                    residual: &residual,
-                    output_norm: &output_norm,
-                    head_rows: head_rows.tensor(),
-                    logits: &logits,
-                    result: result.tensor(),
-                    rows,
-                    slots,
-                    mask_rows,
-                    proposals,
-                    readout_vocabulary: &readout_vocabulary,
-                    hidden,
-                    embedding_scale,
-                    epsilon,
-                },
-            )?;
-            anchor_rows = Some(rows);
-            landed = read;
-            None
-        }
-        _ => return Err("draft method and entries disagree".into()),
-    };
-    // A selector's or corrector's proposals are chosen by path scores over
-    // a few candidates, which give no probability: they carry none.
-    if let Some(confidence) = &confidence {
-        graph.export(confidence)?;
-    }
-    let output = result.tensor().clone();
-    graph.export(&output)?;
+    let pass = BlockPass::of(&entries, (model, numbers), draft_class, reals, (&fusion_norm, &conditioning_rows))?;
+    let (block, output) = pass.build(&mut graph, &layer_weights, drafting, &mut weights, &mut constants)?;
     Ok(DraftGraphParts {
         plan: graph,
         conditioning,
         injection,
-        block: Some(BlockPorts {
-            tokens,
-            head_rows,
-            layers,
-            selections,
-            anchors,
-            anchor_rows,
-            landed,
-            leading,
-            readout_vocabulary,
-            confidence,
-        }),
+        block: Some(block),
         constants,
         weights,
         output,
     })
+}
+
+/// Where a class's injection reads its `[entry rows, hidden]` conditioning:
+/// rows the host writes (an input of the first injection's projection;
+/// every layer's projection reads the same rows), or, of a
+/// device-conditioned class, its bound target features widened in the
+/// graph. Returns them and the rows the injection reads.
+fn draft_conditioning<'a, G: GraphDraft + 'a>(
+    graph: &mut G,
+    entries: &DraftGraphEntries<'a, G>,
+    activation: Element,
+    (numbers, draft_class): (&DraftModelNumbers<Dim>, &DraftClass<Dim, AttentionTopology>),
+    layer_weights: &[Option<AttentionWeights>],
+) -> Result<(DraftConditioning, WorkflowTensor), GraphError> {
+    let (first, first_weights) = layer_weights
+        .iter()
+        .enumerate()
+        .find_map(|(index, layer)| layer.as_ref().map(|layer| (index, layer)))
+        .ok_or("a draft has no injected layers")?;
+    let first_pass = draft_class.passes.injection(first).expect("an injected layer has its injection");
+    let (entry_rows, hidden) = (&draft_class.entry_rows, &numbers.hidden);
+    if draft_class.topology.device {
+        let features = graph.port_with_class_extent(activation, &[entry_rows, hidden], 0, ENTRY_ROWS)?;
+        let widened = graph
+            .enqueue(
+                entries.widen,
+                &[("M", entry_rows), ("D", hidden)],
+                widen_rows::WorkflowArgs { rows: features.tensor().into() },
+            )?
+            .value;
+        return Ok((DraftConditioning::Features(features), widened));
+    }
+    let rows = graph.input_for(
+        G::first(entries.layers[first].injection.project),
+        "hidden",
+        &[
+            first_pass
+                .numbers
+                .widths
+                .key_value_dimensions(&first_pass.topology.form, first_pass.numbers.rows.clone())
+                .as_slice(),
+            first_weights.operands.project_dimensions(true).as_slice(),
+            &InputForm::SINGLE.dimensions(first_pass.numbers.widths.hidden.clone()),
+        ]
+        .concat(),
+    )?;
+    let tensor = rows.tensor().clone();
+    Ok((DraftConditioning::Rows(rows), tensor))
+}
+
+/// The injection: each entry row appends its context K/V at its
+/// destination in every layer the class injects (`layer_weights`'), from
+/// the `conditioning` rows. Returns each layer's ports, none of a skipped
+/// one, and the last injection's rows.
+fn inject<'a, G: GraphDraft + 'a>(
+    graph: &mut G,
+    layers: &[DraftLayerEntries<'a, G>],
+    passes: &ClassPasses<AttentionPass<Dim, AttentionTopology>>,
+    layer_weights: &[Option<AttentionWeights>],
+    conditioning: &WorkflowTensor,
+    constants: &mut Vec<GraphConstant>,
+) -> Result<(Vec<Option<LayerPorts>>, WorkflowTensor), GraphError> {
+    let mut injection = Vec::with_capacity(layers.len());
+    let mut injected = None;
+    for (index, (layer_weight, layer)) in layer_weights.iter().zip(layers).enumerate() {
+        let (Some(weights_of), Some(pass)) = (layer_weight, passes.injection(index)) else {
+            injection.push(None);
+            continue;
+        };
+        let (mixed, state, controls) = attention_graph::attention(
+            graph,
+            layer.injection,
+            &pass.topology,
+            &pass.numbers,
+            weights_of,
+            constants,
+            SublayerInput::single(conditioning),
+            conditioning,
+            &Join::single(Some(ENTRY_ROWS)),
+        )?;
+        injection.push(Some(LayerPorts { controls, planes: state.planes }));
+        injected = Some(mixed);
+    }
+    Ok((injection, injected.ok_or("a draft has no layers")?))
+}
+
+/// A drafting class's block pass: what each of its phases reads beside the
+/// graph, its weights and its constants. Its rows, proposals and selections
+/// are counts of the class and the draft's block (its topology's), its
+/// widths the model's. Its unscaled weights bind the graph's absent operand
+/// (`GraphConstant::absent`).
+struct BlockPass<'r, 'a, G: GraphDraft + 'a> {
+    entries: &'r DraftGraphEntries<'a, G>,
+    model: &'r DraftModelTopology,
+    numbers: &'r DraftModelNumbers<Dim>,
+    reals: &'r Facts<'r>,
+    class: ClassTopology,
+    epsilon: Argument<f32>,
+    embedding_scale: Argument<f32>,
+    softcap: Argument<f32>,
+    /// The injection's entry rows, its fusion norm and its F32
+    /// conditioning rows, which a corrector reads again.
+    entry_rows: &'r Dim,
+    fusion_norm: &'r WorkflowTensor,
+    conditioning: &'r WorkflowTensor,
+    /// The block rows: each slot's block.
+    rows: u64,
+    /// The selections, step-major.
+    selected: u64,
+    /// The projected rows: a corrector's every mask row of every slot
+    /// (slot-major), the rest each proposing row.
+    outputs: u64,
+}
+
+/// A drafting class's readout: its block's last residual, output-normed and
+/// projected to logits over the readout vocabulary, and where its
+/// selections and their confidences are written.
+struct BlockReadout {
+    residual: WorkflowTensor,
+    output_norm: WorkflowTensor,
+    /// The block row of each projected row.
+    head_rows: NativePort,
+    /// The projected rows' logits.
+    logits: WorkflowTensor,
+    /// The selections `[proposals · slots, 2]`, step-major.
+    result: NativePort,
+    /// `[proposals · slots]`, step-major: each proposal's probability under
+    /// the logits it was sampled from; absent for a method choosing by path
+    /// scores.
+    confidence: Option<WorkflowTensor>,
+    /// Weights whose rows are vocabulary entries of the readout, bound to
+    /// their leading readout vocabulary rows.
+    leading: Vec<(WeightRole, NativePort)>,
+}
+
+impl BlockReadout {
+    /// The proposals' confidences, of a method that samples them.
+    fn sampled(&self) -> Result<&WorkflowTensor, GraphError> {
+        self.confidence
+            .as_ref()
+            .ok_or_else(|| GraphError::from("a sampling draft has no confidences".to_owned()))
+    }
+}
+
+/// What a drafting class's method selects with: its selections, and the
+/// ports its path reads.
+struct MethodPorts {
+    selections: Vec<SelectionPorts>,
+    anchors: Option<NativePort>,
+    anchor_rows: Option<NativePort>,
+    landed: Option<LandedReadPorts>,
+}
+
+impl<'r, 'a, G: GraphDraft + 'a> BlockPass<'r, 'a, G> {
+    /// The block pass of `draft_class` of the draft `model` at its
+    /// `numbers`, the model's scalars read from `reals`, after an injection
+    /// through `fusion_norm` of the `conditioning` rows.
+    fn of(
+        entries: &'r DraftGraphEntries<'a, G>,
+        (model, numbers): (&'r DraftModelTopology, &'r DraftModelNumbers<Dim>),
+        draft_class: &'r DraftClass<Dim, AttentionTopology>,
+        reals: &'r Facts<'r>,
+        (fusion_norm, conditioning): (&'r WorkflowTensor, &'r WorkflowTensor),
+    ) -> Result<Self, GraphError> {
+        let class = draft_class.topology;
+        let corrects = match (&numbers.method, &entries.corrector) {
+            (MethodNumbers::LiLiCorr { .. }, Some(_)) => true,
+            (MethodNumbers::LiLiCorr { .. }, None) | (_, Some(_)) => {
+                return Err("draft method and corrector entries disagree".into());
+            }
+            _ => false,
+        };
+        // The selections, step-major; a corrector projects every mask row of
+        // every slot (slot-major), the rest each proposing row.
+        let selected = class.proposals * class.slots;
+        let scalars = reals.arguments(model.scalars);
+        Ok(Self {
+            entries,
+            model,
+            numbers,
+            reals,
+            class,
+            epsilon: scalars.epsilon.f32(),
+            embedding_scale: scalars.embedding_scale.f32(),
+            softcap: scalars.softcap.f32(),
+            entry_rows: &draft_class.entry_rows,
+            fusion_norm,
+            conditioning,
+            rows: class.slots * class.block_rows,
+            selected,
+            outputs: match corrects {
+                true => class.slots * model.mask_rows,
+                false => selected,
+            },
+        })
+    }
+
+    /// The block pass over the `drafting` layers, whose attention weights
+    /// are their injections' (`layer_weights`): its ports and its result,
+    /// the selections.
+    fn build(
+        &self,
+        graph: &mut G,
+        layer_weights: &[Option<AttentionWeights>],
+        drafting: &[DraftingLayer<AttentionPass<Dim, AttentionTopology>>],
+        weights: &mut Vec<(WeightPort, NativePort)>,
+        constants: &mut Vec<GraphConstant>,
+    ) -> Result<(BlockPorts, WorkflowTensor), GraphError> {
+        // The block's tokens are the host's (`BoundDraftGraphs::embedding`).
+        let mut table =
+            GatheredTable::of(graph, &self.numbers.weights, self.model.token_scope, WeightKind::Embedding, weights)?;
+        // The empty directory: every table this graph gathers, it gathers by
+        // the host's rows or the rows of a table held whole (`gathered_table`).
+        let direct = table.by_rows(graph, constants)?;
+        let (tokens, residual, layers) =
+            self.backbone(graph, (&table, &direct), layer_weights, drafting, weights, constants)?;
+        let mut projected = self.project(graph, residual, weights, constants)?;
+        let method = self.select(graph, (&mut table, &direct), &mut projected, weights, constants)?;
+        // A selector's or corrector's proposals are chosen by path scores over
+        // a few candidates, which give no probability: they carry none.
+        if let Some(confidence) = &projected.confidence {
+            graph.export(confidence)?;
+        }
+        let output = projected.result.tensor().clone();
+        graph.export(&output)?;
+        Ok((
+            BlockPorts {
+                tokens,
+                head_rows: projected.head_rows,
+                layers,
+                selections: method.selections,
+                anchors: method.anchors,
+                anchor_rows: method.anchor_rows,
+                landed: method.landed,
+                leading: projected.leading,
+                readout_vocabulary: self.numbers.vocabulary.clone(),
+                confidence: projected.confidence,
+            },
+            output,
+        ))
+    }
+
+    /// The block's tokens embedded from `table` (through `direct`), then
+    /// every layer: its tokens' input port, its last residual and each
+    /// layer's ports.
+    fn backbone(
+        &self,
+        graph: &mut G,
+        (table, direct): (&GatheredTable, &RowDirectory),
+        layer_weights: &[Option<AttentionWeights>],
+        drafting: &[DraftingLayer<AttentionPass<Dim, AttentionTopology>>],
+        weights: &mut Vec<(WeightPort, NativePort)>,
+        constants: &mut Vec<GraphConstant>,
+    ) -> Result<(NativePort, WorkflowTensor, Vec<LayerPorts>), GraphError> {
+        let (entries, numbers, planned) = (self.entries, self.numbers, &self.numbers.weights);
+        let (hidden, rows, block_rows, epsilon) = (&numbers.hidden, self.rows, self.class.block_rows, self.epsilon);
+        let embedding_dims = [
+            ("M", Dim::from(rows)),
+            ("V", table.rows.clone()),
+            ("D", hidden.clone()),
+            ("R", direct.shape[0].clone()),
+            ("F", direct.shape[1].clone()),
+        ];
+        let tokens = graph.input_for(entries.embedding, "tokens", &embedding_dims)?;
+        let mut residual = graph
+            .enqueue(
+                entries.embedding,
+                &embedding_dims,
+                embedding_rows::WorkflowArgs {
+                    table: (&table.table).into(),
+                    tokens: tokens.tensor().into(),
+                    directory: (&direct.tensor).into(),
+                    scale: self.embedding_scale,
+                    normalize: 0.into(),
+                    epsilon,
+                },
+            )?
+            .r1;
+        let mut layers = Vec::with_capacity(drafting.len());
+        // A convolved backbone's unfused layers read their normed rows through
+        // the identity row map of the block rows.
+        let convolved = match (&numbers.convolution, &entries.convolved) {
+            (Some([kernel, group]), Some(stages)) => {
+                let identity = GraphConstant::row_identity(graph, rows, None)?;
+                let rows_map = identity.port().tensor().clone();
+                constants.push(identity);
+                Some((stages, kernel, group, rows_map))
+            }
+            (None, None) => None,
+            _ => return Err("draft convolutions and entries disagree".into()),
+        };
+        for (index, ((layer_weight, layer), drafting)) in
+            layer_weights.iter().zip(&entries.layers).zip(drafting).enumerate()
+        {
+            // A drafting class injects every layer.
+            let injection_weights = layer_weight.as_ref().expect("a drafting class injects every layer");
+            let (topology, block) = (&drafting.block.topology, &drafting.block.numbers);
+            if let Some((stages, kernel, group, rows_map)) = &convolved {
+                let ports;
+                (residual, ports) = convolved_layer(
+                    graph,
+                    ConvolvedLayer {
+                        entries: &stages.layers[index],
+                        convolve_input: stages.convolve_input,
+                        convolve_residual: stages.convolve_residual,
+                        gated: stages.gated,
+                        mix: layer.attention.history,
+                        topology,
+                        block,
+                        epsilon,
+                        index,
+                        attention_weights: injection_weights,
+                        rows_map,
+                        block_rows,
+                        kernel,
+                        group,
+                        hidden,
+                        intermediate: &numbers.dense[index].features,
+                    },
+                    planned,
+                    weights,
+                    constants,
+                    &residual,
+                )?;
+                layers.push(ports);
+                continue;
+            }
+            let input_norm = weight(graph, planned, draft_sublayer(index, 0)?, WeightKind::InputNorm, weights)?;
+            let (mixed, state, controls) = attention_graph::attention(
+                graph,
+                layer.attention,
+                topology,
+                block,
+                &injection_weights.for_block(input_norm),
+                constants,
+                SublayerInput::single(&residual),
+                &residual,
+                &Join::single(None),
+            )?;
+            layers.push(LayerPorts { controls, planes: state.planes });
+            residual = dense_graph::dense(
+                graph,
+                DenseGraphEntries { expand: layer.dense.expand, output: layer.dense.output },
+                self.model.expansions[index],
+                &numbers.dense[index],
+                planned,
+                draft_sublayer(index, 1)?,
+                weights,
+                constants,
+                &mixed,
+                &mixed,
+                &Dim::from(rows),
+                None,
+                epsilon,
+                None,
+            )?;
+        }
+        Ok((tokens, residual, layers))
+    }
+
+    /// The block's last `residual`, output-normed and projected over the
+    /// readout vocabulary, and the ports its selections are written to.
+    fn project(
+        &self,
+        graph: &mut G,
+        residual: WorkflowTensor,
+        weights: &mut Vec<(WeightPort, NativePort)>,
+        constants: &mut Vec<GraphConstant>,
+    ) -> Result<BlockReadout, GraphError> {
+        let (entries, planned) = (self.entries, &self.numbers.weights);
+        let (hidden, vocabulary) = (&self.numbers.hidden, &self.numbers.vocabulary);
+        let (rows, outputs, selected) = (self.rows, self.outputs, self.selected);
+        let output_norm = weight(graph, planned, WeightScope::Draft, WeightKind::OutputNorm, weights)?;
+        let mut leading = Vec::new();
+        // Full draft logits read the projection's vocabulary prefix as it is
+        // stored: the packed projection, or the planes of a scope another reader
+        // selected a class of (`ModelLoadPlan::finalize_readout`), through their
+        // full pass.
+        let projection = self.model.projection.ports(
+            graph,
+            false,
+            &mut VocabularyPrefix {
+                planned,
+                vocabulary,
+                leading: &mut leading,
+                weights: &mut *weights,
+                constants: &mut *constants,
+            },
+        )?;
+        let mut dimensions = vec![
+            ("M", Dim::from(rows)),
+            ("O", Dim::from(outputs)),
+            ("V", vocabulary.clone()),
+            ("D", hidden.clone()),
+            ("PT", Dim::from(1)),
+            ("NM", hidden.clone()),
+        ];
+        match &projection {
+            readout::ProjectionPorts::Packed { scale_extent, .. } => dimensions.push(("WS", scale_extent.clone())),
+            readout::ProjectionPorts::Progressive { depth, .. } => {
+                dimensions.push(("P", Dim::from(u64::from(depth.rest_planes()))));
+            }
+        }
+        let head_rows = entries.head.raw_out_rows(graph, &projection, &dimensions)?;
+        let logits = readout::project_readout(
+            graph,
+            entries.head.borrowed(),
+            &projection,
+            readout::ReadoutInput::RawRms {
+                hidden: &residual,
+                norm: &output_norm,
+                form: InputForm::SINGLE,
+                out_rows: head_rows.tensor(),
+                epsilon: self.epsilon,
+            },
+            readout::ProjectionGeometry {
+                rows: Dim::from(rows),
+                projected: Dim::from(outputs),
+                selected: Dim::from(0),
+                vocabulary: vocabulary.clone(),
+                hidden: hidden.clone(),
+                columns: vocabulary.clone(),
+            },
+            self.softcap,
+            Some(entries.sample),
+            constants,
+        )?
+        .logits;
+        let result =
+            graph.local_for(entries.sample, "result", &[("M", Dim::from(selected)), ("V", vocabulary.clone())])?;
+        // Each proposal's probability under the logits it was sampled from,
+        // step-major beside the selections, of a method that samples them.
+        let confidence = self
+            .model
+            .samples
+            .then(|| {
+                Ok::<_, GraphError>(
+                    graph
+                        .local_for(
+                            entries.confidence,
+                            "confidence",
+                            &[("M", Dim::from(selected)), ("N", Dim::from(outputs)), ("V", vocabulary.clone())],
+                        )?
+                        .tensor()
+                        .clone(),
+                )
+            })
+            .transpose()?;
+        Ok(BlockReadout { residual, output_norm, head_rows, logits, result, confidence, leading })
+    }
+
+    /// The selections of the draft's method from `projected`, its tokens'
+    /// codebooks or candidates read from `table` (through `direct`).
+    fn select(
+        &self,
+        graph: &mut G,
+        (table, direct): (&mut GatheredTable, &RowDirectory),
+        projected: &mut BlockReadout,
+        weights: &mut Vec<(WeightPort, NativePort)>,
+        constants: &mut Vec<GraphConstant>,
+    ) -> Result<MethodPorts, GraphError> {
+        let (entries, numbers, planned) = (self.entries, self.numbers, &self.numbers.weights);
+        let (slots, proposals) = (self.class.slots, self.class.proposals);
+        let (hidden, vocabulary) = (&numbers.hidden, &numbers.vocabulary);
+        Ok(match (&numbers.method, &entries.markov) {
+            (MethodNumbers::DFlash, None) => MethodPorts {
+                selections: vec![self.dflash(graph, projected, constants)?],
+                anchors: None,
+                anchor_rows: None,
+                landed: None,
+            },
+            (MethodNumbers::DSpark { rank }, Some(chain)) => {
+                let (selections, anchors) = self.dspark(graph, (chain, rank), (direct, projected), weights, constants)?;
+                MethodPorts { selections, anchors: Some(anchors), anchor_rows: None, landed: None }
+            }
+            (MethodNumbers::DFlash2 { top_k, rank }, None) => {
+                let stages = entries.selector.as_ref().ok_or("a DFlash2 draft graph has no selector entries")?;
+                let anchors = selector_path(
+                    graph,
+                    stages,
+                    planned,
+                    weights,
+                    constants,
+                    SelectorPath {
+                        direct,
+                        residual: &projected.residual,
+                        output_norm: &projected.output_norm,
+                        head_rows: projected.head_rows.tensor(),
+                        logits: &projected.logits,
+                        result: projected.result.tensor(),
+                        rows: self.rows,
+                        slots,
+                        proposals,
+                        vocabulary,
+                        readout_vocabulary: vocabulary,
+                        hidden,
+                        rank,
+                        top_k,
+                        epsilon: self.epsilon,
+                    },
+                )?;
+                MethodPorts { selections: Vec::new(), anchors: Some(anchors), anchor_rows: None, landed: None }
+            }
+            (MethodNumbers::LiLiCorr { topology, widths }, None) => {
+                let stages = entries.corrector.as_ref().ok_or("a LiLiCorr draft graph has no corrector entries")?;
+                let (anchor_rows, landed) = correct_candidates(
+                    graph,
+                    stages,
+                    entries.embedding,
+                    entries.landing,
+                    planned,
+                    weights,
+                    constants,
+                    CorrectorPath {
+                        topology: self.reals.arguments(topology.clone()),
+                        widths,
+                        table,
+                        conditioning: self.conditioning,
+                        entry_rows: self.entry_rows,
+                        fusion_norm: self.fusion_norm,
+                        residual: &projected.residual,
+                        output_norm: &projected.output_norm,
+                        head_rows: projected.head_rows.tensor(),
+                        logits: &projected.logits,
+                        result: projected.result.tensor(),
+                        rows: self.rows,
+                        slots,
+                        mask_rows: self.model.mask_rows,
+                        proposals,
+                        readout_vocabulary: vocabulary,
+                        hidden,
+                        embedding_scale: self.embedding_scale,
+                        epsilon: self.epsilon,
+                    },
+                )?;
+                MethodPorts { selections: Vec::new(), anchors: None, anchor_rows: Some(anchor_rows), landed }
+            }
+            _ => return Err("draft method and entries disagree".into()),
+        })
+    }
+
+    /// The selection's entries.
+    fn selection_entries(&self) -> readout::SelectionEntries<'a, G> {
+        readout::SelectionEntries {
+            shape: self.entries.shape,
+            sample: self.entries.sample,
+            confidence: self.entries.confidence,
+        }
+    }
+
+    /// DFlash's selection: every proposal from its own row's logits.
+    fn dflash(
+        &self,
+        graph: &mut G,
+        projected: &mut BlockReadout,
+        constants: &mut Vec<GraphConstant>,
+    ) -> Result<SelectionPorts, GraphError> {
+        let (outputs, vocabulary) = (self.outputs, &self.numbers.vocabulary);
+        let mut all = projected.result.tensor().slice_leading(0, outputs);
+        let mut all_confidence = projected.sampled()?.slice_leading(0, outputs);
+        let identity = GraphConstant::identity(graph, outputs)?;
+        let inputs = readout::selection_inputs(graph, self.entries.sample, &Dim::from(outputs), vocabulary)?;
+        let selection = readout::select(
+            graph,
+            self.selection_entries(),
+            vocabulary,
+            &mut projected.logits,
+            None,
+            identity.port().tensor(),
+            &Dim::from(outputs),
+            self.class.shaped,
+            inputs,
+            &mut all,
+            &mut all_confidence,
+        )?;
+        constants.push(identity);
+        Ok(selection)
+    }
+
+    /// DSpark's selections: each step's from its logits biased by the
+    /// Markov memory (`chain`, of `rank` columns) of the token each slot
+    /// follows, its anchor and then its previous selection. Returns them and
+    /// the anchors' input port.
+    fn dspark(
+        &self,
+        graph: &mut G,
+        (chain, rank): (&MarkovEntries<'a, G>, &Dim),
+        (direct, projected): (&RowDirectory, &mut BlockReadout),
+        weights: &mut Vec<(WeightPort, NativePort)>,
+        constants: &mut Vec<GraphConstant>,
+    ) -> Result<(Vec<SelectionPorts>, NativePort), GraphError> {
+        let planned = &self.numbers.weights;
+        let (slots, proposals, outputs) = (self.class.slots, self.class.proposals, self.outputs);
+        let vocabulary = &self.numbers.vocabulary;
+        let markov_table = weight(graph, planned, WeightScope::Draft, WeightKind::MarkovEmbedding, weights)?;
+        let markov_role = WeightRole { scope: WeightScope::Draft, kind: WeightKind::MarkovProjection };
+        // Its bias adds one logit per readout vocabulary row.
+        let markov_projection = leading_port(graph, planned, markov_role, vocabulary, rank, &mut projected.leading)?;
+        let memory_dims = [
+            ("M", Dim::from(slots)),
+            ("V", vocabulary.clone()),
+            ("D", rank.clone()),
+            ("R", direct.shape[0].clone()),
+            ("F", direct.shape[1].clone()),
+        ];
+        let anchors = graph.input_for(chain.embedding, "tokens", &memory_dims)?;
+        // The projection's packing bound (a bound of all its rows bounds
+        // the readout vocabulary's).
+        let markov_bound = PackingBound::planned(graph, planned, markov_role, weights, constants)?;
+        // An NVFP4 projection's second-level scale (absent otherwise).
+        let (markov_scale, markov_scale_extent) = weight_scale_port(graph, planned, markov_role, weights, constants)?;
+        // A step selects from its own biased rows, row `s` slot `s`.
+        let identity = GraphConstant::identity(graph, slots)?;
+        let mut selections = Vec::new();
+        for step in 0..proposals {
+            let rows_of_step = GraphConstant::i32(
+                graph,
+                &(step * slots..(step + 1) * slots)
+                    .map(|row| i32::try_from(row).map_err(|_| "draft output row exceeds i32"))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )?;
+            let previous = match step {
+                0 => anchors.tensor().slice_leading(0, slots),
+                _ => projected.result.tensor().slice_leading((step - 1) * slots, step * slots),
+            };
+            let memory = graph
+                .enqueue(
+                    chain.embedding,
+                    &memory_dims,
+                    embedding_rows::WorkflowArgs {
+                        table: (&markov_table).into(),
+                        tokens: (&previous).into(),
+                        directory: (&direct.tensor).into(),
+                        scale: 1.0.into(),
+                        normalize: 0.into(),
+                        epsilon: self.epsilon,
+                    },
+                )?
+                .r0;
+            let mut biased = graph
+                .enqueue(
+                    G::pick(chain.projection, &Dim::from(outputs)),
+                    &[
+                        ("M", Dim::from(outputs)),
+                        ("O", Dim::from(slots)),
+                        ("H", vocabulary.clone()),
+                        ("F", rank.clone()),
+                        ("DS", markov_scale_extent.clone()),
+                        ("DB", markov_bound.extent.clone()),
+                    ],
+                    dense_output::WorkflowArgs {
+                        residual: (&projected.logits).into(),
+                        product: (&memory).into(),
+                        down_weight: (&markov_projection).into(),
+                        out_rows: rows_of_step.port().tensor().into(),
+                        down_scale: markov_scale.tensor().into(),
+                        down_bound: (&markov_bound.tensor).into(),
+                    },
+                )?
+                .value;
+            let mut step_result = projected.result.tensor().slice_leading(step * slots, (step + 1) * slots);
+            let inputs = readout::selection_inputs(graph, self.entries.sample, &Dim::from(slots), vocabulary)?;
+            let mut step_confidence = projected.sampled()?.slice_leading(step * slots, (step + 1) * slots);
+            // Its proposals' confidence is their probability under the
+            // biased logits they are drawn from. DSpark's own confidence
+            // head (sigmoid(score) < 0 at the service's fixed threshold)
+            // cannot decline a selection (including a NaN score), so
+            // neither its score nor its features are computed.
+            selections.push(readout::select(
+                graph,
+                self.selection_entries(),
+                vocabulary,
+                &mut biased,
+                None,
+                identity.port().tensor(),
+                &Dim::from(slots),
+                self.class.shaped,
+                inputs,
+                &mut step_result,
+                &mut step_confidence,
+            )?);
+            constants.push(rows_of_step);
+        }
+        constants.push(identity);
+        Ok((selections, anchors))
+    }
 }
 
 /// One `project_rows` of `rows` rows through `weight`, binding its planned

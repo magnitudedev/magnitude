@@ -28,7 +28,7 @@ use std::path::PathBuf;
 const PROPOSALS: u8 = 4;
 const PROMPT: usize = 40;
 
-fn open_domain() -> Option<(ExecutorDomain, StateBindings, usize)> {
+fn open_domain() -> Option<(Box<ExecutorDomain>, StateBindings, usize)> {
     let model = PathBuf::from(std::env::var_os("MAGNITUDE_TEST_MTP_GGUF")?);
     let resolved = EngineConfiguration {
         package: PackageOptions {

@@ -29,17 +29,17 @@ use magnitude_service_contracts::HardwareProvider;
 use magnitude_service_contracts::models::{
     CatalogModelState, CatalogModels as _, CustomModelState, LocalModels as _,
     EffectiveModel, ModelInstance, ModelInstanceFailure, ModelInstanceId, ModelInstanceLifecycle,
-    ModelReleaseReason,
+    ModelLoadDevice, ModelReleaseReason,
 };
 use magnitude_service_models::{
-    InventoryConfig, ManagedModelDownloads, ModelDomainResolver, load_release_catalog,
-    managed_model_services,
+    InventoryConfig, ManagedModelDownloads, ManagedModelServices, ManagedModelStore,
+    ModelDomainResolver, load_release_catalog, managed_model_services,
 };
 use magnitude_service_server::assessment::environment::ServingDevice;
 use magnitude_service_server::configurations::ResolvedConfigurations;
 use magnitude_service_server::device_lock::DeviceLock;
 use magnitude_service_server::hardware::HardwareInventory;
-use magnitude_service_server::model_store::{ServedStore, open_served_store};
+use magnitude_service_server::model_store::{ServedStore, ServedVolumes, open_served_store};
 use magnitude_service_server::residency::controller::{ModelInstances, ResidencyEnvironment};
 use magnitude_service_server::residency::worker::run_inference_worker;
 use magnitude_service_server::serving::ServiceModels;
@@ -79,15 +79,77 @@ struct Harness {
     router: axum::Router,
 }
 
+/// The service's model store opened on the machine: what every harness is started over.
+struct Served {
+    inventory: Arc<ManagedModelStore>,
+    resolver: Arc<ModelDomainResolver>,
+    downloads: Arc<ManagedModelDownloads>,
+    configurations: Arc<ResolvedConfigurations>,
+    catalog: Arc<seismic::Devices>,
+    serving: ServingDevice,
+}
+
+impl Served {
+    /// Model instances over the store, releasing an idle model after `idle_timeout`, and the
+    /// protocol router mounted on them.
+    fn harness(&self, idle_timeout: Duration, namespace: &str) -> Harness {
+        let instances = ModelInstances::start(ResidencyEnvironment {
+            models: self.inventory.clone(),
+            model_variants: self.resolver.clone(),
+            configurations: self.configurations.clone(),
+            catalog: self.catalog.clone(),
+            idle_timeout,
+            launcher: WorkerLauncher::current().expect("harness executable"),
+            device: DeviceLock::default(),
+            instance_id_namespace: namespace.to_owned(),
+        });
+        let router = app(
+            AppState::new().with_model_controller(Arc::new(instances.clone())),
+            magnitude_serving::Serving::new(Arc::new(ServiceModels::new(instances.clone()))),
+        );
+        Harness { instances, router }
+    }
+}
+
+/// The first model made resident: its instance, the device its worker opened, and that worker.
+struct Resident {
+    instance: ModelInstance,
+    device: ModelLoadDevice,
+    worker: u32,
+}
+
 async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
+    let (served, volumes) = served(&arguments).await?;
+    let main = served.harness(Duration::from_secs(3600), "main");
+    let services = managed_model_services(
+        served.resolver.clone(),
+        served.downloads.clone(),
+        Arc::new(main.instances.clone()),
+        Arc::new(main.instances.clone()),
+    )?;
+    let (first, second) = ready_pair(&services, &arguments).await?;
+    let resident = ensured(&main, &first, served.serving).await?;
+    hardware(&main, &served, volumes, &resident.device).await?;
+    completions(&main, &first).await?;
+    let replacement = join_and_replace(&main, &first, &second, &resident).await?;
+    stop_in_flight(&main, &second, replacement).await?;
+    stop_during_load(&main, &first).await?;
+    crash(&main, &first).await?;
+    idle(&served, &first).await?;
+    println!("G-D residency lifecycle: all scenarios passed");
+    Ok(())
+}
+
+/// The store the arguments name, opened as the service opens it, and the volumes it serves.
+async fn served(arguments: &[String]) -> anyhow::Result<(Served, ServedVolumes)> {
     let release = Arc::new(load_release_catalog(&PathBuf::from(flag(
-        &arguments, "--bundle",
+        arguments, "--bundle",
     )))?);
     let mut config = InventoryConfig::with_roots(
-        PathBuf::from(flag(&arguments, "--model-store")),
-        PathBuf::from(flag(&arguments, "--cache-root")),
+        PathBuf::from(flag(arguments, "--model-store")),
+        PathBuf::from(flag(arguments, "--cache-root")),
     )?;
-    config.add_hugging_face_caches([PathBuf::from(flag(&arguments, "--hf-cache"))]);
+    config.add_hugging_face_caches([PathBuf::from(flag(arguments, "--hf-cache"))]);
     config.catalog_models = release.catalog().models.clone();
     config.architectures = magnitude_service_server::assessment::candidates::engine_architectures();
     let rate = ReleaseRate::of_machine(None);
@@ -106,30 +168,22 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
         serving,
         Default::default(),
     ));
-    let harness = |idle_timeout: Duration, namespace: &str| {
-        let instances = ModelInstances::start(ResidencyEnvironment {
-            models: inventory.clone(),
-            model_variants: resolver.clone(),
-            configurations: configurations.clone(),
-            catalog: catalog.clone(),
-            idle_timeout,
-            launcher: WorkerLauncher::current().expect("harness executable"),
-            device: DeviceLock::default(),
-            instance_id_namespace: namespace.to_owned(),
-        });
-        let router = app(
-            AppState::new().with_model_controller(Arc::new(instances.clone())),
-            magnitude_serving::Serving::new(Arc::new(ServiceModels::new(instances.clone()))),
-        );
-        Harness { instances, router }
-    };
-    let main = harness(Duration::from_secs(3600), "main");
-    let services = managed_model_services(
-        resolver.clone(),
+    let served = Served {
+        inventory,
+        resolver,
         downloads,
-        Arc::new(main.instances.clone()),
-        Arc::new(main.instances.clone()),
-    )?;
+        configurations,
+        catalog,
+        serving,
+    };
+    Ok((served, volumes))
+}
+
+/// The two ready local models the arguments pick, once the local packages have settled.
+async fn ready_pair(
+    services: &ManagedModelServices,
+    arguments: &[String],
+) -> anyhow::Result<(String, String)> {
     // Local packages are catalog models when the catalog names them, custom models otherwise;
     // either becomes ready once its validation completes.
     let started = Instant::now();
@@ -184,14 +238,19 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
             .cloned()
             .unwrap_or_else(|| panic!("no ready local model matches {needle}"))
     };
-    let first = pick(&flag(&arguments, "--first"));
-    let second = pick(&flag(&arguments, "--second"));
+    let first = pick(&flag(arguments, "--first"));
+    let second = pick(&flag(arguments, "--second"));
     println!("first model  {first}");
     println!("second model {second}");
+    Ok((first, second))
+}
 
+/// The load plan previewed, the host-only properties answered without a load, then `first`
+/// made resident on exactly the previewed device.
+async fn ensured(main: &Harness, first: &str, serving: ServingDevice) -> anyhow::Result<Resident> {
     // Load plan: the engine preview on the service catalog.
     let started = Instant::now();
-    let plan = main.instances.preview_load(&first).await?;
+    let plan = main.instances.preview_load(first.to_owned()).await?;
     println!(
         "preview      {:>7.3} s  context {} required {} device {} ({:?})",
         started.elapsed().as_secs_f64(),
@@ -225,7 +284,7 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
 
     // Ensure: a worker loads exactly the previewed device.
     let started = Instant::now();
-    let ready = main.instances.ensure_resident(&first).await?;
+    let ready = main.instances.ensure_resident(first.to_owned()).await?;
     let ModelInstanceLifecycle::Ready { allocation, device } = &ready.lifecycle else {
         panic!("ensure returned {:?}", ready.lifecycle)
     };
@@ -247,9 +306,22 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
             ))
             .collect::<Vec<_>>()
     );
+    let device = device.clone();
     let worker = worker_pid().expect("a ready instance has a worker");
+    Ok(Resident {
+        instance: ready,
+        device,
+        worker,
+    })
+}
 
-    // Hardware while resident: the service topology merged with the worker's fresh readings.
+/// Hardware while resident: the service topology merged with the worker's fresh readings.
+async fn hardware(
+    main: &Harness,
+    served: &Served,
+    volumes: ServedVolumes,
+    device: &ModelLoadDevice,
+) -> anyhow::Result<()> {
     let started = Instant::now();
     let resident = main
         .instances
@@ -257,9 +329,9 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
         .await
         .expect("a resident worker answers an observation");
     let hardware = HardwareInventory::new(
-        catalog.inventory().clone(),
+        served.catalog.inventory().clone(),
         volumes,
-        serving,
+        served.serving,
         Arc::new(main.instances.clone()),
     );
     let snapshot = HardwareProvider::snapshot(&hardware).await?;
@@ -284,8 +356,11 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
             ))
             .collect::<Vec<_>>()
     );
+    Ok(())
+}
 
-    // A completion through the mounted protocol router, on the lease.
+/// A completion through the mounted protocol router, on the lease, then concurrent ones.
+async fn completions(main: &Harness, first: &str) -> anyhow::Result<()> {
     let started = Instant::now();
     let (status, body) = post(
         &main.router,
@@ -312,7 +387,7 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
         let mut requests = Vec::with_capacity(count);
         for index in 0..count {
             let router = main.router.clone();
-            let model = first.clone();
+            let model = first.to_owned();
             requests.push(tokio::spawn(async move {
                 post(
                     &router,
@@ -340,39 +415,54 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
             started.elapsed().as_secs_f64()
         );
     }
+    Ok(())
+}
 
-    // Join: the same configuration is the same instance.
+/// Join: the same configuration is the same instance. Replacement: another model releases the
+/// first, whose worker is retired. The replacing instance.
+async fn join_and_replace(
+    main: &Harness,
+    first: &str,
+    second: &str,
+    resident: &Resident,
+) -> anyhow::Result<ModelInstance> {
     let started = Instant::now();
-    let joined = main.instances.ensure_resident(&first).await?;
-    assert_eq!(joined.id, ready.id);
+    let joined = main.instances.ensure_resident(first.to_owned()).await?;
+    assert_eq!(joined.id, resident.instance.id);
     println!(
         "join         {:>7.3} s  same instance",
         started.elapsed().as_secs_f64()
     );
 
-    // Replacement: another model releases the first.
     let started = Instant::now();
-    let replacement = main.instances.ensure_resident(&second).await?;
+    let replacement = main.instances.ensure_resident(second.to_owned()).await?;
     assert_eq!(
-        state_of(&main.instances, &ready.id).await,
+        state_of(&main.instances, &resident.instance.id).await,
         ModelInstanceLifecycle::Stopped {
             reason: ModelReleaseReason::Replacement
         }
     );
-    assert!(!alive(worker), "the replaced worker still runs");
+    assert!(!alive(resident.worker), "the replaced worker still runs");
     println!(
         "replace      {:>7.3} s  {} replaced by {}",
         started.elapsed().as_secs_f64(),
-        ready.id.0,
+        resident.instance.id.0,
         replacement.id.0
     );
+    Ok(replacement)
+}
 
-    // Stop with a request in flight: the request ends as `model_instance_stopped` and the worker
-    // is retired before the stop returns.
+/// Stop with a request in flight: the request ends as `model_instance_stopped` and the worker
+/// is retired before the stop returns.
+async fn stop_in_flight(
+    main: &Harness,
+    second: &str,
+    replacement: ModelInstance,
+) -> anyhow::Result<()> {
     let worker = worker_pid().expect("a ready instance has a worker");
     let active = tokio::spawn({
         let router = main.router.clone();
-        let second = second.clone();
+        let second = second.to_owned();
         async move {
             post(
                 &router,
@@ -409,12 +499,15 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
         "stop         {:>7.3} s  active request ended model_instance_stopped, worker {worker} retired",
         stopped_at.as_secs_f64()
     );
+    Ok(())
+}
 
-    // Stop during load: the loading worker is killed and the waiter is told.
+/// Stop during load: the loading worker is killed and the waiter is told.
+async fn stop_during_load(main: &Harness, first: &str) -> anyhow::Result<()> {
     let loading = tokio::spawn({
         let instances = main.instances.clone();
-        let first = first.clone();
-        async move { instances.ensure_resident(&first).await }
+        let first = first.to_owned();
+        async move { instances.ensure_resident(first).await }
     });
     let loading_id = wait_for(&main.instances, |instance| {
         matches!(instance.lifecycle, ModelInstanceLifecycle::Loading { .. })
@@ -436,9 +529,12 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
         "stop-loading {:>7.3} s  worker {worker} retired, waiter stopped",
         started.elapsed().as_secs_f64()
     );
+    Ok(())
+}
 
-    // Crash: a killed worker fails its instance.
-    let crashed = main.instances.ensure_resident(&first).await?;
+/// Crash: a killed worker fails its instance.
+async fn crash(main: &Harness, first: &str) -> anyhow::Result<()> {
+    let crashed = main.instances.ensure_resident(first.to_owned()).await?;
     let worker = worker_pid().expect("ready worker");
     let started = Instant::now();
     unsafe { libc::kill(worker as libc::pid_t, libc::SIGKILL) };
@@ -457,10 +553,13 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
         "crash        {:>7.3} s  instance failed: {code}",
         started.elapsed().as_secs_f64()
     );
+    Ok(())
+}
 
-    // Idle: an unleased ready instance is released after its idle timeout.
-    let idle = harness(Duration::from_secs(2), "idle");
-    let resident = idle.instances.ensure_resident(&first).await?;
+/// Idle: an unleased ready instance is released after its idle timeout.
+async fn idle(served: &Served, first: &str) -> anyhow::Result<()> {
+    let idle = served.harness(Duration::from_secs(2), "idle");
+    let resident = idle.instances.ensure_resident(first.to_owned()).await?;
     let worker = worker_pid().expect("ready worker");
     let started = Instant::now();
     wait_for(&idle.instances, |instance| {
@@ -476,7 +575,6 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
         "idle         {:>7.3} s  released after the 2 s idle timeout",
         started.elapsed().as_secs_f64()
     );
-    println!("G-D residency lifecycle: all scenarios passed");
     Ok(())
 }
 

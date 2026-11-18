@@ -575,11 +575,12 @@ fn a_discrete_banks_conveyor_lies_in_host_storage() {
         },
         standard_service_limits(),
     );
-    let PreparedModelAssessment::Planned { definition, execution, .. } = prepare_model_assessment(&package, &setup.structure)
+    let PreparedModelAssessment::Planned { execution, .. } = prepare_model_assessment(&package, &setup.structure)
         .unwrap_or_else(|error| panic!("operational failure: {error}"))
     else {
         panic!("Qwen3.6 35B is planned streamed on the RTX 3090 under the cap");
     };
+    let definition = execution.definition();
     let draft = execution.draft();
     let bank = draft.load().expert_bank().expect("a capped load streams").clone();
     let conveyor = bank.conveyor();
@@ -630,15 +631,15 @@ fn a_capped_streamed_load_fits_with_its_graphs_priced() {
     for backend in [BackendName::Cuda, BackendName::Vulkan] {
         let policy = ModelPolicy { weight_bound: Some(WeightBound::Cap(6_890_894_474)), ..ModelPolicy::default() };
         let setup = rtx3090_setup(backend, ReleaseRate::of_machine(None), policy, standard_service_limits());
-        let (definition, execution) = match prepare_model_assessment(&package, &setup.structure) {
-            Ok(PreparedModelAssessment::Planned { definition, execution, .. }) => (definition, execution),
+        let execution = match prepare_model_assessment(&package, &setup.structure) {
+            Ok(PreparedModelAssessment::Planned { execution, .. }) => execution,
             Ok(PreparedModelAssessment::Unsupported { unsupported, .. }) => {
                 panic!("{backend:?}: Qwen3.6 35B streams on the RTX 3090 under the cap: {unsupported:?}")
             }
             Err(error) => panic!("{backend:?}: Qwen3.6 35B is planned on the RTX 3090 under the cap: {error}"),
         };
         assert!(execution.draft().load().expert_bank().is_some(), "{backend:?}: a capped load streams");
-        let charge = execution.memory_charge(&definition, setup.structure.selected.graph_cost).unwrap();
+        let charge = execution.memory_charge(execution.definition(), setup.structure.selected.graph_cost).unwrap();
         let graphs = charge.bounds.recorded_graph_bytes;
         assert!(0 < graphs && graphs < charge.allocation_bytes / 8, "{backend:?}: startup graphs {graphs} bytes");
     }
@@ -670,12 +671,10 @@ fn a_weight_cap_grants_the_largest_bank_it_holds() {
         prepare_model_assessment(&package, &setup.structure)
     };
     let prepare = |weight_cap| assess(weight_cap).unwrap_or_else(|error| panic!("operational failure: {error}"));
-    let PreparedModelAssessment::Planned {
-        definition, execution, ..
-    } = prepare(None)
-    else {
+    let PreparedModelAssessment::Planned { execution, .. } = prepare(None) else {
         panic!("Qwen3.6 35B is planned resident");
     };
+    let definition = execution.definition();
     let draft = execution.draft();
     let Err(PlanError::WeightBound {
         needed: floor_weights,
@@ -747,9 +746,10 @@ fn a_linked_bank_streams_only_beside_its_tiers_landing_reserve() {
     // The structure is prepared whatever the room; a plan of it settles
     // its tier into the host's room, here none.
     let roomless = prepare(Some(0));
-    let PreparedModelAssessment::Planned { definition, execution, .. } = roomless else {
+    let PreparedModelAssessment::Planned { execution, .. } = roomless else {
         panic!("a capped load is prepared from its structure");
     };
+    let definition = execution.definition();
     let draft = execution.draft().clone();
     let Err(PlanError::Unstreamed(reason)) = draft.with_bank::<AssessmentMemoryCharge>(&definition, Some(WeightBound::Cap(6_890_894_474)), &synthetic_prices()) else {
         panic!("no host room leaves the experts unstreamed");
@@ -775,7 +775,7 @@ fn a_linked_host_tier_holds_the_slots_host_memory_admits() {
         let prepared = prepare_model_assessment(&package, &setup.structure)
             .unwrap_or_else(|error| panic!("operational failure: {error}"));
         match prepared {
-            PreparedModelAssessment::Planned { definition, execution, .. } => (setup, definition, execution.draft().clone()),
+            PreparedModelAssessment::Planned { execution, .. } => (setup, execution.definition().clone(), execution.draft().clone()),
             PreparedModelAssessment::Unsupported { unsupported, .. } => {
                 panic!("Qwen3.6 35B streams on the RTX 3090 under the cap: {unsupported:?}")
             }
@@ -938,9 +938,10 @@ fn a_q4_moe_on_24_gb_holds_its_bank_and_a_merged_pass() {
     let mut setup = rtx3090_setup(BackendName::Cuda, ReleaseRate::of_machine(None), ModelPolicy::default(), standard_service_limits());
     setup.measurements = synthetic_measurements();
     let prepared = prepare_model_assessment(&package, &setup.structure).unwrap_or_else(|error| panic!("operational failure: {error}"));
-    let PreparedModelAssessment::Planned { definition, execution, .. } = &prepared else {
+    let PreparedModelAssessment::Planned { execution, .. } = &prepared else {
         panic!("Qwen3.6 35B is planned on the RTX 3090");
     };
+    let definition = execution.definition();
     let draft = execution.draft();
     let structure = &setup.structure;
     let device = structure.topology.resolve(draft.device().selector()).unwrap();
@@ -1115,9 +1116,10 @@ fn a_model_fits_resident_streamed_or_not_at_all() {
     assert!(domains.iter().all(|domain| domain.remaining_bytes >= 0));
     assert!(shares.floor() <= shares.slots() && shares.slots() < shares.experts().get());
     assert!(shares.floor_share() <= shares.share() && shares.share() < 1.0);
-    let PreparedModelAssessment::Planned { definition, execution, .. } = &prepared else {
+    let PreparedModelAssessment::Planned { execution, .. } = &prepared else {
         unreachable!("the model was assessed");
     };
+    let definition = execution.definition();
     let draft = execution.draft();
     let Err(PlanError::WeightBound { needed: floor_weights, .. }) =
         draft.clone().with_bank::<AssessmentMemoryCharge>(definition, Some(WeightBound::Cap(0)), &synthetic_prices())

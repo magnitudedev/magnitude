@@ -28,7 +28,7 @@ use magnitude_scheduler::ServiceLimits;
 use magnitude_state::KvCodec;
 use std::path::PathBuf;
 
-fn domain() -> (ExecutorDomain, StateBindings, usize, usize, usize) {
+fn domain() -> (Box<ExecutorDomain>, StateBindings, usize, usize, usize) {
     let model = PathBuf::from(
         std::env::var_os("MAGNITUDE_TEST_MTP_GGUF").expect("set MAGNITUDE_TEST_MTP_GGUF"),
     );

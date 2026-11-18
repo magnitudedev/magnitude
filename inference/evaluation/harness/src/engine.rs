@@ -251,7 +251,7 @@ fn settle_measurements(artifacts: &Artifacts, resolved: &magnitude_engine::compo
 }
 
 pub struct Engine {
-    pub(crate) domain: ExecutorDomain,
+    pub(crate) domain: Box<ExecutorDomain>,
     /// The domain's state bindings while no flight carries them.
     pub(crate) bindings: Option<StateBindings>,
     device: seismic::Device,

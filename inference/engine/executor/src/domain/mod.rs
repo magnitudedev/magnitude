@@ -1643,7 +1643,7 @@ impl ExecutorDomain<NativeFamily> {
         mut recorded: crate::memory::ledger::Recorded,
         mut constants: crate::memory::ledger::Held,
         request_slot: crate::memory::ledger::Claim,
-    ) -> Result<(Self, StateBindings), DomainError> {
+    ) -> Result<(Box<Self>, StateBindings), DomainError> {
         // A model's drafter (its draft head or separate draft) is enabled
         // only when its method drafts.
         if (head_loader.is_some() && definition.head.is_none() && definition.draft.is_none())
@@ -2704,6 +2704,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         })
     }
     /// The domain over `family`, and the one [`StateBindings`] of its stores.
+    /// Boxed from its making: a domain is twelve kilobytes, which every
+    /// frame that moves one on to its owner would otherwise hold.
     pub fn with_family(
         execution: Rc<ExecutionPlan>,
         definition: Rc<ModelDefinition>,
@@ -2716,7 +2718,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         family: F,
         mut recorded: crate::memory::ledger::Recorded,
         request_slot: crate::memory::ledger::Claim,
-    ) -> Result<(Self, StateBindings), DomainError> {
+    ) -> Result<(Box<Self>, StateBindings), DomainError> {
         assert_eq!(
             request_slot.kind(),
             crate::memory::ledger::CommittedKind::RequestSlot,
@@ -2746,7 +2748,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             ProgramIdentity::new(format!("{id}:{lane}"))
                 .expect("a lane identity names its lane and is never empty")
         });
-        let domain = Self {
+        let domain = Box::new(Self {
             execution,
             definition,
             resources,
@@ -2791,7 +2793,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             running_release: None,
             _owner: owner,
             teardown: Default::default(),
-        };
+        });
         let bindings = StateBindings {
             target: target_state,
             head: head_state,

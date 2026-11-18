@@ -1858,7 +1858,7 @@ fn deferred_priming_keeps_pending_completion_and_reports_device_failure() {
 fn target_with_pending_priming(
     request: RequestId,
 ) -> (
-    ExecutorDomain<TestFamily>,
+    Box<ExecutorDomain<TestFamily>>,
     TargetFlight<TestFamily>,
     PendingControl,
 ) {
