@@ -116,7 +116,9 @@ export const runHeadlessApplication = (options: {
         case "DiscardUpdate": return ownerResult(update("discard"))
         case "InstallUpdate": return ownerResult(update("install"))
         case "SetAutoDownload": return ownerResult(updates.setAutoDownload(request.enabled))
-        case "Quit": return options.container ? ownerUnsupported : Effect.succeed(ownerDone(Deferred.succeed(stop, "Requested").pipe(Effect.asVoid)))
+        // The desktop in another account sends Quit to take the port (`takeOverServicePort`). The server waits as it does
+        // for a Yield, instead of exiting into a service manager's restart that would take the port back before the desktop binds it.
+        case "Quit": return options.container ? ownerUnsupported : Effect.succeed(ownerDone(Deferred.succeed(stop, "DesktopTakeover").pipe(Effect.asVoid)))
         // Restarting re-admits the owner, so settings that apply at service start take effect.
         case "RestartService": return Effect.succeed(ownerDone(Deferred.succeed(stop, "Restart").pipe(Effect.asVoid)))
         case "SetLoginStartup": return ownerUnsupported
