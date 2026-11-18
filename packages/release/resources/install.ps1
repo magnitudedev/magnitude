@@ -229,9 +229,20 @@ public static extern IntPtr SendMessageTimeout(IntPtr window, uint message, UInt
     [Console]::Error.WriteLine('Could not announce the PATH change; sign out and back in if new terminals do not find magnitude.')
   }
 }
+# The desktop installer publishes its launcher only into a folder that this user alone may access (a protected
+# DACL with one inheritable full-control entry), so the CLI-only install gives the shared slot the same DACL.
+function Initialize-CommandDirectory {
+  [IO.Directory]::CreateDirectory($commandDirectory) | Out-Null
+  $user = [Security.Principal.WindowsIdentity]::GetCurrent().User
+  $security = New-Object Security.AccessControl.DirectorySecurity
+  $security.SetOwner($user)
+  $security.SetAccessRuleProtection($true, $false)
+  $security.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($user, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
+  Set-Acl -LiteralPath $commandDirectory -AclObject $security
+}
 # A running launcher (a serve started at login, say) cannot be overwritten, but it can be renamed away.
 function Install-Launcher([string]$Source) {
-  [IO.Directory]::CreateDirectory($commandDirectory) | Out-Null
+  Initialize-CommandDirectory
   $target = Join-Path $commandDirectory 'magnitude.exe'
   Get-ChildItem -LiteralPath $commandDirectory -Force | Where-Object { $_.Name -like 'magnitude.exe.new-*' -or $_.Name -like 'magnitude.exe.old-*' } |
     Remove-Item -Force -ErrorAction SilentlyContinue
