@@ -119,11 +119,8 @@ fn asserted(error: &NativeCompilationError) -> bool {
     text.contains("static assertion failed") || text.contains("static_assert failed")
 }
 
+/// The first line of `error` as it reads, whole: what failed, whatever its
+/// wording.
 fn compilation_message(error: &NativeCompilationError) -> String {
-    let text = format!("{error:?}");
-    text.lines()
-        .filter(|line| line.contains("ERROR") || line.contains("error"))
-        .take(4)
-        .collect::<Vec<_>>()
-        .join(" | ")
+    error.to_string().lines().next().unwrap_or_default().to_owned()
 }
