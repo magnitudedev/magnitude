@@ -2695,6 +2695,22 @@ mod tests {
         }
     }
 
+    /// The pool's return of `returned` of the `charged` bytes the device
+    /// held, as `Pool::return_freed` documents it: a block it emptied stays
+    /// charged until the copies out of it complete, then is released from
+    /// their completion off this thread. `complete` reads back what moved,
+    /// the device work production completes by reading; the tally reaches
+    /// `charged - returned` within the pool's own test's deadline
+    /// (`a_vacate_enqueues_its_moves_beside_work_in_flight_and_releases_the_block_behind_them`).
+    fn returns_once_moved(device: &OwnDevice, charged: u64, returned: u64, complete: impl FnOnce()) {
+        complete();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while device.tally.held() != charged - returned {
+            assert!(std::time::Instant::now() < deadline, "the emptied block is released once the copies out of it complete");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     /// One past the highest backed row and bank, as the one-domain store
     /// reported them.
     fn committed_extent(store: &StateStore) -> (usize, usize) {
@@ -5098,18 +5114,19 @@ mod tests {
             let returned = device.pool.return_freed(freed).unwrap();
             device.tally.bound(u64::MAX);
             assert_eq!(returned, device.pool.block_bytes());
-            assert_eq!(device.tally.held(), charged - returned);
             assert_eq!(committed_extent(&store), extent);
             assert_eq!(high.ranges(), vec![(2 * slab_rows + 1, 1)]);
-            assert_eq!(
-                store
-                    .history_slabs()
-                    .region_rows(0, (2 * slab_rows + 1) as u64, 1)
-                    .unwrap()
-                    .read_to_host()
-                    .unwrap(),
-                value
-            );
+            returns_once_moved(&device, charged, returned, || {
+                assert_eq!(
+                    store
+                        .history_slabs()
+                        .region_rows(0, (2 * slab_rows + 1) as u64, 1)
+                        .unwrap()
+                        .read_to_host()
+                        .unwrap(),
+                    value
+                );
+            });
         }
     }
 
@@ -5204,11 +5221,10 @@ mod tests {
             let returned = device.pool.return_freed(freed).unwrap();
             device.tally.bound(u64::MAX);
             assert_eq!(returned, device.pool.block_bytes());
-            assert_eq!(device.tally.held(), charged - returned);
             assert_eq!(committed_extent(&store), extent);
             assert_eq!(store.available_banks(), available - 4, "the released slab's banks left the free slots");
             assert_eq!(placed(), kept);
-            holds();
+            returns_once_moved(&device, charged, returned, holds);
             assert_eq!(bindings.shrink(&NextSteps::default()).unwrap(), 0);
             assert_eq!(placed(), kept);
             holds();
