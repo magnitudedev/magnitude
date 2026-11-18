@@ -48,8 +48,8 @@ export const normalizeGpuName = (value: string) => normalizeHardwareName(value)
 const portableCategories = new Set(["Laptop", "Gaming laptop", "Gaming tablet", "Mobile workstation", "All-in-one"])
 
 /** Only pass accelerators backed by observed dedicated memory as component candidates. */
-export const hardwarePresentation = (identity: MachineIdentityObservation | null, dedicatedAccelerators: readonly string[], processor: Option.Option<string>) => {
-  const identified = identity?._tag === "Identified" ? identity : null
+export const hardwarePresentation = (identity: MachineIdentityObservation, dedicatedAccelerators: readonly string[], processor: Option.Option<string>) => {
+  const identified = identity._tag === "Identified" ? identity : null
   const devicePhoto = Option.fromNullable(identified ? hardwarePhotoInventory.find(({ match, processorModels }) => {
     if (match._tag === "Gpu") return false
     if (Option.isSome(processorModels) && (Option.isNone(processor) || !processorModels.value.some(model => normalizeHardwareName(processor.value).split(/[^a-z0-9+-]+/).includes(normalizeHardwareName(model))))) return false
@@ -60,9 +60,9 @@ export const hardwarePresentation = (identity: MachineIdentityObservation | null
   }) : undefined)
   const enclosure = Option.match(devicePhoto, {
     onSome: entry => entry.category,
-    onNone: () => ({ Portable: "Laptop / tablet", Desktop: "Desktop", AllInOne: "All-in-one", MiniPc: "Mini PC", Server: "Server", Unknown: "Computer" })[identity?.formFactor ?? "Unknown"],
+    onNone: () => ({ Portable: "Laptop / tablet", Desktop: "Desktop", AllInOne: "All-in-one", MiniPc: "Mini PC", Server: "Server", Unknown: "Computer" })[identity.formFactor],
   })
-  const portable = identity?.formFactor === "Portable" || identity?.formFactor === "AllInOne" || portableCategories.has(enclosure)
+  const portable = identity.formFactor === "Portable" || identity.formFactor === "AllInOne" || portableCategories.has(enclosure)
   const photo = Option.orElse(devicePhoto, () => portable ? Option.none() : Option.fromNullable(hardwarePhotoInventory.find(({ match }) =>
     match._tag === "Gpu" && dedicatedAccelerators.some(name => match.names.some(candidate => normalizeGpuName(candidate) === normalizeGpuName(name))))))
   const name = Option.orElse(Option.map(devicePhoto, value => value.subject), () => identified ? Option.some(`${identified.manufacturer} ${identified.model}`) : Option.none<string>())

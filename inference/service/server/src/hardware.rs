@@ -14,13 +14,13 @@ use magnitude_executor::platform::Fit;
 use magnitude_service_contracts::{
     ExecutionBackend, HardwareAccessPath, HardwareBackendDiagnostic, HardwareDeviceId,
     HardwareDeviceKind, HardwareDeviceMemory, HardwareDiagnosticSource, HardwareExecutor,
-    HardwareExecutorAvailability, HardwareGrant, HardwareHostRam,
+    HardwareExecutorAvailability, HardwareFormFactor, HardwareGrant, HardwareHostRam, HardwareMachineIdentity,
     HardwarePhysicalDevice, HardwarePhysicalDeviceId, HardwareProvider, HardwareReportedBy,
     HardwareSnapshot, HardwareStore, HardwareTransferPath, HardwareVolume, InventoryError,
 };
 use seismic::{
     Availability, BackendName, DeviceMemory, DeviceTopology, DiagnosticSource, Inventory,
-    Contract, PhysicalIdentity, ReportedBy, RuntimeStatus, Status, StoreKind,
+    Contract, MachineFormFactor, PhysicalIdentity, ReportedBy, RuntimeStatus, Status, StoreKind,
 };
 use sha2::{Digest, Sha256};
 
@@ -42,7 +42,7 @@ pub fn execution_backend(backend: BackendName) -> ExecutionBackend {
 
 /// Descriptive facts about the machine that do not change while the service runs.
 struct MachineDescription {
-    system_product_name: Option<String>,
+    machine: seismic::Machine,
     cpu_model: Option<String>,
     // Every count is the engine's own processors' (`seismic::Processors`): at least one, since
     // the pool's count (`Processors::cores`) is.
@@ -60,7 +60,7 @@ impl MachineDescription {
             .map_err(|error| format!("the host's processors: {error}"))?;
         let cores = || processors.nodes().iter().flat_map(|node| &node.cores);
         Ok(Self {
-            system_product_name: system_product_name(),
+            machine: seismic::Machine::discover(),
             cpu_model: system
                 .cpus()
                 .first()
@@ -395,7 +395,21 @@ fn snapshot(
         captured_at: u64::try_from(captured_at).map_err(|error| internal(&error))?,
         platform: std::env::consts::OS.to_owned(),
         architecture: std::env::consts::ARCH.to_owned(),
-        system_product_name: machine.system_product_name.clone(),
+        system_product_name: machine.machine.name.clone(),
+        machine_identity: machine.machine.identity.as_ref().map(|identity| HardwareMachineIdentity {
+            manufacturer: identity.manufacturer.clone(),
+            model: identity.model.clone(),
+            family: identity.family.clone(),
+            version: identity.version.clone(),
+        }),
+        form_factor: match machine.machine.form_factor {
+            MachineFormFactor::Portable => HardwareFormFactor::Portable,
+            MachineFormFactor::Desktop => HardwareFormFactor::Desktop,
+            MachineFormFactor::AllInOne => HardwareFormFactor::AllInOne,
+            MachineFormFactor::MiniPc => HardwareFormFactor::MiniPc,
+            MachineFormFactor::Server => HardwareFormFactor::Server,
+            MachineFormFactor::Unknown => HardwareFormFactor::Unknown,
+        },
         cpu_model: machine.cpu_model.clone(),
         chip_cores: machine.chip_cores,
         logical_cpus: machine.logical_cpus,
@@ -413,71 +427,11 @@ fn snapshot(
     })
 }
 
-fn system_product_name() -> Option<String> {
-    match std::env::consts::OS {
-        "linux" => [
-            "/sys/devices/virtual/dmi/id/product_name",
-            "/sys/class/dmi/id/product_name",
-            "/proc/device-tree/model",
-        ]
-        .into_iter()
-        .find_map(|path| {
-            std::fs::read(path)
-                .ok()
-                .and_then(|value| normalize_product_name(&value))
-        }),
-        "macos" => std::process::Command::new("/usr/sbin/system_profiler")
-            .args(["SPHardwareDataType", "-json"])
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .and_then(|output| serde_json::from_slice::<serde_json::Value>(&output.stdout).ok())
-            .and_then(|document| {
-                document
-                    .get("SPHardwareDataType")?
-                    .as_array()?
-                    .first()?
-                    .get("machine_name")?
-                    .as_str()
-                    .and_then(|name| normalize_product_name(name.as_bytes()))
-            }),
-        _ => None,
-    }
-}
-
-fn normalize_product_name(value: &[u8]) -> Option<String> {
-    let name = String::from_utf8_lossy(value)
-        .replace('_', " ")
-        .trim_matches(|character: char| character == '\0' || character.is_whitespace())
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let placeholder = [
-        "default string",
-        "not specified",
-        "system product name",
-        "to be filled by o.e.m.",
-        "unknown",
-    ]
-    .iter()
-    .any(|placeholder| name.eq_ignore_ascii_case(placeholder));
-    (!name.is_empty() && !placeholder).then_some(name)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use magnitude_executor::platform::VolumeReserves;
     use magnitude_service_contracts::HardwareVolumeRole;
-
-    #[test]
-    fn product_name_placeholders_are_absent() {
-        assert_eq!(normalize_product_name(b"Default string\0"), None);
-        assert_eq!(
-            normalize_product_name(b"MacBook_Pro  "),
-            Some("MacBook Pro".to_owned())
-        );
-    }
 
     #[test]
     fn resident_readings_update_only_their_physical_store() {

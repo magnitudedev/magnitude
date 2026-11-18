@@ -21,7 +21,7 @@ const paths = [
   { id: 1, executor: "vulkan:0", store: "system", grant: null },
 ]
 const fields = (overrides: Record<string, unknown> = {}) => ({
-  captured_at: 1, platform: "linux", architecture: "x86_64", cpu_model: "AMD EPYC 7742", chip_cores: 2, logical_cpus: 4, cpu_pool_cores: 2,
+  captured_at: 1, platform: "linux", architecture: "x86_64", form_factor: "unknown", cpu_model: "AMD EPYC 7742", chip_cores: 2, logical_cpus: 4, cpu_pool_cores: 2,
   native_build: "test", topology_fingerprint: "test", host_ram: host, device_memory: [],
   volumes: [], physical_devices: [cpu], selected_executor: "host-cpu", access_paths: [], transfer_paths: [], ...overrides,
 })
@@ -46,6 +46,12 @@ it("admits no snapshot without its core counts", () => {
     const { [field]: _, ...without } = fields()
     expect(Either.isLeft(Schema.decodeUnknownEither(HardwareSnapshot)(without))).toBe(true)
   }
+})
+it("names the machine as the service's firmware reader does, its enclosure even where it names no model", () => {
+  const machine = { manufacturer: "LENOVO", model: "21K4S2YW00", family: null, version: "ThinkPad T14 Gen 4" }
+  expect(Effect.runSync(projectInferenceHardware(snapshot({ machine_identity: machine, form_factor: "portable" }), none)).identity).toEqual({
+    _tag: "Identified", manufacturer: "LENOVO", model: "21K4S2YW00", family: Option.none(), version: Option.some("ThinkPad T14 Gen 4"), formFactor: "Portable" })
+  expect(Effect.runSync(projectInferenceHardware(snapshot({ form_factor: "mini_pc" }), none)).identity).toEqual({ _tag: "Unavailable", formFactor: "MiniPc" })
 })
 it("counts host RAM within the process's memory limits, as a container's limit sets them", () => {
   const limited = { ...host, store: { ...store("system"), allocation_capacity_bytes: 6 }, current_free_bytes: 5 }

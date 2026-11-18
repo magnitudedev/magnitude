@@ -68,27 +68,9 @@ export const NetworkAccessChange = Schema.Struct({
 })
 export type NetworkAccessChange = typeof NetworkAccessChange.Type
 
-/** Host enclosure identity supplements, but never determines, inference capabilities. */
-export const MachineFormFactor = Schema.Literal("Portable", "Desktop", "AllInOne", "MiniPc", "Server", "Unknown")
-export type MachineFormFactor = typeof MachineFormFactor.Type
-const FirmwareLabel = Schema.Trimmed.pipe(Schema.minLength(1), Schema.maxLength(255))
-export const MachineIdentity = Schema.Struct({
-  manufacturer: Schema.Trimmed.pipe(Schema.minLength(1), Schema.maxLength(255)),
-  model: Schema.Trimmed.pipe(Schema.minLength(1), Schema.maxLength(255)),
-  family: optional(FirmwareLabel),
-  version: optional(FirmwareLabel),
-  formFactor: MachineFormFactor,
-})
-export const MachineIdentityObservation = Schema.Union(
-  Schema.TaggedStruct("Identified", MachineIdentity.fields),
-  Schema.TaggedStruct("Unavailable", { formFactor: MachineFormFactor }),
-)
-export type MachineIdentityObservation = typeof MachineIdentityObservation.Type
-
-/** The machine running Magnitude: its OS for commands run there, and its enclosure. */
+/** The machine running Magnitude: its OS, for commands run there. */
 export const ServerMachine = Schema.Struct({
   platform: Schema.String,
-  identity: MachineIdentityObservation,
 })
 export type ServerMachine = typeof ServerMachine.Type
 

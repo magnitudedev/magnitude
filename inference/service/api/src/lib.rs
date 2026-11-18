@@ -2578,6 +2578,7 @@ mod tests {
                     "captured_at": 10,
                     "platform": "test",
                     "architecture": "test64",
+                    "form_factor": "unknown",
                     "cpu_model": "Test CPU",
                     "chip_cores": 4,
                     "logical_cpus": 8,

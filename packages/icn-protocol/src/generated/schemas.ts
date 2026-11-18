@@ -1625,6 +1625,17 @@ export const HardwareExecutorAvailability = S.Union(
 export type HardwareExecutorAvailability = S.Schema.Type<typeof HardwareExecutorAvailability>
 export type HardwareExecutorAvailabilityEncoded = S.Schema.Encoded<typeof HardwareExecutorAvailability>
 
+export const HardwareFormFactor = S.Union(
+  S.Literal("portable"),
+  S.Literal("desktop"),
+  S.Literal("all_in_one"),
+  S.Literal("mini_pc"),
+  S.Literal("server"),
+  S.Literal("unknown"),
+)
+export type HardwareFormFactor = S.Schema.Type<typeof HardwareFormFactor>
+export type HardwareFormFactorEncoded = S.Schema.Encoded<typeof HardwareFormFactor>
+
 export const HardwareGrant = S.Struct({
   basis: S.suspend((): S.Schema<HardwareReportedBy, HardwareReportedByEncoded> => HardwareReportedBy),
   bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
@@ -1642,6 +1653,15 @@ export const HardwareHostRam = S.Struct({
 })
 export type HardwareHostRam = S.Schema.Type<typeof HardwareHostRam>
 export type HardwareHostRamEncoded = S.Schema.Encoded<typeof HardwareHostRam>
+
+export const HardwareMachineIdentity = S.Struct({
+  family: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
+  manufacturer: S.String,
+  model: S.String,
+  version: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
+})
+export type HardwareMachineIdentity = S.Schema.Type<typeof HardwareMachineIdentity>
+export type HardwareMachineIdentityEncoded = S.Schema.Encoded<typeof HardwareMachineIdentity>
 
 export const HardwarePhysicalDevice = S.Struct({
   executors: S.Array(S.suspend((): S.Schema<HardwareExecutor, HardwareExecutorEncoded> => HardwareExecutor)),
@@ -1704,8 +1724,16 @@ export const HardwareSnapshot = S.Struct({
   device_memory: S.Array(
     S.suspend((): S.Schema<HardwareDeviceMemory, HardwareDeviceMemoryEncoded> => HardwareDeviceMemory),
   ),
+  form_factor: S.suspend((): S.Schema<HardwareFormFactor, HardwareFormFactorEncoded> => HardwareFormFactor),
   host_ram: S.suspend((): S.Schema<HardwareHostRam, HardwareHostRamEncoded> => HardwareHostRam),
   logical_cpus: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  machine_identity: S.optionalWith(
+    S.Union(
+      S.Null,
+      S.suspend((): S.Schema<HardwareMachineIdentity, HardwareMachineIdentityEncoded> => HardwareMachineIdentity),
+    ),
+    { exact: true, as: "Option" },
+  ),
   native_build: S.String,
   physical_devices: S.Array(
     S.suspend((): S.Schema<HardwarePhysicalDevice, HardwarePhysicalDeviceEncoded> => HardwarePhysicalDevice),

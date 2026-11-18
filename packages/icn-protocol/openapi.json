@@ -6364,6 +6364,18 @@
         ],
         "description": "Whether an executor can run: with its device placement's stable fit, or\nthe reason it cannot."
       },
+      "HardwareFormFactor": {
+        "type": "string",
+        "description": "The machine's enclosure, from its firmware's chassis type.",
+        "enum": [
+          "portable",
+          "desktop",
+          "all_in_one",
+          "mini_pc",
+          "server",
+          "unknown"
+        ]
+      },
       "HardwareGrant": {
         "type": "object",
         "description": "What an executor's driver lets this process place along one path.",
@@ -6409,6 +6421,35 @@
             "format": "int64",
             "description": "What the OS can give this process within its binding scope (the\nhost, or the limit that binds): free pages above its target, clean\nfile cache and reclaimable cold pages.",
             "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "HardwareMachineIdentity": {
+        "type": "object",
+        "description": "The machine's maker and model, as its firmware names them; a snapshot has none where its\nfirmware does not name both.",
+        "required": [
+          "manufacturer",
+          "model"
+        ],
+        "properties": {
+          "manufacturer": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          },
+          "family": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "additionalProperties": false
@@ -6481,6 +6522,7 @@
           "captured_at",
           "platform",
           "architecture",
+          "form_factor",
           "chip_cores",
           "logical_cpus",
           "cpu_pool_cores",
@@ -6510,7 +6552,21 @@
             "type": [
               "string",
               "null"
+            ],
+            "description": "What people call the machine: macOS's marketing name, elsewhere its model."
+          },
+          "machine_identity": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/HardwareMachineIdentity"
+              }
             ]
+          },
+          "form_factor": {
+            "$ref": "#/components/schemas/HardwareFormFactor"
           },
           "cpu_model": {
             "type": [

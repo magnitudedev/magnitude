@@ -65,6 +65,11 @@ pub(crate) fn last_level_cache() -> Result<Option<Reported<u64>>, String> {
     platform::last_level_cache()
 }
 
+/// The machine's names as its firmware writes them (`crate::machine`).
+pub(crate) fn machine() -> crate::machine::Firmware {
+    platform::machine()
+}
+
 /// The host's processors (`crate::processors`).
 pub(crate) fn processors() -> Result<crate::Processors, String> {
     platform::processors()

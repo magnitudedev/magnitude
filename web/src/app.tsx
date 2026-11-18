@@ -92,10 +92,8 @@ const moveModelsCommand = (platform: string, from: string, to: string) => platfo
 
 /** The computer Magnitude runs on: its photo, name, memory and free disk. */
 function ThisMachine() {
-  const client = useAgentClient()
   const hardware = useLocalInferenceHardware()
-  const machine = useAtomValue(client.Configuration.GetServerMachine({})).result
-  return Result.isSuccess(hardware) ? <MachineCard machine={machineView(hardware.value, Result.isSuccess(machine) ? machine.value.identity : null)} /> : <MachineCardSkeleton />
+  return Result.isSuccess(hardware) ? <MachineCard machine={machineView(hardware.value)} /> : <MachineCardSkeleton />
 }
 
 /**

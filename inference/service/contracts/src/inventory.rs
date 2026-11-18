@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 pub use schema::{
     ContentIdentity, DownloadFailure, DownloadStage, ExecutionBackend, HardwareAccessPath,
     HardwareBackendDiagnostic, HardwareDeviceId, HardwareDeviceKind, HardwareDeviceMemory,
-    HardwareDiagnosticSource, HardwareExecutor, HardwareExecutorAvailability, HardwareGrant,
-    HardwareHostRam, HardwarePhysicalDevice, HardwarePhysicalDeviceId, HardwareReportedBy,
+    HardwareDiagnosticSource, HardwareExecutor, HardwareExecutorAvailability, HardwareFormFactor,
+    HardwareGrant, HardwareHostRam, HardwareMachineIdentity, HardwarePhysicalDevice, HardwarePhysicalDeviceId, HardwareReportedBy,
     HardwareSnapshot, HardwareStore, HardwareTransferPath, HardwareVolume, HardwareVolumeRole,
     HuggingFaceAccess, HuggingFaceBaseRelation, HuggingFaceCredential, HuggingFaceModelBase,
     HuggingFaceModelSearchRequest, HuggingFaceModelSearchResult, HuggingFaceModelSearchResults,
@@ -261,6 +261,31 @@ mod schema {
         pub executor: HardwareDeviceId,
     }
 
+    /// The machine's maker and model, as its firmware names them; a snapshot has none where its
+    /// firmware does not name both.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct HardwareMachineIdentity {
+        pub manufacturer: String,
+        pub model: String,
+        pub family: Option<String>,
+        pub version: Option<String>,
+    }
+
+    /// The machine's enclosure, from its firmware's chassis type.
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum HardwareFormFactor {
+        Portable,
+        Desktop,
+        AllInOne,
+        MiniPc,
+        Server,
+        Unknown,
+    }
+
     #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -268,8 +293,11 @@ mod schema {
         pub captured_at: u64,
         pub platform: String,
         pub architecture: String,
+        /// What people call the machine: macOS's marketing name, elsewhere its model.
         #[serde(default)]
         pub system_product_name: Option<String>,
+        pub machine_identity: Option<HardwareMachineIdentity>,
+        pub form_factor: HardwareFormFactor,
         pub cpu_model: Option<String>,
         /// The chip's cores of every kind, as the host's processor topology reports them, whatever
         /// this process may run on: what identifies the chip's variant. A virtual machine's are its

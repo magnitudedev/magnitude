@@ -5,6 +5,8 @@ import {
   LocalInferenceDeviceIdSchema,
   LocalInferenceMemoryDomainIdSchema,
   type LocalInferenceHardware,
+  type MachineFormFactor,
+  type MachineIdentityObservation,
 } from "./model-state"
 import type { AcnHardwareSummary } from "./acn-health"
 
@@ -65,6 +67,22 @@ const resolveActive = (
   })
 }
 
+const formFactors = {
+  portable: "Portable", desktop: "Desktop", all_in_one: "AllInOne", mini_pc: "MiniPc", server: "Server", unknown: "Unknown",
+} as const satisfies Record<InferenceSchema.HardwareFormFactor, MachineFormFactor>
+
+/** The machine as the service's firmware reader names it. */
+const machineIdentity = (hardware: InferenceSchema.HardwareSnapshot): MachineIdentityObservation => {
+  const formFactor = formFactors[hardware.form_factor]
+  return Option.match(Option.flatMap(hardware.machine_identity, Option.fromNullable), {
+    onNone: (): MachineIdentityObservation => ({ _tag: "Unavailable", formFactor }),
+    onSome: ({ manufacturer, model, family, version }): MachineIdentityObservation => ({
+      _tag: "Identified", manufacturer, model, formFactor,
+      family: Option.flatMap(family, Option.fromNullable), version: Option.flatMap(version, Option.fromNullable),
+    }),
+  })
+}
+
 export const projectInferenceHardware = (
   hardware: InferenceSchema.HardwareSnapshot,
   instances: InferenceSchema.ModelInstancesSnapshot,
@@ -119,6 +137,7 @@ export const projectInferenceHardware = (
     platform,
     architecture,
     productName: Option.flatMap(hardware.system_product_name, Option.fromNullable),
+    identity: machineIdentity(hardware),
     processor: Option.flatMap(hardware.cpu_model, Option.fromNullable),
     chipCores: hardware.chip_cores,
     logicalCpus: hardware.logical_cpus,

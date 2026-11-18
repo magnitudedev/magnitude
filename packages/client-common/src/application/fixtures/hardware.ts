@@ -11,6 +11,7 @@ export const servingHardware = (memory: "Discrete" | "Unified"): LocalInferenceH
   Schema.decodeUnknownSync(LocalInferenceHardwareSchema)({
     platform: memory === "Discrete" ? "Linux" : "MacOS",
     architecture: memory === "Discrete" ? "X64" : "Arm64",
+    identity: { _tag: "Unavailable", formFactor: "Unknown" },
     chipCores: 4, logicalCpus: 8, cpuPoolCores: 4,
     totalSystemMemoryBytes: 16 * GiB,
     accelerators: [{

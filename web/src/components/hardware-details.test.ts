@@ -1,7 +1,7 @@
 import { Option, Schema } from "effect"
 import { expect, it } from "vitest"
 import { hardwareDetails, hardwareFactsCatalog, normalizeProcessorName } from "./hardware-details"
-import { hardware, identity, hardwareScenarios } from "../../test/hardware/fixtures"
+import { hardware, identified, identity, hardwareScenarios } from "../../test/hardware/fixtures"
 import inventory from "../../../assets/hardware/inventory.json"
 import coverageJson from "../../../assets/hardware/coverage.json"
 import { normalizeGpuName } from "./hardware-photos"
@@ -48,16 +48,16 @@ it.each([
   ["RTX A2000 Laptop GPU", 4, "Up to 192 GB/s"], ["RTX A2000 Laptop GPU", 8, "Up to 224 GB/s"],
   ["RTX 3050 Laptop GPU", 4, "Up to 192 GB/s"], ["RTX 3050 Laptop GPU", 6, "Up to 168 GB/s"],
 ])("selects %s bandwidth for %s GB physical VRAM", (name, memory, value) => {
-  const result = hardwareDetails(null, hardware("Unknown", 64, 8, [{ name, memory }]))
+  const result = hardwareDetails(hardware("Unknown", 64, 8, [{ name, memory }]))
   expect(result.accelerators[0]?.facts).toContainEqual({ label: "Memory bandwidth (spec)", value })
 })
 it("uses dedicated physical capacity, allowing small reservations but not budgets or shared memory", () => {
   const base = hardware("Unknown", 64, 8, [{ name: "RTX 3060", memory: 12 }])
   const value = { ...base, memoryDomains: base.memoryDomains.map(domain => domain.kind === "PhysicalDevice"
     ? { ...domain, totalBytes: 12 * 1024 ** 3 - 64 * 1024 ** 2 } : domain) }
-  expect(hardwareDetails(null, value).accelerators[0]?.facts).toContainEqual({ label: "Memory bandwidth (spec)", value: "360 GB/s" })
+  expect(hardwareDetails(value).accelerators[0]?.facts).toContainEqual({ label: "Memory bandwidth (spec)", value: "360 GB/s" })
   for (const gpu of [{ memory: 0 }, { memory: 10 }, { memory: 11.5 }, { memory: 12, shared: true }]) {
-    expect(hardwareDetails(null, hardware("Unknown", 64, 8, [{ name: "RTX 3060", ...gpu }])).accelerators[0]?.facts.some(f => f.label === "Memory bandwidth (spec)")).toBe(false)
+    expect(hardwareDetails(hardware("Unknown", 64, 8, [{ name: "RTX 3060", ...gpu }])).accelerators[0]?.facts.some(f => f.label === "Memory bandwidth (spec)")).toBe(false)
   }
 })
 it.each([
@@ -65,7 +65,7 @@ it.each([
   ["A100-SXM4-40GB", 40, "1,555 GB/s"], ["A100-PCIE-40GB", 40, "1,555 GB/s"],
   ["A100-SXM4-80GB", 80, "2,039 GB/s"], ["A100-PCIE-80GB", 80, "1,935 GB/s"],
 ])("keeps bandwidth specific to %s", (name, memory, value) => {
-  expect(hardwareDetails(null, hardware("Unknown", 128, 8, [{ name, memory }])).accelerators[0]?.facts)
+  expect(hardwareDetails(hardware("Unknown", 128, 8, [{ name, memory }])).accelerators[0]?.facts)
     .toContainEqual({ label: "Memory bandwidth (spec)", value })
 })
 it("covers bandwidth for every cataloged discrete GPU without inventing dedicated bandwidth for shared Radeon graphics", () => {
@@ -79,18 +79,18 @@ it("covers bandwidth for every cataloged discrete GPU without inventing dedicate
 it("shows the CPU cores and the logical CPUs, each under its own label", () => {
   // A 4-vCPU VM of two SMT cores.
   const vm = hardware("AMD EPYC 7763 64-Core Processor", 16, 4, [], 2)
-  expect(hardwareDetails(null, vm).summary.filter(f => /CPU|threads/.test(f.label)))
+  expect(hardwareDetails(vm).summary.filter(f => /CPU|threads/.test(f.label)))
     .toEqual([{ label: "CPU cores", value: "2" }, { label: "logical CPUs", value: "4" }])
 })
 it("matches decorated CPU names without collapsing different SKUs", () => {
   expect(normalizeProcessorName("13th Gen Intel(R) Core(TM) i7-13700H @ 2.40GHz")).toBe("intel core i7-13700h")
   expect(normalizeProcessorName("AMD Ryzen 7 7840U w/ Radeon 780M Graphics")).toBe("amd ryzen 7 7840u")
-  expect(hardwareDetails(null, hardware("13th Gen Intel(R) Core(TM) i7-13700H", 32, 20, [], 14)).groups[0]?.truncateName).toBe(false)
-  expect(hardwareDetails(null, hardware("Intel Core i7-13700HK", 32, 20, [], 14)).groups[0]?.truncateName).toBe(true)
+  expect(hardwareDetails(hardware("13th Gen Intel(R) Core(TM) i7-13700H", 32, 20, [], 14)).groups[0]?.truncateName).toBe(false)
+  expect(hardwareDetails(hardware("Intel Core i7-13700HK", 32, 20, [], 14)).groups[0]?.truncateName).toBe(true)
 })
 
 it.each(hardwareScenarios)("presents $label from observed data", scenario => {
-  const result = hardwareDetails(scenario.identity, scenario.value)
+  const result = hardwareDetails(scenario.value)
   expect(result.summary.some(f => /threads/.test(f.label))).toBe(false)
   expect(result.summary.filter(f => f.label === "CPU cores").length).toBeLessThanOrEqual(1)
   expect(result.summary[0]?.label).toBe(scenario.value.memoryDomains[0]?.kind === "UnifiedMemory" ? "Unified memory" : "System RAM")
@@ -98,40 +98,40 @@ it.each(hardwareScenarios)("presents $label from observed data", scenario => {
   expect(Option.isSome(result.photo)).toBe(true)
 })
 it("keeps laptop identity with discrete or external graphics", () => {
-  const result = hardwareDetails(identity("Dell", "XPS 15 9530", "Portable"), hardware("Intel Core i7-13700H", 32, 16, [{ name: "RTX 5090", memory: 32 }]))
+  const result = hardwareDetails(identified(hardware("Intel Core i7-13700H", 32, 16, [{ name: "RTX 5090", memory: 32 }]), identity("Dell", "XPS 15 9530", "Portable")))
   expect(Option.getOrThrow(result.photo).kind).toBe("Device")
   expect(result.accelerators[0]?.detail).toBe("34.4 GB VRAM")
 })
 it("never substitutes a graphics card for an unknown portable or all-in-one", () => {
   for (const formFactor of ["Portable", "AllInOne"] as const) {
-    const result = hardwareDetails({ _tag: "Unavailable", formFactor }, hardware("Intel Core i7-13700H", 32, 16, [{ name: "RTX 5090", memory: 32 }]))
+    const result = hardwareDetails(identified(hardware("Intel Core i7-13700H", 32, 16, [{ name: "RTX 5090", memory: 32 }]), { _tag: "Unavailable", formFactor }))
     expect(result.photo).toEqual(Option.none())
   }
 })
 it("does not treat shared GPU memory as VRAM or select a component photo", () => {
-  const result = hardwareDetails(null, hardware("Test", 64, 16, [{ name: "RTX 5090", memory: 64, shared: true }]))
+  const result = hardwareDetails(hardware("Test", 64, 16, [{ name: "RTX 5090", memory: 64, shared: true }]))
   expect(result.photo).toEqual(Option.none())
   expect(result.accelerators[0]?.detail).toBe("Shares unified memory")
 })
 it("keeps multi-GPU memory separate and handles duplicate names", () => {
-  const result = hardwareDetails(null, hardware("AMD", 128, 32, [{ name: "RTX 5090", memory: 32 }, { name: "RTX 5090", memory: 32 }]))
+  const result = hardwareDetails(hardware("AMD", 128, 32, [{ name: "RTX 5090", memory: 32 }, { name: "RTX 5090", memory: 32 }]))
   expect(result.summary[0]?.value).toBe("137.4 GB")
   expect(result.accelerators.map(gpu => gpu.detail)).toEqual(["34.4 GB VRAM", "34.4 GB VRAM"])
   expect(new Set(result.accelerators.map(gpu => gpu.id)).size).toBe(2)
 })
 it("never infers a desktop SKU from a mobile suffix", () => {
-  const result = hardwareDetails(null, hardware("Unknown", 64, 16, [{ name: "RTX 4090 Laptop GPU", memory: 16 }]))
+  const result = hardwareDetails(hardware("Unknown", 64, 16, [{ name: "RTX 4090 Laptop GPU", memory: 16 }]))
   expect(result.accelerators[0]?.facts).toContainEqual({ label: "CUDA cores (spec)", value: "9,728" })
 })
 it("resolves Apple bins from the chip's cores, never the engine's pool", () => {
   const limited = { ...hardware("Apple M4 Max", 64, 16), cpuPoolCores: 4 }
-  expect(hardwareDetails(null, limited).summary).toContainEqual({ label: "GPU cores (spec)", value: "40" })
-  expect(hardwareDetails(null, limited).summary).toContainEqual({ label: "Memory bandwidth (spec)", value: "546 GB/s" })
+  expect(hardwareDetails(limited).summary).toContainEqual({ label: "GPU cores (spec)", value: "40" })
+  expect(hardwareDetails(limited).summary).toContainEqual({ label: "Memory bandwidth (spec)", value: "546 GB/s" })
   const ambiguous = hardware("Apple M5 Max", 64, 18)
-  expect(hardwareDetails(null, ambiguous).summary.some(fact => fact.label === "GPU cores (spec)" || fact.label === "Memory bandwidth (spec)")).toBe(false)
+  expect(hardwareDetails(ambiguous).summary.some(fact => fact.label === "GPU cores (spec)" || fact.label === "Memory bandwidth (spec)")).toBe(false)
 })
 it("does not promote a chip into a particular mini PC", () => {
-  const result = hardwareDetails(null, hardware("NVIDIA GB10", 128, 20, [{ name: "NVIDIA GB10", memory: 128, shared: true }]))
+  const result = hardwareDetails(hardware("NVIDIA GB10", 128, 20, [{ name: "NVIDIA GB10", memory: 128, shared: true }]))
   expect(result.photo).toEqual(Option.none())
   expect(result.deviceId).toEqual(Option.none())
   expect(result.summary).toContainEqual({ label: "CPU cores", value: "20" })
@@ -141,7 +141,7 @@ it("requires exact fact identities and retains primary source URLs", () => {
     expect(entry.source).toMatch(/^https:\/\//)
     expect(entry.facts.every(fact => fact.label.endsWith("(spec)"))).toBe(true)
   }
-  const result = hardwareDetails(null, hardware("Unknown", 32, 8, [{ name: "RTX 5090 D", memory: 32 }]))
+  const result = hardwareDetails(hardware("Unknown", 32, 8, [{ name: "RTX 5090 D", memory: 32 }]))
   expect(result.accelerators[0]?.facts).toEqual([])
 })
 
@@ -149,7 +149,7 @@ it("counts dedicated memory once when two backends expose one physical domain", 
   const value = hardware("AMD", 64, 16, [{ name: "RTX 4090", memory: 24 }])
   const accelerator = value.accelerators[0]!
   const executor = accelerator.executors[0]!
-  const result = hardwareDetails(null, { ...value, accelerators: [{ ...accelerator, executors: [executor, { ...executor, deviceId: "vulkan-alias" as typeof executor.deviceId, backend: "vulkan" }] }] })
+  const result = hardwareDetails({ ...value, accelerators: [{ ...accelerator, executors: [executor, { ...executor, deviceId: "vulkan-alias" as typeof executor.deviceId, backend: "vulkan" }] }] })
   expect(result.accelerators.map(gpu => gpu.detail)).toEqual(["25.8 GB VRAM"])
   expect(result.groups.at(-1)?.details).toContain("CUDA acceleration")
   expect(result.groups.at(-1)?.details).not.toContain("Vulkan acceleration")
@@ -160,7 +160,7 @@ it("shows the backend on the GPU holding the active device, and none on the othe
     ...accelerator.executors,
     { ...accelerator.executors[0]!, deviceId: `${accelerator.acceleratorId}-vulkan` as typeof accelerator.executors[0]["deviceId"], backend: "vulkan" as const },
   ] }))
-  const result = hardwareDetails(null, { ...value, accelerators: views })
+  const result = hardwareDetails({ ...value, accelerators: views })
   expect(result.groups.map(group => group.label)).toEqual(["CPU", "Memory", "GPU 1", "GPU 2"])
   expect(result.groups.slice(2).map(group => group.details.filter(detail => detail.endsWith("acceleration")))).toEqual([
     ["CUDA acceleration"],
@@ -170,7 +170,7 @@ it("shows the backend on the GPU holding the active device, and none on the othe
 })
 it("leads with the serving discrete GPU and keeps an integrated GPU's host RAM as system memory", () => {
   const value = hardware("AMD", 64, 16, [{ name: "Integrated graphics", memory: 64, shared: true }, { name: "RTX 4090", memory: 24 }])
-  const result = hardwareDetails(null, {
+  const result = hardwareDetails({
     ...value,
     activeDeviceId: value.accelerators[1]!.executors[0]!.deviceId,
     memoryDomains: value.memoryDomains.map(domain => domain.memoryDomainId === "system" ? { ...domain, kind: "System" as const } : domain),
@@ -184,7 +184,7 @@ it("leads with the serving discrete GPU and keeps an integrated GPU's host RAM a
 })
 
 it("groups an Apple chip once and retains distinct accelerators", () => {
-  const result = hardwareDetails(null, hardware("Apple M4 Pro", 48, 14, [
+  const result = hardwareDetails(hardware("Apple M4 Pro", 48, 14, [
     { name: "Apple M4 Pro", memory: 48, shared: true }, { name: "RTX 5090", memory: 32 },
   ], 14))
   expect(result.groups.map(group => group.label)).toEqual(["Chip", "Memory", "GPU"])
@@ -195,7 +195,7 @@ it("groups an Apple chip once and retains distinct accelerators", () => {
   expect(result.groups[2]?.name).toBe("RTX 5090")
 })
 it("labels PC components consistently and numbers separate GPUs", () => {
-  const result = hardwareDetails(null, hardware("AMD Ryzen 9 9950X", 128, 32, [
+  const result = hardwareDetails(hardware("AMD Ryzen 9 9950X", 128, 32, [
     { name: "RTX 5090", memory: 32 }, { name: "RTX 5090", memory: 32 },
   ], 16))
   expect(result.groups.map(group => group.label)).toEqual(["CPU", "Memory", "GPU 1", "GPU 2"])
@@ -206,7 +206,7 @@ it("labels PC components consistently and numbers separate GPUs", () => {
 })
 
 it.each(["RTX 5090", "Radeon 8060S Graphics", "Arc B580", "RX 580"])("omits implementation-specific GPU unit counts from the %s card", name => {
-  const result = hardwareDetails(null, hardware("Unknown", 64, 8, [{ name, memory: 16 }]))
+  const result = hardwareDetails(hardware("Unknown", 64, 8, [{ name, memory: 16 }]))
   const group = result.groups.find(group => group.label === "GPU")!
   expect(group.details.some(detail => /CUDA cores|GPU compute units|Xe cores|Stream processors/.test(detail))).toBe(false)
   expect(group.details[0]).toBe("17.2 GB VRAM")

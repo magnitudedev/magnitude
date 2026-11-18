@@ -42,7 +42,7 @@ const build = Effect.gen(function* () {
       "-framework", "Security", "-framework", "CoreFoundation",
       resolve(root, "native/mac-update-validation.c"), resolve(root, "native/mac-update-napi.c"),
       resolve(root, "native/mac-update-filesystem.c"), resolve(root, "native/mac-update-lease.c")] : []),
-    "-I", headers, resolve(root, "native/desktop-host.c"), resolve(root, "native/application-memory.c"), resolve(root, "native/machine-identity.c"), "-o", output]
+    "-I", headers, resolve(root, "native/desktop-host.c"), resolve(root, "native/application-memory.c"), "-o", output]
   yield* Effect.async<void, NativeBuildFailed>(resume => {
     const child = spawn(process.env.CC ?? "cc", args, { stdio: "inherit" })
     child.once("error", error => resume(Effect.fail(new NativeBuildFailed({ message: error.message }))))

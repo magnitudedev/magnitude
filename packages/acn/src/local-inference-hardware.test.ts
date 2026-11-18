@@ -28,6 +28,7 @@ const snapshot = (freeMemory: number, freeDisk: number, logicalCpus = 8): LocalI
   Schema.decodeUnknownSync(LocalInferenceHardwareSchema)({
     platform: "Linux",
     architecture: "X64",
+    identity: { _tag: "Unavailable", formFactor: "Unknown" },
     chipCores: 4,
     logicalCpus,
     cpuPoolCores: 4,

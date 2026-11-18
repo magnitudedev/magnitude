@@ -58,6 +58,7 @@ export const makeHardware = (
   platform: "Linux",
   architecture: "X64",
   productName: Option.none(),
+  identity: { _tag: "Unavailable", formFactor: "Unknown" },
   processor: Option.some("Test CPU"),
   chipCores: 8,
   logicalCpus: 16,

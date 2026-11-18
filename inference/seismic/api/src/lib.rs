@@ -385,7 +385,7 @@ pub fn device_block_packing(backend: BackendName) -> Option<DeviceBlockPacking> 
 mod slab;
 pub use seismic_discovery::{
     device_node, host_sample, pin, place_process, volume_available, volume_identity, Core, DeviceNode, DiscoveryError,
-    Counted, Harm, HostSample, Inventory, Lag, MemoryNode, ObservationError, OwnCold, OwnReclaimed, PciLocation,
+    Counted, Harm, HostSample, Inventory, Lag, Machine, MachineFormFactor, MachineIdentity, MemoryNode, ObservationError, OwnCold, OwnReclaimed, PciLocation,
     PressureEvents, PressureLevel, PressureWaker, ProcessPlacement, Processors, ProcessorsReportedBy, RuntimeStatus,
     Sample, Status, Supply, Wake, WiredFigures, WiredLimit,
 };

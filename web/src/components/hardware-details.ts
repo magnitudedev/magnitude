@@ -1,6 +1,5 @@
 import { Option, Schema } from "effect"
 import type { LocalInferenceHardware } from "@magnitudedev/sdk"
-import type { MachineIdentityObservation } from "@magnitudedev/sdk/desktop-host"
 import { deriveHardwareRoles, formatLocalInferenceBackend, formatMemorySize } from "@magnitudedev/client-common"
 import { hardwarePresentation, normalizeGpuName, normalizeHardwareName } from "./hardware-photos"
 import facts from "../../../assets/hardware/facts.json"
@@ -49,10 +48,10 @@ const publishedFacts = (target: typeof CatalogEntry.Type.target, name: string, c
 }
 
 /** A view of existing observations and exact published specifications; no probing or benchmarking. */
-export const hardwareDetails = (identity: MachineIdentityObservation | null, hardware: LocalInferenceHardware) => {
+export const hardwareDetails = (hardware: LocalInferenceHardware) => {
   const roles = deriveHardwareRoles(hardware)
   const dedicated = roles.devices.filter(device => Option.isSome(device.dedicatedMemoryBytes))
-  const presentation = hardwarePresentation(identity, dedicated.map(({ accelerator }) => accelerator.name), hardware.processor)
+  const presentation = hardwarePresentation(hardware.identity, dedicated.map(({ accelerator }) => accelerator.name), hardware.processor)
   const unified = roles.unifiedMemory
   const processorFacts = Option.match(hardware.processor, { onNone: () => [], onSome: name => publishedFacts("Processor", name, Option.some(hardware.chipCores)) })
   const summary = [

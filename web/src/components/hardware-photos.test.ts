@@ -6,6 +6,7 @@ import { hardwarePhotos, hardwarePresentation as selectPresentation, hardwarePho
 
 const hardwarePresentation = (identity: Parameters<typeof selectPresentation>[0], accelerators: readonly string[]) => selectPresentation(identity, accelerators, Option.some("13th Gen Intel(R) Core(TM) i7-13700H"))
 const mac = (model: string) => ({ _tag: "Identified" as const, manufacturer: "Apple", family: Option.none<string>(), version: Option.none<string>(), formFactor: "Unknown" as const, model })
+const unknown = { _tag: "Unavailable" as const, formFactor: "Unknown" as const }
 it.each([
   ["Mac16,5", "book16"], ["Mac16,8", "book14"], ["Mac16,9", "studio"],
   ["Mac16,11", "mini"], ["Mac16,12", "air13"],
@@ -21,7 +22,7 @@ it.each(["NVIDIA GeForce RTX 5090", "GeForce RTX 5090", "RTX 5090 Founders Editi
   expect(hardwarePresentation({ _tag: "Unavailable", formFactor: "Unknown" }, [name]).photo).toEqual(Option.some(hardwarePhotos.rtx5090))
 })
 it.each(["RTX 5090 Laptop GPU", "NVIDIA GeForce RTX 5090 D", "RTX 50900", "RTX 590", "RX 590", "RTX 4090 Laptop GPU"])("never substitutes a different GPU photo for %s", name => {
-  expect(hardwarePresentation(null, [name]).photo).toEqual(Option.none())
+  expect(hardwarePresentation(unknown, [name]).photo).toEqual(Option.none())
 })
 it("keeps the enclosure as the primary photo and preserves unknown PC identity", () => {
   expect(hardwarePresentation(mac("Mac16,5"), ["RTX 5090"]).photo).toEqual(Option.some(hardwarePhotos.book16))
@@ -32,9 +33,9 @@ it.each(hardwarePhotoInventory)("matches the verified identity for $id", entry =
   const match = entry.match
   if (match._tag === "Gpu") {
     for (const name of match.names) {
-      expect(hardwarePresentation(null, [name]).photo).toEqual(Option.some(entry))
-      expect(hardwarePresentation(null, [name + " Laptop GPU"]).photo).toEqual(Option.none())
-      expect(hardwarePresentation(null, [name + " D"]).photo).toEqual(Option.none())
+      expect(hardwarePresentation(unknown, [name]).photo).toEqual(Option.some(entry))
+      expect(hardwarePresentation(unknown, [name + " Laptop GPU"]).photo).toEqual(Option.none())
+      expect(hardwarePresentation(unknown, [name + " D"]).photo).toEqual(Option.none())
     }
   } else {
     for (const model of match.models) {
@@ -90,5 +91,5 @@ it.each([
   ["Intel(R) Arc(TM) B580 Graphics", "arc-b580"],
   ["AMD Radeon RX 7900 XTX (RADV NAVI31)", "rx7900xtx"],
 ] as const)("matches driver decoration without changing the GPU SKU: %s", (name, id) => {
-  expect(hardwarePresentation(null, [name]).photo).toEqual(Option.some(hardwarePhotos[id]))
+  expect(hardwarePresentation(unknown, [name]).photo).toEqual(Option.some(hardwarePhotos[id]))
 })
