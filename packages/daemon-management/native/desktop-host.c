@@ -331,7 +331,9 @@ static napi_value guard(napi_env env, napi_callback_info info) {
   if (napi_get_cb_info(env, info, &argc, &arg, NULL, NULL) != napi_ok || argc != 1 ||
       napi_get_value_int32(env, arg, &descriptor) != napi_ok || descriptor != 0)
     return failure(env, "Invalid Windows ownership admission");
-  if (guarded) return failure(env, "Parent ownership already validated");
+  /* A kill-on-close job without breakaway cannot be left, so a later admission in the same process
+     (a serve resuming after the desktop, or restarting in place) needs no new validation. */
+  if (guarded) { napi_get_undefined(env, &result); return result; }
   if (magnitude_owned_validate_current() != ERROR_SUCCESS)
     return failure(env, "Windows child requires a containing kill-on-close job without breakaway");
   guarded = 1;
