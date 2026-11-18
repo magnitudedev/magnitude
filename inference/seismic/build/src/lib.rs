@@ -3534,7 +3534,7 @@ mod native_tests {
             generated.contains("pub fn param_unroll(&self) -> u64 { self.invocation.param(1) }")
         );
         assert!(generated.contains("#[target_feature(enable = \"sse3,ssse3,sse4.1,sse4.2,popcnt,avx,avx2,fma,f16c,bmi1,bmi2,lzcnt,movbe\")]"));
-        assert!(generated.contains("scale::<seismic::cpu::X86V3, Elements_>"));
+        assert!(generated.contains("super::scale::<seismic::cpu::X86V3, super::Elements_>"));
 
         fs::write(&cuda, "#include <cuda_fp16.h>\nextern \"C\" __global__ void scale(SEISMIC_KERNEL_PARAMS) {}\n")
             .expect("CUDA fixture");
