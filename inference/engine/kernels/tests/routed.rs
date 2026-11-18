@@ -7,6 +7,7 @@
 )]
 
 mod common;
+mod decision;
 mod declared;
 
 use common::bound::{self, Float, Form, Library, Products};
@@ -4819,10 +4820,35 @@ impl Qwen35b {
             chosen.sort_unstable();
             let mut expected = ranked[..k].to_vec();
             expected.sort_unstable();
-            // A different set is only admissible at a near tie on the boundary.
-            let (last, next) = (probability[ranked[k - 1]], probability[ranked[k]]);
+            // A different set only where the k-th and the next probability
+            // are within rounding of each other (`decision::settled`): each
+            // logit is the native's F32 sum of the products in its own order,
+            // carried through the softmax's slope, its own and its
+            // denominator's.
+            let logit_scales = (0..e)
+                .map(|expert| match self.slot[expert] {
+                    Some(_) => decision::summed(
+                        h,
+                        normalized
+                            .iter()
+                            .zip(&self.router[expert * h..(expert + 1) * h])
+                            .map(|(x, w)| (f64::from(*x) * f64::from(*w)).abs())
+                            .sum::<f64>(),
+                    ),
+                    None => decision::summed(
+                        h,
+                        normalized.iter().map(|v| f64::from(*v).abs()).sum::<f64>() * f64::from(bf16_round(UNUSED_ROUTER)).abs(),
+                    ),
+                })
+                .collect::<Vec<_>>();
+            let widest = logit_scales.iter().copied().fold(0.0, f64::max);
+            let probabilities = probability
+                .iter()
+                .zip(&logit_scales)
+                .map(|(p, scale)| decision::Quantity::carried(*p, p * (scale + widest) + 2.0 * decision::operation(*p)))
+                .collect::<Vec<_>>();
             assert!(
-                chosen == expected || last - next <= 1e-4 * last,
+                chosen == expected || !decision::settled(&probabilities, k),
                 "{label}: routes {routes:?}, reference {:?}",
                 &ranked[..k]
             );

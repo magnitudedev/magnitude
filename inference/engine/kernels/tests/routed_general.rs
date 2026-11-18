@@ -11,6 +11,7 @@
 )]
 
 mod common;
+mod decision;
 mod declared;
 mod mapped;
 
@@ -476,14 +477,8 @@ struct Selection {
     routes: Vec<i32>,
     weights: Vec<f64>,
     normalized: Vec<f64>,
-    ranked: Vec<f64>,
+    ranked: Vec<decision::Quantity>,
 }
-
-/// A selection difference is accepted only between experts whose ranked
-/// values are this close: the natives and the interpreter reassociate the RMS
-/// and logit sums, which can flip a BF16 rounding of the router input (a
-/// logit moves by about ulp(x) * |router| ~ 2e-4 here).
-const NEAR_TIE: f64 = 1e-4;
 
 fn host_select(routing: &Routing, case: &SelectCase) -> Selection {
     let (h, e, k, m) = (routing.hidden, routing.experts, routing.selected, case.rows);
@@ -513,25 +508,58 @@ fn host_select(routing: &Routing, case: &SelectCase) -> Selection {
                     .sum::<f64>()
             })
             .collect::<Vec<_>>();
+        // Each logit's rounding scale: an implementation that reassociates
+        // the RMS sum may round any router input to the BF16 value one step
+        // away, and its F32 sum of the products reassociates.
+        let logit_scales = (0..e)
+            .map(|expert| {
+                let (mut flips, mut magnitude) = (0.0, 0.0);
+                for j in 0..h {
+                    let (x, w) = (router_rows[row * h + j], f64::from(case.router[expert * h + j]).abs());
+                    flips += 2.0 * (common::bound::Float::Bf16.unit() * x.abs() + common::bound::Float::Bf16.underflow()) * w;
+                    magnitude += x.abs() * w;
+                }
+                flips + decision::summed(h, magnitude)
+            })
+            .collect::<Vec<_>>();
+        let widest = logit_scales.iter().copied().fold(0.0, f64::max);
         let maximum = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         let total = logits.iter().map(|l| (l - maximum).exp()).sum::<f64>();
+        // Each score with its scale: the logit's carried through the score's
+        // slope (a softmax's also through its denominator), and the score's
+        // own few F32 operations.
         let scores = logits
             .iter()
-            .map(|logit| match routing.score {
-                0 => (logit - maximum).exp() / total,
-                1 => 1.0 / (1.0 + (-logit).exp()),
-                2 => (logit.max(0.0) + (-logit.abs()).exp().ln_1p()).sqrt(),
-                other => panic!("score function {other}"),
+            .zip(&logit_scales)
+            .map(|(logit, scale)| {
+                let (score, slope_scale) = match routing.score {
+                    0 => {
+                        let s = (logit - maximum).exp() / total;
+                        (s, s * (scale + widest))
+                    }
+                    1 => {
+                        let s = 1.0 / (1.0 + (-logit).exp());
+                        (s, s * (1.0 - s) * scale)
+                    }
+                    2 => {
+                        let softplus = logit.max(0.0) + (-logit.abs()).exp().ln_1p();
+                        let sigmoid = 1.0 / (1.0 + (-logit).exp());
+                        (softplus.sqrt(), sigmoid / (2.0 * softplus.sqrt()) * scale)
+                    }
+                    other => panic!("score function {other}"),
+                };
+                decision::Quantity::carried(score, slope_scale + 2.0 * decision::operation(score))
             })
             .collect::<Vec<_>>();
         let row_ranked = scores
             .iter()
             .zip(&case.bias)
-            .map(|(s, b)| s + f64::from(*b))
+            .map(|(s, b)| decision::Quantity::carried(s.value + f64::from(*b), s.scale))
             .collect::<Vec<_>>();
+        let scores = scores.iter().map(|s| s.value).collect::<Vec<_>>();
         // Descending ranked value; equal values rank the higher expert first.
         let mut order = (0..e).collect::<Vec<_>>();
-        order.sort_by(|a, b| row_ranked[*b].total_cmp(&row_ranked[*a]).then(b.cmp(a)));
+        order.sort_by(|a, b| row_ranked[*b].value.total_cmp(&row_ranked[*a].value).then(b.cmp(a)));
         for (rank, expert) in order[..k].iter().enumerate() {
             routes[row * k + k - 1 - rank] = *expert as i32;
             weights[row * k + k - 1 - rank] = scores[*expert];
@@ -561,7 +589,8 @@ fn host_select(routing: &Routing, case: &SelectCase) -> Selection {
 }
 
 /// Checks a selection (native or portable) against the host reference: slot
-/// by slot the same experts except near-ties, the same weights by expert when
+/// by slot the same experts but where their ranked values are within rounding
+/// of each other (`decision::chosen`), the same weights by expert when
 /// the selected sets agree, and the normalized rows within one BF16 ulp.
 fn assert_selection(
     label: &str,
@@ -575,12 +604,14 @@ fn assert_selection(
     for row in 0..routes.len() / k {
         for slot in 0..k {
             let (actual, expected) = (routes[row * k + slot], reference.routes[row * k + slot]);
-            if actual != expected {
-                let gap = (reference.ranked[row * e + actual as usize]
-                    - reference.ranked[row * e + expected as usize])
-                    .abs();
-                assert!(gap < NEAR_TIE, "{label} row {row} slot {slot}: expert {actual}, reference {expected}, gap {gap}");
-            }
+            let index = |expert: i32| usize::try_from(expert).unwrap_or(usize::MAX);
+            let ranked = &reference.ranked[row * e..(row + 1) * e];
+            assert!(
+                decision::chosen(ranked, &[index(expected)], &[index(actual)]).is_empty(),
+                "{label} row {row} slot {slot}: expert {actual}, reference {expected}, ranked {:?} and {:?}",
+                ranked.get(index(actual)),
+                ranked[index(expected)]
+            );
         }
         let mut actual_set = routes[row * k..(row + 1) * k].to_vec();
         let mut expected_set = reference.routes[row * k..(row + 1) * k].to_vec();

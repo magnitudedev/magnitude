@@ -1,6 +1,8 @@
 mod common;
+mod decision;
 mod declared;
 
+use decision::{Cut, Quantity};
 use magnitude_kernels::{sample_rows, shape_rows};
 
 const ROWS: usize = 3;
@@ -107,7 +109,12 @@ fn assert_values(actual: &[f32], expected: &[f32]) {
     }
 }
 
-fn philox_score(value: f32, token: u32, draw: [u32; 6]) -> f32 {
+/// The Gumbel score of `value` at `token` under `draw`, as the host
+/// computes it, with its rounding scale: the uniform is exact (a 23-bit
+/// integer and a half over 2^23), each logarithm rounds once and the outer
+/// one carries the inner's scale through its slope `1 / |ln u|`, and the
+/// difference with the logit rounds once.
+fn philox_score(value: f32, token: u32, draw: [u32; 6]) -> Quantity {
     let mut counter = [token, draw[3], draw[4], draw[5]];
     let mut key = [draw[1], draw[2]];
     for _ in 0..10 {
@@ -123,7 +130,11 @@ fn philox_score(value: f32, token: u32, draw: [u32; 6]) -> f32 {
         key[1] = key[1].wrapping_add(3_144_134_277);
     }
     let uniform = ((counter[0] >> 9) as f32 + 0.5) / 8_388_608.0;
-    value - (-uniform.ln()).ln()
+    let inner = Quantity::rounded(f64::from(uniform.ln()), 1);
+    let outer = (-uniform.ln()).ln();
+    let carried = Quantity::carried(f64::from(outer), inner.scale / inner.value.abs());
+    let score = value - outer;
+    Quantity::carried(f64::from(score), carried.scale)
 }
 
 #[test]
@@ -451,9 +462,19 @@ fn logits_pattern(count: usize, seed: u64, quantized: bool) -> Vec<f32> {
         .collect()
 }
 
-fn sample_reference(logits: &[f32], mask: &[u32], constrained: bool, draw: [u32; 6]) -> (i32, i32) {
+/// The host's draw of one row: its status, its winner, and every token's
+/// score (an ineligible token's is [`Quantity::INELIGIBLE`]): the logit
+/// itself when greedy, its Gumbel score when sampling.
+struct Sampled {
+    token: i32,
+    status: i32,
+    scores: Vec<Quantity>,
+}
+
+fn sample_reference(logits: &[f32], mask: &[u32], constrained: bool, draw: [u32; 6]) -> Sampled {
     let mut bad = false;
     let mut best: Option<(f32, usize)> = None;
+    let mut scores = vec![Quantity::INELIGIBLE; logits.len()];
     for (token, value) in logits.iter().enumerate() {
         bad |= value.is_nan() || *value == f32::INFINITY;
         if (constrained && (mask[token / 32] >> (token % 32)) & 1 == 0) || !value.is_finite() {
@@ -462,24 +483,54 @@ fn sample_reference(logits: &[f32], mask: &[u32], constrained: bool, draw: [u32;
         let score = if draw[0] == 1 {
             philox_score(*value, token as u32, draw)
         } else {
-            *value
+            Quantity::exact(f64::from(*value))
         };
+        scores[token] = score;
+        let score = score.value as f32;
         if best.map_or(true, |(b, _)| score > b) {
             best = Some((score, token));
         }
     }
-    match (bad, best) {
+    let (token, status) = match (bad, best) {
         (true, _) => (-1, 2),
         (false, Some((_, token))) => (token as i32, 0),
         (false, None) => (-1, 1),
-    }
+    };
+    Sampled { token, status, scores }
 }
 
-/// The portable shaping semantics in O(V log V); `edge` marks tokens whose
-/// top-p decision lies within rounding of the threshold.
-fn shaping_reference(logits: &[f32], p: &[f32], history: &[i32]) -> (Vec<f32>, Vec<bool>) {
+/// A native's `(token, status)` against the host's draw: the status
+/// exactly, and the winner the host's except where their scores are within
+/// rounding of each other (`decision::chosen`).
+fn assert_sampled(label: &str, (token, status): (i32, i32), expected: &Sampled) {
+    assert_eq!(status, expected.status, "{label}: status");
+    if status != 0 {
+        assert_eq!(token, expected.token, "{label}: token");
+        return;
+    }
+    let index = |token: i32| usize::try_from(token).unwrap_or(usize::MAX);
+    assert!(
+        decision::chosen(&expected.scores, &[index(expected.token)], &[index(token)]).is_empty(),
+        "{label}: token {token}, reference {}, scores {:?} and {:?}",
+        expected.token,
+        expected.scores.get(index(token)),
+        expected.scores[index(expected.token)]
+    );
+}
+
+/// The portable shaping semantics in O(V log V), with the cuts each token
+/// was decided by (`decision::selected`): its top-k value against the
+/// (k + 1)-th where it ranks within k and against the k-th where it does not,
+/// its min-p weight against min-p, its preceding top-p mass against top-p,
+/// each stage's it reached. A row left unfiltered (greedy, or holding a NaN
+/// or +inf) has none.
+fn shaping_reference(logits: &[f32], p: &[f32], history: &[i32]) -> (Vec<f32>, Vec<Vec<Cut>>) {
     let vocabulary = logits.len();
     let mut values = logits.to_vec();
+    // The F32 operations of each token's value before its cuts: a
+    // penalized token's repetition, presence, frequency product and
+    // difference, then every token's temperature.
+    let mut operations = vec![0usize; vocabulary];
     for (token, value) in values.iter_mut().enumerate() {
         let count = history.iter().filter(|h| **h == token as i32).count();
         if count > 0 {
@@ -489,32 +540,72 @@ fn shaping_reference(logits: &[f32], p: &[f32], history: &[i32]) -> (Vec<f32>, V
                 *value / p[4]
             };
             *value = *value - p[5] - p[6] * count as f32;
+            operations[token] = 4;
         }
     }
-    let mut edge = vec![false; vocabulary];
+    let mut cuts = vec![Vec::new(); vocabulary];
     if p[0] == 0.0 {
-        return (values, edge);
+        return (values, cuts);
     }
     for value in values.iter_mut() {
         *value /= p[0];
     }
     if values.iter().any(|x| x.is_nan() || *x == f32::INFINITY) {
-        return (values, edge);
+        return (values, cuts);
     }
+    let tempered = values
+        .iter()
+        .zip(&operations)
+        .map(|(value, operations)| Quantity::rounded(f64::from(*value), operations + 1))
+        .collect::<Vec<_>>();
     let top_k = p[1] as i32;
     if top_k > 0 {
-        let mut sorted = values.clone();
-        sorted.sort_by(|a, b| b.total_cmp(a));
-        let kth = sorted[(top_k as usize).min(vocabulary) - 1];
+        let mut order = (0..vocabulary).collect::<Vec<_>>();
+        order.sort_by(|a, b| values[*b].total_cmp(&values[*a]));
+        let k = (top_k as usize).min(vocabulary);
+        let kth = order[k - 1];
+        // A token ranked within k leaves the top k only by falling below
+        // the (k + 1)-th value, one ranked below by rising above the k-th:
+        // each is decided against the other side's nearest. With k at the
+        // vocabulary, top-k removes nothing and decides no token.
+        for (rank, &token) in order.iter().enumerate() {
+            let against = if rank < k { order.get(k).copied() } else { Some(kth) };
+            if let Some(against) = against {
+                cuts[token].push(Cut {
+                    quantity: tempered[token],
+                    boundary: tempered[against],
+                });
+            }
+        }
+        let boundary = values[kth];
         for value in values.iter_mut() {
-            if *value < kth {
+            if *value < boundary {
                 *value = f32::NEG_INFINITY;
             }
         }
     }
     let maximum = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let top = values
+        .iter()
+        .position(|value| *value == maximum)
+        .map_or(Quantity::exact(f64::from(maximum)), |token| tempered[token]);
+    // A surviving token's weight exp(v - max): the difference carries both
+    // values' scales, the exponential carries the difference's through its
+    // slope, the weight itself.
+    let weight = |token: usize, value: f32| {
+        let difference = value - maximum;
+        let carried = Quantity::carried(f64::from(difference), tempered[token].scale + top.scale);
+        let weight = difference.exp();
+        Quantity::carried(f64::from(weight), f64::from(weight) * carried.scale)
+    };
     if p[3] > 0.0 {
-        for value in values.iter_mut() {
+        for (token, value) in values.iter_mut().enumerate() {
+            if *value != f32::NEG_INFINITY {
+                cuts[token].push(Cut {
+                    quantity: weight(token, *value),
+                    boundary: Quantity::exact(f64::from(p[3])),
+                });
+            }
             if (*value - maximum).exp() < p[3] {
                 *value = f32::NEG_INFINITY;
             }
@@ -523,23 +614,92 @@ fn shaping_reference(logits: &[f32], p: &[f32], history: &[i32]) -> (Vec<f32>, V
     if p[2] < 1.0 {
         let weights = values
             .iter()
-            .map(|x| f64::from((*x - maximum).exp()))
+            .enumerate()
+            .map(|(token, value)| weight(token, *value))
             .collect::<Vec<_>>();
-        let denominator = weights.iter().sum::<f64>();
+        let denominator = weights.iter().map(|w| w.value).sum::<f64>();
+        let spread = weights.iter().map(|w| w.scale).sum::<f64>();
         let mut order = (0..vocabulary).collect::<Vec<_>>();
         // IEEE order: -0.0 and +0.0 are one tie group, as in the portable body.
         order.sort_by(|a, b| values[*b].partial_cmp(&values[*a]).unwrap().then(a.cmp(b)));
-        let mut before = 0f64;
+        let (mut before, mut before_spread) = (0f64, 0f64);
         for token in order {
+            // The mass before the token: its sum's and the denominator's
+            // scales, the sum itself in F64.
             let preceding = before / denominator;
-            edge[token] = (preceding - f64::from(p[2])).abs() < 1e-5;
+            if values[token] != f32::NEG_INFINITY {
+                cuts[token].push(Cut {
+                    quantity: Quantity {
+                        value: preceding,
+                        scale: (before_spread + preceding * spread) / denominator,
+                    },
+                    boundary: Quantity::exact(f64::from(p[2])),
+                });
+            }
             if preceding >= f64::from(p[2]) {
                 values[token] = f32::NEG_INFINITY;
             }
-            before += weights[token];
+            before += weights[token].value;
+            before_spread += weights[token].scale;
         }
     }
-    (values, edge)
+    (values, cuts)
+}
+
+/// A native's shaping of one row against the host's: each kept value the
+/// host's (its bits, or within 1e-6 relative), and each token kept or
+/// removed as the host decided it except within rounding of one of its cuts
+/// (`decision::selected`).
+fn assert_shaped(label: &str, actual: &[f32], expected: &[f32], cuts: &[Vec<Cut>]) {
+    let kept = |row: &[f32]| row.iter().map(|value| *value != f32::NEG_INFINITY).collect::<Vec<_>>();
+    let decided = decision::selected(&kept(expected), &kept(actual), |token| cuts[token].clone());
+    assert!(
+        decided.is_empty(),
+        "{label}: {} tokens kept or removed beyond rounding of their cuts, first {:?}",
+        decided.len(),
+        decided
+            .iter()
+            .take(4)
+            .map(|t| (*t, actual[*t], expected[*t], &cuts[*t]))
+            .collect::<Vec<_>>()
+    );
+    let wrong = (0..expected.len())
+        .filter(|t| {
+            let (a, e) = (actual[*t], expected[*t]);
+            a != f32::NEG_INFINITY
+                && e != f32::NEG_INFINITY
+                && a.to_bits() != e.to_bits()
+                && (a.is_infinite() || e.is_infinite() || (a - e).abs() > 1e-6 * e.abs())
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        wrong.is_empty(),
+        "{label}: {} kept values differ, first {:?}",
+        wrong.len(),
+        wrong.iter().take(4).map(|t| (*t, actual[*t], expected[*t])).collect::<Vec<_>>()
+    );
+}
+
+/// A top-k token is decided against the value across the cut from it, so a
+/// native that keeps k - 1 tokens, removing the k-th whose value lies far
+/// above the (k + 1)-th, is refused (`decision::selected`), as is one that
+/// keeps k + 1.
+#[test]
+fn shaping_reference_refuses_a_top_k_off_by_one() {
+    let logits = [4.0f32, 3.0, 2.0, 1.0, 0.0];
+    // Temperature 1, top-k 3; top-p, min-p and penalties off.
+    let params = [1.0f32, 3.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0];
+    let (expected, cuts) = shaping_reference(&logits, &params, &[-1; 4]);
+    let kept = |row: &[f32]| row.iter().map(|value| *value != f32::NEG_INFINITY).collect::<Vec<_>>();
+    assert_eq!(kept(&expected), [true, true, true, false, false]);
+    let decided = |actual: &[f32]| decision::selected(&kept(&expected), &kept(actual), |token| cuts[token].clone());
+    assert!(decided(&expected).is_empty());
+    let mut fewer = expected.clone();
+    fewer[2] = f32::NEG_INFINITY;
+    assert_eq!(decided(&fewer), [2], "keeping k - 1 drops the k-th beyond rounding");
+    let mut more = expected.clone();
+    more[3] = logits[3];
+    assert_eq!(decided(&more), [3], "keeping k + 1 keeps the (k + 1)-th beyond rounding");
 }
 
 #[test]
@@ -701,30 +861,16 @@ fn ordered_semantics_at_full_vocabulary_on(device: &seismic::Device) {
             );
         }
         for row in 0..rows {
-            let (expected, edge) = shaping_reference(
+            let (expected, cuts) = shaping_reference(
                 &logits[row * vocabulary..(row + 1) * vocabulary],
                 &param_rows[row],
                 &history[row * 64..(row + 1) * 64],
             );
-            let actual = &base[row * vocabulary..(row + 1) * vocabulary];
-            let wrong = (0..vocabulary)
-                .filter(|t| {
-                    !edge[*t]
-                        && actual[*t].to_bits() != expected[*t].to_bits()
-                        && (actual[*t].is_infinite()
-                            || expected[*t].is_infinite()
-                            || (actual[*t] - expected[*t]).abs() > 1e-6 * expected[*t].abs())
-                })
-                .collect::<Vec<_>>();
-            assert!(
-                wrong.is_empty(),
-                "V {vocabulary} row {row}: {} tokens differ, first {:?}",
-                wrong.len(),
-                wrong
-                    .iter()
-                    .take(4)
-                    .map(|t| (*t, actual[*t], expected[*t]))
-                    .collect::<Vec<_>>()
+            assert_shaped(
+                &format!("V {vocabulary} row {row}"),
+                &base[row * vocabulary..(row + 1) * vocabulary],
+                &expected,
+                &cuts,
             );
         }
     }
@@ -857,30 +1003,16 @@ fn constrained_shaping_ranks_only_admitted_tokens_on(device: &seismic::Device) {
                     }
                 })
                 .collect::<Vec<_>>();
-            let (expected, edge) = shaping_reference(
+            let (expected, cuts) = shaping_reference(
                 &masked,
                 &param_rows[row],
                 &history[row * 64..(row + 1) * 64],
             );
-            let actual = &base[row * vocabulary..(row + 1) * vocabulary];
-            let wrong = (0..vocabulary)
-                .filter(|t| {
-                    !edge[*t]
-                        && actual[*t].to_bits() != expected[*t].to_bits()
-                        && (actual[*t].is_infinite()
-                            || expected[*t].is_infinite()
-                            || (actual[*t] - expected[*t]).abs() > 1e-6 * expected[*t].abs())
-                })
-                .collect::<Vec<_>>();
-            assert!(
-                wrong.is_empty(),
-                "V {vocabulary} row {row}: {} tokens differ, first {:?}",
-                wrong.len(),
-                wrong
-                    .iter()
-                    .take(4)
-                    .map(|t| (*t, actual[*t], expected[*t]))
-                    .collect::<Vec<_>>()
+            assert_shaped(
+                &format!("V {vocabulary} row {row}"),
+                &base[row * vocabulary..(row + 1) * vocabulary],
+                &expected,
+                &cuts,
             );
         }
         // The unconstrained nucleus holds no admitted token, so a mask
@@ -1008,10 +1140,10 @@ fn sampling_statuses_ties_masks_and_winners_on(device: &seismic::Device) {
                 constrained[row] != 0,
                 draw,
             );
-            assert_eq!(
+            assert_sampled(
+                &format!("V {vocabulary} row {row}"),
                 (base[2 * row], base[2 * row + 1]),
-                expected,
-                "V {vocabulary} row {row}"
+                &expected,
             );
         }
         assert_eq!(
@@ -1078,7 +1210,7 @@ fn cpu_flattened_spans_match_the_host_references_at_every_split() {
                 constrained[row] != 0,
                 draw,
             );
-            assert_eq!((sampled[2 * row], sampled[2 * row + 1]), expected, "{label}: sampled row {row}");
+            assert_sampled(&format!("{label}: sampled row {row}"), (sampled[2 * row], sampled[2 * row + 1]), &expected);
         }
 
         let params = shaping.repeat(rows);
@@ -1087,27 +1219,93 @@ fn cpu_flattened_spans_match_the_host_references_at_every_split() {
             .collect::<Vec<_>>();
         let shaped = native_shape(&device, &logits, rows, vocabulary, &params, &history, None);
         for row in 0..rows {
-            let (expected, edge) = shaping_reference(
+            let (expected, cuts) = shaping_reference(
                 &logits[row * vocabulary..(row + 1) * vocabulary],
                 &shaping,
                 &history[row * 64..(row + 1) * 64],
             );
-            let actual = &shaped[row * vocabulary..(row + 1) * vocabulary];
-            let wrong = (0..vocabulary)
-                .filter(|t| {
-                    !edge[*t]
-                        && actual[*t].to_bits() != expected[*t].to_bits()
-                        && (actual[*t].is_infinite()
-                            || expected[*t].is_infinite()
-                            || (actual[*t] - expected[*t]).abs() > 1e-6 * expected[*t].abs())
-                })
-                .collect::<Vec<_>>();
-            assert!(
-                wrong.is_empty(),
-                "{label}: shaped row {row}: {} tokens differ, first {:?}",
-                wrong.len(),
-                wrong.iter().take(4).map(|t| (*t, actual[*t], expected[*t])).collect::<Vec<_>>()
+            assert_shaped(
+                &format!("{label}: shaped row {row}"),
+                &shaped[row * vocabulary..(row + 1) * vocabulary],
+                &expected,
+                &cuts,
             );
         }
+    }
+}
+
+/// The decision checks' own rules (`decision`), held here so they run in
+/// one test binary of those that declare the module.
+mod decision_rules {
+    use super::decision::*;
+
+    /// A min-p cut at 0.05, and token weights near it and far from it, each
+    /// formed by the reference's `exp` of a difference of about 3.
+    fn weight(value: f64) -> Quantity {
+        Quantity::carried(value, value * operation(3.0))
+    }
+
+    const MIN_P: Quantity = Quantity {
+        value: 0.05,
+        scale: 0.0,
+    };
+
+    #[test]
+    fn a_mask_flip_within_rounding_of_its_cut_is_accepted() {
+        // The reference keeps a weight a few F32 steps above the cut; the
+        // other removes it.
+        let at = weight(0.05 + 3.0 * step(0.05));
+        assert!(at.value >= MIN_P.value);
+        assert!(selected(&[true], &[false], |_| vec![Cut { quantity: at, boundary: MIN_P }]).is_empty());
+    }
+
+    #[test]
+    fn a_mask_flip_far_from_its_cut_is_rejected() {
+        // Removed far above the cut, and kept far below it.
+        let (above, below) = (weight(0.2), weight(0.001));
+        let cut = |token: usize| vec![Cut { quantity: [above, below][token], boundary: MIN_P }];
+        assert_eq!(selected(&[true, false], &[false, true], cut), [0, 1]);
+        // A close cut excuses only its own token.
+        let at = weight(0.05);
+        let cuts = |token: usize| vec![Cut { quantity: [at, below][token], boundary: MIN_P }];
+        assert_eq!(selected(&[true, false], &[false, true], cuts), [1]);
+    }
+
+    #[test]
+    fn a_swapped_choice_between_near_equal_scores_is_accepted() {
+        // Two Gumbel scores a rounding apart, then a far one.
+        let scores = [
+            Quantity::rounded(2.5, 4),
+            Quantity::rounded(2.5 + step(2.5), 4),
+            Quantity::rounded(-1.0, 4),
+        ];
+        assert!(chosen(&scores, &[1], &[0]).is_empty());
+        // Ranked slots holding the near pair in either order.
+        assert!(chosen(&scores, &[1, 0], &[0, 1]).is_empty());
+    }
+
+    #[test]
+    fn a_swapped_choice_between_distinct_scores_is_rejected() {
+        let scores = [Quantity::rounded(2.5, 4), Quantity::rounded(2.0, 4)];
+        assert_eq!(chosen(&scores, &[0], &[1]), [0]);
+        // Equal scores held exactly (greedy logits) follow the tie rule
+        // exactly; an item outside the scores is never a choice.
+        let exact = [Quantity::exact(1.0), Quantity::exact(1.0)];
+        assert_eq!(chosen(&exact, &[0], &[1]), [0]);
+        assert_eq!(chosen(&exact, &[0], &[usize::MAX]), [0]);
+        assert_eq!(chosen(&[Quantity::INELIGIBLE, Quantity::INELIGIBLE], &[0], &[1]), [0]);
+    }
+
+    #[test]
+    fn a_non_monotone_mask_is_rejected() {
+        // Weights in descending order: the reference keeps the two above the
+        // cut. The other keeps the lowest and removes the highest instead,
+        // each beyond rounding of the cut, while the near-cut token agrees.
+        let tokens = [weight(0.4), weight(0.05 + 3.0 * step(0.05)), weight(0.01)];
+        let cut = |token: usize| vec![Cut { quantity: tokens[token], boundary: MIN_P }];
+        assert_eq!(selected(&[true, true, false], &[false, true, true], cut), [0, 2]);
+        // A top-k whose k-th and next are a rounding apart is unsettled.
+        assert!(settled(&tokens, 1));
+        assert!(!settled(&[weight(0.4), weight(0.4 + step(0.4))], 1));
     }
 }

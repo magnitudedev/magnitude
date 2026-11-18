@@ -244,9 +244,11 @@ native shape_rows for metal from "metal/shape_rows.metal":
 # prepare applies the constraint mask, penalties and temperature; select
 # finds both cutoffs in one
 # 1024-thread block per row with order-independent integer sums; apply writes
-# -inf over removed tokens. The result is independent of PARTS and WIDTH.
-# Differs from Metal: 3 launches (Metal selects over 6 count/select rounds
-# plus a ties launch, 5 stages); both follow the same contract bit for bit.
+# -inf over removed tokens. On one device the result is independent of PARTS
+# and WIDTH: every configuration decides each token alike. Differs from
+# Metal: 3 launches (Metal selects over 6 count/select rounds plus a ties
+# launch, 5 stages); both follow the same contract, and their decisions differ
+# only for a token within rounding of a cut (tests/decision).
 native shape_rows for cuda from "cuda/shape_rows.cu":
     static (V, Hn)
     params (PARTS in [64, 128, 32] default 64, WIDTH in [256, 512] default 256)
@@ -262,7 +264,7 @@ native shape_rows for cuda from "cuda/shape_rows.cu":
         threadgroups (PARTS, Sx, 1)
         threads_per_threadgroup (WIDTH, 1, 1)
 
-# Native Vulkan: the CUDA form, the same contract bit for bit; the select's
+# Native Vulkan: the CUDA form, the same contract (as Metal's); the select's
 # 64-bit histogram is (low, high) u32 planes with carrying atomic adds.
 # Shared: prepare holds the history row and the partition maximum; select
 # 5190 words (histogram planes, lane totals, the top-p total, per-invocation
