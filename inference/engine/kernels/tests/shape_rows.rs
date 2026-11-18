@@ -201,20 +201,11 @@ fn generated_surface_exposes_planned_and_native_preparation() {
 
 const PARTITIONS: [u64; 3] = [64, 32, 128];
 
-/// Every accelerator this host opens, then the CPU.
+/// Every accelerator the host has, then the CPU; a requested backend alone
+/// ([`seismic_native_tests::devices`]).
 fn devices() -> Vec<seismic::Device> {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    [
-        seismic::BackendName::Metal,
-        seismic::BackendName::Cuda,
-        seismic::BackendName::Vulkan,
-    ]
-    .into_iter()
-    .filter_map(|backend| catalog.open_backend(backend).ok())
-    .chain(std::iter::once(
-        catalog.open_backend(seismic::BackendName::Cpu).unwrap(),
-    ))
-    .collect()
+    use seismic::BackendName::{Cpu, Cuda, Metal, Vulkan};
+    seismic_native_tests::devices(&[Metal, Cuda, Vulkan, Cpu])
 }
 
 fn is_cpu(device: &seismic::Device) -> bool {

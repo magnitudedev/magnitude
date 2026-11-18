@@ -117,11 +117,17 @@ struct OpBF16 {
             : "r"(biased), "r"(0x3F803F80u), "r"(negative | (negative << 16)));
         return value;
     }
-    // Signed bytes `i` of `slots_low` and `slots_high`.
+    // Signed bytes `i` of `slots_low` and `slots_high`. A byte b is
+    // (b & 127) - 128 (b >> 7): each half is 128 + (b & 127), exact in the
+    // binade [128, 256), minus 128 or 256, the powers whose exponents differ
+    // in their low bit, which is b's sign bit where the byte sits.
     __device__ static __forceinline__ u32 bytes(u32 slots_low, u32 slots_high, int i) {
-        const int low = ((int)(slots_low << (24 - 8 * i))) >> 24;
-        const int high = ((int)(slots_high << (24 - 8 * i))) >> 24;
-        return pack((float)low, (float)high);
+        const u32 pair = prmt(slots_low, slots_high, (u32)i | ((u32)(4 + i) << 8));
+        const u32 biased = (pair & 0x007F007Fu) | 0x43004300u;   // 128 + (b & 127)
+        const u32 negative = (pair & 0x00800080u) | 0xC300C300u; // -128, or -256 where b < 0
+        u32 value;
+        asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(value) : "r"(biased), "r"(0x3F803F80u), "r"(negative));
+        return value;
     }
     __device__ static __forceinline__ void mma(float (&c)[4], const u32 (&a)[4], const u32 (&b)[2]) {
         seismic_mma_m16n8k16_bf16(c, a, b);
@@ -247,6 +253,9 @@ struct Rows {
     u64 scales;
     u64 supers;
     u64 supers_bytes; // payload bytes of a row's supers plane
+    // Where tile `tile`'s rows begin: row 16 tile, every plane of a row at
+    // its offset from the row (`CodePlane::chunk`, the decoders' `super_word`).
+    __device__ __forceinline__ const u8 *tile_base(u64 tile) const { return base + 16 * tile * stride; }
 };
 
 // Coefficients of one k-block for the fragment rows g and g+8, per group.
@@ -862,13 +871,100 @@ template <int K> struct OddCode {
 // fragments of rows g and g+8, and `READS<BITS>` whether it reads codes of
 // BITS bits.
 
+// Where a decoder reads grid points (`grids::table<GRID>`): in global memory
+// (`GlobalPoints`, through the read-only path), or in the block's copy in
+// shared memory (`BlockPoints`), which `stage_block_points` fills and which a
+// GEMV block reads once a block rather than once a lane per entry, as an L1
+// gather of up to one line a lane.
+template <class T> struct Pointee;
+template <class T> struct Pointee<const T *> {
+    typedef T type;
+};
+template <u32 GRID> struct PointsTable {
+    typedef typename Pointee<decltype(grids::table<GRID>::points())>::type Element;
+    static constexpr u32 SIZE = grids::table<GRID>::SIZE;
+};
+struct GlobalPoints {
+    template <u32 GRID> __device__ static __forceinline__ u32 word(u32 index) {
+        return seismic_ld_nc_u32(reinterpret_cast<const u32 *>(grids::table<GRID>::points()) + index);
+    }
+    template <u32 GRID> __device__ static __forceinline__ uint2 pair(u32 index) {
+        return seismic_ld_nc_v2(reinterpret_cast<const uint2 *>(grids::table<GRID>::points()) + index);
+    }
+};
+// The block's copy of grid GRID's points (one per kernel that reads it).
+template <u32 GRID> __device__ __forceinline__ typename PointsTable<GRID>::Element *block_points() {
+    __shared__ typename PointsTable<GRID>::Element table[PointsTable<GRID>::SIZE];
+    return table;
+}
+struct BlockPoints {
+    template <u32 GRID> __device__ static __forceinline__ u32 word(u32 index) {
+        return reinterpret_cast<const u32 *>(block_points<GRID>())[index];
+    }
+    template <u32 GRID> __device__ static __forceinline__ uint2 pair(u32 index) {
+        return reinterpret_cast<const uint2 *>(block_points<GRID>())[index];
+    }
+};
+// Fill the block's copy of grid GRID's points (block-collective; the caller
+// synchronizes the block before any read).
+template <u32 GRID> __device__ __forceinline__ void stage_block_points() {
+    typename PointsTable<GRID>::Element *table = block_points<GRID>();
+    for (u32 i = threadIdx.x; i < PointsTable<GRID>::SIZE; i += blockDim.x)
+        table[i] = grids::table<GRID>::points()[i];
+}
+
+// A step's slots of planes P (`P::slots`), grid planes' with their points
+// read from Src.
+template <class G> struct GridPlanes;
+template <class P> struct IsGridPlanes {
+    static constexpr bool value = false;
+};
+template <class G> struct IsGridPlanes<GridPlanes<G>> {
+    static constexpr bool value = true;
+};
+// The int8 GEMV's superblock of planes P whose whole superblock is S: grid
+// planes' lane entries where they hold less (`GridPlanes::LANE_FETCH`,
+// `LaneSuper`), else S.
+template <class P, class S> struct LaneSuperOf {
+    typedef S type;
+};
+template <class G, class S> struct LaneSuperOf<GridPlanes<G>, S> {
+    typedef typename Select<GridPlanes<G>::LANE_FETCH, typename GridPlanes<G>::LaneSuper, S>::type type;
+};
+// The order the int8 GEMM reads a weight's codes in (`S8_GEMM_ENTRIES`), from
+// the two costs that compete. Entry order costs a masked k32 MMA a group
+// wherever a group's codes straddle the k16 halves of the MMA (groups of 16
+// codes). Slot order costs, for a grid whose points are not magnitudes under
+// sign bits (signed points or a delta: `GridCodes::magnitudes`), a point
+// lookup by each of an entry's four lanes, where entry order takes one. A
+// grid weight reads entry order where it pays no masked MMA or saves those
+// lookups, else slot order; every other weight reads slot order. On an RTX
+// 3090 (dense_output 4096x12288, 512 rows, INT8, BLOCKS 1; run
+// 20261117T213836Z-script-736743), entry order against slot order: IQ2_XS
+// 4-10% and IQ2_S 6-8% slower (magnitude grids, groups of 16; IQ2_S spilling
+// 104 stack bytes, not 24), IQ1_M 3-6% faster (a delta grid, groups of 16).
+template <class P, int GROUP> __host__ __device__ constexpr bool s8_gemm_entries() {
+    if constexpr (IsGridPlanes<P>::value)
+        return GROUP >= 32 || !P::codes::magnitudes();
+    else
+        return false;
+}
+
+template <class P, class Src, class Raw>
+__device__ __forceinline__ void slots_of(const Raw &raw, int step, u32 &low, u32 &high) {
+    if constexpr (IsGridPlanes<P>::value)
+        P::template slots<Src>(raw, step, low, high);
+    else
+        P::slots(raw, step, low, high);
+}
+
 // Linear codes (`OffsetCode`): the offset subtracted exactly in the
 // operand (`O::codes<OFFSET>`), in the s8 bytes (`s8_less`) and in the
 // integer value; codes below 128.
 template <u32 OFFSET> struct Linear : OffsetCode<(int)OFFSET> {
     template <int BITS> static constexpr bool READS = BITS < 8;
-    template <class O, class P> __device__ static __forceinline__ void decode(const typename P::Raw &raw, int step,
-                                                                           u32 (&a)[4]) {
+    template <class O, class P, class Src = GlobalPoints>
+    __device__ static __forceinline__ void decode(const typename P::Raw &raw, int step, u32 (&a)[4]) {
 #pragma unroll
         for (int i = 0; i < 4; ++i)
             a[i] = O::template codes<OFFSET>(P::pair(raw, step, i));
@@ -887,8 +983,8 @@ template <u32 OFFSET> struct Linear : OffsetCode<(int)OFFSET> {
 // the operand, the s8 bytes and the integer value); codes below 64.
 template <u32 K> struct Odd : OddCode<(int)K> {
     template <int BITS> static constexpr bool READS = BITS < 7;
-    template <class O, class P> __device__ static __forceinline__ void decode(const typename P::Raw &raw, int step,
-                                                                           u32 (&a)[4]) {
+    template <class O, class P, class Src = GlobalPoints>
+    __device__ static __forceinline__ void decode(const typename P::Raw &raw, int step, u32 (&a)[4]) {
 #pragma unroll
         for (int i = 0; i < 4; ++i)
             a[i] = O::template codes<2 * K>((P::pair(raw, step, i) << 1) | 0x00010001u);
@@ -907,15 +1003,15 @@ template <u32 K> struct Odd : OddCode<(int)K> {
 // step's slots (`P::slots`).
 struct Twos : TwosCode<8> {
     template <int BITS> static constexpr bool READS = BITS == 8;
-    template <class O, class P> __device__ static __forceinline__ void decode(const typename P::Raw &raw, int step,
-                                                                           u32 (&a)[4]) {
+    template <class O, class P, class Src = GlobalPoints>
+    __device__ static __forceinline__ void decode(const typename P::Raw &raw, int step, u32 (&a)[4]) {
         u32 low, high;
-        P::slots(raw, step, low, high);
+        slots_of<P, Src>(raw, step, low, high);
         slot_operands<O>(low, high, a);
     }
     template <class P> __device__ static __forceinline__ S8Pair s8(const typename P::Raw &raw, int step) {
         u32 low, high;
-        P::slots(raw, step, low, high);
+        slots_of<P, GlobalPoints>(raw, step, low, high);
         return slot_s8(low, high);
     }
 };
@@ -925,8 +1021,8 @@ template <u32 ID> struct Table {
     typedef typename CodebookOf<ID>::type B;
     template <int BITS> static constexpr bool READS = BITS == 4;
     __device__ static __forceinline__ float value(u32 code) { return (float)(int)(signed char)B::values(code); }
-    template <class O, class P> __device__ static __forceinline__ void decode(const typename P::Raw &raw, int step,
-                                                                           u32 (&a)[4]) {
+    template <class O, class P, class Src = GlobalPoints>
+    __device__ static __forceinline__ void decode(const typename P::Raw &raw, int step, u32 (&a)[4]) {
         B::template decode<O>(P::nibbles(raw, step), a);
     }
     template <class P> __device__ static __forceinline__ S8Pair s8(const typename P::Raw &raw, int step) {
@@ -966,10 +1062,10 @@ struct E4M3 {
                (((pair & 0x00800080u) << 8) & ~(nan * 0x8000u)) | nan * QUIET_NAN;
     }
     // Register i: slots i (low half) and 4 + i, byte i of `low` and `high`.
-    template <class O, class P> __device__ static __forceinline__ void decode(const typename P::Raw &raw, int step,
-                                                                           u32 (&a)[4]) {
+    template <class O, class P, class Src = GlobalPoints>
+    __device__ static __forceinline__ void decode(const typename P::Raw &raw, int step, u32 (&a)[4]) {
         u32 low, high;
-        P::slots(raw, step, low, high);
+        slots_of<P, Src>(raw, step, low, high);
 #pragma unroll
         for (int i = 0; i < 4; ++i)
             a[i] = operands<O>(prmt(low, high, (u32)i | ((u32)(4 + i) << 8)));
@@ -1497,10 +1593,47 @@ struct Packed : Rows, Select<K::BIAS, None, typename OrderOf<P, K::GROUP>::type>
         return P::fetch_superblock(*this, tile, superblock, kblocks, lane);
     }
     __device__ __forceinline__ Raw raw(const Super &super, int q, u32 lane) const { return P::raw(super, q, lane); }
-    template <class O> __device__ __forceinline__ void decode(const Raw &raw, int step, u32 (&a)[4]) const {
-        C::template decode<O, P>(raw, step, a);
+    // The INT8 GEMV's superblock (`projection::S8Superblock`): under grid
+    // planes of multi-byte entries each lane's own entries
+    // (`GridPlanes::LaneSuper`), else whole.
+    typedef typename LaneSuperOf<P, Super>::type S8Super;
+    __device__ __forceinline__ S8Super fetch_s8_superblock(u64 tile, u64 superblock, u64 kblocks, u32 lane) const {
+        if constexpr (!Same<S8Super, Super>::value)
+            return P::fetch_lane_superblock(*this, tile, superblock, lane);
+        else
+            return fetch_superblock(tile, superblock, kblocks, lane);
     }
-    __device__ __forceinline__ S8Pair s8(const Raw &raw, int step) const { return C::template s8<P>(raw, step); }
+    __device__ __forceinline__ auto s8_raw(const S8Super &super, int q, u32 lane) const {
+        if constexpr (!Same<S8Super, Super>::value)
+            return super.raw[q];
+        else
+            return raw(super, q, lane);
+    }
+    template <class O, class Src = GlobalPoints>
+    __device__ __forceinline__ void decode(const Raw &raw, int step, u32 (&a)[4]) const {
+        C::template decode<O, P, Src>(raw, step, a);
+    }
+    // The int8 MMA's registers of k-block half h: in entry order (ENTRIES,
+    // which only grid planes take: `GridPlanes::s8_half`), or the s8 words
+    // of steps 2h and 2h + 1 (the slot order of `S8Pair`), which every
+    // planes take. The GEMV reads grid planes in entry order (S8_ENTRIES),
+    // and the int8 GEMM in the order its rows were staged in, which follows
+    // S8_GEMM_ENTRIES. From a whole k-block (`Raw`), or in entry order the
+    // lane's own entries (`S8Super`).
+    static constexpr bool S8_ENTRIES = IsGridPlanes<P>::value;
+    static constexpr bool S8_GEMM_ENTRIES = s8_gemm_entries<P, GROUP>();
+    template <class Src = GlobalPoints, bool ENTRIES = S8_ENTRIES, class R>
+    __device__ __forceinline__ void s8_half(const R &raw, int h, u32 (&a)[4]) const {
+        static_assert(!ENTRIES || S8_ENTRIES, "only grid planes' int8 codes take entry order");
+        if constexpr (ENTRIES) {
+            static_assert(Same<C, Twos>::value, "grid planes' codes are their s8 bytes");
+            P::template s8_half<Src>(raw, h, a);
+        } else {
+            static_assert(Same<R, Raw>::value, "slot order reads whole k-blocks");
+            const S8Pair first = C::template s8<P>(raw, 2 * h), second = C::template s8<P>(raw, 2 * h + 1);
+            a[0] = first.row_g, a[1] = first.row_g8, a[2] = second.row_g, a[3] = second.row_g8;
+        }
+    }
     __device__ __forceinline__ void coefficient(u64 row, u64 kblock, int group, float &scale, float &bias) const {
         K::coefficient(*this, row, kblock, group, scale, bias);
     }
@@ -1616,6 +1749,12 @@ template <> struct Entries<2> {
     static constexpr int BYTES = 2;
     static constexpr int WORDS = 4;
     __device__ static __forceinline__ u32 read(const u8 *at) { return *reinterpret_cast<const u16 *>(at); }
+    // Each entry from its own word (words t / 2 and 2 + t / 2).
+    __device__ static __forceinline__ void load_lane(const u8 *global, u32 t, u32 (&e)[2]) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+            e[h] = (seismic_ld_nc_u32(global + 4 * (2 * h + t / 2)) >> (16 * (t % 2))) & 0xFFFFu;
+    }
     __device__ static __forceinline__ void load(const u8 *global, u32 (&w)[WORDS]) {
         const uint4 v = seismic_ld_nc_v4(global);
         w[0] = v.x, w[1] = v.y, w[2] = v.z, w[3] = v.w;
@@ -1630,6 +1769,18 @@ template <> struct Entries<3> {
     static constexpr int WORDS = 6;
     __device__ static __forceinline__ u32 read(const u8 *at) {
         return (u32)at[0] | ((u32)at[1] << 8) | ((u32)at[2] << 16);
+    }
+    // Each entry's three bytes from the word holding its first and the word
+    // holding its last (the same word where it does not straddle, so no
+    // word past the k-block's is read).
+    __device__ static __forceinline__ void load_lane(const u8 *global, u32 t, u32 (&e)[2]) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const u32 first = 3 * (4 * h + t);
+            const u32 low = seismic_ld_nc_u32(global + 4 * (first / 4));
+            const u32 high = seismic_ld_nc_u32(global + 4 * ((first + 2) / 4));
+            e[h] = __funnelshift_r(low, high, 8 * (first % 4)) & 0xFFFFFFu;
+        }
     }
     __device__ static __forceinline__ void load(const u8 *global, u32 (&w)[WORDS]) {
 #pragma unroll
@@ -1648,33 +1799,31 @@ template <> struct Entries<3> {
 };
 
 // An entry's grid points (`grids::table<GRID>`, LANES values a point, its
-// first INDEX_BITS-bit index lowest).
+// first INDEX_BITS-bit index lowest), read from Src (`GlobalPoints`,
+// `BlockPoints`).
 template <u32 GRID, int INDEX_BITS, int LANES> struct Points;
 template <u32 GRID_, int INDEX_BITS> struct Points<GRID_, INDEX_BITS, 8> {
     static constexpr int LANES = 8;
     static constexpr u32 GRID = GRID_;
     static constexpr u32 MASK = (1u << INDEX_BITS) - 1u;
     // Lanes 2t, 2t + 1's magnitudes (bytes 0, 1).
-    __device__ static __forceinline__ u32 lanes(u32 entry, u32 t) {
-        return seismic_ld_nc_u32(reinterpret_cast<const u32 *>(grids::table<GRID>::points()) + 2 * (entry & MASK) +
-                                 t / 2) >>
-               (16 * (t % 2));
+    template <class Src> __device__ static __forceinline__ u32 lanes(u32 entry, u32 t) {
+        return Src::template word<GRID>(2 * (entry & MASK) + t / 2) >> (16 * (t % 2));
     }
-    __device__ static __forceinline__ uint2 point(u32 entry) {
-        return seismic_ld_nc_v2(grids::table<GRID>::points() + (entry & MASK));
+    template <class Src> __device__ static __forceinline__ uint2 point(u32 entry) {
+        return Src::template pair<GRID>(entry & MASK);
     }
 };
 template <u32 GRID_, int INDEX_BITS> struct Points<GRID_, INDEX_BITS, 4> {
     static constexpr int LANES = 4;
     static constexpr u32 GRID = GRID_;
     static constexpr u32 MASK = (1u << INDEX_BITS) - 1u;
-    __device__ static __forceinline__ u32 lanes(u32 entry, u32 t) {
-        return seismic_ld_nc_u32(grids::table<GRID>::points() + ((entry >> (INDEX_BITS * (t / 2))) & MASK)) >>
-               (16 * (t % 2));
+    template <class Src> __device__ static __forceinline__ u32 lanes(u32 entry, u32 t) {
+        return Src::template word<GRID>((entry >> (INDEX_BITS * (t / 2))) & MASK) >> (16 * (t % 2));
     }
-    __device__ static __forceinline__ uint2 point(u32 entry) {
-        return make_uint2(seismic_ld_nc_u32(grids::table<GRID>::points() + (entry & MASK)),
-                          seismic_ld_nc_u32(grids::table<GRID>::points() + ((entry >> INDEX_BITS) & MASK)));
+    template <class Src> __device__ static __forceinline__ uint2 point(u32 entry) {
+        return make_uint2(Src::template word<GRID>(entry & MASK),
+                          Src::template word<GRID>((entry >> INDEX_BITS) & MASK));
     }
 };
 
@@ -1739,6 +1888,17 @@ struct GridCodes {
         }
     }
     __device__ static __forceinline__ u32 signs(u32 entry) { return S::of(entry >> SIGN_BIT); }
+    // Lane t's entries t and 4 + t of a row's k-block, read alone: their
+    // whole bytes at `global` (`E::load_lane`) and, with HIGH, their high
+    // bits from `high` (unread without).
+    __device__ static __forceinline__ void load_lane(const u8 *global, u32 high, u32 t, u32 (&e)[2]) {
+        E::load_lane(global, t, e);
+        if constexpr (HIGH != 0) {
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+                e[h] |= ((high >> (HIGH * (4 * h + t))) & ((1u << HIGH) - 1u)) << (8 * E::BYTES);
+        }
+    }
     // Entry e of a row's k-block words.
     __device__ static __forceinline__ u32 entry(const u32 (&w)[WORDS], int e) {
         if constexpr (HIGH == 0)
@@ -1749,16 +1909,16 @@ struct GridCodes {
     }
     // Lanes 2t, 2t + 1 of entry e: their magnitudes (bytes 0, 1) and sign
     // bits (bits 0, 1).
-    __device__ static __forceinline__ u32 lanes(const u32 (&w)[WORDS], int e, u32 t, u32 &signs_) {
+    template <class Src> __device__ static __forceinline__ u32 lanes(const u32 (&w)[WORDS], int e, u32 t, u32 &signs_) {
         const u32 entry = GridCodes::entry(w, e);
         signs_ = signs(entry) >> (2 * t);
-        return Pts::lanes(entry, t);
+        return Pts::template lanes<Src>(entry, t);
     }
     // Entry e whole: its eight magnitudes (lanes 0..3 in x) and eight signs.
-    __device__ static __forceinline__ uint2 point(const u32 (&w)[WORDS], int e, u32 &signs_) {
+    template <class Src> __device__ static __forceinline__ uint2 point(const u32 (&w)[WORDS], int e, u32 &signs_) {
         const u32 entry = GridCodes::entry(w, e);
         signs_ = signs(entry);
-        return Pts::point(entry);
+        return Pts::template point<Src>(entry);
     }
     // The values (s8 bytes) of `bytes`, lanes of an entry whose sign bits
     // are `signs` (bit i lane byte i) and delta bit `delta`: signed, then
@@ -1776,16 +1936,25 @@ struct GridCodes {
         return v;
     }
     // The values of lanes 2t, 2t + 1 of entry e (bytes 0, 1).
-    __device__ static __forceinline__ u32 lane_values(const u32 (&w)[WORDS], int e, u32 t) {
+    template <class Src> __device__ static __forceinline__ u32 lane_values(const u32 (&w)[WORDS], int e, u32 t) {
         const u32 entry = GridCodes::entry(w, e);
         const u32 delta = DELTA >= 0 ? (entry >> delta_bit()) & 1u : 0u;
-        return values(Pts::lanes(entry, t) & 0xFFFFu, (signs(entry) >> (2 * t)) & 3u, delta) & 0xFFFFu;
+        return values(Pts::template lanes<Src>(entry, t) & 0xFFFFu, (signs(entry) >> (2 * t)) & 3u, delta) & 0xFFFFu;
     }
     // The values of lanes 4h .. 4h + 3 of `entry` (bytes 0..3).
-    __device__ static __forceinline__ u32 entry_values(u32 entry, int h) {
-        const uint2 point = Pts::point(entry);
+    template <class Src> __device__ static __forceinline__ u32 entry_values(u32 entry, int h) {
+        const uint2 point = Pts::template point<Src>(entry);
         const u32 delta = DELTA >= 0 ? (entry >> delta_bit()) & 1u : 0u;
         return values(h ? point.y : point.x, signs(entry) >> (4 * h), delta);
+    }
+    // The values of all eight lanes of `entry` from one point: lanes 0..3
+    // (`low`) and 4..7 (`high`), s8 bytes.
+    template <class Src> __device__ static __forceinline__ void entry_s8(u32 entry, u32 &low, u32 &high) {
+        const uint2 point = Pts::template point<Src>(entry);
+        const u32 delta = DELTA >= 0 ? (entry >> delta_bit()) & 1u : 0u;
+        const u32 sign = signs(entry);
+        low = values(point.x, sign, delta);
+        high = values(point.y, sign >> 4, delta);
     }
 };
 
@@ -1815,6 +1984,7 @@ __host__ __device__ constexpr int grid_chunk_bytes(int high) {
 // high plane, placed as the grids plane is (`PackedRowLayout::code_bit`): a
 // tile's [k-block][row][the row's eight entries' HIGH bytes].
 template <class G> struct GridPlanes {
+    typedef G codes;
     static constexpr int BITS = 8;
     // Bytes of a row's k-block of entries.
     static constexpr int KBLOCK_BYTES = 4 * G::entries::WORDS;
@@ -1898,27 +2068,84 @@ template <class G> struct GridPlanes {
     // Slots 0..3 (low) and 4..7 (high) of step `step`, as q8's: the codes at
     // k 2t of (row g, entry 2s), (row g + 8, entry 2s), (row g, entry 2s + 1)
     // and (row g + 8, entry 2s + 1), and at k 2t + 1. A byte negates where
-    // its sign bit is set (mask 0xff: (m ^ mask) - mask).
+    // its sign bit is set (mask 0xff: (m ^ mask) - mask). Points are read
+    // from Src (`GlobalPoints`, `BlockPoints`).
+    template <class Src = GlobalPoints>
     __device__ static __forceinline__ void slots(const Raw &raw, int step, u32 &low, u32 &high) {
         if constexpr (!G::magnitudes()) {
             // Signed points or a delta: each entry's lane values whole.
-            const u32 x = G::lane_values(raw.g, 2 * step, raw.t) | (G::lane_values(raw.g8, 2 * step, raw.t) << 16);
-            const u32 y =
-                G::lane_values(raw.g, 2 * step + 1, raw.t) | (G::lane_values(raw.g8, 2 * step + 1, raw.t) << 16);
+            const u32 x = G::template lane_values<Src>(raw.g, 2 * step, raw.t) |
+                          (G::template lane_values<Src>(raw.g8, 2 * step, raw.t) << 16);
+            const u32 y = G::template lane_values<Src>(raw.g, 2 * step + 1, raw.t) |
+                          (G::template lane_values<Src>(raw.g8, 2 * step + 1, raw.t) << 16);
             low = prmt(x, y, 0x6420u);
             high = prmt(x, y, 0x7531u);
             return;
         }
         u32 s0, s1, s2, s3;
-        const u32 m0 = G::lanes(raw.g, 2 * step, raw.t, s0);
-        const u32 m1 = G::lanes(raw.g8, 2 * step, raw.t, s1);
-        const u32 m2 = G::lanes(raw.g, 2 * step + 1, raw.t, s2);
-        const u32 m3 = G::lanes(raw.g8, 2 * step + 1, raw.t, s3);
+        const u32 m0 = G::template lanes<Src>(raw.g, 2 * step, raw.t, s0);
+        const u32 m1 = G::template lanes<Src>(raw.g8, 2 * step, raw.t, s1);
+        const u32 m2 = G::template lanes<Src>(raw.g, 2 * step + 1, raw.t, s2);
+        const u32 m3 = G::template lanes<Src>(raw.g8, 2 * step + 1, raw.t, s3);
         const u32 x = (m0 & 0xFFFFu) | (m1 << 16), y = (m2 & 0xFFFFu) | (m3 << 16);
         const u32 mx = sign_bytes((s0 & 3u) | ((s1 & 3u) << 2)), my = sign_bytes((s2 & 3u) | ((s3 & 3u) << 2));
         const u32 sx = __vsub4(x ^ mx, mx), sy = __vsub4(y ^ my, my);
         low = prmt(sx, sy, 0x6420u);
         high = prmt(sx, sy, 0x7531u);
+    }
+    // The int8 MMA's registers of k-block half h in entry order
+    // (`Packed::S8_ENTRIES`, `s8_real_offset`): lane t takes entry 4h + t
+    // of rows g and g + 8, its values 0..3 at virtual k 4t .. 4t + 3 and 4..7
+    // at 16 + 4t .., so each entry is read, looked up and signed once, by one
+    // lane. a = {row g low, row g + 8 low, row g high, row g + 8 high}. From
+    // a whole k-block (`Raw`, the GEMM's) or the lane's own entries
+    // (`LaneRaw`, the GEMV's).
+    template <class Src = GlobalPoints>
+    __device__ static __forceinline__ void s8_half(const Raw &raw, int h, u32 (&a)[4]) {
+        const int e = 4 * h + (int)raw.t;
+        s8_entries<Src>(G::entry(raw.g, e), G::entry(raw.g8, e), a);
+    }
+    // The entries of one k-block the int8 path multiplies on lane t: t and
+    // 4 + t (halves 0 and 1) of rows g and g + 8, read alone, so a lane
+    // holds a quarter of its rows' codes in flight (`LaneSuper`). Only
+    // entries of two or more bytes (LANE_FETCH): a lane's two one-byte
+    // entries span its row's whole eight bytes, so it would hold no less.
+    static constexpr bool LANE_FETCH = G::entries::BYTES > 1;
+    struct LaneRaw {
+        u32 g[2];
+        u32 g8[2];
+    };
+    struct LaneSuper {
+        LaneRaw raw[4];
+    };
+    template <class W>
+    __device__ static __forceinline__ LaneRaw fetch_lane(const W &w, u64 tile, u64 kblock, u32 lane) {
+        const u32 r = lane / 4, t = lane % 4;
+        const u8 *g = w.low.chunk(w.base, w.stride, tile, (kblock * 16 + r) * KBLOCK_BYTES);
+        const u8 *g8 = w.low.chunk(w.base, w.stride, tile, (kblock * 16 + r + 8) * KBLOCK_BYTES);
+        const u32 high_g = high_word(w, tile, kblock, r), high_g8 = high_word(w, tile, kblock, r + 8);
+        LaneRaw raw;
+        G::load_lane(g, high_g, t, raw.g);
+        G::load_lane(g8, high_g8, t, raw.g8);
+        return raw;
+    }
+    template <class W>
+    __device__ static __forceinline__ LaneSuper fetch_lane_superblock(const W &w, u64 tile, u64 superblock,
+                                                                      u32 lane) {
+        LaneSuper super;
+#pragma unroll
+        for (int q = 0; q < 4; ++q)
+            super.raw[q] = fetch_lane(w, tile, 4 * superblock + q, lane);
+        return super;
+    }
+    template <class Src = GlobalPoints>
+    __device__ static __forceinline__ void s8_half(const LaneRaw &raw, int h, u32 (&a)[4]) {
+        s8_entries<Src>(raw.g[h], raw.g8[h], a);
+    }
+    template <class Src>
+    __device__ static __forceinline__ void s8_entries(u32 g, u32 g8, u32 (&a)[4]) {
+        G::template entry_s8<Src>(g, a[0], a[2]);
+        G::template entry_s8<Src>(g8, a[1], a[3]);
     }
     __device__ static __forceinline__ u32 code(const Raw &raw, int step, u32 slot) {
         u32 low, high;
@@ -2017,25 +2244,26 @@ template <class G> struct GridPlanes {
         // The A pairs of values (4 h, 4 h + 1) and (4 h + 2, 4 h + 3) of
         // coefficient group `group`'s entry of row g (`row` 0) or g + 8 (1)
         // of lane t's k-block entries, signed, as O operands.
-        template <class O>
+        template <class O, class Src = GlobalPoints>
         __device__ static __forceinline__ void entry_pairs(const EntryRaw &raw, int row, int group, u32 t, int h,
                                                            u32 &low, u32 &high) {
             if constexpr (word_entries())
-                entry_pairs_of<O>(G::entry(row ? raw.g8 : raw.g, gemv_entry(group, t)), h, low, high);
+                entry_pairs_of<O, Src>(G::entry(row ? raw.g8 : raw.g, gemv_entry(group, t)), h, low, high);
             else
-                entry_pairs_of<O>(raw.entries[group][row], h, low, high);
+                entry_pairs_of<O, Src>(raw.entries[group][row], h, low, high);
         }
         // The same of entry `entry`.
-        template <class O> __device__ static __forceinline__ void entry_pairs_of(u32 entry, int h, u32 &low, u32 &high) {
+        template <class O, class Src = GlobalPoints>
+        __device__ static __forceinline__ void entry_pairs_of(u32 entry, int h, u32 &low, u32 &high) {
             if constexpr (!G::magnitudes()) {
                 // Signed points or a delta: the half's values as s8 bytes.
-                const u32 v = G::entry_values(entry, h);
+                const u32 v = G::template entry_values<Src>(entry, h);
                 low = O::bytes(v, v >> 8, 0);
                 high = O::bytes(v, v >> 8, 2);
                 return;
             }
             const u32 signs = G::signs(entry);
-            const uint2 magnitudes = G::points::point(entry);
+            const uint2 magnitudes = G::points::template point<Src>(entry);
             const u32 bytes = h ? magnitudes.y : magnitudes.x;
             // sign bit j of the half to bit 8 j + 7, then to the pairs' bits 15 and 31
             const u32 negate = (((signs >> (4 * h)) & 15u) * 0x10204080u) & 0x80808080u;
@@ -2140,11 +2368,14 @@ template <class G, class K> struct Records {
     static constexpr u64 ENTRIES = 1024;
     static constexpr u64 FACTORS = 32;
 
+    // Where tile `tile`'s records begin: every group's entries, then its
+    // factors (`factors`), each row's at its place within the tile.
+    __device__ __forceinline__ const u8 *tile_base(u64 tile) const { return base + tile * 16 * stride; }
     __device__ __forceinline__ const u8 *entries_at(u64 tile, u64 superblock) const {
-        return base + tile * 16 * stride + superblock * ENTRIES;
+        return tile_base(tile) + superblock * ENTRIES;
     }
     __device__ __forceinline__ const u8 *factors_at(u64 tile, u64 superblock) const {
-        return base + tile * 16 * stride + factors + superblock * FACTORS;
+        return tile_base(tile) + factors + superblock * FACTORS;
     }
 
     // ---- GEMV in records (`gemv_records_group`).
@@ -2222,7 +2453,7 @@ template <class G, class K> struct Records {
     }
     __device__ static __forceinline__ void form_table(Table &table, u32 thread, u32 threads) {
         for (u32 i = thread; i <= Pts::MASK; i += threads) {
-            const uint2 point = Pts::point(i);
+            const uint2 point = Pts::template point<GlobalPoints>(i);
             table.points[i] = magnitude_codes(point.x) | (magnitude_codes(point.y) << 16);
         }
     }
@@ -2280,11 +2511,24 @@ template <class G, class K> struct Records {
             for (int group = 0; group < GROUPS; ++group)
                 c.scale[r][group] = block.scale[r][2 * q + group];
     }
-    template <class O> __device__ __forceinline__ void decode(const Raw &raw, int step, u32 (&a)[4]) const {
-        Twos::template decode<O, GridPlanes<G>>(raw, step, a);
+    template <class O, class Src = GlobalPoints>
+    __device__ __forceinline__ void decode(const Raw &raw, int step, u32 (&a)[4]) const {
+        Twos::template decode<O, GridPlanes<G>, Src>(raw, step, a);
     }
-    __device__ __forceinline__ S8Pair s8(const Raw &raw, int step) const {
-        return Twos::template s8<GridPlanes<G>>(raw, step);
+    // The int8 MMA's registers of k-block half h, in entry order
+    // (`GridPlanes::s8_half`) or slot order (`Packed::s8_half`), the GEMM's
+    // as `s8_gemm_entries` derives it.
+    static constexpr bool S8_ENTRIES = true;
+    static constexpr bool S8_GEMM_ENTRIES = s8_gemm_entries<GridPlanes<G>, GROUP>();
+    template <class Src = GlobalPoints, bool ENTRIES = S8_ENTRIES>
+    __device__ __forceinline__ void s8_half(const Raw &raw, int h, u32 (&a)[4]) const {
+        if constexpr (ENTRIES) {
+            GridPlanes<G>::template s8_half<Src>(raw, h, a);
+        } else {
+            const S8Pair first = Twos::template s8<GridPlanes<G>>(raw, 2 * h),
+                         second = Twos::template s8<GridPlanes<G>>(raw, 2 * h + 1);
+            a[0] = first.row_g, a[1] = first.row_g8, a[2] = second.row_g, a[3] = second.row_g8;
+        }
     }
 
     // ---- GEMM: a k-block's chunks are its eight bytes of each lane of the
@@ -2530,7 +2774,9 @@ template <class E> struct Dense {
         else
             return E::unpack2(raw.w[step][i][0]);
     }
-    template <class O> __device__ __forceinline__ void decode(const Raw &raw, int step, u32 (&a)[4]) const {
+    // (Dense values read no grid points: `Src` is the decoders' common signature.)
+    template <class O, class = GlobalPoints>
+    __device__ __forceinline__ void decode(const Raw &raw, int step, u32 (&a)[4]) const {
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
             if constexpr (NativeOperand<O, E>::value) {
@@ -2664,12 +2910,15 @@ struct CoefficientsOf<SEISMIC_COEFF_HIER, SCALE, BIAS, BIAS_SIGN, GROUP, STORAGE
 // form admission, whose layout holds the codes in records), FOLD when the
 // weight is admitted to the scaled GEMM (`_FORM_GEMM_FOLD`, the runtime's
 // form admission) and LOCAL the sign with which the int8 GEMM multiplies
-// local codes into the codes (`_FORM_INT8_LOCAL`, `Packed::int8_local`).
+// local codes into the codes (`_FORM_INT8_LOCAL`, `Packed::int8_local`), and
+// S8_ENTRIES the order of its int8 codes as the runtime declares it
+// (`_FORM_S8_ENTRIES`), which its producer's own (`S8_ENTRIES`) must be.
 template <u32 CODES, u32 LOW, u32 HIGH, int OFFSET, u32 TABLE, u32 GRID, u32 INDEX_BITS, u32 LANES, u32 SIGNS,
           u32 DELTA, u32 DELTA_EXPONENT, u32 SIGN_BIT, u32 SIGN_BITS, u32 DELTA_BIT, class K, bool RECORDS,
-          bool OPERANDS, bool FOLD, int LOCAL>
+          bool OPERANDS, bool FOLD, int LOCAL, bool S8_ENTRIES>
 struct Decoder {
     static_assert(!RECORDS, "only grid codes are held in records");
+    static_assert(!S8_ENTRIES, "only grid codes' int8 codes are in entry order");
     typedef Packed<Planes<(int)LOW, (int)HIGH, K::WHOLE>, typename CodesOf<CODES, OFFSET, TABLE>::type, K, FOLD,
                    OPERANDS, LOCAL>
         type;
@@ -2680,11 +2929,12 @@ struct Decoder {
 // `CarriedPlanes`), all multiplied through the scaled GEMM.
 template <u32 LOW, u32 HIGH, int OFFSET, u32 TABLE, u32 GRID, u32 INDEX_BITS, u32 LANES, u32 SIGNS, u32 DELTA,
           u32 DELTA_EXPONENT, u32 SIGN_BIT, u32 SIGN_BITS, u32 DELTA_BIT, class K, bool RECORDS, bool OPERANDS,
-          bool FOLD, int LOCAL>
+          bool FOLD, int LOCAL, bool S8_ENTRIES>
 struct Decoder<SEISMIC_CODES_GRID, LOW, HIGH, OFFSET, TABLE, GRID, INDEX_BITS, LANES, SIGNS, DELTA, DELTA_EXPONENT,
-               SIGN_BIT, SIGN_BITS, DELTA_BIT, K, RECORDS, OPERANDS, FOLD, LOCAL> {
+               SIGN_BIT, SIGN_BITS, DELTA_BIT, K, RECORDS, OPERANDS, FOLD, LOCAL, S8_ENTRIES> {
     static_assert(!OPERANDS, "grid codes have no NVFP4 operands");
     static_assert(FOLD, "grid codes are admitted to the scaled GEMM only");
+    static_assert(S8_ENTRIES, "grid codes' int8 codes are in entry order (`GridPlanes::s8_half`)");
     static_assert(!RECORDS || IsCarried<K>::value, "mma16 records hold carried coefficient codes");
     typedef typename GridCodesOf<LOW, HIGH, GRID, INDEX_BITS, LANES, SIGNS, DELTA, DELTA_EXPONENT, SIGN_BIT,
                                  SIGN_BITS, DELTA_BIT>::type Codes;
@@ -2777,7 +3027,8 @@ __device__ __forceinline__ void row_packet8(const W &w, u64 row, u64 rows, u64 p
                      ELEMENT_CAT(P, _CODES_GRID_SIGN_BITS), ELEMENT_CAT(P, _CODES_GRID_DELTA_BIT),               \
                      PACKETS_COEFFICIENTS(P), ELEMENT_CAT(P, _FORM_GEMV_RECORDS) != 0,                           \
                      ELEMENT_HAS(P, _OPERANDS_NVFP4) != 0, ELEMENT_CAT(P, _FORM_GEMM_FOLD) != 0,                 \
-                     ELEMENT_CAT(P, _FORM_INT8_LOCAL) * (1 - 2 * ELEMENT_CAT(P, _FORM_INT8_LOCAL_NEGATED))>::type
+                     ELEMENT_CAT(P, _FORM_INT8_LOCAL) * (1 - 2 * ELEMENT_CAT(P, _FORM_INT8_LOCAL_NEGATED)),     \
+                     ELEMENT_CAT(P, _FORM_S8_ENTRIES) != 0>::type
 #define PACKETS_MAKE(TYPE, P, pointer)                                                                   \
     TYPE {                                                                                               \
         packets::Rows {                                                                                  \

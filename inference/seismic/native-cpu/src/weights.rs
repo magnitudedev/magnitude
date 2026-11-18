@@ -2586,9 +2586,9 @@ pub trait Coefficients: Copy + Send + Sync + 'static {
     /// The largest magnitude of a unit's integer and of a minimum code.
     const MAGNITUDE: i32;
 
-    /// The tile kernel's exact integers of a block against `W` activation
-    /// rows: `tile::Scaled` with integer unit coefficients, else
-    /// `tile::Sums`.
+    /// The tile kernel's accumulator of a block against `W` activation
+    /// rows, which takes each unit's exact integers as the core forms them:
+    /// `tile::Scaled` with integer unit coefficients, else `tile::Sums`.
     type Units<const W: usize>: tile::Integers<W>;
 
     /// The coefficients of block `b` (its first `packets` packets) of the
@@ -2601,7 +2601,7 @@ pub trait Coefficients: Copy + Send + Sync + 'static {
     unsafe fn tile_side<const STORAGE: usize, V: Vectors>(rows: &[Row; 8], b: usize, packets: usize, panel: bool, side: &mut tile::Side);
 
     /// Each of the `W` activation rows' products with the eight rows, from
-    /// the core's exact integers `units`: the single-row dot's `f32`
+    /// the block's accumulator `units`: the single-row dot's `f32`
     /// arithmetic, in its order, every row a lane.
     fn tile_combine<const W: usize, const R: usize>(side: &tile::Side, units: &Self::Units<W>, x: &Q8Tile<R>) -> [[f32; 8]; W];
 
@@ -3158,21 +3158,12 @@ impl<S: Scale, const GROUP: usize, const BIAS: bool, const CODE_EXPONENT: i32> C
     }
 
     #[inline(always)]
-    fn tile_combine<const W: usize, const R: usize>(side: &tile::Side, units: &tile::Sums<W>, x: &Q8Tile<R>) -> [[f32; 8]; W] {
+    fn tile_combine<const W: usize, const R: usize>(_: &tile::Side, units: &tile::Sums<W>, x: &Q8Tile<R>) -> [[f32; 8]; W] {
+        // Each row's fused sum in group order, as `Coefficients::dot_q8`,
+        // formed unit by unit (`tile::Sums`), then the activation scale.
         let mut out = [[0.0f32; 8]; W];
         for (a, out) in out.iter_mut().enumerate() {
-            // Each row's fused sum in group order, as `Coefficients::dot_q8`.
-            let mut sums = [0.0f32; 8];
-            for u in 0..units.count {
-                let codes = if BIAS { tile::unit_sum(x, Self::UNIT, u, a) } else { 0 };
-                for r in 0..8 {
-                    sums[r] = side.scales[u][r].mul_add(units.units[u][a][r] as f32, sums[r]);
-                    if BIAS {
-                        sums[r] = side.biases[u][r].mul_add(codes as f32, sums[r]);
-                    }
-                }
-            }
-            for (out, sum) in out.iter_mut().zip(sums) {
+            for (out, sum) in out.iter_mut().zip(units.values[a]) {
                 *out = x.d[a] * sum;
             }
         }
@@ -4694,6 +4685,28 @@ mod packed_neon {
                 a = in(vreg) a,
                 b = in(vreg) b,
                 lane = const LANE,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+        }
+        acc
+    }
+
+    /// `acc` plus the 2 x 2 matrix of signed byte dots of `a`'s two rows of
+    /// eight bytes with `b`'s: lane `2 i + j` adds row `i` of `a` dot row
+    /// `j` of `b`.
+    ///
+    /// # Safety
+    /// The CPU has `i8mm`.
+    #[inline]
+    #[target_feature(enable = "i8mm")]
+    pub(super) unsafe fn smmla(mut acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
+        // Rust's matrix-multiply intrinsic is not stable yet.
+        unsafe {
+            std::arch::asm!(
+                "smmla {acc:v}.4s, {a:v}.16b, {b:v}.16b",
+                acc = inout(vreg) acc,
+                a = in(vreg) a,
+                b = in(vreg) b,
                 options(pure, nomem, nostack, preserves_flags),
             );
         }

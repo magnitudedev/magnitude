@@ -143,11 +143,11 @@ projection routed for metal:
     let WIDEST = most(W, WIDTH) for grouped
     let FRAGMENT_BYTES = BLOCKS * ceil_div(GROUP_ROWS, 64) * 64 * WIDEST * 2 for grouped
     let INT8_BYTES = PADDED * (WIDEST + WIDEST / 16 + ceil_div(WIDEST, 1024) * 64) for grouped
-    let PACK_BYTES = PADDED * (WIDEST * 2 + WIDEST / 8 + 4) + 1024 for grouped
+    let PACK_BYTES = PADDED * (WIDEST * 2 + WIDEST / 8 * (1 + most(W, form(W, PACK_SUMS))) + 4) + 1024 for grouped
     let EXPANSION_OPERAND = (TALL - INT8 - PACK) * FRAGMENT_BYTES + INT8 * INT8_BYTES + PACK * PACK_BYTES for grouped
     let DOWN_OPERAND = (DOWN_TALL - DOWN_INT8 - DOWN_PACK) * FRAGMENT_BYTES + DOWN_INT8 * INT8_BYTES + DOWN_PACK * PACK_BYTES for grouped
-    let EXPANSION_TABLES = sum(W, FIRST * (INT8 * (N * (WIDTH / 32) * 4 + ceil_div(N, 32) * 32 * ceil_div(WIDTH, 1024) * 64) + PACK * (N * (WIDTH / 32) * 4 + N * 4))) for grouped
-    let DOWN_TABLES = sum(W, (1 - FIRST) * (DOWN_INT8 * (N * (WIDTH / 32) * 4 + ceil_div(N, 32) * 32 * ceil_div(WIDTH, 1024) * 64) + DOWN_PACK * (N * (WIDTH / 32) * 4 + N * 4))) for grouped
+    let EXPANSION_TABLES = sum(W, FIRST * (INT8 * (N * (WIDTH / 32) * 4 + ceil_div(N, 32) * 32 * ceil_div(WIDTH, 1024) * 64) + PACK * (N * (WIDTH / 32) * 4 * (1 + form(W, PACK_SUMS)) + N * 4))) for grouped
+    let DOWN_TABLES = sum(W, (1 - FIRST) * (DOWN_INT8 * (N * (WIDTH / 32) * 4 + ceil_div(N, 32) * 32 * ceil_div(WIDTH, 1024) * 64) + DOWN_PACK * (N * (WIDTH / 32) * 4 * (1 + form(W, PACK_SUMS)) + N * 4))) for grouped
     let USED_EXPERTS = STACKED * min(E, B) + 1 - STACKED for grouped
     let ORDINAL_BYTES = STACKED * ceil_div(B, 4) * 16 for grouped
     params (SIMDGROUPS in [2, 4, 8, 16] default 2 for choice, ROWS in [1, 2, 4] default 1 for choice,
@@ -166,7 +166,7 @@ projection routed for metal:
     where (INT8 == 0 or (TALL == 1 and (STACKED == 1 or SERVED == 2) and WIDTH % 512 == 0 and N % (64 / SERVED) == 0 and each(W, FIRST == 0 or form(W, INT8) == 1) and sum(W, FIRST * form(W, INT8_INTERLEAVED)) % SERVED == 0)) for grouped
     where (DOWN_INT8 == 0 or (DOWN_TALL == 1 and each(W, FIRST == 1 or (WIDTH % 512 == 0 and N % 64 == 0 and form(W, INT8) == 1)))) for grouped
     where (DOWN_INT8 == 1 or STACKED == 1 or INT8_TILE == 128) for grouped
-    where (PACK == 0 or (TALL == 1 and INT8 == 0 and WIDTH % 256 == 0 and WIDTH < 1048576 and N % (64 / SERVED) == 0 and each(W, FIRST == 0 or form(W, PACK) == 1) and sum(W, FIRST * form(W, PACK_FOLDS)) == SERVED * most(W, FIRST * form(W, PACK_FOLDS)) and sum(W, FIRST * form(W, PACK_RESIDUE)) % SERVED == 0)) for grouped
+    where (PACK == 0 or (TALL == 1 and INT8 == 0 and WIDTH % 256 == 0 and WIDTH < 1048576 and N % (64 / SERVED) == 0 and each(W, FIRST == 0 or form(W, PACK) == 1) and sum(W, FIRST * form(W, PACK_FOLDS)) == SERVED * most(W, FIRST * form(W, PACK_FOLDS)) and sum(W, FIRST * form(W, PACK_RESIDUE)) % SERVED == 0 and sum(W, FIRST * form(W, PACK_SUMS)) % SERVED == 0)) for grouped
     where (DOWN_PACK == 0 or (DOWN_TALL == 1 and DOWN_INT8 == 0 and each(W, FIRST == 1 or (WIDTH % 256 == 0 and WIDTH < 1048576 and N % 64 == 0 and form(W, PACK) == 1)))) for grouped
     where (PACK == 1 or ((STACKED == 1 or PACK_TOKENS == 4) and WEIGHTS_AHEAD == 0)) for grouped
     where (DOWN_PACK == 1 or ((STACKED == 1 or DOWN_PACK_TOKENS == 4) and DOWN_WEIGHTS_AHEAD == 0)) for grouped
@@ -375,13 +375,17 @@ projection routed for metal:
         threads_per_threadgroup (128, 1, 1)
 
 # CUDA. choice and summed: the mma16 swap-AB GEMV, TPW 16-row tiles a warp
-# group, KSPLIT-way K split reduced in part order. A choice's experts take
-# their operand row formed in the block (the one-row form) or, gathered
+# group, KSPLIT-way K split reduced in part order. Every one-row block (a
+# choice, a summed slot, the shared expert's at one row) forms its row in
+# its shared memory with its weights' operand sums (`shared_row`, WIDTH * 5
+# / 2 bytes), from the rows it would read: the activation row, or the row a
+# stage launch formed where the experts take NVFP4 operands. Gathered
 # (GATHERED, valid at every M), a chosen expert runs once over the rows of
-# each of its choices (`routed::gather`), its records streamed once a
-# step, over rows a stage launch formed where the experts take NVFP4
-# operands. With the shared expert (`routed_expand`), whose row y = M * K
-# stages every activation row, both forms read the staged rows. summed
+# each of its choices (`routed::gather`), its records streamed once a step,
+# over those rows in place. With the shared expert (`routed_expand`, its
+# row y = M * K), the stage launch forms every activation row, and at one
+# row the shared expert's block is a one-row block: the gathered launch
+# declares its row's bytes there (SHARED, M 1), and none otherwise. summed
 # publishes each slot's projection in A (`published`, [M, K + SHARED, H])
 # for the entry's slot-order join. grouped: fixed 32-row (by expert) or
 # 64-row (every row) x 128-column mma.sync tiles, 3 cp.async stages; the
@@ -393,8 +397,9 @@ projection routed for metal:
 # (`staged` codes, `groups` of (d, d * sum q)), the quantize launch each
 # live product row (`product_codes`, `product_groups`), and s8 MMAs fold
 # them under the weights' groups as the dense int8 GEMM does, one k-block a
-# stage, so a row's projection is the one the dense int8 GEMM (unsplit)
-# gives it by its expert's weights.
+# stage, each GEMM's rows in its weights' order (`packets::s8_gemm_entries`),
+# so a row's projection is the one the dense int8 GEMM (unsplit) gives it by
+# its expert's weights.
 projection routed for cuda:
     let DECODE_GROUPS = ceil_div(ceil_div(ceil_div(most(W, N), 16), TPW), 4 / KSPLIT) for choice | summed
     let TILE = 64 - 32 * STACKED for grouped
@@ -428,11 +433,12 @@ projection routed for cuda:
         reads (TPW, KSPLIT)
         threadgroups (DECODE_GROUPS, M * K + SHARED, 1)
         threads_per_threadgroup (128, 1, 1)
-        shared_bytes ((1 - SHARED) * most(W, operands(W)) * WIDTH * 2)
+        shared_bytes (most(W, WIDTH) * SHARED_ROW_PAIR_BYTES / 2)
     launch gathered for choice when GATHERED == 1 and PER_ROW == 0:
         reads (TPW, KSPLIT)
         threadgroups (DECODE_GROUPS, M * K + SHARED, 1)
         threads_per_threadgroup (128, 1, 1)
+        shared_bytes (SHARED * (1 - min(1, M - 1)) * most(W, WIDTH) * SHARED_ROW_PAIR_BYTES / 2)
     launch stage for summed when (SHARED == 1 or M > 1) and any(W, operands(W) == 1):
         staging
         threadgroups (M * (K + SHARED), 1, 1)
@@ -441,7 +447,7 @@ projection routed for cuda:
         reads (TPW, KSPLIT)
         threadgroups (DECODE_GROUPS, M * (K + SHARED), 1)
         threads_per_threadgroup (128, 1, 1)
-        shared_bytes ((1 - SHARED) * most(W, operands(W)) * WIDTH * 2)
+        shared_bytes (most(W, WIDTH) * SHARED_ROW_PAIR_BYTES / 2)
     launch gathered for summed when M > 1:
         reads (TPW, KSPLIT)
         alike (summed)

@@ -35,6 +35,11 @@ constexpr bool UP_NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4>:
 // Whether both GEMMs run on the int8 path (INT8 = 1, which the declaration
 // admits where every weight is admitted to it).
 #define GROUPED_S8 (projection::int8_path<INT8, PACKETS_FORM_INT8(KERNEL_W0), PACKETS_FORM_INT8(KERNEL_W1)>())
+// The order of the int8 rows each GEMM reads (`projection::gemm_s8_entries`),
+// as the stage and quantize launches form them: the up GEMM's of the up
+// weight, the down GEMM's of the down weight.
+#define UP_ENTRIES (projection::gemm_s8_entries<GROUPED_S8, packets::W0>())
+#define DOWN_ENTRIES (projection::gemm_s8_entries<GROUPED_S8, packets::W1>())
 
 #ifdef SEISMIC_FORMING_ROUTED_EXPERTS_UP_GRIDS
 __global__ void routed_experts_up_grids(SEISMIC_KERNEL_PARAMS) {
@@ -56,7 +61,8 @@ __device__ void routed_experts_up_stage_block(SEISMIC_KERNEL_PARAMS) {
         Raw{SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED), SEISMIC_NORMALIZED_STRIDE_0, projection::AllRows{}}};
     const unsigned first = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_FIRST))[0];
     if constexpr (GROUPED_S8)
-        projection::stage_row_s8(source, first + blockIdx.x, SEISMIC_DIM_H, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED),
+        projection::stage_row_s8<UP_ENTRIES>(
+            source, first + blockIdx.x, SEISMIC_DIM_H, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED),
                                  reinterpret_cast<float2 *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GROUPS)));
     else
         projection::materialize_operand_row<Operands>(source, first + blockIdx.x, SEISMIC_DIM_H,
@@ -95,7 +101,7 @@ __device__ void routed_experts_up_expand_block(SEISMIC_KERNEL_PARAMS) {
                                  SEISMIC_UP_SCALE_STRIDE_0, (projection::u64)expert), 1.0f);
     constexpr bool STAGED = S8 || OPERAND == 1 || UP_NVFP4;
     const auto source = routed::grouped_rows(
-        projection::gemm_source<S8>(STAGED ? SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED) : SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED),
+        projection::gemm_source<S8, UP_ENTRIES>(STAGED ? SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED) : SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED),
                                     STAGED ? SEISMIC_DIM_H : SEISMIC_NORMALIZED_STRIDE_0,
                                     SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GROUPS), SEISMIC_DIM_H),
         order, SEISMIC_ORDER_STRIDE_1);
@@ -119,7 +125,7 @@ __device__ void routed_experts_up_quantize_block(SEISMIC_KERNEL_PARAMS) {
         return;
     // The product the expand stored, as the down GEMM's operands.
     if constexpr (GROUPED_S8)
-        projection::stage_row_s8(
+        projection::stage_row_s8<DOWN_ENTRIES>(
             projection::Plain<Act, projection::AllRows>{SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT), SEISMIC_DIM_F,
                                                         projection::AllRows{}},
             blockIdx.x, SEISMIC_DIM_F, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT_CODES),
@@ -150,7 +156,7 @@ __device__ void routed_experts_up_down_block(SEISMIC_KERNEL_PARAMS) {
     const projection::Store<Act> epi{SEISMIC_RESULT_0_OUT.offset(block * SEISMIC_RESULT_0_STRIDE_0),
                                      SEISMIC_RESULT_0_STRIDE_1, 0};
     // The block's product rows, or their s8 rows and groups.
-    const auto source = projection::gemm_source<S8>(
+    const auto source = projection::gemm_source<S8, DOWN_ENTRIES>(
         S8 ? SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT_CODES) + rows * SEISMIC_DIM_F
            : SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT) + rows * SEISMIC_DIM_F * 2,
         SEISMIC_DIM_F, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT_GROUPS) + rows * (SEISMIC_DIM_F / 32) * 8,

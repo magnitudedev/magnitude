@@ -19,6 +19,11 @@ using element::Act;
 #define GROUPED_S8                                                                                         \
     (projection::int8_path<INT8, PACKETS_FORM_INT8(KERNEL_W0), PACKETS_FORM_INT8(KERNEL_W1),               \
                            PACKETS_FORM_INT8(KERNEL_W2)>())
+// The order of the int8 rows each GEMM reads (`projection::gemm_s8_entries`),
+// as the stage and quantize launches form them: the expansion's of the gate
+// and up weights, the down GEMM's of the down weight.
+#define EXPAND_ENTRIES (projection::gemm_s8_entries<GROUPED_S8, packets::W1, packets::W2>())
+#define DOWN_ENTRIES (projection::gemm_s8_entries<GROUPED_S8, packets::W0>())
 
 struct CombineEpi {
     element::Out<element::F32> out;
@@ -56,7 +61,8 @@ __global__ void routed_combine_stage(SEISMIC_KERNEL_PARAMS) {
     using Operands = typename projection::GemmOperands<OPERAND>::type;
     const projection::Plain<Act, projection::AllRows> source{SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED), SEISMIC_NORMALIZED_STRIDE_0, projection::AllRows{}};
     if constexpr (GROUPED_S8)
-        projection::stage_row_s8(source, blockIdx.x, SEISMIC_DIM_H, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED),
+        projection::stage_row_s8<EXPAND_ENTRIES>(
+            source, blockIdx.x, SEISMIC_DIM_H, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED),
                                  reinterpret_cast<float2 *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GROUPS)));
     else
         projection::materialize_operand_row<Operands>(source, blockIdx.x, SEISMIC_DIM_H, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED));
@@ -74,7 +80,7 @@ __global__ void routed_combine_expand(SEISMIC_KERNEL_PARAMS) {
         return;
     const projection::Glu<typename Operands::Storage, Act> epi{
         element::out_over_scratch<typename Operands::Storage>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT)), SEISMIC_DIM_S, 0};
-    projection::gemm_run<GShape, S8, Operands>(reinterpret_cast<projection::u8 *>(dynamic_shared),
+    projection::gemm_run<GShape, S8, EXPAND_ENTRIES, Operands>(reinterpret_cast<projection::u8 *>(dynamic_shared),
                              STAGED ? SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED) : SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED),
                              STAGED ? SEISMIC_DIM_H : SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GROUPS),
                              (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H, blockIdx.x, SEISMIC_DIM_S,
@@ -88,7 +94,7 @@ __global__ void routed_combine_expand(SEISMIC_KERNEL_PARAMS) {
 #ifdef SEISMIC_FORMING_ROUTED_COMBINE_QUANTIZE
 template <unsigned INT8, unsigned OPERAND>
 __global__ void routed_combine_quantize(SEISMIC_KERNEL_PARAMS) {
-    projection::stage_row_s8(
+    projection::stage_row_s8<DOWN_ENTRIES>(
         projection::Plain<Act, projection::AllRows>{SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT), SEISMIC_DIM_S,
                                                     projection::AllRows{}},
         blockIdx.x, SEISMIC_DIM_S, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT_CODES),
@@ -112,7 +118,7 @@ __global__ void routed_combine_down(SEISMIC_KERNEL_PARAMS) {
                          reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCORES)), SEISMIC_SCORES_STRIDE_0,
                          reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_COEFFICIENT)),
                          reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_INJECT)), SEISMIC_INJECT_STRIDE_0};
-    projection::gemm_run<GShape, S8, Operands>(reinterpret_cast<projection::u8 *>(dynamic_shared),
+    projection::gemm_run<GShape, S8, DOWN_ENTRIES, Operands>(reinterpret_cast<projection::u8 *>(dynamic_shared),
                              S8 ? SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT_CODES) : SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT),
                              SEISMIC_DIM_S, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT_GROUPS),
                              (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_S, blockIdx.x, SEISMIC_DIM_H,

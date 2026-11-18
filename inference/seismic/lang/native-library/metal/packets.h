@@ -184,10 +184,11 @@ struct Fields {
 
 // Code planes (`registry::code_planes`): a low plane of LOW bits a code and a
 // high plane of HIGH. `floats` yields a step's codes, their bytes with `mask`
-// flipped, as exact floats less `offset - 1024`; `pair` the step's codes 2j
-// and 2j + 1, the second in bits 16.., with `mask` flipped alike; `nibbles`
-// the step's eight 4-bit codes as one word and `nibble_pair` its byte j (two
-// codes), the indices a codebook reads.
+// flipped, each first shifted left by AT bits within its byte, as exact
+// floats less `offset - 1024`; `pair` the step's codes 2j and 2j + 1, the
+// second in bits 16.., with `mask` flipped alike; `nibbles` the step's eight
+// 4-bit codes as one word and `nibble_pair` its byte j (two codes), the
+// indices a codebook reads.
 
 // The words of a packet's codes below a nibble: its low plane's
 // (`Fields<LOW>`) and, HIGH, its high plane's (`Fields<HIGH>`).
@@ -216,18 +217,58 @@ struct Planes {
             w.high = high_plane::load(row, layout, layout.high, p);
         return w;
     }
-    template <uint MASK>
+    template <uint MASK, uint AT = 0u>
     static void floats(thread const words &w, uint step, half offset, thread float4 &even, thread float4 &odd) {
-        uint e, o;
-        split_fields<LOW, 0>(low_plane::step(w.low, step), e, o);
-        if constexpr (HIGH != 0u) {
-            uint he, ho;
-            split_fields<HIGH, LOW>(high_plane::step(w.high, step), he, ho);
-            e |= he;
-            o |= ho;
+        static_assert(LOW + HIGH + AT <= 8u, "a shifted code fills at most its byte");
+        if constexpr (HIGH == 0u && MASK == 0u) {
+            in_place<AT>(w.low, step, float(offset) - 1024.0f, even, odd);
+        } else {
+            uint e, o;
+            split_fields<LOW, AT>(low_plane::step(w.low, step), e, o);
+            if constexpr (HIGH != 0u) {
+                uint he, ho;
+                split_fields<HIGH, LOW + AT>(high_plane::step(w.high, step), he, ho);
+                e |= he;
+                o |= ho;
+            }
+            even = byte_floats(e ^ MASK, offset);
+            odd = byte_floats(o ^ MASK, offset);
         }
-        even = byte_floats(e ^ MASK, offset);
-        odd = byte_floats(o ^ MASK, offset);
+    }
+    // A plane's step of codes c as the floats (c << AT) - moved, read where
+    // they are stored rather than shuffled into bytes (`split_fields`): right
+    // shifts issue at about a third of the rate of masks, selects and FMAs
+    // (M4 Pro). A 1-bit code selects its value; a 2-bit code masked in place
+    // below bit 10 of its half is the mantissa of 1024 + c 2^b, which one FMA
+    // scales and moves, exactly (`code_at`): the codes of bits 10.. of a half
+    // take one shift a word.
+    template <uint AT>
+    static void in_place(typename low_plane::words w, uint step, float moved, thread float4 &even, thread float4 &odd) {
+        if constexpr (LOW == 1u) {
+            const float zero = -moved, one = float(1u << AT) - moved;
+            for (uint j = 0; j < 4; ++j) {
+                even[j] = metal::select(zero, one, (w & (1u << (8u * step + 2u * j))) != 0u);
+                odd[j] = metal::select(zero, one, (w & (2u << (8u * step + 2u * j))) != 0u);
+            }
+        } else {
+            const uint word = w[step >> 1], high = word >> 6;
+            const uint lane = step & 1u;
+            even = float4(code_at<AT, 0>(word, lane, moved), code_at<AT, 4>(word, lane, moved),
+                code_at<AT, 8>(word, lane, moved), code_at<AT, 6>(high, lane, moved));
+            odd = float4(code_at<AT, 2>(word, lane, moved), code_at<AT, 6>(word, lane, moved),
+                code_at<AT, 4>(high, lane, moved), code_at<AT, 8>(high, lane, moved));
+        }
+    }
+    // The 2-bit code at bit B of half `lane` of `word` as (c << AT) - moved:
+    // 1024 + c 2^B is exact in a half (B <= 8), its conversion is an operand
+    // of the FMA, and the FMA's result, an integer below 2^11 in magnitude,
+    // is exact.
+    template <uint AT, uint B>
+    static float code_at(uint word, uint lane, float moved) {
+        static_assert(B <= 8u, "1024 + 3 2^B is an exact half");
+        const half2 h = as_type<half2>((word & (0x00030003u << B)) | 0x64006400u);
+        constexpr float scale = power2<int(AT) - int(B)>();
+        return metal::fma(float(h[lane]), scale, -1024.0f * scale - moved);
     }
     template <uint MASK>
     static uint pair(thread const words &w, uint step, uint j) {
@@ -478,8 +519,9 @@ struct Entries<3> {
 // any other constant costs a subtraction more a step (M4 Pro, prefill
 // `attention_project` staging q6k: 9.74 against 9.54 ms); a product
 // operand takes the zero off as the exact bias -(zero scale)
-// (`Packet::values`). `pair` takes it off in its half subtraction, so a value
-// of zero keeps its sign.
+// (`Packet::values`). `pair` and `centered` (the codes less the zero code,
+// which an exact or factored decode takes) take it off in their half
+// subtraction, so a value of zero keeps its sign.
 template <uint MASK, int ZERO>
 struct Linear {
     static_assert(ZERO >= 0 && (ZERO & (ZERO - 1)) == 0, "a zero code is a power of two: -(zero scale) is exact");
@@ -487,6 +529,10 @@ struct Linear {
     template <typename P>
     static void codes(thread const typename P::words &w, uint step, thread float4 &even, thread float4 &odd) {
         P::template floats<MASK>(w, step, 1024.0h, even, odd);
+    }
+    template <typename P>
+    static void centered(thread const typename P::words &w, uint step, thread float4 &even, thread float4 &odd) {
+        P::template floats<MASK>(w, step, half(1024 + ZERO), even, odd);
     }
     template <typename P>
     static float2 pair(thread const typename P::words &w, uint step, uint j) {
@@ -503,16 +549,16 @@ using Offset = Linear<0u, ZERO>;
 typedef Offset<0> Unsigned;
 typedef Linear<0x80808080u, 128> Twos;
 
-// Odd codes `2 (c - K) + 1` (`registry::CodeInterpretation::Odd`): the codes'
-// bytes as exact floats, doubled and moved by 1 - 2K by one exact fma.
+// Odd codes `2 (c - K) + 1` (`registry::CodeInterpretation::Odd`): the
+// codes doubled in their bytes (shifted left a bit) and moved by 1 - 2K in
+// the half subtraction that makes them floats, exactly.
 template <int K>
 struct OddCodes {
+    static_assert(-512 < K && K < 512, "the moved code's offset, 1023 + 2K, is an exact half");
     static constant constexpr int zero = 0;
     template <typename P>
     static void codes(thread const typename P::words &w, uint step, thread float4 &even, thread float4 &odd) {
-        P::template floats<0u>(w, step, 1024.0h, even, odd);
-        even = metal::fma(even, float4(2.0f), float4(float(1 - 2 * K)));
-        odd = metal::fma(odd, float4(2.0f), float4(float(1 - 2 * K)));
+        P::template floats<0u, 1u>(w, step, half(1023 + 2 * K), even, odd);
     }
     template <typename P>
     static float2 pair(thread const typename P::words &w, uint step, uint j) {
@@ -624,9 +670,51 @@ struct Grid {
     static_assert(SIGNS == SEISMIC_GRID_SIGNS_PARITY_PLUS7 || SIGNS == SEISMIC_GRID_SIGNS_EXPLICIT8 ||
         SIGNS == SEISMIC_GRID_SIGNS_NONE, "a grid entry's signs are parity, explicit or none");
     static_assert(DELTA || DELTA_EXPONENT == 0u, "a delta exponent is a delta's");
+    static_assert(!DELTA || SIGNS == SEISMIC_GRID_SIGNS_NONE, "a delta moves signed points (`moved_points`)");
     static constant constexpr int zero = 0;
     typedef Points<GRID, INDEX_BITS, LANES> points;
     static constexpr bool signed_points() { return SIGNS == SEISMIC_GRID_SIGNS_NONE; }
+    // Each byte of `word`'s signed points (bytes where `lanes` has a 1) times
+    // 2^S, exactly: every grid scaled so holds points small enough
+    // (`repr::scaled_grid_points_fit_their_bytes`).
+    template <uint S>
+    static uint scaled_bytes(uint word, uint lanes) {
+        static_assert(S < 8u, "a scaled point stays within its byte");
+        return (word << S) & (((0xffu << S) & 0xffu) * lanes);
+    }
+    // Eight signed points of `entry` times 2^S plus `move` (a small integer),
+    // exactly: offset binary bytes whose half subtraction takes the move off
+    // with their offset, so a move costs a step one subtraction.
+    template <uint S>
+    static void moved_points(uint entry, half move, thread float4 &even, thread float4 &odd) {
+        static_assert(signed_points(), "a move adds to signed points");
+        if constexpr (grids::trits<GRID>::any) {
+            // Lanes of -1, 0 and 1 as 2-bit codes, value + 1 (`trits`),
+            // spread to bytes at bit S: the half subtraction takes 2^S off
+            // with the move's offset.
+            uint even_codes, odd_codes;
+            split_fields<2u, S>(grids::trits<GRID>::codes()[entry & ((1u << INDEX_BITS) - 1u)], even_codes, odd_codes);
+            const half offset = half(1024u + (1u << S)) - move;
+            even = byte_floats(even_codes, offset);
+            odd = byte_floats(odd_codes, offset);
+        } else {
+            const uint2 point = points::point(entry);
+            const half offset = 1152.0h - move;
+            const float4 low = byte_floats(scaled_bytes<S>(point.x, 0x01010101u) ^ 0x80808080u, offset);
+            const float4 high = byte_floats(scaled_bytes<S>(point.y, 0x01010101u) ^ 0x80808080u, offset);
+            even = float4(low.x, low.z, high.x, high.z);
+            odd = float4(low.y, low.w, high.y, high.w);
+        }
+    }
+    // Whether a step's codes move (`moved`): signed points without a delta of
+    // their own.
+    static constexpr bool moves() { return signed_points() && !DELTA; }
+    // A step's codes times 2^S plus `move` (`moved_points`).
+    template <uint S, typename P>
+    static void moved(thread const typename P::words &w, uint step, half move, thread float4 &even, thread float4 &odd) {
+        static_assert(moves(), "moved codes are signed points without a delta");
+        moved_points<S>(P::entry(w, step), move, even, odd);
+    }
     static uint signs(uint entry) {
         const uint bits = (entry >> SIGN_BIT) & ((1u << SIGN_BITS) - 1u);
         if constexpr (SIGNS == SEISMIC_GRID_SIGNS_PARITY_PLUS7)
@@ -641,11 +729,9 @@ struct Grid {
     static void codes(thread const typename P::words &w, uint step, thread float4 &even, thread float4 &odd) {
         uint entry = P::entry(w, step);
         if constexpr (signed_points()) {
-            // Two's complement bytes, their sign bits flipped to offset binary.
-            uint2 point = points::point(entry);
-            float4 low = byte_floats(point.x ^ 0x80808080u, 1152.0h), high = byte_floats(point.y ^ 0x80808080u, 1152.0h);
-            even = float4(low.x, low.z, high.x, high.z);
-            odd = float4(low.y, low.w, high.y, high.w);
+            // Two's complement bytes, their sign bits flipped to offset
+            // binary, scaled and moved by the delta in their conversion.
+            moved_points<DELTA_EXPONENT>(entry, DELTA ? half(delta(entry)) : 0.0h, even, odd);
         } else {
             // The signed values + 128 as bytes, four at a time.
             uint s = signs(entry);
@@ -654,11 +740,6 @@ struct Grid {
             float4 high = byte_floats(signed_bytes(point.y, s >> 4), 1152.0h);
             even = float4(low.x, low.z, high.x, high.z);
             odd = float4(low.y, low.w, high.y, high.w);
-        }
-        if constexpr (DELTA) {
-            const float d = delta(entry);
-            even = metal::fma(even, float4(power2<int(DELTA_EXPONENT)>()), float4(d));
-            odd = metal::fma(odd, float4(power2<int(DELTA_EXPONENT)>()), float4(d));
         }
     }
     // Lanes 2j and 2j + 1 of the same.
@@ -669,14 +750,13 @@ struct Grid {
         uint word = (j < 2u ? point.x : point.y) >> (16u * (j & 1u));
         float2 values;
         if constexpr (signed_points()) {
-            values = code_pair(((word & 0xffu) | ((word & 0xff00u) << 8)) ^ 0x00800080u, 1152.0h);
+            const uint bytes = scaled_bytes<DELTA_EXPONENT>((word & 0xffu) | ((word & 0xff00u) << 8), 0x00010001u);
+            values = code_pair(bytes ^ 0x00800080u, 1152.0h - (DELTA ? half(delta(entry)) : 0.0h));
         } else {
             uint s = signs(entry) >> (2u * j);
             float2 magnitudes = code_pair((word & 0xffu) | ((word & 0xff00u) << 8), 1024.0h);
             values = as_type<float2>(as_type<uint2>(magnitudes) ^ ((uint2(s, s >> 1) & 1u) << 31));
         }
-        if constexpr (DELTA)
-            values = metal::fma(values, float2(power2<int(DELTA_EXPONENT)>()), float2(delta(entry)));
         return values;
     }
 };
@@ -1025,8 +1105,10 @@ struct Hier {
     static_assert(!carries || (!MIN && LOCAL_BITS <= GROUP / 8u), "a group's entries carry its scale code");
     static constant constexpr uint groups = 32u / GROUP;
     static constant constexpr bool biased = MIN || signed_bias();
-    // Whether its bias is an offset of its codes (`SignedCoefficients`).
+    // Whether its bias is an offset of its codes (`SignedCoefficients`),
+    // each ±2^offset_exponent().
     static constant constexpr bool offsets = signed_bias();
+    static constexpr int offset_exponent() { return SB::exponent(); }
     typedef metal::conditional_t<offsets, SignedCoefficients<groups>, Coefficients<groups, biased>> coefficients;
     static constant constexpr uint width = LOCAL_BITS * (MIN ? 2u : 1u);
     static constant constexpr uint field_bits = width * groups;
@@ -1149,21 +1231,42 @@ struct Hier {
 // The consumer forms the runtime admits a weight to (`<prefix>_FORM_<NAME>`,
 // its one form admission, `abi/forms.rs`), which projection libraries select
 // on: the token-packing GEMM (`PACK`, with its codes' entry: a code enters as
-// its value + PACK_OFFSET, centred at PACK_CENTRE, and its sums take
-// PACK_RESIDUE residue bits), the int8 GEMM (`INT8`) and the matrix GEMV
+// its value + PACK_OFFSET, centred at PACK_CENTRE, its sums take
+// PACK_RESIDUE residue bits, and PACK_SUMS where each of a block's two runs
+// folds a min term), the int8 GEMM (`INT8`) and the matrix GEMV
 // folding a block's scale codes, over a block's runs or of symmetric 32
 // columns (`MATRIX_CODES`, `MATRIX_RUNS`, `MATRIX_SYMMETRIC`, at most one;
 // `MATRIX_RUNS` 2 where a run's products are exact F16 operands,
 // `matrix_runs_halves`).
-template <bool PACK, uint PACK_CENTRE, uint PACK_OFFSET, uint PACK_RESIDUE, bool INT8, bool MATRIX_CODES,
-    uint MATRIX_RUNS, bool MATRIX_SYMMETRIC>
+template <bool PACK, uint PACK_CENTRE, uint PACK_OFFSET, uint PACK_RESIDUE, bool PACK_SUMS, bool INT8,
+    bool MATRIX_CODES, uint MATRIX_RUNS, bool MATRIX_SYMMETRIC>
 struct Forms {
-    static constant constexpr bool pack = PACK, int8 = INT8;
+    static constant constexpr bool pack = PACK, pack_sums = PACK_SUMS, int8 = INT8;
     static constant constexpr uint pack_centre = PACK_CENTRE, pack_offset = PACK_OFFSET, pack_residue = PACK_RESIDUE;
     static constant constexpr bool matrix_codes = MATRIX_CODES, matrix_runs = MATRIX_RUNS != 0u,
         matrix_symmetric = MATRIX_SYMMETRIC;
     static constexpr bool matrix_runs_halves() { return MATRIX_RUNS == 2u; }
 };
+
+// Whether codes `C` move exactly within their bytes (`Grid::moved`).
+template <typename C, typename = void>
+struct code_moves {
+    static constant constexpr bool value = false;
+};
+template <typename C>
+struct code_moves<C, metal::enable_if_t<C::moves()>> {
+    static constant constexpr bool value = true;
+};
+
+// A step's codes less their zero code, exactly (`Linear::centered`; codes
+// of zero code 0 are their codes).
+template <typename C, typename P>
+inline void centered_codes(thread const typename P::words &w, uint step, thread float4 &even, thread float4 &odd) {
+    if constexpr (C::zero != 0)
+        C::template centered<P>(w, step, even, odd);
+    else
+        C::template codes<P>(w, step, even, odd);
+}
 
 // A decoder of codes in planes `P` interpreted by `C` under coefficients `K`,
 // admitted to the consumer forms `F` (`Forms`).
@@ -1191,22 +1294,41 @@ struct Packet {
     // two bits a weight and below, the per-weight scale bounds the one-row
     // GEMV on instruction issue.
     static constexpr bool factored() { return !K::biased || K::offsets; }
+    // Whether its codes take their offsets, ±2^-S, as integers: codes of
+    // signed points times 2^S moved by ±1 in their conversion, their factor
+    // times 2^-S. Both are exact, so a factored product rounds as the
+    // unmoved one does.
+    static constexpr bool moves_offsets() {
+        if constexpr (K::offsets)
+            return code_moves<C>::value && K::offset_exponent() < 0 && K::offset_exponent() > -8;
+        else
+            return false;
+    }
     // Step `step`'s eight codes over its factor, each exact: the code less
     // its zero code, moved by its group's signed bias over its scale.
     static void codes(thread const packet &k, uint step, thread float4 &even, thread float4 &odd) {
         static_assert(factored(), "a factored decoder's bias is an offset of its codes");
-        C::template codes<P>(k.codes, step, even, odd);
-        if constexpr (C::zero != 0) {
-            even -= float(C::zero);
-            odd -= float(C::zero);
-        }
-        if constexpr (K::offsets) {
-            const float offset = k.coefficients.offset(group(step));
-            even += offset;
-            odd += offset;
+        if constexpr (moves_offsets()) {
+            // The codes and their offset over 2^offset_exponent, an integer,
+            // moved in their conversion (`factor` takes the power back).
+            constexpr uint S = uint(-K::offset_exponent());
+            const half move = half(k.coefficients.offset(group(step)) * power2<int(S)>());
+            C::template moved<S, P>(k.codes, step, move, even, odd);
+        } else {
+            centered_codes<C, P>(k.codes, step, even, odd);
+            if constexpr (K::offsets) {
+                const float offset = k.coefficients.offset(group(step));
+                even += offset;
+                odd += offset;
+            }
         }
     }
-    static float factor(thread const packet &k, uint step) { return scale(k, step); }
+    static float factor(thread const packet &k, uint step) {
+        if constexpr (moves_offsets())
+            return scale(k, step) * power2<K::offset_exponent()>();
+        else
+            return scale(k, step);
+    }
     // Step `step`'s eight values (even, odd) as product operands: scale *
     // code with one rounding, plus by the same fma a stored bias, the exact
     // -(zero code scale) (`Linear`) or +0, so a value of zero is +0. Where
@@ -1226,11 +1348,7 @@ struct Packet {
     // them: scale * (code - zero code), the difference exact, plus a stored
     // bias by one fma, so a zero keeps the sign of scale * 0.
     static void exact_values(thread const packet &k, uint step, thread float4 &even, thread float4 &odd) {
-        C::template codes<P>(k.codes, step, even, odd);
-        if (C::zero != 0) {
-            even -= float(C::zero);
-            odd -= float(C::zero);
-        }
+        centered_codes<C, P>(k.codes, step, even, odd);
         const float s = scale(k, step);
         if (K::biased) {
             const float b = k.coefficients.bias(group(step));
@@ -1483,7 +1601,8 @@ struct CoefficientsOf<SEISMIC_COEFF_HIER, CODES, SCALE, BIAS, BIAS_SIGN, GROUP, 
             ELEMENT_CAT(P, _COEFF_LOCAL_OFFSET),                                                                \
             ELEMENT_CAT(P, _COEFF_CARRIED), ELEMENT_CAT(P, _COEFF_SIGNED_BIAS_EXPONENT)>::type,                 \
         packets::Forms<ELEMENT_CAT(P, _FORM_PACK) != 0, ELEMENT_CAT(P, _FORM_PACK_CENTRE),                       \
-            ELEMENT_CAT(P, _FORM_PACK_OFFSET), ELEMENT_CAT(P, _FORM_PACK_RESIDUE), ELEMENT_CAT(P, _FORM_INT8) != 0,  \
+            ELEMENT_CAT(P, _FORM_PACK_OFFSET), ELEMENT_CAT(P, _FORM_PACK_RESIDUE),                              \
+            ELEMENT_CAT(P, _FORM_PACK_SUMS) != 0, ELEMENT_CAT(P, _FORM_INT8) != 0,                              \
             ELEMENT_CAT(P, _FORM_MATRIX_CODES) != 0, ELEMENT_CAT(P, _FORM_MATRIX_RUNS),                          \
             ELEMENT_CAT(P, _FORM_MATRIX_SYMMETRIC) != 0>>
 #define PACKETS_ROWS(P)                                                                                \

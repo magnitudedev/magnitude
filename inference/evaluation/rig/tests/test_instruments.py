@@ -359,8 +359,15 @@ def test_kernel_shows_configurations_as_changes_from_the_default_and_the_search(
         return {"Measured": {"points": [{"point": f"p{i}", "median_seconds": t, "deviation_seconds": 1e-7}
                                         for i, t in enumerate(times)], "confirmed": []}}
 
+    def work(configuration, point, seconds):
+        return {"configuration": configuration,
+                "outcome": {"Measured": {"point": point, "median_seconds": seconds, "deviation_seconds": 1e-7}}}
+
     default, fast = configuration(A=1, B=2), configuration(A=1, B=4)
+    surveyed = {"formed": 2, "points": [{"work": [work(default, "p0", 20e-6), work(fast, "p0", 10e-6)]},
+                                        {"work": [work(default, "p1", 30e-6), work(fast, "p1", 40e-6)]}]}
     record = {"points": [{"label": "p0"}, {"label": "p1"}], "served": [default], "overall": fast,
+              "method": {"Survey": {"samples": 15, "record": surveyed}},
               "configurations": [{"configuration": default, "outcome": measured(20e-6, 30e-6)},
                                  {"configuration": fast, "outcome": measured(10e-6, 40e-6)}]}
     (tmp_path / "survey").mkdir()
@@ -376,12 +383,21 @@ def test_kernel_shows_configurations_as_changes_from_the_default_and_the_search(
     log = tmp_path / "log"
     log.write_text("")
     answer = REGISTRY["kernel"].answer(argparse.Namespace(entry="e"), {"kernel": JobResult(tmp_path, log, 0)})
+    assert answer.lines[0] == "e [A=bf16] · 2 configurations formed, 4 works measured"
     assert answer.lines[2] == "  tuner's choice: B=4"
     assert answer.lines[4].split()[-1] == "B=4" and answer.lines[5].split()[-1] == "default"
     assert answer.lines[6] == "  search on e [A=bf16] {}"
     assert answer.lines[7].split()[:7] == ["2", "evaluations:", "within", "1%", "90.0%,", "2%", "95.0%,"]
     assert answer.lines[8] == "    one configuration for all points: per-point gap: 12.5%"
     assert answer.measures["e A=bf16 p0"].value == pytest.approx(10.0)
+
+
+def test_kernel_tunes_over_the_models_own_weights():
+    # Over the header export every weight is zero: every configuration's output is zero, and
+    # validation admits every configuration alike.
+    arguments = parse("kernel", "--backend", "metal", "--model", MODEL, "--context", "4096", "--entry", "e",
+                      "--purpose", "p", "--estimate", "5m")
+    assert REGISTRY["kernel"].plan(arguments, None, "alpha").acquires == engine.Weights(MODEL)
 
 
 def test_assess_breakdown_sums_each_entrys_launches_and_time(tmp_path):

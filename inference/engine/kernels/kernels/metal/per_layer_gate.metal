@@ -5,8 +5,11 @@
 #include "lib/projection/projection.h"
 #include "lib/projection/packing.h"
 #include "lib/projection/operator.h"
-#if defined(SEISMIC_FORMING_PER_LAYER_GATE_GEMV) || defined(SEISMIC_FORMING_PER_LAYER_GATE_GEMV_ROWS) || defined(SEISMIC_FORMING_PER_LAYER_GATE_GEMV_PAIR)
+#if defined(SEISMIC_FORMING_PER_LAYER_GATE_GEMV) || defined(SEISMIC_FORMING_PER_LAYER_GATE_GEMV_ROWS) || defined(SEISMIC_FORMING_PER_LAYER_GATE_GEMV_PAIR) || defined(SEISMIC_FORMING_PER_LAYER_GATE_GEMV_PACKED)
 #include "lib/projection/gemv.h"
+#endif
+#ifdef SEISMIC_FORMING_PER_LAYER_GATE_GEMV_PACKED
+#include "lib/projection/gemv_packed.h"
 #endif
 
 typedef element::Act activation;
@@ -81,21 +84,27 @@ kernel void per_layer_gate_stage(PROJECTION_ARGUMENTS,
 
 // The `dense` projection's launches (`lib/projection/operator.h`).
 #ifdef SEISMIC_FORMING_PER_LAYER_GATE_GEMV
-template <uint LANES, uint TILED, uint ROWS>
+template <uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void per_layer_gate_gemv(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(ONE, TILED);
 }
 #endif
 #ifdef SEISMIC_FORMING_PER_LAYER_GATE_GEMV_PAIR
-template <uint LANES, uint TILED, uint ROWS>
+template <uint LANES, uint TILED, uint STAGE, uint PACKED_ROWS, uint ROWS>
 kernel void per_layer_gate_gemv_pair(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(PAIR, TILED);
 }
 #endif
 #ifdef SEISMIC_FORMING_PER_LAYER_GATE_GEMV_ROWS
-template <uint LANES, uint TILED, uint ROWS>
+template <uint LANES, uint TILED, uint STAGE, uint PACKED_ROWS, uint ROWS>
 kernel void per_layer_gate_gemv_rows(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SINGLE_GEMV(SEVERAL, TILED);
+}
+#endif
+#ifdef SEISMIC_FORMING_PER_LAYER_GATE_GEMV_PACKED
+template <uint LANES, uint PACKED_ROWS, uint ROWS>
+kernel void per_layer_gate_gemv_packed(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
+    PROJECTION_SINGLE_GEMV_PACKED;
 }
 #endif
 #ifdef SEISMIC_FORMING_PER_LAYER_GATE_BATCH

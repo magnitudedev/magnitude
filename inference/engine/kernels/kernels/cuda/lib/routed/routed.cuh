@@ -40,6 +40,7 @@ template <class Rows> struct GroupedRows {
     __device__ __forceinline__ const u8 *row(u64 m) const { return rows.row(at(m)); }
     __device__ __forceinline__ const float2 *groups_of(u64 m) const { return rows.groups_of(at(m)); }
     __device__ __forceinline__ bool wide() const { return rows.wide(); }
+    __host__ __device__ static constexpr bool entries() { return Rows::entries(); }
 };
 template <class Rows>
 __device__ __forceinline__ GroupedRows<Rows> grouped_rows(const Rows &rows, const int *order, u64 order_stride) {
@@ -75,7 +76,9 @@ __device__ __forceinline__ bool first_choice(const int *routes, u64 row_stride, 
 
 // The choices of `expert` from `choice` (one of its) in order, one a row:
 // `choice`, then each later row's that names it, into `chosen`; returns
-// their count.
+// their count. The forms run at most VERIFY_ROWS rows, each naming an expert
+// once, so `chosen` is never full when another choice is found; one found
+// then breaks that invariant, and the block traps rather than drop it.
 __device__ __forceinline__ u32 choices_of(const int *routes, u64 row_stride, u64 slot_stride, u32 rows, u32 slots,
                                           u32 choice, int expert, u32 (&chosen)[SEISMIC_CONST_VERIFY_ROWS]) {
     u32 count = 0;
@@ -83,6 +86,8 @@ __device__ __forceinline__ u32 choices_of(const int *routes, u64 row_stride, u64
     for (u32 m = choice / slots + 1; m < rows; ++m)
         for (u32 k = 0; k < slots; ++k)
             if (route(routes, row_stride, slot_stride, slots, m * slots + k) == expert) {
+                if (count == SEISMIC_CONST_VERIFY_ROWS)
+                    __trap();
                 chosen[count++] = m * slots + k;
                 break;
             }
@@ -166,7 +171,7 @@ struct GatheredRows {
 // once per block: measured on GB10 with iq2xxs experts, 1.7x the rate of two
 // warp rows of four tiles). Weights whose rows hold fewer than 64 code bytes
 // per k-block (the 4- to 6-bit codes) stage k-blocks in spans of two, so each
-// warp copy reads 64 contiguous bytes of a row (`gemm_load_codes_span`).
+// warp copy reads 64 contiguous bytes of a row (`GemmStreamLoader::codes`).
 // The spanned layout must fit the declared shared bytes (`DECLARED`), else
 // the 3-stage single k-block pipeline runs, as the int8 GEMM (S8) always
 // does: it stages one k-block a stage (`gemm_segment_s8`).

@@ -1,4 +1,4 @@
-use seismic::{BackendName, Devices, Element, NativeSpecialization, NativeTensorBatch, SlabFill, SlabRegion, SlabTensor, Tensor};
+use seismic::{BackendName, Element, NativeSpecialization, NativeTensorBatch, SlabFill, SlabRegion, SlabTensor, Tensor};
 use seismic_native_tests::{pool, scale_rows, slab_scale};
 
 #[test]
@@ -56,10 +56,7 @@ fn native_cuda_slab_port_refuses_a_plain_tensor() {
 /// slab addresses. A call refuses one, as a native graph's port binding
 /// does, before anything is encoded.
 fn slab_port_refuses_a_plain_tensor(backend: BackendName) {
-    let device = Devices::discover(&[])
-        .unwrap()
-        .open_backend(backend)
-        .unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(backend) else { return };
     let kernel = slab_scale::native_for_device(&device, &NativeSpecialization::new()).unwrap();
     let plain = Tensor::from_host(&device, Element::f32(), &[4, 1], &[0; 16]).unwrap();
     let refused = seismic::WorkflowError::PlainSlabBinding { parameter: "x".into() };
@@ -96,10 +93,7 @@ fn slab_port_refuses_a_plain_tensor(backend: BackendName) {
 /// tensor is; a slice past the extent is still refused.
 #[test]
 fn an_empty_slice_of_a_slab_view_holds_no_slab() {
-    let device = Devices::discover(&[])
-        .unwrap()
-        .open_backend(BackendName::Cpu)
-        .unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Cpu) else { return };
     let slabs = SlabTensor::in_pool(
         &pool(&device),
         2,
@@ -146,10 +140,7 @@ fn native_reads_rows_across_slab_boundary(backend: BackendName) {
 }
 
 fn native_reads_rows_with_slab_size(backend: BackendName, slab_rows: u64) {
-    let device = Devices::discover(&[])
-        .unwrap()
-        .open_backend(backend)
-        .unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(backend) else { return };
     let tail_rows = slab_rows.min(44);
     let logical_rows = slab_rows + tail_rows;
     let slabs = SlabTensor::in_pool(
@@ -220,10 +211,7 @@ fn native_vulkan_reads_reused_interior_slab_index() {
 }
 
 fn native_reads_reused_interior_slab_index(backend: BackendName) {
-    let device = Devices::discover(&[])
-        .unwrap()
-        .open_backend(backend)
-        .unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(backend) else { return };
     let slabs = SlabTensor::in_pool(
         &pool(&device),
         256,
@@ -351,10 +339,7 @@ fn metal_submission_cost_with_one_and_one_hundred_slabs() {
         )
     }
 
-    let device = Devices::discover(&[])
-        .unwrap()
-        .open_backend(BackendName::Metal)
-        .unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Metal) else { return };
     let one_before = sample(&device, 1);
     let hundred = sample(&device, 100);
     let one_after = sample(&device, 1);
@@ -378,10 +363,7 @@ fn metal_frees_slab_after_submitted_read() {
 }
 
 fn free_after_submitted_read(backend: BackendName) {
-    let device = Devices::discover(&[])
-        .unwrap()
-        .open_backend(backend)
-        .unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(backend) else { return };
     let slabs = SlabTensor::in_pool(
         &pool(&device),
         256,
@@ -453,10 +435,7 @@ fn free_after_submitted_read(backend: BackendName) {
 /// the run runs, so a slab frees beside it.
 #[test]
 fn a_queued_graph_run_holds_off_no_slab_change() {
-    let device = Devices::discover(&[])
-        .unwrap()
-        .open_backend(BackendName::Cpu)
-        .unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Cpu) else { return };
     let slabs = SlabTensor::in_pool(
         &pool(&device),
         256,
@@ -514,10 +493,7 @@ fn metal_frees_slab_after_a_submitted_batch_read() {
 /// A slab freed while a batch's read is in flight keeps its rows for that
 /// read: its granule is claimable again only once the batch completes.
 fn free_after_batch_read(backend: BackendName) {
-    let device = Devices::discover(&[])
-        .unwrap()
-        .open_backend(backend)
-        .unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(backend) else { return };
     let slabs = SlabTensor::in_pool(
         &pool(&device),
         256,

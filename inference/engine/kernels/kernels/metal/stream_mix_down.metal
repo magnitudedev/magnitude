@@ -121,7 +121,7 @@ kernel void stream_mix_down_stage(PROJECTION_ARGUMENTS,
 // The `dense` projection's launches (`lib/projection/operator.h`); every
 // GEMV row class is the parts GEMV.
 #ifdef SEISMIC_FORMING_STREAM_MIX_DOWN_GEMV
-template <uint LANES, uint TILED, uint ROWS>
+template <uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void stream_mix_down_gemv(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SEGMENTED_PARTS_GEMV;
 }
@@ -150,13 +150,13 @@ kernel void stream_mix_down_tall(PROJECTION_ARGUMENTS, PROJECTION_TILE_ARGUMENTS
 }
 #endif
 #ifdef SEISMIC_FORMING_STREAM_MIX_DOWN_GEMV_ROWS
-template <uint LANES, uint TILED, uint ROWS>
+template <uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void stream_mix_down_gemv_rows(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SEGMENTED_PARTS_GEMV;
 }
 #endif
 #ifdef SEISMIC_FORMING_STREAM_MIX_DOWN_GEMV_PAIR
-template <uint LANES, uint TILED, uint ROWS>
+template <uint LANES, uint TILED, uint STAGE, uint ROWS>
 kernel void stream_mix_down_gemv_pair(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
     PROJECTION_SEGMENTED_PARTS_GEMV;
 }

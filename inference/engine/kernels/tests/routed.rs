@@ -9,7 +9,7 @@ use seismic::BackendName;
 
 use magnitude_kernels::{
     SlotTable, constants, landing_extent, list_extent, routed_combine, routed_copy, routed_down, routed_expand,
-    routed_experts, routed_gate_up, routed_group, routed_land, routed_list_grid, routed_output,
+    routed_experts, routed_experts_up, routed_gate_up, routed_group, routed_land, routed_list_grid, routed_output,
     routed_pass_map, routed_round, routed_route, routed_route_shared, routed_scratch_grids, routed_scratch_request,
     gated_delta_project, routed_seed_commit, routed_select, routed_select_streamed, routed_step, routed_up,
 };
@@ -25,6 +25,7 @@ use seismic_lang::{
 
 mod mapped;
 mod operands;
+mod packed;
 mod streaming_words;
 
 use mapped::Mapped;
@@ -2303,6 +2304,9 @@ enum Experts {
     /// Nemotron 3.5 Bolt's vector codes: every expert and shared weight
     /// iq2xxs (IQ2_XXS).
     Iq2Xxs,
+    /// A Q2_K quant's experts: gate and up q2k, whose two runs a block each
+    /// fold a min term, down q3k.
+    Q2,
 }
 
 /// The 35B-A3B storage mix at reduced width: expert weights per `Experts`,
@@ -2356,6 +2360,7 @@ impl PackedBlock {
             Experts::Fp4A4 => ["nvfp4g16a4", "nvfp4g16a4", "q5g32s"],
             Experts::Grid => ["iq2xs", "iq3xxs", "iq2xs"],
             Experts::Iq2Xxs => ["iq2xxs"; 3],
+            Experts::Q2 => ["q2k", "q2k", "q3k"],
         };
         let expert_weight = |which: usize, shape: &[u64], seed: u32| match experts {
             Experts::Bf16 => bf16_weight(device, shape, seed),
@@ -4095,6 +4100,195 @@ fn native_routed_experts_match_reference_with_iq4_block_experts() {
             0,
         );
     }
+}
+
+/// Q2_K experts in the grouped (prefill) expert GEMMs: on Metal the packed
+/// GEMM of gate and up weights whose runs each fold a min term.
+#[test]
+fn native_grouped_prefill_matches_reference_with_q2k_experts() {
+    for device in seismic_native_tests::every_device() {
+        native_grouped_prefill_matches_reference_on(&device, PackedBlock::new(&device, Experts::Q2), 0);
+    }
+}
+
+/// Q2_K experts in the ungated grouped expert pass (`routed_experts_up`,
+/// relu^2): on Metal its packed GEMMs, over up weights whose two runs a
+/// block each fold a min term and q3k down weights, are the packed
+/// reference's (`packed`) of each block's expert: the up sums', relu^2 of
+/// them rounded to bf16 (each product within what the up sums' budgets
+/// leave it), then the down sums' over those products, rounded to bf16.
+#[test]
+fn metal_packed_experts_up_agrees_with_the_default_form_with_q2k_experts() {
+    let Some(device) = seismic_native_tests::every_device()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let block = PackedBlock::new(&device, Experts::Q2);
+    let (h, e, k, f) = (
+        PackedBlock::HIDDEN as u64,
+        PackedBlock::EXPERTS as u64,
+        PackedBlock::CHOICES as u64,
+        block.routed.features as u64,
+    );
+    let tile = 32u64;
+    let experts = grouped_projection(
+        routed_experts_up::native_entry_with(routed_experts_up::Elements {
+            A: seismic::Element::bf16(),
+            EUW: block.expert_up.element(),
+            EDW: block.expert_down.element(),
+        }),
+        [[("H", h), ("F", f), ("T", tile)].as_slice(), &block.routed.expansion_statics()].concat(),
+        0,
+    );
+    let mappings = grouped_mappings(&device);
+    let default = GroupedForm::default();
+    let packed = GroupedForm {
+        params: vec![("TALL", 1), ("PACK", 1), ("DOWN_TALL", 1), ("DOWN_PACK", 1)],
+        quantized: true,
+    };
+    let at = |form| Grouped {
+        mapping: mappings[0].as_slice(),
+        form,
+    };
+    assert!(experts.admits(&device, at(&packed)), "routed_experts_up takes PACK over q2k up and q3k down weights");
+    let [_, up_scale] = block.routed.expansion_scales(&device);
+    // Past 64 rows, where the forms apply; 200 leaves a partial tile.
+    for rows in [80usize, 200] {
+        let routing = PackedBlock::routing(rows, 190 + rows as u32);
+        let m = rows as u64;
+        let blocks = group_blocks(m * k, e, tile);
+        let fill = |shape: &[u64]| i32_tensor(&device, shape, &vec![-9; shape.iter().product::<u64>() as usize]);
+        let (mut counts, mut order, mut inverse, mut table, mut used) =
+            (fill(&[e]), fill(&[blocks, tile]), fill(&[m, k]), fill(&[blocks]), fill(&[1]));
+        let grouped = i32_tensor(&device, &[1], &[m as i32]);
+        routed_group::native_for_device(&device, &default_group_specialization(&device, e, k))
+            .unwrap()
+            .call(routed_group::Args {
+                first: &first_row(&device),
+                rows: &grouped,
+                routes: &i32_tensor(&device, &[m, k], &routing.routes),
+                counts: &mut counts,
+                order: &mut order,
+                inverse: &mut inverse,
+                blocks: &mut table,
+                used: &mut used,
+            })
+            .unwrap();
+        let normalized = bf16_tensor(&device, &[m, h], &routing.normalized);
+        // Each choice's output row, at its grouped position.
+        let positions = read_i32(&inverse);
+        let output = |form| {
+            read_bf16(
+                &experts
+                    .kernel(&device, at(form))
+                    .call(routed_experts_up::Args {
+                        first: &first_row(&device),
+                        rows: &grouped,
+                        normalized: &normalized,
+                        order: &order,
+                        blocks: &table,
+                        used: &used,
+                        expert_up: &block.expert_up,
+                        expert_down: &block.expert_down,
+                        map: &absent_map(&device),
+                        step: &absent_step(&device),
+                        records_up: &block.expert_up,
+                        records_down: &block.expert_down,
+                        up_scale: &up_scale,
+                        activation: 2,
+                    })
+                    .unwrap()
+                    .value,
+            )
+        };
+        // Each block's tokens at their positions (padding zero), through the
+        // packed reference of its expert's up and down weights.
+        let (order, table, used) = (read_i32(&order), read_i32(&table), read_i32(&used)[0] as usize);
+        let (h, f, tile) = (h as usize, f as usize, tile as usize);
+        let up_operand = packed::Packed::of(block.expert_up.element().metal_packing().unwrap(), 1);
+        let down_operand = packed::Packed::of(block.expert_down.element().metal_packing().unwrap(), 1);
+        let actual = output(&packed);
+        let reference = output(&default);
+        let mut worst = 0f64;
+        for b in 0..used {
+            let expert = table[b] as usize;
+            let sources = &order[b * tile..(b + 1) * tile];
+            let rows_host = &routing.normalized;
+            let x = sources
+                .iter()
+                .flat_map(|&row| (0..h).map(move |c| if row < 0 { 0.0 } else { bf16_round(rows_host[row as usize * h + c]) }))
+                .collect::<Vec<_>>();
+            let up = packed::reference(
+                up_operand,
+                h,
+                &x,
+                &[],
+                &block.routed.expert_up[expert * f * h..(expert + 1) * f * h],
+                None,
+            );
+            // Each product as the down GEMM reads it: bf16(relu(bf16(u))^2),
+            // monotone in u, over the up sum's interval (padding zero).
+            let product = |u: f64| {
+                let r = bf16_round(u as f32).max(0.0);
+                f64::from(bf16_round(r * r))
+            };
+            let (products, slack): (Vec<f32>, Vec<f64>) = (0..tile * f)
+                .map(|i| {
+                    if sources[i / f] < 0 {
+                        return (0.0, 0.0);
+                    }
+                    let (lo, hi) = (product(up.expected[i] - up.budget[i]), product(up.expected[i] + up.budget[i]));
+                    if lo == hi { (lo as f32, 0.0) } else { ((0.5 * (lo + hi)) as f32, 0.5 * (hi - lo)) }
+                })
+                .unzip();
+            let down = packed::reference(
+                down_operand,
+                f,
+                &products,
+                &slack,
+                &block.routed.expert_down[expert * h * f..(expert + 1) * h * f],
+                None,
+            );
+            for (t, &row) in sources.iter().enumerate() {
+                if row < 0 {
+                    continue;
+                }
+                let position = b * tile + t;
+                let values = actual_positions(&actual, position, h);
+                let window = packed::Reference {
+                    expected: down.expected[t * h..(t + 1) * h].to_vec(),
+                    budget: down.budget[t * h..(t + 1) * h].to_vec(),
+                };
+                let label = format!("packed routed_experts_up q2k rows {rows} position {position} (block {b}, expert {expert})");
+                worst = worst.max(packed::assert_within(&label, &window, &values, |_, expected, budget| {
+                    Float::Bf16.rounded_from_exact(budget, expected)
+                }));
+            }
+        }
+        eprintln!("packed routed_experts_up q2k rows {rows}: largest difference {worst:.2} of its budget");
+        let rms = |values: &mut dyn Iterator<Item = f64>| {
+            let (sum, count) = values.fold((0.0, 0usize), |(sum, count), value| (sum + value * value, count + 1));
+            (sum / count as f64).sqrt()
+        };
+        let (reference, actual) = (positioned(&reference, &positions, h), positioned(&actual, &positions, h));
+        let scale = rms(&mut reference.iter().copied());
+        assert!(scale > 0.0, "rows {rows}: the default form's outputs are not all zero");
+        let relative = rms(&mut reference.iter().zip(&actual).map(|(a, b)| a - b)) / scale;
+        eprintln!("packed routed_experts_up q2k rows {rows}: relative RMS difference from the default form {relative:.2e}");
+    }
+}
+
+/// Output position `position`'s `h` values of a grouped pass's rows.
+fn actual_positions(values: &[f32], position: usize, h: usize) -> Vec<f64> {
+    values[position * h..(position + 1) * h].iter().map(|&value| f64::from(value)).collect()
+}
+
+/// Each choice's output row (`positions`: its flat tile position) of a
+/// grouped pass's rows, in choice order.
+fn positioned(values: &[f32], positions: &[i32], h: usize) -> Vec<f64> {
+    positions.iter().flat_map(|&position| actual_positions(values, position as usize, h)).collect()
 }
 
 /// Dense bf16 experts in the grouped (prefill) expert GEMMs.

@@ -297,6 +297,14 @@ const VULKAN_BASE: seismic_vulkan::FormationTarget = seismic_vulkan::FormationTa
     denorm_preserve_32: true,
 };
 
+/// The Vulkan floor's cooperative-matrix target: the baseline with the
+/// matrix path formed, whose sources no baseline formation compiles.
+const VULKAN_MATRIX: seismic_vulkan::FormationTarget = seismic_vulkan::FormationTarget {
+    matrix: true,
+    matrix_hardware: true,
+    ..VULKAN_BASE
+};
+
 impl Former {
     fn open(backend: BackendName) -> Result<Self, CoverageError> {
         match backend {
@@ -349,14 +357,23 @@ impl Former {
         }
     }
 
+    /// The configuration a search starts from: the first of [`Self::bases`].
     fn base(&self) -> Configuration {
+        self.bases()[0]
+    }
+
+    /// The configurations every entry's base forms in ([`form_bases`]):
+    /// each source path a configuration selects, so a check that forms only
+    /// the bases still compiles every path. On Vulkan the floor baseline and
+    /// its cooperative-matrix target.
+    fn bases(&self) -> Vec<Configuration> {
         match self {
-            Self::Vulkan => Configuration::Vulkan(VULKAN_BASE),
-            Self::Cuda { architectures, .. } => Configuration::Cuda {
+            Self::Vulkan => vec![Configuration::Vulkan(VULKAN_BASE), Configuration::Vulkan(VULKAN_MATRIX)],
+            Self::Cuda { architectures, .. } => vec![Configuration::Cuda {
                 architecture: architectures[0],
-            },
+            }],
             #[cfg(target_os = "macos")]
-            Self::Metal { .. } => Configuration::Metal { tensor_ops: false },
+            Self::Metal { .. } => vec![Configuration::Metal { tensor_ops: false }],
         }
     }
 
@@ -1874,17 +1891,18 @@ impl Search {
     }
 }
 
-/// The base of `subject`'s search, formed and recorded in `search`: the first
-/// binding in candidate order that is admitted, implemented and not rejected
-/// by the toolchain.
+/// The base of `subject`'s search in `configuration`, formed and recorded in
+/// `search`: the first binding in candidate order that is admitted,
+/// implemented and not rejected by the toolchain.
 fn search_base(
     subject: &Subject<'_>,
     forms: Forms<'_>,
+    configuration: Configuration,
     search: &mut Search,
 ) -> Result<Option<Row>, CoverageError> {
     base_row(
         subject,
-        forms.former.base(),
+        configuration,
         |row, mut evaluated| {
             search
                 .universe
@@ -1905,7 +1923,7 @@ fn search_base(
 
 fn search(subject: &Subject<'_>, forms: Forms<'_>) -> Result<Option<Search>, CoverageError> {
     let mut search = Search::default();
-    let base = search_base(subject, forms, &mut search)?;
+    let base = search_base(subject, forms, forms.former.base(), &mut search)?;
     let Some(base) = base else {
         return Ok(None);
     };
@@ -2349,12 +2367,13 @@ pub fn cover(
     Ok(coverage)
 }
 
-/// Form the base configuration of every native implementation of `module`
-/// with `toolchain`, through `forming`, in parallel across entries: each
-/// entry's first binding in candidate order that is admitted and
-/// implemented, without [`cover`]'s search of the others. What a caller that
-/// must run on every change bounds by entry, one formation of each.
-/// `progress` counts the entries formed.
+/// Form the base of every native implementation of `module` in each of the
+/// backend's base configurations ([`Former::bases`]) with `toolchain`,
+/// through `forming`, in parallel across entries: each entry's first binding
+/// in candidate order that is admitted and implemented, without [`cover`]'s
+/// search of the others. What a caller that must run on every change bounds
+/// by entry, one formation of each per base configuration. `progress`
+/// counts the entries formed.
 pub fn form_bases(
     module: &CheckedModule,
     toolchain: &Toolchain,
@@ -2367,11 +2386,15 @@ pub fn form_bases(
     };
     let subjects = subjects(module, toolchain.backend())?;
     progress.begin(subjects.len());
+    let configurations = toolchain.former.bases();
     let bases = in_parallel(&subjects, |subject| {
         let mut search = Search::default();
-        let base = search_base(subject, forms, &mut search);
+        let mut implemented = true;
+        for configuration in &configurations {
+            implemented &= search_base(subject, forms, *configuration, &mut search)?.is_some();
+        }
         progress.advance();
-        base.map(|base| (base.is_some(), search))
+        Ok::<_, CoverageError>((implemented, search))
     });
     let mut coverage = Coverage::default();
     for (subject, base) in subjects.iter().zip(bases) {

@@ -40,8 +40,12 @@ use crate::types::DType;
 /// CUDA's forms, in emission order: the folded GEMM recipe (`GEMM_FOLD`),
 /// the int8 GEMM (`INT8`), the records GEMV (`GEMV_RECORDS`) and the int8
 /// GEMM's local scale codes multiplied into the codes (`INT8_LOCAL`), negated
-/// (`INT8_LOCAL_NEGATED`). [`cuda_forms`] values them in this order.
-const CUDA_FORMS: [&str; 5] = ["GEMM_FOLD", "INT8", "GEMV_RECORDS", "INT8_LOCAL", "INT8_LOCAL_NEGATED"];
+/// (`INT8_LOCAL_NEGATED`), whether its int8 codes are in entry order
+/// (`S8_ENTRIES`), and the shared bytes that bound the int8 GEMM's 128-row
+/// layout of the weight (`INT8_SHARED`, [`cuda_int8_shared`]). [`cuda_forms`]
+/// values them in this order.
+const CUDA_FORMS: [&str; 7] =
+    ["GEMM_FOLD", "INT8", "GEMV_RECORDS", "INT8_LOCAL", "INT8_LOCAL_NEGATED", "S8_ENTRIES", "INT8_SHARED"];
 
 /// Vulkan's forms: whether its packet decoder reads the weight (`DECODED`),
 /// and the bytes of the table its decoder stages in shared memory for it
@@ -51,12 +55,14 @@ const VULKAN_FORMS: [&str; 2] = ["DECODED", "TABLE"];
 
 /// Metal's forms, in emission order (`packets::Forms` reads those its
 /// library selects on). [`metal_forms`] values them in this order.
-const METAL_FORMS: [&str; 11] = [
+const METAL_FORMS: [&str; 13] = [
     "PACK",
     "PACK_CENTRE",
     "PACK_OFFSET",
     "PACK_RESIDUE",
     "PACK_FOLDS",
+    "PACK_SUMS",
+    "PACK_LANES",
     "INT8",
     "INT8_INTERLEAVED",
     "MATRIX_CODES",
@@ -315,7 +321,64 @@ fn cuda_forms(rows: &registry::PackedRowLayout, weight: &Weight, operands: Opera
         u32::from(rows.records()),
         u32::from(local.is_some()),
         u32::from(local == Some(true)),
+        // The int8 producer reads grid codes in entry order (a lane's eight
+        // codes of a row are one entry: `GridPlanes::s8_half`), every other
+        // weight's in slot order; a launch's int8 weights that share rows
+        // share one order (`dense.seismic`, `routed.seismic`).
+        u32::from(matches!(weight.axes.coding.codes(), ValueCodes::Grid(_))),
+        cuda_int8_shared(rows, &weight.axes, operands),
     ]
+}
+
+/// The shared bytes that bound the int8 GEMM's layout of one weight
+/// (`projection::GemmShape::LAYOUT_BYTES` of the 128-row band:
+/// `projection::LargeGemm`, 2 stages, 8 warps of one weight tile each), 0
+/// where the int8 GEMM does not take the weight (`cuda_int8`). A
+/// declaration admits two blocks an SM to the int8 GEMM of weights whose
+/// bound fits half an SM's shared memory (`dense.seismic`, `BLOCKS`), and
+/// declares it as the launch's shared bytes; the GEMM traps where its layout
+/// exceeds what its launch declares. Per stage: the activation rows (128
+/// rows of 64 codes at a pitch of 80 bytes, then each row's two 16-byte
+/// groups) and 8 tiles' codes of one k-block (16 rows of every code plane's
+/// bytes of 64 values); per record buffer (two): 128 rows' coefficient
+/// records of a 256-code superblock (each coefficient plane's bytes of it in
+/// whole words, the record in whole 16 bytes); per warp: its 16 rows'
+/// coefficients of a k-block (`GemmShape::COEF_ROW`: a scale, with a bias
+/// or local code where the weight has either, for each group of the
+/// k-block, in whole 16 bytes). Each term is the GEMM's own or more.
+fn cuda_int8_shared(rows: &registry::PackedRowLayout, axes: &registry::DecodeAxes, operands: OperandRecipe) -> u32 {
+    if !cuda_int8(axes, operands) {
+        return 0;
+    }
+    const STAGES: u64 = 2;
+    const ROWS: u64 = 128;
+    const WARPS: u64 = 8;
+    let group = u64::from(rows.packet.group);
+    let per = |plane: &registry::RowPlaneInfo, values: u64| (u64::from(plane.bytes_per_group) * values).div_ceil(group);
+    let mut codes = 0;
+    let mut words = 0;
+    for plane in &rows.planes {
+        match plane.content {
+            registry::RowPlaneContent::Codes { .. }
+            | registry::RowPlaneContent::Grids { .. }
+            | registry::RowPlaneContent::GridHigh { .. } => codes += per(plane, 64),
+            registry::RowPlaneContent::Groups { .. } => words += per(plane, 256).div_ceil(4),
+            // A records plane holds a group's entries and its factors
+            // together: bounded as codes and as coefficients both.
+            registry::RowPlaneContent::Records { .. } => {
+                codes += per(plane, 64);
+                words += per(plane, 256).div_ceil(4);
+            }
+        }
+    }
+    let profile = axes.profile();
+    let groups = 64 / u64::from(profile.local.group.min(64));
+    let single = profile.local.bias == Bias::None && matches!(profile.local.scale, LocalScale::Stored(_));
+    let coefficient_row = (groups * if single { 1 } else { 2 } * 4).next_multiple_of(16);
+    let stage = ROWS * 96 + 8 * 16 * codes;
+    let records = ROWS * (4 * words).next_multiple_of(16);
+    let bytes = STAGES * stage + 2 * records + WARPS * 16 * coefficient_row;
+    u32::try_from(bytes).expect("a layout of under 4 GiB")
 }
 
 /// Whether CUDA's GEMM multiplies the weight's exact codes and applies each
@@ -413,16 +476,17 @@ fn cuda_int8_local(weight: &Weight, operands: OperandRecipe) -> Option<bool> {
 
 /// Metal's forms, in the order of [`METAL_FORMS`]: the token-packing GEMM
 /// with its codes' entry and its operand's layout (`PACK`, `PACK_CENTRE`,
-/// `PACK_OFFSET`, `PACK_RESIDUE`, `PACK_FOLDS`; 0 where not admitted), the
-/// int8 GEMM with its operand's order (`INT8`, `INT8_INTERLEAVED`) and the
-/// matrix GEMV, by one of its three products or none (`MATRIX_CODES`,
-/// `MATRIX_RUNS` with its operands' type, `MATRIX_SYMMETRIC`; `MATRIX`
-/// whether one serves it, which a declaration offers its batched rows as the
-/// alternative to). Each admits
+/// `PACK_OFFSET`, `PACK_RESIDUE`, `PACK_FOLDS`, `PACK_SUMS`, and the most
+/// rows the packed-rows GEMV packs an element, `PACK_LANES`; 0 where not
+/// admitted), the int8 GEMM with its operand's order (`INT8`,
+/// `INT8_INTERLEAVED`) and the matrix GEMV, by one of its three products or
+/// none (`MATRIX_CODES`, `MATRIX_RUNS` with its operands' type,
+/// `MATRIX_SYMMETRIC`; `MATRIX` whether one serves it, which a declaration
+/// offers its batched rows as the alternative to). Each admits
 /// the weight on any device; whether a device runs the form (tensor
 /// operations) is the library's condition. One operand serves several weights of a declaration only
-/// where their operand layout (`PACK_FOLDS`, `PACK_RESIDUE`) or order
-/// (`INT8_INTERLEAVED`) agree.
+/// where their operand layout (`PACK_FOLDS`, `PACK_RESIDUE`, `PACK_SUMS`) or
+/// order (`INT8_INTERLEAVED`) agree.
 fn metal_forms(weight: &Weight) -> [u32; METAL_FORMS.len()] {
     let packing = metal_packing(weight);
     let int8 = metal_int8(weight);
@@ -433,6 +497,8 @@ fn metal_forms(weight: &Weight) -> [u32; METAL_FORMS.len()] {
         packing.map_or(0, |packing| packing.offset),
         packing.map_or(0, |packing| u32::from(packing.residue)),
         packing.map_or(0, |packing| packing.folds),
+        packing.map_or(0, |packing| u32::from(packing.sums)),
+        packing.map_or(0, |packing| packing.lanes),
         u32::from(int8.is_some()),
         u32::from(int8 == Some(MetalInt8::Nibbles)),
         u32::from(matrix == Some(MetalMatrix::Codes)),
@@ -472,6 +538,19 @@ pub struct MetalPacking {
     /// the entries are values of 8 bits, whose sums 16 bits a token do not
     /// hold at a useful gain.
     pub residue: bool,
+    /// Whether each of a block's two runs folds a min term of its own: the
+    /// operand then carries each run's code sums beside its scales, and the
+    /// weight's factors are each run's scale and min term.
+    pub sums: bool,
+    /// The most rows one operand element of the packed-rows GEMV carries
+    /// (`packing_lanes`), which a declaration offers as `PACKED_ROWS` up to
+    /// this: a lane's field pays for its run's largest code magnitude about
+    /// the centre, so codes of magnitude at most 2 (2-bit, ternary and +-1
+    /// entries) take 3, without residue bits (the 8-bit entries' layout).
+    /// Every other weight keeps 2. Which count serves a unit is the
+    /// tuner's, under admission. The token-packing GEMM packs two
+    /// (`packing_gemm_lanes`).
+    pub lanes: u32,
 }
 
 impl MetalPacking {
@@ -487,13 +566,15 @@ impl MetalPacking {
 /// storage other than packed rows, or which the form does not serve.
 pub fn metal_packing_of(id: RepresentationId) -> Option<MetalPacking> {
     let values = values(BackendName::Metal, id)?;
-    let [pack, centre, offset, residue, folds, ..] = *<&[u32; METAL_FORMS.len()]>::try_from(values)
+    let [pack, centre, offset, residue, folds, sums, lanes, ..] = *<&[u32; METAL_FORMS.len()]>::try_from(values)
         .expect("Metal's forms are valued in the order of its names");
     (pack == 1).then_some(MetalPacking {
         folds,
         centre,
         offset,
         residue: residue == 1,
+        sums: sums == 1,
+        lanes,
     })
 }
 
@@ -501,10 +582,11 @@ pub fn metal_packing_of(id: RepresentationId) -> Option<MetalPacking> {
 ///
 /// Its arithmetic requires integer values whose coefficients fold per run
 /// of a 32-column block: a factor per 256 columns over local codes, or
-/// direct groups of whole runs in 256 columns; and a block of two runs only
-/// without a bias term, (centre - offset) scale + bias. A power of two
-/// scaling the values (E2M1's halves) is in the coefficients, which the
-/// decoder folds it into.
+/// direct groups of whole runs in 256 columns. A block with a bias term,
+/// (centre - offset) scale + bias, folds it per run, so a block of two runs
+/// with one carries each run's code sums (`sums`). A power of two scaling
+/// the values (E2M1's halves) is in the coefficients, which the decoder
+/// folds it into.
 ///
 /// Its producer packs a weight's lane codes (`producers::lanes`) as entries,
 /// the values + `offset`, of the fewest bits that hold them centred as the
@@ -535,12 +617,20 @@ fn metal_packing(weight: &Weight) -> Option<MetalPacking> {
         Some(upper) => upper.group == 256,
         None => 256 % profile.local.group == 0,
     };
-    let requires = factors && (folds == 1 || !biased);
-    (requires && entries).then_some(MetalPacking {
+    // The centred codes' largest magnitude: entries are values + offset,
+    // centred at `centre`.
+    let centred = |code: i64| (code + i64::from(offset) - i64::from(centre)).unsigned_abs();
+    let magnitude = centred(profile.codes.least.into()).max(centred(profile.codes.greatest.into()));
+    let residue = bits == 8;
+    let sums = folds == 2 && biased;
+    let lanes = if !residue && magnitude <= 2 { 3 } else { 2 };
+    (factors && entries).then_some(MetalPacking {
         folds,
         centre,
         offset,
-        residue: bits == 8,
+        residue,
+        sums,
+        lanes,
     })
 }
 
@@ -990,113 +1080,115 @@ mod tests {
     }
 
     /// Metal's admissions of every representation it imports: PACK (folds,
-    /// centre, offset, residue), INT8 and the matrix GEMV product, as
+    /// centre, offset, residue, sums, lanes), INT8 and the matrix GEMV product, as
     /// `metal_packing`, `metal_int8` and `metal_matrix` admit each over the
     /// lane codes `producers::lanes` delivers (every code-plane split up to 8
-    /// bits, codebook and grid of `i8` values; no odd codes).
+    /// bits, one-bit odd codes, codebook and grid of `i8` values).
     #[test]
     fn metal_admissions_are_pinned() {
-        let pack = |folds, centre, offset, residue| {
+        let pack = |folds, centre, offset, residue, lanes| {
             Some(MetalPacking {
                 folds,
                 centre,
                 offset,
                 residue,
+                sums: false,
+                lanes,
             })
         };
         let expected = [
-            ("q4k", pack(1, 8, 0, false), Some(MetalInt8::Nibbles), Some(MetalMatrix::Codes)),
-            ("q5k", pack(1, 16, 0, false), None, Some(MetalMatrix::Codes)),
+            ("q4k", pack(1, 8, 0, false, 2), Some(MetalInt8::Nibbles), Some(MetalMatrix::Codes)),
+            ("q5k", pack(1, 16, 0, false, 2), None, Some(MetalMatrix::Codes)),
             (
                 "q6k",
-                pack(2, 32, 32, false),
+                pack(2, 32, 32, false, 2),
                 None,
                 Some(MetalMatrix::Runs { halves: false }),
             ),
             (
                 "q8g32s",
-                pack(1, 128, 128, true),
+                pack(1, 128, 128, true, 2),
                 Some(MetalInt8::Bytes),
                 Some(MetalMatrix::Symmetric),
             ),
             (
                 "q4g32s",
-                pack(1, 8, 8, false),
+                pack(1, 8, 8, false, 2),
                 None,
                 Some(MetalMatrix::Symmetric),
             ),
             (
                 "iq4g32s",
-                pack(1, 128, 128, true),
+                pack(1, 128, 128, true, 2),
                 None,
                 Some(MetalMatrix::Symmetric),
             ),
             (
                 "q5g32s",
-                pack(1, 16, 16, false),
+                pack(1, 16, 16, false, 2),
                 None,
                 Some(MetalMatrix::Symmetric),
             ),
-            ("q5g32", pack(1, 16, 0, false), None, Some(MetalMatrix::Symmetric)),
-            ("mxfp4g32", pack(1, 16, 16, false), None, Some(MetalMatrix::Symmetric)),
-            ("nvfp4g16", pack(2, 16, 16, false), None, None),
-            ("nvfp4g16a4", pack(2, 16, 16, false), None, None),
+            ("q5g32", pack(1, 16, 0, false, 2), None, Some(MetalMatrix::Symmetric)),
+            ("mxfp4g32", pack(1, 16, 16, false, 2), None, Some(MetalMatrix::Symmetric)),
+            ("nvfp4g16", pack(2, 16, 16, false, 2), None, None),
+            ("nvfp4g16a4", pack(2, 16, 16, false, 2), None, None),
             (
                 "iq2xs",
-                pack(2, 64, 64, false),
+                pack(2, 64, 64, false, 2),
                 None,
                 Some(MetalMatrix::Runs { halves: true }),
             ),
             (
                 "iq3xxs",
-                pack(1, 64, 64, false),
+                pack(1, 64, 64, false, 2),
                 None,
                 Some(MetalMatrix::Runs { halves: true }),
             ),
-            ("iq2xxs", pack(1, 64, 64, false), None, None),
-            ("q4g32", pack(1, 8, 0, false), None, Some(MetalMatrix::Symmetric)),
-            ("q2k", None, None, None),
+            ("iq2xxs", pack(1, 64, 64, false, 2), None, None),
+            ("q4g32", pack(1, 8, 0, false, 2), None, Some(MetalMatrix::Symmetric)),
+            ("q2k", Some(MetalPacking { folds: 2, centre: 2, offset: 0, residue: false, sums: true, lanes: 3 }), None, None),
             (
                 "q2g256",
-                pack(1, 4, 4, false),
+                pack(1, 4, 4, false, 3),
                 None,
                 Some(MetalMatrix::Symmetric),
             ),
             (
                 "q2g64",
-                pack(1, 4, 4, false),
+                pack(1, 4, 4, false, 3),
                 None,
                 Some(MetalMatrix::Symmetric),
             ),
-            ("q1g128", None, None, None),
+            ("q1g128", pack(1, 2, 2, false, 3), None, Some(MetalMatrix::Symmetric)),
             (
                 "iq2s",
-                pack(2, 64, 64, false),
+                pack(2, 64, 64, false, 2),
                 None,
                 Some(MetalMatrix::Runs { halves: true }),
             ),
-            ("iq1s", pack(1, 2, 2, false), None, None),
+            ("iq1s", pack(1, 2, 2, false, 3), None, None),
             (
                 "iq1m",
-                pack(2, 16, 16, false),
+                pack(2, 16, 16, false, 2),
                 None,
                 Some(MetalMatrix::Runs { halves: true }),
             ),
             (
                 "q3k",
-                pack(2, 4, 4, false),
+                pack(2, 4, 4, false, 2),
                 None,
                 Some(MetalMatrix::Runs { halves: true }),
             ),
             (
                 "iq4xs",
-                pack(1, 128, 128, true),
+                pack(1, 128, 128, true, 2),
                 None,
                 Some(MetalMatrix::Runs { halves: false }),
             ),
             (
                 "iq3s",
-                pack(1, 16, 16, false),
+                pack(1, 16, 16, false, 2),
                 None,
                 Some(MetalMatrix::Runs { halves: true }),
             ),
@@ -1260,8 +1352,8 @@ mod tests {
     /// 32 KiB floor wherever its own region does. A pair of iq1_s weights
     /// (`dense_expand`, 32 KiB of tables) forms with every region within the
     /// floor and its tables read in place; one iq1_s weight (`dense_output`,
-    /// 16 KiB) is held by the GEMM's region and not the GEMV's; iq2_xxs's
-    /// 2 KiB grid by both.
+    /// 16 KiB) is held by the GEMM's region and by the GEMV's, which stages
+    /// fewer packets at once to hold it; iq2_xxs's 2 KiB grid by both.
     #[test]
     fn vulkan_tables_are_held_where_every_device_holds_them() {
         const DECODING: [&str; 11] = [
@@ -1325,7 +1417,7 @@ mod tests {
         };
         for (regions, gemv, gemm) in [
             (expand, false, false),
-            (output(iq1s), false, true),
+            (output(iq1s), true, true),
             (output(id("iq2xxs@rows16")), true, true),
         ] {
             assert!(!regions.is_empty(), "the projection decodes");

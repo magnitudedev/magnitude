@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::bound::{Float, Form, Library, Products, assert_within};
+use common::bound::{Float, Form, Library, Products, assert_within, silu_f64, silu_product_from_exact};
 use magnitude_kernels::constants::VERIFY_ROWS;
 use magnitude_kernels::{
     attention_output, attention_project, dense_expand, dense_output, dense_up, embedding_rows,
@@ -29,6 +29,7 @@ mod declared;
 mod gguf_formats;
 mod int8_rule;
 mod operands;
+mod packed;
 
 use gguf_formats::{Format, Rng, gguf_format_tests};
 use magnitude_ggml::Encoding;
@@ -547,19 +548,12 @@ fn slack_dot(slack: &[f64], w: &[f32]) -> f64 {
 // Device helpers.
 
 /// Metal on macOS, elsewhere Vulkan when present (rows16 is the resident
-/// layout of both), and the CPU device.
+/// layout of both), and the CPU device; a requested backend among them alone
+/// ([`seismic_native_tests::first_and_cpu`]).
 fn devices() -> Vec<Device> {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    let gpu = if cfg!(target_os = "macos") {
-        Some(catalog.open_backend(seismic::BackendName::Metal).unwrap())
-    } else {
-        catalog.open_backend(seismic::BackendName::Vulkan).ok()
-    };
-    gpu.into_iter()
-        .chain(std::iter::once(
-            catalog.open_backend(seismic::BackendName::Cpu).unwrap(),
-        ))
-        .collect()
+    use seismic::BackendName::{Cpu, Metal, Vulkan};
+    let gpu = if cfg!(target_os = "macos") { Metal } else { Vulkan };
+    seismic_native_tests::first_and_cpu(&[gpu], &[gpu, Cpu])
 }
 
 /// `specialization` with the clamp's static LB at `word`, on the GPU
@@ -639,6 +633,12 @@ struct Mapping {
     batch_parts: u64,
     /// `dense_output`'s INT8 tile rows on Metal (INT8_TILE).
     int8_tile: u64,
+    /// The GEMV launches' activation staging (STAGE) on Metal and Vulkan:
+    /// Metal takes it under TILED 0 and LANES below 32, Vulkan at LANES
+    /// below 32.
+    stage: u64,
+    /// The Vulkan dense GEMV's codes decoded by logic and adds (DECODE).
+    decode: u64,
 }
 
 /// A tall GEMM threadgroup: TALL_M rows, TALL_K columns per stage, STAGERS
@@ -674,6 +674,8 @@ const fn gemm_mapping(tile_m: u64, tile_n: u64, split: u64) -> Mapping {
         tiled: 0,
         batch_parts: 2,
         int8_tile: 128,
+        stage: 0,
+        decode: 0,
     }
 }
 
@@ -693,6 +695,8 @@ const MAPPINGS: [Mapping; 4] = [
         tiled: 0,
         batch_parts: 2,
         int8_tile: 128,
+        stage: 0,
+        decode: 1,
     },
     Mapping {
         simdgroups: 2,
@@ -709,6 +713,8 @@ const MAPPINGS: [Mapping; 4] = [
         tiled: 1,
         batch_parts: 1,
         int8_tile: 128,
+        stage: 1,
+        decode: 0,
     },
     Mapping {
         simdgroups: 32,
@@ -725,6 +731,8 @@ const MAPPINGS: [Mapping; 4] = [
         tiled: 1,
         batch_parts: 4,
         int8_tile: 128,
+        stage: 0,
+        decode: 0,
     },
     Mapping {
         simdgroups: 16,
@@ -741,6 +749,8 @@ const MAPPINGS: [Mapping; 4] = [
         tiled: 0,
         batch_parts: 2,
         int8_tile: 128,
+        stage: 1,
+        decode: 1,
     },
 ];
 
@@ -816,6 +826,12 @@ fn specialization_on(
         specialization
             .with_param("BATCH_SIMDGROUPS", mapping.batch_simdgroups)
             .with_param("BATCH_ROWS", mapping.batch_rows)
+    } else if device.backend() == BackendName::Vulkan {
+        specialization
+            .with_param("SUB_M", mapping.sub_m)
+            .with_param("SUB_N", mapping.sub_n)
+            .with_param("STAGE", mapping.stage)
+            .with_param("DECODE", mapping.decode)
     } else {
         specialization
             .with_param("SUB_M", mapping.sub_m)
@@ -870,7 +886,8 @@ fn scoped_projection_specialization_on<E: seismic::Entry>(
 
 /// `mapping`'s GEMV threadgroup on the Metal launches for three rows up to
 /// VERIFY_ROWS and for two rows of an entry that launches its GEMV per row
-/// count.
+/// count, and on a single projection's packed-rows launch, whose form
+/// (PACKED_ROWS) is off.
 fn with_gemv_rows<E: seismic::Entry>(
     device: &Device,
     specialization: NativeSpecialization,
@@ -879,6 +896,13 @@ fn with_gemv_rows<E: seismic::Entry>(
     if device.backend() != BackendName::Metal {
         return specialization;
     }
+    let specialization = match common::metal_launch_of::<E>("gemv_packed") {
+        Some(packed) => specialization
+            .with_param("PACKED_ROWS", 0)
+            .with_launch_param(packed, "SIMDGROUPS", mapping.simdgroups)
+            .with_launch_param(packed, "ROWS", mapping.rows),
+        None => specialization,
+    };
     ["gemv_rows", "gemv_pair"].into_iter().fold(specialization, |specialization, launch| {
         let launch = common::metal_launch::<E>(launch);
         specialization
@@ -939,6 +963,8 @@ fn with_projection_forms<E: seismic::Entry>(
         .with_param("TILED", mapping.tiled)
         .with_param("SMALL", 1)
         .with_param("PACK", 0)
+        // Metal stages F32 activations only in its row-mapping GEMV (TILED 0).
+        .with_param("STAGE", if mapping.tiled == 0 { mapping.stage } else { 0 })
         .with_launch_param(common::metal_launch::<E>("batch"), "BATCH_PARTS", mapping.batch_parts)
 }
 
@@ -1125,7 +1151,7 @@ fn pack_mapping() -> Mapping {
     }
 }
 
-/// Every PACK tile launch.
+/// Every PACK tile launch; the first is the default tile.
 fn pack_tiles() -> Vec<Pack> {
     let mut all = Vec::new();
     for tokens in [4, 2] {
@@ -1266,9 +1292,10 @@ const PAIRED_LAUNCHES: [&str; 14] = [
     "gemv", "batch", "gemm_small", "gemm", "tall", "quantize", "coefficients", "int8", "gemv_rows", "gemv_pair",
     "pack", "pack_coefficients", "packed", "unpacked",
 ];
-const SINGLE_LAUNCHES: [&str; 17] = [
+const SINGLE_LAUNCHES: [&str; 18] = [
     "gemv", "batch", "gemm_small", "reduce_small", "gemm", "reduce", "relayout", "tall", "quantize",
-    "coefficients", "int8", "gemv_rows", "gemv_pair", "pack", "pack_coefficients", "packed", "unpacked",
+    "coefficients", "int8", "gemv_rows", "gemv_packed", "gemv_pair", "pack", "pack_coefficients", "packed",
+    "unpacked",
 ];
 const SEGMENTED_LAUNCHES: [&str; 11] = [
     "gemv", "batch", "gemm_small", "gemm", "tall", "gemv_rows", "gemv_pair", "pack", "pack_coefficients", "packed",
@@ -1313,6 +1340,30 @@ fn metal_projecting_entries_check_to_their_projections_launches() {
             .unwrap_or_else(|| panic!("`{entry}` has a Metal implementation"));
         let launches = native.launches.iter().map(|launch| launch.kernel.clone()).collect::<Vec<_>>();
         assert_eq!(launches, expected, "`{entry}`'s Metal launches");
+    }
+}
+
+/// The `dense` projection's F32 activation staging (STAGE) is declared only
+/// where the row-mapping GEMV reads it: an entry over weights takes both
+/// values, a plane set (the exact view's recipe, the 4-bit view) only 0.
+#[test]
+fn metal_activation_staging_is_declared_only_over_the_row_mapping() {
+    let module = crate::common::kernels();
+    for (entry, values) in [
+        ("dense_output", vec![0, 1]),
+        ("dense_expand", vec![0, 1]),
+        ("readout_top_rows", vec![0]),
+        ("readout_planes_rows", vec![0]),
+    ] {
+        let id = module.entry_named(entry).unwrap_or_else(|| panic!("`{entry}` is declared"));
+        let native = module
+            .native_implementation(id, BackendName::Metal)
+            .unwrap_or_else(|| panic!("`{entry}` has a Metal implementation"));
+        let stage = native
+            .declared_params()
+            .find(|parameter| parameter.name == "STAGE")
+            .unwrap_or_else(|| panic!("`{entry}` declares STAGE"));
+        assert_eq!(stage.values, values, "`{entry}`'s STAGE");
     }
 }
 
@@ -2397,13 +2448,29 @@ fn dense_output_native_arithmetic(
         specialization,
         &[("A", act.element()), ("DW", down.repr.resident(&device))],
     );
+    dense_output_call(device, act, down, residual, rows, product, out_rows, &specialization, &absent_bound(device))
+}
+
+/// `dense_output` under `specialization`, its bound port `bound`.
+fn dense_output_call(
+    device: &Device,
+    act: Act,
+    down: &Weight,
+    residual: &[f32],
+    rows: usize,
+    product: &[f32],
+    out_rows: &[i32],
+    specialization: &NativeSpecialization,
+    bound: &Tensor,
+) -> Vec<f32> {
+    let (h, f) = (down.rows, down.k);
     let kernel = declared::prepared(
         device,
         &dense_output::native_entry_with(dense_output::Elements {
             A: act.element(),
-            DW: down.repr.resident(&device),
+            DW: down.repr.resident(device),
         }),
-        &specialization,
+        specialization,
     )
     .unwrap();
     let out = kernel
@@ -2413,7 +2480,7 @@ fn dense_output_native_arithmetic(
             down_weight: &down.tensor(device),
             out_rows: &i32_tensor(device, &[out_rows.len()], out_rows),
             down_scale: &f32_tensor(device, &[0], &[]),
-            down_bound: &absent_bound(device),
+            down_bound: bound,
         })
         .unwrap()
         .value;
@@ -2704,10 +2771,40 @@ fn project_rows_native(
     read_f32(&out)
 }
 
+/// The packed operand (`packed::Packed`) of the PACK tile launch `pack` over
+/// one weight of `repr` on `device`, a weight the form admits.
+fn packed_operand(device: &Device, repr: Repr, pack: Pack) -> packed::Packed {
+    let packing = repr.resident(device).metal_packing().expect("a weight the PACK form admits");
+    packed::Packed::of(packing, pack.residue)
+}
+
+/// The inputs a packed form is judged on: the rows as drawn, then silenced
+/// so that every run accumulator is exact (`packed::Silence`), which leaves
+/// the reference's budget at the F16 fold's rounding.
+fn packed_inputs(x: &[f32], k: usize) -> [(&'static str, Vec<f32>); 3] {
+    [
+        ("drawn", x.to_vec()),
+        ("bottom lane silent", packed::silenced(x, k, packed::Silence::Bottom)),
+        ("bottom lane alone", packed::silenced(x, k, packed::Silence::Others)),
+    ]
+}
+
+/// The PACK tile launches a packed agreement test runs: every tile, and
+/// with residue bits beside, the wide residue.
+fn packed_launches(device: &Device, repr: Repr) -> Vec<Pack> {
+    let mut all = pack_tiles();
+    if repr.takes_residue(device) {
+        all.push(PACK_WIDE);
+    }
+    all
+}
+
 /// Metal's tall and PACK forms of the plain projection over a format the
 /// PACK form admits (`Element::metal_packing`; a generated test a format):
-/// the tall tile gives the staged tile's bits; the PACK form differs from
-/// them by the packed form's error.
+/// the tall tile gives the staged tile's bits; the PACK form, at each
+/// residue width, is its packed reference's (`packed`) within its budget,
+/// on drawn rows and on rows silenced for an exact accumulator, and every
+/// tile launch gives the same bits.
 fn metal_tall_and_packed_project_rows_agree_with_the_staged_form(format: Format) {
     let Some(device) = devices()
         .into_iter()
@@ -2721,50 +2818,48 @@ fn metal_tall_and_packed_project_rows_agree_with_the_staged_form(format: Format)
     if repr.resident(&device).metal_packing().is_none() {
         return;
     }
-    {
-        let (outputs, k) = (192, 1024);
-        let weight = weight(repr, outputs, k, 97, 1.0);
-        for rows in [128usize, 200, 512] {
-            let mut rng = Rng::new(rows as u64 + 98);
-            let source = (0..rows * k).map(|_| rng.symmetric()).collect::<Vec<_>>();
-            let exact = project_rows_native(&device, act, &weight, &source, staged, None);
-            let tall = project_rows_native(&device, act, &weight, &source, pack_mapping(), None);
-            assert!(
-                exact
-                    .iter()
-                    .zip(&tall)
-                    .all(|(a, b)| a.to_bits() == b.to_bits()),
-                "tall project_rows {repr:?} rows {rows} differs from the staged tile"
-            );
-            let mut first: Option<Vec<f32>> = None;
-            for pack in pack_tiles() {
-                let packed =
-                    project_rows_native(&device, act, &weight, &source, pack_mapping(), Some(pack));
-                // Every tile launch gives the same bits.
-                let first = first.get_or_insert_with(|| packed.clone());
-                assert!(
-                    first
-                        .iter()
-                        .zip(&packed)
-                        .all(|(a, b)| a.to_bits() == b.to_bits()),
-                    "packed project_rows {repr:?} rows {rows} {pack:?} differs from {PACK_DEFAULT:?}"
-                );
-                let wide = |values: &[f32]| {
-                    values
-                        .iter()
-                        .map(|value| f64::from(*value))
-                        .collect::<Vec<_>>()
-                };
-                let (relative, worst) = relative_difference(&wide(&exact), &wide(&packed));
-                if pack == PACK_DEFAULT {
-                    eprintln!(
-                        "packed project_rows {repr:?} rows {rows}: relative RMS error {relative:.2e}, largest {worst:.2e} reference RMS"
+    let (outputs, k) = (192, 1024);
+    let weight = weight(repr, outputs, k, 97, 1.0);
+    let (bound, bound_extent) = weight.bound(&device);
+    let squares = (bound_extent > 0).then(|| read_f32(&bound));
+    let wide = |values: &[f32]| values.iter().map(|value| f64::from(*value)).collect::<Vec<_>>();
+    for rows in [128usize, 200, 512] {
+        let mut rng = Rng::new(rows as u64 + 98);
+        let source = (0..rows * k).map(|_| act.round(rng.symmetric())).collect::<Vec<_>>();
+        let exact = project_rows_native(&device, act, &weight, &source, staged, None);
+        let tall = project_rows_native(&device, act, &weight, &source, pack_mapping(), None);
+        assert!(
+            exact.iter().zip(&tall).all(|(a, b)| a.to_bits() == b.to_bits()),
+            "tall project_rows {repr:?} rows {rows} differs from the staged tile"
+        );
+        let mut first: Option<Vec<f32>> = None;
+        for pack in packed_launches(&device, repr) {
+            let operand = packed_operand(&device, repr, pack);
+            // Tiles past the default give the same bits, on drawn rows.
+            let judged = pack == PACK_DEFAULT || pack.residue != 1;
+            for (input, x) in packed_inputs(&source, k).into_iter().filter(|(input, _)| judged || *input == "drawn") {
+                let packed = project_rows_native(&device, act, &weight, &x, pack_mapping(), Some(pack));
+                if input == "drawn" && pack.residue == 1 {
+                    // Every tile launch gives the same bits.
+                    let first = first.get_or_insert_with(|| packed.clone());
+                    assert!(
+                        first.iter().zip(&packed).all(|(a, b)| a.to_bits() == b.to_bits()),
+                        "packed project_rows {repr:?} rows {rows} {pack:?} differs from the default tile"
                     );
                 }
-                assert!(
-                    relative <= 1.5e-2 && worst <= 0.1,
-                    "packed project_rows {repr:?} rows {rows} {pack:?}: relative RMS error {relative:.2e}, largest {worst:.2e}"
-                );
+                if !judged {
+                    continue;
+                }
+                let reference = packed::reference(operand, k, &x, &[], &weight.values, squares.as_deref());
+                let label = format!("packed project_rows {repr:?} rows {rows} {pack:?} {input}");
+                let worst = packed::assert_within(&label, &reference, &wide(&packed), |_, expected, budget| {
+                    Float::F32.rounded_from_exact(budget, expected)
+                });
+                eprintln!("{label}: largest difference {worst:.2} of its budget");
+                if input == "drawn" {
+                    let (relative, _) = relative_difference(&wide(&exact), &wide(&packed));
+                    eprintln!("{label}: relative RMS difference from the staged form {relative:.2e}");
+                }
             }
         }
     }
@@ -2794,34 +2889,15 @@ fn dense_output_packed(
         specialization,
         &[("A", act.element()), ("DW", down.repr.resident(device))],
     );
-    let kernel = declared::prepared(
-        device,
-        &dense_output::native_entry_with(dense_output::Elements {
-            A: act.element(),
-            DW: down.repr.resident(device),
-        }),
-        &specialization,
-    )
-    .unwrap();
-    let out = kernel
-        .call(dense_output::Args {
-            residual: &f32_tensor(device, &[rows, h], residual),
-            product: &act_tensor(device, act, &[out_rows.len(), f], product),
-            down_weight: &down.tensor(device),
-            out_rows: &i32_tensor(device, &[out_rows.len()], out_rows),
-            down_scale: &f32_tensor(device, &[0], &[]),
-            down_bound: &bound,
-        })
-        .unwrap()
-        .value;
-    read_f32(&out)
+    dense_output_call(device, act, down, residual, rows, product, out_rows, &specialization, &bound)
 }
 
-/// Metal's PACK form of the down projection: integer activation codes per
-/// (row, 32 columns), two rows packed per operand element against the exact
-/// codes of a format the form admits (a generated test a format). Its
-/// results differ from the staged form's by the activation rounding, the
-/// packed accumulator's rounding and the F16 fold.
+/// Metal's PACK form of the down projection over a format the form admits
+/// (a generated test a format), as for the plain projection
+/// (`metal_tall_and_packed_project_rows_agree_with_the_staged_form`): at
+/// each residue width its projection (less the exact residual) is the
+/// packed reference's within its budget and the F32 sum with the residual,
+/// on drawn and silenced rows, and every tile launch gives the same bits.
 fn metal_packed_dense_output_agrees_with_the_staged_form(format: Format) {
     let Some(device) = devices()
         .into_iter()
@@ -2835,21 +2911,96 @@ fn metal_packed_dense_output_agrees_with_the_staged_form(format: Format) {
     if repr.resident(&device).metal_packing().is_none() {
         return;
     }
-    {
-        let (outputs, k) = (192, 1024);
-        let down = weight(repr, outputs, k, 91, 1.0);
-        for rows in [128usize, 200, 512] {
-            let mut rng = Rng::new(rows as u64 + 92);
-            let residual = (0..rows * outputs)
-                .map(|_| rng.symmetric())
-                .collect::<Vec<_>>();
+    let (outputs, k) = (192, 1024);
+    let down = weight(repr, outputs, k, 91, 1.0);
+    let (bound, bound_extent) = down.bound(&device);
+    let squares = (bound_extent > 0).then(|| read_f32(&bound));
+    for rows in [128usize, 200, 512] {
+        let mut rng = Rng::new(rows as u64 + 92);
+        let residual = (0..rows * outputs).map(|_| rng.symmetric()).collect::<Vec<_>>();
+        let product = (0..rows * k).map(|_| act.round(rng.symmetric())).collect::<Vec<_>>();
+        let out_rows = (0..rows as i32).collect::<Vec<_>>();
+        // The projection alone (the residual rows are exact in both).
+        let projected = |values: &[f32]| {
+            values.iter().zip(&residual).map(|(value, residual)| f64::from(value - residual)).collect::<Vec<_>>()
+        };
+        let exact = projected(&dense_output_native_arithmetic(
+            &device, act, &down, &residual, rows, &product, &out_rows, staged, false,
+        ));
+        let mut first: Option<Vec<f32>> = None;
+        for pack in packed_launches(&device, repr) {
+            let operand = packed_operand(&device, repr, pack);
+            // Tiles past the default give the same bits, on drawn rows.
+            let judged = pack == PACK_DEFAULT || pack.residue != 1;
+            for (input, x) in packed_inputs(&product, k).into_iter().filter(|(input, _)| judged || *input == "drawn") {
+                let packed = dense_output_packed(&device, act, &down, &residual, rows, &x, &out_rows, pack);
+                if input == "drawn" && pack.residue == 1 {
+                    // A sum is its element's tokens' and weight row's
+                    // alone: every tile launch gives the same bits.
+                    let first = first.get_or_insert_with(|| packed.clone());
+                    assert!(
+                        first.iter().zip(&packed).all(|(a, b)| a.to_bits() == b.to_bits()),
+                        "packed dense_output {repr:?} rows {rows} {pack:?} differs from the default tile"
+                    );
+                }
+                if !judged {
+                    continue;
+                }
+                let reference = packed::reference(operand, k, &x, &[], &down.values, squares.as_deref());
+                let label = format!("packed dense_output {repr:?} rows {rows} {pack:?} {input}");
+                let worst = packed::assert_within(&label, &reference, &projected(&packed), |i, expected, budget| {
+                    Float::F32.rounded_from_exact(budget, f64::from(residual[i]) + expected)
+                });
+                eprintln!("{label}: largest difference {worst:.2} of its budget");
+                if input == "drawn" {
+                    let (relative, _) = relative_difference(&exact, &projected(&packed));
+                    eprintln!("{label}: relative RMS difference from the staged form {relative:.2e}");
+                }
+            }
+        }
+    }
+}
+
+/// Metal's packed-rows GEMV of the down projection (`PACKED_ROWS` = N, each
+/// N its weight's PACK_LANES offers): N activation rows packed per operand
+/// element against the codes of a format the packed form admits without
+/// residue bits, at the decode and verification row counts (a generated
+/// test a format), under the weight's packing bound. It checks structure,
+/// not error, which admission judges: a sum is its packed rows' and weight
+/// row's alone, the same bits under every mapping of one LANES; and each
+/// output is the GEMV's within the form's certified budget, half a code
+/// step a column (the held scale `packing.h` certifies, over its rows'
+/// norms and the bound) and, for a group's bottom row, the accumulator's n
+/// roundings of a run (`packing_lanes::exponent`), with F32 rounding beside.
+fn metal_packed_rows_dense_output_agrees_with_the_gemv(format: Format) {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let repr = Repr::of(format);
+    let Some(packing) = repr.resident(&device).metal_packing() else {
+        return;
+    };
+    if packing.residue {
+        return;
+    }
+    let act = Act::Bf16;
+    let (outputs, k) = (192, 1024);
+    let down = weight(repr, outputs, k, 93, 1.0);
+    let (bound, bound_extent) = down.bound(&device);
+    let squares = if bound_extent > 0 { read_f32(&bound) } else { Vec::new() };
+    let run = 32 / packing.folds as usize;
+    let n = run as f64;
+    let centre = f64::from(packing.centre);
+    for lanes in 2..=(packing.lanes as usize).min(3) {
+        let fields = packed::Fields::new(lanes, 0, n);
+        for rows in [2usize, 3, 5, 8] {
+            let mut rng = Rng::new(rows as u64 + 94);
+            let residual = (0..rows * outputs).map(|_| rng.symmetric()).collect::<Vec<_>>();
             let product = (0..rows * k).map(|_| rng.symmetric()).collect::<Vec<_>>();
             let out_rows = (0..rows as i32).collect::<Vec<_>>();
-            let exact = dense_output_native_arithmetic(
-                &device, act, &down, &residual, rows, &product, &out_rows, staged, false,
-            );
-            let mut first: Option<Vec<f32>> = None;
-            // The projection alone (the residual rows are exact in both).
             let projected = |values: &[f32]| {
                 values
                     .iter()
@@ -2857,61 +3008,99 @@ fn metal_packed_dense_output_agrees_with_the_staged_form(format: Format) {
                     .map(|(value, residual)| f64::from(value - residual))
                     .collect::<Vec<_>>()
             };
-            let mut narrow = 0.0;
-            for pack in pack_tiles() {
-                let packed = dense_output_packed(
-                    &device, act, &down, &residual, rows, &product, &out_rows, pack,
+            let exact = projected(&dense_output_native_arithmetic(
+                &device, act, &down, &residual, rows, &product, &out_rows, MAPPINGS[0], false,
+            ));
+            // An upper bound on a row's code step a run (its held scale
+            // times its code step, over 64), as `packing_lane_scales`
+            // certifies it: its lane's sum limit at code step s against |x|_1
+            // and, under the bound, |x|_2, capped by its codes against
+            // |x|_inf; the bottom lane may take even codes (s = 2). Its F32
+            // norms and the held rounding are covered by a 2^-7 margin.
+            let step = |m: usize, r: usize| {
+                let x = (0..run).map(|c| f64::from(act.round(product[m * k + r * run + c]))).collect::<Vec<_>>();
+                let l1 = x.iter().map(|v| v.abs()).sum::<f64>();
+                let peak = x.iter().fold(0.0f64, |a, v| a.max(v.abs()));
+                let l2 = x.iter().map(|v| v * v).sum::<f64>().sqrt();
+                let lane = m % lanes;
+                let certified = |s: f64| {
+                    let bound = squares.get(r).map(|&b2| f64::from(b2));
+                    packed::certified_scale(&fields, lane, l1, l2 * l2, bound, centre, packing.folds as usize, s)
+                        .max(peak * 64.0 / fields.codes[lane])
+                };
+                let held = if lane == 0 { certified(1.0).max(2.0 * certified(2.0)) } else { certified(1.0) };
+                held * (1.0 + 2f64.powi(-7)) / 64.0
+            };
+            let mut first: Option<Vec<f32>> = None;
+            for mapping in MAPPINGS {
+                let specialization = with_matrix::<dense_output::Entry>(
+                    &device,
+                    dense_output_specialization_on(&device, &[("H", outputs), ("F", k)], mapping),
+                    &[("A", act.element()), ("DW", repr.resident(&device))],
+                )
+                .with_param("PACKED_ROWS", lanes as u64)
+                .with_param("TILED", 0)
+                .with_param("STAGE", 0)
+                .with_static("DB", bound_extent as u64);
+                let values = dense_output_call(
+                    &device, act, &down, &residual, rows, &product, &out_rows, &specialization, &bound,
                 );
-                // A sum is its token pair's and weight row's alone: every
-                // tile launch gives the same bits.
-                let first = first.get_or_insert_with(|| packed.clone());
-                assert!(
-                    first
-                        .iter()
-                        .zip(&packed)
-                        .all(|(a, b)| a.to_bits() == b.to_bits()),
-                    "packed dense_output {repr:?} rows {rows} {pack:?} differs from {PACK_DEFAULT:?}"
-                );
-                let (relative, worst) =
-                    relative_difference(&projected(&exact), &projected(&packed));
-                if pack == PACK_DEFAULT {
-                    narrow = relative;
-                    eprintln!(
-                        "packed dense_output {repr:?} rows {rows}: relative RMS error {relative:.2e}, largest {worst:.2e} reference RMS"
+                if mapping.lanes == MAPPINGS[0].lanes {
+                    let first = first.get_or_insert_with(|| values.clone());
+                    assert!(
+                        first.iter().zip(&values).all(|(a, b)| a.to_bits() == b.to_bits()),
+                        "packed rows dense_output {repr:?} rows {rows} N {lanes} {mapping:?} differs across mappings"
                     );
                 }
-                assert!(
-                    relative <= 1.5e-2 && worst <= 0.1,
-                    "packed dense_output {repr:?} rows {rows} {pack:?}: relative RMS error {relative:.2e}, largest {worst:.2e}"
-                );
-            }
-            // 8-bit values: two residue bits give the top sum one more bit,
-            // the top token half its step. With the pair's two errors alike
-            // the form's falls to sqrt((1/4 + 1) / 2) of it, 0.79.
-            if repr.takes_residue(&device) {
-                let packed = dense_output_packed(
-                    &device, act, &down, &residual, rows, &product, &out_rows, PACK_WIDE,
-                );
-                let (relative, worst) =
-                    relative_difference(&projected(&exact), &projected(&packed));
-                eprintln!(
-                    "packed dense_output {repr:?} rows {rows} RESIDUE 2: relative RMS error {relative:.2e}, largest {worst:.2e} reference RMS"
-                );
-                assert!(
-                    relative <= 0.8 * narrow && worst <= 0.1,
-                    "packed dense_output {repr:?} rows {rows} RESIDUE 2: relative RMS error {relative:.2e} against {narrow:.2e} with one"
-                );
+                let packed = projected(&values);
+                for m in 0..rows {
+                    for j in 0..outputs {
+                        let w = &down.values[j * k..(j + 1) * k];
+                        let mut budget = 0.0;
+                        let mut magnitude = 0.0;
+                        for r in 0..k / run {
+                            let w = &w[r * run..(r + 1) * run];
+                            let step = step(m, r);
+                            let absolute = w.iter().map(|v| f64::from(v.abs())).sum::<f64>();
+                            budget += step * 0.5 * absolute;
+                            if m % lanes == 0 {
+                                budget += step * n * 2f64.powi(fields.exponent - 25) * packed::run_factor(w);
+                            }
+                            magnitude += (0..run)
+                                .map(|c| f64::from(w[c].abs()) * f64::from(product[m * k + r * run + c].abs()))
+                                .sum::<f64>();
+                        }
+                        let difference = (packed[m * outputs + j] - exact[m * outputs + j]).abs();
+                        assert!(
+                            difference <= budget + 1e-5 * magnitude,
+                            "packed rows dense_output {repr:?} rows {rows} N {lanes} {mapping:?}: output ({m}, {j}) differs from the GEMV by {difference:.3e}, beyond its certified {budget:.3e}"
+                        );
+                    }
+                }
             }
         }
     }
 }
 
+/// The packed operand one PACK tile launch `pack` shares between weights of
+/// `reprs` (one layout): coded for the largest centre among them.
+fn shared_operand(device: &Device, reprs: &[Repr], pack: Pack) -> packed::Packed {
+    let operands = reprs.iter().map(|&repr| packed_operand(device, repr, pack)).collect::<Vec<_>>();
+    assert!(
+        operands.iter().all(|o| (o.folds, o.residue) == (operands[0].folds, operands[0].residue)),
+        "one operand serves weights of one layout: {reprs:?}"
+    );
+    packed::Packed { centre: operands.iter().map(|o| o.centre).max().unwrap(), ..operands[0] }
+}
+
 /// Metal's PACK form of the paired gate/up projection, as for the down
-/// projection: the GLU outputs differ from the staged form's by the packed
-/// form's error with gate and up weights one packed operand serves (Q4_K,
-/// Q5_K and q4g32s together, both Q6_K, or Q8_0 and iq4xs together), and are
-/// the staged tile's bit for bit on a device without the packed path; other
-/// pairs have no PACK configuration.
+/// projection, with gate and up weights one packed operand serves (Q4_K,
+/// Q5_K and q4g32s together, both Q6_K, or Q8_0 and iq4xs together; the
+/// 2-bit, ternary and +-1 weights q2k, q2g64, q2g256, q1g128 and iq1s): at
+/// each residue width, its gate and up sums are the packed reference's over
+/// the host's normed rows, and the GLU output the activation's of them
+/// within their budgets, on drawn rows and rows silenced for an exact
+/// accumulator; every tile launch gives the same bits. Other pairs have no PACK configuration.
 #[test]
 fn metal_packed_dense_expand_agrees_with_the_staged_form() {
     let Some(device) = devices()
@@ -2922,6 +3111,7 @@ fn metal_packed_dense_expand_agrees_with_the_staged_form() {
     };
     let act = Act::Bf16;
     let staged = gemm_mapping(64, 64, 1);
+    let library = Library::of(BackendName::Metal);
     for (gate_repr, up_repr, served) in [
         (Repr::Q4k, Repr::Q4k, true),
         (Repr::Q5k, Repr::Q4k, true),
@@ -2929,17 +3119,14 @@ fn metal_packed_dense_expand_agrees_with_the_staged_form() {
         (Repr::gguf(Encoding::Q4_0), Repr::gguf(Encoding::Q4_0), true),
         (Repr::gguf(Encoding::Q4_0), Repr::Q4k, true),
         (Repr::Q8, Repr::Q8, true),
-        (
-            Repr::gguf(Encoding::Iq4Xs),
-            Repr::gguf(Encoding::Iq4Xs),
-            true,
-        ),
+        (Repr::gguf(Encoding::Iq4Xs), Repr::gguf(Encoding::Iq4Xs), true),
         (Repr::gguf(Encoding::Iq4Xs), Repr::Q8, true),
-        (
-            Repr::gguf(Encoding::Iq4Nl),
-            Repr::gguf(Encoding::Iq4Nl),
-            true,
-        ),
+        (Repr::gguf(Encoding::Iq4Nl), Repr::gguf(Encoding::Iq4Nl), true),
+        (Repr::gguf(Encoding::Q2K), Repr::gguf(Encoding::Q2K), true),
+        (Repr::gguf(Encoding::Q2_0), Repr::gguf(Encoding::Q2_0), true),
+        (Repr::gguf(Encoding::Tq2_0), Repr::gguf(Encoding::Tq2_0), true),
+        (Repr::gguf(Encoding::Q1_0), Repr::gguf(Encoding::Q1_0), true),
+        (Repr::gguf(Encoding::Iq1S), Repr::gguf(Encoding::Iq1S), true),
         (Repr::Q4k, Repr::Q6k, false),
         (Repr::Q8, Repr::Q4k, false),
     ] {
@@ -2947,114 +3134,124 @@ fn metal_packed_dense_expand_agrees_with_the_staged_form() {
         let gate = weight(gate_repr, f, h, 93, 1.0);
         let up = weight(up_repr, f, h, 94, 1.0);
         let norm = norm_values(h, 95);
+        let (gate_bound, gate_bound_extent) = gate.bound(&device);
+        let (up_bound, up_bound_extent) = up.bound(&device);
+        let bound = (gate_bound_extent > 0 && up_bound_extent > 0)
+            .then(|| packed::served_bound(&[&read_f32(&gate_bound), &read_f32(&up_bound)]));
+        let run = |pack: Pack, residual: &[f32], rows: usize| {
+            let specialization = with_pack::<dense_expand::Entry>(
+                dense_expand_specialization_on(&device, &[("H", h), ("F", f)], pack_mapping()),
+                pack,
+            )
+            .with_static("GB", gate_bound_extent as u64)
+            .with_static("UB", up_bound_extent as u64);
+            let specialization = with_matrix::<dense_expand::Entry>(
+                &device,
+                specialization,
+                &[
+                    ("NW", Element::bf16()),
+                    ("GW", gate.repr.resident(&device)),
+                    ("UW", up.repr.resident(&device)),
+                    ("A", act.element()),
+                ],
+            );
+            let kernel = declared::prepared(
+                &device,
+                &dense_expand::native_entry_with(dense_expand::Elements {
+                    NW: Element::bf16(),
+                    GW: gate.repr.resident(&device),
+                    UW: up.repr.resident(&device),
+                    A: act.element(),
+                }),
+                &specialization,
+            )
+            .ok()?;
+            let out_rows = (0..rows as i32).collect::<Vec<_>>();
+            Some(read_act(
+                act,
+                &kernel
+                    .call(dense_expand::Args {
+                        residual: &f32_tensor(&device, &[rows, h], residual),
+                        norm: &bf16_norm(&device, &norm),
+                        gate_weight: &gate.tensor(&device),
+                        up_weight: &up.tensor(&device),
+                        out_rows: &i32_tensor(&device, &[rows], &out_rows),
+                        eps: 1e-6,
+                        activation: 0,
+                        glu_limit: &i32_tensor(&device, &[0, 0], &[]),
+                        gate_scale: &f32_tensor(&device, &[0], &[]),
+                        up_scale: &f32_tensor(&device, &[0], &[]),
+                        gate_bound: &gate_bound,
+                        up_bound: &up_bound,
+                    })
+                    .unwrap()
+                    .value,
+            ))
+        };
+        if !served {
+            assert!(run(PACK_DEFAULT, &[], 0).is_none(), "{gate_repr:?} {up_repr:?} have no PACK configuration");
+            continue;
+        }
+        let launches = packed_launches(&device, gate_repr)
+            .into_iter()
+            .filter(|pack| pack.residue == 1 || up.repr.takes_residue(&device))
+            .collect::<Vec<_>>();
         for rows in [128usize, 200, 512] {
             let mut rng = Rng::new(rows as u64 + 96);
             let residual = (0..rows * h).map(|_| rng.symmetric()).collect::<Vec<_>>();
             let out_rows = (0..rows as i32).collect::<Vec<_>>();
             let exact = dense_expand_native_arithmetic(
-                &device, act, &gate, &up, &residual, rows, &norm, &out_rows, 1e-6, None, staged,
-                false,
+                &device, act, &gate, &up, &residual, rows, &norm, &out_rows, 1e-6, None, staged, false,
             );
+            let wide = |values: &[f32]| values.iter().map(|value| f64::from(*value)).collect::<Vec<_>>();
             let mut first: Option<Vec<f32>> = None;
-            let (gate_bound, gate_bound_extent) = gate.bound(&device);
-            let (up_bound, up_bound_extent) = up.bound(&device);
-            // 8-bit values also take two residue bits.
-            let bytes = served
-                && gate_bound_extent > 0
-                && up_bound_extent > 0
-                && gate.repr.takes_residue(&device)
-                && up.repr.takes_residue(&device);
-            let mut narrow = 0.0;
-            for pack in pack_tiles().into_iter().chain(bytes.then_some(PACK_WIDE)) {
-                let specialization = with_pack::<dense_expand::Entry>(
-                    dense_expand_specialization_on(&device, &[("H", h), ("F", f)], pack_mapping()),
-                    pack,
-                )
-                .with_static("GB", gate_bound_extent as u64)
-                .with_static("UB", up_bound_extent as u64);
-                let specialization = with_matrix::<dense_expand::Entry>(
-                    &device,
-                    specialization,
-                    &[
-                        ("NW", Element::bf16()),
-                        ("GW", gate.repr.resident(&device)),
-                        ("UW", up.repr.resident(&device)),
-                        ("A", act.element()),
-                    ],
-                );
-                let kernel = declared::prepared(
-                    &device,
-                    &dense_expand::native_entry_with(dense_expand::Elements {
-                        NW: Element::bf16(),
-                        GW: gate.repr.resident(&device),
-                        UW: up.repr.resident(&device),
-                        A: act.element(),
-                    }),
-                    &specialization,
-                );
-                if !served {
-                    assert!(kernel.is_err(), "{gate_repr:?} {up_repr:?} have no PACK configuration");
-                    continue;
-                }
-                let kernel = kernel.unwrap();
-                let packed = read_act(
-                    act,
-                    &kernel
-                        .call(dense_expand::Args {
-                            residual: &f32_tensor(&device, &[rows, h], &residual),
-                            norm: &bf16_norm(&device, &norm),
-                            gate_weight: &gate.tensor(&device),
-                            up_weight: &up.tensor(&device),
-                            out_rows: &i32_tensor(&device, &[rows], &out_rows),
-                            eps: 1e-6,
-                            activation: 0,
-                            glu_limit: &i32_tensor(&device, &[0, 0], &[]),
-                            gate_scale: &f32_tensor(&device, &[0], &[]),
-                            up_scale: &f32_tensor(&device, &[0], &[]),
-                            gate_bound: &gate_bound,
-                            up_bound: &up_bound,
-                        })
-                        .unwrap()
-                        .value,
-                );
-                let wide = |values: &[f32]| {
-                    values
-                        .iter()
-                        .map(|value| f64::from(*value))
-                        .collect::<Vec<_>>()
-                };
-                let (relative, _) = relative_difference(&wide(&exact), &wide(&packed));
-                if pack.residue == 2 {
-                    // Two residue bits halve the top token's step (the
-                    // form's error to 0.79 of it with the pair's alike).
-                    eprintln!(
-                        "packed dense_expand {gate_repr:?} {up_repr:?} rows {rows} RESIDUE 2: relative RMS error {relative:.2e}"
-                    );
+            for pack in launches.iter().copied() {
+                let judged = pack == PACK_DEFAULT || pack.residue != 1;
+                if pack.residue == 1 {
+                    // Every tile launch gives the same bits.
+                    let packed = run(pack, &residual, rows).unwrap();
+                    if pack == PACK_DEFAULT {
+                        let (relative, _) = relative_difference(&wide(&exact), &wide(&packed));
+                        eprintln!(
+                            "packed dense_expand {gate_repr:?} {up_repr:?} rows {rows}: relative RMS difference from the staged form {relative:.2e}"
+                        );
+                    }
+                    let first = first.get_or_insert_with(|| packed.clone());
                     assert!(
-                        relative <= 0.8 * narrow,
-                        "packed dense_expand {gate_repr:?} {up_repr:?} rows {rows} RESIDUE 2: relative RMS error {relative:.2e} against {narrow:.2e} with one"
+                        first.iter().zip(&packed).all(|(a, b)| a.to_bits() == b.to_bits()),
+                        "packed dense_expand {gate_repr:?} {up_repr:?} rows {rows} {pack:?} differs from the default tile"
                     );
+                }
+                if !judged {
                     continue;
                 }
-                // Every tile launch gives the same bits.
-                let first = first.get_or_insert_with(|| packed.clone());
-                assert!(
-                    first
-                        .iter()
-                        .zip(&packed)
-                        .all(|(a, b)| a.to_bits() == b.to_bits()),
-                    "packed dense_expand {gate_repr:?} {up_repr:?} rows {rows} {pack:?} differs from {PACK_DEFAULT:?}"
-                );
-                if pack == PACK_DEFAULT {
-                    narrow = relative;
-                    eprintln!(
-                        "packed dense_expand {gate_repr:?} {up_repr:?} rows {rows}: relative RMS error {relative:.2e}"
-                    );
+                let operand = shared_operand(&device, &[gate_repr, up_repr], pack);
+                for (input, residual) in packed_inputs(&residual, h) {
+                    let packed = run(pack, &residual, rows).unwrap();
+                    let (normed, slack): (Vec<_>, Vec<_>) = (0..rows)
+                        .map(|r| rms_row(BackendName::Metal, act, &residual[r * h..(r + 1) * h], &norm, 1e-6))
+                        .unzip();
+                    let (normed, slack) = (normed.concat(), slack.concat());
+                    let sums = [&gate, &up]
+                        .map(|weight| packed::reference(operand, h, &normed, &slack, &weight.values, bound.as_deref()));
+                    let [g, u] = &sums;
+                    let glu = packed::Reference {
+                        expected: g.expected.iter().zip(&u.expected).map(|(&g, &u)| silu_f64(g) * u).collect(),
+                        budget: (0..g.expected.len())
+                            .map(|i| {
+                                silu_product_from_exact(
+                                    act.float(),
+                                    &library,
+                                    (g.expected[i], g.budget[i]),
+                                    (u.expected[i], u.budget[i]),
+                                )
+                            })
+                            .collect(),
+                    };
+                    let label = format!("packed dense_expand {gate_repr:?} {up_repr:?} rows {rows} {pack:?} {input}");
+                    let worst = packed::assert_within(&label, &glu, &wide(&packed), |_, _, budget| budget);
+                    eprintln!("{label}: largest difference {worst:.2} of its budget");
                 }
-                assert!(
-                    relative <= 3e-2,
-                    "packed dense_expand {gate_repr:?} {up_repr:?} rows {rows} {pack:?}: relative RMS error {relative:.2e}"
-                );
             }
         }
     }
@@ -3078,8 +3275,11 @@ fn recurrent_project_elements(
 /// Metal's PACK form of the recurrent projection (qkv | z | alpha | beta), the
 /// attention projection (query | key | value, with and without the zeroed
 /// query) and the output projection past 64 rows. A segment whose weights the
-/// packed operand serves on the device differs from the staged tiles by the
-/// form's error; every other segment, and every segment on a device without
+/// packed operand serves on the device is the packed reference's over that
+/// operand (`shared_operand`; the normed rows' rounding flips and the
+/// activation rounding, or the F32 residual sum, beside), at each tile
+/// launch and residue width, on drawn rows and rows silenced for an exact
+/// accumulator; every other segment, and every segment on a device without
 /// the form, is the staged tiles' bit for bit.
 #[test]
 fn metal_packed_recurrent_and_attention_projections_agree_with_the_staged_tiles() {
@@ -3128,27 +3328,23 @@ fn metal_packed_recurrent_and_attention_projections_agree_with_the_staged_tiles(
         Pack {
             tokens: 2,
             weights_ahead: 1,
-            residue: 1,
+            ..PACK_DEFAULT
         },
     ];
     let same = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits());
-    let check = |label: String, pack: Pack, reference: &[f32], actual: &[f32]| {
-        let wide = |values: &[f32]| {
-            values
-                .iter()
-                .map(|value| f64::from(*value))
-                .collect::<Vec<_>>()
-        };
-        let (relative, worst) = relative_difference(&wide(reference), &wide(actual));
-        if pack == PACK_DEFAULT {
-            eprintln!(
-                "packed {label}: relative RMS error {relative:.2e}, largest {worst:.2e} reference RMS"
-            );
-        }
-        assert!(
-            relative <= 2e-2 && worst <= 0.2,
-            "packed {label} {pack:?}: relative RMS error {relative:.2e}, largest {worst:.2e}"
-        );
+    let wide = |values: &[f32]| values.iter().map(|value| f64::from(*value)).collect::<Vec<_>>();
+    // The packed reference of `weight` under `operand` over `x` (`slack` its
+    // flips), `actual` within it as `within` makes it.
+    let judge = |label: String,
+                 operand: packed::Packed,
+                 (x, slack): (&[f32], &[f64]),
+                 weight: &Weight,
+                 bound: Option<&[f32]>,
+                 actual: &[f64],
+                 within: &dyn Fn(usize, f64, f64) -> f64| {
+        let reference = packed::reference(operand, weight.k, x, slack, &weight.values, bound);
+        let worst = packed::assert_within(&label, &reference, actual, within);
+        eprintln!("packed {label}: largest difference {worst:.2} of its budget");
     };
     for rows in [128usize, 200, 512] {
         let mut rng = Rng::new(rows as u64 + 186);
@@ -3159,221 +3355,349 @@ fn metal_packed_recurrent_and_attention_projections_agree_with_the_staged_tiles(
         let gated = (0..rows * heads * width)
             .map(|_| act.round(rng.symmetric()))
             .collect::<Vec<_>>();
-        let project = |pack: Option<Pack>, project_mode| {
-            let specialization = attention_project_specialization_on(
-                &device,
-                &attention_project_statics(d, kv, g, w),
-                if pack.is_some() {
-                    pack_mapping()
-                } else {
-                    staged
-                },
-            );
-            let out = declared::prepared(
-                &device,
-                &attention_project::native_entry_with(attention_project::Elements {
-                    NW: Element::bf16(),
-                    QW: project_reprs[0].resident(&device),
-                    GW: Element::bf16(),
-                    KW: project_reprs[1].resident(&device),
-                    VW: project_reprs[2].resident(&device),
-                    A: act.element(),
-                    Y: act.element(),
-                }),
-                &match pack {
-                    Some(pack) => with_pack::<attention_project::Entry>(specialization, pack),
-                    None => specialization,
-                },
-            )
-            .unwrap()
-            .call(attention_project::Args {
-                hidden: &f32_tensor(&device, &[rows, d], &hidden),
-                input_norm: &bf16_norm(&device, &norm),
-                query_weight: &project_weights[0].tensor(&device),
-                gate_weight: &act_tensor(&device, Act::Bf16, &[0, d], &[]),
-                key_weight: &project_weights[1].tensor(&device),
-                value_weight: &project_weights[2].tensor(&device),
-                epsilon: 1e-6,
-                project_mode,
-                query_scale: &no_scale(&device),
-                gate_scale: &no_scale(&device),
-                key_scale: &no_scale(&device),
-                value_scale: &no_scale(&device),
-                query_bound: &absent_bound(&device),
-                gate_bound: &absent_bound(&device),
-                key_bound: &absent_bound(&device),
-                value_bound: &absent_bound(&device),
-            })
-            .unwrap();
-            [
-                read_act(act, &out.r0),
-                read_act(act, &out.r2),
-                read_act(act, &out.r3),
-            ]
-        };
-        let output = |pack: Option<Pack>, weight: &Weight| {
-            let (bound, bound_extent) = weight.bound(&device);
-            let specialization = attention_output_specialization_on(
-                &device,
-                &[("D", outputs), ("Q", heads), ("W", width)],
-                if pack.is_some() {
-                    pack_mapping()
-                } else {
-                    staged
-                },
-            )
-            .with_static("OB", bound_extent as u64);
-            let specialization = with_matrix::<attention_output::Entry>(
-                &device,
-                specialization,
-                &[("OW", weight.repr.resident(&device)), ("A", act.element())],
-            );
-            let out = declared::prepared(
-                &device,
-                &attention_output::native_entry_with(attention_output::Elements {
-                    OW: weight.repr.resident(&device),
-                    A: act.element(),
-                }),
-                &match pack {
-                    Some(pack) => with_pack::<attention_output::Entry>(specialization, pack),
-                    None => specialization,
-                },
-            )
-            .unwrap()
-            .call(attention_output::Args {
-                hidden: &f32_tensor(&device, &[rows, outputs], &narrow),
-                inject: &no_inject(&device, rows as u64),
-                gated: &act_tensor(&device, act, &[rows, heads, width], &gated),
-                output_weight: &weight.tensor(&device),
-                output_scale: &no_scale(&device),
-                output_bound: &bound,
-            })
-            .unwrap()
-            .value;
-            // The projection alone (the residual rows are exact in every form).
-            read_f32(&out)
-                .iter()
-                .zip(&narrow)
-                .map(|(value, residual)| value - residual)
-                .collect::<Vec<_>>()
-        };
-        let recurrent = |pack: Option<Pack>| {
-            let specialization = segmented_projection_specialization_on::<gated_delta_project::Entry>(
-                &device,
-                &[("H", d), ("NK", nk), ("NV", nv), ("W", head_width)],
-                if pack.is_some() {
-                    pack_mapping()
-                } else {
-                    staged
-                },
-                RECURRENT_PROJECT_BOUNDS,
-            );
-            let out = declared::prepared(
-                &device,
-                &gated_delta_project::native_entry_with(recurrent_project_elements(&device, recurrent_reprs, act)),
-                &match pack {
-                    Some(pack) => with_pack::<gated_delta_project::Entry>(specialization, pack),
-                    None => specialization,
-                },
-            )
-            .unwrap()
-            .call(gated_delta_project::Args {
-                hidden: &f32_tensor(&device, &[rows, d], &hidden),
-                input_norm: &bf16_norm(&device, &norm),
-                qkv_weight: &recurrent_weights[0].tensor(&device),
-                gate_weight: &recurrent_weights[1].tensor(&device),
-                alpha_weight: &recurrent_weights[2].tensor(&device),
-                beta_weight: &recurrent_weights[3].tensor(&device),
-                epsilon: 1e-6,
-                qkv_bound: &absent_bound(&device),
-                gate_bound: &absent_bound(&device),
-            })
-            .unwrap()
-            .value;
-            // The row-major projection as its segments' columns.
-            let values = read_act(act, &out);
-            let mut first = 0;
-            recurrent_rows.map(|columns| {
-                let segment = values
-                    .chunks(recurrent_columns)
-                    .flat_map(|row| row[first..first + columns].iter().copied())
-                    .collect::<Vec<_>>();
-                first += columns;
-                segment
-            })
-        };
-        let project_staged = [project(None, 0), project(None, 1)];
-        let output_staged = out_weights.each_ref().map(|weight| output(None, weight));
-        let recurrent_staged = recurrent(None);
-        for pack in tiles {
-            let actual = recurrent(Some(pack));
-            for (segment, name) in ["qkv", "z"].into_iter().enumerate() {
-                check(
-                    format!("gated_delta_project {name} rows {rows}"),
-                    pack,
-                    &recurrent_staged[segment],
-                    &actual[segment],
+        // Drawn rows, then rows silenced for an exact accumulator.
+        let silenced_hidden = packed_inputs(&hidden, d);
+        let silenced_gated = packed_inputs(&gated, heads * width);
+        for ((input, hidden), (_, gated)) in silenced_hidden.into_iter().zip(silenced_gated) {
+            let (normed, flips): (Vec<_>, Vec<_>) = (0..rows)
+                .map(|r| rms_row(BackendName::Metal, act, &hidden[r * d..(r + 1) * d], &norm, 1e-6))
+                .unzip();
+            let (normed, flips) = (normed.concat(), flips.concat());
+            let activation = |_: usize, expected: f64, budget: f64| act.float().rounded_from_exact(budget, expected);
+            let summed = |i: usize, expected: f64, budget: f64| {
+                Float::F32.rounded_from_exact(budget, f64::from(narrow[i]) + expected)
+            };
+            let project = |pack: Option<Pack>, project_mode| {
+                let specialization = attention_project_specialization_on(
+                    &device,
+                    &attention_project_statics(d, kv, g, w),
+                    if pack.is_some() {
+                        pack_mapping()
+                    } else {
+                        staged
+                    },
                 );
-            }
-            for segment in 2..4 {
-                assert!(
-                    same(&actual[segment], &recurrent_staged[segment]),
-                    "gated_delta_project segment {segment} rows {rows} {pack:?}"
+                let out = declared::prepared(
+                    &device,
+                    &attention_project::native_entry_with(attention_project::Elements {
+                        NW: Element::bf16(),
+                        QW: project_reprs[0].resident(&device),
+                        GW: Element::bf16(),
+                        KW: project_reprs[1].resident(&device),
+                        VW: project_reprs[2].resident(&device),
+                        A: act.element(),
+                        Y: act.element(),
+                    }),
+                    &match pack {
+                        Some(pack) => with_pack::<attention_project::Entry>(specialization, pack),
+                        None => specialization,
+                    },
+                )
+                .unwrap()
+                .call(attention_project::Args {
+                    hidden: &f32_tensor(&device, &[rows, d], &hidden),
+                    input_norm: &bf16_norm(&device, &norm),
+                    query_weight: &project_weights[0].tensor(&device),
+                    gate_weight: &act_tensor(&device, Act::Bf16, &[0, d], &[]),
+                    key_weight: &project_weights[1].tensor(&device),
+                    value_weight: &project_weights[2].tensor(&device),
+                    epsilon: 1e-6,
+                    project_mode,
+                    query_scale: &no_scale(&device),
+                    gate_scale: &no_scale(&device),
+                    key_scale: &no_scale(&device),
+                    value_scale: &no_scale(&device),
+                    query_bound: &absent_bound(&device),
+                    gate_bound: &absent_bound(&device),
+                    key_bound: &absent_bound(&device),
+                    value_bound: &absent_bound(&device),
+                })
+                .unwrap();
+                [
+                    read_act(act, &out.r0),
+                    read_act(act, &out.r2),
+                    read_act(act, &out.r3),
+                ]
+            };
+            let output = |pack: Option<Pack>, weight: &Weight| {
+                let (bound, bound_extent) = weight.bound(&device);
+                let specialization = attention_output_specialization_on(
+                    &device,
+                    &[("D", outputs), ("Q", heads), ("W", width)],
+                    if pack.is_some() {
+                        pack_mapping()
+                    } else {
+                        staged
+                    },
+                )
+                .with_static("OB", bound_extent as u64);
+                let specialization = with_matrix::<attention_output::Entry>(
+                    &device,
+                    specialization,
+                    &[("OW", weight.repr.resident(&device)), ("A", act.element())],
                 );
-            }
-            for (mode, expected) in project_staged.iter().enumerate() {
-                let actual = project(Some(pack), mode as i32);
-                for (segment, name) in ["query", "key"].into_iter().enumerate() {
-                    if segment == 0 && mode == 1 {
-                        assert!(
-                            same(&actual[0], &expected[0]),
-                            "attention_project zeroed query rows {rows} {pack:?}"
-                        );
-                        continue;
-                    }
-                    check(
-                        format!("attention_project {name} mode {mode} rows {rows}"),
-                        pack,
-                        &expected[segment],
-                        &actual[segment],
+                let out = declared::prepared(
+                    &device,
+                    &attention_output::native_entry_with(attention_output::Elements {
+                        OW: weight.repr.resident(&device),
+                        A: act.element(),
+                    }),
+                    &match pack {
+                        Some(pack) => with_pack::<attention_output::Entry>(specialization, pack),
+                        None => specialization,
+                    },
+                )
+                .unwrap()
+                .call(attention_output::Args {
+                    hidden: &f32_tensor(&device, &[rows, outputs], &narrow),
+                    inject: &no_inject(&device, rows as u64),
+                    gated: &act_tensor(&device, act, &[rows, heads, width], &gated),
+                    output_weight: &weight.tensor(&device),
+                    output_scale: &no_scale(&device),
+                    output_bound: &bound,
+                })
+                .unwrap()
+                .value;
+                // The projection alone (the residual rows are exact in every
+                // form), each output's F32 sum less its residual.
+                read_f32(&out)
+                    .iter()
+                    .zip(&narrow)
+                    .map(|(value, residual)| f64::from(*value) - f64::from(*residual))
+                    .collect::<Vec<_>>()
+            };
+            let recurrent = |pack: Option<Pack>| {
+                let specialization = segmented_projection_specialization_on::<gated_delta_project::Entry>(
+                    &device,
+                    &[("H", d), ("NK", nk), ("NV", nv), ("W", head_width)],
+                    if pack.is_some() {
+                        pack_mapping()
+                    } else {
+                        staged
+                    },
+                    RECURRENT_PROJECT_BOUNDS,
+                );
+                let out = declared::prepared(
+                    &device,
+                    &gated_delta_project::native_entry_with(recurrent_project_elements(&device, recurrent_reprs, act)),
+                    &match pack {
+                        Some(pack) => with_pack::<gated_delta_project::Entry>(specialization, pack),
+                        None => specialization,
+                    },
+                )
+                .unwrap()
+                .call(gated_delta_project::Args {
+                    hidden: &f32_tensor(&device, &[rows, d], &hidden),
+                    input_norm: &bf16_norm(&device, &norm),
+                    qkv_weight: &recurrent_weights[0].tensor(&device),
+                    gate_weight: &recurrent_weights[1].tensor(&device),
+                    alpha_weight: &recurrent_weights[2].tensor(&device),
+                    beta_weight: &recurrent_weights[3].tensor(&device),
+                    epsilon: 1e-6,
+                    qkv_bound: &absent_bound(&device),
+                    gate_bound: &absent_bound(&device),
+                })
+                .unwrap()
+                .value;
+                // The row-major projection as its segments' columns.
+                let values = read_act(act, &out);
+                let mut first = 0;
+                recurrent_rows.map(|columns| {
+                    let segment = values
+                        .chunks(recurrent_columns)
+                        .flat_map(|row| row[first..first + columns].iter().copied())
+                        .collect::<Vec<_>>();
+                    first += columns;
+                    segment
+                })
+            };
+            let project_staged = [project(None, 0), project(None, 1)];
+            let recurrent_staged = recurrent(None);
+            for pack in tiles {
+                let actual = recurrent(Some(pack));
+                let operand = shared_operand(&device, &recurrent_reprs[..2], pack);
+                for (segment, name) in ["qkv", "z"].into_iter().enumerate() {
+                    judge(
+                        format!("gated_delta_project {name} rows {rows} {pack:?} {input}"),
+                        operand,
+                        (normed.as_slice(), flips.as_slice()),
+                        &recurrent_weights[segment],
+                        None,
+                        &wide(&actual[segment]),
+                        &activation,
                     );
                 }
-                // The operand is laid out for the query's Q4_K runs, which
-                // do not serve the Q6_K value weights.
-                assert!(
-                    same(&actual[2], &expected[2]),
-                    "attention_project value mode {mode} rows {rows} {pack:?}"
-                );
+                for segment in 2..4 {
+                    assert!(
+                        same(&actual[segment], &recurrent_staged[segment]),
+                        "gated_delta_project segment {segment} rows {rows} {pack:?}"
+                    );
+                }
+                let operand = shared_operand(&device, &project_reprs[..2], pack);
+                for (mode, expected) in project_staged.iter().enumerate() {
+                    let actual = project(Some(pack), mode as i32);
+                    for (segment, name) in ["query", "key"].into_iter().enumerate() {
+                        if segment == 0 && mode == 1 {
+                            assert!(
+                                same(&actual[0], &expected[0]),
+                                "attention_project zeroed query rows {rows} {pack:?}"
+                            );
+                            continue;
+                        }
+                        judge(
+                            format!("attention_project {name} mode {mode} rows {rows} {pack:?} {input}"),
+                            operand,
+                            (normed.as_slice(), flips.as_slice()),
+                            &project_weights[segment],
+                            None,
+                            &wide(&actual[segment]),
+                            &activation,
+                        );
+                    }
+                    // The operand is laid out for the query's Q4_K runs, which
+                    // do not serve the Q6_K value weights.
+                    assert!(
+                        same(&actual[2], &expected[2]),
+                        "attention_project value mode {mode} rows {rows} {pack:?}"
+                    );
+                }
             }
-            for (weight, expected) in out_weights.iter().zip(&output_staged) {
-                check(
-                    format!("attention_output {:?} rows {rows}", weight.repr),
-                    pack,
-                    expected,
-                    &output(Some(pack), weight),
-                );
+            // Each output weight at each tile launch, and with residue bits at
+            // the wide residue too.
+            for weight in &out_weights {
+                let (bound, bound_extent) = weight.bound(&device);
+                let squares = (bound_extent > 0).then(|| read_f32(&bound));
+                let wide_residue = weight.repr.takes_residue(&device).then_some(PACK_WIDE);
+                for pack in tiles.into_iter().chain(wide_residue) {
+                    judge(
+                        format!("attention_output {:?} rows {rows} {pack:?} {input}", weight.repr),
+                        packed_operand(&device, weight.repr, pack),
+                        (gated.as_slice(), &[][..]),
+                        weight,
+                        squares.as_deref(),
+                        &output(Some(pack), weight),
+                        &summed,
+                    );
+                }
             }
         }
-        // 8-bit values: two residue bits halve the top token's step, so the
-        // form's error falls.
-        let projection = |values: &[f32]| values.iter().map(|value| f64::from(*value)).collect::<Vec<_>>();
-        for (weight, expected) in out_weights.iter().zip(&output_staged) {
-            if !weight.repr.takes_residue(&device) {
-                continue;
+    }
+}
+
+/// Metal's PACK form of a segmented projection over 2-bit, ternary and +-1
+/// weights (q2k, q2g64, q2g256, q1g128 and iq1s): the attention projection's
+/// query, key and value of one such format, without its gate (an absent
+/// segment, which the form leaves to the staged tiles). Each segment, one
+/// operand serving all three, is the packed reference's over the host's
+/// normed rows (their rounding flips in its budget) and the activation
+/// rounding, on drawn rows and rows silenced for an exact accumulator, and
+/// every tile launch gives the same bits.
+#[test]
+fn metal_packed_attention_project_agrees_with_the_staged_tiles_over_low_bit_weights() {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let act = Act::Bf16;
+    let staged = gemm_mapping(64, 64, 1);
+    let d = 512;
+    let norm = norm_values(d, 87);
+    let (kv, g, w) = (1, 1, 64);
+    let segment_rows = [kv * g * 2 * w, kv * w, kv * w];
+    for encoding in [Encoding::Q2K, Encoding::Q2_0, Encoding::Tq2_0, Encoding::Q1_0, Encoding::Iq1S] {
+        let repr = Repr::gguf(encoding);
+        if repr.resident(&device).metal_packing().is_none() {
+            continue;
+        }
+        let weights = segment_rows
+            .iter()
+            .enumerate()
+            .map(|(i, &rows)| weight(repr, rows, d, 201 + i as u64, 1.0))
+            .collect::<Vec<_>>();
+            for rows in [128usize, 200, 512] {
+            let mut rng = Rng::new(rows as u64 + 202);
+            let hidden = (0..rows * d).map(|_| rng.symmetric()).collect::<Vec<_>>();
+            let project = |pack: Option<Pack>, hidden: &[f32]| {
+                let specialization = attention_project_specialization_on(
+                    &device,
+                    &attention_project_statics(d, kv, g, w),
+                    if pack.is_some() { pack_mapping() } else { staged },
+                );
+                let out = declared::prepared(
+                    &device,
+                    &attention_project::native_entry_with(attention_project::Elements {
+                        NW: Element::bf16(),
+                        QW: repr.resident(&device),
+                        GW: Element::bf16(),
+                        KW: repr.resident(&device),
+                        VW: repr.resident(&device),
+                        A: act.element(),
+                        Y: act.element(),
+                    }),
+                    &match pack {
+                        Some(pack) => with_pack::<attention_project::Entry>(specialization, pack),
+                        None => specialization,
+                    },
+                )
+                .unwrap()
+                .call(attention_project::Args {
+                    hidden: &f32_tensor(&device, &[rows, d], hidden),
+                    input_norm: &bf16_norm(&device, &norm),
+                    query_weight: &weights[0].tensor(&device),
+                    gate_weight: &act_tensor(&device, Act::Bf16, &[0, d], &[]),
+                    key_weight: &weights[1].tensor(&device),
+                    value_weight: &weights[2].tensor(&device),
+                    epsilon: 1e-6,
+                    project_mode: 0,
+                    query_scale: &no_scale(&device),
+                    gate_scale: &no_scale(&device),
+                    key_scale: &no_scale(&device),
+                    value_scale: &no_scale(&device),
+                    query_bound: &absent_bound(&device),
+                    gate_bound: &absent_bound(&device),
+                    key_bound: &absent_bound(&device),
+                    value_bound: &absent_bound(&device),
+                })
+                .unwrap();
+                [read_act(act, &out.r0), read_act(act, &out.r2), read_act(act, &out.r3)]
+            };
+            let wide = |values: &[f32]| values.iter().map(|value| f64::from(*value)).collect::<Vec<_>>();
+            let expected = project(None, &hidden);
+            let tiles = [
+                PACK_DEFAULT,
+                Pack { tokens: 2, weights_ahead: 1, ..PACK_DEFAULT },
+            ];
+            let actual = project(Some(tiles[0]), &hidden);
+            let other = project(Some(tiles[1]), &hidden);
+            for (segment, name) in ["query", "key", "value"].into_iter().enumerate() {
+                assert!(
+                    actual[segment].iter().zip(&other[segment]).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "packed attention_project {repr:?} {name} rows {rows} {:?} differs from the default tile",
+                    tiles[1]
+                );
+                let (relative, _) = relative_difference(&wide(&expected[segment]), &wide(&actual[segment]));
+                eprintln!(
+                    "packed attention_project {repr:?} {name} rows {rows}: relative RMS difference from the staged tiles {relative:.2e}"
+                );
             }
-            let (narrow, _) =
-                relative_difference(&projection(expected), &projection(&output(Some(PACK_DEFAULT), weight)));
-            let (relative, worst) =
-                relative_difference(&projection(expected), &projection(&output(Some(PACK_WIDE), weight)));
-            eprintln!(
-                "packed attention_output {:?} rows {rows} RESIDUE 2: relative RMS error {relative:.2e} (one bit {narrow:.2e}), largest {worst:.2e}",
-                weight.repr
-            );
-            assert!(
-                relative <= 0.8 * narrow && worst <= 0.2,
-                "packed attention_output {:?} rows {rows} RESIDUE 2: relative RMS error {relative:.2e} against {narrow:.2e} with one",
-                weight.repr
-            );
+            let operand = packed_operand(&device, repr, tiles[0]);
+            for (input, hidden) in packed_inputs(&hidden, d) {
+                let actual = project(Some(tiles[0]), &hidden);
+                let (normed, slack): (Vec<_>, Vec<_>) = (0..rows)
+                    .map(|r| rms_row(BackendName::Metal, act, &hidden[r * d..(r + 1) * d], &norm, 1e-6))
+                    .unzip();
+                let (normed, slack) = (normed.concat(), slack.concat());
+                for (segment, name) in ["query", "key", "value"].into_iter().enumerate() {
+                    let reference = packed::reference(operand, d, &normed, &slack, &weights[segment].values, None);
+                    let label = format!("packed attention_project {repr:?} {name} rows {rows} {input}");
+                    let worst = packed::assert_within(&label, &reference, &wide(&actual[segment]), |_, expected, budget| {
+                        act.float().rounded_from_exact(budget, expected)
+                    });
+                    eprintln!("{label}: largest difference {worst:.2} of its budget");
+                }
+            }
         }
     }
 }
@@ -3927,126 +4251,48 @@ fn dense_output_matches_its_portable_body_and_the_host_reference_on(device: &Dev
     }
 }
 
-/// DeepSeek V4.1's gated pooled projection at its geometry (D 5120; 512
-/// pooled and 512 gate rows of BF16, published in F32, so no rounding to A
-/// hides a different summation order) on Metal. Under the decode mapping,
-/// every GEMV class (up to `VERIFY_ROWS` rows, a draft verification's)
-/// reproduces each row's M = 1 result bit for bit, as plain decode computes
-/// it. The batched class (above `VERIFY_ROWS`, to 16 rows) sums in its own
-/// order, still in F32 over the same rounded operands, and is not required
-/// to: the test prints how many of its results differ from M = 1, and the
-/// relative gaps of those above the median magnitude, which cancellation
-/// does not inflate.
+/// The Vulkan dense GEMV's F32 staging (STAGE) and its decode by logic and
+/// adds (DECODE) keep every value: `dense_output` at one and three rows, over
+/// sign, offset, two's complement, k-quant and grid codes, is bit for bit
+/// the same under each as under neither.
 #[test]
-fn metal_gated_pooled_projection_reproduces_single_rows_up_to_verify_rows() {
-    let Some(device) = devices()
-        .into_iter()
-        .find(|device| device.backend() == BackendName::Metal)
-    else {
-        return;
-    };
+fn vulkan_gemv_stage_and_decode_keep_every_bit() {
+    let encodings = [
+        Encoding::Q1_0,
+        Encoding::Tq2_0,
+        Encoding::Q4_0,
+        Encoding::Q8_0,
+        Encoding::Q2K,
+        Encoding::Q3K,
+        Encoding::Iq2Xxs,
+        Encoding::Iq3S,
+        Encoding::Iq1S,
+    ];
     let act = Act::Bf16;
-    let (d, segment) = (5120usize, 512usize);
-    let projection = weight(Repr::Bf16, segment, d, 81, 1.0);
-    let gate = weight(Repr::Bf16, segment, d, 82, 1.0);
-    let norm = norm_values(d, 83);
-    let rows_max = 16usize;
-    let mut rng = Rng::new(84);
-    let hidden = (0..rows_max * d)
-        .map(|_| rng.symmetric() * 3.0)
-        .collect::<Vec<_>>();
-    let element = Repr::Bf16.resident(&device);
-    let empty = Tensor::from_host(&device, element, &[0, d as u64], &[]).unwrap();
-    // The pooled and gate results of the rows `input`, `[rows, 512]` each.
-    let project = |input: &[f32], mapping: Mapping| -> [Vec<f32>; 2] {
-        let rows = input.len() / d;
-        let out = declared::prepared(
-            &device,
-            &attention_project::native_entry_with(attention_project::Elements {
-                NW: Element::bf16(),
-                QW: element,
-                GW: element,
-                KW: element,
-                VW: element,
-                A: act.element(),
-                Y: Element::f32(),
-            }),
-            &attention_project_specialization_on(
-                &device,
-                &[("D", d), ("Q", segment), ("GR", segment), ("K", 0), ("V", 0)],
-                mapping,
-            ),
-        )
-        .unwrap()
-        .call(attention_project::Args {
-            hidden: &f32_tensor(&device, &[rows, d], input),
-            input_norm: &bf16_norm(&device, &norm),
-            query_weight: &projection.tensor(&device),
-            gate_weight: &gate.tensor(&device),
-            key_weight: &empty,
-            value_weight: &empty,
-            epsilon: 1e-6,
-            project_mode: 0,
-            query_scale: &no_scale(&device),
-            gate_scale: &no_scale(&device),
-            key_scale: &no_scale(&device),
-            value_scale: &no_scale(&device),
-            query_bound: &absent_bound(&device),
-            gate_bound: &absent_bound(&device),
-            key_bound: &absent_bound(&device),
-            value_bound: &absent_bound(&device),
-        })
-        .unwrap();
-        [read_f32(&out.r0), read_f32(&out.r1)]
-    };
-    // The default GEMV mapping and one that reads the rows differently
-    // (more rows a lane group, wider lanes, fewer simdgroups): each reproduces
-    // its own one-row bits at every row count up to VERIFY_ROWS.
-    let decode = gemm_mapping(64, 64, 1);
-    let widest = Mapping { simdgroups: 8, rows: 2, lanes: 32, ..decode };
-    for mapping in [decode, widest] {
-        let single = (0..rows_max)
-            .map(|row| project(&hidden[row * d..(row + 1) * d], mapping))
-            .collect::<Vec<_>>();
-        for rows in 2..=rows_max {
-            let out = project(&hidden[..rows * d], mapping);
-            for (name, index) in [("pooled", 0), ("gate", 1)] {
-                // Each result's magnitude alone and its gap from M = 1, relative.
-                let mut gaps = (0..rows)
-                    .flat_map(|row| {
-                        let ours = &out[index][row * segment..(row + 1) * segment];
-                        ours.iter().zip(&single[row][index]).map(|(value, alone)| {
-                            let gap = match value.to_bits() == alone.to_bits() {
-                                true => 0.0,
-                                false => (value - alone).abs() / alone.abs().max(f32::MIN_POSITIVE),
-                            };
-                            (alone.abs(), gap)
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                let differing = gaps.iter().filter(|(_, gap)| *gap != 0.0).count();
-                if rows as u64 <= VERIFY_ROWS {
-                    assert_eq!(differing, 0, "{name} M {rows} differs from M = 1 in {differing} results");
-                    continue;
+    let (h, f) = (300, 1024);
+    for device in devices().into_iter().filter(|device| device.backend() == BackendName::Vulkan) {
+        for encoding in encodings {
+            let down = weight(Repr::gguf(encoding), h, f, 35, 1.0);
+            for rows in [1usize, 3] {
+                let mut rng = Rng::new(rows as u64 + 200);
+                let residual = (0..rows * h).map(|_| rng.symmetric()).collect::<Vec<_>>();
+                let out_rows = (0..rows as i32).collect::<Vec<_>>();
+                let product = (0..rows * f).map(|_| act.round(rng.symmetric())).collect::<Vec<_>>();
+                let run = |stage, decode| {
+                    let mapping = Mapping { stage, decode, ..MAPPINGS[3] };
+                    dense_output_native(&device, act, &down, &residual, rows, &product, &out_rows, mapping)
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>()
+                };
+                let neither = run(0, 0);
+                for (stage, decode) in [(1, 0), (0, 1), (1, 1)] {
+                    assert_eq!(
+                        run(stage, decode),
+                        neither,
+                        "{encoding:?} M {rows} STAGE {stage} DECODE {decode}"
+                    );
                 }
-                let worst = gaps.iter().map(|(_, gap)| *gap).fold(0.0, f32::max);
-                // The relative gaps of the results above the median magnitude,
-                // where cancellation does not inflate them.
-                gaps.sort_by(|a, b| a.0.total_cmp(&b.0));
-                let mut upper = gaps[gaps.len() / 2..].iter().map(|(_, gap)| *gap).collect::<Vec<_>>();
-                upper.sort_by(f32::total_cmp);
-                let quantile = |q: f64| upper[((upper.len() - 1) as f64 * q) as usize];
-                eprintln!(
-                    "batched {name} M {rows}: {differing} of {} results differ from M = 1, \
-                     by up to {worst:.3e} relative; above the median magnitude {:.3e}, relative gaps \
-                     p50 {:.3e} p90 {:.3e} p99 {:.3e} max {:.3e}",
-                    rows * segment,
-                    gaps[gaps.len() / 2].0,
-                    quantile(0.5),
-                    quantile(0.9),
-                    quantile(0.99),
-                    quantile(1.0),
-                );
             }
         }
     }
@@ -4054,17 +4300,15 @@ fn metal_gated_pooled_projection_reproduces_single_rows_up_to_verify_rows() {
 
 /// The decode and verify row classes at the pinned Qwen3.5 4B geometry
 /// (H 2560, F 9216) with the decode mapping: every M from 1 to 16 and the
-/// first GEMM class 17, against the host reference. The GEMV class (M up to
-/// `VERIFY_ROWS`) must reproduce each row's M = 1 result bit for bit, so a
-/// speculative verify row computes exactly what plain decode computes.
+/// first GEMM class 17, against the host reference.
 #[test]
-fn dense_entries_at_4b_geometry_match_the_host_reference_and_single_rows() {
+fn dense_entries_at_4b_geometry_match_the_host_reference() {
     for device in devices() {
-        dense_entries_at_4b_geometry_match_the_host_reference_and_single_rows_on(&device);
+        dense_entries_at_4b_geometry_match_the_host_reference_on(&device);
     }
 }
 
-fn dense_entries_at_4b_geometry_match_the_host_reference_and_single_rows_on(device: &Device) {
+fn dense_entries_at_4b_geometry_match_the_host_reference_on(device: &Device) {
     let act = Act::Bf16;
     let (h, f) = (2560, 9216);
     let mapping = gemm_mapping(64, 64, 1);
@@ -4081,39 +4325,6 @@ fn dense_entries_at_4b_geometry_match_the_host_reference_and_single_rows_on(devi
     let product = (0..rows_max * f)
         .map(|_| act.round(rng.symmetric()))
         .collect::<Vec<_>>();
-    let expand_single = (0..rows_max)
-        .map(|r| {
-            dense_expand_native(
-                &device,
-                act,
-                &gate,
-                &up,
-                &residual,
-                rows_max,
-                &norm,
-                &[r as i32],
-                1e-6,
-                mapping,
-            )
-        })
-        .collect::<Vec<_>>();
-    let output_single = |down: &Weight| {
-        (0..rows_max)
-            .map(|r| {
-                dense_output_native(
-                    &device,
-                    act,
-                    down,
-                    &residual,
-                    rows_max,
-                    &product[r * f..(r + 1) * f],
-                    &[r as i32],
-                    mapping,
-                )
-            })
-            .collect::<Vec<_>>()
-    };
-    let (single6, single4) = (output_single(&down6), output_single(&down4));
     for rows in 1..=rows_max {
         let out_rows = (0..rows as i32).collect::<Vec<_>>();
         let (expected, bound) = dense_expand_reference(
@@ -4128,7 +4339,7 @@ fn dense_entries_at_4b_geometry_match_the_host_reference_and_single_rows_on(devi
             &expected,
             &bound,
         );
-        for (label, down, single) in [("q6k", &down6, &single6), ("q4k", &down4, &single4)] {
+        for (label, down) in [("q6k", &down6), ("q4k", &down4)] {
             let (expected, bound) = dense_output_reference(
                 device.backend(), act, down, &residual, &product[..rows * f], &out_rows,
             );
@@ -4148,1051 +4359,8 @@ fn dense_entries_at_4b_geometry_match_the_host_reference_and_single_rows_on(devi
                 &expected,
                 &bound,
             );
-            if rows as u64 <= VERIFY_ROWS {
-                for r in 0..rows {
-                    assert!(
-                        output[r * h..(r + 1) * h]
-                            .iter()
-                            .zip(&single[r])
-                            .all(|(a, b)| a.to_bits() == b.to_bits()),
-                        "dense_output {label} 4B M {rows} row {r} differs from its M = 1 result"
-                    );
-                }
-            }
-        }
-        if rows as u64 <= VERIFY_ROWS {
-            for r in 0..rows {
-                assert!(
-                    native[r * f..(r + 1) * f]
-                        .iter()
-                        .zip(&expand_single[r])
-                        .all(|(a, b)| a.to_bits() == b.to_bits()),
-                    "dense_expand 4B M {rows} row {r} differs from its M = 1 result"
-                );
-            }
         }
     }
-}
-
-/// The input rows a decode check holds: the most any backend's row classes
-/// serve (CUDA's `X_gemv16`, 16 rows).
-const CLASS_ROWS: usize = 16;
-
-/// The launches `implementation` runs for a call of `rows` rows under
-/// `specialization`.
-fn launches_at(implementation: &seismic::OnDevice, specialization: &NativeSpecialization, rows: u64) -> Vec<usize> {
-    let at = specialization.clone().with_range("M", rows, rows).with_range("O", rows, rows);
-    (0..implementation.launches.len())
-        .filter(|&launch| implementation.reachable(&at, launch))
-        .collect()
-}
-
-/// The specializations a decode check runs: `default`, then `default` with
-/// each other value of every reduction-order (`arithmetic`) parameter read
-/// by a row class's launch ([`declared::row_launches`]) or by a launch of a
-/// one-row call, one at a time, each set where it is declared (its owning
-/// launch, or the entry). Each comes with its setting's name.
-fn reduction_orders(
-    implementation: &seismic::OnDevice,
-    default: &NativeSpecialization,
-) -> Vec<(String, NativeSpecialization)> {
-    let mut orders = vec![("defaults".to_owned(), default.clone())];
-    let mut seen: Vec<(Option<usize>, String)> = Vec::new();
-    let mut launches = declared::row_launches(implementation);
-    launches.extend(launches_at(implementation, default, 1));
-    launches.sort_unstable();
-    launches.dedup();
-    for ordinal in launches {
-        let launch = &implementation.launches[ordinal];
-        let names = implementation
-            .launch_parameters(ordinal)
-            .into_iter()
-            .chain(implementation.code_parameters(ordinal).into_iter().map(|(_, name)| name.to_owned()))
-            .chain(launch.reads.iter().cloned())
-            .collect::<Vec<_>>();
-        for name in names {
-            let owner = launch.params.iter().any(|parameter| parameter.name == name).then_some(ordinal);
-            if seen.contains(&(owner, name.clone())) {
-                continue;
-            }
-            seen.push((owner, name.clone()));
-            let declared = match owner {
-                Some(owner) => implementation.launches[owner].params.iter().find(|parameter| parameter.name == name),
-                None => implementation.params.iter().find(|parameter| parameter.name == name),
-            };
-            let Some(declared) = declared.filter(|parameter| parameter.arithmetic) else {
-                continue;
-            };
-            let current = match owner {
-                Some(owner) => default.launch_param(owner, &name),
-                None => default.param(&name),
-            };
-            for &value in declared.values.iter().filter(|value| Some(**value) != current) {
-                orders.push(match owner {
-                    Some(owner) => (
-                        format!("{} {name} {value}", implementation.launches[owner].kernel),
-                        default.clone().with_launch_param(owner, name.clone(), value),
-                    ),
-                    None => (format!("{name} {value}"), default.clone().with_param(name.clone(), value)),
-                });
-            }
-        }
-    }
-    orders
-}
-
-/// The most rows a call of `implementation` takes in its row classes under
-/// `specialization`, the row counts from 2 up while one holds: a row class's
-/// launch runs ([`declared::row_launches`]), or the launches of a one-row
-/// call run and no other (one launch serving every row count: a
-/// single-launch GEMV, CUDA's indexed readout, the CPU's form). Up to the
-/// rows a draft verification carries (`VERIFY_ROWS`) either holds; above
-/// them, only a row class whose launch its declaration bounds within
-/// [`CLASS_ROWS`] (CUDA's `X_gemv16`), so a decode form that a `when` does
-/// not bound, which the executor runs to `VERIFY_ROWS` only (a routed
-/// expansion), is held to those rows.
-fn row_class_rows(implementation: &seismic::OnDevice, specialization: &NativeSpecialization) -> usize {
-    let verify = VERIFY_ROWS;
-    let classes = declared::row_launches(implementation);
-    let alone = launches_at(implementation, specialization, 1);
-    let unbounded = launches_at(implementation, specialization, CLASS_ROWS as u64 + 1);
-    let served = |rows: u64| {
-        let launches = launches_at(implementation, specialization, rows);
-        let class = launches
-            .iter()
-            .any(|launch| classes.contains(launch) && (rows <= verify || !unbounded.contains(launch)));
-        class || (rows <= verify && launches == alone)
-    };
-    (2..=CLASS_ROWS).take_while(|&rows| served(rows as u64)).last().unwrap_or(1)
-}
-
-/// What a decode check found on one device.
-#[derive(Default)]
-struct DecodeRows {
-    /// Rows not bit-equal to the same row alone.
-    unlike: Vec<String>,
-    /// Natives the device does not offer at the case's elements.
-    absent: Vec<&'static str>,
-    /// The (native, setting, rows) cases run.
-    cases: Vec<String>,
-    /// Settings the declaration refuses at the case's statics.
-    inadmissible: Vec<String>,
-    /// Natives whose row classes end below a draft verification's rows
-    /// ([`VERIFY_ROWS`]), with the rows.
-    short: Vec<String>,
-}
-
-impl DecodeRows {
-    /// `entry` on `device` at every specialization of [`reduction_orders`],
-    /// each static it declares valued by `statics`, each form of `forms` held
-    /// at its value (a backend that does not declare one has no such case):
-    /// each row of a call of 2 up to [`row_class_rows`] rows bit-equal to
-    /// that row alone. `run(kernel, rows)` computes the input rows `rows` in
-    /// one call and returns each of its outputs flattened `[rows, width]`.
-    fn check<E: seismic::Entry>(
-        &mut self,
-        device: &Device,
-        entry: seismic::BoundEntry<E>,
-        statics: &[(&str, usize)],
-        forms: &[(&'static str, u64)],
-        run: impl Fn(&seismic::NativeKernel<E>, std::ops::Range<usize>) -> Vec<Vec<f32>>,
-    ) {
-        let Some(implementation) = entry.offered(device).unwrap() else {
-            self.absent.push(E::NAME);
-            return;
-        };
-        if !forms.iter().all(|(name, _)| implementation.params.iter().any(|parameter| parameter.name == *name)) {
-            return;
-        }
-        let case = format!(
-            "{} ({})",
-            E::NAME,
-            statics
-                .iter()
-                .map(|(name, value)| format!("{name} {value}"))
-                .chain(forms.iter().map(|(name, value)| format!("{name} {value}")))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        let default = declared::declared(
-            device,
-            &entry,
-            |name| {
-                statics
-                    .iter()
-                    .find(|(given, _)| *given == name)
-                    .unwrap_or_else(|| panic!("{} declares static `{name}`, which the case does not give", E::NAME))
-                    .1 as u64
-            },
-            forms,
-        );
-        let default = match default {
-            Ok(default) => default,
-            Err(error) => {
-                self.inadmissible.push(format!("{case} defaults: {error:?}"));
-                return;
-            }
-        };
-        for (setting, specialization) in reduction_orders(&implementation, &default) {
-            if declared::declared_at(device, &entry, &specialization).is_err() {
-                self.inadmissible.push(format!("{case} {setting}"));
-                continue;
-            }
-            let rows = row_class_rows(&implementation, &specialization);
-            if (rows as u64) < VERIFY_ROWS {
-                self.short.push(format!("{case} {setting} (M 2..={rows})"));
-            }
-            let kernel = entry.prepare(device, &specialization).unwrap();
-            let label = format!("{case} on {:?} at {setting}", device.backend());
-            self.unlike.extend(rows_unlike_alone(&label, rows, |range| run(&kernel, range)));
-            self.cases.push(format!("{case} {setting} (M 2..={rows})"));
-        }
-    }
-}
-
-/// `rows` rows of `k` values whose second half is the first's negation
-/// within 2^-7: over a [`mirrored_weight`] their products nearly cancel, so
-/// a sum's rounding residue reaches the bits an A-rounded result keeps, and
-/// a change of summation order shows in them.
-fn cancelling_rows(rows: usize, k: usize, seed: u64, scale: f32) -> Vec<f32> {
-    let mut rng = Rng::new(seed);
-    let mut values = Vec::with_capacity(rows * k);
-    for _ in 0..rows {
-        let half = (0..k / 2).map(|_| rng.symmetric() * scale).collect::<Vec<_>>();
-        values.extend(&half);
-        values.extend(half.iter().map(|value| -value * (1.0 + rng.symmetric() / 128.0)));
-    }
-    values
-}
-
-/// A random Q4_K weight whose second half of columns repeats its first
-/// (`k` a multiple of 512: whole superblocks in each half).
-fn mirrored_weight(rows: usize, k: usize, seed: u64) -> Weight {
-    let half = k / 2;
-    assert_eq!(half % 256, 0, "a mirrored half is whole superblocks");
-    let blocks = half / 256;
-    let mut mirrored = weight(Repr::Q4k, rows, k, seed, 1.0);
-    let p = planes(Repr::Q4k, k);
-    for r in 0..rows {
-        let row = &mut mirrored.bytes[r * p.stride..(r + 1) * p.stride];
-        row.copy_within(p.codes..p.codes + half / 2, p.codes + half / 2);
-        row.copy_within(p.scales..p.scales + 12 * blocks, p.scales + 12 * blocks);
-        row.copy_within(p.supers..p.supers + 4 * blocks, p.supers + 4 * blocks);
-        mirrored.values.copy_within(r * k..r * k + half, r * k + half);
-    }
-    mirrored
-}
-
-/// `weights`, of one shape `[rows, k]`, stacked `[weights.len(), rows, k]`
-/// in `device`'s resident layout: a routed entry's expert stack.
-fn stacked(device: &Device, weights: &[Weight]) -> Tensor {
-    let layout = resident_layout(device);
-    let bytes = weights.iter().flat_map(|weight| weight.bytes_in(layout).into_owned()).collect::<Vec<_>>();
-    let shape = [weights.len() as u64, weights[0].rows as u64, weights[0].k as u64];
-    Tensor::from_host(device, weights[0].repr.element_in(layout), &shape, &bytes).unwrap()
-}
-
-/// `k` RMS norm weights whose second half repeats the first, as a
-/// [`cancelling_rows`] input's halves need to stay opposite once normalized.
-fn mirrored_norm(k: usize, seed: u64) -> Vec<f32> {
-    let half = norm_values(k / 2, seed);
-    [half.clone(), half].concat()
-}
-
-/// The rows of calls of 2 to `most` rows that are not bit-equal to the same
-/// row computed alone. `run(rows)` computes the input rows `rows` in one
-/// call and returns each of its outputs flattened `[rows, width]`.
-fn rows_unlike_alone(label: &str, most: usize, run: impl Fn(std::ops::Range<usize>) -> Vec<Vec<f32>>) -> Vec<String> {
-    let alone = (0..most).map(|row| run(row..row + 1)).collect::<Vec<_>>();
-    for (row, outputs) in alone.iter().enumerate() {
-        for (output, values) in outputs.iter().enumerate() {
-            assert!(
-                values.iter().any(|value| *value != 0.0),
-                "{label}: output {output} of row {row} alone is all zero"
-            );
-        }
-    }
-    let mut unlike = Vec::new();
-    for rows in 2..=most {
-        for (output, values) in run(0..rows).iter().enumerate() {
-            let width = alone[0][output].len();
-            assert_eq!(values.len(), rows * width, "{label}: output {output} at M = {rows}");
-            for row in 0..rows {
-                let differing = values[row * width..(row + 1) * width]
-                    .iter()
-                    .zip(&alone[row][output])
-                    .filter(|(together, alone)| together.to_bits() != alone.to_bits())
-                    .count();
-                if differing > 0 {
-                    unlike.push(format!(
-                        "{label}: output {output}, row {row} at M = {rows}: \
-                         {differing} of {width} values differ from the row alone"
-                    ));
-                }
-            }
-        }
-    }
-    unlike
-}
-
-/// A decode row's bits do not depend on how many rows its call carries: on
-/// every backend this host has, for every decode projection (the dense
-/// ones, the routed expansions in each form, the head readouts and the
-/// progressive head's planes readout; not the streamed route, whose inputs
-/// are a step's tables), at its declaration's defaults and at every other
-/// value of each reduction-order parameter its row-class launches read
-/// ([`reduction_orders`]), each row of a call of 2
-/// up to the most rows its row classes serve ([`row_class_rows`]) is
-/// bit-equal to that row computed alone (M = 1), so a draft verification row
-/// computes exactly what plain decode computes. The row classes are the
-/// declarations' `alike` launches ([`declared::row_classes`]), each held to
-/// the launch it names, and the one launch of a projection serving every row
-/// count by it; they share a reduction order only where the declaration makes
-/// them read one setting, which the other tests' mappings, setting every
-/// launch alike, cannot show. Inputs nearly cancel ([`cancelling_rows`]), so
-/// an A-rounded result shows a changed summation order too.
-#[test]
-fn decode_rows_keep_their_single_row_bits_at_every_reduction_order() {
-    let mut unlike = Vec::new();
-    for device in seismic_native_tests::every_device() {
-        let found = decode_rows_on(&device);
-        seismic_native_tests::progress(format_args!(
-            "decode rows on {:?}: {} cases, {} rows unlike alone; {} settings inadmissible {:?}; not offered {:?}",
-            device.backend(),
-            found.cases.len(),
-            found.unlike.len(),
-            found.inadmissible.len(),
-            found.inadmissible,
-            found.absent,
-        ));
-        for case in &found.cases {
-            seismic_native_tests::progress(format_args!("  {:?} {case}", device.backend()));
-        }
-        // Metal declares every one of these projections.
-        if device.backend() == BackendName::Metal {
-            assert!(found.absent.is_empty(), "Metal offers no {:?} at these elements", found.absent);
-        }
-        assert!(found.short.is_empty(), "row classes end below a draft verification's rows: {:?}", found.short);
-        unlike.extend(found.unlike);
-    }
-    assert!(unlike.is_empty(), "rows unlike alone:\n{}", unlike.join("\n"));
-}
-
-fn decode_rows_on(device: &Device) -> DecodeRows {
-    use magnitude_kernels::{
-        gated_delta_project_convolved, per_layer_gate, readout_planes_rows, routed_expand, routed_gate_up,
-        routed_up, short_conv_project, stream_mix_down, stream_mix_up,
-    };
-    use seismic::SlabRegion;
-    let act = Act::Bf16;
-    let a = act.element();
-    let q4k = Repr::Q4k.resident(device);
-    let mut tally = DecodeRows::default();
-    let width = 1024;
-    let norm = bf16_norm(device, &mirrored_norm(width, 91));
-    let hidden = cancelling_rows(CLASS_ROWS, width, 92, 3.0);
-    let hidden_rows = |rows: &std::ops::Range<usize>| {
-        f32_tensor(device, &[rows.len(), width], &hidden[rows.start * width..rows.end * width])
-    };
-    let empty = || f32_tensor(device, &[0], &[]);
-    let out_rows = |rows: &std::ops::Range<usize>| {
-        i32_tensor(device, &[rows.len()], &(0..rows.len() as i32).collect::<Vec<_>>())
-    };
-
-    // attention_project: query, gate, key and value segments, F32 results.
-    let segments = [256usize, 128, 128, 128];
-    let projections = segments
-        .iter()
-        .enumerate()
-        .map(|(i, &rows)| mirrored_weight(rows, width, 93 + i as u64).tensor(device))
-        .collect::<Vec<_>>();
-    tally.check(
-        device,
-        attention_project::native_entry_with(attention_project::Elements {
-            NW: Element::bf16(),
-            QW: q4k,
-            GW: q4k,
-            KW: q4k,
-            VW: q4k,
-            A: a,
-            Y: Element::f32(),
-        }),
-        &[
-            ("D", width),
-            ("PT", 1),
-            ("NM", width),
-            ("Q", segments[0]),
-            ("GR", segments[1]),
-            ("K", segments[2]),
-            ("V", segments[3]),
-            ("QS", 0),
-            ("GS", 0),
-            ("KS", 0),
-            ("VS", 0),
-            ("QB", 0),
-            ("GB", 0),
-            ("KB", 0),
-            ("VB", 0),
-        ],
-        &[],
-        |kernel, rows| {
-            let out = kernel
-                .call(attention_project::Args {
-                    hidden: &hidden_rows(&rows),
-                    input_norm: &norm,
-                    query_weight: &projections[0],
-                    gate_weight: &projections[1],
-                    key_weight: &projections[2],
-                    value_weight: &projections[3],
-                    epsilon: 1e-6,
-                    project_mode: 0,
-                    query_scale: &no_scale(device),
-                    gate_scale: &no_scale(device),
-                    key_scale: &no_scale(device),
-                    value_scale: &no_scale(device),
-                    query_bound: &absent_bound(device),
-                    gate_bound: &absent_bound(device),
-                    key_bound: &absent_bound(device),
-                    value_bound: &absent_bound(device),
-                })
-                .unwrap();
-            vec![read_f32(&out.r0), read_f32(&out.r1), read_f32(&out.r2), read_f32(&out.r3)]
-        },
-    );
-
-    // attention_output: Q x W gated heads onto the F32 residual.
-    let (heads, head_width) = (8, 128);
-    let gated = cancelling_rows(CLASS_ROWS, heads * head_width, 101, 1.0);
-    let output_weight = mirrored_weight(width, heads * head_width, 102).tensor(device);
-    tally.check(
-        device,
-        attention_output::native_entry_with(attention_output::Elements { OW: q4k, A: a }),
-        &[("D", width), ("SN", 1), ("IN", 0), ("Q", heads), ("W", head_width), ("OS", 0), ("OB", 0)],
-        &[],
-        |kernel, rows| {
-            let n = heads * head_width;
-            let out = kernel
-                .call(attention_output::Args {
-                    hidden: &hidden_rows(&rows),
-                    inject: &no_inject(device, rows.len() as u64),
-                    gated: &act_tensor(
-                        device,
-                        act,
-                        &[rows.len(), heads, head_width],
-                        &gated[rows.start * n..rows.end * n],
-                    ),
-                    output_weight: &output_weight,
-                    output_scale: &no_scale(device),
-                    output_bound: &absent_bound(device),
-                })
-                .unwrap()
-                .value;
-            vec![read_f32(&out)]
-        },
-    );
-
-    // dense_expand: the gated pair, A results.
-    let features = 1024;
-    let gate = mirrored_weight(features, width, 103).tensor(device);
-    let up = mirrored_weight(features, width, 104).tensor(device);
-    tally.check(
-        device,
-        dense_expand::native_entry_with(dense_expand::Elements { NW: Element::bf16(), GW: q4k, UW: q4k, A: a }),
-        &[("H", width), ("F", features), ("GS", 0), ("US", 0), ("GB", 0), ("UB", 0), ("LB", 0)],
-        &[],
-        |kernel, rows| {
-            let out = kernel
-                .call(dense_expand::Args {
-                    residual: &hidden_rows(&rows),
-                    norm: &norm,
-                    gate_weight: &gate,
-                    up_weight: &up,
-                    out_rows: &out_rows(&rows),
-                    eps: 1e-6,
-                    activation: 0,
-                    glu_limit: &i32_tensor(device, &[0, 0], &[]),
-                    gate_scale: &empty(),
-                    up_scale: &empty(),
-                    gate_bound: &absent_bound(device),
-                    up_bound: &absent_bound(device),
-                })
-                .unwrap()
-                .value;
-            vec![read_act(act, &out)]
-        },
-    );
-
-    // dense_output: the product rows onto the F32 residual.
-    let product = cancelling_rows(CLASS_ROWS, features, 105, 1.0);
-    let down = mirrored_weight(width, features, 106).tensor(device);
-    tally.check(
-        device,
-        dense_output::native_entry_with(dense_output::Elements { A: a, DW: q4k }),
-        &[("H", width), ("F", features), ("DS", 0), ("DB", 0)],
-        &[],
-        |kernel, rows| {
-            let out = kernel
-                .call(dense_output::Args {
-                    residual: &hidden_rows(&rows),
-                    product: &act_tensor(
-                        device,
-                        act,
-                        &[rows.len(), features],
-                        &product[rows.start * features..rows.end * features],
-                    ),
-                    down_weight: &down,
-                    out_rows: &out_rows(&rows),
-                    down_scale: &empty(),
-                    down_bound: &absent_bound(device),
-                })
-                .unwrap()
-                .value;
-            vec![read_f32(&out)]
-        },
-    );
-
-    // dense_up: the up projection alone, ReLU² A results.
-    let up_only = mirrored_weight(features, width, 127).tensor(device);
-    tally.check(
-        device,
-        dense_up::native_entry_with(dense_up::Elements { NW: Element::bf16(), UW: q4k, A: a }),
-        &[("H", width), ("F", features), ("US", 0)],
-        &[],
-        |kernel, rows| {
-            let out = kernel
-                .call(dense_up::Args {
-                    residual: &hidden_rows(&rows),
-                    norm: &norm,
-                    up_weight: &up_only,
-                    out_rows: &out_rows(&rows),
-                    eps: 1e-6,
-                    activation: 2,
-                    up_scale: &empty(),
-                })
-                .unwrap()
-                .value;
-            vec![read_act(act, &out)]
-        },
-    );
-
-    // readout_head_rows: the head's F32 logits.
-    let vocabulary = 2048;
-    let head = mirrored_weight(vocabulary, width, 107).tensor(device);
-    tally.check(
-        device,
-        readout_head_rows::native_entry_with(readout_head_rows::Elements { NW: Element::bf16(), OW: q4k, A: a }),
-        &[("V", vocabulary), ("D", width), ("PT", 1), ("NM", width), ("WS", 0)],
-        &[],
-        |kernel, rows| {
-            let out = kernel
-                .call(readout_head_rows::Args {
-                    hidden: &hidden_rows(&rows),
-                    norm: &norm,
-                    weight: &head,
-                    out_rows: &out_rows(&rows),
-                    epsilon: 1e-6,
-                    softcap: 0.0,
-                    weight_scale: &empty(),
-                })
-                .unwrap()
-                .value;
-            vec![read_f32(&out)]
-        },
-    );
-
-    // readout_selected_rows: the head's F32 logits at selected vocabulary
-    // rows.
-    let chosen = (0..96).map(|i| ((i * 37 + 11) % vocabulary) as i32).collect::<Vec<_>>();
-    tally.check(
-        device,
-        readout_selected_rows::native_entry_with(readout_selected_rows::Elements {
-            NW: Element::bf16(),
-            OW: q4k,
-            A: a,
-        }),
-        &[("V", vocabulary), ("D", width), ("PT", 1), ("NM", width)],
-        &[],
-        |kernel, rows| {
-            let out = kernel
-                .call(readout_selected_rows::Args {
-                    hidden: &hidden_rows(&rows),
-                    norm: &norm,
-                    weight: &head,
-                    out_rows: &out_rows(&rows),
-                    selected: &i32_tensor(device, &[chosen.len()], &chosen),
-                    epsilon: 1e-6,
-                    softcap: 0.0,
-                })
-                .unwrap()
-                .value;
-            vec![read_f32(&out)]
-        },
-    );
-
-    // readout_project_rows: the head's F32 logits of A feature rows, over
-    // its first columns (I 0) and over columns each row indexes (I 1).
-    let feature_rows = cancelling_rows(CLASS_ROWS, width, 128, 1.0);
-    for indexed in [0, 1] {
-        let columns = if indexed == 1 { 64 } else { 512 };
-        let tokens = (0..CLASS_ROWS * indexed * columns)
-            .map(|i| ((i * 53 + 7) % vocabulary) as i32)
-            .collect::<Vec<_>>();
-        tally.check(
-            device,
-            readout_project_rows::native_entry_with(readout_project_rows::Elements { A: a, OW: q4k }),
-            &[("V", vocabulary), ("D", width), ("S", columns), ("I", indexed), ("WS", 0)],
-            &[],
-            |kernel, rows| {
-                let per_row = indexed * columns;
-                let out = kernel
-                    .call(readout_project_rows::Args {
-                        features: &act_tensor(
-                            device,
-                            act,
-                            &[rows.len(), width],
-                            &feature_rows[rows.start * width..rows.end * width],
-                        ),
-                        weight: &head,
-                        token_rows: &i32_tensor(
-                            device,
-                            &[rows.len(), indexed, columns],
-                            &tokens[rows.start * per_row..rows.end * per_row],
-                        ),
-                        weight_scale: &empty(),
-                        softcap: 0.0,
-                    })
-                    .unwrap()
-                    .value;
-                vec![read_f32(&out)]
-            },
-        );
-    }
-
-    // The recurrent projection and its convolved decode form: qkv, gate,
-    // alpha and beta segments, A results; the convolved form also
-    // convolves each slot's row over its source window (one slot a row,
-    // reading bank `row` and publishing bank CLASS_ROWS + `row`).
-    let (key_heads, value_heads, recurrent_width, taps) = (2usize, 4usize, 64usize, 4usize);
-    let channels = (2 * key_heads + value_heads) * recurrent_width;
-    let recurrent = [channels, value_heads * recurrent_width, value_heads, value_heads]
-        .iter()
-        .enumerate()
-        .map(|(i, &rows)| mirrored_weight(rows, width, 108 + i as u64).tensor(device))
-        .collect::<Vec<_>>();
-    tally.check(
-        device,
-        gated_delta_project::native_entry_with(gated_delta_project::Elements {
-            NW: Element::bf16(),
-            QW: q4k,
-            GW: q4k,
-            AW: q4k,
-            BW: q4k,
-            A: a,
-        }),
-        &[
-            ("H", width),
-            ("PT", 1),
-            ("NM", width),
-            ("NK", key_heads),
-            ("NV", value_heads),
-            ("W", recurrent_width),
-            ("QB", 0),
-            ("ZB", 0),
-        ],
-        &[],
-        |kernel, rows| {
-            let out = kernel
-                .call(gated_delta_project::Args {
-                    hidden: &hidden_rows(&rows),
-                    input_norm: &norm,
-                    qkv_weight: &recurrent[0],
-                    gate_weight: &recurrent[1],
-                    alpha_weight: &recurrent[2],
-                    beta_weight: &recurrent[3],
-                    epsilon: 1e-6,
-                    qkv_bound: &absent_bound(device),
-                    gate_bound: &absent_bound(device),
-                })
-                .unwrap()
-                .value;
-            vec![read_act(act, &out)]
-        },
-    );
-    let banks = 2 * CLASS_ROWS;
-    let window_rows = taps - 1;
-    let initial = uniform_values(banks * window_rows * channels, 112, 0.5);
-    let convolution = f32_tensor(device, &[channels, taps], &uniform_values(channels * taps, 113, 0.25));
-    tally.check(
-        device,
-        gated_delta_project_convolved::native_entry_with(gated_delta_project_convolved::Elements {
-            NW: Element::bf16(),
-            QW: q4k,
-            GW: q4k,
-            AW: q4k,
-            BW: q4k,
-            A: a,
-        }),
-        &[
-            ("H", width),
-            ("PT", 1),
-            ("NM", width),
-            ("NK", key_heads),
-            ("NV", value_heads),
-            ("W", recurrent_width),
-            ("C", taps),
-        ],
-        &[],
-        |kernel, rows| {
-            let slabs = crate::common::slab_tensor(
-                device,
-                2,
-                banks as u64,
-                &[SlabRegion {
-                    element: a,
-                    row_shape: vec![window_rows as u64, channels as u64],
-                }],
-            );
-            for slab in 0..banks / 2 {
-                slabs.add_slab(seismic::SlabFill::Zeroed).unwrap();
-                let bank_values = window_rows * channels;
-                slabs
-                    .region_rows(0, 2 * slab as u64, 2)
-                    .unwrap()
-                    .write_from_host(&act.bytes(&initial[2 * slab * bank_values..2 * (slab + 1) * bank_values]))
-                    .unwrap();
-            }
-            let mut window = slabs.logical_region(0).unwrap();
-            let slots = rows.len();
-            let ints = |values: Vec<i32>| i32_tensor(device, &[values.len()], &values);
-            let segments = (0..=slots as i32)
-                .flat_map(|slot| [slot, (slot + 1).min(slots as i32)])
-                .collect::<Vec<_>>();
-            let out = kernel
-                .call(gated_delta_project_convolved::Args {
-                    hidden: &hidden_rows(&rows),
-                    input_norm: &norm,
-                    qkv_weight: &recurrent[0],
-                    gate_weight: &recurrent[1],
-                    alpha_weight: &recurrent[2],
-                    beta_weight: &recurrent[3],
-                    convolution: &convolution,
-                    segments: &i32_tensor(device, &[slots + 1, 2], &segments),
-                    stop: &ints(vec![1; slots]),
-                    previous_bank: &ints(rows.clone().map(|row| row as i32).collect()),
-                    previous_tape: &ints(vec![0; slots]),
-                    following_bank: &ints(rows.clone().map(|row| (CLASS_ROWS + row) as i32).collect()),
-                    window: &mut window,
-                    epsilon: 1e-6,
-                    slab_banks: 2,
-                })
-                .unwrap();
-            vec![read_act(act, &out.r0), read_f32(&out.r1)]
-        },
-    );
-
-    // project_rows: activation rows to F32.
-    let source = cancelling_rows(CLASS_ROWS, width, 114, 1.0);
-    let plain = mirrored_weight(512, width, 115).tensor(device);
-    tally.check(
-        device,
-        project_rows::native_entry_with(project_rows::Elements { A: a, W: q4k, Y: Element::f32() }),
-        &[("G", 1), ("K", width), ("N", 512), ("WS", 0), ("WB", 0)],
-        &[],
-        |kernel, rows| {
-            let out = kernel
-                .call(project_rows::Args {
-                    source: &act_tensor(
-                        device,
-                        act,
-                        &[rows.len(), width],
-                        &source[rows.start * width..rows.end * width],
-                    ),
-                    weight: &plain,
-                    weight_scale: &empty(),
-                    weight_bound: &absent_bound(device),
-                })
-                .unwrap()
-                .value;
-            vec![read_f32(&out)]
-        },
-    );
-
-    // short_conv_project: the b, c and x projections, F32 results.
-    let conv_channels = 512;
-    let conv = (0..3)
-        .map(|i| mirrored_weight(conv_channels, width, 116 + i).tensor(device))
-        .collect::<Vec<_>>();
-    tally.check(
-        device,
-        short_conv_project::native_entry_with(short_conv_project::Elements {
-            NW: Element::bf16(),
-            BW: q4k,
-            CW: q4k,
-            XW: q4k,
-            A: a,
-        }),
-        &[("H", width), ("CH", conv_channels), ("BS", 0), ("CS", 0), ("XS", 0)],
-        &[],
-        |kernel, rows| {
-            let out = kernel
-                .call(short_conv_project::Args {
-                    residual: &hidden_rows(&rows),
-                    norm: &norm,
-                    b_weight: &conv[0],
-                    c_weight: &conv[1],
-                    x_weight: &conv[2],
-                    eps: 1e-6,
-                    b_scale: &empty(),
-                    c_scale: &empty(),
-                    x_scale: &empty(),
-                })
-                .unwrap()
-                .value;
-            vec![read_f32(&out)]
-        },
-    );
-
-    // per_layer_gate: the gate projection times layer 1's inputs, A results.
-    let (layers, per_layer) = (2, 512);
-    let layer_gate = mirrored_weight(per_layer, width, 119).tensor(device);
-    let inputs = uniform_values(CLASS_ROWS * layers * per_layer, 120, 1.0);
-    tally.check(
-        device,
-        per_layer_gate::native_entry_with(per_layer_gate::Elements { GW: q4k, A: a }),
-        &[("D", width), ("L", layers), ("P", per_layer), ("GS", 0)],
-        &[],
-        |kernel, rows| {
-            let n = layers * per_layer;
-            let out = kernel
-                .call(per_layer_gate::Args {
-                    hidden: &hidden_rows(&rows),
-                    gate_weight: &layer_gate,
-                    inputs: &f32_tensor(
-                        device,
-                        &[rows.len(), layers, per_layer],
-                        &inputs[rows.start * n..rows.end * n],
-                    ),
-                    layer: 1,
-                    activation: 1,
-                    gate_scale: &empty(),
-                })
-                .unwrap()
-                .value;
-            vec![read_act(act, &out)]
-        },
-    );
-
-    // The stream mix site's two stages over dense BF16 weights (the
-    // declarations admit no packed operands): low-rank rows, inject values
-    // and inverses; the input row.
-    let (stream_width, streams, rank) = (256usize, 4usize, 64usize);
-    let flat = streams * stream_width;
-    let stream_hidden = uniform_values(CLASS_ROWS * flat, 121, 3.0);
-    let stream_norm = f32_tensor(device, &[streams, stream_width], &norm_values(flat, 122));
-    let mix_down = weight(Repr::Bf16, rank, flat, 123, 1.0).tensor(device);
-    let inject = f32_tensor(device, &[streams, flat], &uniform_values(streams * flat, 124, 2.0 / (flat as f32).sqrt()));
-    let mix_up = weight(Repr::Bf16, flat, rank, 125, 1.0).tensor(device);
-    let low = uniform_values(CLASS_ROWS * rank, 126, 1.0);
-    let inverse = (0..CLASS_ROWS * streams).map(|i| 0.5 + 0.01 * i as f32).collect::<Vec<_>>();
-    let stream_rows = |rows: &std::ops::Range<usize>| {
-        f32_tensor(device, &[rows.len(), streams, stream_width], &stream_hidden[rows.start * flat..rows.end * flat])
-    };
-    tally.check(
-        device,
-        stream_mix_down::native_entry_with(stream_mix_down::Elements {
-            NW: Element::f32(),
-            DW: Element::bf16(),
-            IW: Element::f32(),
-            A: a,
-        }),
-        &[("H", stream_width), ("S", streams), ("LR", rank), ("C", 1)],
-        &[],
-        |kernel, rows| {
-            let out = kernel
-                .call(stream_mix_down::Args {
-                    hidden: &stream_rows(&rows),
-                    norm: &stream_norm,
-                    down_weight: &mix_down,
-                    inject_weight: &inject,
-                    epsilon: 1e-6,
-                })
-                .unwrap();
-            vec![read_act(act, &out.r0), read_f32(&out.r1), read_f32(&out.r2)]
-        },
-    );
-    tally.check(
-        device,
-        stream_mix_up::native_entry_with(stream_mix_up::Elements {
-            UW: Element::bf16(),
-            NW: Element::f32(),
-            A: a,
-        }),
-        &[("H", stream_width), ("S", streams), ("LR", rank)],
-        &[],
-        |kernel, rows| {
-            let out = kernel
-                .call(stream_mix_up::Args {
-                    low: &act_tensor(device, act, &[rows.len(), rank], &low[rows.start * rank..rows.end * rank]),
-                    up_weight: &mix_up,
-                    hidden: &stream_rows(&rows),
-                    inverse: &f32_tensor(
-                        device,
-                        &[rows.len(), streams],
-                        &inverse[rows.start * streams..rows.end * streams],
-                    ),
-                    norm: &stream_norm,
-                })
-                .unwrap()
-                .value;
-            vec![read_f32(&out)]
-        },
-    );
-
-    // The routed decode expansions over a stack of four experts, two choices
-    // a row: row r chooses experts r and r + 1 (modulo four), so each expert
-    // serves several rows of a call, which a gathered form runs together.
-    // `routed_expand` also projects the shared expert.
-    let (experts, choices, expert_features) = (4usize, 2usize, 256usize);
-    let routes = (0..CLASS_ROWS * choices)
-        .map(|i| ((i / choices + i % choices) % experts) as i32)
-        .collect::<Vec<_>>();
-    let normalized = cancelling_rows(CLASS_ROWS, width, 129, 1.0);
-    let normalized_rows = |rows: &std::ops::Range<usize>| {
-        act_tensor(device, act, &[rows.len(), width], &normalized[rows.start * width..rows.end * width])
-    };
-    let route_rows = |rows: &std::ops::Range<usize>| {
-        i32_tensor(device, &[rows.len(), choices], &routes[rows.start * choices..rows.end * choices])
-    };
-    let expert_stack = |seed: u64| {
-        let stack = (0..experts as u64)
-            .map(|expert| mirrored_weight(expert_features, width, seed + expert))
-            .collect::<Vec<_>>();
-        stacked(device, &stack)
-    };
-    let (expert_gate, expert_up) = (expert_stack(130), expert_stack(134));
-    let shared_gate = mirrored_weight(expert_features, width, 138).tensor(device);
-    let shared_up = mirrored_weight(expert_features, width, 139).tensor(device);
-    tally.check(
-        device,
-        routed_expand::native_entry_with(routed_expand::Elements { A: a, EGW: q4k, EUW: q4k, SGW: q4k, SUW: q4k }),
-        &[("H", width), ("K", choices), ("F", expert_features), ("S", expert_features), ("GS", 0), ("US", 0)],
-        &[],
-        |kernel, rows| {
-            let out = kernel
-                .call(routed_expand::Args {
-                    normalized: &normalized_rows(&rows),
-                    routes: &route_rows(&rows),
-                    expert_gate: &expert_gate,
-                    expert_up: &expert_up,
-                    shared_gate: &shared_gate,
-                    shared_up: &shared_up,
-                    gate_scale: &empty(),
-                    up_scale: &empty(),
-                })
-                .unwrap();
-            vec![read_act(act, &out.r0), read_act(act, &out.r1)]
-        },
-    );
-    // The gated and up-only expansions of resident experts (no sources, no
-    // tier), in each form a backend declares: per choice, and gathered.
-    let no_sources = |rows: &std::ops::Range<usize>| i32_tensor(device, &[0, rows.len(), choices], &[]);
-    let forms: [&[(&'static str, u64)]; 2] = [&[], &[("GATHERED", 1)]];
-    for forms in forms {
-        tally.check(
-            device,
-            routed_gate_up::native_entry_with(routed_gate_up::Elements { A: a, EGW: q4k, EUW: q4k }),
-            &[("H", width), ("K", choices), ("F", expert_features), ("GS", 0), ("US", 0), ("LB", 0)],
-            forms,
-            |kernel, rows| {
-                let out = kernel
-                    .call(routed_gate_up::Args {
-                        normalized: &normalized_rows(&rows),
-                        routes: &route_rows(&rows),
-                        sources: &no_sources(&rows),
-                        expert_gate: &expert_gate,
-                        expert_up: &expert_up,
-                        tier_gate: &expert_gate.slice_leading(0, 0).unwrap(),
-                        tier_up: &expert_up.slice_leading(0, 0).unwrap(),
-                        activation: 0,
-                        gate_scale: &empty(),
-                        up_scale: &empty(),
-                        glu_limit: &i32_tensor(device, &[0, 0], &[]),
-                    })
-                    .unwrap()
-                    .value;
-                vec![read_act(act, &out)]
-            },
-        );
-        tally.check(
-            device,
-            routed_up::native_entry_with(routed_up::Elements { A: a, EUW: q4k }),
-            &[("H", width), ("K", choices), ("F", expert_features), ("US", 0)],
-            forms,
-            |kernel, rows| {
-                let out = kernel
-                    .call(routed_up::Args {
-                        normalized: &normalized_rows(&rows),
-                        routes: &route_rows(&rows),
-                        sources: &no_sources(&rows),
-                        expert_up: &expert_up,
-                        tier_up: &expert_up.slice_leading(0, 0).unwrap(),
-                        up_scale: &empty(),
-                        activation: 2,
-                    })
-                    .unwrap()
-                    .value;
-                vec![read_act(act, &out)]
-            },
-        );
-    }
-
-    // readout_planes_rows: the progressive head's exact F32 logits from its
-    // planes (P 3: four top planes, bit 3 and three rest planes a group of 32
-    // columns) of random words, under scales of alternating sign.
-    let groups = vocabulary * width / 32;
-    let mut rng = Rng::new(140);
-    let mut words = |count: usize| {
-        (0..count)
-            .flat_map(|_| (rng.next() ^ (rng.next() << 1)).to_le_bytes())
-            .collect::<Vec<u8>>()
-    };
-    let plane = |shape: &[u64], bytes: Vec<u8>| Tensor::from_host(device, Element::u32(), shape, &bytes).unwrap();
-    let extents = [vocabulary as u64, (width / 32) as u64];
-    let top = plane(&[extents[0], extents[1], 4], words(4 * groups));
-    let bit3 = plane(&extents, words(groups));
-    let rest = plane(&[extents[0], extents[1], 3], words(3 * groups));
-    let scales = (0..groups)
-        .flat_map(|group| {
-            let sign = if group % 2 == 0 { 1.0 } else { -1.0 };
-            f16_bits(sign * rng.uniform(0.5, 1.5) * 0.02 / (width as f32).sqrt()).to_le_bytes()
-        })
-        .collect::<Vec<u8>>();
-    let scales = Tensor::from_host(device, Element::f16(), &extents, &scales).unwrap();
-    tally.check(
-        device,
-        readout_planes_rows::native_entry_with(readout_planes_rows::Elements { NW: Element::bf16(), A: a }),
-        &[("V", vocabulary), ("D", width), ("PT", 1), ("NM", width), ("P", 3)],
-        &[],
-        |kernel, rows| {
-            let out = kernel
-                .call(readout_planes_rows::Args {
-                    hidden: &one_part(&hidden_rows(&rows)),
-                    norm: &norm,
-                    top: &top,
-                    bit3: &bit3,
-                    rest: &rest,
-                    scales: &scales,
-                    out_rows: &out_rows(&rows),
-                    epsilon: 1e-6,
-                    softcap: 0.0,
-                })
-                .unwrap()
-                .value;
-            vec![read_f32(&out)]
-        },
-    );
-
-    tally
 }
 
 /// Which cases a segmented projection check runs: the small and 4B
@@ -6748,7 +5916,6 @@ fn uniform_values(count: usize, seed: u64, scale: f32) -> Vec<f32> {
 /// rows. (CUDA's mma16 tables: `cuda_projection.rs`.)
 #[test]
 fn embedding_rows_read_the_slots_their_directory_names() {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
     let module = crate::common::kernels();
     let act = Act::Bf16;
     let (v, d) = (300usize, 512usize);
@@ -6763,15 +5930,8 @@ fn embedding_rows_read_the_slots_their_directory_names() {
             }
         })
         .collect::<Vec<_>>();
-    for backend in [BackendName::Metal, BackendName::Vulkan, BackendName::Cpu] {
-        let device = match catalog.open_backend(backend) {
-            Ok(device) => device,
-            Err(error) if backend != BackendName::Cpu => {
-                eprintln!("gathered rows: {backend:?} unavailable: {error}");
-                continue;
-            }
-            Err(error) => panic!("gathered rows: CPU unavailable: {error}"),
-        };
+    for device in seismic_native_tests::devices(&[BackendName::Metal, BackendName::Vulkan, BackendName::Cpu]) {
+        let backend = device.backend();
         eprintln!("gathered rows: testing {backend:?}");
         let directory = i32_tensor(&device, &[logical, 1], &directory_values);
         let direct = i32_tensor(&device, &[0, 1], &[]);
@@ -7044,6 +6204,7 @@ gguf_format_tests! {
         embedding_rows_decode_exactly_as_the_portable_body
         metal_tall_and_packed_project_rows_agree_with_the_staged_form
         metal_packed_dense_output_agrees_with_the_staged_form
+        metal_packed_rows_dense_output_agrees_with_the_gemv
         packing_bound_matches_its_portable_body
     ];
 }
@@ -8299,8 +7460,112 @@ fn mxfp8_grouped_project_rows_at_deepseek_v41_prefill_wo_a_times() {
     }
 }
 
+/// One timed `dense_output` call at H x F over `rows` activation rows of
+/// `weight` (`format`), under `mapping`: the median device time of a call
+/// over 15 samples, and what the compiler made of each launch (its registers
+/// and local memory, where the driver reports them), or None where `mapping`
+/// is not admitted.
+fn time_dense_output(
+    device: &Device,
+    format: Format,
+    weight: &Tensor,
+    (h, f, rows): (usize, usize, usize),
+    mapping: Mapping,
+) -> Option<(f64, String)> {
+    let repr = Repr::of(format);
+    let act = Act::Bf16;
+    let mut rng = Rng::new(rows as u64);
+    let residual = f32_tensor(device, &[rows, h], &(0..rows * h).map(|_| rng.symmetric()).collect::<Vec<_>>());
+    let product = act_tensor(
+        device,
+        act,
+        &[rows, f],
+        &(0..rows * f).map(|_| act.round(rng.symmetric())).collect::<Vec<_>>(),
+    );
+    let out_rows = i32_tensor(device, &[rows], &(0..rows as i32).collect::<Vec<_>>());
+    let (scale, bound) = (f32_tensor(device, &[0], &[]), absent_bound(device));
+    let elements = [("A", act.element()), ("DW", repr.resident(device))];
+    let specialization = dense_output_specialization_on(device, &[("H", h), ("F", f)], mapping);
+    let specialization = with_matrix::<dense_output::Entry>(device, specialization, &elements);
+    if !seismic::generated::native_specialization_valid::<dense_output::Entry>(device, &specialization, &elements)
+        .unwrap()
+    {
+        return None;
+    }
+    let point = seismic::TuningPoint {
+        label: format!("m{rows}"),
+        weight: 1.0,
+        class: None,
+        cost: 1.0,
+        workload: seismic::WorkloadRotation::All,
+        rotation: vec![dense_output::Args {
+            residual: &residual,
+            product: &product,
+            down_weight: weight,
+            out_rows: &out_rows,
+            down_scale: &scale,
+            down_bound: &bound,
+        }],
+        initialize: None,
+        written: Default::default(),
+    };
+    let result = dense_output::native_tune_with(
+        device,
+        dense_output::Elements { A: act.element(), DW: repr.resident(device) },
+        &specialization,
+        vec![point],
+        seismic::NumericalRequirement::RoundingSteps { alpha: 8., activation: Some(seismic::DType::BF16) },
+        seismic::Strategy::Survey(seismic::SurveyPlan {
+            samples: 15,
+            min_sample_seconds: 0.05,
+            domains: Default::default(),
+        }),
+    )
+    .unwrap();
+    let (median, launches) = result
+        .configurations
+        .iter()
+        .find_map(|record| match &record.outcome {
+            seismic::Outcome::Measured { points, .. } => Some((points[0].median_seconds, &record.launches)),
+            seismic::Outcome::Excluded(_) => None,
+        })
+        .expect("the fixed configuration is measured");
+    let programs = launches
+        .iter()
+        .flatten()
+        .map(|program| {
+            program
+                .statistics
+                .iter()
+                .filter(|statistic| {
+                    ["register", "spill", "local", "scratch", "private"]
+                        .iter()
+                        .any(|word| statistic.name.to_lowercase().contains(word))
+                })
+                .map(|statistic| format!("{} {:?}", statistic.name, statistic.value))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    Some((median, programs))
+}
+
+/// A weight of `format` at H x F, its bytes alone (its host values, an
+/// interpreted decode of 50M values, are no part of a timing); `uniform`
+/// sets every code 0, so every grid lookup reads one table entry.
+fn timing_weight(device: &Device, format: Format, (h, f): (usize, usize), uniform: bool) -> Tensor {
+    let repr = Repr::of(format);
+    let shape = [h as u64, f as u64];
+    let external = format.external(&mut Rng::new(91), &shape, 2.0 / (f as f32).sqrt());
+    let external = if uniform { vec![0; external.len()] } else { external };
+    let bytes = repr.element().repack_host(format.source(), &shape, &external).unwrap();
+    Tensor::from_host(device, repr.resident(device), &shape, &bytes).unwrap()
+}
+
 /// `dense_output` at Qwen3.5-9B's feed-forward down shape (H 4096, F 12288)
-/// over the grid and codebook formats, q4_K and F8_E4M3, at a decode row and
+/// over a format of every decode class (the grid and codebook formats, the
+/// direct linear, k-quant and odd-width ones, q4_K and F8_E4M3), at a decode row and
 /// a 512-row prefill chunk, under the declaration's default GEMV and GEMM
 /// configuration: the median device time of a call over 15 samples. The grid
 /// formats are timed again over uniform weights (every code 0, so every
@@ -8311,6 +7576,13 @@ fn mxfp8_grouped_project_rows_at_deepseek_v41_prefill_wo_a_times() {
 fn dense_output_timing_at_shape() {
     let (h, f) = (4096usize, 12288usize);
     let formats = [
+        Encoding::Q8_0,
+        Encoding::Q4_0,
+        Encoding::Q4_1,
+        Encoding::Q2K,
+        Encoding::Q6K,
+        Encoding::Q1_0,
+        Encoding::Tq2_0,
         Encoding::Iq1S,
         Encoding::Iq1M,
         Encoding::Iq2Xxs,
@@ -8328,81 +7600,54 @@ fn dense_output_timing_at_shape() {
     .chain([Format::F8_E4M3])
     .map(|format| (format, false))
     .chain([Encoding::Iq1S, Encoding::Iq2Xxs, Encoding::Iq3Xxs].map(|encoding| (Format::rounded(encoding), true)));
-    let act = Act::Bf16;
     for device in devices().into_iter().filter(|device| !is_cpu(device)) {
         for (format, uniform) in formats.clone() {
-            // The weight's bytes alone: its host values (an interpreted
-            // decode of 50M values) are no part of a timing.
-            let repr = Repr::of(format);
-            let shape = [h as u64, f as u64];
-            let external = format.external(&mut Rng::new(91), &shape, 2.0 / (f as f32).sqrt());
-            let external = if uniform { vec![0; external.len()] } else { external };
-            let bytes = repr.element().repack_host(format.source(), &shape, &external).unwrap();
-            let weight_tensor = Tensor::from_host(&device, repr.resident(&device), &shape, &bytes).unwrap();
+            let weight = timing_weight(&device, format, (h, f), uniform);
             for rows in [1usize, 512] {
-                let mut rng = Rng::new(rows as u64);
-                let residual = f32_tensor(&device, &[rows, h], &(0..rows * h).map(|_| rng.symmetric()).collect::<Vec<_>>());
-                let product = act_tensor(
-                    &device,
-                    act,
-                    &[rows, f],
-                    &(0..rows * f).map(|_| act.round(rng.symmetric())).collect::<Vec<_>>(),
-                );
-                let out_rows = i32_tensor(&device, &[rows], &(0..rows as i32).collect::<Vec<_>>());
-                let (scale, bound) = (f32_tensor(&device, &[0], &[]), absent_bound(&device));
-                let specialization = with_matrix::<dense_output::Entry>(
-                    &device,
-                    dense_output_specialization_on(&device, &[("H", h), ("F", f)], gemm_mapping(64, 128, 1)),
-                    &[("A", act.element()), ("DW", repr.resident(&device))],
-                );
-                let point = seismic::TuningPoint {
-                    label: format!("m{rows}"),
-                    weight: 1.0,
-                    class: None,
-                    cost: 1.0,
-                    workload: seismic::WorkloadRotation::All,
-                    rotation: vec![dense_output::Args {
-                        residual: &residual,
-                        product: &product,
-                        down_weight: &weight_tensor,
-                        out_rows: &out_rows,
-                        down_scale: &scale,
-                        down_bound: &bound,
-                    }],
-                    initialize: None,
-                    written: Default::default(),
-                };
-                let result = dense_output::native_tune_with(
-                    &device,
-                    dense_output::Elements { A: act.element(), DW: repr.resident(&device) },
-                    &specialization,
-                    vec![point],
-                    seismic::NumericalRequirement::RoundingSteps {
-                        alpha: 8.,
-                        activation: Some(seismic::DType::BF16),
-                    },
-                    seismic::Strategy::Survey(seismic::SurveyPlan {
-                        samples: 15,
-                        min_sample_seconds: 0.05,
-                        domains: Default::default(),
-                    }),
-                )
-                .unwrap();
-                let median = result
-                    .configurations
-                    .iter()
-                    .find_map(|record| match &record.outcome {
-                        seismic::Outcome::Measured { points, .. } => Some(points[0].median_seconds),
-                        seismic::Outcome::Excluded(_) => None,
-                    })
-                    .expect("the fixed configuration is measured");
+                let (median, programs) =
+                    time_dense_output(&device, format, &weight, (h, f, rows), gemm_mapping(64, 128, 1))
+                        .expect("the default configuration is admitted");
                 eprintln!(
-                    "timing {:?} dense_output {format:?}{} H {h} F {f} M {rows}: {:.1} us per call, {:.0} G values/s",
+                    "timing {:?} dense_output {format:?}{} H {h} F {f} M {rows}: {:.1} us per call, {:.0} G values/s, {:.2} TFLOPS [{programs}]",
                     device.backend(),
                     if uniform { " uniform" } else { "" },
                     1e6 * median,
-                    (h * f) as f64 / median / 1e9
+                    (h * f) as f64 / median / 1e9,
+                    2.0 * (h * f * rows) as f64 / median / 1e12
                 );
+            }
+        }
+    }
+}
+
+/// `dense_output`'s 512-row GEMM alone at the same shape, per admitted tile
+/// (TM x TN of WM x WN sub-tiles), for a direct and a grid weight: the GEMM
+/// core is the same for every format and only their B staging differs. A
+/// timing for before/after comparisons and tile choices of the GEMM.
+#[test]
+#[ignore = "timing at shape"]
+fn dense_output_gemm_timing_at_shape() {
+    let (h, f, rows) = (4096usize, 12288usize, 512usize);
+    for device in devices().into_iter().filter(|device| !is_cpu(device)) {
+        for format in [Encoding::Q4_0, Encoding::Iq2Xxs].map(Format::rounded) {
+            let weight = timing_weight(&device, format, (h, f), false);
+            for (tile_m, tile_n) in [(64, 64), (64, 128), (128, 64), (128, 128)] {
+                for (sub_m, sub_n) in [(32, 32), (32, 64), (64, 32), (64, 64)] {
+                    if sub_m > tile_m || sub_n > tile_n {
+                        continue;
+                    }
+                    let mapping = Mapping { sub_m, sub_n, ..gemm_mapping(tile_m, tile_n, 1) };
+                    let Some((median, programs)) = time_dense_output(&device, format, &weight, (h, f, rows), mapping)
+                    else {
+                        continue;
+                    };
+                    eprintln!(
+                        "timing {:?} dense_output {format:?} H {h} F {f} M {rows} tile {tile_m}x{tile_n}/{sub_m}x{sub_n}: {:.1} us per call, {:.2} TFLOPS [{programs}]",
+                        device.backend(),
+                        1e6 * median,
+                        2.0 * (h * f * rows) as f64 / median / 1e12
+                    );
+                }
             }
         }
     }

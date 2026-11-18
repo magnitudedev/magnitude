@@ -60,18 +60,26 @@ constant constexpr uint combine_threads = 256;
     const projection::Store<routed::Act> out{element::out_over_scratch<routed::Act>(shared_output), SEISMIC_DIM_H, 1, 0}
 
 // The forms' scratch (`routed.h`): the GEMM's operand over every row
-// (128-row padded), with the table of weight `weight` of the GEMM's
-// `weights`, of `n` rows by `k` columns; the operand alone for its own pass.
+// (128-row padded), with the table of weight `weight` (packets W) of the
+// GEMM's `weights`, of `n` rows by `k` columns; the operand alone for its own
+// pass, laid out with each run's code sums where `sums`; the table alone for
+// the coefficient pass.
 #define COMBINE_OPERAND_ROWS ((ulong(SEISMIC_DIM_M) + 127u) / 128u * 128u)
 #define COMBINE_INT8(weights, weight)                                                                           \
     routed::int8_forms(operand, COMBINE_OPERAND_ROWS,                                                           \
         routed::weight_table(tables, 0, 0, weights, weight, routed::int8_table_bytes(n, k)), n, k)
-#define COMBINE_PACKING(weights, weight)                                                                        \
+#define COMBINE_PACKING_TABLE(weights, weight, W)                                                               \
+    routed::weight_table(tables, 0, 0, weights, weight,                                                         \
+        routed::packing_table_bytes(n, k, projection::packing_codes<W>::sums))
+#define COMBINE_PACKING(weights, weight, W)                                                                     \
     routed::packing_forms<projection::packing_scratch>(operand, COMBINE_OPERAND_ROWS,                           \
-        routed::weight_table(tables, 0, 0, weights, weight, routed::packing_table_bytes(n, k)), n, k)
+        COMBINE_PACKING_TABLE(weights, weight, W), n, k, projection::packing_codes<W>::sums)
+#define COMBINE_PACKING_COEFFICIENTS(weights, weight, W)                                                        \
+    routed::packing_table<projection::packing_scratch>(COMBINE_PACKING_TABLE(weights, weight, W), n, k,          \
+        projection::packing_codes<W>::sums)
 #define COMBINE_INT8_OPERAND routed::int8_forms(operand, COMBINE_OPERAND_ROWS, tables, 0, k)
-#define COMBINE_PACKING_OPERAND                                                                                 \
-    routed::packing_forms<projection::packing_scratch>(operand, COMBINE_OPERAND_ROWS, tables, 0, k)
+#define COMBINE_PACKING_OPERAND(sums)                                                                           \
+    routed::packing_forms<projection::packing_scratch>(operand, COMBINE_OPERAND_ROWS, tables, 0, k, sums)
 
 #ifdef SEISMIC_FORMING_ROUTED_COMBINE_EXPAND
 template <uint TILE_M, uint TILE_N>
@@ -140,12 +148,12 @@ kernel void routed_combine_int8(COMBINE_ARGUMENTS, PROJECTION_TILE_ARGUMENTS) {
 kernel void routed_combine_pack(COMBINE_ARGUMENTS, PROJECTION_THREADGROUP_ARGUMENTS) {
     if constexpr (!projection::packing_path<packets::W1, packets::W2>())
         return;
-    threadgroup float4 peaks[8];
+    threadgroup float peaks[projection::packing_peaks()];
     COMBINE_EXPANSION;
     typedef projection::packing_shared<1, packets::W1, 1, packets::W2, 1> coded;
     const projection::packing_bounds<0> bounds{};
-    projection::packing_operand<coded::centre, coded::folds, coded::residue, 0>(in, COMBINE_PACKING_OPERAND, bounds,
-        m, k, index, peaks, thread_index, sg, lane);
+    projection::packing_operand<coded::centre, coded::folds, coded::sums, coded::residue, 0>(in,
+        COMBINE_PACKING_OPERAND(coded::sums), bounds, m, k, index, peaks, thread_index, sg, lane);
 }
 #endif
 
@@ -156,8 +164,10 @@ kernel void routed_combine_pack_coefficients(COMBINE_ARGUMENTS, PROJECTION_THREA
     threadgroup float peaks0[8];
     threadgroup float peaks1[8];
     COMBINE_EXPANSION;
-    projection::packing_tile_coefficients(gate, COMBINE_PACKING(2, 0), k, index, peaks0, thread_index, sg, lane);
-    projection::packing_tile_coefficients(up, COMBINE_PACKING(2, 1), k, index, peaks1, thread_index, sg, lane);
+    projection::packing_tile_coefficients(gate, COMBINE_PACKING_COEFFICIENTS(2, 0, packets::W1), k, index, peaks0,
+        thread_index, sg, lane);
+    projection::packing_tile_coefficients(up, COMBINE_PACKING_COEFFICIENTS(2, 1, packets::W2), k, index, peaks1,
+        thread_index, sg, lane);
 }
 #endif
 
@@ -167,11 +177,11 @@ template <uint PACK_TOKENS, uint WEIGHTS_AHEAD>
 kernel void routed_combine_packed(COMBINE_ARGUMENTS, PROJECTION_THREADGROUP_ARGUMENTS) {
     if constexpr (!projection::packing_path<packets::W1, packets::W2>())
         return;
-    threadgroup float4 exchange[projection::packing_simdgroups / 2 * projection::packing_exchange];
+    threadgroup float exchange[projection::packing_simdgroups / 2 * projection::packing_exchange()];
     COMBINE_EXPANSION;
     projection::gemm_packed_paired<packets::W1, packets::W2, 1, PACK_TOKENS, WEIGHTS_AHEAD>(out, gate, up,
-        COMBINE_PACKING(2, 0), COMBINE_PACKING(2, 1), m, (m + 63u) / 64u * 64u, n, k, index,
-        projection::packing_simdgroups, exchange, sg, lane);
+        COMBINE_PACKING(2, 0, packets::W1), COMBINE_PACKING(2, 1, packets::W2), m, projection::packing_padded(m, 1u),
+        n, k, index, projection::packing_simdgroups, exchange, sg, lane);
 }
 #endif
 
@@ -248,12 +258,12 @@ kernel void routed_combine_down_int8(COMBINE_ARGUMENTS, PROJECTION_TILE_ARGUMENT
 kernel void routed_combine_down_pack(COMBINE_ARGUMENTS, PROJECTION_THREADGROUP_ARGUMENTS) {
     if constexpr (!projection::packing_path<packets::W0>())
         return;
-    threadgroup float4 peaks[8];
+    threadgroup float peaks[projection::packing_peaks()];
     COMBINE_DOWN;
     typedef projection::packing_codes<packets::W0> coded;
     const projection::packing_bounds<0> bounds{};
-    projection::packing_operand<coded::centre, coded::folds, (coded::residue != 0 ? 1 : 0), 0>(in,
-        COMBINE_PACKING_OPERAND, bounds, m, k, index, peaks, thread_index, sg, lane);
+    projection::packing_operand<coded::centre, coded::folds, coded::sums, (coded::residue != 0 ? 1 : 0), 0>(in,
+        COMBINE_PACKING_OPERAND(coded::sums), bounds, m, k, index, peaks, thread_index, sg, lane);
 }
 #endif
 
@@ -263,7 +273,8 @@ kernel void routed_combine_down_pack_coefficients(COMBINE_ARGUMENTS, PROJECTION_
         return;
     threadgroup float peaks[8];
     COMBINE_DOWN;
-    projection::packing_tile_coefficients(down, COMBINE_PACKING(1, 0), k, index, peaks, thread_index, sg, lane);
+    projection::packing_tile_coefficients(
+        down, COMBINE_PACKING_COEFFICIENTS(1, 0, packets::W0), k, index, peaks, thread_index, sg, lane);
 }
 #endif
 
@@ -273,8 +284,9 @@ kernel void routed_combine_down_packed(COMBINE_ARGUMENTS, PROJECTION_THREADGROUP
     if constexpr (!projection::packing_path<packets::W0>())
         return;
     COMBINE_DOWN;
-    projection::gemm_packed<packets::W0, 1, DOWN_PACK_TOKENS, DOWN_WEIGHTS_AHEAD>(out, down, COMBINE_PACKING(1, 0),
-        m, (m + 127u) / 128u * 128u, n, k, index * projection::packing_simdgroups + sg, lane);
+    projection::gemm_packed<packets::W0, 1, DOWN_PACK_TOKENS, DOWN_WEIGHTS_AHEAD>(
+        out, down, COMBINE_PACKING(1, 0, packets::W0),
+        m, projection::packing_padded(m, 2u), n, k, index * projection::packing_simdgroups + sg, lane);
 }
 #endif
 

@@ -4,7 +4,7 @@
 //! available device.
 
 use seismic::{
-    BackendName, Devices, Element, NativeGraphClassSlice, NativeGraphFamily,
+    BackendName, Element, NativeGraphClassSlice, NativeGraphFamily,
     NativeGraphMetadata, NativeSpecialization, Tensor,
 };
 use seismic_native_tests::scale_rows;
@@ -179,10 +179,7 @@ fn a_templates_classes_seal_their_store_into_its_layout() {
 /// exactly, once, and is then not exported.
 #[test]
 fn a_store_takes_one_exact_external_port() {
-    let device = Devices::discover(&[])
-        .unwrap()
-        .open_backend(BackendName::Cpu)
-        .unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Cpu) else { return };
     let kernel =
         scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1))
             .unwrap();

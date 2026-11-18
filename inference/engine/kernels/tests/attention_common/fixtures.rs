@@ -327,17 +327,12 @@ impl Case {
 
 /// Metal on macOS, elsewhere Vulkan when present (both run the Metal
 /// decode/prefill contract with the same decode parameters), and the CPU
-/// device.
+/// device; a requested backend among them alone
+/// ([`seismic_native_tests::first_and_cpu`]).
 fn devices() -> Vec<Device> {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    let gpu = if cfg!(target_os = "macos") {
-        Some(catalog.open_backend(BackendName::Metal).unwrap())
-    } else {
-        catalog.open_backend(BackendName::Vulkan).ok()
-    };
-    gpu.into_iter()
-        .chain(std::iter::once(catalog.open_backend(BackendName::Cpu).unwrap()))
-        .collect()
+    use BackendName::{Cpu, Metal, Vulkan};
+    let gpu = if cfg!(target_os = "macos") { Metal } else { Vulkan };
+    seismic_native_tests::first_and_cpu(&[gpu], &[gpu, Cpu])
 }
 
 fn is_cpu(device: &Device) -> bool {

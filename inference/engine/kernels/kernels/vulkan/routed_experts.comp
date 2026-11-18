@@ -44,6 +44,11 @@
 #define EXPERTS_TN SEISMIC_TUNE_TILE_N
 #define EXPERTS_WM SEISMIC_TUNE_SUB_M
 #define EXPERTS_WN SEISMIC_TUNE_SUB_N
+#define PROJECTION_GEMM_TM EXPERTS_TM
+#define PROJECTION_GEMM_TN EXPERTS_TN
+#define PROJECTION_GEMM_WM EXPERTS_WM
+#define PROJECTION_GEMM_WN EXPERTS_WN
+#include "lib/projection/gemm.glsl"
 
 void routed_experts_grids() {
     routed_expert_grids(uint(element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_ROWS))),
@@ -112,7 +117,7 @@ void routed_experts_expand() {
         projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_US, SEISMIC_UP_SCALE_STRIDE_0,
             uint64_t(expert)));
     const uint live = routed_block_rows(order, SEISMIC_ORDER_STRIDE_1, uint(tile_rows));
-    projection_gemm_paired(PACKETS_W0, PACKETS_W1, EXPERTS_TM, EXPERTS_TN, EXPERTS_WM, EXPERTS_WN, x, out_, gate, up, uint(tile_rows),
+    projection_gemm_paired(PACKETS_W0, PACKETS_W1, x, out_, gate, up, uint(tile_rows),
         uint(SEISMIC_DIM_F), hidden, tm_index, gl_WorkGroupID.x, live);
 }
 
@@ -137,6 +142,6 @@ void routed_experts_down() {
         SEISMIC_RESULT_0_STRIDE_2, 0ul);
     const uint live = routed_block_rows(SEISMIC_PTR(SEISMIC_BUFFER_ORDER) + block * SEISMIC_ORDER_STRIDE_0 * 4ul,
         SEISMIC_ORDER_STRIDE_1, uint(tile_rows));
-    projection_gemm(PACKETS_W2, EXPERTS_TM, EXPERTS_TN, EXPERTS_WM, EXPERTS_WN, x, out_, down, uint(tile_rows), uint(SEISMIC_DIM_H), features,
+    projection_gemm(PACKETS_W2, x, out_, down, uint(tile_rows), uint(SEISMIC_DIM_H), features,
         tm_index, gl_WorkGroupID.x, live);
 }

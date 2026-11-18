@@ -328,7 +328,8 @@ inline device uchar *block_fragments(device uchar *fragments, uint block, uint t
 // expert's tables of the GEMM's `weights` weights, ordinal o's weight j at
 // o * weights + j (`weight_table`); one set over dense weights (blocks 0,
 // ordinal 0). A weight of `rows` rows by `columns` columns takes the INT8
-// form's block coefficients and biases, or the PACK form's block factors and
+// form's block coefficients and biases, or the PACK form's block factors
+// (twice them where each run has its code sums, `packing_codes::sums`) and
 // weight scales (`*_table_bytes`).
 inline device int *ordinals(device uchar *tables) {
     return reinterpret_cast<device int *>(tables);
@@ -336,8 +337,8 @@ inline device int *ordinals(device uchar *tables) {
 inline ulong int8_table_bytes(uint rows, uint columns) {
     return ulong(rows) * (columns / 32u) * 4u + ulong((rows + 31u) / 32u * 32u) * ((columns + 1023u) / 1024u) * 64u;
 }
-inline ulong packing_table_bytes(uint rows, uint columns) {
-    return ulong(rows) * (columns / 32u) * 4u + ulong(rows) * 4u;
+inline ulong packing_table_bytes(uint rows, uint columns, bool sums) {
+    return ulong(rows) * (columns / 32u) * (sums ? 8u : 4u) + ulong(rows) * 4u;
 }
 inline device uchar *weight_table(device uchar *tables, uint blocks, int ordinal, uint weights, uint weight,
     ulong bytes) {
@@ -345,7 +346,10 @@ inline device uchar *weight_table(device uchar *tables, uint blocks, int ordinal
 }
 // The INT8 and PACK forms' scratch of a weight whose table is `table` (the
 // operand's own passes take no table: `rows` 0); PACK's a
-// `projection::packing_scratch`, of `packing.h`, which its entries include.
+// `projection::packing_scratch`, of `packing.h`, which its entries include,
+// whose tokens' entries and weights' factors are twice as wide where each run
+// has its code sums (`sums`). `packing_table` is the weight's table alone,
+// which the coefficient pass reads (its operand pointers none).
 inline projection::int8_scratch int8_forms(device uchar *operand, ulong operand_rows, device uchar *table,
     uint rows, uint columns) {
     device uchar *row_scales = operand + operand_rows * columns;
@@ -355,13 +359,20 @@ inline projection::int8_scratch int8_forms(device uchar *operand, ulong operand_
         reinterpret_cast<device half *>(table + ulong(rows) * (columns / 32u) * 4u)};
 }
 template <typename Packing>
+inline Packing packing_table(device uchar *table, uint rows, uint columns, bool sums) {
+    return Packing{nullptr, nullptr, nullptr, reinterpret_cast<device half *>(table),
+        reinterpret_cast<device float *>(table + ulong(rows) * (columns / 32u) * (sums ? 8u : 4u))};
+}
+template <typename Packing>
 inline Packing packing_forms(device uchar *operand, ulong operand_rows, device uchar *table, uint rows,
-    uint columns) {
+    uint columns, bool sums) {
+    Packing forms = packing_table<Packing>(table, rows, columns, sums);
     device uchar *token_factors = operand + operand_rows * columns * 2u + 1024u;
-    device uchar *token_scales = token_factors + operand_rows * (columns / 32u) * 4u;
-    return Packing{reinterpret_cast<device float *>(operand), reinterpret_cast<device half *>(token_factors),
-        reinterpret_cast<device float *>(token_scales), reinterpret_cast<device half *>(table),
-        reinterpret_cast<device float *>(table + ulong(rows) * (columns / 32u) * 4u)};
+    forms.operand = reinterpret_cast<device float *>(operand);
+    forms.tokens = reinterpret_cast<device half *>(token_factors);
+    forms.token_scales =
+        reinterpret_cast<device float *>(token_factors + operand_rows * (columns / 32u) * (sums ? 8u : 4u));
+    return forms;
 }
 
 // An epilogue of one block's rows reached at the grouped rows' positions:

@@ -240,18 +240,18 @@ fn generated_surface_is_one_dense_import_and_one_exact_repack() {
     assert!(!source.contains("NegativeExp"));
 }
 
-/// The opened device of `backend`, when this host has one.
+/// The device of `backend`, where the host has one and the runner requests
+/// it or none ([`seismic_native_tests::devices`]).
 fn device(backend: seismic::BackendName) -> Option<seismic::Device> {
-    seismic::Devices::discover(&[])
-        .ok()?
-        .open_backend(backend)
-        .ok()
+    seismic_native_tests::devices(&[backend]).into_iter().next()
 }
 
 #[cfg(target_os = "macos")]
 #[test]
 fn metal_dense_import_matches_host_for_all_nine_pairs() {
-    dense_import_matches_host_for_all_nine_pairs(&device(seismic::BackendName::Metal).unwrap());
+    if let Some(device) = device(seismic::BackendName::Metal) {
+        dense_import_matches_host_for_all_nine_pairs(&device);
+    }
 }
 
 /// A record port whose records lie in a graph's workspace (an import's
@@ -260,7 +260,9 @@ fn metal_dense_import_matches_host_for_all_nine_pairs() {
 #[cfg(target_os = "macos")]
 #[test]
 fn metal_record_ports_bind_graph_workspace_records() {
-    let device = device(seismic::BackendName::Metal).unwrap();
+    let Some(device) = device(seismic::BackendName::Metal) else {
+        return;
+    };
     let values = [-3.25f32, -0.0, 0.125, 1.5, 19.0];
     let extents = [3, 7, values.len() as u64];
     let bytes = dense_bytes("f32", &values).repeat(21);
@@ -305,7 +307,9 @@ fn metal_record_ports_bind_graph_workspace_records() {
 
 #[test]
 fn cpu_dense_import_matches_host_for_all_nine_pairs() {
-    dense_import_matches_host_for_all_nine_pairs(&device(seismic::BackendName::Cpu).unwrap());
+    if let Some(device) = device(seismic::BackendName::Cpu) {
+        dense_import_matches_host_for_all_nine_pairs(&device);
+    }
 }
 
 #[test]
@@ -320,8 +324,11 @@ fn cuda_dense_import_matches_host_for_all_nine_pairs() {
 fn metal_repack_matches_the_registered_conversion_for_every_format_and_layout() {
     // Metal's repack writes every storage of these layouts but CUDA's
     // `records`.
+    let Some(device) = device(seismic::BackendName::Metal) else {
+        return;
+    };
     repack_matches_the_registered_conversion(
-        &device(seismic::BackendName::Metal).unwrap(),
+        &device,
         &[
             seismic::Layout::Packet,
             seismic::Layout::Rows16,
@@ -339,8 +346,11 @@ fn metal_repack_matches_the_registered_conversion_for_every_format_and_layout() 
 #[test]
 #[ignore = "timing"]
 fn metal_repack_timing() {
+    let Some(device) = device(seismic::BackendName::Metal) else {
+        return;
+    };
     repack_timing(
-        &device(seismic::BackendName::Metal).unwrap(),
+        &device,
         &[seismic::Layout::Packet, seismic::Layout::Rows32],
     );
 }
@@ -502,8 +512,11 @@ fn vulkan_dense_import_matches_host_for_all_nine_pairs() {
 /// The CPU repacks into both supported row layouts.
 #[test]
 fn cpu_repack_matches_the_registered_conversion_for_every_format() {
+    let Some(device) = device(seismic::BackendName::Cpu) else {
+        return;
+    };
     repack_matches_the_registered_conversion(
-        &device(seismic::BackendName::Cpu).unwrap(),
+        &device,
         &[seismic::Layout::Rows16, seismic::Layout::Rows8],
         false,
     );

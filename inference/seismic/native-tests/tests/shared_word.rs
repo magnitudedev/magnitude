@@ -5,14 +5,11 @@
 #[cfg(target_os = "macos")]
 #[test]
 fn a_running_kernel_and_the_host_exchange_words() {
-    use seismic::{BackendName, Devices, Element, NativeSpecialization, Tensor};
+    use seismic::{BackendName, Element, NativeSpecialization, Tensor};
     use seismic_native_tests::word_exchange;
     use std::time::{Duration, Instant};
 
-    let device = Devices::discover(&[])
-        .unwrap()
-        .open_backend(BackendName::Metal)
-        .unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Metal) else { return };
     let kernel = word_exchange::native_for_device(&device, &NativeSpecialization::new()).unwrap();
     let mut graph = device.native_graph();
     let mut exchange = graph.port(Element::i32(), &[4]).unwrap();

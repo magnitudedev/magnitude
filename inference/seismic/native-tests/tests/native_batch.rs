@@ -1,10 +1,9 @@
-use seismic::{BackendName, Devices, Element, NativeSpecialization, NativeTensorBatch, Tensor};
+use seismic::{BackendName, Element, NativeSpecialization, NativeTensorBatch, Tensor};
 use seismic_native_tests::{scale_rows, scoped_scale};
 
 #[test]
 fn different_native_entries_complete_in_one_metal_batch() {
-    let devices = Devices::discover(&[]).unwrap();
-    let Ok(device) = devices.open_backend(BackendName::Metal) else {
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Metal) else {
         return;
     };
     let rows =
@@ -89,8 +88,7 @@ fn canonical_formation_alone_serves_a_legal_choice_without_building_observations
         }
     }
 
-    let devices = Devices::discover(&[]).unwrap();
-    let Ok(device) = devices.open_backend(BackendName::Metal) else {
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Metal) else {
         return;
     };
     // Both a demanded case and a zero-demand required witness have no evidence
@@ -151,8 +149,7 @@ const SAMPLED_PAIRS: usize = 32 * 2_048;
 /// launch-detail trace, submitted back to back and collected once: every
 /// launch is timed, each after the one before, and the results are right.
 fn time_batches(batches: usize, launches: usize) {
-    let devices = Devices::discover(&[]).unwrap();
-    let Ok(device) = devices.open_backend(BackendName::Metal) else {
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Metal) else {
         return;
     };
     let rows =

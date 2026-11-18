@@ -100,16 +100,7 @@ fn generated_surface_exposes_native_and_planned_dense_plane_bindings() {
 
 #[test]
 fn native_copies_indexed_word_plane_rows_bit_exactly_on_every_device() {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    for backend in [
-        seismic::BackendName::Metal,
-        seismic::BackendName::Cuda,
-        seismic::BackendName::Vulkan,
-        seismic::BackendName::Cpu,
-    ] {
-        let Ok(device) = catalog.open_backend(backend) else {
-            continue;
-        };
+    for device in seismic_native_tests::devices(&[seismic::BackendName::Metal, seismic::BackendName::Cuda, seismic::BackendName::Vulkan, seismic::BackendName::Cpu]) {
         copy_word_plane_rows(&device);
     }
 }
@@ -159,19 +150,13 @@ fn copy_word_plane_rows(device: &seismic::Device) {
     assert_eq!(&actual[18..24], &source[18..24], "{:?}", device.backend());
 }
 
-/// The host's GPU (Metal on macOS, else Vulkan when present), then the CPU.
+/// The host's GPU (Metal on macOS, else Vulkan when present), then the CPU;
+/// a requested backend among them alone
+/// ([`seismic_native_tests::first_and_cpu`]).
 fn devices() -> Vec<seismic::Device> {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    let gpu = if cfg!(target_os = "macos") {
-        Some(catalog.open_backend(seismic::BackendName::Metal).unwrap())
-    } else {
-        catalog.open_backend(seismic::BackendName::Vulkan).ok()
-    };
-    gpu.into_iter()
-        .chain(std::iter::once(
-            catalog.open_backend(seismic::BackendName::Cpu).unwrap(),
-        ))
-        .collect()
+    use seismic::BackendName::{Cpu, Metal, Vulkan};
+    let gpu = if cfg!(target_os = "macos") { Metal } else { Vulkan };
+    seismic_native_tests::first_and_cpu(&[gpu], &[gpu, Cpu])
 }
 
 fn assert_native_two_byte_plane_copy(

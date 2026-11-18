@@ -307,16 +307,7 @@ fn reference(
 
 #[test]
 fn draft_rows_match_the_host_model_over_resident_weights() {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    for backend in [
-        seismic::BackendName::Metal,
-        seismic::BackendName::Cuda,
-        seismic::BackendName::Vulkan,
-        seismic::BackendName::Cpu,
-    ] {
-        let Ok(device) = catalog.open_backend(backend) else {
-            continue;
-        };
+    for device in seismic_native_tests::devices(&[seismic::BackendName::Metal, seismic::BackendName::Cuda, seismic::BackendName::Vulkan, seismic::BackendName::Cpu]) {
         draft_rows_match_on(&device);
     }
 }
@@ -519,16 +510,8 @@ fn draft_rows_match_on(device: &Device) {
 
 #[test]
 fn draft_rows_preserve_distinct_f32_streams() {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    for backend in [
-        seismic::BackendName::Cuda,
-        seismic::BackendName::Metal,
-        seismic::BackendName::Cpu,
-        seismic::BackendName::Vulkan,
-    ] {
-        let Ok(device) = catalog.open_backend(backend) else {
-            continue;
-        };
+    for device in seismic_native_tests::devices(&[seismic::BackendName::Cuda, seismic::BackendName::Metal, seismic::BackendName::Cpu, seismic::BackendName::Vulkan]) {
+        let backend = device.backend();
         let width = 64;
         let streams = 4;
         for rows in [1, 4, 5, 16, 17, 65] {
@@ -626,16 +609,7 @@ fn draft_rows_preserve_distinct_f32_streams() {
 /// resident layout) and streamed (`rows16` slots).
 #[test]
 fn draft_rows_match_the_host_model_over_every_table_form() {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    for backend in [
-        seismic::BackendName::Metal,
-        seismic::BackendName::Cuda,
-        seismic::BackendName::Vulkan,
-        seismic::BackendName::Cpu,
-    ] {
-        let Ok(device) = catalog.open_backend(backend) else {
-            continue;
-        };
+    for device in seismic_native_tests::devices(&[seismic::BackendName::Metal, seismic::BackendName::Cuda, seismic::BackendName::Vulkan, seismic::BackendName::Cpu]) {
         let mut layouts = vec![resident_layout(&device), Layout::Rows16];
         layouts.dedup();
         for layout in layouts {

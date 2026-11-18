@@ -5,20 +5,24 @@
 //! the rows' codes a step of four columns at a time (`[row][4 codes]`: one
 //! vector on AVX2, two on NEON) against each activation row of a strip of
 //! up to eight ([`Q8Tile`]; a [`Q8Block`] is a one-row one), and the
-//! combine applies the rows' coefficients ([`Side`]). A rows8 tile's code
+//! combine applies the rows' coefficients ([`Side`]); with `i8mm`, strips of
+//! two or more rows multiply pairs of steps of pairs of rows by pairs of
+//! activation rows instead (`smmla`, [`core_mmla`]). A rows8 tile's code
 //! spans are such steps already (its panels, `registry::Layout::Rows8`):
 //! read in place for one strip ([`Spans`]), else decoded once into a
 //! [`Panel`]; any other rows' packets are transposed into one.
 //!
 //! The integer core forms, per row and activation row, the exact integers
-//! the single-row dots form, the coefficient component's own
-//! (`Coefficients::Units`): with integer unit coefficients the block's
-//! `scaled` and `minimums` ([`Scaled`]), else each unit's (a coefficient
-//! group, at most a packet: `Coefficients::UNIT`) `Σ code * activation`
-//! ([`Sums`]). The combine then applies the coefficient
-//! component's own `f32` arithmetic in its own order, every row a lane
-//! (`Coefficients::tile_combine`). So every output is the single-row dot's
-//! bit for bit, whatever the instructions, the source and the strip.
+//! the single-row dots form, and hands each unit's (a coefficient group, at
+//! most a packet: `Coefficients::UNIT`) to the coefficient component's own
+//! accumulator as it forms them (`Coefficients::Units`, [`Integers::add`]):
+//! with integer unit coefficients the block's `scaled` and `minimums`
+//! ([`Scaled`]), else the unit's fused `f32` terms, in unit order
+//! ([`Sums`]); no unit's integers are kept. The combine then applies the
+//! rest of the coefficient component's own `f32` arithmetic in its own
+//! order, every row a lane (`Coefficients::tile_combine`). So every output
+//! is the single-row dot's bit for bit, whatever the instructions, the
+//! source and the strip.
 //!
 //! x86 takes the codes as every x86 dot does (`packed_x86::shift`): unsigned
 //! bytes shifted by their least value, whose sum against the activations it
@@ -60,12 +64,13 @@ pub struct Side {
     pub(super) pairs: [[[i32; 8]; Q8_BLOCK / PACKET]; 2],
 }
 
-/// Direct coefficients' exact integers: per unit `u` of the first `count`,
-/// activation row `a` and weight row `r`, `units[u][a][r] = Σ code a` of
-/// true code values.
+/// Direct coefficients' sums: per activation row `a` and weight row `r`,
+/// the single-row dot's fused sum over the units added so far, in unit
+/// order (`fma(scale, Σ code a, sum)`, then with a bias `fma(bias, Σ a,
+/// sum)`), before the activation row's scale. Each unit's integers are
+/// combined as the core forms them, so no unit's are kept.
 pub struct Sums<const W: usize> {
-    pub(super) units: [[[i32; 8]; W]; UNITS],
-    pub(super) count: usize,
+    pub(super) values: [[f32; 8]; W],
 }
 
 /// Integer-unit coefficients' exact integers: per activation row and weight
@@ -79,9 +84,13 @@ pub struct Scaled<const W: usize> {
 /// A coefficient component's exact integers of a block against a strip of
 /// `W` activation rows (`Coefficients::Units`).
 pub trait Integers<const W: usize>: Sized {
-    /// From each of the first `count` units' sum `units[u][a][r]` widened by
-    /// its integer (`Side::widen`).
-    fn of_units<K: Coefficients, const R: usize>(units: [[[i32; 8]; W]; UNITS], count: usize, side: &Side, x: &Q8Tile<R>) -> Self;
+    /// No unit's integers.
+    const ZERO: Self;
+
+    /// Adds unit `u`'s exact integers of activation row `a`, `sums[r]` per
+    /// weight row, each widened by its integer (`Side::widen`). An
+    /// activation row's units arrive in unit order.
+    fn add<K: Coefficients, const R: usize>(&mut self, u: usize, a: usize, sums: [i32; 8], side: &Side, x: &Q8Tile<R>);
 
     /// The x86 core's, of the source's first `packets` packets.
     ///
@@ -93,33 +102,39 @@ pub trait Integers<const W: usize>: Sized {
 }
 
 impl<const W: usize> Integers<W> for Sums<W> {
+    const ZERO: Self = Self { values: [[0.0; 8]; W] };
+
+    /// The unit's fused terms, as `Coefficients::dot_q8` adds them.
     #[inline(always)]
-    fn of_units<K: Coefficients, const R: usize>(units: [[[i32; 8]; W]; UNITS], count: usize, _: &Side, _: &Q8Tile<R>) -> Self {
-        Self { units, count }
+    fn add<K: Coefficients, const R: usize>(&mut self, u: usize, a: usize, sums: [i32; 8], side: &Side, x: &Q8Tile<R>) {
+        let codes = if K::BIASED { unit_sum(x, K::UNIT, u, a) } else { 0 };
+        for (r, value) in self.values[a].iter_mut().enumerate() {
+            *value = side.scales[u][r].mul_add(sums[r] as f32, *value);
+            if K::BIASED {
+                *value = side.biases[u][r].mul_add(codes as f32, *value);
+            }
+        }
     }
 
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
-    unsafe fn x86<C: Codes, K: Coefficients, V: Vectors, S: Source, const R: usize>(source: S, _: &Side, x: &Q8Tile<R>, packets: usize) -> Self {
-        unsafe { x86::units::<C, K, V, S, W, R>(source, x, packets) }
+    unsafe fn x86<C: Codes, K: Coefficients, V: Vectors, S: Source, const R: usize>(source: S, side: &Side, x: &Q8Tile<R>, packets: usize) -> Self {
+        unsafe { x86::units::<C, K, V, S, W, R>(source, side, x, packets) }
     }
 }
 
 impl<const W: usize> Integers<W> for Scaled<W> {
-    /// The units added into `scaled`, and `minimums` from the block sums.
+    const ZERO: Self = Self { scaled: [[0; 8]; W], minimums: [[0; 8]; W] };
+
+    /// The unit added into `scaled`, and its minimums from the block sums.
     #[inline(always)]
-    fn of_units<K: Coefficients, const R: usize>(units: [[[i32; 8]; W]; UNITS], count: usize, side: &Side, x: &Q8Tile<R>) -> Self {
-        let mut out = Self { scaled: [[0; 8]; W], minimums: [[0; 8]; W] };
-        for a in 0..W {
-            for u in 0..count {
-                let codes = unit_sum(x, K::UNIT, u, a);
-                for r in 0..8 {
-                    out.scaled[a][r] += units[u][a][r];
-                    out.minimums[a][r] += side.minimums[u][r] * codes;
-                }
-            }
+    fn add<K: Coefficients, const R: usize>(&mut self, u: usize, a: usize, sums: [i32; 8], side: &Side, x: &Q8Tile<R>) {
+        let codes = unit_sum(x, K::UNIT, u, a);
+        let (scaled, minimums) = (&mut self.scaled[a], &mut self.minimums[a]);
+        for (r, sum) in sums.into_iter().enumerate() {
+            scaled[r] += sum;
+            minimums[r] += side.minimums[u][r] * codes;
         }
-        out
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -503,16 +518,21 @@ unsafe fn integers<C: Codes, K: Coefficients, V: Vectors, S: Source, const W: us
     if V::QUANTIZED_DOTS >= 1 {
         return unsafe { <K::Units<W> as Integers<W>>::x86::<C, K, V, S, R>(source, side, x, packets) };
     }
-    let mut units = [[[0i32; 8]; W]; UNITS];
+    let mut out = <K::Units<W> as Integers<W>>::ZERO;
     let (count, steps) = (packets * PACKET / K::UNIT, K::UNIT / 4);
     #[cfg(target_arch = "aarch64")]
     if V::QUANTIZED_DOTS >= 1 {
-        unsafe { core_neon::<S, W, R>(source, side, x, count, steps, &mut units) };
-        return <K::Units<W> as Integers<W>>::of_units::<K, R>(units, count, side, x);
+        if V::I8MM && W >= 2 {
+            unsafe { core_mmla::<K, S, W, R>(source, side, x, count, steps, &mut out) };
+        } else {
+            unsafe { core_neon::<K, S, W, R>(source, side, x, count, steps, &mut out) };
+        }
+        return out;
     }
-    for (u, units) in units.iter_mut().enumerate().take(count) {
-        for (a, units) in units.iter_mut().enumerate() {
-            for (r, sum) in units.iter_mut().enumerate() {
+    for u in 0..count {
+        for a in 0..W {
+            let mut sums = [0i32; 8];
+            for (r, sum) in sums.iter_mut().enumerate() {
                 let mut dot = 0i32;
                 for step in u * steps..(u + 1) * steps {
                     let values = source.values(step);
@@ -522,9 +542,10 @@ unsafe fn integers<C: Codes, K: Coefficients, V: Vectors, S: Source, const W: us
                 }
                 *sum = dot * side.widen[u][r];
             }
+            out.add::<K, R>(u, a, sums, side, x);
         }
     }
-    <K::Units<W> as Integers<W>>::of_units::<K, R>(units, count, side, x)
+    out
 }
 
 /// The NEON core: per four rows and step a weight vector against each
@@ -533,27 +554,39 @@ unsafe fn integers<C: Codes, K: Coefficients, V: Vectors, S: Source, const W: us
 /// widened by each row's integer.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn core_neon<S: Source, const W: usize, const R: usize>(
+unsafe fn core_neon<K: Coefficients, S: Source, const W: usize, const R: usize>(
     source: S,
     side: &Side,
     x: &Q8Tile<R>,
     count: usize,
     steps: usize,
-    units: &mut [[[i32; 8]; W]; UNITS],
+    out: &mut K::Units<W>,
 ) {
     use std::arch::aarch64::*;
     unsafe {
-        for quad in 0..2 {
-            for u in 0..count {
+        for u in 0..count {
+            // Each activation row's widened sums of the eight rows.
+            let mut rows = [[0i32; 8]; W];
+            for quad in 0..2 {
                 let mut sums = [vdupq_n_s32(0); W];
                 if R == 1 {
-                    // One row: steps `4 q .. 4 q + 4`'s codes a vector.
+                    // One row: steps `4 q .. 4 q + 4`'s codes a vector,
+                    // each of the four steps into sums of its own, so a
+                    // unit's dots are four dependency chains, not one.
+                    // Lanes are written out, never looped over: a loop
+                    // keeps its sums in memory and branches to each
+                    // `sdot`'s lane, an immediate.
+                    let mut lanes = [vdupq_n_s32(0); 4];
                     for four in (u * steps / 4)..((u + 1) * steps / 4) {
                         let codes = vld1q_s8(x.codes[2 * four].as_ptr().cast());
-                        for lane in 0..4 {
-                            sums[0] = by_lane(sums[0], source.neon(4 * four + lane, quad), codes, lane);
+                        macro_rules! lanes {
+                            ($($lane:literal)*) => {$(
+                                lanes[$lane] = packed_neon::sdot_lane::<$lane>(lanes[$lane], source.neon(4 * four + $lane, quad), codes);
+                            )*};
                         }
+                        lanes!(0 1 2 3);
                     }
+                    sums[0] = vaddq_s32(vaddq_s32(lanes[0], lanes[1]), vaddq_s32(lanes[2], lanes[3]));
                 } else {
                     for pair in (u * steps / 2)..((u + 1) * steps / 2) {
                         // Rows 0..4 and 4..8 of the strip: four codes a
@@ -564,38 +597,85 @@ unsafe fn core_neon<S: Source, const W: usize, const R: usize>(
                         for half in 0..2 {
                             let weights = source.neon(2 * pair + half, quad);
                             let codes = if half == 0 { [low.0, high.0] } else { [low.1, high.1] };
-                            for (a, sums) in sums.iter_mut().enumerate() {
-                                *sums = by_lane(*sums, weights, vreinterpretq_s8_s32(codes[a / 4]), a % 4);
+                            macro_rules! rows {
+                                ($($a:literal)*) => {$(
+                                    if $a < W {
+                                        sums[$a] = packed_neon::sdot_lane::<{ $a % 4 }>(sums[$a], weights, vreinterpretq_s8_s32(codes[$a / 4]));
+                                    }
+                                )*};
                             }
+                            rows!(0 1 2 3 4 5 6 7);
                         }
                     }
                 }
                 let widen = vld1q_s32(side.widen[u][4 * quad..].as_ptr());
-                for (out, sums) in units[u].iter_mut().zip(sums) {
-                    vst1q_s32(out[4 * quad..].as_mut_ptr(), vmulq_s32(sums, widen));
+                for (rows, sums) in rows.iter_mut().zip(sums) {
+                    vst1q_s32(rows[4 * quad..].as_mut_ptr(), vmulq_s32(sums, widen));
                 }
+            }
+            for (a, rows) in rows.into_iter().enumerate() {
+                out.add::<K, R>(u, a, rows, side, x);
             }
         }
     }
 }
 
-/// `acc` plus the by-element `sdot` of `weights` and lane `lane` of
-/// `codes`. (A function, not a closure: a closure would not take the
-/// caller's features, and its `sdot` would not inline.)
+/// The i8mm core: per pair of steps (eight columns) each pair of weight
+/// rows as an `smmla` operand (`[row][8 codes]`, two steps' words zipped)
+/// against each pair of the strip's activation rows, whose eight codes lie
+/// together in the tile (`Q8Tile::codes`): every instruction 32 products,
+/// twice the by-element `sdot`'s. Each unit's 2 x 2 sums are widened by
+/// their rows' integers and unzipped into rows, the same integers as
+/// [`core_neon`]'s.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn by_lane(
-    acc: std::arch::aarch64::int32x4_t,
-    weights: std::arch::aarch64::int8x16_t,
-    codes: std::arch::aarch64::int8x16_t,
-    lane: usize,
-) -> std::arch::aarch64::int32x4_t {
+unsafe fn core_mmla<K: Coefficients, S: Source, const W: usize, const R: usize>(
+    source: S,
+    side: &Side,
+    x: &Q8Tile<R>,
+    count: usize,
+    steps: usize,
+    out: &mut K::Units<W>,
+) {
+    use std::arch::aarch64::*;
+    // Instantiated for every strip width, called for the even ones.
+    debug_assert!(W.is_multiple_of(2) && W <= R && steps.is_multiple_of(2), "whole activation row pairs and pairs of steps");
     unsafe {
-        match lane {
-            0 => packed_neon::sdot_lane::<0>(acc, weights, codes),
-            1 => packed_neon::sdot_lane::<1>(acc, weights, codes),
-            2 => packed_neon::sdot_lane::<2>(acc, weights, codes),
-            _ => packed_neon::sdot_lane::<3>(acc, weights, codes),
+        for u in 0..count {
+            // `sums[q][p]`: weight rows `2 p, 2 p + 1` against activation
+            // rows `2 q, 2 q + 1`, lane `2 i + j` row `2 p + i` against
+            // activation row `2 q + j`.
+            let mut sums = [[vdupq_n_s32(0); 4]; W];
+            for pair in (u * steps / 2)..((u + 1) * steps / 2) {
+                let mut rows = [vdupq_n_s8(0); 4];
+                for quad in 0..2 {
+                    let (first, second) = (
+                        vreinterpretq_s32_s8(source.neon(2 * pair, quad)),
+                        vreinterpretq_s32_s8(source.neon(2 * pair + 1, quad)),
+                    );
+                    rows[2 * quad] = vreinterpretq_s8_s32(vzip1q_s32(first, second));
+                    rows[2 * quad + 1] = vreinterpretq_s8_s32(vzip2q_s32(first, second));
+                }
+                for (q, sums) in sums.iter_mut().enumerate().take(W / 2) {
+                    let codes = vld1q_s8(x.codes[pair][2 * q].as_ptr());
+                    for (sums, rows) in sums.iter_mut().zip(rows) {
+                        *sums = packed_neon::smmla(*sums, rows, codes);
+                    }
+                }
+            }
+            let mut rows = [[0i32; 8]; W];
+            for half in 0..2 {
+                let widen = vld1q_s32(side.widen[u][4 * half..].as_ptr());
+                let (first, second) = (vzip1q_s32(widen, widen), vzip2q_s32(widen, widen));
+                for (q, sums) in sums.iter().enumerate().take(W / 2) {
+                    let (first, second) = (vmulq_s32(sums[2 * half], first), vmulq_s32(sums[2 * half + 1], second));
+                    vst1q_s32(rows[2 * q][4 * half..].as_mut_ptr(), vuzp1q_s32(first, second));
+                    vst1q_s32(rows[2 * q + 1][4 * half..].as_mut_ptr(), vuzp2q_s32(first, second));
+                }
+            }
+            for (a, rows) in rows.into_iter().enumerate() {
+                out.add::<K, R>(u, a, rows, side, x);
+            }
         }
     }
 }

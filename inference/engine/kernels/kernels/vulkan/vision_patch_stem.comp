@@ -72,7 +72,7 @@ void vision_patch_stem_first() {
     const projection_weights w = vision_weights(SEISMIC_PTR(SEISMIC_BUFFER_FRAME_WEIGHT), PACKETS_W0_ROWS, STEM_K);
     const projection_epilogue out_ = projection_store(
         out_over_scratch(ELEMENT_F32, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIAL)), uint64_t(h), 1ul, 0ul);
-    projection_gemm(PACKETS_W0, VISION_TILE_M, VISION_TILE_N, VISION_SUB, VISION_SUB, stem_frame(0u), out_, w, uint(SEISMIC_DIM_M), h,
+    projection_gemm(PACKETS_W0, stem_frame(0u), out_, w, uint(SEISMIC_DIM_M), h,
         STEM_K, gl_WorkGroupID.y, gl_WorkGroupID.x, uint(SEISMIC_DIM_M));
 }
 

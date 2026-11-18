@@ -463,8 +463,13 @@ fn blocked_parts(gates: &[Gate], parts: &[PartTicks]) -> usize {
 
 impl Encoding {
     /// Commit `command`: a timed batch's page goes in flight with it, and
-    /// an observed one's envelope starts immediately before the commit.
-    fn commit(&mut self, command: Retained<ProtocolObject<dyn MTLCommandBuffer>>) -> CommittedCommand {
+    /// an observed batch's envelope opens immediately before its first
+    /// commit.
+    fn commit(
+        &mut self,
+        command: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+        envelope: &mut Option<SubmissionTime>,
+    ) -> Retained<ProtocolObject<dyn MTLCommandBuffer>> {
         let observed = match self {
             Self::Grouped { observed, held, .. } => {
                 *held = Held::Nothing;
@@ -477,9 +482,11 @@ impl Encoding {
                 true
             }
         };
-        let time = observed.then(SubmissionTime::before_commit);
+        if observed && envelope.is_none() {
+            *envelope = Some(SubmissionTime::before_commit());
+        }
         crate::pooled(|| command.commit());
-        CommittedCommand { command, time }
+        command
     }
 
     /// The launch attribution of a timed batch.
@@ -489,13 +496,6 @@ impl Encoding {
             Self::Timed { timing, .. } => Some(timing),
         }
     }
-}
-
-/// A committed command buffer, with the lower end of its submission
-/// envelope where its batch observes device intervals.
-struct CommittedCommand {
-    command: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
-    time: Option<SubmissionTime>,
 }
 
 /// Direct launches encoded into command buffers: one, and one more after
@@ -508,7 +508,13 @@ struct CommittedCommand {
 pub struct DirectBatch {
     device: MetalDevice,
     /// The command buffers committed before the current one, in order.
-    committed: Vec<CommittedCommand>,
+    committed: Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
+    /// Where the batch observes device intervals, the lower end of its
+    /// submission envelope: the host clock just before its first commit.
+    /// The driver may coalesce consecutive command buffers into one device
+    /// submission, so a later buffer can report a start before its own
+    /// commit; only the batch's first commit bounds every buffer.
+    envelope: Option<SubmissionTime>,
     command: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     /// Whether anything is encoded in `command`.
     used: bool,
@@ -625,6 +631,7 @@ impl DirectBatch {
         Ok(Self {
             device: device.clone(),
             committed: Vec::new(),
+            envelope: None,
             command: command_buffer(device)?,
             used: false,
             encoding: Encoding::Grouped {
@@ -678,7 +685,7 @@ impl DirectBatch {
         // Formed before the commit: a failure commits nothing.
         let next = command_buffer(&self.device)?;
         let previous = std::mem::replace(&mut self.command, next);
-        let committed = self.encoding.commit(previous);
+        let committed = self.encoding.commit(previous, &mut self.envelope);
         self.committed.push(committed);
         Ok(())
     }
@@ -744,6 +751,7 @@ impl DirectBatch {
         Ok(Self {
             device: device.clone(),
             committed: Vec::new(),
+            envelope: None,
             command: command_buffer(device)?,
             used: false,
             encoding: Encoding::Timed {
@@ -866,12 +874,13 @@ impl DirectBatch {
     /// order.
     pub fn commit(mut self) -> DirectSubmission {
         self.end_open();
-        let last = self.encoding.commit(self.command);
+        let last = self.encoding.commit(self.command, &mut self.envelope);
         let mut commands = self.committed;
         commands.push(last);
         DirectSubmission {
             device: self.device,
             commands,
+            envelope: self.envelope,
             timing: self.encoding.launch_timing(),
         }
     }
@@ -885,7 +894,8 @@ impl DirectBatch {
             device: self.device,
             commands: self.committed,
             // Launch attribution covers the whole batch; the committed
-            // prefix keeps only its commands' envelopes.
+            // prefix keeps only its envelope.
+            envelope: self.envelope,
             timing: None,
         })
     }
@@ -969,7 +979,9 @@ const WAIT_POLL: std::time::Duration = std::time::Duration::from_micros(20);
 /// A committed direct batch: its command buffers, in commit order.
 pub struct DirectSubmission {
     device: MetalDevice,
-    commands: Vec<CommittedCommand>,
+    commands: Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
+    /// The batch's submission envelope, where it observes device intervals.
+    envelope: Option<SubmissionTime>,
     /// A timed batch's launch attribution.
     timing: Option<Box<LaunchTiming>>,
 }
@@ -983,13 +995,13 @@ impl DirectSubmission {
     /// command buffer runs, and the first one's failure once every one
     /// ended and one failed.
     pub fn completed(&self) -> Result<bool, ExecutionError> {
-        if !self.commands.iter().all(|committed| ended(&committed.command)) {
+        if !self.commands.iter().all(|command| ended(command)) {
             return Ok(false);
         }
         crate::pooled(|| {
             self.commands
                 .iter()
-                .find_map(|committed| committed.command.error())
+                .find_map(|command| command.error())
                 .map_or(Ok(true), |error| {
                     Err(ExecutionError::SubmissionFailed(
                         error.localizedDescription().to_string(),
@@ -1022,12 +1034,14 @@ impl DirectSubmission {
     pub fn device_interval(&self) -> Result<(f64, f64), ExecutionError> {
         self.finish()?;
         crate::pooled(|| {
+            let envelope = self.envelope.as_ref().ok_or_else(|| ExecutionError::SubmissionFailed(
+                "Metal submission interval observation was not requested".into()))?;
             let mut span = None;
-            for CommittedCommand { command, time } in &self.commands {
-                let time = time.as_ref().ok_or_else(|| ExecutionError::SubmissionFailed(
-                    "Metal submission interval observation was not requested".into()))?;
-                let interval = time.interval(command.GPUStartTime(), command.GPUEndTime())
-                    .map_err(ExecutionError::SubmissionFailed)?;
+            let count = self.commands.len();
+            for (index, command) in self.commands.iter().enumerate() {
+                let interval = envelope.interval(command.GPUStartTime(), command.GPUEndTime())
+                    .map_err(|error| ExecutionError::SubmissionFailed(
+                        format!("command buffer {} of {count}: {error}", index + 1)))?;
                 span = Some(match span {
                     None => interval,
                     Some((start, _)) => (start, interval.1),

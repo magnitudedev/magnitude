@@ -199,11 +199,11 @@ pub fn project_with_slack(
 }
 
 /// The arithmetic of CUDA's projection of `rows` rows over a weight resident
-/// as `element` on `mapping`: the INT8 path's past the GEMV band
+/// as `element` on `mapping`: the INT8 path's where it quantizes
 /// ([`Mapping::quantizes`], [`Form::cuda_int8`]), else the 16-bit path's
 /// ([`Form::projection`]).
 pub fn form(element: Element, rows: usize, mapping: Mapping) -> Form {
-    if mapping.quantizes(rows) {
+    if mapping.quantizes() {
         Form::cuda_int8()
     } else {
         Form::projection(BackendName::Cuda, rows, Float::Bf16, element)
@@ -272,8 +272,12 @@ pub const GEMV_ROWS: usize = bound::gemv_rows(BackendName::Cuda);
 /// (`projection::SMALL_GEMM_ROWS`); larger counts run the large-band GEMM.
 pub const SMALL_GEMM_ROWS: usize = 64;
 
-/// A native mapping: the GEMV K split, the small-band GEMM's INT8 operand
-/// path (the large-band GEMM is the 16-bit path), the large-band GEMM's
+/// The launch ordinal of the dense pair's (`dense_up`, `dense_output`)
+/// 128-row GEMM, whose scope holds ROTATE and BLOCKS.
+pub const DENSE_PAIR_GEMM: usize = 4;
+
+/// A native mapping: the GEMV K split, the INT8 operand path (every band that
+/// reads INT8), the large-band GEMM's
 /// loader rotation, the dense pair's GEMV residency (blocks of streaming
 /// weights per SM) and a single-weight entry's split of K over parts for
 /// 17..128 rows (`split`: 1 sums whole sums, as the entries that never split).
@@ -333,7 +337,7 @@ impl Mapping {
             .with_param("SPLIT", self.split)
             .with_param("STAGING", self.staging)
             .with_launch_param(1, "RESIDENCY", self.residency)
-            .with_launch_param(4, "ROTATE", self.rotate)
+            .with_launch_param(DENSE_PAIR_GEMM, "ROTATE", self.rotate)
     }
     /// Readout head GEMVs read the entry-wide KSPLIT, its GEMM owns ROTATE.
     pub fn head_params(self, spec: seismic::NativeSpecialization) -> seismic::NativeSpecialization {
@@ -344,13 +348,15 @@ impl Mapping {
             .with_launch_param(1, "RESIDENCY", self.residency)
             .with_launch_param(4, "ROTATE", self.rotate)
     }
-    /// Whether `rows` rows use quantized activation operands in a matrix band.
-    pub fn quantizes(self, rows: usize) -> bool {
-        self.int8 == 1 && rows > GEMV_ROWS
+    /// Whether activation operands are quantized: INT8 1, which the GEMV
+    /// band takes as the GEMM bands do.
+    pub fn quantizes(self) -> bool {
+        self.int8 == 1
     }
 }
 
-/// GEMV mappings. INT8 1 is included to show the GEMV ignores it.
+/// GEMV mappings: the 16-bit path (INT8 0) and the INT8 path (INT8 1), each
+/// at two K splits.
 pub const GEMV_MAPPINGS: [Mapping; 4] = [
     Mapping {
         ksplit: 4,
@@ -524,7 +530,7 @@ pub fn operand_rows(
 ) -> (Vec<f32>, Vec<f64>) {
     if format.is_some_and(|format| format.operands == OperandRecipe::Nvfp4Rows) {
         (nvfp4_rows(x, k), vec![0.0; x.len()])
-    } else if mapping.quantizes(x.len() / k) {
+    } else if mapping.quantizes() {
         quantize(x, k)
     } else {
         (x.to_vec(), vec![0.0; x.len()])

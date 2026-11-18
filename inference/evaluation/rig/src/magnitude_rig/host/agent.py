@@ -88,12 +88,12 @@ in `logs/<phase>.log`:
                                               `tests` writes the test executables the
                                               build's cargo steps produced to PATH first
                                               (`[[executable, manifest], ...]`)
-    {"op": "built", "side": S, "release": R,  record the units the build's cargo steps
-     "provenance": P}                         reference, trim the checkout's target to what
-                                              its kept builds reference, record its bytes
-                                              and the build's seconds by its warmth;
-                                              complete the build's output (the executables
-                                              build provenance record P kept) and, with R,
+    {"op": "built", "side": S, "release": R,  complete the build's output (the executables
+     "provenance": P}                         build provenance record P kept); record the
+                                              units the build's cargo steps reference, trim
+                                              the checkout's target to what its kept builds
+                                              reference, record its bytes and the build's
+                                              seconds by its warmth; with R,
                                               release the checkout (without it, a job of
                                               the side reads it: held until the run ends);
                                               then keep the rig's checkouts within its
@@ -172,8 +172,8 @@ holds (one whose run died).
 
 A target keeps what its builds reference and nothing else. The runner carries out each cargo
 build step with cargo's JSON messages, showing each diagnostic as the step's own format would
-and collecting every unit the step references, fresh or built (its artifacts and its build
-scripts' output directories). After the build, `built` keeps that set as B's in the checkout (`references`, the latest `BUILDS_KEPT` builds), and removes from the target's
+and collecting every unit the step references, fresh or built (its artifacts, an uplifted one by
+its unit's hashed entry, and its build scripts' output directories). After the build, `built` keeps that set as B's in the checkout (`references`, the latest `BUILDS_KEPT` builds), and removes from the target's
 `deps`, `build` and `examples` directories every hashed artifact no kept build references; a
 unit removed that a later build needs is one cargo rebuilds (its outputs are missing), so
 trimming never makes a build wrong. A checkout therefore holds the units of the builds it
@@ -267,10 +267,12 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
 import time
+import traceback
 from datetime import datetime, timezone
 
 POLL_SECONDS = 0.5
@@ -348,6 +350,8 @@ SHARE = 0.4
 HASHED = re.compile(r"-([0-9a-f]{16})(?:\.|$)")
 # The target directories of a profile whose entries are units' artifacts (`trim`).
 UNIT_DIRECTORIES = ("deps", "build", "examples")
+# The unit directories holding the entry of a root unit cargo uplifts (`units_of`).
+UPLIFTED_FROM = ("deps", "examples")
 # In `REFERENCES`: the units a checkout held before it first recorded a build's, kept as the
 # oldest build's until `BUILDS_KEPT` builds of any kind have been recorded since (`left`, the
 # count still to come).
@@ -530,7 +534,7 @@ class Session:
         kept = _references(directory)
         before = build in kept
         peak = checkout_bytes(directory)  # outside the guard: a large target takes seconds
-        trimmed = {"bytes": 0, "entries": 0, "removed": []}
+        trimmed = {"bytes": 0, "entries": 0}
         if units is not None:
             began = time.time() - seconds
             if not os.path.exists(os.path.join(directory, REFERENCES)):  # what its builds before recorded none of
@@ -995,9 +999,12 @@ def shareable(live: list, own: set, tree: str, build: str):
     return None
 
 
+def _names(directory: str) -> list:
+    return os.listdir(directory) if os.path.isdir(directory) else []
+
+
 def _directories(base: str) -> list:
-    names = os.listdir(base) if os.path.isdir(base) else []
-    return [name for name in names if os.path.isdir(os.path.join(base, name))]
+    return [name for name in _names(base) if os.path.isdir(os.path.join(base, name))]
 
 
 def _waited(rig: Rig, run: str) -> dict:
@@ -1118,19 +1125,38 @@ def _references(checkout: str) -> dict:
 
 def units_of(target: str, paths) -> set:
     """The units of `target` the artifact paths `paths` name: `<profile>/<dir>/<hash>` for each
-    under a profile's unit directory (`UNIT_DIRECTORIES`) whose entry there is hashed; paths
-    elsewhere (a profile's own outputs, another target) name none."""
+    under a profile's unit directory (`UNIT_DIRECTORIES`) whose entry there is hashed, and for
+    each artifact of a root unit cargo uplifted (an executable or library it put unhashed in
+    its profile or `examples/`, a hard link or a copy of the unit's own entry, and the only
+    path it reports for it), the unit of each hashed entry of that name with its contents;
+    paths elsewhere (another target, a profile's own output no unit's entry matches) name
+    none. Cargo's symlink of an uplifted executable's debug bundle names no more than the
+    executable."""
     units = set()
+    listed = {}  # profile, relative to `target` -> the (directory, name) of each entry it may uplift
     for path in paths:
         parts = os.path.relpath(path, target).split(os.sep)
         if parts[0] == os.pardir:
             continue
-        for index, part in enumerate(parts[:-1]):
-            if part in UNIT_DIRECTORIES:
-                found = HASHED.search(parts[index + 1])
-                if found:
-                    units.add("/".join(parts[:index + 1] + [found.group(1)]))
-                break
+        under = next((index for index, part in enumerate(parts[:-1]) if part in UNIT_DIRECTORIES), None)
+        found = HASHED.search(parts[under + 1]) if under is not None else None
+        if found:
+            units.add("/".join(parts[:under + 1] + [found.group(1)]))
+            continue
+        profile = parts[:-2] if len(parts) > 2 and parts[-2] in UNIT_DIRECTORIES else parts[:-1]
+        if not profile or not stat.S_ISREG(os.lstat(path).st_mode):  # cargo reports what its step produced
+            continue
+        relative = "/".join(profile)
+        if relative not in listed:
+            listed[relative] = [(directory, name) for directory in UPLIFTED_FROM
+                                for name in _names(os.path.join(target, *profile, directory))]
+        stem, dot, suffix = parts[-1].partition(".")  # its unit's entry: `<crate name>-<hash>`, then the suffix
+        entry = re.compile("%s-([0-9a-f]{16})%s\\Z" % ("[-_]".join(re.escape(word) for word in re.split("[-_]", stem)),
+                                                       re.escape(dot + suffix)))
+        for directory, name in listed[relative]:
+            found = entry.match(name)
+            if found and filecmp.cmp(path, os.path.join(target, *profile, directory, name), shallow=False):
+                units.add("%s/%s/%s" % (relative, directory, found.group(1)))
     return units
 
 
@@ -1157,10 +1183,9 @@ def present_units(target: str) -> set:
 def trim(target: str, kept: dict) -> dict:
     """Remove from `target` every hashed entry of a unit directory that no build of `kept`
     (`_references`) references, never its incremental directories (see the module
-    documentation): the bytes and the entries removed, and the real paths of the entries."""
+    documentation): the bytes and the entries removed."""
     units = {unit for build in kept.values() for unit in build["units"]}
     freed = entries = 0
-    removed = []
     for relative in _unit_directories(target):
         directory = os.path.join(target, *relative.split("/"))
         for name in os.listdir(directory):
@@ -1170,9 +1195,8 @@ def trim(target: str, kept: dict) -> dict:
                 continue
             freed += checkout_bytes(path) if os.path.isdir(path) and not os.path.islink(path) else os.lstat(path).st_size
             entries += 1
-            removed.append(os.path.join(os.path.realpath(directory), name))
             _clear(path)
-    return {"bytes": freed, "entries": entries, "removed": removed}
+    return {"bytes": freed, "entries": entries}
 
 
 def need(directory: str, checkout: str, build: str, fallback):
@@ -1547,12 +1571,10 @@ class Runner:
         _link_tree(os.path.join(checkout, "src"), staged)
         self._move_in(staged, os.path.join(output, "src"))
 
-    def materialize(self, side: str, proven: str, trimmed) -> int:
+    def materialize(self, side: str, proven: str) -> int:
         """Complete the side's output from its build, once: every executable of the target's
-        profile and example directories that its build provenance (`proven`, its record) kept
-        and its trim left (`trimmed`, the paths the trim removed: an executable no kept build
-        references, another build's left in the target, which the provenance saw before the
-        trim), and every test executable the build produced, linked at
+        profile and example directories that its build provenance (`proven`, its record) kept,
+        and every test executable the build produced, linked at
         its path under the output's `target`, and the list of the test executables with their
         packages' directories in the output's source (`TESTS`). The executables linked."""
         output, checkout = self.outputs[side], self.rig.checkout(self.checkouts[side])
@@ -1564,7 +1586,7 @@ class Runner:
         os.makedirs(staged)
         tests = [(os.path.realpath(path), manifest) for path, manifest in tests]
         with open(proven) as stream:
-            executables = set(json.load(stream)["kept"]) - set(trimmed) | {path for path, _ in tests}
+            executables = set(json.load(stream)["kept"]) | {path for path, _ in tests}
         for path in executables:
             relative = os.path.relpath(path, target)
             os.makedirs(os.path.dirname(os.path.join(staged, relative)), exist_ok=True)
@@ -1784,14 +1806,14 @@ class Runner:
             name = self.checkouts[op["side"]]
             units = None if self.unknown else self.units
             self.units, self.unknown = None, False
+            # Before the trim: what the provenance record kept is linked into the output while
+            # the checkout still holds all of it.
+            linked = self.materialize(op["side"], op["provenance"])
             shared = op["side"] in self.shared
             if shared:
                 self.session.shared_built(name)
-                trimmed = ()
             else:
                 built = self.session.built(name, seconds, units)
-                trimmed = built["trimmed"]["removed"]
-            linked = self.materialize(op["side"], op["provenance"], trimmed)
             if op["release"]:
                 self.session.release("checkout:" + name)
                 self.events.note("released checkout %s: this run's later steps read its build output %s (%d executables)"
@@ -1831,7 +1853,7 @@ class Runner:
             if isinstance(failure, Moved):
                 failed["moved"] = True
         except Exception as error:  # the run's end is recorded whatever ends it
-            failed = {"phase": self.events.phase, "detail": "agent: %r" % error}
+            failed = {"phase": self.events.phase, "detail": "agent: %s" % _fault(error)}
         if self.child is not None and not self.child.finished.is_set():
             self.child.kill()
         self.session.end_outputs()
@@ -1845,6 +1867,14 @@ class Runner:
         os.replace(staged, os.path.join(self.directory, ENDED))
         self.events.emit("ended", **ended)
         return ended
+
+
+def _fault(error: Exception) -> str:
+    """An unexpected exception as a run's failure records it: its type, its message (an
+    `OSError`'s with the paths it names) and where it was raised, from `carry_out` down."""
+    frames = traceback.extract_tb(error.__traceback__)
+    return "%s: %s at %s" % (type(error).__name__, error, " > ".join(
+        "%s:%d %s" % (os.path.basename(frame.filename), frame.lineno, frame.name) for frame in frames))
 
 
 def invocation() -> list:

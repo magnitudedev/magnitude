@@ -382,3 +382,11 @@ __device__ __forceinline__ void seismic_mma_m16n8k32_s8(int (&acc)[4], const uns
         : "+r"(acc[0]), "+r"(acc[1]), "+r"(acc[2]), "+r"(acc[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
+// m16n8k16, signed 8-bit elements: one k16 half of the m16n8k32 operands
+// above, a = {a[0], a[1]} (or {a[2], a[3]}) and b = b[0] (or b[1]).
+__device__ __forceinline__ void seismic_mma_m16n8k16_s8(int (&acc)[4], unsigned a0, unsigned a1, unsigned b) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%0, %1, %2, %3};"
+        : "+r"(acc[0]), "+r"(acc[1]), "+r"(acc[2]), "+r"(acc[3])
+        : "r"(a0), "r"(a1), "r"(b));
+}

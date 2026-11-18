@@ -16,12 +16,13 @@
 # The lane producers (`lane_codes`): a packet's chunks of eight codes, which a
 # lane takes two at a time as unsigned integers entering at a zero code.
 # Linear codes of every split of up to 8 bits (`unsigned`, `offset` and
-# `twos`, whose own zero is the sign bit the 8-bit plane flips), 4-bit
-# codebook codes (each byte's two values + their zero, `codebooks::pairs`)
-# and the entries of grids of signed bytes. Floating (E4M3) and odd codes
-# enter no lane as integers.
+# `twos`, whose own zero is the sign bit the 8-bit plane flips), one-bit
+# odd codes (-1 or +1, whose own zero is 1), 4-bit codebook codes (each
+# byte's two values + their zero, `codebooks::pairs`) and the entries of
+# grids of signed bytes. Floating (E4M3) codes enter no lane as integers.
 producer lane
 codes=unsigned|offset planes=1.0|2.0|2.1|4.0|4.1|4.2 enter=pairs
+codes=odd planes=1.0 enter=pairs
 codes=unsigned|offset|twos planes=8.0 enter=bytes
 codes=table planes=4.0 enter=bytes:128
 codes=grid values=i8 enter=pairs

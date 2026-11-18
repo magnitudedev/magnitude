@@ -533,28 +533,22 @@ fn entries_match_on(device: &Device) {
 
 #[test]
 fn dflash2_entries_match_the_host_model_on_cpu() {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    entries_match_on(&catalog.open_backend(BackendName::Cpu).unwrap());
+    for device in seismic_native_tests::devices(&[BackendName::Cpu]) {
+        entries_match_on(&device);
+    }
 }
 
 #[test]
 fn dflash2_entries_match_the_host_model_on_accelerators() {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    for backend in [BackendName::Metal, BackendName::Cuda, BackendName::Vulkan] {
-        let Ok(device) = catalog.open_backend(backend) else {
-            continue;
-        };
+    for device in seismic_native_tests::devices(&[BackendName::Metal, BackendName::Cuda, BackendName::Vulkan]) {
         entries_match_on(&device);
     }
 }
 
 #[test]
 fn partitioned_top_k_matches_full_vocabulary_on_accelerators() {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    for backend in [BackendName::Metal, BackendName::Cuda] {
-        let Ok(device) = catalog.open_backend(backend) else {
-            continue;
-        };
+    for device in seismic_native_tests::devices(&[BackendName::Metal, BackendName::Cuda]) {
+        let backend = device.backend();
         for vocabulary in [8192usize, 8193, 8199, 65_536, 248_320] {
             top_k_orders_by_value_then_token(&device, vocabulary, 16);
             eprintln!("{backend:?} partitioned top-k V={vocabulary} passed exact host comparison");

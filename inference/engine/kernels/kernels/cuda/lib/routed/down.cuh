@@ -15,7 +15,6 @@
 
 using Raw = projection::Plain<ELEMENT_OF(SEISMIC_ELEMENT_A), projection::AllRows>;
 using Pro = projection::Operands<projection::OperandRecipe<packets::W0_OPERANDS_NVFP4>::NVFP4, Raw>;
-using Source = projection::GemvSource<Pro>;
 
 #define DOWN_WEIGHTS(m, k, expert)                                                                                 \
     (slab::Experts{SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_DOWN), SEISMIC_PTR(SEISMIC_BUFFER_TIER_DOWN)}                 \
@@ -43,14 +42,13 @@ struct ChoiceProjectedEpi {
 
 #define ROUTED_DOWN_SUMMED_BODY(TPW, KSPLIT)                                                                       \
     using Shape = routed::DecodeShape<TPW, KSPLIT>;                                                                \
-    __shared__ projection::GemvShared<Shape, Source::type> shared;                                                 \
-    extern __shared__ uint4 dynamic_shared[];                                                                      \
+    __shared__ projection::GemvShared<Shape, projection::SharedRow> shared;                                        \
     const projection::u64 m = blockIdx.y / SEISMIC_DIM_K, k = blockIdx.y % SEISMIC_DIM_K;                          \
-    const Source::type pro = Source::make(                                                                         \
+    const projection::SharedRow pro = projection::shared_row(                                                      \
         Pro{Raw{SEISMIC_PTR(SEISMIC_BUFFER_PRODUCT) +                                                              \
                     (m * SEISMIC_PRODUCT_STRIDE_0 + k * SEISMIC_PRODUCT_STRIDE_1) * 2,                             \
                 0, projection::AllRows{}}},                                                                        \
-        reinterpret_cast<projection::u8 *>(dynamic_shared), 1u, SEISMIC_DIM_F, nullptr);                           \
+        SEISMIC_DIM_F);                                                                                            \
     const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));                         \
     const slab::Matrix down = DOWN_WEIGHTS(m, k, routes[m * SEISMIC_ROUTES_STRIDE_0 + k * SEISMIC_ROUTES_STRIDE_1]); \
     const projection::u64 s2 = ROUTED_PROJECTED_S2;                                                                \

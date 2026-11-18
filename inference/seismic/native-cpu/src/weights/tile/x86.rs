@@ -499,6 +499,7 @@ unsafe fn unit<L: Lanes, P: Multiply<L>, V: Vectors, S: Source, const W: usize, 
 #[inline(always)]
 pub(super) unsafe fn units<C: Codes, K: Coefficients, V: Vectors, S: Source, const W: usize, const R: usize>(
     source: S,
+    side: &Side,
     x: &Q8Tile<R>,
     packets: usize,
 ) -> Sums<W> {
@@ -507,11 +508,11 @@ pub(super) unsafe fn units<C: Codes, K: Coefficients, V: Vectors, S: Source, con
     let (together, least) = const { unit_form::<C, K, V>().chunking() };
     unsafe {
         if const { matches!(unit_form::<C, K, V>(), Steps::Sign) } {
-            unit_sums::<Sign, K, V, S, W, R>(source, x, packets, together, least)
+            unit_sums::<Sign, K, V, S, W, R>(source, side, x, packets, together, least)
         } else if const { unit_form::<C, K, V>().shifted_by(Products::Bytes16) } {
-            unit_sums::<Bytes16, K, V, S, W, R>(source, x, packets, together, least)
+            unit_sums::<Bytes16, K, V, S, W, R>(source, side, x, packets, together, least)
         } else if const { unit_form::<C, K, V>().shifted_by(Products::Dots32) } {
-            unit_sums::<Dots32, K, V, S, W, R>(source, x, packets, together, least)
+            unit_sums::<Dots32, K, V, S, W, R>(source, side, x, packets, together, least)
         } else {
             unreachable!("every instance form is one of the arms")
         }
@@ -521,21 +522,24 @@ pub(super) unsafe fn units<C: Codes, K: Coefficients, V: Vectors, S: Source, con
 #[inline(always)]
 unsafe fn unit_sums<P: Multiply<Step>, K: Coefficients, V: Vectors, S: Source, const W: usize, const R: usize>(
     source: S,
+    side: &Side,
     x: &Q8Tile<R>,
     packets: usize,
     together: usize,
     least: i32,
 ) -> Sums<W> {
-    let mut sums = Sums { units: [[[0; 8]; W]; UNITS], count: packets * PACKET / K::UNIT };
+    let mut sums = Sums::ZERO;
     unsafe {
         // 16-bit chunks widen by one; VNNI's 32-bit sums add as they are.
         let ones = if P::DOTS32 { None } else { Some(Step::codes(&[1; 8], false)) };
-        for u in 0..sums.count {
+        for u in 0..packets * PACKET / K::UNIT {
             let mut acc = [Step::zero(); W];
             unit::<Step, P, V, S, W, R>(source, x, u, K::UNIT / 4, together, ones, &mut acc);
-            for (a, (out, acc)) in sums.units[u].iter_mut().zip(acc).enumerate() {
+            for (a, acc) in acc.into_iter().enumerate() {
                 let acc = if least != 0 { _mm256_add_epi32(acc, _mm256_set1_epi32(least * unit_sum(x, K::UNIT, u, a))) } else { acc };
-                _mm256_storeu_si256(out.as_mut_ptr().cast(), acc);
+                let mut rows = [0i32; 8];
+                _mm256_storeu_si256(rows.as_mut_ptr().cast(), acc);
+                sums.add::<K, R>(u, a, rows, side, x);
             }
         }
     }

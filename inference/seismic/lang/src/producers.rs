@@ -278,6 +278,8 @@ impl Declaration {
                 ValueCodes::Fields(CodeInterpretation::Unsigned) | ValueCodes::Grid(_) => 0,
                 ValueCodes::Fields(CodeInterpretation::Offset(offset)) => u32::try_from(offset).ok()?,
                 ValueCodes::Fields(CodeInterpretation::TwosComplement) => 1 << (weight.axes.low + weight.axes.high - 1),
+                // Odd codes 2 (c - k) + 1 enter at their least's negation.
+                ValueCodes::Fields(CodeInterpretation::Odd(k)) => u32::try_from(2 * k - 1).ok()?,
                 codes => panic!("a lane producer of {codes:?} states the zero they enter at"),
             },
         };
@@ -348,9 +350,9 @@ mod tests {
         }
     }
 
-    /// The lane producers read neither floating nor odd codes; PACK reads
-    /// local codes of the scales plane and those grid entries carry
-    /// (`packing_factors`).
+    /// The lane producers read no floating codes and odd codes of one bit
+    /// alone; PACK reads local codes of the scales plane and those grid
+    /// entries carry (`packing_factors`).
     #[test]
     fn metal_lane_producers_read_integer_codes() {
         let (mut covered, mut carried) = (0, 0);
@@ -358,7 +360,8 @@ mod tests {
             let Some(weight) = Weight::of(info) else { continue };
             let key = weight.axes.axis_key();
             let covers = covers(crate::forms::METAL_PACK, &weight);
-            if matches!(key.kind, CodeKind::E4m3 | CodeKind::Odd) {
+            let one_bit = (weight.axes.low, weight.axes.high) == (1, 0);
+            if key.kind == CodeKind::E4m3 || (key.kind == CodeKind::Odd && !one_bit) {
                 assert!(!covers, "{} is not read by a lane producer", info.name);
             }
             if matches!(key.locals, Locals::Carried(_)) {

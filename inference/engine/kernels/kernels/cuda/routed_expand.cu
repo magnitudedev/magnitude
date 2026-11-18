@@ -54,11 +54,29 @@ __global__ void routed_expand_stage(SEISMIC_KERNEL_PARAMS) {
         projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_US,                      \
                                  SEISMIC_UP_SCALE_STRIDE_0, (expert)))
 
+// The shared expert's block (row y = M * K): the paired GEMV over every
+// activation row, a one-row call's from its `shared_row` (a macro: the
+// buffers are kernel parameters).
+#define SHARED_EXPERT(Shape, shared, group)                                                                 \
+    do {                                                                                                    \
+        const Pro pro{ROWS_OF(SHARED_NVFP4), STRIDE_OF(SHARED_NVFP4), projection::AllRows{}};               \
+        const Epi epi{SEISMIC_RESULT_1_OUT, SEISMIC_RESULT_1_STRIDE_0};                                     \
+        const auto gate = KERNEL_W2_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_GATE));                            \
+        const auto up = KERNEL_W3_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_UP));                                \
+        if (SEISMIC_DIM_M == 1)                                                                             \
+            projection::gemv_segment_ready<Shape>(shared, projection::shared_row_after_dependency(pro, SEISMIC_DIM_H), \
+                                                  1u, SEISMIC_DIM_H / 64, group, SEISMIC_DIM_S, gate, up, epi); \
+        else                                                                                                \
+            projection::gemv_segment_ready<Shape>(shared, projection::after_dependency(pro),                \
+                                                  (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H / 64, group,       \
+                                                  SEISMIC_DIM_S, gate, up, epi);                            \
+    } while (0)
+
 #ifdef SEISMIC_FORMING_ROUTED_EXPAND_CHOICE
 template <int TPW, int KSPLIT>
 __global__ void routed_expand_choice(SEISMIC_KERNEL_PARAMS) {
     using Shape = routed::DecodeShape<TPW, KSPLIT>;
-    __shared__ projection::GemvShared<Shape, Pro> shared;
+    __shared__ projection::GemvShared<Shape, projection::SharedRow> shared;
     const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));
     const projection::u64 group = Shape::tile_group();
     const projection::u64 choices = SEISMIC_DIM_M * SEISMIC_DIM_K;
@@ -69,8 +87,9 @@ __global__ void routed_expand_choice(SEISMIC_KERNEL_PARAMS) {
         seismic_dependency_start();
         const projection::u64 m = blockIdx.y / SEISMIC_DIM_K, k = blockIdx.y % SEISMIC_DIM_K;
         const projection::u64 expert = (projection::u64)routes[m * SEISMIC_ROUTES_STRIDE_0 + k * SEISMIC_ROUTES_STRIDE_1];
-        const Pro pro{ROWS_OF(ROUTED_NVFP4) + m * STRIDE_OF(ROUTED_NVFP4) * 2, STRIDE_OF(ROUTED_NVFP4),
-                      projection::AllRows{}};
+        const projection::SharedRow pro = projection::shared_row(
+            Pro{ROWS_OF(ROUTED_NVFP4) + m * STRIDE_OF(ROUTED_NVFP4) * 2, STRIDE_OF(ROUTED_NVFP4), projection::AllRows{}},
+            SEISMIC_DIM_H);
         const Epi epi{SEISMIC_RESULT_0_OUT.offset(m * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1), 0};
         projection::gemv_segment<Shape>(shared, pro, 1u, SEISMIC_DIM_H / 64, group, SEISMIC_DIM_F,
                                 ROUTED_RECORD(KERNEL_W0, slab::region(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_GATE), expert)),
@@ -79,11 +98,7 @@ __global__ void routed_expand_choice(SEISMIC_KERNEL_PARAMS) {
         return;
     }
 
-    const Pro pro{ROWS_OF(SHARED_NVFP4), STRIDE_OF(SHARED_NVFP4), projection::AllRows{}};
-    const Epi epi{SEISMIC_RESULT_1_OUT, SEISMIC_RESULT_1_STRIDE_0};
-    projection::gemv_segment_ready<Shape>(shared, projection::after_dependency(pro), (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H / 64, group, SEISMIC_DIM_S,
-                            KERNEL_W2_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_GATE)),
-                            KERNEL_W3_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_UP)), epi);
+    SHARED_EXPERT(Shape, shared, group);
 }
 #endif
 
@@ -115,10 +130,6 @@ __global__ void routed_expand_gathered(SEISMIC_KERNEL_PARAMS) {
         return;
     }
 
-    const Pro pro{ROWS_OF(SHARED_NVFP4), STRIDE_OF(SHARED_NVFP4), projection::AllRows{}};
-    const Epi epi{SEISMIC_RESULT_1_OUT, SEISMIC_RESULT_1_STRIDE_0};
-    projection::gemv_segment_ready<Shape>(shared, projection::after_dependency(pro), (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H / 64, group, SEISMIC_DIM_S,
-                            KERNEL_W2_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_GATE)),
-                            KERNEL_W3_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_UP)), epi);
+    SHARED_EXPERT(Shape, shared, group);
 }
 #endif

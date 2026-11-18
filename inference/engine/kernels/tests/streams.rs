@@ -343,36 +343,59 @@ impl Case {
         [low, inject, inverse, partials]
     }
 
+    /// The statics of the case's entries.
+    fn statics(&self) -> [(&'static str, u64); 4] {
+        [
+            ("H", self.h as u64),
+            ("S", self.s as u64),
+            ("LR", self.r as u64),
+            ("C", self.c as u64),
+        ]
+    }
+
+    /// `stream_mix_down` on `device` at its declared defaults as `specialize`
+    /// changes them: (low, inject, inverse).
+    fn mixed(
+        &self,
+        device: &seismic::Device,
+        specialize: impl Fn(seismic::NativeSpecialization) -> seismic::NativeSpecialization,
+    ) -> [Vec<f32>; 3] {
+        let (s, h, r, rows, width) = (self.s, self.h, self.r, self.rows, self.width());
+        let statics = self.statics();
+        let entry = stream_mix_down::native_entry_with(stream_mix_down::Elements {
+            NW: seismic::Element::f32(),
+            DW: seismic::Element::bf16(),
+            IW: seismic::Element::f32(),
+            A: seismic::Element::bf16(),
+        });
+        let declared = declared::declared(device, &entry, |name| {
+            statics
+                .iter()
+                .find(|(given, _)| *given == name)
+                .unwrap_or_else(|| panic!("static {name} is given"))
+                .1
+        }, &[]).unwrap();
+        let mixed = entry
+            .prepare(device, &specialize(declared))
+            .unwrap()
+            .call(stream_mix_down::Args {
+                hidden: &tensor(device, DType::F32, &[rows, s, h], &self.hidden),
+                norm: &tensor(device, DType::F32, &[s, h], &self.norm),
+                down_weight: &tensor(device, DType::BF16, &[r, width], &self.down),
+                inject_weight: &tensor(device, DType::F32, &[self.c * s, width], &self.inject),
+                epsilon: EPSILON,
+            })
+            .unwrap();
+        [read(&mixed.r0, DType::BF16), read(&mixed.r1, DType::F32), read(&mixed.r2, DType::F32)]
+    }
+
     /// The native entries on `device`: (low, inject, inverse) of the first
     /// stage, and the second stage's partials over the expected first
     /// stage's low rows and inverses.
     fn native(&self, device: &seismic::Device, expected: &[Vec<f64>; 4]) -> [Vec<f32>; 4] {
         let (s, h, r, rows, width) = (self.s, self.h, self.r, self.rows, self.width());
-        let statics = [
-            ("H", h as u64),
-            ("S", s as u64),
-            ("LR", r as u64),
-            ("C", self.c as u64),
-        ];
-        let mixed = at_defaults(
-            device,
-            stream_mix_down::native_entry_with(stream_mix_down::Elements {
-                NW: seismic::Element::f32(),
-                DW: seismic::Element::bf16(),
-                IW: seismic::Element::f32(),
-                A: seismic::Element::bf16(),
-            }),
-            &statics,
-        )
-        .unwrap()
-        .call(stream_mix_down::Args {
-            hidden: &tensor(device, DType::F32, &[rows, s, h], &self.hidden),
-            norm: &tensor(device, DType::F32, &[s, h], &self.norm),
-            down_weight: &tensor(device, DType::BF16, &[r, width], &self.down),
-            inject_weight: &tensor(device, DType::F32, &[self.c * s, width], &self.inject),
-            epsilon: EPSILON,
-        })
-        .unwrap();
+        let statics = self.statics();
+        let [low_rows, inject, inverse_rows] = self.mixed(device, |declared| declared);
         let low = expected[0].iter().map(|v| *v as f32).collect::<Vec<_>>();
         let inverse = expected[2].iter().map(|v| *v as f32).collect::<Vec<_>>();
         let gated = at_defaults(
@@ -393,12 +416,7 @@ impl Case {
             norm: &tensor(device, DType::F32, &[s, h], &self.norm),
         })
         .unwrap();
-        [
-            read(&mixed.r0, DType::BF16),
-            read(&mixed.r1, DType::F32),
-            read(&mixed.r2, DType::F32),
-            read(&gated.value, DType::F32),
-        ]
+        [low_rows, inject, inverse_rows, read(&gated.value, DType::F32)]
     }
 }
 
@@ -498,7 +516,7 @@ fn native_stream_mix_matches_portable_bodies() {
 #[test]
 fn cpu_stream_mix_row_shares_match_the_host_replica() {
     use seismic::device::DeviceValues;
-    let device = seismic::Devices::discover(&[]).unwrap().open_backend(seismic::BackendName::Cpu).unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(seismic::BackendName::Cpu) else { return };
     let units = device.properties().value("units") as usize;
     for (geometry, c) in [
         ((32, 1, 4), 1),
@@ -1389,5 +1407,44 @@ fn native_sinkhorn_split_timing() {
             best.as_secs_f64() * 1e6,
             function_bytes / best.as_secs_f64() / 1e9
         );
+    }
+}
+
+/// `stream_mix_down`'s parted GEMV (`gemv_runtime`) stages its activations
+/// as F32 under STAGE, a plain form the `dense` projection declares at both
+/// values: at every GEMV row count of every case, low, inject and inverse
+/// are bit for bit those of STAGE 0.
+#[test]
+fn metal_stream_mix_down_stages_activations_without_changing_a_bit() {
+    let module = crate::common::kernels();
+    let id = module.entry_named("stream_mix_down").expect("`stream_mix_down` is declared");
+    let native = module
+        .native_implementation(id, seismic::BackendName::Metal)
+        .expect("`stream_mix_down` has a Metal implementation");
+    let stage = native
+        .declared_params()
+        .find(|parameter| parameter.name == "STAGE")
+        .expect("`stream_mix_down` declares STAGE");
+    assert_eq!(stage.values, vec![0, 1]);
+    let Some(device) = devices().into_iter().find(|device| device.backend() == seismic::BackendName::Metal) else {
+        return;
+    };
+    let gemv_rows = ROWS
+        .into_iter()
+        .filter(|&rows| rows as u64 <= magnitude_kernels::constants::VERIFY_ROWS);
+    for geometry in GEOMETRIES {
+        for c in [1, 0] {
+            for rows in gemv_rows.clone() {
+                let case = Case::new(geometry, c, rows);
+                let [neither, staged] =
+                    [0, 1].map(|stage| case.mixed(&device, |declared| declared.with_param("STAGE", stage)));
+                for (name, (neither, staged)) in ["low", "inject", "inverse"].into_iter().zip(neither.iter().zip(&staged)) {
+                    assert!(
+                        neither.iter().zip(staged).all(|(a, b)| a.to_bits() == b.to_bits()),
+                        "{geometry:?} C {c} M {rows}: {name} differs under STAGE 1"
+                    );
+                }
+            }
+        }
     }
 }

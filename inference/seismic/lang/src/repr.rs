@@ -2962,6 +2962,29 @@ impl Repr {
 mod tests {
     use super::*;
 
+    /// A grid whose points Metal scales within their bytes, by its delta's
+    /// exponent or by the power its signed bias takes off (`packets::Grid::
+    /// scaled_bytes`), holds points that stay signed bytes once scaled.
+    #[test]
+    fn scaled_grid_points_fit_their_bytes() {
+        for repr in REPRS {
+            let CodeStorage::Grid(codes) = repr.coding.codes() else {
+                continue;
+            };
+            let biased = match &repr.coding {
+                Coding::Hierarchical { locals: LocalCodes::Carried { signed_bias: Some(bias), .. }, .. } => -bias,
+                _ => 0,
+            };
+            let shift = biased.max(codes.delta.map_or(0, |exponent| exponent as i32));
+            for point in 0..codes.points().len() {
+                for lane in 0..codes.lanes() {
+                    let scaled = codes.point_value(point, lane) << shift;
+                    assert!((-128..=127).contains(&scaled), "{} point {point} lane {lane}", repr.name);
+                }
+            }
+        }
+    }
+
     /// A tiny reference evaluator of a decode recipe over temporaries held
     /// as `f64`, with plane contents supplied per (ordinal, entry): a packed
     /// entry is its raw code, a dense entry its value.

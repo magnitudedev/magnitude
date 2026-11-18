@@ -5,7 +5,7 @@
 //! submitting thread, so its gate blocks that thread until another opens it.
 
 use seismic::{
-    BackendName, Devices, Element, NativeGraphFamily, NativeGraphMetadata,
+    BackendName, Element, NativeGraphFamily, NativeGraphMetadata,
     NativeSpecialization, Tensor, Timeline,
 };
 use seismic_native_tests::scale_rows;
@@ -180,10 +180,7 @@ fn an_open_gate_lets_the_run_through() {
 /// A run's every timeline node must be bound, to a timeline of its device.
 #[test]
 fn a_run_binds_every_timeline_node() {
-    let device = Devices::discover(&[])
-        .unwrap()
-        .open_backend(BackendName::Cpu)
-        .unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Cpu) else { return };
     let kernel =
         scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1))
             .unwrap();
@@ -219,10 +216,7 @@ fn a_run_binds_every_timeline_node() {
 /// A plan with timeline nodes holds the host heap its topology plans.
 #[test]
 fn timeline_nodes_are_in_the_planned_host_heap() {
-    let device = Devices::discover(&[])
-        .unwrap()
-        .open_backend(BackendName::Cpu)
-        .unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Cpu) else { return };
     let kernel =
         scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1))
             .unwrap();

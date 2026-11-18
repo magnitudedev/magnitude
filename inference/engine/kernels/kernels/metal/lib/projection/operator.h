@@ -12,9 +12,10 @@
 // The GEMV of a launch that serves COUNT (ONE, PAIR, SEVERAL) rows of `x`:
 // by the packets' own recipe where they name one (`gemv_recipe`, a single
 // projection's), else with TILED = 1 the row tiles where every weight's rows
-// are tiled, else the row mapping (walked by packet class with TILED = 2).
-// `n` is the rows of each weight, `k` their columns; the kernel provides
-// `tile`, `shared`, `simdgroups`, `sg` and `lane`.
+// are tiled, else the row mapping (walked by packet class with TILED = 2),
+// its activations staged as F32 with STAGE = 1. `n` is the rows of each
+// weight, `k` their columns; the kernel provides `tile`, `shared`,
+// `simdgroups`, `sg`, `lane` and its template's STAGE.
 #define PROJECTION_GEMV(W0, W1, PAIRED, ROWS, LANES, TILED, COUNT, x, out, w0, w1, rows, n, k)                  \
     if constexpr (projection::gemv_recipe<W0>::value) {                                                         \
         projection::gemv_recipe_rows<W0, ROWS, LANES>(x, out, w0, rows, n, k, tile, shared, simdgroups, sg,      \
@@ -26,7 +27,7 @@
                 x, out, w0, w1, rows, n, k, tile, shared, simdgroups, sg, lane));                               \
     } else {                                                                                                    \
         PROJECTION_FOR_##COUNT##_ROWS(rows,                                                                     \
-            projection::gemv_form<W0, W1, PAIRED, ROWS, MAXM, LANES, (TILED == 2)>(                             \
+            projection::gemv_form<W0, W1, PAIRED, ROWS, MAXM, LANES, (TILED == 2), (STAGE == 1)>(              \
                 x, out, w0, w1, rows, n, k, tile, shared, simdgroups, sg, lane));                               \
     }
 
@@ -122,6 +123,26 @@
     PROJECTION_OPERANDS_SHARED(globals, NVFP4);                                                                 \
     const auto x = Operands::rows(input, m, k, globals, simdgroups, sg, lane);                                  \
     PROJECTION_GEMV(packets::W0, packets::W0, false, ROWS, LANES, TILED, COUNT, x, out, w, w, m, n, k)
+
+// The packed-rows GEMV (PACKED_ROWS rows an operand, `gemv_packed`), on a
+// device that runs the packed forms (`packing_forms`); elsewhere the GEMV's
+// row mapping in its place, as the PACK form's `unpacked` launch.
+#define PROJECTION_SINGLE_GEMV_PACKED                                                                           \
+    const uint tile = position.x;                                                                               \
+    PROJECTION_OPERANDS(PROJECTION_GROUP(position.z));                                                          \
+    PROJECTION_GEMV_INPUT(input);                                                                               \
+    PROJECTION_OPERANDS_SHARED(globals, NVFP4);                                                                 \
+    const auto x = Operands::rows(input, m, k, globals, simdgroups, sg, lane);                                  \
+    if constexpr (projection::packing_forms) {                                                                  \
+        PROJECTION_BOUNDS;                                                                                      \
+        PROJECTION_FOR_PACKED_ROWS(m,                                                                           \
+            projection::gemv_packed<packets::W0, PACKED_ROWS, ROWS, MAXM, LANES, BOUNDS>(x, out, w, bounds, m,   \
+                n, k, tile, shared, simdgroups, sg, lane));                                                     \
+    } else {                                                                                                    \
+        PROJECTION_FOR_PACKED_ROWS(m,                                                                           \
+            projection::gemv_form<packets::W0, packets::W0, false, ROWS, MAXM, LANES, false, false>(x, out, w, w, \
+                m, n, k, tile, shared, simdgroups, sg, lane));                                                  \
+    }
 
 #define PROJECTION_SINGLE_BATCH                                                                                 \
     const uint tile = position.x;                                                                               \
@@ -224,21 +245,21 @@
     projection::gemm_int8<packets::W0, INT8_TILE, PATH>(in, out, w, scratch, m, n, k, tile.x, tile.y, shared,   \
         sg, lane)
 
-// The PACK form past 64 rows: the rows as integer codes, two rows packed per
-// operand element (RESIDUE: the operand's residue width for weights with
-// residue bits), the weight's block scales and biases, then the packed
-// tiles; on a device without the packed path, the staged tiles of the
-// default form, with its results.
+// The PACK form past 64 rows: the rows as integer codes, two rows
+// packed per operand element (RESIDUE: the operand's residue width for
+// weights with residue bits), the weight's block scales and biases, then the
+// packed tiles over the rows padded to two operand tiles; on a device without
+// the packed path, the staged tiles of the default form, with its results.
 #define PROJECTION_SINGLE_PACK                                                                                  \
     if constexpr (!projection::packing_path<packets::W0>())                                                     \
         return;                                                                                                 \
-    threadgroup float4 peaks[8];                                                                                \
+    threadgroup float peaks[projection::packing_peaks()];                                                       \
     PROJECTION_OPERANDS(0u);                                                                                    \
     PROJECTION_PACKING_SCRATCH;                                                                                 \
     PROJECTION_BOUNDS;                                                                                          \
     typedef projection::packing_codes<packets::W0> coded;                                                       \
-    projection::packing_operand<coded::centre, coded::folds, (coded::residue != 0 ? RESIDUE : 0), BOUNDS>(in,   \
-        scratch, bounds, m, k, index, peaks, thread_index, sg, lane)
+    projection::packing_operand<coded::centre, coded::folds, coded::sums, (coded::residue != 0 ? RESIDUE : 0),   \
+        BOUNDS>(in, scratch, bounds, m, k, index, peaks, thread_index, sg, lane)
 
 #define PROJECTION_SINGLE_PACK_COEFFICIENTS                                                                     \
     if constexpr (!projection::packing_path<packets::W0>())                                                     \
@@ -254,7 +275,7 @@
     PROJECTION_OPERANDS(0u);                                                                                    \
     PROJECTION_PACKING_SCRATCH;                                                                                 \
     projection::gemm_packed<packets::W0, RESIDUE, PACK_TOKENS, WEIGHTS_AHEAD>(out, w, scratch, m,               \
-        (m + 127u) / 128u * 128u, n, k, index * projection::packing_simdgroups + sg, lane)
+        projection::packing_padded(m, 2u), n, k, index * projection::packing_simdgroups + sg, lane)
 
 #define PROJECTION_SINGLE_UNPACKED                                                                              \
     if constexpr (projection::packing_path<packets::W0>())                                                      \
@@ -353,19 +374,20 @@
     projection::gemm_int8_paired<packets::W0, packets::W1, PATH, 64>(in, out, w0, w1, scratch0, scratch1, m, n, k, \
         tile.y, tile.x, shared, exchange, sg, lane)
 
-// The PACK form past 64 rows: the staged rows as integer codes, two rows
-// packed per operand element, once for both weights (RESIDUE: the operand's
+// The PACK form past 64 rows: the staged rows as integer codes, two
+// rows packed per operand element, once for both weights (RESIDUE: the operand's
 // residue width for weights with residue bits), both weights' block scales
 // and biases, then the paired packed tiles; on a device without the packed
 // path, the staged tiles of the default form, with its results. PACK = 1
 // names them only for a gate and an up weight one operand serves, of one
-// layout (`PACK_FOLDS`, `PACK_RESIDUE`), which the projection's `where`
-// requires.
+// layout (`PACK_FOLDS`, `PACK_RESIDUE`, `PACK_SUMS`), which the projection's
+// `where` requires.
 #define PROJECTION_PAIRED_PACKING_PATH projection::packing_path<packets::W0, packets::W1>()
 #define PROJECTION_PAIRED_PACKING_ADMITTED                                                                      \
     static_assert(projection::packing_codes<packets::W0>::folds == projection::packing_codes<packets::W1>::folds \
             && (projection::packing_codes<packets::W0>::residue != 0)                                           \
-                == (projection::packing_codes<packets::W1>::residue != 0),                                      \
+                == (projection::packing_codes<packets::W1>::residue != 0)                                       \
+            && projection::packing_codes<packets::W0>::sums == projection::packing_codes<packets::W1>::sums,    \
         "PACK = 1 names the packed GEMM of weights one operand serves")
 
 // The operand serves both weights: their bounds, where both have one.
@@ -373,14 +395,14 @@
     PROJECTION_PAIRED_PACKING_ADMITTED;                                                                         \
     if constexpr (!PROJECTION_PAIRED_PACKING_PATH)                                                              \
         return;                                                                                                 \
-    threadgroup float4 peaks[8];                                                                                \
+    threadgroup float peaks[projection::packing_peaks()];                                                       \
     PROJECTION_OPERANDS;                                                                                        \
     PROJECTION_PACKING_SCRATCH;                                                                                 \
     typedef projection::packing_shared<RESIDUE, packets::W0, 1, packets::W1, 1> coded;                          \
     constexpr uint BOUNDS = projection::packing_bounded<3u, PROJECTION_BOUNDED>::value;                         \
     const projection::packing_bounds<BOUNDS> bounds{PROJECTION_BOUND_TABLES};                                   \
-    projection::packing_operand<coded::centre, coded::folds, coded::residue, BOUNDS>(in, scratch0, bounds, m, k, \
-        index, peaks, thread_index, sg, lane)
+    projection::packing_operand<coded::centre, coded::folds, coded::sums, coded::residue, BOUNDS>(              \
+        in, scratch0, bounds, m, k, index, peaks, thread_index, sg, lane)
 
 #define PROJECTION_PAIRED_PACK_COEFFICIENTS                                                                     \
     PROJECTION_PAIRED_PACKING_ADMITTED;                                                                         \
@@ -393,17 +415,17 @@
     projection::packing_tile_coefficients(w0, scratch0, k, index, peaks0, thread_index, sg, lane);              \
     projection::packing_tile_coefficients(w1, scratch1, k, index, peaks1, thread_index, sg, lane)
 
-// The operand's rows padded to the paired tile's 64.
+// The operand's rows padded to the paired tile's one operand tile.
 #define PROJECTION_PAIRED_PACKED                                                                                \
     PROJECTION_PAIRED_PACKING_ADMITTED;                                                                         \
     if constexpr (!PROJECTION_PAIRED_PACKING_PATH)                                                              \
         return;                                                                                                 \
-    threadgroup float4 exchange[projection::packing_simdgroups / 2 * projection::packing_exchange];            \
+    threadgroup float exchange[projection::packing_simdgroups / 2 * projection::packing_exchange()];            \
     PROJECTION_OPERANDS;                                                                                        \
     PROJECTION_PACKING_SCRATCH;                                                                                 \
-    projection::gemm_packed_paired<packets::W0, packets::W1, RESIDUE, PACK_TOKENS, WEIGHTS_AHEAD>(out, w0, w1,  \
-        scratch0, scratch1, m, (m + 63u) / 64u * 64u, n, k, index, projection::packing_simdgroups, exchange, sg, \
-        lane)
+    projection::gemm_packed_paired<packets::W0, packets::W1, RESIDUE, PACK_TOKENS, WEIGHTS_AHEAD>(              \
+        out, w0, w1, scratch0, scratch1, m, projection::packing_padded(m, 1u), n, k, index,                     \
+        projection::packing_simdgroups, exchange, sg, lane)
 
 #define PROJECTION_PAIRED_UNPACKED                                                                              \
     PROJECTION_PAIRED_PACKING_ADMITTED;                                                                         \
@@ -771,7 +793,8 @@ inline void segment_tall(thread const In &in, thread const Out &out, thread cons
 #define PROJECTION_PACKING PROJECTION_PACKING_OF(1)
 #define PROJECTION_SERVED(s)                                                                                    \
     (PROJECTION_N##s != 0 && PROJECTION_N##s % 32 == 0                                                          \
-        && projection::packing_serves<PROJECTION_PACKET(s), PROJECTION_PACKING::folds, PROJECTION_PACKING::residue>::value)
+        && projection::packing_serves<PROJECTION_PACKET(s), PROJECTION_PACKING::folds, PROJECTION_PACKING::residue, \
+            PROJECTION_PACKING::sums>::value)
 #define PROJECTION_SERVED_BIT(s, ...) (PROJECTION_SERVED(s) ? 1u << s##u : 0u) |
 #define PROJECTION_ADMITTED(s, ...)                                                                             \
     (projection::packing_admitted<PROJECTION_PACKET(s)>::value && PROJECTION_N##s != 0 && PROJECTION_N##s % 32 == 0) ||
@@ -780,23 +803,26 @@ inline void segment_tall(thread const In &in, thread const Out &out, thread cons
 #define PROJECTION_PACKING_ADMITTED                                                                             \
     static_assert(PROJECTION_EACH_SEGMENT(PROJECTION_ADMITTED, ) false,                                         \
         "PACK = 1 names the packed GEMM of a segment of weights admitted to it")
-// Segment s's factor tables, beside the shared operand.
+// Segment s's factor tables, beside the shared operand: the served weights'
+// factors are its layout's (two F16 a row and block, four with each run's
+// sums).
 #define PROJECTION_SEGMENT_SCRATCH(s)                                                                           \
     projection::packing_scratch{packed, token_factors, token_scales,                                            \
-        factors + ulong(PROJECTION_FIRST_##s) * (k / 32u) * 2u, scales + PROJECTION_FIRST_##s}
+        factors + ulong(PROJECTION_FIRST_##s) * (k / 32u) * (PROJECTION_PACKING::sums ? 4u : 2u),              \
+        scales + PROJECTION_FIRST_##s}
 
 #define PROJECTION_SEGMENTED_PACK                                                                               \
     PROJECTION_PACKING_ADMITTED;                                                                                \
     if constexpr (!projection::packing_forms)                                                                   \
         return;                                                                                                 \
-    threadgroup float4 peaks[8];                                                                                \
+    threadgroup float peaks[projection::packing_peaks()];                                                       \
     PROJECTION_OPERANDS;                                                                                        \
     constexpr uint SERVED = PROJECTION_EACH_SEGMENT(PROJECTION_SERVED_BIT, ) 0u;                                \
     constexpr uint BOUNDS = projection::packing_bounded<SERVED, PROJECTION_BOUNDED>::value;                     \
     const projection::packing_bounds<BOUNDS> bounds{PROJECTION_BOUND_TABLES};                                   \
-    projection::packing_operand<PROJECTION_PACKING::centre, PROJECTION_PACKING::folds,                          \
-        PROJECTION_PACKING_OF(RESIDUE)::residue, BOUNDS>(in, PROJECTION_SEGMENT_SCRATCH(0), bounds, m, k, index, \
-        peaks, thread_index, sg, lane)
+    projection::packing_operand<PROJECTION_PACKING::centre, PROJECTION_PACKING::folds, PROJECTION_PACKING::sums, \
+        PROJECTION_PACKING_OF(RESIDUE)::residue, BOUNDS>(in, PROJECTION_SEGMENT_SCRATCH(0), bounds, m,          \
+        k, index, peaks, thread_index, sg, lane)
 
 #define PROJECTION_SEGMENT_COEFFICIENTS(s, ...)                                                                 \
     if (row < uint(PROJECTION_N##s)) {                                                                          \
@@ -815,15 +841,15 @@ inline void segment_tall(thread const In &in, thread const Out &out, thread cons
     PROJECTION_EACH_SEGMENT(PROJECTION_SEGMENT_COEFFICIENTS, )
 
 #define PROJECTION_SEGMENT_PACKED(s, ...)                                                                       \
-    if (projection::gemm_packed_segment<PROJECTION_PACKET(s), PROJECTION_SERVED(s), CODED, PACK_TOKENS,               \
-            WEIGHTS_AHEAD>(out##s, w##s, PROJECTION_SEGMENT_SCRATCH(s), PROJECTION_ZEROED(s) ? 0u : m, padded,  \
+    if (projection::gemm_packed_segment<PROJECTION_PACKET(s), PROJECTION_SERVED(s), CODED,                      \
+            PACK_TOKENS, WEIGHTS_AHEAD>(out##s, w##s, PROJECTION_SEGMENT_SCRATCH(s), PROJECTION_ZEROED(s) ? 0u : m, padded,  \
             uint(PROJECTION_N##s), k, group, projection::packing_simdgroups, sg, lane))                         \
         return;
 
 #define PROJECTION_SEGMENTED_PACKED                                                                             \
     PROJECTION_PACKING_ADMITTED;                                                                                \
     PROJECTION_OPERANDS;                                                                                        \
-    const uint padded = (m + 127u) / 128u * 128u;                                                               \
+    const uint padded = projection::packing_padded(m, 2u);                                                      \
     constexpr uint CODED = PROJECTION_PACKING_OF(RESIDUE)::residue;                                             \
     uint group = index;                                                                                         \
     PROJECTION_EACH_SEGMENT(PROJECTION_SEGMENT_PACKED, )
@@ -873,7 +899,8 @@ struct PartPartial {
 
 #define PROJECTION_SEGMENT_PART_GEMV(s, ...)                                                                    \
     else if (segment == s##u)                                                                                   \
-        PROJECTION_FOR_ROWS(m, projection::gemv_runtime<PROJECTION_PACKET(s), ROWS, MAXM, LANES>(x,             \
+        PROJECTION_FOR_ROWS(m,                                                                                  \
+            projection::gemv_runtime<PROJECTION_PACKET(s), ROWS, MAXM, LANES, (STAGE == 1)>(x,                  \
             projection::PartPartial{sums.y, sums.row, sums.column + PROJECTION_FIRST_##s}, w##s, m,             \
             uint(PROJECTION_N##s), width, local, shared, simdgroups, sg, lane, part * (width / 32u)));
 
@@ -920,6 +947,9 @@ namespace projection {
 
 template <typename W>
 struct OrderedWeight {
+    // Whether a lane fetches a block's columns in the reference order's
+    // stride (`fetch_strided`), so the walk needs no transpose.
+    static constant constexpr bool strided = false;
     struct fetched {
         typename W::packet pkt;
         bool valid;
@@ -1008,6 +1038,26 @@ struct OrderedWeight<packets::Dense<E>> {
         } else {
             out.raw[0] = as_type<uint4>(float4(s[0], s[1], s[2], s[3]));
             out.raw[1] = as_type<uint4>(float4(s[4], s[5], s[6], s[7]));
+        }
+        return out;
+    }
+    static constant constexpr bool strided = true;
+    // Columns 64 block + 8 s + u (s = 0..7) of a whole block, value s in
+    // place s: lane u's operands after `ordered_transpose8`, each read where
+    // the eight lanes of a row read 16 consecutive bytes.
+    static fetched fetch_strided(thread const Weights<packets::Dense<E>> &w, uint row, uint block, uint u) {
+        fetched out;
+        const auto geom = w.geometry(row);
+        const auto s = slab::as<typename E::storage>(w.row(row) + geom.codes + ulong(64u * block + u) * E::bytes);
+        if constexpr (E::bytes == 2u) {
+            uint pair[4];
+            PROJECTION_UNROLL
+            for (uint j = 0; j < 4u; ++j)
+                pair[j] = uint(as_type<ushort>(s[16u * j])) | (uint(as_type<ushort>(s[16u * j + 8u])) << 16u);
+            out.raw[0] = uint4(pair[0], pair[1], pair[2], pair[3]);
+        } else {
+            out.raw[0] = as_type<uint4>(float4(s[0], s[8], s[16], s[24]));
+            out.raw[1] = as_type<uint4>(float4(s[32], s[40], s[48], s[56]));
         }
         return out;
     }
@@ -1101,9 +1151,30 @@ inline float ordered_weight_at(thread const Weights<packets::Dense<E>> &w, uint 
     return E::load(slab::as<typename E::storage>(w.row(row) + w.geometry(row).codes)[col]);
 }
 
+// Blocks a 1-row ordered walk fetches together (`ordered_gemv_maxm_run`):
+// as many as 64 bytes of fetched weights hold, so a batch and the next one in
+// flight fit a lane's registers; one where a block's fetch is larger.
+template <typename W>
+constexpr uint ordered_walk_batch() {
+    constexpr uint fit = 64u / uint(sizeof(typename OrderedWeight<W>::fetched));
+    return fit < 1u ? 1u : (fit > 8u ? 8u : fit);
+}
+
 template <uint MAXM>
 constexpr uint ordered_mixed_w_per_sg() {
     return (MAXM == 1u) ? 4u : ((MAXM == 2u) ? 2u : 1u);
+}
+// The simdgroups of a threadgroup that hold an ordered segment's rows: at one
+// row, two (a tile of 8 rows), so a router of a few hundred rows reads its
+// weights from many cores rather than a few; the rest of the threadgroup
+// stages the row and leaves. `dense.seismic`'s `ordered_gemv1` grid matches.
+template <uint MAXM, uint SIMDGROUPS>
+constexpr uint ordered_mixed_sgs() {
+    return (MAXM == 1u && SIMDGROUPS > 2u) ? 2u : SIMDGROUPS;
+}
+template <uint MAXM, uint SIMDGROUPS>
+constexpr uint ordered_mixed_rows() {
+    return ordered_mixed_sgs<MAXM, SIMDGROUPS>() * ordered_mixed_w_per_sg<MAXM>();
 }
 
 // Unified reference-order GEMV (`M <= 8`): four weight rows per simdgroup
@@ -1340,10 +1411,10 @@ inline void ordered_gemv_maxm_run(thread const In &in, thread const Out &out, th
     const uint u = lane & 7u;
     const uint w_off = (MAXM == 1u) ? q : ((MAXM == 2u) ? (q >> 1u) : 0u);
     const uint r0 = (MAXM == 1u) ? 0u : ((MAXM == 2u) ? (q & 1u) : q);
-    const uint sg_base_row = local_tile * (SIMDGROUPS * W_PER_SG) + sg * W_PER_SG;
+    const uint sg_base_row = local_tile * ordered_mixed_rows<MAXM, SIMDGROUPS>() + sg * W_PER_SG;
     const uint w_row = sg_base_row + w_off;
-    const bool sg_has_rows = sg_base_row < n;
-    const bool has_row = w_row < n;
+    const bool sg_has_rows = sg < ordered_mixed_sgs<MAXM, SIMDGROUPS>() && sg_base_row < n;
+    const bool has_row = sg_has_rows && w_row < n;
     const uint p_own = u >> 2u;
     const uint s_own = u & 3u;
     typename Ow::fetched cur_w = Ow::empty();
@@ -1359,37 +1430,66 @@ inline void ordered_gemv_maxm_run(thread const In &in, thread const Out &out, th
                 if (sg_has_rows) {
                     threadgroup const uint4 *x_packed = reinterpret_cast<threadgroup const uint4 *>(shared);
                     float acc = 0.0f;
-                    uint col0 = 0u;
-                    for (; col0 + 64u <= k; col0 += 64u) {
-                        float wt[8];
-                        if (has_row)
-                            Ow::decode_full(cur_w, s_own, wt);
-                        else {
-                            PROJECTION_UNROLL
-                            for (uint j = 0u; j < 8u; ++j)
-                                wt[j] = 0.0f;
+                    // The row's whole blocks in batches of WALK, the next
+                    // batch's loads in flight while this one is summed, so
+                    // the walk waits on memory once a batch, not once a
+                    // block; the sum keeps the block order.
+                    constexpr uint WALK = ordered_walk_batch<W>();
+                    const uint blocks = k >> 6u;
+                    // A block's fetch: lane u's own columns where the weights
+                    // fetch in stride, else its eight consecutive ones, which
+                    // `ordered_transpose8` exchanges.
+                    const auto fetch_block = [&](uint block) {
+                        if constexpr (Ow::strided)
+                            return Ow::fetch_strided(w, w_row, block, u);
+                        else
+                            return Ow::fetch_full(w, w_row, 2u * block + p_own, s_own);
+                    };
+                    typename Ow::fetched cur[WALK];
+                    cur[0] = Ow::strided ? (has_row && blocks > 0u ? fetch_block(0u) : Ow::empty()) : cur_w;
+                    PROJECTION_UNROLL
+                    for (uint d = 1u; d < WALK; ++d)
+                        cur[d] = (has_row && d < blocks) ? fetch_block(d) : Ow::empty();
+                    for (uint b = 0u; b < blocks; b += WALK) {
+                        typename Ow::fetched next[WALK];
+                        PROJECTION_UNROLL
+                        for (uint d = 0u; d < WALK; ++d) {
+                            const uint nb = b + WALK + d;
+                            next[d] = (has_row && nb < blocks) ? fetch_block(nb) : Ow::empty();
                         }
-                        const uint next_col = col0 + 64u;
-                        if (has_row) {
-                            if (next_col + 64u <= k)
-                                cur_w = Ow::fetch_full(w, w_row, (next_col >> 5u) + p_own, s_own);
-                            else if (next_col + 8u * u < k)
-                                cur_w = Ow::fetch(w, w_row, (next_col >> 5u) + p_own, s_own);
-                            else
-                                cur_w = Ow::empty();
+                        PROJECTION_UNROLL
+                        for (uint d = 0u; d < WALK; ++d) {
+                            if (b + d < blocks) {
+                                float wt[8];
+                                if (has_row)
+                                    Ow::decode_full(cur[d], s_own, wt);
+                                else {
+                                    PROJECTION_UNROLL
+                                    for (uint j = 0u; j < 8u; ++j)
+                                        wt[j] = 0.0f;
+                                }
+                                if constexpr (!Ow::strided)
+                                    ordered_transpose8(wt, u);
+                                float4 xe, xo;
+                                A::split8(x_packed[(b + d) * 8u + u], xe, xo);
+                                acc = metal::fma(xe.x, wt[0], acc);
+                                acc = metal::fma(xo.x, wt[1], acc);
+                                acc = metal::fma(xe.y, wt[2], acc);
+                                acc = metal::fma(xo.y, wt[3], acc);
+                                acc = metal::fma(xe.z, wt[4], acc);
+                                acc = metal::fma(xo.z, wt[5], acc);
+                                acc = metal::fma(xe.w, wt[6], acc);
+                                acc = metal::fma(xo.w, wt[7], acc);
+                            }
                         }
-                        ordered_transpose8(wt, u);
-                        float4 xe, xo;
-                        A::split8(x_packed[(col0 >> 6u) * 8u + u], xe, xo);
-                        acc = metal::fma(xe.x, wt[0], acc);
-                        acc = metal::fma(xo.x, wt[1], acc);
-                        acc = metal::fma(xe.y, wt[2], acc);
-                        acc = metal::fma(xo.y, wt[3], acc);
-                        acc = metal::fma(xe.z, wt[4], acc);
-                        acc = metal::fma(xo.z, wt[5], acc);
-                        acc = metal::fma(xe.w, wt[6], acc);
-                        acc = metal::fma(xo.w, wt[7], acc);
+                        PROJECTION_UNROLL
+                        for (uint d = 0u; d < WALK; ++d)
+                            cur[d] = next[d];
                     }
+                    const uint col0 = blocks << 6u;
+                    if (col0 < k)
+                        cur_w = (has_row && col0 + 8u * u < k) ? Ow::fetch(w, w_row, (col0 >> 5u) + p_own, s_own)
+                                                               : Ow::empty();
                     if (col0 < k) {
                         float wt[8];
                         if (has_row && col0 + 8u * u < k)
@@ -2091,7 +2191,7 @@ inline void ordered_gemm_run(thread const In &in, thread const Out &out, thread 
     PROJECTION_ORDERED_EPILOGUE(ordered_tiles)
 
 #define PROJECTION_SEGMENTED_ORDERED_GEMV_MIXED(MAXM)                                                           \
-    constexpr uint ord_per = simdgroups * projection::ordered_mixed_w_per_sg<(MAXM)>();                                                                   \
+    constexpr uint ord_per = projection::ordered_mixed_rows<(MAXM), simdgroups>();                                                                   \
     constexpr uint unord_per = simdgroups * ROWS * (32u / LANES);                                               \
     PROJECTION_OPERANDS;                                                                                        \
     const uint ordered_tiles = 0u PROJECTION_EACH_SEGMENT(PROJECTION_ORDERED_ADD_TILES, ord_per);               \

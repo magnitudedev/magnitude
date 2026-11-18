@@ -63,8 +63,8 @@ void routed_up_rows(const uint64_t choice, uint64_t rows, uint64_t outputs, uint
         routed_zero_features(out_, count, tile * rows_per_tile, rows_per_tile, uint(SEISMIC_DIM_F));
         return;
     }
-    projection_gemv(PACKETS_W0, PACKETS_W0, false, SEISMIC_TUNE_ROWS, 32u, maxm, PROJECTION_NORM_NONE, x, out_, up, up,
-        count, uint(SEISMIC_DIM_F), hidden, tile);
+    projection_gemv(PACKETS_W0, PACKETS_W0, false, SEISMIC_TUNE_ROWS, 32u, maxm, false, false,
+        PROJECTION_NORM_NONE, x, out_, up, up, count, uint(SEISMIC_DIM_F), hidden, tile);
 }
 
 void routed_up_choice() { routed_up_rows(gl_WorkGroupID.y, 0ul, 0ul, 1u, 1u); }

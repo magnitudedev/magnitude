@@ -4,11 +4,10 @@
 
 include!("attention.rs");
 
+/// The CUDA device, where the host has one or the runner requests CUDA
+/// ([`seismic_native_tests::devices`]).
 fn cuda() -> Option<Device> {
-    seismic::Devices::discover(&[])
-        .ok()?
-        .open_backend(BackendName::Cuda)
-        .ok()
+    seismic_native_tests::devices(&[BackendName::Cuda]).into_iter().next()
 }
 
 fn cuda_decode(

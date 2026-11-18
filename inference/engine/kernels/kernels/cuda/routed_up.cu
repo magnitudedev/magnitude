@@ -16,11 +16,10 @@
 #define KERNEL_W0 SEISMIC_EXPERT_UP
 #include "lib/routed/routed.cuh"
 
-// A block's one row, read in place unless the experts take it as NVFP4
-// operands, which the block forms in its shared memory.
+// A block's one row, as the experts take it (NVFP4 operands or A), which the
+// block forms in its shared memory (`shared_row`).
 using Raw = projection::Plain<ELEMENT_OF(SEISMIC_ELEMENT_A), projection::AllRows>;
 using Pro = projection::Operands<projection::OperandRecipe<packets::W0_OPERANDS_NVFP4>::NVFP4, Raw>;
-using Source = projection::GemvSource<Pro>;
 using Epi = projection::Activated<ELEMENT_OF(SEISMIC_ELEMENT_A)>;
 
 // Where choice (m, k) of `expert` reads its up weights: a bank record, or
@@ -34,15 +33,14 @@ using Epi = projection::Activated<ELEMENT_OF(SEISMIC_ELEMENT_A)>;
 template <int TPW, int KSPLIT>
 __launch_bounds__(routed::DECODE_THREADS) __global__ void routed_up_choice(SEISMIC_KERNEL_PARAMS) {
     using Shape = routed::DecodeShape<TPW, KSPLIT>;
-    __shared__ projection::GemvShared<Shape, Source::type> shared;
-    extern __shared__ uint4 dynamic_shared[];
+    __shared__ projection::GemvShared<Shape, projection::SharedRow> shared;
     const projection::u8 *normalized = SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED);
     const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));
     const projection::u64 m = blockIdx.y / SEISMIC_DIM_K, k = blockIdx.y % SEISMIC_DIM_K;
     // Block-collective: before any warp leaves.
-    const Source::type pro = Source::make(
+    const projection::SharedRow pro = projection::shared_row(
         Pro{Raw{normalized + m * SEISMIC_NORMALIZED_STRIDE_0 * 2, SEISMIC_NORMALIZED_STRIDE_0, projection::AllRows{}}},
-        reinterpret_cast<projection::u8 *>(dynamic_shared), 1u, SEISMIC_DIM_H, nullptr);
+        SEISMIC_DIM_H);
     const projection::u64 expert = (projection::u64)routes[m * SEISMIC_ROUTES_STRIDE_0 + k * SEISMIC_ROUTES_STRIDE_1];
     const slab::Matrix weights = UP_WEIGHTS(m, k, (int)expert);
     const element::Out<ELEMENT_OF(SEISMIC_ELEMENT_A)> product =

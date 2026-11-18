@@ -206,7 +206,7 @@ fn relative(a: &[f64], b: &[f64], reference: &[f64]) -> Error {
 }
 
 fn mapping_label(mapping: Mapping, rows: usize) -> String {
-    let path = if mapping.quantizes(rows) {
+    let path = if mapping.quantizes() {
         "int8"
     } else {
         "16-bit"

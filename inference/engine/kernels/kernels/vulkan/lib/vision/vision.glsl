@@ -18,16 +18,22 @@
 // last row, so every attention tile reads whole contiguous rows.
 //
 // This file is independent of any entry ABI.
+
+// The projections' GEMM shape (`projection.glsl`): 64 x 64 tiles of 32 x 32
+// sub-tiles, 128 invocations.
+#define VISION_TILE_M 64u
+#define VISION_TILE_N 64u
+#define PROJECTION_GEMM_TM VISION_TILE_M
+#define PROJECTION_GEMM_TN VISION_TILE_N
+#define PROJECTION_GEMM_WM 32u
+#define PROJECTION_GEMM_WN 32u
 #include "../projection/projection.glsl"
+#include "../projection/gemm.glsl"
 #include "../core/rotary.glsl"
 #include "../core/norm.glsl"
 #include "../attention/flash.glsl"
 #include "../core/precise.glsl"
 
-#define VISION_TILE_M 64u
-#define VISION_TILE_N 64u
-// 32 x 32 per subgroup: 128 invocations.
-#define VISION_SUB 32u
 // Output columns per attention pass (`lib/attention/flash.glsl`).
 #define VISION_WINDOW FLASH_WINDOW
 // Shared bytes of a vision GEMM launch: (TM + TN) * 80.
@@ -172,13 +178,12 @@ void vision_put(vision_epilogue out_, uint m, uint n, float value) {
 void vision_gemm(const int wk, projection_prologue in_, vision_epilogue out_, projection_weights w, uint m_rows,
     uint rows, uint k, uint tm_index, uint tn_index) {
     const uint first = tn_index * VISION_TILE_N;
-    projection_gemm_acc acc;
-    projection_gemm_accumulate(wk, wk, false, VISION_TILE_M, VISION_TILE_N, VISION_SUB, VISION_SUB, in_, w, w, first,
-        rows, tm_index * VISION_TILE_M, m_rows, k, 0u, (k + PROJECTION_GEMM_K - 1u) / PROJECTION_GEMM_K, m_rows, acc);
-    [[unroll]] for (uint q = 0u; q < projection_gemm_pairs(VISION_SUB, VISION_SUB); ++q) {
-        const vec2 c = projection_gemm_pair(acc, VISION_SUB, q);
-        const uint m = tm_index * VISION_TILE_M + projection_gemm_pair_row(VISION_TILE_N, VISION_SUB, VISION_SUB, q);
-        const uint n = first + projection_gemm_pair_column(VISION_TILE_N, VISION_SUB, q);
+    projection_gemm_accumulate(wk, wk, false, in_, w, w, first, rows, tm_index * VISION_TILE_M, m_rows, k, 0u,
+        (k + PROJECTION_GEMM_K - 1u) / PROJECTION_GEMM_K, m_rows);
+    [[unroll]] for (uint q = 0u; q < PROJECTION_GEMM_PAIRS; ++q) {
+        const vec2 c = projection_gemm_pair(q);
+        const uint m = tm_index * VISION_TILE_M + projection_gemm_pair_row(q);
+        const uint n = first + projection_gemm_pair_column(q);
         if (m < m_rows && n < rows)
             vision_put(out_, m, n, c.x);
         if (m < m_rows && n + 1u < rows)

@@ -75,17 +75,16 @@ __global__ void attention_project_stage(SEISMIC_KERNEL_PARAMS) {
 #endif
 
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_GEMV
-template <unsigned STAGING, unsigned KSPLIT>
+template <unsigned INT8, unsigned STAGING, unsigned KSPLIT>
 __global__ void attention_project_gemv(SEISMIC_KERNEL_PARAMS) {
-    extern __shared__ uint4 dynamic_shared[];
-    PROJECTION_SEGMENTED_GEMV(1, KSPLIT, STAGING, reinterpret_cast<projection::u8 *>(dynamic_shared));
+    PROJECTION_SEGMENTED_GEMV(1, KSPLIT, STAGING);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_GEMV16
-template <unsigned STAGING, unsigned KSPLIT>
+template <unsigned INT8, unsigned STAGING, unsigned KSPLIT>
 __global__ void attention_project_gemv16(SEISMIC_KERNEL_PARAMS) {
-    PROJECTION_SEGMENTED_GEMV(2, KSPLIT, STAGING, nullptr);
+    PROJECTION_SEGMENTED_GEMV(2, KSPLIT, STAGING);
 }
 #endif
 
@@ -97,8 +96,8 @@ __global__ void attention_project_gemm_small(SEISMIC_KERNEL_PARAMS) {
 #endif
 
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_GEMM
-template <unsigned INT8, unsigned OPERAND, unsigned ROTATE>
-__global__ void attention_project_gemm(SEISMIC_KERNEL_PARAMS) {
+template <unsigned INT8, unsigned OPERAND, unsigned ROTATE, unsigned BLOCKS>
+__launch_bounds__(256, BLOCKS) __global__ void attention_project_gemm(SEISMIC_KERNEL_PARAMS) {
     PROJECTION_SEGMENTED_GEMM(projection::LargeGemm<ROTATE>, PROJECTION_OPERANDS);
 }
 #endif

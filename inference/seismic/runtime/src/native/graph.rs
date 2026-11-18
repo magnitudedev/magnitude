@@ -6307,7 +6307,7 @@ mod operand_pairing_tests {
         let storage = plan_storage(&ports, &producing, &links, &results, &[], &[]);
         assert_eq!(storage.node_scratch[0][0], Placement::Port(2));
         assert_eq!(storage.node_scratch[0][1], Placement::Port(3));
-        assert!(matches!(storage.node_scratch[0][2], Placement::Scratch(_)), "its arrivals stay in the workspace");
+        assert!(matches!(storage.node_scratch[0][2], Placement::Sync(_)), "its arrivals stay in the slot's sync region");
 
         let consuming = vec![consumer((INPUT_NODE, 0))];
         let links = operand_links(&consuming, &[carry_in(2)]).unwrap();

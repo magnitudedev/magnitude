@@ -44,13 +44,14 @@ pub fn slab_tensor(
 /// The ordinal of `E`'s Metal launch `launch`, its kernel `<entry>_<launch>`.
 #[allow(dead_code)]
 pub fn metal_launch<E: seismic::Entry>(launch: &str) -> usize {
+    metal_launch_of::<E>(launch).unwrap_or_else(|| panic!("`{}` has no Metal launch `{launch}`", E::NAME))
+}
+
+/// The declaration index of `E`'s Metal launch `launch`, where it has one.
+pub fn metal_launch_of<E: seismic::Entry>(launch: &str) -> Option<usize> {
     let native = seismic::generated::native_implementation_for_backend::<E>(seismic::BackendName::Metal)
         .expect("the kernel bundle decodes")
         .unwrap_or_else(|| panic!("`{}` has a Metal implementation", E::NAME));
     let kernel = format!("{}_{launch}", E::NAME);
-    native
-        .launches
-        .iter()
-        .position(|candidate| candidate.kernel == kernel)
-        .unwrap_or_else(|| panic!("`{}` has no Metal launch `{kernel}`", E::NAME))
+    native.launches.iter().position(|candidate| candidate.kernel == kernel)
 }

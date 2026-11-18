@@ -8,7 +8,7 @@
 //! expanded from it.
 
 /// The version of the CPU library, part of every CPU implementation digest.
-pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+cpu-library-7");
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+cpu-library-8");
 
 /// Passes every tier, lowest first within its architecture, to the macro
 /// `$callback`, one `Token module "target_arch" ["feature", ..];` per tier:
@@ -50,6 +50,7 @@ macro_rules! tiers {
             ];
             Neon neon "aarch64" 5 () ["neon"];
             NeonDot neondot "aarch64" 6 (Neon) ["neon", "dotprod"];
+            NeonI8mm neoni8mm "aarch64" 8 (NeonDot) ["neon", "dotprod", "i8mm"];
         }
     };
     (@full $callback:ident $($rows:tt)*) => {
@@ -204,7 +205,7 @@ impl Tier {
     /// whole: SSE's 128 bits, AVX2's 256, AVX-512's 512, NEON's 128.
     pub const fn vector_bytes(self) -> usize {
         match self {
-            Tier::X86V2 | Tier::Neon | Tier::NeonDot => 16,
+            Tier::X86V2 | Tier::Neon | Tier::NeonDot | Tier::NeonI8mm => 16,
             Tier::X86V3 | Tier::X86V3Vnni => 32,
             Tier::X86V4 | Tier::X86V4Vnni => 64,
         }
@@ -223,12 +224,13 @@ impl Tier {
     }
 
     /// How the tier's quantized (INT8) dots multiply: 0 in portable integer
-    /// loops, 1 with vector byte products (AVX2, or NEON `sdot`), 2 with VNNI
+    /// loops, 1 with vector byte products (AVX2, or NEON `sdot`; with `i8mm`
+    /// also `smmla`, [`Tier::has`]), 2 with VNNI
     /// dot products (AVX-VNNI on 256-bit vectors, or AVX-512 VNNI).
     pub const fn quantized_dots(self) -> u8 {
         match self {
             Tier::X86V2 | Tier::Neon => 0,
-            Tier::X86V3 | Tier::X86V4 | Tier::NeonDot => 1,
+            Tier::X86V3 | Tier::X86V4 | Tier::NeonDot | Tier::NeonI8mm => 1,
             Tier::X86V3Vnni | Tier::X86V4Vnni => 2,
         }
     }

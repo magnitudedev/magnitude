@@ -191,7 +191,7 @@ __device__ __forceinline__ void draft_gemm(const unsigned char *staged, element:
                                           const packets::W1 &combine, u64 rows, u64 width) {
     extern __shared__ uint4 dynamic_shared[];
     const projection::Store<element::F32> out{result, width, 0};
-    projection::gemm_run<Shape, false>(reinterpret_cast<projection::u8 *>(dynamic_shared),
+    projection::gemm_run<Shape, false, false>(reinterpret_cast<projection::u8 *>(dynamic_shared),
         staged, 2 * width, nullptr, rows, 2 * width, projection::gemm_column<Shape>(), width,
         combine, projection::NoWeight{}, out);
 }

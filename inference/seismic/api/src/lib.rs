@@ -259,6 +259,9 @@ pub mod coverage {
 }
 /// Replay of the tuning search against recorded surveys (development).
 pub use seismic_runtime::native::replay;
+pub use seismic_runtime::native::survey::{
+    SurveyIndex, SurveyRecord, SurveyedPoint, SurveyedRow, SurveyedWork, WorkOutcome,
+};
 pub use seismic_runtime::native::search::{
     Cost, LaunchKey, ParameterValues, SearchSettings, SearchStop,
 };
@@ -374,6 +377,7 @@ pub use seismic_lang::forms::MetalPacking;
 /// The threads this process may run at once (`seismic-threads`): its share
 /// of the machine, which every thread pool of the process sizes itself by.
 pub use seismic_threads as threads;
+pub use seismic_runtime::native::{LaunchProgram, ProgramStatistic, StatisticValue};
 /// Measuring work on a device (`seismic-measure`): the timing session, the
 /// sustained clock, the statistics and the records of measured points. The
 /// runtime's measurable work is [`KernelPoint`] and [`GraphPoint`].
@@ -5288,6 +5292,14 @@ impl<E: Entry> NativeKernel<E> {
     /// and toolchain.
     pub fn artifact(&self) -> &NativeArtifactIdentity {
         self.inner.artifact()
+    }
+
+    /// What each launch's program uses, in ordinal order: its threads and
+    /// what its backend's compiler reports (CUDA's registers and local
+    /// bytes a thread, Vulkan's pipeline statistics); none for a launch not
+    /// formed.
+    pub fn launch_programs(&self) -> Vec<Option<LaunchProgram>> {
+        self.inner.launch_programs()
     }
 
     /// Calls cycling through `rotation`, each argument set validated and

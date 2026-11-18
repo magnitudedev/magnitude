@@ -3,7 +3,7 @@
 //! device batches kept in flight up to the ring's depth.
 
 use seismic::{
-    BackendName, Devices, Element, FlightRing, NativeSpecialization, NativeTensorBatch,
+    BackendName, Element, FlightRing, NativeSpecialization, NativeTensorBatch,
     NativeTensorBatchCompletion, Tensor,
 };
 use seismic_native_tests::scale_rows;
@@ -24,8 +24,7 @@ fn bytes(values: &[f32]) -> Vec<u8> {
 /// result is the scaled values written into its entry, none overwritten
 /// while the device still read it.
 fn an_entry_is_rewritten_only_after_its_batch_completed(backend: BackendName) {
-    let devices = Devices::discover(&[]).unwrap();
-    let Ok(device) = devices.open_backend(backend) else {
+    let Some(device) = seismic_native_tests::fresh_device(backend) else {
         return;
     };
     let kernel =

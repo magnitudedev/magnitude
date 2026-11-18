@@ -149,6 +149,11 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "cooperative-matrix tile pieces shared by the prefill and vision attention bodies",
     ),
     (
+        "lib/projection/gemm",
+        &[BackendName::Vulkan],
+        "the projection GEMM, apart from `projection.glsl` because its register arrays are sized by the pipeline's GEMM shape, which only a GEMM's includer defines; Metal and CUDA keep their GEMMs in their projection headers",
+    ),
+    (
         "lib/projection/operator",
         &[BackendName::Metal, BackendName::Cuda, BackendName::Vulkan],
         "the `dense` projection's form bodies (`dense.seismic`), which the GPU entries take; the CPU takes its `quantized` projection from `cpu/lib/projection`",
@@ -202,6 +207,11 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "lib/projection/gemv",
         &[BackendName::Metal],
         "the projection family's GEMV row classes, apart from `projection.h` so a library that runs no GEMV (a GEMM's, a batched GEMV's) compiles none of them: Metal compiles a launch's library whole",
+    ),
+    (
+        "lib/projection/gemv_packed",
+        &[BackendName::Metal],
+        "the packed-rows GEMV of a single projection's PACKED_ROWS form, over the token-packing GEMM's operand, apart from `gemv.h` so only its own launch's library compiles it",
     ),
     (
         "lib/core/head",

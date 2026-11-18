@@ -222,7 +222,8 @@ def test_a_build_keeps_the_units_its_kept_builds_reference_and_trims_the_rest(tm
     os.utime(target / "debug" / "incremental" / "old-1", (1000, 1000))
     (checkout / agent.REFERENCES).write_text("{}")  # it has recorded builds: none it keeps
     units = agent.units_of(str(target), [str(target / f"release/deps/libfoo-{keep}.rlib"),
-                                         str(target / f"release/build/foo-{keep}/out"), str(target / "release" / "x")])
+                                         str(target / f"release/build/foo-{keep}/out"),
+                                         str(target / "release" / "magnitude-inference")])
     assert units == {f"release/deps/{keep}", f"release/build/{keep}"}
     built = current.built("slot-0", 1.0, units)
     left = sorted(str(p.relative_to(target)) for p in target.rglob("*") if p.is_file())
@@ -230,11 +231,43 @@ def test_a_build_keeps_the_units_its_kept_builds_reference_and_trims_the_rest(tm
                            "release/.fingerprint/foo-%s/x" % stale, f"release/build/foo-{keep}/out/x",
                            f"release/deps/foo-{keep}.d", f"release/deps/foo-{keep}.provenance.json",
                            f"release/deps/libfoo-{keep}.rlib", "release/magnitude-inference"])
-    removed = built["trimmed"].pop("removed")
-    assert built["trimmed"] == {"bytes": 30, "entries": 3} and len(removed) == 3
-    assert sorted(removed) == sorted(str(target.resolve() / relative) for relative in (
-        f"release/deps/libfoo-{stale}.rlib", f"release/build/foo-{stale}", f"debug/deps/libbar-{other}.rmeta"))
+    assert built["trimmed"] == {"bytes": 30, "entries": 3}
     assert BUILD in json.loads((checkout / agent.REFERENCES).read_text())
+    end(current)
+
+
+def test_a_build_keeps_the_units_of_the_executables_cargo_uplifted(tmp_path):
+    """Cargo reports a built example or binary only at its unhashed uplifted path, a hard link
+    or (on macOS) a copy of its unit's hashed entry, which a binary names by its crate name;
+    the build keeps that unit (and the debug bundle macOS writes beside it) as it keeps any
+    other it references, and trims an older build of it."""
+    checkout = tmp_path / "checkouts" / "slot-0"
+    current = session(tmp_path, "run")
+    assert claim(current, "a") == "slot-0"
+    target = checkout / "target"
+    example, binary, stale = "dbb1e08491d91a20", "0123456789abcdef", "fedcba9876543210"
+    examples, deps = target / "release" / "examples", target / "release" / "deps"
+    for directory, name, unit in ((examples, "kernel_h2h", example), (examples, "kernel_h2h", stale),
+                                  (deps, "magnitude_harness", binary)):
+        (directory / f"{name}-{unit}.dSYM" / "Contents").mkdir(parents=True)
+        (directory / f"{name}-{unit}.dSYM" / "Contents" / "Info.plist").write_bytes(b"\0" * 10)
+        (directory / f"{name}-{unit}").write_bytes(unit.encode())
+        (directory / f"{name}-{unit}.d").write_bytes(b"\0" * 10)
+    uplifted = [(examples / "kernel_h2h", examples / f"kernel_h2h-{example}"),
+                (target / "release" / "magnitude-harness", deps / f"magnitude_harness-{binary}")]
+    os.link(*reversed(uplifted[0]))  # as cargo uplifts: the file hard-linked or copied, its bundle symlinked
+    shutil.copyfile(*reversed(uplifted[1]))
+    for link, entry in uplifted:
+        os.symlink(entry.name + ".dSYM", str(link) + ".dSYM")
+    (checkout / agent.REFERENCES).write_text("{}")
+    reported = [str(path) for link, _ in uplifted for path in (link, str(link) + ".dSYM")]
+    units = agent.units_of(str(target), reported)
+    assert units == {f"release/examples/{example}", f"release/deps/{binary}"}
+    assert current.built("slot-0", 1.0, units)["trimmed"]["entries"] == 3
+    assert sorted(p.name for p in examples.iterdir()) == sorted([
+        "kernel_h2h", "kernel_h2h.dSYM", f"kernel_h2h-{example}", f"kernel_h2h-{example}.d",
+        f"kernel_h2h-{example}.dSYM"])
+    assert all(entry.exists() for _, entry in uplifted)
     end(current)
 
 
@@ -1383,11 +1416,10 @@ def test_a_build_runs_from_its_output_releases_its_checkout_and_trims_what_no_ke
 
 
 @needs_cargo
-def test_an_executable_the_build_trims_is_left_out_of_its_output(tmp_path):
-    """Provenance keeps what it verified before the build's trim, an executable no kept build
-    references left in the target among it (another build's); the trim removes it, and the output
-    holds what the trim left, never failing on what it removed (b9e76b: another build's
-    executable)."""
+def test_an_executable_the_build_trims_is_linked_into_its_output_first(tmp_path):
+    """Provenance keeps an executable no kept build references, left in the target (another
+    build's); the output is completed before the trim removes it, so the build never fails on
+    what the trim removed (b9e76b: another build's executable)."""
     target = tmp_path / "checkouts" / "slot-0" / "target"
     stage = _crate(tmp_path / "v1", "0.1.0")
     start(tmp_path, "first", _build_plan(stage, "t1"))
@@ -1398,7 +1430,60 @@ def test_an_executable_the_build_trims_is_left_out_of_its_output(tmp_path):
     start(tmp_path, "second", _build_plan(stage, "t1", kept=(stale,)))
     result = ended(tmp_path, "second")
     assert result["failed"] is None and result["codes"] == {"tests": 0}, result
-    assert not stale.exists()  # trimmed, and its output completed without it
+    assert not stale.exists()  # trimmed after its output was completed
+
+
+@needs_cargo
+def test_a_build_of_an_example_completes_its_output_with_what_its_provenance_kept(tmp_path):
+    """An example's build in a checkout that records its builds (as macOS lays one out with
+    debug info: a dSYM bundle beside each executable) links into its output every executable
+    its provenance record kept, the hashed one included, and the checkout keeps the example's
+    unit for the next build."""
+    stage = _crate(tmp_path / "v1", "0.1.0")
+    (stage / "Cargo.toml").write_text(
+        '[workspace]\nmembers = ["lib"]\nresolver = "2"\n\n[profile.release]\ndebug = true\nsplit-debuginfo = "packed"\n')
+    (stage / "lib" / "examples").mkdir()
+    (stage / "lib" / "examples" / "h2h.rs").write_text("fn main() { println!(\"{}\", my_lib::who()); }\n")
+    proven = str(tmp_path / "provenance.json")
+    keep = ("import json, os, sys; d = os.path.join(sys.argv[1], 'release', 'examples'); json.dump({'kept': "
+            "[os.path.join(d, n) for n in os.listdir(d) if '.' not in n] if os.path.isdir(d) else []}, "
+            "open(sys.argv[2], 'w'))")
+
+    def build(tree: str, *selected: str, after=()) -> list:
+        return [*_claim_and_install(stage, tree), {"op": "phase", "phase": "build-s"},
+                {"op": "run", "argv": ["cargo", "build", "--release", "--offline", "-p", "my-lib", *selected],
+                 "cwd": "{checkout:s}/src", "env": {"CARGO_TARGET_DIR": "{checkout:s}/target"}},
+                run_op([sys.executable, "-c", keep, "{checkout:s}/target", proven], tmp_path),
+                {"op": "built", "side": "s", "release": True, "provenance": proven}, *after]
+
+    start(tmp_path, "first", build("t1", "--lib"))  # from here on the checkout records its builds
+    assert ended(tmp_path, "first")["failed"] is None
+    start(tmp_path, "second", build("t2", "--example", "h2h", after=[until_exists(tmp_path / "go")]))
+    while not any("released checkout" in e.get("text", "") for e in events(tmp_path, "second")):
+        assert "ended" not in {e["event"] for e in events(tmp_path, "second")}, ended(tmp_path, "second")
+        time.sleep(0.1)
+    kept = json.loads(Path(proven).read_text())["kept"]
+    assert len(kept) == 2  # the example and its hashed unit entry
+    output = tmp_path / "outputs" / "t2-b" / "target" / "release" / "examples"
+    assert sorted(p.name for p in output.iterdir()) == sorted(os.path.basename(path) for path in kept)
+    assert all(os.path.exists(path) for path in kept)  # the checkout keeps the example's unit
+    (tmp_path / "go").write_text("")
+    assert ended(tmp_path, "second")["failed"] is None
+
+
+def test_an_unexpected_fault_fails_the_run_with_what_raised_it_and_where(tmp_path):
+    """A fault of the agent's own (here, a provenance record that was never written) ends the
+    run as a failure that names the exception, the path it names, and the code that raised it."""
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    missing = tmp_path / "provenance.json"
+    start(tmp_path, "run", [*_claim_and_install(stage, "t"), {"op": "phase", "phase": "build-s"},
+                            {"op": "built", "side": "s", "release": True, "provenance": str(missing)}])
+    failed = ended(tmp_path, "run")["failed"]
+    assert failed["phase"] == "build-s"
+    assert re.fullmatch(r"agent: FileNotFoundError: \[Errno 2\] No such file or directory: '%s' "
+                        r"at agent\.py:\d+ carry_out > agent\.py:\d+ operate > agent\.py:\d+ materialize" % re.escape(str(missing)),
+                        failed["detail"]), failed["detail"]
 
 
 def test_a_run_sharing_a_checkout_neither_trims_nor_records_it_nor_makes_room(tmp_path):
