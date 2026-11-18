@@ -830,6 +830,20 @@ __declspec(dllexport) DWORD WINAPI RemoveOwnedStartup(LPCWSTR executable) {
   return error == ERROR_FILE_NOT_FOUND ? ERROR_SUCCESS : error;
 }
 
+/* Asks the folder's owner to step aside. A CLI-only `serve` yields as it does to the desktop app and keeps
+   waiting for its turn; a running desktop app ignores the request and keeps the lock. */
+static void request_owner_yield(LPCWSTR endpoint) {
+  HANDLE pipe = CreateFileW(endpoint, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+  if (pipe == INVALID_HANDLE_VALUE && GetLastError() == ERROR_PIPE_BUSY && WaitNamedPipeW(endpoint, 2000))
+    pipe = CreateFileW(endpoint, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+  if (pipe == INVALID_HANDLE_VALUE) return;
+  static const char request[] = "{\"version\":1,\"intent\":\"Yield\"}\n";
+  char reply[4096];
+  DWORD written = 0, read = 0;
+  if (WriteFile(pipe, request, (DWORD)(sizeof(request) - 1), &written, NULL)) ReadFile(pipe, reply, (DWORD)sizeof(reply), &read, NULL);
+  CloseHandle(pipe);
+}
+
 /* Process-scoped installation lease; never starts or adopts a service. */
 __declspec(dllexport) DWORD WINAPI HoldOwnership(void) {
   WCHAR root[32768], state[32768], path[32768];
@@ -871,7 +885,15 @@ __declspec(dllexport) DWORD WINAPI HoldOwnership(void) {
   if (error) { CloseHandle(file); CloseHandle(directory); return error; }
   OVERLAPPED offset = {0};
   if (!LockFileEx(file, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &offset)) {
-    error = GetLastError(); CloseHandle(file); CloseHandle(directory); return error;
+    error = GetLastError();
+    if (error == ERROR_LOCK_VIOLATION) {
+      request_owner_yield(endpoint);
+      for (int attempt = 0; attempt < 300 && error == ERROR_LOCK_VIOLATION; ++attempt) {
+        Sleep(100);
+        error = LockFileEx(file, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &offset) ? ERROR_SUCCESS : GetLastError();
+      }
+    }
+    if (error) { CloseHandle(file); CloseHandle(directory); return error; }
   }
   leaseHeld = TRUE;
   /* Non-inheritable kernel handles deliberately live until installer process exit.
