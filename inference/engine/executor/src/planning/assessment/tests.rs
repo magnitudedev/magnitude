@@ -1530,7 +1530,7 @@ fn checked_vision_family_bounds_exact_patch_classes() {
         let program =
             crate::operators::vision::vision_program(&description, &|_| Ok(f32)).unwrap();
         assert_eq!(program.registers, description.stem.registers());
-        let plan = VisionProgramPlan::new(program.kernels().into_iter().cloned().collect());
+        let plan = VisionProgramPlan::new(&program);
         let resources = |classes: &[u64]| {
             crate::programs::native_vision::checked_vision_family_resources(
                 BackendName::Cpu,

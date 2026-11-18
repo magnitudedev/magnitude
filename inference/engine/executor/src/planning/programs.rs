@@ -15,7 +15,7 @@ use crate::operators::routed::GeneralRoutedBinding;
 use crate::operators::short_conv::ShortConvBinding;
 use crate::operators::state_space::StateSpaceBinding;
 use crate::operators::streams::{BlockStreams, SinkhornExit};
-use crate::operators::vision::VisionKernel;
+use crate::operators::vision::{VisionGeometry, VisionKernel, VisionProgram, VisionProjection};
 use crate::operators::{
     self, CausalHeadBlock, attention_slot, dense_slot, feed_forward_slot, mixer_slot, paired_block,
 };
@@ -486,20 +486,58 @@ pub struct SharedHeadProgramPlan {
     pub activation: Element,
 }
 
-/// The distinct kernel specializations of the projector's vision program
-/// (`operators::vision`), in first-use order.
+/// The projector's vision program (`operators::vision`): its distinct
+/// kernel specializations in first-use order, the invocations of each
+/// projecting one in program order (what its tuning case measures), and the
+/// tower's rows of an image.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VisionProgramPlan {
     kernels: Vec<VisionKernel>,
+    projections: Vec<(VisionKernel, Vec<VisionProjection>)>,
+    geometry: VisionGeometry,
 }
 
 impl VisionProgramPlan {
-    pub(crate) fn new(kernels: Vec<VisionKernel>) -> Self {
-        Self { kernels }
+    pub(crate) fn new(program: &VisionProgram) -> Self {
+        let mut projections: Vec<(VisionKernel, Vec<VisionProjection>)> = Vec::new();
+        for op in &program.ops {
+            let Some(projection) = op.operands.projection() else {
+                continue;
+            };
+            match projections.iter_mut().find(|(kernel, _)| *kernel == op.kernel) {
+                Some((_, invocations)) => invocations.push(projection),
+                None => projections.push((op.kernel.clone(), vec![projection])),
+            }
+        }
+        Self {
+            kernels: program.kernels().into_iter().cloned().collect(),
+            projections,
+            geometry: VisionGeometry {
+                cell_rows: program.cell_rows,
+                registers: program.registers,
+            },
+        }
     }
 
     pub fn kernels(&self) -> &[VisionKernel] {
         &self.kernels
+    }
+
+    /// Each invocation of the projecting kernel `kernel`, in program order.
+    ///
+    /// # Panics
+    ///
+    /// When the program invokes no projecting kernel `kernel`.
+    pub fn projections(&self, kernel: &VisionKernel) -> &[VisionProjection] {
+        self.projections
+            .iter()
+            .find(|(planned, _)| planned == kernel)
+            .map(|(_, invocations)| invocations.as_slice())
+            .unwrap_or_else(|| panic!("vision kernel {kernel:?} projects nothing"))
+    }
+
+    pub fn geometry(&self) -> VisionGeometry {
+        self.geometry
     }
 }
 
@@ -997,9 +1035,7 @@ pub(super) fn derive_program_plan(
             let program = operators::vision::vision_program(description, &|role| {
                 lookup(weights, role.scope, role.kind)
             })?;
-            Some(VisionProgramPlan::new(
-                program.kernels().into_iter().cloned().collect(),
-            ))
+            Some(VisionProgramPlan::new(&program))
         }
         (_, None) => None,
         _ => {

@@ -14,7 +14,12 @@
 //! - `decode(C)`: one decode step with C tokens of history, as the load
 //!   decodes: one target row per sequence without drafting; with drafting,
 //!   the drafter's launches for a width and the target's verification of
-//!   its drafts and their anchor.
+//!   its drafts and their anchor;
+//! - `vision(C)`, of a load that encodes images: encoding one image of the
+//!   largest class the load encodes, of C merged cells, each tower launch
+//!   at the image's rows. Only the vision units launch in it, so it enters
+//!   their objectives alone: it weighs as a text metric does, beside the
+//!   text metrics rather than taking from their weights.
 //!
 //! **Score.** Every metric counts by its relative change: the tuner
 //! minimizes the weighted mean over the objective's terms of
@@ -44,13 +49,16 @@ pub(crate) enum Phase {
     Prefill,
     /// One decode step at the metric's context of history.
     Decode,
+    /// Encoding one image of the metric's context of merged cells.
+    Vision,
 }
 
 /// One measurement the engine is held to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Metric {
     pub phase: Phase,
-    /// The prompt's tokens (prefill) or the history decoded at (decode).
+    /// The prompt's tokens (prefill), the history decoded at (decode) or
+    /// the image's merged cells (vision).
     pub context: u64,
     /// The sequences served together, each with a context of its own.
     pub sequences: u64,
@@ -88,8 +96,9 @@ pub(crate) fn metric_weight(_metric: &Metric) -> f64 {
     1.
 }
 
-/// The load's metrics.
-pub(crate) fn metrics(limits: TuningLimits) -> Vec<Metric> {
+/// The load's metrics: an image's (`images`, a load that prepares a vision
+/// program) beside its text's.
+pub(crate) fn metrics(limits: TuningLimits, images: bool) -> Vec<Metric> {
     let mut metrics = Vec::new();
     for phase in [Phase::Prefill, Phase::Decode] {
         for &sequences in &concurrency(limits) {
@@ -102,15 +111,31 @@ pub(crate) fn metrics(limits: TuningLimits) -> Vec<Metric> {
             }
         }
     }
+    if images {
+        assert!(
+            limits.image_cells > 0,
+            "a load that prepares a vision program encodes images"
+        );
+        metrics.push(Metric {
+            phase: Phase::Vision,
+            context: limits.image_cells,
+            sequences: 1,
+        });
+    }
     metrics
 }
 
 /// The objective's terms for a load whose drafter prepares `widths` (none
-/// without drafting): every metric, a drafted decode metric once for each
-/// width, the weights summing to one.
-pub(crate) fn terms(limits: TuningLimits, widths: &[u64]) -> Vec<Term> {
-    let metrics = metrics(limits);
-    let total = metrics.iter().map(metric_weight).sum::<f64>();
+/// without drafting) and that encodes `images` ([`metrics`]): every metric,
+/// a drafted decode metric once for each width, the text metrics' weights
+/// summing to one and the image's beside them.
+pub(crate) fn terms(limits: TuningLimits, widths: &[u64], images: bool) -> Vec<Term> {
+    let metrics = metrics(limits, images);
+    let total = metrics
+        .iter()
+        .filter(|metric| metric.phase != Phase::Vision)
+        .map(metric_weight)
+        .sum::<f64>();
     metrics
         .into_iter()
         .flat_map(|metric| {
@@ -139,6 +164,7 @@ mod tests {
         max_rows: 512,
         max_projected_rows: 8,
         context_tokens: 64256,
+        image_cells: 0,
     };
 
     /// Prefill and decode at every context point to the limit; a drafted
@@ -151,14 +177,14 @@ mod tests {
             ..LIMITS
         };
         assert_eq!(contexts(short), [2048]);
-        let plain = terms(LIMITS, &[]);
+        let plain = terms(LIMITS, &[], false);
         assert_eq!(plain.len(), 4);
         assert!(
             plain
                 .iter()
                 .all(|term| (term.weight - 1. / 4.).abs() < 1e-12)
         );
-        let drafted = terms(LIMITS, &[1, 2, 3]);
+        let drafted = terms(LIMITS, &[1, 2, 3], false);
         assert_eq!(drafted.len(), 2 + 2 * 3);
         assert!((drafted.iter().map(|term| term.weight).sum::<f64>() - 1.).abs() < 1e-12);
         let decode_64k = drafted
@@ -167,5 +193,25 @@ mod tests {
             .map(|term| term.weight)
             .sum::<f64>();
         assert!((decode_64k - 1. / 4.).abs() < 1e-12);
+    }
+
+    /// A load that encodes images holds one more metric, an image of its
+    /// largest class, weighing as a text metric does, after the text terms,
+    /// which it leaves exactly as a load without images has them.
+    #[test]
+    fn an_image_is_a_metric_beside_the_text_metrics() {
+        let images = TuningLimits {
+            image_cells: 256,
+            ..LIMITS
+        };
+        let text = terms(images, &[1, 2], false);
+        let terms = terms(images, &[1, 2], true);
+        assert_eq!(terms[..text.len()], text[..]);
+        let [vision] = &terms[text.len()..] else {
+            panic!("one image term follows the text terms: {terms:?}");
+        };
+        assert_eq!(vision.metric.phase, Phase::Vision);
+        assert_eq!(vision.metric.context, 256);
+        assert!((vision.weight - 1. / 4.).abs() < 1e-12);
     }
 }

@@ -13,14 +13,9 @@ fn pattern(count: u64, span: usize, shift: usize) -> Vec<f32> {
 
 /// The static dimension `name` of a planned kernel.
 fn statics(kernel: &VisionKernel, name: &str, label: &str) -> Result<u64, CatalogFailure> {
-    kernel
-        .statics
-        .iter()
-        .find(|(bound, _)| *bound == name)
-        .map(|(_, value)| *value)
-        .ok_or_else(|| {
-            qualification_dynamic("vision", label, format!("no static dimension {name}"))
-        })
+    kernel.dimension(name).ok_or_else(|| {
+        qualification_dynamic("vision", label, format!("no static dimension {name}"))
+    })
 }
 
 /// The element bound to `name`.
@@ -110,6 +105,7 @@ impl<'a> QualificationView<'a> {
                         table_values[..h as usize].copy_from_slice(&table_row);
                     }
                     let result = prepared(&kernels.patch_stem, kernel, entry, label)?
+                        .for_rows(&seismic::Dim::from(rows))
                         .call(charges, vision_patch_stem::Args {
                             pixels: &zeros(entry, Element::f32(), &[rows, c, 1 + s, p, p])?,
                             frame_weight: &zeros(entry, element("W0")?, &[h, c, p, p])?,
@@ -217,6 +213,7 @@ impl<'a> QualificationView<'a> {
                     let residual_values = pattern(rows * n, 9, 3);
                     let gate_values = pattern(rows * n, 3, 1);
                     let result = prepared(&kernels.linear, kernel, entry, label)?
+                        .for_rows(&seismic::Dim::from(rows))
                         .call(charges, vision_linear::Args {
                             x: &values(entry, activation, &[rows, k], &pattern(rows * k, 5, 0))?,
                             weight: &zeros(entry, element("W")?, &[n, k])?,
@@ -519,12 +516,12 @@ impl<'a> QualificationView<'a> {
     }
 }
 
-fn prepared<'a, E: seismic::Entry>(
-    kernels: &'a std::collections::HashMap<VisionKernel, NativeKernel<E>>,
+fn prepared<'a, K>(
+    kernels: &'a std::collections::HashMap<VisionKernel, K>,
     kernel: &VisionKernel,
     entry: &'static str,
     label: &str,
-) -> Result<&'a NativeKernel<E>, CatalogFailure> {
+) -> Result<&'a K, CatalogFailure> {
     kernels
         .get(kernel)
         .ok_or_else(|| qualification_dynamic(entry, label, "the kernel was not prepared"))

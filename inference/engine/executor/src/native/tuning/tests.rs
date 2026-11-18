@@ -14,6 +14,7 @@ const LIMITS: TuningLimits = TuningLimits {
     max_rows: 512,
     max_projected_rows: 8,
     context_tokens: 16384,
+    image_cells: 0,
 };
 
 /// What a demand walk collects for `case` alone, decoding without drafting:
@@ -24,7 +25,7 @@ fn fixture_invocations<T: EntryTuning>(
     statics: &NativeSpecialization,
     limits: TuningLimits,
 ) -> super::super::specialization::InvocationDemand {
-    let terms = workload::terms(limits, &[]);
+    let terms = workload::terms(limits, &[], false);
     let mut demand = super::super::specialization::InvocationDemand {
         units: HashMap::new(),
         objective: Objective::new(terms),
@@ -106,7 +107,7 @@ fn a_units_share_is_its_mean_fraction_of_every_terms_time() {
 #[test]
 fn launches_reach_the_points_at_their_rows_sequences_and_histories() {
     use crate::programs::invocation_demand::{InvocationCounts, Launch};
-    let mut objective = Objective::new(workload::terms(LIMITS, &[]));
+    let mut objective = Objective::new(workload::terms(LIMITS, &[], false));
     objective.measured = vec![1.; objective.terms.len()];
     let mut counts = InvocationCounts::default();
     let launch = |term, rows, sequences, history| Launch {
@@ -685,6 +686,7 @@ fn attention_points_cross_rows_with_served_contexts() {
         max_rows: 1,
         max_projected_rows: 1,
         context_tokens: 128,
+        image_cells: 0,
     });
     assert_eq!(
         short.iter().map(|p| p.context.unwrap()).collect::<Vec<_>>(),
@@ -789,6 +791,7 @@ fn a_search_forms_each_dependant_at_its_prerequisites_final_arithmetic() {
         max_rows: 64,
         max_projected_rows: 8,
         context_tokens: 256,
+        image_cells: 0,
     };
     let implementation = dense_output_implementation(&device);
     let statics = [("H", 8), ("F", 16), ("DS", 0), ("DB", 0)]
@@ -1406,6 +1409,7 @@ fn a_prepare_abandoned_mid_search_is_searched_again_by_the_next_prepare() {
         max_rows: 64,
         max_projected_rows: 8,
         context_tokens: 256,
+        image_cells: 0,
     };
     let implementation = dense_output_implementation(&device);
     let statics = implementation
@@ -1666,6 +1670,7 @@ fn a_record_is_published_with_a_promotion_and_once_when_the_work_stops() {
         max_rows: 64,
         max_projected_rows: 8,
         context_tokens: 256,
+        image_cells: 0,
     };
     let implementation = dense_output_implementation(&device);
     let statics = implementation
@@ -1860,6 +1865,7 @@ fn a_record_made_without_demand_is_read_without_demand_and_searched_with_it() {
         max_rows: 64,
         max_projected_rows: 8,
         context_tokens: 256,
+        image_cells: 0,
     };
     let implementation = dense_output_implementation(&device);
     let statics = implementation
@@ -1996,6 +2002,7 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
         max_rows: 64,
         max_projected_rows: 8,
         context_tokens: 256,
+        image_cells: 0,
     };
     let implementation = dense_output_implementation(&device);
     let statics = implementation
@@ -2063,6 +2070,8 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
     let mut expected = vec![seismic::Stage::Discovery; labels.len()];
     expected.extend([seismic::Stage::Measure, seismic::Stage::Promote]);
     assert_eq!(*case.stages.borrow(), expected);
+    // The run's end reports what became of its budget.
+    let concluded = tuner.conclude();
     let events = recorder.0.borrow();
     // Progress counts milliseconds of the tuning time from the count.
     let total = STANDARD_TUNING_BUDGET.as_millis() as usize;
@@ -2153,7 +2162,7 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
     );
     assert!(tuned.qualified);
     assert_eq!(tuned.stop, Some(SearchStop::Exhausted));
-    assert_eq!(tuner.conclude(), [(*tuned).clone()]);
+    assert_eq!(concluded, [(*tuned).clone()]);
 }
 
 /// Stored tuning results (tuning spec §C2): a miss tunes and stores the
@@ -2198,6 +2207,7 @@ fn stored_results_are_offered_to_runtime_validation_and_changed_keys_miss() {
         max_rows: 64,
         max_projected_rows: 8,
         context_tokens: 256,
+        image_cells: 0,
     };
     // One load: a count, a census and a search. Returns the unit's outcome,
     // whether its search started, and whether tuning reported progress.
@@ -2418,6 +2428,7 @@ fn a_stored_record_is_served_under_another_alpha_without_forming_or_measuring() 
         max_rows: 64,
         max_projected_rows: 8,
         context_tokens: 256,
+        image_cells: 0,
     };
     // One load under `alpha`: the unit's outcome, and its case, which
     // counts what the load formed, built and measured.
@@ -2570,6 +2581,7 @@ fn unqualified_terminal_choices_are_reused_with_their_disposition_and_without_se
         max_rows: 64,
         max_projected_rows: 8,
         context_tokens: 256,
+        image_cells: 0,
     };
     let load_once = |case: &FakeCase| -> (TunedEntry, bool) {
         let recorder = Recorder::default();
@@ -3049,6 +3061,7 @@ fn units_measure_baselines_before_search() {
         max_rows: 64,
         max_projected_rows: 8,
         context_tokens: 256,
+        image_cells: 0,
     };
     let mut tuner = Tuner::count(
         &charges,
@@ -3206,6 +3219,7 @@ fn stored_attention_choice_must_admit_every_served_span_class() {
         max_rows: 64,
         max_projected_rows: 8,
         context_tokens: 4096,
+        image_cells: 0,
     };
     let context = TuningContext {
         definition: &definition,
@@ -3381,6 +3395,7 @@ fn a_load_reads_records_and_reports_or_serves_defaults_without_searching() {
         max_rows: 64,
         max_projected_rows: 8,
         context_tokens: 256,
+        image_cells: 0,
     };
     let defaults = implementation.default_specialization(&statics).unwrap();
     let invocations = |cases: &[&FakeCase]| {

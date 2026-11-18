@@ -164,6 +164,7 @@ pub(crate) mod streams;
 #[cfg(feature = "tuning-survey")]
 pub mod survey;
 mod trace;
+pub(crate) mod vision;
 mod weights;
 pub(crate) mod workload;
 
@@ -476,6 +477,10 @@ pub struct TuningLimits {
     pub max_projected_rows: u64,
     /// The served context: the longest history a row attends to.
     pub context_tokens: u64,
+    /// Merged cells of the largest image class the load encodes
+    /// (`magnitude_batching::image_cell_class`): 0 for a load without
+    /// images.
+    pub image_cells: u64,
 }
 
 impl TuningLimits {
@@ -485,6 +490,8 @@ impl TuningLimits {
             max_rows: limits.max_launch_rows as u64,
             max_projected_rows: crate::programs::graph::readout::max_projected_rows(limits) as u64,
             context_tokens: definition.decoder.context_limit,
+            image_cells: magnitude_batching::image_cell_class(limits.max_image_cells)
+                .map_or(0, |cells| cells as u64),
         }
     }
 }
@@ -784,7 +791,12 @@ pub fn served_row_points(limits: TuningLimits, serves: impl Fn(u64) -> bool) -> 
             .map(|rows| row_point(rows, 1.0))
             .collect();
     }
-    normalized(within.into_iter().map(|rows| row_point(rows, 1.)).collect())
+    points_at(within)
+}
+
+/// A point of one sequence at each of `rows`, alike in weight.
+pub(crate) fn points_at(rows: impl IntoIterator<Item = u64>) -> Vec<PointShape> {
+    normalized(rows.into_iter().map(|rows| row_point(rows, 1.)).collect())
 }
 
 /// The longest history the engine serves to layers keeping at most `window`
@@ -1874,9 +1886,12 @@ pub struct FormedAhead {
     pub actual_seconds: f64,
 }
 
-/// What became of one load's tuning budget. Times are seconds.
+/// What became of one tuning run's budget, over its rounds that searched.
+/// Times are seconds on the run's tuning clock.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BudgetReport {
+    /// When the run's budget ended: its last search's tuning budget from
+    /// when that search began.
     pub budget_seconds: f64,
     /// Tuning time when the optional work ended, the records its units
     /// owed published.
@@ -1903,6 +1918,30 @@ pub struct BudgetReport {
     /// The allocator's own work between the last piece and its stop.
     pub ending: EndingReport,
     pub memory: TuningMemory,
+}
+
+impl BudgetReport {
+    /// A run's report after a later round of it: the budget, the time and
+    /// the allocator's ending of the later, on the run's clock, and the
+    /// memory as the tuner last recorded it; the time past each round's
+    /// budget, the publishing, the pieces and what each round refused,
+    /// abandoned and released, of both.
+    fn then(mut self, later: Self) -> Self {
+        self.settling_seconds += later.settling_seconds;
+        self.overrun_seconds += later.overrun_seconds;
+        self.stages += later.stages;
+        self.refused.extend(later.refused);
+        self.abandoned.extend(later.abandoned);
+        self.released.extend(later.released);
+        Self {
+            budget_seconds: later.budget_seconds,
+            used_seconds: later.used_seconds,
+            unused_seconds: later.unused_seconds,
+            ending: later.ending,
+            memory: later.memory,
+            ..self
+        }
+    }
 }
 
 /// The allocator's own work from the end of the last piece performed to
@@ -2345,10 +2384,11 @@ impl TuningInputs<'_, '_> {
 }
 
 impl TuningInputs<'_, '_> {
-    /// The layers of `point`'s argument sets: up to [`ROTATION_LAYERS`] of
-    /// `scopes`, spread over the model's depth, for decode rows (up to
-    /// [`STREAMING_ROWS`]); the first layer alone for prefill rows.
-    pub fn rotation_scopes(scopes: &[WeightScope], point: &PointShape) -> Vec<WeightScope> {
+    /// The layers of `point`'s argument sets, of a case's `scopes` (or of
+    /// whatever else it holds one of per launch): up to [`ROTATION_LAYERS`]
+    /// of them, spread over the model's depth, for decode rows (up to
+    /// [`STREAMING_ROWS`]); the first alone for prefill rows.
+    pub fn rotation_scopes<S: Clone>(scopes: &[S], point: &PointShape) -> Vec<S> {
         let layers = if point.rows <= STREAMING_ROWS {
             ROTATION_LAYERS
         } else {
@@ -2358,7 +2398,7 @@ impl TuningInputs<'_, '_> {
             return scopes.to_vec();
         }
         (0..layers)
-            .map(|index| scopes[index * scopes.len() / layers])
+            .map(|index| scopes[index * scopes.len() / layers].clone())
             .collect()
     }
 
@@ -3622,9 +3662,19 @@ pub(crate) struct Tuner<'a> {
     /// formation and all optional work are measured on it; the budget is
     /// counted from it. Counting forms nothing.
     started: Instant,
-    /// This preparation has uncached units: it reports what became of its
+    /// This round has uncached units: it reports what became of its
     /// budget.
     first_load_search: bool,
+    /// The searches the run makes, one after another on its clock, each
+    /// within the tuning budget from when it begins
+    /// ([`Self::next_search`]): the run's progress is over all of them.
+    searches: u32,
+    /// When the search under way ends on the tuning clock: the tuning
+    /// budget from when it began.
+    deadline: Duration,
+    /// What became of the budget of the run's rounds that searched so far,
+    /// reported once, when the run ends, however it ends (its `Drop`).
+    spent: Option<BudgetReport>,
     /// Units a load found no stored record for and prepared at their
     /// canonical defaults.
     unprepared: usize,
@@ -3703,6 +3753,17 @@ impl Staff {
 impl Drop for Staff {
     fn drop(&mut self) {
         self.device.staff(None);
+    }
+}
+
+/// The run ends with its tuner: what became of its budget is reported then,
+/// whether the run concluded or failed; nothing when no round of it
+/// searched.
+impl Drop for Tuner<'_> {
+    fn drop(&mut self) {
+        if let Some(spent) = self.spent.take() {
+            self.context.observer.event(&TuningEvent::Budget(spent));
+        }
     }
 }
 
@@ -3788,6 +3849,23 @@ impl<'a> Tuner<'a> {
         self.staff = Some(Staff::of(self.charges.device()));
         self
     }
+
+    /// The run makes `searches` searches, the first this tuner's
+    /// ([`Self::next_search`]).
+    pub fn searches(mut self, searches: u32) -> Self {
+        self.searches = searches;
+        self
+    }
+
+    /// The run's next search, after the last round of one: on the same
+    /// tuning clock, a count that opens only the units no search has
+    /// decided, within the tuning budget from now.
+    pub fn next_search(self) -> Self {
+        let mut next = self.recount();
+        next.deadline = next.started.elapsed() + next.budget();
+        next
+    }
+
     pub(super) fn device(&self) -> Device {
         self.charges.device()
     }
@@ -3941,6 +4019,9 @@ impl<'a> Tuner<'a> {
             unprepared: 0,
             started: Instant::now(),
             first_load_search: false,
+            searches: 1,
+            deadline: context.settings.budget,
+            spent: None,
             tuned: Vec::new(),
             chosen: HashMap::new(),
             provisional: std::collections::HashSet::new(),
@@ -4224,7 +4305,7 @@ impl<'a> Tuner<'a> {
             unreachable!("a search follows the census");
         };
         let clock = Elapsed(self.started);
-        let budget = self.budget();
+        let budget = self.deadline;
         let indices = units
             .iter()
             .enumerate()
@@ -4374,31 +4455,33 @@ impl<'a> Tuner<'a> {
         self.memory.return_freed_pages();
         self.memory.breakdown_returned = seismic::ProcessMemory::read();
         if self.first_load_search {
-            self.context
-                .observer
-                .event(&TuningEvent::Budget(BudgetReport {
-                    budget_seconds: budget.as_secs_f64(),
-                    used_seconds: report.ended.as_secs_f64(),
-                    settling_seconds: report.settling.as_secs_f64(),
-                    unused_seconds: report.unused().as_secs_f64(),
-                    overrun_seconds: report.overrun().as_secs_f64(),
-                    stages: report.admitted.len(),
-                    refused,
-                    abandoned,
-                    released,
-                    ending: EndingReport {
-                        began_seconds: report.ending.began.as_secs_f64(),
-                        held_seconds: report.ending.held.as_secs_f64(),
-                        passes: report.ending.passes,
-                        deciding_seconds: report.ending.deciding.as_secs_f64(),
-                        narrowed: report.ending.narrowed,
-                        narrowing_seconds: report.ending.narrowing.as_secs_f64(),
-                        released: report.ending.released,
-                        releasing_seconds: report.ending.releasing.as_secs_f64(),
-                        draining_seconds: report.ending.draining.as_secs_f64(),
-                    },
-                    memory: self.memory.clone(),
-                }));
+            let searched = BudgetReport {
+                budget_seconds: budget.as_secs_f64(),
+                used_seconds: report.ended.as_secs_f64(),
+                settling_seconds: report.settling.as_secs_f64(),
+                unused_seconds: report.unused().as_secs_f64(),
+                overrun_seconds: report.overrun().as_secs_f64(),
+                stages: report.admitted.len(),
+                refused,
+                abandoned,
+                released,
+                ending: EndingReport {
+                    began_seconds: report.ending.began.as_secs_f64(),
+                    held_seconds: report.ending.held.as_secs_f64(),
+                    passes: report.ending.passes,
+                    deciding_seconds: report.ending.deciding.as_secs_f64(),
+                    narrowed: report.ending.narrowed,
+                    narrowing_seconds: report.ending.narrowing.as_secs_f64(),
+                    released: report.ending.released,
+                    releasing_seconds: report.ending.releasing.as_secs_f64(),
+                    draining_seconds: report.ending.draining.as_secs_f64(),
+                },
+                memory: self.memory.clone(),
+            };
+            self.spent = Some(match self.spent.take() {
+                Some(spent) => spent.then(searched),
+                None => searched,
+            });
         }
         outcome.and(reported)?;
         Ok(self)
@@ -4415,9 +4498,10 @@ impl<'a> Tuner<'a> {
         }
     }
 
-    /// Report the tuning time spent so far, of the tuning budget.
+    /// Report the tuning time spent so far, of the run's: the tuning budget
+    /// of each of its searches.
     fn report_progress(&self) {
-        let total = self.budget().as_millis() as usize;
+        let total = (self.budget() * self.searches).as_millis() as usize;
         self.context.observer.event(&TuningEvent::Progress {
             completed: (self.started.elapsed().as_millis() as usize).min(total),
             total,
