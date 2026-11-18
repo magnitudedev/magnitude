@@ -45,7 +45,7 @@ Windows PowerShell:
 irm https://magnitude.dev/install.ps1 | iex
 ```
 
-Installs the CLI only, for servers and headless use. For the desktop app, use the download links above, or add `--desktop` (on Windows, see [the PowerShell command](https://docs.magnitude.dev/installation/windows#install-from-powershell)).
+Installs the CLI only, for servers and headless use. For the desktop app, use the download links above, or run `curl -fsSL https://magnitude.dev/install.sh | sh -s -- --desktop` (Windows PowerShell: `& ([scriptblock]::Create((irm https://magnitude.dev/install.ps1))) -Desktop`).
 
 To run Magnitude as a service other computers can use, see [Remote server](https://docs.magnitude.dev/remote-server). To run it in a container, see [Docker](https://docs.magnitude.dev/installation/docker).
 
